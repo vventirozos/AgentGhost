@@ -126,8 +126,10 @@ def test_vortex_self_similar_swallow(graph_js):
         "spiral wind must stay near-nothing — flow multiplies it into rotation"
     assert "vPulseScale = 0.35 * Math.max(engage, drive)" in graph_js, \
         "idle pulse must be OFF (busy-only slight pulse)"
-    # Denser membrane: vortex-only link-radius multiplier.
-    assert "formIndex === 3 ? 1.5 : 1.0" in graph_js
+    # Denser membrane: the vortex's 1.5× link-radius multiplier — since
+    # 2026-07-29 it lives in the per-form LINK_MULT map (name-keyed;
+    # the old `formIndex === 3` literal broke whenever FORMS grew).
+    assert re.search(r"LINK_MULT = \{[^}]*vortex: 1\.5", graph_js, re.DOTALL)
 
 
 def test_form_button_wired(graph_js):

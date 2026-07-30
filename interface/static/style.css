@@ -307,36 +307,52 @@ footer#input-area-wrapper {
     background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.5) 70%, transparent 100%);
 }
 
-#activity-container {
-    height: 40px;
+/* Turn status line (v3): re-parented directly under the waiting reply
+   bubble while a user turn runs — timer chip + description + text-sized
+   icon. Integration pass (operator: "the timer doesn't belong there"):
+   the clock becomes a quiet tabular-nums CHIP (a badge, not part of the
+   sentence — and no width jitter at 0:09→0:10), the description reads
+   in the UI's main font, and visual grouping replaces the literal
+   `:`/`-` separators. Hidden and parked outside the chat log between
+   turns. */
+#turn-status {
     display: flex;
     align-items: center;
-    justify-content: center;
+    gap: 9px;
+    margin: 4px 0 12px 12px;
+    max-width: 85%;
+    animation: slideInLeft 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
-
-#activity-icon {
-    font-size: 2.2rem;
-    filter: drop-shadow(0 0 15px var(--accent-color));
-    opacity: 0.9;
-    transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1),
-                transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
-                filter 0.5s ease;
+#turn-status.hidden { display: none; }
+#turn-status-clock {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.6px;
+    line-height: 1;
+    padding: 3px 7px;
+    border-radius: 7px;
+    background: rgba(123, 98, 196, 0.12);
+    border: 1px solid rgba(123, 98, 196, 0.18);
+    color: rgba(178, 188, 208, 0.75);
 }
-
-#activity-icon.working {
-    transform: scale(1.15);
-    filter: drop-shadow(0 0 25px var(--accent-color));
-    animation: pulseIcon 1.5s infinite alternate;
+#turn-status-desc {
+    font-family: var(--font-main);
+    font-size: 0.74rem;
+    font-weight: 300;
+    letter-spacing: 0.02em;
+    color: rgba(168, 178, 198, 0.8);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
 }
-
-@keyframes pulseIcon {
-    from {
-        transform: scale(1.1);
-    }
-
-    to {
-        transform: scale(1.2);
-    }
+#turn-status-icon {
+    flex-shrink: 0;
+    font-size: 0.8rem;
+    line-height: 1;
+    opacity: 0.85;
 }
 
 #input-area {
@@ -492,10 +508,6 @@ body.zen-mode .icon-btn {
 
 body.zen-mode .icon-btn:hover {
     opacity: 1;
-}
-
-body.zen-mode #activity-container {
-    transform: scale(1.3);
 }
 
 @media (max-width: 768px) {
@@ -1111,10 +1123,6 @@ pre:hover .render-code-btn {
     to   { opacity: 1; transform: translateY(0); }
 }
 
-/* Activity icon swap — glide new icons in rather than snap. */
-#activity-icon {
-    animation: fadeInSoft 0.25s ease;
-}
 
 /* uConsole 5-inch 720p Optimizations */
 @media (max-width: 1280px) and (max-height: 720px) {
@@ -1597,6 +1605,91 @@ body.zen-mode #rail-scrim {
     font-size: 0.75rem;
     line-height: 1.6;
     color: rgba(158, 170, 192, 0.6);
+}
+
+/* Destructive rail footer: quiet until hovered, unmistakable when armed.
+   Two-step confirm lives in sessions.js — the .armed state is the
+   "click again" window. */
+#rail-footer {
+    flex-shrink: 0;
+    padding: 8px 10px 12px 10px;
+    border-top: 1px solid rgba(123, 98, 196, 0.12);
+}
+#rail-footer.hidden { display: none; }
+#delete-all-sessions-btn {
+    width: 100%;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.5px;
+    color: rgba(158, 170, 192, 0.45);
+    cursor: pointer;
+    transition: color 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+}
+#delete-all-sessions-btn:hover {
+    color: #e0637f;
+    background: rgba(194, 39, 69, 0.10);
+}
+#delete-all-sessions-btn.armed {
+    color: #fff;
+    background: rgba(194, 39, 69, 0.28);
+    border-color: rgba(224, 99, 127, 0.55);
+}
+#delete-all-sessions-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* Face-form picker: same glass-panel language as #msg-menu, anchored
+   under the header button by app.js. */
+#face-form-menu {
+    position: fixed;
+    z-index: 160;
+    min-width: 230px;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    padding: 6px;
+}
+#face-form-menu.hidden { display: none; }
+.face-form-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 14px;
+    width: 100%;
+    background: none;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 12px;
+    cursor: pointer;
+    text-align: left;
+}
+.face-form-item:hover { background: rgba(123, 98, 196, 0.16); }
+.face-form-item.active { background: rgba(123, 98, 196, 0.22); }
+.face-form-name {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    letter-spacing: 0.5px;
+    color: rgba(255, 255, 255, 0.85);
+}
+.face-form-item.active .face-form-name { color: #fff; }
+.face-form-item.active .face-form-name::before {
+    content: '● ';
+    color: #9b7fe8;
+    font-size: 0.6rem;
+}
+.face-form-hint {
+    font-family: var(--font-main);
+    font-size: 0.68rem;
+    color: rgba(158, 170, 192, 0.55);
+    white-space: nowrap;
 }
 #rail-note.hidden { display: none; }
 

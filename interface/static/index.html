@@ -30,7 +30,7 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=4.2">
+    <link rel="stylesheet" href="/static/style.css?v=4.8">
 </head>
 
 <body>
@@ -52,6 +52,14 @@
                aria-label="Filter sessions" />
         <div id="session-list" role="list"></div>
         <div id="rail-note" class="hidden"></div>
+        <!-- Destructive footer: two-step armed confirm (first click arms,
+             second click within 4s executes) — no browser dialog, and a
+             stray click can never wipe the strata. Hidden while sessions
+             are disabled or the list is empty. -->
+        <div id="rail-footer" class="hidden">
+            <button id="delete-all-sessions-btn" type="button"
+                    aria-label="Delete all sessions">Delete all sessions</button>
+        </div>
     </aside>
     <div id="rail-scrim" class="hidden" aria-hidden="true"></div>
 
@@ -172,8 +180,15 @@
         </main>
 
         <footer id="input-area-wrapper">
-            <div id="activity-container">
-                <div id="activity-icon"></div>
+            <!-- Turn status line (2026-07-29 v3): re-parented under the
+                 waiting reply bubble while a user turn runs — timer chip,
+                 description, text-sized icon (visual grouping does the
+                 separating; the literal `:`/`-` punctuation read as soup).
+                 Parked here hidden between turns. -->
+            <div id="turn-status" class="hidden">
+                <span id="turn-status-clock">0:00</span>
+                <span id="turn-status-desc"></span>
+                <span id="turn-status-icon"></span>
             </div>
             <div id="input-area">
                 <textarea id="chat-input" placeholder="Enter command or message..." rows="1"></textarea>
@@ -244,7 +259,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=6.7"></script>
+    <script type="module" src="/static/app.js?v=7.6"></script>
 </body>
 
 </html>

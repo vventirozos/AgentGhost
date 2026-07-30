@@ -135,6 +135,31 @@ const VORTEX_LMIN = 0.55;
 const VORTEX_KOUT = 2.6;      // exponential expansion — self-similarity knob
 const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;   // cone half-angle
 
+// ── AI-form state (2026-07-29) ─────────────────────────────────────
+// stack: one shared climb accumulator — packets ride it at fixed
+// stagger offsets, so busy speeds every token without phase jumps.
+let stackFlow = 0.0;
+// embedding: the query comet's flight state. From/to are cluster
+// indices; embT is eased 0..1 along a bezier whose control point is
+// pushed outward so the flight arcs through the void between concepts.
+let embFrom = 0, embTo = 1, embT = 0.5;
+const embExcite = [];        // per-cluster recall glow, decays ~2s
+let _embCenters = [];        // rebuilt by _buildEmbedding
+// descent: the optimizer bead. True gradient descent on the (moving)
+// loss surface — velocity, damping, soft walls, stuck-kick.
+let beadX = 0.4, beadZ = 0.3, beadVX = 0.0, beadVZ = 0.0;
+let beadStill = 0.0;         // seconds spent near-stationary
+const beadTrail = [];        // recent (x,z) surface points, newest first
+let _descTick = 0;
+// cube: the resident complexities (anchors rebuilt with the form) and
+// the active mutation's strength. Growth is driven by the USER turn
+// (mirrors vortexTravel — ambient work only adds restlessness), decay
+// is a slow organic taming after completion.
+let _cubeCx = [];            // [{ax,ay,az, r0, ph}]
+let cubeActive = 0;          // index of the mutating complexity
+let cubeS = 0.0;             // active mutation strength 0..1
+let _cubePrevTurn = false;   // rising-edge detector for picking anchor
+
 let errorState = 0.0;
 let targetErrorState = 0.0;
 let workingState = 0.0;
@@ -171,10 +196,10 @@ let hueDrift = 0.0;
 // The shader-side counterpart is the uOrganic uniform.
 const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 
-// ── Alien forms (2026-07-28) ───────────────────────────────────────
-// Three interchangeable body plans over ONE motion engine (the
-// asymmetric _pulseShape propulsion, metachronal strand waves, hot
-// core, flinch, thermal anatomy):
+// ── Alien forms (2026-07-28) + AI forms (2026-07-29) ───────────────
+// Interchangeable body plans over ONE motion engine (the asymmetric
+// _pulseShape propulsion, metachronal strand waves, hot core, flinch,
+// thermal anatomy):
 //   abyssal — asymmetric lobed mantle tilted off-axis, feelers
 //             reaching in all directions, off-center core.
 //   horizon — eccentric orbital shells collapsing toward a burning
@@ -182,8 +207,37 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 //             they fall.
 //   cortex  — asymmetric neural lobes swelling with thought-waves;
 //             dendrites radiating outward carrying signal trains.
+//   vortex  — a black hole ahead of the viewer; self-similar
+//             expansion flow, accretion ring, dark shadow.
+// AI forms (2026-07-29 — "this is an AI project": the machine's own
+// internals as anatomy, same engine, first ANGULAR silhouettes):
+//   lattice   — the weight tensor: a tumbling crystal grid; diagonal
+//               activation waves heat the sites they cross; a hot
+//               attention kernel drifts the volume, bending the grid
+//               toward itself; charge runners ride the axes.
+//   stack     — the transformer: tapering layer-rings threaded by a
+//               hot residual-stream column; token packets climb,
+//               rippling each layer they pass, enriching as they go.
+//   embedding — latent space: cold concept clusters on slow orbits; a
+//               hot query comet streaks cluster→cluster, and each
+//               arrival IGNITES the recalled cluster (it tightens,
+//               flares, cools back).
+//   descent   — the loss landscape: an undulating terrain sheet, cold
+//               ridges / warm valleys; the optimizer bead rolls
+//               downhill trailing heat, kicked to explore again
+//               whenever it settles (and on error flinches).
+//   cube      — the infinite monolith (operator concept, 2026-07-29,
+//               distilled from what they loved in lattice): a large
+//               dark cube with a FEW resident alien complexities
+//               quietly deforming it from inside. A user turn wakes
+//               one — it grows aggressively-but-not-fast, mutating
+//               and re-weaving the grid around it like a spreading
+//               infection, running crimson; the dive rides INTO the
+//               mutation as it evolves, and on completion it tames,
+//               the cube re-knits, and the camera pulls back out.
 // The header's form button cycles these; the choice persists.
-const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex', 'empty'];
+const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex',
+    'lattice', 'stack', 'embedding', 'descent', 'cube', 'empty'];
 // Default form: VORTEX (operator pick, 2026-07-28 — superseded horizon
 // after the black-hole iteration). An explicit button choice still
 // overrides via localStorage below.
@@ -598,6 +652,11 @@ function _buildAnatomy() {
     if (f === 'horizon') _buildHorizon();
     else if (f === 'cortex') _buildCortex();
     else if (f === 'vortex') _buildVortex();
+    else if (f === 'lattice') _buildLattice();
+    else if (f === 'stack') _buildStack();
+    else if (f === 'embedding') _buildEmbedding();
+    else if (f === 'descent') _buildDescent();
+    else if (f === 'cube') _buildCube();
     else if (f === 'empty') _buildEmpty();
     else _buildAbyssal();
 }
@@ -930,8 +989,373 @@ function _buildVortex() {
     }
 }
 
+// Form F — LATTICE: the weight tensor. A slowly tumbling crystal grid,
+// cell edge tuned just under the (form-tightened) link radius so ONLY
+// axis-neighbors weave — a literal wireframe tensor, the first angular
+// silhouette. Cold at the corners, warming toward the middle; diagonal
+// activation waves and a drifting hot attention kernel do the living.
+const LATTICE_N = IS_MOBILE ? [4, 5, 5] : [6, 6, 6];
+const LATTICE_A = IS_MOBILE ? 0.80 : 0.72;   // cell edge
+function _buildLattice() {
+    const [NX, NY, NZ] = LATTICE_N;
+    const SITES = NX * NY * NZ;
+    const RUNNERS = Math.min(IS_MOBILE ? 12 : 20, NODE_COUNT - SITES - 8);
+    const spanOf = (m) => ((m - 1) / 2) * LATTICE_A;
+    let n = 0;
+    for (let ix = 0; ix < NX; ix++)
+        for (let iy = 0; iy < NY; iy++)
+            for (let iz = 0; iz < NZ; iz++, n++) {
+                // Chebyshev shell 0 (center) → 1 (corner): the cold
+                // base gradient — corners coldest, heart warmer.
+                const shell = Math.max(
+                    Math.abs(ix - (NX - 1) / 2) / Math.max((NX - 1) / 2, 1),
+                    Math.abs(iy - (NY - 1) / 2) / Math.max((NY - 1) / 2, 1),
+                    Math.abs(iz - (NZ - 1) / 2) / Math.max((NZ - 1) / 2, 1));
+                basePositions.push({
+                    kind: 0,
+                    gx: (ix - (NX - 1) / 2) * LATTICE_A,
+                    gy: (iy - (NY - 1) / 2) * LATTICE_A,
+                    gz: (iz - (NZ - 1) / 2) * LATTICE_A,
+                    // Diagonal wave phase 0..1 across the volume.
+                    wp: (ix + iy + iz) / (NX + NY + NZ - 3),
+                    seed0: 0.20 - shell * 0.16 + Math.random() * 0.02,
+                    jit: Math.random() * Math.PI * 2,
+                });
+                nodeSeeds[n] = basePositions[n].seed0;   // reheated per frame
+            }
+    // Charge runners: violet packets riding the grid lines, wrapping
+    // face to face (size-tapered at the faces so the wrap hides).
+    for (let k = 0; k < RUNNERS; k++, n++) {
+        const axis = Math.floor(Math.random() * 3);
+        const cell = (m) => (Math.floor(Math.random() * m) - (m - 1) / 2) * LATTICE_A;
+        basePositions.push({
+            kind: 1,
+            dx: axis === 0 ? 1 : 0, dy: axis === 1 ? 1 : 0, dz: axis === 2 ? 1 : 0,
+            ox: axis === 0 ? 0 : cell(NX),
+            oy: axis === 1 ? 0 : cell(NY),
+            oz: axis === 2 ? 0 : cell(NZ),
+            span: spanOf(axis === 0 ? NX : axis === 1 ? NY : NZ) + 0.30,
+            d0: Math.random(),
+            speed: 0.05 + Math.random() * 0.08,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.85,
+        });
+        nodeSeeds[n] = 0.44 + Math.random() * 0.05;
+    }
+    // The attention kernel: a hot locus scanning the tensor (its
+    // drifting center is computed per frame; these are its offsets).
+    while (n < NODE_COUNT) {
+        const th = Math.random() * Math.PI * 2;
+        const ph = Math.acos(2 * Math.random() - 1);
+        const rr = 0.26 * Math.cbrt(Math.random());
+        basePositions.push({
+            kind: 2,
+            hx: rr * Math.sin(ph) * Math.cos(th),
+            hy: rr * Math.cos(ph),
+            hz: rr * Math.sin(ph) * Math.sin(th),
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.85,
+        });
+        nodeSeeds[n] = 0.58 + Math.random() * 0.04;
+        n++;
+    }
+}
+
+// Form G — STACK: the transformer. Tapering layer-rings (wide input →
+// narrow output) threaded by the hot residual-stream column; token
+// packets climb a helix just outside the rings, RIPPLING each layer
+// they pass and enriching (heating) as they rise. The wrap top→bottom
+// hides behind a size taper at both ends.
+const STACK_LAYERS = IS_MOBILE ? 4 : 6;
+const STACK_PACKETS = IS_MOBILE ? 4 : 5;
+// Layer gap (0.72 desktop) must stay ABOVE the stack's tightened link
+// radius (see LINK_MULT) or vertical scaffold links weave the discs
+// into a solid woven cylinder (first render): the layers must read as
+// separate rings, bridged only by the column and the climbing packets.
+const STACK_Y0 = -1.8, STACK_Y1 = 1.8;
+function _stackROfY(y) {
+    const t = Math.min(Math.max((y - STACK_Y0) / (STACK_Y1 - STACK_Y0), 0), 1);
+    return 1.55 - 0.40 * t;
+}
+function _buildStack() {
+    const COL_COUNT = IS_MOBILE ? 12 : 22;
+    const PER_PACKET = IS_MOBILE ? 7 : 12;
+    const RING_TOTAL = NODE_COUNT - COL_COUNT - STACK_PACKETS * PER_PACKET;
+    const per = Math.floor(RING_TOTAL / STACK_LAYERS);
+    let n = 0;
+    for (let li = 0; li < STACK_LAYERS; li++) {
+        const count = li === STACK_LAYERS - 1
+            ? RING_TOTAL - per * (STACK_LAYERS - 1) : per;
+        const y0 = STACK_Y0 + (STACK_Y1 - STACK_Y0) * li / (STACK_LAYERS - 1);
+        for (let b = 0; b < count; b++, n++) {
+            basePositions.push({
+                kind: 0, li, y0,
+                th0: (b / count) * Math.PI * 2 + li * 0.5,
+                r0: _stackROfY(y0) * (0.97 + Math.random() * 0.06),
+                omega: (li % 2 ? -1 : 1) * (0.05 + 0.012 * li),
+                tilt: 0.03 * Math.sin(li * 2.3 + 0.7),
+                offX: 0.10 * Math.sin(li * 2.1),
+                offZ: 0.08 * Math.cos(li * 1.3),
+                jit: Math.random() * Math.PI * 2,
+            });
+            // Bottom layers coldest; refinement warms toward the top.
+            nodeSeeds[n] = 0.03
+                + (li / Math.max(STACK_LAYERS - 1, 1)) * 0.17
+                + Math.random() * 0.02;
+        }
+    }
+    for (let p = 0; p < STACK_PACKETS; p++) {
+        const off = p / STACK_PACKETS;               // stagger the climbs
+        const th0 = Math.random() * Math.PI * 2;
+        for (let j = 0; j < PER_PACKET; j++, n++) {
+            basePositions.push({
+                kind: 1, off, th0,
+                s: j / Math.max(PER_PACKET - 1, 1),  // 0 head → 1 tail
+                rr: 0.09 + Math.random() * 0.09,
+                jit: Math.random() * Math.PI * 2,
+                sz: 1.0,
+            });
+            nodeSeeds[n] = 0.42;                     // reheated per frame
+        }
+    }
+    while (n < NODE_COUNT) {   // the residual stream
+        const ci = COL_COUNT - (NODE_COUNT - n);
+        basePositions.push({
+            kind: 2,
+            y0: -1.85 + 3.7 * (ci + 0.5) / COL_COUNT,
+            rx: (Math.random() - 0.5) * 0.10,
+            rz: (Math.random() - 0.5) * 0.10,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.85,
+        });
+        nodeSeeds[n] = 0.56 + Math.random() * 0.05;
+        n++;
+    }
+    stackFlow = 0.0;
+}
+
+// Form H — EMBEDDING: latent space. Cold concept clusters anchored on
+// jittered octahedral directions (≥ ~80° apart, so with the tightened
+// link radius clusters can never cross-link — the void between
+// concepts stays void), each with its own slow orbit and internal
+// swirl. The hot query comet streaks cluster→cluster doing recall.
+const EMB_CLUSTERS = IS_MOBILE ? 5 : 6;
+function _buildEmbedding() {
+    const DIRS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    _embCenters = [];
+    embExcite.length = 0;
+    for (let c = 0; c < EMB_CLUSTERS; c++) {
+        const d = DIRS[c];
+        const R = 1.50 + Math.random() * 0.25;
+        _embCenters.push({
+            bx: d[0] * R + (Math.random() - 0.5) * 0.30,
+            by: d[1] * R + (Math.random() - 0.5) * 0.30,
+            bz: d[2] * R + (Math.random() - 0.5) * 0.30,
+            oa: Math.random() * Math.PI * 2,          // orbit phase
+            ow: 0.04 + Math.random() * 0.03,          // orbit rate
+            or: 0.10 + Math.random() * 0.08,          // orbit radius
+            spin: 0.08 + Math.random() * 0.07,        // internal swirl
+        });
+        embExcite.push(0);
+    }
+    const QUERY = IS_MOBILE ? 10 : 16;
+    const CL_TOTAL = NODE_COUNT - QUERY;
+    const per = Math.floor(CL_TOTAL / EMB_CLUSTERS);
+    let n = 0;
+    for (let c = 0; c < EMB_CLUSTERS; c++) {
+        const count = c === EMB_CLUSTERS - 1
+            ? CL_TOTAL - per * (EMB_CLUSTERS - 1) : per;
+        for (let b = 0; b < count; b++, n++) {
+            const th = Math.random() * Math.PI * 2;
+            const ph = Math.acos(2 * Math.random() - 1);
+            basePositions.push({
+                kind: 0, ci: c,
+                dx: Math.sin(ph) * Math.cos(th),
+                dy: Math.cos(ph),
+                dz: Math.sin(ph) * Math.sin(th),
+                r0: 0.42 * Math.cbrt(Math.random()),
+                jit: Math.random() * Math.PI * 2,
+                // Per-cluster temperature: distinct concepts sit at
+                // slightly different colds.
+                seed0: 0.04 + c * 0.024 + Math.random() * 0.03,
+            });
+            nodeSeeds[n] = basePositions[n].seed0;   // reheated on recall
+        }
+    }
+    while (n < NODE_COUNT) {   // the query comet (head → tail)
+        const qi = n - CL_TOTAL;
+        const QN = NODE_COUNT - CL_TOTAL;
+        basePositions.push({
+            kind: 1,
+            s: qi / Math.max(QN - 1, 1),
+            rr: 0.05 + Math.random() * 0.06,
+            jit: Math.random() * Math.PI * 2,
+            sz: 1.0,
+        });
+        nodeSeeds[n] = 0.60 - (qi / Math.max(QN, 1)) * 0.16;
+        n++;
+    }
+    embFrom = 0;
+    embTo = EMB_CLUSTERS > 1 ? 1 : 0;
+    embT = 0.0;
+}
+
+// Form I — DESCENT: the loss landscape. A tilted terrain sheet whose
+// height field slowly EVOLVES (the objective is non-stationary —
+// training), cold on the ridges, warming in the valleys; the hot
+// optimizer bead rolls true gradient descent across it, pressing the
+// surface down where it passes, trailing heat, and taking a
+// learning-rate kick whenever it settles too long (or on a flinch).
+const DESC_NX = IS_MOBILE ? 11 : 15, DESC_NZ = IS_MOBILE ? 9 : 15;
+const DESC_SX = 4.4, DESC_SZ = 3.4;   // sheet spans (x, z)
+const DESC_H = 0.85;                  // height-field scale
+function _lossH(x, z, t) {
+    return DESC_H * (0.30 * Math.sin(1.7 * x + 0.9 * z + t * 0.13)
+        + 0.22 * Math.sin(2.3 * z - 1.1 * x + t * 0.117)
+        + 0.14 * Math.sin(2.2 * x + 3.1 * z + t * 0.071)
+        + 0.10 * Math.sin(2.5 * (x + z) - t * 0.093));
+}
+function _buildDescent() {
+    let n = 0;
+    for (let ix = 0; ix < DESC_NX; ix++)
+        for (let iz = 0; iz < DESC_NZ; iz++, n++) {
+            basePositions.push({
+                kind: 0,
+                gx: -DESC_SX / 2 + DESC_SX * ix / (DESC_NX - 1),
+                gz: -DESC_SZ / 2 + DESC_SZ * iz / (DESC_NZ - 1),
+                jit: Math.random() * Math.PI * 2,
+            });
+            nodeSeeds[n] = 0.1;                      // recomputed per frame
+        }
+    while (n < NODE_COUNT) {   // the optimizer bead + cooling trail
+        const bi = n - DESC_NX * DESC_NZ;
+        const total = NODE_COUNT - DESC_NX * DESC_NZ;
+        basePositions.push({
+            kind: 1,
+            s: bi / Math.max(total - 1, 1),          // 0 head → 1 tail end
+            rr: 0.03 + Math.random() * 0.05,
+            jit: Math.random() * Math.PI * 2,
+            sz: 1.0,
+        });
+        nodeSeeds[n] = 0.60;
+        n++;
+    }
+    beadX = 0.4; beadZ = 0.3; beadVX = 0; beadVZ = 0;
+    beadStill = 0; beadTrail.length = 0;
+}
+
+// Form J — CUBE: the infinite monolith. A large dark grid — bigger
+// cell edge than lattice, spanning past the view so the eye never
+// finds a boundary — holding a FEW resident alien complexities:
+// localized regions where incommensurate sine fields quietly deform
+// the grid (not many; just enough to be interesting). One of them is
+// the MUTATION: on a user turn it grows (aggressively but not fast),
+// spreading through an irregular per-node boundary like an infection,
+// re-weaving links as displaced nodes tear and rejoin, running
+// crimson at its heart while the rest of the cube stays cold dark
+// blue. The immersion dive is focus-translated onto it (same lesson
+// as descent/embedding), so the camera rides INTO the mutation as it
+// evolves; on completion it tames and the cube re-knits.
+const CUBE_N = IS_MOBILE ? [5, 5, 4] : [6, 6, 6];
+// Cell edge trimmed 0.88 → 0.80 (v2, operator: "the cube is not
+// clear"): the whole silhouette must FIT the view so it reads as a
+// monolith, not an endless field.
+const CUBE_A = IS_MOBILE ? 0.85 : 0.80;
+const CUBE_CX_COUNT = IS_MOBILE ? 2 : 3;
+// Partial dive for this form: the point is WATCHING the mutation
+// spread across the grid, not being inside a cloud of dots — the
+// camera closes to ~3.1 (vs the global 1.3) and the swell is gentled.
+const CUBE_DIVE_Z = 3.1;
+function _buildCube() {
+    const [NX, NY, NZ] = CUBE_N;
+    const SITES = NX * NY * NZ;
+    // Resident complexities: random interior anchors, kept apart so
+    // they read as separate organisms living in the grid.
+    _cubeCx = [];
+    const spans = [
+        ((NX - 1) / 2) * CUBE_A * 0.6,
+        ((NY - 1) / 2) * CUBE_A * 0.6,
+        ((NZ - 1) / 2) * CUBE_A * 0.6,
+    ];
+    for (let k = 0; k < CUBE_CX_COUNT; k++) {
+        let ax = 0, ay = 0, az = 0;
+        for (let attempt = 0; attempt < 24; attempt++) {
+            ax = (Math.random() * 2 - 1) * spans[0];
+            ay = (Math.random() * 2 - 1) * spans[1];
+            az = (Math.random() * 2 - 1) * spans[2];
+            const ok = _cubeCx.every(c =>
+                Math.hypot(ax - c.ax, ay - c.ay, az - c.az) > 1.4);
+            if (ok) break;
+        }
+        _cubeCx.push({
+            ax, ay, az,
+            r0: 0.50 + Math.random() * 0.15,      // idle influence radius
+            ph: Math.random() * Math.PI * 2,       // personality phase
+        });
+    }
+    cubeActive = 0;
+    cubeS = 0.0;
+    _cubePrevTurn = false;
+
+    let n = 0;
+    for (let ix = 0; ix < NX; ix++)
+        for (let iy = 0; iy < NY; iy++)
+            for (let iz = 0; iz < NZ; iz++, n++) {
+                // How many axes sit on the cube's surface: 0 interior,
+                // 1 face, 2 edge, 3 corner. The WIREFRAME SILHOUETTE is
+                // what makes the monolith legible (v2): edge and corner
+                // nodes render larger, tracing the cube's outline.
+                const onFace =
+                    (ix === 0 || ix === NX - 1 ? 1 : 0)
+                    + (iy === 0 || iy === NY - 1 ? 1 : 0)
+                    + (iz === 0 || iz === NZ - 1 ? 1 : 0);
+                basePositions.push({
+                    kind: 0,
+                    gx: (ix - (NX - 1) / 2) * CUBE_A,
+                    gy: (iy - (NY - 1) / 2) * CUBE_A,
+                    gz: (iz - (NZ - 1) / 2) * CUBE_A,
+                    // Darker than lattice — a monolith, not a machine.
+                    seed0: 0.03 + onFace * 0.025 + Math.random() * 0.012,
+                    sz: onFace >= 2 ? 1.3 : onFace === 1 ? 1.0 : 0.85,
+                    // Per-node spread threshold: the mutation's boundary
+                    // is IRREGULAR (some nodes resist, some succumb
+                    // early) — that irregularity is what reads organic.
+                    gate: 0.80 + Math.random() * 0.35,
+                    jit: Math.random() * Math.PI * 2,
+                });
+                nodeSeeds[n] = basePositions[n].seed0;   // reheated per frame
+            }
+    // Each complexity's visible HEART: a small tangle of nodes orbiting
+    // its anchor — CRIMSON already at rest (v2, operator: "the
+    // mutations must be red"), burning brighter as its mutation grows.
+    while (n < NODE_COUNT) {
+        const ci = (n - SITES) % CUBE_CX_COUNT;
+        const th = Math.random() * Math.PI * 2;
+        const phv = Math.acos(2 * Math.random() - 1);
+        const rr = 0.06 + 0.16 * Math.cbrt(Math.random());
+        basePositions.push({
+            kind: 2, ci,
+            dx: Math.sin(phv) * Math.cos(th),
+            dy: Math.cos(phv),
+            dz: Math.sin(phv) * Math.sin(th),
+            rr,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.8,
+        });
+        nodeSeeds[n] = 0.54 + Math.random() * 0.04;      // reheated per frame
+        n++;
+    }
+}
+
 // ── Form switching ─────────────────────────────────────────────────
 export function getForm() { return FORMS[formIndex]; }
+
+// The full body-plan roster (copy — callers can't mutate the cycle).
+// The header's form MENU builds itself from this, so a new form added
+// here appears in the picker with no app.js edit (2026-07-29: the
+// cycle button stopped scaling at 9 forms — up to 8 clicks × 1.4s
+// blends to reach the one you wanted).
+export function getForms() { return FORMS.slice(); }
 
 export function setForm(name) {
     const i = FORMS.indexOf(name);
@@ -1337,12 +1761,17 @@ function animate() {
     // Smoothstepped path so both ends of the dive are gentle.
     const dive = immersion * immersion * (3.0 - 2.0 * immersion);
 
+    // Form name, bound once per frame — every per-form branch below
+    // keys on the NAME (index comparisons broke silently whenever the
+    // FORMS array grew; 2026-07-29, when the four AI forms joined).
+    const FORM = FORMS[formIndex];
+
     // Vortex engagement + flow (see the vortexTravel declaration).
     // Engagement eases up while a user turn runs and eases back down on
     // completion — since the camera never moves and the cone is
     // self-similar, that ease IS the whole transition: busy morphs into
     // idle with no reset of any kind.
-    if (formIndex === 3) {
+    if (FORM === 'vortex') {
         if (userTurnState > 0.5) {
             vortexTravel += (IMMERSION_CAP - vortexTravel) * 0.010;
         } else if (vortexTravel > 0.001) {
@@ -1396,14 +1825,19 @@ function animate() {
     const baseScale = 0.9 * breathe * (1.0 + dive * 0.55);
     // The vortex's journey is the CAMERA's — swelling the scene under it
     // would double-transform the funnel, so the swell is neutralized.
-    const sceneScale = formIndex === 3 ? 0.9 * breathe : baseScale;
+    // The cube gets a GENTLED swell (v2): the point of its dive is
+    // watching the mutation spread across the monolith, not entering a
+    // cloud — full swell dissolved the silhouette into dots.
+    const sceneScale = FORM === 'vortex' ? 0.9 * breathe
+        : FORM === 'cube' ? 0.9 * breathe * (1.0 + dive * 0.18)
+        : baseScale;
     scene.scale.set(sceneScale, sceneScale, sceneScale);
 
     // Slow continuous orbit (faster while working) plus a gentle tilt
     // gives the network real depth and life at idle. Skipped entirely
     // under reduced-motion.
     if (!PREFERS_REDUCED_MOTION) {
-        if (formIndex === 3) {
+        if (FORM === 'vortex') {
             // Vortex: the funnel must keep facing the viewer, so no big
             // heading wander — instead the whole scene ROLLS around the
             // view axis (global swirl) with only a whisper of tilt.
@@ -1412,6 +1846,17 @@ function animate() {
             scene.rotation.z = vortexSpin * 0.22;
             scene.position.x = 0.05 * Math.sin(time * 0.031);
             scene.position.y = _bob * 0.5;
+        } else if (FORM === 'cube') {
+            // Monolith: near-still heading — its OWN slow tumble is the
+            // motion. The full heading wander compounded with the
+            // focus-translation release into the "erratic zoom-out"
+            // (v2), and it also kept the silhouette from ever settling
+            // into a readable cube.
+            scene.rotation.y = 0.09 * Math.sin(time * 0.029);
+            scene.rotation.x = 0.05 * Math.sin(time * 0.021 + 0.7);
+            scene.rotation.z = 0.02 * Math.sin(time * 0.017 + 2.0);
+            scene.position.x = 0.04 * Math.sin(time * 0.023);
+            scene.position.y = _bob * 0.4;
         } else {
             // Heading wander: the creature holds a loose heading and lets
             // it drift — sums of incommensurate slow sines, so it turns
@@ -1432,19 +1877,23 @@ function animate() {
     // rides on top at any depth.
     camera.position.x += (parallaxTargetX - camera.position.x) * 0.04;
     camera.position.y += (parallaxTargetY - camera.position.y) * 0.04;
-    if (formIndex === 3) {
+    if (FORM === 'vortex') {
         // Vortex: THE CAMERA NEVER MOVES — the self-similar swallow does
         // all the traveling. It studies the hole itself.
         camera.position.z = CAMERA_REST_Z;
         camera.lookAt(camera.position.x * 0.35, camera.position.y * 0.35,
             VORTEX_APEX_Z);
     } else {
-        camera.position.z = CAMERA_REST_Z - (CAMERA_REST_Z - CAMERA_DIVE_Z) * dive;
+        // Cube (v2): PARTIAL dive only — close enough to watch the
+        // mutation spread across the monolith, never inside the cloud
+        // ("zoom is too much... just shows random dots").
+        const _diveZ = FORM === 'cube' ? CUBE_DIVE_Z : CAMERA_DIVE_Z;
+        camera.position.z = CAMERA_REST_Z - (CAMERA_REST_Z - _diveZ) * dive;
         // Look-target blend: at rest the camera studies the origin; deep in
         // the cloud it must look FORWARD through it instead — near the
         // origin, lookAt(0,0,0) turns tiny parallax offsets into wild
         // rotations (the lookAt singularity).
-        camera.lookAt(0, 0, -3.5 * dive);
+        camera.lookAt(0, 0, (FORM === 'cube' ? -1.0 : -3.5) * dive);
     }
 
     // Structure changes form slowly when idle, faster when busy. "Busy"
@@ -1492,7 +1941,7 @@ function animate() {
     _bobTarget = 0.10 * Math.sin(time * 0.043 + 0.5);
     _bob += (_bobTarget - _bob) * 0.02;
 
-    if (formIndex === 0) {
+    if (FORM === 'abyssal') {
         // ── ABYSSAL: lobed husk contraction + omnidirectional feelers,
         //    the whole body baked onto an off-axis tilt (no "up").
         for (let i = 0; i < NODE_COUNT; i++) {
@@ -1530,7 +1979,7 @@ function animate() {
             const z2 = y1 * _TSX + z * _TCX;
             currentPositions[i].set(x1, y2, z2);
         }
-    } else if (formIndex === 1) {
+    } else if (FORM === 'horizon') {
         // ── EVENT HORIZON — a choreographed feeding cycle, not a beat:
         //    filament surges race rim→core, the core FLARES as they
         //    land, and a rebound ripple travels back out through the
@@ -1591,7 +2040,7 @@ function animate() {
                 currentPositions[i].set(bp.hx * g, bp.hy * g, bp.hz * g);
             }
         }
-    } else if (formIndex === 3) {
+    } else if (FORM === 'vortex') {
         // ── VORTEX: the self-similar swallow. Each wall node's depth
         //    FLOWS (dEff advances with tunnelFlow); its distance from
         //    the apex is L0·e^(−k·d) so the wrap is an invisible fractal
@@ -1675,7 +2124,393 @@ function animate() {
             }
         }
         instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    } else if (formIndex === 4) {
+    } else if (FORM === 'lattice') {
+        // ── LATTICE: the weight tensor tumbles slowly while diagonal
+        //    activation waves sweep it (riding the shared pulse clock),
+        //    heating the sites they cross; the hot attention kernel
+        //    drifts a Lissajous through the volume, bending nearby grid
+        //    toward itself; charge runners ride the axis lines.
+        const la1 = time * 0.055 * CALM, la2 = time * 0.034 * CALM;
+        const lc1 = Math.cos(la1), ls1 = Math.sin(la1);
+        const lc2 = Math.cos(la2), ls2 = Math.sin(la2);
+        const kx = 0.85 * Math.sin(time * 0.111);
+        const ky = 0.80 * Math.sin(time * 0.087 + 1.7);
+        const kz = 0.85 * Math.cos(time * 0.067 + 0.6);
+        const waveGain = 0.16 + 0.22 * drive + 0.15 * flinch;
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                const w = _pulseShape(_fract(pulsePhase - bp.wp * 0.42));
+                const dxk = bp.gx - kx, dyk = bp.gy - ky, dzk = bp.gz - kz;
+                const kAtt = Math.exp(-(dxk * dxk + dyk * dyk + dzk * dzk) / 0.55);
+                const lean = 0.10 * kAtt;            // pulled toward attention
+                const wd = 0.055 * pulseAmp * w * CALM;   // along (1,1,1)/√3
+                x = bp.gx - dxk * lean + wd * 0.577
+                    + 0.018 * CALM * Math.sin(time * 1.1 + bp.jit);
+                y = bp.gy - dyk * lean + wd * 0.577
+                    + 0.018 * CALM * Math.sin(time * 0.8 + bp.jit * 2.0);
+                z = bp.gz - dzk * lean + wd * 0.577;
+                nodeSeeds[i] = Math.min(0.60,
+                    bp.seed0 + w * waveGain + 0.28 * kAtt);
+            } else if (bp.kind === 1) {
+                const t = _fract(bp.d0 + time * bp.speed * (1.0 + 1.5 * drive));
+                const p = -bp.span + t * 2 * bp.span;
+                // Taper at the faces so the wrap hides off-grid.
+                bp.sz = 0.85 * Math.min(1, 8 * Math.min(t, 1 - t) + 0.10);
+                x = bp.ox + bp.dx * p;
+                y = bp.oy + bp.dy * p;
+                z = bp.oz + bp.dz * p;
+            } else {
+                const c = _pulseShape(_fract(pulsePhase + 0.05));
+                const g = 1.0 + 0.15 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
+                x = kx + bp.hx * g;
+                y = ky + bp.hy * g;
+                z = kz + bp.hz * g;
+            }
+            // Stately two-axis tumble — crystalline, no medusan sway.
+            const x1 = x * lc1 + z * ls1;
+            const z1 = -x * ls1 + z * lc1;
+            currentPositions[i].set(
+                x1,
+                y * lc2 - z1 * ls2,
+                y * ls2 + z1 * lc2);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'stack') {
+        // ── STACK: token packets climb the layer stack (one shared
+        //    flow accumulator, staggered offsets); each ring RIPPLES as
+        //    a packet passes through it; the residual-stream column
+        //    sways like a slow artery. Packets heat as they rise —
+        //    representation enriching layer by layer.
+        stackFlow += (1 / 60) * (0.055 + 0.16 * drive) * CALM;
+        const pkY = [];
+        for (let p = 0; p < STACK_PACKETS; p++) {
+            pkY.push(-2.0 + _fract(stackFlow + p / STACK_PACKETS) * 4.0);
+        }
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                const wave = _pulseShape(_fract(pulsePhase - bp.li * 0.10));
+                let ripple = 0;
+                for (let p = 0; p < pkY.length; p++) {
+                    const dy = pkY[p] - bp.y0;
+                    ripple += Math.exp(-dy * dy / 0.05);
+                }
+                ripple = Math.min(ripple, 1.5);
+                const th = bp.th0 + time * bp.omega * CALM;
+                const r = bp.r0 * (1.0 + 0.05 * pulseAmp * wave
+                    + 0.10 * ripple * CALM);
+                x = bp.offX + r * Math.cos(th);
+                z = bp.offZ + r * Math.sin(th);
+                y = bp.y0 + bp.tilt * Math.sin(th + time * 0.1)
+                    + 0.03 * ripple * CALM
+                    + 0.02 * CALM * Math.sin(time * 0.7 + bp.jit);
+            } else if (bp.kind === 1) {
+                let tt = _fract(stackFlow + bp.off) - bp.s * 0.05;
+                if (tt < 0) tt += 1;
+                const py = -2.0 + tt * 4.0;
+                const th = bp.th0 + tt * 2.6;
+                const rr = _stackROfY(py) + 0.16;
+                x = rr * Math.cos(th)
+                    + bp.rr * Math.sin(bp.jit * 3.1 + time * 1.3) * 0.5;
+                y = py + bp.rr * Math.cos(bp.jit * 2.3 + time * 1.1) * 0.4;
+                z = rr * Math.sin(th)
+                    + bp.rr * Math.cos(bp.jit * 4.7 + time * 0.9) * 0.5;
+                // Fade through the wrap; heat with altitude.
+                bp.sz = Math.min(1, 8 * Math.min(tt, 1 - tt) + 0.06)
+                    * (1.0 - bp.s * 0.35);
+                nodeSeeds[i] = 0.28 + 0.26 * tt - bp.s * 0.05;
+            } else {
+                const c = _pulseShape(_fract(pulsePhase + 0.05));
+                x = bp.rx + 0.07 * Math.sin(time * 0.50 + bp.y0 * 2.3);
+                y = bp.y0 * (1.0 + 0.015 * c);
+                z = bp.rz + 0.07 * Math.cos(time * 0.45 + bp.y0 * 1.9);
+            }
+            currentPositions[i].set(x, y, z);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'embedding') {
+        // ── EMBEDDING: concept clusters drift on slow orbits with
+        //    gentle internal swirl; the query comet flies an outward
+        //    bezier arc cluster→cluster (faster while the agent is
+        //    busy). Arrival IGNITES the recalled cluster — it flares
+        //    hot and tightens, then cools back over ~2s.
+        const cc = [];
+        for (let c = 0; c < _embCenters.length; c++) {
+            const e = _embCenters[c];
+            const a = e.oa + time * e.ow;
+            cc.push([
+                e.bx + e.or * Math.sin(a),
+                e.by + e.or * 0.6 * Math.sin(a * 1.31 + 1.2),
+                e.bz + e.or * Math.cos(a * 0.83),
+            ]);
+            embExcite[c] *= 0.985;
+        }
+        embT += (1 / 60) * (0.24 + 0.60 * drive + 0.4 * flinch) * CALM;
+        if (embT >= 1.0) {
+            embExcite[embTo] = 1.0;
+            embFrom = embTo;
+            let next = Math.floor(Math.random() * _embCenters.length);
+            if (next === embFrom) next = (next + 1) % _embCenters.length;
+            embTo = next;
+            embT = 0.0;
+        }
+        const A = cc[embFrom] || [0, 0, 0], B = cc[embTo] || [0, 0, 0];
+        // Control point pushed outward: the flight arcs through the
+        // void between concepts instead of cutting through the origin.
+        const CXx = (A[0] + B[0]) * 0.5 * 1.75;
+        const CXy = (A[1] + B[1]) * 0.5 * 1.75;
+        const CXz = (A[2] + B[2]) * 0.5 * 1.75;
+        // Dive focus (2026-07-29 operator report, descent's sibling
+        // fix): the immersion dive zooms toward the scene ORIGIN, and
+        // embedding's origin is DELIBERATELY empty void between the
+        // clusters. While diving, translate the whole space so the
+        // QUERY HEAD sits at the origin — a user turn rides the recall
+        // flight itself. Weighted by `dive`, so at rest nothing moves;
+        // the head's path is continuous (bezier, and each new flight
+        // starts where the last one landed), so the follow never jumps.
+        const _ehE = embT * embT * (3 - 2 * embT);
+        const _ehU = 1 - _ehE;
+        const _embFx = dive * (_ehU * _ehU * A[0] + 2 * _ehU * _ehE * CXx + _ehE * _ehE * B[0]);
+        const _embFy = dive * (_ehU * _ehU * A[1] + 2 * _ehU * _ehE * CXy + _ehE * _ehE * B[1]);
+        const _embFz = dive * (_ehU * _ehU * A[2] + 2 * _ehU * _ehE * CXz + _ehE * _ehE * B[2]);
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                const ex = embExcite[bp.ci] || 0;
+                const C = cc[bp.ci] || [0, 0, 0];
+                const sp = time * _embCenters[bp.ci].spin * CALM;
+                const cs = Math.cos(sp), sn = Math.sin(sp);
+                const ox = bp.dx * cs + bp.dz * sn;
+                const oz = -bp.dx * sn + bp.dz * cs;
+                const r = bp.r0 * (1.0 - 0.30 * ex)
+                    * (1.0 + 0.06 * pulseAmp
+                        * _pulseShape(_fract(pulsePhase - bp.ci * 0.13)));
+                x = C[0] + ox * r + 0.015 * CALM * Math.sin(time * 1.0 + bp.jit);
+                y = C[1] + bp.dy * r + 0.015 * CALM * Math.sin(time * 0.8 + bp.jit * 2.0);
+                z = C[2] + oz * r;
+                nodeSeeds[i] = Math.min(0.58, bp.seed0 + 0.40 * ex);
+            } else {
+                // Query comet: head leads, tail nodes trail along the
+                // same flight path with a slight lag.
+                const tl = Math.max(0, Math.min(1, embT - bp.s * 0.10));
+                const e = tl * tl * (3 - 2 * tl);
+                const u = 1 - e;
+                x = u * u * A[0] + 2 * u * e * CXx + e * e * B[0]
+                    + bp.rr * Math.sin(time * 2.1 + bp.jit * 3.0);
+                y = u * u * A[1] + 2 * u * e * CXy + e * e * B[1]
+                    + bp.rr * Math.cos(time * 1.7 + bp.jit * 2.0);
+                z = u * u * A[2] + 2 * u * e * CXz + e * e * B[2]
+                    + bp.rr * Math.sin(time * 1.9 + bp.jit * 5.0);
+                bp.sz = 1.0 - bp.s * 0.5;
+            }
+            currentPositions[i].set(x - _embFx, y - _embFy, z - _embFz);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'descent') {
+        // ── DESCENT: true gradient descent on the evolving loss
+        //    surface. Numeric ∇h each frame; damping keeps the roll
+        //    readable; soft walls; a learning-rate kick fires when the
+        //    bead settles (basin found) or the agent flinches (bad
+        //    gradient step). The sheet dips under the bead and heats
+        //    where it passes; ridges stay cold, valleys warm.
+        const ddt = 1 / 60;
+        const lr = 1.6 * (0.55 + 0.45 * drive);
+        const eps = 0.06;
+        const gX = (_lossH(beadX + eps, beadZ, time)
+            - _lossH(beadX - eps, beadZ, time)) / (2 * eps);
+        const gZ = (_lossH(beadX, beadZ + eps, time)
+            - _lossH(beadX, beadZ - eps, time)) / (2 * eps);
+        beadVX = (beadVX - gX * lr * ddt) * 0.965;
+        beadVZ = (beadVZ - gZ * lr * ddt) * 0.965;
+        beadX += beadVX * ddt * 2.0 * CALM;
+        beadZ += beadVZ * ddt * 2.0 * CALM;
+        const XL = DESC_SX / 2 - 0.25, ZL = DESC_SZ / 2 - 0.25;
+        if (beadX > XL) { beadX = XL; beadVX = -Math.abs(beadVX) * 0.5; }
+        if (beadX < -XL) { beadX = -XL; beadVX = Math.abs(beadVX) * 0.5; }
+        if (beadZ > ZL) { beadZ = ZL; beadVZ = -Math.abs(beadVZ) * 0.5; }
+        if (beadZ < -ZL) { beadZ = -ZL; beadVZ = Math.abs(beadVZ) * 0.5; }
+        const spd = Math.hypot(beadVX, beadVZ);
+        beadStill = spd < 0.10 ? beadStill + ddt : 0;
+        if (beadStill > 2.2 || (flinch > 0.55 && beadStill > 0.4)) {
+            const ka = Math.random() * Math.PI * 2;
+            const kk = 0.9 + 0.7 * drive;
+            beadVX += Math.cos(ka) * kk;
+            beadVZ += Math.sin(ka) * kk;
+            beadStill = 0;
+        }
+        if ((_descTick++ % 3) === 0) {
+            beadTrail.unshift([beadX, beadZ]);
+            if (beadTrail.length > 40) beadTrail.pop();
+        }
+        // Tilt the whole landscape toward the camera.
+        const TC = Math.cos(-0.52), TS = Math.sin(-0.52);
+        // Dive focus (2026-07-29 operator report: "descent usually
+        // zooms into an uninteresting location when busy"): the
+        // immersion dive zooms toward the scene ORIGIN — a generic
+        // patch of terrain — while the story (the hot bead) is off
+        // wherever it rolled. While diving, translate the whole sheet
+        // so the BEAD sits at the origin, slightly below the view axis
+        // (+0.30 lift so the camera hovers over the surface instead of
+        // clipping into it): a user turn rides the optimizer hunting
+        // the minimum. Weighted by `dive` — at rest nothing moves; the
+        // bead's position is continuous (velocity physics; kicks jolt
+        // velocity, never position), so the follow never jumps.
+        const _bwYpre = _lossH(beadX, beadZ, time) + 0.10;
+        const _descFx = dive * beadX;
+        const _descFy = dive * (_bwYpre * TC - beadZ * TS - 0.15 + 0.30);
+        const _descFz = dive * (_bwYpre * TS + beadZ * TC);
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                const h = _lossH(bp.gx, bp.gz, time);
+                const dxb = bp.gx - beadX, dzb = bp.gz - beadZ;
+                const heat = Math.exp(-(dxb * dxb + dzb * dzb) / 0.30);
+                x = bp.gx;
+                y = h - 0.10 * heat
+                    + 0.02 * CALM * Math.sin(time * 0.9 + bp.jit);
+                z = bp.gz;
+                // Height → thermal: ridges cold, valleys warm, the
+                // bead's neighborhood glowing.
+                const hn = Math.max(0, Math.min(1, 0.5 + h / (2 * DESC_H * 0.76)));
+                nodeSeeds[i] = 0.04 + (1 - hn) * 0.30 + 0.24 * heat;
+            } else {
+                const ti = Math.min(
+                    Math.floor(bp.s * Math.max(beadTrail.length - 1, 0)),
+                    Math.max(beadTrail.length - 1, 0));
+                const P = beadTrail.length ? beadTrail[ti] : [beadX, beadZ];
+                x = P[0] + bp.rr * Math.sin(time * 2.3 + bp.jit * 3.0);
+                y = _lossH(P[0], P[1], time) + 0.10
+                    + bp.rr * Math.cos(time * 1.9 + bp.jit * 2.0);
+                z = P[1] + bp.rr * Math.sin(time * 2.1 + bp.jit * 5.0);
+                bp.sz = 1.0 - bp.s * 0.55;
+                nodeSeeds[i] = 0.60 - bp.s * 0.22;
+            }
+            currentPositions[i].set(
+                x - _descFx,
+                y * TC - z * TS - 0.15 - _descFy,
+                y * TS + z * TC - _descFz);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'cube') {
+        // ── CUBE: the infinite monolith. The grid barely moves — the
+        //    LIFE is in the resident complexities, each an alien sine
+        //    field quietly warping its neighborhood. A user turn wakes
+        //    one (the mutation): it grows aggressively-but-not-fast,
+        //    spreads through each node's own irregular gate, churns
+        //    faster as it strengthens, runs crimson at its heart — and
+        //    the dive translation carries the camera into it. On
+        //    completion it tames over ~6s and the cube re-knits.
+        const _turnOn = userTurnState > 0.5;
+        if (_turnOn && !_cubePrevTurn && cubeS < 0.4) {
+            // New turn while calm: a (possibly different) complexity
+            // wakes. Mid-decay re-arms keep the SAME one — the heat
+            // must never teleport.
+            cubeActive = Math.floor(Math.random() * _cubeCx.length);
+        }
+        _cubePrevTurn = _turnOn;
+        if (_turnOn) {
+            cubeS += (1.0 - cubeS) * 0.014;   // ~5s to full presence
+        } else if (cubeS > 0.001) {
+            // Taming tail slowed 0.988 → 0.9935 (v2): the spring-back
+            // must pace the ~10s dive-out — nodes releasing faster than
+            // the camera retreats was the "erratic zoom-out".
+            cubeS *= 0.9935;
+        } else {
+            cubeS = 0.0;
+        }
+        // Stately monolith tumble — slower than lattice.
+        const ka1 = time * 0.030 * CALM, ka2 = time * 0.019 * CALM;
+        const kc1 = Math.cos(ka1), ks1 = Math.sin(ka1);
+        const kc2 = Math.cos(ka2), ks2 = Math.sin(ka2);
+        // Dive focus: the ACTIVE complexity's post-tumble position —
+        // the camera rides into the mutation, not a generic corner
+        // (the descent/embedding lesson applied from birth).
+        const _A = _cubeCx[cubeActive] || { ax: 0, ay: 0, az: 0 };
+        const _awx = _A.ax * kc1 + _A.az * ks1;
+        const _awz1 = -_A.ax * ks1 + _A.az * kc1;
+        const _awy = _A.ay * kc2 - _awz1 * ks2;
+        const _awz = _A.ay * ks2 + _awz1 * kc2;
+        const kfx = dive * _awx, kfy = dive * _awy, kfz = dive * _awz;
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            let x, y, z;
+            if (bp.kind === 0) {
+                x = bp.gx; y = bp.gy; z = bp.gz;
+                let heat = 0;
+                for (let k = 0; k < _cubeCx.length; k++) {
+                    const c = _cubeCx[k];
+                    const Sk = k === cubeActive ? cubeS : 0;
+                    // Idle life (v2): each complexity is ALREADY a slow
+                    // red organism — swelling and shrinking on its own
+                    // rhythm — and the active one adds the mutation on
+                    // top. S_total drives radius, motion and heat alike.
+                    const St = 0.22 + 0.12 * Math.sin(time * 0.11 + c.ph) + Sk;
+                    const edge = c.r0 * (0.8 + 1.5 * St) * bp.gate;
+                    const dx = bp.gx - c.ax, dy = bp.gy - c.ay, dz = bp.gz - c.az;
+                    const d = Math.hypot(dx, dy, dz);
+                    if (d > edge + 0.4) continue;
+                    const w = 1 - d / (edge + 0.4);
+                    const wS = w * w;
+                    const amp = (0.06 + 0.30 * St) * wS * CALM
+                        * (1 + 0.5 * flinch);
+                    // The mutation churns FASTER as it strengthens.
+                    const tk = time * (0.7 + 1.4 * Sk);
+                    // SPATIALLY COHERENT field (v2, "random dots" fix):
+                    // phases keyed to grid POSITION at low frequency, so
+                    // neighbors move together — waves rippling through
+                    // flesh — with only a whisper of per-node texture.
+                    x += amp * (Math.sin(tk * 0.9 + bp.gy * 1.9 + bp.gz * 1.3 + c.ph)
+                        + 0.15 * Math.sin(tk * 1.7 + bp.jit * 3.0));
+                    y += amp * (Math.sin(tk * 0.75 + bp.gz * 1.7 + bp.gx * 1.1 + c.ph * 2.0)
+                        + 0.15 * Math.sin(tk * 1.5 + bp.jit * 5.0));
+                    z += amp * (Math.sin(tk * 0.6 + bp.gx * 1.5 + bp.gy * 1.4 + c.ph * 3.0)
+                        + 0.15 * Math.sin(tk * 1.3 + bp.jit * 7.0));
+                    // ACCRETION, gentled 0.55 → 0.35 (v2): enough to
+                    // knit the mutation visibly denser, small enough
+                    // that its release can never read erratic.
+                    const pull = 0.35 * Sk * w;
+                    x -= dx * pull;
+                    y -= dy * pull;
+                    z -= dz * pull;
+                    // RED that reads as a spreading REGION: the heat
+                    // front rides the same envelope as the deformation,
+                    // so wherever the flesh moves, it is red — idle
+                    // cores sit visibly crimson, the mutation drives
+                    // the front outward across the grid.
+                    heat += wS * (0.30 + 0.34 * St);
+                }
+                nodeSeeds[i] = Math.min(0.60, bp.seed0 + heat);
+            } else {
+                // Complexity heart: a small orbiting tangle — violet at
+                // rest, swelling and running crimson as ITS mutation
+                // grows.
+                const c = _cubeCx[bp.ci] || _cubeCx[0] || { ax: 0, ay: 0, az: 0, ph: 0 };
+                const Sk = bp.ci === cubeActive ? cubeS : 0;
+                const sp = time * (0.35 + 1.3 * Sk) * CALM + bp.jit;
+                const cs = Math.cos(sp), sn = Math.sin(sp);
+                const r = bp.rr * (1 + 1.1 * Sk)
+                    * (1 + 0.10 * Math.sin(time * 0.9 + bp.jit * 2.0));
+                const ox = bp.dx * cs + bp.dz * sn;
+                const oz = -bp.dx * sn + bp.dz * cs;
+                x = c.ax + ox * r;
+                y = c.ay + bp.dy * r * (1 + 0.3 * Math.sin(time * 0.7 + bp.jit));
+                z = c.az + oz * r;
+                nodeSeeds[i] = Math.min(0.62,
+                    0.52 + 0.08 * Sk + 0.03 * Math.sin(time * 0.8 + bp.jit));
+            }
+            const x1 = x * kc1 + z * ks1;
+            const z1 = -x * ks1 + z * kc1;
+            const y2 = y * kc2 - z1 * ks2;
+            const z2 = y * ks2 + z1 * kc2;
+            currentPositions[i].set(x1 - kfx, y2 - kfy, z2 - kfz);
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (FORM === 'empty') {
         // ── EMPTY: the dispersed far sphere — static, unlinked,
         //    invisible. (Must stay an explicit branch: the trailing
         //    else belongs to cortex.)
@@ -1746,10 +2581,30 @@ function animate() {
     // up with the dive forms more links exactly when the viewer is in
     // the middle of them (the O(n²) distances are computed either way;
     // this only accepts more pairs, bounded by MAX_LINES).
-    // The vortex reads best DENSE — a 1.5× link-radius² multiplier weaves
-    // the funnel membrane much tighter (operator: "a bit more dense").
+    // Per-form link-radius² multipliers: the vortex reads best DENSE
+    // (1.5× weaves the funnel membrane tighter — "a bit more dense");
+    // the AI forms need TIGHTER radii — lattice so only axis-neighbors
+    // weave (a clean wireframe tensor, no diagonals), embedding so
+    // clusters can never cross-link (the void between concepts stays
+    // void), descent so the terrain reads as a mesh surface, not a
+    // solid (the mobile sheet is sparser, hence the wider radius).
+    const LINK_MULT = {
+        vortex: 1.5,
+        lattice: 0.45,
+        // Cube: neighbors-only like lattice but on the BIGGER cell edge
+        // (0.88/0.95); mutation displacement deliberately exceeds the
+        // link slack so the grid visibly tears and re-weaves around it.
+        cube: 0.62,
+        stack: 0.25,
+        embedding: 0.62,
+        // Descent radius must cover a grid step across the WORST-CASE
+        // analytic slope of _lossH (all terms aligned), or the sheet
+        // tears momentarily on steep ridges — computed invariant pinned
+        // in tests/test_interface_face_forms_ai.py.
+        descent: IS_MOBILE ? 0.38 : 0.20,
+    };
     const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15)
-        * (formIndex === 3 ? 1.5 : 1.0);
+        * (LINK_MULT[FORM] || 1.0);
 
     for (let i = 0; i < NODE_COUNT; i++) {
         for (let j = i + 1; j < NODE_COUNT; j++) {
@@ -1798,7 +2653,7 @@ function animate() {
         // core additionally FLARES in size when the infall surges land.
         const bpi = basePositions[i];
         const s = nodeScales[i] * (bpi.sz || 1.0)
-            * (formIndex === 1 && bpi.kind === 2 ? coreFlare : 1.0);
+            * (FORM === 'horizon' && bpi.kind === 2 ? coreFlare : 1.0);
         if (s < 0.001) {
             dummy.scale.set(0, 0, 0);
             dummy.position.set(9999, 9999, 9999);
@@ -1828,10 +2683,10 @@ function animate() {
     // distance (its hot zone sits on the view axis at depth) and damps
     // the hue wave/drift so its center stays anchored DARK RED instead
     // of swinging through the plum stop ("bright purple" report).
-    const centerDim = formIndex === 1 || formIndex === 3 ? 0.85 : 0.30;
-    const centerXY = formIndex === 3 ? 1.0 : 0.0;
-    const waveAmp = formIndex === 3 ? 0.3 : 1.0;
-    const hueDriftOut = hueDrift * (formIndex === 3 ? 0.3 : 1.0);
+    const centerDim = FORM === 'horizon' || FORM === 'vortex' ? 0.85 : 0.30;
+    const centerXY = FORM === 'vortex' ? 1.0 : 0.0;
+    const waveAmp = FORM === 'vortex' ? 0.3 : 1.0;
+    const hueDriftOut = hueDrift * (FORM === 'vortex' ? 0.3 : 1.0);
     // Master luminance: EVERY form emits ~half the light so the face
     // BLENDS into the background (operator: "too bright and
     // distracting", then extended to all faces) — structure and motion
@@ -1867,7 +2722,7 @@ function animate() {
     // Interior motes: only rendered while actually diving — and never
     // for the empty form (a dive there would summon motes out of a
     // deliberately blank screen).
-    motesMesh.visible = dive > 0.01 && formIndex !== 4;
+    motesMesh.visible = dive > 0.01 && FORM !== 'empty';
     if (motesMesh.visible) {
         motesMaterial.uniforms.uTime.value = time;
         motesMaterial.uniforms.uDive.value = dive;

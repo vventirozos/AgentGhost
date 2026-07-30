@@ -6314,6 +6314,65 @@ class GhostAgent:
                 pass
         return 25.0
 
+    async def _adaptive_bon_final(self, *, messages, final_ai_content,
+                                  last_user_content, model):
+        """§4F Phase 3b: wobble-band comparative best-of-N (core/tts.py).
+
+        Generates K alternative standalone finals SEQUENTIALLY on the main
+        model, then ONE list-wise comparative judge call on the cheap pool
+        picks the reply that ships. Returns (winner_text, meta) — winner
+        may be the original; every failure mode resolves to the original.
+        Callers gate on tts.adaptive_bon_enabled() + tts.wobble_band()."""
+        from . import tts as _tts
+
+        async def _gen(i: int):
+            payload = {
+                "model": model,
+                "messages": list(messages) + [{
+                    "role": "user",
+                    "content": (
+                        "Produce your single best FINAL reply to the "
+                        "user's request above. Standalone and complete — "
+                        "do not reference earlier drafts or this "
+                        "instruction."),
+                }],
+                # Diversify candidates by temperature (survey result:
+                # diversified rollouts lift Pass@k) — the judge, not the
+                # sampler, is the precision instrument here.
+                "temperature": 0.4 + 0.25 * i,
+                "max_tokens": 2048,
+                "stream": False,
+            }
+            res = await self.context.llm_client.chat_completion(payload)
+            return (((res or {}).get("choices") or [{}])[0]
+                    .get("message", {}).get("content", "") or None)
+
+        async def _judge(prompt: str):
+            # Payload shape owned by tts.judge_payload — judges are
+            # verifier-class no-think calls; agent.py itself must never
+            # carry the disable-thinking switch (guard test).
+            payload = _tts.judge_payload(prompt)
+            kwargs: dict = {"timeout": 45.0}
+            if getattr(self.context.llm_client, "critic_clients", None):
+                kwargs["use_critic"] = True
+            else:
+                kwargs["use_worker"] = True
+            res = await self.context.llm_client.chat_completion(
+                payload, **kwargs)
+            return (((res or {}).get("choices") or [{}])[0]
+                    .get("message", {}).get("content", "") or "")
+
+        winner, meta = await _tts.adaptive_bon(
+            _gen, _judge, last_user_content or "", final_ai_content or "")
+        if meta.get("substituted"):
+            pretty_log(
+                "TTS BoN",
+                f"wobble-band substitution: candidate "
+                f"{meta['winner'] + 1}/{meta['candidates']} ships — "
+                f"{str(meta.get('why', ''))[:80]}",
+                icon=Icons.BRAIN_THINK)
+        return winner, meta
+
     async def _compute_verifier_verdict_gated(
         self, *, tools_run_this_turn, messages, final_ai_content,
         last_user_content, lc, trajectory_id, conv_fp=None,
@@ -14222,6 +14281,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     type(_rep_exc).__name__, _rep_exc,
                                 )
                                 _do_repair = False
+                            # §4F Phase 3b: adaptive best-of-N on the
+                            # verifier's WOBBLE BAND (GHOST_TTS_ADAPTIVE_BON,
+                            # default OFF). Only when NOT repairing — hard
+                            # REFUTED keeps the repair path, so the two
+                            # regeneration mechanisms never interact. Any
+                            # failure inside keeps the original answer.
+                            if not _do_repair:
+                                try:
+                                    from . import tts as _tts_mod
+                                    _cvr = (_verifier_verdict_cache
+                                            or (None, None))[0]
+                                    if (_tts_mod.adaptive_bon_enabled()
+                                            and _tts_mod.wobble_band(_cvr)):
+                                        final_ai_content, _ = (
+                                            await self._adaptive_bon_final(
+                                                messages=messages,
+                                                final_ai_content=final_ai_content,
+                                                last_user_content=last_user_content,
+                                                model=model,
+                                            ))
+                                except Exception as _bon_exc:
+                                    logger.debug(
+                                        "adaptive BoN skipped: %s: %s",
+                                        type(_bon_exc).__name__, _bon_exc)
                             if _do_repair:
                                 _directive += _REPAIR_STANDALONE_SUFFIX
                                 messages.append(msg)

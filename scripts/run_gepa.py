@@ -5,7 +5,7 @@ signatures.
 Usage:
   python -m scripts.run_gepa \\
       --signature planning.decompose \\
-      --trajectories $GHOST_HOME/trajectories \\
+      --trajectories $GHOST_HOME/system/trajectories \\
       --upstream-url http://127.0.0.1:8080 \\
       --model qwen-3.6-35b-a3 \\
       --max-iterations 8 \\
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -34,7 +35,11 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 from ghost_agent.distill.collector import TrajectoryCollector  # noqa: E402
 from ghost_agent.optim.signatures import SIGNATURES  # noqa: E402
-from ghost_agent.optim.trainset import build_trainset, split_train_eval  # noqa: E402
+from ghost_agent.optim.trainset import (  # noqa: E402
+    build_trainset,
+    split_public_private,
+    split_train_eval,
+)
 
 
 async def main() -> int:
@@ -43,7 +48,7 @@ async def main() -> int:
                         choices=sorted(SIGNATURES.keys()),
                         help="Which optimizable signature to tune.")
     parser.add_argument("--trajectories", type=Path, default=None,
-                        help="Path to the trajectory store root. Defaults to $GHOST_HOME/trajectories.")
+                        help="Path to the trajectory store root. Defaults to $GHOST_HOME/system/trajectories (where the live agent writes).")
     parser.add_argument("--upstream-url", default="http://127.0.0.1:8080")
     parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
     parser.add_argument("--max-iterations", type=int, default=8)
@@ -63,11 +68,18 @@ async def main() -> int:
                         help="Skip the A/B gate and adopt the tuned prompt UNVERIFIED. Use only when there is no eval split to compare on.")
     parser.add_argument("--ab-min-delta", type=float, default=0.02,
                         help="Minimum eval pass-rate improvement for --ab-gate to ship the candidate. Default 0.02.")
+    parser.add_argument("--private-pct", type=int, default=30,
+                        help="Percent of examples reserved (by per-item hash) for the PRIVATE "
+                             "holdout the A/B ship-gate judges on. The optimizer never sees "
+                             "them. Membership is stable per trajectory across runs. Default 30.")
     args = parser.parse_args()
 
     # Resolve default paths
     base = Path(os.getenv("GHOST_HOME", str(Path.home() / "ghost_llamacpp")))
-    traj_root = args.trajectories or (base / "trajectories")
+    # "system/trajectories", NOT "trajectories": prod writes via
+    # memory_dir.parent (= $GHOST_HOME/system) — the old default pointed one
+    # level up at a directory that never exists on a live deployment.
+    traj_root = args.trajectories or (base / "system" / "trajectories")
     output_path = args.output or (base / "system" / "optim" / f"{args.signature}.json")
 
     sig = SIGNATURES[args.signature]
@@ -82,10 +94,13 @@ async def main() -> int:
         print(f"no trajectories under {traj_root} — run some user turns first", file=sys.stderr)
         return 2
 
+    # No cap yet — the signature-target filter below must see the whole
+    # corpus first (plan-bearing trajectories are ~1 in 4 of PASSED; capping
+    # first would truncate away most of the usable examples).
     examples = build_trainset(
         trajectories,
         signature_name=sig.name,
-        max_examples=args.max_examples,
+        max_examples=None,
     )
     if not examples:
         print(
@@ -95,23 +110,73 @@ async def main() -> int:
         )
         return 2
 
-    train_set, eval_set = split_train_eval(examples, eval_fraction=args.eval_fraction)
-    print(f"{len(train_set)} train / {len(eval_set)} eval examples for {sig.name}")
+    # Prefer examples that carry a target for one of the signature's OWN
+    # output fields (e.g. planning_output → "plan"): the metric grades
+    # against those fields, and an example without them can only score via
+    # the weaker final_response fallback.
+    keyed = [e for e in examples
+             if any((e.expected_output or {}).get(f) for f in sig.outputs)]
+    if len(keyed) >= 20:
+        if len(keyed) < len(examples):
+            print(f"filtered to {len(keyed)}/{len(examples)} examples with a "
+                  f"{sorted(sig.outputs)} target")
+        examples = keyed
+    elif keyed:
+        print(f"only {len(keyed)} examples carry a signature-output target "
+              f"(<20) — keeping all {len(examples)}; metric falls back to "
+              f"final_response overlap")
+    examples = examples[:args.max_examples]
+
+    # PUBLIC/PRIVATE first: the private tier is hash-assigned per trajectory
+    # and is the ONLY thing the A/B ship-gate judges on. The optimizer —
+    # including its internal train/val split below — works exclusively on
+    # the public tier. Judging the ship decision on data the optimizer
+    # could see is how proxy-gamed prompts get promoted.
+    public_set, private_set = split_public_private(examples, private_pct=args.private_pct)
+    train_set, eval_set = split_train_eval(public_set, eval_fraction=args.eval_fraction)
+    print(f"{len(train_set)} train / {len(eval_set)} val (public) / "
+          f"{len(private_set)} PRIVATE holdout examples for {sig.name}")
 
     # Build LLM client + metric
     from ghost_agent.core.llm import LLMClient
     llm_client = LLMClient(args.upstream_url)
 
-    # Simple metric: substring match of the expected output's
-    # final_response in the model's output. Callers with a richer
-    # verifier should copy + adapt this script; GEPA/MIPROv2 both accept
-    # any callable as the metric.
-    def _metric(example, prediction) -> float:
-        want = str(getattr(example, "expected_output", {}).get("final_response", "")).strip().lower()
-        got = str(getattr(prediction, "final_response", prediction) or "").strip().lower()
-        if not want or not got:
+    # Ignition metric: graded token recall of the expected target inside the
+    # prediction's declared output fields. Deterministic, zero extra LLM
+    # calls, and GRADED — GEPA needs a gradient, and the old binary
+    # substring check scored ~everything 0. Replaced by real benches
+    # (verify_bench / replay fixtures) in §4F Phase 2.
+    def _overlap(want: str, got: str) -> float:
+        w = set(re.findall(r"[a-z0-9_]+", want.lower()))
+        g = set(re.findall(r"[a-z0-9_]+", got.lower()))
+        if not w or not g:
             return 0.0
-        return 1.0 if want[:120] in got else 0.0
+        return len(w & g) / len(w)
+
+    def _expected_target(fields_obj) -> str:
+        """First non-empty signature-output field on the gold (falling back
+        to final_response). `fields_obj` is a dspy.Example after
+        `_to_dspy_examples` — attribute access — or a raw dict."""
+        for f in list(sig.outputs) + ["final_response"]:
+            if isinstance(fields_obj, dict):
+                v = fields_obj.get(f, "")
+            else:
+                v = getattr(fields_obj, f, "")
+            v = str(v or "").strip()
+            if v:
+                return v
+        return ""
+
+    # dspy 3.x GEPA validates this exact 5-positional signature at
+    # construction: (gold, pred, trace, pred_name, pred_trace).
+    def _metric(gold, pred, trace=None, pred_name=None, pred_trace=None) -> float:
+        want = _expected_target(gold)
+        got = " ".join(
+            str(getattr(pred, f, "") or "") for f in sig.outputs
+        ).strip() or str(pred or "")
+        if not want:
+            return 0.0
+        return _overlap(want, got)
 
     # Write the tuned instruction to a STAGING path, NOT the live path the
     # agent reads. It is only promoted after passing the A/B gate below, so a
@@ -127,6 +192,9 @@ async def main() -> int:
         max_iterations=args.max_iterations,
         optimizer=args.optimizer,
         output_path=staging_path,
+        # Public-tier val split for GEPA's own candidate selection — the
+        # PRIVATE holdout stays exclusive to the A/B ship-gate below.
+        valset=eval_set,
     )
 
     print(f"optimized instruction written to staging {staging_path}")
@@ -134,8 +202,13 @@ async def main() -> int:
     print(f"optimized: {result.optimized_instruction[:120]}...")
 
     def _discard_staging():
+        # Keep the rejected candidate for post-mortem instead of deleting
+        # the only copy of what GEPA produced. The ".rejected" suffix is
+        # invisible to the loader and to learning-health (both match
+        # exactly "*.json").
         try:
-            staging_path.unlink()
+            os.replace(staging_path,
+                       Path(str(staging_path) + ".rejected"))
         except FileNotFoundError:
             pass
 
@@ -153,11 +226,12 @@ async def main() -> int:
         print(f"A/B gate DISABLED (--no-ab-gate) — adopted UNVERIFIED at {output_path}")
         return 0
 
-    if not eval_set:
+    if not private_set:
         _discard_staging()
-        print("A/B gate is ON but the eval split is empty — cannot verify the "
-              "candidate; NOT promoting. Re-run with --no-ab-gate to adopt it "
-              "unverified, or log more passing trajectories.", file=sys.stderr)
+        print("A/B gate is ON but the PRIVATE holdout is empty — cannot verify "
+              "the candidate; NOT promoting. Log more passing trajectories "
+              "(or raise --private-pct); --no-ab-gate adopts it unverified.",
+              file=sys.stderr)
         return 1
 
     from ghost_agent.optim.ab_eval import compare_prompts
@@ -177,20 +251,29 @@ async def main() -> int:
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": str(user_req)},
             ],
-            "temperature": 0.0, "max_tokens": 1024, "stream": False,
+            # Mirror the optimizer-rollout regime (no-think + full budget).
+            # At 1024 tokens with thinking on, the reasoning phase consumed
+            # the entire budget, content came back empty, and BOTH arms
+            # scored at the noise floor (baseline 0.05 vs candidate 0.00) —
+            # a gate that can only ever reject.
+            "temperature": 0.0, "max_tokens": 8192, "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         })
         got = ((res or {}).get("choices", [{}])[0]
                .get("message", {}).get("content", "") or "")
-        want = str((payload.get("expected_output") or {})
-                   .get("final_response", "")).strip().lower()
-        passed = bool(want and want[:120] in got.strip().lower())
+        # Same graded target/overlap as the optimizer metric so baseline and
+        # candidate are judged on identical semantics; 0.3 recall = "the
+        # prediction substantially covers the validator-approved target".
+        want = _expected_target(payload.get("expected_output") or {})
+        passed = bool(want) and _overlap(want, got) >= 0.3
         return {"passed": passed, "output": got}
 
     cmp = await compare_prompts(
         result.baseline_instruction, result.optimized_instruction,
-        eval_set, _ab_runner, min_delta=args.ab_min_delta,
+        private_set, _ab_runner, min_delta=args.ab_min_delta,
     )
-    print(f"A/B: baseline={cmp.baseline_pass_rate:.2f} "
+    print(f"A/B (PRIVATE holdout, n={len(private_set)}): "
+          f"baseline={cmp.baseline_pass_rate:.2f} "
           f"candidate={cmp.candidate_pass_rate:.2f} "
           f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
     if not cmp.candidate_ships:

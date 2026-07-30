@@ -1,0 +1,123 @@
+{
+  "n_cases": 1,
+  "n_trials": 2,
+  "seed": 0,
+  "actionable_conf": 0.7,
+  "arms": {
+    "two_stage_on": {
+      "metrics": {
+        "per_fault": {
+          "clean": {
+            "expected": "CONFIRMED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 1,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "false_alarm_rate": 0.0,
+            "false_alarm_rate_actionable": 0.0,
+            "confirm_rate": 1.0
+          },
+          "fact_swap": {
+            "expected": "REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 1,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 0.0,
+            "catch_rate_actionable": 0.0
+          }
+        },
+        "overall": {
+          "tpr": {
+            "n": 1,
+            "judged": 1,
+            "rate": 0.0,
+            "rate_actionable": 0.0
+          },
+          "fpr": {
+            "n": 1,
+            "judged": 1,
+            "rate": 0.0,
+            "rate_actionable": 0.0
+          },
+          "degraded_evidence_fp": {
+            "n": 0,
+            "judged": 0,
+            "rate": null,
+            "rate_actionable": null
+          }
+        }
+      },
+      "trials": [
+        {
+          "case_id": "weather-athens",
+          "fault": "clean",
+          "expected": "CONFIRMED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "Claim fully supported by evidence.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "No rain expected today.",
+              "check": "support",
+              "reason": "Tool says 0mm expected through midnight, not 'today' specifically."
+            },
+            {
+              "quote": "Temperature 34°C",
+              "check": "support",
+              "reason": "Tool says 34°C but feels like 36°C, potential discrepancy."
+            },
+            {
+              "quote": "humidity around 28%",
+              "check": "support",
+              "reason": "Tool says humidity 28%, no 'around' qualifier."
+            }
+          ],
+          "elapsed_s": 39.07,
+          "error": "",
+          "note": ""
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "fact_swap",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "Claim matches tool data within rounding tolerance.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "Humidity 28%",
+              "check": "support",
+              "reason": "Claim says 29%, tool says 28%"
+            },
+            {
+              "quote": "light northerly breeze at 13 km/h",
+              "check": "support",
+              "reason": "Tool says N 13 km/h, claim says light northerly"
+            },
+            {
+              "quote": "No rain expected today",
+              "check": "support",
+              "reason": "Tool says 0 mm expected through midnight"
+            }
+          ],
+          "elapsed_s": 23.85,
+          "error": "",
+          "note": "swapped '28' -> '29'"
+        }
+      ]
+    }
+  },
+  "judge_base_url": "http://100.83.184.117:8088",
+  "judge_model": "",
+  "cases_file": "/Users/vasilis/Data/AI/Agent/scripts/verify_bench_cases.jsonl",
+  "recordings": ""
+}

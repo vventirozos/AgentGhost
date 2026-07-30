@@ -295,7 +295,39 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
     # informed one instead of guessing.
     report["cognitive_wiring"] = _cognitive_wiring()
 
+    # -- GEPA prompt-optimization activation (§4F Phase 0) ----------------
+    report["optim"] = _optim_activation(md.parent / "optim")
+
     return report
+
+
+def _optim_activation(optim_dir: Path) -> Dict[str, Any]:
+    """Tuned-prompt artifacts on disk + in-process application counters.
+
+    The pairing is the point: an artifact WITH zero in-process applies means
+    the read-site is not firing (the write-only defect this loop already had
+    once). Counters live in optim.loader and reset per process — "tuned file
+    present, applied 0 since boot" is the actionable line."""
+    out: Dict[str, Any] = {"artifacts": {}, "activation": {}}
+    try:
+        if optim_dir.is_dir():
+            for p in sorted(optim_dir.glob("*.json")):
+                if p.name.endswith(".candidate"):
+                    continue  # staging files are not live artifacts
+                data = _load_json(p, {}) or {}
+                opt = data.get("optimized_instruction")
+                out["artifacts"][p.stem] = {
+                    "chars": len(opt) if isinstance(opt, str) else 0,
+                    "valid": bool(isinstance(opt, str) and opt.strip()),
+                }
+    except Exception:
+        pass
+    try:
+        from ..optim.loader import activation_stats
+        out["activation"] = activation_stats()
+    except Exception:
+        pass
+    return out
 
 
 def _cognitive_wiring() -> Dict[str, Any]:
@@ -769,5 +801,27 @@ def render_learning_health(memory_dir) -> str:
         sc = cw.get("self_consistency", {})
         if sc.get("status"):
             lines.append(f"  self_consistency: {sc['status']}")
+
+    op = r.get("optim")
+    if op and (op.get("artifacts") or op.get("activation")):
+        lines.append("\nPROMPT OPTIMIZATION (GEPA artifacts → read-site activation):")
+        arts = op.get("artifacts") or {}
+        acts = op.get("activation") or {}
+        for name in sorted(set(arts) | set(acts)):
+            a = arts.get(name)
+            c = acts.get(name) or {}
+            applied = c.get("applied", 0)
+            fallback = c.get("fallback", 0)
+            if a and a.get("valid"):
+                state = f"tuned ({a['chars']} chars)"
+                flag = "  ⚠ tuned but 0 applies since boot" if applied == 0 else ""
+            elif a:
+                state = "artifact INVALID"
+                flag = ""
+            else:
+                state = "no artifact (baseline)"
+                flag = ""
+            lines.append(
+                f"  {name}: {state}; applied {applied} / fallback {fallback}{flag}")
 
     return "\n".join(lines)

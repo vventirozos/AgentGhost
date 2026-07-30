@@ -1,7 +1,7 @@
 """JSONL trajectory writer.
 
 Writes one Trajectory per line to a day-partitioned file under
-`$GHOST_HOME/trajectories/YYYY-MM-DD/session-<sid>.jsonl`. Append-only,
+`$GHOST_HOME/system/trajectories/YYYY-MM-DD/session-<sid>.jsonl`. Append-only,
 thread-safe, crash-safe (uses line-buffered writes with explicit flush).
 
 Designed to live inside the agent's hot path without becoming one —
@@ -42,9 +42,14 @@ CORRECTIONS_FILENAME = "corrections.jsonl"
 
 
 def _default_root() -> Path:
+    # $GHOST_HOME/system/trajectories — matching where prod actually writes
+    # (main.py: memory_dir.parent / "trajectories", memory_dir being
+    # $GHOST_HOME/system/memory). The old default lacked the "system/"
+    # segment, so default-rooted readers (scripts/run_gepa.py) looked at an
+    # empty directory while 24 days of trajectories sat one level down.
     base = os.getenv("GHOST_HOME")
     if base:
-        return Path(base) / "trajectories"
+        return Path(base) / "system" / "trajectories"
     return Path.home() / ".ghost" / "trajectories"
 
 

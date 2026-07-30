@@ -181,6 +181,139 @@ order in place.
   defers `import dspy` to call sites via `_require_dspy()` so a
   broken install surfaces a clear error instead of a cryptic
   `ImportError` during module load.
+
+### Optimizer eval hygiene (§4F Phase 0, 2026-07-29)
+
+Any loop that rewrites its own prompts must not be allowed to grade
+itself. Measured context: proxy-gaming rates in self-optimizing agents
+run 46–74% and *rise* with optimization steps (26%→58% between 10 and
+100); self-critique does not fix it, a hidden holdout does. Three
+mechanisms enforce this, all live before the first real GEPA run:
+
+* **PUBLIC/PRIVATE example split** — `trainset.split_public_private`
+  assigns every example a tier by `sha256` of a stable identity
+  (`source_trajectory_id` when present, content key otherwise; the
+  identity deliberately excludes `signature_name` so one trajectory
+  lands in the same tier for *every* signature). Membership therefore
+  never migrates as the corpus grows — unlike a seeded positional
+  shuffle, which re-deals membership each run and slowly leaks
+  training examples into the "holdout". `scripts/run_gepa.py` gives
+  the optimizer (train + its internal val split) ONLY the public tier;
+  the A/B ship-gate (`ab_eval.compare_prompts`) judges ONLY the
+  private tier (default `--private-pct 30`). An empty private tier
+  refuses promotion rather than falling back to public examples.
+  The public val split is forwarded to the optimizer as its own
+  candidate-selection set (`run_gepa(..., valset=...)`, with a
+  TypeError fallback for tuners that don't accept one) — GEPA picks
+  its Pareto frontier on the valset, which is exactly why that set
+  must be public-tier, never the ship-gate holdout.
+* **`MAX_OPT_ITERATIONS` (=16)** — clamped inside `run_gepa()` itself
+  so every caller inherits the cap; raising it is only legitimate
+  alongside a stronger private holdout.
+* **Activation telemetry** — `optim/loader.py` counts tuned-vs-baseline
+  applications per signature (`activation_stats()`), and
+  `learning_health` pairs artifacts-on-disk with those counters
+  (`PROMPT OPTIMIZATION` section; `introspect action='learning'`).
+  A tuned artifact with zero applies since boot renders with a ⚠ flag —
+  this exact loop was once write-only, and the field's 2026 finding is
+  that harness components failing to *fire* (not bad content) is the
+  dominant failure mode. Counters survive `clear_cache()` by design.
+  Operational rule: **never call `clear_cache()` on a live process** —
+  a mid-session prompt reload shifts the KV stable-prefix pin; retrain
+  offline, deploy via restart.
+
+Tests: `tests/test_optim_eval_hygiene.py` (split stability under corpus
+growth, cross-signature tier consistency, clamp-before-optimize, counter
+semantics, learning-health pairing + ⚠ render).
+
+### Verifier prompt optimization (§4F Phase 2, 2026-07-29)
+
+The two-stage verifier templates (`_VERIFY_ENUMERATE_PROMPT`,
+`_VERIFY_ADJUDICATE_PROMPT`) are GEPA-optimizable text assets:
+
+* **Read-site** — `verifier._stage_template(name, baseline)` resolves
+  in-process override (offline optimizer hook `_TEMPLATE_OVERRIDES`) →
+  GEPA artifact via `optim.loader` (which also feeds the activation
+  counters) → baseline constant. A tuned template is accepted ONLY if a
+  **probe-format with dummy values succeeds AND every placeholder is
+  present** (`_validate_stage_template`) — this rejects candidates that
+  lost `{claim}`-class placeholders or broke the `{{ }}` JSON-brace
+  escaping, which would otherwise raise inside `verify_claim` at
+  runtime. Rejection logs a warning and falls back to the baseline.
+* **Optimizer** — `scripts/optimize_verifier.py` uses the standalone
+  `gepa` library with a custom adapter over the REAL pipeline: each
+  candidate (both templates, two components) is evaluated by running
+  fault-injected bench trials (`eval.verify_bench`) through
+  `Verifier.verify_claim` against the judge endpoint that serves VERIFY
+  in production (`--base-url`, the worker node). Scores are graded
+  verdict-correctness; reflective feedback names the injected fault the
+  verdict missed. A fresh `HttpChatClient` is built per evaluation loop
+  (httpx pools are loop-affine; the adapter runs one `asyncio.run` per
+  candidate).
+* **Hygiene** — bench CASES hash-split public/private via
+  `holdout_tier("vbcase:<id>")`; the optimizer trains on public trials
+  only; the ship-gate compares baseline vs candidate on PRIVATE trials
+  and promotes both artifacts (`verifier.enumerate.json`,
+  `verifier.adjudicate.json`) only on `delta > --min-delta` AND a final
+  placeholder re-validation; rejects persist as `*.candidate.rejected`.
+  Iterations clamp to `MAX_OPT_ITERATIONS`.
+* Run `scripts/verify_bench.py` against the same judge BEFORE
+  optimizing (baseline TPR/FPR) — the standing rule for any verifier
+  change, including judge-model swaps.
+
+Tests: `tests/test_verifier_tuned_templates.py` (baseline self-probe
+regression, placeholder/brace rejection, override/artifact resolution
+order, activation counting, formats-cleanly end check).
+
+### Trajectory-level test-time scaling (§4F Phase 3, 2026-07-30)
+
+Both features are env-gated **OFF by default** per the §3 doctrine (no
+unproven layer rides a live turn without a measured win) and read their
+switches per call so benches can A/B via env.
+
+**Phase 3a — logit-expectation confidence probe**
+(`GHOST_VERIFY_LOGIT_EXPECT=1`): after a two-stage verdict parses
+(CONFIRMED/REFUTED only — UNCERTAIN excluded), one bounded score-token
+call asks the judge for a single acceptability digit 0-9 with
+top-logprobs (`entropy.request_logprobs` handles field selection); the
+EXPECTATION over the digit distribution (`_digit_expectation`) is a
+continuous p(acceptable) that blends 50/50 into `confidence`
+(verdict-aligned: inverted for REFUTED). Motivation: self-reported
+confidence saturates (bench mean-conf ≈ 0.96-1.0 even on wrong
+verdicts), so the actionable-confidence gates get no separation.
+Verdicts are never changed; probe failure leaves the result untouched;
+the raw reading lands in `VerifyResult.probe_score` for observability.
+The probe always rides a cheap pool (critic if configured, else
+worker) — never the main slot.
+
+**Phase 3b — wobble-band adaptive best-of-N** (`core/tts.py`,
+`GHOST_TTS_ADAPTIVE_BON=1`, `GHOST_TTS_BON_K` extra candidates, clamp
+1-4): fires at the loop-exit verifier gate ONLY when the verdict is in
+the wobble band — UNCERTAIN, or REFUTED below the 0.7 action threshold.
+Hard-REFUTED keeps the existing auto-repair path, so the two
+regeneration mechanisms never interact. Mechanism (arXiv:2604.16529 /
+Agent S3 consensus shape): K alternative standalone finals generated
+SEQUENTIALLY on the main model (single-slot box — parallel would
+duplicate KV RAM) at diversified temperatures; each reduced to a
+deterministic compact excerpt; ONE list-wise comparative judge call on
+the cheap pool (never per-candidate independent scores); winner
+substitutes `final_ai_content`. The ORIGINAL answer is always candidate
+1 and every failure mode (no distinct alternatives, judge error,
+unparseable or out-of-range verdict) resolves to it — the pass cannot
+make the answer worse by construction. Substitutions log via
+`pretty_log("TTS BoN", ...)`.
+
+**Phase 3c — verified-restart: substantially pre-existing.** The
+auto-repair loop already restarts generation conditioned on the
+verifier's critique, discards the poisoned narration on REFUTED, and is
+budget-capped (`_MAX_VERIFIER_REPAIRS`). The §4F delta (conditioning on
+a distilled attempt summary instead of the critique) was assessed as
+marginal and is deferred.
+
+Tests: `tests/test_verifier_score_probe.py` (expectation math,
+env gate, blend alignment, verdict immutability, failure semantics),
+`tests/test_tts_adaptive_bon.py` (gates, wobble band incl. enum
+verdicts, judge parsing guards, substitution/failure contracts).
 * `router/` uses hand-crafted features; the (optional) embedding
   augment is downloaded once and then runs offline.
 

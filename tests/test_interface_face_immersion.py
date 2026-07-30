@@ -8,6 +8,7 @@ scale=1.54 → released camZ=4.94, no page errors. These pins guard the
 safety-critical parts of the design.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -69,7 +70,12 @@ def test_bloom_damped_while_inside(graph_js):
 def test_lookat_singularity_handled(graph_js):
     # Near the origin, lookAt(0,0,0) turns parallax into wild rotation;
     # the target must blend forward through the cloud with the dive.
-    assert "camera.lookAt(0, 0, -3.5 * dive)" in graph_js
+    # Since the cube form (2026-07-29) the forward blend is form-aware
+    # (the cube's partial dive looks less far through), but it must
+    # still scale with `dive` and never target the origin.
+    assert re.search(
+        r"camera\.lookAt\(0, 0, \(FORM === 'cube' \? -[\d.]+ : -3\.5\) \* dive\)",
+        graph_js)
     assert "camera.lookAt(0, 0, 0);" not in graph_js
 
 

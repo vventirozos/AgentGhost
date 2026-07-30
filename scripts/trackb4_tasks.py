@@ -831,6 +831,466 @@ def _ex_da_rolling(fx):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Compositional tasks (§4F hardening, 2026-07-30).
+#
+# The 2026-07-30 pilot measured the single-step pool SATURATED (33/33 PASS on
+# a control agent): messy data alone does not defeat a write-run-verify
+# sandbox loop. These tasks chain 2 stages — stage B consumes stage A's
+# output — so a stage-A error PROPAGATES to the graded artifact
+# (compositional depth, the measured 2026 difficulty axis). References are
+# pure chained functions; verification stays the standard token-containment
+# check on the FINAL artifact only. ring="comp" (depth, not transfer
+# distance). Prompts name the intermediate files as a required contract even
+# though only the final artifact is graded.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _int_rows(rng: random.Random, n: int, lo: int, hi: int) -> List[int]:
+    return [rng.randint(lo, hi) for _ in range(n)]
+
+
+# 1. clean → rank (2nd-highest region)
+def _cfx_clean_rank(rng):
+    rows = ["region,amount"]
+    totals = {r: 0 for r in _REGIONS}
+    for _ in range(60):
+        r = rng.choice(_REGIONS)
+        roll = rng.random()
+        if roll < 0.12:
+            rows.append(f"{r},NA")
+        elif roll < 0.2:
+            rows.append(f"{r},{rng.randint(1, 99)}x")   # malformed
+        else:
+            v = rng.randint(-40, 160)
+            rows.append(f"{r},{v}")
+            totals[r] += v
+    # Force distinct totals so "second-highest" is unambiguous.
+    for i, r in enumerate(sorted(_REGIONS, key=lambda x: totals[x])):
+        rows.append(f"{r},{i + 1}")
+    return {"comp_sales_a.csv": "\n".join(rows) + "\n"}
+
+
+def _cex_clean_rank(fx):
+    totals: Dict[str, int] = {}
+    for line in fx["comp_sales_a.csv"].splitlines()[1:]:
+        parts = line.split(",")
+        if len(parts) != 2:
+            continue
+        try:
+            v = int(parts[1])
+        except ValueError:
+            continue
+        totals[parts[0]] = totals.get(parts[0], 0) + v
+    ranked = sorted(totals, key=lambda r: totals[r], reverse=True)
+    return ranked[1]
+
+
+# 2. regex-extract → mode-IP byte total
+def _cfx_log_topip(rng):
+    ips = [f"10.0.0.{rng.randint(2, 9)}" for _ in range(3)]
+    dominant = f"10.0.0.{rng.randint(10, 19)}"
+    lines = []
+    for _ in range(50):
+        roll = rng.random()
+        ip = dominant if roll < 0.4 else rng.choice(ips)
+        status = rng.choice([200, 200, 200, 404, 500])
+        size = rng.choice([rng.randint(100, 9000), "-"])
+        lines.append(f'{ip} - [30/Jul/2026] "GET /p{rng.randint(1, 40)}" '
+                     f"{status} {size}")
+        if rng.random() < 0.1:
+            lines.append("### rotated marker not-a-request line ###")
+    return {"comp_access_a.log": "\n".join(lines) + "\n"}
+
+
+def _cex_log_topip(fx):
+    import re as _re
+    per: Dict[str, List[int]] = {}
+    pat = _re.compile(r'^(\d+\.\d+\.\d+\.\d+) - \[[^\]]+\] "[^"]*" '
+                      r"(\d+) (\d+|-)$")
+    for line in fx["comp_access_a.log"].splitlines():
+        m = pat.match(line)
+        if not m or m.group(2) != "200":
+            continue
+        size = 0 if m.group(3) == "-" else int(m.group(3))
+        per.setdefault(m.group(1), []).append(size)
+    top = sorted(per, key=lambda ip: (-len(per[ip]), ip))[0]
+    return sum(per[top])
+
+
+# 3. dup-resolve → gold total (refunds included, positive by construction)
+def _cfx_gold_refunds(rng):
+    cust = ["customer,tier"]
+    golds = []
+    for i in range(8):
+        t = rng.choice(["gold", "silver", "bronze"])
+        if t == "gold":
+            golds.append(f"c{i}")
+        cust.append(f"c{i},{t}")
+    if not golds:                       # guarantee ≥2 gold customers
+        cust[1] = "c0,gold"
+        cust[2] = "c1,gold"
+        golds = ["c0", "c1"]
+    orders = ["order_id,customer,amount"]
+    oid = 100
+    for _ in range(30):
+        c = f"c{rng.randint(0, 7)}"
+        amt = rng.randint(-60, 40)      # refunds are negative
+        orders.append(f"o{oid},{c},{amt}")
+        if rng.random() < 0.2:          # duplicate id — LATER row wins
+            orders.append(f"o{oid},{c},{rng.randint(-60, 40)}")
+        oid += 1
+    for g in golds:                     # keep the gold total clearly positive
+        orders.append(f"o{oid},{g},{rng.randint(200, 400)}")
+        oid += 1
+    return {"comp_cust.csv": "\n".join(cust) + "\n",
+            "comp_orders.csv": "\n".join(orders) + "\n"}
+
+
+def _cex_gold_refunds(fx):
+    tier = dict(l.split(",") for l in fx["comp_cust.csv"].splitlines()[1:])
+    resolved: Dict[str, Tuple[str, int]] = {}
+    for line in fx["comp_orders.csv"].splitlines()[1:]:
+        p = line.split(",")
+        if len(p) == 3:
+            try:
+                resolved[p[0]] = (p[1], int(p[2]))
+            except ValueError:
+                continue
+    return sum(a for (c, a) in resolved.values()
+               if tier.get(c) == "gold")
+
+
+# 4. edge-clean → BFS shortest path
+def _cfx_graph_path(rng):
+    n = rng.randint(9, 12)
+    nodes = [f"n{i}" for i in range(n)]
+    edges = [f"{nodes[i]}-{nodes[i + 1]}" for i in range(n - 1)]  # backbone
+    for _ in range(n):
+        a, b = rng.sample(nodes, 2)
+        edges.append(f"{a}-{b}")
+    edges += [f"{rng.choice(nodes)}-{rng.choice(nodes)}"          # self-loops
+              for _ in range(2)]
+    edges += ["broken line !!", f"{nodes[0]}-"]                   # malformed
+    rng.shuffle(edges)
+    dups = edges + [rng.choice(edges) for _ in range(4)]
+    return {"comp_edges.txt": "\n".join(dups) + "\n",
+            "comp_query.txt": f"{nodes[0]} {nodes[-1]}\n"}
+
+
+def _cex_graph_path(fx):
+    adj: Dict[str, set] = {}
+    for line in fx["comp_edges.txt"].splitlines():
+        parts = line.strip().split("-")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        a, b = parts[0].strip(), parts[1].strip()
+        if not a or not b or a == b or " " in a or " " in b:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    src, dst = fx["comp_query.txt"].split()
+    seen, frontier, depth = {src}, [src], 0
+    while frontier:
+        depth += 1
+        nxt = []
+        for u in frontier:
+            for v in adj.get(u, ()):
+                if v == dst:
+                    return depth
+                if v not in seen:
+                    seen.add(v)
+                    nxt.append(v)
+        frontier = nxt
+    return -1
+
+
+# 5. rotated-log merge → windowed ERROR count
+def _cfx_rotated_errors(rng):
+    base = 1000
+    all_lines = []
+    for _ in range(45):
+        base += rng.randint(1, 9)
+        lvl = rng.choice(["INFO", "INFO", "WARN", "ERROR"])
+        all_lines.append(f"{base} {lvl} event_{rng.randint(1, 99)}")
+    third = len(all_lines) // 3
+    parts = [all_lines[2 * third:], all_lines[third:2 * third],
+             all_lines[:third]]                    # .1 newest … .3 oldest
+    parts[1] = parts[1] + parts[0][:2]             # duplicated boundary lines
+    ts = sorted(int(l.split()[0]) for l in all_lines)
+    lo, hi = ts[len(ts) // 4], ts[3 * len(ts) // 4]
+    return {"comp_app.log.1": "\n".join(parts[0]) + "\n",
+            "comp_app.log.2": "\n".join(parts[1]) + "\n",
+            "comp_app.log.3": "\n".join(parts[2]) + "\n",
+            "comp_window.txt": f"{lo} {hi}\n"}
+
+
+def _cex_rotated_errors(fx):
+    lines = set()
+    for name in ("comp_app.log.1", "comp_app.log.2", "comp_app.log.3"):
+        lines.update(l for l in fx[name].splitlines() if l.strip())
+    lo, hi = (int(x) for x in fx["comp_window.txt"].split())
+    n = 0
+    for l in lines:
+        p = l.split()
+        if len(p) >= 2 and p[1] == "ERROR" and lo <= int(p[0]) <= hi:
+            n += 1
+    return n
+
+
+# 6. json merge (newer wins, b breaks ties) → odd-qty sum
+def _cfx_inventory(rng):
+    import json as _json
+    skus = [f"sku{i}" for i in range(12)]
+    a = [{"sku": s, "qty": rng.randint(1, 50),
+          "updated": rng.randint(100, 199)}
+         for s in rng.sample(skus, 9)]
+    b = [{"sku": s, "qty": rng.randint(1, 50),
+          "updated": rng.randint(100, 199)}
+         for s in rng.sample(skus, 9)]
+    if a and b:                        # force ≥1 exact timestamp tie
+        b[0] = dict(b[0], sku=a[0]["sku"], updated=a[0]["updated"])
+    return {"comp_inv_a.json": _json.dumps(a, indent=1) + "\n",
+            "comp_inv_b.json": _json.dumps(b, indent=1) + "\n"}
+
+
+def _cex_inventory(fx):
+    import json as _json
+    merged: Dict[str, Tuple[int, int, int]] = {}   # sku -> (updated, pri, qty)
+    for pri, name in ((0, "comp_inv_a.json"), (1, "comp_inv_b.json")):
+        for item in _json.loads(fx[name]):
+            cur = merged.get(item["sku"])
+            key = (item["updated"], pri)
+            if cur is None or key >= (cur[0], cur[1]):
+                merged[item["sku"]] = (item["updated"], pri, item["qty"])
+    return sum(q for (_, _, q) in merged.values() if q % 2 == 1)
+
+
+# 7. per-file sums (worker pool) → median  (7 files → integer median)
+def _cfx_worker_median(rng):
+    fx = {}
+    for i in range(1, 8):
+        vals = []
+        for _ in range(rng.randint(8, 14)):
+            roll = rng.random()
+            if roll < 0.12:
+                vals.append("junk")
+            elif roll < 0.2:
+                vals.append("")
+            else:
+                vals.append(str(rng.randint(-20, 90)))
+        fx[f"comp_job_{i}.txt"] = "\n".join(vals) + "\n"
+    return fx
+
+
+def _cex_worker_median(fx):
+    sums = []
+    for i in range(1, 8):
+        s = 0
+        for line in fx[f"comp_job_{i}.txt"].splitlines():
+            try:
+                s += int(line.strip())
+            except ValueError:
+                continue
+        sums.append(s)
+    return sorted(sums)[3]
+
+
+# 8. HTML table extract (skip commented row) → top dept  (far ring)
+def _cfx_web_table(rng):
+    depts = ["ops", "lab", "field"]
+    totals = {d: 0 for d in depts}
+    rows = []
+    for i in range(12):
+        d = rng.choice(depts)
+        h = rng.randint(3, 40)
+        totals[d] += h
+        rows.append(f"  <tr><td><span>emp{i}</span></td>"
+                    f"<td>{d.upper()}</td><td> {h} </td></tr>")
+    for i, d in enumerate(sorted(depts, key=lambda x: totals[x])):
+        rows.append(f"  <tr><td>fix{i}</td><td>{d}</td>"
+                    f"<td>{i + 1}</td></tr>")   # break ties deterministically
+    fake = ('  <!-- <tr><td>ghost</td><td>OPS</td><td>999</td></tr> -->')
+    rows.insert(rng.randint(0, len(rows)), fake)
+    html = ("<html><body><h1>Hours &amp; staffing</h1>\n<table>\n"
+            "<tr><th>name</th><th>dept</th><th>hours</th></tr>\n"
+            + "\n".join(rows) + "\n</table></body></html>\n")
+    return {"comp_report.html": html}
+
+
+def _cex_web_table(fx):
+    import re as _re
+    body = _re.sub(r"<!--.*?-->", "", fx["comp_report.html"],
+                   flags=_re.DOTALL)
+    totals: Dict[str, int] = {}
+    for m in _re.finditer(
+            r"<tr><td>(?:<span>)?[^<]+(?:</span>)?</td>"
+            r"<td>([^<]+)</td><td>\s*(\d+)\s*</td></tr>", body):
+        d = m.group(1).strip().lower()
+        totals[d] = totals.get(d, 0) + int(m.group(2))
+    return sorted(totals, key=lambda d: totals[d], reverse=True)[0]
+
+
+# 9. monthly pivot → largest month2→month3 drop
+def _cfx_pivot_drop(rng):
+    rows = ["region,month,amount"]
+    per: Dict[Tuple[str, int], int] = {}
+    for _ in range(70):
+        r, m = rng.choice(_REGIONS), rng.randint(1, 3)
+        if rng.random() < 0.1:
+            rows.append(f"{r},{m},NA")
+            continue
+        v = rng.randint(5, 120)
+        rows.append(f"{r},{m},{v}")
+        per[(r, m)] = per.get((r, m), 0) + v
+    drops = {r: per.get((r, 2), 0) - per.get((r, 3), 0) for r in _REGIONS}
+    ranked = sorted(_REGIONS, key=lambda r: (-drops[r], r))
+    if drops[ranked[0]] == drops[ranked[1]]:       # force a unique winner
+        rows.append(f"{ranked[0]},2,7")
+    return {"comp_monthly.csv": "\n".join(rows) + "\n"}
+
+
+def _cex_pivot_drop(fx):
+    per: Dict[Tuple[str, int], int] = {}
+    for line in fx["comp_monthly.csv"].splitlines()[1:]:
+        p = line.split(",")
+        if len(p) != 3:
+            continue
+        try:
+            per[(p[0], int(p[1]))] = per.get((p[0], int(p[1])), 0) + int(p[2])
+        except ValueError:
+            continue
+    drops = {r: per.get((r, 2), 0) - per.get((r, 3), 0) for r in _REGIONS}
+    return sorted(_REGIONS, key=lambda r: (-drops[r], r))[0]
+
+
+# 10. ledger reconcile → absolute-difference total
+def _cfx_ledger(rng):
+    bank = ["txn_id,amount"]
+    book = ["txn_id,amount"]
+    total_ids = [f"t{i}" for i in range(20)]
+    for t in total_ids:
+        amt = rng.randint(10, 500)
+        in_bank, in_book = rng.random() > 0.1, rng.random() > 0.1
+        if in_bank:
+            bank.append(f"{t},{amt}")
+        if in_book:
+            drift = rng.choice([0, 0, 0, rng.randint(1, 25)])
+            book.append(f"{t},{amt + drift}")
+    return {"comp_bank.csv": "\n".join(bank) + "\n",
+            "comp_book.csv": "\n".join(book) + "\n"}
+
+
+def _cex_ledger(fx):
+    def _load(name):
+        out = {}
+        for line in fx[name].splitlines()[1:]:
+            p = line.split(",")
+            if len(p) == 2:
+                out[p[0]] = int(p[1])
+        return out
+    bank, book = _load("comp_bank.csv"), _load("comp_book.csv")
+    total = 0
+    for t in set(bank) | set(book):
+        a, b = bank.get(t, 0), book.get(t, 0)
+        if a != b:
+            total += abs(a - b)
+    return total
+
+
+def load_b4_comp() -> List[B4Task]:
+    """The compositional candidate pool (§4F hardening). Two-stage chains:
+    the prompt requires a named intermediate artifact, the grade rides only
+    the final one — a stage-A mistake propagates."""
+    T = B4Task
+    return [
+        T("comp_clean_rank2", "data_analysis", "comp", "probe",
+          _steer("Step 1: read comp_sales_a.csv (region,amount); drop rows "
+                 "whose amount is missing (NA) or not a valid integer; KEEP "
+                 "negative amounts; write the cleaned rows to "
+                 "comp_cleaned.csv (same header). Step 2: using ONLY "
+                 "comp_cleaned.csv, total the amounts per region and answer "
+                 "with the region that has the SECOND-highest total."),
+          _cfx_clean_rank, _cex_clean_rank),
+        T("comp_log_topip_bytes", "regex_parse", "comp", "probe",
+          _steer("Step 1: from comp_access_a.log extract, for every "
+                 "well-formed request line with HTTP status 200, the client "
+                 "IP and the response bytes ('-' counts as 0); write them as "
+                 "ip,bytes lines to comp_ips.csv. Step 2: using ONLY "
+                 "comp_ips.csv, find the IP with the MOST such requests "
+                 "(break ties by choosing the lexicographically smallest "
+                 "IP) and answer with the total bytes for that IP."),
+          _cfx_log_topip, _cex_log_topip),
+        T("comp_gold_refunds", "sql", "comp", "probe",
+          _steer("Step 1: comp_orders.csv (order_id,customer,amount) "
+                 "contains duplicated order_ids — when an order_id repeats, "
+                 "the LATER row is the correction and replaces the earlier "
+                 "one; write the resolved orders to comp_resolved.csv. "
+                 "Step 2: join with comp_cust.csv (customer,tier) and answer "
+                 "with the total amount over customers whose tier is 'gold' "
+                 "(amounts can be negative refunds — include them)."),
+          _cfx_gold_refunds, _cex_gold_refunds),
+        T("comp_graph_path", "algo", "comp", "probe",
+          _steer("Step 1: comp_edges.txt has one undirected edge per line as "
+                 "a-b; drop malformed lines, self-loops, and duplicates, and "
+                 "write the cleaned edge list to comp_clean_edges.txt. "
+                 "Step 2: comp_query.txt names two nodes; answer with the "
+                 "number of edges on the SHORTEST path between them in the "
+                 "cleaned graph."),
+          _cfx_graph_path, _cex_graph_path),
+        T("comp_rotated_errors", "bash", "comp", "probe",
+          _steer("Step 1: comp_app.log.1/.2/.3 are rotated logs (.3 is "
+                 "oldest) whose lines are 'timestamp LEVEL message'; some "
+                 "boundary lines appear in TWO files — merge them into one "
+                 "chronological, de-duplicated file comp_merged.log. "
+                 "Step 2: comp_window.txt has two timestamps LO HI; answer "
+                 "with how many ERROR lines have LO <= timestamp <= HI."),
+          _cfx_rotated_errors, _cex_rotated_errors),
+        T("comp_inventory_merge", "python_general", "comp", "probe",
+          _steer("Step 1: comp_inv_a.json and comp_inv_b.json each hold a "
+                 "list of records with fields sku, qty, updated. Merge them "
+                 "into comp_merged.json keeping, per sku, the record with "
+                 "the NEWER updated value; if the updated values are EQUAL, "
+                 "the record from comp_inv_b.json wins. Step 2: answer with "
+                 "the sum of qty over merged records whose qty is odd."),
+          _cfx_inventory, _cex_inventory),
+        T("comp_worker_median", "concurrency", "comp", "probe",
+          _steer("Step 1: the files comp_job_1.txt through comp_job_7.txt "
+                 "each contain one value per line (some lines are blank or "
+                 "junk — skip those). Process the 7 files CONCURRENTLY with "
+                 "a worker pool, computing each file's sum of valid "
+                 "integers, and write 'filename,sum' lines to "
+                 "comp_sums.csv. Step 2: answer with the MEDIAN of the 7 "
+                 "sums."),
+          _cfx_worker_median, _cex_worker_median),
+        T("comp_web_table", "web_automation", "comp", "probe",
+          _steer("Step 1: comp_report.html contains a table with columns "
+                 "name, dept, hours; extract the REAL data rows (one row is "
+                 "commented out in an HTML comment — it must NOT count) and "
+                 "write dept,hours lines to comp_hours.csv with dept "
+                 "lowercased. Step 2: answer with the dept that has the "
+                 "highest total hours (lowercase)."),
+          _cfx_web_table, _cex_web_table),
+        T("comp_pivot_drop", "data_analysis", "comp", "probe",
+          _steer("Step 1: read comp_monthly.csv (region,month,amount), skip "
+                 "NA amounts, and write a pivot comp_pivot.csv with one line "
+                 "per region: region,month1_total,month2_total,month3_total. "
+                 "Step 2: answer with the region whose total DROPPED the "
+                 "most from month 2 to month 3 (largest month2_total minus "
+                 "month3_total; if regions tie, answer the alphabetically "
+                 "first)."),
+          _cfx_pivot_drop, _cex_pivot_drop),
+        T("comp_ledger_abs", "sql", "comp", "probe",
+          _steer("Step 1: compare comp_bank.csv and comp_book.csv (both "
+                 "txn_id,amount): a txn disagrees when its amounts differ "
+                 "OR it is missing from one file (a missing amount counts "
+                 "as 0). Write the disagreeing txn_ids to comp_diff.csv. "
+                 "Step 2: answer with the sum of the absolute differences "
+                 "over the disagreeing txns."),
+          _cfx_ledger, _cex_ledger),
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # The pools
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1048,7 +1508,7 @@ def load_b4_battery() -> List[B4Task]:
           _steer("Read the local file links_page.html. Count how many links "
                  "(href attributes) point to .pdf files."),
           _fx_web_links, _ex_web_links),
-    ]
+    ] + load_b4_comp()
 
 
 def load_b4_seeding() -> List[B4Task]:

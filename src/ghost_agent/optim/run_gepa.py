@@ -8,9 +8,13 @@ instead of a cryptic ImportError at module load.
 
 The wrapper does three things:
 
-  1. Maps our `OptimizableSignature` onto a `dspy.Signature`.
-  2. Wraps Ghost's own LLMClient as a dspy `LM` so the optimizer uses
-     only the local upstream (no teacher, no external call).
+  1. Maps our `OptimizableSignature` onto a `dspy.Signature` (and
+     TrainExamples onto `dspy.Example`s bound to its field names).
+  2. Points `dspy.LM` (OpenAI-compatible) at the SAME local upstream the
+     agent uses — api_base is derived from the passed LLMClient, so there
+     is no teacher and no external endpoint. (The hand-rolled
+     `_GhostLMAdapter` is retained for other callers but no longer drives
+     GEPA: dspy 3.x isinstance-gates on `dspy.BaseLM`.)
   3. Runs DSPy's optimizer (GEPA by default, with MIPROv2 as a
      fallback), persists the winning instruction to disk, and returns
      it for the A/B harness to evaluate.
@@ -27,6 +31,14 @@ from typing import Any, Callable, Dict, List, Optional
 from .signatures import OptimizableSignature
 
 logger = logging.getLogger("GhostOptim")
+
+# Hard ceiling on optimization iterations, clamped in `run_gepa()` so every
+# caller inherits it. Proxy-gaming grows WITH optimization steps (measured
+# 26%→58% hacking rate between 10 and 100 steps on self-improving code
+# agents) — a long-running optimizer drifts toward gaming its metric, and
+# self-critique does not fix that. Raise only alongside a stronger private
+# holdout, never on its own.
+MAX_OPT_ITERATIONS = 16
 
 
 def _require_dspy():
@@ -139,6 +151,40 @@ class _GhostLMAdapter:
         return asyncio.run(self._acall(prompt, messages, **kwargs))
 
 
+def _to_dspy_examples(examples: List[Any], sig: OptimizableSignature) -> List[Any]:
+    """Convert our TrainExample dataclasses into `dspy.Example`s bound to
+    `sig`'s field names.
+
+    dspy binds example fields to signature fields BY NAME and requires
+    `.with_inputs(...)` — raw TrainExamples (plain dicts on `.inputs` /
+    `.expected_output`) die inside `Evaluate` with `dict not callable`.
+    Signature inputs missing from the example default to "" (the generic
+    trainset only carries `user_request`); expected-output keys that don't
+    exist on the signature are dropped rather than invented. Objects that
+    are already dspy.Examples pass through untouched."""
+    import dspy
+
+    out: List[Any] = []
+    for ex in examples:
+        if isinstance(ex, dspy.Example):
+            out.append(ex)
+            continue
+        ex_inputs = getattr(ex, "inputs", None)
+        ex_expected = getattr(ex, "expected_output", None)
+        if not isinstance(ex_inputs, dict):
+            out.append(ex)
+            continue
+        fields: Dict[str, Any] = {
+            name: str(ex_inputs.get(name, "") or "") for name in sig.inputs
+        }
+        if isinstance(ex_expected, dict):
+            for name in sig.outputs:
+                if ex_expected.get(name):
+                    fields[name] = str(ex_expected[name])
+        out.append(dspy.Example(**fields).with_inputs(*sig.inputs.keys()))
+    return out
+
+
 def run_gepa(
     signature: OptimizableSignature,
     trainset: List[Any],
@@ -149,21 +195,75 @@ def run_gepa(
     max_iterations: int = 8,
     optimizer: str = "GEPA",
     output_path: Optional[Path] = None,
+    valset: Optional[List[Any]] = None,
 ) -> GEPAResult:
     """Run GEPA (or MIPROv2 as fallback) on `signature` using `trainset`.
 
     The caller supplies the metric because signature-specific scoring
     (exact-match? BLEU? validator-pass?) is domain-specific — we don't
     pick for them.
+
+    `valset` (optional) is the optimizer's OWN candidate-selection split —
+    still optimizer-visible, i.e. PUBLIC-tier data. It must never contain
+    the private ship-gate holdout: GEPA selects its Pareto frontier on the
+    valset, which is exactly the leak the private tier exists to prevent.
     """
+    if max_iterations > MAX_OPT_ITERATIONS:
+        logger.warning(
+            "GEPA: max_iterations %d clamped to MAX_OPT_ITERATIONS %d "
+            "(proxy-gaming grows with step count)",
+            max_iterations, MAX_OPT_ITERATIONS,
+        )
+        max_iterations = MAX_OPT_ITERATIONS
+
     _require_dspy()
     import dspy
 
     sig_cls = _build_dspy_signature(signature)
-    lm = _GhostLMAdapter(llm_client, model=model)
+
+    # dspy 3.x type-checks the LM against `dspy.BaseLM` inside
+    # Predict.forward — duck-typing is rejected outright. This was the
+    # adapter's THIRD dspy-interface break (positional-prompt TypeError,
+    # choices IndexError, now the isinstance gate), so stop chasing BaseLM
+    # internals: use dspy's own OpenAI-compatible client pinned to the SAME
+    # local upstream. llama-server speaks /v1/chat/completions natively and
+    # the api_base pin preserves the no-external-endpoint invariant.
+    # _GhostLMAdapter stays for existing callers/tests but no longer drives
+    # GEPA.
+    upstream = str(
+        getattr(llm_client, "upstream_url", "") or "http://127.0.0.1:8088"
+    ).rstrip("/")
+    if not upstream.endswith("/v1"):
+        upstream += "/v1"
+    # max_tokens must cover the model's THINKING budget: at 2048 the
+    # reasoning phase alone exhausted it, llama-server returned empty
+    # `content`, and every rollout scored as "empty or null response".
+    # The chat_template_kwargs no-think hint speeds task rollouts where the
+    # template honors it and is ignored harmlessly where it doesn't.
+    lm = dspy.LM(
+        f"openai/{model}",
+        api_base=upstream,
+        api_key="local",
+        temperature=0.2,
+        max_tokens=8192,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    # Reflection writes new instructions — give it headroom, a little
+    # temperature, and KEEP thinking on (GEPA guidance: strongest
+    # reflector; deliberation pays here, not in rollouts).
+    reflection_lm = dspy.LM(
+        f"openai/{model}",
+        api_base=upstream,
+        api_key="local",
+        temperature=0.7,
+        max_tokens=8192,
+    )
     dspy.configure(lm=lm)
 
     module = dspy.Predict(sig_cls)
+
+    trainset = _to_dspy_examples(trainset, signature)
+    valset = _to_dspy_examples(valset, signature) if valset else valset
 
     # GEPA was introduced in dspy 2.5+; fall back if unavailable.
     if optimizer == "GEPA" and hasattr(dspy, "GEPA"):
@@ -176,7 +276,7 @@ def run_gepa(
         # the only model this deployment can reach (Tor-only egress), so
         # it reflects with the same adapter.
         tuner = dspy.GEPA(metric=metric, max_full_evals=max_iterations,
-                          reflection_lm=lm)
+                          reflection_lm=reflection_lm)
     elif hasattr(dspy, "MIPROv2"):
         logger.info("GEPA unavailable; falling back to MIPROv2")
         tuner = dspy.MIPROv2(metric=metric, num_trials=max_iterations)
@@ -185,7 +285,16 @@ def run_gepa(
         logger.info("GEPA/MIPROv2 unavailable; falling back to BootstrapFewShot")
         tuner = dspy.BootstrapFewShot(metric=metric, max_bootstrapped_demos=4)
 
-    compiled = tuner.compile(module, trainset=trainset)
+    # Pass the public val split through when the optimizer supports it
+    # (GEPA/MIPROv2 do; BootstrapFewShot does not) — without it, dspy
+    # falls back to selecting candidates on the trainset itself.
+    if valset:
+        try:
+            compiled = tuner.compile(module, trainset=trainset, valset=valset)
+        except TypeError:
+            compiled = tuner.compile(module, trainset=trainset)
+    else:
+        compiled = tuner.compile(module, trainset=trainset)
 
     # Best-effort extraction of the new instruction. DSPy exposes it on
     # the compiled predictor's signature.

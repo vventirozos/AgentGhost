@@ -373,10 +373,110 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 > Next cycle, if reopened, the stalest un-hunted surfaces are the web-facing `interface/server.py` + CLI
 > and the mid-July tool cohorts. **╚════════════════════════════════════════════╝**
 
-The detailed catalogue follows. **§4E is placed FIRST deliberately — it is the only ACTIVE, headless-
-actionable item; A-D are historical record whose per-item FIXED/RESOLVED markers are current.** Grouped:
-(E) negative-label-supply tiers 2-4 (PENDING), (A) improvement-review partials/blocked, (B) static-hunt
-deferred findings, (C) functional-hunt deferred findings, (D) the B4 outcome-battery design.
+The detailed catalogue follows. **§4F and §4E are the ACTIVE items (§4F added 2026-07-29); A-D are
+historical record whose per-item FIXED/RESOLVED markers are current.** Grouped: (F) the 4-phase
+agentic-methodology upgrade plan (ACTIVE), (E) negative-label-supply tiers 2-4 (PENDING), (A)
+improvement-review partials/blocked, (B) static-hunt deferred findings, (C) functional-hunt deferred
+findings, (D) the B4 outcome-battery design.
+
+### 4F. Agentic-methodology upgrade — 4-phase plan (2026-07-29) ⏳ ACTIVE — Phase 0 DONE
+
+**Origin.** Four-agent deep web survey of mid-2026 agentic-engineering SOTA vs this stack (memory:
+`agentic-methodology-survey-2026-07`). Three cross-validated heavy-impact gaps: (1) text-space
+prompt/skill optimization (GEPA-class — ICLR 2026 oral, beats weight-level RL at 35× fewer rollouts;
+SkillOpt measured **+9.1 on Qwen3.6-35B-A3B**, our exact model), (2) trajectory-level verifier-guided
+test-time scaling (+12.1 avg on an 8B — the largest fixed-model deltas of the period), (3) long-horizon
+context discipline (proactive timed injection +8.3 TB2; structured compaction +46% for small LMs).
+**Discovery that reordered the plan: the GEPA loop is FULLY BUILT and read-wired but has NEVER RUN** —
+`optim/` (signatures/trainset/run_gepa/ab_eval/loader), read-site live at the planner
+(`core/agent.py` ~12313), but no `$GHOST_HOME/system/optim/` exists and 24 days of trajectories sit
+unused. Phases 0-2 close that loop; Phase 3 is the only net-new machinery; Phase 4 is deliberate last
+(turn-loop surgery).
+
+**Phase 0 — eval hygiene (DONE 2026-07-29, this session).** Prereq for ANY optimizer: reward hacking
+hits 46-74% of self-optimization runs and RISES 26%→58% from 10→100 steps; self-critique doesn't fix
+it; a hidden holdout does (63%→34%, AIDE²). Shipped: (a) per-item deterministic PUBLIC/PRIVATE split
+(sha256 of stable example identity, default 30% private) — membership can never migrate as the corpus
+grows, unlike the old seeded-positional `split_train_eval` which re-deals membership every run (slow
+leakage); optimizer + GEPA-internal val see ONLY public, the A/B ship-gate judges ONLY private;
+(b) `MAX_OPT_ITERATIONS` hard cap clamped at the `run_gepa()` chokepoint; (c) activation telemetry —
+loader counts tuned-vs-baseline applications per signature, surfaced in learning-health (the 2026
+"harness updating ≠ harness benefit" result: mid-tier models gain most but the dominant failure is
+the component never firing; our own built-but-unwired history says the same).
+
+**Phase 1 — ignite the existing GEPA loop. ✅ DONE 2026-07-29 (§6 "later 7") — CANDIDATE PROMOTED.**
+Ran on `planning.decompose`, NOT tool_selection.pick as planned: the generic trainset
+(user_request→final_response/plan) is field-coherent only with the planning signature —
+tool_selection.pick needs a Phase-2 extractor for step_description/tool_catalog examples. Result:
+GEPA public valset 0.401 → 0.589; **A/B on the 20-example PRIVATE tier: baseline 0.45 → candidate
+0.80 (delta +0.35) → promoted** to `$GHOST_HOME/system/optim/planning.decompose.json`. The 35B
+self-reflector did NOT plateau — it discovered strict output structure + explicit constraint-encoding
+("[Action] while strictly adhering to [constraint]") from Ghost's own traces. Ignition flushed 6
+written-but-never-run defects — see §6.
+**Post-restart activation check (2026-07-29 20:38): counter correctly reads 0 — the planner
+read-site is DARK in prod.** Live exec line (ps eww) has NO `--use-planning`; the strategic-planner
+path (agent.py `use_plan` gate) is the ONLY consumer of planning.decompose/tool_selection.pick tuned
+prompts. The telemetry caught exactly the defect class it was built for, on day one. Disposition:
+artifact stays (loads the moment planning is enabled); do NOT flip `--use-planning` without a paired
+ablation per §3 doctrine (a better prompt for a subsystem is not evidence the subsystem earns its
+latency); Phase 2 therefore targets read-sites that are LIVE in prod — verifier prompts (verifier
+ENABLED since 2026-07-05) and tool descriptions (always live).
+
+**Phase 2 — extend to the two highest-leverage surfaces. (a) verifier prompts ✅ SHIPPED+LIVE
+2026-07-30 (§6):** optimized against verify_bench via a custom gepa adapter over the REAL two-stage
+pipeline; private gate +0.087 (0.796→0.883, n=23 never-seen trials); deployed via restart; both
+templates confirmed loading on live turns. (b) tool descriptions (`tools/registry.py`) — ⏳ STILL
+PENDING: closes improvement-ledger #7-descriptions; metric = tool-selection accuracy replayed over
+GHOST_LLM_RECORD fixtures (deterministic scoring, no live LLM). Keep staging→A/B(private)→promote.
+The `optim/__init__` exclusions (dream/watchdog/safety prompts) STAND — do not widen scope there.
+
+**Phase 3 — trajectory-level test-time scaling. ✅ BUILT 2026-07-30 (§6), default-OFF pending
+measured wins.** (a) Logit-expectation probe: BUILT as a score-token probe (digit-scale + top-
+logprobs expectation — the verdict path has no logprob access; the worker route() returns content
+only), `GHOST_VERIFY_LOGIT_EXPECT`, benched via the A/B in §6. (b) Adaptive comparative best-of-N:
+BUILT (`core/tts.py` + loop-exit hook), trigger = verifier WOBBLE BAND (UNCERTAIN or sub-0.7
+REFUTED — not the confidence composite; hard REFUTED keeps auto-repair), `GHOST_TTS_ADAPTIVE_BON`.
+(c) Verified-restart: RESOLVED AS PRE-EXISTING — the auto-repair loop IS critique-conditioned
+restart with narration discard + round caps; summary-conditioning delta deferred as marginal.
+STILL TODO before any live enablement: the stable-prefix-hash regression test with Phase-3 features
+active, and a paired ablation (or B4-private measurement) justifying each default flip. Expected
+(unchanged): hard-suite ~78-80% → mid-80s; latency 2-3× only on the triggered tail.
+
+**Phase 4 — long-horizon context discipline (LAST; after 1-3 prove out).** Structured
+mandatory-section compaction template (intent / files+paths / decisions / active goals / next steps)
++ probe-based compaction eval (recall/artifact/continuation/decision probes, not ROUGE) +
+post-compaction constraint re-pin audit (the "governance decay" class: compaction silently erases
+standing constraints) + deterministic pre-compaction cleanup (dedup file reads, purge resolved
+errors). Proactive memory injection as a worker-node monitor, **append-only at the tail** — never
+mutate earlier context (KV thrash otherwise). Turn-loop surgery: needs Phase-0 instruments and the
+Phase-2/3 verifier to measure honestly.
+
+**Cross-phase acceptance rule — AMENDED 2026-07-30 (operator decision, option c).** The synthetic
+B4 battery ceilinged twice in one day (single-step 33/33, compositional 10/10 — §6): the agent has
+outgrown short sandbox batteries, so §4F phases are judged OBSERVATIONALLY on live trajectories
+over a ~2-week window (the earn-keep post-mortem's pre-approved "instrument changes" route).
+Concrete watch set (all instruments already live): (1) verifier — periodic verify_bench re-runs
+(NOT saturated; the one controlled instrument left) + live refute-escalation overturn rate (FP
+proxy, `escalated_overturn`) + correction churn; (2) task outcomes — graded outcome-label pass-rate
+trend (Tier-1 labels) + failed_retrievals arm; (3) learning-health telemetry (lesson utility,
+hydration, activation counters). Phase-3 default flips (probe recalibration, BoN) proceed one at a
+time as enable→watch→revert-if-worse sequential comparisons, never in bundles. HONEST CAVEAT:
+observational evidence is weaker than the paired-ablation standard (no control arm) — treat trends
+as directional, demand the controlled verify_bench for anything verifier-shaped, and PARK Phase 4
+unless the observational picture is clearly positive. B4 infra (incl. the 10 comp tasks + live
+pilot instrumentation + --only-ring) stays in tree as dormant, revivable for deep discovery-chains
+(fork option a) opportunistically.
+
+**WATCH STARTED 2026-07-30 ~16:00 (T0).** Prod restarted with logs reset; tuned verifier templates
+confirmed LOADED in the live process (loader lines 15:57:58/15:58:07 + activation counters; note:
+the claim path fires on evidence-shaped turns — CODE-exec turns ride _VERIFY_CODE_PROMPT and never
+touch the tuned templates, which is why a code probe showed ⚠ 0-applies; not a defect).
+T0 bundle: `ablation_out/watch-4f/t0/` (pre-ship + post-ship + probe-A/B verify_bench results,
+learning-health snapshot, optim artifact sha256s). READING SCHEDULE: T+3d log spot-check
+(escalated_overturn count, correction churn, false-refute complaints, BoN/probe still default-off);
+T+7d verify_bench re-run vs t0 post-ship numbers + outcome-label trend; T+14d verdict per the
+amended acceptance rule (incl. the FPR-regression watch: if live false-refute churn is up
+noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix FIRST).
 
 ### 4E. Negative-label supply — Tier 3 ⏳ PENDING, Tier 4 ⛔ HOLD (Tiers 1-2 DONE 2026-07-27)
 
@@ -1166,6 +1266,270 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-30 — §4F overnight: verifier prompts SHIPPED+LIVE (+0.087 private), Phase 3 built, B4 staged
+
+**Headline: the first GEPA-optimized prompts are serving production traffic.** Verifier two-stage
+templates optimized against the REAL pipeline (custom gepa adapter over verify_bench fault-injected
+trials, judge = the live worker endpoint), gate-judged on 23 PRIVATE trials the optimizer never saw:
+**baseline 0.796 → candidate 0.883 (+0.087 ≫ 0.02 gate) → PROMOTED → agent restarted → both
+templates confirmed LOADED on a live tool turn** ("GEPA: loaded tuned instruction for
+'verifier.enumerate' (2035 chars) / 'verifier.adjudicate' (5366 chars)") — unlike Phase 1's dark
+planner, this read-site is hot on every substantive turn. Pre-ship instrument reading (Gemma judge,
+two-stage): TPR 0.80 overall but **FPR 0.31** and degraded-evidence FP 0.78 — exactly the
+false-positive surface the adjudicate prompt owns. Post-ship bench + Phase 3a probe A/B: see the
+appended reading below.
+
+**Phase 2 verifier machinery built this session** (`scripts/optimize_verifier.py` + verifier.py
+changes): tunable stage templates behind `_stage_template` (override → loader artifact → baseline)
+with a **probe-format placeholder guard** (a candidate that lost `{claim}` or broke `{{ }}`-escaping
+falls back to baseline instead of raising in verify_claim); custom gepa `GEPAAdapter` whose
+`evaluate()` runs REAL `verify_claim` over bench trials (fresh HttpChatClient per event loop —
+httpx pools are loop-affine) and whose reflective dataset names the injected fault each wrong
+verdict missed; bench CASES hash-split public/private (`holdout_tier("vbcase:<id>")`);
+`--run-dir` gepa checkpointing after a session-transition kill vaporized a 90%-complete run
+(watchers die with sessions — the optimizer itself now runs nohup-detached). Bugs found live:
+gepa probes the OPTIONAL `propose_new_texts` adapter attr by direct access (must exist as None —
+first fixed run completed with zero mutations and correctly self-rejected at the gate);
+model-churn note: nova briefly served Agents-A1-4B (confirmed confirming corrupted claims at
+conf 1.0) before operator reverted to Gemma — the bench measures the JUDGE, always re-baseline
+after judge swaps.
+
+**Phase 3 (§4F) built, default-OFF per §3 doctrine (no unproven layer live without a measured
+win):** (a) logit-expectation confidence probe (`GHOST_VERIFY_LOGIT_EXPECT`): one bounded digit-
+scale score call after two-stage verdicts, expectation over top-logprobs digit mass →
+`VerifyResult.probe_score`, blended 50/50 verdict-aligned into confidence; verdicts never change;
+probe failure leaves the result untouched; always rides the cheap pool. (b) wobble-band adaptive
+best-of-N (`core/tts.py` + `_adaptive_bon_final` hook at the loop-exit verifier gate;
+`GHOST_TTS_ADAPTIVE_BON`, `GHOST_TTS_BON_K`): fires ONLY on UNCERTAIN or sub-0.7 REFUTED (hard
+REFUTED keeps auto-repair — mechanisms never interact); K sequential diversified candidates → ONE
+list-wise comparative judge call → winner substitutes; every failure resolves to the original.
+Judge payload lives in tts.judge_payload — agent.py stays under the one-disable-thinking-switch
+guard (test_self_play_redesign caught the migration; moved, guard re-armed + a tts-side twin).
+(c) verified-restart: assessed as substantially PRE-EXISTING (auto-repair = critique-conditioned
+restart w/ narration discard + round caps); summary-conditioning delta deferred as marginal.
+Tests: +12 probe, +23 tts; suite 9917 passed (2 FORCE_COLOR env artifacts pass in clean shell).
+
+**B4 battery staged for the §4F acceptance rule** (operator asked mid-wait): infra from 2026-07-09
+verified alive (103 tests, zero drift), candidate pool grew 22→35 across 7 clusters + held-out
+web_automation; pilot emitter now ALSO writes `b4_battery_tiers.json` (hash-stable public/private
+via `holdout_tier("b4:<id>")` — full-pool preview 28/7). Pilot logging made LIVE (per-task
+PASS/FAIL + incremental records + per-pass aggregate) after the operator flagged the B3-ceiling
+risk pre-commit.
+
+**B4 PILOT RUN + ABORTED (2026-07-30 ~14:05): THE POOL IS SATURATED — operator's call, confirmed
+in 41 min instead of 2.5 h.** Pass 1 on a control-configured agent: **33/33 PASS, zero failures**
+(run killed at 33/35 per the pre-registered >80% abort rule; partial records in
+`ablation_out/b4-pilot-20260730/b4_pilot_records.partial.json`). Reading: the 07-09 pool was
+designed to produce real failures and the CURRENT agent ceilings it — a genuine capability datum
+(three weeks of self-play on exactly these cluster families + the July fix cohorts; near-ring
+isomorphism to challenge_templates makes contamination-by-training the default suspect, §4D's
+own contamination guard notwithstanding). Twist-stacked messy data does NOT defeat a
+write-run-verify sandbox loop at this scale. HARDENING FORK (operator decision pending):
+(a) twist/scale escalation — mechanical ~1 h, HIGH risk of a second ceiling; (b) COMPOSITIONAL
+tasks (chain existing shapes, A's artifact feeds B; compositional depth is the measured 2026
+difficulty axis) — ~half-day of honest verifier plumbing, recommended core; (c) new far-ring
+families self-play never trained (only 2 web_automation shapes exist) — most authoring, best
+contamination profile. Battery remains the Phase-4 gate; §4F acceptance rule unchanged.
+
+**Hardening option (b) DELIVERED same day (operator-picked): 10 compositional tasks**
+(`load_b4_comp()` in trackb4_tasks.py, ring="comp" — a DEPTH axis orthogonal to transfer rings;
+structure test updated for the new contract). Two-stage chains over all 7 clusters + the held-out
+family (clean→rank, extract→aggregate, dup-resolve→join-total, edge-clean→BFS, rotated-merge→
+windowed-count, tie-broken JSON merge→filter-sum, concurrent per-file sums→median, comment-aware
+HTML extract→top-dept, pivot→largest-drop, ledger reconcile→abs-diff total). References are pure
+chained functions (stage-A error propagates to the graded artifact); prompts contract intermediate
+files; verify remains final-artifact token containment. 123 battery tests green (auto-swept).
+Pilot economics: `--only-ring comp` added — re-pilot = 10×3 runs ≈ 30-50 min prod-down, not 2.5 h.
+Comp tier preview: 8 public / 2 private (thin — if private-side survivors < ~3, raise the b4:
+namespace private pct before first §4F use).
+
+**COMP PILOT RESULT (2026-07-30 15:41): 10/10 PASS — the compositional pool ceilings too** (aborted
+at pass-1 aggregate per the >80% rule; ~28 min prod-down; slowest task comp_web_table 172 s, still
+solved). TWO difficulty models falsified in one day: neither messy data nor 2-stage composition
+defeats this agent's write-run-verify loop on these task families. Honest reading: 2-stage chains
+sit far below the literature's collapse thresholds (failures concentrate at 5-10+ DEPENDENT steps
+with state, hidden information, mid-task changes, and constraint retention across long horizons —
+not at depth 2), and three weeks of self-play on these exact cluster families moved the envelope.
+DESIGN FORK for the instrument (operator decision): (a) deep discovery-chains — 5-8 stages where
+each stage's SPEC is revealed only by the previous stage's output (defeats one-shot scripting,
+stresses multi-turn coherence; same pure-reference pattern, needs per-task timeout > 300 s);
+(b) long-horizon behavioral tasks matching where prod actually fails (autonomous project work, web
+research under uncertainty, constraint retention) — highest validity, 10-30 min/task makes piloting
+expensive; (c) accept the ceiling as a FINDING: the agent has outgrown sandbox data-task batteries;
+measure §4F phases on live-trajectory outcomes instead (observational, the earn-keep post-mortem's
+"instrument changes" route). Costs sunk so far are small (2 aborted pilots ≈ 70 min downtime) and
+the abort instrumentation works.
+
+**Post-ship instrument reading (full 13-case bench, Gemma judge, two-stage):**
+- **Tuned templates: TPR 0.80 → 0.893** (artifact_leak 0.385→0.846, fact_swap 0.50→0.90 — the two
+  worst classes fixed); **FPR 0.31 → 0.385 (WORSE)**, degraded-evidence FP 0.78→0.889. Honest read:
+  the optimizer traded false negatives for false positives, and the gate's composite rewarded it
+  because REFUTED-expecting trials outnumber clean ~5:1 in the trial mix — a metric-weighting
+  artifact to fix before the next optimization round (weight clean/NOT_REFUTED trials up).
+  KEEPING the ship: it passed the pre-registered gate, and in prod the refute-escalation bounds FP
+  damage (cheap-judge REFUTED must be confirmed by the main model before acting — false refutes
+  cost latency, missed catches cost correctness). WATCH: live false-refute churn (correction dedup
+  + `escalated_overturn` counts) over the next log audits.
+- **Phase 3a probe A/B (tuned + GHOST_VERIFY_LOGIT_EXPECT=1): default stays OFF.** Raw rates
+  similar (TPR 0.92 / FPR 0.462 — judge nondeterminism), but the 50/50 blend drags nearly ALL
+  confidences below the 0.7 actionable gate: actionable FPR 0.0 (good) at actionable TPR 0.347
+  (unacceptable — would neuter the verifier). Signal exists but the blend is miscalibrated;
+  revisit with a lighter blend weight or threshold-aware calibration, never a straight flip.
+
+### 2026-07-29 (later 7) — §4F Phase 1 IGNITED: first GEPA candidate PROMOTED through the private gate
+
+The never-run GEPA loop ran end-to-end for the first time. **Result: `planning.decompose` candidate
+promoted — public valset 0.401→0.589; A/B on the PRIVATE 20-example holdout: baseline 0.45 →
+candidate 0.80 (+0.35 ≫ 0.02 gate)** → live artifact `$GHOST_HOME/system/optim/planning.decompose.json`.
+The evolved instruction (self-reflected by the 35B from its own trajectories) mandates a strict
+`### plan`/`### rationale` structure, a 4-step logical flow, explicit empty-tools handling, and a
+constraint-encoding template — independently converging on the "constraint loss dominates
+long-horizon failure" finding from the 2026 literature. **Deploy = restart** (loader caches
+per-process); success check = learning-health `PROMPT OPTIMIZATION` activation counter > 0 in prod.
+
+**Ignition flushed 6 written-but-never-exercised defects** (the §4F prediction, on schedule):
+1. Trajectory-root drift: script + `collector._default_root()` pointed at `$GHOST_HOME/trajectories`;
+   prod writes `$GHOST_HOME/system/trajectories` (main.py memory_dir.parent). Both fixed + regression
+   test pinning default-root to the prod path.
+2. Raw `TrainExample`s fed to dspy (needs `dspy.Example` bound to signature FIELD NAMES) →
+   `_to_dspy_examples()` with ""-defaults for missing inputs; drops expected keys not on the signature.
+3. Metric arity: dspy 3.x GEPA isinstance-checks a 5-positional metric `(gold, pred, trace,
+   pred_name, pred_trace)`; the shipped 2-arg metric died at construction.
+4. Binary substring metric scored ~everything 0 (no gradient) → graded token-recall `_overlap`,
+   shared verbatim by optimizer metric and A/B runner (same semantics both sides of the gate).
+5. `_GhostLMAdapter` hit its THIRD dspy-interface break (BaseLM isinstance gate) → GEPA now uses
+   `dspy.LM` pinned to the same local `/v1` endpoint (adapter retained for other callers). Thinking
+   models need max_tokens ≥ 8k or reasoning eats the budget and content returns EMPTY
+   (`chat_template_kwargs.enable_thinking=false` for rollouts; reflection keeps thinking).
+6. The A/B runner had the same empty-content bug (1024 tokens, think-on): both arms scored at the
+   noise floor (0.05/0.00) and the gate could only ever reject — measured live when a TaskStop-orphaned
+   first attempt completed with exactly that verdict. Fixed to mirror the rollout regime; rejected
+   candidates now kept as `.candidate.rejected` for post-mortem instead of deleted.
+Also: field-coherence finding — the generic trainset only matches `planning.decompose`;
+`tool_selection.pick`/`reflection.critique` need signature-specific example extractors (Phase 2).
+Ops notes: GEPA runs ~35 min cold on the box (~11 s/rollout think-off; dspy disk cache makes reruns
+minutes); kill by PID (TaskStop on the pipeline orphans the python); one log file per launch.
+
+### 2026-07-29 (later 6) — Methodology survey → §4F 4-phase plan; Phase 0 eval hygiene SHIPPED
+
+Four-agent web survey of mid-2026 agentic-engineering SOTA vs this stack (full findings + arXiv ids:
+memory `agentic-methodology-survey-2026-07`; plan: **§4F**). Cross-validated top-3 gaps: text-space
+prompt optimization (GEPA/SkillOpt), trajectory-level verifier-guided TTS, long-horizon context
+discipline. **The finding that reordered everything: the GEPA loop (`optim/`) was fully built and
+read-wired but had NEVER RUN** — no `$GHOST_HOME/system/optim/` exists; 24 days of trajectories
+unused. Also resolved the model watch-item: Agents-A1 35B-A3B shipped open (GGUFs 07-02, 4B 07-14,
+bake-off pending); open Qwen3.7 is dead (API-only pivot) — memory updated.
+
+**Phase 0 (eval hygiene) shipped this session** — the precondition for ever running the optimizer
+(proxy-gaming hits 46–74% of self-optimization runs, RISES with steps, and only a hidden holdout
+reliably prevents it):
+- `optim/trainset.py`: `holdout_tier` + `split_public_private` — per-item sha256 PUBLIC/PRIVATE
+  split on `source_trajectory_id` (content-key fallback; identity excludes signature_name so one
+  trajectory is same-tier for every signature). Membership can never migrate as the corpus grows —
+  the old seeded-shuffle `split_train_eval` re-deals membership every run (slow leakage). Public
+  never starved (rescue-one rule).
+- `scripts/run_gepa.py`: optimizer + its internal val now see ONLY public; the A/B ship-gate judges
+  ONLY private (`--private-pct`, default 30); empty private ⇒ refuse promotion. The public val split
+  is passed through as `run_gepa(..., valset=...)` (GEPA selects its Pareto frontier on it —
+  public-tier by construction; TypeError fallback for tuners without valset).
+- `optim/run_gepa.py`: `MAX_OPT_ITERATIONS=16` clamped inside `run_gepa()` (all callers inherit).
+- `optim/loader.py`: activation counters (applied vs fallback per signature, survive `clear_cache()`)
+  + `activation_stats()`; docstring hardened: NEVER `clear_cache()` live (KV stable-prefix re-prime).
+- `core/learning_health.py`: `optim` section pairs artifacts-on-disk with in-process counters;
+  render flags "tuned but 0 applies since boot" ⚠ — the write-only defect class this loop already
+  exhibited once, made visible in `introspect action='learning'`.
+- Tests: `tests/test_optim_eval_hygiene.py` (15, incl. membership-stability-under-growth and
+  clamp-before-optimize); optim/gepa/learning-health regressions green (51+15). Docs:
+  `docs/self_improvement.md` "Optimizer eval hygiene" section. Next: Phase 1 ignition run on
+  `tool_selection.pick` (needs llama-server idle window).
+
+### 2026-07-29 (later 5) — Web UI: the 'cube' face (infinite monolith with a growing mutation)
+
+**v2 rework** (operator: cube unclear / mutations must be red + evolving at idle / zoom too deep, "random
+dots" / erratic zoom-out): cell edge 0.88→0.80 + edge/corner nodes render larger (wireframe SILHOUETTE =
+legible monolith) + near-still per-form heading wander; complexities idle as slow RED organisms (S_total =
+0.22+0.12·sin breath + active cubeS; hearts 0.52+ crimson at rest); displacement field made SPATIALLY
+COHERENT (position-keyed low-freq phases, per-node jitter down to texture — neighbors move together =
+spreading flesh, not dots); dive PARTIAL for this form (CUBE_DIVE_Z 3.1, swell 0.18, lookAt −1.0 — watch
+the spread, never enter the dot cloud); erratic zoom-out fixed by pacing (taming 0.988→0.9935 ≈ dive-out),
+gentler accretion (0.55→0.35) and the damped wander. Full lifecycle re-verified live, 133 interface tests
+green (lookAt pin made form-aware).
+
+Operator concept, distilled from what they loved in lattice ("a large dark cube with alien complexities in
+some parts of it"): an infinite-reading dark grid (cell edge 0.88/0.95, spans past the viewport) with 3/2
+resident complexities — localized alien sine fields + violet heart tangles — quietly deforming it. A USER
+turn wakes ONE (userTurnState rising edge, vortex pattern; ambient work doesn't): eased growth ~5s
+("aggressively but not overly fast"), influence ×2.6, churn speeds with strength, per-node irregular `gate`
+spread boundary, links tear/re-weave, ACCRETION (0.55·S·w — two renders read as scattered stars until the
+pull got wide/strong) weaves the crimson knot the dive lands on; dive focus-translated onto the active
+anchor (descent/embedding lesson applied from birth). Completion: ×0.988 taming tail, cube re-knits, dive
+eases out; mid-decay re-arms keep the same anchor (heat never teleports). Full lifecycle live-verified
+headlessly (idle/growth/full-immersion/recovery, zero JS errors). FORMS now 10 ('cube' before 'empty');
+menu auto-lists it (hint "infinite monolith"). Cache-bust app/matrix 7.5. Pins: `test_cube_mutation_contract`,
+`test_cube_links_neighbors_but_not_diagonals`, node-harness budgets.
+
+### 2026-07-29 (later 4) — Web UI: four AI face forms (lattice / stack / embedding / descent)
+
+Operator: same nodes-lines-animation design as the 2026-07-28 forms, different shapes, AI-themed. Four
+new body plans over the shared motion engine — the machine's own internals as anatomy, first ANGULAR
+silhouettes: **lattice** (tumbling weight-tensor grid, diagonal activation waves, drifting hot attention
+kernel, axis charge-runners), **stack** (tapering transformer layer-rings + hot residual column + climbing
+token packets that ripple each layer), **embedding** (octahedral concept clusters + hot query comet doing
+bezier-arc recall — arrival ignites the cluster), **descent** (evolving loss-landscape sheet, TRUE
+gradient-descent bead with damping/soft-walls/stuck-kick, flinch = bad gradient step). Cycle keeps 'empty'
+last. Operator picked all three structural ideas + embedding from six proposals (loom/swarm passed on).
+
+Engineering: form dispatch refactored to NAME-based (`const FORM = FORMS[formIndex]` — the hardcoded
+`formIndex === N` comparisons would have silently mis-dispatched when FORMS grew past 5); per-form link
+radii centralized in `LINK_MULT` (lattice 0.45 = neighbors-only wireframe; stack 0.25 = discs must not
+scaffold into a cylinder, which the first render did; embedding 0.62 = clusters can never cross-link;
+descent 0.20/0.38 = mesh must survive the worst-case analytic slope — my own test caught the 0.16 margin
+violation). All four reheat `nodeSeeds` per frame (aSeed upload like vortex). Verified: builders executed
+under node for BOTH device classes (exact NODE_COUNT fill — mismatch corrupts instanced attributes
+silently), all four forms rendered live on :8080 via Playwright (anatomy + pulse + zero JS errors,
+screenshots reviewed; only stack needed the link tuning). Cache-bust 6.7→6.8 both files. Tests:
+`tests/test_interface_face_forms_ai.py` (incl. computed geometry invariants + node-executed budgets);
+`test_interface_face_palette.py` vortex pin updated to the LINK_MULT shape. Docs:
+`docs/interfaces/web_server.html` "AI face forms". No server/agent changes — static-only, live on next
+browser reload.
+
+Follow-up 3 (operator: "any other UX improvements?" — picked the activity ticker from a 7-item survey):
+**turn status line**, placement iterated three times to the operator's final spec: v1 breadcrumb trail
+inside the thinking bubble (rejected), v2 caption next to the center-stage 2.2rem activity icon (rejected —
+icon dwarfed it), v3 FINAL: `timer : description - icon` with a text-sized icon, re-parented directly UNDER
+the waiting reply bubble each turn (parked hidden between turns; survives /clear repaints via re-adoption).
+Friendly descriptions via TICKER_VERBS map + detail-column suffix ("delegating to the worker node ·
+decompose query…"); think-class → "thinking… - 💭", first content chunk → "writing the reply… - 💬"; hides
+at turn end. Corridor-id adoption keeps background self-play/dream lines out (first "request started" after
+send = ours); TICKER_NOISE plumbing filter. All three versions live-verified with a real tool turn each
+(test sessions deleted after). Then the center-stage #activity-icon was REMOVED outright (operator:
+"remove the icon from the middle") — element, container, dwell/priority arbitration, flash/fade, zen-scale
+rule all excised; updateStateFromIcon kept as the face's working-state driver; live-verified (icon gone,
+status line intact, zero JS errors). Integration polish (operator: "the timer doesn't belong there"): the
+clock became a quiet tabular-nums CHIP (violet-bordered pill — a badge, not part of the sentence; no width
+jitter at 0:09→0:10), the description moved to the UI's main font, literal `:`/`-` separators replaced by
+visual grouping (style 4.8). Cache-bust app 7.4 / style 4.8. Pin: `test_turn_status_line`.
+Remaining survey items (not built): jump-to-latest pill, draft persistence, retry-last-turn, session
+export, full-text session search, shortcuts overlay.
+
+Follow-up 2 (operator): (a) **delete-all sessions** button at the rail bottom — two-step armed confirm
+(first click arms danger-red with the count, second within 4s executes; timeout/pointer-leave disarms),
+iterates the enumerated per-id DELETE proxy (no bulk endpoint added), lands on a fresh session, hidden when
+the list is empty; (b) **face-form picker** replaced the blind cycle button (9 forms = up to 8 clicks ×
+1.4s blends) — a glass menu built from matrix_graph's own `getForms()` roster (new forms auto-appear),
+name + hint per row, current marked, `setForm()` jumps directly, stale-cache cycle fallback kept.
+Verified live headlessly (menu items/active/switch; delete-all with DELETE interception — real sessions
+untouched). Cache-bust: app/matrix_graph 7.0, workspace→sessions 6.8, style.css 4.3. Pins:
+`test_delete_all_sessions_button`, `test_form_picker_menu`.
+
+Follow-up (operator: "descent usually zooms into an uninteresting location when busy"): the immersion dive
+targets the scene ORIGIN — for descent a generic terrain patch, for embedding the deliberately-empty void
+between clusters. Both forms now translate their space while diving (dive-weighted, zero at rest) so the
+dive rides the form's HOT FOCUS: the optimizer bead (+0.30 lift so the camera hovers over the surface) /
+the query comet mid-recall. Both foci are positionally continuous, so the follow never jumps. Verified at
+full dive via Playwright (immersion 1.0, camZ 1.3, screenshots). Cache-bust 6.8→6.9; pin
+`test_dive_centers_on_the_form_focus`.
 
 ### 2026-07-29 (later 3) — Daytime-log audit: the two ungated self-play spots compounded
 

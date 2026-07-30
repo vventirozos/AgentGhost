@@ -127,6 +127,78 @@ def test_sessions_delete_confirms_first():
     assert "method: 'DELETE'" in fn
 
 
+def test_turn_status_line():
+    """2026-07-29 (v3, final after two placement iterations): while a
+    user turn runs, a caption line sits directly UNDER the waiting reply
+    bubble — `timer : description - icon`, with a TEXT-sized icon of its
+    own (v2's 2.2rem stage icon dwarfed the caption). Parsed live from
+    the WS log frames."""
+    html = _read("index.html")
+    assert 'id="turn-status"' in html
+    for el_id in ("turn-status-clock", "turn-status-desc", "turn-status-icon"):
+        assert f'id="{el_id}"' in html, f"missing #{el_id}"
+    # Format order: clock, then desc, then icon.
+    ts = html.split('id="turn-status"', 1)[1].split("</div>", 1)[0]
+    assert ts.index("turn-status-clock") < ts.index("turn-status-desc") \
+        < ts.index("turn-status-icon")
+    js = _read("app.js")
+    # Re-parented under the current waiting bubble each turn.
+    assert "startTurnTicker(currentAgentMessageDiv)" in js
+    assert "insertAdjacentElement('afterend', turnStatusEl)" in js
+    assert "noteTickerLine(data.content)" in js, "WS log frames must feed it"
+    # Corridor filtering: only OUR request's lines update the caption —
+    # background self-play/dream corridors stream on the same socket.
+    assert "request started" in js and "tickerReqId" in js
+    assert "parts[1] !== tickerReqId" in js
+    # Plumbing lines never narrate progress; common steps read human.
+    assert "TICKER_NOISE" in js and "'prefill cache'" in js
+    assert "TICKER_VERBS" in js
+    # Reasoning stretches + streaming get honest captions + icons too.
+    assert "setTurnStatusDesc('thinking…', '💭')" in js
+    assert "setTurnStatusDesc('writing the reply…', '💬')" in js
+    # One idempotent teardown covers every request path's end.
+    assert "if (!isProcessing) stopTurnTicker();" in js
+    css = _read("style.css")
+    assert "#turn-status" in css and "#turn-status-icon" in css
+    # The caption's icon is TEXT-sized — the whole point of v3 (the old
+    # stage icon was 2.2rem). Pin the invariant, not the exact value.
+    icon_block = css.split("#turn-status-icon {", 1)[1].split("}", 1)[0]
+    m = re.search(r"font-size:\s*([\d.]+)rem", icon_block)
+    assert m and float(m.group(1)) < 1.0, "status icon must stay text-sized"
+    # Integration pass (operator: "the timer doesn't belong there"): the
+    # clock is a quiet tabular-nums chip so its width never jitters.
+    clock_block = css.split("#turn-status-clock {", 1)[1].split("}", 1)[0]
+    assert "tabular-nums" in clock_block
+
+
+def test_delete_all_sessions_button():
+    # 2026-07-29 operator request: bulk destructive control at the
+    # bottom of the rail.
+    html = _read("index.html")
+    assert 'id="rail-footer"' in html
+    assert 'id="delete-all-sessions-btn"' in html
+    js = _read("sessions.js")
+    # Two-step armed confirm — no browser dialog, and a stray click can
+    # never wipe the strata: first click arms (danger state + explicit
+    # count), second click within the window executes, timeout/leaving
+    # the rail disarms.
+    assert "deleteAllBtn.classList.contains('armed')" in js
+    assert "disarmDeleteAll" in js
+    assert "pointerleave" in js, "leaving the rail must disarm"
+    fn = js.split("async function deleteAllSessions", 1)[1].split(
+        "deleteAllBtn?.addEventListener", 1)[0]
+    # Deletion iterates the ENUMERATED per-id proxy — deliberately no
+    # bulk endpoint (the LAN-reachable surface stays enumerated).
+    assert "method: 'DELETE'" in fn
+    assert "encodeURIComponent(s.id)" in fn
+    assert "Core.isProcessing()" in fn, "mid-turn delete-all must be refused"
+    assert "mintId()" in fn, "must land on a fresh session afterwards"
+    # Footer only exists when there is something to destroy.
+    assert "sessions.length > 0" in js
+    css = _read("style.css")
+    assert "#delete-all-sessions-btn.armed" in css
+
+
 # ---------------------------------------------------------------------------
 # notifications.js
 # ---------------------------------------------------------------------------

@@ -166,3 +166,58 @@ def split_train_eval(
     eval_set = shuffled[:n_eval]
     train_set = shuffled[n_eval:]
     return train_set, eval_set
+
+
+def _example_identity(ex: TrainExample) -> str:
+    """Stable identity for holdout assignment. `source_trajectory_id` when
+    present (same trajectory → same tier across ALL signatures, so a task the
+    optimizer saw for planning can never grade tool-selection); otherwise a
+    content key. Deliberately excludes `signature_name` for id-bearing
+    examples for exactly that cross-signature reason."""
+    if ex.source_trajectory_id:
+        return f"traj:{ex.source_trajectory_id}"
+    return "content:" + "|".join(
+        f"{k}={ex.inputs.get(k, '')}" for k in sorted(ex.inputs)
+    )
+
+
+def holdout_tier(identity: str, *, private_pct: int = 30) -> str:
+    """Deterministic PUBLIC/PRIVATE bucket for one example identity.
+
+    sha256-based so membership depends ONLY on the identity — never on
+    corpus size, ordering, or an RNG seed. The seeded-shuffle split above
+    re-deals membership whenever the corpus grows, which leaks: an example
+    the optimizer trained on in run N can land in the "holdout" of run N+1.
+    Hash membership is forever, which is the property the ship-gate needs.
+    """
+    import hashlib
+    pct = max(0, min(100, int(private_pct)))
+    bucket = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8], 16) % 100
+    return "private" if bucket < pct else "public"
+
+
+def split_public_private(
+    examples: List[TrainExample],
+    *,
+    private_pct: int = 30,
+) -> Tuple[List[TrainExample], List[TrainExample]]:
+    """Partition into (public, private) by per-item hash — see `holdout_tier`.
+
+    PUBLIC is everything the optimizer may touch (its train set AND its
+    internal validation split). PRIVATE is reserved for the A/B ship-gate
+    and must never be passed to the optimizer. Order within each tier is
+    preserved. If hashing would leave the public side empty while examples
+    exist, the first private example is reassigned — an optimizer with no
+    train data "optimizes" nothing, and a starved run is worse than a
+    marginally smaller holdout.
+    """
+    public: List[TrainExample] = []
+    private: List[TrainExample] = []
+    for ex in examples:
+        if holdout_tier(_example_identity(ex), private_pct=private_pct) == "private":
+            private.append(ex)
+        else:
+            public.append(ex)
+    if examples and not public:
+        public.append(private.pop(0))
+    return public, private

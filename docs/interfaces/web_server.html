@@ -122,6 +122,123 @@
   <h2>Static assets</h2>
   <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframes), <code>style.css</code> (cyan/magenta cyber theme — directional message entrances, streaming edge-pulse, animated input glow, gradient hero wordmark), <code>matrix_graph.js</code> (the background "face" — a three.js particle system with depth-faded nodes/links, a slow orbit, and envelope-reactive bloom; state-reactive via <code>setWorkingState/triggerSpike/triggerPulse/setAudioLevel</code>. THREE ALIEN FORMS since 2026-07-28 (three passes the same day: thermal two-pole recolor → "still looks like random lines and dots" → anatomy rebuild as a medusa → "jellyfish seems wrong for an AI backend" → three interchangeable alien body plans over ONE motion engine; <em>alive is a property of anatomy, not timing curves</em>). The <code>#face-form-btn</code> header button cycles <strong>abyssal</strong> (asymmetric lobed husk tilted off-axis, feelers reaching in all directions, off-center core), <strong>horizon</strong> (eccentric orbital shells collapsing toward a burning core, filament spirals falling inward and heating — briefly the default on 2026-07-28 before vortex superseded it; same-day center fix: a per-form <code>uCenterDim</code> radial dim in both node and line shaders stops additive stacking from bleaching the core to pink, the inner shell sits dead on the arterial-red stop with cold blues confined to the outer shells, and core quads render at 0.7 size via the per-node <code>sz</code> factor — together these keep the heart CRIMSON), <strong>cortex</strong> (asymmetric neural lobes swelling with sequenced thought-waves, dendrites carrying displacement signal-trains), and <strong>vortex</strong> (the DEFAULT since 2026-07-28 evening — a black hole AHEAD of the viewer — final shape after four same-day operator iterations: a dark-red <em>accretion ring</em> (kind 3, slow elliptic orbit) around a genuinely dark <em>shadow</em> with dim crimson embers, fed by five spiral streams. THE CAMERA NEVER MOVES and the flow is <em>expansion</em>: matter emerges through the ring's glow (spawn at <code>VORTEX_LMIN</code>, at the ring edge — inside it the hole stays dark) and blooms exponentially outward past the viewer (<code>L = LMIN·e^(K·dOut)</code>, self-similar, wrap invisible at both extremes) — contraction was tried first and read as moving <em>backward</em>; expansion optical flow is what "falling in" looks like. Hue runs hottest at the hole, cooling blue outward; the vortex damps the hue wave/drift to 30% (<code>uWaveAmp</code>) and dims by screen-radial distance (<code>uCenterXY</code>, strength 0.85) so the center stays DARK RED instead of bleaching pink or swinging plum. A drifting 3-harmonic field morphs the streams through organic never-repeating shapes (the "procedurally generated content"), swelling while a turn runs. A master luminance dial (<code>uFormDim</code> 0.55 + bloom ×0.65 — introduced for the vortex, extended to ALL forms the same day) makes every face emit roughly half its former light so it BLENDS into the background — structure and motion carry visibility, not brightness. Behavior: idle = slow emergence + swirl (idle spin +25%, idle pulse cut to 20%); busy = the swallow surges (~5s per emergence cycle) for as long as the turn runs while spin HALVES (work de-emphasizes rotation — "the main animation is the swallow"); completion is a pure intensity morph — no reset of any kind exists (both the cut-on-black and the ascent resets were vetoed; self-similarity makes busy and idle the same scene)), plus <strong>empty</strong> (no face at all — nodes park on a sparse far sphere past the link radius, so the reorganization blend disperses the face beyond the screen edges on the way in and materializes the next form from the void on the way out; motes are suppressed during dives); the choice persists in localStorage (<code>ghost_face_form</code>) and a switch plays a ~1.4s reorganization blend — the nodes visibly re-assemble into the new body. All forms share the propulsion engine: Motion is medusan propulsion — <code>_pulseShape()</code> is an asymmetric muscle envelope (fast squeeze 0→0.16 of the cycle, long release, quiescent glide; deliberately NOT a sine) propagating apex→margin, tugging the tentacles and kicking a swim bob; tentacles carry metachronal traveling waves; the heading wanders like attention (no turntable orbit); errors trigger a physical flinch (one sharp agitated pulse) alongside the hot tint. Pulse ~4s idle → ~1.7s busy. Colors are the thermal two-pole ring (<code>COLORS.palette</code>: deep ocean blue → indigo → violet → dark arterial red → plum, all dark-first) mapped ANATOMICALLY — cold blue crown, violet waist, hot tentacle currents and arterial core — with seeds assigned per body part; <code>uHueDrift</code> now OSCILLATES (±0.07) instead of cycling so anatomy never scrambles, and the <code>hueWave()</code> chunk (damped by <code>uOrganic</code> under reduced-motion) sends warmth/cold currents through the body. Fragment brightness, line alpha, and bloom (base 0.88) all trimmed because the anatomy is locally dense and additive stacking multiplies luminance; accent-tint cap 0.5 so mood colors the weather without erasing the poles. <code>PROXIMITY_SQ</code> tightened 2.5→1.7 so links trace the anatomy. Restore points: <code>matrix_graph.js.bak-20260728-premedusa</code> (thermal point cloud), <code>matrix_graph.js.bak-20260713-preimmersion</code>. Pins extended in <code>tests/test_interface_face_palette.py</code> (thermal axis, hue wave, medusa anatomy + asymmetric envelope). Palette contract pinned by <code>tests/test_interface_face_palette.py</code>. <strong>Immersion dive (2026-07-13):</strong> while a USER request is in flight the grid "swallows" the camera — scene scales up ×1.7 around the viewer while the camera dollies z=5.0→1.3 into the cloud, drifting back out organically on completion. Driven ONLY by the dedicated <code>setUserTurn()</code> state since 2026-07-28 (it was nominally workingState-gated before, but ambient working-class log icons re-arm workingState almost continuously on an autonomously busy agent, which held the camera inside the cloud all night; the dive now engages exclusively for the operator's own in-flight request — live-verified: real log traffic at workingState≈1.0 leaves the camera at rest, a user turn dives it, completion eases it back out over ~10s while ambient work continues) through an asymmetric ease far slower than workingState itself (~5s in / ~10s out; short requests just lean). Safety rails: near-camera fade in both shaders (nodes dissolve instead of becoming screen-filling quads), bloom damped ×0.65 fully inside (the streaming reply is read on top of near geometry), look-target blends forward through the cloud to dodge the lookAt-origin singularity, and <code>prefers-reduced-motion</code> caps the dive at a 15% lean. Debug/verification hook: <code>window.__ghostFace.getDebugState()</code>. Pre-immersion restore point: <code>matrix_graph.js.bak-20260713-preimmersion</code>. <em>Interior enrichment (v3.6)</em>: the swell dilutes local density exactly when the camera is closest, so the inside looked empty — three dive-gated compensators fix it with zero cost at rest: 400 shader-drifted interior motes (one draw call, <code>visible=false</code> at rest), a ×1.5 thicker proximity web while inside, and +60% data-pulse tempo, with the scale boost trimmed 0.7→0.55. Pins: <code>tests/test_interface_face_immersion.py</code>), <code>cyber_face.png</code> (the notification icon), and <code>sw.js</code> (service worker). All decorative motion (CSS animations and the 3D sphere's orbit/morph) is damped under <code>prefers-reduced-motion</code>. CDN failures degrade gracefully: <code>marked</code>/<code>DOMPurify</code> fall back to escaped plain text, and a missing <code>mermaid</code> only disables diagram rendering rather than breaking the page.</p>
 
+  <h2>AI face forms (2026-07-29)</h2>
+  <p>Four AI-native body plans joined the alien forms — the machine's own internals as anatomy, over the SAME
+  motion engine (<code>_pulseShape</code> propulsion, drive/flinch, thermal cold-blue→arterial-red seeds,
+  reorganization blend) — and the first ANGULAR silhouettes in the set. The cycle is now abyssal → horizon →
+  cortex → vortex → <strong>lattice</strong> → <strong>stack</strong> → <strong>embedding</strong> →
+  <strong>descent</strong> → empty ('empty' deliberately last, so cycling into it disperses the face and the next
+  press materializes abyssal from the void).</p>
+  <ul>
+    <li><strong>lattice</strong> — <em>the weight tensor</em>: a slowly tumbling crystal grid (6³ desktop / 4×5×5
+    mobile) whose cell edge sits just under a form-tightened link radius so ONLY axis-neighbors weave — a clean
+    wireframe tensor, no diagonal mush (computed invariant pinned in tests). Diagonal activation plane-waves ride
+    the shared pulse clock and HEAT the sites they cross; a hot attention kernel drifts a Lissajous through the
+    volume, bending nearby grid toward itself and igniting it; violet charge runners ride the axis lines
+    (size-tapered at the faces so wraps hide). Stately two-axis tumble, CALM-damped.</li>
+    <li><strong>stack</strong> — <em>the transformer</em>: six tapering layer-rings (wide input → narrow output)
+    threaded by the hot sinuous residual-stream column; token packets climb a helix just outside the rings on one
+    shared flow accumulator (staggered offsets; busy speeds every token without phase jumps), RIPPLING each ring
+    they pass and heating as they rise — representation enriching layer by layer. The inter-layer gap must clear
+    the stack's tightened link radius even at opposing tilt extremes or vertical scaffold links weave the discs
+    into a solid cylinder (exactly what the first render did — hence the computed gap-vs-radius test pin).</li>
+    <li><strong>embedding</strong> — <em>latent space</em>: cold concept clusters anchored on jittered octahedral
+    directions (≥ ~80° apart, so with the tightened radius clusters can never cross-link — the void between
+    concepts stays void), each with its own slow orbit and internal swirl. The hot query comet flies an outward
+    bezier arc cluster→cluster (faster while the agent works); each arrival IGNITES the recalled cluster — it
+    flares toward red and tightens (nearest-neighbor recall), cooling back over ~2s.</li>
+    <li><strong>descent</strong> — <em>the loss landscape</em>: a tilted terrain sheet whose height field slowly
+    EVOLVES (the objective is non-stationary — training), cold ridges / warm valleys; the optimizer bead rolls
+    TRUE gradient descent (numeric ∇h per frame, damping, soft walls), pressing the surface down where it passes
+    and trailing heat; settling too long in a basin triggers a learning-rate kick, and an error flinch kicks it
+    too (a bad gradient step). The link radius must cover one grid step across the field's worst-case analytic
+    slope or the sheet tears on ridges — computed invariant pinned in tests.</li>
+  </ul>
+  <p><strong>Dive focus:</strong> the immersion dive zooms toward the scene ORIGIN — which for descent is a
+  generic terrain patch (operator: "descent usually zooms into an uninteresting location when busy") and for
+  embedding the deliberately-empty void between clusters. Both forms translate their space while diving
+  (dive-weighted, zero at rest) so the ORIGIN IS the form's hot focus: a user turn rides the optimizer bead
+  hunting the minimum (with a +0.30 lift so the camera hovers over the surface instead of clipping into it) or
+  flies alongside the query comet mid-recall. Both foci are positionally continuous (bead = velocity physics,
+  kicks jolt velocity not position; query = bezier whose next flight starts where the last landed), so the
+  follow never jumps. Verified at full dive via Playwright (<code>setUserTurn(true)</code>, immersion → 1.0,
+  camZ → 1.3, screenshots reviewed).</p>
+  <p><strong>cube (2026-07-29, operator concept distilled from lattice):</strong> <em>the infinite
+  monolith</em>. A large dark grid — bigger cell edge than lattice (0.88/0.95), spanning past the viewport so
+  the eye never finds a boundary — holding a FEW resident alien complexities (3 desktop / 2 mobile: random
+  interior anchors kept ≥1.4 apart), each an incommensurate sine field quietly warping its neighborhood, with
+  a small violet orbiting "heart" tangle. A USER turn (not ambient work — <code>userTurnState</code>, the
+  vortex pattern) wakes ONE as the mutation: strength eases up (<code>cubeS += (1-cubeS)·0.014</code>, ~5s —
+  "aggressively but not overly fast"), its influence radius grows ×2.6, the churn speeds up with strength,
+  the spread passes through each node's own irregular <code>gate</code> threshold (organic infection
+  boundary), displaced nodes tear and re-weave links, ACCRETION pulls the neighborhood inward
+  (<code>0.55·S·w</code> — the first two renders read as scattered stars until the pull got wide and strong)
+  and the heart runs crimson (seeds capped dead on the red stop). The immersion dive is focus-translated onto
+  the active mutation's post-tumble position — the camera rides INTO it as it evolves. On completion the
+  strength decays ×0.988/frame (~6s taming), the cube re-knits, and the dive eases back out. Mid-decay
+  re-arms keep the SAME anchor so the heat never teleports. Verified live through the full lifecycle
+  (idle → growth/dive-in → full immersion inside the crimson web → tame/re-knit/pull-out, zero JS errors).</p>
+  <p>Engineering notes: form dispatch is NAME-based since this change (<code>const FORM = FORMS[formIndex]</code>
+  everywhere — the old <code>formIndex === N</code> comparisons silently mis-dispatched whenever the FORMS array
+  grew); per-form link-radius² multipliers live in one <code>LINK_MULT</code> map (vortex 1.5 dense membrane,
+  lattice 0.45, stack 0.25, embedding 0.62, descent 0.20/0.38 desktop/mobile); all four AI forms rewrite
+  <code>nodeSeeds</code> per frame (wave/kernel heat, packet altitude, recall ignition, height+bead heat) and
+  flag <code>aSeed.needsUpdate</code> like the vortex does. Builders were executed headlessly under node for both
+  device classes (every builder must fill EXACTLY <code>NODE_COUNT</code> — a mismatch corrupts the instanced
+  attributes with no console error), and all four forms were verified live on :8080 via Playwright (correct
+  anatomy reported by <code>getDebugState()</code>, pulse advancing, no JS errors, screenshots reviewed).
+  Cache-bust bumped 6.7 → 6.8 on <code>app.js</code> + <code>matrix_graph.js</code> together. Pins:
+  <code>tests/test_interface_face_forms_ai.py</code> (presence, cycle order, name dispatch, geometry invariants
+  computed from the shipped constants, node-executed builder budgets).</p>
+
+  <h2>Form picker + delete-all sessions (2026-07-29)</h2>
+  <p><strong>Form picker:</strong> the header face button no longer blind-cycles (at 9 forms, reaching the one
+  you wanted took up to 8 clicks × 1.4s reorganization blends). It now opens <code>#face-form-menu</code> — a
+  glass panel in the <code>#msg-menu</code> visual language, anchored under the button — listing every form
+  (mono name + one-line hint: "vortex — black hole", "lattice — weight tensor" …) with the current one marked;
+  one click jumps straight to it via <code>setForm()</code>. The menu builds itself from matrix_graph's own
+  roster (<code>getForms()</code> export — a new form added to <code>FORMS</code> appears in the picker with no
+  app.js edit). Outside click / Escape closes; a stale-cached face module without <code>getForms</code> falls
+  back to the old cycle.</p>
+  <p><strong>Delete-all sessions:</strong> <code>#rail-footer</code> at the bottom of the sessions rail holds
+  <code>#delete-all-sessions-btn</code> — quiet mono text until hovered, hidden entirely while sessions are
+  disabled or the list is empty. Destructive-action design: a two-step ARMED confirm instead of a browser
+  dialog — the first click arms it (danger-red, "Really delete all N? Click again"), the second click within
+  4s executes; the timeout or the pointer leaving the rail disarms (walking away is a "no"). Deletion iterates
+  the enumerated per-id proxy (<code>DELETE /api/sessions/{id}</code>) — deliberately NO bulk endpoint, the
+  LAN-reachable surface stays enumerated — then lands on a fresh minted session. Mid-turn requests are refused
+  (same gate as single delete: an in-flight turn would silently recreate its session server-side). Verified
+  live headlessly with DELETE interception (8 requests fired and faked; armed text, emptied rail, footer
+  auto-hide, zero JS errors — real sessions untouched). Pins:
+  <code>tests/test_interface_workspace.py::test_delete_all_sessions_button</code>,
+  <code>tests/test_interface_face_forms_ai.py::test_form_picker_menu</code>.</p>
+
+  <h2>Turn status line (2026-07-29)</h2>
+  <p>Turns routinely run 30–60s+ of tools + thinking before the first content token; that stretch used to show
+  only three dots. The WS pretty-log stream already narrates every step, so while a user turn runs
+  <code>#turn-status</code> is re-parented directly UNDER the waiting reply bubble as a quiet caption line in
+  the operator's chosen format — <code>timer : description - icon</code>:
+  <code>0:42 : delegating to the worker node · decompose query… - 🔧</code>. The icon is TEXT-sized
+  (0.85rem) and belongs to the line itself. Placement iterated three times with the operator: v1 breadcrumb
+  trail inside the bubble (rejected), v2 caption next to the center-stage 2.2rem activity icon (rejected — the
+  stage icon dwarfed it), v3 final as above. The element survives <code>/clear</code>/history repaints because
+  each turn re-adopts the same parked node via <code>insertAdjacentElement</code>. <strong>The center-stage
+  <code>#activity-icon</code> itself was then REMOVED in the same session</strong> ("remove the icon from the
+  middle") — element, container, dwell/priority arbitration tables, flash/fade logic, and the zen-mode scale
+  rule all excised; the status line is now the only per-turn icon surface, ambient activity still animates the
+  face itself, and <code>updateStateFromIcon</code> survives purely as the face's working-state driver.
+  <strong>Corridor filtering:</strong> background work (self-play, dreams) streams on the same socket with its
+  own request ids — on send the line adopts the id of the FIRST "request started" corridor that opens (ours:
+  the POST fires it within ~a second; an already-open corridor can never be adopted) and only lines carrying
+  that id update the caption. <code>TICKER_VERBS</code> maps common step titles to friendly phrasings
+  ("scanning the workspace", "verifying the answer"), with the line's detail column appended for specificity
+  ("reading a file · solution.py"); <code>TICKER_NOISE</code> plumbing titles never show; think-class lines
+  caption as "thinking… - 💭" and the first content chunk flips to "writing the reply… - 💬". One idempotent
+  teardown in <code>toggleSendButtonUI(false)</code> hides it on every request path's end. Verified with a
+  live turn (under-bubble placement, caption lifecycle thinking → worker verify → verifier-escalation,
+  counting clock, hide-on-finish, zero JS errors; throwaway session deleted). Pins:
+  <code>tests/test_interface_workspace.py::test_turn_status_line</code>.</p>
+
   <h2>Live log console (2026-07-13)</h2>
   <p>A terminal-icon header button (<code>#logs-btn</code>) toggles a bottom-drawer console (<code>#log-console</code>) that renders the agent's pretty-log stream in near-realtime. No new transport: the same WebSocket <code>type:"log"</code> frames that drive the face's activity envelope and the planner monologue feed a 500-entry ring buffer, which collects <em>even while the drawer is closed</em> — opening shows recent history instead of starting blind. Lines are ANSI-stripped client-side (the server broadcasts raw pretty-stream lines), rendered as dim monospace with a jewel-accent left border from the same icon→color mapping the face uses, errors tinted crimson. Auto-scroll follows the tail until the user scrolls up; a "paused — N new" pill offers jump-to-live; DOM is capped at the buffer size. Drawer sits at <code>z-index:90</code> (below <code>#render-window</code>), respects <code>env(safe-area-inset-bottom)</code> on phones. Verified live headlessly (marker appended to the agent log appeared in the open drawer; history survived close/reopen). Pins: <code>tests/test_interface_log_console.py</code>.</p>
 

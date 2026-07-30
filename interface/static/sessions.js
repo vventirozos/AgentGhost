@@ -19,6 +19,8 @@ export function initSessions(ctx) {
     const noteEl = document.getElementById('rail-note');
     const searchEl = document.getElementById('session-search');
     const newBtn = document.getElementById('new-chat-btn');
+    const footerEl = document.getElementById('rail-footer');
+    const deleteAllBtn = document.getElementById('delete-all-sessions-btn');
 
     let enabled = null;          // null = unknown yet
     let sessions = [];           // summaries, most recent first
@@ -66,6 +68,11 @@ export function initSessions(ctx) {
         if (!shown.length && !currentId) {
             listEl.appendChild(el('div', 'session-empty',
                 'No sessions yet. Start a conversation and it lands here.'));
+        }
+        // The destructive footer only exists when there is something to
+        // destroy (and sessions are enabled at all).
+        if (footerEl) {
+            footerEl.classList.toggle('hidden', !(enabled && sessions.length > 0));
         }
     }
 
@@ -186,6 +193,71 @@ export function initSessions(ctx) {
             toast(`Delete failed: ${e.message}`, 'error');
         }
     }
+
+    // ── Delete ALL sessions (2026-07-29) ───────────────────────────
+    // Two-step armed confirm instead of window.confirm: the first click
+    // arms the button (it turns danger-red and says so), the second
+    // click within 4s executes; anything else — timeout, pointer leaving
+    // the rail — disarms. A stray click can never wipe the strata, and
+    // no browser dialog breaks the UI's flow. Deletion iterates the
+    // enumerated per-id proxy (DELETE /api/sessions/{id}) — deliberately
+    // no bulk endpoint, the LAN-reachable surface stays as it is.
+    let deleteAllArmTimer = null;
+
+    function disarmDeleteAll() {
+        clearTimeout(deleteAllArmTimer);
+        deleteAllArmTimer = null;
+        if (deleteAllBtn) {
+            deleteAllBtn.classList.remove('armed');
+            deleteAllBtn.textContent = 'Delete all sessions';
+        }
+    }
+
+    async function deleteAllSessions() {
+        disarmDeleteAll();
+        if (Core.isProcessing()) {
+            toast('Wait for the current turn to finish first', 'error');
+            return;
+        }
+        const targets = sessions.slice();
+        if (!targets.length) return;
+        if (deleteAllBtn) deleteAllBtn.disabled = true;
+        let failed = 0;
+        for (const s of targets) {
+            try {
+                const res = await fetch(`/api/sessions/${encodeURIComponent(s.id)}`,
+                    { method: 'DELETE' });
+                if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
+                sessions = sessions.filter(x => x.id !== s.id);
+            } catch (e) {
+                failed++;
+            }
+        }
+        if (deleteAllBtn) deleteAllBtn.disabled = false;
+        // The active conversation was among the deleted (or never
+        // persisted) — start clean either way, same as deleting the
+        // current session individually.
+        Core.clearConversation();
+        setCurrent(mintId());
+        toast(failed
+            ? `Deleted ${targets.length - failed} session(s), ${failed} failed`
+            : `Deleted ${targets.length} session(s)`,
+            failed ? 'error' : undefined);
+    }
+
+    deleteAllBtn?.addEventListener('click', () => {
+        if (deleteAllBtn.classList.contains('armed')) {
+            deleteAllSessions();
+            return;
+        }
+        deleteAllBtn.classList.add('armed');
+        deleteAllBtn.textContent = `Really delete all ${sessions.length}? Click again`;
+        clearTimeout(deleteAllArmTimer);
+        deleteAllArmTimer = setTimeout(disarmDeleteAll, 4000);
+    });
+    // Leaving the rail disarms — walking away is a "no".
+    document.getElementById('session-rail')
+        ?.addEventListener('pointerleave', disarmDeleteAll);
 
     function scheduleRefresh() {
         clearTimeout(refreshTimer);

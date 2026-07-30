@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=6.7';
+import * as matrixGraphFace from './matrix_graph.js?v=7.6';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -17,7 +17,6 @@ let activeFace = matrixGraphFace;
 const chatLog = document.getElementById('chat-log');
 const chatInput = document.getElementById('chat-input');
 const sendBtn = document.getElementById('send-btn');
-const activityIcon = document.getElementById('activity-icon');
 const fullscreenBtn = document.getElementById('fullscreen-btn');
 const statusText = document.getElementById('status-text');
 const connectionDot = document.getElementById('connection-dot');
@@ -183,27 +182,11 @@ const ICON_CLASS = {
     '🔥': 'accent',
 };
 
-// Minimum time an icon of a given class stays "locked" against lower
-// priorities. So: a 🐍 (tool) sticks for 4s even if a 🧠 (think) arrives
-// 500 ms later — after 4s, think can take over. Accent icons flash but
-// don't lock (their job is to briefly assert, not dominate).
-const ICON_DWELL_MS = {
-    accent: 1400,
-    tool:   4500,
-    memory: 3000,
-    plan:   2000,
-    think:   600,
-    idle:    800,
-};
-
-// Numeric priority for comparisons. Higher = harder to preempt.
-const ICON_PRIORITY = {
-    accent: 5, tool: 4, memory: 3, plan: 2, think: 1, idle: 0,
-};
+// (The dwell/priority tables that arbitrated the center-stage
+// #activity-icon left with it, 2026-07-29 — the turn status line shows
+// the CURRENT corridor step verbatim, no arbitration needed.)
 
 function _iconClass(icon) { return ICON_CLASS[icon] || 'think'; }
-function _iconPriority(icon) { return ICON_PRIORITY[_iconClass(icon)]; }
-function _iconDwell(icon) { return ICON_DWELL_MS[_iconClass(icon)]; }
 
 // Used elsewhere (setWorkingState gating). "Working" = the agent is
 // actively doing something a user cares to watch; true for everything
@@ -241,6 +224,9 @@ const SEND_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" st
 const CANCEL_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`;
 
 function toggleSendButtonUI(isProcessing) {
+    // Every request path (chat, voice, resume) ends through here with
+    // false — one idempotent hook covers all ticker teardown.
+    if (!isProcessing) stopTurnTicker();
     if (sendBtn) {
         if (isProcessing) {
             sendBtn.innerHTML = CANCEL_SVG;
@@ -343,6 +329,9 @@ function connectWebSocket() {
                 // Feed the live log console's ring buffer (renders only
                 // while the drawer is open; collects regardless).
                 pushLogEntry(data.content, data.is_error);
+                // …and the in-turn activity ticker (no-op unless a turn
+                // is showing its typing indicator right now).
+                noteTickerLine(data.content);
 
                 // Log lines feed the face's activity ENVELOPE — a small
                 // energy contribution each, smoothed inside matrix_graph —
@@ -358,14 +347,12 @@ function connectWebSocket() {
                 }
 
                 if (icon) {
-                    updateActivityIcon(icon);
                     updateStateFromIcon(icon);
                     // Genuine failures only: ⚠️ warnings are routine (node
                     // fallbacks, heals) and kept tinting the face on
                     // ordinary healthy turns.
                     if (['❌', '🛑', '🔥'].includes(icon)) activeFace.triggerSpike();
                 }
-                flashActivityIcon();
                 if (data.is_error) activeFace.triggerSpike();
 
                 // Check for Planner Monologue
@@ -581,78 +568,12 @@ function getIconColor(icon) {
     return _ICON_CLASS_COLOR[_iconClass(icon)] || _ICON_CLASS_COLOR.think;
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Activity icon — priority-gated replacement
-//
-//  Previously this function referenced a `resuming` variable that
-//  only existed inside sendMessage's closure, so every call from the
-//  WebSocket log handler threw ReferenceError (silently caught by
-//  ws.onmessage). The activity icon was effectively only ever
-//  updated from sendMessage, which hardcodes '🧠' — that's why the
-//  user saw 🧠 almost all the time regardless of agent activity.
-//
-//  Replacement is priority-gated by dwell time: a high-priority icon
-//  (tool, memory) locks the slot for its dwell window so a stream of
-//  ubiquitous low-priority 🧠 logs can't clobber it before the user
-//  sees it. Same-class icons always replace (so 🐍 → 🐚 swaps promptly).
-// ═══════════════════════════════════════════════════════════════
-
-let iconHideTimeout;
-let _currentMainIcon = '';
-let _currentMainClass = 'think';
-let _currentMainSetAt = 0;
-
-function updateActivityIcon(icon) {
-    if (!activityIcon || !icon) return;
-
-    const now = performance.now();
-    const newClass = _iconClass(icon);
-    const newPri = _iconPriority(icon);
-    const curPri = ICON_PRIORITY[_currentMainClass] || 0;
-    const elapsed = now - _currentMainSetAt;
-    const dwell = _iconDwell(_currentMainIcon) || 0;
-
-    // Priority gate:
-    //   * Empty slot → always take it.
-    //   * Same-or-higher priority → take it.
-    //   * Lower priority → only after the current icon's dwell expired.
-    let accept;
-    if (!_currentMainIcon) accept = true;
-    else if (newPri >= curPri) accept = true;
-    else accept = elapsed >= dwell;
-
-    if (!accept) return;
-
-    _currentMainIcon = icon;
-    _currentMainClass = newClass;
-    _currentMainSetAt = now;
-    activityIcon.textContent = icon;
-    activityIcon.style.opacity = '1';
-    // Color the main glow to match the class so the user can learn
-    // the palette (magenta=tool, orange=memory, cyan=think, etc.).
-    activityIcon.style.filter = `drop-shadow(0 0 15px ${getIconColor(icon)})`;
-    clearTimeout(iconHideTimeout);
-
-    if (!isProcessingRequest) {
-        // Idle auto-fade: long enough that a WORKING icon is still
-        // visible after the burst, short enough that stale icons
-        // don't linger forever. No more 60s-on-a-🧠 dominance.
-        const timeoutDuration = dwell + 1500;
-        iconHideTimeout = setTimeout(() => {
-            if (!isProcessingRequest) {
-                activityIcon.style.opacity = '0';
-                setTimeout(() => {
-                    if (activityIcon.style.opacity === '0') {
-                        activityIcon.textContent = '';
-                        activityIcon.style.opacity = '1';
-                        _currentMainIcon = '';
-                        _currentMainClass = 'think';
-                    }
-                }, 300);
-            }
-        }, timeoutDuration);
-    }
-}
+// The center-stage #activity-icon was REMOVED 2026-07-29 (operator:
+// "remove the icon from the middle") — the turn status line under the
+// waiting reply bubble carries the per-turn icon now, and ambient
+// activity still animates the face itself. updateStateFromIcon stays:
+// it drives the FACE's working state from the log stream, icon element
+// or not.
 
 let workTimer;
 function updateStateFromIcon(icon) {
@@ -660,27 +581,15 @@ function updateStateFromIcon(icon) {
 
     if (WORKING_ICONS.has(icon)) {
         activeFace.setWorkingState(true);
-        if (activityIcon) activityIcon.classList.add('working');
         clearTimeout(workTimer);
         workTimer = setTimeout(() => {
             if (!isProcessingRequest) {
                 activeFace.setWorkingState(false);
-                if (activityIcon) activityIcon.classList.remove('working');
             }
         }, 60000);
     } else if (IDLE_ICONS.has(icon)) {
         activeFace.setWorkingState(false);
-        if (activityIcon) activityIcon.classList.remove('working');
         clearTimeout(workTimer);
-    }
-}
-
-let iconTimeout;
-function flashActivityIcon() {
-    if (activityIcon && !activityIcon.classList.contains('working')) {
-        activityIcon.style.transform = "scale(1.2)";
-        clearTimeout(iconTimeout);
-        iconTimeout = setTimeout(() => { activityIcon.style.transform = "scale(1)"; }, 150);
     }
 }
 
@@ -1091,6 +1000,131 @@ chatInput.addEventListener('input', function () {
     this.style.height = this.scrollHeight + 'px';
 });
 
+// ═══════════════════════════════════════════════════════════════
+//  Turn status HUD (2026-07-29, v2 — operator direction)
+//
+//  The agent's turns routinely run 30-60s+ of tools + thinking before
+//  the first content token. Placement iterated twice with the
+//  operator: v1 breadcrumb inside the bubble (rejected), v2 next to
+//  the center-stage activity icon (rejected — the 2.2rem icon dwarfed
+//  the caption), v3 FINAL: a caption line re-parented directly UNDER
+//  the waiting reply bubble, format `timer : description - icon` with
+//  a text-sized icon of its own. (The big center-stage #activity-icon
+//  was removed entirely right after — same operator session.)
+//
+//  Corridor filtering: background work (self-play, dreams) streams
+//  over the same socket with its own request ids. On send we adopt the
+//  id of the FIRST "request started" corridor that opens (ours — the
+//  POST fires it within ~a second; a corridor already open when we
+//  sent can never be adopted) and only lines carrying that id update
+//  the description; until adoption only the clock runs.
+// ═══════════════════════════════════════════════════════════════
+
+// Titles that narrate plumbing, not progress — never shown.
+const TICKER_NOISE = new Set([
+    'prefill cache', 'memory bus', 'llm request',
+    'constraint check', 'metacog conf', 'turn outcome', 'agent parser',
+]);
+// Friendly phrasings for the most common step titles; anything not
+// listed falls back to the raw title (already short and readable).
+const TICKER_VERBS = {
+    'worker compute': 'delegating to the worker node',
+    'sandbox tree': 'scanning the workspace',
+    'sandbox exec': 'running a command',
+    'execution task': 'executing code',
+    'file read': 'reading a file',
+    'file write': 'writing a file',
+    'web search': 'searching the web',
+    'web read': 'reading a page',
+    'browser': 'driving the browser',
+    'verifier': 'verifying the answer',
+    'memory search': 'recalling memories',
+    'memory save': 'saving a memory',
+    'graph updated': 'updating the knowledge graph',
+    'belief revision': 'revisiting a belief',
+    'hydrated context': 'gathering context',
+    'system weather': 'checking the weather',
+    'vision': 'looking at an image',
+    'delegation': 'delegating a subtask',
+};
+const turnStatusEl = document.getElementById('turn-status');
+const turnStatusDescEl = document.getElementById('turn-status-desc');
+const turnStatusClockEl = document.getElementById('turn-status-clock');
+const turnStatusIconEl = document.getElementById('turn-status-icon');
+let tickerTimer = null, tickerStart = 0, tickerReqId = null;
+
+function startTurnTicker(afterEl) {
+    stopTurnTicker();
+    if (!turnStatusEl) return;
+    tickerStart = Date.now();
+    tickerReqId = null;
+    turnStatusDescEl.textContent = 'starting…';
+    turnStatusClockEl.textContent = '0:00';
+    turnStatusIconEl.textContent = '⏳';
+    // Re-parent under the waiting reply bubble (the element survives
+    // detachment by /clear or history repaints — appendChild re-adopts
+    // the same node wherever the current bubble lives).
+    if (afterEl && afterEl.insertAdjacentElement) {
+        afterEl.insertAdjacentElement('afterend', turnStatusEl);
+    }
+    turnStatusEl.classList.remove('hidden');
+    tickerTimer = setInterval(() => {
+        const s = Math.floor((Date.now() - tickerStart) / 1000);
+        turnStatusClockEl.textContent =
+            `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    }, 1000);
+}
+
+function stopTurnTicker() {
+    clearInterval(tickerTimer);
+    tickerTimer = null;
+    tickerReqId = null;
+    if (turnStatusEl) turnStatusEl.classList.add('hidden');
+}
+
+function setTurnStatusDesc(text, icon) {
+    if (!tickerTimer) return;
+    if (turnStatusDescEl) turnStatusDescEl.textContent = text;
+    if (icon && turnStatusIconEl) turnStatusIconEl.textContent = icon;
+}
+
+function noteTickerLine(raw) {
+    if (!tickerTimer) return;                       // no turn in flight
+    const clean = cleanLogLine(raw);
+    // Corridor adoption: the first corridor that OPENS after our send.
+    if (tickerReqId === null) {
+        if (/request started/.test(clean)) {
+            const m = clean.match(/^\S+\s+(\S+)\s/);
+            if (m) tickerReqId = m[1];
+        }
+        return;
+    }
+    // Body lines: │  <id>  <icon>  <+delta>  <title>  <content…>
+    const parts = clean.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
+    if (parts.length < 3 || parts[1] !== tickerReqId) return;
+    const icon = extractIcon(clean);
+    if (!icon) return;
+    const cls = _iconClass(icon);
+    if (cls === 'think') {
+        // Long reasoning stretches between tools: say so instead of
+        // leaving the last tool's caption to go stale.
+        setTurnStatusDesc('thinking…', '💭');
+        return;
+    }
+    if (cls !== 'tool' && cls !== 'memory' && cls !== 'plan' && cls !== 'accent') return;
+    const iconIdx = parts.findIndex(p => p.includes(icon));
+    if (iconIdx < 0) return;
+    let ti = iconIdx + 1;
+    if (/^\+[\d.\s]*m?s$/.test(parts[ti] || '')) ti++;
+    const title = (parts[ti] || '').toLowerCase().slice(0, 22).trim();
+    if (!title || TICKER_NOISE.has(title)) return;
+    let desc = TICKER_VERBS[title] || title;
+    // Specificity when the line carries it ("reading a file · foo.py").
+    const detail = parts.slice(ti + 1).join(' ').trim();
+    if (detail) desc += ` · ${detail.slice(0, 30)}${detail.length > 30 ? '…' : ''}`;
+    setTurnStatusDesc(desc, icon);
+}
+
 async function sendMessage(isResume = false) {
     const resuming = isResume === true;
     const text = chatInput.value.trim();
@@ -1158,6 +1192,9 @@ async function sendMessage(isResume = false) {
         _ind.appendChild(document.createElement('span'));
         currentAgentMessageDiv.appendChild(_ind);
         chatLog.appendChild(currentAgentMessageDiv);
+        // Turn status line under the waiting bubble (`timer :
+        // description - icon`) — see the Turn status block above.
+        startTurnTicker(currentAgentMessageDiv);
         scrollToBottom();
         currentThinkingInterval = null;
     } else {
@@ -1178,19 +1215,6 @@ async function sendMessage(isResume = false) {
     if (ws && ws.readyState === WebSocket.OPEN) {
         setConnectionState('busy', 'PROCESSING…');
     }
-    if (activityIcon && !resuming) {
-        clearTimeout(iconHideTimeout);
-        // Reset the priority gate so this turn's first WS event can
-        // take over immediately — otherwise the 🧠 "think" floor we
-        // set here would lock for its dwell time and suppress the
-        // real first-event icon (🧭 route, 📋 plan, etc.).
-        _currentMainIcon = '';
-        _currentMainClass = 'think';
-        _currentMainSetAt = 0;
-        updateActivityIcon('🧠');
-        activityIcon.classList.add('working');
-    }
-
     try {
         // Deliberately omit `model`: the agent validates a supplied model
         // name against its single configured model and returns 404
@@ -1280,6 +1304,9 @@ async function sendMessage(isResume = false) {
                             // content starts streaming in.
                             currentAgentMessageDiv.classList.remove('thinking');
                             currentAgentMessageDiv.textContent = "";
+                            // From here the reply itself is the story —
+                            // the caption says so until turn end.
+                            setTurnStatusDesc('writing the reply…', '💬');
                         }
 
                         currentAccumulatedContent += chunkContent;
@@ -1410,10 +1437,6 @@ async function sendMessage(isResume = false) {
         if (ws && ws.readyState === WebSocket.OPEN) {
             setConnectionState('online', 'SYSTEM ONLINE');
         }
-        if (activityIcon && !resuming) {
-            activityIcon.classList.remove('working');
-            updateActivityIcon('✅');
-        }
         setTimeout(scrollToBottom, 100);
 
         // Auto-hide planner monologue 2 seconds after reply
@@ -1453,15 +1476,108 @@ if (fullscreenBtn) {
     fullscreenBtn.addEventListener('click', () => { document.body.classList.toggle('zen-mode'); });
 }
 
-// Cycle the face between its alien forms (abyssal / horizon / cortex).
-// The choice persists in localStorage inside matrix_graph.
+// Face-form picker (2026-07-29 — replaced the blind cycle: at 9 forms,
+// reaching the one you wanted took up to 8 clicks × 1.4s reorganization
+// blends, each through a form you didn't ask for). The button now opens
+// a menu built from matrix_graph's own roster (getForms — a form added
+// there appears here with no edit), current form highlighted, one click
+// jumps straight to it. Falls back to the old cycle if the face module
+// predates getForms/setForm (stale cache).
+const FACE_FORM_HINTS = {
+    abyssal: 'deep-sea creature',
+    horizon: 'collapsing orbits',
+    cortex: 'neural lobes',
+    vortex: 'black hole',
+    lattice: 'weight tensor',
+    stack: 'transformer',
+    embedding: 'latent space',
+    descent: 'loss landscape',
+    cube: 'infinite monolith',
+    empty: 'no face',
+};
 const faceFormBtn = document.getElementById('face-form-btn');
+let faceFormMenu = null;
+
+function closeFaceFormMenu() {
+    if (faceFormMenu) faceFormMenu.classList.add('hidden');
+}
+
+function buildFaceFormMenu() {
+    if (faceFormMenu) return faceFormMenu;
+    faceFormMenu = document.createElement('div');
+    faceFormMenu.id = 'face-form-menu';
+    faceFormMenu.className = 'hidden';
+    faceFormMenu.setAttribute('role', 'menu');
+    faceFormMenu.setAttribute('aria-label', 'Face form');
+    for (const name of activeFace.getForms()) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'face-form-item';
+        item.dataset.form = name;
+        item.setAttribute('role', 'menuitemradio');
+        const label = document.createElement('span');
+        label.className = 'face-form-name';
+        label.textContent = name;
+        item.appendChild(label);
+        const hint = document.createElement('span');
+        hint.className = 'face-form-hint';
+        hint.textContent = FACE_FORM_HINTS[name] || '';
+        item.appendChild(hint);
+        item.addEventListener('click', () => {
+            const picked = activeFace.setForm(name);
+            markActiveFaceForm();
+            closeFaceFormMenu();
+            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+            if (toast) toast(`Face form: ${picked}`);
+        });
+        faceFormMenu.appendChild(item);
+    }
+    document.body.appendChild(faceFormMenu);
+    // Outside click / Escape closes — standard menu manners.
+    document.addEventListener('click', (ev) => {
+        if (!faceFormMenu.classList.contains('hidden')
+            && !faceFormMenu.contains(ev.target)
+            && ev.target !== faceFormBtn && !faceFormBtn.contains(ev.target)) {
+            closeFaceFormMenu();
+        }
+    });
+    document.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') closeFaceFormMenu();
+    });
+    return faceFormMenu;
+}
+
+function markActiveFaceForm() {
+    if (!faceFormMenu) return;
+    const current = typeof activeFace.getForm === 'function' ? activeFace.getForm() : '';
+    for (const item of faceFormMenu.querySelectorAll('.face-form-item')) {
+        item.classList.toggle('active', item.dataset.form === current);
+        item.setAttribute('aria-checked', item.dataset.form === current ? 'true' : 'false');
+    }
+}
+
 if (faceFormBtn) {
     faceFormBtn.addEventListener('click', () => {
-        if (typeof activeFace.cycleForm !== 'function') return;
-        const name = activeFace.cycleForm();
-        const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
-        if (toast) toast(`Face form: ${name}`);
+        if (typeof activeFace.getForms !== 'function'
+            || typeof activeFace.setForm !== 'function') {
+            // Stale-cache fallback: the old blind cycle still works.
+            if (typeof activeFace.cycleForm !== 'function') return;
+            const name = activeFace.cycleForm();
+            const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+            if (toast) toast(`Face form: ${name}`);
+            return;
+        }
+        const menu = buildFaceFormMenu();
+        if (!menu.classList.contains('hidden')) {
+            closeFaceFormMenu();
+            return;
+        }
+        markActiveFaceForm();
+        // Anchor under the button, right-aligned to it, clamped on-screen.
+        const rect = faceFormBtn.getBoundingClientRect();
+        menu.style.top = `${Math.round(rect.bottom + 8)}px`;
+        menu.style.right = `${Math.max(8, Math.round(window.innerWidth - rect.right))}px`;
+        menu.classList.remove('hidden');
     });
 }
 
@@ -2874,6 +2990,6 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=6.7').catch(e =>
+import('./workspace.js?v=6.8').catch(e =>
     console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 

@@ -37,10 +37,16 @@ def test_pool_structure():
     arts = [t.artifact for t in ALL]
     assert len(arts) == len(set(arts)), "duplicate artifact names"
     assert all(t.cluster in _CLUSTERS for t in ALL)
-    assert all(t.ring in ("near", "mid", "far") for t in ALL)
+    # "comp" (§4F hardening, 2026-07-30) is the compositional-DEPTH axis —
+    # orthogonal to the near/mid/far TRANSFER distance of single-step tasks.
+    assert all(t.ring in ("near", "mid", "far", "comp") for t in ALL)
     assert len(BATTERY) >= 20
-    # far-transfer ring is exactly the held-out family, and vice versa
+    # Among single-step tasks, far-transfer ring is exactly the held-out
+    # family, and vice versa. Comp tasks may sit in ANY cluster including
+    # the held-out one (comp_web_table is deliberately both).
     for t in BATTERY:
+        if t.ring == "comp":
+            continue
         assert (t.ring == "far") == (t.cluster == "web_automation"), t.task_id
 
 

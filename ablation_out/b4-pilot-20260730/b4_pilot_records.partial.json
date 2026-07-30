@@ -1,0 +1,478 @@
+{
+  "da_group_sum": [
+    {
+      "task_id": "da_group_sum",
+      "cluster": "data_analysis",
+      "ring": "near",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 50.28241799992975,
+      "out": "Done. The file `b4_da_group_sum.txt` contains `3780`."
+    }
+  ],
+  "da_top_region": [
+    {
+      "task_id": "da_top_region",
+      "cluster": "data_analysis",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 53.43286299996544,
+      "out": "The region with the highest total amount is **east**. The answer has been written to `b4_da_top_region.txt`."
+    }
+  ],
+  "da_revenue": [
+    {
+      "task_id": "da_revenue",
+      "cluster": "data_analysis",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 76.66470820899121,
+      "out": "The total revenue is **11778**, written to `b4_da_revenue.txt`."
+    }
+  ],
+  "da_join_gold": [
+    {
+      "task_id": "da_join_gold",
+      "cluster": "data_analysis",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 57.59113587497268,
+      "out": "Done. The file `b4_da_join_gold.txt` contains `11449`."
+    }
+  ],
+  "rp_5xx_count": [
+    {
+      "task_id": "rp_5xx_count",
+      "cluster": "regex_parse",
+      "ring": "near",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 103.3437185420189,
+      "out": "Done \u2014 the file `b4_rp_5xx_count.txt` contains `62`, the count of 5xx requests from `access.log`."
+    }
+  ],
+  "rp_top_404_ip": [
+    {
+      "task_id": "rp_top_404_ip",
+      "cluster": "regex_parse",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 51.63940229197033,
+      "out": "Done. The file `b4_rp_top_404_ip.txt` contains `10.0.9.72`."
+    }
+  ],
+  "rp_err_codes": [
+    {
+      "task_id": "rp_err_codes",
+      "cluster": "regex_parse",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 52.264008249971084,
+      "out": "Done. The file `b4_rp_err_codes.txt` contains `8` \u2014 the count of distinct error codes matching `ERR-` followed by 4 digits."
+    }
+  ],
+  "sql_group_qty": [
+    {
+      "task_id": "sql_group_qty",
+      "cluster": "sql",
+      "ring": "near",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 93.65968504198827,
+      "out": "The constraint check notes that the query should use a `GROUP BY` clause. My original query used `WHERE` + `SUM` without `GROUP BY`. Let me redo it properly.\n\nT"
+    }
+  ],
+  "sql_having_avg": [
+    {
+      "task_id": "sql_having_avg",
+      "cluster": "sql",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 76.45100929192267,
+      "out": "Done. The file `b4_sql_having_avg.txt` contains `3` \u2014 three categories have an average price strictly greater than 40."
+    }
+  ],
+  "sql_join_hours": [
+    {
+      "task_id": "sql_join_hours",
+      "cluster": "sql",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 86.43721316603478,
+      "out": "The total hours logged by employees in dept 'eng' is **385**, written to `b4_sql_join_hours.txt`."
+    }
+  ],
+  "algo_kth_largest": [
+    {
+      "task_id": "algo_kth_largest",
+      "cluster": "algo",
+      "ring": "near",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 56.5806476669386,
+      "out": "Done. The file `b4_algo_kth_largest.txt` contains `1833`."
+    }
+  ],
+  "algo_longest_run": [
+    {
+      "task_id": "algo_longest_run",
+      "cluster": "algo",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 102.7083793329075,
+      "out": "The file `b4_algo_longest_run.txt` contains `4` \u2014 the length of the longest strictly increasing consecutive run in `sequence.txt`."
+    }
+  ],
+  "algo_merge_intervals": [
+    {
+      "task_id": "algo_merge_intervals",
+      "cluster": "algo",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 58.1827332500834,
+      "out": "Done. The file `b4_algo_merge_intervals.txt` contains `7`."
+    }
+  ],
+  "bash_error_count": [
+    {
+      "task_id": "bash_error_count",
+      "cluster": "bash",
+      "ring": "near",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 124.50313783297315,
+      "out": "The file `b4_bash_error_count.txt` contains `38` \u2014 the number of lines in `app.log` where the log level field is exactly `ERROR`."
+    }
+  ],
+  "bash_distinct_users": [
+    {
+      "task_id": "bash_distinct_users",
+      "cluster": "bash",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 35.28943579108454,
+      "out": "Done \u2014 `b4_bash_distinct_users.txt` contains `25`, the count of distinct users from `auth_app.log`."
+    }
+  ],
+  "bash_top_user": [
+    {
+      "task_id": "bash_top_user",
+      "cluster": "bash",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 39.708499250002205,
+      "out": "Done. The file `b4_bash_top_user.txt` contains `user68` \u2014 the user with the most lines (30) in `traffic_app.log`."
+    }
+  ],
+  "pg_wordfreq": [
+    {
+      "task_id": "pg_wordfreq",
+      "cluster": "python_general",
+      "ring": "near",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 51.25069249991793,
+      "out": "Done. The file `b4_pg_wordfreq.txt` contains `lantern`."
+    }
+  ],
+  "pg_dedupe_count": [
+    {
+      "task_id": "pg_dedupe_count",
+      "cluster": "python_general",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 106.02538799995091,
+      "out": "The file `b4_pg_dedupe_count.txt` contains `56` \u2014 the count of unique row IDs from `rows.txt`."
+    }
+  ],
+  "pg_jsonl_sum": [
+    {
+      "task_id": "pg_jsonl_sum",
+      "cluster": "python_general",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 46.395674541941844,
+      "out": "Done \u2014 `b4_pg_jsonl_sum.txt` contains `3209`."
+    }
+  ],
+  "conc_ordered_map": [
+    {
+      "task_id": "conc_ordered_map",
+      "cluster": "concurrency",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 50.21453320898581,
+      "out": "Done. The file `b4_conc_ordered_map.txt` contains the squared values in original order:\n\n`5476,8836,4900,400,225,2500,8281,81,5929,4356,4761,16,6561,7744,9801,4"
+    }
+  ],
+  "conc_worker_sum": [
+    {
+      "task_id": "conc_worker_sum",
+      "cluster": "concurrency",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 39.908035417087376,
+      "out": "Done. The total sum of all values in `work.txt` is **15125**, written to `b4_conc_worker_sum.txt`."
+    }
+  ],
+  "sql_dirty_join": [
+    {
+      "task_id": "sql_dirty_join",
+      "cluster": "sql",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 157.15663920808583,
+      "out": "Done \u2014 `b4_sql_dirty_join.txt` contains `6727`."
+    }
+  ],
+  "sql_third_category": [
+    {
+      "task_id": "sql_third_category",
+      "cluster": "sql",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 44.059321166947484,
+      "out": "Done. The file `b4_sql_third_category.txt` contains: `misc`"
+    }
+  ],
+  "sql_eng_payout": [
+    {
+      "task_id": "sql_eng_payout",
+      "cluster": "sql",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 94.89831066702027,
+      "out": "The total payout for employees in dept 'eng' is **9675**, written to `b4_sql_eng_payout.txt`."
+    }
+  ],
+  "algo_gap_count": [
+    {
+      "task_id": "algo_gap_count",
+      "cluster": "algo",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 95.9486383330077,
+      "out": "The file `b4_algo_gap_count.txt` contains `6`."
+    }
+  ],
+  "algo_second_mode": [
+    {
+      "task_id": "algo_second_mode",
+      "cluster": "algo",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 57.59572633297648,
+      "out": "Done. The file `b4_algo_second_mode.txt` contains `31`."
+    }
+  ],
+  "rp_api_4xx_business_hours": [
+    {
+      "task_id": "rp_api_4xx_business_hours",
+      "cluster": "regex_parse",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 66.19950358301867,
+      "out": "Done. The file `b4_rp_api_4xx_business_hours.txt` contains `33`."
+    }
+  ],
+  "rp_spread_ips": [
+    {
+      "task_id": "rp_spread_ips",
+      "cluster": "regex_parse",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 0,
+      "duration_s": 115.00617508299183,
+      "out": "The file `b4_rp_spread_ips.txt` contains `42` \u2014 the count of distinct IP addresses that made requests across at least 3 different hours."
+    }
+  ],
+  "pg_nested_urgent": [
+    {
+      "task_id": "pg_nested_urgent",
+      "cluster": "python_general",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 1,
+      "duration_s": 93.76308062497992,
+      "out": "Done. The file `b4_pg_nested_urgent.txt` contains `37` \u2014 the count of objects in `queue.jsonl` with `'urgent'` in `meta.tags` and a strictly positive `value`."
+    }
+  ],
+  "bash_top_error_event": [
+    {
+      "task_id": "bash_top_error_event",
+      "cluster": "bash",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 2,
+      "duration_s": 43.57123170909472,
+      "out": "Done. The file `b4_bash_top_error_event.txt` contains `event205` \u2014 the event ID appearing most frequently among ERROR lines in `service.log`."
+    }
+  ],
+  "conc_pool_squares": [
+    {
+      "task_id": "conc_pool_squares",
+      "cluster": "concurrency",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 2,
+      "duration_s": 88.12838358303998,
+      "out": "Done. The sum of squares of all values in `jobs.txt` is **2564281**, written to `b4_conc_pool_squares.txt`."
+    }
+  ],
+  "da_median_region": [
+    {
+      "task_id": "da_median_region",
+      "cluster": "data_analysis",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 2,
+      "duration_s": 66.45293416595086,
+      "out": "The region with the highest median amount is **north**. Saved to `b4_da_median_region.txt`."
+    }
+  ],
+  "da_best_week": [
+    {
+      "task_id": "da_best_week",
+      "cluster": "data_analysis",
+      "ring": "mid",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 2,
+      "duration_s": 62.96417454094626,
+      "out": "The file `b4_da_best_week.txt` has been written with the answer: **11**."
+    }
+  ],
+  "web_table_sum": [
+    {
+      "task_id": "web_table_sum",
+      "cluster": "web_automation",
+      "ring": "far",
+      "role": "probe",
+      "passed": true,
+      "why": "",
+      "artifact_found": true,
+      "mediated_lessons": 2,
+      "duration_s": 102.53092454106081,
+      "out": "Done \u2014 `b4_web_table_sum.txt` contains `1148`, the sum of the count column from `status_page.html`."
+    }
+  ]
+}

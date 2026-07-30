@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
@@ -174,6 +174,10 @@ class VerifyResult:
     # adjudicated ([{"quote","check","reason"}, ...]). None on the classic
     # single-stage path so downstream dict shapes are unchanged there.
     suspects: Optional[List[Dict[str, str]]] = None
+    # §4F Phase 3a: raw score-token expectation from the logit probe
+    # (p(acceptable) ∈ [0,1]), None when the probe is off/unavailable.
+    # Diagnostic — the blended value lands in `confidence`.
+    probe_score: Optional[float] = None
 
     def passed(self) -> bool:
         return self.verdict == VerifyVerdict.CONFIRMED
@@ -291,6 +295,119 @@ Do NOT refute the CLAIM for weaknesses of the EVIDENCE pipeline itself — tool 
 
 Be terse: each "why" and each issue at most 20 words, reasoning at most one short sentence. Fill "checks" FIRST — one entry per suspect, in order, deciding each against the EVIDENCE — before the verdict fields. Respond ONLY with a MINIFIED single-line JSON object — no code fences, no prose before or after, no extra keys. Your response MUST start with the character {{ and contain no newlines:
 {{"checks": [{{"suspect": 1, "real": true, "why": "checked against which tool output, found what"}}], "extra_problems": ["REAL problems the suspects missed; empty if none"], "verdict": "CONFIRMED|REFUTED|UNCERTAIN", "confidence": 0.0-1.0, "reasoning": "one short sentence", "issues": ["each REAL problem; empty if none"]}}"""
+
+# ── Logit-expectation score probe (§4F Phase 3a) ─────────────────────
+# After a two-stage verdict parses, one tiny extra call asks the judge
+# for a single acceptability digit 0-9 with top-logprobs; the EXPECTATION
+# over the digit distribution is a continuous p(acceptable) that sharpens
+# `confidence` (the self-reported value saturates near 1.0 — see the
+# bench's mean-conf columns). Verdicts are NEVER changed by the probe;
+# only confidence is blended, and any probe failure leaves the result
+# exactly as it was. Default OFF until verify_bench shows a win
+# (GHOST_VERIFY_LOGIT_EXPECT=1 to enable; read per call so the bench can
+# A/B it via env).
+
+
+def _logit_expect_enabled() -> bool:
+    return os.getenv("GHOST_VERIFY_LOGIT_EXPECT", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+_VERIFY_SCORE_PROBE_PROMPT = """You are auditing an agent's reply. Rate how likely the CLAIM is an acceptable reply to the USER REQUEST given only the EVIDENCE.
+
+CLAIM:
+{claim}
+
+EVIDENCE:
+{evidence}
+
+USER REQUEST:
+{context}
+
+Scale: 0 = certainly unacceptable (fabricated, contradicted, off-topic), 9 = certainly acceptable (supported and responsive).
+Respond with ONLY one digit 0-9. No other text."""
+
+
+def _digit_expectation(top_logprobs: List[Dict[str, Any]]) -> Optional[float]:
+    """Expectation over digit tokens in one position's top-logprobs list
+    ([{"token": str, "logprob": float}, ...]) → score in [0,1], or None
+    when no digit mass is present."""
+    import math
+
+    num = 0.0
+    den = 0.0
+    for entry in top_logprobs or []:
+        if not isinstance(entry, dict):
+            continue
+        tok = str(entry.get("token", "")).strip()
+        lp = entry.get("logprob")
+        if len(tok) == 1 and tok.isdigit() and lp is not None:
+            p = math.exp(float(lp))
+            num += int(tok) * p
+            den += p
+    if den <= 0.0:
+        return None
+    return max(0.0, min(1.0, (num / den) / 9.0))
+
+
+# ── GEPA-tunable stage templates (§4F Phase 2) ───────────────────────
+# The two-stage prompts above are optimizable text assets. Resolution
+# order: _TEMPLATE_OVERRIDES (in-process hook used by the offline
+# optimizer while evaluating candidates) → GEPA artifact on disk
+# (optim.loader, which also feeds the learning-health activation
+# counters) → the baseline constant. A tuned template is accepted ONLY
+# if a probe-format with dummy values succeeds — this rejects candidates
+# that lost a placeholder OR broke the {{ }} JSON-brace escaping, which
+# would otherwise raise inside verify_claim at runtime (the fail-open
+# parser class). Rejection falls back to the baseline and logs.
+
+_TEMPLATE_PLACEHOLDERS: Dict[str, Tuple[str, ...]] = {
+    "verifier.enumerate": ("claim", "evidence", "context"),
+    "verifier.adjudicate": ("claim", "evidence", "context", "suspects"),
+}
+
+# Offline-optimizer hook: {"verifier.enumerate": "<template>", ...}.
+# Never set on a live agent — candidates go through the loader artifact
+# + restart path in production.
+_TEMPLATE_OVERRIDES: Dict[str, str] = {}
+
+
+def _validate_stage_template(name: str, template: str) -> bool:
+    """True iff `template` format-probes cleanly with this stage's
+    placeholders — catches missing/renamed placeholders, stray unescaped
+    braces, and unknown fields in one check."""
+    fields = _TEMPLATE_PLACEHOLDERS.get(name, ())
+    try:
+        template.format(**{f: "x" for f in fields})
+        return all(("{%s}" % f) in template for f in fields)
+    except Exception:
+        return False
+
+
+def _stage_template(name: str, baseline: str) -> str:
+    """Resolve the live template for stage `name` (see block comment)."""
+    override = _TEMPLATE_OVERRIDES.get(name)
+    if override:
+        if _validate_stage_template(name, override):
+            return override
+        logger.warning(
+            "Verifier: override template %s failed placeholder probe — "
+            "using baseline", name)
+        return baseline
+    try:
+        from ..optim.loader import tuned_instruction
+        tuned = tuned_instruction(name, "")
+    except Exception:
+        return baseline
+    if not tuned:
+        return baseline
+    if not _validate_stage_template(name, tuned):
+        logger.warning(
+            "Verifier: tuned template %s failed placeholder probe — "
+            "using baseline", name)
+        return baseline
+    return tuned
+
 
 _VERIFY_CODE_PROMPT = """You are a code output auditor. Determine whether the agent's RESPONSE actually answers the user's INTENT — including any explicit constraints in the user's wording.
 
@@ -708,6 +825,53 @@ class Verifier:
                 f'{i}. [{s["check"]}] "{s["quote"]}" — {s["reason"]}')
         return "\n".join(lines)
 
+    async def _verdict_score_probe(self, claim: str, evidence: str,
+                                   context: str) -> Optional[float]:
+        """One bounded score-token call → p(acceptable) ∈ [0,1] via digit
+        expectation (§4F Phase 3a). Never raises; None on any failure.
+        Always rides a cheap pool (the probe is advisory — it must not
+        cost a main-slot round-trip)."""
+        if not self.llm_client:
+            return None
+        try:
+            from .entropy import request_logprobs
+            payload = {
+                "messages": [{"role": "user", "content":
+                              _VERIFY_SCORE_PROBE_PROMPT.format(
+                                  claim=claim, evidence=evidence,
+                                  context=context) + "\n\n/no_think"}],
+                "temperature": 0.0,
+                "max_tokens": 4,
+                "stream": False,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+            request_logprobs(payload, top_k=10)
+            kwargs: Dict[str, Any] = {"timeout": 30.0}
+            if getattr(self.llm_client, "critic_clients", None):
+                kwargs["use_critic"] = True
+            else:
+                kwargs["use_worker"] = True
+            res = await self.llm_client.chat_completion(payload, **kwargs)
+            choice = ((res or {}).get("choices") or [{}])[0]
+            content_lp = ((choice.get("logprobs") or {}).get("content")
+                          or [])
+            for entry in content_lp:
+                tok = str((entry or {}).get("token", "")).strip()
+                if tok and (tok.isdigit() or entry.get("top_logprobs")):
+                    score = _digit_expectation(
+                        entry.get("top_logprobs") or [])
+                    if score is not None:
+                        return score
+            # No usable distribution — fall back to the emitted digit
+            # (still a probe reading, just not an expectation).
+            text = str(choice.get("message", {}).get("content", "") or "")
+            for ch in text.strip()[:3]:
+                if ch.isdigit():
+                    return int(ch) / 9.0
+        except Exception as exc:
+            logger.debug("Verifier score probe failed: %s", exc)
+        return None
+
     async def _verify_claim_two_stage(self, claim: str, evidence: str,
                                       context: str,
                                       force_main: bool = False
@@ -719,7 +883,8 @@ class Verifier:
         the two-stage pipeline must never make the verifier LESS available
         than it was before.
         """
-        enum_prompt = _VERIFY_ENUMERATE_PROMPT.format(
+        enum_prompt = _stage_template(
+            "verifier.enumerate", _VERIFY_ENUMERATE_PROMPT).format(
             claim=claim, evidence=evidence, context=context)
         stage1 = await self._call_llm(enum_prompt, temperature=0.1, force_main=force_main,
                                       max_tokens=_STAGE_MAX_TOKENS,
@@ -732,7 +897,8 @@ class Verifier:
                          "falling back to single-stage")
             return None
 
-        adj_prompt = _VERIFY_ADJUDICATE_PROMPT.format(
+        adj_prompt = _stage_template(
+            "verifier.adjudicate", _VERIFY_ADJUDICATE_PROMPT).format(
             claim=claim, evidence=evidence, context=context,
             suspects=self._format_suspects_block(suspects))
         stage2 = await self._call_llm(adj_prompt, temperature=0.1, force_main=force_main,
@@ -744,6 +910,20 @@ class Verifier:
                          "falling back to single-stage")
             return None
         result.suspects = suspects
+
+        # §4F Phase 3a: sharpen confidence with the score-token probe.
+        # The verdict itself is untouched; UNCERTAIN is excluded (the
+        # acceptability scale doesn't map onto "cannot judge").
+        if (_logit_expect_enabled()
+                and result.verdict in (VerifyVerdict.CONFIRMED,
+                                       VerifyVerdict.REFUTED)):
+            probe = await self._verdict_score_probe(claim, evidence, context)
+            if probe is not None:
+                result.probe_score = round(probe, 3)
+                aligned = (probe if result.verdict == VerifyVerdict.CONFIRMED
+                           else 1.0 - probe)
+                result.confidence = round(
+                    0.5 * float(result.confidence) + 0.5 * aligned, 3)
         return result
 
     async def verify_claim(self, claim: str, evidence: str,

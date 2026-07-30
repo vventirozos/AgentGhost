@@ -25,6 +25,17 @@ logger = logging.getLogger("GhostAgent")
 # signature_name -> tuned instruction str (or None when absent/invalid)
 _CACHE: Dict[str, Optional[str]] = {}
 
+# Activation telemetry: how often each signature's prompt-build actually
+# APPLIED a tuned instruction vs fell back to the hand-written baseline.
+# The dominant failure mode of harness additions is the component silently
+# never firing (this exact loop was write-only once already) — so activation
+# is counted at the only chokepoint every read-site goes through, and
+# surfaced via learning-health. In-process counters: they reset on restart,
+# which is fine — "zero applies since boot despite a tuned file on disk"
+# is precisely the signal we are after.
+_APPLIED_COUNTS: Dict[str, int] = {}
+_FALLBACK_COUNTS: Dict[str, int] = {}
+
 
 def _optim_dir() -> Path:
     """`$GHOST_HOME/system/optim` — the SAME path scripts/run_gepa.py writes to
@@ -41,6 +52,10 @@ def tuned_instruction(signature_name: str, default: str = "") -> str:
         return default
     if signature_name in _CACHE:
         cached = _CACHE[signature_name]
+        if cached:
+            _APPLIED_COUNTS[signature_name] = _APPLIED_COUNTS.get(signature_name, 0) + 1
+        else:
+            _FALLBACK_COUNTS[signature_name] = _FALLBACK_COUNTS.get(signature_name, 0) + 1
         return cached if cached else default
 
     value: Optional[str] = None
@@ -59,10 +74,35 @@ def tuned_instruction(signature_name: str, default: str = "") -> str:
         logger.debug("GEPA tuned_instruction('%s') load failed: %s", signature_name, e)
 
     _CACHE[signature_name] = value
+    if value:
+        _APPLIED_COUNTS[signature_name] = _APPLIED_COUNTS.get(signature_name, 0) + 1
+    else:
+        _FALLBACK_COUNTS[signature_name] = _FALLBACK_COUNTS.get(signature_name, 0) + 1
     return value if value else default
+
+
+def activation_stats() -> Dict[str, Dict[str, int]]:
+    """Per-signature tuned-vs-baseline application counts since process
+    start: ``{signature: {"applied": n, "fallback": m}}``. A signature with
+    a tuned file on disk but zero ``applied`` means the read-site is not
+    firing — the defect class this counter exists to catch."""
+    names = set(_APPLIED_COUNTS) | set(_FALLBACK_COUNTS)
+    return {
+        n: {
+            "applied": _APPLIED_COUNTS.get(n, 0),
+            "fallback": _FALLBACK_COUNTS.get(n, 0),
+        }
+        for n in sorted(names)
+    }
 
 
 def clear_cache() -> None:
     """Drop the in-process cache so the next lookup re-reads disk (e.g. after
-    an offline GEPA retrain produced new tuned files)."""
+    an offline GEPA retrain produced new tuned files).
+
+    ⚠ NEVER call on a live agent process: a mid-session reload changes the
+    prompt bytes under the KV stable-prefix pin and forces a full re-prime
+    every turn thereafter. Retrain offline, then deploy via restart.
+    Activation counters are deliberately NOT cleared — they describe the
+    process, not the cache."""
     _CACHE.clear()

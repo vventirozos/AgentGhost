@@ -496,6 +496,21 @@ async def _pilot(args, battery, seeding) -> int:
                 sent += 1
                 await _wait_arm_quiet(arm, sent, driver_tag=_DRIVER_TAG)
                 per_task[t.task_id].append(rec)
+                # Live verdict + incremental dump: a ceilinged pool must be
+                # visible DURING pass 1, not after three passes (the operator
+                # abort-check; also survives a killed run for post-mortem).
+                AE._log(f"  [{t.task_id}] "
+                        f"{'PASS' if rec['passed'] else 'FAIL'} "
+                        f"{rec['duration_s']:.0f}s"
+                        + ("" if rec["passed"]
+                           else f" — {rec['why'][:80]}"))
+                (logdir / "b4_pilot_records.partial.json").write_text(
+                    json.dumps(per_task, indent=2, default=str))
+            n_pass = sum(1 for t in battery
+                         if per_task[t.task_id]
+                         and per_task[t.task_id][-1]["passed"])
+            AE._log(f"=== pass {rep + 1} aggregate: {n_pass}/{len(battery)} "
+                    f"passed ({n_pass / max(1, len(battery)):.0%}) ===")
     finally:
         _teardown(arm)
     lines = ["# B4 pilot — candidate difficulty", ""]
@@ -514,11 +529,25 @@ async def _pilot(args, battery, seeding) -> int:
     lines.append(f"\nsurvivors: {len(survivors)}/{len(per_task)} → b4_battery.json")
     lines.append("(operator may hand-tune: a 3/3 task can stay if it probes a "
                  "cluster nothing else covers — see per-task rows above)")
+    # §4F Phase 0 hygiene for the acceptance-rule instrument: hash-stable
+    # PUBLIC/PRIVATE tier per surviving task (sidecar file — the battery
+    # list format is unchanged for existing consumers). Any optimizer or
+    # tuning loop may only ever see the public half; §4F phase verdicts
+    # are judged on the PRIVATE half. Membership never migrates as the
+    # pool changes (same mechanism as optim.trainset.split_public_private).
+    sys.path.insert(0, str(HERE.parent / "src"))
+    from ghost_agent.optim.trainset import holdout_tier  # noqa: E402
+    tiers = {tid: holdout_tier(f"b4:{tid}") for tid in survivors}
+    n_priv = sum(1 for v in tiers.values() if v == "private")
+    lines.append(f"tiers: {len(survivors) - n_priv} public / {n_priv} PRIVATE "
+                 "→ b4_battery_tiers.json (hash-stable; optimizers see only "
+                 "the public half, §4F verdicts judge the private half)")
     report = "\n".join(lines) + "\n"
     (logdir / "b4_pilot_report.md").write_text(report)
     (logdir / "b4_pilot_records.json").write_text(
         json.dumps(per_task, indent=2, default=str))
     (logdir / "b4_battery.json").write_text(json.dumps(survivors, indent=2))
+    (logdir / "b4_battery_tiers.json").write_text(json.dumps(tiers, indent=2))
     print(report)
     return 0
 
@@ -540,6 +569,10 @@ def main() -> int:
                     help="calibration mode: one control agent × --pilot-repeats "
                          "passes over ALL candidates; emits b4_battery.json")
     ap.add_argument("--pilot-repeats", type=int, default=3)
+    ap.add_argument("--only-ring", default="",
+                    help="pilot only tasks with this ring (e.g. 'comp' — "
+                         "re-calibrating new tasks without re-running a "
+                         "pool already measured as ceilinged)")
     ap.add_argument("--battery-file", default=None,
                     help="JSON list of task_ids (from the pilot) to probe with; "
                          "default = the full candidate pool")
@@ -548,6 +581,12 @@ def main() -> int:
 
     candidates = load_b4_battery()
     seeding = load_b4_seeding()
+    if getattr(args, "only_ring", ""):
+        candidates = [t for t in candidates if t.ring == args.only_ring]
+        if not candidates:
+            print(f"no candidates with ring={args.only_ring!r}",
+                  file=sys.stderr)
+            return 2
 
     if args.pilot:
         # --battery-file also filters PILOT candidates, so a re-pilot can
