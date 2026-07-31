@@ -117,6 +117,17 @@ def _tool_call_failed(tc) -> bool:
     return _looks_like_tool_error(getattr(tc, "result", "") or "")
 
 
+def tool_call_failed(tc) -> bool:
+    """Public alias for ``_tool_call_failed``.
+
+    Exists so other packages (skills_auto's honest-failure graduation
+    guard) can reuse THE failure sniffer instead of writing a second
+    one — a duplicated "did this tool fail?" rule is how the corpus and
+    the operator line came to disagree in the first place.
+    """
+    return _tool_call_failed(tc)
+
+
 def _looks_like_tool_error(result: str) -> bool:
     """Cheap text detector for "this tool call failed" — the FALLBACK when the
     structured ``ToolCall.error`` flag isn't set (legacy trajectories).

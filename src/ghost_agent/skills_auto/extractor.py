@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..distill.schema import Trajectory, ToolCall, Outcome
+from ..distill.outcome_heuristics import tool_call_failed
 
 
 @dataclass
@@ -59,6 +60,11 @@ class ExtractionReport:
     n_groups_considered: int = 0
     n_candidates_emitted: int = 0
     rejected_below_support: int = 0
+    # Honest-failure guard (2026-07-31): PASSED trajectories whose tool
+    # calls did not actually accomplish anything. Counted, not silent —
+    # a rising number means the outcome rule is admitting turns the
+    # skill pipeline should keep ignoring.
+    rejected_no_successful_tools: int = 0
 
 
 def summarize_tool_sequence(tool_calls: Iterable[ToolCall]) -> Tuple[str, ...]:
@@ -144,6 +150,19 @@ def extract_candidates(
             continue
         key = (t.cluster, seq)
         if t.outcome == Outcome.PASSED.value:
+            # Honest-failure guard (2026-07-31). Since the outcome rule
+            # started labelling "the tool broke and I said so" as PASSED
+            # (resolve_turn_outcome), a turn can be PASSED while having
+            # accomplished nothing — an honest error report is a good
+            # ANSWER but not a reusable PROCEDURE. A skill is a path you
+            # would replay, so require the trajectory to contain at least
+            # `min_tool_calls` calls that actually SUCCEEDED. Uses the
+            # shared sniffer rather than a second copy of the rule.
+            n_ok = sum(1 for tc in (t.tool_calls or ())
+                       if tc is not None and not tool_call_failed(tc))
+            if n_ok < min_tool_calls:
+                report.rejected_no_successful_tools += 1
+                continue
             report.n_passed_with_tools += 1
             groups[key].append(t)
         elif t.outcome == Outcome.FAILED.value:

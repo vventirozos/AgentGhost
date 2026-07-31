@@ -1358,6 +1358,75 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-31 (later 5) — The caption-lesson hypothesis was FALSE: nothing to scrub, and the retraction mechanism had already worked
+
+**Asked to scrub the "stale caption-workflow lessons", I audited the store first and found
+they do not exist. My own earlier claim — that hydrated freq≥7 lessons from the pinball
+incident were teaching the describe_picture workflow and beating the prompt steer — was
+inference from a `memory bus  Hydrated context for:` log line plus the observed behaviour. I
+never checked the playbook. It was wrong.**
+
+**What the audit actually found** (50-lesson playbook + chroma twins, read-only):
+- ZERO lessons mention describe_picture-as-verification. Two vision-adjacent entries exist and
+  neither teaches the caption workflow: idx 35 (freq 7) is about a vision-node OUTAGE and webp
+  fallback ("re-invoke the primary tool after conversion"), idx 34 (freq 4) is about chaining
+  navigate→screenshot→analyze after a TargetClosedError. Both are sound; neither is stale
+  enough to delete, and deleting a still-useful lesson is worse than keeping it.
+- The pinball-incident lessons are GONE — because req 66d64313 ended `LATE REFUTED (100%) …
+  scrubbing this turn's lessons`. **The retraction mechanism did its job automatically at the
+  time**, which is precisely why there was nothing left to scrub tonight. Only one low-value
+  pinball entry survives (freq 1, a project-bookkeeping lesson from an unrelated turn).
+- No ORPHANED vector twins: the 12 chroma hits for pinball/describe_picture are episodic user
+  messages and one SITUATION doc whose playbook entry still exists. The twin-deletion path
+  (`_delete_lesson_twin`) is holding.
+- Also searched the class today's OWN fixes could have made stale — lessons teaching
+  "one tool call per response" as a corruption workaround, which would now suppress the
+  parallelism the native-header fix restored. None exist either.
+
+**Nothing was deleted.** The false claim is struck through in the (later 2) entry and in the
+`ui-verification-channels` memory rather than quietly edited away — a wrong causal story in a
+durable record is worse than the bug it describes, because the next session inherits it.
+
+**The transferable lesson** (same shape as the 2026-07-22 memory-substrate finding "validate
+silent-memory bugs against live DB, not logs): a hydration log line proves lessons were
+CONSIDERED, not what they SAID. Causal claims about memory content require reading the store.
+The simpler explanation for the residual behaviour stands: on a BROAD "does it render
+correctly?" question a caption is a reasonable answer, and the model's own priors favour the
+familiar tool — which is why the moment-of-use TIP on describe_picture results (later 2) was
+the right lever, and it is prompt-level, not memory-level.
+
+### 2026-07-31 (later 4) — Closed both watch-items instead of leaving them as watch-items
+
+The two things the honest-failure + corruption work left OPEN are now fixed, not merely
+monitored:
+
+**1. Skills-auto graduation guard (the risk the honest-failure rule created).** Since
+"the tool broke and I said so" is now PASSED, a turn can be PASSED having accomplished
+NOTHING — and the extractor keeps PASSED trajectories with ≥2 tool calls, so an honest error
+report could have graduated as a "skill". A skill is a path you would REPLAY, so a PASSED
+trajectory now qualifies only when ≥`min_tool_calls` of its calls actually SUCCEEDED.
+Rejections are COUNTED (`ExtractionReport.rejected_no_successful_tools`), not dropped
+silently — a rising number is the evidence that the outcome rule is admitting turns this
+pipeline should keep ignoring. Guard imports the shared `outcome_heuristics.tool_call_failed`
+(new public alias) rather than writing a second failure sniffer — duplicated copies of that
+judgement are exactly how the corpus and the operator line came to disagree. Skill identities
+untouched (sequence key still built from all tool names → no store re-keying). Verified
+behaviourally: all-failed PASSED ×3 → 0 candidates / 3 rejections; genuinely successful ×3 →
+1 candidate.
+
+**2. Repair fire = tripwire, not noise.** The corruption's root cause is fixed and the probe
+battery produced zero fires, so a fire now means a NOVEL shape. The log line says exactly that
+("UNEXPECTED since the 2026-07-31 native-header fix … this is a NEW corruption shape") because
+for months it read as background noise and was scrolled past, AND the event is filed in the
+background-activity ledger (phase `native_tool_repair`, INFO — durable + queryable via
+`introspect action='activity'`, without interrupting the operator over one repaired call).
+The raw pre-repair snapshot is carried in the record's meta, since it is the only artifact of
+whatever new shape fired.
+
+Tests: +4 in test_skills_auto_extractor.py (incl. a pin that the shared sniffer is imported,
+not redefined), +2 in test_native_tool_header.py. Docs: skill_acquisition.html new
+"Honest-failure graduation guard", prompts.html tripwire paragraph.
+
 ### 2026-07-31 (later 3) — Honest-failure rule: a broken TOOL is no longer a failed TURN (operator decision)
 
 **Headline: `resolve_turn_outcome` ranked structural execution failure above everything, so a
@@ -1398,6 +1467,33 @@ is mutually discriminating). Two of my own earlier pins updated (the eval self-c
 eval/tasks.py all still hold unchanged — verified). Docs: docs/core/agent.html new
 "Honest-failure rule" section, docs/algorithms/skill_acquisition.html direction-guard
 exception.
+
+**LIVE-VALIDATED post-restart (suite 10144 green, listener 46936), verified against the CORPUS
+not the log:** the "NOPE" turn (req F0/85a2d9ce) wrote `outcome: failed, failure_reason:
+'structural failure'` and the late CONFIRMED then appended `{"outcome": "passed", "source":
+"verifier_late"}` to the corrections sidecar — the exact upgrade the old direction guard made
+impossible. Full battery re-run clean: evaluate (exact coords), verify_ui (verdict JSON),
+browser+vision in ONE response (batch-order barrier fired, verified·0.90), visual gate (VISUAL
+CONFIRMED 100%, verified·0.90), fail→recover (verified·0.89). Repair-fire counter 18→18 across
+the battery — the corruption fix continues to hold.
+
+**FOLLOW-UP SHIPPED (operator asked): the Turn Outcome line now SELF-CORRECTS.** In
+async-critic mode the line is printed before any verdict exists, so an honest-failure turn
+flashed `failed` (and a refuted turn flashed `ok`) while only the corpus got fixed.
+`_record_late_verdict` → new `_emit_late_outcome_correction` re-renders the line from a
+bounded 32-entry snapshot ring captured at finalize:
+`turn outcome  CORRECTED failed → verified (late verdict) · confidence 0.93 · tools:
+file_system · 4 chars · 1 tool failure(s), honestly reported`.
+Two anti-noise properties, one of them found BY a failing test rather than by design:
+(1) **valence gate** — emits only when the label crosses the failure boundary; `ok → verified`
+is more information but NOT a mislabel, and announcing it would have put a correction line on
+EVERY successful async turn (i.e. the first draft was noise-generating; the test that asserted
+"agreeing verdict stays silent" caught it); (2) **once per turn** — the snapshot is popped on
+emit so an escalation backfill can't re-announce. The priority ladder now lives in ONE shared
+helper `_turn_outcome_label`, used by the finalize line AND the correction — two copies would
+have drifted on the first edit, which is the exact defect shape this whole cluster kept
+surfacing. Also noted: pretty_log truncates the tail in the stream, so the state change leads
+the message (the suffix is supplementary). +7 tests in test_outcome_consolidation.py.
 
 **Watch:** PASSED-with-tools volume in the corpus (skills-auto graduation input) — this rule
 admits a class that was previously excluded; if graduation starts minting skills whose
@@ -1629,10 +1725,12 @@ Docs: `docs/tools/browser.html`, `docs/tools/vision.html`, `docs/core/verifier.h
 verified 0.96), verify_ui PASS (37.7s, verified 0.91), and the VISUAL gate produced its
 SECOND live verdict (`VISUAL CONFIRMED (100%)`, req 2c5ec4b5) — the gate is now reproducibly
 alive. But the uptake probe STILL chose bare describe_picture despite the persona steer being
-live, and the log showed why: the memory bus hydrates the agent's own auto-learned lessons
-from the incident session, which embed the OLD caption workflow (freq≥7 reinforced) — habit +
-lessons beat a prompt bullet. Two follow-ups shipped (STAGED — need next restart; a live user
-request was on the box so no kill):
+live. ⚠️ **My explanation at the time — "the memory bus hydrates auto-learned lessons from the
+incident session which embed the OLD caption workflow (freq≥7)" — was WRONG and was corrected
+by a store audit the same evening; see "(later 5) — the caption-lesson hypothesis was false".
+It was inferred from a hydration log line plus the observed behaviour, never checked against
+the playbook.** Two follow-ups shipped anyway, and both stand on their own merits (STAGED —
+need next restart; a live user request was on the box so no kill):
 - **Moment-of-use steer:** a bare describe_picture (no prompt) result now carries a TIP line
   pointing at verify_ui — same pattern as browser's PRE_INTERACTION; lands mid-decision where
   prompt guidance loses.
@@ -1652,8 +1750,8 @@ two restarts. Residual: on BROAD "does it render correctly" questions the agent 
 with bare describe_picture — defensible there (a caption answers a broad question), and that
 result now carries the verify_ui TIP for the moment it isn't.
 
-**Watch:** whether the stale caption-workflow lessons decay via outcome-gated utility or need
-a manual scrub (only matters if specific-question turns regress to captions). Kill switches:
+**Watch:** ~~whether the stale caption-workflow lessons decay or need a manual scrub~~ —
+RESOLVED by audit, there are no such lessons (see "(later 5)"). Kill switches:
 `GHOST_VISUAL_NO_THINK=0` (restores thinking for BOTH visual paths), `GHOST_VISUAL_MAX_TOKENS`.
 
 ### 2026-07-30 (later 3) — Auth orphaned sandbox apps → service tokens; a false premise looped the solver

@@ -38,14 +38,17 @@ def test_turn_outcome_failed_requires_terminal_failure():
     Extended 2026-07-31 (honest-failure rule): the line's priority must
     also mirror resolve_turn_outcome — a verifier PASS outranks a
     terminal execution failure, and the suffix must not claim a recovery
-    that did not happen."""
+    that did not happen. The priority ladder itself now lives in the
+    SHARED `_turn_outcome_label` helper (also used by the late-verdict
+    correction) so the printed line and its correction cannot drift."""
     src = _source()
     assert "recovered {execution_failure_count} strike(s)" in src
     # Terminality is still coupled to the ledger…
     assert ("_exec_terminal = (execution_failure_count > 0\n"
             "                              and bool(last_was_failure))" in src)
-    # …and the honest-failure priority + truthful suffix are in place.
-    assert 'elif _verifier_passed:\n                _state = "verified"' in src
+    # …the finalize line resolves its state through the shared helper…
+    assert "_state = self._turn_outcome_label(" in src
+    # …and the truthful suffix survives.
     assert "tool failure(s), honestly reported" in src
 
 

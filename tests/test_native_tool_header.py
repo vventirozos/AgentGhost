@@ -91,3 +91,35 @@ def test_system_prompt_tool_instruction_is_path_neutral():
         not in SYSTEM_PROMPT
     assert "native tool_calls API when tool schemas are advertised natively" \
         in SYSTEM_PROMPT
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Repair fire = tripwire, not routine noise (2026-07-31)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_repair_fire_is_flagged_as_unexpected():
+    """The root cause is fixed and a 6-probe battery (incl. explicit
+    parallel-call demands) produced zero fires, so a fire now means a
+    NOVEL corruption shape. For months this line read as background
+    noise and was scrolled past — it must now say what it means and
+    point at the raw snapshot that is the only record of the new shape."""
+    import inspect
+    import ghost_agent.core.agent as agent_mod
+    src = inspect.getsource(agent_mod)
+    assert "UNEXPECTED since" in src
+    assert "NEW corruption shape" in src
+
+
+def test_repair_fire_is_recorded_in_the_activity_ledger():
+    """The live stream scrolls away; the rate must stay answerable after
+    the fact via introspect action='activity'. INFO severity — one
+    repaired call is not worth interrupting the operator."""
+    import inspect
+    import ghost_agent.core.agent as agent_mod
+    src = inspect.getsource(agent_mod)
+    assert '"native_tool_repair"' in src
+    # Recorded, but deliberately NOT notify-severity (chat stays clean).
+    idx = src.index('"native_tool_repair"')
+    region = src[idx:idx + 600]
+    assert "SEVERITY_NOTIFY" not in region
+    assert "raw_head" in region

@@ -212,3 +212,64 @@ def test_trigger_examples_deduped():
     trajs.append(_mk(user_request="different ask"))
     cands, _ = extract_candidates(trajs, min_support=2)
     assert cands[0].trigger_examples == ["same ask", "different ask"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Honest-failure graduation guard (2026-07-31)
+# ══════════════════════════════════════════════════════════════════════
+
+def _traj(names, failed_idx=(), outcome=None):
+    """Trajectory whose calls at `failed_idx` carry a structured error."""
+    from ghost_agent.distill.schema import Trajectory, ToolCall, Outcome
+    calls = [
+        ToolCall(name=n,
+                 result=("Error: nope" if i in failed_idx else "ok"),
+                 error=("boom" if i in failed_idx else ""))
+        for i, n in enumerate(names)
+    ]
+    return Trajectory(
+        tool_calls=calls,
+        outcome=outcome or Outcome.PASSED.value,
+    )
+
+
+def test_all_failed_passed_trajectory_never_graduates():
+    """Since resolve_turn_outcome started labelling "the tool broke and I
+    said so" as PASSED, a turn can be PASSED having accomplished nothing.
+    An honest error report is a good ANSWER but not a reusable PROCEDURE
+    — a skill is a path you would replay."""
+    trajs = [_traj(["file_system", "file_system"], failed_idx=(0, 1))
+             for _ in range(3)]
+    cands, report = extract_candidates(trajs, min_support=2)
+    assert cands == []
+    assert report.rejected_no_successful_tools == 3
+    assert report.n_passed_with_tools == 0
+
+
+def test_partially_failed_needs_enough_successful_calls():
+    """One success + one failure is a single successful call — below the
+    2-call floor that makes a sequence a skill at all."""
+    trajs = [_traj(["file_system", "file_system"], failed_idx=(0,))
+             for _ in range(3)]
+    cands, report = extract_candidates(trajs, min_support=2)
+    assert cands == []
+    assert report.rejected_no_successful_tools == 3
+
+
+def test_genuinely_successful_trajectory_still_graduates():
+    """The guard must not break the real pipeline."""
+    trajs = [_traj(["browser", "file_system"]) for _ in range(3)]
+    cands, report = extract_candidates(trajs, min_support=2)
+    assert len(cands) == 1
+    assert report.n_passed_with_tools == 3
+    assert report.rejected_no_successful_tools == 0
+
+
+def test_guard_reuses_the_shared_failure_sniffer():
+    """A second copy of "did this tool fail?" is how the corpus and the
+    operator line came to disagree — the extractor must import THE one."""
+    import inspect
+    from ghost_agent.skills_auto import extractor as ex
+    src = inspect.getsource(ex)
+    assert "from ..distill.outcome_heuristics import tool_call_failed" in src
+    assert "def tool_call_failed" not in src  # not redefined locally

@@ -202,3 +202,92 @@ class TestHonestFailureRecording:
         agent.context._recent_trajectories_for_correction = {"k": traj}
         agent._backfill_trajectory_outcome("th5", P)
         assert traj.outcome == F
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Operator-facing line: self-correction on late verdicts (2026-07-31)
+# ══════════════════════════════════════════════════════════════════════
+
+class TestLateOutcomeCorrection:
+    """In async-critic mode (production) the Turn Outcome line is printed
+    BEFORE any verdict exists, so an honest-failure turn flashed `failed`
+    and a refuted turn flashed `ok` — the corpus got corrected a beat
+    later but the LIVE STREAM, which is what the operator watches, kept
+    the stale label. The late handler now re-emits the line, but ONLY
+    when the label actually changes."""
+
+    def _agent_with_stash(self, snap, tid="t-late"):
+        agent, _col = _agent_with_collector()
+        agent.context._recent_turn_outcome = {tid: snap}
+        return agent, tid
+
+    def test_label_helper_mirrors_resolve_priority(self):
+        from ghost_agent.core.agent import GhostAgent
+        L = GhostAgent._turn_outcome_label
+        # refute beats everything
+        assert L(verifier_failed=True, verifier_passed=False,
+                 budget_exhausted=True, exec_terminal=True) == "failed"
+        # honest failure: PASS outranks a terminal tool failure
+        assert L(verifier_failed=False, verifier_passed=True,
+                 budget_exhausted=False, exec_terminal=True) == "verified"
+        # no verdict + terminal failure still fails
+        assert L(verifier_failed=False, verifier_passed=False,
+                 budget_exhausted=False, exec_terminal=True) == "failed"
+        assert L(verifier_failed=False, verifier_passed=False,
+                 budget_exhausted=False, exec_terminal=False) == "ok"
+
+    def test_late_pass_corrects_a_failed_line(self, capsys):
+        agent, tid = self._agent_with_stash({
+            "state": "failed", "confidence": 0.93, "tools": ["file_system"],
+            "chars": 4, "exec_failures": 1, "exec_terminal": True,
+            "budget_exhausted": False,
+        })
+        agent._emit_late_outcome_correction(tid, "passed")
+        out = capsys.readouterr().out
+        # pretty_log truncates the tail in the stream, so assert on the
+        # part the operator actually sees: the state change itself.
+        assert "CORRECTED failed → verified" in out
+
+    def test_late_refute_corrects_an_ok_line(self, capsys):
+        agent, tid = self._agent_with_stash({
+            "state": "ok", "confidence": 0.9, "tools": ["web_search"],
+            "chars": 120, "exec_failures": 0, "exec_terminal": False,
+            "budget_exhausted": False,
+        })
+        agent._emit_late_outcome_correction(tid, "failed")
+        out = capsys.readouterr().out
+        assert "CORRECTED ok → failed" in out
+
+    def test_no_valence_flip_stays_silent(self, capsys):
+        """A turn that printed "ok" and is later CONFIRMED becomes
+        "verified" — strictly more information, but NOT a mislabel.
+        Announcing it would put a correction line on every successful
+        async turn, training the operator to ignore the line that
+        matters. Only a failure-ness flip is worth the stream."""
+        agent, tid = self._agent_with_stash({
+            "state": "ok", "confidence": 0.9, "tools": ["recall"],
+            "chars": 50, "exec_failures": 0, "exec_terminal": False,
+            "budget_exhausted": False,
+        })
+        agent._emit_late_outcome_correction(tid, "passed")
+        assert "CORRECTED" not in capsys.readouterr().out
+
+    def test_correction_is_emitted_once(self, capsys):
+        agent, tid = self._agent_with_stash({
+            "state": "failed", "confidence": 0.9, "tools": ["file_system"],
+            "chars": 4, "exec_failures": 1, "exec_terminal": True,
+            "budget_exhausted": False,
+        })
+        agent._emit_late_outcome_correction(tid, "passed")
+        capsys.readouterr()
+        agent._emit_late_outcome_correction(tid, "passed")
+        assert "CORRECTED" not in capsys.readouterr().out
+
+    def test_unknown_trajectory_is_a_noop(self, capsys):
+        agent, _tid = self._agent_with_stash({"state": "ok"})
+        agent._emit_late_outcome_correction("no-such-id", "failed")
+        assert "CORRECTED" not in capsys.readouterr().out
+
+    def test_never_raises_on_malformed_stash(self):
+        agent, tid = self._agent_with_stash({"state": None})
+        agent._emit_late_outcome_correction(tid, "passed")  # must not raise

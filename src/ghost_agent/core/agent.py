@@ -6920,6 +6920,102 @@ class GhostAgent:
                 icon=Icons.IDEA,
             )
 
+    @staticmethod
+    def _turn_outcome_label(*, verifier_failed: bool, verifier_passed: bool,
+                            budget_exhausted: bool, exec_terminal: bool) -> str:
+        """The operator-facing label for a finished turn.
+
+        SHARED by the finalize line and the late-verdict correction so the
+        two can never disagree — the whole point of the correction is that
+        the stream tells the truth, and two copies of this priority ladder
+        would drift the first time one side is edited (the exact defect
+        shape the 2026-07-31 outcome work kept finding).
+
+        Mirrors ``distill.outcome_heuristics.resolve_turn_outcome``:
+        refute > budget-exhaustion > verifier PASS > terminal execution
+        failure. A verifier PASS outranking a broken tool is the
+        honest-failure rule — see that function's docstring.
+        """
+        if verifier_failed:
+            return "failed"
+        if budget_exhausted:
+            return "partial (budget exhausted)"
+        if verifier_passed:
+            return "verified"
+        if exec_terminal:
+            return "failed"
+        return "ok"
+
+    def _emit_late_outcome_correction(self, trajectory_id, verdict_tag):
+        """Re-emit the Turn Outcome line when a LATE verdict changes the
+        label the operator already saw.
+
+        In async-critic mode (production) the finalize line is printed
+        BEFORE any verdict exists, so an honest-failure turn flashes
+        ``failed`` and a refuted turn flashes ``ok`` — the durable corpus
+        gets corrected a beat later but the live stream, which is what the
+        operator actually watches, kept the stale label. This closes that
+        gap: one line, only when the label actually CHANGES (a verdict
+        that agrees with what was printed stays silent — no noise).
+
+        Never raises: a logging nicety must not break the verdict path.
+        """
+        try:
+            if not trajectory_id or verdict_tag not in ("passed", "failed"):
+                return
+            stash = getattr(self.context, "_recent_turn_outcome", None)
+            snap = (stash or {}).get(trajectory_id)
+            if not snap:
+                return
+            new_state = self._turn_outcome_label(
+                verifier_failed=(verdict_tag == "failed"),
+                verifier_passed=(verdict_tag == "passed"),
+                budget_exhausted=bool(snap.get("budget_exhausted")),
+                exec_terminal=bool(snap.get("exec_terminal")),
+            )
+            old_state = str(snap.get("state") or "")
+            # Emit only on a VALENCE FLIP — the label going from
+            # failure-shaped to not, or vice versa. A turn that printed
+            # "ok" and is later CONFIRMED becomes "verified": strictly
+            # more information, but not a mislabel, and announcing it
+            # would put a correction line on EVERY successful async turn
+            # (the common case) — noise that would train the operator to
+            # ignore exactly the line that matters.
+            if (new_state == "failed") == (old_state == "failed"):
+                return
+            # Recompute the suffix too: "recovered N strike(s)" vs the
+            # honest-report wording depends on the (new) state.
+            _fails = int(snap.get("exec_failures") or 0)
+            if _fails > 0 and new_state != "failed":
+                note = (f" · {_fails} tool failure(s), honestly reported"
+                        if snap.get("exec_terminal")
+                        else f" · recovered {_fails} strike(s)")
+            else:
+                note = ""
+            _conf = snap.get("confidence")
+            _tnames = list(snap.get("tools") or [])
+            pretty_log(
+                "Turn Outcome",
+                f"CORRECTED {old_state} → {new_state} (late verdict)"
+                + (f" · confidence {_conf:.2f}"
+                   if isinstance(_conf, (int, float)) else "")
+                + (f" · tools: {', '.join(_tnames)}" if _tnames else " · no tools")
+                + f" · {snap.get('chars', 0)} chars"
+                + note,
+                icon=(Icons.FAIL if new_state == "failed" else Icons.OK),
+                level=("WARNING" if new_state == "failed" else "INFO"),
+            )
+            # One correction per turn: the label is now accurate, and a
+            # second verdict for the same trajectory (escalation backfill)
+            # must not re-announce it.
+            try:
+                stash.pop(trajectory_id, None)
+            except Exception:
+                pass
+        except Exception as _exc:  # noqa: BLE001
+            logger.debug("late outcome correction skipped: %s: %s",
+                         type(_exc).__name__, _exc)
+
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
                              last_tool=None, force_correction=False,
                              project_id=None):
@@ -6973,6 +7069,7 @@ class GhostAgent:
         if v_result.confidence >= 0.7:
             if v_result.verdict == VerifyVerdict.CONFIRMED:
                 self._backfill_trajectory_outcome(trajectory_id, "passed")
+                self._emit_late_outcome_correction(trajectory_id, "passed")
             elif v_result.verdict == VerifyVerdict.REFUTED:
                 _bf_reason = (
                     "; ".join(v_result.issues[:2])
@@ -6982,6 +7079,7 @@ class GhostAgent:
                     trajectory_id, "failed",
                     reason=f"verifier refuted (late): {_bf_reason}"[:300],
                 )
+                self._emit_late_outcome_correction(trajectory_id, "failed")
         if (v_result.verdict == VerifyVerdict.REFUTED
                 and v_result.confidence >= 0.7):
             issues_str = (
@@ -7770,11 +7868,21 @@ class GhostAgent:
                     _raw_tc_snapshot = str(tool_calls)[:4096]
                 tool_calls, _repaired = _repair_native_tool_calls(tool_calls, _avail)
                 if _repaired:
+                    # TRIPWIRE, not routine noise (2026-07-31). The merge
+                    # corruption's root cause — the legacy XML dialect being
+                    # taught on the native path — is FIXED, and a 6-probe
+                    # battery incl. explicit parallel-call demands produced
+                    # zero fires. So a fire now means a genuinely NOVEL
+                    # shape, and the raw snapshot below is the only record
+                    # of it. Says so in the line, because for months this
+                    # read as background noise and was scrolled past.
                     pretty_log(
                         "Agent Parser",
                         "Repaired corrupt native tool_call(s): upstream merged a "
                         "multi-tool reply into one call's arguments — recovered the "
-                        "intended value and split the leaked calls.",
+                        "intended value and split the leaked calls. UNEXPECTED since "
+                        "the 2026-07-31 native-header fix: read the raw pre-repair "
+                        "snapshot in the log, this is a NEW corruption shape.",
                         level="WARNING", icon=Icons.WARN,
                     )
                     logger.warning(
@@ -7782,6 +7890,28 @@ class GhostAgent:
                         "calls (truncated to 4 KB): %s",
                         _raw_tc_snapshot.replace("\n", "\\n"),
                     )
+                    # Durable + queryable: the live stream scrolls away, so
+                    # file it in the background-activity ledger where
+                    # `introspect action='activity'` can surface it. INFO,
+                    # not notify — one repaired call is not worth
+                    # interrupting the operator (chat stays clean), but the
+                    # rate must be answerable after the fact.
+                    try:
+                        from .autonomous_activity import get_activity_log
+                        _alog = get_activity_log(self.context)
+                        if _alog is not None:
+                            _alog.record(
+                                "native_tool_repair",
+                                "native tool_call corruption repaired — "
+                                "unexpected after the native-header fix; "
+                                "a new shape to investigate",
+                                tools=",".join(
+                                    str((tc.get("function") or {}).get("name", "?"))
+                                    for tc in (tool_calls or [])[:4]),
+                                raw_head=_raw_tc_snapshot[:300],
+                            )
+                    except Exception as _alx:  # noqa: BLE001
+                        logger.debug("repair activity record skipped: %s", _alx)
 
             if not tool_calls and parse_target.strip().startswith('{'):
                 # Fallback: check if it outputted raw JSON instead of XML
@@ -11089,24 +11219,19 @@ class GhostAgent:
             # strike, correct verified answer, line said "failed · 0.86"
             # while both late verdicts CONFIRMED 100%). Recovered strikes
             # stay visible via the suffix below instead.
-            # Priority mirrors resolve_turn_outcome (they must never disagree
-            # — the operator line IS how a mislabel gets noticed): refute >
+            # Priority lives in _turn_outcome_label — SHARED with the
+            # late-verdict correction so the printed line and its correction
+            # can never disagree. It mirrors resolve_turn_outcome: refute >
             # budget-exhaustion > verifier PASS > terminal execution failure.
-            # The PASS-over-execution-failure order is the 2026-07-31 honest-
-            # failure rule: a turn whose tool broke but whose answer truthfully
-            # says so is a GOOD turn, not a failed one.
             _exec_terminal = (execution_failure_count > 0
                               and bool(last_was_failure))
-            if _verifier_failed:
-                _state = "failed"
-            elif getattr(fs, "turn_budget_exhausted", False):
-                _state = "partial (budget exhausted)"
-            elif _verifier_passed:
-                _state = "verified"
-            elif _exec_terminal:
-                _state = "failed"
-            else:
-                _state = "ok"
+            _budget_exhausted = bool(getattr(fs, "turn_budget_exhausted", False))
+            _state = self._turn_outcome_label(
+                verifier_failed=_verifier_failed,
+                verifier_passed=_verifier_passed,
+                budget_exhausted=_budget_exhausted,
+                exec_terminal=_exec_terminal,
+            )
             # Name what actually happened. "recovered" is only true when a
             # later call succeeded; when the LAST call failed and the answer
             # was verified honest, say that instead — this line exists to make
@@ -11132,6 +11257,29 @@ class GhostAgent:
                       else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
                 level=("WARNING" if (_state == "failed"
                                      or _state.startswith("partial")) else "INFO"))
+            # Snapshot what we just printed so a LATE verdict can correct
+            # the stream (async-critic mode prints this BEFORE any verdict
+            # exists). Bounded ring — this is a logging aid, never a store.
+            if current_trajectory_id and not _verifier_failed and not _verifier_passed:
+                try:
+                    from collections import OrderedDict as _OD
+                    _ring = getattr(self.context, "_recent_turn_outcome", None)
+                    if _ring is None:
+                        _ring = _OD()
+                        self.context._recent_turn_outcome = _ring
+                    _ring[current_trajectory_id] = {
+                        "state": _state,
+                        "confidence": _conf,
+                        "tools": _tnames,
+                        "chars": len(final_ai_content or ""),
+                        "exec_failures": execution_failure_count,
+                        "exec_terminal": _exec_terminal,
+                        "budget_exhausted": _budget_exhausted,
+                    }
+                    while len(_ring) > 32:
+                        _ring.popitem(last=False)
+                except Exception:
+                    pass
         except Exception:
             pass
         return final_ai_content, created_time, req_id
