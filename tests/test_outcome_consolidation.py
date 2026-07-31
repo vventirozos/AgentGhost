@@ -25,10 +25,32 @@ P, F, U = Outcome.PASSED.value, Outcome.FAILED.value, Outcome.UNKNOWN.value
 # ══════════════════════════════════════════════════════════════════════
 
 class TestResolveTurnOutcome:
-    def test_structural_failure_is_ground_truth(self):
+    def test_structural_failure_fails_when_unverified(self):
         assert resolve_turn_outcome(current=U, execution_failed=True) == F
-        # structural failure beats even a verifier "passed"
-        assert resolve_turn_outcome(current=U, execution_failed=True, verifier="passed") == F
+
+    def test_honest_failure_report_passes(self):
+        """PRIORITY REVERSED 2026-07-31 (operator decision): structural
+        failure used to beat a verifier PASS, so a turn whose only tool call
+        failed and whose answer HONESTLY reported that failure ("that file
+        does not exist") was labelled FAILED. That taught the corpus,
+        calibration and skills-auto that truthful failure-reporting is bad
+        behaviour — the exact incentive that breeds fabricated success. The
+        verifier inspected the answer against the evidence; it wins. The
+        environment failed, the turn did not."""
+        assert resolve_turn_outcome(
+            current=U, execution_failed=True, verifier="passed") == P
+
+    def test_refute_still_beats_everything(self):
+        """The honest-failure rule must not weaken the refute arm."""
+        assert resolve_turn_outcome(
+            current=U, execution_failed=True, verifier="failed") == F
+
+    def test_shape_heuristic_failed_not_upgraded_by_honest_report(self):
+        """Rule 2 still guards: a turn that thrashed a selector 4× or hit a
+        runtime abort marker stays FAILED however honestly it says so —
+        that failure is BEHAVIOURAL, not environmental."""
+        assert resolve_turn_outcome(
+            current=F, execution_failed=True, verifier="passed") == F
 
     def test_verifier_refuted_fails(self):
         assert resolve_turn_outcome(current=U, verifier="failed") == F
@@ -119,3 +141,64 @@ class TestRecordTrajectoryConsolidation:
             trajectory_id="t4", user_request="q", verifier="passed",
         )
         assert col.appended[0].outcome == P
+
+
+class TestHonestFailureRecording:
+    """End-to-end for the 2026-07-31 honest-failure rule, both delivery
+    paths. The sync path folds the verdict in at write time; the ASYNC path
+    (production default, GHOST_CRITIC_ASYNC=1) writes FAILED first and must
+    let the late CONFIRMED upgrade it — otherwise the two paths disagree on
+    identical evidence, which is how this class of mislabel hides."""
+
+    def test_sync_path_writes_passed(self):
+        agent, col = _agent_with_collector()
+        agent._record_turn_trajectory(
+            messages=_MSGS, final_content="that file does not exist",
+            req_id="rh1", model="m", trajectory_id="th1",
+            user_request="read missing.txt", verifier="passed",
+            execution_failed=True,
+        )
+        assert col.appended[0].outcome == P
+
+    def test_structural_failed_carries_the_upgradable_reason(self):
+        """The reason string is the async path's only discriminator between
+        'the tool broke' and 'the answer was refuted'."""
+        from ghost_agent.distill.outcome_heuristics import (
+            STRUCTURAL_FAILURE_REASON,
+        )
+        agent, col = _agent_with_collector()
+        agent._record_turn_trajectory(
+            messages=_MSGS, final_content="x", req_id="rh2", model="m",
+            trajectory_id="th2", user_request="q", execution_failed=True,
+        )
+        assert col.appended[0].outcome == F
+        assert col.appended[0].failure_reason == STRUCTURAL_FAILURE_REASON
+
+    def test_late_pass_upgrades_structural_failed(self):
+        from ghost_agent.distill.outcome_heuristics import (
+            STRUCTURAL_FAILURE_REASON,
+        )
+        agent, _col = _agent_with_collector()
+        traj = types.SimpleNamespace(
+            id="th3", outcome=F, failure_reason=STRUCTURAL_FAILURE_REASON)
+        agent.context._recent_trajectories_for_correction = {"k": traj}
+        agent._backfill_trajectory_outcome("th3", P)
+        assert traj.outcome == P
+        assert traj.failure_reason == ""  # stale reason cleared
+
+    def test_late_pass_does_not_upgrade_a_refute(self):
+        agent, _col = _agent_with_collector()
+        traj = types.SimpleNamespace(
+            id="th4", outcome=F, failure_reason="verifier refuted")
+        agent.context._recent_trajectories_for_correction = {"k": traj}
+        agent._backfill_trajectory_outcome("th4", P)
+        assert traj.outcome == F
+
+    def test_late_pass_does_not_upgrade_a_shape_heuristic_failure(self):
+        agent, _col = _agent_with_collector()
+        traj = types.SimpleNamespace(
+            id="th5", outcome=F,
+            failure_reason="browser selector '#go' used 5× in one turn")
+        agent.context._recent_trajectories_for_correction = {"k": traj}
+        agent._backfill_trajectory_outcome("th5", P)
+        assert traj.outcome == F

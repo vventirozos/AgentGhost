@@ -90,6 +90,24 @@ except ValueError:
 # tools/vision.py MAX_VISION_BYTES guard.
 _MAX_VISUAL_BYTES = 16 * 1024 * 1024
 
+# Thinking suppression for the VISUAL verdict call. On a thinking vision
+# model the entire max_tokens budget goes to the <think> prelude and the
+# content field comes back EMPTY (finish_reason=length) — reproduced live
+# 2026-07-31 against Qwen3.6+mmproj: 1024/1024 tokens of reasoning_content,
+# 0 chars of content, so every VISUAL check logged "vision returned no
+# verdict" and the whole ground-truth gate was silently inert. Same switch
+# pair as the critic/stage paths. Override with GHOST_VISUAL_NO_THINK=0.
+_VISUAL_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+try:
+    _VISUAL_MAX_TOKENS = int(os.getenv("GHOST_VISUAL_MAX_TOKENS", "2048") or 2048)
+except ValueError:
+    _VISUAL_MAX_TOKENS = 2048
+if _VISUAL_MAX_TOKENS <= 0:
+    # "0" is a truthy STRING, so it survives the `or 2048` guard — and a
+    # zero/negative cap would silence every verdict, recreating the exact
+    # dead-gate failure this flag exists to fix.
+    _VISUAL_MAX_TOKENS = 2048
+
 
 def _two_stage_enabled() -> bool:
     """Two-stage claim verification (forced identification → adjudication).
@@ -1055,6 +1073,8 @@ class Verifier:
         if not self.llm_client or not image_paths:
             return {}
 
+        if _VISUAL_NO_THINK:
+            prompt = prompt + "\n\n/no_think"
         content_array: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         loaded = 0
         for pth in image_paths:
@@ -1089,9 +1109,15 @@ class Verifier:
                 {"role": "user", "content": content_array},
             ],
             "temperature": temperature,
-            "max_tokens": 1024,
+            # _VISUAL_MAX_TOKENS, not a hardcoded 1024: with no-think off
+            # (or a backend that ignores enable_thinking) the old 1024 cap
+            # was consumed entirely by the <think> prelude and the verdict
+            # never appeared — see _VISUAL_NO_THINK above.
+            "max_tokens": _VISUAL_MAX_TOKENS,
             "stream": False,
         }
+        if _VISUAL_NO_THINK:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             result = await self.llm_client.chat_completion(payload, use_vision=True)
             text = (

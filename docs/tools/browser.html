@@ -91,7 +91,14 @@
     <li><code>{"action":"wait_for_selector","selector":"...","state":"visible|hidden|attached|detached","timeout_ms":5000}</code> — <code>state</code> defaults to <code>visible</code>; use <code>hidden</code> to wait for an overlay to GO AWAY (the LLM-facing missing primitive that drove the 2026-04-26 incident).</li>
     <li><code>{"action":"screenshot","out_path":"..."}</code> — sandbox-safety + host→container path rewriting is applied per sub-action.</li>
     <li><code>{"action":"sleep","ms":500}</code> — when you need an explicit pause and there's no selector to wait on.</li>
+    <li><code>{"action":"evaluate","js":"({x: ball.x, y: ball.y})","max_chars":16384,"timeout_ms":5000}</code> — run a JS expression (or <code>() =&gt; ...</code> arrow function) in the page and get its JSON-serialised value back in the per-action results. Aliases <code>expression</code>/<code>script</code> are healed. Output is capped like <code>extract_text</code> (true length + <code>truncated</code> flag reported); non-JSON-serialisable values degrade to strings via <code>default=str</code> (circular structures via the <code>ValueError</code> fallback). <strong>Per-action bounded:</strong> <code>page.evaluate</code> is not governed by Playwright's default-timeout machinery, so the runner wraps it in <code>asyncio.wait_for</code> (step <code>timeout_ms</code>, else the op default; floored at 1s) — an unsettled Promise fails <em>that action</em> with a "poll with sleep+evaluate instead" steer rather than hanging until the subprocess kill, which would have discarded every earlier action's result along with the <code>[BROWSER_OK]</code> payload.</li>
   </ul>
+
+  <h3><code>evaluate</code>: exact-state probes for agent-built apps (2026-07-31)</h3>
+  <p><strong>The incident.</strong> Debugging its own pinball game (req <code>66d64313</code>), the agent needed one fact — <em>did the ball exit the launcher channel?</em> — and had no way to ask the page. <code>page.evaluate</code> existed inside the runner (powering <code>extract_text</code>) but was never exposed as a sub-action, so the agent fell back to screenshot + <code>describe_picture</code>: five ~30&nbsp;s vision round-trips returning caption-shaped answers, one misjudged frame, and five failed wall-geometry fixes steered by feedback too coarse to discriminate between hypotheses. A single <code>evaluate</code> of <code>ball.x</code> would have answered exactly, instantly.</p>
+  <p><strong>The rule of thumb</strong> (mirrored in the tool description and the system prompt): screenshots + <a href="vision.html">vision</a> are for how things <em>look</em> (rendering, colours, layout); <code>evaluate</code> is for what the state <em>is</em> (positions, scores, velocities, <code>getBoundingClientRect()</code> geometry). For motion, sample twice: <code>click → sleep → evaluate → sleep → evaluate</code> — two samples show the trajectory.</p>
+  <p><strong>Trust &amp; safety.</strong> The JS runs in the page context — the same trust domain as <code>click</code>/<code>fill</code> on a page the agent can already navigate and rewrite. JS-initiated <code>fetch</code>/navigation still passes the context's SSRF route guard (<code>_install_ssrf_guard</code>), so <code>evaluate</code> adds capability, not network exposure.</p>
+  <p>Coverage: <code>tests/test_browser_interact_evaluate.py</code>.</p>
 
   <h3>Project-scoped <code>file://</code> heal (2026-06-20)</h3>
   <p><code>_resolve_file_url(sandbox_dir, url)</code> rewrites a <code>file://</code> URL to where the file actually lives when a project scopes the sandbox to <code>&lt;root&gt;/projects/&lt;id&gt;/</code>. It resolves the path the same way <a href="file_system.html"><code>_get_safe_path</code></a> does and translates back with <code>_to_container_path</code>, so every route the model invents — <code>file:///workspace/...</code>, <code>file:///sandbox/projects/&lt;id&gt;/...</code>, a bare name — lands on the single correct container path <code>file:///workspace/projects/&lt;id&gt;/&lt;name&gt;</code>. This is what fixed the live <code>net::ERR_FILE_NOT_FOUND</code> loop where a model-built <code>file:///workspace/sandbox/projects/&lt;id&gt;/browser-os.html</code> double-nested and 404'd three times. Applied to <code>navigate</code> and to each <code>goto</code> sub-action of <code>interact</code>. Covered by <code>tests/test_browser_path_scoping.py</code>.</p>
@@ -239,6 +246,18 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
   proxied <code>navigate</code> that timed out is retried ONCE with <code>wait_until='commit'</code>
   (navigation committed, HTML streaming — the weakest milestone), which usually lands on the same
   circuit. Skipped when the caller already pinned <code>commit</code>.</p>
+
+  <h2>Chromium launch-race retry (2026-07-31)</h2>
+  <p>The first atomic op after recent browser activity can fail with <code>TargetClosedError:
+  BrowserType.launch_persistent_context: Target page, context or browser has been closed</code> —
+  the previous call's Chromium is still tearing down on the SHARED profile dir when the new launch
+  grabs it (<code>_BROWSER_PROFILE_LOCK</code> serialises our runner subprocesses, not Chromium's
+  own async shutdown). Observed on probe req <code>68033190</code>: the agent self-healed
+  (navigate, then screenshot again) but burned ~2 turns and an error result doing so. Any op whose
+  runner error mentions <code>TargetClosedError</code> is now retried ONCE after a 1.5&nbsp;s
+  settle; all other errors surface immediately (no generic retry — a genuine failure repeated
+  twice doubles latency for nothing). Covered by
+  <code>tests/test_browser_target_closed_retry.py</code>.</p>
 
   <h2>Related</h2>
   <ul>

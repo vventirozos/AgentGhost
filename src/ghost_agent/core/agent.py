@@ -936,6 +936,23 @@ def _select_visual_evidence(messages: list, last_user_content: str,
         if before_img:
             break
 
+    # Provenance beats name-matching (probe req 68033190): a screenshot the
+    # AGENT wrote this turn is after-evidence even when its filename appears
+    # in the user's message ("save it as functest_visual.png"). The old
+    # `resolved != before_img` exclusion classified exactly that render as
+    # "the user's own image" and skipped the whole visual check. Paths that
+    # appear as an out_path in this turn's tool calls (native-JSON or XML
+    # form) are RENDERED; only merely-referenced tokens keep the
+    # user's-own-image exclusion.
+    rendered: List[str] = []
+
+    def _note_rendered(raw: Any) -> None:
+        if not raw or not isinstance(raw, str):
+            return
+        resolved = _resolve_image_path(raw.strip(), sandbox_dir)
+        if resolved and resolved not in rendered:
+            rendered.append(resolved)
+
     candidates: List[str] = []
     for msg in messages:
         if not isinstance(msg, dict):
@@ -953,10 +970,40 @@ def _select_visual_evidence(messages: list, last_user_content: str,
                     blob_parts.append(json.dumps(tc))
                 except Exception:
                     blob_parts.append(str(tc))
-        for tok in _extract_image_tokens(" ".join(blob_parts)):
+                # Structural out_path extraction: arguments may be a JSON
+                # string or already a dict, and json.dumps above escapes
+                # the inner quotes, so a regex over the blob misses them.
+                try:
+                    args = (tc.get("function") or {}).get("arguments")
+                    if isinstance(args, str):
+                        args = json.loads(args)
+                    if isinstance(args, dict):
+                        _note_rendered(args.get("out_path"))
+                        acts = args.get("actions")
+                        if isinstance(acts, list):
+                            for a in acts:
+                                if isinstance(a, dict):
+                                    _note_rendered(a.get("out_path"))
+                except Exception:
+                    pass
+        blob = " ".join(blob_parts)
+        if msg.get("role") == "assistant":
+            # XML tool-call form embeds parameters in content.
+            for raw in re.findall(r'name="out_path">\s*([^<]+)<', blob):
+                _note_rendered(raw)
+        for tok in _extract_image_tokens(blob):
             resolved = _resolve_image_path(tok, sandbox_dir)
             if resolved and resolved != before_img and resolved not in candidates:
                 candidates.append(resolved)
+
+    if before_img and before_img in rendered:
+        # The "user's image" is a file the agent wrote THIS turn — the user
+        # was naming the output, not referencing a pre-existing symptom
+        # shot. There is no genuine before; the render is after-evidence.
+        before_img = None
+    for r in rendered:
+        if r not in candidates:
+            candidates.append(r)
 
     after_img = None
     if candidates:
@@ -6620,8 +6667,28 @@ class GhostAgent:
             self._flush_stashed_lesson_outcome(
                 trajectory_id, outcome == _Outcome.PASSED.value)
             if outcome == _Outcome.PASSED.value:
-                if cached is None or cached.outcome != _Outcome.UNKNOWN.value:
+                if cached is None:
                     return
+                if cached.outcome != _Outcome.UNKNOWN.value:
+                    # Honest-failure upgrade (2026-07-31): in async-critic
+                    # mode the trajectory is written BEFORE the verdict, so a
+                    # turn whose only tool call failed lands FAILED/"structural
+                    # failure" here and the late CONFIRMED could never correct
+                    # it — the sync path resolved the same turn to PASSED, so
+                    # the two delivery paths disagreed on identical evidence.
+                    # A structural-only FAILED is upgradable; a refuted or
+                    # shape-heuristic FAILED is NOT (same guard as
+                    # resolve_turn_outcome rule 2).
+                    from ..distill.outcome_heuristics import (
+                        STRUCTURAL_FAILURE_REASON,
+                    )
+                    if not (cached.outcome == _Outcome.FAILED.value
+                            and (cached.failure_reason or "")
+                            == STRUCTURAL_FAILURE_REASON):
+                        return
+                    # The stale reason must not survive the upgrade.
+                    cached.failure_reason = ""
+                    reason = ""
             if cached is not None:
                 cached.outcome = outcome
                 if reason and outcome == _Outcome.FAILED.value \
@@ -8507,9 +8574,41 @@ class GhostAgent:
                         exec_coros.append((i, task))
 
                 if exec_coros:
-                    exec_results = await asyncio.gather(*(c[1] for c in exec_coros), return_exceptions=True)
-                    for (i, _), res in zip(exec_coros, exec_results):
-                        results[i] = res
+                    # Producer→consumer ordering inside the batch (2026-07-31,
+                    # probe req d02db9d6): after the native-repair split a
+                    # merged "browser screenshot + vision_analysis" reply,
+                    # both landed in this gather and vision probed the PNG
+                    # before the screenshot existed → file-not-found → a
+                    # spurious FATAL strike + a retry turn. When one batch
+                    # holds both a file-producing tool and vision_analysis,
+                    # the model authored a sequence — await the producers
+                    # (and everything else) first, then the vision reads.
+                    _FILE_PRODUCERS = {"browser", "image_generation"}
+                    _prod = {i for i, _ in exec_coros
+                             if tool_call_metadata[i][0] in _FILE_PRODUCERS}
+                    _cons = {i for i, _ in exec_coros
+                             if tool_call_metadata[i][0] == "vision_analysis"}
+                    if _prod and _cons:
+                        pretty_log(
+                            "Batch Order",
+                            "vision_analysis shares this batch with a "
+                            "file-producing tool — running producers first "
+                            "so vision reads the artifact, not its absence.",
+                            icon=Icons.TOOL_DEEP,
+                        )
+                        _first = [(i, t) for i, t in exec_coros if i not in _cons]
+                        _second = [(i, t) for i, t in exec_coros if i in _cons]
+                        for _sub in (_first, _second):
+                            if not _sub:
+                                continue
+                            _sub_results = await asyncio.gather(
+                                *(t for _, t in _sub), return_exceptions=True)
+                            for (i, _), res in zip(_sub, _sub_results):
+                                results[i] = res
+                    else:
+                        exec_results = await asyncio.gather(*(c[1] for c in exec_coros), return_exceptions=True)
+                        for (i, _), res in zip(exec_coros, exec_results):
+                            results[i] = res
 
                 # Phase 3: fan the first instance's result out to its
                 # batch-local duplicates (read-only calls collapsed at
@@ -8642,6 +8741,18 @@ class GhostAgent:
                                 f"again.",
                                 icon=Icons.RETRY,
                             )
+
+                    # Terminal-result tracking (2026-07-31, probe F2b): the
+                    # LAST processed result decides `last_was_failure`. It
+                    # was only ever SET on failure and never cleared by a
+                    # later success in the same batch, so a fail→recover
+                    # batch ended True and both the trajectory corpus and
+                    # the Turn Outcome line (whose conditions promise "the
+                    # FINAL tool call actually failed") branded the
+                    # recovered turn FAILED. The failure branches below may
+                    # re-assert True — harmless; no-result iterations keep
+                    # the per-batch reset at the region top.
+                    last_was_failure = bool(_res_is_error or _pf_exec_failed)
 
                     # One-task-per-turn gate: a manage_projects call that
                     # actually closed a task to DONE ends the interactive
@@ -9443,9 +9554,13 @@ class GhostAgent:
                                 "file from the listing; if an approach is wrong, change it."
                             )})
 
-                    last_was_failure = True
-                    # strikes.note_failure already reset the clean-success
-                    # streak; this assignment is implicit in the ledger.
+                    # NO blanket `last_was_failure = True` here (2026-07-31):
+                    # the per-result tracking inside the results loop already
+                    # holds the TERMINAL state — a fail→recover batch ends
+                    # False, a terminal failure ends True. The blanket True
+                    # branded recovered batches FAILED in the corpus and the
+                    # Turn Outcome line (probe F2b). strikes.note_failure
+                    # already reset the clean-success streak regardless.
 
                     # Check for tool fallback suggestions
                     from ..tools.fallback_chains import get_fallback_hint
@@ -10965,10 +11080,44 @@ class GhostAgent:
         try:
             _verifier_failed = bool(verifier_backfill and verifier_backfill[0] == "failed")
             _verifier_passed = bool(verifier_backfill and verifier_backfill[0] == "passed")
-            _state = ("failed" if (execution_failure_count > 0 or _verifier_failed)
-                      else ("partial (budget exhausted)"
-                            if getattr(fs, "turn_budget_exhausted", False)
-                            else ("verified" if _verifier_passed else "ok")))
+            # "failed" requires the failure to be TERMINAL (last call still
+            # failing), matching the trajectory-corpus rule at
+            # _record_turn_trajectory: `execution_failure_count` is a
+            # decayed-strike ledger, and labelling any residual strike
+            # "failed" branded RECOVERED turns as failures in the
+            # operator's eye (probe req d02db9d6: one spurious mid-turn
+            # strike, correct verified answer, line said "failed · 0.86"
+            # while both late verdicts CONFIRMED 100%). Recovered strikes
+            # stay visible via the suffix below instead.
+            # Priority mirrors resolve_turn_outcome (they must never disagree
+            # — the operator line IS how a mislabel gets noticed): refute >
+            # budget-exhaustion > verifier PASS > terminal execution failure.
+            # The PASS-over-execution-failure order is the 2026-07-31 honest-
+            # failure rule: a turn whose tool broke but whose answer truthfully
+            # says so is a GOOD turn, not a failed one.
+            _exec_terminal = (execution_failure_count > 0
+                              and bool(last_was_failure))
+            if _verifier_failed:
+                _state = "failed"
+            elif getattr(fs, "turn_budget_exhausted", False):
+                _state = "partial (budget exhausted)"
+            elif _verifier_passed:
+                _state = "verified"
+            elif _exec_terminal:
+                _state = "failed"
+            else:
+                _state = "ok"
+            # Name what actually happened. "recovered" is only true when a
+            # later call succeeded; when the LAST call failed and the answer
+            # was verified honest, say that instead — this line exists to make
+            # mislabels visible, so it must not invent a recovery.
+            if execution_failure_count > 0 and _state != "failed":
+                _recovered_note = (
+                    f" · {execution_failure_count} tool failure(s), honestly reported"
+                    if _exec_terminal
+                    else f" · recovered {execution_failure_count} strike(s)")
+            else:
+                _recovered_note = ""
             _conf = getattr(getattr(self.context, "last_confidence", None), "composite", None)
             _tnames = [t.get("name") for t in (tools_run_this_turn or [])
                        if isinstance(t, dict) and t.get("name")]
@@ -10977,7 +11126,8 @@ class GhostAgent:
                 _state
                 + (f" · confidence {_conf:.2f}" if isinstance(_conf, (int, float)) else "")
                 + (f" · tools: {', '.join(_tnames)}" if _tnames else " · no tools")
-                + f" · {len(final_ai_content or '')} chars",
+                + f" · {len(final_ai_content or '')} chars"
+                + _recovered_note,
                 icon=(Icons.FAIL if _state == "failed"
                       else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
                 level=("WARNING" if (_state == "failed"
@@ -12661,7 +12811,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     if hasattr(self, 'disabled_tools') and self.disabled_tools:
                         all_tools = [t for t in all_tools if t["function"]["name"] not in self.disabled_tools]
 
-                    from .prompts import QWEN_TOOL_PROMPT
+                    from .prompts import QWEN_TOOL_PROMPT, QWEN_TOOL_PROMPT_NATIVE
 
                     # ARCHITECTURAL OPTIMISATION #1: NO MORE per-turn system
                     # slot mutation. The system message was already locked at
@@ -12789,8 +12939,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             f"`tool_calls` API on this request. Available "
                             f"tools: {_tool_names}.)"
                         )
+                        # QWEN_TOOL_PROMPT_NATIVE, not QWEN_TOOL_PROMPT
+                        # (2026-07-31): splicing the legacy XML format rules
+                        # on the native path was the ROOT CAUSE of the
+                        # "merged multi-tool reply" corruption — the model
+                        # emitted hybrid XML the upstream's incremental
+                        # parser mangled on every stacked call (ablation-
+                        # proven, journal §6). The native header teaches
+                        # think-discipline + parallelism only; the chat
+                        # template owns the call format.
                         tool_header_block = (
-                            QWEN_TOOL_PROMPT
+                            QWEN_TOOL_PROMPT_NATIVE
                             .replace('{tool_schemas}', _native_pointer)
                             .replace('{think_budget_guidance}', render_think_budget_guidance(think_budget))
                             .replace("\r", "")
@@ -14041,7 +14200,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     if not tool_calls:
                         clean_ui = ui_content.strip("` \n\r")
                         has_img_markdown = bool(re.search(r'!\[.*?\]\(.*?\)', clean_ui))
-                        has_valid_image_tool = any(t in raw_tools_called for t in ["image_generation", "execute", "file_system"])
+                        # "browser" belongs here: a screenshot op returns
+                        # `DOWNLOAD: /api/download/<name>` — a legitimate
+                        # image source. Without it the guard false-positived
+                        # on a correct browser-screenshot link whenever the
+                        # DOWNLOAD line had scrolled past the 4-message
+                        # link-validation window (probe req d02db9d6: the
+                        # agent then burned a turn arguing with the alert).
+                        has_valid_image_tool = any(t in raw_tools_called for t in ["image_generation", "execute", "file_system", "browser"])
                         has_run_tools = len(tools_run_this_turn) > 0
 
                         # Catch a PROMISED NOTIFICATION dropped at the finish
@@ -16567,15 +16733,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # calibration + selfhood already act on. Without this a verifier-caught
         # wrong answer stayed UNKNOWN here and never became a lesson.
         try:
-            from ..distill.outcome_heuristics import resolve_turn_outcome
+            from ..distill.outcome_heuristics import (
+                resolve_turn_outcome, STRUCTURAL_FAILURE_REASON,
+            )
             _resolved = resolve_turn_outcome(
                 current=traj.outcome, verifier=verifier,
                 execution_failed=bool(execution_failed),
             )
             if _resolved != traj.outcome:
                 if not traj.failure_reason and _resolved == Outcome.FAILED.value:
+                    # STRUCTURAL_FAILURE_REASON is load-bearing, not cosmetic:
+                    # it marks a FAILED that a LATE verifier PASS is allowed to
+                    # upgrade (see _backfill_trajectory_outcome). Keep it in
+                    # sync via the shared constant.
                     traj.failure_reason = (
-                        "verifier refuted" if verifier == "failed" else "structural failure"
+                        "verifier refuted" if verifier == "failed"
+                        else STRUCTURAL_FAILURE_REASON
                     )
                 traj.outcome = _resolved
         except Exception as e:

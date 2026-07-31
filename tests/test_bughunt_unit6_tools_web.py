@@ -105,7 +105,13 @@ class TestVision:
         )
         assert "assets/sandbox/logo.png" in out  # path preserved in the error
 
-    async def test_content_null_does_not_error(self, tmp_path):
+    async def test_content_null_does_not_crash_and_names_the_emptiness(self, tmp_path):
+        """Contract evolved 2026-07-31: originally this pinned 'null content
+        → clean empty success' (guarding the TypeError crash). Live req
+        2c5ec4b5 showed the empty success was a fail-open — a contended
+        node returned "" under the success banner and the agent lost 57s
+        noticing it. The crash-protection half stands (None coerces, no
+        TypeError); the outcome is now a NAMED empty-result error."""
         img = tmp_path / "x.png"
         img.write_bytes(b"\x89PNG\r\n\x1a\nfakepng")
         client = MagicMock()
@@ -116,9 +122,8 @@ class TestVision:
             action="describe_picture", target="x.png",
             sandbox_dir=tmp_path, llm_client=client,
         )
-        # Pre-fix: TypeError → "Vision API Error". Now a clean (empty) result.
-        assert "VISION ANALYSIS RESULT" in out
-        assert "Error" not in out
+        assert "TypeError" not in out
+        assert "EMPTY" in out and out.startswith("Vision API Error")
 
 
 # ──────────────────────────────────────────────────────────────────────

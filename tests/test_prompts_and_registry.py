@@ -7,8 +7,14 @@ from src.ghost_agent.core.prompts import (
 from src.ghost_agent.tools.registry import TOOL_DEFINITIONS
 
 def test_system_prompt_json_tools_constraint():
-    """Verify that SYSTEM_PROMPT mandates XML tool usage and prevents hallucinated responses."""
-    assert "When you need to call a tool, you MUST use the exact tool calling format instructed using XML tags" in SYSTEM_PROMPT
+    """Contract evolved 2026-07-31 (corruption root-cause fix): the old
+    unconditional "MUST use ... XML tags" order was part of the mixed
+    messaging that made the model emit hybrid XML on the NATIVE path and
+    corrupted every stacked tool call. The instruction is now path-aware;
+    the anti-hallucination asserts stand. See test_native_tool_header.py."""
+    assert "you MUST use exactly the tool-calling mechanism this session provides" in SYSTEM_PROMPT
+    assert "native tool_calls API when tool schemas are advertised natively" in SYSTEM_PROMPT
+    assert "otherwise the XML format instructed in the Tools section" in SYSTEM_PROMPT
     assert "The native tools (file_system, knowledge_base, etc.) are triggered via the native tool_calls API, NOT by typing raw JSON" in SYSTEM_PROMPT
     # Guarantee we removed the previous hallucination-causing suggestion
     assert "import knowledge_base" not in SYSTEM_PROMPT

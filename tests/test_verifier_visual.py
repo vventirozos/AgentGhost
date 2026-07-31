@@ -201,6 +201,141 @@ def test_select_visual_evidence_survives_injected_user_message(tmp_path):
     assert after == str(tmp_path / "vtest_box.png")
 
 
+# ─────────────────────── thinking suppression (2026-07-31) ───────────────────────
+#
+# Reproduced live against the prod vision node (Qwen3.6-35B + mmproj,
+# preserve_thinking template): the visual verdict call came back
+# finish_reason=length with ALL 1024 tokens in reasoning_content and an
+# EMPTY content field — so _parse_json got "", _build_verify_result got {},
+# verify_visual returned None, and EVERY visual check logged "vision
+# returned no verdict". The whole pixels-ground-truth gate was silently
+# inert. The fix is the same switch pair the critic/stage paths use:
+# /no_think soft-switch + chat_template_kwargs enable_thinking=False, plus
+# a raised token cap as the belt when a backend ignores the kwargs.
+
+
+async def test_visual_call_ships_no_think_switches(tmp_path, monkeypatch):
+    """Flags are read at import, so pin the module attribute rather than
+    the env — an operator shell exercising the documented
+    GHOST_VISUAL_NO_THINK=0 kill switch must not turn this red."""
+    import ghost_agent.core.verifier as verifier_mod
+    monkeypatch.setattr(verifier_mod, "_VISUAL_NO_THINK", True)
+    after = tmp_path / "after.png"
+    after.write_bytes(_PNG_1x1)
+    client = _StubVisionClient('{"verdict":"CONFIRMED","confidence":0.8}')
+    v = Verifier(llm_client=client)
+    await v.verify_visual(symptom="x", claim="y", after_image=str(after))
+    payload = client.last_payload
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    text_parts = [c["text"] for c in payload["messages"][1]["content"]
+                  if c.get("type") == "text"]
+    assert "/no_think" in text_parts[0]
+
+
+async def test_visual_call_flag_off_restores_thinking(tmp_path, monkeypatch):
+    """The kill switch must actually kill: no chat_template_kwargs, no
+    /no_think suffix — the pre-fix payload shape."""
+    import ghost_agent.core.verifier as verifier_mod
+    monkeypatch.setattr(verifier_mod, "_VISUAL_NO_THINK", False)
+    after = tmp_path / "after.png"
+    after.write_bytes(_PNG_1x1)
+    client = _StubVisionClient('{"verdict":"CONFIRMED","confidence":0.8}')
+    v = Verifier(llm_client=client)
+    await v.verify_visual(symptom="x", claim="y", after_image=str(after))
+    payload = client.last_payload
+    assert "chat_template_kwargs" not in payload
+    text_parts = [c["text"] for c in payload["messages"][1]["content"]
+                  if c.get("type") == "text"]
+    assert "/no_think" not in text_parts[0]
+
+
+async def test_visual_call_token_cap_comes_from_module_flag(tmp_path, monkeypatch):
+    """1024 was exactly the budget the <think> prelude consumed. The cap
+    must flow from _VISUAL_MAX_TOKENS (sentinel-checked so the test is
+    independent of the GHOST_VISUAL_MAX_TOKENS env)."""
+    import ghost_agent.core.verifier as verifier_mod
+    monkeypatch.setattr(verifier_mod, "_VISUAL_MAX_TOKENS", 1234)
+    after = tmp_path / "after.png"
+    after.write_bytes(_PNG_1x1)
+    client = _StubVisionClient('{"verdict":"CONFIRMED","confidence":0.8}')
+    v = Verifier(llm_client=client)
+    await v.verify_visual(symptom="x", claim="y", after_image=str(after))
+    assert client.last_payload["max_tokens"] == 1234
+
+
+async def test_visual_empty_content_returns_none_not_fabricated(tmp_path):
+    """The live failure shape: a thinking model truncates mid-<think> and
+    content is empty. That must surface as a SKIP (None) — never as a
+    fabricated UNCERTAIN verdict."""
+    after = tmp_path / "after.png"
+    after.write_bytes(_PNG_1x1)
+    client = _StubVisionClient("")
+    v = Verifier(llm_client=client)
+    res = await v.verify_visual(symptom="x", claim="y", after_image=str(after))
+    assert res is None
+
+
+def test_select_visual_evidence_provenance_beats_filename_collision(tmp_path):
+    """Probe req 68033190: the user's message NAMED the output filename
+    ('save it as functest_visual.png'), the agent screenshotted to exactly
+    that name, and the old `resolved != before_img` exclusion classified
+    the agent's render as 'the user's own image' → after=None → visual
+    check skipped despite fresh evidence on disk. A path appearing as an
+    out_path in this turn's tool calls is RENDERED: it is after-evidence,
+    and the phantom 'before' (a file that only exists because the agent
+    just wrote it) must clear to None."""
+    (tmp_path / "functest_visual.png").write_bytes(_PNG_1x1)
+    user = ("take one screenshot of the game, save it as "
+            "functest_visual.png, and tell me if it renders")
+    messages = [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "browser",
+                          "arguments": '{"op":"screenshot","out_path":"/workspace/functest_visual.png"}'}}
+        ]},
+        {"role": "tool", "name": "browser",
+         "content": "SAVED: functest_visual.png"},
+    ]
+    before, after = _select_visual_evidence(messages, user, tmp_path)
+    assert after == str(tmp_path / "functest_visual.png")
+    assert before is None
+
+
+def test_select_visual_evidence_xml_out_path_is_provenance_too(tmp_path):
+    """Same collision through the XML tool-call form."""
+    (tmp_path / "shot.png").write_bytes(_PNG_1x1)
+    user = "screenshot it to shot.png — does the table look right?"
+    messages = [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content":
+            '<tool_call>\n<function name="browser">\n'
+            '<parameter name="out_path">/workspace/shot.png</parameter>\n'
+            '</function>\n</tool_call>'},
+    ]
+    before, after = _select_visual_evidence(messages, user, tmp_path)
+    assert after == str(tmp_path / "shot.png")
+    assert before is None
+
+
+def test_select_visual_evidence_real_before_survives_rendering(tmp_path):
+    """A genuine user symptom shot (referenced, never written this turn)
+    must stay the before-image while the agent's distinct render is the
+    after — the original happy path, unchanged by the provenance fix."""
+    (tmp_path / "user_symptom.png").write_bytes(_PNG_1x1)
+    (tmp_path / "agent_after.png").write_bytes(_PNG_1x1)
+    user = "look at user_symptom.png, the flipper is missing"
+    messages = [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "browser",
+                          "arguments": '{"op":"screenshot","out_path":"/workspace/agent_after.png"}'}}
+        ]},
+    ]
+    before, after = _select_visual_evidence(messages, user, tmp_path)
+    assert before == str(tmp_path / "user_symptom.png")
+    assert after == str(tmp_path / "agent_after.png")
+
+
 def test_select_visual_evidence_no_after_when_only_user_image(tmp_path):
     """If the agent only re-looked at the user's own screenshot and never
     rendered a new one, there is NO post-fix evidence — after must be None

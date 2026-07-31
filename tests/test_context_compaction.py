@@ -96,20 +96,27 @@ async def test_native_tools_suppresses_xml_schema_in_prompt():
 
 
 @pytest.mark.asyncio
-async def test_native_tools_keeps_format_scaffolding():
-    """Suppress only the schema, not the XML parsing rules — the agent's
-    XML parser is the documented fallback path. Models that emit the
-    legacy `<tool_call>` shape must still be supported."""
+async def test_native_tools_drops_xml_format_scaffolding():
+    """Contract REVERSED 2026-07-31 (corruption root-cause fix): the old
+    rule ("suppress only the schema, keep the XML parsing rules as the
+    fallback contract") was ablation-proven to be the trigger of the
+    native tool_call corruption — teaching the XML dialect alongside the
+    template's native format made the model emit hybrid XML, and the
+    upstream parser merged every stacked call (8/8 corrupt with the
+    scaffolding, 13/13 clean without; journal §6). The agent's XML PARSER
+    remains available for stragglers — but the prompt must no longer
+    TEACH the dialect on the native path. See test_native_tool_header.py."""
     agent = _make_agent(native_tools=True, llm_response="answer")
     body = {"messages": [{"role": "user", "content": "Run a tool please"}], "model": "test"}
     await agent.handle_chat(body, MagicMock())
     payload = _payload_after(agent)
 
     all_content = _all_content(payload)
-    # Format scaffolding stays put.
-    assert "<tool_call>" in all_content
+    # The XML dialect is GONE from the native prompt…
+    assert "<function name=" not in all_content
+    assert "CDATA" not in all_content
+    # …while parallelism stays invited and the schema pointer is informative.
     assert "PARALLEL EXECUTION" in all_content
-    # The pointer that replaces the schema is informative.
     assert "advertised via the native" in all_content
 
 

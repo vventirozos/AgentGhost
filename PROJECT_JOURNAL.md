@@ -1358,6 +1358,304 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-31 (later 3) — Honest-failure rule: a broken TOOL is no longer a failed TURN (operator decision)
+
+**Headline: `resolve_turn_outcome` ranked structural execution failure above everything, so a
+turn whose only tool call failed and whose answer HONESTLY reported it ("that file does not
+exist") was recorded FAILED — with the verifier CONFIRMING at 100%. Rules 3/4 swapped: a
+verifier PASS now outranks the structural signal.** Flagged as a design edge in the previous
+entry (probe F2), decided by the operator, implemented here.
+
+**Why it mattered:** that label fed the trajectory corpus (Reflector / PRM / skills-auto) and
+the operator's log line — teaching, in the only currency the learning loops read, that
+truthful failure-reporting is bad behaviour. That is exactly the incentive gradient that
+produces fabricated success, the failure mode half this project's guards exist to catch.
+
+**What did NOT change (the guardrails):** REFUTED still beats everything (priority 1); a
+shape-heuristic FAILED (abort marker, 4× selector thrash, 3× identical tool error, aborted
+browser sequence) is still never upgraded — that failure is BEHAVIOURAL, not environmental;
+an execution failure with NO verdict still lands FAILED; and the verifier's own priority-1
+request-alignment check still refutes replies that don't answer the ask, so an off-topic
+non-answer can't ride the rule to PASSED. Net: "the tool broke and I said so" = PASSED;
+"I thrashed and gave up" = FAILED.
+
+**Both delivery paths (the subtle half).** Sync folds the verdict in at write time → PASSED.
+ASYNC (production) writes FIRST, so such a turn lands FAILED/"structural failure" and the late
+CONFIRMED was blocked forever by the PASSED direction guard — the two paths disagreed on
+identical evidence. `_backfill_trajectory_outcome` now upgrades a FAILED whose reason is
+exactly `STRUCTURAL_FAILURE_REASON` (shared constant, writer+reader, so a key≠serializer drift
+can't silently disable the rule — the recurring defect class) and clears the stale reason.
+Refuted / shape-heuristic FAILED stay un-upgradable.
+
+**Calibration needed NO change** — `grade_turn_outcome` already checks the verifier arms before
+the execution-failure penalty (verified while implementing). The operator's Turn Outcome line
+now mirrors the same priority and says "N tool failure(s), honestly reported" instead of
+claiming a recovery that never happened.
+
+Tests: test_outcome_consolidation.py (+9: priority matrix incl. refute-still-wins and
+shape-not-upgraded, both delivery paths, reason-string contract, upgrade/no-upgrade pair that
+is mutually discriminating). Two of my own earlier pins updated (the eval self-checks in
+eval/tasks.py all still hold unchanged — verified). Docs: docs/core/agent.html new
+"Honest-failure rule" section, docs/algorithms/skill_acquisition.html direction-guard
+exception.
+
+**Watch:** PASSED-with-tools volume in the corpus (skills-auto graduation input) — this rule
+admits a class that was previously excluded; if graduation starts minting skills whose
+"success" was an honest error report, tighten by requiring the verdict AND a non-empty
+successful tool call rather than reverting the rule.
+
+### 2026-07-31 (later 2) — Native tool_call corruption ROOT-CAUSED: the agent was teaching a second dialect
+
+**Headline: the "merged multi-tool reply" corruption (guarded since 2026-07-05, memory says
+"suspect the native path") is NOT llama.cpp flakiness — it is the agent's own legacy XML tool
+prompt riding the NATIVE path. Ablation-proven, deterministic, fixed by a header split,
+validated 13/13 clean.**
+
+**Frequency finding:** 18 repair fires in one 2.5h log window (110 requests / 599 turns) —
+self-play and interactive alike. Single calls usually survive the parser, so it presented as
+"occasional browser/file_system weirdness"; in reality effectively EVERY stacked-call reply
+corrupted (browser+vision, read+read — the pairs the model batches most).
+
+**Ablation against the live upstream (llama.cpp b10180, template froggeric-v21.3, 31 trials):**
+two-call demands parse CLEAN with simple schemas (5/5), real registry schemas (5/5), streamed
+with proper per-call index deltas, and with an attribute-dialect example planted in history
+(3/3). They corrupt 8/8 DETERMINISTICALLY the moment the full QWEN_TOOL_PROMPT is in the
+system slot — which the native branch spliced (agent.py ~12890: schemas swapped for a pointer,
+every XML format rule kept). Taught two dialects (agent `<function name="…">` attribute-style
+× template `<function=…>` equals-style), the model emits a HYBRID (captured: `<parameter=path>`
+mixed with attribute closers) and the server's incremental parser swallows everything after
+the first parameter into that argument value → one merged call, the exact repair signature,
+leaked `</parameter> </function>` fragments included. Removing the XML block: 13/13 clean.
+
+**Fix (deployed with tests+docs):** new `QWEN_TOOL_PROMPT_NATIVE` (think-discipline + parallel
+invitation, ZERO XML format instruction — the template owns the format) spliced on the native
+branch; legacy branch keeps `QWEN_TOOL_PROMPT` (its XML rules ARE that path's contract);
+SYSTEM_PROMPT's CRITICAL INSTRUCTION made path-aware (was: unconditional "MUST use … XML
+tags"). The XML parser + repair guard stay as fallbacks for stragglers. Two old tests pinned
+the broken design and were updated with the reversal rationale
+(test_native_tools_keeps_format_scaffolding → …drops_xml_format_scaffolding;
+test_system_prompt_json_tools_constraint). New: tests/test_native_tool_header.py (dialect-
+marker absence, load-bearing parts kept, splice pins, path-neutral instruction).
+Docs: docs/core/prompts.html new section. Repro harness: scratchpad corruption_repro*.py
+(session-local; the journal narrative preserves the method).
+
+**LIVE-VALIDATED post-deploy (suite 10136 green, listener 45779, 6-probe battery):**
+- P1 parallel file_system×2 (the 100%-corrupting shape): **zero repair fires**, both calls
+  executed, ok·0.89.
+- P6 browser screenshot + verify_ui demanded in ONE response (the original d02db9d6 incident
+  shape): **zero repair fires**, the two calls arrived as clean native calls, the
+  **batch-order barrier fired** ("batch order: vision_analysis shares this batch with a
+  file-producing tool") and sequenced vision behind the screenshot — verdict JSON returned,
+  ok·0.90. Both prior-cluster fixes proven live in one probe.
+- P2 evaluate (exact ball coords), P3 verify_ui (clean verdict), P4 visual gate
+  (VISUAL CONFIRMED 100%, verified·0.86), P5 fail→recover (verified·0.89 — inline verifier
+  now lands on the recovered shape) — all PASS. Repair-fire counter: 18 before battery → 18
+  after, across 6 probes including two explicit parallel-call demands.
+
+**Watch:** repair-fire rate over the next days (expect ~zero; each fire now warrants a look at
+the raw snapshot — it would be a genuinely novel shape); parallel-call uptake may RISE now
+that stacked calls actually work — the batch-order barrier (previous entry, fix 4) matters
+more.
+
+### 2026-07-31 (later) — Probe-findings fix cluster: all 5 OPEN items from the live probes CLOSED
+
+**Headline: the five pre-existing defects the verification-tooling probes surfaced (previous
+entry, "Probe-log findings") are all fixed, tested, and documented.** In fix order:
+
+1. **TargetClosedError launch race (browser.py):** any op whose runner error mentions
+   TargetClosedError retries ONCE after a 1.5s settle — the previous call's Chromium is still
+   tearing down on the shared profile dir; the profile lock serialises our subprocesses, not
+   Chromium's shutdown. Other errors never retry. `tests/test_browser_target_closed_retry.py`.
+2. **Image-markdown guard (agent.py):** `browser` added to the valid-image-tool whitelist —
+   a screenshot's `DOWNLOAD: /api/download/...` line is a legitimate image source; the guard
+   used to false-positive whenever that line scrolled past the 4-message validation window.
+3. **Visual-evidence provenance (agent.py `_select_visual_evidence`):** paths appearing as an
+   `out_path` in this turn's tool calls (native JSON args — parsed structurally, since
+   json.dumps escapes inner quotes past any blob regex — or XML parameter form) are RENDERED
+   and count as after-evidence even when the user named the filename; a "before" that turns
+   out to be agent-written this turn clears to None. 3 new tests in `test_verifier_visual.py`
+   (collision, XML form, genuine-before preserved).
+4. **Producer→consumer batch ordering (agent.py dispatch):** when one batch holds a
+   file-producing tool (browser/image_generation) AND vision_analysis, producers complete
+   before vision runs (two-phase gather; tool coroutines are cold until awaited so the
+   sequencing is real). Kills the repaired-merged-call race that minted a spurious FATAL
+   strike. 2 new tests in `test_dispatch_pipeline_extraction.py`.
+5. **Turn Outcome honesty (agent.py finalize):** the operator line now requires the failure
+   to be TERMINAL (`execution_failure_count > 0 AND last_was_failure` — the trajectory-corpus
+   rule) before printing "failed", and surfaces recovery as "· recovered N strike(s)".
+   Verified during the fix: calibration already grades recovery-aware (grade_turn_outcome),
+   the corpus wrote UNKNOWN→late-CONFIRMED upgraded it to PASSED correctly in req d02db9d6,
+   and work_log's descriptive "had_failures" stays. Structural pins for the inline conditions:
+   `tests/test_probe_findings_2026_07_31.py`.
+
+Also: vision pretty_log target cap 30→72 chars (the "pinball_render_chec" truncation).
+Docs: browser.html (launch-race retry), verifier.html (evidence provenance), agent.html (new
+"Probe-log fix cluster" section). Note for the record: repaired-batch calls stay concurrent
+EXCEPT for the vision-behind-producers barrier — full sequential execution of repaired batches
+was considered and rejected (most merged batches are independent reads; the file dependency is
+the only observed hazard).
+
+**Live re-validation found the DEEPER root of the outcome mislabel (probe F2b):**
+`last_was_failure` was BATCH-granular — only ever SET on failure, never cleared by a later
+success in the same batch, plus a post-loop blanket `= True` in the failure-handling block —
+so a fail→recover batch ("read missing file → list dir → answer") still ended True and BOTH
+the trajectory corpus and the (already-fixed) Turn Outcome line branded it failed, despite
+their own comments promising "the FINAL tool call actually failed". Fixed: per-result
+assignment in the results loop (last processed result decides; deeper failure branches may
+re-assert True) + the blanket post-loop True removed. Both orderings pinned in
+`test_dispatch_pipeline_extraction.py::test_last_was_failure_is_terminal_result_granular`.
+KNOWN DESIGN EDGE, deliberately unchanged: a turn whose ONLY/last tool call fails but whose
+answer honestly reports it (probe F2: "read missing file → reply NOPE" → outcome failed)
+still labels failed — resolve_turn_outcome priority 1 treats terminal execution failure as
+ground truth over a verifier PASS; softening that hierarchy is a calibration-design decision,
+not a bug fix. Probe F1 re-validated the evidence-provenance fix live: the exact
+filename-collision prompt that used to skip now yields VISUAL CONFIRMED (100%).
+
+**Deployed + live-validated (suite 10131 green, listener 43101):** F1 evidence provenance →
+VISUAL CONFIRMED (100%) ✅; F2c terminal-granularity → `turn outcome ok · 0.86` WITH Strike
+2/6 on the ledger (was "failed" for this shape) ✅; F3 markdown guard → browser screenshot
+shown inline via its /api/download link, zero guard fires ✅. TargetClosedError retry +
+producer→vision batch ordering are race-dependent (not force-triggerable) — unit-covered;
+their log lines ("Browser Retry", "Batch Order") self-announce if they fire live.
+OBSERVATION for the record: the upstream native tool_call corruption fired TWICE in this
+probe round on parallel multi-call replies (req 36: two file_system calls merged; repaired
+first call carried leaked XML as its path → garbage-path read failure). The repair guard
+holds, but multi-call replies remain corruption-prone on the current llama.cpp build — the
+model-side workaround (one call per response) is reliable.
+
+### 2026-07-31 — The agent was verifying its own UI with captions: verify_ui + browser evaluate + the VISUAL gate was never alive
+
+**Headline: request 66d64313 (pinball debugging) exposed a three-layer verification gap — the
+agent's only feedback channel for "did my fix work?" was a generic `describe_picture` caption;
+the exact-state probe it needed didn't exist; and the verifier's pixels-ground-truth gate had
+NEVER produced a verdict on this model. All three closed, tests + docs shipped.**
+
+**The incident (550s, 5 failed fixes).** Debugging its own pinball game, the agent needed one
+fact — "did the ball exit the launcher channel?" — and verified five successive wall-geometry
+edits with screenshot → `describe_picture` round-trips (~30s each, ~150s of the request). Caption-
+shaped feedback made it misjudge one frame ("ball is in the play area — fix works", contradicted
+a turn later), oscillate through five hypotheses, and the late verifier REFUTED the turn because
+the coordinates its claim leaned on were "not found in the vision" output — a caption structurally
+cannot carry them. Same request also logged "VISUAL check skipped (vision returned no verdict)".
+
+**Diagnosis 1 — the VISUAL gate was dead-on-arrival on a thinking vision model (silent-inoperative
+class).** Reproduced live against Eva (Qwen3.6-35B + mmproj, preserve_thinking template):
+`verify_visual`'s payload capped `max_tokens=1024`, the model spent ALL 1024 in
+`reasoning_content` (`finish_reason=length`), `content` came back EMPTY → `_parse_json("")` → `{}`
+→ None → skip, every time. The current log window contains ZERO successful VISUAL verdicts. With
+the codebase's established switch pair (`/no_think` + `chat_template_kwargs enable_thinking=false`)
+the identical call answered in 163 tokens of clean, correct JSON (it even REFUTED the test claim
+for the right reason: the frame showed the menu, not gameplay).
+
+**Fixes (all deployed together):**
+1. **`core/verifier.py` `_call_llm_vision`** — ships the no-think switch pair (new
+   `GHOST_VISUAL_NO_THINK`, default ON) + token cap raised via `_VISUAL_MAX_TOKENS`
+   (`GHOST_VISUAL_MAX_TOKENS`, default 2048) as the belt for backends that ignore the kwargs.
+   The VISUAL pixels-override gate is now actually live for the first time on this model.
+2. **`tools/vision.py` `action='verify_ui'`** — the question channel, agent-facing: mandatory
+   `prompt` (fails fast with an instructive error), fixed JSON verdict `{answer, confidence,
+   evidence, details}` judged by a UI-auditor system prompt with an UNCERTAIN-don't-guess escape
+   hatch for menu/blank frames; same no-think knob; distinct result banner ("UI VERIFICATION
+   RESULT (judged from pixels only)") so the verifier can tell verdicts from captions. NOTE:
+   `describe_picture` already accepted a `prompt` param — the agent never used it because nothing
+   taught it to; registry description + system prompt now steer UI checks to verify_ui explicitly.
+3. **`tools/browser.py` interact `evaluate` sub-action** — the probe the pinball session actually
+   needed: run a JS expression in the page, get its JSON value back (aliases expression/script
+   healed; output capped like extract_text with true-length + truncated flag; `default=str`
+   salvage for non-serialisable values; VALUE surfaced in full by the formatter). `page.evaluate`
+   existed inside the runner all along (powering extract_text) but was never exposed. JS-initiated
+   fetches still pass the context's SSRF route guard — capability added, no new network exposure.
+   Prompt + registry now teach the split: vision for how things LOOK, evaluate for what state IS
+   (sample twice around a sleep to see motion).
+
+**Fresh-eyes review round (read-only agent on my own edits — the 2026-07-27 convention paid off
+again, 5 actionable findings past a 10111-green suite):** (a) `evaluate` was the only UNBOUNDED
+sub-action — `page.evaluate` is not governed by set_default_timeout, so an unsettled Promise
+("await the gameover event") hung until the subprocess kill, which discards the [BROWSER_OK]
+payload and with it every EARLIER action's result → now wrapped in `asyncio.wait_for` (step
+timeout_ms, 1s floor) failing per-action with a "poll with sleep+evaluate" steer; (b) 4 new tests
+hard-asserted env-controlled defaults, so exercising the documented GHOST_VISUAL_NO_THINK=0 kill
+turned green→red → tests now pin module attrs via monkeypatch + flag-OFF branches covered +
+verified green under the kill-switch env; (c) the prompts.py verify_ui example omitted the
+REQUIRED `target` param (models mirror examples over schemas) → fixed; (d) `action` was never
+normalized ("Verify-UI" silently fell to the generic else and returned a caption under the
+wrong banner) → normalized like the prompt aliases, tested; (e) SSRF pre-flight checked only
+action=="goto" while the sanitiser heals ("goto","navigate") → guard widened to match (future-
+alias asymmetry, not a live hole — the runner ignores url on evaluate and the ctx.route guard
+covers JS-initiated fetches); plus GHOST_VISUAL_MAX_TOKENS="0" truthy-string edge guarded, and
+one test docstring corrected (a set exercises default=str, not the except fallback — a genuine
+circular-ref test now covers that path).
+
+**Tests:** `test_browser_interact_evaluate.py` (12), `test_vision_verify_ui.py` (10), +5 no-think
+regressions in `test_verifier_visual.py` (incl. empty-content → None, the live shape; flag-off).
+Docs: `docs/tools/browser.html`, `docs/tools/vision.html`, `docs/core/verifier.html`.
+
+**LIVE-VALIDATED same day (4 probes on :8000, post-deploy):**
+- **evaluate** (req e63f0371): one bounded interact call → `{"title":"Pinball","ballX":370,
+  "ballY":560}` returned verbatim, 42s turn, verified 0.96. The question the incident burned
+  5 vision calls on is now one exact probe.
+- **verify_ui** (req 884726e5): clean verdict JSON (answer/confidence/evidence/details, with
+  genuinely specific details — bumper point values, flipper labels). Vision round-trip **7.1s
+  vs 18–31s** for describe_picture in the same log — the no-think switches measured live.
+- **VISUAL gate** (req d02db9d6): **`VISUAL CONFIRMED (100%)` — the first live visual verdict
+  this gate has EVER produced** (previous log windows: skip lines only).
+
+**Probe-log findings (deficiency sweep of the 4 requests):**
+1. **FIXED same hour** — both screenshot-verify turns ran under the SPECIALIST persona ("Ghost
+   Specialist Activated") which had NO verify_ui steer (I'd only added it to SYSTEM_PROMPT), so
+   the agent kept reaching for bare describe_picture. Steer added to SPECIALIST_SYSTEM_PROMPT
+   (UI/APP VERIFICATION bullet), test pins BOTH personas, redeployed (listener 37941→39300).
+2. OPEN — visual-evidence selection misclassifies an agent-rendered screenshot as "the user's
+   own image" when the USER's message names the filename (probe 68033190: agent DID screenshot
+   functest_visual.png but the gate skipped "no rendered after-image" because the name appeared
+   in the prompt). Prefer tool-call provenance (out_path written this turn) over name matching.
+3. OPEN — after the native tool_call repair splits a merged multi-tool reply (req d02db9d6),
+   the split calls ran CONCURRENTLY: vision_analysis raced the browser screenshot it depended
+   on → file-not-found → spurious fatal Strike 1/6 + a retry turn. Repaired calls should run
+   sequentially (or file-target tools should wait on same-turn writers).
+4. OPEN — the image-markdown guard ("Caught image markdown without tool call") false-positived
+   on a legitimate browser-screenshot DOWNLOAD link; the agent burned a turn arguing with it.
+   Whitelist browser screenshot results as image-tag sources.
+5. OPEN/WATCH — req d02db9d6's turn outcome printed **failed · 0.86** (strike-driven) although
+   the reply was correct and BOTH late verdicts (VISUAL + text) CONFIRMED 100% — the backfill
+   corrected the corpus, but the outcome label mismatch is the anti-correlated-calibration
+   shape from the 2026-07-29 night-log audit. Verify the trajectory record post-backfill.
+6. OPEN (minor) — transient `TargetClosedError` on the first atomic screenshot after prior
+   browser activity (launch race on the shared profile; self-healed at the cost of 2 turns).
+   A single tool-layer retry on TargetClosedError would absorb it. Also cosmetic: pretty_log
+   truncates vision targets at 30 chars ("pinball_render_chec").
+
+**RETRY round (operator-restarted server, 3 probes + log sweep):** evaluate PASS (35.6s,
+verified 0.96), verify_ui PASS (37.7s, verified 0.91), and the VISUAL gate produced its
+SECOND live verdict (`VISUAL CONFIRMED (100%)`, req 2c5ec4b5) — the gate is now reproducibly
+alive. But the uptake probe STILL chose bare describe_picture despite the persona steer being
+live, and the log showed why: the memory bus hydrates the agent's own auto-learned lessons
+from the incident session, which embed the OLD caption workflow (freq≥7 reinforced) — habit +
+lessons beat a prompt bullet. Two follow-ups shipped (STAGED — need next restart; a live user
+request was on the box so no kill):
+- **Moment-of-use steer:** a bare describe_picture (no prompt) result now carries a TIP line
+  pointing at verify_ui — same pattern as browser's PRE_INTERACTION; lands mid-decision where
+  prompt guidance loses.
+- **Empty-vision fail-open closed:** req 2c5ec4b5 turn 2 got "" back from the contended node
+  UNDER THE SUCCESS BANNER and burned 57s noticing; empty content now ships as a named
+  "Vision API Error: … EMPTY result" (contract change: test_content_null_does_not_error
+  updated — crash-protection half stands, silent-empty-success half deliberately reversed).
+
+**FINAL round (post-TIP restart, listener 40061): UNPROMPTED UPTAKE CONFIRMED on the incident
+shape.** Asked the exact question class that caused the original 550s failure ("is the ball in
+the launcher channel or the play area, at what coordinates?" — NO tool named), the agent's
+thinking chose it explicitly ("use browser's evaluate action to read the game's JavaScript
+state directly"): one evaluate call → precise answer (channel, x=370/y=560, cross-checked
+against the channel geometry from the source) with ZERO vision calls, verified flow, C=0.92,
+97s. The VISUAL gate also produced its THIRD consecutive live verdict (CONFIRMED 100%) across
+two restarts. Residual: on BROAD "does it render correctly" questions the agent still opens
+with bare describe_picture — defensible there (a caption answers a broad question), and that
+result now carries the verify_ui TIP for the moment it isn't.
+
+**Watch:** whether the stale caption-workflow lessons decay via outcome-gated utility or need
+a manual scrub (only matters if specific-question turns regress to captions). Kill switches:
+`GHOST_VISUAL_NO_THINK=0` (restores thinking for BOTH visual paths), `GHOST_VISUAL_MAX_TOKENS`.
+
 ### 2026-07-30 (later 3) — Auth orphaned sandbox apps → service tokens; a false premise looped the solver
 
 **Headline: the 2026-07-13 auth rollout silently broke every sandbox-hosted app that integrates

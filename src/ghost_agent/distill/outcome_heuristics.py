@@ -56,6 +56,14 @@ from .schema import Trajectory, Outcome
 
 _ATTEMPT_ABORTED_RE = re.compile(r"\[ATTEMPT_ABORTED_[A-Z_]+\]")
 
+# The failure_reason stamped when a trajectory is FAILED *solely* because a
+# tool call broke — no refute, no shape-heuristic finding. Shared so the
+# writer (agent._record_turn_trajectory) and the reader (the late-verdict
+# backfill, which may upgrade exactly this kind of FAILED to PASSED) cannot
+# drift apart: a key≠serializer mismatch here would silently disable the
+# 2026-07-31 honest-failure rule on the async-verdict path.
+STRUCTURAL_FAILURE_REASON = "structural failure"
+
 
 @dataclass
 class FailureClassification:
@@ -300,24 +308,40 @@ def resolve_turn_outcome(
     became a lesson or a PRM negative. This unifies them.
 
     Priority, strongest first:
-      1. a STRUCTURAL execution failure (non-zero exit / tool error) is ground
-         truth  → FAILED;
-      2. a REFUTED verifier verdict (already thresholded at conf ≥ 0.7 by the
+      1. a REFUTED verifier verdict (already thresholded at conf ≥ 0.7 by the
          caller)                                                     → FAILED;
-      3. an existing FAILED (from the shape heuristics or a prior signal) is
+      2. an existing FAILED (from the shape heuristics or a prior signal) is
          never upgraded away                                         → FAILED;
-      4. a SUPPORTED verifier verdict                                → PASSED;
+      3. a SUPPORTED verifier verdict                                → PASSED;
+      4. a STRUCTURAL execution failure (non-zero exit / tool error) → FAILED;
       5. otherwise keep ``current`` (UNKNOWN for a signal-free chat turn).
+
+    **Rules 3 and 4 swapped on 2026-07-31 (operator decision).** Structural
+    failure used to be priority 1: ground truth that something broke. But it
+    conflated a BROKEN TURN with a FAILED ENVIRONMENT — a turn whose only
+    tool call fails and whose answer *honestly reports that failure* ("that
+    file does not exist") was labelled FAILED, even though the agent did the
+    right thing and the verifier CONFIRMED it. That taught the corpus,
+    calibration, and skills-auto to treat honest failure-reporting as bad
+    behaviour, which is precisely the incentive that produces fabricated
+    success. The verifier is the signal that actually inspected the answer
+    against the evidence, so a CONFIRMED verdict now outranks the structural
+    signal — the environment failed, the turn did not. An execution failure
+    still lands FAILED whenever no verdict exists (rule 4), and rule 2 keeps
+    the shape heuristics intact: a turn that thrashed a selector 4× or hit a
+    runtime abort marker stays FAILED no matter how honestly it says so.
 
     ``verifier`` is the ``verifier_backfill`` tag: ``"passed"`` | ``"failed"``
     | ``None``. ``current`` is the outcome already on the trajectory (after the
     shape heuristics ran).
     """
     cur = current or Outcome.UNKNOWN.value
-    if execution_failed or verifier == "failed":
+    if verifier == "failed":
         return Outcome.FAILED.value
     if cur == Outcome.FAILED.value:
         return Outcome.FAILED.value
     if verifier == "passed":
         return Outcome.PASSED.value
+    if execution_failed:
+        return Outcome.FAILED.value
     return cur

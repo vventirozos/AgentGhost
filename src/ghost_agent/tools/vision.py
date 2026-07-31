@@ -1,10 +1,19 @@
 import asyncio
 import base64
 import mimetypes
+import os
 import httpx
 from pathlib import Path
 from ..utils.logging import Icons, pretty_log
 from .file_system import _get_safe_path, _download_redirect_target, _MAX_DOWNLOAD_REDIRECTS
+
+# Thinking suppression for the verdict-shaped `verify_ui` action. Same
+# failure mode (and same env knob) as the verifier's visual gate: on a
+# thinking vision model the <think> prelude can consume the whole token
+# budget and the JSON verdict never appears. A verdict is a tiny object —
+# it does not need a reasoning prelude. GHOST_VISUAL_NO_THINK=0 restores
+# thinking for BOTH paths.
+_VERIFY_UI_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
 
 # Magic-byte signatures for the formats vision servers actually accept.
 # Used to (a) type local files that lack a useful extension and (b) refuse
@@ -109,13 +118,30 @@ _MAX_PDF_PAGE_PIXELS = 4_000_000
 async def tool_vision_analysis(action: str = None, target: str = None, llm_client=None, sandbox_dir: Path = None, tor_proxy: str = None, prompt: str = None, **kwargs):
     if not action or not target:
         return "SYSTEM ERROR: The 'action' and 'target' parameters are MANDATORY."
-    pretty_log("Vision AI", f"{action} -> {str(target)[:30]}", icon=Icons.TOOL_DEEP)
+    # Normalize the action the same way prompt aliases are healed below:
+    # "Verify_UI" / "verify-ui" must not silently fall into the generic
+    # else-branch and return a caption where a verdict was asked for.
+    action = str(action).strip().lower().replace("-", "_")
+    # 72, not 30: the old cap cut real filenames mid-word in the operator
+    # stream ("pinball_render_chec") — the target IS the signal here.
+    pretty_log("Vision AI", f"{action} -> {str(target)[:72]}", icon=Icons.TOOL_DEEP)
 
     # Accept the aliases the model reaches for (same healing policy as
     # file_system): the custom instruction usually lands in one of these.
     if not prompt:
         prompt = (kwargs.get("question") or kwargs.get("query")
                   or kwargs.get("text") or kwargs.get("instruction") or None)
+
+    # verify_ui is a targeted claim-check, not a caption — without the
+    # question there is nothing to verify. Fail fast, before any file I/O.
+    if action == "verify_ui" and not prompt:
+        return (
+            "SYSTEM ERROR: action='verify_ui' requires 'prompt' — the specific "
+            "question or claim to check against the image. Example: "
+            "prompt='Is the ball inside the main play area (left of the "
+            "launcher channel), or still inside the channel? Give its "
+            "approximate position.'"
+        )
 
     # Strip these ONLY as a leading prefix — str.replace() would also clobber
     # the substring mid-path (e.g. "assets/sandbox/logo.png").
@@ -304,7 +330,38 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         else:
             default_prompt = "Analyze the image."
 
-        final_prompt = prompt if prompt else default_prompt
+        if action == "verify_ui":
+            # Verdict-shaped: the caller's question is answered strictly from
+            # the pixels, in a fixed JSON schema, so the answer can feed both
+            # the agent's own loop and the verifier's evidence set. A generic
+            # caption structurally cannot do this — the 2026-07-31 pinball
+            # session burned 5 describe_picture round-trips inferring a
+            # yes/no from prose (and the late verifier refuted the turn
+            # because the coordinates it claimed were "not found in the
+            # vision" output).
+            sys_prompt = (
+                "You are a meticulous UI auditor. Judge ONLY what is actually "
+                "visible in the image(s) — never what the caller hopes or "
+                "expects to see."
+            )
+            final_prompt = (
+                "Answer the QUESTION strictly from the pixels of the image(s).\n\n"
+                f"QUESTION:\n{prompt}\n\n"
+                "Respond ONLY with a JSON object:\n"
+                "{\n"
+                '  "answer": "YES" | "NO" | "UNCERTAIN" | "<the specific value asked for>",\n'
+                '  "confidence": 0.0-1.0,\n'
+                '  "evidence": "one sentence describing exactly what you see that supports the answer",\n'
+                '  "details": "positions/coordinates/colors/text relevant to the question, if applicable"\n'
+                "}\n"
+                "If the image cannot answer the question (blank frame, loading "
+                "screen, a start MENU instead of the running app), answer "
+                "UNCERTAIN and say why in `evidence` — do NOT guess."
+            )
+            if _VERIFY_UI_NO_THINK:
+                final_prompt += "\n\n/no_think"
+        else:
+            final_prompt = prompt if prompt else default_prompt
 
         content_array = [{"type": "text", "text": final_prompt}]
         for mime, b64 in b64_images:
@@ -319,12 +376,29 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
             "temperature": 0.1,
             "max_tokens": 4096
         }
+        if action == "verify_ui" and _VERIFY_UI_NO_THINK:
+            # Hard-switch companion to the /no_think soft-switch above —
+            # without it a thinking vision model spends the whole budget on
+            # the <think> prelude and content comes back empty (the exact
+            # silent failure that kept the verifier's VISUAL gate inert).
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         resp_data = await llm_client.chat_completion(payload, use_vision=True)
         # `.get("content", "")` returns None when the key exists with a null
         # value (some OpenAI-compatible servers do that) → the concat below
         # would TypeError and a SUCCESS gets reported as an error. Coerce.
         analysis = (resp_data["choices"][0]["message"].get("content") or "")
+        # An empty answer must not ship under a success banner: live req
+        # 2c5ec4b5 got "" back from a contended node and the agent had to
+        # NOTICE the emptiness itself before retrying (57s lost). Name the
+        # failure so the retry decision has signal.
+        if not analysis.strip():
+            return (
+                "Vision API Error: the vision node returned an EMPTY result "
+                "(node contention or truncation — the image itself was "
+                "readable). Retry the same call once; if it stays empty, "
+                "the node is unhealthy."
+            )
         # Truncation must never be silent (same policy as file listings): a
         # 50-page PDF analysed as if complete misleads every downstream step.
         page_note = ""
@@ -335,7 +409,25 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 f"file_system(operation='read_chunked', path='{target}', "
                 f"page={pdf_pages_analyzed + 1}) or knowledge_base ingestion."
             )
-        return "VISION ANALYSIS RESULT:\n" + analysis + page_note
+        if action == "verify_ui":
+            return "UI VERIFICATION RESULT (judged from pixels only):\n" + analysis + page_note
+        # Moment-of-use steer (same pattern as browser's PRE_INTERACTION /
+        # RENDER_CHECK lines): the prompt-level guidance loses to habit and
+        # to auto-learned lessons that embed the old caption workflow — a
+        # tip on the RESULT lands exactly when the agent is mid-decision.
+        # Only for bare describe_picture: a caller-supplied prompt already
+        # targeted the question.
+        tip = ""
+        if action == "describe_picture" and not prompt:
+            tip = (
+                "\nTIP: if you were checking for something SPECIFIC (does X "
+                "render? is the ball past the wall?), call "
+                "action='verify_ui' with prompt='<your exact question>' — "
+                "it returns a JSON verdict {answer, confidence, evidence, "
+                "details} instead of a caption that may omit the detail "
+                "you need."
+            )
+        return "VISION ANALYSIS RESULT:\n" + analysis + page_note + tip
 
     except Exception as e:
         pretty_log("Vision Error", str(e), level="ERROR", icon=Icons.FAIL)

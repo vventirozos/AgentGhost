@@ -251,3 +251,109 @@ async def test_successful_file_write_resets_noprogress_ledger():
     ], strikes=strikes, repeated_action_steered=set())
     await agent._dispatch_and_process_tool_batch(ts2)
     assert strikes.action_sigs == {}
+
+
+@pytest.mark.asyncio
+async def test_vision_waits_for_file_producers_in_same_batch():
+    """Producer→consumer ordering (2026-07-31, probe req d02db9d6): after
+    the native-repair split a merged 'browser screenshot + vision_analysis'
+    reply, both landed in one gather and vision probed the PNG before the
+    screenshot existed → file-not-found → spurious FATAL strike + a retry
+    turn. When one batch holds a file-producing tool AND vision_analysis,
+    the producers must complete before vision runs."""
+    import asyncio
+
+    agent = _make_agent()
+    events = []
+    written = {"done": False}
+
+    async def browser(**kwargs):
+        await asyncio.sleep(0.05)  # give a racing vision time to jump ahead
+        written["done"] = True
+        events.append("browser")
+        return "SAVED: shot.png"
+
+    async def vision(**kwargs):
+        events.append(f"vision(sees_file={written['done']})")
+        return "VISION ANALYSIS RESULT: fine"
+
+    agent.available_tools = {"browser": browser, "vision_analysis": vision}
+    tc = [
+        {"id": "b0", "type": "function",
+         "function": {"name": "browser",
+                      "arguments": '{"operation": "screenshot", "url": "file:///x.html", "out_path": "shot.png"}'}},
+        {"id": "v0", "type": "function",
+         "function": {"name": "vision_analysis",
+                      "arguments": '{"action": "describe_picture", "target": "shot.png"}'}},
+    ]
+    ts = _make_ts(tool_calls=tc, strikes=StrikeLedger(),
+                  repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts)
+
+    assert events == ["browser", "vision(sees_file=True)"], events
+    # Both calls got real answers.
+    tool_msgs = [m for m in ts.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+
+
+@pytest.mark.asyncio
+async def test_vision_without_producer_runs_unordered():
+    """No file producer in the batch → no sequencing barrier; vision runs
+    in the ordinary concurrent gather (and completes fine)."""
+    agent = _make_agent()
+
+    async def vision(**kwargs):
+        return "VISION ANALYSIS RESULT: fine"
+
+    async def probe(**kwargs):
+        return "probe"
+
+    agent.available_tools = {"vision_analysis": vision, "probe_tool": probe}
+    tc = [
+        {"id": "v0", "type": "function",
+         "function": {"name": "vision_analysis",
+                      "arguments": '{"action": "describe_picture", "target": "old.png"}'}},
+        {"id": "p0", "type": "function",
+         "function": {"name": "probe_tool", "arguments": '{"q": "x"}'}},
+    ]
+    ts = _make_ts(tool_calls=tc, strikes=StrikeLedger(),
+                  repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    tool_msgs = [m for m in ts.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 2
+
+
+@pytest.mark.asyncio
+async def test_last_was_failure_is_terminal_result_granular():
+    """Probe F2b (2026-07-31): `last_was_failure` was only SET on failure,
+    never cleared by a later success in the same batch — so a fail→recover
+    batch stayed True and the corpus + Turn Outcome line branded the
+    recovered turn FAILED. The LAST processed result must decide."""
+    agent = _make_agent()
+
+    async def flaky(**kwargs):
+        return "Error: nope"
+
+    async def steady(**kwargs):
+        return "fine"
+
+    agent.available_tools = {"flaky": flaky, "steady": steady}
+
+    def _batch(order):
+        return [
+            {"id": f"c{i}", "type": "function",
+             "function": {"name": n, "arguments": f'{{"q": "{i}"}}'}}
+            for i, n in enumerate(order)
+        ]
+
+    # fail → recover: terminal result succeeded → False
+    ts = _make_ts(tool_calls=_batch(["flaky", "steady"]),
+                  strikes=StrikeLedger(), repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    assert ts.last_was_failure is False
+
+    # recover → fail: terminal result failed → True
+    ts2 = _make_ts(tool_calls=_batch(["steady", "flaky"]),
+                   strikes=StrikeLedger(), repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts2)
+    assert ts2.last_was_failure is True

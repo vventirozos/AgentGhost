@@ -851,6 +851,16 @@ async def op_interact(op):
       {"action": "wait_for_selector", "selector": "...", "timeout_ms": N}
       {"action": "screenshot", "out_path": "..."}
       {"action": "sleep", "ms": N}
+      {"action": "evaluate", "js": "...", "max_chars": N}
+
+    ``evaluate`` runs a JS expression (or arrow function) in the page and
+    returns its JSON-serialised value. This is the ground-truth probe for
+    app STATE the agent itself built — reading `ball.x` beats judging a
+    screenshot of a moving ball (the 2026-07-31 pinball session burned
+    five ~30s vision round-trips on a question one evaluate answers
+    exactly). Runs in the page context, same trust domain as click/fill;
+    JS-initiated fetches still pass through the context's SSRF route
+    guard.
 
     Failures are reported per-action: a click that times out doesn't
     abort the whole sequence by default (``stop_on_error=False``),
@@ -1144,11 +1154,56 @@ async def op_interact(op):
                     results.append({
                         "index": idx, "action": "sleep", "ok": True, "ms": ms,
                     })
+                elif name == "evaluate":
+                    js = (step.get("js") or step.get("expression")
+                          or step.get("script"))
+                    if not js:
+                        raise ValueError("evaluate requires 'js'")
+                    # page.evaluate is NOT governed by set_default_timeout
+                    # (that covers actions/navigations only), so an
+                    # unsettled promise ("await a gameover event") would
+                    # hang until the subprocess kill — which discards the
+                    # [BROWSER_OK] payload and with it every EARLIER
+                    # action's result. Bound it per-action so a stuck
+                    # evaluate degrades to a per-action failure like any
+                    # sibling branch.
+                    _eval_timeout_s = max(
+                        1.0, int(step.get("timeout_ms", op["timeout_ms"])) / 1000.0)
+                    try:
+                        value = await asyncio.wait_for(
+                            page.evaluate(js), timeout=_eval_timeout_s)
+                    except asyncio.TimeoutError:
+                        raise RuntimeError(
+                            f"evaluate timed out after {_eval_timeout_s:.0f}s — "
+                            "the expression never settled (an unresolved "
+                            "Promise?). Poll with sleep+evaluate instead of "
+                            "awaiting an event inside one evaluate."
+                        )
+                    # The page can hand back anything JS can build —
+                    # serialise defensively (default=str catches whatever
+                    # Playwright let through) and CAP the output so one
+                    # evaluate can't dump a whole data structure into the
+                    # model context (same policy as extract_text).
+                    try:
+                        as_json = json.dumps(value, default=str)
+                    except (TypeError, ValueError):
+                        as_json = json.dumps(str(value))
+                    max_chars = int(step.get("max_chars", 16 * 1024))
+                    full_len = len(as_json)
+                    truncated = False
+                    if len(as_json) > max_chars:
+                        as_json = as_json[:max_chars]
+                        truncated = True
+                    results.append({
+                        "index": idx, "action": "evaluate", "ok": True,
+                        "value": as_json,
+                        "length": full_len, "truncated": truncated,
+                    })
                 else:
                     raise ValueError(
                         f"unknown action {name!r}; valid: "
                         "goto, click, dblclick, extract_text, fill, "
-                        "wait_for_selector, screenshot, sleep"
+                        "wait_for_selector, screenshot, sleep, evaluate"
                     )
             except Exception as e:
                 results.append({
@@ -1598,7 +1653,9 @@ async def tool_browser(
                 (click + extract + screenshot etc. share transient DOM
                 state). Required for multi-step SPA flows where the
                 atomic per-op re-navigation would wipe intermediate
-                state.
+                state. Includes an `evaluate` sub-action that runs a JS
+                expression in the page and returns its value — the
+                exact-state probe for apps the agent built itself.
 
     `tor_proxy` is forwarded as Chromium's `--proxy-server` with
     `--host-resolver-rules` forcing DNS through the proxy.
@@ -1646,8 +1703,12 @@ async def tool_browser(
                               allowed_local_ports=_svc_ports)
     if _b:
         return _err(f"Refused navigation: {_b}")
+    # ("goto", "navigate"): the sanitiser below heals BOTH spellings'
+    # file:// URLs, so the guard must inspect both — checking only "goto"
+    # would let a future runner-side "navigate" alias skip the host-side
+    # SSRF pre-flight silently.
     for _a in (actions or []):
-        if isinstance(_a, dict) and _a.get("action") == "goto":
+        if isinstance(_a, dict) and _a.get("action") in ("goto", "navigate"):
             _b = _browser_blocked_url(_a.get("url"), anonymous=_anon,
                                       allowed_local_ports=_svc_ports)
             if _b:
@@ -1793,6 +1854,30 @@ async def tool_browser(
         return _err(f"sandbox execute failed: {e}")
 
     ok, parsed = _parse_runner_output(output or "")
+
+    # Chromium launch-race retry (2026-07-31, probe req 68033190). The first
+    # atomic op after recent browser activity can hit `TargetClosedError:
+    # BrowserType.launch_persistent_context: Target page, context or browser
+    # has been closed` — the previous call's Chromium is still tearing down
+    # on the SHARED profile dir when the new launch grabs it. The lock
+    # serialises our runner subprocesses, not Chromium's own shutdown. One
+    # bounded retry after a short settle absorbs it; without this the agent
+    # self-heals but burns ~2 turns and an error strike doing so.
+    if not ok and "TargetClosedError" in str(parsed):
+        pretty_log("Browser Retry",
+                   "Chromium launch race (TargetClosedError) — retrying once "
+                   "after settle",
+                   icon=Icons.RETRY, level="WARNING")
+        await asyncio.sleep(1.5)
+        try:
+            async with _BROWSER_PROFILE_LOCK:
+                output, exit_code = await asyncio.to_thread(
+                    sandbox_manager.execute, cmd,
+                    timeout=subprocess_timeout, **_wd_kw
+                )
+            ok, parsed = _parse_runner_output(output or "")
+        except Exception as e:
+            logger.debug("TargetClosedError retry failed: %s", e)
 
     # Degraded-milestone navigate retry (2026-07-18). Over Tor a slow exit
     # circuit stalls subresources and even `domcontentloaded` can miss the
@@ -2034,6 +2119,14 @@ async def tool_browser(
                     )
                 elif act == "sleep":
                     lines.append(f"  [{idx}] {status} sleep {r.get('ms')}ms")
+                elif act == "evaluate":
+                    val = r.get("value", "")
+                    trunc = " (truncated)" if r.get("truncated") else ""
+                    lines.append(f"  [{idx}] {status} evaluate: len={r.get('length')}{trunc}")
+                    # The value IS the point of this action — surface it in
+                    # full (it is already capped runner-side), not a 500-char
+                    # teaser like extract_text's preview.
+                    lines.append(f"      VALUE: {val}")
                 else:
                     lines.append(f"  [{idx}] {status} {act}")
             else:
