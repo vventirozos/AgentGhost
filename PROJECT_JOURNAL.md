@@ -535,10 +535,17 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    VERDICT per the amended acceptance rule → **decides Phase 4 (parked unless clearly positive)**.
    Ask any session for "the 4F watch reading".
 2. **Phase 2b fixture supply** (`GHOST_LLM_RECORD=1` in the launcher since 07-30 16:06 —
-   UNREDACTED, local-only): after ~3-7 days → build miner (tool choice parsed from
-   `message.content` via the agent's own parser — NOT structured tool_calls; ground truth =
-   error-free executions; public/private by request-id hash), registry read-site via optim loader,
-   gepa run, private gate, deploy — **then flip recording OFF + archive/delete day-files**.
+   UNREDACTED, local-only): **supply was structurally broken until 07-31 ~13:40** — the main tool
+   loop STREAMS and the recorder had no streaming hook (the §4-parked "dev feature" turned out
+   load-bearing: 21 h of heavy traffic = 7 fixtures). IMPLEMENTED + DEPLOYED 07-31: stream-side
+   recording in `_do_stream_chat_completion` (delta accumulation incl. indexed `delta.tool_calls`
+   fragments — native-tools streams carry the parsed call THERE with empty content; reassembled
+   OpenAI-shaped record on clean completion only, kind=`chat_completion_stream`; zero cost when
+   recording off; `tests/test_stream_recording.py`, 10 tests). Live-verified: probe turn recorded
+   tool calls with names+arguments. Miner ground truth = `message.tool_calls` (structured — the
+   earlier content-parsing contract note is OBSOLETE for streamed records). After ~2-3 days of
+   supply → miner, registry read-site, gepa run, private gate, deploy — **then flip recording OFF
+   + archive/delete day-files**.
 
 **Queued behind evidence (do NOT start early):**
 3. Next verifier optimization round MUST use a rebalanced trial mix first (clean/NOT_REFUTED

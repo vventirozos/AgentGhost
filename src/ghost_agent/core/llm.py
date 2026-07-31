@@ -1414,6 +1414,69 @@ class LLMClient:
         except Exception:
             pass
 
+    @staticmethod
+    def _stream_rec_accumulate(line: str, acc: Dict[str, Any]) -> None:
+        """Fold one SSE line into the stream-recording accumulator
+        (§4F Phase 2b: the main tool loop STREAMS, so without this the
+        recorder never saw a tool-bearing call — 7 fixtures in 21 h).
+        Tolerant by contract: any unparseable line is ignored."""
+        if not line or not line.startswith("data:"):
+            return
+        body = line[5:].strip()
+        if not body or body == "[DONE]":
+            return
+        try:
+            chunk = json.loads(body)
+            choice = (chunk.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                acc["content"].append(str(delta["content"]))
+            if delta.get("reasoning_content"):
+                acc["reasoning"].append(str(delta["reasoning_content"]))
+            # Native-tools streaming: llama-server emits the PARSED call as
+            # indexed delta.tool_calls fragments (name once, arguments in
+            # pieces) with finish_reason "tool_calls" — content stays empty,
+            # so without this branch tool-choice fixtures record blank.
+            for tc in (delta.get("tool_calls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                idx = int(tc.get("index") or 0)
+                slot = acc["tool_calls"].setdefault(
+                    idx, {"id": "", "name": "", "arguments": []})
+                if tc.get("id"):
+                    slot["id"] = str(tc["id"])
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = str(fn["name"])
+                if fn.get("arguments"):
+                    slot["arguments"].append(str(fn["arguments"]))
+            if choice.get("finish_reason"):
+                acc["finish"] = choice["finish_reason"]
+        except Exception:
+            pass
+
+    @staticmethod
+    def _stream_rec_response(acc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Reassemble the accumulator into an OpenAI-shaped response dict,
+        or None when nothing was captured (error/empty streams are not
+        recorded — fixture mining wants complete generations)."""
+        if (not acc["content"] and not acc["reasoning"]
+                and not acc["tool_calls"]):
+            return None
+        msg: Dict[str, Any] = {"role": "assistant",
+                               "content": "".join(acc["content"])}
+        if acc["reasoning"]:
+            msg["reasoning_content"] = "".join(acc["reasoning"])
+        if acc["tool_calls"]:
+            msg["tool_calls"] = [
+                {"id": slot["id"], "type": "function",
+                 "function": {"name": slot["name"],
+                              "arguments": "".join(slot["arguments"])}}
+                for _, slot in sorted(acc["tool_calls"].items())]
+        return {"object": "chat.completion.stream-reassembled",
+                "choices": [{"message": msg,
+                             "finish_reason": acc.get("finish")}]}
+
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
         Fetches embeddings from the upstream LLM with robust retry logic.
@@ -1467,6 +1530,17 @@ class LLMClient:
         # We wrap in a generic retry similar to the non-streaming one if it fails at the start.
         # But once bytes are yielded, if it fails mid-stream, it breaks.
         yielded_any = False
+        # Stream-side recording (§4F Phase 2b): checked ONCE per call so the
+        # off path costs one import + one getenv. When on, deltas are folded
+        # into `_rec_acc` as they pass through and ONE reassembled record is
+        # written on clean completion (never on error/stall paths).
+        try:
+            from .llm_recording import recording_enabled as _rec_enabled
+            _rec_on = _rec_enabled()
+        except Exception:
+            _rec_on = False
+        _rec_acc: Dict[str, Any] = {"content": [], "reasoning": [],
+                                    "tool_calls": {}, "finish": None}
         for attempt in range(2):
             try:
                 # We use stream() to keep the connection open and read chunks.
@@ -1509,7 +1583,15 @@ class LLMClient:
                         awaiting_first_byte = False
                         if chunk:
                             yielded_any = True
+                            if _rec_on:
+                                self._stream_rec_accumulate(chunk, _rec_acc)
                             yield f"{chunk}\n\n".encode('utf-8')
+                    if _rec_on:
+                        _rec_resp = self._stream_rec_response(_rec_acc)
+                        if _rec_resp is not None:
+                            self._maybe_record_call(
+                                payload, _rec_resp,
+                                kind="chat_completion_stream")
                 finally:
                     await resp.aclose()
                 return
