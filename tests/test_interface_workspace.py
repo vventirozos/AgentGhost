@@ -290,3 +290,14 @@ def test_css_palette_input_never_triggers_ios_zoom():
     css = _read("style.css")
     box = css.split("#palette-input {", 1)[1].split("}", 1)[0]
     assert "max(1rem, 16px)" in box, "sub-16px inputs make iOS Safari auto-zoom"
+
+
+def test_delete_all_disarm_is_mouse_only():
+    """Touch pointers are transient: EVERY tap ends in a pointerleave, so an
+    unconditional rail pointerleave-disarm made the second tap of the
+    delete-all confirm re-arm instead of execute — mobile delete-all was
+    impossible (2026-08-01). The disarm must check pointerType === 'mouse';
+    touch relies on the 4s timeout."""
+    js = _read("sessions.js")
+    handler = js.split("pointerleave", 1)[1].split(");", 1)[0]
+    assert "pointerType === 'mouse'" in handler

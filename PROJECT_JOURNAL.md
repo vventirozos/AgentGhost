@@ -1427,6 +1427,37 @@ image filenames; `/api/download` gains nosniff + attachment-forced HTML/XML/SVG 
 HTML would render same-origin with the key). Docs: web_server.html "Visualizer
 overhaul". Versions: app/matrix 8.3, style 5.1.
 
+**Addendum (same session): input-box misplacement WITHOUT rotation (operator: happens
+"when the reply is long enough").** Third producer of the stuck-layout symptom:
+`syncBodyHeight` pinned `body.style.height = visualViewport.height` on EVERY vv event —
+one stale final reading (more streaming = more events = higher odds) left the body
+pinned short forever, footer floating mid-screen. Fixes (v8.4): the pin clears to the
+CSS 100dvh steady state when vv ≈ innerHeight; and a **geometry WATCHDOG** (800ms tick)
+verifies both the body pin and the keyboard translate against FRESH measurements,
+correcting >32px drift — stop chasing event producers (rotation, scroll-dismiss,
+staleness), make every stale state self-heal ≤1s. Playwright: injected stale body-pin
+(input at y=406 — the exact symptom), stuck translate, and both combined, all healed
+with ZERO events fired.
+
+**Addendum 3 (v8.6): mobile delete-all-sessions was IMPOSSIBLE** — the rail's
+unconditional `pointerleave` disarm fired on every tap's trailing pointerleave (touch
+pointers are transient), so tap 2 of the armed confirm always RE-armed instead of
+executing. Disarm is now mouse-only (`ev.pointerType === 'mouse'`); touch keeps the 4s
+timeout as its "no". Live-verified via touch-tap + synthetic pointerleave (no real
+deletion); pin `test_delete_all_disarm_is_mouse_only`. Chain: sessions 6.9 →
+workspace 6.9 → app/matrix 8.6.
+
+**Addendum 2 (v8.5): the v8.4 "vv≈innerHeight ⇒ no keyboard" test was WRONG in
+standalone PWAs — innerHeight SHRINKS WITH the keyboard there (Safari-browser keeps it
+at layout height), so keyboard-open read as no-keyboard → pin cleared → typing blind
+behind the keyboard (operator repro).** Keyboard presence now = focused editable + vv
+below this orientation's MAX-SEEN vv height by >80px (`_vvKeyboardOpen`; baseline
+resets on rotation). Watchdog went bidirectional: heals a stale pin (input floating)
+AND a missing pin (typing blind). Playwright (standalone-style emulation: viewport
+shrink, width constant): pin applied + input visible at the keyboard edge; missed-event
+re-pin ≤1s; restore on close. Lesson: innerHeight semantics differ per display-mode —
+never use it to classify keyboard state; derive from the vv's own per-orientation max.
+
 ### 2026-08-01 (later 7) — req 65d8cf76 post-mortem: one dropped '<' became five strikes; parser heal + replay scrub + path-aware hints SHIPPED
 
 **Incident (16:39, after the later-5 deploy — NOT caused by it):** the model emitted an

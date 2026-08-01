@@ -255,9 +255,15 @@ export function initSessions(ctx) {
         clearTimeout(deleteAllArmTimer);
         deleteAllArmTimer = setTimeout(disarmDeleteAll, 4000);
     });
-    // Leaving the rail disarms — walking away is a "no".
+    // Leaving the rail disarms — walking away is a "no". MOUSE ONLY:
+    // touch pointers are transient, so EVERY tap ends in a pointerleave —
+    // which disarmed the button between tap 1 and tap 2, making the
+    // second tap re-arm instead of execute (mobile delete-all was
+    // impossible, 2026-08-01). Touch relies on the 4s timeout instead.
     document.getElementById('session-rail')
-        ?.addEventListener('pointerleave', disarmDeleteAll);
+        ?.addEventListener('pointerleave', (ev) => {
+            if (ev.pointerType === 'mouse') disarmDeleteAll();
+        });
 
     function scheduleRefresh() {
         clearTimeout(refreshTimer);

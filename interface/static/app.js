@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=8.3';
+import * as matrixGraphFace from './matrix_graph.js?v=8.6';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -449,6 +449,33 @@ window.addEventListener('pageshow', (e) => {
 });
 
 // VisualViewport: track virtual keyboard height so the input area stays visible on iOS.
+//
+// "Is a keyboard open?" can NOT be derived from innerHeight vs vv.height:
+// in standalone-PWA contexts innerHeight SHRINKS with the keyboard (unlike
+// Safari-browser, where it stays at layout height) — that comparison read
+// keyboard-open as no-keyboard, cleared the body pin, and the user typed
+// blind behind the keyboard (operator repro 2026-08-01). The reliable
+// baseline is the MAXIMUM vv height seen in this orientation: a focused
+// editable + a vv meaningfully below that maximum = keyboard.
+let _vvMaxH = 0;
+function _vvEditing() {
+    const ae = document.activeElement;
+    return !!ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT'
+        || ae.isContentEditable);
+}
+function _vvNoteHeight() {
+    const vv = window.visualViewport;
+    if (vv && Math.abs(window.innerWidth - vv.width) <= 2
+            && vv.height > _vvMaxH) {
+        _vvMaxH = vv.height;
+    }
+}
+function _vvKeyboardOpen() {
+    const vv = window.visualViewport;
+    return !!vv && _vvEditing() && (_vvMaxH - vv.height) > 80;
+}
+function _vvResetMax() { _vvMaxH = 0; }   // rotation: re-learn the baseline
+
 if ('visualViewport' in window) {
     let kbSettleTimer = null;
     let kbGuardRetries = 0;
@@ -456,14 +483,11 @@ if ('visualViewport' in window) {
 
     const setKb = (px) => document.documentElement.style.setProperty(
         '--keyboard-height', `${px}px`);
-    const isEditing = () => {
-        const ae = document.activeElement;
-        return !!ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT'
-            || ae.isContentEditable);
-    };
+    const isEditing = _vvEditing;
 
     const updateKeyboardOffset = () => {
         const vv = window.visualViewport;
+        _vvNoteHeight();
         let kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
         // Mid-rotation, innerHeight and vv.height describe DIFFERENT
         // orientations (bogus half-screen "keyboard"). Defer while the
@@ -501,6 +525,7 @@ if ('visualViewport' in window) {
     const onRotate = () => {
         if (isEditing()) { try { document.activeElement.blur(); } catch (e) {} }
         setKb(0);
+        _vvResetMax();   // the old orientation's max height is meaningless now
         scheduleSettle(400);
     };
     window.addEventListener('orientationchange', onRotate);
@@ -2178,7 +2203,19 @@ if (window.visualViewport) {
     let bodySettleTimer = null;
     const syncBodyHeight = () => {
         scrollToBottom();
-        document.body.style.height = window.visualViewport.height + 'px';
+        _vvNoteHeight();
+        // Pin the body ONLY while a keyboard is genuinely open (focused
+        // editable + vv meaningfully below this orientation's max — see
+        // _vvKeyboardOpen; innerHeight comparisons are unusable because
+        // standalone PWAs shrink innerHeight WITH the keyboard). Clearing
+        // to the CSS 100dvh steady state otherwise keeps one stale WebKit
+        // reading (likelier the longer a reply streams) from freezing the
+        // body short — footer floating mid-screen (operator repro).
+        if (_vvKeyboardOpen()) {
+            document.body.style.height = window.visualViewport.height + 'px';
+        } else {
+            document.body.style.height = '';
+        }
         window.scrollTo(0, 0);
     };
     window.visualViewport.addEventListener('resize', syncBodyHeight);
@@ -2189,6 +2226,52 @@ if (window.visualViewport) {
         clearTimeout(bodySettleTimer);
         bodySettleTimer = setTimeout(syncBodyHeight, 300);
     });
+
+    // ── Geometry watchdog ──────────────────────────────────────────
+    // Events cannot be trusted to arrive, arrive in order, or carry
+    // fresh numbers on iOS (rotation, scroll-dismiss, WebKit staleness —
+    // three distinct producers of the same stuck-layout symptom so far).
+    // Instead of chasing each producer, verify the applied geometry
+    // against FRESH measurements on a slow tick and correct drift. Only
+    // acts when something is measurably wrong (>32px), so the steady
+    // state costs two computed-style reads per tick.
+    setInterval(() => {
+        try {
+            const vv = window.visualViewport;
+            if (Math.abs(window.innerWidth - vv.width) > 2) return; // mid-rotate
+            _vvNoteHeight();
+            // 1. Body pin: BOTH directions. A stale pin with no keyboard
+            // floats the input mid-screen; a MISSING pin with the keyboard
+            // open hides the input behind it (typing blind) — heal each.
+            const pinned = document.body.style.height;
+            if (_vvKeyboardOpen()) {
+                const want = vv.height;
+                if (!pinned || Math.abs(parseFloat(pinned) - want) > 32) {
+                    document.body.style.height = want + 'px';
+                    window.scrollTo(0, 0);
+                }
+            } else if (pinned) {
+                document.body.style.height = '';
+                window.scrollTo(0, 0);
+            }
+            // 2. Keyboard-translate drift.
+            const applied = parseFloat(getComputedStyle(document.documentElement)
+                .getPropertyValue('--keyboard-height')) || 0;
+            if (applied > 0) {
+                const ae = document.activeElement;
+                const editing = !!ae && (ae.tagName === 'TEXTAREA'
+                    || ae.tagName === 'INPUT' || ae.isContentEditable);
+                let want = editing
+                    ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+                    : 0;
+                want = Math.min(want, Math.round(window.innerHeight * 0.55));
+                if (Math.abs(applied - want) > 32) {
+                    document.documentElement.style.setProperty(
+                        '--keyboard-height', `${want}px`);
+                }
+            }
+        } catch (e) { /* never let the watchdog take the page down */ }
+    }, 800);
 }
 
 document.addEventListener('dblclick', function (event) { event.preventDefault(); }, { passive: false });
@@ -3457,6 +3540,6 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=6.8').catch(e =>
+import('./workspace.js?v=6.9').catch(e =>
     console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 
