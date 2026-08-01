@@ -244,8 +244,13 @@ async def test_inline_py_autoconvert_carries_pythonpath(tmp_path):
                                 sandbox_dir=tmp_path, sandbox_manager=mgr)
     assert "SYSTEM BLOCK" not in result
     ran = mgr.execute.call_args[0][0]
+    # Per-script EMPTY directory (2026-08-01, req 50855398): the script must
+    # NOT live in shared /tmp — Python puts the script's dir at sys.path[0],
+    # AHEAD of PYTHONPATH, so any stale module there shadows the workspace's.
     assert re.search(
-        r'PYTHONPATH="\$PWD[^"]*" python3 /tmp/_ghost_inline_\w+\.py', ran)
+        r'PYTHONPATH="\$PWD[^"]*" python3 /tmp/_ghost_inline_\w+/inline\.py',
+        ran)
+    assert re.search(r'mkdir -p /tmp/_ghost_inline_\w+ &&', ran)
 
 
 async def test_inline_bash_autoconvert_has_no_pythonpath(tmp_path):
@@ -255,7 +260,7 @@ async def test_inline_bash_autoconvert_has_no_pythonpath(tmp_path):
                        sandbox_dir=tmp_path, sandbox_manager=mgr)
     ran = mgr.execute.call_args[0][0]
     assert "PYTHONPATH" not in ran
-    assert re.search(r'bash /tmp/_ghost_inline_\w+\.sh', ran)
+    assert re.search(r'bash /tmp/_ghost_inline_\w+/inline\.sh', ran)
 
 
 async def test_remap_note_rides_failed_runs_too(tmp_path):

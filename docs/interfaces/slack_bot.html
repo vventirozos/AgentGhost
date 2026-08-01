@@ -177,6 +177,57 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
   <code>runs = 10, last exit code = 78</code>. Bit us live on this exact
   install. Fix: <code>sudo chown vasilis:staff</code> the two log files.</p>
 
+  <h2>Notification-workflow review fixes (2026-08-01)</h2>
+  <p>A code review of the outbound pipeline (activity ledger → <code>/api/notifications</code> →
+  poller → owner DM) found the plumbing sound — owner lock, delivery-before-ack ordering, and the
+  2026-07-13 wedge fixes all hold — and four operational defects, all fixed:</p>
+  <ul>
+    <li><b>Log hygiene.</b> <code>basicConfig(INFO)</code> sent everything (including httpx's two
+    INFO lines per 30s poll) to stderr → the unrotated launchd <code>.err</code> grew to 11&nbsp;MB
+    in three weeks while the <code>.log</code> stayed empty, and the documented wedge signature
+    ("200-OK polls with zero <code>delivered</code> lines") drowned. Now: INFO+ goes to a
+    self-rotating file (<code>GHOST_SLACKBOT_LOG</code>, default
+    <code>ghost-slack-bot.info.log</code> — deliberately NOT the launchd <code>.log</code>, whose
+    fd a rotation rename would silently divert; 5&nbsp;MB × 3 backups, no newsyslog/sudo needed;
+    explicitly empty = stderr only, used by tests; an unwritable path logs a loud
+    "INFO file logging is DARK" warning instead of failing silent), stderr carries WARNING+ only,
+    httpx/httpcore INFO is silenced, and the poller emits an hourly
+    <code>poller heartbeat: N poll(s), M delivered, K error(s)</code> line — a positive
+    liveness signal in place of the old noise.</li>
+    <li><b>Idle-ack churn.</b> The poller acked every poll even when the watermark hadn't moved —
+    a no-op POST plus a <code>notify_consumers.json</code> rewrite every 30s, which also kept that
+    file's mtime permanently fresh (destroying its "stale mtime = wedged" diagnostic value). The
+    ack is now skipped ONLY when the watermark equals the last value this process
+    <em>successfully</em> acked (a non-2xx ack is retried next poll, never recorded); an empty
+    response with an <em>advanced</em> watermark is still acked (the exact 2026-07-13 wedge case,
+    regression-pinned), and an <code>enabled:false</code> response is never acked (its literal
+    watermark 0 would reset the stored offset and replay the whole history later). Because the
+    skip removed the blind 30s re-ack that used to paper over a truncated ledger,
+    <code>/api/notifications/pending</code> now heals a shrunk ledger itself: a consumer offset
+    past EOF returns the re-baselined EOF watermark instead of echoing the stale offset forever.
+    Server-side, <code>save_consumer_offset</code> independently skips identical-value writes for
+    every consumer (web-ui included). The poller also reuses one persistent
+    <code>httpx.AsyncClient</code> (rebuilt on error) instead of a new client per poll.</li>
+    <li><b>Thread re-upload clobber.</b> <code>build_thread_context</code> rebuilds the whole
+    thread on every message, and re-uploaded every earlier attachment each time — re-POSTing the
+    ORIGINAL over the agent's sandbox copy, silently clobbering any edits the agent had made
+    ("fix this file" flows lost the fix on the owner's next message). An in-memory Slack-file-id
+    cache (bounded, 512 entries, 6h TTL — uploads land in the ACTIVE project's scope and sweeps
+    can delete them, so an aged entry re-uploads to re-assert reality) now skips the re-upload on
+    rebuilds; the <code>[SYSTEM NOTE]</code> stays in the context. A bot restart re-uploads once
+    (pre-fix behaviour).</li>
+    <li><b>Readability.</b> Outbound notifications render human phase labels ("scheduled task",
+    not <code>scheduled_task</code>) and a stale-age suffix (<code>_(2.1h ago)_</code>) on records
+    older than 5 minutes — a backlog re-served after downtime no longer reads as breaking news.
+    The live-status <code>EMOJI_MAP</code> gained the current request-path icons
+    (🧠 🧪 🔗 🧭 🎯 🔒 📣 🐘).</li>
+  </ul>
+  <p>Known unwired sibling: <code>interface/slack_project_commands.py</code> is a complete,
+  tested <code>/ghost project …</code> slash-command router that nothing imports — it needs an
+  agent-API-backed store context to wire into this bot. Tests:
+  <code>tests/test_slack_bot_owner_lock.py</code> (poller churn, formatting, upload dedupe,
+  emoji map) and <code>tests/test_autonomous_activity.py</code> (no-op watermark writes).</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

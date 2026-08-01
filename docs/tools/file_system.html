@@ -259,6 +259,28 @@ SyntaxError: Unexpected identifier 't'</pre>
 
   <h2>Download: async close on the curl_cffi path (2026-07-29)</h2>
   <p>Sibling of the <a href="search.html">page-fetch async-drain fix (2026-07-28)</a>, found by the post-fix "grep the other siblings" review. <code>tool_download_file</code>'s curl_cffi branch uses <code>AsyncSession(stream=True)</code>, whose responses must be closed with the ASYNC sequence — <code>quit_now.set()</code> (the curl write callback then aborts the transfer) followed by <code>await aclose()</code>. The sync <code>close()</code> reaps <code>stream_task</code>, which AsyncSession responses never set (they set <code>astream_task</code>), so it was a silent no-op: every redirect hop left its transfer running; the non-200 branch slept 5&nbsp;s for Tor identity renewal while the abandoned body pumped into the response's unbounded <code>asyncio.Queue</code> in RAM; and the &gt;50&nbsp;MB overflow break never aborted the stream at all — the body kept downloading until session teardown. All three now go through the shared <code>utils.helpers.aclose_curl_response()</code> (redirect hops, SSRF-reject, non-200/oversize returns, and a <code>finally</code> around the write loop). Covered by the curl-async download tests in <code>tests/test_download_redirect_ssrf.py</code>; the shared streaming mock's sync <code>iter_content</code> is now a tripwire (raises), so any async path regressing to a sync drain fails loudly instead of staying green.</p>
+  <h2>Two diagnosis upgrades from req 50855398 (2026-08-01)</h2>
+  <ul>
+    <li><b>Double-escape shape named outright.</b> A .py file written as ONE line full of
+    literal <code>\n</code> two-char sequences (a JSON-escaped string landed verbatim) used to
+    produce only the generic SyntaxError ("unmatched '}' (line 1, col 8370)", "unexpected
+    character after line continuation") — the model patch-spiralled for ~180s before diagnosing
+    the shape itself. <code>_syntax_feedback</code> now detects the shape (≤2 real newlines,
+    ≥5 literal <code>\n</code>) and appends "THE WHOLE FILE IS ONE LINE … DOUBLE-ESCAPED …
+    REWRITE the entire file with real newlines" — which also rides the coding executor's
+    retry feedback. (The executor additionally REPAIRS such content pre-write when the
+    unescaped text parses — see <a href="../core/coding_executor.html">coding_executor</a>.)</li>
+    <li><b>Project-title-as-directory catch.</b> Two consecutive live requests read
+    "Mini AI/…" / "Mini AI v2/…" — the model prefixes the project TITLE as a directory even
+    though the workspace root IS the project. When a missing path has a directory prefix and a
+    file with the same basename exists, <code>_missing_file_message</code> now leads with the
+    exact correction ("you are ALREADY inside this project's workspace … use the relative path
+    '&lt;where it actually is&gt;'") instead of steering toward creating a duplicate — naming the
+    MATCHED entry, so a basename living in a subdirectory points at <code>src/train.py</code>,
+    never at a bare name that would fail again (review pass, same day).</li>
+  </ul>
+  <p>Tests: <code>tests/test_req50855398_fixes.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

@@ -152,6 +152,29 @@ class TestWatermarks:
         assert load_consumer_offset(p, "slack") == 10
         assert load_consumer_offset(p, "ntfy") == 99
 
+    def test_save_consumer_offset_skips_noop_writes(self, tmp_path,
+                                                    monkeypatch):
+        """Idle pollers re-ack the same watermark every ~30s; an identical
+        value must not rewrite the file (churn + it kept the mtime
+        permanently fresh, killing the 'stale mtime = wedged consumer'
+        diagnostic from the 2026-07-13 postmortem)."""
+        import ghost_agent.core.autonomous_activity as aa
+        p = tmp_path / "consumers.json"
+        save_consumer_offset(p, "slack", 100)
+        replaces = []
+        real_replace = os.replace
+        monkeypatch.setattr(
+            aa.os, "replace",
+            lambda *a: (replaces.append(a), real_replace(*a))[1])
+        save_consumer_offset(p, "slack", 100)   # identical → no write
+        assert replaces == []
+        save_consumer_offset(p, "slack", 200)   # advanced → writes
+        assert len(replaces) == 1
+        save_consumer_offset(p, "web-ui", 100)  # other consumer → writes
+        assert len(replaces) == 2
+        assert load_consumer_offset(p, "slack") == 200
+        assert load_consumer_offset(p, "web-ui") == 100
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Digest rendering
@@ -592,6 +615,39 @@ class TestNotificationsAPI:
                         content=b"not json",
                         headers={"Content-Type": "application/json"})
             assert r2.status_code == 400
+
+    def test_pending_heals_shrunk_ledger(self, tmp_path):
+        """Ledger truncated/replaced BELOW a consumer's acked offset: the
+        returned watermark must be the re-baselined EOF, never the stale
+        offset. The stale echo used to be papered over by the client's
+        blind 30s re-ack + the ack route's clamp; the bot's idle-identity
+        ack skip (2026-08-01) removed that loop, so a stale watermark
+        echoed forever = no notification ever served again (review
+        finding)."""
+        app, ctx = _make_app(tmp_path)
+        with TestClient(app) as c:
+            for i in range(5):
+                ctx.activity_log.record("agent_message", f"n{i}",
+                                        severity=SEVERITY_NOTIFY)
+            base = c.get("/api/notifications/pending?consumer=slack").json()
+            c.post("/api/notifications/ack",
+                   json={"consumer": "slack", "watermark": base["watermark"]})
+            stale = base["watermark"]
+            # Truncate the ledger (redeploy/cleanup/manual clear), then a
+            # new record lands at an offset far below the stale watermark.
+            ctx.activity_log.path.write_text("")
+            ctx.activity_log.record("agent_message", "after truncation",
+                                    severity=SEVERITY_NOTIFY)
+            r = c.get("/api/notifications/pending?consumer=slack").json()
+            assert r["watermark"] < stale                    # healed DOWN
+            assert r["watermark"] == ctx.activity_log.current_offset()
+            # After acking the healed watermark, NEW records flow again.
+            c.post("/api/notifications/ack",
+                   json={"consumer": "slack", "watermark": r["watermark"]})
+            ctx.activity_log.record("agent_message", "post-heal",
+                                    severity=SEVERITY_NOTIFY)
+            r2 = c.get("/api/notifications/pending?consumer=slack").json()
+            assert [x["summary"] for x in r2["records"]] == ["post-heal"]
 
 
 # ──────────────────────────────────────────────────────────────────────

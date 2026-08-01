@@ -1380,6 +1380,126 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-08-01 (later 3) — Mini AI v3 retest PASSED + notify promise now persists on the project
+
+**Retest (4 requests, 07:47–08:00): the v2 test shape completed clean — 7/7 tasks persisted
+(decompose fix), design gate honored + needs-user Slack DM delivered in ~30s, final autoadvance
+5 tasks/292s/zero strikes (v2: 1789s, 6/6 abort), deliverables verified on disk (parse + demo
+runs exit-0). The new inline per-dir transport and JSON-recovery paths visibly fired in
+production. Model weaknesses persist (1 think-loop abort, 3 malformed spec parses) — all
+contained. NOTE: req 5299219b died 3.9s in via an external graceful SIGTERM at 07:50:44
+(operator restart presumed — NOT the agent, NOT my deploy); that request carried the only
+"notify me in slack" ask, which exposed the last gap:**
+
+**Notify promise now persists on the PROJECT (core/notify_promise.py): captured into project
+metadata at request start (before the first LLM call — an early death can't lose it), fired
+when the project settles (DONE/FAILED) from both finalize twins (model-notified dedupe) and
+main.py's on_project_done hook (idle completions; stands down while a foreground request is
+active). Atomic consume via _atomic_metadata_update → exactly-once delivery across racing
+paths; rate-limited attempts leave the flag for retry; 'project' phase = Slack delivery without
+chat-banner double-render. Tests: tests/test_notify_promise.py (13, incl. request-52 replay);
+docs: core/autonomous_activity.html.**
+
+**Review pass (5th straight with real catches — 5 fixed): internal-turn settles (sched-/sub-)
+would have STRANDED the promise (finalize gated the fire on non-internal; now only the backstop
+and CAPTURE are internal-gated — a sub-agent prompt echoing "notify me" can't store a phantom
+promise, but a cron completion still delivers); the streamed twin read live current_project_id
+in the post-semaphore drain (could fire/consume ANOTHER project's promise — now uses the
+_drain_pid snapshot like work_log); a failed ledger write after the atomic pop silently ate the
+promise (now restored via setdefault); an active promise now suppresses the per-request
+backstop (premature mid-project "Done —" + settle fire = guaranteed double ping); brittle test
+pins relaxed. Residual (documented): idle-loop FAILED rollups deliver on the next foreground
+touch; a mid-stream client disconnect defers to the same.**
+
+### 2026-08-01 (later 2) — req 50855398 post-mortem (1789s abort): model struggled, FOUR agent defects turned it into a failed request
+
+**Operator question: "model not smart enough, or agent not good enough?" Verdict: BOTH, with
+distinct shares. MODEL (Qwen 35B): 5 thinking-loop aborts in one request, double-escaped JSON
+spec content (data_generator.py emitted as ONE line of literal \n), two find==replace corrupted
+edits, from-scratch backprop with wrong gradient indexing it could not debug in 700s, and
+title-as-directory paths ("Mini AI v2/train.py") two requests running. AGENT: four containment
+gaps let that struggle become a 6/6-strike abort with the promised Slack notification never
+sent (verifier late-refuted the turn for exactly that). All four fixed + a fifth steering fix:**
+- **F1 (the abort's direct cause): inline `-c` conversion ran scripts from SHARED /tmp** —
+  script dir = sys.path[0], AHEAD of the 2026-07-02 PYTHONPATH=$PWD fix, so a stale
+  /tmp/ai_model.py (left by an earlier scaffolding script) shadowed the project's file; strikes
+  5+6 were both `ImportError … (/tmp/ai_model.py)`. Now each script gets its own empty
+  /tmp/_ghost_inline_<id>/ dir — nothing to shadow (tools/execute.py).
+- **F2: promised-notification BACKSTOP at finalize** (`_notify_promise_backstop`, agent.py):
+  the finish-line guard stands down on forced finals — exactly when the promise matters. On any
+  non-internal end without a notify_operator call, the agent writes the notify record itself,
+  honestly labelled, req_id-stamped (no same-turn echo), 12/h-budgeted.
+- **F3: double-escape containment**: file_system syntax feedback names the shape outright
+  ("THE WHOLE FILE IS ONE LINE … DOUBLE-ESCAPED — REWRITE"), and the coding executor REPAIRS
+  such content pre-write via bounded unescape (common escapes only, accepted ONLY if the result
+  ast.parses). Live cost had been 3 blind executor retries + ~180s of interactive re-discovery.
+- **F4: System 3 pivot fit inside its own 120s wall**: generator/evaluator now /no_think +
+  enable_thinking=false + max_tokens 1500/700 — the incident pivot burned its full 120s in the
+  think channel and ReadTimeout'd during the crisis it existed to solve.
+- **F5: title-as-directory catch in _missing_file_message**: missing path with a dir prefix
+  whose basename EXISTS → "you are ALREADY inside this project's workspace — use the bare
+  relative path". (Second incident in two requests.)
+
+**Tests: tests/test_req50855398_fixes.py (19) + updated execute-conversion pins; docs:
+tools/execute.html, tools/file_system.html, core/coding_executor.html,
+core/autonomous_activity.html, core/agent.html.**
+
+**Review pass (fourth straight session with real catches — 6 findings): (1) three stale
+autoconvert tests still pinned the flat /tmp path (suite would have gone red); (2) the backstop's
+`had_failures` keyed on force_stop, which terminal-tool SUCCESSES also set — "stopped early
+after repeated failures — Dream cycle complete." would have paged the operator; now strike-count
+only; (3) the title-prefix hint recommended the bare basename even when the file lives in a
+subdirectory — now names the MATCHED path; (4) the backstop never ran on STREAMED finals (web UI
+always streams — the incident shape exactly); twin wiring added in the streamed post-work block;
+(5) simulation/dream turns with "notify me" in synthetic prompts could page the operator —
+is_simulation guard added; (6) an ERRORED notify_operator call suppressed the backstop — only a
+non-error call counts as promise-kept.**
+
+### 2026-08-01 (later) — Slack notification workflow review: pipeline sound, four operational defects fixed
+
+**Reviewed the whole outbound path (activity ledger → on_notify push → /api/notifications
+pending/ack → bot poller → owner DM) plus the bot's interactive half. The 2026-07-11/13-era
+core holds: owner lock fail-closed, thread filtering, delivery-before-ack ordering, watermark
+clamp, the wedge fixes. Four operational defects, all fixed + tested (172 green in the two
+touched test files):**
+- **.err was 11MB/unrotated, .log empty since Jul 11** (the §5A watch item): basicConfig(INFO)
+  → stderr only, and httpx logged every poll (2 INFO lines/30s ≈ 5.8k/day) — the 07-13 wedge
+  signature was buried in its own noise. Now: rotating file handler on the .log path (5MB×3,
+  GHOST_SLACKBOT_LOG; empty disables for tests), stderr WARNING+, httpx/httpcore silenced,
+  hourly `poller heartbeat: N poll(s), M delivered, K error(s)` line as the positive liveness
+  signal.
+- **Idle-ack churn**: unconditional ack every 30s → no-op POST + notify_consumers.json rewrite
+  around the clock (mtime permanently fresh = the "stale mtime" diagnostic dead). Bot skips the
+  ack only when the watermark EQUALS the last acked value (empty-but-advanced still acks — the
+  07-13 wedge case stays pinned); server-side save_consumer_offset skips identical-value writes
+  for ALL consumers (web-ui too). Poller reuses one persistent AsyncClient, rebuilt on error.
+- **Thread re-upload clobber (data-loss class)**: build_thread_context re-uploaded every earlier
+  attachment on EVERY thread message — re-POSTing the original over the agent's sandbox copy,
+  silently clobbering agent edits ("fix this file" flows lost the fix). Bounded in-memory Slack
+  file-id cache skips re-uploads; restart re-uploads once (pre-fix behaviour).
+- **Readability**: human phase labels + stale-age suffix (_(2.1h ago)_) on re-served records;
+  EMOJI_MAP refreshed with current request-path icons (🧠 🧪 🔗 🧭 🎯 🔒 📣 🐘).
+
+**Also surfaced: `interface/slack_project_commands.py` is a complete, tested `/ghost project…`
+slash-command router that NOTHING imports (built-but-unwired) — wiring needs an agent-API-backed
+store context; logged, not built. Docs: docs/interfaces/slack_bot.html,
+docs/core/autonomous_activity.html, .env.example. Deploy = kill the bot pid (KeepAlive
+respawns); the 11MB .err truncated during the restart window.**
+
+**Review pass (third session in a row where it paid): the ack-identity skip had quietly deleted
+the system's only self-heal loop — a TRUNCATED ledger's stale watermark was echoed by /pending
+forever and the skip suppressed the blind re-ack + clamp that used to converge it (permanent
+silent wedge until bot restart). Fixed at the SERVER: /pending adopts read_since's shrunk-ledger
+re-baseline and returns the healed EOF watermark (+ regression test with a real truncation).
+Also from the review: a non-2xx ack is no longer recorded as acked (one agent 500 would have
+become a permanently suppressed retry under the identity skip); enabled:false responses are
+never acked (literal watermark 0 would reset the offset → full history replay later); the
+upload cache got a 6h TTL (uploads are project-scoped and sweepable — an eternal cache entry
+asserts files that no longer exist); the rotating log moved OFF the launchd .log (rotation
+under launchd's open fd diverts stdout into a backup) to ghost-slack-bot.info.log; an
+unwritable log path now warns loudly instead of going dark. NOTE for other consumers (web-ui):
+mirror the bot's ack contract — ack only on 2xx, never ack enabled:false.**
+
 ### 2026-08-01 — Mini AI incident (req b7e516b9): five ledger-integrity defects fixed + data repaired
 
 **The operator asked what went wrong with project management in request b7e516b9. Root-cause

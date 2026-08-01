@@ -927,21 +927,33 @@ class TestChallengeGenDisablesThinking:
         copies the non-thinking switches into the main agent path
         would silently degrade the agent's reasoning quality."""
         src = AGENT_SRC.read_text()
-        # The disable-thinking hard-switch is legitimately present EXACTLY
-        # once — in the trivial fast-path (greeting) payload, which SHOULD
-        # suppress <think> for "hi"/"thanks". The guard is that it never gets
-        # copied into the main tool-turn loop. Asserting a single occurrence
-        # catches that regression while allowing the (correct) trivial path.
-        occurrences = src.count('"chat_template_kwargs": {"enable_thinking": False}')
-        assert occurrences <= 1, (
+        # The disable-thinking hard-switch is legitimately present in
+        # agent.py only in BOUNDED side-call payloads: the trivial
+        # fast-path (greeting) and, since 2026-08-01 (req 50855398), the
+        # two System 3 crisis-pivot calls (generator/evaluator) — a pivot
+        # that thinks blows its own 120s wall and ReadTimeouts during the
+        # crisis. The guard is that the switch never gets copied into the
+        # MAIN TOOL-TURN loop: cap the count at those known sites and
+        # require every occurrence to sit in a /no_think-marked or
+        # trivial-path block.
+        needle = '"chat_template_kwargs": {"enable_thinking": False}'
+        occurrences = src.count(needle)
+        assert occurrences <= 3, (
             f"disable-thinking switch appears {occurrences}x — it must stay "
-            "confined to the trivial fast-path, never the main tool turn."
+            "confined to the trivial fast-path and the System 3 pivot, "
+            "never the main tool turn."
         )
-        # And the single occurrence must sit in the trivial-path block.
-        idx = src.find('"chat_template_kwargs": {"enable_thinking": False}')
-        if idx != -1:
+        start = 0
+        while True:
+            idx = src.find(needle, start)
+            if idx == -1:
+                break
             preceding = src[max(0, idx - 1200):idx]
-            assert "trivial" in preceding.lower() or "/no_think" in preceding
+            assert ("trivial" in preceding.lower()
+                    or "/no_think" in preceding), (
+                "disable-thinking switch found outside the known bounded "
+                "side-call blocks")
+            start = idx + 1
 
     @pytest.mark.asyncio
     async def test_challenge_gen_payload_end_to_end(self, monkeypatch, tmp_path):

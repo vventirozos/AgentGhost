@@ -2415,6 +2415,70 @@ def _user_asked_for_notification(user_text) -> bool:
     return bool(_NOTIFY_INTENT_RE.search(t))
 
 
+def _notify_promise_backstop(context, *, last_user_content, tools_run,
+                             final_content, req_id,
+                             had_failures: bool) -> bool:
+    """Deliver the notification the user EXPLICITLY asked for when the turn
+    is ending WITHOUT a notify_operator call — by writing the notify record
+    directly, model not involved.
+
+    The in-loop finish-line guard steers the MODEL once, but it deliberately
+    stands down on force-finalising ends (strike cap, think-loop halt) — and
+    that is exactly when the promise matters most: req 50855398 died at
+    strike 6/6 after 1789s and "notify me in slack when you're done" never
+    fired; the verifier late-refuted the turn for that alone. A promised
+    notification is a DELIVERY REQUIREMENT, not a suggestion — on any end
+    where the model didn't make the call (aborted OR simply ignored the
+    steer), the agent keeps the promise itself, honestly labelled. Respects
+    notify_tool's rate limit; never raises; returns True when a record was
+    written."""
+    try:
+        if not _user_asked_for_notification(last_user_content):
+            return False
+        for t in tools_run or []:
+            if (str((t or {}).get("name", "")).lower().strip()
+                    == "notify_operator"):
+                # A notify_operator call that ERRORED (rate limit aside,
+                # e.g. "failed to write the notification record") did NOT
+                # keep the promise — only a non-error call suppresses the
+                # backstop.
+                if not str((t or {}).get("content", "")).lstrip().startswith(
+                        "Error"):
+                    return False
+        from ..tools.notify_tool import (
+            PHASE as _NOTIFY_PHASE, _note_sent, _rate_limited,
+        )
+        from .autonomous_activity import (
+            SEVERITY_NOTIFY, get_activity_log, summarize_turn_content,
+        )
+        log = get_activity_log(context)
+        if log is None or _rate_limited():
+            return False
+        head = summarize_turn_content(final_content, limit=260)
+        msg = (("Task stopped early after repeated failures — "
+                if had_failures else "Done — ")
+               + (head or "(no summary produced)"))[:500]
+        # req_id stamped unconditionally: the same-turn digest filters on
+        # meta.req_id == current req_id, so an unstamped record would echo
+        # back as "while you were away" in the very reply that produced it.
+        meta = {"auto": "finish-line backstop"}
+        if req_id:
+            meta["req_id"] = str(req_id)
+        ok = log.record(_NOTIFY_PHASE, msg, severity=SEVERITY_NOTIFY, **meta)
+        if ok:
+            _note_sent()
+            pretty_log(
+                "Notify Guard",
+                "auto-delivered the promised notification (turn ended "
+                "without a notify_operator call)",
+                level="WARNING", icon=Icons.NOTIFY_OUT,
+            )
+        return bool(ok)
+    except Exception:
+        logger.debug("notify promise backstop skipped", exc_info=True)
+        return False
+
+
 # Trailing-promise detection (2026-07-14). A final reply whose LAST sentence
 # promises imminent action ("…Let me fix it.") means the model narrated an
 # action instead of doing it — the turn ends and nothing runs afterwards
@@ -11063,6 +11127,76 @@ class GhostAgent:
         except Exception as _dgx:
             logger.debug(f"autoadvance digest skipped: {_dgx}")
 
+        # Promised-notification BACKSTOP (2026-08-01, req 50855398): the
+        # user explicitly asked to be notified and this turn is ending
+        # without a notify_operator call — write the record directly. The
+        # in-loop steer can't help on forced finals (strike cap) and the
+        # model can ignore it on normal ones; the promise fires either
+        # way, honestly labelled with the turn's fate. Internal turns
+        # (sched-/job-/sub-) are excluded: record_scheduled_result already
+        # notifies for those.
+        try:
+            from .autonomous_activity import (
+                is_internal_request as _is_internal_req_nb)
+            # NOT force_stop as the failure signal: terminal-tool successes
+            # (dream/self-play "complete", task-tree root DONE) also set it,
+            # and would page the operator "stopped early after repeated
+            # failures — Dream cycle complete." The strike shape is the
+            # failure count itself. `is_simulation` (computed above from
+            # skill_memory.is_read_only) keeps synthetic self-play/dream
+            # turns whose PROMPTS contain "notify me…" off the operator's
+            # phone.
+            _np_pid = getattr(self.context, "current_project_id", None)
+            _np_store = getattr(self.context, "project_store", None)
+            # A live project-scoped promise OWNS delivery: the per-request
+            # backstop's "Done —" would be PREMATURE mid-project (this turn
+            # finished, the project didn't) and guarantee a double ping when
+            # the settle fire lands later. Bound project + stored flag →
+            # skip the backstop; the promise fires at true completion.
+            _promise_active = False
+            if _np_pid and _np_store is not None:
+                from .notify_promise import peek_promise as _np_peek
+                _promise_active = _np_peek(_np_store, _np_pid) is not None
+            _backstop_fired = False
+            if (final_ai_content and not _is_internal_req_nb(req_id)
+                    and not is_simulation and not _promise_active):
+                _backstop_fired = _notify_promise_backstop(
+                    self.context,
+                    last_user_content=last_user_content,
+                    tools_run=tools_run_this_turn,
+                    final_content=final_ai_content,
+                    req_id=req_id,
+                    had_failures=execution_failure_count >= 3,
+                )
+            # Stored-promise fire (2026-08-01): a notify ask captured in an
+            # EARLIER request (possibly one that died mid-turn) rides the
+            # project's metadata; deliver it when THIS turn leaves the
+            # project settled. Runs for INTERNAL turns too (a cron/sub-agent
+            # turn that completes the project must still keep the user's
+            # promise — the internal gate above protects only the
+            # per-request backstop). A successful notify_operator call or a
+            # just-fired backstop counts as promise-kept (flag consumed, no
+            # second ping).
+            if _np_pid and not is_simulation:
+                from .autonomous_activity import (
+                    get_activity_log as _np_get_alog,
+                    summarize_turn_content as _np_head)
+                from .notify_promise import fire_promise_if_settled
+                _model_notified = _backstop_fired or any(
+                    (str((t or {}).get("name", "")).lower().strip()
+                     == "notify_operator")
+                    and not str((t or {}).get("content", "")).lstrip()
+                    .startswith("Error")
+                    for t in tools_run_this_turn or [])
+                fire_promise_if_settled(
+                    _np_store, _np_get_alog(self.context), _np_pid,
+                    model_notified=_model_notified,
+                    req_id=str(req_id or ""),
+                    headline=_np_head(final_ai_content, limit=220),
+                )
+        except Exception:
+            logger.debug("notify backstop wiring skipped", exc_info=True)
+
         # Background-activity digest — the ALL-PHASE companion of the
         # project digest above (2026-07-11). Idle-phase outcomes (dream /
         # reflection / post-mortem / skills graduation / PRM / router /
@@ -11879,6 +12013,56 @@ class GhostAgent:
                 (_request_constraints, _request_constraint_block,
                  _constraint_steer_pending) = self._merge_project_constraints(
                     _request_constraints, last_user_content)
+
+                # Persist an explicit notify ask on the bound project
+                # (2026-08-01, req 5299219b): "proceed with all tasks,
+                # notify me in slack" died 3.9s in when a restart landed
+                # mid-turn — the ask lived only in that message, the
+                # follow-up requests completed the work, and no ping ever
+                # fired. A notify ask is a delivery requirement on the
+                # WORK: stamp it into project metadata NOW (before the
+                # first LLM call, so an early death can't lose it); the
+                # finalize chain / project-done hook fire it when the
+                # project settles, whichever request gets it there.
+                try:
+                    from .autonomous_activity import (
+                        is_internal_request as _np_is_internal)
+                    # request_id_context comes from the MODULE-level import
+                    # (line ~35) — re-importing it here would make the name
+                    # function-local for ALL of handle_chat and blow up the
+                    # `request_id_context.set(req_id)` at turn start with
+                    # UnboundLocalError (broke 172 tests on first wiring).
+                    # Internal turns (sub-/sched-/job-) never CAPTURE: a
+                    # delegated prompt echoing "notify me…" is model-
+                    # authored text, not the user's ask — storing it would
+                    # page the operator later for a promise nobody made.
+                    # (Internal turns still FIRE an already-stored promise
+                    # at finalize.)
+                    if (_user_asked_for_notification(last_user_content)
+                            and not _np_is_internal(
+                                request_id_context.get())
+                            and getattr(getattr(self.context, "skill_memory",
+                                                None),
+                                        "is_read_only", False) is not True):
+                        _np_pid = getattr(self.context,
+                                          "current_project_id", None)
+                        if _np_pid:
+                            from .notify_promise import capture_promise
+                            if capture_promise(
+                                    getattr(self.context, "project_store",
+                                            None),
+                                    _np_pid, last_user_content,
+                                    req_id=request_id_context.get()):
+                                pretty_log(
+                                    "Notify Guard",
+                                    f"stored notify-on-done promise on "
+                                    f"project {_np_pid} — fires when the "
+                                    f"project settles, survives restarts",
+                                    icon=Icons.NOTIFY_OUT,
+                                )
+                except Exception:
+                    logger.debug("notify-promise capture skipped",
+                                 exc_info=True)
 
                 # Repro-first nudge for bug reports. Injected BEFORE the
                 # first LLM call so the very first action is an
@@ -16369,6 +16553,63 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 req_id=req_id,
             )
 
+            # Promised-notification backstop — streamed twin of the
+            # finalize wiring (same 2026-07-20 H1 rationale as the
+            # trajectory/work_log re-runs above: the web UI always
+            # streams, so without this the promise is only kept for
+            # stream:false clients — the reply streams to a possibly
+            # dead tab and the Slack ping never fires).
+            try:
+                from .autonomous_activity import (
+                    is_internal_request as _is_internal_req_snb)
+                _sim = getattr(getattr(self.context, "skill_memory", None),
+                               "is_read_only", False) is True
+                # _drain_pid, NOT live current_project_id: this drain runs
+                # post-semaphore, and a concurrent turn can re-point the
+                # global pointer mid-drain — firing (or consuming) another
+                # project's promise (the same hazard the work_log snapshot
+                # above exists for).
+                _np_pid = _drain_pid
+                _np_store = getattr(self.context, "project_store", None)
+                _promise_active = False
+                if _np_pid and _np_store is not None:
+                    from .notify_promise import peek_promise as _np_peek
+                    _promise_active = (_np_peek(_np_store, _np_pid)
+                                       is not None)
+                _sbf = False
+                if (full_content and not _is_internal_req_snb(req_id)
+                        and not _sim and not _promise_active):
+                    _sbf = _notify_promise_backstop(
+                        self.context,
+                        last_user_content=last_user_content,
+                        tools_run=stream_tools_snapshot,
+                        final_content=full_content,
+                        req_id=req_id,
+                        had_failures=execution_failure_count >= 3,
+                    )
+                # Stored-promise fire — streamed twin (see finalize; runs
+                # for internal turns too).
+                if _np_pid and not _sim:
+                    from .autonomous_activity import (
+                        get_activity_log as _np_get_alog,
+                        summarize_turn_content as _np_head)
+                    from .notify_promise import fire_promise_if_settled
+                    _model_notified = _sbf or any(
+                        (str((t or {}).get("name", "")).lower().strip()
+                         == "notify_operator")
+                        and not str((t or {}).get("content", ""))
+                        .lstrip().startswith("Error")
+                        for t in stream_tools_snapshot or [])
+                    fire_promise_if_settled(
+                        _np_store, _np_get_alog(self.context), _np_pid,
+                        model_notified=_model_notified,
+                        req_id=str(req_id or ""),
+                        headline=_np_head(full_content, limit=220),
+                    )
+            except Exception:
+                logger.debug("streamed notify backstop skipped",
+                             exc_info=True)
+
             # Calibration sample — same reason as the trajectory/work_log
             # re-runs above: the streamed path returns before
             # _finalize_and_return, so this was NEVER recorded on the common
@@ -17236,13 +17477,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 f"### ERROR CONTEXT (what failed and why):\n{error_context[:3000]}\n\n"
                 f"### CURRENT SANDBOX STATE:\n{sandbox_state[:1500]}"
             )
+            # NO-THINK + token caps (2026-08-01, req 50855398): with the
+            # 120s wall (below) and thinking enabled, the generator spent
+            # its whole budget in the think channel and died on ReadTimeout
+            # — the crisis tool failed DURING the crisis, burning 120s for
+            # nothing. The output is a small JSON strategy list; the think
+            # phase is where the budget went. Same recipe as the other
+            # bounded JSON calls (constraint gate, research summarizer).
             gen_payload = {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": SYSTEM_3_GENERATION_PROMPT},
-                    {"role": "user", "content": gen_user_msg}
+                    {"role": "user", "content": gen_user_msg + "\n\n/no_think"}
                 ],
                 "temperature": 0.7,
+                "max_tokens": 1500,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "response_format": {"type": "json_object"}
             }
             use_swarm = bool(getattr(self.context.llm_client, 'swarm_clients', None))
@@ -17269,9 +17519,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "model": model,
                 "messages": [
                     {"role": "system", "content": SYSTEM_3_EVALUATOR_PROMPT},
-                    {"role": "user", "content": eval_user_msg}
+                    {"role": "user", "content": eval_user_msg + "\n\n/no_think"}
                 ],
                 "temperature": 0.0,
+                "max_tokens": 700,
+                "chat_template_kwargs": {"enable_thinking": False},
                 "response_format": {"type": "json_object"}
             }
             eval_data = await self.context.llm_client.chat_completion(

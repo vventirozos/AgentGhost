@@ -102,14 +102,16 @@ class TestJudgePayload:
         assert p["stream"] is False
 
     def test_agent_source_carries_no_disable_thinking_switch_for_bon(self):
-        """The guard in test_self_play_redesign allows at most ONE
-        disable-thinking switch in agent.py (trivial fast-path). The BoN
-        judge's switch must live in tts.py — never migrate it back."""
+        """The guard in test_self_play_redesign allows the disable-thinking
+        switch in agent.py only at the known bounded side-call sites
+        (trivial fast-path + the two System 3 pivot calls, 2026-08-01).
+        The BoN judge's switch must live in tts.py — never migrate it
+        back."""
         from pathlib import Path
         import ghost_agent.core.agent as agent_mod
         src = Path(agent_mod.__file__).read_text()
         assert src.count(
-            '"chat_template_kwargs": {"enable_thinking": False}') <= 1
+            '"chat_template_kwargs": {"enable_thinking": False}') <= 3
 
 
 def _run(coro):

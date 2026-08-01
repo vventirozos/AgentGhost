@@ -661,8 +661,33 @@ def _missing_file_message(filename, sandbox_dir) -> str:
     else:
         listing = ("This project's sandbox is currently EMPTY (no files yet)."
                    + _outer_root_files_hint(sandbox_dir))
+    # Title-as-directory catch (2026-08-01): two consecutive live requests
+    # read "Mini AI/…" / "Mini AI v2/…" — the model prefixes the PROJECT
+    # TITLE as a directory even though the workspace root IS the project.
+    # When the requested path has a directory prefix and a file with the
+    # same basename exists, name the exact correction up front (the generic
+    # message steered toward CREATING a duplicate instead).
+    _norm = str(filename or "").replace("\\", "/").strip("/")
+    _base = _norm.rsplit("/", 1)[-1] if "/" in _norm else ""
+    prefix_hint = ""
+    if _base:
+        _pref = _norm.rsplit("/", 1)[0]
+        # The advice must name where the file ACTUALLY is: for a root match
+        # the bare name; for a subdirectory match the real relative path —
+        # "use 'train.py'" when only src/train.py exists would send the
+        # model straight into another failing read.
+        _match = next((e for e in existing
+                       if e == _base or e.endswith("/" + _base)), None)
+        if _match:
+            prefix_hint = (
+                f" NOTE: '{_base}' DOES exist at '{_match}' — you are "
+                f"ALREADY inside this project's workspace, so '{_pref}/' "
+                f"is not a directory here (a project TITLE is not a "
+                f"path). Use the relative path '{_match}'."
+            )
     return (
-        f"Error: '{filename}' does not exist in the current project's sandbox. "
+        f"Error: '{filename}' does not exist in the current project's sandbox."
+        f"{prefix_hint} "
         f"{listing} The live sandbox is AUTHORITATIVE — if a workspace narrative, "
         f"memory, prior session, or DYNAMIC SYSTEM STATE hint referenced "
         f"'{filename}', that was a DIFFERENT project/session and does NOT apply "
@@ -1936,11 +1961,27 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
         # Mirrors the same fix already applied to tool_write_file's write.
         if ext == "py":
             import ast
+            _pytext = await asyncio.to_thread(
+                path.read_text, encoding="utf-8", errors="replace")
             try:
-                ast.parse(await asyncio.to_thread(
-                    path.read_text, encoding="utf-8", errors="replace"))
+                ast.parse(_pytext)
             except SyntaxError as se:
                 err = f"{se.msg} (line {se.lineno}, col {se.offset})"
+                # Whole-file DOUBLE-ESCAPE shape (2026-08-01, req 50855398):
+                # the content landed as ONE long line full of literal \n
+                # two-char sequences (a JSON-escaped string written
+                # verbatim). The generic SyntaxError ("unmatched '}' line 1
+                # col 8370", "unexpected character after line continuation")
+                # sent the model into line-patch spirals — three executor
+                # retries and ~180s of interactive turns before it diagnosed
+                # the shape itself. Name it outright.
+                if _pytext.count("\n") <= 2 and _pytext.count("\\n") >= 5:
+                    err += (
+                        " — THE WHOLE FILE IS ONE LINE built of literal \\n "
+                        "escape sequences: the content was written DOUBLE-"
+                        "ESCAPED. Do NOT patch individual lines (there is "
+                        "only one); REWRITE the entire file with real "
+                        "newlines.")
         elif ext == "json":
             try:
                 json.loads(await asyncio.to_thread(

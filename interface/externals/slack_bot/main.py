@@ -42,16 +42,60 @@ Also fixed in this rewrite (the bot had rotted while unused):
 import argparse
 import asyncio
 import logging
+import logging.handlers
 import os
 import re
+import time
 import uuid
 
 import httpx
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
-logging.basicConfig(level=logging.INFO)
+# Log hygiene (2026-08-01). The old `basicConfig(INFO)` sent EVERYTHING to
+# stderr → launchd's ghost-slack-bot.err, which nothing rotates: httpx logs
+# every poll request at INFO (2 lines / 30s ≈ 5.8k lines/day), the file hit
+# 11 MB in 3 weeks, and the wedge diagnostic this bot's history says to
+# watch for ("200-OK polls with zero `delivered` lines", 2026-07-13) was
+# buried in its own noise. Now:
+#   * INFO and up go to a self-ROTATING file (the .log launchd points at,
+#     which had been empty since Jul 11) — 5 MB × 3 backups, no newsyslog
+#     or sudo required;
+#   * stderr (the launchd .err) gets WARNING+ only, so it stays quiet and
+#     crash tracebacks stand out;
+#   * httpx/httpcore request-level INFO is silenced outright — the poller
+#     logs its own `delivered N` lines and an hourly heartbeat instead.
+_LOG_FMT = "%(asctime)s %(levelname)s:%(name)s:%(message)s"
+# NOT ghost-slack-bot.log: launchd holds that open as StandardOutPath, and
+# a rotation RENAME under launchd's fd would silently divert process stdout
+# into a backup (then an unlinked inode) until restart. The rotating INFO
+# file is its own sibling path.
+_BOT_LOG_PATH = os.environ.get(
+    "GHOST_SLACKBOT_LOG",
+    "/Users/vasilis/Data/AI/Logs/ghost-slack-bot.info.log")
+_stderr_handler = logging.StreamHandler()
+_stderr_handler.setLevel(logging.WARNING)
+_log_handlers: list = [_stderr_handler]
+_file_log_error: str | None = None
+if _BOT_LOG_PATH:  # explicitly EMPTY (tests) → stderr only, no file
+    try:
+        _file_handler = logging.handlers.RotatingFileHandler(
+            _BOT_LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3,
+            encoding="utf-8")
+        _log_handlers.append(_file_handler)
+    except OSError as _e:  # unwritable path must never keep the bot down
+        _file_log_error = str(_e)
+logging.basicConfig(level=logging.INFO, format=_LOG_FMT,
+                    handlers=_log_handlers)
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger("GhostSlackBot")
+if _file_log_error:
+    # Loud, or the fallback recreates "quiet log = can't tell wedged from
+    # healthy" with zero indication: INFO ('delivered N', the heartbeat)
+    # would silently go nowhere.
+    logger.warning("INFO file logging is DARK — %s unwritable (%s); only "
+                   "WARNING+ reaches stderr", _BOT_LOG_PATH, _file_log_error)
 
 app = AsyncApp(token=os.environ.get("SLACK_BOT_TOKEN"))
 
@@ -93,8 +137,11 @@ BOT_USER_ID: str | None = None
 # ---------------------------------------------------------------------------
 EMOJI_MAP = {
     "💭": "Thinking...",
+    "🧠": "Reasoning...",
     "📋": "Planning...",
     "🧩": "Recalling context...",
+    "🧭": "Routing...",
+    "🎯": "Targeting...",
     "💬": "Asking LLM...",
     "🤖": "LLM responding...",
     "🌐": "Searching web...",
@@ -115,6 +162,11 @@ EMOJI_MAP = {
     "🔧": "Worker node...",
     "📡": "Background activity...",
     "🎓": "Learning...",
+    "🧪": "Verifying...",
+    "🔗": "Checking constraints...",
+    "🔒": "Guarding...",
+    "🐘": "Querying Postgres...",
+    "📣": "Notifying...",
     "🔄": "Retrying...",
     "🔶": "Warning...",
     "🛑": "Stopping...",
@@ -256,6 +308,23 @@ def _file_note(filename: str) -> str:
             f"knowledge_base tools to interact with it.]")
 
 
+# Slack file ids recently ingested → (sandbox filename, upload ts).
+# build_thread_context rebuilds the WHOLE thread history on every message,
+# so without this each subsequent turn re-uploaded every earlier attachment
+# — re-POSTing the original over the agent's copy and silently CLOBBERING
+# any edits the agent had made to it in the meantime ("fix this file" flows
+# lost their fix on the owner's next message). A cache hit keeps the
+# [SYSTEM NOTE] in the rebuilt context but skips the network round-trips.
+# TTL-bounded (not process-lifetime): the upload lands in the ACTIVE
+# project's scope and sandbox sweeps can delete it, so an old hit could
+# assert a file that no longer exists where the note claims — a few hours
+# kills the every-message clobber while re-asserting reality daily-ish.
+# In-memory only: a bot restart re-uploads once (pre-existing behaviour).
+_UPLOADED_FILE_IDS: dict = {}
+_UPLOADED_FILE_IDS_MAX = 512
+_UPLOAD_CACHE_TTL_S = 6 * 3600.0
+
+
 async def upload_file_to_agent(file_info: dict) -> str | None:
     """Fetch a Slack attachment and hand it to the agent via /api/upload.
 
@@ -268,6 +337,12 @@ async def upload_file_to_agent(file_info: dict) -> str | None:
     filename = os.path.basename(file_info.get("name") or "")
     if not url or not filename or filename in (".", ".."):
         return None
+    file_id = str(file_info.get("id") or "")
+    if file_id and file_id in _UPLOADED_FILE_IDS:
+        cached_name, cached_ts = _UPLOADED_FILE_IDS[file_id]
+        if time.time() - cached_ts < _UPLOAD_CACHE_TTL_S:
+            return cached_name
+        _UPLOADED_FILE_IDS.pop(file_id, None)  # expired → re-upload
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             slack_headers = {
@@ -280,6 +355,11 @@ async def upload_file_to_agent(file_info: dict) -> str | None:
                 files={"file": (filename, resp.content)},
             )
             if up.status_code == 200:
+                if file_id:
+                    while len(_UPLOADED_FILE_IDS) >= _UPLOADED_FILE_IDS_MAX:
+                        _UPLOADED_FILE_IDS.pop(
+                            next(iter(_UPLOADED_FILE_IDS)))
+                    _UPLOADED_FILE_IDS[file_id] = (filename, time.time())
                 return filename
             logger.error(f"/api/upload returned {up.status_code} for {filename}")
     except Exception as e:  # noqa: BLE001
@@ -540,12 +620,56 @@ _PHASE_EMOJI = {
     "job": ":package:",
 }
 
+# Human labels for the Slack line — mirrors the agent's digest labels
+# (core/autonomous_activity._PHASE_LABELS). Raw slugs like
+# `scheduled_task` read as debug output on a phone.
+_PHASE_LABELS = {
+    "project": "project",
+    "scheduled_task": "scheduled task",
+    "agent_message": "agent",
+    "service": "service",
+    "job": "background job",
+    "open_questions": "open questions",
+}
 
-def format_notification(rec: dict) -> str:
+# Records older than this get an age suffix: after downtime/a wedge the
+# poller re-serves the backlog, and without the age an hours-old event
+# reads as breaking news (the 2026-07-13 unwedge delivered 2-day-old
+# "needs your input" items as if current).
+_STALE_AFTER_S = 300.0
+
+
+def _age_suffix(ts: float, now: float | None = None) -> str:
+    try:
+        delta = (now if now is not None else time.time()) - float(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if not ts or delta < _STALE_AFTER_S:
+        return ""
+    if delta < 5400:
+        return f"  _({int(delta // 60)}m ago)_"
+    if delta < 129600:
+        return f"  _({delta / 3600:.1f}h ago)_"
+    return f"  _({delta / 86400:.1f}d ago)_"
+
+
+def format_notification(rec: dict, now: float | None = None) -> str:
     phase = str(rec.get("phase", "") or "event")
     summary = str(rec.get("summary", "") or "")
     icon = _PHASE_EMOJI.get(phase, ":satellite_antenna:")
-    return f"{icon} *[{phase}]* {summary}"
+    label = _PHASE_LABELS.get(phase, phase)
+    return f"{icon} *[{label}]* {summary}{_age_suffix(rec.get('ts'), now)}"
+
+
+# Last watermark this process successfully acked. The server's watermark on
+# an IDLE ledger is the same number every poll — re-acking it was a no-op
+# POST plus a notify_consumers.json rewrite every 30s, around the clock
+# (and kept that file's mtime permanently fresh, killing its documented
+# value as a staleness diagnostic). The ack is skipped ONLY when the
+# watermark equals what we already acked; an empty response whose watermark
+# ADVANCED is still acked — that exact case is the 2026-07-13 wedge and its
+# regression test.
+_last_acked_watermark = None
 
 
 async def poll_and_deliver_once(client, channel: str, poster=None) -> int:
@@ -554,6 +678,7 @@ async def poll_and_deliver_once(client, channel: str, poster=None) -> int:
     testable (``poster`` defaults to the live Slack client's
     chat_postMessage; tests inject a fake).
     """
+    global _last_acked_watermark
     poster = poster or app.client.chat_postMessage
     r = await client.get(
         f"{GHOST_API_BASE}/api/notifications/pending",
@@ -563,37 +688,100 @@ async def poll_and_deliver_once(client, channel: str, poster=None) -> int:
     if r.status_code != 200:
         raise RuntimeError(f"pending poll HTTP {r.status_code}")
     data = r.json()
+    if data.get("enabled") is False:
+        # No activity ledger on the agent (boot/config gap). Its watermark
+        # is a literal 0 — acking that would OVERWRITE the stored consumer
+        # offset with 0, and when the ledger comes back the first-contact
+        # baseline is bypassed and the ENTIRE notify history replays.
+        return 0
     records = data.get("records") or []
     watermark = data.get("watermark")
     if records:
         text = "\n".join(format_notification(rec) for rec in records)
         await poster(channel=channel, text=text)
         logger.info(f"delivered {len(records)} notification(s) → {channel}")
-    # Ack UNCONDITIONALLY (post-delivery). The old `records or baseline`
-    # guard skipped the ack on empty responses — but the server's scan
-    # window can be all non-notify lines, so an empty response still
-    # carries an ADVANCED watermark. Not acking it froze the consumer at
-    # the same offset and re-scanned the same window forever (wedged
-    # 2026-07-11→13; NOTHING was delivered for two days). Ordering is
-    # preserved: a crash between post and ack re-serves rather than drops.
-    if watermark is not None:
-        await client.post(
+    # Ack every response whose watermark MOVED (or that delivered records),
+    # after delivery. The 2026-07-13 contract stands: an empty response can
+    # still carry an ADVANCED watermark (the scan window was all non-notify
+    # lines) and skipping that ack wedged the consumer for two days. What's
+    # new is only the idle-identity skip — re-acking the same number was
+    # pure churn. Ordering is preserved: a crash between post and ack
+    # re-serves rather than drops. NOTE the skip compares against the last
+    # SUCCESSFUL (2xx) ack — recording a failed ack as done would convert
+    # one agent-side 500 into a permanently suppressed retry.
+    if watermark is not None and (records
+                                  or watermark != _last_acked_watermark):
+        ack = await client.post(
             f"{GHOST_API_BASE}/api/notifications/ack",
             json={"consumer": _NOTIFY_CONSUMER, "watermark": watermark},
             headers=AUTH_HEADERS,
         )
+        if 200 <= ack.status_code < 300:
+            _last_acked_watermark = watermark
+        else:
+            logger.warning(f"ack HTTP {ack.status_code} — will retry "
+                           f"watermark {watermark} next poll")
     return len(records)
+
+
+# Hourly heartbeat: one INFO line summarizing the poller's last hour. With
+# httpx request-logging silenced, a QUIET log needs a positive liveness
+# signal — the 2026-07-13 wedge was diagnosed by the ABSENCE of `delivered`
+# lines among poll noise; now the heartbeat states polls/delivered/errors
+# outright, so a wedged or dead poller is visible in two lines of log.
+_HEARTBEAT_EVERY_S = 3600.0
+
+
+class _PollerHeartbeat:
+    def __init__(self, every_s: float = _HEARTBEAT_EVERY_S):
+        self.every_s = float(every_s)
+        self.polls = 0
+        self.delivered = 0
+        self.errors = 0
+        self._last_beat = time.time()
+
+    def note(self, delivered: int = 0, error: bool = False,
+             now: float | None = None) -> str | None:
+        """Record one cycle; returns the heartbeat line when due."""
+        now = now if now is not None else time.time()
+        self.polls += 1
+        self.delivered += max(0, int(delivered))
+        if error:
+            self.errors += 1
+        if now - self._last_beat < self.every_s:
+            return None
+        line = (f"poller heartbeat: {self.polls} poll(s), "
+                f"{self.delivered} delivered, {self.errors} error(s) "
+                f"in the last {(now - self._last_beat) / 60:.0f}m")
+        self.polls = self.delivered = self.errors = 0
+        self._last_beat = now
+        return line
 
 
 async def notification_poller(channel: str):
     logger.info(
         f"Notification poller ON → {channel} every {NOTIFY_POLL_SECONDS:.0f}s")
+    hb = _PollerHeartbeat()
+    client = None
     while True:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                await poll_and_deliver_once(client, channel)
+            if client is None:
+                # One persistent client (connection pooling) instead of a
+                # new TCP+client per 30s poll; rebuilt after any error.
+                client = httpx.AsyncClient(timeout=15.0)
+            n = await poll_and_deliver_once(client, channel)
+            beat = hb.note(n)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"notification poller: {e}")
+            beat = hb.note(0, error=True)
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+                client = None
+        if beat:
+            logger.info(beat)
         await asyncio.sleep(NOTIFY_POLL_SECONDS)
 
 

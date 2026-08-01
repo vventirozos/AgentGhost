@@ -279,6 +279,53 @@ def _py_append_guard(base: str, snippet: str, path: str) -> Optional[str]:
     return None
 
 
+_ESCAPE_MAP = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'",
+               "\\": "\\"}
+
+
+def _unescape_common(s: str) -> str:
+    """Decode the common backslash escapes (\\n \\t \\r \\" \\' \\\\) in a
+    single left-to-right walk. NOT ``unicode_escape`` — that codec mangles
+    non-ASCII (UTF-8 text round-trips through latin-1) and decodes escapes
+    we don't want to guess about."""
+    out: List[str] = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            mapped = _ESCAPE_MAP.get(s[i + 1])
+            if mapped is not None:
+                out.append(mapped)
+                i += 2
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _maybe_unescape_double_escaped(content: str, path: str) -> Optional[str]:
+    """Bounded repair for DOUBLE-ESCAPED Python spec content — the JSON
+    string's escapes arrived literally, so the whole file is one line full
+    of two-char ``\\n`` sequences. Observed live 2026-08-01 (req 50855398):
+    data_generator.py was written this way, three executor retries re-broke
+    it, the task FAILED, and the interactive loop burned ~180s discovering
+    the shape. Returns the repaired text ONLY when every check passes:
+    the original does not parse, it has the single-line-escaped shape, and
+    the unescaped candidate DOES ``ast.parse`` — a tolerant repair must
+    bound its OUTPUT, not just its trigger. Otherwise None (caller writes
+    the original and the normal syntax-failure feedback loop applies)."""
+    if not path.lower().endswith(".py") or not content:
+        return None
+    if content.count("\n") > 2 or content.count("\\n") < 5:
+        return None
+    if _py_parse_error(content) is None:
+        return None  # parses as-is — leave it alone
+    candidate = _unescape_common(content)
+    if _py_parse_error(candidate) is None:
+        return candidate
+    return None
+
+
 def _regression_reason(old: Optional[str], new: str) -> Optional[str]:
     """Why writing ``new`` over the existing ``old`` would LOSE work — or None
     if it safely extends. None for a brand-new file (no prior work to lose)."""
@@ -1025,6 +1072,19 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         return (None, None)
     if not isinstance(content, str):
         content = str(content)
+    # Double-escaped spec content repair (2026-08-01): the model sometimes
+    # emits the file as a one-line JSON-escaped string that survives
+    # extraction verbatim. Writing it as-is lands a broken file on disk
+    # that the retry loop demonstrably cannot fix (req 50855398: three
+    # attempts, same corruption). The repair is accepted ONLY when the
+    # unescaped text ast-parses — see _maybe_unescape_double_escaped.
+    _repaired = _maybe_unescape_double_escaped(content, path)
+    if _repaired is not None:
+        logger.warning(
+            "coding_executor: %s content arrived double-escaped (one line, "
+            "literal \\n sequences) — unescaped repair parses; writing the "
+            "repaired text instead", path)
+        content = _repaired
     if len(content) > MAX_CONTENT_CHARS:
         # Fail loudly — never silently slice a full file mid-code (it would cut
         # a function/closing tag and write BROKEN code). Mirrors the append

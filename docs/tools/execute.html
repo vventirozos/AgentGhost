@@ -188,6 +188,21 @@ STDOUT/STDERR:
   <a href="../sandbox/services.html">sandbox/services</a> for the lease/ownership redesign this
   completes.</p>
 
+  <h2>Inline `-c` conversion: per-script empty directory (2026-08-01, req 50855398)</h2>
+  <p>The auto-converted inline script used to land as <code>/tmp/_ghost_inline_&lt;id&gt;.py</code> —
+  in the SHARED /tmp. Python puts the <em>script's directory</em> at <code>sys.path[0]</code>,
+  ahead of the <code>PYTHONPATH=$PWD</code> fix (2026-07-02), so any stale module in /tmp
+  silently shadowed the workspace file of the same name: a scaffolding script had left an old
+  <code>ai_model.py</code> in /tmp, and two consecutive converted probes imported that corpse
+  instead of the project's file (<code>ImportError: cannot import name … from 'ai_model'
+  (/tmp/ai_model.py)</code>), striking the turn out at 6/6 and aborting a 1789-second request.
+  Each conversion now creates its own empty directory
+  (<code>mkdir -p /tmp/_ghost_inline_&lt;id&gt; && … &gt; …/inline.py</code>): an empty
+  <code>sys.path[0]</code> has nothing to shadow with, and the CWD (via PYTHONPATH) resolves
+  workspace imports exactly as the inline form would. Tests:
+  <code>tests/test_execute_path_and_exit1_heal.py</code>,
+  <code>tests/test_req50855398_fixes.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

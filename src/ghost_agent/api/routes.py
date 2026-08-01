@@ -1069,6 +1069,17 @@ async def notifications_pending(request: Request, consumer: str = "default",
                                            severity=SEVERITY_NOTIFY)
         records.extend(chunk)
         if new_cursor <= cursor:  # EOF / no progress
+            # A new_cursor BELOW the request cursor is read_since's
+            # shrunk-ledger re-baseline (the file was truncated/replaced
+            # and this consumer's offset points past the new EOF). Adopt
+            # it so the RETURNED watermark heals the consumer: returning
+            # the stale offset instead used to rely on the bot blindly
+            # re-acking + the ack route's clamp to converge — a loop the
+            # bot's idle-identity ack skip (2026-08-01) removed. With the
+            # stale value echoed forever, a truncated ledger meant no
+            # notification was ever served again for this consumer.
+            if new_cursor < cursor:
+                cursor = new_cursor
             break
         cursor = new_cursor
         if len(records) >= limit:

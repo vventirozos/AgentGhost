@@ -261,6 +261,15 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
                     data = {}
             except Exception:  # noqa: BLE001
                 data = {}
+            # No-op acks skip the write (2026-08-01). Pollers (slack,
+            # web-ui) used to re-ack an unchanged watermark every cycle,
+            # rewriting this file every ~30s around the clock — pointless
+            # fsync churn, and it kept the file's mtime permanently fresh,
+            # which destroyed its documented diagnostic value ("stale
+            # notify_consumers.json mtime = wedged consumer", 2026-07-13
+            # postmortem). Identical value → nothing to persist.
+            if data.get(str(consumer)) == int(offset):
+                return
             data[str(consumer)] = int(offset)
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(".tmp")

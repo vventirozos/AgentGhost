@@ -203,6 +203,63 @@
   egress routing + MockTransport delivery, the /api/notifications endpoints,
   and source-inspection wiring checks for main.py / agent.py /
   project_advancer.py / the Slack poller.</p>
+
+  <h2>Promised-notification backstop at finalize (2026-08-01, req 50855398)</h2>
+  <p>When the user explicitly asked to be notified ("notify me in slack when you're done") and
+  the turn ends WITHOUT a <code>notify_operator</code> call, <code>core/agent.py</code>'s
+  <code>_notify_promise_backstop</code> writes the notify-severity record directly at finalize —
+  model not involved. The in-loop finish-line guard (2026-07-13) steers the model once but
+  deliberately stands down on force-finalising ends (strike cap, think-loop halt) — which is
+  exactly when the promise matters most: the incident request died at strike 6/6 after 1789s,
+  the notification never fired, and the verifier late-refuted the turn for that alone. The
+  backstop fires on any non-internal end (aborted OR steer-ignored), labels the outcome honestly
+  ("Task stopped early after repeated failures — …" vs "Done — …"), stamps <code>req_id</code>
+  so the same turn's digest doesn't echo it, and respects <code>notify_operator</code>'s
+  12/hour budget. Review-pass hardenings (same day): the failure label keys on the strike count,
+  never <code>force_stop</code> (terminal-tool successes set it — "stopped after failures — Dream
+  cycle complete" was the bug shape); simulation turns (<code>skill_memory.is_read_only</code>)
+  never page the operator; an ERRORED <code>notify_operator</code> call does not count as
+  promise-kept; and the STREAMED final path (the web UI always streams) carries its own twin
+  wiring next to the streamed trajectory/work_log block. Tests:
+  <code>tests/test_req50855398_fixes.py</code>.</p>
+
+  <h2>Notify promise persists on the PROJECT (2026-08-01, req 5299219b)</h2>
+  <p>"proceed with all tasks, notify me in slack when you're done" died 3.9s in when a restart
+  landed mid-turn. The ask lived only in that request's text: the follow-up "resume … proceed"
+  requests completed the project and no ping fired — the per-request detector and the finalize
+  backstop only read the CURRENT message. An explicit notify ask is a delivery requirement on
+  the <em>work</em>, not the message: <code>core/notify_promise.py</code> now persists it in the
+  project's metadata (<code>notify_on_done</code>) at REQUEST START — before the first LLM call,
+  so an early death can't lose it — exactly the pattern stored constraints already use. It fires
+  when the project reaches DONE/FAILED, from whichever path gets it there: both finalize twins
+  (with model-notified dedupe — a successful <code>notify_operator</code> call or a fired
+  per-request backstop consumes the flag silently) and main.py's <code>on_project_done</code>
+  hook for idle-loop completions (which stands down while a foreground request is active). The
+  flag is consumed with an ATOMIC metadata pop (<code>BEGIN IMMEDIATE</code> read-modify-write),
+  so a hook/finalize race delivers exactly once; a rate-limited attempt LEAVES the flag for a
+  later one. Records use the <code>project</code> phase: Slack/push delivery via the consumer
+  feed, no double-render in the chat banner (project digest covers that surface).</p>
+  <p>Review-pass hardenings (same day): the settle fire runs for INTERNAL turns too (a cron or
+  sub-agent turn that completes the project keeps the user's promise — only capture is
+  internal-gated, so a delegated prompt echoing "notify me…" can't store a promise nobody made);
+  an ACTIVE stored promise suppresses the per-request backstop (its "Done —" would be premature
+  mid-project and guarantee a double ping at settle time); the streamed twin fires against the
+  drain-snapshot project id, never the live pointer a concurrent turn can re-point; and a failed
+  ledger write RESTORES the consumed flag for a later retry. Known residual: a project rolled to
+  FAILED by the idle loop delivers on the next foreground turn touching it (the store's
+  done-hook fires only on DONE by design). Tests: <code>tests/test_notify_promise.py</code>
+  (13, incl. the request-52 replay).</p>
+
+  <h2>No-op consumer acks skip the write (2026-08-01)</h2>
+  <p><code>save_consumer_offset</code> returns early when the stored watermark already equals the
+  new value. Idle pollers (slack, web-ui) re-ack an unchanged watermark every ~30s; each ack
+  rewrote <code>notify_consumers.json</code> — pointless fsync churn around the clock, and it
+  kept the file's mtime permanently fresh, which destroyed the documented wedge diagnostic
+  ("stale <code>notify_consumers.json</code> mtime = wedged consumer", 2026-07-13 postmortem).
+  The Slack bot additionally skips the ack HTTP call itself when the watermark hasn't moved
+  (see <a href="../interfaces/slack_bot.html">the bot page</a>); this store-level guard covers
+  every other consumer. Tests:
+  <code>tests/test_autonomous_activity.py::test_save_consumer_offset_skips_noop_writes</code>.</p>
 </main>
 </body>
 </html>

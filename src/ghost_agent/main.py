@@ -439,9 +439,30 @@ async def lifespan(app):
         # keep registered deliverables, delete the rest. Fires only on the
         # transition to DONE (see ProjectStore._fire_project_done).
         from .core.workspace_cleanup import sweep_project_workspace
-        context.project_store.on_project_done = (
-            lambda pid, _store=context.project_store: sweep_project_workspace(_store, pid)
-        )
+        def _on_project_done(pid, _store=context.project_store,
+                             _context=context):
+            # Stored notify promise FIRST (2026-08-01): idle-loop
+            # completions never reach a finalize chain, so the promise a
+            # user parked on the project ("notify me in slack when done")
+            # is delivered here. Stands down while a FOREGROUND request is
+            # active — that request's finalize owns delivery, with
+            # model-notified dedupe; the atomic consume makes a race
+            # single-delivery anyway. Runs before the sweep so a cleanup
+            # error can't eat the ping.
+            try:
+                from .utils.logging import request_id_context
+                if request_id_context.get() in ("", "SYSTEM", None):
+                    from .core.notify_promise import fire_promise_if_settled
+                    fire_promise_if_settled(
+                        _store,
+                        getattr(_context, "activity_log", None),
+                        pid)
+            except Exception:
+                logging.getLogger("GhostAgent").debug(
+                    "project-done notify promise skipped", exc_info=True)
+            sweep_project_workspace(_store, pid)
+
+        context.project_store.on_project_done = _on_project_done
         # Boot reaper (2026-07-20 H3): the advancer claims a leaf by writing
         # it IN_PROGRESS before a multi-minute build/LLM step. A deploy (plain
         # SIGTERM — the standard workflow) or crash mid-tick leaves the task

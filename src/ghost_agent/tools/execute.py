@@ -562,23 +562,37 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     # --- AUTO-CONVERT → in-sandbox file run -------------------
                     _interp = _inline_py_match.group("interp")
                     _ext = "sh" if _interp == "bash" else "py"
-                    _path = f"/tmp/_ghost_inline_{uuid.uuid4().hex[:8]}.{_ext}"
+                    # Each converted script gets its OWN EMPTY directory. A
+                    # shared /tmp is an import minefield: Python puts the
+                    # SCRIPT'S directory at sys.path[0] — ahead of PYTHONPATH
+                    # — so any stale module in /tmp (e.g. an ai_model.py a
+                    # previous scaffolding script left there) silently
+                    # SHADOWS the workspace file of the same name. Observed
+                    # live 2026-08-01 (req 50855398): two consecutive
+                    # converted probes imported /tmp/ai_model.py instead of
+                    # the project's, struck out the turn at 6/6, and the
+                    # request aborted. An empty per-script dir has nothing
+                    # to shadow with.
+                    _dir = f"/tmp/_ghost_inline_{uuid.uuid4().hex[:8]}"
+                    _path = f"{_dir}/inline.{_ext}"
                     _b64 = base64.b64encode(_bash_body.encode("utf-8")).decode("ascii")
                     _prefix = command[:_inline_py_match.start()]
                     _sep = _inline_py_match.group("sep")
-                    # `cd proj && python3 /tmp/x.py` — cd (if any) is preserved
-                    # so the script's relative paths resolve like the inline
-                    # form did; the file is written to an absolute /tmp path so
-                    # the write itself is cwd-independent.
+                    # `cd proj && python3 /tmp/.../inline.py` — cd (if any) is
+                    # preserved so the script's relative paths resolve like
+                    # the inline form did; the file is written to an absolute
+                    # /tmp path so the write itself is cwd-independent.
                     #
-                    # For Python, `python -c "<body>"` puts the CWD on sys.path
-                    # ('' as sys.path[0]); running the converted file from /tmp
-                    # puts /tmp there instead, so a body that imports a module
-                    # sitting in the working directory breaks with
-                    # ModuleNotFoundError (observed live, 2026-07 chess trace:
-                    # `from chess_engine import Board` failed only BECAUSE of
-                    # this conversion). Prepend the runtime CWD to PYTHONPATH
-                    # to keep the inline form's import semantics.
+                    # For Python, `python -c "<body>"` puts the CWD on
+                    # sys.path ('' as sys.path[0]); running the converted
+                    # file puts the script dir there instead, so a body that
+                    # imports a module sitting in the working directory
+                    # breaks with ModuleNotFoundError (observed live,
+                    # 2026-07 chess trace: `from chess_engine import Board`
+                    # failed only BECAUSE of this conversion). Prepend the
+                    # runtime CWD to PYTHONPATH to keep the inline form's
+                    # import semantics; the empty script dir (above) keeps
+                    # sys.path[0] harmless.
                     if _ext == "py":
                         _invoke = ('PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" '
                                    f"{_interp} {_path}")
@@ -586,6 +600,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                         _invoke = f"{_interp} {_path}"
                     _run = f"{_prefix}{_sep} {_invoke}".strip()
                     command = (
+                        f"mkdir -p {_dir} && "
                         f"printf %s {shlex.quote(_b64)} | base64 -d > {_path} "
                         f"&& {_run}"
                     )

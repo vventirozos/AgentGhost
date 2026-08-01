@@ -76,6 +76,23 @@ class TestDetectThinkingLoop:
 # ---------------------------------------------------------------------------
 
 class TestAtomicPrint:
+    @pytest.fixture(autouse=True)
+    def _no_color_env_leak(self, monkeypatch):
+        # These tests pin the non-tty default (no ANSI). `_USE_COLOR` is
+        # computed ONCE at module import, honoring FORCE_COLOR by design —
+        # a developer shell exporting FORCE_COLOR leaks through pytest and
+        # bakes color ON before any test runs (bit a full-suite run
+        # 2026-08-01: FORCE_COLOR=3 in the session shell, 2 false fails).
+        # Pin the module attribute AND the import-time-baked constants
+        # (RESET/DIM/BOLD/_LEVEL_COLOR are computed via _ansi() at import,
+        # so they carry escapes forever once color was on at import).
+        monkeypatch.setattr(glog, "_USE_COLOR", False)
+        monkeypatch.setattr(glog, "RESET", "")
+        monkeypatch.setattr(glog, "DIM", "")
+        monkeypatch.setattr(glog, "BOLD", "")
+        monkeypatch.setattr(glog, "_LEVEL_COLOR",
+                            {k: "" for k in glog._LEVEL_COLOR})
+
     def test_atomic_print_writes_one_line_with_newline(self):
         buf = io.StringIO()
         with redirect_stdout(buf):

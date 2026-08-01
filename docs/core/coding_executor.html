@@ -259,6 +259,19 @@
   <p>Tests: <code>tests/test_project_ledger_integrity_fixes.py</code> (guards, disk-survival
   end-to-end, verify-only survival, ALREADY-ON-DISK steer).</p>
 
+  <h2>Double-escaped spec content: bounded pre-write repair (2026-08-01, req 50855398)</h2>
+  <p>The spec model sometimes emits a file as a one-line JSON-escaped string that survives
+  extraction verbatim — every newline a literal <code>\n</code> pair. Writing it lands a broken
+  file the retry loop demonstrably cannot fix (live: three attempts on
+  <code>data_generator.py</code>, all still escaped, task FAILED). <code>_apply_file</code>'s
+  full-<code>content</code> path now runs <code>_maybe_unescape_double_escaped</code>: trigger
+  only on the exact shape (.py, ≤2 real newlines, ≥5 literal <code>\n</code>, original does NOT
+  parse), decode only the common escapes (<code>\n \t \r \" \' \\</code> — not
+  <code>unicode_escape</code>, which mangles UTF-8), and accept the repair ONLY when the result
+  <code>ast.parse</code>s — a tolerant repair must bound its OUTPUT, not just its trigger. On
+  any miss the original is written and the (now shape-naming) syntax feedback drives the retry.
+  Tests: <code>tests/test_req50855398_fixes.py</code>.</p>
+
 </main>
 </body>
 </html>

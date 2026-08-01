@@ -32,6 +32,11 @@ def bot():
     """Load the bot module once, with the env its import requires."""
     os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
     os.environ.setdefault("GHOST_API_KEY", "test-key")
+    # Explicitly EMPTY (ASSIGNED, not setdefault): no rotating-file handler
+    # at import. A dev shell that sourced the bot's .env would otherwise
+    # carry the live path into the env and every module (re)load here would
+    # attach a handler on the LIVE bot log to this pytest process.
+    os.environ["GHOST_SLACKBOT_LOG"] = ""
     spec = importlib.util.spec_from_file_location("ghost_slack_bot_under_test",
                                                   _BOT_PATH)
     mod = importlib.util.module_from_spec(spec)
@@ -404,7 +409,10 @@ class _FakeHttp:
         return _FakeResp({"ok": True})
 
 
-def test_poller_acks_empty_response(bot):
+def test_poller_acks_empty_response(bot, monkeypatch):
+    # Reset the module-global ack memory: this test pins FIRST-CONTACT
+    # behaviour and must not depend on which poller test ran before it.
+    monkeypatch.setattr(bot, "_last_acked_watermark", None)
     http = _FakeHttp({"records": [], "watermark": 4242})
     poster = AsyncMock()
     n = asyncio.run(bot.poll_and_deliver_once(http, "C123", poster=poster))
@@ -453,3 +461,264 @@ def test_poller_raises_on_http_error(bot):
     with pytest.raises(RuntimeError):
         asyncio.run(bot.poll_and_deliver_once(_Err(), "C123",
                                               poster=AsyncMock()))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Poller churn fixes (2026-08-01): idle-identity ack skip + heartbeat
+# ══════════════════════════════════════════════════════════════════════
+#
+# An idle ledger returns the SAME watermark every poll; re-acking it was a
+# no-op POST plus a notify_consumers.json rewrite every 30s around the
+# clock. The skip applies ONLY when the watermark equals what this process
+# already acked — an empty response with an ADVANCED watermark is still
+# acked (that exact case is the 2026-07-13 wedge, pinned above).
+
+
+def test_poller_skips_ack_when_watermark_unchanged(bot, monkeypatch):
+    monkeypatch.setattr(bot, "_last_acked_watermark", 5555)
+    http = _FakeHttp({"records": [], "watermark": 5555})
+    n = asyncio.run(bot.poll_and_deliver_once(http, "C123",
+                                              poster=AsyncMock()))
+    assert n == 0
+    assert [c for c in http.calls if c[0] == "post"] == []
+
+
+def test_poller_still_acks_advanced_watermark_on_empty(bot, monkeypatch):
+    monkeypatch.setattr(bot, "_last_acked_watermark", 5555)
+    http = _FakeHttp({"records": [], "watermark": 7777})
+    asyncio.run(bot.poll_and_deliver_once(http, "C123", poster=AsyncMock()))
+    acks = [c for c in http.calls if c[0] == "post"]
+    assert len(acks) == 1
+    assert acks[0][2]["watermark"] == 7777
+    assert bot._last_acked_watermark == 7777
+
+
+def test_poller_acks_when_records_delivered_even_if_watermark_repeats(
+        bot, monkeypatch):
+    # Defensive: records present → always ack after delivery, no identity
+    # reasoning about the watermark value.
+    monkeypatch.setattr(bot, "_last_acked_watermark", 9999)
+    http = _FakeHttp({"records": [{"phase": "agent_message",
+                                   "summary": "done"}],
+                      "watermark": 9999})
+    n = asyncio.run(bot.poll_and_deliver_once(http, "C123",
+                                              poster=AsyncMock()))
+    assert n == 1
+    assert len([c for c in http.calls if c[0] == "post"]) == 1
+
+
+def test_poller_failed_ack_is_retried_next_poll(bot, monkeypatch):
+    """A non-2xx ack must NOT be recorded as done — recording it would
+    convert one agent-side 500 into a permanently suppressed retry (the
+    identity skip would then swallow every re-ack; review finding)."""
+    monkeypatch.setattr(bot, "_last_acked_watermark", 100)
+
+    class _FailingAck(_FakeHttp):
+        async def post(self, url, json=None, **kw):
+            self.calls.append(("post", url, json))
+            r = _FakeResp({"ok": False})
+            r.status_code = 500
+            return r
+
+    http = _FailingAck({"records": [], "watermark": 200})
+    asyncio.run(bot.poll_and_deliver_once(http, "C123", poster=AsyncMock()))
+    assert bot._last_acked_watermark == 100      # NOT advanced
+    # Same response next poll → the ack is attempted again.
+    asyncio.run(bot.poll_and_deliver_once(http, "C123", poster=AsyncMock()))
+    assert len([c for c in http.calls if c[0] == "post"]) == 2
+
+
+def test_poller_never_acks_enabled_false(bot, monkeypatch):
+    """enabled:false carries a literal watermark 0 — acking it would reset
+    the stored consumer offset and replay the ENTIRE notify history when
+    the ledger comes back (first-contact baseline bypassed)."""
+    monkeypatch.setattr(bot, "_last_acked_watermark", None)
+    http = _FakeHttp({"enabled": False, "records": [], "watermark": 0})
+    n = asyncio.run(bot.poll_and_deliver_once(http, "C123",
+                                              poster=AsyncMock()))
+    assert n == 0
+    assert [c for c in http.calls if c[0] == "post"] == []
+    assert bot._last_acked_watermark is None
+
+
+def test_poller_heartbeat_counts_and_resets(bot):
+    hb = bot._PollerHeartbeat(every_s=3600)
+    hb._last_beat = 1000.0
+    assert hb.note(2, now=1500.0) is None
+    assert hb.note(0, error=True, now=2000.0) is None
+    line = hb.note(1, now=5000.0)
+    assert line is not None
+    assert "3 poll(s)" in line and "3 delivered" in line \
+        and "1 error(s)" in line
+    # counters reset after the beat
+    assert (hb.polls, hb.delivered, hb.errors) == (0, 0, 0)
+    assert hb._last_beat == 5000.0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Notification formatting: human labels + stale-age suffix (2026-08-01)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_format_notification_human_label_and_age(bot):
+    now = 1_000_000.0
+    old = {"phase": "scheduled_task", "summary": "backup done",
+           "ts": now - 7200}
+    line = bot.format_notification(old, now=now)
+    assert "*[scheduled task]*" in line          # not the raw slug
+    assert "backup done" in line
+    assert "2.0h ago" in line                     # re-served ≠ breaking news
+
+
+def test_format_notification_fresh_record_has_no_age(bot):
+    now = 1_000_000.0
+    fresh = {"phase": "agent_message", "summary": "hi", "ts": now - 10}
+    line = bot.format_notification(fresh, now=now)
+    assert "ago" not in line
+    assert "*[agent]*" in line
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Thread re-upload dedupe (2026-08-01): a rebuilt thread context must not
+# re-POST an already-ingested attachment — the re-upload silently
+# clobbered any edits the agent had made to its sandbox copy.
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_upload_cache_hit_skips_network(bot, monkeypatch):
+    import time as _time
+    monkeypatch.setattr(bot, "_UPLOADED_FILE_IDS",
+                        {"F123": ("doc.pdf", _time.time())})
+
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise AssertionError("network client built on a cache hit")
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", _Boom)
+    got = asyncio.run(bot.upload_file_to_agent(
+        {"id": "F123", "name": "doc.pdf",
+         "url_private_download": "http://x/doc"}))
+    assert got == "doc.pdf"
+
+
+def test_upload_populates_cache_on_success(bot, monkeypatch):
+    monkeypatch.setattr(bot, "_UPLOADED_FILE_IDS", {})
+
+    class _Resp:
+        status_code = 200
+        content = b"bytes"
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+        async def post(self, url, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", _Client)
+    got = asyncio.run(bot.upload_file_to_agent(
+        {"id": "F777", "name": "data.csv",
+         "url_private_download": "http://x/data"}))
+    assert got == "data.csv"
+    assert set(bot._UPLOADED_FILE_IDS) == {"F777"}
+    name, ts = bot._UPLOADED_FILE_IDS["F777"]
+    assert name == "data.csv" and ts > 0
+
+
+def test_upload_cache_expires_after_ttl(bot, monkeypatch):
+    """A stale entry must NOT assert sandbox presence forever: the upload
+    lands in the ACTIVE project's scope and sweeps can delete it, so an
+    aged hit re-uploads to re-assert reality (review finding)."""
+    import time as _time
+    stale_ts = _time.time() - bot._UPLOAD_CACHE_TTL_S - 60
+    monkeypatch.setattr(bot, "_UPLOADED_FILE_IDS",
+                        {"F123": ("doc.pdf", stale_ts)})
+
+    class _Resp:
+        status_code = 200
+        content = b"b"
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+        async def post(self, url, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", _Client)
+    got = asyncio.run(bot.upload_file_to_agent(
+        {"id": "F123", "name": "doc.pdf",
+         "url_private_download": "http://x/doc"}))
+    assert got == "doc.pdf"
+    name, ts = bot._UPLOADED_FILE_IDS["F123"]   # refreshed entry
+    assert name == "doc.pdf" and ts > stale_ts
+
+
+def test_upload_without_file_id_still_uploads(bot, monkeypatch):
+    # No Slack file id → no cache key; behaviour is the pre-fix path.
+    monkeypatch.setattr(bot, "_UPLOADED_FILE_IDS", {})
+
+    class _Resp:
+        status_code = 200
+        content = b"b"
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+        async def post(self, url, **kw):
+            return _Resp()
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", _Client)
+    got = asyncio.run(bot.upload_file_to_agent(
+        {"name": "noid.txt", "url_private_download": "http://x/noid"}))
+    assert got == "noid.txt"
+    assert bot._UPLOADED_FILE_IDS == {}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# EMOJI_MAP refresh (2026-08-01): current request-path icons must map
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_emoji_map_covers_current_request_icons(bot):
+    for emoji in ("🧠", "🧪", "🔗", "🧭", "🎯", "🔒", "📣", "🐘"):
+        assert emoji in bot.EMOJI_MAP
+    armed, event = bot.scan_log_line("│ AB 🧪 verifier CONFIRMED", "xx", True)
+    assert armed and event == ("status", "🧪", bot.EMOJI_MAP["🧪"])

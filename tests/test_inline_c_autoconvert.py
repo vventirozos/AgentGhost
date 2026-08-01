@@ -57,7 +57,7 @@ async def test_multi_statement_one_liner_auto_converts(tmp_path):
     assert "SYSTEM BLOCK" not in result
     ran = _ran_command(mgr)
     assert "base64 -d" in ran
-    assert re.search(r'python3 /tmp/_ghost_inline_\w+\.py', ran)
+    assert re.search(r'python3 /tmp/_ghost_inline_\w+/inline\.py', ran)
     assert _decode_transported_body(ran) == body
 
 
@@ -101,7 +101,7 @@ async def test_cd_prefix_is_preserved(tmp_path):
     # `&&` and the interpreter so the converted file keeps `-c`'s
     # cwd-on-sys.path import semantics.
     assert re.search(
-        r'cd projects/abc/app && PYTHONPATH="\$PWD[^"]*" python3 /tmp/_ghost_inline_\w+\.py',
+        r'cd projects/abc/app && PYTHONPATH="\$PWD[^"]*" python3 /tmp/_ghost_inline_\w+/inline\.py',
         ran)
 
 
@@ -113,7 +113,7 @@ async def test_bash_c_auto_converts_to_sh_file(tmp_path):
     await tool_execute(command=f'bash -c "{body}"',
                        sandbox_dir=tmp_path, sandbox_manager=mgr)
     ran = _ran_command(mgr)
-    assert re.search(r'bash /tmp/_ghost_inline_\w+\.sh', ran)
+    assert re.search(r'bash /tmp/_ghost_inline_\w+/inline\.sh', ran)
     assert _decode_transported_body(ran) == body
 
 
