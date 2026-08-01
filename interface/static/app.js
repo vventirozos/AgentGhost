@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=7.6';
+import * as matrixGraphFace from './matrix_graph.js?v=8.3';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -245,7 +245,10 @@ const isStandalonePWA = window.matchMedia('(display-mode: standalone)').matches 
     window.navigator.standalone === true;
 const notificationsSupported = ('Notification' in window) && (!isIOS || isStandalonePWA);
 
-if ('serviceWorker' in navigator && !isIOS) {
+// iOS standalone (installed PWA) MUST register the SW too — it is the
+// only iOS context that can hold a push subscription. The old blanket
+// `!isIOS` skip kept even installed PWAs pushless.
+if ('serviceWorker' in navigator && (!isIOS || isStandalonePWA)) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register('/sw.js')
             .then(reg => console.log('Service Worker registered successfully'))
@@ -253,18 +256,76 @@ if ('serviceWorker' in navigator && !isIOS) {
     });
 }
 
+// ── Web push subscription (2026-08-01) ─────────────────────────────
+// Subscribes this device for locked-phone delivery: reply-ready pushes
+// (the ack-grace contract in server.py) + agent notify events. Runs
+// after permission lands; re-runs each boot (subscribe is idempotent —
+// the server upserts by endpoint).
+function _b64urlToUint8(base64url) {
+    const pad = '='.repeat((4 - (base64url.length % 4)) % 4);
+    const b64 = (base64url + pad).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(b64);
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+async function ensurePushSubscription() {
+    try {
+        if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+        if (isIOS && !isStandalonePWA) return;   // Safari tab: no push context
+        if (Notification.permission !== 'granted') return;
+        const res = await fetch('/api/push/vapid');
+        if (!res.ok) return;
+        const { enabled, key } = await res.json();
+        if (!enabled || !key) return;
+        const registration = await navigator.serviceWorker.ready;
+        let sub = await registration.pushManager.getSubscription();
+        // VAPID rotation: a subscription bound to a RETIRED server key
+        // looks alive on both ends (server upserts it forever, pushes
+        // fail 401/403) and never delivers again. Compare and re-bind.
+        if (sub && sub.options && sub.options.applicationServerKey) {
+            const cur = new Uint8Array(sub.options.applicationServerKey);
+            const want = _b64urlToUint8(key);
+            const same = cur.length === want.length
+                && cur.every((v, i) => v === want[i]);
+            if (!same) {
+                try { await sub.unsubscribe(); } catch (e) { /* re-bind anyway */ }
+                sub = null;
+            }
+        }
+        if (!sub) {
+            sub = await registration.pushManager.subscribe({
+                userVisibleOnly: true,
+                applicationServerKey: _b64urlToUint8(key),
+            });
+        }
+        await fetch('/api/push/subscribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subscription: sub.toJSON() }),
+        });
+    } catch (e) {
+        console.warn('Push subscription unavailable:', e);
+    }
+}
+
 document.addEventListener('click', () => {
     if (notificationsSupported && Notification.permission === "default") {
         try {
             const result = Notification.requestPermission();
-            if (result && typeof result.catch === 'function') {
-                result.catch(e => console.error('Notification permission error:', e));
+            if (result && typeof result.then === 'function') {
+                result.then(() => ensurePushSubscription())
+                      .catch(e => console.error('Notification permission error:', e));
+            } else {
+                ensurePushSubscription();
             }
         } catch (e) {
             console.error('Notification permission error:', e);
         }
     }
 }, { once: true });
+
+// Already-granted permission (returning visitor): subscribe on boot.
+window.addEventListener('load', () => { ensurePushSubscription(); });
 
 async function notifyUser(message) {
     if (!notificationsSupported) return;
@@ -275,10 +336,14 @@ async function notifyUser(message) {
             const registration = await navigator.serviceWorker.ready;
             registration.showNotification("Ghost System", {
                 body: message,
-                icon: "/static/cyber_face.png"
+                icon: "/static/icons/icon-192.png?v=2",
+                // Keyed URL: the SW click handler opens data.url; a bare
+                // '/' would land a fresh window on the 401 page.
+                data: { url: location.pathname + location.search }
             });
         } else {
-            new Notification("Ghost System", { body: message, icon: "/static/cyber_face.png" });
+            new Notification("Ghost System", {
+                body: message, icon: "/static/icons/icon-192.png?v=2" });
         }
     } catch (e) {
         console.error("Notification failed:", e);
@@ -317,7 +382,7 @@ function connectWebSocket() {
     setConnectionState('pending', 'CONNECTING…');
     ws = new WebSocket(wsUrl);
     ws.onopen = () => {
-        setConnectionState('online', 'SYSTEM ONLINE');
+        setConnectionState('online', 'ONLINE');
     };
     ws.onmessage = (event) => {
         try {
@@ -385,13 +450,78 @@ window.addEventListener('pageshow', (e) => {
 
 // VisualViewport: track virtual keyboard height so the input area stays visible on iOS.
 if ('visualViewport' in window) {
+    let kbSettleTimer = null;
+    let kbGuardRetries = 0;
+    let lastWinWidth = window.innerWidth;
+
+    const setKb = (px) => document.documentElement.style.setProperty(
+        '--keyboard-height', `${px}px`);
+    const isEditing = () => {
+        const ae = document.activeElement;
+        return !!ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT'
+            || ae.isContentEditable);
+    };
+
     const updateKeyboardOffset = () => {
         const vv = window.visualViewport;
-        const keyboardHeight = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-        document.documentElement.style.setProperty('--keyboard-height', `${keyboardHeight}px`);
+        let kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        // Mid-rotation, innerHeight and vv.height describe DIFFERENT
+        // orientations (bogus half-screen "keyboard"). Defer while the
+        // widths disagree — but only a few times: real iOS Safari can
+        // report slightly incoherent widths indefinitely, and an
+        // ever-deferring guard would freeze keyboard tracking entirely.
+        if (Math.abs(window.innerWidth - vv.width) > 2 && kbGuardRetries < 8) {
+            kbGuardRetries += 1;
+            clearTimeout(kbSettleTimer);
+            kbSettleTimer = setTimeout(updateKeyboardOffset, 250);
+            return;
+        }
+        kbGuardRetries = 0;
+        // No focused editable = no keyboard; anything left over is stale.
+        if (!isEditing()) kb = 0;
+        // A real mobile keyboard never exceeds ~55% of the screen.
+        kb = Math.min(kb, Math.round(window.innerHeight * 0.55));
+        setKb(kb);
     };
     window.visualViewport.addEventListener('resize', updateKeyboardOffset);
     window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+
+    const scheduleSettle = (delay) => {
+        clearTimeout(kbSettleTimer);
+        kbSettleTimer = setTimeout(updateKeyboardOffset, delay);
+    };
+
+    // Rotation is the state we can never trust on iOS Safari: it dismisses
+    // the keyboard but can KEEP the element focused, and visualViewport
+    // may report stale geometry until the next user interaction — every
+    // derived value is suspect (the "input box at the top of the screen"
+    // repro: focus → rotate → rotate back). Don't repair the lie — make
+    // the state deterministic: blur (the keyboard is gone anyway), zero
+    // the translate NOW, re-measure once settled.
+    const onRotate = () => {
+        if (isEditing()) { try { document.activeElement.blur(); } catch (e) {} }
+        setKb(0);
+        scheduleSettle(400);
+    };
+    window.addEventListener('orientationchange', onRotate);
+    window.addEventListener('resize', () => {
+        if (window.innerWidth !== lastWinWidth) {
+            // Width change == rotation (mobile viewports don't resize
+            // horizontally otherwise; desktop windows don't run this UI
+            // with a virtual keyboard).
+            lastWinWidth = window.innerWidth;
+            onRotate();
+            return;
+        }
+        scheduleSettle(250);
+    });
+
+    // Keyboard closed via blur: zero the translate immediately — the vv
+    // resize event can arrive late or (WebKit quirk) with stale numbers.
+    // Small delay so focus hopping between two editables doesn't flicker.
+    document.addEventListener('focusout', () => {
+        setTimeout(() => { if (!isEditing()) setKb(0); }, 50);
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -987,6 +1117,213 @@ function loadChatState() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  In-flight turn survival (2026-08-01) — the Claude-app model.
+//
+//  The proxy buffers every chat stream server-side (task lives while
+//  running + 10 min after completion), and the AGENT persists the
+//  finished reply into the durable session store. What used to be lost
+//  when iOS killed the page mid-request was only the HANDLE — the task
+//  id lived in a module `let`. Persist it, and on return:
+//    1. proxy replay buffer still there  → reattach the live stream
+//    2. buffer gone, turn still running  → placeholder + poll sessions
+//    3. buffer gone, turn finished       → adopt the session's history
+//  (3) goes through wholesale adoption (server canonical), never an
+//  append — appending a diverged fat replay is the merge_history
+//  doubling case.
+// ═══════════════════════════════════════════════════════════════
+const INFLIGHT_KEY = 'ghost_inflight_turn';
+let reconcilePollTimer = null;
+let resumeLatch = false;        // synchronous re-entry guard (see below)
+let inflightHeartbeat = null;   // owner-tab liveness while streaming
+
+// Tab identity: sessionStorage survives same-tab reloads but NOT an iOS
+// PWA kill — which is exactly right: the reopened app gets a fresh id
+// and may adopt the orphaned handle, while a SECOND live tab (whose
+// heartbeat is fresh) must keep its hands off another tab's turn.
+const TAB_ID = (() => {
+    try {
+        let id = sessionStorage.getItem('ghost_tab_id');
+        if (!id) {
+            id = (crypto.randomUUID ? crypto.randomUUID()
+                : `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+            sessionStorage.setItem('ghost_tab_id', id);
+        }
+        return id;
+    } catch (e) { return `tab-${Math.random().toString(36).slice(2)}`; }
+})();
+
+function saveInflightHandle() {
+    if (!currentTaskId) return;
+    safeStorage.set(INFLIGHT_KEY, JSON.stringify({
+        taskId: currentTaskId,
+        sessionId: window.__ghostSessionId || safeStorage.get('ghost_session_id') || null,
+        tabId: TAB_ID,
+        ts: Date.now(),
+        beat: Date.now(),
+    }));
+    // Heartbeat while the owning tab streams: lets other tabs tell a
+    // LIVE owner from a killed one.
+    if (inflightHeartbeat) clearInterval(inflightHeartbeat);
+    inflightHeartbeat = setInterval(() => {
+        try {
+            const raw = safeStorage.get(INFLIGHT_KEY);
+            if (!raw) return;
+            const h = JSON.parse(raw);
+            if (h.tabId !== TAB_ID) return;  // another tab took over
+            h.beat = Date.now();
+            safeStorage.set(INFLIGHT_KEY, JSON.stringify(h));
+        } catch (e) { /* storage gone — nothing to keep alive */ }
+    }, 5000);
+}
+
+function clearInflightHandle() {
+    safeStorage.remove(INFLIGHT_KEY);
+    if (reconcilePollTimer) { clearTimeout(reconcilePollTimer); reconcilePollTimer = null; }
+    if (inflightHeartbeat) { clearInterval(inflightHeartbeat); inflightHeartbeat = null; }
+}
+
+function readInflightHandle() {
+    try {
+        const raw = safeStorage.get(INFLIGHT_KEY);
+        if (!raw) return null;
+        const h = JSON.parse(raw);
+        return (h && typeof h.taskId === 'string' && h.taskId) ? h : null;
+    } catch (e) { return null; }
+}
+
+// Recreate the thinking bubble + ticker for a resume that outlived the
+// page (after a reload nothing of the original turn's DOM exists). No-op
+// when the original bubble is still attached (same-page Safari resume).
+function ensureAgentBubbleForResume() {
+    if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) return;
+    dismissEmptyStateHero();
+    currentAgentMessageDiv = document.createElement('div');
+    currentAgentMessageDiv.className = 'message agent thinking';
+    currentAgentMessageDiv.dataset.ts = String(Date.now());
+    const ind = document.createElement('span');
+    ind.className = 'typing-indicator';
+    ind.setAttribute('aria-label', 'Thinking');
+    ind.appendChild(document.createElement('span'));
+    ind.appendChild(document.createElement('span'));
+    ind.appendChild(document.createElement('span'));
+    currentAgentMessageDiv.appendChild(ind);
+    chatLog.appendChild(currentAgentMessageDiv);
+    startTurnTicker(currentAgentMessageDiv);
+    scrollToBottom();
+}
+
+async function reconcileFromSession(sid) {
+    if (!sid) { clearInflightHandle(); return; }
+    // A LIVE turn owns the log. Bail at entry AND after every await —
+    // adoption calls renderHistoryToLog, which would detach the bubble a
+    // new turn is streaming into and drop its user message.
+    if (isProcessingRequest) return;
+    let stillRunning = false;
+    try {
+        const tr = await fetch('/api/turns');
+        if (isProcessingRequest) return;
+        if (tr.ok) {
+            const td = await tr.json();
+            stillRunning = (td.turns || []).some(
+                (t) => t.session_id === sid && (t.running || t.queued));
+        }
+    } catch (e) { /* agent unreachable — retry on next visibility */ return; }
+    if (stillRunning) {
+        // The proxy's replay buffer is gone (restart) but the agent is
+        // still computing. The reply will land in the session store when
+        // it finishes — keep a placeholder and poll.
+        ensureAgentBubbleForResume();
+        if (!reconcilePollTimer) {
+            addMessage('system', 'Ghost is still working on your request…');
+            reconcilePollTimer = setTimeout(() => {
+                reconcilePollTimer = null;
+                reconcileFromSession(sid);
+            }, 5000);
+        }
+        return;
+    }
+    try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`);
+        if (isProcessingRequest) return;
+        if (res.ok) {
+            const data = await res.json();
+            const msgs = Array.isArray(data.messages) ? data.messages : [];
+            if (msgs.length > chatHistory.length) {
+                // Server is canonical: ADOPT, never append.
+                chatHistory = msgs.map((m) => ({ role: m.role, content: m.content }));
+                renderHistoryToLog(chatHistory);
+                saveChatState();
+                addMessage('system', 'Recovered the reply that finished while you were away.');
+            } else {
+                addMessage('system', 'The previous request could not be recovered.');
+            }
+        } else if (res.status === 404) {
+            addMessage('system', 'The previous request could not be recovered.');
+        } else {
+            return; // sessions store hiccup — retry on next visibility
+        }
+    } catch (e) { return; }
+    // A placeholder bubble that never streamed has nothing to show.
+    if (currentAgentMessageDiv && currentAgentMessageDiv.classList.contains('thinking')) {
+        stopTurnTicker();
+        currentAgentMessageDiv.remove();
+        currentAgentMessageDiv = null;
+    }
+    clearInflightHandle();
+}
+
+async function resumeOrReconcileInflightTurn() {
+    // Synchronous latch: boot + visibilitychange + pageshow can all fire
+    // in one tick (bfcache restore), and the isProcessingRequest guard
+    // alone has an async gap before sendMessage(true) claims the turn —
+    // two concurrent resumes each replayed the stream from chunk 0 into
+    // one bubble and pushed TWO assistant messages (review CRITICAL).
+    if (resumeLatch || isProcessingRequest) return;
+    resumeLatch = true;
+    try {
+        const h = readInflightHandle();
+        if (!h) return;
+        // Another LIVE tab owns this turn: fresh heartbeat → hands off.
+        // A dead owner (killed PWA) stops beating and may be adopted.
+        if (h.tabId && h.tabId !== TAB_ID
+                && Date.now() - (h.beat || h.ts || 0) < 15000) {
+            return;
+        }
+        // The handle belongs to a conversation this client no longer
+        // shows (/clear minted a new session while the turn hung):
+        // resurrecting the old transcript into the new session would
+        // duplicate it server-side. Drop it.
+        const currentSid = window.__ghostSessionId
+            || safeStorage.get('ghost_session_id') || null;
+        if (h.sessionId && currentSid && h.sessionId !== currentSid) {
+            clearInflightHandle();
+            return;
+        }
+        let state = null;
+        try {
+            const r = await fetch(`/api/chat/task/${encodeURIComponent(h.taskId)}/state`);
+            if (r.ok) state = await r.json();
+        } catch (e) { /* proxy down — nothing to do until it returns */ return; }
+        if (isProcessingRequest) return;
+        if (state && state.exists) {
+            // Replay buffer alive: reattach the stream exactly like the
+            // same-page Safari resume, with a fresh bubble. sendMessage
+            // sets isProcessingRequest synchronously before its first
+            // await, so the latch can release right after this call.
+            currentTaskId = h.taskId;
+            currentChunkIndex = 0;
+            currentAccumulatedContent = "";
+            ensureAgentBubbleForResume();
+            sendMessage(true);
+            return;
+        }
+        await reconcileFromSession(h.sessionId);
+    } finally {
+        resumeLatch = false;
+    }
+}
+
 // Auto-expand textarea height organically. When the field empties,
 // CLEAR the inline height so the `rows="1"` attribute regains control
 // — `height: auto` on an already-styled textarea computes from content
@@ -1129,6 +1466,11 @@ async function sendMessage(isResume = false) {
     const resuming = isResume === true;
     const text = chatInput.value.trim();
     if (!resuming && (!text || isProcessingRequest)) return;
+    // A resume must not stack on a turn either: the legacy same-page
+    // auto-resume (resumeOnVisible) and the persisted-handle path can
+    // both fire on the same visibilitychange — the second replay wiped
+    // the first's accumulator and double-pushed the assistant message.
+    if (resuming && isProcessingRequest) return;
 
     if (text === '/clear' && !resuming) {
         chatInput.value = '';
@@ -1136,6 +1478,14 @@ async function sendMessage(isResume = false) {
         chatLog.innerHTML = '';
         chatHistory = [];
         safeStorage.remove('ghost_chat_history');
+        // A surviving in-flight handle points at the OLD conversation —
+        // left alone, the next reconcile would resurrect the cleared
+        // transcript into the freshly minted session.
+        clearInflightHandle();
+        // Close the visualizer BEFORE revoking: it may be displaying one
+        // of these blobs right now (blank preview + dead Download button
+        // otherwise).
+        if (typeof closeRenderWindow === 'function') closeRenderWindow();
         // Flush the authed-image blob cache too — the thumbnails those
         // URLs pointed at are gone from the DOM, so holding on to the
         // blobs is pure leak.
@@ -1198,6 +1548,9 @@ async function sendMessage(isResume = false) {
         scrollToBottom();
         currentThinkingInterval = null;
     } else {
+        // Cross-reload resumes have no surviving bubble; same-page resumes
+        // keep theirs (this is a no-op then).
+        ensureAgentBubbleForResume();
         addMessage('system', 'Reconnected directly to Ghost Server.');
         setTimeout(scrollToBottom, 100);
     }
@@ -1249,6 +1602,9 @@ async function sendMessage(isResume = false) {
             });
             if (response.headers.has('X-Task-ID')) {
                 currentTaskId = response.headers.get('X-Task-ID');
+                // Survive a page kill: the handle is all a reload needs to
+                // reattach this stream (see resumeOrReconcileInflightTurn).
+                saveInflightHandle();
             }
         }
 
@@ -1367,7 +1723,15 @@ async function sendMessage(isResume = false) {
         }
         if (typeof saveChatState === 'function') saveChatState();
         if (typeof notifyUser === 'function') notifyUser("Response complete.");
+        // Delivery ack: proof that live JS rendered the reply. Without it
+        // the server assumes the phone is locked and sends the reply-ready
+        // push after the grace window.
+        if (currentTaskId) {
+            fetch(`/api/chat/ack/${encodeURIComponent(currentTaskId)}`,
+                { method: 'POST' }).catch(() => {});
+        }
         currentTaskId = null; // Clear task id
+        clearInflightHandle();
 
         if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
     } catch (e) {
@@ -1384,6 +1748,7 @@ async function sendMessage(isResume = false) {
                 addMessage('system', 'Request cancelled by user.');
             }
             currentTaskId = null;
+            clearInflightHandle();
             if (typeof saveChatState === 'function') saveChatState();
             // The agent may have persisted the FULL reply while this client
             // kept the aborted stub — let the sessions module re-align from
@@ -1410,6 +1775,9 @@ async function sendMessage(isResume = false) {
             } else {
                 addMessage('system', `Network Error: ${e.message}`);
                 activeFace.triggerSpike();
+                // The turn is abandoned client-side. If the agent finishes
+                // anyway, the sessions resync (visibilitychange) adopts it.
+                clearInflightHandle();
             }
         }
     } finally {
@@ -1435,7 +1803,7 @@ async function sendMessage(isResume = false) {
         activeFace.setWorkingState(false);
         if (typeof activeFace.setUserTurn === 'function') activeFace.setUserTurn(false);
         if (ws && ws.readyState === WebSocket.OPEN) {
-            setConnectionState('online', 'SYSTEM ONLINE');
+            setConnectionState('online', 'ONLINE');
         }
         setTimeout(scrollToBottom, 100);
 
@@ -1573,11 +1941,24 @@ if (faceFormBtn) {
             return;
         }
         markActiveFaceForm();
-        // Anchor under the button, right-aligned to it, clamped on-screen.
+        // Anchor under the button, right-aligned to it, clamped on-screen
+        // on BOTH axes (the #msg-menu manners — workspace.js). The old code
+        // clamped only the right offset: on a phone the centered header
+        // puts this button near the LEFT edge, so a right-anchored 230px+
+        // menu hung ~half off the left of the screen. Must be visible
+        // before measuring (hidden = display:none).
         const rect = faceFormBtn.getBoundingClientRect();
-        menu.style.top = `${Math.round(rect.bottom + 8)}px`;
-        menu.style.right = `${Math.max(8, Math.round(window.innerWidth - rect.right))}px`;
         menu.classList.remove('hidden');
+        const mw = menu.offsetWidth;
+        const mh = menu.offsetHeight;
+        const rightMax = Math.max(8, window.innerWidth - mw - 8);
+        menu.style.right = `${Math.min(
+            Math.max(8, Math.round(window.innerWidth - rect.right)), rightMax)}px`;
+        let top = Math.round(rect.bottom + 8);
+        if (top + mh > window.innerHeight - 8) {
+            top = Math.max(8, window.innerHeight - mh - 8);
+        }
+        menu.style.top = `${top}px`;
     });
 }
 
@@ -1794,10 +2175,19 @@ if (downloadBtn) {
 }
 
 if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', () => {
+    let bodySettleTimer = null;
+    const syncBodyHeight = () => {
         scrollToBottom();
         document.body.style.height = window.visualViewport.height + 'px';
         window.scrollTo(0, 0);
+    };
+    window.visualViewport.addEventListener('resize', syncBodyHeight);
+    // Same rotation-transient hazard as the keyboard offset above: if the
+    // LAST vv resize fired mid-rotate, body height stuck at the wrong
+    // orientation's value. Re-sync once the window geometry settles.
+    window.addEventListener('resize', () => {
+        clearTimeout(bodySettleTimer);
+        bodySettleTimer = setTimeout(syncBodyHeight, 300);
     });
 }
 
@@ -1830,6 +2220,21 @@ activeFace.init();
 // don't already mutate.
 window.__ghostFace = activeFace;
 loadChatState();
+// Reattach or reconcile a turn that outlived the page. Ordering vs the
+// sessions boot (dynamic import below) is TIMING, not structure: the
+// local /state probe normally resolves well before sessions.js finishes
+// its two module fetches + agent round trips, so sendMessage(true) has
+// already claimed isProcessingRequest (checked by the sessions boot)
+// by the time it could reload history. If the probe loses the race the
+// cost is a redundant render, not corruption — reconcileFromSession
+// re-checks isProcessingRequest after every await.
+resumeOrReconcileInflightTurn();
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resumeOrReconcileInflightTurn();
+});
+window.addEventListener('pageshow', (e) => {
+    if (e.persisted) resumeOrReconcileInflightTurn();
+});
 connectWebSocket();
 if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
 // If the chat log is empty after loading history, show an onboarding hero.
@@ -1873,23 +2278,72 @@ const renderDownloadBtn = document.getElementById('render-download');
 let currentChart = null;
 let currentZoom = 1.0;
 let currentRenderState = null;
+let _pdfBlobUrl = null;   // PDFs bypass the image LRU (multi-MB); one live URL
 
-// --- Close button ---
-renderCloseBtn.addEventListener('click', () => {
-    renderWindow.classList.add('hidden');
-    renderIframe.src = 'about:blank';
-    // Tear down any agent code so it stops running while hidden.
-    renderIframeSandboxed.removeAttribute('srcdoc');
+// HTML-attribute escaper for srcdoc interpolation. The old code used
+// contentDocument.write + setAttribute to dodge attribute breakout —
+// correct, but document.write races the close handler's about:blank
+// navigation and cannot follow a PDF src (contentDocument inaccessible).
+// srcdoc with PROPERLY ESCAPED values is equally breakout-proof and
+// deterministic from any prior frame state.
+const _escAttr = (s) => String(s).replace(/[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;',
+              '"': '&quot;', "'": '&#39;' }[c]));
+
+// Every open path goes through this FIRST. Hiding a surface is not enough:
+// agent code in the sandboxed frame keeps running (audio, timers) while
+// display:none, a destroyed chart leaves its canvas, the previous mermaid
+// SVG masquerades as the new diagram, and a stale zoom magnifies a blank
+// margin. Tear down, then let the caller show its own surface.
+function resetRenderSurfaces() {
+    renderIframe.style.display = 'none';
     renderIframeSandboxed.style.display = 'none';
-    mermaidContainer.innerHTML = '';
+    mermaidContainer.style.display = 'none';
+    chartContainer.style.display = 'none';
+    renderIframeSandboxed.removeAttribute('srcdoc');   // stops agent code
+    renderIframe.removeAttribute('srcdoc');
+    if (renderIframe.getAttribute('src')) renderIframe.src = 'about:blank';
+    mermaidContainer.replaceChildren();
     if (currentChart) {
         currentChart.destroy();
         currentChart = null;
     }
     currentZoom = 1.0;
-    currentRenderState = null;
     applyZoom();
-});
+}
+
+// Wrapper-document helper for our OWN markup (never agent content).
+function _setMainFrameHTML(html) {
+    renderIframe.removeAttribute('src');
+    renderIframe.srcdoc = html;   // srcdoc wins over any queued navigation
+    renderIframe.style.display = 'block';
+}
+
+// Friendly in-window failure panel — a visualizer that pops open and shows
+// NOTHING is the defect class this file kept reproducing.
+function _showRenderError(text) {
+    currentRenderState = null;
+    _setMainFrameHTML(
+        '<!DOCTYPE html><html><head><style>'
+        + 'body{margin:0;height:100vh;display:flex;align-items:center;'
+        + 'justify-content:center;background:#0f0505;color:#ff8888;'
+        + 'font-family:monospace;font-size:14px;padding:24px;'
+        + 'box-sizing:border-box;text-align:center;}'
+        + '</style></head><body>' + _escAttr(text) + '</body></html>');
+}
+
+function closeRenderWindow() {
+    renderWindow.classList.add('hidden');
+    resetRenderSurfaces();
+    if (_pdfBlobUrl) {
+        try { URL.revokeObjectURL(_pdfBlobUrl); } catch (e) { /* ignore */ }
+        _pdfBlobUrl = null;
+    }
+    currentRenderState = null;
+}
+
+// --- Close button ---
+renderCloseBtn.addEventListener('click', closeRenderWindow);
 
 // --- Download helper ---
 if (renderDownloadBtn) {
@@ -1930,12 +2384,20 @@ if (renderDownloadBtn) {
 
         if (currentRenderState.type === 'image') {
             const url = currentRenderState.src;
-            let filename = 'image.png';
-            if (url.startsWith('http') && url.includes('/')) {
+            // The src is a blob: URL by the time we get here — the real
+            // filename was stashed at open time from the /api/download
+            // path (the old startsWith('http') branch never matched, so
+            // every image saved as image.png).
+            let filename = currentRenderState.name || 'image.png';
+            if (!currentRenderState.name && url.startsWith('http') && url.includes('/')) {
                 const parts = url.split('/');
                 filename = parts[parts.length - 1].split('?')[0] || 'image.png';
             }
             triggerDownload(url, filename);
+        } else if (currentRenderState.type === 'pdf') {
+            // Was a silent no-op: type 'pdf' matched no branch.
+            triggerDownload(currentRenderState.src,
+                currentRenderState.name || 'report.pdf');
         } else if (currentRenderState.type === 'mermaid') {
             const svgElement = mermaidContainer.querySelector('svg');
             if (svgElement) {
@@ -2040,8 +2502,16 @@ renderZoomOut.addEventListener('click', () => {
         const clientY = e.type.includes('mouse') ? e.clientY : e.touches[0].clientY;
         const dx = clientX - startX;
         const dy = clientY - startY;
-        renderWindow.style.left = (origLeft + dx) + 'px';
-        renderWindow.style.top = (origTop + dy) + 'px';
+        // Clamp so at least a grabbable sliver of the header stays
+        // on-screen — a window dragged fully off-viewport had no recovery
+        // path (no reset control, position not persisted).
+        const w = renderWindow.offsetWidth;
+        const newLeft = Math.min(Math.max(origLeft + dx, -(w - 60)),
+            window.innerWidth - 60);
+        const newTop = Math.min(Math.max(origTop + dy, 0),
+            window.innerHeight - 44);
+        renderWindow.style.left = newLeft + 'px';
+        renderWindow.style.top = newTop + 'px';
         if (e.cancelable) e.preventDefault();
     }
 
@@ -2154,10 +2624,8 @@ function attachRenderButtons() {
         btn.addEventListener('click', () => {
             const codeText = code.textContent;
 
-            // Show window & reset zoom
+            resetRenderSurfaces();
             renderWindow.classList.remove('hidden');
-            currentZoom = 1.0;
-            applyZoom();
 
             if (lang === 'language-mermaid') {
                 renderMermaid(codeText);
@@ -2175,18 +2643,22 @@ function attachRenderButtons() {
     });
 }
 
-// --- Mermaid renderer ---
+// --- Mermaid renderer --- (caller ran resetRenderSurfaces)
 function renderMermaid(codeText) {
     currentRenderState = { type: 'mermaid' };
-    renderIframe.style.display = 'none';
-    renderIframeSandboxed.style.display = 'none';
-    chartContainer.style.display = 'none';
     mermaidContainer.style.display = 'flex';
 
     if (!window.mermaid) {
         mermaidContainer.innerHTML = `<pre style="color:#ff4444;">Diagram rendering unavailable (mermaid failed to load).</pre>`;
         return;
     }
+    // Visible placeholder while the async render runs — the container was
+    // just cleared by resetRenderSurfaces, so the PREVIOUS diagram can no
+    // longer masquerade as this one during the wait.
+    const wait = document.createElement('pre');
+    wait.style.color = 'rgba(158,170,192,0.6)';
+    wait.textContent = 'Rendering diagram…';
+    mermaidContainer.appendChild(wait);
     mermaid.render('mermaid-graph-' + Date.now(), codeText).then(result => {
         mermaidContainer.innerHTML = result.svg;
     }).catch(err => {
@@ -2200,13 +2672,10 @@ function renderMermaid(codeText) {
     });
 }
 
-// --- HTML / CSS / JS renderer ---
+// --- HTML / CSS / JS renderer --- (caller ran resetRenderSurfaces)
 function renderHTMLContent(codeText, lang) {
     currentRenderState = { type: 'html', content: codeText, lang: lang };
-    mermaidContainer.style.display = 'none';
-    chartContainer.style.display = 'none';
-    // Hide the same-origin iframe; agent code goes into the sandboxed one.
-    renderIframe.style.display = 'none';
+    // Agent code goes into the SANDBOXED frame only.
     renderIframeSandboxed.style.display = 'block';
 
     let html = codeText;
@@ -2224,18 +2693,17 @@ function renderHTMLContent(codeText, lang) {
     renderIframeSandboxed.srcdoc = html;
 }
 
-// --- CSV / Chart renderer ---
+// --- CSV / Chart renderer --- (caller ran resetRenderSurfaces)
 function renderCSV(codeText) {
-    currentRenderState = { type: 'chart' };
-    mermaidContainer.style.display = 'none';
-    renderIframe.style.display = 'none';
-    renderIframeSandboxed.style.display = 'none';
-    chartContainer.style.display = 'block';
-
-    if (currentChart) {
-        currentChart.destroy();
-        currentChart = null;
+    // Vendored libs are local, but a failed load previously threw a raw
+    // ReferenceError out of the click handler with the window already
+    // open on stale content.
+    if (!window.Papa || !window.Chart) {
+        _showRenderError('Chart rendering unavailable (vendor library failed to load).');
+        return;
     }
+    currentRenderState = { type: 'chart' };
+    chartContainer.style.display = 'block';
 
     const parsed = Papa.parse(codeText.trim(), {
         header: true,
@@ -2244,7 +2712,13 @@ function renderCSV(codeText) {
     });
 
     const fields = parsed.meta.fields;
-    if (!fields || fields.length < 2) return;
+    if (!fields || fields.length < 2) {
+        // Was a silent `return`: empty black panel, and Download handed
+        // out a black PNG of the destroyed chart.
+        chartContainer.style.display = 'none';
+        _showRenderError('This CSV needs a header row and at least two columns to chart.');
+        return;
+    }
 
     const labelKey = fields[0];
     const labelsArray = parsed.data.map(row => row[labelKey]);
@@ -2285,47 +2759,38 @@ function renderCSV(codeText) {
     });
 }
 
-// Stamp the iframe with a zoomed-image viewer. Builds the image via the
-// iframe's own document APIs so the src is set through setAttribute
-// (which escapes attribute context) rather than string interpolation.
-// String templates that inject `src="${url}"` break out of the attribute
-// on any embedded quote — `" onload="alert(1)` was the intended vector.
+// Zoomed-image viewer via srcdoc. The src is interpolated through
+// _escAttr, which closes the `" onload="alert(1)` attribute-breakout the
+// old document.write/setAttribute approach existed to prevent — while
+// being deterministic from ANY prior frame state (document.write can't
+// follow a PDF src and raced the close handler's navigation).
 function writeImageIntoIframe(iframe, imgSrc) {
     if (!iframe) return;
-    // The sandboxed code iframe may still be visible from a prior
-    // "Visualize" — hide it so the image preview isn't covered.
-    if (renderIframeSandboxed) renderIframeSandboxed.style.display = 'none';
-    iframe.contentDocument.open();
-    iframe.contentDocument.write(
+    _setMainFrameHTML(
         '<!DOCTYPE html><html><head><style>'
         + 'body{margin:0;display:flex;justify-content:center;align-items:center;'
         + 'height:100vh;background:#0f0505;}'
         + 'img{max-width:100%;max-height:100%;object-fit:contain;'
         + 'border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,0.5);}'
-        + '</style></head><body></body></html>'
+        + '</style></head><body>'
+        + `<img src="${_escAttr(imgSrc)}">`
+        + '</body></html>'
     );
-    iframe.contentDocument.close();
-    const doc = iframe.contentDocument;
-    const img = doc.createElement('img');
-    img.setAttribute('src', imgSrc);
-    doc.body.appendChild(img);
+}
+
+function openImageInVisualizer(imgEl) {
+    resetRenderSurfaces();
+    currentRenderState = {
+        type: 'image', src: imgEl.src,
+        name: imgEl.dataset.ghostName || null,
+    };
+    writeImageIntoIframe(renderIframe, imgEl.src);
+    renderWindow.classList.remove('hidden');
 }
 
 chatLog.addEventListener('click', (e) => {
     if (e.target.tagName === 'IMG' && e.target.closest('.message')) {
-        currentRenderState = { type: 'image', src: e.target.src };
-        const renderWindow = document.getElementById('render-window');
-        const renderIframe = document.getElementById('render-iframe');
-        const mermaidContainer = document.getElementById('mermaid-container');
-        const chartContainer = document.getElementById('chart-container');
-
-        renderWindow.classList.remove('hidden');
-        if (typeof currentZoom !== 'undefined') { currentZoom = 1.0; applyZoom(); }
-        mermaidContainer.style.display = 'none';
-        chartContainer.style.display = 'none';
-        renderIframe.style.display = 'block';
-
-        writeImageIntoIframe(renderIframe, e.target.src);
+        openImageInVisualizer(e.target);
     }
 });
 
@@ -2346,10 +2811,18 @@ const AUTHED_BLOB_CACHE_MAX = 100;
 const _authedBlobCache = new Map();  // raw URL → blob object URL
 
 function _evictAuthedBlobCache() {
-    while (_authedBlobCache.size > AUTHED_BLOB_CACHE_MAX) {
+    let guard = _authedBlobCache.size;
+    while (_authedBlobCache.size > AUTHED_BLOB_CACHE_MAX && guard-- > 0) {
         const oldestKey = _authedBlobCache.keys().next().value;
         const oldestUrl = _authedBlobCache.get(oldestKey);
         _authedBlobCache.delete(oldestKey);
+        // Never revoke the URL the visualizer is showing RIGHT NOW —
+        // that blanked the open preview and killed its Download button.
+        // Re-insert as most-recent and evict the next-oldest instead.
+        if (currentRenderState && currentRenderState.src === oldestUrl) {
+            _authedBlobCache.set(oldestKey, oldestUrl);
+            continue;
+        }
         try { URL.revokeObjectURL(oldestUrl); } catch (e) { /* ignore */ }
     }
 }
@@ -2398,6 +2871,10 @@ async function _handleChatImage(img) {
             if (blobUrl !== rawSrc) {
                 img.src = blobUrl;
                 swappedToBlob = true;
+                // Real filename for the visualizer's Download button — by
+                // open time the src is an anonymous blob: URL.
+                img.dataset.ghostName =
+                    rawSrc.split('/').pop().split('?')[0] || '';
             }
         } else {
             // Non-API URL: browser loads it natively, no rewrite, so
@@ -2426,15 +2903,7 @@ async function _handleChatImage(img) {
     // history we still swap to the blob URL and add the reopen button
     // below, but we don't pop the floating window open on page load.
     if (!restoringAtStart) {
-        if (mermaidContainer) mermaidContainer.style.display = 'none';
-        if (chartContainer) chartContainer.style.display = 'none';
-        if (renderIframe) renderIframe.style.display = 'block';
-
-        if (typeof currentZoom !== 'undefined') { currentZoom = 1.0; applyZoom(); }
-        currentRenderState = { type: 'image', src: img.src };
-
-        writeImageIntoIframe(renderIframe, img.src);
-        if (renderWindow) renderWindow.classList.remove('hidden');
+        openImageInVisualizer(img);
     }
 
     const placeholder = document.createElement('button');
@@ -2445,17 +2914,7 @@ async function _handleChatImage(img) {
     placeholder.style.borderRadius = '8px';
     placeholder.style.marginTop = '10px';
     placeholder.style.height = '40px';
-    placeholder.onclick = () => {
-        currentRenderState = { type: 'image', src: img.src };
-        if (renderWindow) renderWindow.classList.remove('hidden');
-        if (typeof currentZoom !== 'undefined') { currentZoom = 1.0; applyZoom(); }
-        if (mermaidContainer) mermaidContainer.style.display = 'none';
-        if (chartContainer) chartContainer.style.display = 'none';
-        if (renderIframe) {
-            renderIframe.style.display = 'block';
-            writeImageIntoIframe(renderIframe, img.src);
-        }
-    };
+    placeholder.onclick = () => { openImageInVisualizer(img); };
     // Insert BEFORE hiding the img so a concurrent error event (rare,
     // blob-decode failure) can't run `img.replaceWith(badge)` while
     // the placeholder button is still un-inserted — that would leave
@@ -2468,31 +2927,34 @@ async function _handleChatImage(img) {
     img._ghostPlaceholderBtn = placeholder;
 }
 
-// PDF report support (mirrors the image flow).
+// PDF report support.
 //
 // The agent's `report_pdf` tool returns markdown of the form
 //   [📄 Title (PDF)](/api/download/report_xxx.pdf)
-// which marked renders as a plain <a href="/api/download/...">. Clicking
-// that link navigates the browser straight at the proxy URL, which 401s
-// because plain navigations don't carry the X-Ghost-Key header. We
-// intercept the click, fetch via the authed wrapper, and:
-//   1. open the resulting blob URL in the right-rail visualizer iframe
-//      (browsers render application/pdf blobs natively), and
-//   2. ALSO offer it as a true download via a hidden anchor.
-function _writePdfIntoIframe(iframe, pdfBlobUrl) {
-    if (!iframe) return;
-    if (renderIframeSandboxed) renderIframeSandboxed.style.display = 'none';
-    iframe.contentDocument.open();
-    iframe.contentDocument.write(
+// which marked renders as a plain <a href="/api/download/...">. A plain
+// navigation 401s (no X-Ghost-Key header), so we intercept the click and
+// fetch the blob ourselves. History of this feature (2026-08-01 review):
+// the first version nested an iframe inside a sandbox'd iframe — the
+// plugins-sandbox flag is unclearable and inherited, so the PDF viewer
+// was blocked in EVERY engine and the window opened onto nothing.
+// Now: desktop gets the blob straight into the (unsandboxed, same-origin)
+// #render-iframe — browsers render application/pdf blobs natively. iOS
+// cannot render PDFs in ANY subframe (platform limit, not fixable with
+// attributes), so it gets an in-window panel whose "Open PDF" link
+// targets a new top-level tab, where Safari's native viewer works.
+function _showPdfPanel(pdfBlobUrl, filename) {
+    _setMainFrameHTML(
         '<!DOCTYPE html><html><head><style>'
-        + 'html,body{margin:0;height:100%;background:#0f0505;}'
-        + 'iframe{border:0;width:100%;height:100%;}'
-        + '</style></head><body></body></html>'
-    );
-    iframe.contentDocument.close();
-    const inner = iframe.contentDocument.createElement('iframe');
-    inner.setAttribute('src', pdfBlobUrl);
-    iframe.contentDocument.body.appendChild(inner);
+        + 'body{margin:0;height:100vh;display:flex;flex-direction:column;gap:18px;'
+        + 'align-items:center;justify-content:center;background:#0f0505;'
+        + 'font-family:-apple-system,sans-serif;}'
+        + 'a{color:#0ff;font-size:18px;text-decoration:none;border:1px solid #0aa;'
+        + 'border-radius:10px;padding:14px 26px;}'
+        + 'p{color:#9eaac0;font-size:13px;margin:0;}'
+        + '</style></head><body>'
+        + `<a href="${_escAttr(pdfBlobUrl)}" target="_blank" rel="noopener">📄 Open ${_escAttr(filename)}</a>`
+        + '<p>PDF preview opens in a new tab on this device.</p>'
+        + '</body></html>');
 }
 
 async function _handleChatPdfLink(link) {
@@ -2510,36 +2972,38 @@ async function _handleChatPdfLink(link) {
 
     link.addEventListener('click', async (ev) => {
         ev.preventDefault();
+        const rawHref = link.getAttribute('href') || '';
+        const filename = rawHref.split('/').pop().split('?')[0] || 'report.pdf';
         try {
-            const blobUrl = await _toAuthedBlobUrl(link.getAttribute('href') || link.href);
-
-            // 1) Inline preview in the right-rail iframe.
-            const renderWindow = document.getElementById('render-window');
-            const renderIframe = document.getElementById('render-iframe');
-            const mermaidContainer = document.getElementById('mermaid-container');
-            const chartContainer = document.getElementById('chart-container');
-            if (mermaidContainer) mermaidContainer.style.display = 'none';
-            if (chartContainer) chartContainer.style.display = 'none';
-            if (renderIframe) {
-                renderIframe.style.display = 'block';
-                _writePdfIntoIframe(renderIframe, blobUrl);
+            // Dedicated blob, NOT the image LRU: PDFs are multi-MB and a
+            // 100-entry cache of them is a phone tab-kill. One live URL,
+            // revoked on replace and on window close.
+            const res = await fetch(rawHref || link.href);
+            if (!res.ok) throw new Error(`PDF fetch ${res.status}`);
+            const blob = await res.blob();
+            if (_pdfBlobUrl) {
+                try { URL.revokeObjectURL(_pdfBlobUrl); } catch (e) { /* ignore */ }
             }
-            if (renderWindow) renderWindow.classList.remove('hidden');
-            currentRenderState = { type: 'pdf', src: blobUrl };
+            _pdfBlobUrl = URL.createObjectURL(blob);
 
-            // 2) Trigger a real download alongside the preview so the
-            //    user gets a file they can keep, not just a viewer tab.
-            const a = document.createElement('a');
-            a.href = blobUrl;
-            const rawHref = link.getAttribute('href') || '';
-            const filename = rawHref.split('/').pop().split('?')[0] || 'report.pdf';
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+            resetRenderSurfaces();
+            currentRenderState = { type: 'pdf', src: _pdfBlobUrl, name: filename };
+            if (isIOS) {
+                _showPdfPanel(_pdfBlobUrl, filename);
+            } else {
+                renderIframe.removeAttribute('srcdoc');
+                renderIframe.src = _pdfBlobUrl;   // native viewer
+                renderIframe.style.display = 'block';
+            }
+            renderWindow.classList.remove('hidden');
+            // No auto-download anymore: it prompted on every click (iOS)
+            // and could fall outside the user-activation window. The
+            // window's Download button covers keeping a copy.
         } catch (e) {
             console.warn('PDF fetch failed', e);
-            addMessage('system', `Could not load PDF: ${e.message || e}`);
+            resetRenderSurfaces();
+            renderWindow.classList.remove('hidden');
+            _showRenderError(`Could not load ${filename}: ${e.message || e}`);
         }
     });
 
@@ -2978,6 +3442,9 @@ window.GhostCore = {
         chatLog.innerHTML = '';
         chatHistory = [];
         safeStorage.remove('ghost_chat_history');
+        // Close the visualizer BEFORE revoking — it may be displaying one
+        // of these blobs (session switches used to blank the open preview).
+        closeRenderWindow();
         for (const url of _authedBlobCache.values()) {
             try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
         }

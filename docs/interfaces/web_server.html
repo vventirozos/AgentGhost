@@ -115,9 +115,76 @@
   with the full <code>touchstart/touchend/touchcancel</code> lifecycle +
   <code>touch-action:none</code> on the mic (the long-press belongs to the recording
   gesture, not text-selection or the iOS callout), <code>wss:</code> auto-selected under
-  TLS, and an iOS <code>getUserMedia</code> permission timeout. Note: the service worker
-  does not register over a <em>self-signed</em> cert (browser policy) — harmless, it only
-  provides PWA caching.</p>
+  TLS, and an iOS <code>getUserMedia</code> permission timeout. The service worker
+  does not register over a <em>self-signed</em> cert (browser policy) — which is why the
+  mobile entry point is the <strong>tailscale-served front door</strong> below, not
+  <code>:8080</code> directly. The face-form menu clamps to the viewport on BOTH axes and
+  scrolls internally (<code>max-height</code>) — a right-anchored menu near the left edge
+  of the centered phone header used to hang half off-screen
+  (2026-08-01; <code>tests/test_interface_log_and_mobile.py</code> +
+  Playwright verification).</p>
+
+  <h2>Mobile app model — PWA, resume, web push (2026-08-01)</h2>
+  <p>The client now behaves like the Claude/Gemini mobile apps: send a request, lock the
+  phone or kill the tab, the agent keeps working, the reply is there when you return, and
+  a push tells you it's ready. Four cooperating pieces:</p>
+  <ul>
+    <li><strong>Trusted front door.</strong> <code>tailscale serve --bg --https=8443
+    https+insecure://127.0.0.1:8080</code> fronts the self-signed uvicorn with a real LE
+    cert at <code>https://eva.taila2b1d.ts.net:8443/?key=…</code> (tailnet-only). Service
+    workers and APNs web push both require trusted HTTPS, so the phone must use this URL.
+    Disable with <code>tailscale serve --https=8443 off</code>.</li>
+    <li><strong>PWA install.</strong> <code>GET /manifest.webmanifest</code> (key-gated
+    like <code>/</code>; the link is INJECTED by server.py so its URL — and the
+    manifest's <code>start_url</code> — carry the access key without ever placing it in
+    the unauthenticated <code>/static</code> mount). <code>apple-touch-icon</code> +
+    icons under <code>static/icons/</code>. iOS delivers web push ONLY to
+    Home-Screen-installed PWAs, so the SW registration gate is
+    <code>(!isIOS || isStandalonePWA)</code> — the old blanket <code>!isIOS</code> skip
+    kept even installed PWAs pushless.</li>
+    <li><strong>In-flight turn survival</strong> (app.js `ghost_inflight_turn` +
+    <code>GET /api/chat/task/{id}/state</code>). The proxy already buffered every stream
+    (task lives while running + 10&nbsp;min after; TTL counts from COMPLETION) and the
+    agent persists finished replies into the session store — what died with the page was
+    only the in-memory task id. The handle is now persisted; on boot /
+    visibility-return / bfcache-restore the client probes task state and either
+    reattaches the live stream (fresh thinking bubble + <code>/api/chat/resume</code>),
+    polls a still-running agent turn (<code>/api/turns</code>), or ADOPTS the session's
+    server-side history wholesale — never appends, which would recreate the
+    merge_history doubling case.</li>
+    <li><strong>Web push</strong> (<code>interface/webpush_notify.py</code>; VAPID keys
+    <code>~/Data/AI/.ghost_vapid.json</code>, subscriptions
+    <code>~/Data/AI/.ghost_push_subs.json</code>, both 0600). Two producers: (a)
+    <em>reply-ready</em> — the stream worker schedules a probe at completion; if live
+    page JS didn't confirm delivery via <code>POST /api/chat/ack/{id}</code> within the
+    grace window (<code>GHOST_PUSH_ACK_GRACE</code>, 12&nbsp;s — server-side "stream
+    drained" is NOT proof: a locked phone's dead socket swallows the tail into TCP
+    buffers), every subscribed device gets a push with a preview of the request; (b) the
+    agent's notify-severity ledger via a 30&nbsp;s poller under its own watermark
+    consumer <code>web-push</code> (≤5 pushes/cycle; overflow is acked unpushed and
+    stays in the bell). <code>sw.js</code> shows a notification per push (iOS revokes
+    subscriptions on silent pushes) and opens the KEYED url on click.
+    Endpoints: <code>GET /api/push/vapid</code>, <code>POST /api/push/subscribe</code>
+    (upsert by endpoint), <code>POST /api/push/unsubscribe</code>; dead subscriptions
+    (404/410) are pruned on send. Hardening from the same-day review: pywebpush gets a
+    <code>py_vapid.Vapid</code> INSTANCE built from the PEM (passing PEM text dies inside
+    <code>Vapid.from_string</code> — push was silently dead until the real-crypto test
+    existed); a user-cancelled turn sets <code>cancelled</code> and never pushes; the
+    client compares its subscription's <code>applicationServerKey</code> against
+    <code>/api/push/vapid</code> and re-binds on VAPID rotation; the notify poller keeps
+    a last-acked watermark (no 30&nbsp;s <code>notify_consumers.json</code> mtime churn);
+    resume has a synchronous re-entry latch + tab-ownership heartbeat (two concurrent
+    resumes replayed one stream into one bubble twice), <code>/clear</code> drops the
+    in-flight handle, and session-mismatched handles are discarded rather than
+    resurrecting a cleared conversation. Tests:
+    <code>tests/test_interface_push_and_resume.py</code> (incl. REAL py_vapid/pywebpush
+    signing+encryption with only the HTTP POST faked — the test that catches key-format
+    regressions).</li>
+  </ul>
+  <p><strong>iPhone setup (one-time):</strong> open the 8443 URL in Safari → Share →
+  Add to Home Screen → open the installed app → tap anywhere once to grant
+  notifications. Uninstalling the PWA or clearing Safari data kills the push
+  subscription; re-opening the app re-subscribes automatically.</p>
 
   <h2>Static assets</h2>
   <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframes), <code>style.css</code> (cyan/magenta cyber theme — directional message entrances, streaming edge-pulse, animated input glow, gradient hero wordmark), <code>matrix_graph.js</code> (the background "face" — a three.js particle system with depth-faded nodes/links, a slow orbit, and envelope-reactive bloom; state-reactive via <code>setWorkingState/triggerSpike/triggerPulse/setAudioLevel</code>. THREE ALIEN FORMS since 2026-07-28 (three passes the same day: thermal two-pole recolor → "still looks like random lines and dots" → anatomy rebuild as a medusa → "jellyfish seems wrong for an AI backend" → three interchangeable alien body plans over ONE motion engine; <em>alive is a property of anatomy, not timing curves</em>). The <code>#face-form-btn</code> header button cycles <strong>abyssal</strong> (asymmetric lobed husk tilted off-axis, feelers reaching in all directions, off-center core), <strong>horizon</strong> (eccentric orbital shells collapsing toward a burning core, filament spirals falling inward and heating — briefly the default on 2026-07-28 before vortex superseded it; same-day center fix: a per-form <code>uCenterDim</code> radial dim in both node and line shaders stops additive stacking from bleaching the core to pink, the inner shell sits dead on the arterial-red stop with cold blues confined to the outer shells, and core quads render at 0.7 size via the per-node <code>sz</code> factor — together these keep the heart CRIMSON), <strong>cortex</strong> (asymmetric neural lobes swelling with sequenced thought-waves, dendrites carrying displacement signal-trains), and <strong>vortex</strong> (the DEFAULT since 2026-07-28 evening — a black hole AHEAD of the viewer — final shape after four same-day operator iterations: a dark-red <em>accretion ring</em> (kind 3, slow elliptic orbit) around a genuinely dark <em>shadow</em> with dim crimson embers, fed by five spiral streams. THE CAMERA NEVER MOVES and the flow is <em>expansion</em>: matter emerges through the ring's glow (spawn at <code>VORTEX_LMIN</code>, at the ring edge — inside it the hole stays dark) and blooms exponentially outward past the viewer (<code>L = LMIN·e^(K·dOut)</code>, self-similar, wrap invisible at both extremes) — contraction was tried first and read as moving <em>backward</em>; expansion optical flow is what "falling in" looks like. Hue runs hottest at the hole, cooling blue outward; the vortex damps the hue wave/drift to 30% (<code>uWaveAmp</code>) and dims by screen-radial distance (<code>uCenterXY</code>, strength 0.85) so the center stays DARK RED instead of bleaching pink or swinging plum. A drifting 3-harmonic field morphs the streams through organic never-repeating shapes (the "procedurally generated content"), swelling while a turn runs. A master luminance dial (<code>uFormDim</code> 0.55 + bloom ×0.65 — introduced for the vortex, extended to ALL forms the same day) makes every face emit roughly half its former light so it BLENDS into the background — structure and motion carry visibility, not brightness. Behavior: idle = slow emergence + swirl (idle spin +25%, idle pulse cut to 20%); busy = the swallow surges (~5s per emergence cycle) for as long as the turn runs while spin HALVES (work de-emphasizes rotation — "the main animation is the swallow"); completion is a pure intensity morph — no reset of any kind exists (both the cut-on-black and the ascent resets were vetoed; self-similarity makes busy and idle the same scene)), plus <strong>empty</strong> (no face at all — nodes park on a sparse far sphere past the link radius, so the reorganization blend disperses the face beyond the screen edges on the way in and materializes the next form from the void on the way out; motes are suppressed during dives); the choice persists in localStorage (<code>ghost_face_form</code>) and a switch plays a ~1.4s reorganization blend — the nodes visibly re-assemble into the new body. All forms share the propulsion engine: Motion is medusan propulsion — <code>_pulseShape()</code> is an asymmetric muscle envelope (fast squeeze 0→0.16 of the cycle, long release, quiescent glide; deliberately NOT a sine) propagating apex→margin, tugging the tentacles and kicking a swim bob; tentacles carry metachronal traveling waves; the heading wanders like attention (no turntable orbit); errors trigger a physical flinch (one sharp agitated pulse) alongside the hot tint. Pulse ~4s idle → ~1.7s busy. Colors are the thermal two-pole ring (<code>COLORS.palette</code>: deep ocean blue → indigo → violet → dark arterial red → plum, all dark-first) mapped ANATOMICALLY — cold blue crown, violet waist, hot tentacle currents and arterial core — with seeds assigned per body part; <code>uHueDrift</code> now OSCILLATES (±0.07) instead of cycling so anatomy never scrambles, and the <code>hueWave()</code> chunk (damped by <code>uOrganic</code> under reduced-motion) sends warmth/cold currents through the body. Fragment brightness, line alpha, and bloom (base 0.88) all trimmed because the anatomy is locally dense and additive stacking multiplies luminance; accent-tint cap 0.5 so mood colors the weather without erasing the poles. <code>PROXIMITY_SQ</code> tightened 2.5→1.7 so links trace the anatomy. Restore points: <code>matrix_graph.js.bak-20260728-premedusa</code> (thermal point cloud), <code>matrix_graph.js.bak-20260713-preimmersion</code>. Pins extended in <code>tests/test_interface_face_palette.py</code> (thermal axis, hue wave, medusa anatomy + asymmetric envelope). Palette contract pinned by <code>tests/test_interface_face_palette.py</code>. <strong>Immersion dive (2026-07-13):</strong> while a USER request is in flight the grid "swallows" the camera — scene scales up ×1.7 around the viewer while the camera dollies z=5.0→1.3 into the cloud, drifting back out organically on completion. Driven ONLY by the dedicated <code>setUserTurn()</code> state since 2026-07-28 (it was nominally workingState-gated before, but ambient working-class log icons re-arm workingState almost continuously on an autonomously busy agent, which held the camera inside the cloud all night; the dive now engages exclusively for the operator's own in-flight request — live-verified: real log traffic at workingState≈1.0 leaves the camera at rest, a user turn dives it, completion eases it back out over ~10s while ambient work continues) through an asymmetric ease far slower than workingState itself (~5s in / ~10s out; short requests just lean). Safety rails: near-camera fade in both shaders (nodes dissolve instead of becoming screen-filling quads), bloom damped ×0.65 fully inside (the streaming reply is read on top of near geometry), look-target blends forward through the cloud to dodge the lookAt-origin singularity, and <code>prefers-reduced-motion</code> caps the dive at a 15% lean. Debug/verification hook: <code>window.__ghostFace.getDebugState()</code>. Pre-immersion restore point: <code>matrix_graph.js.bak-20260713-preimmersion</code>. <em>Interior enrichment (v3.6)</em>: the swell dilutes local density exactly when the camera is closest, so the inside looked empty — three dive-gated compensators fix it with zero cost at rest: 400 shader-drifted interior motes (one draw call, <code>visible=false</code> at rest), a ×1.5 thicker proximity web while inside, and +60% data-pulse tempo, with the scale boost trimmed 0.7→0.55. Pins: <code>tests/test_interface_face_immersion.py</code>), <code>cyber_face.png</code> (the notification icon), and <code>sw.js</code> (service worker). All decorative motion (CSS animations and the 3D sphere's orbit/morph) is damped under <code>prefers-reduced-motion</code>. CDN failures degrade gracefully: <code>marked</code>/<code>DOMPurify</code> fall back to escaped plain text, and a missing <code>mermaid</code> only disables diagram rendering rather than breaking the page.</p>
@@ -247,6 +314,40 @@
   <p><code>main#chat-container</code> fills the space from the header down to the input using the robust flex pattern <code>flex:1 1 0; min-height:0</code>. An earlier attempt used <code>margin-top:auto</code> on top of <code>flex-grow:1</code> to bottom-anchor a <code>max-height</code>-capped block — but since the container is <code>position:relative</code>, on iOS Safari that auto-margin + grow combination let it overlap the (statically-positioned) header band and, because <code>#chat-log</code> has <code>pointer-events:auto</code>, swallow taps meant for the header buttons. The fill pattern can't overflow its siblings, and the header is given <code>position:relative; z-index:20</code> so it always paints above the chat and stays tappable. Two other red herrings on the chat container were cleaned up along the way: a <code>55vh</code>/<code>78vh</code> <code>max-height</code> cap and a top <code>mask-image</code> gradient that faded the top 15% of messages until hovered — both removed. Regression-guarded by <code>tests/test_interface_chat_layout.py</code> (header buttons horizontal, header above chat, fill pattern with no auto-margin/cap, no fade).</p>
   <p><strong>Mobile (iOS Safari) note:</strong> the uConsole optimisation media query (<code>max-width:1280px and max-height:720px</code>) also matches portrait phones, where the <code>&le;480px</code> rule stacks the header into a two-row column (status + buttons). That query originally pinned <code>header { height:50px }</code> — a fixed height that clipped the taller column header, so <code>#header-controls</code> overflowed below the header box straight into the chat (the buttons appeared overlapped by chat). It is now <code>min-height:50px</code> so the header grows to contain its buttons while staying compact on the uConsole. The test suite forbids any fixed <code>height</code> on a <code>header</code> rule. Verified at iPhone width with a WebKit (Playwright) render: header 110px tall, buttons fully inside it, chat starts 8px below.</p>
   <p>Two more leaks from that same broad query were split out into a uConsole-only <code>@media (min-width:1000px) and (max-height:720px)</code> block (phones are &lt;1000px wide, even in landscape, so they no longer match): (1) the <code>36px</code> shrink of <code>.icon-btn/#send-btn/#mic-btn</code> — phones now keep the 44px base touch target; and (2) <code>#chat-input { font-size:0.95rem }</code> — at &lt;16px iOS Safari auto-zooms the page when the field is focused, so phones now keep &ge;16px. A WebKit sweep (iPhone SE / 13 portrait+landscape / 15 Pro Max landscape / uConsole) confirms phones report 44px controls and 16px input while the uConsole still gets its compact 36px/0.95rem. Guarded by <code>tests/test_interface_chat_layout.py</code>. Pinch-zoom remains intentionally disabled via the viewport meta (<code>user-scalable=no</code>).</p>
+
+  <h2>Visualizer overhaul (2026-08-01)</h2>
+  <p>Operator-reported: "PDFs pop the window but show nothing." Root cause: PDFs were
+  written into a <em>nested</em> iframe inside a <code>sandbox</code>'d iframe — the
+  plugins-sandbox flag is unclearable, inherited by descendants, and blocks the PDF
+  viewer in every engine; and <code>sandbox="allow-scripts allow-same-origin"</code> on
+  a same-origin frame is a security no-op anyway (all real containment lives on
+  <code>#render-iframe-sandboxed</code>, <code>allow-scripts</code> only). Fixes:
+  <strong>(a)</strong> the same-origin frame is no longer sandboxed; desktop PDFs load
+  as <code>iframe.src = blobUrl</code> (native viewer); iOS — which cannot render PDFs
+  in ANY subframe — gets an in-window panel whose "Open PDF" link targets a new tab
+  (top-level Safari renders PDFs fine). <strong>(b)</strong> one
+  <code>resetRenderSurfaces()</code> runs before every open: hides all four surfaces,
+  strips the sandboxed frame's <code>srcdoc</code> (agent code/audio kept RUNNING when
+  merely hidden), clears the old mermaid SVG (it masqueraded as the next diagram),
+  destroys the chart, resets zoom (a stale 3× zoom showed a magnified blank margin —
+  PDF was the one path that never reset). <strong>(c)</strong> failures render a
+  visible in-window panel (<code>_showRenderError</code>) — bad CSV and missing vendor
+  libs were silent black. <strong>(d)</strong> wrapper docs build via
+  <code>srcdoc</code> with <code>_escAttr</code>-escaped interpolation (the old
+  <code>document.write</code> raced the close navigation and can't follow a PDF
+  <code>src</code>). <strong>(e)</strong> PDFs bypass the 100-entry image blob LRU
+  (dedicated URL, revoked on replace/close); LRU eviction spares the on-screen blob;
+  <code>/clear</code>/session-switch close the window before revoking.
+  <strong>(f)</strong> drag/resize un-broken on landscape phones + uConsole (the
+  media-query <code>!important</code>s beat inline drag styles); drag clamps on-screen.
+  <strong>(g)</strong> Download works for PDFs (was a silent no-op) and images keep
+  their real filename (was always <code>image.png</code>). Proxy hardening:
+  <code>/api/download</code> sends <code>X-Content-Type-Options: nosniff</code> and
+  forces HTML/XML/SVG to <code>Content-Disposition: attachment</code> (agent-authored
+  HTML fetched directly would render same-origin with the key). Pins:
+  <code>tests/test_interface_visualizer.py</code>; live Playwright sweep: mermaid, CSV
+  chart + error panel, sandboxed HTML, PDF desktop + iOS panel, zoom reset, close
+  teardown.</p>
 
   <h2>Visualizer iframes &amp; sandboxing</h2>
   <p>The floating "VISUALIZER" window uses <strong>two</strong> iframes. <code>#render-iframe</code> (<code>sandbox="allow-scripts allow-same-origin"</code>) is used <em>only</em> to display our own blob previews — images and PDFs — which need the parent to write into <code>contentDocument</code>. Untrusted agent-authored HTML/CSS/JS from "Visualize" buttons goes into a separate <code>#render-iframe-sandboxed</code> (<code>sandbox="allow-scripts"</code>, no <code>allow-same-origin</code>) via <code>srcdoc</code>, so it runs in an opaque origin and cannot reach <code>window.parent</code> or read the injected <code>GHOST_API_KEY</code>. Mixing <code>allow-scripts</code> + <code>allow-same-origin</code> on a single iframe rendering agent code would let it escape the sandbox and exfiltrate the key.</p>

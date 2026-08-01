@@ -22,6 +22,13 @@ import uvicorn
 import os
 import secrets
 
+try:
+    # Runtime: uvicorn runs with cwd=interface/, plain module on sys.path.
+    import webpush_notify
+except ModuleNotFoundError:
+    # Tests import this file as `interface.server` from the repo root.
+    from interface import webpush_notify
+
 # GHOST_API_KEY is required. A hardcoded default (e.g. "ghost-secret-123")
 # turns the interface server into an open relay for anyone who knows the
 # default — if someone forgets to set the env var in prod, the fallback
@@ -202,6 +209,7 @@ async def _lifespan(_app: "FastAPI"):
     global SHARED_HTTP_CLIENT
     _BACKGROUND_TASKS.append(asyncio.create_task(log_streamer()))
     _BACKGROUND_TASKS.append(asyncio.create_task(_active_chat_tasks_janitor()))
+    _BACKGROUND_TASKS.append(asyncio.create_task(_notify_push_poller()))
     try:
         yield
     finally:
@@ -209,6 +217,12 @@ async def _lifespan(_app: "FastAPI"):
             _task.cancel()
         await asyncio.gather(*_BACKGROUND_TASKS, return_exceptions=True)
         _BACKGROUND_TASKS.clear()
+        # Pending reply-push probes (12s grace sleeps) must not outlive
+        # the loop — "Task was destroyed but it is pending" otherwise.
+        for _task in list(_push_probe_tasks):
+            _task.cancel()
+        await asyncio.gather(*_push_probe_tasks, return_exceptions=True)
+        _push_probe_tasks.clear()
         if SHARED_HTTP_CLIENT is not None and not SHARED_HTTP_CLIENT.is_closed:
             try:
                 await SHARED_HTTP_CLIENT.aclose()
@@ -469,8 +483,14 @@ async def get(key: str | None = None):
         )
     html = (static_dir / "index.html").read_text()
     # Inject the key as a global the JS reads to attach X-Ghost-Key on every API call.
+    # The manifest link is injected too (not static markup): its URL must
+    # carry the key — iOS installs the PWA from the manifest's start_url,
+    # and an unkeyed start_url would land the installed app on the 401
+    # page. Keeping it out of index.html keeps the key out of the
+    # unauthenticated /static mount.
     injected = (
         f'<script>window.GHOST_API_KEY={json.dumps(GHOST_API_KEY)};</script>\n'
+        f'<link rel="manifest" href="/manifest.webmanifest?key={quote(GHOST_API_KEY)}">\n'
     )
     html = html.replace("</head>", f"{injected}</head>", 1)
     # `no-cache` forces the browser to revalidate the document with the
@@ -486,9 +506,49 @@ async def get(key: str | None = None):
         headers={"Cache-Control": "no-cache, must-revalidate, private"},
     )
 
+@app.get("/manifest.webmanifest")
+async def get_manifest(key: str | None = None):
+    """PWA manifest (key-gated like `/`). iOS requires a manifest for
+    Add-to-Home-Screen installation, which in turn is the ONLY context
+    Safari delivers web push to. start_url embeds the key so the
+    installed app opens authenticated."""
+    if not key or not secrets.compare_digest(
+        key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
+    ):
+        return _err_json(401, "key required")
+    manifest = {
+        "name": "Ghost",
+        "short_name": "Ghost",
+        "description": "Ghost agent console",
+        "start_url": f"/?key={quote(GHOST_API_KEY)}",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#05060a",
+        "theme_color": "#05060a",
+        "icons": [
+            # ?v= busts icon caches on artwork swaps (ghost since
+            # 2026-08-01); an installed PWA still shows the OLD icon until
+            # removed and re-added — iOS snapshots it at install time.
+            {"src": "/static/icons/icon-192.png?v=2", "sizes": "192x192",
+             "type": "image/png"},
+            {"src": "/static/icons/icon-512.png?v=2", "sizes": "512x512",
+             "type": "image/png"},
+        ],
+    }
+    return JSONResponse(
+        manifest,
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache, must-revalidate, private"},
+    )
+
 @app.get("/sw.js")
 async def get_sw():
-    return FileResponse(static_dir / "sw.js", media_type="application/javascript")
+    # no-cache: a stale service worker is the worst kind of stale — it
+    # intercepts push events with old code for up to 24h. Revalidate on
+    # every load (the file is tiny).
+    return FileResponse(
+        static_dir / "sw.js", media_type="application/javascript",
+        headers={"Cache-Control": "no-cache, must-revalidate"})
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, key: str | None = None):
@@ -616,6 +676,109 @@ async def _active_chat_tasks_janitor():
         except Exception as e:
             logger.warning(f"active_chat_tasks janitor error: {e}")
 
+# ── Web push (2026-08-01) ──────────────────────────────────────────────
+# Reply-ready pushes for turns that finish while the phone is locked/away,
+# plus the agent's notify-severity ledger events. Transport lives in
+# webpush_notify.py; iOS prerequisites (installed PWA + trusted cert) are
+# documented in docs/interfaces/web_server.html.
+
+def _push_ack_grace_s() -> float:
+    try:
+        return float(os.environ.get("GHOST_PUSH_ACK_GRACE", "12"))
+    except (TypeError, ValueError):
+        return 12.0
+
+# Strong refs: an unreferenced create_task() result can be GC'd mid-run
+# (same reason _BACKGROUND_TASKS exists).
+_push_probe_tasks: set = set()
+
+def _schedule_reply_push(task_id: str, user_text: str) -> None:
+    t = asyncio.create_task(_push_if_unacked(task_id, user_text))
+    _push_probe_tasks.add(t)
+    t.add_done_callback(_push_probe_tasks.discard)
+
+async def _push_if_unacked(task_id: str, user_text: str) -> None:
+    """After the grace window, push unless the PAGE confirmed delivery.
+    The ack (POST /api/chat/ack/{id}) can only come from live JS — a
+    locked iPhone can't send it, which is exactly the case that needs
+    the push."""
+    try:
+        await asyncio.sleep(_push_ack_grace_s())
+        task = active_chat_tasks.get(task_id)
+        if task is None or task.get("client_acked") or task.get("cancelled"):
+            return
+        if webpush_notify.subscription_count() == 0:
+            return
+        preview = (user_text or "your request").strip()
+        if len(preview) > 120:
+            preview = preview[:117] + "…"
+        body = (f"Failed: {task['error'][:200]}" if task.get("error")
+                else f"Reply ready — {preview}")
+        await webpush_notify.broadcast_async(
+            "Ghost", body, url=f"/?key={quote(GHOST_API_KEY)}",
+            tag=f"ghost-turn-{task_id[:8]}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"reply-ready push failed: {e}")
+
+def _last_user_text(payload) -> str:
+    try:
+        for msg in reversed(payload.get("messages") or []):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+    except Exception:
+        pass
+    return ""
+
+async def _notify_push_poller():
+    """Forward the agent's notify-severity ledger records as web pushes.
+    Own consumer name ('web-push') per the watermark contract — never
+    steals records from the Slack bot or the in-page bell. Ack AFTER
+    pushing (the bell's crash-re-serve convention); at most 5 pushes per
+    cycle — overflow records are acked unpushed and stay visible in the
+    bell rather than storming the lock screen."""
+    consumer = "web-push"
+    last_acked = None  # skip re-acking an unchanged watermark: an idle
+    # ledger otherwise gets notify_consumers.json rewritten every 30s
+    # around the clock, killing that file's mtime staleness diagnostic
+    # (the Slack poller documents removing exactly this churn).
+    while True:
+        try:
+            await asyncio.sleep(30)
+            if webpush_notify.subscription_count() == 0:
+                continue
+            client = _get_http_client()
+            r = await client.get(
+                "http://localhost:8000/api/notifications/pending",
+                params={"consumer": consumer, "limit": 20},
+                headers={"X-Ghost-Key": GHOST_API_KEY}, timeout=10.0)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if not data.get("enabled"):
+                continue
+            records = [] if data.get("baseline") else (data.get("records") or [])
+            for rec in records[:5]:
+                await webpush_notify.broadcast_async(
+                    f"Ghost — {str(rec.get('phase', 'event')).upper()[:40]}",
+                    str(rec.get("summary", ""))[:300],
+                    url=f"/?key={quote(GHOST_API_KEY)}", tag="ghost-notify")
+            watermark = data.get("watermark", 0)
+            if records or data.get("baseline") or watermark != last_acked:
+                resp = await client.post(
+                    "http://localhost:8000/api/notifications/ack",
+                    json={"consumer": consumer, "watermark": watermark},
+                    headers={"X-Ghost-Key": GHOST_API_KEY}, timeout=10.0)
+                if resp.status_code == 200:
+                    last_acked = watermark
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning(f"notify push poller error: {e}")
+
 @app.post("/api/chat", dependencies=[Depends(verify_interface_key)])
 async def chat_proxy(request: Request):
     """Proxies chat requests to the Ghost Agent."""
@@ -730,6 +893,12 @@ async def chat_proxy(request: Request):
                 finally:
                     t["finished_at"] = time.time()
                     t["new_data_event"].set()
+                    # Reply-ready push: fires after the grace window unless
+                    # live page JS acked delivery (locked phones can't).
+                    try:
+                        _schedule_reply_push(t_id, _last_user_text(payload))
+                    except Exception:
+                        pass
 
             # Start detached generation task
             bg_task = asyncio.create_task(background_stream_worker(task_id, body))
@@ -866,6 +1035,68 @@ async def chat_resume_proxy(task_id: str, offset: int = 0):
     }
     return StreamingResponse(stream_generator(), media_type="text/event-stream; charset=utf-8", headers=headers)
 
+@app.post("/api/chat/ack/{task_id}", dependencies=[Depends(verify_interface_key)])
+async def chat_ack_proxy(task_id: str):
+    """Client delivery confirmation (2026-08-01). Server-side "the stream
+    drained" is NOT proof the user saw the reply — a locked iPhone's dead
+    socket can swallow the tail into TCP buffers without an error. Only
+    JS actually running in the page can confirm receipt; the absence of
+    this ack within the grace window is what triggers the reply-ready
+    web push."""
+    task = active_chat_tasks.get(task_id)
+    if not task:
+        return _err_json(404, "not_found_or_done")
+    task["client_acked"] = True
+    return {"ok": True}
+
+@app.get("/api/push/vapid", dependencies=[Depends(verify_interface_key)])
+async def push_vapid_key():
+    """VAPID public key for pushManager.subscribe. `enabled:false` when no
+    keypair is provisioned (push feature off, not an error)."""
+    key = webpush_notify.public_key()
+    return {"enabled": bool(key), "key": key}
+
+@app.post("/api/push/subscribe", dependencies=[Depends(verify_interface_key)])
+async def push_subscribe(request: Request):
+    body = await _parse_json_body(request)
+    if not isinstance(body, dict):
+        return _err_json(400, "Request body must be a JSON object.")
+    sub = body.get("subscription")
+    if not isinstance(sub, dict) or not webpush_notify.add_subscription(sub):
+        return _err_json(400, "Malformed push subscription.")
+    return {"ok": True, "count": webpush_notify.subscription_count()}
+
+@app.post("/api/push/unsubscribe", dependencies=[Depends(verify_interface_key)])
+async def push_unsubscribe(request: Request):
+    body = await _parse_json_body(request)
+    if not isinstance(body, dict):
+        return _err_json(400, "Request body must be a JSON object.")
+    endpoint = body.get("endpoint")
+    if not isinstance(endpoint, str):
+        return _err_json(400, "endpoint required")
+    return {"ok": True, "removed": webpush_notify.remove_subscription(endpoint)}
+
+@app.get("/api/chat/task/{task_id}/state", dependencies=[Depends(verify_interface_key)])
+async def chat_task_state(task_id: str):
+    """Cheap liveness probe for the in-flight-turn resume flow (2026-08-01).
+
+    The client persists its task id across page kills (iOS lock/close) and
+    asks here BEFORE reattaching: streaming a full replay just to discover
+    a 404 would waste the buffer's bandwidth, and a plain resume 404 was
+    indistinguishable from a network error in the UI. `exists:false` is a
+    normal answer (TTL swept / proxy restarted), not an error — the client
+    then falls back to session-store reconciliation."""
+    task = active_chat_tasks.get(task_id)
+    if not task:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "done": bool(task.get("done")),
+        "error": task.get("error"),
+        "truncated": bool(task.get("truncated")),
+        "chunks": len(task.get("buffer", [])),
+    }
+
 @app.post("/api/chat/cancel/{task_id}", dependencies=[Depends(verify_interface_key)])
 async def chat_cancel_proxy(task_id: str):
     task = active_chat_tasks.get(task_id)
@@ -873,6 +1104,9 @@ async def chat_cancel_proxy(task_id: str):
         if task["background_task"]:
             task["background_task"].cancel()
         task["done"] = True
+        # The user ENDED this turn — a "Reply ready" push 12s after they
+        # hit Stop would be noise. The push probe checks this flag.
+        task["cancelled"] = True
         # Stamp + wake HERE, not only in the worker's finally: a reader
         # parked on new_data_event otherwise stayed parked until the
         # cancelled worker got around to its finally — and a worker
@@ -1041,6 +1275,15 @@ async def download_proxy(filename: str):
                 headers["content-type"] = resp.headers["content-type"]
             if "content-disposition" in resp.headers:
                 headers["content-disposition"] = resp.headers["content-disposition"]
+            # Agent-authored files serve from the SAME origin as the app and
+            # its injected key. The UI only ever inlines images and PDFs —
+            # but a pasted /api/download/x.html URL would render agent HTML
+            # same-origin. Force HTML-ish types to download instead, and
+            # never let the browser sniff its way to the same place.
+            headers["x-content-type-options"] = "nosniff"
+            ctype = headers.get("content-type", "").lower()
+            if "html" in ctype or "xml" in ctype or "svg" in ctype:
+                headers["content-disposition"] = "attachment"
         except Exception:
             if resp is not None:
                 await resp.aclose()

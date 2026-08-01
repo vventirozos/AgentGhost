@@ -521,6 +521,12 @@ body.zen-mode .icon-btn:hover {
 @media (max-width: 480px) {
     header {
         padding: 12px 16px;
+        /* The shorthand above RESETS padding-top, silently discarding the
+           base rule's safe-area inset — in a standalone (home-screen) PWA
+           with black-translucent the page runs under the iOS status bar,
+           so the header sat beneath the clock/Dynamic Island (2026-08-01).
+           Re-assert the inset after every padding shorthand on header. */
+        padding-top: max(12px, env(safe-area-inset-top));
         flex-direction: column;
         align-items: center;
         gap: 16px;
@@ -803,7 +809,11 @@ body.zen-mode .icon-btn:hover {
     overflow: auto;
     padding: 20px;
     box-sizing: border-box;
-    display: flex;
+    /* display:none by DEFAULT (JS shows flex when rendering a diagram):
+       these two containers are opaque, absolutely positioned LAST in the
+       wrapper, so any path that forgets to hide them paints over the
+       iframes — the "window opens, shows nothing" symptom class. */
+    display: none;
     align-items: center;
     justify-content: center;
     background: #0d0716;
@@ -812,6 +822,7 @@ body.zen-mode .icon-btn:hover {
 #chart-container {
     padding: 20px;
     box-sizing: border-box;
+    display: none;
     background: #0d0716;
 }
 
@@ -1128,6 +1139,14 @@ pre:hover .render-code-btn {
 @media (max-width: 1280px) and (max-height: 720px) {
     header {
         padding: 8px 15px;
+        /* Landscape PHONES also match this uConsole query, and the
+           shorthand resets the safe-area insets: the status bar/Dynamic
+           Island occupy the top and LEFT edge in landscape standalone
+           mode. max() keeps the uConsole (no notch, env()=0) at its
+           compact 8/15px. */
+        padding-top: max(8px, env(safe-area-inset-top));
+        padding-left: max(15px, env(safe-area-inset-left));
+        padding-right: max(15px, env(safe-area-inset-right));
         /* min-height, NOT a fixed height. On a portrait phone this query
            also matches (height <= 720) while the <=480 rule makes the
            header a 2-row column (status + buttons); a fixed 50px clipped
@@ -1154,12 +1173,16 @@ pre:hover .render-code-btn {
            (see the min-width:1000px block below). */
         padding: 10px;
     }
-    /* Scale down the Render Window for the small screen */
+    /* Scale down the Render Window for the small screen. NO !important:
+       drag/resize write inline styles, and !important here silently made
+       both dead on the uConsole and landscape phones (inline loses to a
+       stylesheet !important). Specificity + source order still beat the
+       base rule; a user drag simply wins afterwards. */
     #render-window {
-        width: 85vw !important;
-        height: 80vh !important;
-        left: 7.5vw !important;
-        top: 10vh !important;
+        width: 85vw;
+        height: 80vh;
+        left: 7.5vw;
+        top: 10vh;
     }
 }
 
@@ -1649,6 +1672,14 @@ body.zen-mode #rail-scrim {
     position: fixed;
     z-index: 160;
     min-width: 230px;
+    /* Phone guards: never wider than the viewport, and 10 items don't fit
+       a landscape phone — scroll inside the menu instead of off-screen.
+       app.js clamps the anchor position on BOTH axes to match. */
+    max-width: calc(100vw - 16px);
+    max-height: min(60dvh, calc(100dvh - 90px));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
     background: var(--panel-bg);
     border: 1px solid var(--panel-border);
     border-radius: 10px;

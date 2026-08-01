@@ -20,7 +20,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
-from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
+from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 from .planning import TaskTree, TaskStatus
 # Shared "what did this call operate on" helper — same definition the
 # offline post-mortem signature uses, so the in-run no-progress
@@ -1691,9 +1691,22 @@ from .stream_guards import (  # noqa: E402
 )
 
 
-def _render_assistant_with_tool_calls(content: str, tool_calls: list) -> str:
+def _render_assistant_with_tool_calls(content: str, tool_calls: list,
+                                      native: bool = False) -> str:
     """Render an assistant message + its native ``tool_calls`` list as the
     inline XML string the upstream Qwen-style API expects to see in history.
+
+    ``native=True`` renders the EQUALS dialect (``<function=name>`` /
+    ``<parameter=key>`` with values on their own lines) — on the native
+    path that is the dialect the model itself GENERATED (the server
+    template parsed it into structured calls; re-rendering it as
+    attribute-style ``<function name="…">`` showed the model a dialect it
+    never wrote, a standing dual-dialect nudge in intra-request history
+    that pushes later turns off the native channel onto the strike-prone
+    text-parse lane — the 2026-07-31 corruption class, req 93/65d8cf76's
+    drift). ``native=False`` keeps attribute style: the legacy XML path's
+    QWEN_TOOL_PROMPT contract. Both dialects round-trip through
+    ``_parse_assistant_tool_calls`` (pinned in tests).
 
     The previous implementation re-checked ``"<tool_call>" in ast_content``
     on every iteration of the render loop. After the FIRST call was
@@ -1703,6 +1716,18 @@ def _render_assistant_with_tool_calls(content: str, tool_calls: list) -> str:
     guard). Snapshot the inline-check ONCE before the loop.
     """
     ast_content = content or ""
+    # Never render the synthetic `system_parse_error` marker entries —
+    # they are strike bookkeeping, not calls. Pre-scrub (2026-08-01)
+    # they were accidentally suppressed because the broken content
+    # still contained '<tool_call'; once the retry scrub replaced that
+    # text with a note, the suppression vanished and the serializer
+    # taught the model a well-formed call to a nonexistent tool, in
+    # the attribute dialect, right under the equals-dialect SYSTEM
+    # ERROR hint (review catch).
+    tool_calls = [
+        tc for tc in (tool_calls or [])
+        if (tc.get("function") or {}).get("name") != "system_parse_error"
+    ]
     if not tool_calls:
         return ast_content.strip()
     already_inline = "<tool_call>" in ast_content or "<tool_call" in ast_content
@@ -1718,13 +1743,19 @@ def _render_assistant_with_tool_calls(content: str, tool_calls: list) -> str:
                 tc_args_dict = {}
         else:
             tc_args_dict = tc_args
-        xml_call = f'\n<tool_call>\n<function name="{tc_func.get("name", "")}">\n'
+        if native:
+            xml_call = f'\n<tool_call>\n<function={tc_func.get("name", "")}>\n'
+        else:
+            xml_call = f'\n<tool_call>\n<function name="{tc_func.get("name", "")}">\n'
         for k, v in tc_args_dict.items():
             if isinstance(v, (dict, list, bool, type(None))):
                 v_rendered = json.dumps(v, ensure_ascii=False)
             else:
                 v_rendered = str(v)
-            xml_call += f'<parameter name="{k}">\n{v_rendered}\n</parameter>\n'
+            if native:
+                xml_call += f'<parameter={k}>\n{v_rendered}\n</parameter>\n'
+            else:
+                xml_call += f'<parameter name="{k}">\n{v_rendered}\n</parameter>\n'
         xml_call += "</function>\n</tool_call>\n"
         ast_content += xml_call
     return ast_content.strip()
@@ -1943,8 +1974,17 @@ def _repair_native_tool_calls(tool_calls: list, available_names=None):
 # named `<function …>`), never a bare quoted mention.
 # ============================================================================
 _THINK_CLOSED_RE = re.compile(r'<think\b[^>]*>.*?</think\s*>', re.DOTALL | re.IGNORECASE)
+# The unclosed-think lookahead must also recognize the LESIONED opener
+# shape `<tool_call>function=…` (dropped '<', req 65d8cf76) — otherwise
+# the strip-to-EOS branch swallows the whole call silently (no strike,
+# no recovery hint, an empty turn) whenever the lesion follows an
+# unclosed <think>. The lesion alternative mirrors the parser heal's
+# exact condition (`function…=`), so a bare prose mention of
+# "<tool_call> function" cannot anchor it.
 _THINK_UNCLOSED_RE = re.compile(
-    r'<think\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b|<function\s+name\b|<function\s*=)'
+    r'<think\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b'
+    r'|<tool_call\b[^>]*>\s*function(?:_name)?\s*(?:=|\s+name\s*=)'
+    r'|<function\s+name\b|<function\s*=)'
     r'|<think\b[^>]*>.*$',
     re.DOTALL | re.IGNORECASE,
 )
@@ -1962,6 +2002,107 @@ def _strip_think_blocks(text: str) -> str:
     if '<think' in text.lower():
         text = _THINK_UNCLOSED_RE.sub('', text)
     return text
+
+
+# Tool-call XML shapes the retry-history scrub must cover. This set must
+# stay a SUPERSET of the shapes the parser can strike out on — the parser
+# heals `<tool>` and `<function_name…` into parseable forms, so a
+# parse-FAILING emission can arrive in any of them (review catch: the
+# first cut only matched `<tool_call`/`<function`, so a failed `<tool>`
+# hallucination was replayed verbatim — the exact imitation loop this
+# scrub exists to kill). `(?<!\x60)` skips backtick-quoted mentions:
+# retry turns routinely QUOTE `<tool_call>` from the SYSTEM ERROR hint
+# while reasoning about it, and eating the surrounding analysis throws
+# away legitimate prose (observed live 2026-08-01). NB `<tool\b` cannot
+# match `<tool_call`/`<tool_response` — `_` is a word char, no boundary.
+_SCRUB_TOOL_XML_RES = (
+    re.compile(r'(?<!`)<tool_call\b.*?(?:</tool_call\s*>|\Z)', re.DOTALL | re.IGNORECASE),
+    re.compile(r'(?<!`)<tool\b[^>]*>.*?(?:</tool\s*>|\Z)', re.DOTALL | re.IGNORECASE),
+    re.compile(r'(?<!`)<function(?:_name)?\b.*?(?:</function\s*>|\Z)', re.DOTALL | re.IGNORECASE),
+)
+
+
+def _scrub_unparsed_tool_call_text(text: str, reason: str = "") -> str:
+    """Replace tool-call XML in an assistant message that failed to parse
+    with a short bracketed note, before the message is replayed into the
+    retry history.
+
+    Why: replaying the malformed block verbatim TEACHES the model its own
+    mistake — req 65d8cf76 (2026-08-01) emitted one lesioned call
+    ('<tool_call>function=…', dropped '<'), the raw text was replayed as
+    the assistant turn, and the model then copied the exact broken shape
+    on every retry (temp 0.6 imitation beat four recovery hints) until
+    the strike cap aborted the request. The next-turn SYSTEM ERROR
+    message carries the correct format; the history only needs to record
+    THAT a call was attempted, not preserve the broken bytes.
+
+    The CALLER must gate on an actual parse failure (a
+    `system_parse_error` entry in the parsed tool_calls) — the reason
+    string alone is not enough: "truncated" is stamped by pre-parse
+    open/close counting and can accompany a fully parsed and EXECUTED
+    call, and scrubbing that would tell the model to re-emit a mutation
+    that already ran (review catch).
+
+    Output is HARD-bounded: only the first ``_SCRUB_MAX_NOTES`` regions
+    become notes, every further region is deleted outright — a
+    degenerate thousand-block reply (the 4056-strike trace shape) must
+    shrink, not amplify, in the retry path. Replacement is a callable,
+    so no character of `note`/`reason` is ever interpreted as a regex
+    template (a '\\1' in a future reason string would otherwise crash
+    the replay).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    note = "[malformed tool_call removed — it did not parse"
+    if reason:
+        note += f" ({reason})"
+    note += "; re-emit it in the format shown in the SYSTEM ERROR below]"
+    _SCRUB_MAX_NOTES = 2
+    emitted = 0
+
+    def _repl(_m):
+        nonlocal emitted
+        emitted += 1
+        return note if emitted <= _SCRUB_MAX_NOTES else ""
+
+    out = text
+    for pat in _SCRUB_TOOL_XML_RES:
+        out = pat.sub(_repl, out)
+    # Collapse adjacent duplicate notes (multi-block failures) so the
+    # replayed message doesn't repeat the note.
+    out = re.sub(
+        re.escape(note) + r'(?:\s*' + re.escape(note) + r')+',
+        lambda _m: note, out,
+    )
+    return out.strip()
+
+
+def _tool_call_format_example(native: bool, param: str = "arg1", value: str = "value1") -> str:
+    """The tool-call skeleton to show in parse-failure recovery hints.
+
+    Path-aware on purpose: the native path's server template
+    (froggeric-v21.3) teaches and parses the EQUALS dialect
+    (`<function=name>` / `<parameter=key>` with values on their own
+    lines) — teaching attribute-style `<function name="…">` there
+    re-introduces the dual-dialect corruption root-caused on
+    2026-07-31 ("the agent was teaching a second dialect"), and it
+    demonstrably failed to break the req 65d8cf76 retry loop. The
+    legacy XML path keeps attribute style — its QWEN_TOOL_PROMPT
+    contract. Both dialects parse in the agent's fallback parser; the
+    point is to show the model ONE dialect: the one its own prompt
+    path already speaks.
+    """
+    if native:
+        return (
+            "<tool_call>\n<function=the_tool_name>\n"
+            f"<parameter={param}>\n{value}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+    return (
+        "<tool_call>\n  <function name=\"the_tool_name\">\n"
+        f"    <parameter name=\"{param}\">{value}</parameter>\n"
+        "  </function>\n</tool_call>"
+    )
 
 
 # ============================================================================
@@ -7450,6 +7591,23 @@ class GhostAgent:
         parse_target = re.sub(r'<tool\b[^>]*>', '<tool_call>', parse_target, flags=re.IGNORECASE)
         parse_target = re.sub(r'</tool>', '</tool_call>', parse_target, flags=re.IGNORECASE)
 
+        # Heal a dropped '<' on the function opener directly after
+        # <tool_call> (req 65d8cf76, 2026-08-01: five otherwise
+        # perfectly-formed calls arrived as
+        # '<tool_call>function=knowledge_base>' — one lost '\n<'
+        # token upstream — and every one struck out as
+        # no_function_tag). Anchored to the <tool_call> opener so a
+        # parameter body that legitimately contains 'function=' can
+        # never be rewritten. The opener may carry attributes
+        # (`<tool_call id="1">`) — the sibling heals accept those,
+        # so the same lesion behind an attributed opener must heal
+        # too (review catch).
+        parse_target = re.sub(
+            r'(<tool_call\b[^>]*>\s*)(?=function(?:_name)?\s*(?:=|\s+name\s*=))',
+            r'\1<',
+            parse_target, flags=re.IGNORECASE,
+        )
+
         # Heal bare <function> tags missing the <tool_call> wrapper
         if '<function' in parse_target and '<tool_call' not in parse_target:
             parse_target = parse_target.replace('<function', '<tool_call>\n<function')
@@ -7474,6 +7632,18 @@ class GhostAgent:
         parse_target = re.sub(
             r'<(function|parameter)\s+name\s*=\s*',
             r'<\1 name=',
+            parse_target, flags=re.IGNORECASE,
+        )
+        # UNQUOTED `<function_name=x>` — the quoted variant is healed
+        # by the sloppy-attribute rule above, but an unquoted value
+        # slipped through every rule and struck out as "malformed"
+        # (review catch). Normalize the tag itself to the equals
+        # dialect the downstream `<function(?:\s+name=|=)` regex
+        # already parses; runs after the quoted heal so it only sees
+        # the leftovers.
+        parse_target = re.sub(
+            r'<function_name\s*=\s*',
+            r'<function=',
             parse_target, flags=re.IGNORECASE,
         )
         # -----------------------------
@@ -8342,34 +8512,46 @@ class GhostAgent:
                             "truncation."
                         )
                     elif parse_failure_reason == "no_function_tag":
+                        _native = bool(getattr(
+                            getattr(self.context, "args", None), "native_tools", False))
+                        _fn_tag = "<function=...>" if _native else "<function name=\"...\">"
                         err_msg_content = (
                             "SYSTEM ERROR: Your `<tool_call>` block was present but "
-                            "contained no `<function name=\"...\">` tag. Output the "
-                            "tool call with the exact shape:\n"
-                            "<tool_call>\n  <function name=\"the_tool_name\">\n"
-                            "    <parameter name=\"arg1\">value1</parameter>\n"
-                            "  </function>\n</tool_call>"
+                            f"contained no `{_fn_tag}` tag (it may have lost its "
+                            "opening `<`). Re-emit the ENTIRE tool call with the "
+                            "exact shape:\n"
+                            + _tool_call_format_example(_native)
                         )
                     elif consecutive_parse_errors >= 2:
                         # Switched-strategy hint only after the
                         # second failure, and only for genuinely
                         # malformed (not truncated) output.
+                        _native = bool(getattr(
+                            getattr(self.context, "args", None), "native_tools", False))
+                        if _native:
+                            _cdata_example = (
+                                "`<parameter=content>\n<![CDATA[...]]>\n</parameter>`"
+                            )
+                        else:
+                            _cdata_example = (
+                                "`<parameter name=\"content\"><![CDATA[...]]></parameter>`"
+                            )
                         err_msg_content = (
                             f"SYSTEM ESCAPE HATCH (parse failed {consecutive_parse_errors}x): "
                             "STOP repeating the same shape — it does not parse.\n\n"
                             "Pick ONE alternative:\n"
                             "(A) CDATA envelope for content with literal `</parameter>` / `<` / `>` / JSON:\n"
-                            "    `<parameter name=\"content\"><![CDATA[...]]></parameter>`\n"
+                            f"    {_cdata_example}\n"
                             "(B) `file_system` `operation=\"write\"` (native) instead of `execute`.\n"
                             "(C) `file_system` `operation=\"replace\"` for small edits.\n\n"
                             "Output ONE complete tool_call. Do not ask for clarification."
                         )
                     else:
+                        _native = bool(getattr(
+                            getattr(self.context, "args", None), "native_tools", False))
                         err_msg_content = (
                             "SYSTEM ERROR: Your `<tool_call>` did not parse. Use strict XML:\n"
-                            "<tool_call>\n  <function name=\"the_tool_name\">\n"
-                            "    <parameter name=\"arg1\">value1</parameter>\n"
-                            "  </function>\n</tool_call>\n\n"
+                            + _tool_call_format_example(_native) + "\n\n"
                             "If a parameter body contains literal `</parameter>` / `<` / `>` / JSON, "
                             "wrap it in `<![CDATA[ ... ]]>`."
                         )
@@ -12462,7 +12644,23 @@ class GhostAgent:
                 active_persona = ""
                 if has_coding_intent and not is_meta_task:
                     pretty_log("Mode Switch", "Ghost Specialist Activated", icon=Icons.MODE_GHOST)
-                    active_persona = f"{SPECIALIST_SYSTEM_PROMPT.replace('{{PROFILE}}', profile_context)}\n\n"
+                    # Tool-XML guidance is path-split (2026-08-01): the
+                    # attribute-dialect examples + CDATA rule are the LEGACY
+                    # path's contract; on the native path they were the one
+                    # dialect-teaching block the 07-31 header split missed —
+                    # riding every coding turn, the exact prompt class the
+                    # ablation showed corrupts stacked calls.
+                    _specialist_native = bool(getattr(
+                        getattr(self.context, "args", None), "native_tools", False))
+                    active_persona = (
+                        SPECIALIST_SYSTEM_PROMPT
+                        .replace('{{PROFILE}}', profile_context)
+                        .replace(
+                            '{{TOOL_XML_GUIDANCE}}',
+                            SPECIALIST_TOOL_XML_NATIVE if _specialist_native
+                            else SPECIALIST_TOOL_XML_LEGACY,
+                        )
+                    ) + "\n\n"
 
                 # base_prompt += active_persona  <-- RELOCATED to user message for cache efficacy
 
@@ -13529,6 +13727,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     is_final_generation = force_final_response or str(target_tool or "all").lower() == "none"
 
                     # Translate messages to bypass strict API validation and emulate Qwen-Agent
+                    # Replayed calls are rendered in the dialect of the ACTIVE
+                    # path: on native, the equals dialect the model itself
+                    # generated (attribute-style here was a standing
+                    # dual-dialect nudge in intra-request history — 2026-08-01).
+                    _render_native = bool(getattr(
+                        getattr(self.context, "args", None), "native_tools", False))
                     req_messages = []
                     for m in messages:
                         if m.get("role") == "tool":
@@ -13543,6 +13747,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 "content": _render_assistant_with_tool_calls(
                                     m.get("content"),
                                     m.get("tool_calls") or [],
+                                    native=_render_native,
                                 ),
                             })
                         elif m.get("role") == "user":
@@ -13755,12 +13960,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # wiring (pattern-type triggers; /v1/chat/completions).
                     # Best-effort: `{}` on any failure, and servers without
                     # the fields ignore them. GHOST_TOOL_GRAMMAR=0 disables.
+                    # Native gate (2026-08-01): the GBNF grammar hard-codes
+                    # the ATTRIBUTE dialect. Arming it while native tools
+                    # are on would force the sampler into a dialect the
+                    # server template can't parse natively — a three-way
+                    # conflict with the equals-dialect hints and history.
+                    # Skip with a loud warning instead of silently fighting.
                     if not is_final_generation and all_tools:
-                        try:
-                            from .tool_grammar import grammar_payload_fields
-                            payload.update(grammar_payload_fields(all_tools))
-                        except Exception as _tg_exc:
-                            logger.debug("tool grammar skipped: %s", _tg_exc)
+                        if bool(getattr(getattr(self.context, "args", None), "native_tools", False)):
+                            import os as _tg_os
+                            if _tg_os.environ.get("GHOST_TOOL_GRAMMAR", "0") == "1":
+                                logger.warning(
+                                    "GHOST_TOOL_GRAMMAR=1 ignored: the GBNF grammar emits the "
+                                    "attribute dialect, which conflicts with --native-tools "
+                                    "(template + hints + history all speak the equals dialect). "
+                                    "Run with --no-native-tools to use the grammar."
+                                )
+                        else:
+                            try:
+                                from .tool_grammar import grammar_payload_fields
+                                payload.update(grammar_payload_fields(all_tools))
+                            except Exception as _tg_exc:
+                                logger.debug("tool grammar skipped: %s", _tg_exc)
 
                     pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
 
@@ -14558,6 +14779,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # CRITICAL: Preserve the raw XML tags in the assistant's internal message context so it remembers!
                     # BUT STRIP <think> blocks to prevent cognitive looping!
                     clean_content_for_history = _strip_think_blocks(content).strip()
+                    # …EXCEPT when the XML failed to parse: replaying the
+                    # broken bytes teaches the model to copy its own
+                    # mistake on every retry (req 65d8cf76 looped 5x on a
+                    # one-character lesion this way). Replace the failed
+                    # block(s) with a constant-size note; the parsed calls
+                    # (if any) live on in msg["tool_calls"] and their
+                    # results in the following tool messages. Gate on an
+                    # ACTUAL failed block — not on parse_failure_reason
+                    # alone: "truncated" is stamped by pre-parse counting
+                    # and can accompany a fully parsed+executed call, and
+                    # scrubbing that would ask the model to re-run a
+                    # mutation that already succeeded. The gate also
+                    # guarantees the note's "SYSTEM ERROR below" promise:
+                    # the recovery hint only fires for system_parse_error
+                    # entries.
+                    if parse_failure_reason and any(
+                        (tc.get("function") or {}).get("name") == "system_parse_error"
+                        for tc in tool_calls
+                    ):
+                        clean_content_for_history = _scrub_unparsed_tool_call_text(
+                            clean_content_for_history, parse_failure_reason,
+                        )
                     msg["content"] = clean_content_for_history
                     msg["tool_calls"] = tool_calls
 
@@ -16150,7 +16393,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         if last_60.strip() and tail.count(last_60) >= 5:
                             pretty_log("Cognitive Watchdog", "Infinite <think> loop detected. Severing stream.", level="WARNING", icon=Icons.STOP)
                             loop_detected = True
-                            break_text = "\n</think>\n<tool_call>\n<function name=\"replan\">\n<parameter name=\"reason\">SYSTEM OVERRIDE: My internal monologue got stuck in an infinite loop. I am forcing a strategy reset.</parameter>\n</function>\n</tool_call>"
+                            # Path-aware dialect (2026-08-01): this synthetic
+                            # call is persisted into episode/trajectory and
+                            # replayed as assistant history — on the native
+                            # path an attribute-dialect exemplar here was a
+                            # standing dual-dialect nudge.
+                            _bt_reason = "SYSTEM OVERRIDE: My internal monologue got stuck in an infinite loop. I am forcing a strategy reset."
+                            if bool(getattr(getattr(self.context, "args", None), "native_tools", False)):
+                                break_text = f"\n</think>\n<tool_call>\n<function=replan>\n<parameter=reason>\n{_bt_reason}\n</parameter>\n</function>\n</tool_call>"
+                            else:
+                                break_text = f"\n</think>\n<tool_call>\n<function name=\"replan\">\n<parameter name=\"reason\">{_bt_reason}</parameter>\n</function>\n</tool_call>"
                             break_chunk = {
                                 "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
                                 "model": stream_model, "choices": [{"index": 0, "delta": {"content": break_text}, "finish_reason": None}]

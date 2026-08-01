@@ -543,10 +543,11 @@ async def test_lifespan_holds_and_cancels_background_tasks(monkeypatch):
 
     monkeypatch.setattr(server, "log_streamer", stub)
     monkeypatch.setattr(server, "_active_chat_tasks_janitor", stub)
+    monkeypatch.setattr(server, "_notify_push_poller", stub)
 
     async with server._lifespan(server.app):
         await asyncio.sleep(0)
-        assert len(server._BACKGROUND_TASKS) == 2
+        assert len(server._BACKGROUND_TASKS) == 3
         assert all(not t.done() for t in server._BACKGROUND_TASKS)
         refs = list(server._BACKGROUND_TASKS)
 

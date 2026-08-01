@@ -128,8 +128,14 @@ class TestWiring:
                / "src" / "ghost_agent" / "core" / "agent.py").read_text()
         idx = src.find("from .tool_grammar import grammar_payload_fields")
         assert idx != -1
-        window = src[idx - 600:idx]
+        # Window widened 600→1800 (2026-08-01): the native-path guard
+        # (grammar refused with a warning when --native-tools is on —
+        # the GBNF emits the attribute dialect, which would fight the
+        # equals-dialect template/hints/history) now sits between the
+        # turn gate and the import.
+        window = src[idx - 1800:idx]
         assert "not is_final_generation and all_tools" in window
+        assert "GHOST_TOOL_GRAMMAR=1 ignored" in window
 
     def test_launcher_keeps_native_parsing_with_revert_notes(self):
         """The --no-native-tools experiment was REVERTED same-day: moving

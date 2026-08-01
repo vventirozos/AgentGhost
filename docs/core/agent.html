@@ -570,6 +570,92 @@
   the same discipline as the constraint gate. Fail-open behaviour on miss is unchanged.
   Pinned by <code>tests/test_req50855398_fixes.py</code>.</p>
 
+  <h2>Parse-failure recovery cluster: dropped-'&lt;' heal, replay scrub, path-aware hints (2026-08-01, req 65d8cf76)</h2>
+  <p>One lesioned emission — <code>&lt;tool_call&gt;function=knowledge_base&gt;</code>, the
+  <code>\n&lt;</code> between the opener and the function tag lost upstream (single-token drop at
+  temp 1.0 or a server-side stream swallow; indistinguishable from the boundary recording) —
+  struck out five times and aborted the request, despite the call being otherwise byte-perfect
+  every time. Three compounding defects, three fixes:</p>
+  <ul>
+    <li><strong>Missing heal.</strong> The parser healed <code>&lt;tool&gt;</code>, bare
+    <code>&lt;function&gt;</code>, and quoted sloppy-attribute shapes, but not a dropped
+    <code>&lt;</code> on the function opener. New heal in
+    <code>_parse_assistant_tool_calls</code>: <code>&lt;tool_call&gt;</code> followed directly by
+    <code>function=</code> / <code>function name=</code> / <code>function_name=</code> gets its
+    <code>&lt;</code> restored. Anchored to the opener, so <code>function=</code> inside a
+    parameter body (e.g. Python kwargs) can never be rewritten. This alone recovers all five
+    incident turns.</li>
+    <li><strong>Broken-bytes replay.</strong> <code>handle_chat</code> replayed the malformed
+    assistant text verbatim into the retry history ("preserve the raw XML so it remembers") —
+    so the model copied its own broken shape on every retry; in-context imitation at temp 0.6
+    beat four recovery hints. On <code>parse_failure_reason</code>, the replayed message now
+    passes through <code>_scrub_unparsed_tool_call_text</code>: tool-call XML regions (closed,
+    unclosed-to-EOS, and bare <code>&lt;function&gt;</code>) are replaced with a constant-size
+    "malformed tool_call removed (<em>reason</em>)" note. Parsed calls survive in
+    <code>msg["tool_calls"]</code> and their results in the following tool messages, so nothing
+    the model needs is lost; output is bounded by construction.</li>
+    <li><strong>Wrong-dialect hints.</strong> The <code>no_function_tag</code> / generic
+    recovery hints unconditionally taught attribute-style <code>&lt;function name="…"&gt;</code>
+    — on the native path, whose server template speaks the equals dialect
+    (<code>&lt;function=…&gt;</code>), that re-introduces the dual-dialect teaching root-caused
+    on 2026-07-31 (<a href="prompts.html">prompts</a>). Hints in
+    <code>_dispatch_and_process_tool_batch</code> now select the skeleton via
+    <code>_tool_call_format_example(native)</code> keyed on <code>args.native_tools</code>:
+    equals dialect (values on their own lines, native-path shape) vs attribute dialect (the
+    legacy path's <code>QWEN_TOOL_PROMPT</code> contract). Both examples are pinned to
+    round-trip through our own fallback parser.</li>
+  </ul>
+  <p><strong>Review catches (2 read-only agents, all execution-verified, fixed same-session):</strong>
+  the scrub originally keyed on <code>parse_failure_reason</code> alone — but
+  <code>"truncated"</code> is stamped by pre-parse open/close counting and can accompany a fully
+  parsed and EXECUTED call, so the note would have asked the model to re-run a completed mutation
+  (now gated on an actual <code>system_parse_error</code> entry, which also guarantees the note's
+  "SYSTEM ERROR below" promise); scrubbing the content un-suppressed the history serializer's
+  <code>already_inline</code> check so it rendered the synthetic <code>system_parse_error</code>
+  entries as an imitable attribute-dialect call to a nonexistent tool
+  (<code>_render_assistant_with_tool_calls</code> now filters them); scrub coverage missed the
+  heal-only shapes <code>&lt;tool&gt;</code> and <code>&lt;function_name</code> (patterns
+  extended); a degenerate thousand-block reply amplified ~5x through the scrub (now hard-bounded:
+  first 2 regions become notes, the rest are deleted); the lesion behind an <em>unclosed</em>
+  <code>&lt;think&gt;</code> was stripped to EOS and swallowed silently
+  (<code>_THINK_UNCLOSED_RE</code> lookahead now knows the lesioned opener); the note string was
+  passed to <code>re.sub</code> as a replacement template (now a callable); backtick-quoted
+  <code>`&lt;tool_call&gt;`</code> mentions in retry prose were eaten from the mention onward
+  (negative lookbehind); attributed openers (<code>&lt;tool_call id="1"&gt;</code>) and unquoted
+  <code>&lt;function_name=x&gt;</code> variants of the lesion didn't heal (they do now). A sweep
+  of ~4,300 healthy recorded contents from 07-31/08-01 confirmed the heal fires ONLY on the five
+  incident emissions — zero false fires.</p>
+  <p><strong>Follow-up (same day): the history serializer is now path-aware too.</strong>
+  <code>_render_assistant_with_tool_calls</code> rendered VALID replayed calls in attribute
+  dialect unconditionally — on the native path that showed the model a dialect it never wrote
+  (the server template parsed its equals-dialect output into structured calls; our re-render
+  then re-taught attribute style in intra-request history — the drift lane req 93 followed to a
+  text-path emission). The renderer takes <code>native=</code> from <code>args.native_tools</code>
+  at its single call site and renders <code>&lt;function=name&gt;</code> /
+  <code>&lt;parameter=key&gt;</code> on the native path; the legacy path keeps attribute style.
+  Both render dialects are pinned to round-trip through <code>_parse_assistant_tool_calls</code>.
+  With this, the native path is one-dialect end to end: the system prompt teaches no format
+  (template owns it), recovery hints teach equals, and replayed history shows exactly what the
+  model generated.</p>
+  <p><strong>Review of the renderer change surfaced three more attribute-dialect leaks onto the
+  native path — all closed:</strong> (1) <code>SPECIALIST_SYSTEM_PROMPT</code> shipped two full
+  attribute-dialect examples (fix-script + CDATA rule) on every coding turn with no native gate
+  — the exact prompt-block class the 07-31 ablation showed corrupts stacked calls 8/8; the
+  guidance is now a <code>{{TOOL_XML_GUIDANCE}}</code> slot spliced per path
+  (<code>SPECIALIST_TOOL_XML_LEGACY</code> keeps the original;
+  <code>SPECIALIST_TOOL_XML_NATIVE</code> carries the same fix-script workflow with ZERO
+  tool-call XML and a raw-values rule instead of CDATA — on the native path the server template
+  parses values as raw text, so a CDATA wrapper would land verbatim inside the argument).
+  (2) The Cognitive Watchdog's think-loop sever injected an attribute-dialect
+  <code>replan</code> call into persisted/replayed content — now path-aware. (3) The dormant
+  GBNF tool grammar hard-codes the attribute dialect; arming <code>GHOST_TOOL_GRAMMAR=1</code>
+  under <code>--native-tools</code> is now refused with a loud warning instead of forcing a
+  three-way dialect conflict at the sampler.</p>
+  <p>Pinned by <code>tests/test_parse_failure_recovery_fixes.py</code> (includes the exact
+  live payload from <code>llm_recordings/2026-08-01.jsonl</code> as a regression fixture) and the
+  path-aware parametrization of <code>test_system_parse_error_messaging</code> in
+  <code>tests/test_agent_recent_fallbacks.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

@@ -1404,6 +1404,172 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-08-01 (later 8) — visualizer window overhaul (operator: "PDFs pop the window but show nothing")
+
+One-feature adversarial review (16 findings: 1 CRIT, 3 HIGH) + full repair; interface
+tests 170 green incl. new `tests/test_interface_visualizer.py`; live Playwright sweep
+9/10 + direct forensics for both PDF paths. **Root cause (CRIT): PDFs rendered into a
+NESTED iframe inside a `sandbox`'d iframe — the plugins-sandbox flag is unclearable,
+inherited, and blocks the PDF viewer in EVERY engine (desktop was as broken as the
+phone); the sandbox on that same-origin frame was a security no-op** (real containment
+= `#render-iframe-sandboxed`, allow-scripts only, unchanged). Shipped: unsandboxed main
+frame + direct `src = blob` on desktop; iOS panel with open-in-new-tab link (iOS can't
+render PDFs in ANY subframe — platform limit); central `resetRenderSurfaces()` before
+every open (agent code/audio kept RUNNING while hidden; stale mermaid masqueraded as
+the new diagram; PDF never reset zoom → magnified blank margin); `_showRenderError`
+panel for bad CSV / missing vendors (were silent black); srcdoc + `_escAttr` replaces
+`document.write` (raced close navigation, can't follow a PDF src); PDFs bypass the
+image LRU (dedicated revoked URL — 100 multi-MB entries was a phone tab-kill); LRU
+spares the on-screen blob; `/clear`/session-switch close the window before revoking;
+drag/resize un-broken on landscape phones/uConsole (media-query `!important` beat the
+inline drag styles) + on-screen clamp; PDF Download branch (was silent no-op) + real
+image filenames; `/api/download` gains nosniff + attachment-forced HTML/XML/SVG (agent
+HTML would render same-origin with the key). Docs: web_server.html "Visualizer
+overhaul". Versions: app/matrix 8.3, style 5.1.
+
+### 2026-08-01 (later 7) — req 65d8cf76 post-mortem: one dropped '<' became five strikes; parser heal + replay scrub + path-aware hints SHIPPED
+
+**Incident (16:39, after the later-5 deploy — NOT caused by it):** the model emitted an
+otherwise byte-perfect equals-dialect call as `<tool_call>function=knowledge_base>` — the
+`\n<` between opener and function tag lost upstream (single-token drop at temp 1.0 or a
+server stream swallow; the boundary recording can't distinguish). llama-server passed it
+through as content; the fallback XML parser (whose job is exactly this straggler class per
+the 07-31 design) missed it by one character → `no_function_tag`. The broken text was then
+replayed VERBATIM as the assistant turn ("preserve the raw XML so it remembers"), so at
+temp 0.6 the model copied its own broken shape on turns 2/3/5 (in-context imitation beat
+four recovery hints — which were teaching the WRONG dialect for the native path anyway);
+turn 4 stalled → structural=6 → abort, failed·0.46. Evidence:
+`llm_recordings/2026-08-01.jsonl` req 65d8cf76eb814134 (turn-1 history had ZERO XML
+examples; turn-2 payload shows the verbatim replay).
+
+**Fixes (agent.py):**
+- **Heal:** `<tool_call…>` directly followed by `function…=` gets its `<` restored —
+  anchored to the opener so parameter bodies can't be rewritten. Recovers all five
+  incident turns; a sweep of ~4,300 healthy recorded contents (07-31 + 08-01) fired ZERO
+  false heals.
+- **Replay scrub:** on an actual failed block (`system_parse_error` entry — NOT
+  `parse_failure_reason` alone; "truncated" accompanies fully-executed calls), the failed
+  tool-call XML in the replayed assistant message becomes a constant-size note. Covers
+  `<tool_call`/`<tool`/`<function(_name)` shapes, skips backtick-quoted mentions,
+  hard-bounded (first 2 regions → notes, rest deleted), callable replacement (no template
+  injection).
+- **Path-aware hints:** `no_function_tag`/generic/escape-hatch recovery messages now
+  serve the equals dialect on the native path (`_tool_call_format_example`, keyed on
+  `args.native_tools`) — attribute style stays on legacy. Both examples pinned to
+  round-trip through our own fallback parser.
+- **Review catches (2 read-only agents, execution-verified, all fixed same-session — the
+  streak holds):** scrub-gate false positive on executed mutations (would have asked the
+  model to re-run a completed mutation); history serializer rendered the synthetic
+  `system_parse_error` entries as an imitable attribute-dialect call once the scrub
+  removed the `already_inline` suppression (renderer now filters them); scrub missed
+  heal-only shapes (`<tool>`, `<function_name`); degenerate thousand-block replies
+  amplified ~5x through the scrub (now shrink); the lesion behind an UNCLOSED `<think>`
+  was swallowed silently by `_THINK_UNCLOSED_RE` strip-to-EOS (lookahead now knows the
+  lesioned opener); note-as-regex-template crash; attributed-opener and unquoted
+  `<function_name=` lesion variants.
+
+Tests: `test_parse_failure_recovery_fixes.py` (30, incl. the exact live payload) +
+path-aware parametrization of `test_system_parse_error_messaging`. Suite 10343 green
+(2 unrelated known flakes pass in isolation: interface dead-subscription prune,
+memory-bus concurrent fanout). Docs: `docs/core/agent.html` new section. DEPLOYED:
+listener 8511→16682, health ok, bounded live probe through the full turn loop returned
+exactly PARSER-DEPLOY-OK.
+
+**Watch:** `system_parse_error` fires on the native path should now be rare AND
+self-recovering (one note + correct-dialect hint, no imitation loop). Any repeat of a
+5-strike parse abort is news.
+
+**Follow-up (same session, operator: "fix this properly"):** the remaining dual-dialect
+nudge CLOSED — `_render_assistant_with_tool_calls` now takes `native=` (from
+`args.native_tools` at its single call site) and renders replayed history calls in the
+EQUALS dialect on the native path — i.e. exactly the bytes the model generated before the
+server parsed them into structured calls; legacy path keeps attribute style. Both render
+dialects pinned to round-trip through the fallback parser. Reviewer on the renderer change:
+change itself CLEAR (36-case adversarial round-trip harness, zero regressions; rendered
+shape byte-matches recorded emissions) but it flagged THREE MORE attribute-dialect leaks
+riding the native path — all closed same-session:
+- **SPECIALIST_SYSTEM_PROMPT (MAJOR, the surface the 07-31 header split missed):** two full
+  attribute examples (fix-script + CDATA rule) on EVERY coding turn, no native gate — the
+  prompt-block class the ablation showed corrupts stacked calls 8/8. Now a
+  `{{TOOL_XML_GUIDANCE}}` slot: legacy keeps the original verbatim; native gets the same
+  fix-script workflow with ZERO tool-call XML and a raw-values rule instead of CDATA (the
+  template parses values raw — a CDATA wrapper would land verbatim inside the argument).
+- **Cognitive-watchdog break_text:** the synthetic replan call (persisted + replayed) now
+  speaks the active path's dialect.
+- **GBNF grammar foot-gun:** `GHOST_TOOL_GRAMMAR=1` under `--native-tools` is refused with
+  a loud warning (grammar hard-codes attribute dialect → three-way conflict at the sampler).
+Native path is now one-dialect END TO END: system+specialist prompts teach no format,
+hints teach equals, history shows equals, sever-injections speak equals. The bigger unwind
+(structured tool_calls through the template, dropping the Qwen-Agent string translation)
+stays out of scope pending a 07-31-style ablation — logged as a §4B candidate.
+
+### 2026-08-01 (later 6) — web client → mobile app model (PWA + resume + web push), operator-requested
+
+Operator: "make the web UI fully mobile compatible; requests must survive locking the
+iPhone; iOS notifications must work — like the Claude/Gemini apps." Shipped + live-verified
+(interface tests 153 green; Playwright 7/7 on iPhone viewport incl. reload-mid-stream
+recovery; REAL push delivered to both live device subscriptions, sent:2).
+
+- **Mobile layout.** Face-form menu: two-axis viewport clamp + max-height scroll (the
+  right-anchored menu near the LEFT edge of the centered ≤480px header hung ~114px
+  off-screen). **Safe-area trap, bit twice:** a `padding:` SHORTHAND in a header media
+  query silently resets the base `padding-top: max(…, env(safe-area-inset-top))` — in a
+  standalone (home-screen) PWA the header sat under the clock/Dynamic Island. Re-assert
+  insets after EVERY header padding shorthand (≤480 portrait AND the ≤1280×720
+  landscape/uConsole block, which needs left/right too — the island owns the left edge in
+  landscape; max() keeps the uConsole unchanged).
+- **In-flight turn survival (the Claude-app spine).** The proxy already buffered streams
+  (task TTL counts from COMPLETION — long turns survive) and the agent persists replies
+  into sessions; only the HANDLE died with the page. Now: `ghost_inflight_turn` in
+  localStorage (taskId+sessionId+tabId+5s heartbeat) → boot/visibility/pageshow probe
+  `GET /api/chat/task/{id}/state` (new) → reattach the stream, or poll `/api/turns`
+  ("Ghost is still working…"), or ADOPT the session history wholesale (never append —
+  merge_history doubling). `/clear` drops the handle; session-mismatched handles are
+  discarded; a fresh other-tab heartbeat blocks hijack, a stale one allows adoption.
+- **Web push (iOS-capable).** Prereqs: tailscale serve :8443 → :8080 (SW + APNs need a
+  REAL cert; self-signed :8080 cannot), dynamic key-gated `/manifest.webmanifest` (link
+  injected by server.py; start_url carries the key; nothing keyed in unauthed /static),
+  SW registration gate `(!isIOS || isStandalonePWA)`. Transport:
+  `interface/webpush_notify.py` + VAPID keypair (~/Data/AI/.ghost_vapid.json 0600) +
+  subs store (0600 from first byte). Producers: (a) reply-ready via the ACK-GRACE
+  contract — live JS POSTs `/api/chat/ack/{id}` after rendering; no ack in 12s
+  (GHOST_PUSH_ACK_GRACE) + not user-cancelled → push with request preview ("stream
+  drained" is NOT delivery: dead sockets buffer the tail); (b) notify-severity ledger →
+  consumer `web-push`, ≤5/cycle, last-acked watermark (no mtime churn).
+- **REVIEW CATCHES (6th straight session; 2 CRIT + 5 MAJ past 150 green tests AND a live
+  Playwright pass):** (1) push was 100% DEAD — pywebpush cannot parse PEM
+  (`Vapid.from_string` b64-decodes); fixed by passing a py_vapid Vapid INSTANCE; the
+  mocked-pywebpush tests were green throughout → added a REAL-crypto test (fake only the
+  HTTP session). (2) deterministic double-resume on the exact iOS bg/fg flow (boot +
+  visibilitychange + legacy resumeOnVisible all fire; async guard ≠ mutex) → synchronous
+  `resumeLatch` + `resuming&&isProcessing` bail. Plus: cancelled turns pushed "Reply
+  ready" (→ `cancelled` flag), /clear resurrection, reconcile-adopt racing a live turn
+  (re-check after every await), VAPID-rotation deadness (client re-binds), multi-tab
+  hijack (heartbeat), watermark ack churn, ticker leak, subs-file mode window, probe
+  tasks at shutdown.
+- **Keyboard-offset rotation bug (operator repro: focus input → rotate → rotate back →
+  input pinned at the TOP).** `--keyboard-height` is computed as `innerHeight − vv.height`
+  — during rotation those two briefly describe DIFFERENT orientations (a bogus
+  half-screen "keyboard"), and iOS dismisses the real keyboard mid-rotate so no later
+  event corrected the translate. **First fix (v7.9: coherence guard + settled
+  re-measures) FAILED on real Safari** — WebKit can keep the element focused after
+  killing the keyboard AND report stale visualViewport geometry until the next user
+  interaction, so any recompute-based repair builds on numbers that lie. Shipped fix
+  (v8.0): DON'T measure at rotation — force the state: width-change/orientationchange ⇒
+  blur the editable (the keyboard is gone anyway) + write 0 immediately + settled
+  re-measure later; focusout ⇒ 0; retry-capped coherence guard (an uncapped one can
+  freeze tracking forever under persistent width incoherence); 55% clamp. Lesson
+  upgraded: on rotation don't repair derived values — make the underlying state
+  deterministic and derive from that.
+- **Cosmetic follow-ups (operator):** PWA/notification icons swapped to the ghost
+  artwork (`sips` from ghost.jpg → icons/ 180/192/512, `?v=2` busting; installed PWAs
+  keep their install-time icon — remove + re-add); status label `SYSTEM ONLINE` → `ONLINE`
+  (wrapped to two lines fullscreen).
+- **Operator setup (one-time, documented in docs/interfaces/web_server.html):** open
+  `https://eva.taila2b1d.ts.net:8443/?key=…` in Safari → Add to Home Screen → open the
+  installed app → tap once to grant notifications. Version chain ended the session at:
+  style 5.0, app/matrix 8.2.
+
 ### 2026-08-01 (later 5) — §4 remaining-work sweep: Phase-2b miner+read-site BUILT, Phase-3 flip prereq test, §4E Tier 3 SHIPPED
 
 Cleared every §4 item that was actionable without waiting on a clock or evidence gate. Suite

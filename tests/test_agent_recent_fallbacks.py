@@ -58,7 +58,15 @@ async def test_json_root_key_healing(mock_context):
     assert "execute" in tools_called, "JSON with root key tool name was not healed properly"
 
 @pytest.mark.asyncio
-async def test_system_parse_error_messaging(mock_context):
+@pytest.mark.parametrize("native_tools,expected_tag,forbidden_tag", [
+    # Native path: the server template speaks the EQUALS dialect —
+    # teaching attribute-style there re-introduces the dual-dialect
+    # corruption root-caused 2026-07-31 (req 65d8cf76 fix cluster).
+    (True, "<function=the_tool_name>", '<function name="'),
+    # Legacy XML path keeps attribute style — its QWEN_TOOL_PROMPT contract.
+    (False, '<function name="the_tool_name">', "<function="),
+])
+async def test_system_parse_error_messaging(mock_context, native_tools, expected_tag, forbidden_tag):
     mock_llm = mock_context.llm_client
     # Simulate an invalid tool block that triggers system_parse_error
     mock_llm.chat_completion.side_effect = [
@@ -69,23 +77,24 @@ async def test_system_parse_error_messaging(mock_context):
             "choices": [{"message": {"content": "SUCCESS: I have finished."}}]
         }
     ]
-    
+    mock_context.args.native_tools = native_tools
+
     agent = GhostAgent(context=mock_context)
     agent.available_tools = {"execute": AsyncMock(return_value="executed_successfully")}
-    
+
     messages = [{"role": "user", "content": "Run script"}]
     body = {"messages": messages, "model": "test-model"}
     await agent.handle_chat(body, background_tasks=MagicMock(), request_id="req123")
-    
+
     err_msgs = [m["content"] for m in body["messages"] if m.get("role") == "tool" and m.get("name") == "system"]
     assert len(err_msgs) > 0
-    # Recovery message is now reason-specific. For this fixture (an
-    # <invalid>1</invalid> bare tag with no <function>), the branch is
-    # "no_function_tag" — which must direct the model to the correct
-    # shape. The old assertion on the verbatim legacy wording was
-    # brittle — check behaviourally for the XML example instead.
+    # Recovery message is reason-specific AND path-aware: for this
+    # fixture (an <invalid>1</invalid> bare tag with no <function>),
+    # the branch is "no_function_tag" — it must show the dialect the
+    # active prompt path actually speaks, and ONLY that dialect.
     assert "SYSTEM ERROR" in err_msgs[0]
-    assert "<function name=" in err_msgs[0]
+    assert expected_tag in err_msgs[0]
+    assert forbidden_tag not in err_msgs[0]
 
 @pytest.mark.asyncio
 async def test_auto_diagnostic_sandbox_state_append(mock_context):

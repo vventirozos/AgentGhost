@@ -8,6 +8,10 @@
     <meta name="theme-color" content="#000000">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Ghost">
+    <!-- The manifest link is injected by server.py (its URL carries the
+         access key); the touch icon is safe as static markup. -->
+    <link rel="apple-touch-icon" href="/static/icons/icon-180.png?v=2">
     <title>Ghost Interface</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -30,7 +34,7 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=4.8">
+    <link rel="stylesheet" href="/static/style.css?v=5.1">
 </head>
 
 <body>
@@ -77,10 +81,13 @@
                 </div>
             </div>
             <div id="render-content-wrapper">
-                <!-- Same-origin iframe: ONLY used to display our own blob
-                     previews (images / PDFs), which need parent access to
-                     write into contentDocument. Never receives agent code. -->
-                <iframe id="render-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
+                <!-- Same-origin iframe: ONLY our own generated wrappers and
+                     blob previews (images / PDFs). Never receives agent code.
+                     Deliberately NOT sandboxed: `sandbox` on a same-origin
+                     frame with allow-scripts+allow-same-origin is a security
+                     no-op, but its plugins-sandbox flag is unclearable and
+                     blocked the PDF viewer in every engine (2026-08-01). -->
+                <iframe id="render-iframe"></iframe>
                 <!-- Sandboxed iframe: renders untrusted agent-authored
                      HTML/CSS/JS via srcdoc. NO allow-same-origin, so it gets
                      an opaque origin and cannot reach window.parent (and thus
@@ -114,7 +121,7 @@
                 <div id="status-wrapper">
                     <div id="status-indicator" role="button" tabindex="0" title="Agent status">
                         <span id="connection-dot"></span>
-                        <span id="status-text">SYSTEM ONLINE</span>
+                        <span id="status-text">ONLINE</span>
                         <span id="model-pill" class="hidden"></span>
                     </div>
                     <div id="planner-monologue"></div>
@@ -259,7 +266,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=7.6"></script>
+    <script type="module" src="/static/app.js?v=8.3"></script>
 </body>
 
 </html>

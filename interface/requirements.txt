@@ -3,3 +3,4 @@ uvicorn
 websockets
 jinja2
 httpx
+pywebpush
