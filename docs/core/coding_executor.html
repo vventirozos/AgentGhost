@@ -227,6 +227,38 @@
   <h2>Anchored success/error classifiers (bug-hunt 2026-07-26b)</h2>
   <p><code>_op_ok</code> was <code>"success" in out[:200]</code> — a SUBSTRING test. The file_system no-match message embeds the filename (<code>… NOT found in 'payment_success.html'</code>), so a FAILED replace on any <code>*success*</code>-named file (common in web deliverables) had "success" land in the window and counted the un-applied edit as applied — closing the coding leaf DONE with the file unchanged. Now anchored on the SUCCESS head (<code>head.startswith("success")</code>), matching the sibling <code>_looks_like_write_error</code>, whose own <code>"security error" in head</code> substring nit (misclassifying a successful write to a <code>security error handler.py</code>) was anchored to <code>startswith</code> in the same pass. Tests: <code>::TestOpOkAnchored</code>.</p>
 
+  <h2>Never corrupt a working Python file (2026-08-01, "Mini AI" incident)</h2>
+  <p>Autoadvance re-picked a task whose deliverable an interactive turn had already built and
+  verified (the ledger still said PENDING), and the spec appended a SECOND full implementation
+  into the working <code>core.py</code>. Python appends have no isolation (unlike HTML's
+  IIFE-wrapped scripts): the merged file hit a SyntaxError at line 379, three repair attempts
+  failed against it, the task was marked FAILED and the project rolled up FAILED — all while a
+  working file had existed on disk minutes earlier. Three defenses, all <em>pre-write</em>
+  (the post-write syntax signal catches damage only after the working file is already gone):</p>
+  <ul>
+    <li><strong><code>_py_append_guard</code></strong> — an append to a <em>parsing</em>
+    <code>.py</code> file is refused when it re-defines top-level <code>def</code>/<code>class</code>
+    names already present (a duplicate implementation, not an extension), when it adds a second
+    <code>if __name__ == "__main__"</code> block, or when the merged result would not
+    <code>ast.parse</code>. A broken base keeps the old flow (mid-repair files need appends).</li>
+    <li><strong>Overwrite guard</strong> — full-<code>content</code> replacement of a parsing
+    <code>.py</code> file with content that does not parse is refused before the write; the
+    working file survives on disk and the retry gets the exact diagnostic.</li>
+    <li><strong>Verify-only path is first-class</strong> — the spec prompt (system rules + an
+    <code>ALREADY ON DISK</code> steer rendered by <code>_render_already_built</code> when the
+    task description names files that already exist) tells the model to return
+    <code>{"files": [], "verify": "…"}</code> when the deliverable already works.
+    <code>_generate_build_spec</code>'s <code>_usable</code> now accepts a verify-only spec, so
+    it can't be clobbered by the reasoning-channel fallback or steered into re-implementation
+    by the retry loop; <code>build_coding_task</code>'s existing no-files path honours the
+    verify and closes the task without rebuilding. A verify-only spec whose verify is
+    kill-shaped (<code>pkill</code>/<code>fuser -k</code>/…) is refused with feedback rather than
+    skip-passed: with no files, the verify is the ONLY check, so the <code>_run_verify</code>
+    "skip, the files may be good" rationale doesn't apply (review pass, same day).</li>
+  </ul>
+  <p>Tests: <code>tests/test_project_ledger_integrity_fixes.py</code> (guards, disk-survival
+  end-to-end, verify-only survival, ALREADY-ON-DISK steer).</p>
+
 </main>
 </body>
 </html>

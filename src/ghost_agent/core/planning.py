@@ -188,6 +188,14 @@ class TaskTree:
                     )
                     self._check_parent_failure(node.parent_id)
                     return
+                # A task that actually reaches DONE has no CURRENT failure.
+                # Keeping the old failure_reason made every later briefing/
+                # ledger read show a resolved defect as live ("core.py does
+                # NOT parse" survived on a DONE row — 2026-08-01 Mini AI
+                # incident), and downstream failure-dimension tooling counted
+                # it as an open failure. Cleared only AFTER the gates above
+                # pass, so a demoted DONE keeps its real reason.
+                node.failure_reason = ""
                 self._check_parent_completion(node.parent_id)
             elif status in [TaskStatus.FAILED, TaskStatus.BLOCKED]:
                 self._check_parent_failure(node.parent_id)
@@ -287,12 +295,18 @@ class TaskTree:
             # completed (which then cascades up to the root).
             if child_statuses and all(s == TaskStatus.DONE for s in child_statuses):
                 parent.status = TaskStatus.DONE
+                # Same rule as the direct DONE path in update_status: a node
+                # that reaches DONE has no CURRENT failure. A revived child
+                # closing DONE promotes a once-FAILED parent here, and the
+                # stale reason would otherwise survive on the DONE row.
+                parent.failure_reason = ""
                 self._check_parent_completion(parent.parent_id, visited)
 
         elif parent.dependency_type == DependencyType.ANY:
             # First successful child satisfies the parent (OR-branch)
             if any(s == TaskStatus.DONE for s in child_statuses):
                 parent.status = TaskStatus.DONE
+                parent.failure_reason = ""
                 # Collect the winning child's result
                 for cid in parent.children:
                     child = self.nodes.get(cid)
@@ -319,6 +333,7 @@ class TaskTree:
                     parent.result_summary = best.result_summary
                     parent.actual_tool_used = best.actual_tool_used
                     parent.status = TaskStatus.DONE
+                    parent.failure_reason = ""
                 else:
                     parent.status = TaskStatus.FAILED
                     parent.failure_reason = "All BEST-dependency children failed"

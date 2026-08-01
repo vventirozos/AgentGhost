@@ -212,6 +212,30 @@ python scripts/verify_bench.py --base-url http://127.0.0.1:8080 \
   expensive escalation path has to catch it.
   Tests: <code>tests/test_log_audit_fixes_2026_07_29.py::TestSubjectiveGlossRule</code>.</p>
 
+  <h2>Live project-ledger evidence on project turns (2026-08-01)</h2>
+  <p>The Mini AI incident's last line of defense failed politely: the reply claimed the project
+  was complete, the store said <code>project=FAILED</code> with a FAILED task, and the verifier
+  CONFIRMED at 95% — because its evidence held only the turn's tool outputs, and the final
+  autoadvance output itself claimed completion (the claim under audit was its own evidence).
+  <code>core/agent._project_ledger_evidence</code> now appends a live snapshot —
+  <code>[project ledger (live)] project &lt;id&gt; "title" status=…; task &lt;id&gt; STATUS
+  "description" (failure: …)</code> — to the claim evidence whenever the turn ran
+  <code>manage_projects</code> (synthetic entries excluded), read from the store at verify time.
+  Covers the switched-current project plus any project id the manage_projects outputs mention
+  (the tool accepts an explicit <code>project_id</code> without switching, so <code>current</code>
+  alone could judge claim B against ledger A). Capped at 1000 chars; the evidence packer's budget
+  shrinks by the block's size so it always survives <code>verify_claim</code>'s 4000-char evidence
+  cap. Best-effort: no store, no resolvable project, or a store error yields no block and the old
+  behavior.</p>
+  <p>Two turn shapes needed their own plumbing (review pass, same day): (a) a turn whose ONLY
+  tool was <code>manage_projects</code> used to skip the verifier entirely (bookkeeping run-gate) —
+  an output carrying a batch outcome (<code>"stop_reason"</code>, the autoadvance payload
+  signature) now counts as substantive, while plain task_list/create confirmations keep skipping
+  per the 2026-07-25 run-gate/evidence-set split; (b) the code-shaped branch
+  (<code>verify_code_output</code>) judged on the execute output alone — the ledger block now rides
+  the tail of that output too, inside its own 4000-char cap. Tests:
+  <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

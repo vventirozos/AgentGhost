@@ -141,6 +141,16 @@
   <h2>Dependency-cycle guard (2026-07-26c)</h2>
   <p><code>deps_satisfied</code> now detects a <code>depends_on</code> CYCLE (A→B→A). Unlike <code>set_dependency</code>, <code>add_task</code>/<code>decompose</code> don't reject cyclic deps, so every task in a cycle stayed permanently ineligible — <code>next_ready_leaf</code> returned None and <code>advance_many</code> falsely reported <code>project_done</code> on a plan that still held open PENDING work. When a node is in a cycle, its cyclic deps are treated as satisfied (same "a bad reference can't deadlock the whole plan" philosophy as unknown dep ids) so the cycle drains. A normal unsatisfied dep still blocks. Tests: <code>tests/test_bughunt_fixes_2026_07_26b.py::TestDepsCycle</code>.</p>
 
+  <h2>DONE clears <code>failure_reason</code> (2026-08-01)</h2>
+  <p><code>TaskTree.update_status(DONE)</code> left the node's old <code>failure_reason</code>
+  in place, so a task that failed once and was later fixed and closed carried its dead
+  diagnostic forever — every briefing and ledger read showed a resolved defect as live
+  ("core.py does NOT parse" survived on a DONE row in the Mini AI incident), and
+  failure-dimension tooling counted it as an open failure. A DONE that passes the human-gate
+  and postcondition gates now blanks <code>failure_reason</code>; a postcondition-demoted
+  DONE keeps its real (new) reason. Persisted by <code>ProjectPlan.update_status</code>'s
+  field diff as before. Tests: <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

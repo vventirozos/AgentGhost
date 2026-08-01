@@ -1314,8 +1314,19 @@ async def advance_many(
         cls = (res.classification or "").lower()
         if cls == "idle":
             # No ready leaf — all tasks terminal, or the rest are blocked by a
-            # failed dependency. Either way the batch is done advancing.
+            # failed dependency. Either way the batch is done advancing. But
+            # "done advancing" is not "done": when the LEDGER holds FAILED
+            # tasks (from an earlier batch/request — _final_reason only sees
+            # THIS batch), reporting project_done relays a false completion.
             stop_reason = _final_reason("project_done")
+            if stop_reason == "project_done":
+                try:
+                    if any(str(t.get("status", "")).upper() == "FAILED"
+                           for t in store.list_tasks(project_id)):
+                        stop_reason = "project_failed"
+                except Exception:
+                    logger.debug("idle-stop ledger scan skipped",
+                                 exc_info=True)
             break
         if cls == "blocked":
             # budget exhaustion, a non-ACTIVE project, or a project that just
@@ -1324,7 +1335,17 @@ async def advance_many(
             if pstatus == "DONE":
                 stop_reason = "project_done"
             elif pstatus == "FAILED":
-                stop_reason = _final_reason("project_done")
+                # NEVER "project_done" here. A batch invoked on an
+                # already-FAILED project used to fall through
+                # _final_reason("project_done") — with nothing advanced in
+                # THIS batch it reported "All tasks are complete — the
+                # project is done" over a ledger that said FAILED, and the
+                # agent relayed the completion to the user verbatim
+                # (2026-08-01 Mini AI incident, final autoadvance call).
+                stop_reason = ("completed_with_failures"
+                               if any(a.get("status") == "FAILED"
+                                      for a in advanced)
+                               else "project_failed")
             else:
                 stop_reason = "budget_or_inactive"
             break

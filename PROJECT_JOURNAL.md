@@ -469,14 +469,30 @@ templates confirmed loading on live turns. (b) tool descriptions — ⏳ COLLECT
 2026-07-30 ~16:06: the §4E supply-first check measured ZERO usable fixtures (recordings off since
 07-17; the one day-file is a stub) — so `GHOST_LLM_RECORD=1` is now exported in the launcher
 (dated comment + removal criterion; ⚠ recordings are UNREDACTED, local-disk only) and verified
-capturing (108 KB/turn; ~43-tool payloads). MINER CONTRACT learned from live records: tool choices
-are embedded in `message.content` as parsed tool syntax (+ reasoning_content) — NOT structured
-tool_calls; the miner must reuse the agent's own content parser. RUN PLAN: after ~3-7 days of
-supply → mine fixtures (ground truth = choices from turns whose tool executed without error,
-public/private split by request_id hash) → registry read-site via optim loader (per-tool
-description artifacts, length-capped validation) → gepa multi-component optimization → private
-gate → restart deploy. Then FLIP GHOST_LLM_RECORD BACK OFF and archive/delete day-files per
-operator preference. The `optim/__init__` exclusions (dream/watchdog/safety prompts) STAND.
+capturing. **SUPPLY AUDIT 2026-08-01 over the first full day (07-31, 3015 records / 68 MB): all
+required data IS being captured — miner contract CORRECTED.** The main agent loop STREAMS: tool
+choices ride `kind=chat_completion_stream` records whose reassembled responses carry STRUCTURED
+`tool_calls` (327/399; the 07-30 "content-embedded" note was the non-stream path only — those 17
+records have empty content and are ignorable). Distribution: file_system 134, browser 114,
+vision 31, execute 25, manage_projects 16, manage_services 13, web_search 12 (+2 minor) over 66
+requests ≈ **~330 fixtures/day → ~2k by T+7d**. Choice→result pairing WORKS: 319/327 choices link
+to their outcome via ordinal-consecutive records in the same request_id (tool results ride
+USER-role messages in this dialect). Miner gotchas pinned: outcome classifier must treat
+`EXIT CODE: 0` as success (bare "EXIT CODE" match overcounts errors 136 vs true subset) and use
+the failure-report conventions; split by request_id hash (session_id also present).
+**CONTRACT AMENDMENTS from the operator's 2026-07-31 fix cluster (audited 2026-08-01):**
+(1) **ERA FILTER — use only records with ts ≥ 2026-07-31T19:15 local**: the
+QWEN_TOOL_PROMPT_NATIVE split (§6 07-31 "later 2", deployed ~18:54) changed the system prompt in
+every native-path context, and the honest-failure rule landed ~19:14 — earlier records embed the
+old dual-dialect prompt and old outcome semantics (current-era supply: 87 on 07-31 evening + ~330
+per full day thereafter). (2) **GROUND TRUTH = trajectory outcome labels via
+TrajectoryCollector.iter_trajectories() (corrections-sidecar overlay applied), joined on
+request_id — NOT raw exit-code heuristics**: the honest-failure rule (§6 07-31 "later 3") means a
+failed tool + honest report = PASSED; for tool-CHOICE polarity, honest-failure turns are
+EXCLUDED from the fixture set (choice signal ambiguous — never labeled bad per the rule, not
+claimed good either), clean PASSED = positive, REFUTED/shape-FAILED = negative. RUN PLAN
+otherwise unchanged: mine → registry read-site via optim loader → gepa → private gate → restart
+deploy → FLIP GHOST_LLM_RECORD BACK OFF + archive/delete day-files per operator preference. The `optim/__init__` exclusions (dream/watchdog/safety prompts) STAND.
 
 **Phase 3 — trajectory-level test-time scaling. ✅ BUILT 2026-07-30 (§6), default-OFF pending
 measured wins.** (a) Logit-expectation probe: BUILT as a score-token probe (digit-scale + top-
@@ -533,7 +549,13 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    T+3d (~08-02) log spot-check — `escalated_overturn` count, correction churn, false-refute
    complaints; T+7d (~08-06) verify_bench re-run vs t0 + graded outcome-label trend; T+14d (~08-13)
    VERDICT per the amended acceptance rule → **decides Phase 4 (parked unless clearly positive)**.
-   Ask any session for "the 4F watch reading".
+   Ask any session for "the 4F watch reading". **⚠ Reading caveats (audited 2026-08-01):**
+   (a) the honest-failure rule (07-31 ~19:14) is a LABEL-SEMANTICS step change — outcome-label
+   trends must segment at that boundary or the relabeling masquerades as improvement; (b) refute
+   greps must match ALL spellings ("verifier gate — REFUTED", "LATE REFUTED", "refuted (late)") —
+   naive "verifier — REFUTED" counts ZERO; (c) the 17-boot day (07-31) was operator deploy
+   cycles, NOT instability — uptime metrics should exclude it; (d) in-process activation counters
+   reset per boot — use the loader log lines for cross-boot activation evidence.
 2. **Phase 2b fixture supply** (`GHOST_LLM_RECORD=1` in the launcher since 07-30 16:06 —
    UNREDACTED, local-only): **supply was structurally broken until 07-31 ~13:40** — the main tool
    loop STREAMS and the recorder had no streaming hook (the §4-parked "dev feature" turned out
@@ -1357,6 +1379,56 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-08-01 — Mini AI incident (req b7e516b9): five ledger-integrity defects fixed + data repaired
+
+**The operator asked what went wrong with project management in request b7e516b9. Root-cause
+chain: (1) task_decompose's dedup keyed on the generic "Implement:"/"Research:" colon-head, so
+5 planned tasks silently persisted as 3 — the agent then spent turns updating PHANTOM
+train.py/demo.py ids; (2) the agent built core.py out-of-band, the ledger stayed PENDING, and
+a re-invoked autoadvance re-executed the task, APPENDING a second implementation into the
+working file (SyntaxError line 379) → task FAILED → project auto-rolled FAILED; (3) the agent
+rebuilt+verified core.py within minutes but the recorded "does NOT parse" evidence was never
+re-checked, wedging every close attempt; (4) the final autoadvance on the FAILED project
+reported "All tasks are complete — the project is done"; (5) the verifier CONFIRMED the false
+completion at 95% because its evidence never contained the ledger.**
+
+**All five fixed** (tests: `tests/test_project_ledger_integrity_fixes.py`, 25 new):
+- `_feature_key` generic-head fix + `dropped_duplicates` reporting on decompose/create;
+  `task_update` unknown ids return `valid_tasks` + instruction (tools/projects.py).
+- Coding executor pre-write guards: `_py_append_guard` (duplicate top-level defs / second
+  `__main__` / merged-unparseable → refused BEFORE the write), overwrite guard (never replace
+  a parsing .py with non-parsing content), `ALREADY ON DISK` spec steer + verify-only spec
+  (`files:[]` + verify) accepted by `_usable` (core/coding_executor.py).
+- Stale-evidence live re-check: `task_update status=done` on a FAILED task with parse-shaped
+  failure_reason re-runs the syntax check on the CURRENT file — passes become result evidence,
+  failures refuse with the current diagnostic (`_recheck_stale_parse_failure`); DONE clears
+  `failure_reason` (core/planning.py).
+- `advance_many` returns `project_failed` (never `project_done`) on a FAILED project/ledger;
+  autoadvance payload carries `failed_tasks` from the store; `task_next` lists `parked_tasks`
+  with the revival path.
+- `_project_ledger_evidence` (core/agent.py): manage_projects turns append a live ledger
+  snapshot to the verifier's claim evidence, inside the 4000-char cap.
+
+**Data repair (live DB, operator-approved): core.py task DONE with live-verified evidence
+(stale reason cleared), train.py task added retroactively as DONE (decompose had eaten it),
+deliverables registered (core.py, train.py, research brief), project rolled DONE. demo.py was
+never persisted as a task and never built — add a task if still wanted. Docs:
+docs/tools/projects.html, docs/core/{coding_executor,project_advancer,planning,verifier}.html.**
+
+**Review pass (fresh read-only agent on my own edits — the 2026-07-27 discipline paid again,
+6 real findings past a green suite, all fixed + pinned): (1) the live re-check counted
+UNCHECKABLE files (no node binary, unknown ext, read error → `_syntax_feedback`'s "" is clean
+AND unknown) as passes — would have force-closed tasks on manufactured evidence; now only
+verifiable types count. (2) The verifier ledger block was dead on the two most incident-like
+turn shapes: manage_projects-only turns (bookkeeping run-gate skipped → autoadvance outcomes
+with `"stop_reason"` now count as substantive) and execute-ending turns (code branch dropped
+claim_evidence → ledger now rides verify_code_output's output). (3) Ledger snapshot used only
+current_project_id — now also resolves project ids named in the tool outputs. (4) Verify-only
+spec + kill-shaped verify closed a task with ZERO checks — now refused with feedback. (5)
+Parent-cascade DONE promotions kept stale failure_reason — cleared like the direct path. (6)
+The recheck path regex's space-tolerant class swallowed "py_compile failed for core.py" as one
+bogus path — space removed, fail-safe direction preserved.**
 
 ### 2026-07-31 (later 5) — The caption-lesson hypothesis was FALSE: nothing to scrub, and the retraction mechanism had already worked
 

@@ -292,6 +292,17 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
             _c = str(tool.get("content", "")).lstrip()
             if _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
                 return tool
+            # An autoadvance BATCH OUTCOME is a substantive completion/
+            # failure claim, not a state-change confirmation (2026-08-01
+            # Mini AI: the turn's only tool was manage_projects autoadvance
+            # whose output said "project done" over a FAILED ledger — the
+            # run gate skipped, so no verdict, no repair, and the false
+            # completion reached the user unchecked). stop_reason is the
+            # batch payload's signature key; plain task_list/switch/create
+            # confirmations keep skipping per the run-gate/evidence-set
+            # split (2026-07-25).
+            if collapsed == "manage_projects" and '"stop_reason"' in _c:
+                return tool
             continue
         return tool
     return None
@@ -358,6 +369,80 @@ def _squeeze_evidence_noise(text: str) -> str:
     """Collapse zero-entailment-value bulk (long tracking URLs) in a tool
     output before it competes for the verifier's evidence budget."""
     return _EVIDENCE_LONG_URL_RE.sub(lambda m: m.group(0)[:64] + "…", text)
+
+
+def _project_ledger_evidence(context, tools_run: Optional[list],
+                             cap: int = 1000) -> str:
+    """A LIVE project-ledger snapshot for the verifier's evidence, when the
+    turn touched ``manage_projects``.
+
+    The 2026-08-01 Mini AI turn ended with the agent relaying "the project
+    is done" while the store said project=FAILED with a FAILED task — and
+    the verifier CONFIRMED it at 95%, because its evidence held only the
+    turn's tool outputs (whose final autoadvance text itself claimed
+    completion). The ledger is the ground truth the claim is about; give
+    the judge the actual rows. Read at verify time (post-mutation), capped,
+    best-effort — returns "" whenever there is nothing project-shaped to
+    add."""
+    mp_contents: list = []
+    for t in tools_run or []:
+        if not t or t.get("_synthetic"):
+            continue
+        if str(t.get("name", "")).lower().strip() == "manage_projects":
+            mp_contents.append(str(t.get("content", "")))
+    if not mp_contents:
+        return ""
+    store = getattr(context, "project_store", None)
+    if store is None:
+        return ""
+    # The project(s) the turn ACTUALLY operated on: the switched-current
+    # project plus any project id the manage_projects outputs mention —
+    # the tool accepts an explicit project_id without changing
+    # current_project_id (the autoadvance path pins it deliberately), so
+    # snapshotting only `current` could judge claim B against ledger A.
+    pids: list = []
+    cur = getattr(context, "current_project_id", None)
+    if cur:
+        pids.append(str(cur).lower())
+    try:
+        for c in mp_contents:
+            for tok in re.findall(r"\b[0-9a-f]{12}\b", c[:8000]):
+                if tok in pids:
+                    continue
+                if store.get_project(tok):
+                    pids.append(tok)
+                if len(pids) >= 2:
+                    break
+            if len(pids) >= 2:
+                break
+    except Exception:
+        pass
+    blocks = []
+    for pid in pids[:2]:
+        try:
+            proj = store.get_project(pid)
+            if not proj:
+                continue
+            tasks = store.list_tasks(pid)
+        except Exception:
+            continue
+        parts = [
+            f"project {pid} \"{(proj.get('title') or '')[:40]}\" "
+            f"status={proj.get('status')}"
+        ]
+        for t in tasks[:12]:
+            line = (f"task {str(t.get('id', ''))[:12]} {t.get('status')} "
+                    f"\"{(t.get('description') or '')[:60]}\"")
+            fr = " ".join((t.get("failure_reason") or "").split())
+            if fr and str(t.get("status", "")).upper() == "FAILED":
+                line += f" (failure: {fr[:120]})"
+            parts.append(line)
+        if len(tasks) > 12:
+            parts.append(f"(+{len(tasks) - 12} more tasks)")
+        blocks.append("; ".join(parts))
+    if not blocks:
+        return ""
+    return ("[project ledger (live)] " + " || ".join(blocks))[:cap]
 
 
 def _collect_verifier_evidence(tools_run: Optional[list],
@@ -5963,15 +6048,38 @@ class GhostAgent:
         # claim_text: lets the packer pull the OLDER output the claim leans
         # on (mid-turn observation displaced by a failed-retry tail —
         # 2026-07-25 dark-theme refute).
+        # Project-touching turns carry the LIVE ledger as evidence — the
+        # judge must see the store's actual project/task statuses, not just
+        # the turn's own tool narration (which is the thing under audit).
+        # The packer budget shrinks by the block's size and the block rides
+        # the END of the evidence, inside verify_claim's own [:4000] cap.
+        ledger_block = _project_ledger_evidence(
+            self.context, tools_run_this_turn)
         claim_evidence = _collect_verifier_evidence(
             tools_run_this_turn,
+            budget=(4000 - len(ledger_block) - 1) if ledger_block else 4000,
             claim_text=str(final_ai_content or "")) or tool_output
+        if ledger_block:
+            _room = 4000 - len(ledger_block) - 1
+            claim_evidence = ((claim_evidence[:_room] + "\n" + ledger_block)
+                              if _room > 0 else ledger_block)
         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
             code_text = _reconstruct_executed_code(messages, last_tool)
             if code_text:
+                # The code-shaped branch judges on `output` alone — without
+                # this, a project turn ending in an execute (e.g. `python
+                # demo.py` then "project complete") dropped the ledger
+                # block entirely and reproduced the unchecked-completion
+                # blind spot. Reserve tail room inside verify_code_output's
+                # own output[:4000] cap so the ledger survives.
+                _code_output = tool_output
+                if ledger_block:
+                    _lroom = 4000 - len(ledger_block) - 1
+                    _code_output = ((tool_output[:_lroom] + "\n" + ledger_block)
+                                    if _lroom > 0 else ledger_block)
                 v_result = await verifier.verify_code_output(
                     code=code_text,
-                    output=tool_output,
+                    output=_code_output,
                     intent=request_view,
                     response=final_ai_content or "",
                 )

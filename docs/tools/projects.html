@@ -296,6 +296,53 @@
   <h2>Constraint-gate sibling bypass (bug-hunt 2026-07-26b, HIGH)</h2>
   <p><code>task_update</code>'s constraint JUDGMENT gate cached its verdict in a single per-CALL variable, so in a bulk close (<code>task_ids=[t1,t2,t3]</code>) every sibling reused the FIRST task's audit. A constraint-VIOLATING sibling with different files inherited the first (clean) task's pass and closed DONE UNAUDITED — the exact safety bypass the gate exists to stop (and conversely a clean sibling was refused with the first task's evidence). The audit is now cached by the task's FILE SET (<code>frozenset(files)</code>): identical file sets still cost one audit, but a sibling with distinct files is judged on its OWN artifact. The refusal message carries each violating task's own reason. Tests: <code>tests/test_projects_tool_review_fixes.py::test_bulk_violating_sibling_with_different_files_is_audited</code>.</p>
 
+  <h2>Ledger-integrity fixes — the "Mini AI" incident (2026-08-01)</h2>
+  <p>Request <code>b7e516b9</code> chained five defects into a corrupted build and a false
+  completion report (project FAILED in the store while the reply said "done", verifier
+  CONFIRMED 95%). The tool-side fixes:</p>
+  <ul>
+    <li><b>Decompose dedup no longer collapses generic type prefixes.</b>
+    <code>_feature_key</code> keyed on the text before the first colon, so
+    "Implement: core.py…", "Implement: train.py…" and "Implement: demo.py…" all keyed as
+    <code>implement</code> and the duplicate filter silently ate every implement-task after the
+    first (5 planned → 3 persisted; the agent then updated PHANTOM ids for a whole request).
+    A generic head (<code>implement</code>, <code>research</code>, <code>design</code>,
+    <code>build</code>, …) now keys on a longer slice of the full description; specific feature
+    heads ("Core Shell: …") dedup exactly as before.</li>
+    <li><b>Drops are reported, never silent.</b> <code>task_decompose</code> (and
+    <code>create</code>-with-subtasks) return <code>dropped_duplicates</code> +
+    <code>agent_instruction_dropped</code> so the presented plan can't diverge from the persisted
+    ledger without a signal.</li>
+    <li><b><code>task_update</code> with unknown ids names the real ledger.</b> A bare
+    <code>missing:[…]</code> beside <code>count:0</code> read as an empty success and the model
+    retried invented ids. The payload now carries <code>agent_instruction_missing</code> +
+    <code>valid_tasks</code> (id/status/description) so one round-trip breaks the illusion.</li>
+    <li><b>Stale mechanical failure evidence is re-checked LIVE on a DONE attempt.</b> When a
+    FAILED task's <code>failure_reason</code> is parse-shaped ("does NOT parse", "SYNTAX CHECK
+    FAILED", …), <code>task_update status=done</code> re-runs <code>file_system._syntax_feedback</code>
+    on the referenced file(s) as they are NOW (<code>_recheck_stale_parse_failure</code>). If they
+    parse, the re-check result satisfies the evidence gates and becomes the task's
+    <code>result_summary</code>; if a file still fails, the DONE is refused with the CURRENT
+    diagnostic (<code>still_failing</code> + instruction) — a persuasive <code>result</code> string
+    cannot talk past the mechanical check. Only file types the checker can actually verify count
+    (<code>.py</code>/<code>.json</code> in-process; <code>.js</code>/<code>.html</code> only when a
+    node binary exists) — an <em>uncheckable</em> file yields not-applicable, never a fabricated
+    pass. The incident's wedge — a rebuilt, verified core.py blocked forever by an
+    autoadvance-era verdict — closes in one call.</li>
+    <li><b>No more "project is done" over a FAILED ledger.</b> <code>autoadvance</code> on a
+    project whose ledger holds FAILED tasks stops with <code>stop_reason=project_failed</code>
+    (new blurb: do NOT report completion) and returns <code>failed_tasks</code>
+    (id/description/failure_reason) even when THIS batch advanced nothing. <code>task_next</code>
+    with no ready leaf now lists <code>parked_tasks</code> (FAILED/NEEDS_USER) with the revival
+    path instead of a bare "no READY/PENDING leaf".</li>
+  </ul>
+  <p>Companion fixes: the coding executor's Python append/overwrite guards
+  (<a href="../core/coding_executor.html">coding_executor</a>), the advancer's
+  <code>project_failed</code> stop reason (<a href="../core/project_advancer.html">project_advancer</a>),
+  <code>failure_reason</code> cleared on DONE (<a href="../core/planning.html">planning</a>), and the
+  verifier's live project-ledger evidence (<a href="../core/verifier.html">verifier</a>).
+  Tests: <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

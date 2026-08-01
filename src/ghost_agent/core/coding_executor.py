@@ -27,6 +27,7 @@ leaf well (a spec call, N writes/edits, one verify), at most twice.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import re
@@ -215,6 +216,69 @@ def _structural_anchors(text: str) -> set:
     return out
 
 
+def _py_parse_error(text: str) -> Optional[str]:
+    """The SyntaxError diagnostic for Python source ``text``, or None when it
+    parses. In-process and cheap — used to refuse a write BEFORE it lands,
+    because the post-write check catches the damage only after a working file
+    on disk has already been replaced with a broken one."""
+    try:
+        ast.parse(text or "")
+        return None
+    except SyntaxError as se:
+        return f"{se.msg} (line {se.lineno}, col {se.offset})"
+    except Exception:  # noqa: BLE001 — e.g. NUL bytes; not a syntax verdict
+        return None
+
+
+_PY_TOPLEVEL_DEF_RE = re.compile(r"^(?:def|class)\s+([A-Za-z_]\w*)",
+                                 re.MULTILINE)
+
+
+def _py_append_guard(base: str, snippet: str, path: str) -> Optional[str]:
+    """Why appending ``snippet`` to the WORKING Python file ``base`` must be
+    refused — or None when the append is a safe extension.
+
+    Unlike HTML (where appended <script> blocks are IIFE-isolated), Python
+    concatenation has no isolation: a spec that re-emits an implementation
+    for a file that already implements the task lands old+new on disk —
+    duplicate defs, a second ``__main__`` block, and usually a SyntaxError
+    from a snippet that assumed different context. Observed live 2026-08-01
+    (Mini AI, request b7e516b9): autoadvance re-ran an already-built task,
+    appended a second full implementation into a tested, working core.py,
+    and left a file that failed to parse at line 379 — three repair attempts
+    later the task was FAILED and the project rolled up FAILED. Only guards
+    a base that PARSES: a mid-repair broken file keeps the old flow (the
+    post-write check reports it with the fresh diagnostic)."""
+    if not (base or "").strip() or not path.lower().endswith(".py"):
+        return None
+    if _py_parse_error(base) is not None:
+        return None
+    dup = sorted(set(_PY_TOPLEVEL_DEF_RE.findall(base))
+                 & set(_PY_TOPLEVEL_DEF_RE.findall(snippet or "")))
+    if dup:
+        return (f"append to {path} refused: it RE-DEFINES identifiers that "
+                f"already exist in the file ({', '.join(dup[:6])}) — that is "
+                f"a duplicate implementation, not an extension. The file "
+                f"already implements this; if the task is already done, "
+                f'return {{"files": [], "verify": "<cmd that proves it '
+                f'works>"}}. To CHANGE existing code use `edits`.')
+    if "__main__" in (snippet or "") and "__main__" in base:
+        return (f"append to {path} refused: the file already has an "
+                f"`if __name__ == \"__main__\"` block — appending a second "
+                f"entry point duplicates it. Use `edits` to change the "
+                f"existing block, or return files: [] with a verify if the "
+                f"task is already done.")
+    merged_err = _py_parse_error(_smart_append(base, (snippet or "").strip(),
+                                               path))
+    if merged_err:
+        return (f"append to {path} refused BEFORE writing: the merged file "
+                f"would not parse ({merged_err}) while the current file on "
+                f"disk parses cleanly. Do not break a working file — use "
+                f"`edits`, or files: [] with a verify if the task is "
+                f"already done.")
+    return None
+
+
 def _regression_reason(old: Optional[str], new: str) -> Optional[str]:
     """Why writing ``new`` over the existing ``old`` would LOSE work — or None
     if it safely extends. None for a brand-new file (no prior work to lose)."""
@@ -356,6 +420,54 @@ def _render_existing(existing_files: Optional[Dict[str, str]], single_file: bool
                 "growing file(s) with `append`/`edits` — never rewrite from "
                 "scratch." + lead)
     return lead + body + "\n"
+
+
+# A file path/name mentioned in a task description ("Implement: core.py - the
+# model core"). Used to notice that the task's deliverable ALREADY EXISTS.
+_TASK_NAMED_FILE_RE = re.compile(
+    r"(?<![\w./-])([\w][\w./-]{0,60}\.(?:py|js|mjs|cjs|json|html?|htm|css|md|"
+    r"sh|yml|yaml|toml|txt))(?![\w.])", re.IGNORECASE)
+
+
+def _task_named_existing(description: str,
+                         existing_files: Optional[Dict[str, str]]) -> List[str]:
+    """The existing-file keys that the task description names (exact path or
+    basename match). Non-empty means a previous turn probably already built
+    this task's deliverable."""
+    if not existing_files:
+        return []
+    named = {m.group(1).lstrip("./").lower()
+             for m in _TASK_NAMED_FILE_RE.finditer(description or "")}
+    if not named:
+        return []
+    out = []
+    for key in existing_files:
+        k = key.replace("\\", "/").lstrip("./").lower()
+        if k in named or k.rsplit("/", 1)[-1] in named:
+            out.append(key)
+    return out
+
+
+def _render_already_built(description: str,
+                          existing_files: Optional[Dict[str, str]]) -> str:
+    """Steer for the spec model when the task's named deliverable already
+    exists. Without this, autoadvance re-picking a task that an interactive
+    turn already finished re-IMPLEMENTED the file (2026-08-01 Mini AI: a
+    second full core.py appended into the working one → SyntaxError → task
+    FAILED → project FAILED). The executor's verify-only path ("files": [] +
+    "verify") exists exactly for this; the model just never knew to take it."""
+    matched = _task_named_existing(description, existing_files)
+    if not matched:
+        return ""
+    return (
+        "\nALREADY ON DISK: this task names file(s) that already EXIST in "
+        "the project: " + ", ".join(sorted(matched)[:6]) + ". A previous "
+        "turn may have already done this work — check their excerpts above "
+        "FIRST. If the file already implements the task, return "
+        '{"files": [], "verify": "<shell command that proves it works>"} — '
+        "do NOT re-send or re-implement it (a duplicate implementation "
+        "appended to a working file breaks it). Only emit file entries for "
+        "code that is genuinely missing, and prefer `edits` for changes.\n")
 
 
 def _render_research(research_context: Optional[Dict[str, str]]) -> str:
@@ -581,6 +693,8 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         "Rules: complete runnable code (no TODOs/stubs); BARE project-relative "
         "paths (no /workspace, sandbox/, projects/<id>/); only the files THIS "
         "task needs; prefer a runnable verify that exercises what you built. "
+        'When the deliverable ALREADY exists and works, "files" may be [] '
+        "with a verify that proves it — never re-implement working code. "
         "The verify must NOT kill or restart processes/services (no fuser -k, "
         "pkill, kill) — if a service is involved, probe the one already "
         "running (e.g. curl its port)."
@@ -606,6 +720,7 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
                  f"CONSISTENTLY with these):\n{ledger}\n")
     user += _render_research(research_context)
     user += _render_existing(existing_files, single_file)
+    user += _render_already_built(description, existing_files)
     if feedback:
         user += (f"\nYOUR PREVIOUS ATTEMPT FAILED: {feedback}\n"
                  "Produce a corrected spec that fixes exactly this.\n")
@@ -634,7 +749,19 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     from .agent import extract_json_from_text
 
     def _usable(s) -> bool:
-        return bool(isinstance(s, dict) and isinstance(s.get("files"), list) and s.get("files"))
+        if not isinstance(s, dict):
+            return False
+        files = s.get("files")
+        if isinstance(files, list) and files:
+            return True
+        # A VERIFY-ONLY spec ("the deliverable already exists — just prove
+        # it works") is a first-class answer (2026-08-01): the caller's
+        # no-files path honours the verify and closes the task without
+        # rebuilding. Before this, a verify-only spec in the content
+        # channel was "not usable", so the reasoning-channel fallback
+        # could clobber it and the retry loop steered the model into
+        # re-implementing files that already worked.
+        return bool(str(s.get("verify") or "").strip())
 
     spec = extract_json_from_text(content, repair_truncated=True) or {}
     if not _usable(spec) and reasoning:
@@ -850,6 +977,13 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
                               f"NEW file instead")
             else:
                 base = live
+        # Python append guard (2026-08-01): refuse BEFORE writing when the
+        # append would duplicate an existing implementation or leave a
+        # working file unparseable — the post-write syntax check catches the
+        # breakage only after the working file on disk is already gone.
+        pyguard = _py_append_guard(base, append, path)
+        if pyguard:
+            return (None, pyguard)
         new = _smart_append(base, append.strip(), path)
         if len(new) > MAX_CONTENT_CHARS:
             # Never truncate (it would cut off closing tags and break the
@@ -913,6 +1047,19 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
     reg = _regression_reason(old, content)
     if reg:
         return (None, f"refused to overwrite {path}: {reg}")
+    # Python overwrite guard (2026-08-01), sibling of the append guard:
+    # never replace a PARSING .py file with content that does not parse —
+    # refuse pre-write so the working file survives on disk. Brand-new /
+    # already-broken files keep the post-write check (same feedback, and a
+    # broken new file blocks nothing that worked before).
+    if (path.lower().endswith(".py") and old and (old or "").strip()
+            and _py_parse_error(old) is None):
+        new_err = _py_parse_error(content)
+        if new_err:
+            return (None, f"write to {path} refused BEFORE writing: the new "
+                          f"content does not parse ({new_err}) while the "
+                          f"current file on disk parses cleanly. Fix the "
+                          f"syntax (or use `edits`) and retry.")
     try:
         out = await tool_runner(
             "file_system", {"operation": "write", "path": path, "content": content})
@@ -1072,6 +1219,18 @@ async def build_coding_task(
             # Architecture task FAILED in autoadvance though model.py existed
             # and ran). Honour the verify instead of failing on no-files.
             _verify = (spec.get("verify") or "").strip() if isinstance(spec, dict) else ""
+            if _verify and _VERIFY_KILL_RE.search(_verify):
+                # _run_verify skips kill-shaped verifies as a PASS on the
+                # rationale "the files may be good" — but here there ARE no
+                # files: the verify is the only check, so skipping it would
+                # close the task on nothing (review finding, 2026-08-01).
+                last = ("verify-only spec refused: its verify command "
+                        "manages processes (kill/pkill/fuser -k) and there "
+                        "are no files, so nothing would be verified. Provide "
+                        "a verify that TESTS the existing deliverable (run "
+                        "the script, curl the already-running service).")
+                feedback = last
+                continue
             if _verify:
                 vfail = await _run_verify(tool_runner, spec, [])
                 if not vfail:

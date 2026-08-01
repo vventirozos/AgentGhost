@@ -129,6 +129,126 @@ def _files_for_task(store, project_id: str, task_id: str,
     return out
 
 
+# A recorded task failure that a LIVE mechanical check can re-test. When a
+# FAILED task's failure_reason carries one of these markers, a DONE attempt
+# re-runs the syntax check on the referenced file(s) NOW instead of trusting
+# the stored verdict: the 2026-08-01 Mini AI incident wedged on exactly this —
+# the agent rewrote core.py to a clean state (py_compile exit 0, ran, learned
+# XOR) but the task kept its autoadvance-era "does NOT parse" evidence and
+# the model burned the rest of the request arguing with a stale ledger.
+_PARSE_FAILURE_MARKERS = ("does not parse", "syntax check failed",
+                          "syntaxerror", "py_compile")
+# No space in the path class: with one, the leftmost match bridged whole
+# phrases ("py_compile failed for core.py" matched as ONE candidate that
+# is_file() rejects, consuming the real filename) and the recheck went
+# silently inert on realistic failure texts. Space-bearing filenames just
+# don't match — fail-safe (recheck inapplicable), never wrongly-closing.
+_PARSE_RECHECK_PATH_RE = re.compile(
+    r"(?<![\w./-])([\w][\w./-]{0,80}?\.(?:py|js|mjs|cjs|json|html?|htm))\b",
+    re.IGNORECASE)
+
+
+def _parse_failure_candidates(store, project_id: str, task_id: str,
+                              failure_reason: str,
+                              deliverables=None) -> List[Path]:
+    """Absolute, containment-checked paths of the checkable files a
+    parse-shaped failure_reason refers to. Sources: paths named in the
+    failure text itself, the task's registered file artifacts, and the
+    deliverables passed to this call. Only files that exist are returned."""
+    rels: List[str] = []
+    for m in _PARSE_RECHECK_PATH_RE.finditer(failure_reason or ""):
+        rel = m.group(1).strip().replace("\\", "/").lstrip("./")
+        if rel and rel not in rels:
+            rels.append(rel)
+    for rel in (deliverables or []):
+        rel = str(rel or "").strip().replace("\\", "/").lstrip("./")
+        if rel and rel not in rels:
+            rels.append(rel)
+    try:
+        for art in store.list_artifacts(task_id=task_id) or []:
+            if (art.get("kind") or "") != "file":
+                continue
+            rel = str(art.get("payload") or "").strip().replace("\\", "/")
+            rel = rel.lstrip("./")
+            if rel and rel not in rels:
+                rels.append(rel)
+    except Exception:
+        logger.debug("artifact lookup failed for %s", task_id, exc_info=True)
+    root = getattr(store, "sandbox_root", None)
+    pid = str(project_id or "").strip().lower()
+    if not root or not pid:
+        return []
+    base = (Path(root) / "projects" / pid).resolve()
+    out: List[Path] = []
+    for rel in rels[:8]:
+        try:
+            p = (base / rel).resolve()
+            if not str(p).startswith(str(base) + os.sep):
+                continue
+            if p.is_file():
+                out.append(p)
+        except Exception:
+            continue
+    return out
+
+
+async def _recheck_stale_parse_failure(store, project_id: str, task_id: str,
+                                       failure_reason: str,
+                                       deliverables=None):
+    """Re-test a parse-shaped task failure against the CURRENT files.
+
+    Returns ``(verdict, detail)``:
+      * ``(None, "")``  — not applicable (failure isn't parse-shaped, or no
+        referenced file exists to check); callers change nothing.
+      * ``(True, evidence)`` — every referenced file NOW passes the same
+        syntax check that failed it; ``evidence`` is usable result text and
+        the stored failure evidence is stale.
+      * ``(False, diagnostic)`` — a file STILL fails; ``diagnostic`` names
+        the current error (never the stale one).
+    Never raises.
+    """
+    low = (failure_reason or "").lower()
+    if not any(marker in low for marker in _PARSE_FAILURE_MARKERS):
+        return None, ""
+    try:
+        paths = _parse_failure_candidates(store, project_id, task_id,
+                                          failure_reason, deliverables)
+    except Exception:
+        logger.debug("parse-recheck candidate scan failed", exc_info=True)
+        return None, ""
+    if not paths:
+        return None, ""
+    from .file_system import _syntax_feedback, _find_node
+    # Count a file as "checked" ONLY when the checker can actually verify
+    # its type: _syntax_feedback returns "" for clean AND for uncheckable
+    # (unknown extension, node binary absent, read error) — treating those
+    # as passes would MANUFACTURE pass evidence and force-close a still-
+    # broken task (review finding, 2026-08-01). .py/.json verify
+    # in-process; .js/.html need a node binary.
+    checkable = {".py", ".json"}
+    if _find_node():
+        checkable |= {".js", ".mjs", ".cjs", ".html", ".htm"}
+    checked: List[str] = []
+    for p in paths:
+        if p.suffix.lower() not in checkable:
+            continue
+        try:
+            diag = await _syntax_feedback(p, p.name)
+        except Exception:
+            logger.debug("live syntax re-check failed for %s", p,
+                         exc_info=True)
+            continue
+        if diag:
+            return False, (f"{p.name} STILL fails the live syntax check: "
+                           + " ".join(diag.split())[:300])
+        checked.append(p.name)
+    if not checked:
+        return None, ""
+    return True, (f"live syntax re-check: {', '.join(checked)} parse(s) "
+                  f"cleanly now — the recorded parse-failure evidence was "
+                  f"stale and has been superseded")
+
+
 def _ok(payload: Any) -> str:
     if isinstance(payload, str):
         return payload
@@ -828,21 +948,47 @@ def _is_cohesive_single_file(title: str, goal: str) -> bool:
     return bool(_SINGLE_FILE_RE.search(f"{title or ''} {goal or ''}"))
 
 
+# Generic TYPE prefixes are not feature identities. A decompose shaped
+# "Implement: core.py…" / "Implement: train.py…" / "Implement: demo.py…"
+# collapsed onto the single key "implement", so the dedup filter silently ate
+# every implement-task after the first — observed live 2026-08-01 (project
+# 85a350ee099c "Mini AI": 5 planned tasks → 3 persisted, and the next request
+# burned turns updating phantom train.py/demo.py task ids that never existed).
+# When the colon-head is one of these, identity must come from a longer slice
+# of the whole description instead.
+_GENERIC_FEATURE_HEADS = frozenset({
+    "research", "design", "implement", "implementation", "build", "create",
+    "add", "write", "code", "fix", "test", "tests", "verify", "update",
+    "refactor", "document", "documentation", "docs", "deploy", "setup",
+    "set up", "plan", "review", "analyze", "analyse", "investigate",
+    "task", "step", "phase", "todo", "feature", "integrate",
+})
+
+
 def _feature_key(desc: str) -> str:
     """A coarse identity for a task — the feature name before the first colon
     (or the first few words). 'Core Shell: HTML structure…' and 'Core Shell:
-    index.html skeleton…' share the key 'core shell', so they dedup."""
+    index.html skeleton…' share the key 'core shell', so they dedup. A GENERIC
+    head ('Implement: …', 'Research: …') identifies a task TYPE, not a
+    feature — those key on a longer slice of the full description so distinct
+    deliverables never collapse onto one key."""
     d = " ".join((desc or "").strip().lower().split())
-    head = d.split(":", 1)[0]
-    return head[:40] if head else d[:40]
+    head = d.split(":", 1)[0].strip()
+    if head and head not in _GENERIC_FEATURE_HEADS:
+        return head[:40]
+    return d[:80]
 
 
 def _filter_duplicate_subtasks(store, project_id: str, subtasks):
-    """Drop subtask descriptions whose feature already exists as a non-terminal
-    task, and drop intra-list duplicates. Stops the project piling up duplicate
-    tasks when the model calls create-with-subtasks AND task_decompose, or
-    decomposes twice (observed live — duplicate Core Shell / File Explorer that
-    then failed)."""
+    """Split subtask descriptions into ``(kept, dropped)`` — dropped being the
+    ones whose feature already exists as a non-terminal task, plus intra-list
+    duplicates. Stops the project piling up duplicate tasks when the model
+    calls create-with-subtasks AND task_decompose, or decomposes twice
+    (observed live — duplicate Core Shell / File Explorer that then failed).
+
+    Returns BOTH lists so the caller can report what was dropped: silently
+    eating subtasks made the model's presented plan diverge from the persisted
+    ledger with no signal to anyone (2026-08-01 Mini AI incident)."""
     try:
         existing = store.list_tasks(project_id)
     except Exception:
@@ -850,16 +996,18 @@ def _filter_duplicate_subtasks(store, project_id: str, subtasks):
     terminal = {"DONE", "FAILED", "BLOCKED", "ARCHIVED"}
     seen = {_feature_key(t.get("description")) for t in existing
             if str(t.get("status", "")).upper() not in terminal}
-    out = []
+    kept = []
+    dropped = []
     for d in (subtasks or []):
         if not d or not d.strip():
             continue
         k = _feature_key(d)
         if k in seen:
+            dropped.append(d.strip())
             continue
         seen.add(k)
-        out.append(d)
-    return out
+        kept.append(d)
+    return kept, dropped
 
 
 def _infer_kind(title: str, goal: str, explicit_kind: str) -> str:
@@ -892,6 +1040,10 @@ def _parse_advance_count(count) -> Optional[int]:
 
 _ADVANCE_STOP_BLURB = {
     "project_done": "All tasks are complete — the project is done.",
+    "project_failed": "Stopped: the project is in a FAILED state — one or "
+                      "more tasks failed (see failed_tasks). NOTHING is "
+                      "runnable until a failed task is fixed. Do NOT report "
+                      "the project as complete.",
     "completed_with_failures": "Advanced every task it could; some FAILED and "
                                "were skipped (listed below) — retry those.",
     "count_reached": "Advanced the requested number of tasks; more remain.",
@@ -926,7 +1078,8 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     # possible" — report and hand back; do NOT manually rebuild (that long
     # manual build thrashed ~700s and broke project scoping).
     stopped_early = batch.stop_reason in (
-        "failed", "repeated_failures", "budget_or_inactive", "needs_user")
+        "failed", "repeated_failures", "budget_or_inactive", "needs_user",
+        "project_failed")
     if stopped_early:
         return (
             f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
@@ -1923,7 +2076,8 @@ async def tool_manage_projects(
                     "NOT write the file before this create call has run."
                 )
             elif subtasks:
-                subtasks = _filter_duplicate_subtasks(store, pid, subtasks)
+                subtasks, _create_dropped = _filter_duplicate_subtasks(
+                    store, pid, subtasks)
                 plan = ProjectPlan(store, pid)
                 prev_id = None
                 pairs: List[tuple] = []
@@ -1945,6 +2099,13 @@ async def tool_manage_projects(
                     "directs you ('proceed to next task'); for a multi-task "
                     "go-ahead use autoadvance count=<N|all>."
                 )
+                if _create_dropped:
+                    instruction += (
+                        f" NOTE: {len(_create_dropped)} subtask(s) were NOT "
+                        "created (duplicates of each other/existing tasks): "
+                        + " | ".join(d[:80] for d in _create_dropped[:6])
+                        + ". If any is genuinely distinct work, re-add it "
+                        "with task_add and a more specific description.")
             else:
                 instruction = (
                     "Project created. Break the goal into tasks with "
@@ -2356,6 +2517,8 @@ async def tool_manage_projects(
             active_constraints: List[str] = []
             judged_violations: List[str] = []
             judged_violation_reasons: List[str] = []
+            still_failing: List[str] = []
+            still_failing_reasons: List[str] = []
             # (ok, reason) audit cache keyed by the task's FILE SET. The
             # audit is per-file-set (constraint_gate judges specific files);
             # a single per-CALL cache reused the FIRST task's verdict for
@@ -2369,6 +2532,28 @@ async def tool_manage_projects(
                 if tid not in plan.tree.nodes:
                     missing.append(tid)
                     continue
+                # Stale-evidence invalidation (2026-08-01): closing a FAILED
+                # task whose recorded failure is a MECHANICAL check (a parse/
+                # syntax verdict) re-runs that check on the file as it is NOW.
+                # The world changes between the failure and the close attempt
+                # — the Mini AI incident had a rewritten, verified core.py on
+                # disk while the ledger's "does NOT parse" from an earlier
+                # build blocked every close. A passing live check becomes the
+                # result evidence; a failing one refuses the DONE with the
+                # CURRENT diagnostic instead of the stale text.
+                live_evidence = ""
+                if (st_enum == TaskStatus.DONE
+                        and plan.tree.nodes[tid].status == TaskStatus.FAILED
+                        and (plan.tree.nodes[tid].failure_reason or "").strip()):
+                    _verdict, _detail = await _recheck_stale_parse_failure(
+                        store, project_id, tid,
+                        plan.tree.nodes[tid].failure_reason, deliverables)
+                    if _verdict is False:
+                        still_failing.append(tid)
+                        still_failing_reasons.append(_detail)
+                        continue
+                    if _verdict is True:
+                        live_evidence = _detail
                 # DONE-gate: a visual/runnable-artifact task cannot be marked
                 # DONE with NO verification evidence. The model must either
                 # pass a `result` (what it actually observed rendered) or go
@@ -2385,12 +2570,15 @@ async def tool_manage_projects(
                 # gate is deliberately evidence-based, not judgement-based —
                 # judging WHETHER the evidence honors the constraints is the
                 # verifier's job (it receives the constraints in context).
+                # A passing live re-check counts as evidence: it is exactly
+                # the "go verify first" this gate demands, already done.
                 task_constraints = [
                     str(c) for c in
                     (plan.tree.nodes[tid].constraints or [])
                 ] + proj_constraints
                 if (st_enum == TaskStatus.DONE and task_constraints
                         and not (result or "").strip()
+                        and not live_evidence
                         and not (plan.tree.nodes[tid].result_summary or "").strip()):
                     gated_constraints.append(tid)
                     for c in task_constraints:
@@ -2496,7 +2684,10 @@ async def tool_manage_projects(
                         except Exception:
                             logger.debug("ledger append skipped", exc_info=True)
                 if st_enum is not None:
-                    plan.update_status(tid, st_enum, result=result,
+                    # A passing live re-check doubles as the result when the
+                    # model supplied none — it is real, current evidence.
+                    plan.update_status(tid, st_enum,
+                                       result=(result or live_evidence),
                                        failure_reason=failure_reason)
                 extras: Dict[str, Any] = {}
                 # `result` without `status`: persist it as the task's
@@ -2543,6 +2734,28 @@ async def tool_manage_projects(
                                        "count": len(updated)}
             if missing:
                 payload["missing"] = missing
+                # Name the ids that DO exist (2026-08-01): a bare
+                # `missing: [...]` next to `count: 0` read as an empty
+                # success, and the model kept retrying invented ids for
+                # tasks that were never persisted (decompose dedup) —
+                # phantom train.py/demo.py ids burned 4 turns in the Mini
+                # AI incident. Showing the real ledger breaks the illusion
+                # in one round-trip.
+                _valid = [
+                    {"id": t.id, "status": t.status.value,
+                     "description": (t.description or "")[:80]}
+                    for t in plan.tree.nodes.values()
+                ][:20]
+                payload["agent_instruction_missing"] = (
+                    f"{len(missing)} task id(s) do NOT exist in this "
+                    f"project: {missing}. Nothing was updated for them — "
+                    "do not retry these ids. The project's ACTUAL tasks "
+                    "are listed in `valid_tasks`; if the work you want to "
+                    "record has no task there, it was never persisted — "
+                    "create it first with task_add, then task_update THAT "
+                    "id to done with a `result` describing the evidence."
+                )
+                payload["valid_tasks"] = _valid
             if result_only:
                 payload["result_recorded_status_unchanged"] = result_only
                 payload["agent_instruction_result_only"] = (
@@ -2551,6 +2764,16 @@ async def tool_manage_projects(
                     "status is UNCHANGED — a result alone does not close a "
                     "task. To mark it complete, re-call task_update with "
                     "BOTH status=done AND the task id(s)."
+                )
+            if still_failing:
+                payload["still_failing"] = still_failing
+                payload["agent_instruction_still_failing"] = (
+                    f"REFUSED to mark {len(still_failing)} task(s) DONE: the "
+                    "recorded failure was re-checked LIVE against the current "
+                    "file(s) and it STILL fails. Current diagnostic(s): "
+                    + " | ".join(still_failing_reasons)
+                    + " Fix the file first, then re-call task_update with "
+                    "status=done."
                 )
             if judged_violations:
                 payload["constraint_violations"] = judged_violations
@@ -2650,11 +2873,15 @@ async def tool_manage_projects(
                             "(write it directly with file_system); keep it as a "
                             "single task."),
                     })
-                subtasks = _filter_duplicate_subtasks(store, project_id, subtasks)
+                subtasks, dropped_dupes = _filter_duplicate_subtasks(
+                    store, project_id, subtasks)
                 if not subtasks:
                     return _ok({"created": [], "parent_id": None,
+                                "dropped_duplicates": dropped_dupes,
                                 "note": "all subtasks duplicated existing "
                                         "tasks; nothing added"})
+            else:
+                dropped_dupes = []
 
             ids: List[str] = []
             pairs: List[tuple] = []  # (task_id, description) for graph linking
@@ -2702,7 +2929,27 @@ async def tool_manage_projects(
                                      exc_info=True)
             for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
+            # Persisted-vs-planned transparency (2026-08-01): the model plans
+            # N tasks, presents N to the user, but only len(ids) exist. A
+            # silent drop here left the agent operating on PHANTOM tasks for
+            # a whole request (Mini AI incident) — every drop must be echoed
+            # back so the model can re-add genuinely-distinct work.
+            _dropped_note = {}
+            if dropped_dupes:
+                _dropped_note = {
+                    "dropped_duplicates": dropped_dupes,
+                    "agent_instruction_dropped": (
+                        f"{len(dropped_dupes)} subtask(s) were NOT created — "
+                        "they deduplicated against existing/sibling tasks: "
+                        + " | ".join(d[:80] for d in dropped_dupes[:6])
+                        + ". Only the ids in `created` exist. If any dropped "
+                        "subtask is genuinely distinct work, re-add it with "
+                        "task_add and a more specific description. Present "
+                        "ONLY the tasks in `tasks` to the user."
+                    ),
+                }
             return _ok({"created": ids,
+                        **_dropped_note,
                         # id+description pairs (2026-07-25, req f59a793d):
                         # bare ids made this output unverifiable — the
                         # verifier's "task tree" evidence slot held nothing
@@ -2731,7 +2978,33 @@ async def tool_manage_projects(
             plan = ProjectPlan(store, project_id)
             nxt = plan.next_ready_leaf()
             if not nxt:
-                return _ok({"next": None, "reason": "no READY/PENDING leaf available"})
+                # "Nothing ready" without saying WHY reads as "all done".
+                # Name the tasks parked in FAILED/NEEDS_USER and how to
+                # revive them — the 2026-08-01 wedge had exactly one FAILED
+                # leaf behind this message and the model concluded the
+                # state was unreachable.
+                _parked = [
+                    {"id": t.id, "status": t.status.value,
+                     "description": (t.description or "")[:100],
+                     "failure_reason": (t.failure_reason or "")[:160]}
+                    for t in plan.tree.nodes.values()
+                    if t.status in (TaskStatus.FAILED, TaskStatus.NEEDS_USER)
+                ][:10]
+                _payload: Dict[str, Any] = {
+                    "next": None,
+                    "reason": "no READY/PENDING leaf available"}
+                if _parked:
+                    _payload["parked_tasks"] = _parked
+                    _payload["agent_instruction"] = (
+                        f"No runnable task, but {len(_parked)} task(s) are "
+                        "parked (FAILED/NEEDS_USER — listed in "
+                        "parked_tasks). A FAILED task is NOT done: either "
+                        "fix its deliverable and task_update it with "
+                        "status=done plus a `result` (stale recorded "
+                        "failures are re-checked live), or set it "
+                        "status=pending to retry. A NEEDS_USER task wants "
+                        "the user's answer — ask them.")
+                return _ok(_payload)
             return _ok({"next": {"id": nxt.id, "description": nxt.description,
                                  "status": nxt.status.value}})
 
@@ -3496,13 +3769,39 @@ async def tool_manage_projects(
                     # stops on repeated (systemic) failures.
                     stop_on_fail=False,
                 )
-            return _ok({
+            _adv_payload: Dict[str, Any] = {
                 "advanced": batch.advanced,
                 "count": batch.count,
                 "requested": ("all" if max_tasks is None else max_tasks),
                 "stop_reason": batch.stop_reason,
                 "agent_instruction": _advance_batch_instruction(batch, max_tasks),
-            })
+            }
+            # A failure-shaped stop names the LEDGER's failed tasks, not just
+            # this batch's: on an already-FAILED project the batch advanced
+            # nothing, so the model otherwise has no ids/reasons to act on
+            # (2026-08-01: "project done" was relayed over a FAILED ledger).
+            if batch.stop_reason in ("project_failed",
+                                     "completed_with_failures", "failed",
+                                     "repeated_failures"):
+                try:
+                    _adv_payload["failed_tasks"] = [
+                        {"id": t["id"],
+                         "description": (t.get("description") or "")[:100],
+                         "failure_reason": (t.get("failure_reason") or "")[:200]}
+                        for t in store.list_tasks(project_id)
+                        if str(t.get("status", "")).upper() == "FAILED"
+                    ][:10]
+                    if _adv_payload["failed_tasks"]:
+                        _adv_payload["agent_instruction"] += (
+                            " To fix a failed task: repair its deliverable, "
+                            "then task_update it with status=done and a "
+                            "`result` naming the evidence (a stale recorded "
+                            "failure is re-checked live), or revise it with "
+                            "status=pending to let autoadvance retry it.")
+                except Exception:
+                    logger.debug("failed-task enrichment skipped",
+                                 exc_info=True)
+            return _ok(_adv_payload)
 
         # ---- auto-research ----------------------------------------------
 

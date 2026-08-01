@@ -170,6 +170,21 @@
   <h2>Inter-project dependency deadlock + autoadvance mislabel (bug-hunt 2026-07-26b)</h2>
   <p>The inter-project dependency gate blocked a dependent project's autoadvance FOREVER when its dependency was deleted, archived, or failed — states that can never become DONE, so the block never cleared (silently; the operator saw the reason only on a manual autoadvance). Now a terminal-unsatisfiable dependency (missing / ARCHIVED / FAILED) is treated as cleared with a loud warning — the inter-project mirror of the intra-project rule that treats an unknown dep id as satisfied "so a bad reference can't deadlock the whole plan." Recoverable states (PAUSED / NEEDS_USER / BLOCKED) still legitimately block. Separately: an autoadvance tick logged <code>autoadvance_step</code> + work_log <code>outcome="completed"</code> even when <code>update_status(DONE)</code> silently DEMOTED the leaf to FAILED via a postcondition — corrupting the operator's "what did I do last night" ledger; the tick now reads the resulting status and logs <code>autoadvance_step_failed</code> / <code>had_failures</code>. Tests: <code>tests/test_bughunt_fixes_2026_07_26b.py::TestInterProjectDepGate</code>.</p>
 
+  <h2><code>project_failed</code> stop reason — no "done" over a FAILED ledger (2026-08-01)</h2>
+  <p><code>advance_many</code>'s <code>blocked</code> exit mapped a FAILED project through
+  <code>_final_reason("project_done")</code> — which only inspects <em>this batch's</em>
+  advanced list. A fresh batch invoked on an <em>already</em>-FAILED project therefore
+  reported <code>project_done</code> ("All tasks are complete — the project is done"), and
+  the agent relayed the completion verbatim while the store said FAILED (Mini AI incident,
+  request <code>b7e516b9</code>). Both exits are now honest: the <code>blocked</code> exit
+  returns <code>project_failed</code> when the project status is FAILED and this batch
+  advanced no failing task, and the <code>idle</code> exit (no ready leaf) scans the LEDGER
+  for FAILED tasks before claiming <code>project_done</code>. The tool layer adds a
+  do-not-report-completion blurb, marks the reason as stopped-early, and attaches
+  <code>failed_tasks</code> (id/description/failure_reason) from the store so the model has
+  something actionable even when the batch itself is empty. Tests:
+  <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>
