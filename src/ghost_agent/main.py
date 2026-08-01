@@ -463,6 +463,27 @@ async def lifespan(app):
             sweep_project_workspace(_store, pid)
 
         context.project_store.on_project_done = _on_project_done
+        # §4E Tier 3 (2026-08-01): a task reopened after a turn closed it
+        # DONE is a delayed negative on that turn. The store stamps the
+        # closing turn's req_id at close time and fires this hook on the
+        # DONE -> open transition; the tracker re-records the closing
+        # turn's own components at the task_reopened grade (idempotent,
+        # skipped when the turn was already negative). Tracker is attached
+        # to context AFTER this block, so resolve it at fire time.
+        def _on_task_reopened(pid, tid, from_status, closed_req_id,
+                              _context=context):
+            tracker = getattr(_context, "calibration_tracker", None)
+            if tracker is None or not closed_req_id:
+                return
+            if tracker.record_task_reopened_negative(closed_req_id):
+                pretty_log(
+                    "Calibration",
+                    f"task_reopened retro-negative for turn {closed_req_id} "
+                    f"(task {str(tid)[:8]}, was {from_status})",
+                    icon=Icons.BRAIN_CTX,
+                )
+
+        context.project_store.on_task_reopened = _on_task_reopened
         # Boot reaper (2026-07-20 H3): the advancer claims a leaf by writing
         # it IN_PROGRESS before a multi-minute build/LLM step. A deploy (plain
         # SIGTERM — the standard workflow) or crash mid-tick leaves the task

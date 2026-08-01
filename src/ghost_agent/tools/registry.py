@@ -34,6 +34,7 @@ from .workspace_track import tool_workspace_track
 from .uncertainty_tool import tool_flag_uncertainty
 
 import logging
+import os
 import re
 from ..utils.logging import pretty_log, Icons
 
@@ -80,6 +81,144 @@ logger = logging.getLogger("GhostAgent")
 # hundred tokens once; a per-query schema costs a full re-prefill of the
 # whole head on every request.
 _SKILL_ROUTING_MIN_SKILLS = 25
+
+# --------------------------------------------------------------------------
+# §4F Phase 2b — GEPA-tuned tool descriptions (read-site).
+#
+# Artifact-only, mirroring the verifier precedent (no OptimizableSignature —
+# the scope fence stays untouched): a promoted artifact at
+# `$GHOST_HOME/system/optim/tool_description.<tool_name>.json` replaces that
+# tool's advertised description at assembly time. Resolution order:
+# in-process override (offline optimizer only) -> tuned artifact via
+# optim.loader (activation-counted, surfaced in learning-health) -> baseline.
+#
+# KV-stability contract: the available-artifact set is scanned ONCE per
+# process and the loader caches artifact content, so warmup and every
+# request render byte-identical descriptions. A newly promoted artifact is
+# picked up at the next restart — deploy = restart, same as the verifier
+# templates. NEVER reset these caches on a live agent.
+# --------------------------------------------------------------------------
+TOOL_DESC_SIGNATURE_PREFIX = "tool_description."
+
+# Offline-optimizer hook (verifier _TEMPLATE_OVERRIDES analogue). Never
+# populated on a live agent.
+_TOOL_DESC_OVERRIDES: Dict[str, str] = {}
+
+# Aggregate inflation budget: per-tool validation cannot guard the SUM (39
+# per-tool caps total ~10x the real tools block), so a full sweep of
+# individually-valid artifacts could still multiply the KV-pinned prefix.
+# If the total tuned-vs-baseline delta across the assembled list exceeds
+# this many chars, NO swap is applied (all-or-nothing keeps the rendered
+# bytes trivially deterministic) and a warning fires once per process.
+_TOOL_DESC_AGGREGATE_SLACK = 20_000
+
+_TUNED_DESC_NAMES = None  # lazy frozenset of tool names with an artifact
+_DESC_WARNED: set = set()  # warn-once keys (per-call sites re-fire hourly+)
+
+
+def _tuned_desc_names():
+    global _TUNED_DESC_NAMES
+    if _TUNED_DESC_NAMES is None:
+        names = set()
+        try:
+            # Only an EXPLICIT GHOST_HOME is trusted: optim.loader's
+            # ~/ghost_llamacpp fallback would make test runs (conftest
+            # deletes GHOST_HOME) and stray shells scan a live operator
+            # home and bake its artifacts into this process-wide set.
+            if os.getenv("GHOST_HOME"):
+                from ..optim import loader as _optim_loader
+                optim_dir = _optim_loader._optim_dir()
+                for p in optim_dir.glob(f"{TOOL_DESC_SIGNATURE_PREFIX}*.json"):
+                    stem = p.name[: -len(".json")]
+                    name = stem[len(TOOL_DESC_SIGNATURE_PREFIX):]
+                    if name:
+                        names.add(name)
+        except Exception as e:
+            logger.debug("tuned tool-description scan failed: %s", e)
+        _TUNED_DESC_NAMES = frozenset(names)
+    return _TUNED_DESC_NAMES
+
+
+def _reset_tool_desc_cache():
+    """Tests/offline only. NEVER on a live agent — changing the rendered
+    descriptions mid-process busts the KV stable prefix (see optim.loader
+    .clear_cache for the same warning)."""
+    global _TUNED_DESC_NAMES
+    _TUNED_DESC_NAMES = None
+    _DESC_WARNED.clear()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _DESC_WARNED:
+        _DESC_WARNED.add(key)
+        logger.warning(message)
+
+
+def _validate_tool_description(name: str, baseline: str, candidate) -> bool:
+    """Placeholder-probe analogue for descriptions: a tuned description must
+    be a non-empty string of sane size. The cap guards the KV-pinned tools
+    block — a runaway description silently inflates every request's prefix."""
+    if not isinstance(candidate, str):
+        return False
+    c = candidate.strip()
+    if not c:
+        return False
+    if len(c) > max(6000, 3 * len(baseline or "")):
+        return False
+    return True
+
+
+def _tuned_tool_description(name: str, baseline: str) -> str:
+    override = _TOOL_DESC_OVERRIDES.get(name)
+    if override is not None:
+        return override.strip() if _validate_tool_description(
+            name, baseline, override) else baseline
+    if name not in _tuned_desc_names():
+        return baseline
+    from ..optim import loader as _optim_loader
+    tuned = _optim_loader.tuned_instruction(
+        f"{TOOL_DESC_SIGNATURE_PREFIX}{name}", "")
+    if not tuned:
+        return baseline
+    if not _validate_tool_description(name, baseline, tuned):
+        _warn_once(
+            f"reject:{name}",
+            f"GEPA tool_description.{name} rejected by validator — "
+            "baseline kept")
+        return baseline
+    return tuned
+
+
+def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Swap in tuned descriptions copy-on-write; the shared TOOL_DEFINITIONS
+    dicts are never mutated. Fast path: no artifacts and no overrides ->
+    the input list is returned untouched. If the aggregate inflation
+    exceeds _TOOL_DESC_AGGREGATE_SLACK, nothing is swapped."""
+    if not _TOOL_DESC_OVERRIDES and not _tuned_desc_names():
+        return tools
+    out = []
+    inflation = 0
+    swapped = False
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name") or ""
+        baseline = fn.get("description", "")
+        tuned = _tuned_tool_description(name, baseline) if name else baseline
+        if tuned != baseline:
+            inflation += len(tuned) - len(baseline)
+            swapped = True
+            out.append({**t, "function": {**fn, "description": tuned}})
+        else:
+            out.append(t)
+    if swapped and inflation > _TOOL_DESC_AGGREGATE_SLACK:
+        _warn_once(
+            "aggregate",
+            f"GEPA tool descriptions rejected as a set: aggregate "
+            f"inflation {inflation} chars exceeds "
+            f"{_TOOL_DESC_AGGREGATE_SLACK} — every baseline kept (the "
+            "KV-pinned tools block must not silently balloon)")
+        return tools
+    return out
 
 TOOL_DEFINITIONS = [
     {
@@ -826,7 +965,8 @@ def get_active_tool_definitions(context, query: str = None):
         default_db = getattr(getattr(context, "args", None), "default_db", None)
         if not default_db:
             unconfigured.add("postgres_admin")
-    return _intent_filter(active_tools, query, drop_unconfigured=unconfigured)
+    return _apply_tuned_descriptions(
+        _intent_filter(active_tools, query, drop_unconfigured=unconfigured))
 
 def get_available_tools(context):
     from .memory import (

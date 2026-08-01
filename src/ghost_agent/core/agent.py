@@ -11741,6 +11741,9 @@ class GhostAgent:
                     # signal whose only varying input is per-DOMAIN.
                     domain=_dom or "",
                     source="turn",
+                    # §4E Tier 3 join key: a later task-reopen carries the
+                    # closing turn's req_id and retro-labels this sample.
+                    req_id=str(req_id or ""),
                 )
                 # Stash the components keyed by this response's
                 # fingerprint so a NEXT-turn user-correction can record

@@ -378,6 +378,36 @@
   draw a complaint), and a stash gate written for binary labels (<code>&gt;= 1.0</code>) stopped matching once
   the graded label scored clean turns at 0.83 — neither change wrong alone, only in composition.</p>
 
+  <h2>2026-08-01 — Tier 3: retroactive negatives from reopened work</h2>
+  <p>A task a turn closed DONE being later REOPENED is a delayed negative on that turn — the closing was
+  premature. Both halves of the signal already existed (the reopen transition and the closing turn itself);
+  what was missing was the JOIN. Three pieces close it:</p>
+  <ul>
+    <li><strong>Closing stamp.</strong> <code>ProjectStore.update_task</code> stamps the closing turn's
+    request id (<code>request_id_context</code>) into a new <code>tasks.closed_req_id</code> column on the
+    transition <em>to</em> DONE (idempotent migration; "SYSTEM" — boot reaper, maintenance — stays blank,
+    and a re-asserted DONE never steals the original close). Calibration samples symmetrically gained a
+    <code>req_id</code> field, populated by the Tier-1 end-of-turn record — that pair is the join key.</li>
+    <li><strong>Reopen hook.</strong> The TASK-level DONE&nbsp;→&nbsp;open transition (regardless of project
+    status — a task revived on a still-ACTIVE project is just as much a delayed negative as one that fires
+    <code>project_reopened</code>) logs a <code>task_reopened</code> event and fires
+    <code>ProjectStore.on_task_reopened(project_id, task_id, from_status, closed_req_id)</code> — same
+    outside-the-lock, fully-guarded discipline as <code>on_project_done</code>; wired in
+    <code>main.py</code>.</li>
+    <li><strong>Retro writer.</strong> <code>CalibrationTracker.record_task_reopened_negative(closed_req_id)</code>
+    finds the closing turn's <code>source="turn"</code> sample by <code>req_id</code> and re-records
+    <em>its own stored components</em> — the feature side is byte-identical, only the label differs (the
+    no-leakage rule) — at <code>source="task_reopened"</code>, grade 0.15 (<code>_TASK_REOPENED_GRADE</code>,
+    same strength as a failure report: attribution equally loose, a reopen can also mean scope growth).
+    Idempotent per closing turn (a DONE→open→DONE→open cycle labels each distinct closing turn once), and
+    skipped when the closing turn's own label was already negative — Tier 2's no-double-counting rule.</li>
+  </ul>
+  <p>Measured supply is deliberately acknowledged as MARGINAL (~7 reopen events / 20 days at design time,
+  §4E) — this tier exists because it costs one column and one hook, not because it moves the fit alone.
+  The durable <code>req_id</code> join also removes Tier 3's dependence on the 32-entry in-memory
+  fingerprint stash: a reopen can arrive days and several restarts after the close.
+  Tests: <code>tests/test_task_reopened_tier.py</code>.</p>
+
 </main>
 </body>
 </html>

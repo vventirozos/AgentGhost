@@ -265,6 +265,75 @@ Tests: `tests/test_verifier_tuned_templates.py` (baseline self-probe
 regression, placeholder/brace rejection, override/artifact resolution
 order, activation counting, formats-cleanly end check).
 
+### Tool-description optimization (§4F Phase 2b, 2026-08-01)
+
+Tool descriptions are the second always-live GEPA surface. Both halves
+of the loop exist; the GEPA run itself waits for fixture supply
+(~2-3 days of `GHOST_LLM_RECORD` capture).
+
+* **Miner** — `ghost_agent/optim/tool_fixtures.py` +
+  `scripts/mine_tool_fixtures.py` mine tool-CHOICE fixtures from the
+  recording day-files per the audited 2026-08-01 contract: **era
+  filter** `ts >= 2026-07-31T19:15` LOCAL (the native-prompt split +
+  honest-failure rule changed prompt bytes and label semantics before
+  that); choice records = reassembled stream records with
+  `payload.tools` AND structured `message.tool_calls` (never
+  content-parsed); **ground truth** joined from
+  `TrajectoryCollector.iter_trajectories()` (corrections overlay
+  applied — half the verifier-late labels only exist in the sidecar)
+  on recording `request_id` == `Trajectory.session_id`; the `SYSTEM`
+  request sentinel (idle/background work, >80% of records) is excluded
+  — no per-request trajectory exists to join. Polarity: clean PASSED =
+  positive; FAILED = negative; **honest-failure turns (PASSED with a
+  failed tool call) are EXCLUDED** — the choice signal is ambiguous.
+  Tool results pair via ordinal-consecutive records in the same
+  recorder session+request, extracted **from the `<tool_response`
+  marker onward** — the volatile `<system_state_update>` block is
+  prepended to the same user message and must never leak into fixtures
+  (the first live mine had 79% contaminated previews before this); a
+  same-request background occupant (context-shield summarizer) at
+  ordinal+1 yields a lost pair, never a mispair. The mine is ONE
+  streaming pass holding only light fixtures (full records are ~100 KB
+  each; multi-GB backlogs stay bounded). Public/private tier via
+  `holdout_tier("toolfx:<request_id>")` so all fixtures from one turn
+  share a tier. Fixtures are LIGHT — a `source` pointer (file,
+  session_id, ordinal) lets the eval adapter rehydrate the full
+  recorded payload and swap candidate descriptions in (adapter gotcha:
+  `RequestState._active_tool_defs_cache` and the XML schema cache key
+  on tool NAMES, so build a fresh RequestState per candidate). The CLI
+  prints full drop accounting (no silent caps); exit 1 = supply not
+  ready (below `--min-fixtures` OR one-class corpus — zero positives
+  and zero negatives both block), exit 2 = no day-files at all.
+* **Read-site** — `tools/registry._apply_tuned_descriptions` at the
+  tail of `get_active_tool_definitions`: a promoted
+  `$GHOST_HOME/system/optim/tool_description.<tool>.json` artifact
+  replaces that tool's advertised description. Artifact-only (no
+  `OptimizableSignature`, mirroring the verifier precedent — the scope
+  fence stays untouched); resolution order in-process
+  `_TOOL_DESC_OVERRIDES` (offline optimizer) → `optim.loader` artifact
+  (activation-counted, surfaced in learning-health) → baseline.
+  Validator caps size per tool (`max(6000, 3× baseline)`) AND in
+  aggregate (`_TOOL_DESC_AGGREGATE_SLACK`, 20k chars total inflation
+  → NO swap at all, all-or-nothing): the per-tool caps sum to ~10× the
+  real tools block, so only the aggregate guard actually protects the
+  KV-pinned prefix. Rejections warn once per process, not per
+  assembly. **KV contract:** the artifact set is scanned once per
+  process (and ONLY under an explicit `GHOST_HOME` — the loader's
+  `~/ghost_llamacpp` fallback is never scanned, which also keeps
+  GHOST_HOME-less test runs from baking a live operator's artifacts
+  into the process) and content is loader-cached — warmup and every
+  request render identical bytes; deploy = restart, never a live
+  cache reset. Copy-on-write: the shared `TOOL_DEFINITIONS` dicts are
+  never mutated, and the no-artifact path returns the assembled list
+  untouched.
+
+Tests: `tests/test_tool_fixture_miner.py` (era filter incl. local→UTC,
+choice detection, polarity + EXIT-CODE-0 gotcha, honest-failure
+exclusion, overlay flip, tier determinism, result pairing, round-trip),
+`tests/test_tool_desc_readsite.py` (artifact swap, no-mutation,
+activation counters, validator, override precedence, identity fast
+path, dynamically-appended tools).
+
 ### Trajectory-level test-time scaling (§4F Phase 3, 2026-07-30)
 
 Both features are env-gated **OFF by default** per the §3 doctrine (no
@@ -313,7 +382,13 @@ marginal and is deferred.
 Tests: `tests/test_verifier_score_probe.py` (expectation math,
 env gate, blend alignment, verdict immutability, failure semantics),
 `tests/test_tts_adaptive_bon.py` (gates, wobble band incl. enum
-verdicts, judge parsing guards, substitution/failure contracts).
+verdicts, judge parsing guards, substitution/failure contracts),
+`tests/test_stable_prefix_phase3.py` (the §4F flip prerequisite:
+enabling `GHOST_TTS_ADAPTIVE_BON`/`GHOST_VERIFY_LOGIT_EXPECT` leaves the
+KV-pinned stable prefix byte-identical — same-request payload equality
+flags-off vs flags-on, in-request cross-turn pin stability, BoN
+candidates built on a copy of the live message list, and a source guard
+that the prompt-assembly region reads no Phase-3 env switch).
 * `router/` uses hand-crafted features; the (optional) embedding
   augment is downloaded once and then runs offline.
 

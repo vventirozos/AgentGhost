@@ -312,6 +312,21 @@
   <p>Covered by <code>tests/test_projects_store.py</code>.</p>
 
 
+  <h2>Task-reopen provenance (§4E Tier 3, 2026-08-01)</h2>
+  <p>A task reopened after a turn closed it DONE is a <em>delayed negative</em> on that turn.
+  <code>update_task</code> now stamps the closing turn's request id into <code>tasks.closed_req_id</code> on
+  the transition <em>to</em> DONE (additive <code>_migrate</code> column; blank for "SYSTEM"/no-context
+  closes, never overwritten by a re-asserted DONE), and the TASK-level DONE&nbsp;→&nbsp;PENDING/READY/
+  IN_PROGRESS transition — independent of project status, so a revival on a still-ACTIVE project counts too —
+  logs a <code>task_reopened</code> event (<code>{from_status, closed_req_id}</code>; not in the per-type
+  retention prune, like <code>project_reopened</code>) and fires the optional
+  <code>on_task_reopened(project_id, task_id, from_status, closed_req_id)</code> hook, mirroring
+  <code>on_project_done</code>'s outside-the-lock guarded discipline. <code>main.py</code> wires the hook to
+  <code>CalibrationTracker.record_task_reopened_negative</code> — see
+  <a href="../core/calibration.html">calibration</a> for the label semantics. Project-level reopens via
+  <code>add_task</code> (a new defect task on a DONE project) deliberately do <em>not</em> fire it: there is
+  no single closed task to blame. Tests: <code>tests/test_task_reopened_tier.py</code>.</p>
+
   <h2>Audit fixes (2026-07-26)</h2>
   <p><strong><code>update_task</code> reopens DONE projects</strong> — its reopen tuple was missing DONE (add_task's had it since 2026-07-11), so reviving an existing task on a DONE project created permanently unreachable work. <strong>artifact_added carries a path</strong> — the payload was <code>{kind, artifact_id}</code> only (live: all 60 events pathless), making registrations invisible to <code>file_history</code>; kind='file' events now carry the rel path. <strong>Correction-linking needs strong evidence</strong> — 0.5 Jaccard with ONE shared token mislinked distinct projects ("Chess Game" → "Chess Tutorial" stamped correction_of); now ≥2 shared significant tokens or identical token sets. <strong>Per-type event retention</strong> — task_updated/project_updated/work_log rows cap at <code>_EVENTS_RETAIN_PER_TYPE</code> (300) per project; they grew unbounded (reads were capped, the table never). Work-log side (agent.py): failed work-tool calls now accumulate too, so an all-failure debugging turn writes a work_log row (<code>&lt;tool&gt;_failed</code> counts) instead of nothing; and an off-project interlude ("get me the news" — live: the lead row on Jiu Jitsu Calendar) is dropped by a relevance gate (files touched, or command naming the project dir, or token overlap with title/tasks; fail-open). Tests: <code>::TestProjectReopenAndEvents</code>, <code>::TestWorkLogRelevanceGate</code>.</p>
 

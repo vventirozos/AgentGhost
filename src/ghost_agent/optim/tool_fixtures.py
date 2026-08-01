@@ -1,0 +1,395 @@
+"""§4F Phase 2b — tool-choice fixture miner.
+
+Mines tool-CHOICE fixtures for tool-description optimization from the
+GHOST_LLM_RECORD day-files (`$GHOST_HOME/system/llm_recordings/*.jsonl`),
+joined to trajectory ground truth. The contract is the audited 2026-08-01
+one (PROJECT_JOURNAL §4F Phase 2b):
+
+- **Era filter**: only records with ``ts >= 2026-07-31T19:15`` LOCAL time.
+  The QWEN_TOOL_PROMPT_NATIVE split (~18:54) changed the system prompt in
+  every native-path context and the honest-failure rule (~19:14) changed
+  outcome semantics — earlier records mix eras and would teach against a
+  prompt that no longer exists. Record ``ts`` is UTC ("...Z"); the cutoff
+  converts through the local timezone.
+- **Choice records**: reassembled stream records
+  (``kind=chat_completion_stream``, plus non-stream ``chat_completion``)
+  whose payload advertises ``tools`` and whose response carries STRUCTURED
+  ``message.tool_calls`` — never content-parsed. Records carrying the
+  ``SYSTEM`` request sentinel (idle loops, background work) are excluded:
+  they have no per-request trajectory to join, and the first background
+  path that writes one would silently label the whole SYSTEM bucket.
+- **Ground truth**: trajectory outcome labels via
+  ``TrajectoryCollector.iter_trajectories()`` (corrections-sidecar overlay
+  applied — ~half the verifier-late labels ONLY exist in the overlay),
+  joined on recording ``request_id`` == ``Trajectory.session_id``. Never
+  raw exit-code heuristics.
+- **Polarity**: clean PASSED = positive; FAILED (verifier-refuted or
+  shape) = negative; honest-failure turns (PASSED with a failed tool call
+  — the verifier outranked the structural failure) are EXCLUDED: the
+  choice signal is ambiguous, never labeled bad per the rule, not claimed
+  good either. UNKNOWN / unjoined records are excluded.
+- **Result pairing**: a choice's tool result rides the NEXT record (same
+  recorder ``session_id``, ``ordinal + 1``, same ``request_id``) as
+  USER-role messages. Two live gotchas are handled: the volatile
+  system-state injection is PREPENDED to that same user message, so
+  extraction slices from the ``<tool_response`` marker (never the message
+  head); and same-request background calls (e.g. the context-shield
+  summarizer) can occupy ``ordinal + 1`` — a candidate that isn't
+  choice-kind or has no marker yields no preview rather than a mispair.
+- **Split**: public/private tier by ``request_id`` hash
+  (``holdout_tier("toolfx:<request_id>")``) so every fixture from one turn
+  shares a tier — membership can never migrate as the corpus grows.
+
+Memory: the mine is ONE streaming pass. Only the light fixtures and a
+pending-pair index are retained — full records (each ~100 KB with the
+tools block) are dropped as soon as they are classified, so multi-GB
+recording backlogs mine in bounded memory. Fixtures are deliberately
+LIGHT: the full recorded payload stays in the day-file; each fixture
+carries a ``source`` pointer (file, session_id, ordinal) so the GEPA eval
+adapter can rehydrate the exact request and swap candidate descriptions
+in. (Adapter note: `RequestState._active_tool_defs_cache` and the XML
+schema cache key on tool NAMES, not description bytes — an offline
+adapter must build a fresh RequestState per candidate.)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+
+from ..distill.collector import TrajectoryCollector
+from ..distill.outcome_heuristics import tool_call_failed
+from ..distill.schema import Outcome
+from .trainset import holdout_tier
+
+logger = logging.getLogger("GhostAgent")
+
+# The pinned era boundary (LOCAL time — see module docstring).
+DEFAULT_ERA_CUTOFF_LOCAL = "2026-07-31T19:15"
+
+# Kinds that can carry a structured tool choice. The main loop streams, so
+# chat_completion_stream dominates; plain chat_completion is accepted for
+# completeness (a non-stream record without structured tool_calls is
+# skipped by the tools/tool_calls requirement either way).
+_CHOICE_KINDS = ("chat_completion_stream", "chat_completion")
+
+# Tool results are rendered into user-role messages as <tool_response ...>
+# blocks (native dialect). Everything before the marker is injected
+# system state, never tool output.
+_TOOL_RESPONSE_MARKER = "<tool_response"
+
+
+@dataclass
+class ToolChoiceFixture:
+    """One tool-choice decision with ground-truth polarity."""
+
+    fixture_id: str
+    request_id: str
+    ts: str                       # record timestamp (UTC ISO, trailing Z)
+    user_request: str             # from the joined trajectory (canonical)
+    chosen_tools: List[Dict[str, str]] = field(default_factory=list)
+    advertised_tools: List[str] = field(default_factory=list)
+    label: float = 0.0            # 1.0 clean PASSED, 0.0 FAILED
+    outcome: str = ""             # joined trajectory outcome (post-overlay)
+    failure_reason: str = ""
+    tool_results: List[str] = field(default_factory=list)  # previews
+    tier: str = "public"          # public | private (request_id-hash split)
+    source: Dict[str, Any] = field(default_factory=dict)   # {file, session_id, ordinal}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def era_cutoff_utc(local_iso: str = DEFAULT_ERA_CUTOFF_LOCAL) -> datetime:
+    """Interpret a naive ISO string as LOCAL wall-clock time and return the
+    equivalent aware UTC datetime (record ``ts`` fields are UTC)."""
+    naive = datetime.fromisoformat(local_iso)
+    return naive.astimezone().astimezone(timezone.utc)
+
+
+def _record_ts_utc(rec: Dict[str, Any]) -> Optional[datetime]:
+    raw = rec.get("ts")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _response_message(rec: Dict[str, Any]) -> Dict[str, Any]:
+    response = rec.get("response")
+    if not isinstance(response, dict):
+        return {}
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return {}
+    first = choices[0]
+    if not isinstance(first, dict):
+        return {}
+    message = first.get("message")
+    return message if isinstance(message, dict) else {}
+
+
+def _structured_tool_calls(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    calls = _response_message(rec).get("tool_calls") or []
+    if not isinstance(calls, list):
+        return []
+    return [c for c in calls if isinstance(c, dict)
+            and (c.get("function") or {}).get("name")]
+
+
+def is_choice_record(rec: Dict[str, Any]) -> bool:
+    """A record that captured an actual tool CHOICE: an advertised tool set
+    in the payload plus a structured tool_calls response."""
+    if rec.get("kind") not in _CHOICE_KINDS:
+        return False
+    payload = rec.get("payload")
+    if not isinstance(payload, dict) or not payload.get("tools"):
+        return False
+    return bool(_structured_tool_calls(rec))
+
+
+def iter_recording_records(
+    paths: Iterable[Path],
+) -> Iterator[Tuple[Path, Dict[str, Any]]]:
+    """Tolerantly iterate JSONL day-files; corrupt lines are skipped."""
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(rec, dict):
+                        yield path, rec
+        except OSError as e:
+            logger.warning("tool-fixture miner: cannot read %s: %s", path, e)
+
+
+def _result_previews_from_messages(messages: List[Any],
+                                   max_chars: int) -> List[str]:
+    """Extract tool-result previews from a follow-up record's messages.
+
+    Only user-role messages AFTER the last assistant message are
+    considered, and only from the ``<tool_response`` marker onward — the
+    volatile ``<system_state_update>`` block is PREPENDED to the same
+    message on the live path and must never leak into fixtures. A message
+    without the marker (e.g. a same-request summarizer prompt) yields
+    nothing.
+    """
+    if not isinstance(messages, list):
+        return []
+    last_assistant = -1
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            last_assistant = i
+    previews: List[str] = []
+    for m in messages[last_assistant + 1:]:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        idx = content.find(_TOOL_RESPONSE_MARKER)
+        if idx == -1:
+            continue
+        previews.append(content[idx:idx + max_chars])
+    return previews
+
+
+def _label_for(traj) -> Optional[float]:
+    """Fixture polarity per the pinned contract; None = exclude."""
+    outcome = getattr(traj, "outcome", "")
+    if outcome == Outcome.PASSED.value:
+        if any(tool_call_failed(tc) for tc in getattr(traj, "tool_calls", [])):
+            # Honest failure: a tool broke, the agent said so, the verifier
+            # passed the turn. The tool CHOICE is neither confirmed good nor
+            # labeled bad — ambiguous, so it never enters the fixture set.
+            return None
+        return 1.0
+    if outcome == Outcome.FAILED.value:
+        return 0.0
+    return None
+
+
+def _trajectory_index(trajectory_root: Path) -> Dict[str, Any]:
+    """request_id (== Trajectory.session_id) -> trajectory, overlay applied.
+    On duplicate session_ids the latest timestamp wins."""
+    collector = TrajectoryCollector(root=trajectory_root, session_id="reader")
+    index: Dict[str, Any] = {}
+    for traj in collector.iter_trajectories():
+        sid = getattr(traj, "session_id", "") or ""
+        if not sid:
+            continue
+        prev = index.get(sid)
+        if prev is None or getattr(traj, "timestamp", "") >= getattr(prev, "timestamp", ""):
+            index[sid] = traj
+    return index
+
+
+def mine_fixtures(
+    recording_paths: Iterable[Path],
+    trajectory_root: Path,
+    *,
+    era_cutoff_local: str = DEFAULT_ERA_CUTOFF_LOCAL,
+    private_pct: int = 30,
+    max_result_chars: int = 1500,
+) -> Tuple[List[ToolChoiceFixture], Dict[str, int]]:
+    """Mine labeled tool-choice fixtures in one streaming pass.
+
+    Returns (fixtures, stats). ``stats`` reports every drop reason —
+    nothing is silently truncated: scanned / bad_ts / pre_era / malformed /
+    no_choice / no_request_context / unjoined / honest_failure_excluded /
+    unlabeled_outcome / positive / negative / paired_results.
+    """
+    cutoff = era_cutoff_utc(era_cutoff_local)
+    index = _trajectory_index(trajectory_root)
+
+    stats = {
+        "scanned": 0, "bad_ts": 0, "pre_era": 0, "malformed": 0,
+        "no_choice": 0, "no_request_context": 0, "unjoined": 0,
+        "honest_failure_excluded": 0, "unlabeled_outcome": 0,
+        "positive": 0, "negative": 0, "paired_results": 0,
+    }
+
+    fixtures: List[ToolChoiceFixture] = []
+    # (session_id, ordinal) -> index of the fixture awaiting that record as
+    # its result carrier. Recorder ordinals are per-process and append-only,
+    # and day-files are iterated in date order, so the carrier always
+    # arrives AFTER its choice. Only light fixtures are retained — never
+    # full records.
+    pending: Dict[Tuple[str, int], int] = {}
+
+    for path, rec in iter_recording_records(recording_paths):
+        stats["scanned"] += 1
+        try:
+            ts = _record_ts_utc(rec)
+            if ts is None:
+                stats["bad_ts"] += 1
+                continue
+            if ts < cutoff:
+                stats["pre_era"] += 1
+                continue
+
+            sid = rec.get("session_id") or ""
+            ordinal = rec.get("ordinal")
+            key = ((sid, ordinal)
+                   if sid and isinstance(ordinal, int) else None)
+
+            # Complete a pending pair first: this record may be the result
+            # carrier for the previous choice. A wrong-kind or wrong-request
+            # occupant (same-request background call) consumes the slot but
+            # contributes nothing — a lost pair, never a mispair.
+            if key is not None and key in pending:
+                fi = pending.pop(key)
+                if (rec.get("kind") in _CHOICE_KINDS
+                        and rec.get("request_id") == fixtures[fi].request_id):
+                    payload = rec.get("payload")
+                    messages = (payload.get("messages")
+                                if isinstance(payload, dict) else []) or []
+                    previews = _result_previews_from_messages(
+                        messages, max_result_chars)
+                    if previews:
+                        fixtures[fi].tool_results = previews
+                        stats["paired_results"] += 1
+
+            if not is_choice_record(rec):
+                stats["no_choice"] += 1
+                continue
+            request_id = rec.get("request_id") or ""
+            if request_id in ("", "SYSTEM"):
+                stats["no_request_context"] += 1
+                continue
+            traj = index.get(request_id)
+            if traj is None:
+                stats["unjoined"] += 1
+                continue
+            label = _label_for(traj)
+            if label is None:
+                if getattr(traj, "outcome", "") == Outcome.PASSED.value:
+                    stats["honest_failure_excluded"] += 1
+                else:
+                    stats["unlabeled_outcome"] += 1
+                continue
+
+            payload = rec.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            advertised = [
+                (t.get("function") or {}).get("name", "")
+                for t in payload.get("tools") or []
+                if isinstance(t, dict)
+            ]
+            chosen = [
+                {"name": (c.get("function") or {}).get("name", ""),
+                 "arguments": (c.get("function") or {}).get("arguments", "") or ""}
+                for c in _structured_tool_calls(rec)
+            ]
+
+            fixtures.append(ToolChoiceFixture(
+                fixture_id=f"toolfx-{request_id}-{sid}-{ordinal}",
+                request_id=request_id,
+                ts=rec.get("ts") or "",
+                user_request=getattr(traj, "user_request", "") or "",
+                chosen_tools=chosen,
+                advertised_tools=[n for n in advertised if n],
+                label=label,
+                outcome=getattr(traj, "outcome", ""),
+                failure_reason=getattr(traj, "failure_reason", "") or "",
+                tool_results=[],
+                tier=holdout_tier(f"toolfx:{request_id}",
+                                  private_pct=private_pct),
+                source={"file": str(path), "session_id": sid,
+                        "ordinal": ordinal},
+            ))
+            stats["positive" if label >= 0.5 else "negative"] += 1
+            if key is not None:
+                pending[(sid, ordinal + 1)] = len(fixtures) - 1
+        except Exception as e:
+            stats["malformed"] += 1
+            logger.debug("tool-fixture miner: record skipped (%s: %s)",
+                         type(e).__name__, e)
+
+    return fixtures, stats
+
+
+def write_fixtures_jsonl(fixtures: List[ToolChoiceFixture], path: Path) -> int:
+    """Write fixtures as JSONL (atomic replace). Returns the count."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for fx in fixtures:
+            fh.write(json.dumps(fx.to_dict(), ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    return len(fixtures)
+
+
+def load_fixtures_jsonl(path: Path) -> List[ToolChoiceFixture]:
+    """Per-line tolerant loader for a ``write_fixtures_jsonl`` file: torn,
+    non-JSON, or field-incomplete lines are skipped, never fatal."""
+    out: List[ToolChoiceFixture] = []
+    known = set(ToolChoiceFixture.__dataclass_fields__)
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                out.append(ToolChoiceFixture(
+                    **{k: v for k, v in data.items() if k in known}))
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return out

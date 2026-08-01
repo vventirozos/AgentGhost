@@ -378,11 +378,11 @@ container-recreate deaths stay honestly reported (generation stamp, existing).
 >
 > **What genuinely remains is NOT pending hunt-work — it is three buckets:**
 >
-> **(0) ⏳ ACTIVE DESIGNED WORK — negative-label supply (§4E, added 2026-07-27).** Tiers 1-2 (graded
-> labels + provenance; failure-report detection) are DONE and deployed. Tier 3 (reopened work) is
-> pending but MARGINAL — measured supply is ~7 events/20 days; Tier 4 stays on HOLD pending a
-> different instrument. Measure a signal's SUPPLY before designing its detector: doing so already
-> killed two of my own designs (see §4E).
+> **(0) ✅ negative-label supply COMPLETE through Tier 3 (§4E).** Tiers 1-2 (graded labels +
+> provenance; failure-report detection) DONE 2026-07-27; Tier 3 (reopened-work retro-negatives,
+> `task_reopened`) DONE 2026-08-01 — marginal supply by design, cost one column + one hook. Tier 4
+> stays on HOLD pending a different instrument. Measure a signal's SUPPLY before designing its
+> detector: doing so already killed two of my own designs (see §4E).
 >
 > **(1) Blocked on operator action** (cannot be done headless):
 > - **Earn-your-keep / synthetic-ablation route — CLOSED as INCONCLUSIVE-for-this-model (operator decision
@@ -502,9 +502,10 @@ BUILT (`core/tts.py` + loop-exit hook), trigger = verifier WOBBLE BAND (UNCERTAI
 REFUTED — not the confidence composite; hard REFUTED keeps auto-repair), `GHOST_TTS_ADAPTIVE_BON`.
 (c) Verified-restart: RESOLVED AS PRE-EXISTING — the auto-repair loop IS critique-conditioned
 restart with narration discard + round caps; summary-conditioning delta deferred as marginal.
-STILL TODO before any live enablement: the stable-prefix-hash regression test with Phase-3 features
-active, and a paired ablation (or B4-private measurement) justifying each default flip. Expected
-(unchanged): hard-suite ~78-80% → mid-80s; latency 2-3× only on the triggered tail.
+STILL TODO before any live enablement: ~~the stable-prefix-hash regression test with Phase-3
+features active~~ (✅ DONE 2026-08-01 later 5 — `tests/test_stable_prefix_phase3.py`), and a
+paired ablation (or B4-private measurement) justifying each default flip. Expected (unchanged):
+hard-suite ~78-80% → mid-80s; latency 2-3× only on the triggered tail.
 
 **Phase 4 — long-horizon context discipline (LAST; after 1-3 prove out).** Structured
 mandatory-section compaction template (intent / files+paths / decisions / active goals / next steps)
@@ -555,7 +556,19 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    greps must match ALL spellings ("verifier gate — REFUTED", "LATE REFUTED", "refuted (late)") —
    naive "verifier — REFUTED" counts ZERO; (c) the 17-boot day (07-31) was operator deploy
    cycles, NOT instability — uptime metrics should exclude it; (d) in-process activation counters
-   reset per boot — use the loader log lines for cross-boot activation evidence.
+   reset per boot — use the loader log lines for cross-boot activation evidence; (e) ATTRIBUTION
+   confound (added 2026-08-01): the native dual-dialect fix (07-31, stacked-call corruption
+   18 fires/2.5h → ≈0) and the honest-failure relabel both improve live outcomes mid-window from
+   NON-verifier causes — the T+14d observational verdict can report "the stack improved" but
+   cannot attribute to the verifier ship alone; the CONTROLLED verify_bench re-runs (T+7d, same
+   judge + templates, artifact hashes pinned in t0/) are the only verifier-specific evidence and
+   carry the §4F verdict weight accordingly; (f) LOG COVERAGE (verified 2026-08-01): the live log
+   was reset again at a 07-31 ~21:02 deploy boot — log-based counters cover ONLY from there
+   (conveniently ≈ the post-honest-failure segment; rule landed 19:14). The first ~29 h of the
+   window live in the DURABLE stores instead (trajectories + corrections.jsonl at the trajectory
+   root + autonomous_activity ledger). Overturn counter line shape confirmed greppable:
+   "Verifier escalation OVERTURNED a cheap-judge refute" (dedupe the GhostAgent/GhostStream twin
+   emission — one event logs twice).
 2. **Phase 2b fixture supply** (`GHOST_LLM_RECORD=1` in the launcher since 07-30 16:06 —
    UNREDACTED, local-only): **supply was structurally broken until 07-31 ~13:40** — the main tool
    loop STREAMS and the recorder had no streaming hook (the §4-parked "dev feature" turned out
@@ -565,9 +578,15 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    OpenAI-shaped record on clean completion only, kind=`chat_completion_stream`; zero cost when
    recording off; `tests/test_stream_recording.py`, 10 tests). Live-verified: probe turn recorded
    tool calls with names+arguments. Miner ground truth = `message.tool_calls` (structured — the
-   earlier content-parsing contract note is OBSOLETE for streamed records). After ~2-3 days of
-   supply → miner, registry read-site, gepa run, private gate, deploy — **then flip recording OFF
-   + archive/delete day-files**.
+   earlier content-parsing contract note is OBSOLETE for streamed records).
+   **UPDATE 2026-08-01 (later 5): the miner (`optim/tool_fixtures.py` +
+   `scripts/mine_tool_fixtures.py`) and the registry read-site
+   (`tool_description.<tool>.json` artifacts via `_apply_tuned_descriptions`) are BUILT, tested,
+   and live-smoke-tested (111 fixtures mined to scratchpad; supply gate says wait).** Remaining:
+   after ~2-3 days of supply → run the miner for real, write the GEPA adapter (rehydrate payloads
+   via fixture `source` pointers; fresh RequestState per candidate — the tool-defs/XML caches key
+   on tool NAMES), gepa run, private gate, deploy via restart — **then flip recording OFF +
+   archive/delete day-files**.
 
 **Queued behind evidence (do NOT start early):**
 3. Next verifier optimization round MUST use a rebalanced trial mix first (clean/NOT_REFUTED
@@ -586,21 +605,22 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
 7. B4 synthetic battery — dormant after double saturation (33/33 single-step, 10/10 comp);
    revivable via fork option (a) deep discovery-chains (5-8 stages, spec-in-previous-output,
    timeout > 300 s). The 10 comp tasks + live pilot instrumentation + `--only-ring` stay in tree.
-8. Minor: two `test_thinking_loop_guards` color tests fail under FORCE_COLOR-exporting shells
-   (env artifact — pass in clean env); consider pinning env in those tests.
+8. ~~Minor: two `test_thinking_loop_guards` color tests fail under FORCE_COLOR-exporting shells~~
+   ✅ RESOLVED 2026-08-01 (`_no_color_env_leak` autouse fixture pins `_USE_COLOR` + the
+   import-time-baked ANSI constants; verified green under FORCE_COLOR=3).
 
 **═══════════════════════════════════════════════**
 
-### 4E. Negative-label supply — Tier 3 ⏳ PENDING, Tier 4 ⛔ HOLD (Tiers 1-2 DONE 2026-07-27)
+### 4E. Negative-label supply — Tiers 1-3 ✅ DONE (Tier 3 2026-08-01), Tier 4 ⛔ HOLD
 
-**Tiers 1 and 2 are DONE and deployed** (§6 "later 9" and "later 10"). Tier 3 remains pending; Tier 4 is
+**Tiers 1-3 are DONE** (§6 "later 9"/"later 10" 2026-07-27; Tier 3 §6 2026-08-01 "later 5"). Tier 4 is
 on HOLD. Measured supply per tier — do this BEFORE designing any further detector, it has already killed
 two of my own designs:
 | tier | measured supply | status |
 |---|---|---|
 | 1 graded label | every turn | ✅ done |
 | 2 failure reports | 20/246 turns (8.1%), ~1/day | ✅ done (redesigned from evidence) |
-| 3 reopened work | 7 project_reopened events / 20 days | ⏳ pending, marginal |
+| 3 reopened work | 7 project_reopened events / 20 days | ✅ done 2026-08-01 (marginal by design) |
 | 4 generated probes | n/a — instrument failed before | ⛔ hold |
 
 **Why any of this:** the label is ~96% one class. Two distinct problems hide in that — (a) too few
@@ -617,10 +637,14 @@ but are discarded.
   was also killed**: the 11 near-identical re-asks are dominated by the daily-briefing habit, and labelling
   them negative would fabricate failures. Lesson worth keeping: measure the SUPPLY of a signal before
   designing the detector for it.
-- **⏳ TIER 3 — retroactive negatives from reopened work.** A task/defect REOPENED after a turn closed it
-  DONE is a delayed negative on that turn. Both the reopening and the turn→task linkage already exist
-  (project work_log, defect reopening — §6 2026-07-18). Nothing new needs observing, only connecting.
-  Source tag: `task_reopened`.
+- **✅ TIER 3 — DONE 2026-08-01 (later 5) — retroactive negatives from reopened work.** A task REOPENED
+  after a turn closed it DONE is a delayed negative on that turn. The missing join was built rather than
+  assumed: `tasks.closed_req_id` stamp (consumed on reopen) + `req_id` on CalibrationSample →
+  `on_task_reopened` hook → `record_task_reopened_negative` (source `task_reopened`, grade 0.15,
+  no-leakage: the closing turn's own components, idempotent, skip-if-already-negative). Task-LEVEL
+  DONE→open triggers it — including on ACTIVE projects, which the project_reopened supply measurement
+  above never counted, so live supply should run slightly ABOVE the 7/20d estimate. See §6 for the
+  review catches (migration-crash guard, honest record() return) and accepted limitations.
 - **⏳ TIER 4 — generated labelled probes. HOLD — this exact idea has already failed here once.** Self-play /
   counterfactual / GAIA give checkable outcomes and could be balanced by construction (~50% difficulty).
   BUT the earn-keep harness was CLOSED 2026-07-23 precisely because synthetic batteries ceilinged on this
@@ -1380,6 +1404,87 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-08-01 (later 5) — §4 remaining-work sweep: Phase-2b miner+read-site BUILT, Phase-3 flip prereq test, §4E Tier 3 SHIPPED
+
+Cleared every §4 item that was actionable without waiting on a clock or evidence gate. Suite
+10282→10344 green; live-validated where a live surface existed. **Review-your-own-changes paid for
+the FIFTH straight session: 2 fresh read-only agents on my own green-suite edits found 1 MAJOR +
+3 MAJOR + minors — all fixed same-session (details below).**
+
+- **§4F Phase 2b — tool-description fixture miner + registry read-site (both halves of the loop
+  that were missing; the GEPA run itself still waits on supply per the run plan).**
+  `optim/tool_fixtures.py` + `scripts/mine_tool_fixtures.py`: one streaming pass, era filter
+  (local→UTC), structured-tool_calls-only, ground truth via `iter_trajectories()` overlay joined
+  on request_id (SYSTEM sentinel excluded), honest-failure exclusion, `toolfx:<request_id>`
+  tiering, light fixtures with day-file `source` pointers. Read-site:
+  `registry._apply_tuned_descriptions` — artifact-only (`tool_description.<tool>.json`, no
+  OptimizableSignature, scope fence untouched), `_TOOL_DESC_OVERRIDES` offline hook, per-tool
+  validator + 20k **aggregate** inflation guard (all-or-nothing; per-tool caps sum to ~10× the
+  real tools block), copy-on-write, one-scan-per-process under explicit GHOST_HOME only.
+  **Live mine (scratchpad, not promoted): 111 fixtures (22 pos / 89 neg), 45 clean
+  `<tool_response` previews, supply gate correctly says WAIT** (~2-3 days per plan; note the
+  labeled corpus skews negative because clean-PASSED requires ZERO failed tool calls — the
+  55 honest-failure exclusions are mostly passed turns). REVIEW CATCHES (miner agent, live-
+  measured): result previews were 79% injected `<system_state_update>`/playbook text (head-slice
+  → now marker-slice), unbounded by_session retention (~100KB/record → OOM in weeks → one-pass
+  pending-pair index), same-request summarizer at ordinal+1 mispaired (→ kind+marker guard,
+  lost-pair-never-mispair), CLI zero-positive hole, SYSTEM join landmine, test-isolation leak
+  via the loader's ~/ghost_llamacpp fallback. Tests: test_tool_fixture_miner.py (18),
+  test_tool_desc_readsite.py (14). Docs: self_improvement.md §Phase 2b.
+- **§4F Phase 3 flip prereq — stable-prefix-hash regression test DONE**
+  (`tests/test_stable_prefix_phase3.py`, 7): flags-on vs flags-off payload byte-identity (pinned
+  first-user msg + system slot), in-request cross-turn pin stability, BoN-copies-not-mutates
+  (direct `_adaptive_bon_final` drive: k gen calls on `list(messages)+[...]`, judge on cheap
+  pool, live list untouched), source guards (no Phase-3 env read before `_compose_injection`;
+  BoN call inside the `if not _do_repair:` region). LEARNED: the pinned block legitimately
+  varies ACROSS requests (persona/steering reclassify per request) — the KV contract is
+  within-request only; a cross-request byte-identity test is wrong by design.
+- **§4E Tier 3 — task_reopened retro-negatives SHIPPED (the last pending tier).** Join key =
+  new `tasks.closed_req_id` column (stamped from `request_id_context` on the transition INTO
+  DONE; SYSTEM blanks; **reopen CONSUMES the stamp** so each closing turn is labeled at most
+  once and a stale stamp can't mis-attribute a later SYSTEM re-close) + `req_id` field on
+  CalibrationSample/record() (Tier-1 passes it; durable — survives restarts, no dependence on
+  the 32-entry stash). TASK-level DONE→open fires `on_task_reopened` (project status
+  irrelevant — ACTIVE-project revivals count; add_task project-reopens deliberately do NOT — no
+  single closed task to blame) → `task_reopened` event + main.py hook →
+  `CalibrationTracker.record_task_reopened_negative`: re-records the closing turn's OWN stored
+  components (no-leakage) at `_TASK_REOPENED_GRADE` 0.15, idempotent, skip-if-already-negative.
+  REVIEW CATCHES (Tier-3 agent): named-column pre-SELECT would hard-crash every update_task
+  after a skipped best-effort migration (→ SELECT * + dict.get + column-presence gate);
+  record() swallowed write failures while the hook logged success (→ record() returns bool);
+  stale-stamp scenario (→ consume-on-reopen). Accepted limitations, documented: same-turn
+  close→reopen records nothing (turn sample not yet written); multi-process double-fire
+  possible (per-process locks; rare, bounded harm); dup-scan reads full history (rare event,
+  ~1.2k rows). Tests: test_task_reopened_tier.py (18). Docs: core/calibration.html,
+  memory/projects.html.
+- **§4F parked item 8 (FORCE_COLOR color tests) — already fixed** by the earlier 2026-08-01
+  session (`_no_color_env_leak` autouse fixture); verified green under FORCE_COLOR=3. Item
+  CLOSED in the snapshot below.
+
+### 2026-08-01 (later 4) — 4F watch T+3d reading (early, ~T+2d): HEALTHY — refutes are TRUE positives, FP cost absorbed by escalation
+
+Read over the surviving log segment (07-31 ~21:02 deploy boot → 08-01 ~08:53 — conveniently ≈ the
+post-honest-failure segment; caveats a-f §4F applied). **Verdict: HEALTHY, no intervention.**
+- **Activation continuous:** 38 GEPA template loads = 19 boots × 2 — tuned verifier live on EVERY
+  process across the deploy churn. Phase 3 flags verifiably absent from the live env (default-off
+  holding); 0 BoN fires.
+- **Volume:** 242 final verdicts (200 CONFIRMED / ~54 REFUTED-family / 1 UNCERTAIN).
+- **The FPR watch (the pre-registered concern):** 64 cheap-judge refutes OVERTURNED on main-model
+  escalation (≈49% of ~130 cheap refutes) — the tuned judge still over-refutes, consistent with
+  the bench direction (0.31→0.385), BUT the cost lands exactly where the design puts it: ~5
+  extra main-model calls/hour, nothing user-facing. **Facial validity 4/4:** every sampled
+  SURVIVING refute is a true positive (unverified-availability claim; internal-state noise in a
+  reply; a missed second price check after a required delay; and correctly refuting req 50855398 —
+  the known-failed Slack-notify request from this morning's postmortem). The churn is the
+  instrument catching real failures, not crying wolf.
+- **Correction churn:** 51 corrections queued-to-surface across the segment (~21% of
+  verdict-bearing turns) — high but tracking the true-positive refutes; 23 bounded auto-repair
+  rounds; honest-failure late-upgrade fired exactly ONCE (rule is quiet, not distorting).
+- **2b supply (co-clock):** 87 structured tool-call fixture responses TODAY by 08:53 alone —
+  miner-ready volume lands ~08-02/03 as planned.
+Next: T+7d (~08-06) verify_bench re-run vs t0 (the controlled, verifier-specific evidence) +
+segmented outcome-label trend.
+
 ### 2026-08-01 (later 3) — Mini AI v3 retest PASSED + notify promise now persists on the project
 
 **Retest (4 requests, 07:47–08:00): the v2 test shape completed clean — 7/7 tasks persisted
@@ -1410,6 +1515,17 @@ promise (now restored via setdefault); an active promise now suppresses the per-
 backstop (premature mid-project "Done —" + settle fire = guaranteed double ping); brittle test
 pins relaxed. Residual (documented): idle-loop FAILED rollups deliver on the next foreground
 touch; a mid-stream client disconnect defers to the same.**
+
+**Ship wobble worth remembering: the first capture wiring did a function-local
+`from ..utils.logging import request_id_context` inside handle_chat — Python scoping made the
+name local for the WHOLE function, so the `request_id_context.set(req_id)` at turn start blew
+up with UnboundLocalError → 172 test failures on the full run. The module-level import (line
+~35) was already there; the local import was pure poison. Full suite re-run green (10,231
+passed). The remaining 2 "failures" were the session shell's FORCE_COLOR=3 leaking into
+utils/logging's IMPORT-TIME color constants (RESET/DIM/BOLD/_LEVEL_COLOR bake _ansi() results
+at import) — not a code bug; TestAtomicPrint now pins the module attrs via monkeypatch so the
+suite is immune to the invoking shell. DEPLOYED 2026-08-01 ~09:0x (idle-checked before the
+kill — request 5299219b's lesson applied to our own deploy; agent healthy on respawn).**
 
 ### 2026-08-01 (later 2) — req 50855398 post-mortem (1789s abort): model struggled, FOUR agent defects turned it into a failed request
 
@@ -1454,6 +1570,15 @@ always streams — the incident shape exactly); twin wiring added in the streame
 (5) simulation/dream turns with "notify me" in synthetic prompts could page the operator —
 is_simulation guard added; (6) an ERRORED notify_operator call suppressed the backstop — only a
 non-error call counts as promise-kept.**
+
+**Also from this cluster: the F4 no-think switches tripped the two source-inspection guards
+that cap `enable_thinking: False` occurrences in agent.py at 1 (trivial fast-path) —
+test_self_play_redesign + test_tts_adaptive_bon now allow ≤3 with EVERY occurrence still
+required to sit in a /no_think-marked or trivial-path block (the main-tool-turn guard intent is
+preserved; the System 3 pivot is a legitimate bounded side-call). Full suite 10,219 green;
+DEPLOYED 2026-08-01 ~07:45 via plain kill (this deploy also shipped the pending Slack
+server-side halves from the "later" session). The retest that validates this whole cluster is
+the "later 3" entry above (Mini AI v3: 292s, zero strikes, 7/7 tasks).**
 
 ### 2026-08-01 (later) — Slack notification workflow review: pipeline sound, four operational defects fixed
 
@@ -1534,7 +1659,9 @@ completion at 95% because its evidence never contained the ledger.**
 (stale reason cleared), train.py task added retroactively as DONE (decompose had eaten it),
 deliverables registered (core.py, train.py, research brief), project rolled DONE. demo.py was
 never persisted as a task and never built — add a task if still wanted. Docs:
-docs/tools/projects.html, docs/core/{coding_executor,project_advancer,planning,verifier}.html.**
+docs/tools/projects.html, docs/core/{coding_executor,project_advancer,planning,verifier}.html.
+DEPLOYED by the operator same morning (plain kill); live-validated by the Mini AI v3 retest
+(see "later 3": 7/7 tasks persisted, NEEDS_USER honored, stale-evidence wedge gone).**
 
 **Review pass (fresh read-only agent on my own edits — the 2026-07-27 discipline paid again,
 6 real findings past a green suite, all fixed + pinned): (1) the live re-check counted
@@ -3401,7 +3528,9 @@ inertness warning rewritten** in learning_health — the old fail-ONLY-lesson te
 pass rate (live: 29 failed ticks already flowing → arm was never inert; warning now requires ZERO failed ticks
 against ≥20 succeeded); launcher comment fixed (bin/start-ghost-agent.sh said frontier-selfplay "default: ON",
 actual default OFF since #27b 2026-07-09). NOT changed (watch items, not defects): slack-bot 8MB unrotated .err
-(httpx INFO noise, no leak — one poller per process confirmed); native tool_call repair fired in 4/8 overnight
+(httpx INFO noise, no leak — one poller per process confirmed) **[RESOLVED 2026-08-01: log-hygiene rework — see
+§6 "Slack notification workflow review"; .err truncated, httpx silenced, self-rotating .info.log]**; native
+tool_call repair fired in 4/8 overnight
 sessions (guards worked; known upstream issue). Tests: test_counterfactual.py::TestReplayGate,
 test_selfplay_curriculum_2026_07_27.py, test_calibration_entropy_wiring_2026_07_27.py, test_learning_health.py
 (rewritten arm tests). Docs: memory/frontier.html, core/dream.html, core/calibration.html, core/entropy.html,

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     actual_cost REAL NOT NULL DEFAULT 0.0,
     depth INTEGER NOT NULL DEFAULT 0,
     position INTEGER NOT NULL DEFAULT 0,
+    closed_req_id TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -188,6 +189,11 @@ class ProjectStore:
         # automatically. Left None in tests / headless contexts that don't
         # care about cleanup. Signature: (project_id: str) -> None.
         self.on_project_done = None
+        # Optional hook fired when a TASK transitions DONE -> open (§4E
+        # Tier 3, 2026-08-01). main.py wires this to the calibration
+        # retro-negative writer. Left None in tests/headless contexts.
+        # Signature: (project_id, task_id, from_status, closed_req_id).
+        self.on_task_reopened = None
         self._lock = threading.RLock()
         self._init_db()
 
@@ -207,6 +213,22 @@ class ProjectStore:
         except Exception:  # pragma: no cover - defensive
             logger.warning(
                 "on_project_done hook failed for %s", project_id, exc_info=True
+            )
+
+    def _fire_task_reopened(self, project_id: str, task_id: str,
+                            from_status: str, closed_req_id: str) -> None:
+        """Invoke the ``on_task_reopened`` hook (§4E Tier 3). Same discipline
+        as ``_fire_project_done``: outside the DB lock, fully guarded — a
+        calibration write failure must never break the status transition."""
+        cb = getattr(self, "on_task_reopened", None)
+        if cb is None:
+            return
+        try:
+            cb(project_id, task_id, from_status, closed_req_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "on_task_reopened hook failed for task %s", task_id,
+                exc_info=True,
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -246,6 +268,10 @@ class ProjectStore:
             "tasks": [
                 ("depends_on_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("constraints_json", "TEXT NOT NULL DEFAULT '[]'"),
+                # §4E Tier 3 (2026-08-01): the request id of the turn that
+                # last closed this task DONE — the join key for retroactive
+                # calibration negatives when the task is later reopened.
+                ("closed_req_id", "TEXT NOT NULL DEFAULT ''"),
             ],
         }
         for table, columns in wanted.items():
@@ -732,10 +758,50 @@ class ProjectStore:
                 sets.append(f"{key} = ?")
                 values.append(val)
         now = _now()
-        sets.append("updated_at = ?")
-        values.append(now)
-        values.append(task_id)
+        new_status = (str(fields["status"]).upper()
+                      if "status" in fields else None)
+        task_reopened_args = None
         with self._lock, self._connect() as conn:
+            # Read the task's PRE-update state: the DONE->open transition
+            # (§4E Tier 3) and the closing-turn stamp both key off it.
+            # SELECT * + dict.get, NOT a named-column SELECT: _migrate is
+            # best-effort (a locked DB skips the ALTER with a warning), and
+            # naming closed_req_id here would turn that survivable warning
+            # into "no such column" on EVERY update_task until restart.
+            pre_row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            pre = dict(pre_row) if pre_row is not None else {}
+            has_closed_req_col = "closed_req_id" in pre
+            prev_task_status = (pre.get("status") or "").upper()
+            prev_closed_req = str(pre.get("closed_req_id") or "")
+            if (has_closed_req_col and new_status == "DONE"
+                    and prev_task_status != "DONE"):
+                # Stamp WHICH turn closed this task so a later reopen can
+                # retro-label that turn's calibration sample. ALWAYS write
+                # on the transition into DONE: "SYSTEM" (no request context
+                # — boot reaper, maintenance) writes blank, which also
+                # clears a stale stamp from an earlier closing turn.
+                try:
+                    from ..utils.logging import request_id_context
+                    req = request_id_context.get()
+                except Exception:  # pragma: no cover - defensive
+                    req = ""
+                if not req or req == "SYSTEM":
+                    req = ""
+                sets.append("closed_req_id = ?")
+                values.append(str(req))
+            elif (has_closed_req_col
+                    and new_status in ("PENDING", "READY", "IN_PROGRESS")
+                    and prev_task_status == "DONE"):
+                # Reopening consumes the stamp: the retro-negative for this
+                # closing turn fires below exactly once, and a later
+                # re-close re-stamps (or blanks) it fresh.
+                sets.append("closed_req_id = ?")
+                values.append("")
+            sets.append("updated_at = ?")
+            values.append(now)
+            values.append(task_id)
             cur = conn.execute(
                 f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", values
             )
@@ -777,6 +843,16 @@ class ProjectStore:
                     )
                     if rcur.rowcount > 0:
                         reopened_from = prev
+            # §4E Tier 3: the TASK-level DONE -> open transition (regardless
+            # of project status — a task revived on an ACTIVE project is
+            # just as much a delayed negative on the turn that closed it).
+            if (row and cur.rowcount > 0
+                    and new_status in ("PENDING", "READY", "IN_PROGRESS")
+                    and prev_task_status == "DONE"):
+                task_reopened_args = (
+                    row["project_id"], task_id, prev_task_status,
+                    ((pre["closed_req_id"] if pre else "") or ""),
+                )
             conn.commit()
             updated = cur.rowcount > 0
         if updated and row:
@@ -786,6 +862,12 @@ class ProjectStore:
                 self.log_event(row["project_id"], task_id, "project_reopened",
                                {"reason": f"task re-opened on a {reopened_from} project",
                                 "from_status": reopened_from})
+            if task_reopened_args:
+                self.log_event(row["project_id"], task_id, "task_reopened",
+                               {"from_status": task_reopened_args[2],
+                                "closed_req_id": task_reopened_args[3]})
+                # Outside the DB txn (committed above), still guarded.
+                self._fire_task_reopened(*task_reopened_args)
             # Auto-roll-up: when a task status changes, the project as a
             # whole may have finished. If every task is in a terminal
             # state, transition the project. (DONE if all DONE; FAILED

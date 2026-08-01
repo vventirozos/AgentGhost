@@ -95,6 +95,11 @@ _BUDGET_EXHAUSTED_GRADE = 0.2
 # notch above an explicit correction's 0.0, because attribution is slightly
 # looser: the report might name a defect the previous turn did not cause.
 _FAILURE_REPORT_GRADE = 0.15
+# §4E Tier 3 (2026-08-01): a task the turn closed DONE was later REOPENED —
+# delayed evidence the closing was premature. Same strength as a failure
+# report (attribution equally loose: the reopen can also reflect scope
+# growth rather than wrongness), never 0.0.
+_TASK_REOPENED_GRADE = 0.15
 
 
 def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 0,
@@ -297,12 +302,19 @@ class CalibrationSample:
     # PROVENANCE of the label. Without it, mixing signal tiers is
     # irreversible: you can never audit which tier is noisy, nor drop one,
     # without discarding the whole corpus. Every future source (implicit
-    # rephrase-negatives, reopened-task negatives, generated probes) must
-    # carry its own tag so the mix stays visible and separable.
+    # rephrase-negatives, generated probes) must carry its own tag so the
+    # mix stays visible and separable.
     #   "turn"            — the graded end-of-turn label (a PROXY)
     #   "user_correction" — the user said the answer was wrong (ground truth)
+    #   "failure_report"  — the user pasted breakage next turn (ground truth)
+    #   "task_reopened"   — a task this turn closed DONE was later reopened
+    #                       (delayed ground truth; §4E Tier 3)
     # Legacy records predate the field and were all end-of-turn labels.
     source: str = "turn"
+    # The request id of the turn this sample scores. "" on legacy records
+    # and non-turn sources. The §4E Tier-3 join key: a task reopen carries
+    # the closing turn's req_id and finds this sample by it.
+    req_id: str = ""
 
 
 @dataclass
@@ -417,8 +429,11 @@ class CalibrationTracker:
         effort_component: float = 0.5,
         effort_observed: bool = False,
         source: str = "turn",
-    ) -> None:
-        """Append one (confidence, outcome) pair. Never raises.
+        req_id: str = "",
+    ) -> bool:
+        """Append one (confidence, outcome) pair. Never raises; returns
+        True when the sample actually reached disk (callers that report
+        success to the operator must not claim an unwritten row).
 
         ``entropy_observed`` records whether ``entropy_component`` came from
         real token logprobs. Pass it through faithfully — a fabricated
@@ -442,13 +457,68 @@ class CalibrationTracker:
                 effort_component=_clamp01(effort_component),
                 effort_observed=bool(effort_observed),
                 source=str(source or "turn"),
+                req_id=str(req_id or ""),
             )
             with self._lock:
                 self.dir.mkdir(parents=True, exist_ok=True)
                 with self.history_path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(asdict(sample)) + "\n")
+            return True
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("CalibrationTracker.record failed: %s", exc)
+            return False
+
+    def record_task_reopened_negative(self, closed_req_id: str) -> bool:
+        """§4E Tier 3: retroactive negative for the turn that closed a task
+        later REOPENED. Finds that turn's ``source="turn"`` sample by
+        ``req_id`` and re-records ITS OWN stored components (no-leakage:
+        the feature side is untouched, only the label differs) at
+        ``_TASK_REOPENED_GRADE`` with ``source="task_reopened"``.
+
+        Returns True when a retro sample was written. Skips (False) when:
+        no join (legacy rows / stampless close), the closing turn already
+        carries a task_reopened retro row (idempotent — one retro negative
+        per closing turn, however often statuses cycle afterwards), or the
+        closing turn's own label was already negative (mirrors Tier 2's
+        no-double-counting rule). Never raises.
+        """
+        try:
+            closed_req_id = str(closed_req_id or "")
+            if not closed_req_id:
+                return False
+            with self._lock:
+                samples = self._load_samples()
+                base = None
+                for s in samples:
+                    if s.req_id != closed_req_id:
+                        continue
+                    if s.source == "task_reopened":
+                        return False  # already retro-labeled
+                    if s.source == "turn":
+                        base = s  # last write wins
+                if base is None:
+                    return False
+                if base.outcome < 0.5:
+                    return False  # the turn is already a negative
+                # record() reports whether the row reached disk — pass that
+                # through so the operator log never claims an unwritten
+                # retro-negative (and a failed write stays retryable).
+                return self.record(
+                    composite=base.composite,
+                    entropy_component=base.entropy_component,
+                    competence_component=base.competence_component,
+                    uncertainty_pressure=base.uncertainty_pressure,
+                    outcome=_TASK_REOPENED_GRADE,
+                    domain=base.domain,
+                    entropy_observed=base.entropy_observed,
+                    effort_component=base.effort_component,
+                    effort_observed=base.effort_observed,
+                    source="task_reopened",
+                    req_id=closed_req_id,
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("record_task_reopened_negative failed: %s", exc)
+            return False
 
     # ----------------------------------------------------------- reading
 
@@ -491,6 +561,7 @@ class CalibrationTracker:
                         effort_component=_clamp01(d.get("effort_component", 0.5)),
                         effort_observed=bool(d.get("effort_observed", False)),
                         source=str(d.get("source") or "turn"),
+                        req_id=str(d.get("req_id") or ""),
                     )
                 )
             except Exception:
