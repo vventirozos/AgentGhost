@@ -163,6 +163,24 @@ def _now() -> float:
     return time.time()
 
 
+def _constraint_list(value: Any) -> List[str]:
+    """Normalise a metadata constraints value to a list of strings.
+
+    Metadata is model-written JSON: a bare string
+    (``{"constraints": "no pandas"}``) passes the dict boundary check and
+    used to be iterated CHAR-BY-CHAR — the retirement path then persisted
+    the shredded single-character list, destroying the record (review
+    catch, 2026-08-01). Strings wrap to a one-element list; other
+    non-list scalars stringify likewise; lists/tuples stringify per item."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(c) for c in value if str(c).strip()]
+    return [str(value)]
+
+
 class ProjectStore:
     """SQLite-backed store for projects, tasks, artifacts, and events.
 
@@ -432,8 +450,70 @@ class ProjectStore:
             self.log_event(project_id, None, "project_updated", {"fields": list(fields.keys())})
             if (status_norm == ProjectStatus.DONE.value
                     and (prev_status or "").upper() != ProjectStatus.DONE.value):
+                # Constraint lifecycle (2026-08-01, req 56221fad post-mortem):
+                # stored constraints bind work while the project is IN FLIGHT.
+                # A 07-28 deliverable constraint ("Start with: What it means
+                # to BE ghost") kept replaying into every request for 4 days
+                # after the work closed — polluting new artifacts and driving
+                # verifier refutes whose follow-up tasks reopened the project,
+                # a self-feeding loop. DONE retires them; a verifier-refute
+                # reopen does NOT resurrect them; the user restating one
+                # re-arms it (see the create-merge path in tools.projects).
+                self.retire_constraints(project_id, reason="project completed")
                 self._fire_project_done(project_id)
         return updated
+
+    def retire_constraints(self, project_id: str, reason: str = "",
+                           only: Optional[List[str]] = None) -> List[str]:
+        """Move the project's active ``constraints`` to
+        ``constraints_retired`` (deduped, bounded). ``only`` limits the
+        move to the given texts (case-insensitive exact match); default is
+        all of them. Returns the list that was retired (empty when nothing
+        matched OR the write did not persist). Never raises — lifecycle
+        bookkeeping must not break a status transition."""
+        moved: List[str] = []
+        only_keys = ({str(c).lower() for c in only}
+                     if only is not None else None)
+        try:
+            def _mut(meta):
+                active = _constraint_list(meta.get("constraints"))
+                if not active:
+                    return meta
+                if only_keys is None:
+                    moving, keeping = active, []
+                else:
+                    moving = [c for c in active if c.lower() in only_keys]
+                    keeping = [c for c in active if c.lower() not in only_keys]
+                if not moving:
+                    return meta
+                prior = _constraint_list(meta.get("constraints_retired"))
+                seen = {c.lower() for c in prior}
+                for c in moving:
+                    if c.lower() not in seen:
+                        prior.append(c)
+                        seen.add(c.lower())
+                moved.extend(moving)
+                meta["constraints"] = keeping
+                # Bounded: this is an audit trail, not a working set.
+                meta["constraints_retired"] = prior[-20:]
+                return meta
+
+            # Success is the WRITE landing, not the mutator running: a
+            # mid-transaction failure rolls the store back after `moved`
+            # was populated, and reporting those as retired would tell the
+            # caller "stops replaying immediately" about a constraint that
+            # is still live (review catch, 2026-08-01).
+            if self._atomic_metadata_update(project_id, _mut) is None:
+                return []
+            if moved:
+                self.log_event(project_id, None, "constraints_retired",
+                               {"constraints": moved[:10],
+                                "reason": reason or "unspecified"})
+        except Exception:
+            logger.debug("retire_constraints skipped for %s",
+                         project_id, exc_info=True)
+            return []
+        return moved
 
     def delete_project(self, project_id: str, hard: bool = False) -> bool:
         """Archive (soft) or delete (hard) a project.
@@ -963,6 +1043,12 @@ class ProjectStore:
         # FAILED / NEEDS_USER stay resumable (a revised task can roll the
         # project forward to DONE later), so their workspace must survive.
         if new_status == ProjectStatus.DONE.value:
+            # Constraint lifecycle rides EVERY DONE transition — this raw-SQL
+            # rollup (last task closed via task_update/delete_task) is the
+            # path projects normally finish on; retiring only in
+            # update_project would miss the incident's exact shape (review
+            # catch, 2026-08-01).
+            self.retire_constraints(project_id, reason="project completed")
             self._fire_project_done(project_id)
 
     def reset_orphaned_in_progress(self, older_than_seconds: float = 900.0) -> int:

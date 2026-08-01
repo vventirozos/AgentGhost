@@ -21,7 +21,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..memory.projects import ProjectStore, ProjectKind, ProjectStatus
+from ..memory.projects import (ProjectStore, ProjectKind, ProjectStatus,
+                               _constraint_list)
 from ..core.planning import ProjectPlan, TaskStatus, DependencyType
 from ..utils.constraints import extract_constraints
 from ..utils.logging import Icons, pretty_log
@@ -56,6 +57,8 @@ _ACTIONS = {
     "release", "create_version", "unrelease", "verify_release",
     # task removal (round 3 — store.delete_task existed unexposed)
     "task_delete",
+    # constraint lifecycle (2026-08-01 — stale-constraint incident)
+    "constraint_retire",
     # cross-project features (2026-07-25 final round)
     "search", "set_dependency", "clone",
     # workspace hygiene
@@ -897,6 +900,22 @@ def _reconcile_conversation(context, conv_key: str):
             context, cur,
             f"Project '{cur}' belongs to another conversation — "
             "deactivated for this request")
+
+
+def _rearm_inherited_constraints(meta: Dict[str, Any]) -> List[str]:
+    """Constraints a fork/clone inherits as ACTIVE: the source's active
+    list plus its retired list (case-insensitively deduped, order
+    preserved). A DONE/RELEASED source keeps its constraint knowledge in
+    ``constraints_retired`` (lifecycle, 2026-08-01) — new work on the same
+    deliverable line makes that intent live again."""
+    merged: List[str] = []
+    seen = set()
+    for c in (_constraint_list(meta.get("constraints"))
+              + _constraint_list(meta.get("constraints_retired"))):
+        if c.lower() not in seen:
+            merged.append(c)
+            seen.add(c.lower())
+    return merged
 
 
 def _workspace_note(project_id: str) -> str:
@@ -1941,12 +1960,23 @@ async def tool_manage_projects(
                 # "matches exactly what the user wants" after the user had
                 # explicitly excluded it). Merge the fresh constraints into
                 # the project so briefings/DONE-gates see them.
-                prior_constraints = [str(c) for c in
-                                     (existing_meta.get("constraints") or [])]
+                prior_constraints = _constraint_list(
+                    existing_meta.get("constraints"))
                 fresh = [c for c in req_constraints
                          if c.lower() not in {p.lower() for p in prior_constraints}]
                 if fresh:
                     existing_meta["constraints"] = prior_constraints + fresh
+                    # Re-arm: a retired constraint the user RESTATES is live
+                    # intent again — drop it from the retired list so the
+                    # lifecycle can't shadow it (retirement happens on
+                    # project DONE; see store.retire_constraints).
+                    _retired = _constraint_list(
+                        existing_meta.get("constraints_retired"))
+                    if _retired:
+                        _fresh_keys = {c.lower() for c in fresh}
+                        existing_meta["constraints_retired"] = [
+                            c for c in _retired
+                            if c.lower() not in _fresh_keys]
                 try:
                     store.update_project(existing["id"], metadata=existing_meta)
                 except Exception:
@@ -2283,6 +2313,62 @@ async def tool_manage_projects(
             if not ok:
                 return _err(f"update matched no rows for {project_id} — nothing was changed.")
             return _ok({"updated": ok, "fields": list(fields.keys())})
+
+        if act == "constraint_retire":
+            # Constraint lifecycle (2026-08-01): stop a stored constraint
+            # from replaying into future requests WITHOUT deleting the
+            # record — it moves to metadata.constraints_retired (project
+            # DONE retires all of them automatically; the user restating
+            # one re-arms it). payload = the exact constraint text, its
+            # 0-based index in the active list, or "all".
+            if not project_id and not title:
+                return _err("project_id (or title) is required for "
+                            "action=constraint_retire")
+            _rid, _rerr = _resolve_project_ref(store, project_id, title)
+            if _rerr:
+                return _err(_rerr)
+            if not _rid:
+                return _err(f"project not found: {project_id or title!r}")
+            proj = store.get_project(_rid) or {}
+            active = _constraint_list(
+                (proj.get("metadata") or {}).get("constraints"))
+            if not active:
+                return _err("project has no active constraints to retire")
+            sel = str(payload or "").strip()
+            if not sel:
+                return _err(
+                    "payload is required: the exact constraint text, its "
+                    f"index (0-{len(active) - 1}), or 'all'. Active: "
+                    + " | ".join(f"[{i}] {c}" for i, c in enumerate(active)))
+            # Exact text wins over index — a constraint whose text IS a
+            # digit must not be shadowed by positional selection.
+            text_matches = [c for c in active if c.lower() == sel.lower()]
+            if sel.lower() == "all":
+                targets = active
+            elif text_matches:
+                targets = text_matches
+            elif sel.isdigit() and int(sel) < len(active):
+                targets = [active[int(sel)]]
+            else:
+                return _err(
+                    f"no active constraint matches {sel!r}. Active: "
+                    + " | ".join(f"[{i}] {c}"
+                                 for i, c in enumerate(active)))
+            retired = store.retire_constraints(
+                _rid, reason="explicit constraint_retire", only=targets)
+            if not retired:
+                return _err("nothing was retired (concurrent change?) — "
+                            "re-run action=get and retry")
+            pretty_log("Project Constraints",
+                       f"retired {len(retired)} constraint(s) on {_rid}: "
+                       + " | ".join(c[:60] for c in retired),
+                       icon=Icons.CONSTRAINT)
+            remaining = [c for c in active if c not in retired]
+            return _ok({"retired": retired, "active_constraints": remaining,
+                        "note": ("Retired constraints stop replaying into "
+                                 "requests/verifier immediately. They are "
+                                 "kept in metadata.constraints_retired and "
+                                 "re-arm only if the user restates them.")})
 
         if act == "delete":
             # Hard, irreversible delete: DB row + all tasks/artifacts/events
@@ -3404,7 +3490,13 @@ async def tool_manage_projects(
                 "design_ledger": pmeta.get("design_ledger") or "",
                 "config": new_cfg,
                 "file_manifest": pmeta.get("file_manifest") or {},
-                "constraints": pmeta.get("constraints") or [],
+                # A fork is new in-flight work on the same deliverable line,
+                # so the parent's constraints are live intent again — active
+                # AND retired (a RELEASED parent necessarily passed DONE,
+                # which retires; copying only the active list would inherit
+                # [] and silently drop the constraint knowledge). They
+                # retire again when THIS version goes DONE.
+                "constraints": _rearm_inherited_constraints(pmeta),
                 "research_index": pmeta.get("research_index") or [],
             }
             new_pid = store.create_project(
@@ -3669,7 +3761,10 @@ async def tool_manage_projects(
                     "design_ledger": smeta.get("design_ledger") or "",
                     "config": new_cfg,
                     "file_manifest": smeta.get("file_manifest") or {},
-                    "constraints": smeta.get("constraints") or [],
+                    # Active + retired, same rationale as create_version:
+                    # a DONE/RELEASED source carries its constraint
+                    # knowledge in the retired list.
+                    "constraints": _rearm_inherited_constraints(smeta),
                     "cloned_from": project_id,
                 })
             import shutil
@@ -4041,7 +4136,8 @@ MANAGE_PROJECTS_TOOL_DEF = {
                              "description": "Ordered subtask descriptions for task_decompose / promote_from_context. GRANULARITY: make each task own a FILE or a clearly-bounded function/module you can build AND verify on its own (e.g. 'src/parser.py: parse the CSV', 'apps/terminal.js: terminal app'). AVOID splitting one file into N tasks (e.g. 6 tasks that all edit index.html) — that forces re-reading the whole file every turn and does not scale. Prefer a thin shell/entrypoint + one file per feature."},
                 "artifact_kind": {"type": "string",
                                   "enum": ["file", "url", "note", "tool_call"]},
-                "payload": {"type": "string"},
+                "payload": {"type": "string",
+                            "description": "artifact_add: the artifact body/path. constraint_retire: WHICH active constraint to retire — its exact text, its 0-based index, or 'all'. Retiring stops the constraint from replaying into future requests/verifier checks (it is kept in metadata.constraints_retired; the user restating it re-arms it). Project DONE retires all constraints automatically. Use when a stored constraint no longer reflects user intent — e.g. a phrasing rule for deliverables that keeps firing on ordinary replies."},
                 "deliverables": {"type": "array", "items": {"type": "string"},
                                  "description": "task_update with status=DONE: the project-relative paths of files the USER should keep (the actual deliverables — reports, code, generated images). Everything else in the project workspace (screenshots, helper scripts, temp files) is DELETED when the project finishes, so list every file worth keeping here. Paths are relative to the project workspace, e.g. [\"report.pdf\", \"src/solver.py\"]."},
                 "status_filter": {"type": "string"},

@@ -123,6 +123,62 @@ def _group_blocks(blocks: List[str]) -> List[List[int]]:
     return groups
 
 
+# ---------------------------------------------------------------------------
+# System-note stripping (2026-08-01, req 56221fad post-mortem)
+# ---------------------------------------------------------------------------
+# Finalize appends operator-facing notes to the delivered reply (the
+# ⚠ Unverified mutation note, the plan-postcondition note, the uncertainty
+# risk summary) and prepends the async-verdict correction banner. Those are
+# OUR text, not the model's — yet two consumers were reading them as if the
+# model wrote them:
+#   * the hedge auto-scan flagged the Unverified note's "I cannot confirm it
+#     works" as a 40%-confidence assumption, and the risk summary then
+#     re-rendered that self-echo into the reply — the garbled duplicated
+#     footer the 56221fad late refute called "truncated";
+#   * the verifier judged the claim WITH the notes, so "does not confirm the
+#     update" was literally our own INCOMPLETE disclaimer contradicting the
+#     model's ✅ confirmation lines.
+# `strip_system_notes` removes exactly those appended shapes so scanners and
+# judges see the model-authored reply. The markers are matched with their
+# separator context (the `\n---\n` we append with / the banner's exact
+# prefix), so ordinary model text mentioning "assumptions" is untouched.
+
+# Trailing notes are stripped TERMINALLY and iteratively: each appended
+# note is a single blank-line-free block riding the very end of the reply,
+# so only an end-anchored block whose body contains no blank line is ours.
+# A model-authored "**Assumptions I made:**" section followed by real
+# blank-line-separated content fails the match and survives (fail-open —
+# review catch 2026-08-01: the earlier earliest-marker cut deleted
+# everything after a mid-reply lookalike, substance included).
+_TRAILING_NOTE_TAIL_RE = re.compile(
+    r"\n*---\n(?:\*\*⚠ Unverified:\*\*|\*\*Plan check:\*\*|"
+    r"\*\*Things I'm not certain about:\*\*|\*\*Assumptions I made:\*\*)"
+    r"(?:(?!\n\n).)*$",
+    re.DOTALL,
+)
+# The correction banner is PREPENDED (see _consume_pending_corrections) with
+# a fixed shape ending in a blank-line-separated rule.
+_CORRECTION_BANNER_RE = re.compile(
+    r"^⚠️ \*\*Correction to my previous answer:\*\* .*?\n\n---\n\n",
+    re.DOTALL,
+)
+
+
+def strip_system_notes(text: str) -> str:
+    """Return *text* without finalize-appended system notes (trailing
+    Unverified / Plan check / risk-summary blocks, leading correction
+    banner). Model-authored content is preserved byte-for-byte."""
+    if not text:
+        return text
+    out = _CORRECTION_BANNER_RE.sub("", text, count=1)
+    while True:
+        m = _TRAILING_NOTE_TAIL_RE.search(out)
+        if not m:
+            break
+        out = out[:m.start()]
+    return out.rstrip("\n") if out != text else out
+
+
 def smooth_reply(text: str) -> str:
     """Remove working narration and superseded summary groups from an
     accumulated multi-turn reply. See module docstring for the rules."""

@@ -117,6 +117,117 @@ def render_constraint_block(constraints: List[str],
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# START-WITH constraint enforcement on the ASSEMBLED reply
+# ---------------------------------------------------------------------------
+# Req 56221fad (2026-08-01): the model's FINAL turn opened with the mandated
+# phrase, but the delivered reply is a multi-turn accumulation — an earlier
+# turn's analysis block was prepended, burying the opener at char 2253. The
+# verifier judged the assembled text and refuted "fails constraint to start
+# with …" even though the model complied at the message level. Per-turn
+# steers cannot fix an assembly-order problem, so the reply itself is
+# repaired deterministically at finalize: if a start-with constraint is
+# active and some later paragraph-boundary segment opens with the phrase,
+# everything before that segment is pre-answer narration — drop it.
+
+# DELIBERATELY NARROW (review catch 2026-08-01): a bare "start with X" is
+# usually an ORDERING instruction ("Fix the bugs. START with the parser"),
+# and this module's cheap-false-positive contract does not hold here — a
+# misparse doesn't just re-render into a prompt, it DELETES delivered
+# reply text via the hoist. A format mandate must therefore be explicit:
+# a colon ("Start with: X"), a quoted phrase ("start with 'X'"), or a
+# reply-shaped noun ("begin your reply with X").
+_SW_PREFIX = r"^(?:(?:must|always|please)\s+)?(?:start|begin|open)s?\s+"
+_SW_NOUNS = (r"(?:reply|replies|response|responses|answer|answers|message|"
+             r"messages|deliverable|deliverables|file|files|document|"
+             r"documents)")
+_START_WITH_RES = (
+    re.compile(_SW_PREFIX + r"(?:your|the|each|every|all)\s+" + _SW_NOUNS
+               + r"\s+with\s*:?\s*(.{3,120})$", re.IGNORECASE),
+    re.compile(_SW_PREFIX + r"with\s*:\s*(.{3,120})$", re.IGNORECASE),
+    re.compile(_SW_PREFIX + r"with\s+['\"“”`](.{3,120}?)['\"“”`]\s*$",
+               re.IGNORECASE),
+)
+
+# Cosmetic head noise that may legally precede the mandated phrase:
+# horizontal rules, heading hashes, blockquote marks, bold/italic fences,
+# stray quotes/backticks. Stripped iteratively before comparing.
+_HEAD_NOISE_RE = re.compile(r"^(?:-{3,}\s*|#{1,6}\s+|>\s+|\*+|_+|['\"“”`]+)")
+
+# A hoist that keeps less than this fraction of the reply is treated as
+# suspicious (the phrase-led segment is a stub, not the answer) — fail open.
+_START_WITH_MIN_KEEP = 0.4
+
+
+def parse_start_with_phrase(constraints: List[str]) -> Optional[str]:
+    """The mandated opening phrase, when any active constraint is an
+    EXPLICIT reply-format mandate — "Start with: X", "start with 'X'",
+    or "begin your reply with X". Bare ordering instructions
+    ("start with the parser") deliberately return ``None``."""
+    for c in constraints or []:
+        text = str(c or "").strip()
+        m = next((mm for rx in _START_WITH_RES
+                  if (mm := rx.match(text))), None)
+        if not m:
+            continue
+        phrase = m.group(1).strip().strip("'\"“”`").strip()
+        if phrase.endswith((".", "!", "?")) and len(phrase) > 4:
+            phrase = phrase[:-1].rstrip()
+        if len(phrase) >= 3:
+            return phrase
+    return None
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip().casefold()
+
+
+def _head_matches(segment: str, phrase: str) -> bool:
+    """True when *segment* opens with *phrase* after cosmetic head noise."""
+    s = (segment or "").lstrip()
+    for _ in range(6):
+        m = _HEAD_NOISE_RE.match(s)
+        if not m:
+            break
+        s = s[m.end():].lstrip()
+    return _norm(s).startswith(_norm(phrase))
+
+
+def reply_satisfies_start_with(reply: str, phrase: str) -> bool:
+    return _head_matches(reply or "", phrase)
+
+
+def enforce_start_with(reply: str, constraints: List[str]):
+    """Hoist the phrase-led segment of a multi-turn assembled reply to the
+    head when a start-with constraint demands it.
+
+    Returns ``(reply, dropped_chars)`` — unchanged input and 0 when no
+    start-with constraint is active, the reply already complies, no
+    paragraph segment opens with the phrase, the candidate cut would land
+    inside a code fence, or the surviving tail is under
+    ``_START_WITH_MIN_KEEP`` of the reply (fail open: deliver as-is and
+    let the verifier report it)."""
+    phrase = parse_start_with_phrase(constraints)
+    if not phrase or not reply:
+        return reply, 0
+    if reply_satisfies_start_with(reply, phrase):
+        return reply, 0
+    segments = reply.split("\n\n")
+    for i in range(1, len(segments)):
+        if not _head_matches(segments[i], phrase):
+            continue
+        prefix = "\n\n".join(segments[:i])
+        # Never cut inside an unclosed ``` fence — an odd fence count in
+        # the dropped prefix means the "segment head" is mid-code.
+        if prefix.count("```") % 2 == 1:
+            return reply, 0
+        tail = "\n\n".join(segments[i:])
+        if len(tail) < _START_WITH_MIN_KEEP * len(reply):
+            return reply, 0
+        return tail, len(reply) - len(tail)
+    return reply, 0
+
+
 # Participant-mode DETECTION over already-captured constraints (broader than
 # `_PARTICIPANT_RE`, which decides clause capture): the chess sessions showed
 # the binding clauses arrive as "with YOU", "play chess with you", "Ghost

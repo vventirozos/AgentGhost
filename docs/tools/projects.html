@@ -343,6 +343,33 @@
   verifier's live project-ledger evidence (<a href="../core/verifier.html">verifier</a>).
   Tests: <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
 
+  <h2>Constraint lifecycle — DONE retires, restating re-arms (2026-08-01, req 56221fad)</h2>
+  <p>Stored project constraints used to be immortal. One captured on 07-28 for a batch of
+  deliverables ("Start with: What it means to BE ghost") kept replaying into <em>every</em>
+  request bound to the project for four days after that work closed: new files got the phrase
+  jammed above their titles, ordinary chat replies drew verifier refutes for not opening with it,
+  and each refute filed follow-up tasks that reopened the project — a self-feeding loop the
+  operator found as a queue of six "Verifier follow-up" tasks.</p>
+  <ul>
+    <li><b>Project DONE retires all constraints</b> — <code>store.update_project</code>'s DONE
+    transition moves <code>metadata.constraints</code> into
+    <code>metadata.constraints_retired</code> (deduped, capped at 20, event
+    <code>constraints_retired</code> logged). Constraints bind work in flight, not the afterlife.</li>
+    <li><b>Reopens do not resurrect.</b> A verifier-refute follow-up (<code>add_task</code> on a
+    DONE project) reopens the project but the retired constraints stay retired.</li>
+    <li><b>The user restating one re-arms it</b> — the duplicate-create merge path already treats
+    re-issued constraints as corrections; it now also removes a matching entry from
+    <code>constraints_retired</code> so the lifecycle can never shadow live intent.</li>
+    <li><b>Explicit control: <code>action=constraint_retire</code></b> with
+    <code>payload</code> = exact text, 0-based index, or <code>all</code>. Errors list the active
+    constraints with indices. <code>store.retire_constraints(pid, reason, only=[…])</code> is the
+    underlying primitive.</li>
+  </ul>
+  <p>Companions shipped the same day: finalize-time start-with enforcement on the assembled reply
+  (the model had complied in its final turn; accumulation buried the opener at char 2253) and the
+  verifier claim-fairness work (<a href="../core/verifier.html">verifier</a>).
+  Tests: <code>tests/test_constraint_lifecycle_and_claim_fairness.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

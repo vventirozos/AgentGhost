@@ -494,6 +494,45 @@ Respond ONLY with a JSON object:
   "issues": ["specific contradictions, if any"]
 }}"""
 
+# Claim packing (2026-08-01, req 56221fad post-mortem). The old blunt
+# ``claim[:2000]`` cut a 5.7k-char reply mid-sentence: the judge reported
+# "truncated at the end" as a defect of the ANSWER, and the confirmation
+# lines living in the tail ("✅ Ledger updated …") were invisible — so
+# "does not confirm the update" shipped as a 90% refute on a reply that
+# confirmed it. Long claims are now packed head+tail around an explicit
+# elision marker: openings carry constraint compliance, tails carry
+# confirmations/conclusions; the middle is the part a judge can spare.
+_CLAIM_LIMIT = 2000
+_CLAIM_HEAD = 1200
+
+
+def pack_claim(text: str, limit: int = _CLAIM_LIMIT,
+               head: int = _CLAIM_HEAD) -> str:
+    """Fit *text* into *limit* chars keeping its head AND tail, with an
+    explicit "[… N chars omitted …]" marker at the seam so the judge knows
+    the elision is the packer's, not the reply ending mid-sentence.
+    Text already within the limit is returned unchanged (idempotent on
+    its own output for any sane limit)."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+
+    def _marker(n: int) -> str:
+        return (f"\n[… ~{n} chars of the reply omitted here — mid-answer "
+                f"elision by the audit packer, NOT a truncated response …]\n")
+
+    # Two passes: the true omitted count depends on the marker's own
+    # length (digit width), so estimate, then recompute once.
+    omitted = len(text) - limit
+    for _ in range(2):
+        marker = _marker(omitted)
+        tail = limit - head - len(marker)
+        omitted = len(text) - head - max(tail, 0)
+    if tail <= 0:  # degenerate limit — fall back to a plain head cut
+        return text[:limit]
+    return text[:head] + marker + text[-tail:]
+
+
 def _bounded_fallback_kwargs(llm_client: Any) -> Dict[str, Any]:
     """Kwargs for the last-resort direct verdict call on the MAIN model.
 
@@ -968,7 +1007,8 @@ class Verifier:
         confirm expensive — the same gate discipline used elsewhere here.
         Kill switch: GHOST_VERIFY_ESCALATE_REFUTE=0.
         """
-        claim_t = claim[:2000]
+        # Head+tail packing, not a blunt cut — see pack_claim's rationale.
+        claim_t = pack_claim(claim)
         evidence_t = evidence[:4000]
         context_t = context[:1000]
         result = None

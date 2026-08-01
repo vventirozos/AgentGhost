@@ -236,6 +236,33 @@ python scripts/verify_bench.py --base-url http://127.0.0.1:8080 \
   the tail of that output too, inside its own 4000-char cap. Tests:
   <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
 
+  <h2>Claim fairness: head+tail packing + system-note stripping (2026-08-01, req 56221fad)</h2>
+  <p>A 5,737-char reply drew a 90% LATE REFUTED whose three reasons were all instrumentation
+  artifacts. The claim passed to the judge was a blunt <code>final_ai_content[:2000]</code>:
+  it cut mid-sentence (judged as "truncated response"), hid the closing
+  "✅ Ledger updated" confirmations (judged as "does not confirm project update"), and hid the
+  mandated opening phrase sitting at char 2253 of the assembled reply. Two changes:</p>
+  <p><b>(a) <code>pack_claim</code></b> (module-level in <code>core/verifier.py</code>, used inside
+  <code>verify_claim</code>): claims over 2000 chars keep their first 1200 and last ~700 chars
+  around an explicit <i>"[… ~N chars of the reply omitted here — mid-answer elision by the audit
+  packer, NOT a truncated response …]"</i> marker. Openings carry constraint compliance, tails
+  carry confirmations; the middle is what a judge can spare. Idempotent — packed output re-packs
+  to itself, so agent-side callers may pass full or packed text.</p>
+  <p><b>(b) <code>strip_system_notes</code></b> (<code>core/reply_smoothing.py</code>): the judged
+  claim is the MODEL-AUTHORED reply. Finalize-appended notes — the ⚠ Unverified mutation note,
+  the Plan-check note, the uncertainty risk summary, the prepended correction banner — are ours;
+  judging them made the verifier refute its own INCOMPLETE disclaimer as "does not confirm the
+  update". <code>_compute_verifier_verdict</code> strips them from the claim, the evidence
+  packer's <code>claim_text</code>, <code>verify_code_output</code>'s response and
+  <code>verify_visual</code>'s claim. The hedge auto-scan strips them too — it had flagged the
+  Unverified note's "I cannot confirm it works" as a 40% assumption, which the risk summary then
+  re-rendered into the reply as a garbled self-echo footer.</p>
+  <p><b>Follow-up filer filter:</b> refute issues matching
+  <code>truncat|internal system message|system noise</code> are packaging artifacts, never project
+  work — they still surface via the correction banner but are no longer filed as
+  "Verifier follow-up" tasks (the incident filed "Truncated response" onto the project's books).
+  Tests: <code>tests/test_constraint_lifecycle_and_claim_fairness.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

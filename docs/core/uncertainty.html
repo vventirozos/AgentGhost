@@ -96,6 +96,16 @@ tracker.verify_assumption(a, was_correct=True)
   Watch it via the learning-health feature table (<code>n</code>/distinct/separation). Tests:
   <code>tests/test_uncertainty_pressure_wiring.py</code>.</p>
 
+  <h2>Hedge scan reads only the model-authored reply (2026-08-01)</h2>
+  <p>The finalize-appended ⚠ Unverified note contains "I cannot confirm it works" — a textbook
+  hedge. The auto-scan flagged it as a 40%-confidence assumption, and <code>get_risk_summary</code>
+  then re-rendered our own disclaimer back into the reply ("**Assumptions I made:** - ---
+  **⚠ Unverified:** …" — the garbled duplicated footer the 56221fad late refute read as a
+  truncated response). Both hedge-scan sites (finalize + streamed path) now scan
+  <code>strip_system_notes(reply)</code> (<a href="verifier.html">verifier</a> claim fairness,
+  <code>core/reply_smoothing.py</code>) so system notes can never seed assumptions.
+  Tests: <code>tests/test_constraint_lifecycle_and_claim_fairness.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

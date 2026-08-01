@@ -558,8 +558,10 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    cycles, NOT instability — uptime metrics should exclude it; (d) in-process activation counters
    reset per boot — use the loader log lines for cross-boot activation evidence; (e) ATTRIBUTION
    confound (added 2026-08-01): the native dual-dialect fix (07-31, stacked-call corruption
-   18 fires/2.5h → ≈0) and the honest-failure relabel both improve live outcomes mid-window from
-   NON-verifier causes — the T+14d observational verdict can report "the stack improved" but
+   18 fires/2.5h → ≈0), the honest-failure relabel, AND the 08-01 later-9 claim-fairness ship
+   (pack_claim + strip_system_notes + constraint lifecycle — directly reduces false-refute
+   incidence; verify_bench provably unaffected, but LIVE refute/overturn counters are not) all
+   improve live outcomes mid-window from NON-verifier causes — the T+14d observational verdict can report "the stack improved" but
    cannot attribute to the verifier ship alone; the CONTROLLED verify_bench re-runs (T+7d, same
    judge + templates, artifact hashes pinned in t0/) are the only verifier-specific evidence and
    carry the §4F verdict weight accordingly; (f) LOG COVERAGE (verified 2026-08-01): the live log
@@ -1404,7 +1406,69 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
-### 2026-08-01 (later 8) — visualizer window overhaul (operator: "PDFs pop the window but show nothing")
+### 2026-08-01 (later 9) — req 56221fad post-mortem: the verifier refuted its own instrumentation; constraint lifecycle + claim fairness SHIPPED + DEPLOYED
+
+**Incident (operator: "what went wrong on the last one?").** The 22:05 request drew a 90% LATE
+REFUTED whose three reasons were ALL artifacts of our own plumbing, verified against raw
+recordings: (1) "fails constraint to start with 'What it means to BE ghost'" — the model DID open
+its final turn with the phrase; multi-turn assembly prepended turn-2's analysis and buried it at
+char 2253; (2) "does not confirm project update" — the reply's ✅ confirmations sat past the blunt
+`claim[:2000]` cut, and the system-appended ⚠Unverified/INCOMPLETE footer contradicted them;
+(3) "truncated response" — finish_reason=stop; the "truncation" was the claim cap plus a garbled
+footer (hedge auto-scan flagged our own note's "I cannot confirm it works" as a 40% assumption and
+the risk summary re-rendered it — a self-echo). Root poison: a project constraint captured 07-28
+("Start with: …") replayed into EVERY request for 4 days after the work closed, polluting new
+artifacts (the phrase jammed above file titles) and feeding a refute→follow-up-task→reopen loop
+the operator found as a queue of 6 junk "Verifier follow-up" tasks. The one legitimate defect in
+the incident turn: the model finalized on an unverified write ("The tool response said SUCCESS.
+I'll trust it.") — that part of outcome=failed was earned.
+
+**Shipped (4 clusters, all tests green: 10,404 passed / 13 skipped):**
+- **Constraint lifecycle** (`memory/projects.py`, `tools/projects.py`): project DONE retires
+  `metadata.constraints` → `constraints_retired` (deduped, capped 20, event-logged) on BOTH DONE
+  paths — `update_project` AND the raw-SQL task-rollup (`_maybe_rollup_project_status`, the way
+  projects normally finish; review catch — the first cut missed it). Refute-driven reopens do NOT
+  resurrect; the user restating one re-arms it (duplicate-create merge drops it from the retired
+  list); forks/clones inherit active+retired via `_rearm_inherited_constraints` (a RELEASED parent
+  necessarily passed DONE, so copying only the active list inherited []); new
+  `manage_projects action=constraint_retire` (payload = text | index | all; text beats index so a
+  digit-text constraint can't be shadowed). `_constraint_list` normalizer: bare-string metadata
+  wraps to a 1-element list instead of being char-shredded and destructively persisted.
+- **Verifier claim fairness** (`core/verifier.py`, `core/agent.py`): `pack_claim` head+tail
+  packing (1200 + explicit "~N chars omitted — NOT a truncated response" marker + tail) replaces
+  `claim[:2000]` inside `verify_claim`; idempotent. `strip_system_notes`
+  (`core/reply_smoothing.py`) removes finalize-appended notes (⚠Unverified / Plan check / risk
+  summary / leading correction banner) from the judged claim, evidence `claim_text`,
+  `verify_code_output` response, `verify_visual` claim, the FILE-ARTIFACT filename parse (review
+  catch: on streamed turns the banner carries the PREVIOUS refute's filenames → false FILE-ARTIFACT
+  refute cascade), and BOTH hedge-scan sites (kills the self-echo footer). Terminal-block-only
+  stripping (blank-line-free, end-anchored) so a model-authored "Assumptions I made" section
+  followed by real content fails open. **verify_bench unaffected BY CONSTRUCTION: max claim in the
+  exact seed-0 97-trial set is 373 chars — pack_claim never fires; no re-baseline needed.**
+- **Start-with enforcement on the ASSEMBLED reply** (`utils/constraints.py`, finalize): if an
+  explicit format mandate is active and a later paragraph opens with the phrase, the pre-answer
+  narration is hoisted off (fence-guarded, ≥40% keep ratio, fail-open), after smoothing and BEFORE
+  the verifier gate. Parse is DELIBERATELY narrow (review catch: bare "START with the parser" is
+  ordering guidance, and a misparse here deletes delivered text): only "Start with: X",
+  quoted-phrase, or reply-noun forms parse.
+- **Follow-up filer artifact filter** (`agent.py`): refute issues shaped like packaging artifacts
+  (response/reply/answer-truncation wording, "internal system message", "system noise") no longer
+  become project tasks (banner-only). Anchored so truncated-DELIVERABLE issues ("export.csv is
+  truncated at 100 rows") still file (review catch).
+
+**Review discipline held (streak: 8):** two read-only execution-verifying agents on the green
+diff found 1 CRIT (rollup DONE path unretired — the incident's actual finish path), 4 MAJOR
+(string-shred persistence; banner filenames in the FILE-ARTIFACT parse; over-broad truncation
+filter; ordering-instruction misparse deleting reply text), and 5 minors — all fixed same session
+except one accepted audit-trail cosmetic (case-variant dedupe keeps first spelling). Every catch
+is pinned in `tests/test_constraint_lifecycle_and_claim_fairness.py` (44 tests).
+
+**Live cleanup + deploy:** project 7b62e5e533d1's stale constraint retired (event-logged) and all
+6 junk follow-up tasks closed with an honest post-mortem note (store then auto-rolled the project
+to DONE — correct, its work was finished); deployed via listener kill 19750 → 36971, clean boot,
+bounded probe returned exactly PROBE-OK-3117. Docs: verifier.html, projects.html,
+uncertainty.html. **⚠ 4F-watch attribution note:** this cluster reduces false-refute incidence
+mid-window from NON-verifier-optimization causes — added to the §4F caveat (e) confound list.
 
 One-feature adversarial review (16 findings: 1 CRIT, 3 HIGH) + full repair; interface
 tests 170 green incl. new `tests/test_interface_visualizer.py`; live Playwright sweep

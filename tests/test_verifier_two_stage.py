@@ -324,10 +324,16 @@ def test_prompts_carry_bookkeeping_dismissal_rule():
 
 
 async def test_two_stage_truncates_slots_like_classic_path():
+    """Inputs stay bounded — but the claim is PACKED head+tail (2026-08-01,
+    req 56221fad: the old blunt [:2000] hid the reply's closing
+    confirmations from the judge and read as 'truncated response')."""
     stub = _QueueStub([SUSPECTS_JSON, CONFIRM_JSON])
     v = Verifier(llm_client=stub)
     await v.verify_claim("C" * 5000, "E" * 9000, "X" * 3000)
     stage1 = stub.prompts[0]
-    assert "C" * 2000 in stage1 and "C" * 2001 not in stage1
+    # Claim: bounded, head AND tail survive, elision is explicit.
+    assert "C" * 1200 in stage1 and "C" * 2001 not in stage1
+    assert "NOT a truncated response" in stage1
+    # Evidence / context keep the classic hard cuts.
     assert "E" * 4000 in stage1 and "E" * 4001 not in stage1
     assert "X" * 1000 in stage1 and "X" * 1001 not in stage1

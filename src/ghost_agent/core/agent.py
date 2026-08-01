@@ -6129,8 +6129,12 @@ class GhostAgent:
             if store is None or not pid:
                 return []
             proj = store.get_project(pid) or {}
-            cons = [str(c) for c in
-                    ((proj.get("metadata") or {}).get("constraints") or [])]
+            raw = (proj.get("metadata") or {}).get("constraints") or []
+            # Model-written metadata can carry a bare string — iterating
+            # it char-by-char replayed shredded garbage (review 2026-08-01).
+            if isinstance(raw, str):
+                raw = [raw]
+            cons = [str(c) for c in raw]
             return cons[:limit]
         except Exception:
             return []
@@ -6258,12 +6262,20 @@ class GhostAgent:
         # the turn's own tool narration (which is the thing under audit).
         # The packer budget shrinks by the block's size and the block rides
         # the END of the evidence, inside verify_claim's own [:4000] cap.
+        # The judged claim is the MODEL-AUTHORED reply: finalize-appended
+        # system notes (⚠ Unverified / Plan check / risk summary /
+        # correction banner) are ours, and judging them produced the
+        # 56221fad self-refute ("does not confirm the update" = our own
+        # INCOMPLETE disclaimer). verify_claim packs long claims
+        # head+tail itself (pack_claim), so no blunt [:2000] cuts here.
+        from .reply_smoothing import strip_system_notes
+        _claim_src = strip_system_notes(str(final_ai_content or ""))
         ledger_block = _project_ledger_evidence(
             self.context, tools_run_this_turn)
         claim_evidence = _collect_verifier_evidence(
             tools_run_this_turn,
             budget=(4000 - len(ledger_block) - 1) if ledger_block else 4000,
-            claim_text=str(final_ai_content or "")) or tool_output
+            claim_text=_claim_src) or tool_output
         if ledger_block:
             _room = 4000 - len(ledger_block) - 1
             claim_evidence = ((claim_evidence[:_room] + "\n" + ledger_block)
@@ -6286,17 +6298,17 @@ class GhostAgent:
                     code=code_text,
                     output=_code_output,
                     intent=request_view,
-                    response=final_ai_content or "",
+                    response=_claim_src,
                 )
             else:
                 v_result = await verifier.verify_claim(
-                    claim=final_ai_content[:2000],
+                    claim=_claim_src,
                     evidence=claim_evidence,
                     context=request_view[:1000],
                 )
         else:
             v_result = await verifier.verify_claim(
-                claim=final_ai_content[:2000],
+                claim=_claim_src,
                 evidence=claim_evidence,
                 context=request_view[:1000],
             )
@@ -6311,7 +6323,7 @@ class GhostAgent:
                 if _after_img:
                     _vv = await verifier.verify_visual(
                         symptom=last_user_content or "",
-                        claim=final_ai_content or "",
+                        claim=_claim_src,
                         after_image=_after_img,
                         before_image=_before_img,
                     )
@@ -6430,7 +6442,12 @@ class GhostAgent:
         # and feeds the same auto-repair loop, so the agent gets a bounded
         # attempt to actually produce the deliverable.
         try:
-            _claimed = _claimed_deliverable_files(final_ai_content)
+            # Same claim source as the judge (review catch 2026-08-01): on
+            # streamed turns final_ai_content carries the PREPENDED
+            # correction banner, whose text is the previous refute's issue
+            # list — parsing filenames out of it produced a false
+            # FILE-ARTIFACT refute for files this reply never claimed.
+            _claimed = _claimed_deliverable_files(_claim_src)
             # Union with the files the turn ACTUALLY mutated (writes AND
             # replaces, any extension) — claim-prose selection alone let an
             # edited-but-unclaimed file skip the ground-truth re-read
@@ -7141,6 +7158,15 @@ class GhostAgent:
     # is a verdict, not a work item).
     _REFUTE_TASK_MAX = 2
     _REFUTE_TASK_MIN_CHARS = 25
+    # Judge vocabulary for delivery/packaging artifacts (see the filter in
+    # _file_refute_followup_tasks) — matched case-insensitively. Anchored
+    # to RESPONSE-shaped truncation only (review catch 2026-08-01): a bare
+    # `truncat` also killed legitimate truncated-DELIVERABLE follow-ups
+    # ("export.csv is truncated at 100 rows"), a real defect class here.
+    _REFUTE_TASK_ARTIFACT_RE = re.compile(
+        r"truncat\w*\s+(?:response|reply|answer)"
+        r"|(?:response|reply|answer)\s+(?:is|was|appears|seems)?\s*truncat"
+        r"|internal system message|system noise", re.IGNORECASE)
 
     def _file_refute_followup_tasks(self, v_result, project_id):
         """File a late refute's concrete leftovers as tasks on the project
@@ -7173,6 +7199,13 @@ class GhostAgent:
         issues = [str(i).strip() for i in (getattr(v_result, "issues", None)
                                            or [])]
         issues = [i for i in issues if len(i) >= self._REFUTE_TASK_MIN_CHARS]
+        # Delivery/packaging artifacts are never project WORK: "truncated
+        # response" describes the audit packer's own cut (req 56221fad filed
+        # it as a task), and "internal system message" / "system noise"
+        # describe finalize-appended notes, not deliverables. They still
+        # surface via the correction banner; they just don't go on the books.
+        issues = [i for i in issues
+                  if not self._REFUTE_TASK_ARTIFACT_RE.search(i)]
         if not issues:
             return
         if status == "DONE":
@@ -10637,6 +10670,33 @@ class GhostAgent:
             except Exception as _sm_exc:
                 logger.debug("reply smoothing skipped: %s", _sm_exc)
 
+        # Start-with constraint enforcement on the ASSEMBLED reply
+        # (req 56221fad): the model opened its FINAL turn with the mandated
+        # phrase, but multi-turn accumulation prepended an earlier turn's
+        # analysis, burying the opener at char 2253 — the verifier then
+        # refuted the delivered text for failing the constraint. Per-turn
+        # steers can't fix assembly order; this deterministic hoist can.
+        # Runs after smoothing and BEFORE the verifier gate, so the verdict
+        # judges the text the user actually receives.
+        try:
+            from ..utils.constraints import (
+                enforce_start_with, extract_constraints as _exc_fn)
+            _sw_constraints = (list(_exc_fn(last_user_content or ""))
+                               + self._active_project_constraints())
+            _enforced, _sw_dropped = enforce_start_with(
+                final_ai_content, _sw_constraints)
+            if _sw_dropped:
+                pretty_log(
+                    "Constraint Check",
+                    f"assembled reply hoisted to honor a start-with "
+                    f"constraint — dropped {_sw_dropped} chars of "
+                    f"pre-answer narration",
+                    icon=Icons.CONSTRAINT,
+                )
+                final_ai_content = _enforced
+        except Exception as _sw_exc:
+            logger.debug("start-with enforcement skipped: %s", _sw_exc)
+
         # --- THE "PERFECT IT" PROTOCOL INJECTION ---
         # Only trigger proactive optimization for heavy engineering/research tasks
         heavy_tools_used = any(t.get('name') in ['execute', 'deep_research'] for t in tools_run_this_turn)
@@ -11114,8 +11174,15 @@ class GhostAgent:
         try:
             _hs_tracker = getattr(self.context, 'uncertainty_tracker', None)
             if _hs_tracker is not None:
+                # Scan only the MODEL-AUTHORED reply: the finalize-appended
+                # ⚠ Unverified note contains "I cannot confirm it works" —
+                # scanning it flagged our own disclaimer as a 40% assumption,
+                # and the risk summary then re-rendered that self-echo into
+                # the reply (the garbled duplicated footer the 56221fad late
+                # refute read as truncation).
+                from .reply_smoothing import strip_system_notes as _ssn
                 for _hedge in _hs_tracker.scan_text_for_uncertainty(
-                    final_ai_content or ""
+                    _ssn(final_ai_content or "")
                 ):
                     _hs_tracker.flag_assumption(
                         _hedge, confidence=0.4,
@@ -16556,8 +16623,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     _utk = getattr(self.context, "uncertainty_tracker", None)
                                     if _utk is not None:
                                         try:
+                                            from .reply_smoothing import (
+                                                strip_system_notes as _ssn2)
                                             for _hedge in _utk.scan_text_for_uncertainty(
-                                                full_content or ""
+                                                _ssn2(full_content or "")
                                             ):
                                                 _utk.flag_assumption(
                                                     _hedge, confidence=0.4,
