@@ -127,14 +127,14 @@
                     <div id="planner-monologue"></div>
                 </div>
             </div>
+            <!-- Icon order (2026-08-01, operator): alerts first, then the
+                 console, then the three FILE operations grouped together
+                 (workspace / upload / download), appearance toggles (face,
+                 zen) last — rare-cosmetic sits at the end of the row. -->
             <div id="header-controls">
                 <button id="notif-btn" class="icon-btn" title="Notifications" aria-label="Notifications">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
                     <span id="notif-badge" class="hidden">0</span>
-                </button>
-                <button id="face-form-btn" class="icon-btn" title="Cycle face form"
-                        aria-label="Cycle face form">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="9" r="5.5"></circle><path d="M14 10.5a5.5 5.5 0 1 1-3.5 9.9"></path><path d="M12 3.5 13.2 6l2.6.4-1.9 1.9.5 2.6-2.4-1.3"></path></svg>
                 </button>
                 <button id="logs-btn" class="icon-btn" title="Live Log">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -150,17 +150,6 @@
                         <polyline points="7 3 7 8 15 8"></polyline>
                     </svg>
                 </button>
-                <!-- TTS voice toggle removed 2026-07-28 (voice unused; frees
-                     the mobile header to a single row). The TTS engine in
-                     app.js is guarded by `if (ttsToggleBtn)` and stays
-                     dormant; restore by re-adding #tts-toggle-btn here. -->
-                <button id="fullscreen-btn" class="icon-btn" title="Toggle Zen Mode">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                        stroke-linecap="round" stroke-linejoin="round">
-                        <path
-                            d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
-                    </svg>
-                </button>
                 <input type="file" id="file-upload-input" style="display: none;" />
                 <button id="upload-btn" class="icon-btn" title="Upload to Sandbox">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -174,6 +163,21 @@
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                         <polyline points="7 10 12 15 17 10"></polyline>
                         <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                </button>
+                <!-- TTS voice toggle removed 2026-07-28 (voice unused; frees
+                     the mobile header to a single row). The TTS engine in
+                     app.js is guarded by `if (ttsToggleBtn)` and stays
+                     dormant; restore by re-adding #tts-toggle-btn here. -->
+                <button id="face-form-btn" class="icon-btn" title="Cycle face form"
+                        aria-label="Cycle face form">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="9" r="5.5"></circle><path d="M14 10.5a5.5 5.5 0 1 1-3.5 9.9"></path><path d="M12 3.5 13.2 6l2.6.4-1.9 1.9.5 2.6-2.4-1.3"></path></svg>
+                </button>
+                <button id="fullscreen-btn" class="icon-btn" title="Toggle Zen Mode">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path
+                            d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
                     </svg>
                 </button>
             </div>
@@ -199,14 +203,10 @@
             </div>
             <div id="input-area">
                 <textarea id="chat-input" placeholder="Enter message" rows="1"></textarea>
-                <button id="mic-btn" title="Hold to Talk">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                        <line x1="12" y1="19" x2="12" y2="23"></line>
-                        <line x1="8" y1="23" x2="16" y2="23"></line>
-                    </svg>
-                </button>
+                <!-- Hold-to-talk mic removed 2026-08-01 (operator: unused).
+                     The recording engine in app.js is guarded by
+                     `if (micBtn)` and stays dormant; restore by re-adding
+                     #mic-btn here (same pattern as the removed TTS toggle). -->
                 <button id="send-btn">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -222,6 +222,7 @@
     <div id="notif-panel" class="hidden" aria-label="Notifications">
         <div class="panel-header">
             <span class="panel-title">NOTIFICATIONS</span>
+            <button id="notif-clear" class="render-btn" title="Clear all">⌫</button>
             <button id="notif-close" class="render-btn" title="Close">✕</button>
         </div>
         <div id="notif-list"></div>
@@ -266,7 +267,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=8.6"></script>
+    <script type="module" src="/static/app.js?v=8.7"></script>
 </body>
 
 </html>

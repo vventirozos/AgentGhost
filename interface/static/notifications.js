@@ -123,6 +123,16 @@ export function initNotifications(ctx) {
 
     btn?.addEventListener('click', togglePanel);
     document.getElementById('notif-close')?.addEventListener('click', closePanel);
+    // Clear all (2026-08-01): local-only — the records were already acked
+    // server-side at delivery, so emptying the list + `seen` dedupe set is
+    // the whole operation (the watermark guarantees they aren't re-served).
+    document.getElementById('notif-clear')?.addEventListener('click', () => {
+        records = [];
+        seen = new Set();
+        unread = 0;
+        updateBadge();
+        renderList();
+    });
     document.addEventListener('click', (e) => {
         if (panel && !panel.classList.contains('hidden')
             && !panel.contains(e.target) && !btn.contains(e.target)) {

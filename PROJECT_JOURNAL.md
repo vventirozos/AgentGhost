@@ -1439,6 +1439,32 @@ staleness), make every stale state self-heal ≤1s. Playwright: injected stale b
 (input at y=406 — the exact symptom), stuck translate, and both combined, all healed
 with ZERO events fired.
 
+**Addendum 5 (CLI, two rounds): long replies "don't use the whole screen".**
+Round 1 mis-read the complaint as the shred bug and shrank the Live tail (screen/3 —
+the full-height region only repaints cleanly when started at the TOP row; every
+turn-2+ starts mid-screen). Operator: "still doesn't use the whole screen" → the real
+requirement was flow semantics: the reply should FILL the screen as it streams, like
+normal terminal output, not a windowed view + settle reprint. **Shipped
+`_StreamPrinter`: progressive block streaming** — each COMPLETED markdown block
+(boundary = blank line at even code-fence parity, `_flush_point`) prints PERMANENTLY
+into the scroll flow the moment it finishes (rich routes prints above an active Live);
+only the in-progress block rides the small live tail; settle flushes the remainder —
+NO reprint, scrollback holds exactly one clean copy. This reconciles the two hard
+constraints: markdown can't re-render printed lines (⇒ only finished blocks print) and
+a Live region can't exceed the screen (⇒ only the unfinished block lives there).
+tmux capture-pane verified: mid-stream the pane is FULL and flowing (26/30 rows,
+tail -f-like), prompt ends on the last row, transcript exact (0 missing / 0 dup
+across two turns), fences render. `~/Data/AI/bin/ghost` is a SYMLINK to the repo file
+(deploys itself). tests: 317 cli+interface green. notifications panel gained a ⌫ Clear-all
+button (local-only — records are acked at delivery, the watermark prevents re-serving;
+badge+list+dedupe reset); hold-to-talk mic REMOVED from the input row (unused; engine
+stays `if (micBtn)`-guarded dormant, same pattern as the TTS toggle — chrome pin
+updated deliberately); header icons regrouped: bell → logs → workspace/upload/download
+(file ops contiguous) → face → zen (appearance last). Placeholder "Enter command or
+message..." → "Enter message" (didn't fit iPhone portrait). Chain: notifications 6.8 →
+workspace 7.0 → app/matrix 8.7. Live-verified: order, clear behavior, no overflow, no
+page errors.
+
 **Addendum 3 (v8.6): mobile delete-all-sessions was IMPOSSIBLE** — the rail's
 unconditional `pointerleave` disarm fired on every tap's trailing pointerleave (touch
 pointers are transient), so tap 2 of the armed confirm always RE-armed instead of

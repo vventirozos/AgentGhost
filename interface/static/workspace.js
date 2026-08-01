@@ -13,7 +13,7 @@
 //  modal.
 // ═══════════════════════════════════════════════════════════════
 import { initSessions } from './sessions.js?v=6.9';
-import { initNotifications } from './notifications.js?v=6.7';
+import { initNotifications } from './notifications.js?v=6.8';
 import { initStatus } from './status.js?v=6.7';
 import { initPalette } from './palette.js?v=6.7';
 

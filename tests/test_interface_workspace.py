@@ -42,9 +42,12 @@ def test_cache_busters_bumped_for_workspace():
 
 def test_existing_chrome_untouched():
     # The workspace must not have displaced the original surfaces.
+    # mic-btn removed from the list 2026-08-01: DELIBERATE operator removal
+    # (hold-to-talk unused); the recording engine stays `if (micBtn)`-guarded
+    # in app.js, same dormancy pattern as the removed TTS toggle.
     html = _read("index.html")
     for el_id in ("chat-container", "chat-log", "log-console", "render-window",
-                  "mic-btn", "send-btn", "chat-input"):
+                  "send-btn", "chat-input"):
         assert f'id="{el_id}"' in html, f"missing legacy #{el_id}"
 
 

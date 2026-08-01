@@ -199,6 +199,84 @@ def _reply_renderable(text: str) -> Group:
     return Group(Text("👻", style="ghost"), Markdown(text, code_theme=CODE_THEME))
 
 
+def _flush_point(text: str, start: int) -> int:
+    """Index just past the LAST markdown block boundary (a blank line at
+    even code-fence parity) in ``text[start:]`` — everything before it is
+    a COMPLETE block that can be printed permanently. ``start`` when no
+    complete block is pending. Scans only the pending region, so the cost
+    over a whole stream is linear."""
+    point = start
+    in_fence = False
+    pos = start
+    while True:
+        nl = text.find("\n", pos)
+        if nl == -1:
+            break
+        line = text[pos:nl]
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        if not in_fence and not line.strip():
+            point = nl + 1
+        pos = nl + 1
+    return point
+
+
+class _StreamPrinter:
+    """Progressive streaming renderer: the reply FLOWS INTO THE NORMAL
+    SCROLL like any terminal program (operator requirement — "use the
+    whole screen"), fully markdown-rendered, with no settle-time reprint.
+
+    Completed blocks print permanently the moment their boundary arrives
+    (rich routes prints ABOVE an active Live region); only the current
+    in-progress block rides a small transient tail. This keeps the two
+    hard constraints compatible: markdown can't re-render lines already
+    printed (so only FINISHED blocks may print), and a Live region can't
+    exceed the screen (so only the UNFINISHED block may live there —
+    it is naturally small; _TailCrop guards the rare giant one)."""
+
+    def __init__(self, header: Text | None = None):
+        self.header = header
+        self.text = ""
+        self.upto = 0
+        self.live: Live | None = None
+
+    def _print_header_once(self) -> None:
+        if self.header is not None:
+            console.print(self.header)
+            self.header = None
+
+    def feed(self, chunk: str) -> None:
+        self.text += chunk
+        fp = _flush_point(self.text, self.upto)
+        if fp > self.upto:
+            self._print_header_once()
+            segment = self.text[self.upto:fp]
+            if segment.strip():
+                console.print(Markdown(segment, code_theme=CODE_THEME))
+                console.print()   # inter-block spacing rich would have added
+            self.upto = fp
+        pending = self.text[self.upto:]
+        if pending.strip():
+            if self.live is None:
+                self.live = Live(console=console, refresh_per_second=12,
+                                 transient=True)
+                self.live.start()
+            self.live.update(_TailCrop(Markdown(pending,
+                                                code_theme=CODE_THEME)))
+
+    def settle(self) -> None:
+        """Stop the live tail and print whatever block was still open —
+        idempotent, safe from error/abort paths."""
+        if self.live is not None:
+            self.live.stop()
+            self.live = None
+        rest = self.text[self.upto:]
+        self.upto = len(self.text)
+        if rest.strip():
+            self._print_header_once()
+            console.print(Markdown(rest, code_theme=CODE_THEME))
+
+
 class _TailCrop:
     """Stream-safe live view: the last rendered lines that fit the screen.
 
@@ -219,7 +297,17 @@ class _TailCrop:
     def __rich_console__(self, console: Console,
                          options: ConsoleOptions) -> RenderResult:
         lines = console.render_lines(self.renderable, options, pad=False)
-        max_h = max(4, options.size.height - 2)   # margin: cursor + safety
+        # A THIRD of the screen, not height-2: a region sized to ~the full
+        # screen only repaints cleanly when it STARTS at the very top row —
+        # true for the first turn of a fresh session (how this was tested)
+        # and false for every turn after it (cursor starts mid-screen, the
+        # region overflows the bottom, and the terminal's clamped partial
+        # repaints shred mid-screen — operator report 2026-08-01: "finishes
+        # at the middle of the screen" on long replies). A compact tail
+        # fits below any reasonable start position; the FULL reply still
+        # prints once at settle.
+        max_h = max(8, min(options.size.height - 2,
+                           options.size.height // 3))
         if len(lines) > max_h:
             lines = lines[-max_h:]
         new_line = Segment.line()
@@ -846,30 +934,24 @@ class GhostCLI:
         """POST the history and render the streamed reply live as Markdown.
         Returns its text (possibly partial, if aborted) so the caller can
         keep context."""
-        out: list[str] = []
         status_spin = console.status(Text("thinking…", style="mute"),
                                      spinner="dots")
         status_spin.start()
         waiting = True                 # spinner up, no token yet
-        live: Live | None = None
+        printer = _StreamPrinter(header=Text("👻", style="ghost"))
 
         def _settle() -> None:
-            """Idempotent screen hand-off: whoever is drawing, stop them.
-            Called from every exit branch BEFORE printing a notice, so the
-            notice never lands inside a live-render region. The live view is
-            transient (erases itself on stop) and shows only the reply's
-            tail — the settled reply is printed here ONCE, full-height, at
-            the current terminal width (so an abort mid-stream still leaves
-            the partial reply on screen)."""
-            nonlocal waiting, live
+            """Idempotent screen hand-off: stop the spinner/live tail and
+            flush the still-open block. Called from every exit branch
+            BEFORE printing a notice, so the notice never lands inside a
+            live region. Completed blocks were already printed into the
+            scroll flow as they streamed — an abort mid-stream leaves the
+            partial reply on screen with no reprint."""
+            nonlocal waiting
             if waiting:
                 status_spin.stop()
                 waiting = False
-            if live is not None:
-                live.stop()
-                live = None
-                if out:
-                    console.print(_reply_renderable("".join(out)))
+            printer.settle()
 
         try:
             with self.api.chat_stream(self.history, self.session_id,
@@ -903,14 +985,10 @@ class GhostCLI:
                              .get("delta", {}).get("content", ""))
                     if not chunk:
                         continue
-                    if waiting:            # first token: spinner → live render
+                    if waiting:            # first token: spinner down
                         status_spin.stop()
                         waiting = False
-                        live = Live(console=console, refresh_per_second=12,
-                                    transient=True)
-                        live.start()
-                    out.append(chunk)
-                    live.update(_TailCrop(_reply_renderable("".join(out))))
+                    printer.feed(chunk)
         except KeyboardInterrupt:
             _settle()
             self._abort_turn(request_id)
@@ -922,7 +1000,7 @@ class GhostCLI:
             self.notice(f"✖ {type(e).__name__}: {e}", "err")
         finally:
             _settle()
-        return "".join(out)
+        return printer.text
 
     def _abort_turn(self, request_id: str) -> None:
         """Ctrl-C: we closed our socket, but turns are globally serialized on
@@ -1392,19 +1470,14 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
     if session_id:
         body["session_id"] = session_id
     render = sys.stdout.isatty()
-    out: list[str] = []
-    live: Live | None = None
+    printer = _StreamPrinter(header=None)
 
     def _finish() -> None:
-        """Stop the transient live view and print the settled reply once,
-        full-height. Reached from the normal path AND from ``finally``, so
-        an abort/error mid-stream still leaves the partial reply visible."""
-        nonlocal live
-        if live is not None:
-            live.stop()
-            live = None
-            if out:
-                console.print(Markdown("".join(out), code_theme=CODE_THEME))
+        """Flush the still-open block. Reached from the normal path AND
+        from ``finally`` (idempotent), so an abort/error mid-stream still
+        leaves the partial reply visible — completed blocks already flowed
+        into the scroll as they streamed."""
+        printer.settle()
 
     try:
         with api.http.post(api._url("/v1/chat/completions"), json=body,
@@ -1440,21 +1513,15 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                 if not chunk:
                     continue
                 if render:
-                    if live is None:
-                        live = Live(console=console, refresh_per_second=12,
-                                    transient=True)
-                        live.start()
-                    out.append(chunk)
-                    live.update(_TailCrop(
-                        Markdown("".join(out), code_theme=CODE_THEME)))
+                    printer.feed(chunk)
                 else:
                     sys.stdout.write(chunk)
                     sys.stdout.flush()
             _finish()
             if not render:
                 sys.stdout.write("\n")
-            elif out:
-                render_reply_images(api, "".join(out))
+            elif printer.text:
+                render_reply_images(api, printer.text)
             return 1 if got_error else 0
     except requests.RequestException as e:
         print(f"ghost: {type(e).__name__}: cannot reach the agent", file=sys.stderr)
