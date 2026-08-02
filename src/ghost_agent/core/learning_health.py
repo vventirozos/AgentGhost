@@ -13,6 +13,7 @@ Exposed as ``introspect action='learning'`` and ``scripts/learning_health.py``.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from collections import deque
@@ -54,6 +55,42 @@ def _live_entropy_floor() -> int:
         return int(floor)
     except Exception:  # noqa: BLE001
         return _MIN_ENTROPY_SAMPLES
+
+
+def _live_separation(rows: List[dict], attr: str):
+    """The fit's separation gate, evaluated on raw JSONL rows.
+
+    Returns ``(sigmas, required)``. Enough observations is necessary but not
+    sufficient for a weight to leave zero — the column must also separate the
+    outcome classes — so the LEARNABLE verdict has to apply BOTH tests or it
+    resumes lying in the same direction it did before: printing "LEARNABLE"
+    over a corpus the fit pins to 0. Calls calibration's own function rather
+    than reimplementing it, for the same reason.
+    """
+    try:
+        from .calibration import _MIN_SEPARATION_SIGMAS, _separation_sigmas
+        return _separation_sigmas(rows, attr), float(_MIN_SEPARATION_SIGMAS)
+    except Exception:  # noqa: BLE001 — telemetry must never break on import
+        return 0.0, 0.0
+
+
+def _live_epoch_filter(samples: List[dict]):
+    """Scope raw JSONL rows to the epoch `calibration.fit` actually reads.
+
+    Read from the owning module so this cannot drift from the fit — the whole
+    point of the epoch is that cross-epoch rows are incomparable, and a
+    telemetry report that pools them would go on describing a population no
+    fit ever sees (which is how competence read as DEAD: its separation was
+    measured across a label-scheme change). Returns ``(scoped, excluded_n)``
+    and degrades to "everything, nothing excluded" if the import fails.
+    """
+    try:
+        from .calibration import CURRENT_EPOCH, epoch_for_ts
+    except Exception:  # noqa: BLE001 — telemetry must never break on import
+        return samples, 0
+    scoped = [s for s in samples
+              if str(s.get("epoch") or epoch_for_ts(s.get("ts"))) == CURRENT_EPOCH]
+    return scoped, len(samples) - len(scoped)
 
 
 def _live_stale_gates():
@@ -223,8 +260,13 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
 
     # -- Calibration -------------------------------------------------------
     params = _load_json(calib_dir / "calibration_params.json", {}) or {}
-    samples = _load_jsonl(calib_dir / "calibration.jsonl")
-    if params or samples:
+    all_samples = _load_jsonl(calib_dir / "calibration.jsonl")
+    # Every count below is EPOCH-SCOPED, matching the fit. Pooling epochs is
+    # what made this report contradict itself: 1709 rows on disk, of which
+    # only 541 were fittable, while the feature verdicts were computed over
+    # all of them and so measured a label-scheme change rather than a signal.
+    samples, n_other_epochs = _live_epoch_filter(all_samples)
+    if params or all_samples:
         # Count entropy variety over OBSERVED samples only. Counting all of
         # them conflated "the model was 50/50" with "no logprobs came back",
         # which is what made this metric read as a mysterious degeneracy
@@ -252,8 +294,14 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
         obs_pos = sum(1 for s in obs if _row_outcome(s) >= 0.5)
         obs_neg = len(obs) - obs_pos
         ent_floor = _live_entropy_floor()
+        ent_sigmas, sep_floor = _live_separation(obs, "entropy_component")
+        eff_rows = [s for s in samples if s.get("effort_observed")]
+        eff_sigmas, _ = _live_separation(eff_rows, "effort_component")
         report["calibration"] = {
-            "samples_on_disk": len(samples),
+            "samples_on_disk": len(all_samples),
+            "samples_this_epoch": len(samples),
+            "samples_other_epochs": n_other_epochs,
+            "epoch": params.get("epoch"),
             "n_fitted": params.get("n_samples"),
             "brier": params.get("brier"),
             "w_entropy": params.get("w_entropy"),
@@ -266,10 +314,26 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "entropy_observed_pos": obs_pos,
             "entropy_observed_neg": obs_neg,
             "entropy_min_samples_gate": ent_floor,
+            # BOTH halves of the fit gate: enough observations AND measurable
+            # class separation. Reporting only the first is how this line
+            # came to read "LEARNABLE" while the fit pinned w_entropy to 0.
+            "entropy_separation_sigmas": round(ent_sigmas, 2),
+            "effort_separation_sigmas": round(eff_sigmas, 2),
+            "separation_min_sigmas": sep_floor,
             "entropy_learnable": (len(obs) >= ent_floor
-                                  and obs_pos > 0 and obs_neg > 0),
-            "outcome_neg": sum(1 for o in outs if o == 0.0),
-            "outcome_pos": sum(1 for o in outs if o == 1.0),
+                                  and obs_pos > 0 and obs_neg > 0
+                                  and ent_sigmas >= sep_floor),
+            # Split at 0.5, the way every gate in calibration.py splits it.
+            # These used to count only EXACT 0.0/1.0, which silently stopped
+            # describing the corpus when labels went graded: on the current
+            # epoch that covers 162 of 541 rows, so "outcomes 155+/7-" left
+            # 70% of the population invisible. The exact-anchor counts are
+            # kept alongside — a verifier PASS/FAIL is a checked fact and
+            # worth seeing apart from the graded priors.
+            "outcome_neg": sum(1 for o in outs if o < 0.5),
+            "outcome_pos": sum(1 for o in outs if o >= 0.5),
+            "outcome_verified_neg": sum(1 for o in outs if o == 0.0),
+            "outcome_verified_pos": sum(1 for o in outs if o == 1.0),
             "platt_a": params.get("platt_a"),
             "brier_raw": params.get("brier_raw"),
             "brier_base_rate": params.get("brier_base_rate"),
@@ -456,6 +520,15 @@ def _label_health(samples: List[dict]) -> Dict[str, Any]:
 # mirror — no fit gates on it.
 _FEATURE_MIN_SAMPLES = 10
 
+# Features whose rows carry an explicit "was this actually measured?" flag.
+# Only flagged rows are eligible for that feature's verdict — see
+# `_feature_health`. Competence and uncertainty_pressure are recorded on
+# every sample and so have no flag.
+_OBSERVED_FLAG = {
+    "entropy_component": "entropy_observed",
+    "effort_component": "effort_observed",
+}
+
 
 def _feature_health(samples: List[dict]) -> Dict[str, Any]:
     """Per-feature liveness for the confidence composite.
@@ -493,10 +566,15 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
     feats = {}
     for name in ("entropy_component", "competence_component",
                  "uncertainty_pressure", "effort_component"):
-        if name == "entropy_component":
-            rows = [s for s in samples if s.get("entropy_observed")]
-        else:
-            rows = samples
+        # Judge a feature ONLY over rows that actually MEASURED it. An
+        # unobserved row carries the neutral 0.5 stand-in, and averaging
+        # stand-ins with real readings drives separation toward 0 by
+        # construction. This was fixed for entropy and never generalised, so
+        # `effort_component` was still judged over 497 rows when only 394
+        # measured it — reporting a separation the fit (which reads observed
+        # rows only) does not compute, from a population it does not use.
+        _flag = _OBSERVED_FLAG.get(name)
+        rows = [s for s in samples if s.get(_flag)] if _flag else samples
         vals = []
         for s in rows:
             try:
@@ -524,6 +602,7 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
         m_ok, m_bad = _mean(ok), _mean(bad)
         sep = (round(m_ok - m_bad, 4)
                if (m_ok is not None and m_bad is not None) else None)
+        sigmas, sig_floor = _live_separation(rows, name)
         distinct = len(set(round(v, 3) for v in vals))
         # "Dead" = constant (nothing to learn from), or varying but with no
         # measurable ability to tell the two outcome classes apart. Note the
@@ -532,9 +611,20 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
         # competence signal has 270 distinct values and separates by
         # −0.0008. Separation is what matters; distinctness alone only
         # catches the fully-constant case.
+        #
+        # The live/dead cut is the FIT's gate (`_MIN_SEPARATION_SIGMAS`), not
+        # a local constant. It used to be `abs(sep) < 0.02`, a raw delta with
+        # no notion of noise — which put this report in direct contradiction
+        # with the mechanism it describes: live entropy separates by 0.0421
+        # (> 0.02 → "live" here) at 0.63σ (< 2.5σ → PINNED by the fit), so
+        # two adjacent lines of the same report disagreed and the
+        # "features: N/4 live" headline counted a feature the fit refuses to
+        # weight. A raw delta is scale-dependent anyway: 0.02 means different
+        # things for a feature spanning 0.01 than one spanning the unit
+        # interval.
         if len(vals) < _FEATURE_MIN_SAMPLES or sep is None:
             verdict = "insufficient"
-        elif distinct < 2 or abs(sep) < 0.02:
+        elif distinct < 2 or sigmas < sig_floor:
             verdict = "dead"
         else:
             verdict = "live"
@@ -542,6 +632,10 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
             "n": len(vals),
             "distinct": distinct,
             "separation": sep,
+            # Reported beside the raw delta because the delta alone cannot
+            # be judged without knowing the spread it sits in.
+            "separation_sigmas": (round(sigmas, 2)
+                                  if math.isfinite(sigmas) else "inf"),
             "verdict": verdict,
             "dead": verdict == "dead",
         }
@@ -686,13 +780,25 @@ def render_learning_health(memory_dir) -> str:
 
     cal = r.get("calibration")
     if cal:
+        # EVERY ratio below is epoch-scoped, because every number beside it
+        # is. Rendering an epoch-scoped numerator over the whole-file
+        # denominator prints a fraction that contradicts its own percentage
+        # (418/1709 shown as 77.3%) and implies the Brier was measured over
+        # rows no fit ever read.
+        _n_epoch = cal.get("samples_this_epoch", cal["samples_on_disk"])
+        _n_other = cal.get("samples_other_epochs") or 0
         lines.append(
-            f"\nCALIBRATION: {cal['samples_on_disk']} samples, "
-            f"Brier {cal['brier']}, threshold {cal['threshold']}")
+            f"\nCALIBRATION: {_n_epoch} samples, "
+            f"Brier {cal['brier']}, threshold {cal['threshold']}"
+            + (f" · {_n_other} older-epoch rows excluded from the fit"
+               if _n_other else ""))
         lines.append(
             f"  weights: entropy {cal['w_entropy']}, competence {cal['w_competence']}"
             + (f", effort {cal['w_effort']}" if cal.get("w_effort") is not None else "")
-            + f"; outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-")
+            + f"; outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-"
+            + (f" ({cal['outcome_verified_pos']}+/"
+               f"{cal['outcome_verified_neg']}- verifier-checked)"
+               if cal.get("outcome_verified_pos") is not None else ""))
         if cal.get("label_variance") is not None:
             _srcs = cal.get("label_sources") or {}
             lines.append(
@@ -707,10 +813,17 @@ def render_learning_health(memory_dir) -> str:
         if cal.get("effort_observed_samples") is not None:
             lines.append(
                 f"  turn-effort measured on {cal['effort_observed_samples']}/"
-                f"{cal['samples_on_disk']} samples")
+                f"{_n_epoch} samples"
+                + (f", separation {cal['effort_separation_sigmas']}σ"
+                   if cal.get("effort_separation_sigmas") is not None else ""))
+        _sep, _sep_min = (cal.get("entropy_separation_sigmas"),
+                          cal.get("separation_min_sigmas"))
+        _obs_short = cal["entropy_observed_samples"] < cal["entropy_min_samples_gate"]
+        _class_short = (cal["entropy_observed_pos"] == 0
+                        or cal["entropy_observed_neg"] == 0)
         if cal["entropy_learnable"]:
             _ent_note = "LEARNABLE — w_entropy is fit on these"
-        else:
+        elif _obs_short or _class_short:
             _ent_note = (
                 f"w_entropy pinned to 0 until >={cal['entropy_min_samples_gate']} "
                 "observed samples of both outcome classes accumulate. Most "
@@ -719,11 +832,22 @@ def render_learning_health(memory_dir) -> str:
                 "llama.cpp-native n_probs; the OAI logprobs flag is a hard "
                 "400 on tools+stream) — coverage should climb from here. If "
                 "it stays at 0 the probe is broken again, not the corpus")
+        else:
+            # The OTHER half of the gate. Saying "wait for 30 samples" while
+            # 418 sit on disk is the report contradicting itself — the corpus
+            # is sufficient and the FEATURE is the problem.
+            _ent_note = (
+                f"w_entropy pinned to 0 — sample coverage is sufficient, but "
+                f"entropy separates the outcome classes by only {_sep}σ "
+                f"(need >={_sep_min}σ). This is a FEATURE verdict, not a "
+                f"coverage one: more samples will not move it, a better "
+                f"signal would")
         lines.append(
             f"  entropy observed on {cal['entropy_observed_samples']}/"
-            f"{cal['samples_on_disk']} samples ({cal['entropy_observed_pct']}%), "
+            f"{_n_epoch} samples ({cal['entropy_observed_pct']}%), "
             f"{cal['entropy_distinct_values']} distinct values "
-            f"({cal['entropy_observed_pos']}+/{cal['entropy_observed_neg']}- observed)")
+            f"({cal['entropy_observed_pos']}+/{cal['entropy_observed_neg']}- observed)"
+            + (f", separation {_sep}σ" if _sep is not None else ""))
         lines.append(f"  → {_ent_note}")
         _br, _bb = cal.get("brier_raw"), cal.get("brier_base_rate")
         if isinstance(_br, (int, float)) and _br >= 0 and isinstance(_bb, (int, float)) and _bb >= 0:
@@ -754,7 +878,13 @@ def render_learning_health(memory_dir) -> str:
                 _flag = "DEAD" if _flag == "dead" else _flag
                 lines.append(
                     f"    {name}: n={st.get('n')} distinct={st['distinct']} "
-                    f"separation={st['separation']} [{_flag}]")
+                    f"separation={st['separation']}"
+                    # The σ is what decides the verdict; printing the raw
+                    # delta alone leaves DEAD looking arbitrary next to a
+                    # non-zero separation.
+                    + (f" ({st['separation_sigmas']}σ)"
+                       if st.get("separation_sigmas") is not None else "")
+                    + f" [{_flag}]")
             if any(v.get("verdict") == "insufficient" for v in fh.values()):
                 lines.append(
                     "    (insufficient = <10 eligible samples or one outcome "

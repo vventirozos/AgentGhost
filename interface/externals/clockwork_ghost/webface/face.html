@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ghost face</title>
+<!-- Vendored three.js r160 (no CDN): the uConsole must render its face with
+     no runtime network dependency, and the device should not reach out to a
+     third party just to draw a background. `three/addons/` maps to the
+     vendored jsm/ tree, so the addons' own relative imports resolve
+     unchanged. -->
+<script type="importmap">
+{"imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/": "./vendor/jsm/"
+}}
+</script>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  /* The face is ATMOSPHERE — it sits behind the UI and must never grab
+     attention. Same settled brightness taste as the web UI. */
+  #sphere-container { position: fixed; inset: 0; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="sphere-container"></div>
+<script type="module">
+// Bridge for the PyQt host. Every call is QUEUED until init() completes:
+// the widget starts issuing mood changes as soon as the client boots, which
+// is long before three.js has compiled its shaders, and dropping those would
+// leave the face stuck in whatever state it happened to start in.
+const pending = [];
+let face = null;
+
+const API = {
+  mood(name) { call('mood', name); },
+  pulse() { call('pulse'); },
+  startle() { call('startle'); },
+  audio(level) { call('audio', level); },
+  wake() { call('wake'); },
+  form(name) { call('form', name); },
+  cycle() { call('cycle'); },
+};
+
+function call(op, arg) {
+  if (!face) { pending.push([op, arg]); return; }
+  try { apply(op, arg); } catch (e) { /* never let the UI break on the face */ }
+}
+
+function apply(op, arg) {
+  switch (op) {
+    case 'mood':
+      // The web UI separates "the agent is busy" (workingState) from "the
+      // operator is waiting on THIS turn" (userTurn, which drives the
+      // immersion dive). The uConsole only has moods, so map them:
+      if (arg === 'think') { face.setWorkingState(true); face.setUserTurn(true); }
+      else if (arg === 'speak') { face.setWorkingState(true); face.setUserTurn(false); }
+      else if (arg === 'listen') { face.setWorkingState(false); face.setUserTurn(false); face.noteActivity(0.25); }
+      else { face.setWorkingState(false); face.setUserTurn(false); face.setAudioLevel(0); }
+      break;
+    case 'pulse':   face.noteActivity(0.3); break;
+    case 'startle': face.noteError(); break;
+    case 'audio':   face.setAudioLevel(Number(arg) || 0); break;
+    case 'wake':    face.noteActivity(0.5); break;
+    case 'form':    face.setForm(arg); break;
+    // Walks the same FORMS list the browser's face button uses, so the two
+    // clients offer the same shapes in the same order.
+    case 'cycle':   face.cycleForm(); break;
+  }
+}
+
+window.ghostFace = API;
+window.__faceErrors = [];
+window.addEventListener('error', e => window.__faceErrors.push(String(e.message)));
+
+import('./matrix_graph.js').then(mod => {
+  mod.init();
+  face = mod;
+  window.__face = mod;
+  // Drain whatever the host asked for while we were compiling shaders.
+  for (const [op, arg] of pending) { try { apply(op, arg); } catch (e) {} }
+  pending.length = 0;
+  window.__faceReady = true;
+}).catch(err => {
+  window.__faceErrors.push('module load: ' + err);
+  // Leave the page black rather than throwing — a dead face must never take
+  // the client down with it.
+});
+</script>
+</body>
+</html>

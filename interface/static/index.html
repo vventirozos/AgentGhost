@@ -203,10 +203,28 @@
             </div>
             <div id="input-area">
                 <textarea id="chat-input" placeholder="Enter message" rows="1"></textarea>
-                <!-- Hold-to-talk mic removed 2026-08-01 (operator: unused).
-                     The recording engine in app.js is guarded by
-                     `if (micBtn)` and stays dormant; restore by re-adding
-                     #mic-btn here (same pattern as the removed TTS toggle). -->
+                <!-- Hold-to-talk mic. RESTORED 2026-08-02. It was removed
+                     2026-08-01 as "unused" — but the reason nobody used it is
+                     that BOTH voice endpoints proxied to a Raspberry-Pi voice
+                     server that no longer exists (`raspberrypi.local` doesn't
+                     resolve; the launcher's `disorder` override listens on
+                     nothing), so the button was a no-op against a dead host.
+                     STT now runs locally on nova's Gemma 4 audio node and TTS
+                     on the macOS synthesiser — see interface/voice.py.
+                     Holding the mic also enables spoken replies for that turn
+                     (the press is the user gesture that unlocks autoplay);
+                     typing a message turns speech back off. That keeps the
+                     header at six controls, preserving the single-row mobile
+                     layout the TTS toggle was removed to protect. -->
+                <button id="mic-btn" title="Hold to talk" aria-label="Hold to talk">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
                 <button id="send-btn">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -267,7 +285,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=8.7"></script>
+    <script type="module" src="/static/app.js?v=8.9"></script>
 </body>
 
 </html>

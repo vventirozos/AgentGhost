@@ -31,8 +31,8 @@
     <tbody>
       <tr><td><code>POST /api/chat</code></td><td>Streaming chat. SSE chunks accumulated in <code>conversation_history</code>; sentence boundaries (<code>.?!</code>) push to TTS queue.</td></tr>
       <tr><td><code>POST /api/workspace/save · /load</code></td><td>State zip.</td></tr>
-      <tr><td><code>POST $STT_SERVER_URL/stt</code></td><td>multipart audio upload.</td></tr>
-      <tr><td><code>POST $TTS_SERVER_URL/tts</code></td><td>JSON text → audio bytes.</td></tr>
+      <tr><td><code>POST $STT_SERVER_URL</code> → <code>https://eva:8080/api/stt</code></td><td>multipart audio upload (<code>arecord</code> writes 16&nbsp;kHz mono WAV — already the wanted format). Needs <code>X-Ghost-Key</code>.</td></tr>
+      <tr><td><code>POST $TTS_SERVER_URL</code> → <code>https://eva:8080/api/tts</code></td><td>JSON text → <code>audio/wav</code>, piped to <code>aplay -q -</code>. Needs <code>X-Ghost-Key</code>.</td></tr>
       <tr><td><code>GET /api/download/{image_path}</code></td><td>Fetch agent-generated images.</td></tr>
     </tbody>
   </table>
@@ -40,8 +40,8 @@
   <h3>UI layout</h3>
   <ul>
     <li><strong>Left</strong>: chat display + text input with up/down history.</li>
-    <li><strong>Right</strong>: stacked widget — NetworkFaceWidget (default) · FluidFaceWidget · NeuralFaceWidget (iris). Only the visible face animates.</li>
-    <li><strong>Top</strong>: workspace, face toggle, fullscreen.</li>
+    <li><strong>Right</strong>: the Ghost face — the web UI's <code>matrix_graph.js</code> in a QWebEngineView (the three QPainter faces were removed 2026-08-02).</li>
+    <li><strong>Top</strong>: workspace, face-form cycle (<code>◈</code>), fullscreen.</li>
     <li><strong>Bottom</strong>: camera snap, push-to-talk, TTS toggle + stats.</li>
   </ul>
 
@@ -70,7 +70,104 @@
   <h3>Concurrency</h3>
   <p><code>qasync.QEventLoop</code> wraps the QApplication so asyncio and Qt cooperate. Async tasks for <code>audio_fetch_task()</code>, <code>audio_worker_task()</code>, <code>send_chat_request()</code>. Signal/slot pattern for cross-thread UI updates.</p>
 
-  <h2>face/ — avatar package (CPU-rendered, QPainter raster)</h2>
+  <h2>The face — the web UI's own, hosted in QWebEngineView (2026-08-02)</h2>
+  <p>
+    The three QPainter faces below were <strong>removed</strong>. The handheld now runs the
+    <em>same</em> <code>matrix_graph.js</code> the browser does (<code>webface.py</code> +
+    <code>webface/</code>), so it gets the thermal two-pole palette, all eight forms
+    (abyssal · horizon · cortex · vortex · lattice · stack · embedding · descent), the immersion
+    dive, pulses and error flinches — and future work on the web face lands here for free instead
+    of the two drifting into forks. The <code>◈</code> chip now cycles <em>forms</em> rather than
+    swapping renderers.
+  </p>
+  <ul>
+    <li><strong>Why a browser and not a port:</strong> reimplementing ~2,700 lines of particle
+      engine and GLSL in QPainter would have been a fork with a maintenance tail. QtWebEngine and
+      WebGL 1.0 are both already available on the device, so hosting the original costs nothing to
+      build and nothing to keep in sync.</li>
+    <li><strong>Performance is purely fill-rate bound</strong> (measured on the CM4): 16&nbsp;fps at
+      1280×720, 35.7 at 854×480, 50.9 at 640×360. Busy state + dive cost <em>nothing</em> extra.
+      <code>GHOST_FACE_ZOOM</code> (default 2.0) shrinks the CSS viewport so the drawing buffer
+      shrinks with it and the browser upscales — and at 640×329 the face also trips its own
+      <code>IS_MOBILE</code> query (<code>max-height: 600px</code>), halving node count 250→120 and
+      bloom scale. That mobile profile exists for exactly this class of GPU.</li>
+    <li><strong>ES modules need HTTP</strong> — <code>file://</code> silently refuses to execute the
+      module (no console error at all), so <code>webface.py</code> serves the bundle from a
+      loopback-bound thread. This is not optional.</li>
+    <li><strong>QtWebEngineWidgets must be imported before QApplication exists</strong>, otherwise
+      Qt refuses to construct the view ("must be imported … before a QCoreApplication instance is
+      created") and the face degrades to a blank panel. Hence the module-level import in
+      <code>webface.py</code> plus <code>AA_ShareOpenGLContexts</code> in <code>client.py</code>.</li>
+    <li><strong>three.js r160 is vendored</strong> under <code>webface/vendor/</code> (module +
+      EffectComposer/RenderPass/UnrealBloomPass and their deps) so the device needs no CDN at
+      runtime and the face works offline.</li>
+    <li><strong>Measured CPU after the swap:</strong> the client process fell from <strong>61% of a
+      core to below the 3% reporting threshold</strong>; QtWebEngine holds ~41% for the rendering.
+      Memory: client ~284&nbsp;MB, webengine ~233&nbsp;MB.
+      <em>This contradicts the claim in the legacy notes below that hidden QPainter faces cost zero
+      CPU</em> — on the deployed build they did not, and pausing their timers explicitly changed
+      nothing (60.8% vs 61.0%). Only removing them recovered the core.</li>
+  </ul>
+
+  <h2>Glass UI restyle (2026-08-02)</h2>
+  <p>
+    The face moved from the right half to the <strong>background of the whole window</strong>, and
+    every panel became tinted glass over it. Placement is unchanged — transcript and input left,
+    chips top-right, status strip bottom-right — but nothing is opaque, so the thermal palette reads
+    through the entire interface.
+  </p>
+  <ul>
+    <li><strong>Widget-over-webview compositing works</strong> on this device, which is what makes
+      the design possible at all — but only with the face as an explicitly-positioned child plus
+      <code>raise_()</code> on a transparent overlay sheet (<code>WA_TranslucentBackground</code>).
+      The window is a fixed-size frameless kiosk, so no resize handling is needed.</li>
+    <li><strong>The cyan accent was dropped.</strong> The face's ring runs blue → violet → crimson
+      with essentially no green channel, so <code>#7be0ff</code> sat outside that range and made
+      chrome and face look like two different applications. The accent is now violet
+      (<code>#c9a6ff</code>) lifted from the face's own mid-palette, with warm sand
+      (<code>#ffc08a</code>) for user text against its crimson core.</li>
+    <li><strong>Qt cannot do backdrop-blur</strong>, so readability comes from tint alone: the
+      transcript carries a heavier fill (0.46) than chips and inputs (0.30), rather than the uniform
+      low alpha the web UI can afford with real blur behind it.</li>
+    <li><strong>The left/right split is gone</strong> (second pass, same day). Once the panels were
+      transparent the split had no purpose — a nearly-invisible container was still reserving half
+      the screen and still reading as two columns. The transcript container is now fully invisible
+      (no fill, no border) and spans the full width; each message is its own glass bubble that
+      places itself, <strong>operator right, agent left</strong>, exactly as the web UI does, capped
+      at 54% width so the face stays visible down the middle (the web UI caps at 35% for the same
+      reason — to clear the sphere). Input keeps its bottom-left position and the action chips keep
+      bottom-right; they simply share one row now instead of living in separate columns.</li>
+    <li><strong>Rounded bubbles + typography</strong> (third pass, same day). The QTextBrowser was
+      replaced by <code>chatlog.py</code> — a QScrollArea of per-message QLabels — which gets true
+      per-corner radii (notched on the speaker's corner, 16/4/16/16 like the web UI) and content
+      hugging, so a one-word reply is a small pill instead of a half-width slab.
+      <br><em>The non-obvious part:</em> a word-wrapped QLabel reports a SMALL
+      <code>sizeHint().width()</code> regardless of <code>maximumWidth</code>, so any size policy that
+      defers to the hint (Maximum, Preferred) leaves every bubble a narrow ribbon — and raising the
+      cap changes nothing, because the cap was never the binding constraint. <code>_Bubble.fit()</code>
+      measures the text unwrapped, then pins <code>minimum == maximum</code> width to
+      <code>min(natural, cap)</code> so the layout has no choice.
+      <br><em>Typography:</em> markdown arrives as bare <code>&lt;h2&gt;/&lt;p&gt;/&lt;ol&gt;</code>
+      and Qt applies its own defaults — <code>&lt;h1&gt;</code> at ~2x base, <code>&lt;h2&gt;</code> at
+      ~1.5x — so a briefing's headings came out enormous. QLabel offers no document-stylesheet hook, so
+      <code>style_markup()</code> injects sizing inline per tag, with headings only slightly above body
+      size (in a bubble a heading is a label, not a page title). Prose is now SANS (DejaVu/Liberation)
+      at 20px; monospace is reserved for the operator's own messages, inline code and code blocks —
+      mirroring the web UI, where only <code>.message.user</code> overrides to mono. Reading a
+      briefing in 21px monospace was the bulk of "text doesn't look great".</li>
+    <li><strong>Superseded: bubbles as TABLES (square).</strong> Qt's rich-text engine lays tables
+      out reliably with per-cell width and background where aligned/floated divs stack
+      unpredictably — but <code>QTextDocument</code> does not support <code>border-radius</code> at
+      all. That is a hard engine limitation, not a styling oversight, so the bubbles use a 2px
+      accent rail on the speaker's side instead of the web UI's notched corners. Rounded bubbles
+      would require replacing the QTextBrowser with a QScrollArea of per-message QLabels.</li>
+    <li><strong>Cost of the glass:</strong> translucent widgets must be re-blended as the webview
+      repaints underneath, so the client process went from below the 3% reporting threshold to
+      ~49%, with QtWebEngine at ~32% (load ~2.5 of 4 cores). That is the price of the look; turn
+      <code>GHOST_FACE_ZOOM</code> up to claw it back if it ever feels sluggish.</li>
+  </ul>
+
+  <h2>Legacy: face/ — avatar package (REMOVED 2026-08-02, kept for context)</h2>
   <p>Three interchangeable faces share one public API (<code>set_mood · pulse · feed_audio · startle · wake · set_state</code>) and one mood system (<code>moods.py</code>: idle/listen/think/speak/error/sleep, palettes lerped over 0.45&nbsp;s transitions). The default is <code>NetworkFaceWidget</code>; the <code>◈</code> toolbar chip cycles to <code>FluidFaceWidget</code> (smoke oracle) and <code>NeuralFaceWidget</code> (iris eye).</p>
   <ul>
     <li><strong>NetworkFaceWidget (2026-07-12 "tamed" rework)</strong> — sparse MoE diagram: 42 nodes / 72 edges (was 111/276), 4 experts, one expert per pulse. A wavefront takes ~1.8&nbsp;s to cross; activations decay fast enough that a thought visibly <em>passes</em> instead of lighting the whole net. Expert hues are the dark-jewel family: deep violet, crimson, dark blue, dark green. No bloom pass, no offscreen buffer, no wavefront bands, no status readout.</li>
@@ -91,7 +188,42 @@
     <li>httpx, OpenCV (cv2), markdown, subprocess (arecord/aplay).</li>
   </ul>
 
-  <div class="note warn"><strong>Heads-up:</strong> URLs and the <code>X-Ghost-Key</code> in <code>client.py</code> are hardcoded placeholders ("YOUR_KEY_HERE", "http://eva:8000", "http://192.168.0.24:8000"). These should be wired to env vars before deployment.</div>
+  <h3>Voice — repointed 2026-08-02</h3>
+  <p>
+    STT/TTS used to target <code>http://192.168.0.24:8000</code>, a Raspberry-Pi
+    voice server (Whisper + Piper) that <strong>no longer exists</strong> — so voice on this device
+    had been failing silently against a dead LAN host, which is why it looked "unused". Both now use
+    the interface's local endpoints (see <a href="voice_server.html">Voice loop</a>): STT = ffmpeg +
+    the Gemma 4 audio node, TTS = the macOS synthesiser.
+  </p>
+  <p>Two differences from the old Pi server, both load-bearing:</p>
+  <ul>
+    <li>The endpoints live on the <strong>interface</strong> (port 8080, TLS), not the agent
+      (port 8000, plain HTTP) that chat uses — hence <code>https</code> and a different port.
+      <code>GHOST_VOICE_BASE</code> / <code>GHOST_HOST</code> override the default
+      <code>https://eva:8080</code>.</li>
+    <li>They require <code>X-Ghost-Key</code>, like <code>/api/chat</code> already did. The interface
+      serves a self-signed cert, so TLS verification is off by default
+      (<code>GHOST_VOICE_VERIFY_TLS=1</code> to enable) — the hop is inside the tailnet, which is
+      already WireGuard-authenticated, and carries the same key the chat calls send in clear to :8000.</li>
+  </ul>
+  <p>
+    <strong>Verified on-device 2026-08-02</strong> (host <code>clockworkpi</code>, aarch64): <code>eva</code>
+    resolves via MagicDNS to the tailnet IP; a real-speech clip posted from the device transcribed
+    correctly; TTS returned <code>audio/wav</code> and <code>aplay -q -</code> played it (exit 0); the
+    default <code>arecord</code> capture device (a USB Logitech BRIO on card 3) records real audio, so
+    no <code>-D</code> flag is needed. STT errors now surface the server's own message instead of a bare
+    status code — "HTTP 503" alone sent one diagnosis down entirely the wrong path.
+  </p>
+
+  <div class="note warn"><strong>Deploy note:</strong> the LIVE client on the device is
+  <code>~/bin/client.py</code> (launched by <code>~/bin/launch_ghost.sh</code>, which sources the
+  <code>~/gui_env</code> venv and sets <code>QT_QPA_PLATFORM=xcb</code>) — <em>not</em>
+  <code>~/clockwork_ghost/</code>. Deploy with <code>scp</code> to <code>~/bin/client.py</code>, keeping a
+  timestamped backup, and restart with
+  <code>setsid env DISPLAY=:0 XAUTHORITY=~/.Xauthority ~/bin/launch_ghost.sh</code>. Always diff the
+  device copy against the repo copy first — device-deployed externals can drift. The API key lives at
+  <code>~/.ghost_api_key</code> (mode 600).</div>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

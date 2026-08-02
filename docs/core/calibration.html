@@ -38,7 +38,7 @@
         <li><strong>Outcome signal.</strong> A turn is a <em>negative</em> (0.0) on a structural tool failure, a verifier <strong>REFUTED</strong> verdict (≥0.7), or a next-turn <strong>user-correction</strong> promotion (the strongest "confidently wrong" signal — recorded against the prior turn's stashed confidence); otherwise 1.0. Real negatives are what stop the fit from bailing single-class on free-form chat (which is otherwise almost all "clean").</li>
       </ul>
     </li>
-    <li><strong>Self-tune.</strong> Once ≥ 40 samples (both outcome classes present) accumulate, an idle-time grid search re-fits the entropy/competence weights, the verbalised-uncertainty penalty <code>λ</code>, and the decision threshold <code>τ</code> to minimise Brier. The threshold is then chosen to maximise Youden's J on the "predict success when C ≥ τ" decision.</li>
+    <li><strong>Self-tune.</strong> Once ≥ 40 samples <em>of the current <a href="#epochs">epoch</a></em> (both outcome classes present) accumulate, an idle-time grid search re-fits the entropy/competence/effort weights, the verbalised-uncertainty penalty <code>λ</code>, and the decision threshold <code>τ</code>. Candidates are scored on the Brier the pipeline will actually <em>deliver</em> — i.e. after the Platt stage, under the same acceptance rules — and a weight may only leave zero if its feature both has enough observations and measurably <strong>separates</strong> the outcome classes. The threshold is then chosen to maximise Youden's J on the "predict success when C ≥ τ" decision.</li>
     <li><strong>Unify.</strong> The recorded sample carries the verbalised-uncertainty <em>pressure</em> alongside the objective entropy/competence components, so the formerly-disjoint "the agent said it was unsure" track and "the generation/domain was uncertain" track are fit together.</li>
   </ol>
 
@@ -59,10 +59,106 @@
     <li><strong>JSONL / JSON on disk.</strong> Append-only history, atomic param writes (<code>.tmp</code> + <code>os.replace</code>), schema-versioned (<code>ghost.calibration.v1</code>).</li>
     <li><strong>Fail-safe.</strong> A recording or fit failure is logged at debug and never breaks a turn; <code>load_params</code> returns <code>None</code> on any problem so a corrupt file degrades to the hardcoded defaults.</li>
     <li><strong>Bail-on-thin-data.</strong> Below 40 samples, or with only one outcome class present, <code>fit</code> returns <code>None</code> and writes no params — a confidently-miscalibrated threshold is worse than the neutral default (same posture as <code>prm.trainer</code>).</li>
+    <li><strong>One epoch per fit.</strong> Rows from an older label scheme or feature set are never blended with current ones. See <a href="#epochs">Corpus epochs</a> — this is the constraint whose absence silently inverted the fit for 26 days.</li>
   </ul>
 
   <h2>Observability</h2>
-  <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier. <code>tracker.stats()</code> exposes <code>{samples, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty}</code> for introspection.</p>
+  <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier, the sample count <code>n</code> (current epoch) and <code>excluded</code> (older-epoch rows skipped). <code>tracker.stats()</code> exposes <code>{samples, samples_all_epochs, epoch, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty, map_status}</code> for introspection.</p>
+  <p><strong>Reading <code>n</code>:</strong> it counts the current epoch only. When epochs landed it dropped 1709&nbsp;→&nbsp;541 in one refit; <code>excluded</code> sits beside it precisely so that reads as a filter rather than as data loss.</p>
+
+  <h2 id="epochs">Corpus epochs (2026-08-02)</h2>
+  <p>The history is append-only and <code>max_history</code> (4000) exceeded the whole file, so every
+  refit pooled the entire corpus. That is only valid while the label scheme and the feature set hold
+  still — and they had not. The result was <strong>~291 warning lines, one pair per hourly refit for
+  26 days</strong>, reporting that the composite was "anti-correlated with outcomes" and that the fit
+  was "WORSE than always predicting the base rate". Both were true of the pooled corpus and false of
+  the signal.</p>
+  <p>Three era shifts compounded:</p>
+  <table>
+    <thead><tr><th>Era</th><th>n</th><th>mean competence</th><th>mean outcome</th><th>labels</th></tr></thead>
+    <tbody>
+      <tr><td>07-07 → 07-11</td><td>209</td><td>0.757</td><td>0.952</td><td>binary</td></tr>
+      <tr><td>07-12 → 07-19</td><td>691</td><td>0.828</td><td>0.964</td><td>binary</td></tr>
+      <tr><td>07-20 → 07-27</td><td>398</td><td>0.867</td><td>0.939</td><td>binary</td></tr>
+      <tr><td>07-28 → 08-02</td><td>411</td><td>0.898</td><td>0.838</td><td><strong>graded</strong></td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>The <strong>label</strong> changed on 2026-07-27 — binary <code>{0,1}</code> at base rate 0.955 became graded at 0.855. The drop is a redefinition, not a decline in turn quality.</li>
+    <li>The <strong>features</strong> changed the same day: <code>effort_component</code> and real logprob entropy are observed only from then on, so 1298 of 1709 rows (76&nbsp;%) collapse to competence alone under <code>_composite_for</code> and outvote the informative ones 3:1.</li>
+    <li>The <strong>competence prior warms up</strong> out of its cold-start shrinkage toward 0.5.</li>
+  </ul>
+  <p>Pooled, the score rises exactly as the labels fall — a textbook Simpson's paradox that forces a
+  <em>negative</em> Platt slope, so the map was rejected as inverted on every refit and Brier stayed
+  on the raw scale. Measured both ways on the same 1709 rows with the same code:</p>
+  <table>
+    <thead><tr><th>Scope</th><th>AUC</th><th>Platt slope</th><th>Map</th><th>Brier</th><th>vs base rate</th></tr></thead>
+    <tbody>
+      <tr><td>Pooled (all epochs)</td><td>0.530</td><td>−0.077</td><td>REJECTED</td><td>0.0542</td><td>0.0365 — <strong>loses</strong></td></tr>
+      <tr><td>Current epoch only</td><td>0.722</td><td>+1.917</td><td>applied</td><td>0.0244</td><td>0.0255 — <strong>beats, −4.6&nbsp;%</strong></td></tr>
+    </tbody>
+  </table>
+  <p>So <code>CURRENT_EPOCH</code> gates the fit, and every row carries an <code>epoch</code> tag.
+  Untagged legacy rows get theirs <em>derived</em> from <code>ts</code> (<code>epoch_for_ts</code>),
+  never defaulted to the current value — silently promoting them is the contamination the field
+  exists to prevent. The boundary check validates the ISO shape before comparing, because
+  <code>"not-a-timestamp" &gt; "2026-07-27"</code> lexicographically would promote garbage.
+  Retro-negatives (<code>task_reopened</code>) inherit the closing turn's epoch, since they reuse
+  that turn's stored features.</p>
+  <p><strong>Bumping <code>CURRENT_EPOCH</code> is not bookkeeping — it is what keeps the fit valid.</strong>
+  Any label-scheme or feature-set change must bump it. Expect the loop to go quiet afterwards until
+  the new epoch clears the 40-sample floor; that is correct, because no fit beats a fit on
+  incomparable rows. Every read path — <code>brier_score</code>, <code>ece</code>,
+  <code>reliability_table</code>, <code>stats</code>, and the <code>learning_health</code> telemetry —
+  is scoped the same way, or the report would describe a population no fit ever sees.</p>
+
+  <h2>Selecting on the delivered Brier (2026-08-02)</h2>
+  <p>The grid search scored candidates on the <strong>raw</strong> Brier while the pipeline delivers a
+  Platt-mapped one. On the live corpus the raw-best point (0.054164, slope −0.077 → map REJECTED) beat
+  the runner-up (0.054204, slope +0.388 → map ACCEPTED) by <strong>4e-5</strong> — a coin flip in the
+  fourth decimal decided whether the agent got a probability map at all, and 321 of the 396 grid points
+  had a positive slope. Candidates are now scored on what the pipeline actually delivers: the
+  calibrated Brier when the map passes the same acceptance rules applied downstream, the raw one when
+  it does not. This cannot do worse, since a rejected point simply scores its raw Brier as before.</p>
+  <p>Two guards keep that honest:</p>
+  <ul>
+    <li><strong>Tie-break toward the simpler model</strong> (<code>_BRIER_TIE_TOL = 1e-4</code>). A strict
+    <code>&lt;</code> over floats hands the decision to the last decimal place — which is exactly how the
+    inverted map won. Complexity is compared on the integer grid indices, not the divided floats, since
+    <code>0.1 + 0.2 ≠ 0.3</code> in binary would otherwise rank two equally simple points by a rounding
+    artefact.</li>
+    <li><strong>A separation gate</strong> (<code>_MIN_SEPARATION_SIGMAS = 2.5</code>). Scoring on the
+    delivered Brier removes the level penalty that used to suppress a useless column, so without this the
+    grid buys <code>w_entropy = 0.2</code> for a 4.9e-5 in-sample gain on a corpus of pure noise. A
+    tolerance cannot fix it: the spurious gain is heavy-tailed (median 0, tail ~1e-3) and does
+    <em>not</em> shrink as 1/n, so any tolerance large enough to absorb the tail also eats most of a real
+    feature's contribution. Instead a weight may only leave zero when
+    <code>|mean(ok) − mean(bad)|</code> reaches 2.5 standard errors — the module's own "a feature must
+    VARY and SEPARATE" rule, applied in the fit rather than only in the report. Measured over 1000
+    pure-noise corpora spanning n = 40…800 it false-admits 4.9&nbsp;% (2.0σ admits 8.8&nbsp;%), while the
+    live effort feature separates at 3.64σ and is never in danger.
+    <p><strong>The zero-denominator case is two cases.</strong> A feature with no within-class spread
+    has standard error 0, and the first version returned 0.0σ for it — which pinned the single best
+    feature obtainable. A column that is constant <em>within</em> each class and different
+    <em>between</em> them is a PERFECT separator (→ <code>inf</code>); only a column constant across
+    <em>both</em> classes is undecidable (→ <code>0.0</code>, pinned). Note that a real corpus rarely
+    hits the branch exactly: values like 0.9 and 0.2 leave ~1e-18 of float residue and take the
+    ordinary path to a huge finite σ, which is equally correct.</p></li>
+  </ul>
+  <p>The telemetry's <code>entropy_learnable</code> verdict and <code>_feature_health</code>'s
+  live/dead call both invoke <code>calibration._separation_sigmas</code> directly and apply
+  <em>both</em> halves of the gate. Reporting only the sample floor is how that line once printed
+  "LEARNABLE" while the fit was pinning the weight to 0; keeping a local <code>abs(sep) &lt; 0.02</code>
+  cut is how <code>feature_health</code> came to mark entropy <code>[live]</code> (0.0421 &gt; 0.02) in
+  the same report where the fit pinned it (0.63σ &lt; 2.5σ). One function, one verdict.</p>
+
+  <h2>Known asymmetry</h2>
+  <p>The <code>λ</code> (verbalised-uncertainty) grid is <em>not</em> gated by the separation test —
+  only the entropy and effort weights are. In practice <code>uncertainty_pressure</code> is 0.0 on
+  essentially every sample (2 distinct values, mean 0.0003, max 0.067), so the multiplicative term
+  <code>(1 − λ·pressure)</code> can move a composite by at most ~3&nbsp;% and only on the handful of
+  rows that carry any pressure. If that tracker ever starts producing real signal, gate <code>λ</code>
+  the same way before trusting a fitted value.</p>
 
   <h2>Entropy de-degeneration (2026-07-27)</h2>
   <p>1179 of 1180 recorded samples carried <code>entropy_component=0.5</code> — the finalize

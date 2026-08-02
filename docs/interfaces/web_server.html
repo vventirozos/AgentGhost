@@ -36,8 +36,8 @@
       <tr><td>POST /api/chat/cancel/{task_id}</td><td>Cancel an in-flight task.</td></tr>
       <tr><td>POST /api/workspace/save · /load</td><td>Zip download / upload of state.</td></tr>
       <tr><td>POST /api/upload · GET /api/download/{path}</td><td>File I/O against the agent.</td></tr>
-      <tr><td>POST /api/stt</td><td>Audio → text via the Raspberry Pi voice server.</td></tr>
-      <tr><td>POST /api/tts</td><td>Text → audio stream via the Raspberry Pi voice server.</td></tr>
+      <tr><td>POST /api/stt</td><td>Audio → text <strong>locally</strong>: <code>ffmpeg</code> transcode + Gemma 4 audio node (was: Raspberry Pi voice server, retired 2026-08-02 — the host no longer exists). See <a href="voice_server.html">Voice loop</a>.</td></tr>
+      <tr><td>POST /api/tts</td><td>Text → <code>audio/wav</code> <strong>locally</strong> via the macOS <code>say</code> synthesiser (was: Raspberry Pi voice server). Buffered, not streamed — the client needs the whole blob anyway.</td></tr>
       <tr><td>Agent passthrough proxies</td><td>Explicit allowlist added 2026-07-28 for the workspace UI (browser only ever talks to :8080; the proxy injects the key): <code>GET /api/health</code>, <code>GET|POST /api/sessions</code>, <code>GET|DELETE /api/sessions/{id}</code>, <code>GET /api/turns</code>, <code>POST /api/turn/cancel</code>, <code>GET /api/notifications/pending</code>, <code>POST /api/notifications/ack</code>, <code>POST /api/memory/correct</code>, <code>POST /api/memory/delete</code>. Query params + raw body forwarded, upstream status propagated, path params re-quoted. Deliberately NOT a <code>/{path:path}</code> catch-all — the LAN-reachable agent surface stays enumerated. Pins: <code>tests/test_interface_agent_proxies.py</code>.</td></tr>
     </tbody>
   </table>
@@ -443,7 +443,17 @@
     <code>#tts-toggle-btn</code> deleted from the header so the six remaining controls fit a
     single row on phones (verified 390px and 375px viewports). The TTS engine in app.js stays
     dormant behind its <code>if (ttsToggleBtn)</code> guard and the <code>/api/tts</code> proxy
-    remains — restore by re-adding the button (see the HTML comment in place).</li>
+    remains — restore by re-adding the button (see the HTML comment in place).
+    <br><strong>Update 2026-08-02 — voice works again, without restoring either button.</strong>
+    The mic (<code>#mic-btn</code>, removed 2026-08-01) and the TTS toggle went unused because
+    <em>both endpoints proxied to a voice server that no longer exists</em>, so the controls were
+    no-ops. STT/TTS now run locally (<a href="voice_server.html">Voice loop</a>). The
+    <strong>mic is restored in the input area</strong> — not the header, so the six-control
+    single-row layout is untouched — and holding it both enables spoken replies for that turn and
+    performs the autoplay-unlock gesture the removed toggle used to provide. Typing turns speech
+    back off (<code>sendTypedMessage()</code>). The <code>#tts-toggle-btn</code> stays removed;
+    its <code>if (ttsToggleBtn)</code> guard remains, so re-adding it still works and composes
+    with the new behaviour. Pinned by <code>tests/test_interface_voice.py</code>.</li>
     <li><strong>Architecture</strong>: app.js publishes a <code>window.GhostCore</code> bridge
     (methods + an <code>EventTarget</code> emitting <code>turn-complete</code> /
     <code>conversation-cleared</code>) and dynamically imports <code>workspace.js</code>, which

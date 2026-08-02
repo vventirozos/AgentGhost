@@ -120,6 +120,16 @@ def test_competence_gate_reads_the_mechanisms_constant():
     assert _live_competence_gate() == GhostAgent._COMPETENCE_MIN_OBS
 
 
+def _calib_row(**fields):
+    """A calibration row in the CURRENT epoch. Rows without an epoch tag are
+    derived from `ts`, and an undated row is treated as legacy and excluded
+    from both the fit and this report — correct, but it means a fixture that
+    omits both describes an empty corpus."""
+    from ghost_agent.core.calibration import CURRENT_EPOCH
+    fields.setdefault("epoch", CURRENT_EPOCH)
+    return json.dumps(fields) + "\n"
+
+
 def test_entropy_learnable_mirrors_the_fit_gate(tmp_path):
     """calibration.py fits w_entropy only when >= _MIN_ENTROPY_SAMPLES
     observed samples exist AND both outcome classes are represented among
@@ -131,9 +141,8 @@ def test_entropy_learnable_mirrors_the_fit_gate(tmp_path):
     calib.mkdir(parents=True)
     with (calib / "calibration.jsonl").open("w") as fh:
         for i in range(40):  # varied entropy, all positive-class
-            fh.write(json.dumps({
-                "entropy_component": 0.3 + (i % 10) / 20.0,
-                "entropy_observed": True, "outcome": 1.0}) + "\n")
+            fh.write(_calib_row(entropy_component=0.3 + (i % 10) / 20.0,
+                                entropy_observed=True, outcome=1.0))
     r = collect_learning_health(md)
     cal = r["calibration"]
     assert cal["entropy_observed_samples"] == 40
@@ -149,16 +158,70 @@ def test_entropy_learnable_true_with_both_classes(tmp_path):
     calib.mkdir(parents=True)
     with (calib / "calibration.jsonl").open("w") as fh:
         for i in range(35):
-            fh.write(json.dumps({
-                "entropy_component": 0.2 + (i % 7) / 10.0,
-                "entropy_observed": True,
-                "outcome": 1.0 if i % 5 else 0.0}) + "\n")
+            ok = bool(i % 5)
+            # Entropy must actually SEPARATE the classes, not merely vary —
+            # that is the second half of the fit gate.
+            fh.write(_calib_row(
+                entropy_component=(0.80 if ok else 0.20) + (i % 3) / 100.0,
+                entropy_observed=True,
+                outcome=1.0 if ok else 0.0))
     cal = collect_learning_health(md)["calibration"]
     assert cal["entropy_observed_pos"] > 0 and cal["entropy_observed_neg"] > 0
     assert cal["entropy_learnable"] is True
     # And the floor itself is the mechanism's constant, not a copy.
     from ghost_agent.core.calibration import _MIN_ENTROPY_SAMPLES
     assert cal["entropy_min_samples_gate"] == _MIN_ENTROPY_SAMPLES
+
+
+def test_entropy_not_learnable_when_it_varies_but_does_not_separate(tmp_path):
+    """The half of the gate this report used to omit. Plenty of samples,
+    both classes, 30 distinct values — and no ability to tell the classes
+    apart, so the fit pins w_entropy to 0. Reporting LEARNABLE here is the
+    exact lie the mirror-the-gate rule exists to prevent."""
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    calib = md.parent / "calibration"
+    calib.mkdir(parents=True)
+    # Both classes drawn from an IDENTICAL spread of 40 values, so the
+    # separation is exactly zero by construction. Random noise would be
+    # seed-luck: a 2.5σ test admits ~5% of pure-noise corpora by design,
+    # and this test must assert the mechanism, not a lucky draw.
+    values = [j / 40.0 for j in range(40)]
+    with (calib / "calibration.jsonl").open("w") as fh:
+        for v in values:                       # 40 failures
+            fh.write(_calib_row(entropy_component=v,
+                                entropy_observed=True, outcome=0.0))
+        for v in values * 2:                   # 80 successes, same spread
+            fh.write(_calib_row(entropy_component=v,
+                                entropy_observed=True, outcome=1.0))
+    cal = collect_learning_health(md)["calibration"]
+    assert cal["entropy_observed_samples"] == 120
+    assert cal["entropy_observed_pos"] > 0 and cal["entropy_observed_neg"] > 0
+    assert cal["entropy_distinct_values"] > 30      # it VARIES
+    assert cal["entropy_separation_sigmas"] < cal["separation_min_sigmas"]
+    assert cal["entropy_learnable"] is False        # …and still teaches nothing
+
+
+def test_calibration_telemetry_is_epoch_scoped(tmp_path):
+    """Counts must describe the population the fit reads. Pooling epochs is
+    what made `competence_component` report separation 0.0023 / verdict
+    'dead' — a number measured across a label-scheme change."""
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    calib = md.parent / "calibration"
+    calib.mkdir(parents=True)
+    with (calib / "calibration.jsonl").open("w") as fh:
+        for _ in range(60):   # legacy: undated, so derived as the old epoch
+            fh.write(json.dumps({"entropy_component": 0.5, "outcome": 1.0,
+                                 "ts": "2026-07-10T00:00:00Z"}) + "\n")
+        for i in range(20):
+            fh.write(_calib_row(entropy_component=0.4, entropy_observed=True,
+                                outcome=1.0 if i % 4 else 0.0))
+    cal = collect_learning_health(md)["calibration"]
+    assert cal["samples_on_disk"] == 80        # the file, unchanged
+    assert cal["samples_this_epoch"] == 20     # what the fit actually reads
+    assert cal["samples_other_epochs"] == 60
+    assert cal["entropy_observed_samples"] == 20
 
 
 def test_failure_arm_inert_warning(tmp_path):

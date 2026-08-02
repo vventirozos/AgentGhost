@@ -26,6 +26,15 @@ logger = logging.getLogger("GhostAgent")
 # this many seconds and the fact still lands in the vector store.
 _GRAPH_EXTRACT_TIMEOUT_S = 20.0
 
+# Containers routed to the audio-transcription ingest path (memory.audio_ingest)
+# instead of the plain-text branch, which would decode them as replacement-char
+# noise. VIDEO is included deliberately: ffmpeg takes the audio track, and a
+# recorded conference talk is far more often an .mp4 than a .wav.
+_AUDIO_INGEST_EXTS = (
+    ".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma", ".aiff",
+    ".mp4", ".mov", ".mkv", ".webm", ".avi",
+)
+
 
 def _is_within_root(path: Path, root: Path) -> bool:
     """True iff `path` is inside `root`, compared path-component-wise.
@@ -329,7 +338,18 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
         try:
             stat_res = file_path.stat()
             file_size = int(stat_res.st_size)
-            if file_size > MAX_INGEST_FILE_BYTES:
+            # Audio/video are EXEMPT from the byte cap (2026-08-02). The cap
+            # exists to stop a huge text/PDF being pulled into RAM — but a
+            # recording never is: ffmpeg seeks to each ~12-minute window and
+            # only that window's WAV is resident, so peak memory is flat
+            # regardless of file size. The operative bound for a recording is
+            # DURATION (GHOST_AUDIO_MAX_S, enforced in audio_ingest), not
+            # bytes. Without this exemption the primary use case failed at the
+            # door: a 45-minute conference talk is 700 MB–1.3 GB of video, and
+            # the cap's advice ("Split it into chunks first") is useless for a
+            # recording.
+            is_audio_video = filename.lower().endswith(_AUDIO_INGEST_EXTS)
+            if file_size > MAX_INGEST_FILE_BYTES and not is_audio_video:
                 return (
                     f"Error: '{filename}' is {file_size // (1024*1024)} MB; ingest refuses files "
                     f"larger than {MAX_INGEST_FILE_BYTES // (1024*1024)} MB. Split it into chunks first."
@@ -399,10 +419,88 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                 f"filename='{filename}', question='...')."
             )
 
+        # ── AUDIO / VIDEO: WINDOWED TRANSCRIPTION PATH (2026-08-02) ────
+        # Spoken material (conference talks, podcast interviews, recorded
+        # meetings) used to be unreachable: it would fall through to the
+        # plain-text branch below and decode as replacement-char noise, so a
+        # whole media class was invisible to the knowledge base. It is now
+        # transcribed on the Gemma 4 audio node ~12 minutes at a time, and
+        # every chunk is stamped with its TIMESTAMP RANGE so a retrieved
+        # passage is citable back to the moment in the recording. Video
+        # containers work too — ffmpeg simply takes the audio track.
+        if filename.lower().endswith(_AUDIO_INGEST_EXTS):
+            from ..memory.audio_ingest import (
+                ingest_audio_streaming, format_timestamp,
+            )
+
+            # `X/60:.0f` minutes rounded a 3-second clip to "0 minutes, 1
+            # windows" — a successful ingest that reads like a failure. Use the
+            # h:mm:ss formatter (exact at every scale) and pluralise honestly.
+            def _plural(n, word):
+                return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+            def _audio_progress(st):
+                pretty_log(
+                    "KB Ingest",
+                    f"{filename}: {_plural(st.windows, 'window')} · "
+                    f"{format_timestamp(st.seconds)} · "
+                    f"{_plural(st.chunks, 'chunk')}",
+                    icon=Icons.MEM_INGEST,
+                )
+
+            try:
+                stats = await asyncio.to_thread(
+                    ingest_audio_streaming, file_path, filename, memory_system,
+                    progress=_audio_progress,
+                )
+            except Exception as e:
+                return f"Ingest Error: {e}"
+
+            if not stats.chunks:
+                return (
+                    f"Error: no speech was transcribed from '{filename}'. "
+                    f"{'Windows failed: ' + '; '.join(stats.errors[:3]) if stats.errors else 'The recording may be silent or music-only.'}"
+                )
+
+            try:
+                summary = (
+                    f"[Document Summary: {filename}] Audio transcript: "
+                    f"{format_timestamp(stats.seconds)} across "
+                    f"{_plural(stats.windows, 'window')}, "
+                    f"{_plural(stats.chunks, 'indexed chunk')}, {stats.chars} "
+                    f"characters. Chunks are stamped with timestamp ranges. "
+                    f"Query it with knowledge_base(action='query', "
+                    f"filename='{filename}', question='...')."
+                )
+                await asyncio.to_thread(
+                    memory_system.add, summary,
+                    {"type": "document_summary", "source": filename,
+                     "timestamp": get_utc_timestamp()},
+                )
+            except Exception:
+                pass
+
+            note = ""
+            if stats.truncated:
+                note += " (TRUNCATED at the duration cap)"
+            if stats.skipped_windows:
+                note += f" ({stats.skipped_windows} windows failed and were skipped)"
+            return (
+                f"SUCCESS: Transcribed and ingested '{filename}' — "
+                f"{format_timestamp(stats.seconds)} of audio, "
+                f"{_plural(stats.windows, 'window')}, "
+                f"{_plural(stats.chunks, 'chunk')}{note}. "
+                f"Passages carry timestamps, so "
+                f"answers can cite the moment. Ask questions with "
+                f"knowledge_base(action='query', filename='{filename}', "
+                f"question='...')."
+            )
+
         try:
             def _extract_text():
-                # NOTE: PDFs never reach here — they take the streaming
-                # pdf_ingest path above. This is the plain-text branch.
+                # NOTE: PDFs and audio never reach here — they take the
+                # streaming pdf_ingest / audio_ingest paths above. This is the
+                # plain-text branch.
                 extracted_parts: list[str] = []
                 running_len = 0
                 binary_exts = ['.png', '.jpg', '.jpeg', '.gif', '.zip', '.tar', '.gz', '.sqlite', '.db', '.mp4', '.exe']

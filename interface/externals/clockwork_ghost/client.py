@@ -17,14 +17,32 @@ from PyQt6.QtWidgets import (
 import markdown
 import qasync
 
-from face import NeuralFaceWidget as MatrixFaceWidget, FluidFaceWidget, NetworkFaceWidget
+from webface import WebFaceWidget
+from chatlog import ChatLog
 
 audio_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
 
-# Adjust these URLs if the TTS/STT services are hosted centrally on ghost or remotely:
-TTS_SERVER_URL = "http://192.168.0.24:8000/tts"
-STT_SERVER_URL = "http://192.168.0.24:8000/stt"
+# ── Voice endpoints (repointed 2026-08-02) ──────────────────────────────
+# WAS `http://192.168.0.24:8000/{tts,stt}` — a Raspberry-Pi voice server
+# (Whisper + Piper) that NO LONGER EXISTS. Both calls had been failing
+# silently against a dead LAN host, which is why voice on this device was
+# "unused". Voice now runs on eva itself: STT = ffmpeg + the Gemma 4 audio
+# node, TTS = the macOS speech synthesiser (see interface/voice.py).
+#
+# Two things differ from the old Pi server and both are load-bearing:
+#   1. These endpoints live on the INTERFACE (port 8080, TLS), not the agent
+#      (port 8000, plain HTTP) that chat uses — so the URLs carry https and
+#      their own port.
+#   2. They require `X-Ghost-Key`, exactly like /api/chat already does.
+# The interface serves a self-signed cert, so verification is off by default;
+# the hop is inside the tailnet (WireGuard-authenticated) and carries the same
+# key the chat calls already send over plain HTTP to :8000.
+GHOST_HOST = os.environ.get("GHOST_HOST", "eva")
+VOICE_BASE_URL = os.environ.get("GHOST_VOICE_BASE", f"https://{GHOST_HOST}:8080")
+TTS_SERVER_URL = f"{VOICE_BASE_URL}/api/tts"
+STT_SERVER_URL = f"{VOICE_BASE_URL}/api/stt"
+VOICE_VERIFY_TLS = os.environ.get("GHOST_VOICE_VERIFY_TLS", "0").lower() in ("1", "true", "yes")
 
 
 def _resolve_ghost_api_key() -> str:
@@ -57,113 +75,109 @@ GHOST_API_KEY = _resolve_ghost_api_key()
 # THEME — central palette + stylesheet builders
 # ============================================================================
 class T:
-    BG          = "#04060e"
-    BG_PANEL    = "#080c18"
-    BG_INPUT    = "#0c1224"
-    BORDER      = "#172240"
-    BORDER_HOT  = "#2a3a60"
-    TEXT        = "#e6edf8"
-    TEXT_DIM    = "#7e94b8"
-    USER        = "#ffb86b"
-    ASSISTANT   = "#e6edf8"
-    ACCENT      = "#7be0ff"
-    ACCENT_WARM = "#ffb86b"
-    OK          = "#88ff9c"
-    DANGER      = "#ff5a6e"
-    REC         = "#ff3344"
-    SCROLL      = "#1a2440"
-    SCROLL_HOT  = "#2c3e6e"
+    """Glass UI over the live face (2026-08-02 restyle).
+
+    Nothing is opaque any more: the face fills the window and every panel is
+    tinted glass on top of it, so the thermal palette reads through the whole
+    interface instead of being boxed into one half.
+
+    The old scheme was navy panels with a CYAN accent (#7be0ff). Cyan fights
+    the face directly — the face's ring runs blue → violet → crimson with no
+    green channel to speak of, so a cold cyan chrome sat outside that range and
+    made the two look like different applications. The accent is now violet,
+    lifted from the middle of the face's own palette, and the warm user colour
+    sits with its crimson core. No hard fills, hairline borders, larger radii.
+    """
+
+    # Panel fills. Qt widgets cannot do backdrop-blur, so readability comes
+    # from the tint alone — hence a heavier fill behind long-form text than
+    # behind chips, rather than the uniform low alpha the web UI can afford.
+    GLASS       = "rgba(9, 11, 22, 0.46)"     # chat surface (text legibility)
+    GLASS_SOFT  = "rgba(9, 11, 22, 0.30)"     # inputs, chips
+    GLASS_HOT   = "rgba(40, 26, 60, 0.55)"    # hover / active
+    HAIRLINE    = "rgba(255, 255, 255, 0.10)"
+    HAIRLINE_HOT = "rgba(201, 166, 255, 0.55)"
+
+    TEXT        = "#ecebf6"
+    TEXT_DIM    = "rgba(236, 235, 246, 0.52)"
+    USER        = "#ffc08a"   # warm sand — sits with the face's crimson core
+    ASSISTANT   = "#e9e6ff"
+    ACCENT      = "#c9a6ff"   # violet, from the face's mid palette
+    ACCENT_WARM = "#ffc08a"
+    OK          = "#9fe3b8"
+    DANGER      = "#ff7b91"
+    REC         = "#ff5470"
+    SCROLL      = "rgba(255, 255, 255, 0.12)"
+    SCROLL_HOT  = "rgba(201, 166, 255, 0.45)"
+
+    # Kept as aliases so any straggling reference still resolves.
+    BG          = "transparent"
+    BG_PANEL    = GLASS
+    BG_INPUT    = GLASS_SOFT
+    BORDER      = HAIRLINE
+    BORDER_HOT  = HAIRLINE_HOT
+
     FONT        = "'Fira Code', 'JetBrains Mono', 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', monospace"
 
 
-def chip_style(fg=T.TEXT_DIM, border=T.BORDER, hover=T.BG_INPUT):
+def chip_style(fg=T.TEXT_DIM, border=T.HAIRLINE, hover=T.GLASS_HOT):
     return f"""
         QPushButton {{
-            background-color: transparent;
+            background-color: {T.GLASS_SOFT};
             color: {fg};
             border: 1px solid {border};
-            border-radius: 6px;
-            padding: 6px 12px;
+            border-radius: 12px;
+            padding: 9px 16px;
             font-family: {T.FONT};
             font-size: 18px;
             font-weight: bold;
-            letter-spacing: 0.5px;
+            letter-spacing: 1px;
         }}
         QPushButton:hover {{
             background-color: {hover};
             color: {T.ACCENT};
-            border: 1px solid {T.ACCENT};
+            border: 1px solid {T.HAIRLINE_HOT};
         }}
         QPushButton:pressed {{
-            background-color: {T.BORDER};
+            background-color: {T.GLASS_HOT};
+            color: {T.TEXT};
         }}
     """
 
 
 def chip_style_hot(fg, border):
+    """Armed state (recording). Same glass geometry as chip_style so the chip
+    does not change shape when it lights up — only its colour does."""
     return f"""
         QPushButton {{
-            background-color: rgba(255, 90, 110, 0.12);
+            background-color: rgba(255, 84, 112, 0.20);
             color: {fg};
             border: 1px solid {border};
-            border-radius: 6px;
-            padding: 6px 12px;
+            border-radius: 12px;
+            padding: 9px 16px;
             font-family: {T.FONT};
             font-size: 18px;
             font-weight: bold;
-            letter-spacing: 0.5px;
+            letter-spacing: 1px;
         }}
     """
 
 
-CHAT_STYLE = f"""
-    QTextBrowser {{
-        background-color: {T.BG_PANEL};
-        color: {T.TEXT};
-        border: 1px solid {T.BORDER};
-        border-radius: 10px;
-        padding: 18px;
-        font-family: {T.FONT};
-        font-size: 22px;
-        selection-background-color: {T.BORDER_HOT};
-    }}
-    QScrollBar:vertical {{
-        border: none;
-        background: {T.BG_PANEL};
-        width: 12px;
-        margin: 4px 4px 4px 0px;
-        border-radius: 6px;
-    }}
-    QScrollBar::handle:vertical {{
-        background: {T.SCROLL};
-        min-height: 40px;
-        border-radius: 5px;
-    }}
-    QScrollBar::handle:vertical:hover {{
-        background: {T.SCROLL_HOT};
-    }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-        height: 0px; border: none; background: none;
-    }}
-    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-        background: none;
-    }}
-"""
-
 INPUT_STYLE = f"""
     QLineEdit {{
-        background-color: {T.BG_INPUT};
+        background-color: {T.GLASS_SOFT};
         color: {T.TEXT};
-        border: 1px solid {T.BORDER};
-        border-radius: 10px;
-        padding: 14px 16px;
+        border: 1px solid {T.HAIRLINE};
+        border-radius: 16px;
+        padding: 16px 20px;
         font-family: {T.FONT};
         font-size: 22px;
-        selection-background-color: {T.BORDER_HOT};
+        selection-background-color: {T.GLASS_HOT};
+        selection-color: {T.TEXT};
     }}
     QLineEdit:focus {{
-        border: 1px solid {T.ACCENT};
-        background-color: #0d142a;
+        border: 1px solid {T.HAIRLINE_HOT};
+        background-color: {T.GLASS};
     }}
 """
 
@@ -184,8 +198,10 @@ FILEDIALOG_STYLE = f"""
     }}
 """
 
-USER_BUBBLE_PREFIX = f"<br><div style='color:{T.USER};'><b>&gt; </b>"
-ASSISTANT_BUBBLE_PREFIX = f"<br><div style='color:{T.ACCENT};'><b>&lt;&lt; </b>"
+# Chat bubbles moved to chatlog.py (2026-08-02, second pass): they are
+# real QLabel widgets now, so they get true rounded/notched corners and
+# hug their content — neither of which QTextDocument can do.
+
 NOTE_DIM = f"<div style='color:{T.TEXT_DIM};'><i>"
 NOTE_OK = f"<div style='color:{T.OK};'><i>"
 NOTE_WARN = f"<div style='color:{T.ACCENT_WARM};'><i>"
@@ -399,7 +415,6 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.response_start_position = 0
         self.current_response_text = ""
         self.shown_images = set()
         
@@ -426,26 +441,56 @@ class MainWindow(QWidget):
 
     def initUI(self):
         screen_geometry = QApplication.primaryScreen().geometry()
-        self.setFixedSize(screen_geometry.width(), screen_geometry.height())
+        win_w, win_h = screen_geometry.width(), screen_geometry.height()
+        self.setFixedSize(win_w, win_h)
         self.move(0, 0)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
-        self.setStyleSheet(f"background-color: {T.BG};")
+        # Only the window itself gets a fill, and only so there is no flash of
+        # nothing before the face paints — the face covers it entirely.
+        self.setObjectName("root")
+        self.setStyleSheet("QWidget#root { background-color: #05060c; }")
 
-        main_layout = QHBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        # ── The face is the BACKGROUND of the whole window (2026-08-02) ────
+        # It used to sit in the right half with opaque panels beside it. Now
+        # every panel is glass and floats over it, so the thermal palette
+        # reads through the entire interface.
+        #
+        # Explicit geometry + raise_() instead of a layout: this is the exact
+        # arrangement proven to composite correctly over a GPU-backed
+        # QWebEngineView on this device. The window is a fixed size (it is a
+        # frameless full-screen kiosk), so nothing has to react to a resize.
+        self.web_face = WebFaceWidget(self)
+        self.web_face.setGeometry(0, 0, win_w, win_h)
+        self.faces = (self.web_face,)
+        # Face state the client owns (the face itself is async JS now).
+        self._face_mood = "idle"
+        self._face_error = False
+
+        # Everything else lives on a transparent sheet ON TOP of the face.
+        self.overlay = QWidget(self)
+        self.overlay.setGeometry(0, 0, win_w, win_h)
+        self.overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # ONE full-width column, not a left/right split (2026-08-02). The
+        # split existed to keep the transcript clear of the face; now the face
+        # is behind everything and the messages are bubbles that place
+        # themselves — operator right, agent left — so a container column would
+        # only reserve dead space.
+        main_layout = QVBoxLayout(self.overlay)
+        main_layout.setContentsMargins(26, 14, 26, 12)
+        main_layout.setSpacing(10)
 
         left_widget = QWidget()
-        self.left_widget = left_widget
+        self.left_widget = left_widget       # still the fullscreen-face toggle target
         left_layout = QVBoxLayout(left_widget)
-        left_layout.setContentsMargins(20, 20, 20, 20)
-        left_layout.setSpacing(15)
-        
-        self.chat_display = QTextBrowser()
-        self.chat_display.setOpenExternalLinks(False)
-        self.chat_display.setOpenLinks(False)
-        self.chat_display.anchorClicked.connect(self.handle_link_clicked)
-        self.chat_display.setStyleSheet(CHAT_STYLE)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
+
+        # Real widgets, not a rich-text document: QTextDocument cannot do
+        # border-radius, and its table cells take a fixed percentage width
+        # instead of hugging short messages. See chatlog.py.
+        self.chat_display = ChatLog(T)
+        self.chat_display.link_clicked.connect(self.handle_link_clicked)
 
         self.text_input = QLineEdit()
         self.text_input.setPlaceholderText("speak to the ghost…")
@@ -453,27 +498,9 @@ class MainWindow(QWidget):
         self.text_input.returnPressed.connect(self.handle_input)
         self.text_input.installEventFilter(self)
         
+        # Only the transcript lives in this container now; the input moved to
+        # the bottom bar so it can share that row with the action chips.
         left_layout.addWidget(self.chat_display)
-        left_layout.addWidget(self.text_input, stretch=0)
-        
-        # Wrapper for Right Panel to allow bottom bar
-        right_widget = QWidget()
-        right_widget.setStyleSheet(f"background-color: {T.BG};")
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
-
-        self.stacked_widget = QStackedWidget()
-
-        self.fluid_face = FluidFaceWidget()
-        self.network_face = NetworkFaceWidget()
-        self.matrix_face = MatrixFaceWidget()
-
-        self.stacked_widget.addWidget(self.network_face)  # 0 — MoE Network (default)
-        self.stacked_widget.addWidget(self.fluid_face)    # 1 — Smoke Oracle
-        self.stacked_widget.addWidget(self.matrix_face)   # 2 — Iris
-
-        self.stacked_widget.setCurrentIndex(0)
 
         self.fs_btn = QPushButton("◐")
         self.fs_btn.setStyleSheet(chip_style())
@@ -482,11 +509,12 @@ class MainWindow(QWidget):
 
         self.switch_face_btn = QPushButton("◈")
         self.switch_face_btn.setStyleSheet(chip_style())
-        self.switch_face_btn.setToolTip("Switch face")
+        self.switch_face_btn.setToolTip("Cycle face form")
         self.switch_face_btn.clicked.connect(self.toggle_face_style)
 
         top_right_layout = QHBoxLayout()
-        top_right_layout.setContentsMargins(0, 15, 20, 0)
+        top_right_layout.setContentsMargins(0, 0, 0, 0)
+        top_right_layout.setSpacing(8)
         top_right_layout.addStretch()
 
         self.workspace_btn = QPushButton("◇")
@@ -498,13 +526,14 @@ class MainWindow(QWidget):
         top_right_layout.addWidget(self.switch_face_btn)
         top_right_layout.addWidget(self.fs_btn)
         
-        right_layout.addLayout(top_right_layout)
-        right_layout.addWidget(self.stacked_widget, 1)
-        
-        # Discreet Bottom Right Clock/Battery/TTS
+        # Bottom row: the input keeps its left position, the action chips and
+        # the status readout keep theirs on the right — now sharing one row
+        # instead of sitting in two separate columns.
         stats_layout = QHBoxLayout()
-        stats_layout.setContentsMargins(0, 0, 20, 5)
-        
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setSpacing(8)
+        stats_layout.addWidget(self.text_input, 1)
+
         self.snap_btn = QPushButton("◉  SNAP")
         self.snap_btn.setStyleSheet(chip_style())
         self.snap_btn.clicked.connect(self.take_picture)
@@ -518,7 +547,6 @@ class MainWindow(QWidget):
         self.tts_btn.setStyleSheet(chip_style(fg=T.TEXT_DIM))
         self.tts_btn.clicked.connect(self.toggle_tts)
 
-        stats_layout.addStretch()
         stats_layout.addWidget(self.snap_btn)
         stats_layout.addWidget(self.ptt_btn)
         stats_layout.addWidget(self.tts_btn)
@@ -526,11 +554,14 @@ class MainWindow(QWidget):
         self.stats_label = QLabel("⚡ --%   ··:··")
         self.stats_label.setStyleSheet(f"color: {T.TEXT_DIM}; font-family: {T.FONT}; font-size: 18px; font-weight: bold; padding: 0 12px; letter-spacing: 1px;")
         stats_layout.addWidget(self.stats_label)
-        
-        right_layout.addLayout(stats_layout)
 
+        # top chips · transcript (stretch) · input + actions
+        main_layout.addLayout(top_right_layout)
         main_layout.addWidget(left_widget, 1)
-        main_layout.addWidget(right_widget, 1)
+        main_layout.addLayout(stats_layout)
+
+        # Keep the glass UI above the face at all times.
+        self.overlay.raise_()
 
         # Focus text input on startup
         self.text_input.setFocus()
@@ -618,16 +649,16 @@ class MainWindow(QWidget):
                     data = response.json()
                     self.conversation_history = data.get("chat_history", [])
                     self.chat_display.clear()
-                    self.chat_display.insertHtml(f"{NOTE_OK}workspace restored.</i></div><br>")
+                    self.chat_display.add(f"{NOTE_OK}workspace restored.</i></div>", "system")
                     for msg in self.conversation_history:
                         role = msg.get("role")
                         content = msg.get("content", "")
                         if role == "user":
                             if isinstance(content, list):
                                 text_part = next((item["text"] for item in content if item.get("type") == "text"), "[Image Attached]")
-                                self.update_chat_signal.emit("append", f"{USER_BUBBLE_PREFIX}{text_part}</div>")
+                                self.update_chat_signal.emit("user", (text_part))
                             else:
-                                self.update_chat_signal.emit("append", f"{USER_BUBBLE_PREFIX}{content}</div>")
+                                self.update_chat_signal.emit("user", (content))
                         elif role == "assistant":
                             display_content = re.sub(r'<tool_call[\s\S]*?(?:</tool_call>|$)', '', content, flags=re.IGNORECASE | re.DOTALL).strip()
                             if display_content:
@@ -637,8 +668,7 @@ class MainWindow(QWidget):
                                     display_content
                                 )
                                 html = markdown.markdown(processed_text, extensions=['fenced_code', 'tables'])
-                                styled_html = f"<div style='color:{T.TEXT};'>{html}</div>"
-                                self.update_chat_signal.emit("append", f"{ASSISTANT_BUBBLE_PREFIX}{styled_html}</div>")
+                                self.update_chat_signal.emit("agent", html)
                                 matches = re.findall(r'!\[.*?\]\((/api/download/[^\)]+)\)', display_content)
                                 for image_path in matches:
                                     self.show_image_signal.emit(image_path)
@@ -673,9 +703,7 @@ class MainWindow(QWidget):
             }}
         """)
         self.ptt_btn.setText("●  REC")
-        self.fluid_face.set_mood("listen")
-        self.network_face.set_mood("listen")
-        self.matrix_face.set_mood("listen")
+        self.set_face_mood("listen")
 
         # Kill any lingering recording processes just in case
         subprocess.Popen(['pkill', 'arecord']).wait()
@@ -715,7 +743,7 @@ class MainWindow(QWidget):
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
             ]
             
-            self.update_chat_signal.emit("append", f"{USER_BUBBLE_PREFIX}{prompt_text}<br><span style='color:{T.TEXT_DIM};'><i>[ optic capture attached ]</i></span></div>")
+            self.update_chat_signal.emit("user", (f"{prompt_text}<br><span style='color:{T.TEXT_DIM};'><i>[ optic capture attached ]</i></span>"))
             
             self.conversation_history.append({"role": "user", "content": content})
             self.update_workspace_signal.emit()
@@ -724,20 +752,24 @@ class MainWindow(QWidget):
     async def process_stt_audio(self):
         """Uploads the audio and forwards the transcribed text to the chat."""
         if not os.path.exists('/tmp/ghost_stt.wav'):
-            self.fluid_face.set_mood("idle")
-            self.network_face.set_mood("idle")
-            self.matrix_face.set_mood("idle")
+            self.set_face_mood("idle")
             return
 
         self.text_input.setPlaceholderText("Transcribing audio...")
         self.text_input.setEnabled(False)
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            # 60s (was 30): transcription runs on the audio node, and a long
+            # held PTT plus node queueing can exceed 30s. arecord already
+            # writes 16kHz mono WAV — exactly what the endpoint wants — so the
+            # server-side transcode is a cheap passthrough.
+            async with httpx.AsyncClient(timeout=60.0, verify=VOICE_VERIFY_TLS) as client:
                 with open('/tmp/ghost_stt.wav', 'rb') as f:
                     # Standard multipart file upload format
                     files = {'file': ('ghost_stt.wav', f, 'audio/wav')}
-                    response = await client.post(STT_SERVER_URL, files=files)
+                    response = await client.post(
+                        STT_SERVER_URL, files=files,
+                        headers={"X-Ghost-Key": GHOST_API_KEY})
 
                 if response.status_code == 200:
                     data = response.json()
@@ -749,19 +781,22 @@ class MainWindow(QWidget):
                         self.handle_input()
                     else:
                         # Empty transcription — return to idle
-                        self.fluid_face.set_mood("idle")
-                        self.network_face.set_mood("idle")
-                        self.matrix_face.set_mood("idle")
+                        self.set_face_mood("idle")
                 else:
-                    self.update_chat_signal.emit("error", f"STT failed: HTTP {response.status_code}")
-                    self.fluid_face.set_mood("idle")
-                    self.network_face.set_mood("idle")
-                    self.matrix_face.set_mood("idle")
+                    # Surface the server's OWN message, not just the status.
+                    # The endpoint explains real causes (missing binary under
+                    # a daemon PATH, clip too long); "HTTP 503" alone sent the
+                    # last diagnosis down the wrong path entirely.
+                    try:
+                        detail = response.json().get("error") or response.text[:160]
+                    except Exception:
+                        detail = response.text[:160]
+                    self.update_chat_signal.emit(
+                        "error", f"STT failed: HTTP {response.status_code} — {detail}")
+                    self.set_face_mood("idle")
         except Exception as e:
             self.update_chat_signal.emit("error", f"STT Error: {str(e)}")
-            self.fluid_face.set_mood("idle")
-            self.network_face.set_mood("idle")
-            self.matrix_face.set_mood("idle")
+            self.set_face_mood("idle")
         finally:
             self.text_input.setPlaceholderText("")
             self.text_input.setEnabled(True)
@@ -813,20 +848,21 @@ class MainWindow(QWidget):
         super().keyPressEvent(event)
 
     def handle_link_clicked(self, url):
-        link = url.toString()
+        # ChatLog emits a plain string (QLabel.linkActivated); the old
+        # QTextBrowser emitted a QUrl. Accept either.
+        link = url if isinstance(url, str) else url.toString()
         if link.startswith("/api/download/"):
             asyncio.ensure_future(self._download_and_show_image(link))
         else:
             from PyQt6.QtGui import QDesktopServices
-            QDesktopServices.openUrl(url)
+            from PyQt6.QtCore import QUrl as _QUrl
+            QDesktopServices.openUrl(_QUrl(link))
 
     def _check_tts_done(self):
         """Poll TTS queues; when both drain and faces are still in speak, go idle."""
-        if (self.network_face.target_mood.name == "speak"
+        if (self._face_mood == "speak"
                 and audio_queue.empty() and playback_queue.empty()):
-            self.fluid_face.set_mood("idle")
-            self.network_face.set_mood("idle")
-            self.matrix_face.set_mood("idle")
+            self.set_face_mood("idle")
 
     def toggle_tts(self):
         self.tts_enabled = not self.tts_enabled
@@ -845,9 +881,31 @@ class MainWindow(QWidget):
                 try: playback_queue.get_nowait(); playback_queue.task_done()
                 except: pass
 
+    def set_face_mood(self, mood):
+        """Set the face mood, and remember it.
+
+        The mood is tracked here because the face now lives in a browser: its
+        state is only reachable through async JavaScript, so a caller cannot
+        ask "are we still speaking?" synchronously the way it could of the old
+        QPainter widgets. One local string replaces that read.
+        """
+        self._face_mood = mood
+        try:
+            self.web_face.set_mood(mood)
+        except Exception:  # noqa: BLE001 — a face must never break a turn
+            pass
+
     def toggle_face_style(self):
-        idx = (self.stacked_widget.currentIndex() + 1) % self.stacked_widget.count()
-        self.stacked_widget.setCurrentIndex(idx)
+        """Cycle the face FORM (vortex → cortex → lattice → …).
+
+        This used to swap between three separate QPainter renderers. Those are
+        gone; the web face carries the same eight forms the browser has, so the
+        button now walks that list and the two clients stay in step.
+        """
+        try:
+            self.web_face.cycle_form()
+        except Exception:  # noqa: BLE001
+            pass
 
     def toggle_fullscreen_face(self):
         if self.left_widget.isVisible():
@@ -867,11 +925,9 @@ class MainWindow(QWidget):
             self.conversation_history.clear()
             self.update_workspace_signal.emit()
             self.chat_display.clear()
-            self.chat_display.insertHtml(f"{NOTE_WARN}context wiped.</i></div><br>")
+            self.chat_display.add(f"{NOTE_WARN}context wiped.</i></div>", "system")
             self.text_input.clear()
-            self.fluid_face.set_mood("idle")
-            self.network_face.set_mood("idle")
-            self.matrix_face.set_mood("idle")
+            self.set_face_mood("idle")
             
             while not audio_queue.empty():
                 try: audio_queue.get_nowait(); audio_queue.task_done()
@@ -912,12 +968,10 @@ class MainWindow(QWidget):
         self.history_index = -1
         self.text_input.clear()
 
-        self.update_chat_signal.emit("append", f"{USER_BUBBLE_PREFIX}{text}</div>")
+        self.update_chat_signal.emit("user", (text))
 
         self.conversation_history.append({"role": "user", "content": text})
-        self.fluid_face.wake()
-        self.network_face.wake()
-        self.matrix_face.wake()
+        self.web_face.wake()
         self.update_workspace_signal.emit()
         
         asyncio.ensure_future(self.send_chat_request())
@@ -937,9 +991,8 @@ class MainWindow(QWidget):
         }
         
         self.update_chat_signal.emit("start_response", "")
-        self.fluid_face.set_mood("think")
-        self.network_face.set_mood("think")
-        self.matrix_face.set_mood("think")
+        self._face_error = False
+        self.set_face_mood("think")
         self.tts_buffer = ""
         
         try:
@@ -963,12 +1016,11 @@ class MainWindow(QWidget):
                                     
                                 if content:
                                     self.update_chat_signal.emit("update_response", content)
-                                    self.fluid_face.pulse()
-                                    self.matrix_face.pulse()
+                                    self.web_face.pulse()
                                     # Network auto-spawns its own pulses in think mode;
                                     # just feed it a token-activity signal instead of
                                     # stacking extra full MoE cascades on every token.
-                                    self.network_face.feed_audio(0.5)
+                                    self.web_face.feed_audio(0.5)
                                     self.tts_buffer += content
                                     
                                     match = re.search(r'([.?!]+[\s\n]+)', self.tts_buffer)
@@ -996,21 +1048,16 @@ class MainWindow(QWidget):
             self.update_workspace_signal.emit()
             
         except Exception as e:
-            self.fluid_face.startle()
-            self.network_face.startle()
-            self.matrix_face.startle()
+            self.web_face.startle()
+            self._face_error = True
             self.update_chat_signal.emit("error", f"{type(e).__name__}: {str(e)}")
         finally:
             self.update_chat_signal.emit("stop_thinking", "")
-            if not self.matrix_face.state_error:
+            if not self._face_error:
                 if self.tts_enabled and (not audio_queue.empty() or not playback_queue.empty()):
-                    self.fluid_face.set_mood("speak")
-                    self.network_face.set_mood("speak")
-                    self.matrix_face.set_mood("speak")
+                    self.set_face_mood("speak")
                 else:
-                    self.fluid_face.set_mood("idle")
-                    self.network_face.set_mood("idle")
-                    self.matrix_face.set_mood("idle")
+                    self.set_face_mood("idle")
 
     def _animate_thinking(self):
         if getattr(self, 'is_thinking', False):
@@ -1018,24 +1065,35 @@ class MainWindow(QWidget):
             self._render_thinking()
 
     def _render_thinking(self):
-        cursor = self.chat_display.textCursor()
-        cursor.setPosition(self.response_start_position)
-        cursor.movePosition(cursor.MoveOperation.End, cursor.MoveMode.KeepAnchor)
         dots = "·" * self.thinking_dots
-        styled_html = f"<div style='color:{T.TEXT_DIM};'><i>cogitating {dots}</i></div>"
-        cursor.insertHtml(styled_html)
+        self.chat_display.update_agent(
+            f"<span style='color:{T.TEXT_DIM};'><i>cogitating {dots}</i></span>")
+
+    def _close_thinking(self):
+        """Stop the dots and discard the bubble if nothing ever arrived.
+
+        The placeholder holds "cogitating …", so it is never literally empty —
+        it has to be blanked before the log can decide to drop it.
+        """
+        if getattr(self, 'is_thinking', False):
+            self.is_thinking = False
+            self.thinking_timer.stop()
+            if not self.current_response_text:
+                self.chat_display.update_agent("")
+        self.chat_display.end_agent(drop_if_empty=True)
 
     def _update_chat(self, action, data):
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.chat_display.setTextCursor(cursor)
-        
+        # Cursor arithmetic is gone: the transcript is widgets now, and the
+        # streaming bubble is addressed directly instead of by document offset.
         if action == "append":
-            self.chat_display.insertHtml(data)
+            self.chat_display.add(data, "system")
+        elif action == "user":
+            self.chat_display.add(data, "user")
+        elif action == "agent":
+            self.chat_display.add(data, "agent")
         elif action == "start_response":
-            self.chat_display.insertHtml(f"{ASSISTANT_BUBBLE_PREFIX}</div>")
-            self.response_start_position = self.chat_display.textCursor().position()
             self.current_response_text = ""
+            self.chat_display.start_agent()
             self.is_thinking = True
             self.thinking_dots = 1
             self._render_thinking()
@@ -1045,46 +1103,26 @@ class MainWindow(QWidget):
                 self.is_thinking = False
                 self.thinking_timer.stop()
             self.current_response_text += data
-            
+
             processed_text = re.sub(
-                r'!\[(.*?)\]\((/api/download/[^\)]+)\)', 
-                r'<br><a href="\2" style="text-decoration:none; font-size:28px;" title="View Image: \1">🖼️</a>', 
+                r'!\[(.*?)\]\((/api/download/[^\)]+)\)',
+                r'<br><a href="\2" style="text-decoration:none; font-size:28px;" title="View Image: \1">🖼️</a>',
                 self.current_response_text
             )
             html = markdown.markdown(processed_text, extensions=['fenced_code', 'tables'])
-            
-            # Wraps the markdown in a div to constraint formatting
-            styled_html = f"<div style='color:{T.TEXT};'>{html}</div>"
-            
-            cursor.setPosition(self.response_start_position)
-            cursor.movePosition(cursor.MoveOperation.End, cursor.MoveMode.KeepAnchor)
-            cursor.insertHtml(styled_html)
+            self.chat_display.update_agent(html)
 
             matches = re.findall(r'!\[.*?\]\((/api/download/[^\)]+)\)', self.current_response_text)
             for image_path in matches:
                 self.show_image_signal.emit(image_path)
-                
+
         elif action == "stop_thinking":
-            if getattr(self, 'is_thinking', False):
-                self.is_thinking = False
-                self.thinking_timer.stop()
-                if not self.current_response_text:
-                    cursor.setPosition(self.response_start_position)
-                    cursor.movePosition(cursor.MoveOperation.End, cursor.MoveMode.KeepAnchor)
-                    cursor.insertText("")
+            self._close_thinking()
             return
         elif action == "error":
-            if getattr(self, 'is_thinking', False):
-                self.is_thinking = False
-                self.thinking_timer.stop()
-                if not self.current_response_text:
-                    cursor.setPosition(self.response_start_position)
-                    cursor.movePosition(cursor.MoveOperation.End, cursor.MoveMode.KeepAnchor)
-                    cursor.insertText("")
-            self.chat_display.insertHtml(f"<br>{NOTE_ERR}fault → {data}</i></div><br>")
-            
-        scrollbar = self.chat_display.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+            self._close_thinking()
+            self.chat_display.add(
+                f"<span style='color:{T.DANGER};'>fault → {data}</span>", "system")
 
     def _show_image_popup(self, image_path):
         if image_path in self.shown_images:
@@ -1110,7 +1148,9 @@ class MainWindow(QWidget):
         dialog.show()
 
 async def audio_fetch_task():
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    # verify=VOICE_VERIFY_TLS: the voice endpoints moved to the interface's
+    # self-signed TLS port (see the VOICE_BASE_URL block at the top).
+    async with httpx.AsyncClient(timeout=60.0, verify=VOICE_VERIFY_TLS) as client:
         while True:
             try:
                 text_chunk = await audio_queue.get()
@@ -1119,9 +1159,16 @@ async def audio_fetch_task():
                     continue
                 
                 payload = {"text": text_chunk}
-                resp = await client.post(TTS_SERVER_URL, json=payload, timeout=60.0)
+                resp = await client.post(
+                    TTS_SERVER_URL, json=payload, timeout=60.0,
+                    headers={"X-Ghost-Key": GHOST_API_KEY})
                 if resp.status_code == 200:
+                    # audio/wav from the macOS synthesiser; `aplay -q -` reads
+                    # a WAV header off stdin, same as the old Piper output.
                     await playback_queue.put(resp.content)
+                else:
+                    print(f"TTS Fetch Err: HTTP {resp.status_code} "
+                          f"{(resp.text or '')[:160]}")
             except Exception as e:
                 print(f"TTS Fetch Err: {e}")
             finally:
@@ -1158,6 +1205,12 @@ async def audio_worker_task():
                 pass
 
 if __name__ == "__main__":
+    # Belt-and-braces for the web face: QtWebEngine needs shared GL contexts
+    # established BEFORE the QApplication exists. The module-level import in
+    # webface.py already satisfies Qt's requirement; this attribute is the
+    # documented second half of the same contract and costs nothing when the
+    # web face is unavailable.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)

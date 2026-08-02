@@ -254,6 +254,25 @@ the v3 base); a `v3` container re-provisions to v4 on next recreate. Sync guarde
 `test_provisioning_bakes_ss_flask_chess_and_stays_in_sync`. Takes effect on the next sandbox
 container **recreate** (next prod restart).
 
+**Voice loop — LOCAL since 2026-08-02 (needs an interface restart to serve).** `/api/stt` and
+`/api/tts` no longer proxy anywhere: STT = `ffmpeg` transcode + **nova's Gemma 4 audio node**
+(`-mm …mmproj-BF16.gguf`), TTS = macOS `say`. The old `PI_VOICE_URL` target is GONE
+(`raspberrypi.local` doesn't resolve; `disorder:8000` listens on nothing) and that export in
+`start-ghost-client.sh` is now inert. Hold the mic (input area, restored 08-02) → spoken reply for that
+turn; typing turns speech off. Long-form recordings ingest via `knowledge_base(action='ingest_document',
+filename='talk.mp4')` → ~12-min windows, timestamp-stamped chunks. Config (all defaulted):
+`GHOST_AUDIO_NODE_URL` (TAILNET ip — a dotless/mDNS name is what stranded the last backend),
+`GHOST_STT_MAX_SECONDS`, `GHOST_STT_MAX_TOKENS`, `GHOST_TTS_VOICE`, `GHOST_AUDIO_WINDOW_S`,
+`GHOST_AUDIO_MAX_S`, `GHOST_AUDIO_MAX_TOKENS`. **Gotcha 1:** too small a `max_tokens` on any Gemma 4 audio
+call returns EMPTY content with `finish_reason="length"` (thinking tokens are stripped by its template)
+— both call sites raise on that shape rather than reporting silence. **Gotcha 2 — launchd PATH:** a
+daemon's PATH is `/usr/bin:/bin:/usr/sbin:/sbin` and EXCLUDES Homebrew, so `ffmpeg`/`ffprobe`
+(`/opt/homebrew/bin`) are invisible to a bare `which` while `say` (`/usr/bin`) resolves — this 503'd
+every STT request in the deployed process while working from a shell. Both the interface and
+`memory/audio_ingest.py` now use `resolve_binary()` (`GHOST_FFMPEG_BIN`/`GHOST_FFPROBE_BIN`/
+`GHOST_SAY_BIN` → PATH → known prefixes). **Anything a daemon shells out to must not trust PATH.**
+See `docs/interfaces/voice_server.html`.
+
 **Conventions.** Prefer closing loops over new modules. A "bug" needs a concrete failure scenario;
 an "inefficiency" needs measured before/after. Any change adds tests in `tests/` + updates HTML
 docs in `docs/`. Flag/env changes need a manual relaunch. Logging: `pretty_log` + distinct icons;
@@ -326,6 +345,40 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 ---
 
 ## 4. WHAT REMAINS TO DO
+
+### 4H. Confidence-score follow-ups (2026-08-02) — 2 items, both OPEN, neither blocking
+
+Left over from the calibration epoch/objective fix (§6 2026-08-02, DEPLOYED + live-verified). Both are
+deliberate non-actions with a stated trigger, not oversights — **read the §6 entry before starting
+either**, especially the measured verdict that the score has no behavioural consumer today
+(`_METACOG_ARBITER_ENABLED = False`) and that a mid-turn confidence gate is NOT worth building.
+
+1. **`λ` is not gated by the separation test.** `_MIN_SEPARATION_SIGMAS = 2.5` gates `w_entropy` and
+   `w_effort` — a weight may only leave zero once its feature separates the outcome classes by 2.5
+   standard errors. The `λ` (verbalised-uncertainty) grid is still searched unconditionally, so it is
+   the one free parameter the delivered-Brier objective can buy without evidence.
+   **Why it is safe to leave:** `uncertainty_pressure` is dead — 2 distinct values across the whole
+   live epoch, mean 0.0003, max 0.067 — so `(1 − λ·pressure)` can move a composite by at most ~3%,
+   and only on the handful of rows carrying any pressure. The 2026-08-02 refit fitted `lam=0.00`
+   anyway. Gating an inert term now is churn.
+   **Trigger to act:** the moment `UncertaintyTracker` starts producing real signal (watch
+   `uncertainty_pressure` distinct-values / separation in `introspect action='learning'`). At that
+   point λ would be fitting a LIVE feature that never had to earn its place. Fix = same one-line
+   `and _separation_sigmas(...) >= _MIN_SEPARATION_SIGMAS` conjunct the other two weights use.
+   Documented as "Known asymmetry" in `docs/core/calibration.html`.
+
+2. **Offline triage is unbuilt** — the one use the measurement actually supports. Rank trajectories
+   for reflection / postmortem / self-play attention by the calibrated post-hoc score (**AUC 0.727**
+   on 342 labelled trajectories) instead of the binary "failed" flag those selectors use today. A
+   graded calibrated probability is strictly more informative than a boolean, it is exactly where the
+   signal is strong (process health), and it touches no live path — so it needs no §3-style
+   measured-win gate before shipping.
+   **Design call, not a defect** — hence parked rather than done. Two caveats to carry in: the label
+   is a PROXY (`grade_turn_outcome`), so this ranks *process health*, not correctness; and the
+   ground-truth tiers are thin (5 of 546 samples are `failure_report`/`task_reopened`), so keep them
+   flowing or the ranking drifts toward rewarding "did not visibly break".
+   **Free adjunct needing no model at all:** turn DEPTH predicts failure on its own — 17.8% at step 1,
+   35.6% at 4, 42.3% at 6, 52.0% at 8, 60.6% at 12. Usable for budget/escalation policy directly.
 
 ### 4G. Project-aware services + port leases — 3-phase plan (2026-07-30) ✅ IMPLEMENTED same day
 
@@ -570,7 +623,20 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    window live in the DURABLE stores instead (trajectories + corrections.jsonl at the trajectory
    root + autonomous_activity ledger). Overturn counter line shape confirmed greppable:
    "Verifier escalation OVERTURNED a cheap-judge refute" (dedupe the GhostAgent/GhostStream twin
-   emission — one event logs twice).
+   emission — one event logs twice). **(g) T0's calibration block is NOT comparable across the
+   2026-08-02 epoch fix** (§6 that date). `ablation_out/watch-4f/t0/learning_health_t0.json` snapshots
+   `learning_health.calibration`, and several of its keys are now epoch-scoped rather than whole-file,
+   plus two verdict rules changed. A naive T+7d/T+14d diff will show step changes that are INSTRUMENT
+   changes, not behaviour — same trap as caveat (a). Specifically: `entropy_observed_pct` 12.3 → ~77
+   (denominator 1709 → 541); `entropy_observed_samples`, `outcome_pos`/`outcome_neg` (now split at 0.5,
+   not exact 1.0/0.0), `label_*` and `feature_health` all re-scoped; `feature_health` verdicts now use
+   the fit's 2.5σ gate, so `live_features` drops 2/4 → 1/4 and the T0 line
+   `competence_component: separation 0.0023 [dead]` was itself measured ACROSS the label-scheme change.
+   `samples_on_disk` was deliberately left whole-file and stays comparable. **The calibration/confidence
+   stack is otherwise independent of §4F** — `optim/` never reads it, `grade_turn_outcome` is unchanged
+   so the graded-outcome-label trend is bit-identical, and Phase 3 item 4(a)'s "threshold-aware
+   calibration" is the verifier logit-probe blend, not this. For a calibration reading at T+7d/T+14d,
+   re-baseline from a fresh post-fix `introspect action='learning'` rather than diffing t0.
 2. **Phase 2b fixture supply** (`GHOST_LLM_RECORD=1` in the launcher since 07-30 16:06 —
    UNREDACTED, local-only): **supply was structurally broken until 07-31 ~13:40** — the main tool
    loop STREAMS and the recorder had no streaming hook (the §4-parked "dev feature" turned out
@@ -1405,6 +1471,369 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-08-02 (later 2) — uCONSOLE UI: the web UI's face ported to the handheld, three QPainter faces DELETED, whole client restyled to glass + real bubble typography (deployed live)
+
+**Origin.** Operator, after the voice work: *"the UI / UX and its 'face' need redesign, can we have a
+'face' that looks like the webUI"* → then *"remove all three QPainter faces and implement the same
+faces the web UI has"* → *"why do we split the screen if the left window is almost 100%
+transparent?"* → *"do the rounded bubbles rewrite, and fix the padding"* → *"titles are way too big
+… text doesn't look great"*. Five passes in one session, each driven by looking at a screenshot of
+the real panel. Files: `interface/externals/clockwork_ghost/{client.py, webface.py, webface/,
+chatlog.py, deploy.sh}`. **The device is the source of truth for what these look like — every claim
+below was checked with a `grim` screenshot, not inferred.**
+
+**1. The face is now the WEB UI's face, hosted in a QWebEngineView.** Rather than reimplementing
+~2,700 lines of particle engine + GLSL in QPainter (a fork with a permanent maintenance tail), the
+handheld runs the real `matrix_graph.js`: same thermal palette, all 8 forms, dive, pulses, error
+flinches. `deploy.sh` re-copies the canonical `interface/static/matrix_graph.js` on EVERY deploy so
+the two clients cannot drift. three.js r160 is vendored under `webface/vendor/` (module +
+EffectComposer/RenderPass/UnrealBloomPass + deps) so the device needs no CDN at runtime.
+**Feasibility was measured before building:** WebGL 1.0 is available (three falls back from WebGL2,
+which is blocklisted on the V3D driver), and cost is purely FILL-RATE bound — 16 fps @1280×720,
+35.7 @854×480, 50.9 @640×360, with busy-state + dive costing *nothing* extra. `GHOST_FACE_ZOOM=2.0`
+shrinks the CSS viewport (browser upscales) and at 640×329 also trips matrix_graph's own
+`IS_MOBILE` query (`max-height:600px`) → 120 nodes instead of 250, halving its O(n²) proximity loop.
+That mobile profile exists for exactly this class of GPU.
+
+**2. All three QPainter faces REMOVED** (Iris / Smoke Oracle / MoE Network — the device-only
+`~/bin/face/` package, which never existed in the repo). `◈` now cycles FORMS, not renderers.
+**A measurement that contradicted our own docs:** the docs claimed hidden faces cost zero CPU via
+`showEvent`/`hideEvent` gating. On the deployed build the client sat at **61% of a core**; explicitly
+pausing their timers changed nothing (60.8%); *removing* them dropped the client below the 3%
+reporting threshold. The perf note was wrong — measure, don't trust it.
+
+**3. Glass restyle.** The face moved from the right half to the **background of the whole window**
+and every panel became tinted glass over it. Widget-over-webview compositing DOES work here, but
+only with the face as an explicitly-positioned child plus `raise_()` on a
+`WA_TranslucentBackground` overlay (the window is a fixed-size frameless kiosk, so no resize
+handling). **The cyan accent was dropped**: the face's ring runs blue→violet→crimson with
+essentially no green channel, so `#7be0ff` sat outside that range and made chrome and face look like
+two different applications. Accent is now violet `#c9a6ff` from the face's own mid-palette, with warm
+sand `#ffc08a` for the operator against its crimson core. Qt cannot do backdrop-blur, so readability
+comes from tint alone — heavier fill behind text than behind chips.
+
+**4. The left/right split is gone** (operator's observation: a nearly-invisible panel was still
+reserving half the screen). The transcript container is fully invisible and spans the full width;
+messages are free-floating bubbles, **operator right / agent left**, capped at 56% so the face stays
+visible down the middle (the web UI caps at 35% for the same stated reason — to clear the sphere).
+Input keeps bottom-left, action chips bottom-right; they share one row now.
+
+**5. Bubbles rewritten as real widgets** (`chatlog.py`: QScrollArea + one QLabel per message) after
+the table version proved unfixable — **`QTextDocument` supports no `border-radius` at all**, and its
+table cells take a fixed percentage width instead of hugging content. Widgets give true notched
+corners (16/4/16/16, web-UI parity), accent rails, and content hugging.
+> **THE trap, and it cost two failed attempts.** A word-wrapped QLabel reports a *small*
+> `sizeHint().width()` **regardless of `maximumWidth`**, so any size policy that defers to the hint
+> (Maximum, Preferred) leaves every bubble a narrow ribbon. My first fix assumed a pre-layout width
+> and raised the cap — the redeployed screenshot came back byte-identical, because **the cap was
+> never the binding constraint**. `_Bubble.fit()` measures the text with wrap OFF, then pins
+> `minimum == maximum` width to `min(natural, cap)` so the layout has no choice.
+
+**6. Typography — the actual reason "text doesn't look great".** Two causes. (a) Markdown arrives as
+bare `<h2>/<p>/<ol>` and **Qt applies its OWN heading scale on top** (`<h1>`≈2×, `<h2>`≈1.5× base),
+so a briefing's headings rendered enormous; QLabel has no document-stylesheet hook, so
+`style_markup()` injects sizing inline per tag, headings only slightly above body size. (b) The real
+one: **everything was monospace, including prose.** The web UI splits this deliberately — agent
+messages inherit the sans body font and only `.message.user` overrides to mono. Now prose is
+DejaVu/Liberation Sans 20px; mono is reserved for the operator's own messages, inline code and code
+blocks. Also styled: paragraph spacing + 148% line-height, list indents, inline-code chips, code-block
+backgrounds, dimmed blockquotes with a violet rail, table header/column padding.
+
+**Cost of the look:** translucent widgets must be re-blended as the webview repaints beneath them, so
+the client runs ~39-49% of a core with QtWebEngine ~29-32% (load ~2.5 of 4 cores; RAM ~284 MB client
++ ~233 MB webengine). `GHOST_FACE_ZOOM` is the lever if it ever feels sluggish.
+
+**Device/deploy facts worth keeping** (all in `deploy.sh` + `docs/interfaces/clockwork_ghost.html`):
+the LIVE client is `~/bin/client.py`, NOT `~/clockwork_ghost/` (which does not exist on the device);
+the launcher sources the `~/gui_env` venv (system python3 has no httpx — always compile-check with
+the venv one); **QtWebEngineWidgets must be imported BEFORE QApplication exists** or Qt refuses to
+build the view and the face silently degrades to blank; **ES modules do NOT load over `file://`** —
+Chromium refuses with *no console error at all*, so the face is served from a loopback HTTP thread;
+screenshot with `grim` after exporting `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` (scrot renders black);
+and driving the restart via `ssh host "bash -s" <<EOS` avoids the documented pkill self-match (the
+pattern never appears in the remote cmdline). **Not verified remotely:** typing into the client —
+the device has no `wtype`/`ydotool`/`xdotool`, so bubble/markdown rendering was verified by driving
+the real `ChatLog` with representative messages, not by a live turn.
+
+### 2026-08-02 (later) — AUDIO: the voice loop was dead at BOTH ends; re-pointed to local nodes + long-form transcription ingest SHIPPED (interface needs a restart)
+
+**Origin.** Operator: "the worker model is gemma 4-e4b, it supports audio input, we haven't used it —
+what can we do with it?" Live probe of nova found `"modalities":{"vision":false,"audio":false}` — the
+projector wasn't loaded. Operator reloaded llama-server with `-mm
+gemma-4-E4B-it-mmproj-BF16.gguf`; verified end-to-end the same session, then built three features.
+
+**Measured on the live node (all constant across 3 orders of magnitude):** **25.0 audio tokens per
+second** (3.2 s → 83 tok; 38.9 s → 974; 377 s → 9,435). **No encoder window limit** — codewords planted
+at the start, middle AND very end of a 6.3-minute clip were all recovered, plus a faithful full
+transcript, so the "~30 s window" caution in the earlier survey was WRONG for this stack; chunking is a
+CONTEXT-BUDGET concern only. Throughput ~11× real-time (6.3 min in 33.6 s); longer clips are cheaper per
+second (fixed thinking-token overhead amortises). Per-slot ceiling: `--ctx-size 131072 / -np 4` =
+**32,768 tok/slot** ≈ 21 min of audio per request. `-np 4` also means audio need not block nova's other
+duties — the older "nova is a slot, not capacity" framing was wrong by 4×.
+
+**TWO TRAPS, both measured, both encoded in code + tests:**
+1. **The empty-response trap.** Gemma 4 emits thinking blocks its chat template STRIPS, so too small a
+   `max_tokens` returns **empty content with `finish_reason="length"`** — no error, just nothing (256 →
+   `''`; 1024 → correct). Both call sites now RAISE on that exact shape: a silent `""` would have
+   auto-sent an empty prompt to the agent (STT) or deleted a whole window from a transcript (ingest).
+2. **Dialect.** Audio requires the OpenAI `input_audio` part; the `audio_url` data-URI shape
+   `tools/vision.py` uses for images is rejected with `400 unsupported content[].type`. Deliberately NOT
+   a copy of the vision payload builder. Both pinned by regression tests.
+
+**THE REAL FINDING — the voice loop was dead at BOTH ends, and had been quietly deleted rather than
+fixed.** `/api/stt` + `/api/tts` proxied to `PI_VOICE_URL`; its default `raspberrypi.local` does not
+resolve and the launcher's override `http://disorder:8000` resolves on the tailnet but **listens on
+nothing**. Because the buttons were therefore no-ops, both UI controls were removed as "unused" —
+`#tts-toggle-btn` on 07-28, `#mic-btn` on 08-01 (the day before). A dead backend was diagnosed as an
+unwanted feature. Classic silent-inoperative-subsystem, with the twist that the *cleanup* erased the
+evidence.
+
+**Shipped (all local, zero egress — the only speech path compatible with the no-keyed-API rule):**
+- **`interface/voice.py` (new).** STT = ffmpeg transcode (any browser container → 16 kHz mono PCM, temp
+  FILES not pipes: a WAV on a non-seekable pipe carries a placeholder length some decoders reject) +
+  nova. TTS = macOS `say` (184 voices, no new model). `VoiceError` carries its own HTTP status so a
+  client-side problem never reports as a 502. Text reaches `say` via `-f <file>`, never argv/shell.
+  `PI_VOICE_URL` removed entirely; `server.py` proxies rewritten. Wire contract UNCHANGED (`{"text":…}`
+  / audio bytes), so the browser needed no protocol changes.
+- **Mic restored — in the INPUT AREA, not the header.** The header was trimmed to six controls for a
+  verified single-row mobile layout; putting the mic back there would have undone it. Holding the mic
+  now ALSO enables spoken replies for that turn and performs the autoplay-unlock gesture the removed
+  toggle used to provide (iOS needs the silent-buffer trick, not just `resume()`); typing turns speech
+  back off (`sendTypedMessage()`). So voice-in→voice-out with **no new header control**, and
+  `#tts-toggle-btn` stays removed with its `if (ttsToggleBtn)` guard intact so re-adding it still
+  composes. Cache-bust 8.7→8.8 (app.js + matrix_graph together).
+- **`memory/audio_ingest.py` (new) — long-form ingest, sibling of `pdf_ingest`.** ~12-min windows
+  (`-ss` before `-i` so seeking a 3-hour file is cheap), overlapping by 15 s so a sentence spanning a
+  seam survives. Breadcrumb = **timestamp range** (`[talk.mp3] [12:00–24:00]`), the audio analogue of
+  TOC breadcrumbs, stamped into the EMBEDDED text so a retrieved passage is CITABLE to the moment.
+  Per-sentence offsets deliberately NOT claimed (the model returns text, not an alignment). One bad
+  window is skipped into `stats.errors`, never fatal — same policy pdf_ingest applies to a bad page.
+  Routed in `tool_gain_knowledge` BEFORE the plain-text branch (a `.wav` used to decode as
+  replacement-char noise); video containers included (ffmpeg takes the audio track — a recorded talk is
+  usually an .mp4). **Live: a 6:17 recording → 3 windows (`0:00–3:00`, `2:45–5:45`, `5:30–6:17`) → 8
+  chunks, start/middle/end markers all recovered.** A 45-min talk is four windows.
+
+**Two defects found by reviewing my own changes (both would have shipped green):**
+1. **The 100 MB ingest byte-cap sits BEFORE the audio branch** — so every realistic conference-talk
+   video (700 MB–1.3 GB) was refused at the door with "Split it into chunks first", advice that is
+   meaningless for a recording. The cap guards RAM for text/PDF, but audio is never resident (one
+   window's WAV at a time), so audio/video is now EXEMPT and the operative bound is DURATION
+   (`GHOST_AUDIO_MAX_S`). The primary use case failed before this fix.
+2. **`stats.seconds` summed window LENGTHS, which overlap** — a 6:17 file reported as "6.8 min
+   transcribed". Now reports timeline COVERAGE. Caught by a test I wrote expecting the honest number.
+
+**GEPA / §4F Phase-2b interference — CHECKED, negligible (measured, not assumed).** The interface work
+is invisible (separate process, no LLM calls, no tool defs). The one prompt-visible change is
+`knowledge_base`'s description (audio/video now advertised — otherwise the capability is undiscoverable
+by the model). Against the in-era corpus (`ts ≥ 2026-07-31T19:15`): **372 records carry the old
+description, 3 carry the new** (switch at `2026-08-02T16:46:38Z`), and **`knowledge_base` was chosen 0
+times in the entire in-era corpus** — the mined tools are file_system 139 / execute 86 /
+manage_projects 55, none of whose descriptions changed. The miner keeps full payloads and the adapter
+swaps the CANDIDATE description at eval time, so a non-target tool's text is ambient context, not label
+noise. No amendment to the mining plan needed. **One risk to carry forward:**
+`registry._apply_tuned_descriptions` replaces a description WHOLESALE, so if
+`tool_description.knowledge_base.json` is ever promoted it would silently delete the audio steer — the
+capability would keep working while the model stopped knowing it exists. No `tool_description.*`
+artifacts exist yet (only `planning.decompose` + `verifier.*`). Also: the tools block changed → one KV
+stable-prefix re-prefill, already paid.
+
+**Suite: 10,485 passed / 13 skipped / 0 failed.** New: `tests/test_interface_voice.py` (18),
+`tests/test_audio_ingest.py` (21). `test_tts_passes_through_pi_content_type` REPLACED — the Pi
+content-type passthrough it guarded is gone by design, not by regression. Two pinned registry contract
+strings were restored verbatim after I broke them (the audio steer went into a separate sentence rather
+than weakening the guard). Docs: `docs/interfaces/voice_server.html` rewritten (was documenting the
+retired Whisper/Piper service), `docs/interfaces/web_server.html` endpoints + the removal notes,
+`docs/memory/vector.html` audio-ingest section. Two `test_learning_health` entropy tests failed in one
+full run and not the next, pass in isolation, and are not triggered by the new files —
+**pre-existing order-dependent flakiness, unrelated.**
+
+**POST-DEPLOY — two more defects, both found only by RUNNING it. Neither was reachable by any test I
+had written, and the second is a repeat of a documented lesson:**
+
+1. **`can't find variable: updateActivityIcon` — dormant code is not dead code.** Restoring `#mic-btn`
+   revived ~130 lines that had sat behind `if (micBtn)` since 08-01, and one call in them had ROTTED:
+   `updateActivityIcon` was deleted along with the center-stage `#activity-icon` on 2026-07-29, but
+   **two call sites survived**. Site 2 was the mic path (broke STT immediately). **Site 1 was live the
+   whole time** — in the file-upload success path, where the ReferenceError was swallowed by the
+   enclosing `catch` and reported as `Upload Error: …` **after an upload that had actually succeeded**.
+   A 4-day-old user-visible bug, found only because reviving neighbouring code made me audit the block.
+   Both calls removed (the turn-status line owns icons now); guarded by a test that extracts every
+   helper called inside the push-to-talk block and asserts it is defined — **and I verified the guard
+   FAILS when the bug is reintroduced** (my first sanity check injected the defect outside the scanned
+   block and "passed", which would have shipped a guard that guards nothing).
+2. **`STT ERROR: HTTP 503` from Safari — the launchd PATH trap, AGAIN.** `_run_binary` 503s when
+   `shutil.which()` misses, and **launchd hands a service a minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`)
+   that excludes Homebrew**. `say` is `/usr/bin/say` so TTS worked; `ffmpeg`/`ffprobe` are
+   `/opt/homebrew/bin/*` so every STT request failed — **works from a shell, 503s under the daemon**,
+   which is exactly why it survived all my testing. Not Safari-specific at all; Safari is just where it
+   was tried. Fixed with `resolve_binary()` (explicit `GHOST_<NAME>_BIN` → PATH → known prefixes) in
+   BOTH `interface/voice.py` and `memory/audio_ingest.py` — **the ingest path had the identical latent
+   bug** (the agent is also a LaunchDaemon), unhit only because no recording had been ingested yet. The
+   error text now names launchd and the override instead of the misleading "not installed". Verified by
+   re-running the full round trip under `env -i PATH=/usr/bin:/bin`, with a **Safari-shaped MP4/AAC**
+   upload rather than Chrome's WebM. Same defect family as the node binary that was invisible under
+   launchd PATH — worth treating as a standing checklist item for anything a daemon shells out to.
+
+**⚠ DEPLOY:** the agent side is live; the interface was restarted once and **needs one more restart**
+for the two post-deploy fixes (`start-ghost-client.sh`). Cache-bust is now **8.9** (app.js +
+matrix_graph together). `PI_VOICE_URL` in that launcher is inert and can be dropped. New env knobs, all
+defaulted: `GHOST_AUDIO_NODE_URL` (tailnet IP — a dotless/mDNS name is what stranded the last backend),
+`GHOST_STT_MAX_SECONDS`, `GHOST_STT_MAX_TOKENS`, `GHOST_TTS_VOICE`, `GHOST_TTS_RATE`,
+`GHOST_AUDIO_WINDOW_S`, `GHOST_AUDIO_WINDOW_OVERLAP_S`, `GHOST_AUDIO_MAX_S`, `GHOST_AUDIO_MAX_TOKENS`,
+plus `GHOST_FFMPEG_BIN` / `GHOST_FFPROBE_BIN` / `GHOST_SAY_BIN` absolute-path overrides.
+
+### 2026-08-02 — 300 hourly warnings were measuring the CORPUS, not the signal: calibration epochs + delivered-Brier search SHIPPED (not yet deployed)
+
+**Operator: "the agent has 300+ occurrences of `calibration: REJECTED the probability map` — is this
+normal?"** Cadence: yes. Condition: no. ~291 lines of each message across the two logs = ~175 refits,
+one pair per refit, ~1/hour — exactly `--calib-refit-cooldown 3600`. No runaway, no double-fire. But
+`refit=ok` 107× → `map_rejected_inverted` 141×, flipping permanently at n≈1405 and never recovering,
+and the live params carried `map_status: rejected_inverted`, `brier_raw 0.0542` vs
+`brier_base_rate 0.0365`. **The guard fired correctly for 26 days while its diagnosis was wrong.**
+
+**Root cause — three era shifts pooled into one fit.** `calibration.jsonl` is append-only and
+`DEFAULT_MAX_HISTORY=4000` exceeded the whole 1709-row file, so every refit read all of it:
+
+| era | n | mean competence | mean outcome | labels |
+|---|---|---|---|---|
+| 07-07 → 07-11 | 209 | 0.757 | 0.952 | binary |
+| 07-12 → 07-19 | 691 | 0.828 | 0.964 | binary |
+| 07-20 → 07-27 | 398 | 0.867 | 0.939 | binary |
+| 07-28 → 08-02 | 411 | 0.898 | 0.838 | **graded** |
+
+The LABEL changed 07-27 (binary {0,1} base 0.955 → graded base 0.855 — a redefinition, not a decline);
+the FEATURES changed the same day (effort/entropy observed only from then, so 1298/1709 rows collapse
+to competence alone under `_composite_for` and outvote the informative ones 3:1); and the competence
+prior WARMS UP out of cold-start shrinkage. Pooled, **the score rises exactly as the labels fall** — a
+Simpson's paradox that forces a negative Platt slope. Pooled: AUC 0.530, slope −0.077, map REJECTED,
+Brier 0.0542 vs base 0.0365. Current epoch only: **AUC 0.722, slope +1.917, map applied, Brier 0.0244
+vs base 0.0255 (−4.6%)**. Every window from 150 to 1500 fits cleanly; only the full history fails.
+The oldest 209 rows alone flip it.
+
+**Fix 1 — corpus epochs.** `CURRENT_EPOCH="2026-07-27.graded"`; every row carries an `epoch`; untagged
+legacy rows get theirs DERIVED from `ts` (`epoch_for_ts`), never defaulted to current. `fit` reads one
+epoch; so do `brier_score`/`ece`/`reliability_table`/`stats`/telemetry. Retro-negatives inherit the
+CLOSING turn's epoch (they reuse its features — stamping them current would smuggle an old feature set
+in with a negative label). **A label-scheme or feature change must bump `CURRENT_EPOCH`; that bump is
+not bookkeeping, it is what keeps the fit valid.** Expect quiet until the new epoch clears the floor.
+
+**Fix 2 — search the objective the pipeline delivers.** The grid scored candidates on RAW Brier while
+the pipeline ships a Platt-mapped one: the raw-best point (0.054164, slope −0.077 → REJECTED) beat the
+runner-up (0.054204, slope +0.388 → ACCEPTED) by **4e-5**. A coin flip in the 4th decimal decided
+whether the agent got a probability map, with 321/396 grid points positive-slope. Now scored on the
+delivered Brier, ties broken toward the simpler model (`_BRIER_TIE_TOL=1e-4`, compared on INTEGER grid
+indices — `0.1+0.2 != 0.3` would otherwise rank equal-complexity points by rounding).
+
+**The trap fix 2 opened — and why a tolerance can't close it.** Scoring on the delivered Brier removes
+the level penalty that used to suppress useless columns, so the grid buys `w_entropy=0.2` for a 4.9e-5
+in-sample gain on pure noise. Measured over 1000 noise corpora at n=40…800, that gain is
+**heavy-tailed (median 0, tail ~1e-3) and does NOT shrink as 1/n** — so any tolerance wide enough to
+absorb the tail also eats a real feature (at 1e-3 the live effort weight loses 4 of its 4.9 points).
+The fix is an EVIDENCE gate, not a margin: `_MIN_SEPARATION_SIGMAS=2.5` requires
+|mean(ok)−mean(bad)| ≥ 2.5 SE before a weight leaves zero. False-admits 4.9% of noise corpora (2.0σ:
+8.8%); live effort separates at 3.64σ, entropy at 0.63σ → correctly pinned. This is the module's own
+"a feature must VARY and SEPARATE" rule, finally applied in the fit rather than only in the report.
+
+**Self-review pass found 5 more defects, all self-inflicted, all one shape** — a new filter applied to
+SOME readers, leaving the rest describing a population that no longer exists (the "half-migrated
+sanitized view" class):
+1. **The gate rejected the PERFECT feature.** Zero within-class variance → SE 0 → returned 0.0σ. But
+   constant-within-class and different-between-class is the best signal obtainable, not an undecidable
+   one. Now `inf` when the means differ, `0.0` only when they don't (a truly constant column).
+2. **Rendered ratios mixed scopes.** Epoch-scoped numerator over whole-file denominator printed
+   `entropy observed on 418/1709 samples (77.3%)` — a fraction contradicting its own percentage.
+3. **`_feature_health` contradicted the fit in adjacent lines.** Its verdict used a raw `abs(sep)<0.02`
+   delta with no notion of noise, so entropy read `[live]` (0.0421 > 0.02) while the fit pinned it
+   (0.63σ < 2.5σ), and the `features: N/4 live` headline counted a feature the fit refuses to weight.
+   Now uses the fit's own σ gate. Live headline corrected **2/4 → 1/4 live**.
+4. **Effort was judged over rows that never measured it** (n=497 vs 394) — the stand-in-averaging bug
+   fixed for entropy on 2026-07-27 and never generalised. Now `_OBSERVED_FLAG`-driven for both.
+5. **`outcome_pos/neg` counted only EXACT 1.0/0.0**, so under graded labels the line showed 155+/7- of
+   541 rows — 70% invisible. Split at 0.5 like every gate in calibration.py; verifier-checked anchors
+   kept alongside.
+
+**Does this touch §4F/GEPA? No code coupling** — `optim/` has zero references to calibration or
+confidence, `grade_turn_outcome` is untouched (so the graded-label trend the watch tracks is
+bit-identical), and §4F's "threshold-aware calibration" (Phase 3 item 4a) is the verifier LOGIT PROBE
+blend in `verifier.py`, a different subsystem. **One measurement interaction — see §4F caveat (g).**
+
+**Tests:** `tests/test_calibration_epoch_and_objective.py` (39) + 2 rewritten and 2 new in
+`test_learning_health.py`. Suite **10484 passed / 13 skipped / 0 failed**. Writing the tests caught two
+further self-inflicted bugs: `epoch_for_ts("not-a-timestamp")` PROMOTED garbage to the current epoch
+(`"n" > "2"` lexicographically — now shape-checked, and the failure direction matters: promotion is
+the contamination the field exists to prevent), and `entropy_learnable` had silently stopped mirroring
+the fit gate. Docs: `docs/core/calibration.html` §Corpus epochs + §Selecting on the delivered Brier.
+
+**DEPLOYED + LIVE-VERIFIED 2026-08-02 20:37.** Functional tests on :8000, in order:
+`/api/health` ok → a real turn recorded a sample carrying `"epoch": "2026-07-27.graded"` (deployed
+record path) → live telemetry scoped correctly (546 in-epoch, 1168 excluded; effort 3.64σ live,
+entropy 0.61σ pinned, competence 0.06σ dead; `features: 1/4 live`) → **first post-deploy refit at
+20:37:48: `refit=ok threshold=0.83 w_entropy=0.00 lam=0.00 brier=0.02 n=546 excluded=1168`**, params
+`map_status=applied platt_a=1.902957 brier 0.024188 vs base 0.025329` (beats by 4.5%), **and the
+warning pair did NOT fire** (counts frozen at 116/117 since deploy). Hot-swap confirmed on the next
+turn: `C=0.94 threshold=0.82` (raw, pre-refit) → `C=0.88 threshold=0.83` (Platt-mapped, post-refit),
+matching `sigmoid(1.903·0.914 + 0.219) = 0.876` by hand. The prediction made read-only beforehand
+matched the live fit exactly on every field.
+
+**Two traps for whoever verifies a refit next.** (1) The idle window is bounded BOTH ways —
+`900 < idle_secs <= 3600`. Stretches of 66m and 82m appear in the idle-cycle history and would NOT
+fire; the agent needs a quiet 15–60 min, and unrelated traffic (5 requests in 6 min on the evening of
+08-02) resets the clock. Budget for the wait; do not "help" by writing `calibration_params.json`
+externally — the file would be indistinguishable from a real refit and would prove nothing. (2) This
+log file carries NO DATE, only `HH:MM:SS`, and spans many days. Grepping `20:3[5-9]:` pulled refit
+lines with n=1440/1119/1069 from previous days and briefly looked like several agents fighting over
+one corpus. **Read this log in FILE ORDER (`grep -n … | tail`), never by time-of-day match.**
+
+**⚠ THE SCORE HAS NO BEHAVIOURAL CONSUMER — the fix is instrument repair, not behaviour change.**
+Traced post-deploy (operator: "does this mess with GEPA?"). `below_threshold` has exactly three call
+sites: the dual-solver arbiter gate (`metacog.py:359`) and two counter/log-level sites
+(`agent.py:11921`, `:16706`). The arbiter returns at `if not self.arbiter_enabled` BEFORE reading the
+confidence, and live config confirms `toggle._METACOG_ARBITER_ENABLED = False` — the §3 module
+constant, not the `--metacog-disable-arbiter` flag (which is False). So moving C 0.94→0.88 and τ
+0.82→0.83 changed NO agent behaviour. Good news for §4F (there is no path from confidence to any
+watch metric because there is no path from confidence to anything); sobering otherwise — this is the
+"advisory not load-bearing / confidence logged-only" row of the §3 table, still true.
+
+**Measured whether to make it load-bearing. VERDICT: mid-turn steer NOT WORTH BUILDING; use it
+OFFLINE.** Read-only over 342 labelled trajectories carrying `tool_calls` (281 passed / 61 failed):
+
+| still running at step k | 1 | 4 | 6 | 8 | 12 |
+|---|---|---|---|---|---|
+| eventual failure rate | 17.8% | 35.6% | 42.3% | 52.0% | 60.6% |
+| AUC(effort@k) | 0.500 | 0.654 | 0.632 | 0.576 | 0.640 |
+
+1. **Mid-turn, `effort_component` IS the spin term and nothing else.** At fixed k every prefix has
+   exactly k calls, so sprawl is CONSTANT and only the longest same-tool run varies. Proven:
+   `AUC(effort@k) == AUC(spin@k)` to three decimals at k=2..6, and effort@k has exactly k distinct
+   values. Anything gated on mid-turn confidence is gated on repetition.
+2. **The loop-breaker already catches that, more precisely** (same action + target + result, vs merely
+   same tool NAME): by k=6 it fires on 40/71 turns at precision 0.53 / recall 0.70 of eventual
+   failures; by k=8, 0.57 / 0.81. A confidence-gated steer re-derives an existing rule in
+   probabilistic clothing.
+3. **The signal is weakest where it would be most useful** — peaks 0.654 at k=4, decays to 0.576 by
+   k=8, because the population still running by then is uniformly struggling.
+4. **Not leakage, but weak.** Feared spin was error-retry in disguise; it is not — spin>=3 turns had
+   an errored call 42% of the time vs 58% for spin<3 (reverse of the feared direction). On a
+   leakage-free slice (no errored call in first 6, n=36) AUC(spin@6) = 0.570. Real, but thin.
+
+**What to do instead:** (a) **offline triage** — post-hoc AUC **0.727**, materially better than any
+mid-turn value precisely because the dominant term is the final CALL COUNT, which only exists once the
+turn ends. Rank trajectories for reflection / postmortem / self-play attention by calibrated p(bad);
+those currently select on binary "failed" flags and a graded calibrated score is strictly more
+informative, at zero live-path risk. (b) **The depth prior is free and needs no model at all** — a
+turn still running at step 8 fails ~52% of the time. That is directly usable for budget/escalation
+policy without any feature, fit, or calibration. **Do NOT re-arm the dual-solver arbiter to "use" the
+better score**: it was retired (§3) because it sampled 2 completions, threw both away and dispatched
+the original — 0 answer changes at dominant latency. A better gate does not fix that.
+
+**Note for whoever reads the suite next:** separate in-flight work (still in TESTING, not yet
+journaled — not this session's, and deliberately not described here) was editing the tree while this
+landed. Two tests failed mid-session and passed later purely from that movement
+(`test_tool_registry_negative_constraints` — a tool-description string; `test_interface_face_palette`
+— the app.js/matrix_graph.js cache-bust pair). **Neither is calibration-related and neither is a real
+defect**; both are transient states of someone else's edit in progress. A green suite here is a
+snapshot of a tree that was still being written to — re-run before drawing conclusions from it.
 
 ### 2026-08-01 (later 9) — req 56221fad post-mortem: the verifier refuted its own instrumentation; constraint lifecycle + claim fairness SHIPPED + DEPLOYED
 

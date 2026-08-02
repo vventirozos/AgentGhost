@@ -55,6 +55,70 @@ logger = logging.getLogger("GhostAgent")
 
 SCHEMA_VERSION = "ghost.calibration.v1"
 
+# ── Corpus EPOCH ──────────────────────────────────────────────────────
+# The history is append-only and `DEFAULT_MAX_HISTORY` exceeds it, so every
+# refit pools the entire corpus. That is only valid while the label scheme
+# and the feature set hold still — and they have not.
+#
+# Measured 2026-08-02 on 1709 live samples, the pooled fit was structurally
+# broken in three compounding ways:
+#
+#   * The LABEL changed on 2026-07-27. Rows before it are binary {0.0, 1.0}
+#     with base rate 0.955; rows after are graded with base rate 0.855. The
+#     drop is a redefinition, not a decline in turn quality.
+#   * The FEATURES changed on the same day. `effort_component` and real
+#     logprob entropy are observed only from then on, so 1298 of 1709 rows
+#     (76%) collapse to competence alone under `_composite_for` and outvote
+#     the informative ones 3:1.
+#   * The competence prior WARMS UP. Its cold-start shrinkage toward 0.5
+#     means the mean rises 0.757 → 0.898 across the corpus while the label
+#     mean falls 0.952 → 0.838.
+#
+# Pooled, the score rises exactly as the labels fall — a textbook Simpson's
+# paradox that forces a NEGATIVE Platt slope. The map was then rejected as
+# "anti-correlated" on every refit for ~26 days (141 rejections), Brier
+# stayed on the raw scale (0.0542) and lost to the base rate (0.0365), and
+# both warnings fired hourly. The signal was fine; the CORPUS was invalid.
+# Same code on the current epoch alone: AUC 0.711, slope +2.242, Brier
+# 0.0249 against a 0.0255 base rate — map applied, base rate beaten.
+#
+# So: a label-scheme or feature change MUST start a new epoch, and `fit`
+# reads only the current one. Bumping this constant is not bookkeeping — it
+# is what keeps the fit valid. Expect the loop to go quiet for a while after
+# a bump (the fit bails below the sample floor rather than crossing epochs),
+# which is the correct behaviour: no fit beats a fit on incomparable rows.
+CURRENT_EPOCH = "2026-07-27.graded"
+
+# Epoch boundaries for rows written BEFORE the field existed, newest first.
+# Every row recorded from now on carries an explicit `epoch`, so this table
+# is frozen history — it never needs an entry for a future epoch, and
+# bumping `CURRENT_EPOCH` does not require touching it.
+_UNTAGGED_EPOCHS = (
+    ("2026-07-27.graded", "2026-07-27"),  # graded labels + effort/entropy
+    ("2026-07-07.binary", ""),            # everything older
+)
+
+
+def epoch_for_ts(ts: object) -> str:
+    """Epoch of an UNTAGGED legacy row, derived from its timestamp.
+
+    Total and deterministic: anything that is not a recognisable ISO date
+    lands in the OLDEST epoch. The boundaries are compared as strings, which
+    only orders ISO dates correctly — a bare `t >= start` also promotes
+    garbage, since "not-a-timestamp" > "2026-07-27" lexicographically. The
+    failure direction matters: a mis-parsed row promoted into the current
+    epoch is precisely the contamination this whole mechanism prevents, so
+    the shape is checked before the comparison is trusted.
+    """
+    t = str(ts or "")
+    if not (len(t) >= 10 and t[:4].isdigit() and t[4] == "-"
+            and t[5:7].isdigit() and t[7] == "-" and t[8:10].isdigit()):
+        return _UNTAGGED_EPOCHS[-1][0]
+    for name, start in _UNTAGGED_EPOCHS:
+        if not start or t >= start:
+            return name
+    return _UNTAGGED_EPOCHS[-1][0]
+
 # Minimum number of samples that actually OBSERVED token logprobs before the
 # entropy weight is allowed to move off zero. Below this the entropy column
 # is mostly the neutral stand-in and any fitted w_entropy would be noise
@@ -63,6 +127,91 @@ _MIN_ENTROPY_SAMPLES = 30
 
 # Same evidence floor for the turn-effort weight.
 _MIN_EFFORT_SAMPLES = 30
+
+# Divergence backstop for the Platt slope. A separable batch drives the fit
+# toward a near-step function that reports ~0 or ~1 for every turn and makes
+# `below_threshold` a hair-trigger on one competence value; the L2 penalty in
+# `_fit_platt` bounds this in normal use and this is the guard rail. Module
+# level because the grid search consults it too — the candidate objective and
+# the acceptance test must share one definition of "safe", or the search can
+# select a point the stage below then rejects.
+_MAX_SLOPE = 50.0
+
+# Brier improvements smaller than this are treated as a TIE by the weight
+# search, which then prefers the simpler model. Its ONLY job is to stop a
+# strict `<` over floats from handing the decision to the last decimal place
+# — the inverted-map selection this module used to make won by 4e-5. It is
+# deliberately NOT the noise guard: measured over 1000 pure-noise corpora the
+# spurious in-sample gain is heavy-tailed (median 0, but ~1e-3 at the tail,
+# and it does NOT shrink as 1/n), so any tolerance large enough to absorb the
+# tail also eats most of a real feature's contribution. Noise is handled
+# where the evidence lives, by `_MIN_SEPARATION_SIGMAS` below.
+_BRIER_TIE_TOL = 1e-4
+
+# A feature's weight may only leave zero when the feature demonstrably
+# SEPARATES the outcome classes: |mean(ok) − mean(bad)| must reach this many
+# standard errors of that difference. The observation floors above ask "do we
+# have enough samples?" and never "is there anything in them" — so the grid
+# was free to buy a weight for a column of pure noise, which it does, because
+# any extra degree of freedom pays off in-sample. The module already states
+# the rule ("a feature is only useful if it VARIES and SEPARATES"); this is
+# that rule applied where it bites, in the fit rather than only in the report.
+#
+# 2.5σ from measurement: over 1000 pure-noise corpora spanning n = 40…800 it
+# false-admits 4.9% of the time (2.0σ admits 8.8%), while the live effort
+# feature separates at 3.64σ and is never in danger. Tightening to 3.0σ buys
+# only 1.5 points of false-admit and halves the real feature's headroom.
+_MIN_SEPARATION_SIGMAS = 2.5
+
+
+def _separation_sigmas(samples, attr: str) -> float:
+    """|mean(success) − mean(failure)| for ``attr``, in standard errors.
+
+    0.0 whenever the question is unanswerable (a class missing, fewer than
+    two rows in either class, or zero pooled variance) — so an undecidable
+    feature is pinned rather than admitted. Pure and total.
+
+    Accepts :class:`CalibrationSample` objects OR raw JSONL dicts, because
+    the telemetry (`learning_health`) reports the same verdict this gate
+    decides and MUST call this exact function to do it. A second
+    implementation over there would drift, and the module has already been
+    bitten by that: `entropy_learnable` once printed "LEARNABLE" while the
+    fit was pinning the weight to 0.
+    """
+    def _get(s, name):
+        if isinstance(s, dict):
+            return s.get(name)
+        return getattr(s, name, None)
+
+    try:
+        def _out(s) -> float:
+            try:
+                return float(_get(s, "outcome") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        usable = [s for s in samples if _get(s, attr) is not None]
+        ok = [float(_get(s, attr)) for s in usable if _out(s) >= 0.5]
+        bad = [float(_get(s, attr)) for s in usable if _out(s) < 0.5]
+        if len(ok) < 2 or len(bad) < 2:
+            return 0.0
+        m_ok = sum(ok) / len(ok)
+        m_bad = sum(bad) / len(bad)
+        v_ok = sum((v - m_ok) ** 2 for v in ok) / len(ok)
+        v_bad = sum((v - m_bad) ** 2 for v in bad) / len(bad)
+        se = math.sqrt(v_ok / len(ok) + v_bad / len(bad))
+        delta = abs(m_ok - m_bad)
+        if se <= 0.0:
+            # Zero within-class spread. Two very different cases share this
+            # denominator and must NOT share an answer: a CONSTANT column
+            # (means equal too) is undecidable → 0.0, but a column that is
+            # constant WITHIN each class and different BETWEEN them is a
+            # PERFECT separator — the best feature obtainable, not the
+            # worst. Returning 0.0 for both would make this gate reject the
+            # ideal signal outright.
+            return 0.0 if delta <= 0.0 else math.inf
+        return delta / se
+    except Exception:  # noqa: BLE001 — a gate must never break a fit
+        return 0.0
 
 # ── Graded outcome labels ─────────────────────────────────────────────
 # The label used to be binary: 0.0 if (any execution failure OR verifier
@@ -315,6 +464,13 @@ class CalibrationSample:
     # and non-turn sources. The §4E Tier-3 join key: a task reopen carries
     # the closing turn's req_id and finds this sample by it.
     req_id: str = ""
+    # Which CORPUS EPOCH this row belongs to — see `CURRENT_EPOCH`. The fit
+    # reads one epoch only, so a row from a different label scheme or
+    # feature set can never be blended with the current one. Untagged legacy
+    # rows get theirs derived from `ts` on read (`epoch_for_ts`), never the
+    # current value: silently promoting them is the exact contamination the
+    # field exists to prevent.
+    epoch: str = ""
 
 
 @dataclass
@@ -368,6 +524,13 @@ class FittedParams:
     # the map was rejected reads as a healthy calibration when the score
     # is in fact predicting nothing (2026-07-29 log audit).
     map_status: str = "applied"
+    # Which corpus epoch produced this fit, and how many rows were excluded
+    # as belonging to older ones. Without both numbers an operator reading
+    # `n_samples=541` against a 1709-row file has no way to tell a healthy
+    # epoch filter from a truncated read. Empty default so a params file
+    # written before epochs existed loads unchanged.
+    epoch: str = ""
+    n_excluded_other_epochs: int = 0
 
 
 @dataclass
@@ -430,6 +593,7 @@ class CalibrationTracker:
         effort_observed: bool = False,
         source: str = "turn",
         req_id: str = "",
+        epoch: str = "",
     ) -> bool:
         """Append one (confidence, outcome) pair. Never raises; returns
         True when the sample actually reached disk (callers that report
@@ -438,6 +602,10 @@ class CalibrationTracker:
         ``entropy_observed`` records whether ``entropy_component`` came from
         real token logprobs. Pass it through faithfully — a fabricated
         neutral marked as observed re-poisons the entropy fit.
+
+        ``epoch`` defaults to :data:`CURRENT_EPOCH`. Pass it explicitly ONLY
+        to re-label an existing sample (the retro-negative tiers), where the
+        stored features belong to whichever epoch produced them.
         """
         try:
             sample = CalibrationSample(
@@ -458,6 +626,7 @@ class CalibrationTracker:
                 effort_observed=bool(effort_observed),
                 source=str(source or "turn"),
                 req_id=str(req_id or ""),
+                epoch=str(epoch or CURRENT_EPOCH),
             )
             with self._lock:
                 self.dir.mkdir(parents=True, exist_ok=True)
@@ -515,12 +684,31 @@ class CalibrationTracker:
                     effort_observed=base.effort_observed,
                     source="task_reopened",
                     req_id=closed_req_id,
+                    # Inherit the CLOSING turn's epoch. The retro row reuses
+                    # that turn's stored features, so stamping it with the
+                    # current epoch would smuggle an older feature set into
+                    # the live fit — with a negative label attached, i.e. the
+                    # most damaging row it could possibly contribute.
+                    epoch=base.epoch,
                 )
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("record_task_reopened_negative failed: %s", exc)
             return False
 
     # ----------------------------------------------------------- reading
+
+    def _load_epoch(self, limit: Optional[int] = None,
+                    epoch: Optional[str] = None) -> List[CalibrationSample]:
+        """Samples from ONE epoch (the current one by default).
+
+        Every metric the operator reads — Brier, ECE, the reliability table
+        — must be scoped the same way the fit is, or the report describes a
+        population the agent never fits. Mixing epochs here is what made the
+        stored-composite AUC read 0.676 where the honest recomputed value on
+        the current epoch is 0.530.
+        """
+        want = CURRENT_EPOCH if epoch is None else epoch
+        return [s for s in self._load_samples(limit=limit) if s.epoch == want]
 
     def _load_samples(self, limit: Optional[int] = None) -> List[CalibrationSample]:
         if not self.history_path.exists():
@@ -562,6 +750,9 @@ class CalibrationTracker:
                         effort_observed=bool(d.get("effort_observed", False)),
                         source=str(d.get("source") or "turn"),
                         req_id=str(d.get("req_id") or ""),
+                        # Untagged legacy rows get their epoch DERIVED, not
+                        # defaulted to the current one — see `CURRENT_EPOCH`.
+                        epoch=str(d.get("epoch") or epoch_for_ts(d.get("ts"))),
                     )
                 )
             except Exception:
@@ -576,8 +767,9 @@ class CalibrationTracker:
 
     def brier_score(self, *, window: Optional[int] = None) -> Optional[float]:
         """Rolling Brier score ``mean((C − outcome)²)`` over the recent
-        ``window`` samples (all by default). ``None`` when no data."""
-        samples = self._load_samples(limit=window)
+        ``window`` samples of the CURRENT EPOCH (all by default). ``None``
+        when no data."""
+        samples = self._load_epoch(limit=window)
         if not samples:
             return None
         return sum((s.composite - s.outcome) ** 2 for s in samples) / len(samples)
@@ -588,9 +780,10 @@ class CalibrationTracker:
         """10-bin reliability table: for each confidence band, the mean
         predicted confidence vs the mean realized outcome. A perfectly
         calibrated agent has ``mean_confidence ≈ mean_outcome`` in every
-        populated bin."""
+        populated bin. Current epoch only — the stored composite column is
+        not comparable across a formula change."""
         bins = max(1, int(bins))
-        samples = self._load_samples(limit=window)
+        samples = self._load_epoch(limit=window)
         table: List[ReliabilityBin] = []
         for i in range(bins):
             lo = i / bins
@@ -626,18 +819,32 @@ class CalibrationTracker:
     def fit(self, *, min_samples: Optional[int] = None) -> Optional[FittedParams]:
         """Grid-search refit of (weights, λ, τ) minimising Brier.
 
+        Reads the CURRENT EPOCH only (see :data:`CURRENT_EPOCH`) — rows from
+        an older label scheme or feature set are not comparable and pooling
+        them inverts the fit.
+
         Returns the :class:`FittedParams` on success (and persists them),
         or ``None`` with a logged ``bail_reason`` when the data is too
         thin or single-class. No params file is written on a bail — the
         previous fit (or the hardcoded defaults) stays in force.
         """
         floor = min_samples if min_samples is not None else self.min_samples_for_fit
-        samples = self._load_samples(limit=self.max_history)
+        all_samples = self._load_samples(limit=self.max_history)
+        samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
+        n_excluded = len(all_samples) - len(samples)
         if len(samples) < floor:
             logger.debug(
-                "calibration fit bail: %d samples < floor %d", len(samples), floor
+                "calibration fit bail: %d samples in epoch %s < floor %d "
+                "(%d rows excluded as older epochs)",
+                len(samples), CURRENT_EPOCH, floor, n_excluded,
             )
             return None
+        if n_excluded:
+            logger.debug(
+                "calibration: fitting on %d rows of epoch %s; %d older-epoch "
+                "rows excluded as incomparable (different label scheme or "
+                "feature set)", len(samples), CURRENT_EPOCH, n_excluded,
+            )
         n_pos = sum(1 for s in samples if s.outcome >= 0.5)
         n_neg = len(samples) - n_pos
         # Bail on "no information in the labels", measured as variance rather
@@ -665,11 +872,17 @@ class CalibrationTracker:
         # alone, so a weight fit from the observed minority cannot degrade
         # them. Below the floor we pin w_e at 0 and log WHY rather than
         # fitting a weight on fiction.
+        #
+        # Enough observations is necessary but NOT sufficient: the column
+        # must also separate the outcome classes (`_MIN_SEPARATION_SIGMAS`),
+        # or the grid buys a weight for noise.
         observed = [s for s in samples if s.entropy_observed]
         obs_pos = sum(1 for s in observed if s.outcome >= 0.5)
         obs_neg = len(observed) - obs_pos
+        ent_sigmas = _separation_sigmas(observed, "entropy_component")
         entropy_fittable = (
             len(observed) >= _MIN_ENTROPY_SAMPLES and obs_pos > 0 and obs_neg > 0
+            and ent_sigmas >= _MIN_SEPARATION_SIGMAS
         )
         we_range = range(0, 11) if entropy_fittable else range(0, 1)
 
@@ -681,30 +894,60 @@ class CalibrationTracker:
         eff_observed = [s for s in samples if getattr(s, "effort_observed", False)]
         eff_pos = sum(1 for s in eff_observed if s.outcome >= 0.5)
         eff_neg = len(eff_observed) - eff_pos
+        eff_sigmas = _separation_sigmas(eff_observed, "effort_component")
         effort_fittable = (
             len(eff_observed) >= _MIN_EFFORT_SAMPLES and eff_pos > 0 and eff_neg > 0
+            and eff_sigmas >= _MIN_SEPARATION_SIGMAS
         )
         weff_range = range(0, 11) if effort_fittable else range(0, 1)
         if not effort_fittable:
             logger.debug(
-                "calibration: w_effort pinned to 0 — only %d/%d samples "
-                "measured turn shape (pos=%d neg=%d, need >=%d with both "
-                "classes)", len(eff_observed), len(samples), eff_pos, eff_neg,
-                _MIN_EFFORT_SAMPLES)
+                "calibration: w_effort pinned to 0 — %d/%d samples measured "
+                "turn shape (pos=%d neg=%d, need >=%d with both classes), "
+                "separation %.2fσ (need >=%.1fσ)",
+                len(eff_observed), len(samples), eff_pos, eff_neg,
+                _MIN_EFFORT_SAMPLES, eff_sigmas, _MIN_SEPARATION_SIGMAS)
         if not entropy_fittable:
             logger.debug(
-                "calibration: w_entropy pinned to 0 — only %d/%d samples "
-                "observed real logprob entropy (pos=%d neg=%d, need >=%d of "
-                "each class). Upstream refuses logprobs on tools+stream "
-                "payloads, so most turns carry no token entropy.",
+                "calibration: w_entropy pinned to 0 — %d/%d samples observed "
+                "real logprob entropy (pos=%d neg=%d, need >=%d of each "
+                "class), separation %.2fσ (need >=%.1fσ). Upstream refuses "
+                "logprobs on tools+stream payloads, so most turns carry no "
+                "token entropy.",
                 len(observed), len(samples), obs_pos, obs_neg,
-                _MIN_ENTROPY_SAMPLES,
+                _MIN_ENTROPY_SAMPLES, ent_sigmas, _MIN_SEPARATION_SIGMAS,
             )
 
         # Grid over entropy weight (→ competence = 1−w_e) and the
-        # uncertainty penalty λ, minimising Brier over EVERY sample under
-        # the same per-sample formula the scorer uses (`_composite_for`).
-        best = None  # (brier, w_e, w_eff, lam)
+        # uncertainty penalty λ, over EVERY sample under the same per-sample
+        # formula the scorer uses (`_composite_for`).
+        #
+        # The objective is the Brier the pipeline will ACTUALLY DELIVER —
+        # i.e. after the Platt stage below, under the same acceptance rules.
+        # Scoring candidates on the RAW Brier instead was an objective
+        # mismatch with a real cost: on the live corpus the raw-best point
+        # (0.054164, slope −0.077 → map REJECTED) beat the runner-up
+        # (0.054204, slope +0.388 → map ACCEPTED) by 4e-5, so a coin flip in
+        # the fourth decimal decided whether the agent got a probability map
+        # at all. 321 of 396 grid points had a positive slope; optimising the
+        # wrong quantity is what steered the search into the other 75.
+        #
+        # Selecting on the delivered Brier cannot do worse: a point whose map
+        # is rejected simply scores its raw Brier, exactly as before.
+        #
+        # Ties are then broken toward the SIMPLEST model, because a strict
+        # `<` over floats hands the decision to the last decimal place. Both
+        # known failures of this search were exactly that: the inverted-map
+        # selection above won by 4e-5, and on a corpus whose entropy column
+        # is pure noise the grid buys w_entropy = 0.2 for a 4.9e-5 in-sample
+        # gain. Measured against a real signal the margin is not close — the
+        # live effort weight is worth 1.0e-2, some 200× the noise gain — so a
+        # tolerance an order of magnitude above the noise floor and far below
+        # the standard error of a Brier estimate at these sample sizes
+        # (~5e-3) separates them cleanly without suppressing anything real.
+        # This is the same principle as the `_MIN_*_SAMPLES` floors: a weight
+        # must EARN its way off zero, and noise never earns anything.
+        rows = []  # (delivered, we_i, weff_i, lam_i)
         for we_i in we_range:
             w_e = we_i / 10.0
             for weff_i in weff_range:
@@ -713,14 +956,31 @@ class CalibrationTracker:
                     continue          # competence would go negative
                 for lam_i in range(0, 6):
                     lam = lam_i / 10.0
-                    sq = sum((_composite_for(s, w_e, lam, w_eff) - s.outcome) ** 2
-                             for s in samples)
-                    brier = sq / len(samples)
-                    if best is None or brier < best[0]:
-                        best = (brier, w_e, w_eff, lam)
+                    cand = [(_composite_for(s, w_e, lam, w_eff), s.outcome)
+                            for s in samples]
+                    b_raw = sum((c - y) ** 2 for c, y in cand) / len(cand)
+                    a_c, b_c = _fit_platt(cand)
+                    if 0.0 < a_c <= _MAX_SLOPE:
+                        b_cal = sum(
+                            (apply_platt(c, a_c, b_c) - y) ** 2
+                            for c, y in cand) / len(cand)
+                        # The stage below keeps the map only when it helps,
+                        # so the delivered score is the better of the two.
+                        delivered = min(b_cal, b_raw)
+                    else:
+                        delivered = b_raw   # map will be rejected
+                    rows.append((delivered, we_i, weff_i, lam_i))
 
-        assert best is not None
-        brier, w_e, w_eff, lam = best
+        assert rows
+        _floor = min(r[0] for r in rows)
+        # Complexity is compared on the INTEGER grid indices, not the divided
+        # floats: 0.1 + 0.2 != 0.3 in binary, so summing the floats would rank
+        # two equally simple points by a rounding artefact.
+        brier, we_i, weff_i, lam_i = min(
+            (r for r in rows if r[0] <= _floor + _BRIER_TIE_TOL),
+            key=lambda r: (r[1] + r[2], r[3], r[0]),
+        )
+        w_e, w_eff, lam = we_i / 10.0, weff_i / 10.0, lam_i / 10.0
         w_c = max(0.0, 1.0 - w_e - w_eff)
 
         composites = [(_composite_for(s, w_e, lam, w_eff), s.outcome)
@@ -776,7 +1036,6 @@ class CalibrationTracker:
         # Slope also cannot be judged without the composite's spread: a = 3.0
         # over a 0.02-wide range moves probabilities less than a = 0.3 over
         # the full unit interval.
-        _MAX_SLOPE = 50.0
         map_status = "applied"
         if platt_a <= 0.0:
             logger.warning(
@@ -839,6 +1098,8 @@ class CalibrationTracker:
             w_effort=round(w_eff, 4),
             n_effort_observed=len(eff_observed),
             map_status=map_status,
+            epoch=CURRENT_EPOCH,
+            n_excluded_other_epochs=n_excluded,
         )
         self._save_params(params)
         return params
@@ -876,6 +1137,8 @@ class CalibrationTracker:
                 w_effort=float(d.get("w_effort", 0.0)),
                 n_effort_observed=int(d.get("n_effort_observed", 0)),
                 map_status=str(d.get("map_status", "applied")),
+                epoch=str(d.get("epoch", "")),
+                n_excluded_other_epochs=int(d.get("n_excluded_other_epochs", 0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("calibration params malformed: %s", exc)
@@ -894,14 +1157,20 @@ class CalibrationTracker:
 
     def stats(self) -> Dict[str, object]:
         """Introspection summary (for ``introspect`` / the calib log)."""
-        samples = self._load_samples(limit=self.max_history)
+        all_samples = self._load_samples(limit=self.max_history)
+        samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
         brier = (
             sum((s.composite - s.outcome) ** 2 for s in samples) / len(samples)
             if samples else None
         )
         params = self.load_params()
         return {
+            # Current epoch — the population the fit and every metric below
+            # describe. `samples_all_epochs` is reported beside it so a drop
+            # after an epoch bump reads as a filter, not as data loss.
             "samples": len(samples),
+            "samples_all_epochs": len(all_samples),
+            "epoch": CURRENT_EPOCH,
             "brier": round(brier, 4) if brier is not None else None,
             # Same window as `brier` above. Calling `self.ece()` with no
             # argument scored the ENTIRE file while brier scored only the
@@ -1003,4 +1272,6 @@ __all__ = [
     "FittedParams",
     "ReliabilityBin",
     "SCHEMA_VERSION",
+    "CURRENT_EPOCH",
+    "epoch_for_ts",
 ]

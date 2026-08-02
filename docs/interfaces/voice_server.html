@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Voice server — Ghost Agent</title>
+<title>Voice loop — Ghost Agent</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -21,34 +21,130 @@
   </nav>
 </aside>
 <main>
-  <h1>interface / externals / tts_stt / voice_server.py</h1>
-  <p class="subtitle">FastAPI service that runs on a Jetson / Raspberry Pi and exposes Whisper STT and Piper TTS to the agent.</p>
+  <h1>interface / voice.py</h1>
+  <p class="subtitle">The local voice loop: speech-to-text on the Gemma 4 audio node, text-to-speech on the macOS synthesiser. No extra hardware, no API key, no egress.</p>
+
+  <h2>What changed (2026-08-02)</h2>
+  <p>
+    The push-to-talk UI has shipped since 2026-07 (mic button, <code>MediaRecorder</code>,
+    full touch lifecycle in <code>app.js</code>), but <code>/api/stt</code> and
+    <code>/api/tts</code> proxied to a <strong>separate voice server on a Raspberry Pi / Jetson</strong>
+    running Whisper + Piper. <strong>That host no longer exists.</strong> The default
+    <code>raspberrypi.local</code> does not resolve, and the launcher's override
+    <code>http://disorder:8000</code> resolves on the tailnet but listens on nothing — so
+    the mic button was a no-op against a dead node, the classic
+    silent-inoperative-subsystem shape.
+  </p>
+  <p>
+    Both halves now run on infrastructure that is already live and already supervised.
+    The wire contract is <strong>unchanged</strong> — <code>/api/stt</code> still returns
+    <code>{"text": …}</code> and <code>/api/tts</code> still returns audio bytes — so the
+    existing browser UI needed no modification.
+  </p>
+
+  <h2>Architecture</h2>
+  <table>
+    <thead><tr><th>Stage</th><th>Runs on</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>Capture</td><td>Browser (PWA)</td><td><code>MediaRecorder</code> → WebM/Opus, or MP4/AAC on Safari. Needs a secure context; the tailscale cert on :8443 provides it.</td></tr>
+      <tr><td>Transcode</td><td>Interface host</td><td><code>ffmpeg</code> → 16 kHz mono PCM WAV. Temp <em>files</em>, not pipes: a WAV written to a non-seekable pipe carries a placeholder length some decoders reject.</td></tr>
+      <tr><td>Transcribe</td><td>nova (Gemma 4 E4B)</td><td>llama-server with an audio projector (<code>-mm</code>), OpenAI <code>input_audio</code> content part.</td></tr>
+      <tr><td>Speak</td><td>Interface host</td><td>macOS <code>say</code> → WAV, returned as one buffered body.</td></tr>
+    </tbody>
+  </table>
 
   <h2>Endpoints</h2>
   <table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td>POST /stt</td><td>Accepts an <code>UploadFile</code> (audio/wav). WhisperModel <code>large-v3-turbo</code> on CUDA float16. Beam size 2, <code>vad_filter=False</code>, <code>condition_on_previous_text=False</code>. Returns <code>{"text": "..."}</code>.</td></tr>
-      <tr><td>POST /tts</td><td>Accepts <code>{"text": "..."}</code>. Subprocess call to Piper <code>en_US-amy-medium.onnx</code> (CUDA). Streams audio/wav.</td></tr>
+      <tr><td>POST /api/stt</td><td>Accepts multipart <code>file</code> (any browser audio container). Transcodes, then transcribes verbatim on the audio node. Returns <code>{"text": "…"}</code>; <code>""</code> for genuine silence. Auth: <code>X-Ghost-Key</code>.</td></tr>
+      <tr><td>POST /api/tts</td><td>Accepts <code>{"text": "…"}</code>. Returns <code>audio/wav</code>. Auth: <code>X-Ghost-Key</code>.</td></tr>
     </tbody>
   </table>
 
-  <h2>Models &amp; paths</h2>
+  <h2>Configuration</h2>
+  <table>
+    <thead><tr><th>Env var</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_AUDIO_NODE_URL</code></td><td><code>http://100.83.184.117:8088</code></td><td>Audio node. A <strong>tailnet</strong> IP on purpose: macOS Tahoe silently drops a system daemon's packets to <code>192.168.x</code>, and mDNS/dotless names are what stranded the previous backend.</td></tr>
+      <tr><td><code>GHOST_AUDIO_NODE_MODEL</code></td><td><code>gemma</code></td><td>Model field in the chat payload.</td></tr>
+      <tr><td><code>GHOST_STT_MAX_SECONDS</code></td><td><code>900</code> (15 min)</td><td>Per-request audio cap. nova's per-slot context (<code>131072 / -np 4</code> = 32,768 tokens) caps a single request near 21 min at 25 tok/s.</td></tr>
+      <tr><td><code>GHOST_STT_MAX_TOKENS</code></td><td><code>2048</code></td><td>Must clear the thinking-token budget — see the trap below.</td></tr>
+      <tr><td><code>GHOST_TTS_VOICE</code></td><td><code>Samantha</code> (en_US, female)</td><td>Any installed <code>say</code> voice — list with <code>say -v '?'</code> (184 available). Samantha ships with every macOS, so it cannot go missing the way a newer optional voice can. Other verified options: <code>Sandy (English (UK))</code>, <code>Karen</code> (en_AU), <code>Moira</code> (en_IE). An unavailable name no longer kills speech — synthesis falls back to the system default voice and logs a warning naming the cause.</td></tr>
+      <tr><td><code>GHOST_TTS_RATE</code></td><td>voice default</td><td>Words per minute.</td></tr>
+      <tr><td><code>GHOST_TTS_MAX_CHARS</code></td><td><code>2000</code></td><td>Per-request text cap; <code>app.js</code> already chunks replies.</td></tr>
+      <tr><td><code>GHOST_FFMPEG_BIN</code> / <code>GHOST_FFPROBE_BIN</code> / <code>GHOST_SAY_BIN</code></td><td>auto-resolved</td><td>Absolute-path overrides. Normally unnecessary — see the launchd PATH trap below.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="launchd-path">⚠ The launchd PATH trap (cost every STT request a 503)</h2>
+  <p>
+    <strong>launchd hands a service a minimal <code>PATH</code></strong> —
+    <code>/usr/bin:/bin:/usr/sbin:/sbin</code> — which does <em>not</em> include Homebrew.
+    <code>say</code> lives in <code>/usr/bin</code> so TTS worked, but <code>ffmpeg</code> and
+    <code>ffprobe</code> live in <code>/opt/homebrew/bin</code>, so a bare
+    <code>shutil.which("ffmpeg")</code> returned <code>None</code> and <strong>every STT request 503'd
+    under the daemon while working perfectly from a shell</strong> — which is precisely why it survived
+    testing. It presented as a Safari-only failure; it was not browser-related at all.
+  </p>
+  <p>
+    Both call sites now use <code>resolve_binary()</code>: explicit <code>GHOST_&lt;NAME&gt;_BIN</code>
+    override → <code>PATH</code> → known install prefixes (<code>/opt/homebrew/bin</code>,
+    <code>/usr/local/bin</code>, <code>/usr/bin</code>, <code>/bin</code>). The error text names launchd
+    and the override rather than the misleading "not installed". <code>memory/audio_ingest.py</code> had
+    the <em>identical</em> latent bug — the agent is also a LaunchDaemon — and was fixed with it.
+    <strong>Standing checklist item: anything a daemon shells out to must not trust the inherited
+    PATH.</strong>
+  </p>
+
+  <h2>Two traps, both measured</h2>
+  <ol>
+    <li>
+      <strong>The empty-response trap.</strong> Gemma 4 emits thinking blocks that its
+      chat template strips. With <code>max_tokens</code> too low the entire budget goes to
+      thinking and the API returns <strong>empty content with
+      <code>finish_reason="length"</code></strong> — no error, just nothing. Measured: 256
+      tokens → <code>''</code>; 1024 → correct. <code>transcribe()</code> detects that exact
+      shape and <em>raises</em>, because a silent <code>""</code> would be auto-sent to the
+      agent as an empty prompt.
+    </li>
+    <li>
+      <strong>The dialect trap.</strong> Audio must ride an <code>input_audio</code> part.
+      The <code>audio_url</code> data-URI shape <code>tools/vision.py</code> uses for images
+      is rejected with <code>400 unsupported content[].type</code> — so this is deliberately
+      <em>not</em> a copy of the vision payload builder.
+    </li>
+  </ol>
+
+  <h2>Measured characteristics (live, 2026-08-02)</h2>
   <ul>
-    <li>Whisper: <code>large-v3-turbo</code> (16 kHz mono optimised).</li>
-    <li>Piper binary: venv-isolated under <code>/home/vasilis/Data/AI/voice_server/voice_env/bin/piper</code>.</li>
-    <li>Piper voice: <code>models/en_US-amy-medium.onnx</code> relative to working dir.</li>
+    <li><strong>25.0 audio tokens per second</strong> — constant across 3.2 s, 38.9 s and 377 s clips.</li>
+    <li><strong>~11× faster than real-time</strong> — a 6.3-minute clip processed in 33.6 s.</li>
+    <li><strong>No encoder window limit</strong> — codewords at the start, middle <em>and</em> very end of a 6.3-minute clip were all recovered. Chunking is a context-budget concern only.</li>
+    <li>Push-to-talk round trip (3.6 s clip, browser-shaped WebM/Opus): <strong>~6 s</strong>.</li>
   </ul>
 
-  <h2>Concurrency</h2>
-  <p>asyncio for HTTP, <code>subprocess.Popen</code> for Piper (blocking).</p>
-
-  <h2>Dependencies</h2>
+  <h2>Design notes</h2>
   <ul>
-    <li><code>faster_whisper</code> (WhisperModel)</li>
-    <li>CUDA (Jetson)</li>
-    <li>Piper binary in isolated venv</li>
+    <li><strong>Verbatim transcription, not intent extraction.</strong> The transcript goes
+      straight to the 35B agent, which is the thing that should interpret intent —
+      summarising on the small model would discard information before the smart model
+      sees it. Verbatim also preserves the spoken language (no forced translation).</li>
+    <li><strong>Text reaches <code>say</code> through a file</strong> (<code>-f</code>), never argv or a
+      shell string: agent replies routinely contain quotes, backticks and newlines.</li>
+    <li><strong>Errors carry their own HTTP status.</strong> <code>VoiceError</code> distinguishes an
+      unusable upload (4xx) from a backend failure (5xx), so a client mistake is never
+      reported as a 502.</li>
+    <li><strong>Privacy.</strong> Audio never leaves the tailnet. Keyless local processing is the
+      only speech path compatible with the no-identity-egress rule — this capability
+      cannot be bought, only built.</li>
   </ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_interface_voice.py</code> — dialect guard, thinking-trap detection,
+  silence vs failure, duration cap, argv-injection resistance, dead-host regression guard.
+  The TTS content-type test in <code>tests/test_interface_review_fixes.py</code> was replaced:
+  the Pi passthrough it guarded is gone by design.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

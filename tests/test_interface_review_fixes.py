@@ -13,7 +13,7 @@ Covers the four bugs + improvements from the code review:
   8. cancel wakes parked readers and stamps finished_at immediately.
   9. global buffer ceiling across all chat tasks.
  10. upstream 4xx/5xx error frames include a body snippet.
- 11. tts passes through the Pi's content-type.
+ 11. tts returns locally-synthesised WAV audio (was: Pi content-type passthrough).
  12. /ws evicts the socket on ANY exit path.
 """
 import asyncio
@@ -503,33 +503,45 @@ async def test_upstream_error_snippet_read_is_time_bounded(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 11. tts content-type passthrough
+# 11. tts returns locally-synthesised WAV
+#
+# REPLACED 2026-08-02. The original test asserted that /api/tts passed the
+# Raspberry-Pi voice server's content-type through (it could serve ogg/mp3).
+# That host no longer exists — `raspberrypi.local` doesn't resolve and the
+# launcher's `disorder` override listens on nothing — so TTS now synthesises
+# locally with macOS `say` and always returns WAV. The passthrough behaviour
+# it guarded is gone by design, not by regression.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_tts_passes_through_pi_content_type():
-    fake_resp = MagicMock()
-    fake_resp.status_code = 200
-    fake_resp.headers = {"content-type": "audio/ogg"}
-
-    async def _aiter(*args, **kwargs):
-        yield b"OggS"
-    fake_resp.aiter_bytes = MagicMock(side_effect=_aiter)
-    fake_resp.aclose = AsyncMock()
-
-    fake_client = MagicMock()
-    fake_client.build_request = MagicMock(return_value=MagicMock())
-    fake_client.send = AsyncMock(return_value=fake_resp)
+async def test_tts_returns_wav_from_local_synthesis():
+    from interface import voice
 
     req = MagicMock()
     req.json = AsyncMock(return_value={"text": "hello"})
 
-    with patch.object(server, "_get_http_client", return_value=fake_client):
+    with patch.object(voice, "synthesize", AsyncMock(return_value=b"RIFF....WAVE")) as synth:
         resp = await server.tts_proxy(req)
-        async for _ in resp.body_iterator:
-            pass
 
-    assert resp.media_type == "audio/ogg"
+    synth.assert_awaited_once_with("hello")
+    assert resp.media_type == "audio/wav"
+    assert resp.body == b"RIFF....WAVE"
+
+
+@pytest.mark.asyncio
+async def test_tts_voice_error_keeps_its_own_status():
+    """A VoiceError must surface its own status, not a blanket 502 — an
+    empty-text request is the caller's fault and should read as one."""
+    from interface import voice
+
+    req = MagicMock()
+    req.json = AsyncMock(return_value={"text": ""})
+
+    with patch.object(voice, "synthesize",
+                      AsyncMock(side_effect=voice.VoiceError("No text to speak.", 400))):
+        resp = await server.tts_proxy(req)
+
+    assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------

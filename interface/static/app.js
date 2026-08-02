@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=8.7';
+import * as matrixGraphFace from './matrix_graph.js?v=8.9';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -1847,20 +1847,28 @@ async function sendMessage(isResume = false) {
     }
 }
 
+// A TYPED message leaves voice mode: if you're at a keyboard you're reading,
+// not listening. The mic path (which sets isTTSActive) deliberately calls
+// sendMessage() directly so a spoken turn still gets a spoken reply.
+function sendTypedMessage() {
+    isTTSActive = false;
+    sendMessage();
+}
+
 sendBtn.addEventListener('click', () => {
     if (isProcessingRequest && currentChatController) {
         currentChatController.abort();
         toggleSendButtonUI(false);
     } else if (!isProcessingRequest) {
-        sendMessage();
+        sendTypedMessage();
     }
 });
 
 chatInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { 
-        e.preventDefault(); 
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
         if (!isProcessingRequest) {
-            sendMessage();
+            sendTypedMessage();
         }
     }
 });
@@ -2150,8 +2158,14 @@ if (uploadBtn && fileUploadInput) {
                 addMessage('system', `Upload Failed: ${result.error}`);
                 activeFace.triggerSpike();
             } else {
+                // NOTE: an `updateActivityIcon('✅')` call sat here until
+                // 2026-08-02. The function was deleted with the center-stage
+                // #activity-icon on 2026-07-29 but two call sites survived, so
+                // this threw a ReferenceError on every SUCCESSFUL upload — the
+                // enclosing catch then reported "Upload Error" for an upload
+                // that had just worked. The success message above is the
+                // status signal; the turn-status line owns icons now.
                 addMessage('system', `Successfully uploaded ${file.name}.`);
-                updateActivityIcon('✅');
             }
         } catch (error) {
             addMessage('system', `Upload Error: ${error.message}`);
@@ -3367,9 +3381,29 @@ if (micBtn) {
     const startRecording = async (e) => {
         if (e.cancelable) e.preventDefault();
         if (isRecording) return;
-        
+
         stopTTS(); // Full Duplex Interruption
-        
+
+        // Voice in → voice out. Holding the mic is both the intent signal
+        // ("I'm hands-free") and the user gesture browsers require before
+        // they will play audio, so we unlock autoplay HERE rather than
+        // behind a separate TTS button (the header has no room for one —
+        // see index.html). Typing a message switches speech back off.
+        isTTSActive = true;
+        try {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+            // A silent buffer is what actually registers the interaction
+            // with Apple WebKit; resume() alone is not enough on iOS.
+            const silentBuffer = audioCtx.createBuffer(1, 1, 22050);
+            const silentSource = audioCtx.createBufferSource();
+            silentSource.buffer = silentBuffer;
+            silentSource.connect(audioCtx.destination);
+            silentSource.start(0);
+        } catch (_) { /* autoplay unlock is best-effort; STT still works */ }
+
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
             addMessage('system', '🎙️ Error: Microphone access requires HTTPS or localhost context.');
             return;
@@ -3425,9 +3459,12 @@ if (micBtn) {
                 formData.append('file', audioBlob, `voice_record.${ext}`);
                 
                 try {
+                    // (Second orphaned updateActivityIcon call removed
+                    // 2026-08-02 — see the upload path. This one was invisible
+                    // while the mic button was deleted; restoring the button
+                    // revived it and it broke STT with "can't find variable".)
                     activeFace.setWorkingState(true);
-                    updateActivityIcon('🧠');
-                    
+
                     const res = await fetch('/api/stt', {
                         method: 'POST',
                         body: formData

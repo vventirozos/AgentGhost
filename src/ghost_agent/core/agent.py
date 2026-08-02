@@ -4395,6 +4395,12 @@ class GhostAgent:
                             w_entropy=params.w_entropy,
                             lam=params.lambda_uncertainty,
                             brier=params.brier, n=params.n_samples,
+                            # `n` counts the CURRENT EPOCH only. Without the
+                            # excluded count beside it, an operator watching n
+                            # drop (1709 → 541 the day epochs landed) cannot
+                            # tell a healthy filter from a truncated read.
+                            excluded=getattr(
+                                params, "n_excluded_other_epochs", 0),
                         )
                         _map_note = ("" if _map_status == "applied"
                                      else f", map {_map_status}")

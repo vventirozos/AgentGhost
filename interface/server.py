@@ -15,7 +15,9 @@ from fastapi import (
     UploadFile, File, HTTPException, Header, Depends,
 )
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import (
+    HTMLResponse, StreamingResponse, FileResponse, JSONResponse, Response,
+)
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import uvicorn
@@ -25,9 +27,11 @@ import secrets
 try:
     # Runtime: uvicorn runs with cwd=interface/, plain module on sys.path.
     import webpush_notify
+    import voice
 except ModuleNotFoundError:
     # Tests import this file as `interface.server` from the repo root.
     from interface import webpush_notify
+    from interface import voice
 
 # GHOST_API_KEY is required. A hardcoded default (e.g. "ghost-secret-123")
 # turns the interface server into an open relay for anyone who knows the
@@ -51,7 +55,14 @@ if not GHOST_API_KEY.strip():
         "request — the interface would answer 401 to everything. Set the real "
         "shared secret (see ~/Data/AI/.ghost_api_key)."
     )
-PI_VOICE_URL = os.environ.get("PI_VOICE_URL", "http://raspberrypi.local:8000")
+# NOTE (2026-08-02): the former `PI_VOICE_URL` Raspberry-Pi voice-server
+# proxy target is GONE. Its default `raspberrypi.local` no longer resolves and
+# the launcher's `http://disorder:8000` override resolves on the tailnet but
+# listens on nothing — so the PWA's mic button had been a no-op against a dead
+# host. STT and TTS now run on live local infrastructure (nova's Gemma 4 audio
+# node + the macOS speech synthesiser); all voice config lives in
+# interface/voice.py. `PI_VOICE_URL` in start-ghost-client.sh is now inert and
+# can be dropped from that launcher.
 
 # Hard limit on inbound request body sizes for upload paths. Enforced at the
 # ASGI layer by BodySizeLimitMiddleware (see below) BEFORE the body is parsed,
@@ -1305,7 +1316,13 @@ async def download_proxy(filename: str):
 
 @app.post("/api/stt", dependencies=[Depends(verify_interface_key)])
 async def stt_proxy(request: Request):
-    """Proxies audio blobs to the Raspberry Pi for Speech-to-Text."""
+    """Transcribe an uploaded voice clip on the local Gemma 4 audio node.
+
+    Formerly a proxy to a Raspberry-Pi voice server that no longer exists;
+    now ffmpeg transcode + nova (see interface/voice.py). The wire contract
+    is unchanged — app.js reads ``{"text": ...}`` and auto-sends it as a chat
+    message — so the existing push-to-talk UI needs no changes.
+    """
     try:
         form = await request.form()
         file = form.get("file")
@@ -1317,14 +1334,13 @@ async def stt_proxy(request: Request):
         if not hasattr(file, "read"):
             return _err_json(400, "'file' must be an uploaded file, not a text field")
         file_content = await _read_capped_upload(file)
-        client = _get_http_client()
-        files = {"file": (file.filename, file_content, file.content_type)}
-        response = await client.post(
-            f"{PI_VOICE_URL}/stt", files=files, timeout=_proxy_timeout(60.0))
-        if response.status_code != 200:
-            logger.error(f"PI STT Error Body: {response.text}")
-            return _err_json(response.status_code, f"PI STT failed: {response.text[:200]}")
-        return response.json()
+        text = await voice.transcribe(file_content, client=_get_http_client())
+        return {"text": text}
+    except voice.VoiceError as e:
+        # Carries its own status so a client-side problem (unusable upload,
+        # over-length clip) isn't reported as a backend failure.
+        logger.error(f"STT failed: {e}")
+        return _err_json(e.status, str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -1333,47 +1349,22 @@ async def stt_proxy(request: Request):
 
 @app.post("/api/tts", dependencies=[Depends(verify_interface_key)])
 async def tts_proxy(request: Request):
-    """Proxies text chunks to the Raspberry Pi for Text-to-Speech."""
+    """Speak text with the local macOS synthesiser and return WAV bytes.
+
+    Formerly a streaming proxy to the (now nonexistent) Pi voice server. The
+    synthesiser is local and fast, so the response is a single buffered body
+    rather than a stream — app.js calls ``res.blob()`` and hands the result to
+    ``new Audio()``, which needs the complete object anyway.
+    """
     try:
         body = await _parse_json_body(request)
         if not isinstance(body, dict):
             return _err_json(400, "Request body must be a JSON object.")
-        payload = {"text": body.get("text", "")}
-        client = _get_http_client()
-        # Same leak guard as workspace_save: close on pre-stream failure.
-        resp = None
-        try:
-            req = client.build_request(
-                "POST", f"{PI_VOICE_URL}/tts", json=payload,
-                timeout=_proxy_timeout(60.0),
-            )
-            resp = await client.send(req, stream=True)
-            if resp.status_code != 200:
-                await resp.aread()
-                logger.error(f"PI TTS Error Body: {resp.text}")
-                # Explicit raise: raise_for_status() is a no-op for non-200
-                # SUCCESS codes (e.g. 204), which would fall through and try
-                # to stream an already-consumed body.
-                raise RuntimeError(
-                    f"PI TTS returned HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception:
-            if resp is not None:
-                await resp.aclose()
-            raise
-
-        async def stream_generator():
-            try:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-            finally:
-                await resp.aclose()
-
-        return StreamingResponse(
-            stream_generator(),
-            # Pass through what the Pi actually returned instead of
-            # hardcoding audio/wav (the voice node may serve ogg/mp3).
-            media_type=resp.headers.get("content-type", "audio/wav"),
-        )
+        audio = await voice.synthesize(body.get("text", ""))
+        return Response(content=audio, media_type="audio/wav")
+    except voice.VoiceError as e:
+        logger.error(f"TTS failed: {e}")
+        return _err_json(e.status, str(e))
     except HTTPException:
         raise
     except Exception as e:
