@@ -102,6 +102,7 @@ def _run_two_stage(client) -> "VerifyResult":
 class TestProbeBlend:
     def test_confirmed_blends_toward_probe(self, monkeypatch):
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "0.5")
         # probe: digit 9 p=.9, digit 0 p=.1 → E=8.1/9=0.9
         client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
                              _probe("9", 0.9)])
@@ -113,12 +114,32 @@ class TestProbeBlend:
 
     def test_refuted_uses_inverted_probe(self, monkeypatch):
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "0.5")
         # probe says acceptable≈0.9 but verdict REFUTED → aligned = 0.1
         client = _SeqClient([_stage1(), _stage2("REFUTED", 1.0),
                              _probe("9", 0.9)])
         res = _run_two_stage(client)
         assert res.verdict == VerifyVerdict.REFUTED
         assert res.confidence == pytest.approx(0.5 * 1.0 + 0.5 * 0.1)
+
+    def test_default_weight_is_light(self, monkeypatch):
+        """First bench A/B: w=0.5 dragged actionable TPR to 0.347 — the
+        default must stay light (0.25) until a re-bench justifies more."""
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
+        monkeypatch.delenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", raising=False)
+        client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
+                             _probe("9", 0.9)])
+        res = _run_two_stage(client)
+        assert res.confidence == pytest.approx(0.75 * 1.0 + 0.25 * 0.9)
+
+    def test_weight_clamped_and_junk_safe(self, monkeypatch):
+        from ghost_agent.core.verifier import _logit_expect_weight
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "7")
+        assert _logit_expect_weight() == 1.0
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "-1")
+        assert _logit_expect_weight() == 0.0
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "junk")
+        assert _logit_expect_weight() == 0.25
 
     def test_verdict_never_changed_by_probe(self, monkeypatch):
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")

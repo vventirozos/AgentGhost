@@ -14,7 +14,7 @@
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
-    <a class="current" href="voice_server.html">Voice server</a>
+    <a class="current" href="voice_server.html">Voice loop</a>
     <a href="image_gen_server.html">Image-gen server</a>
     <a href="clockwork_ghost.html">Clockwork Ghost</a>
     <a href="cli.html">CLI</a>
@@ -22,14 +22,21 @@
 </aside>
 <main>
   <h1>interface / voice.py</h1>
-  <p class="subtitle">The local voice loop: speech-to-text on the Gemma 4 audio node, text-to-speech on the macOS synthesiser. No extra hardware, no API key, no egress.</p>
+  <p class="subtitle">The local voice loop: speech-to-text on the Gemma 4 audio node, text-to-speech on the macOS synthesiser in <code>Ava (Premium)</code>. No extra hardware, no API key, no egress.</p>
+
+  <div class="note"><strong>There is no voice <em>server</em> any more.</strong> This page keeps its
+  filename for stable links, but nothing here is a separate service: STT is an HTTP call to a
+  worker node the agent already runs, and TTS is a subprocess on the interface host. The only
+  moving parts are <code>interface/voice.py</code> and the two proxy routes in
+  <code>interface/server.py</code>.</div>
 
   <h2>What changed (2026-08-02)</h2>
   <p>
     The push-to-talk UI has shipped since 2026-07 (mic button, <code>MediaRecorder</code>,
     full touch lifecycle in <code>app.js</code>), but <code>/api/stt</code> and
     <code>/api/tts</code> proxied to a <strong>separate voice server on a Raspberry Pi / Jetson</strong>
-    running Whisper + Piper. <strong>That host no longer exists.</strong> The default
+    running <code>faster-whisper</code> + <a href="https://github.com/hexgrad/kokoro">Kokoro</a>.
+    <strong>That host no longer exists.</strong> The default
     <code>raspberrypi.local</code> does not resolve, and the launcher's override
     <code>http://disorder:8000</code> resolves on the tailnet but listens on nothing — so
     the mic button was a no-op against a dead node, the classic
@@ -42,6 +49,60 @@
     existing browser UI needed no modification.
   </p>
 
+  <h2>What changed (2026-08-03)</h2>
+  <ul>
+    <li>
+      <strong>Voice switched to <code>Ava (Premium)</code></strong>, a neural voice, from
+      <code>Samantha</code> (which had itself replaced the <code>Daniel</code> en_GB male voice
+      the day before). Verified end-to-end rather than by inspection: audio returned from the
+      live <code>/api/tts</code> endpoint is <em>byte-identical</em> (SHA-256) to a local
+      <code>say -v "Ava (Premium)"</code> render of the same text, which is what rules out the
+      silent-fallback failure below — a wrong voice name still returns <code>200</code> and
+      plausible audio.
+    </li>
+    <li>
+      <strong>The last <code>PI_VOICE_URL</code> setter is gone.</strong> The variable had been
+      dead in code since 2026-08-02 but was still exported by
+      <code>bin/start-ghost-client.sh</code> and still documented as a live knob on two pages —
+      a reader configuring voice from the docs would have set a variable nothing consumes.
+      Launcher line removed, docs corrected, and a test now guards the settings tables.
+    </li>
+  </ul>
+
+  <h2 id="retired-external">The deleted external (<code>interface/externals/tts_stt/</code>)</h2>
+  <p>
+    <strong>Removed 2026-08-03, along with its <code>soundfile</code> pin.</strong>
+    <code>voice_server.py</code> was a FastAPI "Orin Nano Optimized Voice Node" running
+    <code>faster-whisper</code> + Kokoro on the companion GPU box. It had been unreferenced since
+    2026-08-02 and unrunnable on this host (neither <code>kokoro</code> nor
+    <code>faster_whisper</code> is installed), and it was the only importer of
+    <code>soundfile&gt;=0.12.0</code> — so a dependency was being carried, and documented as
+    required, for a service that could not start.
+  </p>
+  <p>
+    The live voice loop needs no Python audio library at all: <code>ffmpeg</code> for transcode and
+    the system <code>say</code> binary for synthesis. Design record for anyone rebuilding a GPU
+    voice node, since the file is gone and this project has no version control:
+  </p>
+  <table>
+    <thead><tr><th>Stage</th><th>What it ran</th></tr></thead>
+    <tbody>
+      <tr><td>STT</td><td><code>faster-whisper</code> <code>distil-small.en</code>, CUDA,
+        <code>compute_type="int8_float16"</code>, <code>beam_size=1</code>, VAD filter at 500&nbsp;ms
+        min silence. Deliberately downsized from Medium to coexist with Kokoro in VRAM.</td></tr>
+      <tr><td>TTS</td><td>Kokoro <code>KPipeline(lang_code='a', device='cuda')</code>, voice
+        <code>af_heart</code>, <code>speed=1.1</code>, 24&nbsp;kHz output.</td></tr>
+      <tr><td>Both</td><td>Temp files on <code>/dev/shm</code>; explicit <code>gc.collect()</code> +
+        <code>torch.cuda.empty_cache()</code> after every request; served <code>/stt</code> and
+        <code>/tts</code> on <code>0.0.0.0:8000</code>.</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><strong>Grep trap, now one hit shorter.</strong> Searching the tree for TTS used
+  to surface that file's <code>voice='af_heart'</code> first — the wrong answer to "what voice does
+  this agent use". One decoy remains: <code>src/ghost_agent/core/tts.py</code> is
+  <strong>test-time scaling</strong>, not text-to-speech. The only real answer is
+  <code>interface/voice.py</code>.</div>
+
   <h2>Architecture</h2>
   <table>
     <thead><tr><th>Stage</th><th>Runs on</th><th>Detail</th></tr></thead>
@@ -49,7 +110,7 @@
       <tr><td>Capture</td><td>Browser (PWA)</td><td><code>MediaRecorder</code> → WebM/Opus, or MP4/AAC on Safari. Needs a secure context; the tailscale cert on :8443 provides it.</td></tr>
       <tr><td>Transcode</td><td>Interface host</td><td><code>ffmpeg</code> → 16 kHz mono PCM WAV. Temp <em>files</em>, not pipes: a WAV written to a non-seekable pipe carries a placeholder length some decoders reject.</td></tr>
       <tr><td>Transcribe</td><td>nova (Gemma 4 E4B)</td><td>llama-server with an audio projector (<code>-mm</code>), OpenAI <code>input_audio</code> content part.</td></tr>
-      <tr><td>Speak</td><td>Interface host</td><td>macOS <code>say</code> → WAV, returned as one buffered body.</td></tr>
+      <tr><td>Speak</td><td>Interface host</td><td>macOS <code>say</code> in <code>Ava (Premium)</code> → 22.05 kHz LEI16 WAV, returned as one buffered body. Text is passed by <em>file</em> (<code>-f</code>), never argv.</td></tr>
     </tbody>
   </table>
 
@@ -70,7 +131,7 @@
       <tr><td><code>GHOST_AUDIO_NODE_MODEL</code></td><td><code>gemma</code></td><td>Model field in the chat payload.</td></tr>
       <tr><td><code>GHOST_STT_MAX_SECONDS</code></td><td><code>900</code> (15 min)</td><td>Per-request audio cap. nova's per-slot context (<code>131072 / -np 4</code> = 32,768 tokens) caps a single request near 21 min at 25 tok/s.</td></tr>
       <tr><td><code>GHOST_STT_MAX_TOKENS</code></td><td><code>2048</code></td><td>Must clear the thinking-token budget — see the trap below.</td></tr>
-      <tr><td><code>GHOST_TTS_VOICE</code></td><td><code>Samantha</code> (en_US, female)</td><td>Any installed <code>say</code> voice — list with <code>say -v '?'</code> (184 available). Samantha ships with every macOS, so it cannot go missing the way a newer optional voice can. Other verified options: <code>Sandy (English (UK))</code>, <code>Karen</code> (en_AU), <code>Moira</code> (en_IE). An unavailable name no longer kills speech — synthesis falls back to the system default voice and logs a warning naming the cause.</td></tr>
+      <tr><td><code>GHOST_TTS_VOICE</code></td><td><code>Ava (Premium)</code> (en_US, female)</td><td>Any installed <code>say</code> voice — list with <code>say -v '?'</code> (187 on this box). Ava is a <strong>neural</strong> voice, audibly more natural than the compact synthesiser behind every other name here. <strong>It is not stock macOS</strong>: it is a ~1&nbsp;GB download via System&nbsp;Settings → Accessibility → Spoken&nbsp;Content → System&nbsp;Voice → <em>Manage Voices…</em> (the entry sits at the bottom of the voice dropdown itself, not beside it). The <code>(Premium)</code> suffix is part of the name and must be exact — bare <code>Ava</code> is a separate compact voice installed alongside it, so a dropped suffix downgrades quality without erroring. Measured 2026-08-03: 0.58s for a two-sentence chunk vs 0.48s for Samantha, i.e. no meaningful latency cost. Other verified options: <code>Samantha</code> (en_US, present on every macOS), <code>Sandy (English (UK))</code>, <code>Karen</code> (en_AU), <code>Moira</code> (en_IE). An unavailable name never kills speech — synthesis retries with no <code>-v</code> at all, landing on the system default, and logs a warning naming the cause.</td></tr>
       <tr><td><code>GHOST_TTS_RATE</code></td><td>voice default</td><td>Words per minute.</td></tr>
       <tr><td><code>GHOST_TTS_MAX_CHARS</code></td><td><code>2000</code></td><td>Per-request text cap; <code>app.js</code> already chunks replies.</td></tr>
       <tr><td><code>GHOST_FFMPEG_BIN</code> / <code>GHOST_FFPROBE_BIN</code> / <code>GHOST_SAY_BIN</code></td><td>auto-resolved</td><td>Absolute-path overrides. Normally unnecessary — see the launchd PATH trap below.</td></tr>
@@ -141,10 +202,28 @@
   </ul>
 
   <h2>Tests</h2>
-  <p><code>tests/test_interface_voice.py</code> — dialect guard, thinking-trap detection,
+  <p><code>tests/test_interface_voice.py</code> (28) — dialect guard, thinking-trap detection,
   silence vs failure, duration cap, argv-injection resistance, dead-host regression guard.
   The TTS content-type test in <code>tests/test_interface_review_fixes.py</code> was replaced:
   the Pi passthrough it guarded is gone by design.</p>
+  <p>Four guards added 2026-08-03, all aimed at the same failure mode — <strong>speech that keeps
+  working while quietly using the wrong voice</strong>, which no ordinary assertion catches because
+  the endpoint still returns <code>200</code> and valid audio:</p>
+  <ul>
+    <li><code>test_configured_voice_is_passed_to_say_as_one_argv_element</code> — the name contains
+      a space and parentheses. Split across argv, <code>say</code> would see <code>Ava</code> and
+      <code>(Premium)</code> as separate arguments, exit non-zero, and drop onto the fallback.</li>
+    <li><code>test_unavailable_voice_falls_back_without_the_v_flag</code> — the retry must carry
+      <em>no</em> <code>-v</code> at all, or it re-fails on the same missing name. Asserts exactly
+      two invocations.</li>
+    <li><code>test_premium_voice_suffix_is_not_dropped</code> — pins the exact string. Bare
+      <code>Ava</code> is a different compact voice installed alongside the premium one, so a
+      stripped suffix downgrades quality without erroring.</li>
+    <li><code>test_docs_do_not_advertise_the_dead_voice_knob</code> — checks only the <em>name
+      column</em> of settings tables, so prose explaining a retirement stays legal while a
+      re-added row fails. Verified non-vacuous: it fires on the removed
+      <code>PI_VOICE_URL</code> row and passes on the replacement row and on prose.</li>
+  </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

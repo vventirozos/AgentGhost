@@ -603,7 +603,60 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    T+3d (~08-02) log spot-check — `escalated_overturn` count, correction churn, false-refute
    complaints; T+7d (~08-06) verify_bench re-run vs t0 + graded outcome-label trend; T+14d (~08-13)
    VERDICT per the amended acceptance rule → **decides Phase 4 (parked unless clearly positive)**.
-   Ask any session for "the 4F watch reading". **⚠ Reading caveats (audited 2026-08-01):**
+   Ask any session for "the 4F watch reading".
+
+   **T+3d READING — CORRECTED after reconciling with the 08-01 T+2d reading (see below):**
+   my window label was WRONG (the log rotated during the 07-31 deploy churn — the "since T0"
+   numbers below actually cover ~08-02→08-03 only), and the T+2d reading's facial-validity method
+   overturned my first-pass diagnosis. THE REAL SIGNAL IS THE SHIFT: T+2d (07-31→08-01 segment)
+   measured ~130 cheap refutes with 49% overturned and 4/4 sampled SURVIVING refutes true
+   positives (healthy churn); my segment (~08-02→08-03) has 74 overturns and ZERO surviving
+   refutes — overturn rate went 49% → 100% right around the 08-01-evening claim-fairness deploy.
+   Facial check on MY segment's overturns: the cheap judge is refuting subjective glosses
+   ("beautiful hot Sunday evening"), rc-vs-stable version classification, and instrumentation
+   echoes — the EXACT hand-pinned false-alarm rules the baseline adjudicate carried and GEPA's
+   rewrite SHED (the bench's 13 clean cases never exercised those patterns — Goodhart on the
+   under-measured class). Repairs: 0 since current boot (the 07-31 dual-dialect fix HOLDS; my 70
+   count was pre-fix residue). Calibration-map warnings: covered by the operator's 08-02
+   calibration-epochs entry (shipped, not yet deployed). RESPONSE (operator green-lit): balanced
+   re-optimization launched 2026-08-03 — 8 FP-trap clean cases APPENDED to the bench (subjective
+   gloss, derived arithmetic/count/units, rc-vs-stable, paraphrase, instrumentation echo, extra
+   detail — the shed rules, now encoded in the METRIC), class-weighted scores (refute_weight
+   0.263), seeded FROM the live templates, ship-gate = BALANCED macro-average vs the LIVE
+   incumbent on 30 private trials.
+   **REBALANCED RE-OPTIMIZATION RESULT (2026-08-03 evening): REJECTED by the private gate** —
+   candidate 0.708 vs live incumbent 0.840 balanced on 30 never-seen trials (public-valset winner
+   overfit; the gate's third correct rejection; candidates kept as .rejected). **AND the diagnosis
+   is REVISED: reading the LIVE adjudicate disproved rule-shedding** — every July FP rule is
+   present (GEPA even ADDED a numerical-precision rule). Actual mechanism: **capacity-bound
+   rule-following** — the E4B judge fails to APPLY rules it carries in a 5.4KB prompt + long
+   evidence, while the 35B with the SAME prompt applies them on escalation (hence 100% overturns).
+   More rule text cannot fix this (today's run is the demonstration). NEXT DIRECTION (needs
+   green-light, proposed for T+7d): COMPRESSION-constrained optimization — hard length cap on
+   adjudicate candidates (~1500-2000 chars) so the small judge can actually follow what it reads;
+   alternatively verdict-tier routing. FP-trap cases + balanced gate stay (they made this
+   measurable). Live churn (~18 overturns/day, latency-only) accepted until then. Memory
+   `optimizer-sheds-pinned-rules` corrected same evening.
+   **(original first-pass reading below, kept for the record; window label corrected above)**
+   **The pre-registered FPR clause FIRES.** 74 distinct escalation-overturn events in the window
+   (~18/day), **zero standing refutes** — every cheap-judge refute was a false alarm the main-model
+   escalation overturned (live-demonstrated: a correct "Linux 7.1.5" probe answer was refuted, then
+   overturned). Damage stayed bounded exactly as designed (latency-only: ~74 main-slot escalation
+   calls), but the tuned adjudicate is generating pure-noise refutes on live traffic → **next
+   verifier optimization must run with the rebalanced clean-weighted trial mix, and should run
+   SOON rather than waiting for T+14d** (operator green-light pending). Activation healthy:
+   templates load per process, applied>0 after claim-shaped turns; overnight 0/0 was traffic shape
+   — most live verdicts ride the CODE-auditor path, which is NOT GEPA-tuned (scope note: tuning
+   _VERIFY_CODE_PROMPT may matter more for this traffic mix than another claim-template round).
+   Phase-3 switches confirmed OFF. **Anomalies for follow-up:** (a) native tool_call repair fired
+   70× (~17/day) vs the "≈0, each one is news" baseline — regression, model-churn template drift
+   suspected, wants a dedicated look; (b) 52 circuit-breaker opens for 192.168.0.20:8088 in one
+   ~30-min afternoon burst (address absent from current args — transient/operator-experiment
+   suspected; watch recurrence); (c) restart cadence: 27 processes reached the claim path in
+   ~4 days — confirm with operator whether restarts were manual; (d) 116 "calibration REJECTED the
+   probability map" + 42 PRM serve-inert warnings — fold into the next log-audit session.
+   **Phase 2b supply: 636 structured tool-call fixtures** (file_system 290, execute 116, browser
+   114, …, web_search 16) — minable now; rare-tool coverage improves with a few more days. **⚠ Reading caveats (audited 2026-08-01):**
    (a) the honest-failure rule (07-31 ~19:14) is a LABEL-SEMANTICS step change — outcome-label
    trends must segment at that boundary or the relabeling masquerades as improvement; (b) refute
    greps must match ALL spellings ("verifier gate — REFUTED", "LATE REFUTED", "refuted (late)") —
@@ -655,6 +708,17 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    via fixture `source` pointers; fresh RequestState per candidate — the tool-defs/XML caches key
    on tool NAMES), gepa run, private gate, deploy via restart — **then flip recording OFF +
    archive/delete day-files**.
+   **UPDATE 2026-08-03: the RUNNER is BUILT** (`scripts/optimize_tool_descriptions.py` — temp-0
+   replay of recorded contexts against MAIN with candidate descriptions swapped copy-on-write;
+   positives-only scoring; tier split honored; per-tool + aggregate validators reused; --smoke
+   mode; supply gate = 200 POSITIVES). Smoke findings: (a) FIXED a replay bug — recorder ordinals
+   are PER-SESSION, so the record lookup must match (session_id, ordinal), not ordinal alone
+   (7/12 private fixtures read as unreplayable before the fix); (b) supply today = 57 positives
+   (~28/day → gate clears ~08-08); (c) **⚠ CEILING RISK, B4-shaped: incumbent fidelity 1.000
+   (12/12 private at temp 0)** — positives are by construction turns the model already chose
+   well; the metric defends against regressions but may carry no improvement signal. RULE AT
+   GATE-CLEAR: run the full-set incumbent fidelity check FIRST; if ≥0.95, CLOSE 2b as "no
+   measurable problem" (the B4 precedent) — and flip recording OFF either way.
 
 **Queued behind evidence (do NOT start early):**
 3. Next verifier optimization round MUST use a rebalanced trial mix first (clean/NOT_REFUTED

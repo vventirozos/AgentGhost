@@ -37,12 +37,11 @@ psutil>=5.9.0
 # kwarg collisions). The live agent runs `core/agent.py`, which speaks to
 # llama-server over the OpenAI-compatible API and needs none of it.
 #
-# Read audio/waveform I/O. Now required only by the TTS/STT voice-server
-# external (`interface/externals/tts_stt/voice_server.py`), NOT by
-# qwen-agent — keep it pinned for that deploy. macOS / Windows: pip ships a
-# prebuilt wheel with libsndfile bundled. Linux: also needs the system
-# `libsndfile1` package (apt-get install libsndfile1).
-soundfile>=0.12.0
+# soundfile REMOVED 2026-08-03 together with interface/externals/tts_stt/,
+# its last importer. The voice loop moved on-host on 2026-08-02 and needs
+# only ffmpeg + the system `say` binary — no Python audio I/O at all. If you
+# ever reinstate a GPU voice node, this pin (and libsndfile1 on Linux) comes
+# back WITH it, not before.
 # Chess move legality + FEN handling for the participant-mode game endpoint
 # (api: POST /v1/game/move) — the agent plays the user itself; python-chess
 # only validates/applies moves, it never chooses them.

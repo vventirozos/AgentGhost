@@ -18,6 +18,7 @@ These tests pin the two traps that were MEASURED against the live node on
 """
 
 import io
+import re
 import struct
 import sys
 import wave
@@ -204,6 +205,61 @@ async def test_synthesize_truncates_overlong_text():
     assert len(captured["text"]) <= voice.TTS_MAX_CHARS + 2
 
 
+@pytest.mark.asyncio
+async def test_configured_voice_is_passed_to_say_as_one_argv_element():
+    """The premium voice name contains spaces and parentheses ("Ava (Premium)").
+
+    It is passed as a SINGLE list element after -v, so no quoting/splitting
+    can mangle it. A name split across argv would make `say` see "Ava" and
+    "(Premium)" as separate arguments, exit non-zero, and silently drop the
+    turn onto the default-voice fallback — the failure this guards.
+    """
+    captured = {}
+
+    async def _fake_run(cmd, *, timeout, stdin=None):
+        captured["cmd"] = cmd
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF")
+        return b"", b""
+
+    with patch.object(voice, "_run_binary", _fake_run):
+        await voice.synthesize("hello")
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-v") + 1] == voice.TTS_VOICE
+
+
+@pytest.mark.asyncio
+async def test_unavailable_voice_falls_back_without_the_v_flag():
+    """A voice absent from this macOS build must degrade, not kill speech.
+
+    The first `say` invocation (with -v) fails; the retry must carry NO -v at
+    all, so it lands on the system default rather than re-failing on the same
+    missing name.
+    """
+    calls = []
+
+    async def _fake_run(cmd, *, timeout, stdin=None):
+        calls.append(cmd)
+        if "-v" in cmd:
+            raise voice.VoiceError("'say' failed: voice not found", 502)
+        Path(cmd[cmd.index("-o") + 1]).write_bytes(b"RIFF-default")
+        return b"", b""
+
+    with patch.object(voice, "_run_binary", _fake_run):
+        audio = await voice.synthesize("hello")
+
+    assert audio == b"RIFF-default"
+    assert len(calls) == 2, "must retry exactly once, on the default voice"
+    assert "-v" not in calls[1]
+
+
+def test_premium_voice_suffix_is_not_dropped():
+    """Bare "Ava" is a DIFFERENT, compact voice that co-exists with the premium
+    one, so a stripped suffix downgrades quality silently instead of erroring.
+    Pin the exact string rather than a substring match."""
+    assert voice.TTS_VOICE == "Ava (Premium)"
+
+
 # ── the dead-host regression guard ───────────────────────────────────────
 
 def test_no_dead_voice_host_references_remain():
@@ -227,6 +283,53 @@ def test_no_dead_voice_host_references_remain():
     assert not hasattr(voice, "PI_VOICE_URL")
     for dead in ("raspberrypi", "disorder"):
         assert dead not in voice.AUDIO_NODE_URL
+
+
+def test_docs_do_not_advertise_the_dead_voice_knob():
+    """The code stopped reading PI_VOICE_URL on 2026-08-02, but capabilities.html
+    and installation.html kept listing it as a working setting for another day —
+    a reader configuring voice from the docs would have set a variable nothing
+    consumes and concluded the feature was broken. Docs are part of the
+    interface; a retired knob must not survive in them.
+
+    Only the NAME COLUMN of a settings table is checked — the first <td> of a
+    row is what actually advertises "set this". A description or a line of
+    prose that names the variable to explain that it was retired must stay
+    legal: that is the same why-it-vanished documentation the comment-stripping
+    in test_no_dead_voice_host_references_remain deliberately protects, and a
+    reader who still has the old variable exported needs to find it.
+    """
+    first_cell = re.compile(r"<tr>\s*<td>\s*<code>(.*?)</code>")
+    for page in ("capabilities.html", "installation.html", "index.html"):
+        text = (_ROOT / "docs" / page).read_text()
+        for name in first_cell.findall(text):
+            assert "PI_VOICE_URL" not in name, (
+                f"docs/{page} still lists PI_VOICE_URL as a settable knob"
+            )
+
+
+def test_retired_gpu_voice_external_and_its_orphan_pin_stay_gone():
+    """interface/externals/tts_stt/ (faster-whisper + Kokoro on the Orin) was
+    deleted 2026-08-03. It had been unreferenced since 2026-08-02 and could not
+    start here, yet it kept `soundfile` on the dependency list — a package
+    installed on every deploy for a service that could not run.
+
+    Both halves are asserted together on purpose: restoring the external
+    without its pin gives an ImportError, and restoring the pin without the
+    external re-creates the orphan. If a GPU voice node is ever reinstated,
+    this test is the place that should fail and be updated deliberately.
+    """
+    assert not (_ROOT / "interface" / "externals" / "tts_stt").exists(), (
+        "the retired GPU voice external is back — see docs/interfaces/"
+        "voice_server.html#retired-external before restoring it"
+    )
+
+    reqs = (_ROOT / "requirements.txt").read_text()
+    declared = [ln.split("#")[0].strip() for ln in reqs.splitlines()]
+    declared = [ln for ln in declared if ln]
+    assert not any(ln.lower().startswith("soundfile") for ln in declared), (
+        "soundfile is pinned again with no importer in the tree"
+    )
 
 
 def test_mic_button_is_restored_in_the_input_area():

@@ -14,7 +14,7 @@
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
-    <a href="voice_server.html">Voice server</a>
+    <a href="voice_server.html">Voice loop</a>
     <a href="image_gen_server.html">Image-gen server</a>
     <a class="current" href="clockwork_ghost.html">Clockwork Ghost</a>
     <a href="cli.html">CLI</a>
@@ -38,12 +38,70 @@
   </table>
 
   <h3>UI layout</h3>
+  <p>
+    <strong>One full-width column over a full-window face</strong> since 2026-08-02 — not the
+    left/right split it used to be. The face (the web UI's <code>matrix_graph.js</code> in a
+    QWebEngineView; the three QPainter faces are gone) is the <em>background</em> of the whole
+    window at explicit geometry, and every panel is glass floating on a translucent
+    <code>overlay</code> above it.
+  </p>
   <ul>
-    <li><strong>Left</strong>: chat display + text input with up/down history.</li>
-    <li><strong>Right</strong>: the Ghost face — the web UI's <code>matrix_graph.js</code> in a QWebEngineView (the three QPainter faces were removed 2026-08-02).</li>
-    <li><strong>Top</strong>: workspace, face-form cycle (<code>◈</code>), fullscreen.</li>
-    <li><strong>Bottom</strong>: camera snap, push-to-talk, TTS toggle + stats.</li>
+    <li><strong>Top row</strong>: workspace (<code>◇</code>/<code>◆</code>), face-form cycle
+      (<code>◈</code>), fullscreen-face toggle (<code>◐</code>/<code>○</code>).</li>
+    <li><strong>Middle</strong>: <code>left_widget</code> → the transcript, as real
+      <code>QLabel</code> bubbles (operator right, agent left). <strong>This is the only item in
+      the column with a stretch factor.</strong></li>
+    <li><strong>Bottom row</strong>: text input (with up/down history) sharing one row with camera
+      snap, push-to-talk, TTS toggle and the stats readout.</li>
   </ul>
+
+  <h3 id="fullscreen">Fullscreen face (<code>◐</code> / F11)</h3>
+  <p>
+    Hides <strong><code>self.overlay</code> — the entire glass sheet</strong>, leaving nothing but
+    the face. Verified on-device against the real <code>MainWindow</code>: 9 of 9 controls visible
+    normally, <strong>0 of 9</strong> while hidden, face still rendering.
+  </p>
+  <p>
+    <strong>Getting back.</strong> This is a frameless, always-on-top kiosk, so with the overlay
+    hidden there is no visible control to restore it — losing the way back would be worse than the
+    bug. Two independent paths, deliberately redundant:
+  </p>
+  <ul>
+    <li><strong>F11</strong> — an <code>ApplicationShortcut</code>, not the default
+      <code>WindowShortcut</code>: with the overlay gone the <code>QWebEngineView</code> is all
+      that is left to hold focus, and a window-scoped shortcut could be swallowed by it. The face
+      is also <code>NoFocus</code> for the same reason.</li>
+    <li><strong>Any other key</strong> — <code>keyPressEvent</code> restores the UI before its
+      normal type-to-focus handling.</li>
+  </ul>
+  <p>
+    Escape / Alt+Escape / Ctrl+Escape never reach <code>keyPressEvent</code> (they are QShortcuts
+    and fire first), so <strong>push-to-talk, TTS and SNAP keep working while the UI is hidden</strong>
+    — face-only voice mode rather than a dead end.
+  </p>
+
+  <div class="note warn">
+    <strong>Two wrong targets, both shipped before the right one (2026-08-03).</strong>
+    "Hide the UI" looks like it should hide a panel; it has to hide the sheet.
+    <table>
+      <thead><tr><th>Hiding…</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><code>left_widget</code></td><td>Chips and bar stayed up, <strong>and the bar jumped
+          to mid-screen</strong> — it carries the main column's only stretch factor, so hiding it
+          handed the freed space to the bottom row, which grew from 25px to 659px tall and
+          vertically centred its fixed-height children. Measured at the panel's real
+          1280&times;720 (<code>XWAYLAND0</code>, a 720&times;1280 display rotated right), Qt 6.4.2:
+          <code>y=683 h=25</code> (96% down) → <code>y=49 h=659</code> (52% down, dead centre).</td></tr>
+        <tr><td><code>chat_display</code></td><td>Placement correct, but the chips and the bar were
+          still on screen — the button still did not hide the UI.</td></tr>
+        <tr><td><code>overlay</code> ✓</td><td>Everything goes, and the stretch trap cannot fire at
+          all because nothing <em>inside</em> the layout changes.</td></tr>
+      </tbody>
+    </table>
+    <strong>General rule for this file: never hide a widget that carries a stretch factor — hide
+    its contents, or hide the whole sheet.</strong> Guarded by
+    <code>tests/test_clockwork_client_ui.py</code>.
+  </div>
 
   <h3>Voice queues</h3>
   <ul>
@@ -191,10 +249,13 @@
   <h3>Voice — repointed 2026-08-02</h3>
   <p>
     STT/TTS used to target <code>http://192.168.0.24:8000</code>, a Raspberry-Pi
-    voice server (Whisper + Piper) that <strong>no longer exists</strong> — so voice on this device
-    had been failing silently against a dead LAN host, which is why it looked "unused". Both now use
-    the interface's local endpoints (see <a href="voice_server.html">Voice loop</a>): STT = ffmpeg +
-    the Gemma 4 audio node, TTS = the macOS synthesiser.
+    voice server (<code>faster-whisper</code> + Kokoro) that <strong>no longer exists</strong> — so
+    voice on this device had been failing silently against a dead LAN host, which is why it looked
+    "unused". Both now use the interface's local endpoints (see
+    <a href="voice_server.html">Voice loop</a>): STT = ffmpeg + the Gemma 4 audio node,
+    TTS = the macOS synthesiser in <code>Ava (Premium)</code> since 2026-08-03. The device inherits
+    the voice change for free — it only ever posts text to <code>/api/tts</code> and plays the WAV
+    it gets back, so nothing on the uConsole needed touching.
   </p>
   <p>Two differences from the old Pi server, both load-bearing:</p>
   <ul>

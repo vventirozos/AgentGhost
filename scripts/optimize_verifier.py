@@ -86,13 +86,35 @@ def _trial_score(trial: BenchTrial, verdict: Optional[str]) -> float:
     return 0.0
 
 
+def _is_nonrefute(trial: BenchTrial) -> bool:
+    return trial.expected in ("CONFIRMED", "NOT_REFUTED")
+
+
+def balanced_score(trials: List[BenchTrial], raw_scores: List[float]) -> float:
+    """Macro-average over the two expectation classes: catch-rate mass and
+    false-alarm mass count EQUALLY, however lopsided the trial mix is. This
+    is the ship-gate metric — the 2026-07-30 ship optimized a mean dominated
+    ~5:1 by REFUTED-expecting trials and traded FPR for TPR (live cost: ~18
+    escalation overturns/day)."""
+    nr = [s for t, s in zip(trials, raw_scores) if _is_nonrefute(t)]
+    rf = [s for t, s in zip(trials, raw_scores) if not _is_nonrefute(t)]
+    nr_m = sum(nr) / len(nr) if nr else 0.0
+    rf_m = sum(rf) / len(rf) if rf else 0.0
+    return 0.5 * nr_m + 0.5 * rf_m
+
+
 class VerifierBenchAdapter:
     """gepa.GEPAAdapter over the real two-stage verifier pipeline.
 
     A fresh HttpChatClient + Verifier is built INSIDE each evaluate()
     event loop: httpx.AsyncClient pools become loop-affine after first
     use, and this adapter runs one asyncio.run() per candidate
-    evaluation — a shared client would die on the second loop."""
+    evaluation — a shared client would die on the second loop.
+
+    `refute_weight` down-scales REFUTED-expecting trial scores so the two
+    expectation classes carry equal mass in gepa's mean/Pareto view
+    (weight = n_nonrefute / n_refute over the public trials). Raw scores
+    are preserved on trajectories for reflection feedback and gate math."""
 
     # gepa's reflective proposer probes this OPTIONAL hook with a direct
     # attribute access (`if self.adapter.propose_new_texts is not None`),
@@ -101,11 +123,13 @@ class VerifierBenchAdapter:
     propose_new_texts = None
 
     def __init__(self, base_url: str, *, timeout: float = 90.0,
-                 model: str = "", concurrency: int = 2):
+                 model: str = "", concurrency: int = 2,
+                 refute_weight: float = 1.0):
         self.base_url = base_url
         self.timeout = timeout
         self.model = model
         self.concurrency = concurrency
+        self.refute_weight = refute_weight
 
     def evaluate(self, batch: List[BenchTrial], candidate: Dict[str, str],
                  capture_traces: bool = False):
@@ -150,7 +174,8 @@ class VerifierBenchAdapter:
         scores, outputs, trajectories = [], [], []
         for r in results:
             s = _trial_score(r.trial, r.verdict)
-            scores.append(s)
+            w = 1.0 if _is_nonrefute(r.trial) else self.refute_weight
+            scores.append(s * w)
             outputs.append(r.verdict)
             trajectories.append({
                 "trial": r.trial, "verdict": r.verdict,
@@ -286,14 +311,39 @@ def main() -> int:
     print(f"{len(pub_cases)} public cases -> {len(pub_trials)} trials | "
           f"{len(priv_cases)} PRIVATE cases -> {len(priv_trials)} trials")
 
+    n_rf = sum(1 for t in pub_trials if not _is_nonrefute(t))
+    n_nr = len(pub_trials) - n_rf
+    refute_weight = (n_nr / n_rf) if n_rf else 1.0
+    print(f"class mix (public): {n_rf} refute-expecting / {n_nr} non-refute "
+          f"-> refute_weight {refute_weight:.3f}")
     adapter = VerifierBenchAdapter(
         args.base_url, timeout=args.timeout, model=args.model,
-        concurrency=args.concurrency)
+        concurrency=args.concurrency, refute_weight=refute_weight)
 
-    seed_candidate = dict(COMPONENTS)
-    baseline_eval = adapter.evaluate(priv_trials, seed_candidate)
-    baseline_score = sum(baseline_eval.scores) / len(baseline_eval.scores)
-    print(f"BASELINE on PRIVATE trials: {baseline_score:.3f}")
+    # Seed from the LIVE templates when valid artifacts exist — GEPA refines
+    # the incumbent instead of re-deriving from the hand-written baseline,
+    # and the ship-gate compares against what production actually runs.
+    base = Path(os.getenv("GHOST_HOME", str(Path.home() / "ghost_llamacpp")))
+    optim_dir = base / "system" / "optim"
+    seed_candidate: Dict[str, str] = {}
+    for name, baseline in COMPONENTS.items():
+        text, src = baseline, "baseline"
+        try:
+            live = json.loads((optim_dir / f"{name}.json").read_text())[
+                "optimized_instruction"]
+            if verifier_mod._validate_stage_template(name, live):
+                text, src = live, "LIVE artifact"
+        except Exception:
+            pass
+        seed_candidate[name] = text
+        print(f"seed {name}: {src} ({len(text)} chars)")
+
+    baseline_eval = adapter.evaluate(priv_trials, seed_candidate,
+                                     capture_traces=True)
+    baseline_raw = [t["score"] for t in baseline_eval.trajectories]
+    baseline_bal = balanced_score(priv_trials, baseline_raw)
+    print(f"INCUMBENT on PRIVATE trials: balanced={baseline_bal:.3f} "
+          f"raw-mean={sum(baseline_raw) / len(baseline_raw):.3f}")
 
     iterations = min(args.max_iterations, MAX_OPT_ITERATIONS)
     max_metric_calls = iterations * len(pub_trials)
@@ -312,28 +362,28 @@ def main() -> int:
     )
     best = dict(result.best_candidate)
 
-    cand_eval = adapter.evaluate(priv_trials, best)
-    cand_score = sum(cand_eval.scores) / len(cand_eval.scores)
-    delta = cand_score - baseline_score
+    cand_eval = adapter.evaluate(priv_trials, best, capture_traces=True)
+    cand_raw = [t["score"] for t in cand_eval.trajectories]
+    cand_bal = balanced_score(priv_trials, cand_raw)
+    delta = cand_bal - baseline_bal
     valid = all(verifier_mod._validate_stage_template(n, t)
                 for n, t in best.items())
     ships = valid and delta > args.min_delta
-    print(f"A/B (PRIVATE trials, n={len(priv_trials)}): "
-          f"baseline={baseline_score:.3f} candidate={cand_score:.3f} "
+    print(f"A/B (PRIVATE trials, n={len(priv_trials)}, BALANCED metric): "
+          f"incumbent={baseline_bal:.3f} candidate={cand_bal:.3f} "
           f"delta={delta:+.3f} valid={valid} ships={ships}")
 
-    base = Path(os.getenv("GHOST_HOME", str(Path.home() / "ghost_llamacpp")))
-    optim_dir = base / "system" / "optim"
     optim_dir.mkdir(parents=True, exist_ok=True)
     for name, template in best.items():
         payload = json.dumps({
             "signature_name": name,
-            "baseline_instruction": COMPONENTS[name],
+            "baseline_instruction": seed_candidate[name],
             "optimized_instruction": template,
-            "optimizer": "GEPA-verifier-bench",
+            "optimizer": "GEPA-verifier-bench-balanced",
             "iterations": iterations,
-            "private_baseline": round(baseline_score, 4),
-            "private_candidate": round(cand_score, 4),
+            "private_incumbent_balanced": round(baseline_bal, 4),
+            "private_candidate_balanced": round(cand_bal, 4),
+            "refute_weight": round(refute_weight, 4),
         }, indent=2)
         live = optim_dir / f"{name}.json"
         if ships:

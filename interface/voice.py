@@ -67,13 +67,28 @@ STT_MAX_SECONDS = float(os.environ.get("GHOST_STT_MAX_SECONDS", "900"))
 STT_MAX_TOKENS = int(os.environ.get("GHOST_STT_MAX_TOKENS", "2048"))
 STT_TIMEOUT_S = float(os.environ.get("GHOST_STT_TIMEOUT_S", "180"))
 
-# Female voice (operator preference, 2026-08-02; was "Daniel", en_GB male).
-# Samantha is the long-standing macOS female voice: high intelligibility and
-# present on every install, so it cannot go missing the way a newer optional
-# voice can. Alternatives on this box, all verified working through
-# synthesize(): "Sandy (English (UK))" keeps the previous British accent,
-# "Karen" (en_AU), "Moira" (en_IE). List them with `say -v '?'`.
-TTS_VOICE = os.environ.get("GHOST_TTS_VOICE", "Samantha")
+# Female voice (operator preference, 2026-08-03; was "Samantha", itself a
+# 2026-08-02 replacement for "Daniel", en_GB male). Ava (Premium) is a
+# neural voice, a clear step up in naturalness from the compact synthesiser
+# every other name here uses.
+#
+# ⚠ Unlike Samantha, Ava is NOT present on a stock macOS — it is a ~1 GB
+# download (System Settings → Accessibility → Spoken Content → System Voice
+# → Manage Voices…). The parenthesised suffix is part of the name and MUST
+# be exact: bare "Ava" is a DIFFERENT, compact voice that also exists once
+# the download completes, so a dropped suffix silently downgrades quality
+# rather than erroring. On a box without the download, synthesize() falls
+# back to the system default (see the VoiceError handler below) — speech
+# survives, quality degrades, and the warning names the cause.
+#
+# Measured on this box 2026-08-03: 0.58s to synthesize a two-sentence chunk
+# vs 0.48s for Samantha, so the premium model costs no meaningful latency
+# against TTS_TIMEOUT_S.
+#
+# Alternatives, all verified working through synthesize(): "Samantha"
+# (en_US, stock everywhere), "Sandy (English (UK))", "Karen" (en_AU),
+# "Moira" (en_IE). List them with `say -v '?'`.
+TTS_VOICE = os.environ.get("GHOST_TTS_VOICE", "Ava (Premium)")
 TTS_RATE = os.environ.get("GHOST_TTS_RATE", "")  # words/min; "" = voice default
 # app.js already splits replies into chunks and queues them, so a single
 # request is a sentence or two. The cap stops a pathological chunk from

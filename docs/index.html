@@ -167,7 +167,7 @@
       <tr><td><code>src/ghost_agent/sandbox/</code></td><td>Docker container manager</td><td><a href="sandbox/docker.html">Sandbox</a></td></tr>
       <tr><td><code>src/ghost_agent/api/</code></td><td>FastAPI routes</td><td><a href="api/routes.html">API</a></td></tr>
       <tr><td><code>src/ghost_agent/utils/</code></td><td>Logging, sanitiser, token counter, helpers</td><td><a href="cli_reference.html#utils">Utilities</a></td></tr>
-      <tr><td><code>interface/</code></td><td>Web UI, Slack bot, voice/image servers, desktop client</td><td><a href="interfaces/web_server.html">Interfaces</a></td></tr>
+      <tr><td><code>interface/</code></td><td>Web UI (incl. the in-process voice loop), Slack bot, image-gen server, desktop client</td><td><a href="interfaces/web_server.html">Interfaces</a></td></tr>
     </tbody>
   </table>
 
@@ -214,7 +214,8 @@
       <tr><td>Weather &amp; geolocation</td><td><span class="badge good">Tor</span></td><td>Open-Meteo primary, <code>wttr.in</code> fallback; both honour <code>TOR_PROXY</code>.</td></tr>
       <tr><td>Sandbox container egress</td><td><span class="badge good">Tor</span></td><td>When the container has network access, it inherits the Tor SOCKS namespace.</td></tr>
       <tr><td>Upstream LLM inference</td><td><span class="badge">Local</span></td><td>llama.cpp / vLLM runs on <code>127.0.0.1</code>. Never traverses a network boundary, Tor or otherwise.</td></tr>
-      <tr><td>Slack / voice / image-gen servers</td><td><span class="badge">LAN</span></td><td>Operator-owned companion services on the private network; intentionally direct so the agent can reach them behind Tor's default deny.</td></tr>
+      <tr><td>Slack / image-gen servers</td><td><span class="badge">LAN</span></td><td>Operator-owned companion services on the private network; intentionally direct so the agent can reach them behind Tor's default deny.</td></tr>
+      <tr><td>Voice (STT / TTS)</td><td><span class="badge good">Tailnet + local</span></td><td>No companion service since 2026-08-02. Speech-to-text posts to a worker node over the tailnet; text-to-speech is a local <code>say</code> subprocess. Audio never leaves the tailnet and no key or account is involved — the only speech path compatible with the no-identity-egress rule.</td></tr>
     </tbody>
   </table>
 

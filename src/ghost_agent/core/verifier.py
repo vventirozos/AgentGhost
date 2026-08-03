@@ -331,6 +331,19 @@ def _logit_expect_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
+def _logit_expect_weight() -> float:
+    """Blend weight for the probe reading (confidence = (1-w)*self +
+    w*aligned). The first bench A/B (2026-07-30) showed w=0.5 drags nearly
+    every verdict below the 0.7 actionable gate (actionable TPR 0.347 —
+    would neuter the verifier); default is the lighter 0.25 pending the
+    re-bench. Clamped to [0, 1]; read per call so benches can sweep it."""
+    try:
+        w = float(os.getenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "0.25"))
+    except ValueError:
+        w = 0.25
+    return max(0.0, min(1.0, w))
+
+
 _VERIFY_SCORE_PROBE_PROMPT = """You are auditing an agent's reply. Rate how likely the CLAIM is an acceptable reply to the USER REQUEST given only the EVIDENCE.
 
 CLAIM:
@@ -979,8 +992,9 @@ class Verifier:
                 result.probe_score = round(probe, 3)
                 aligned = (probe if result.verdict == VerifyVerdict.CONFIRMED
                            else 1.0 - probe)
+                w = _logit_expect_weight()
                 result.confidence = round(
-                    0.5 * float(result.confidence) + 0.5 * aligned, 3)
+                    (1.0 - w) * float(result.confidence) + w * aligned, 3)
         return result
 
     async def verify_claim(self, claim: str, evidence: str,

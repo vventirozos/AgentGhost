@@ -461,6 +461,11 @@ class MainWindow(QWidget):
         # frameless full-screen kiosk), so nothing has to react to a resize.
         self.web_face = WebFaceWidget(self)
         self.web_face.setGeometry(0, 0, win_w, win_h)
+        # The face is decorative — it must never take focus. If it did, key
+        # presses would go to the web view and the any-key escape out of
+        # fullscreen-face mode (keyPressEvent) would never fire, stranding the
+        # operator in a frameless kiosk with no visible controls.
+        self.web_face.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.faces = (self.web_face,)
         # Face state the client owns (the face itself is async JS now).
         self._face_mood = "idle"
@@ -481,7 +486,10 @@ class MainWindow(QWidget):
         main_layout.setSpacing(10)
 
         left_widget = QWidget()
-        self.left_widget = left_widget       # still the fullscreen-face toggle target
+        # Holds the ONLY stretch factor in the main column. It must stay
+        # VISIBLE even in fullscreen-face mode — see toggle_fullscreen_face()
+        # for what hiding it does to the bottom bar. Toggle self.chat_display.
+        self.left_widget = left_widget
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(12)
@@ -582,6 +590,15 @@ class MainWindow(QWidget):
         self.snap_shortcut = QShortcut(QKeySequence("Ctrl+Escape"), self)
         self.snap_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self.snap_shortcut.activated.connect(self.take_picture)
+
+        # The way back out of fullscreen-face mode. ApplicationShortcut, not
+        # the default WindowShortcut: with the overlay hidden the QWebEngineView
+        # is the only thing left, and a shortcut scoped to the focused widget
+        # could be swallowed by it. F11 is the conventional fullscreen key;
+        # keyPressEvent accepts any other key as a backstop.
+        self.fullscreen_shortcut = QShortcut(QKeySequence(Qt.Key.Key_F11), self)
+        self.fullscreen_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.fullscreen_shortcut.activated.connect(self.toggle_fullscreen_face)
 
     def update_workspace_btn_state(self):
         if not hasattr(self, 'workspace_btn'):
@@ -841,6 +858,16 @@ class MainWindow(QWidget):
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
+        # Escape hatch. With the glass UI hidden there is no visible control to
+        # bring it back and this is a frameless always-on-top kiosk, so ANY key
+        # restores it rather than only the documented F11. Escape/Alt+Escape/
+        # Ctrl+Escape never reach here — they are QShortcuts and fire first —
+        # so push-to-talk, TTS and SNAP still work with the UI hidden, which is
+        # the point of a face-only mode.
+        if not self.overlay.isVisible():
+            self._restore_overlay()
+            return
+
         if not self.text_input.hasFocus() and len(event.text()) > 0 and event.text().isprintable():
             self.text_input.setFocus()
             QApplication.sendEvent(self.text_input, event)
@@ -908,13 +935,45 @@ class MainWindow(QWidget):
             pass
 
     def toggle_fullscreen_face(self):
-        if self.left_widget.isVisible():
-            self.left_widget.hide()
-            self.fs_btn.setText("📖")
+        """Hide the ENTIRE glass UI so nothing but the face remains.
+
+        This hides `self.overlay` — the single translucent sheet that carries
+        the top chips, the transcript and the bottom bar. Two earlier attempts
+        hid something smaller and both were wrong:
+
+        * Hiding `left_widget` (the transcript's container) left the chips and
+          the bottom bar on screen AND moved the bar to the middle of the deck:
+          it carries the main column's only stretch factor, so hiding it handed
+          the freed space to the bottom row, which grew from 25px to 659px tall
+          and vertically centred its fixed-height chips. Measured on-device at
+          1280x720: bottom bar y=683 → y=49.
+        * Hiding `chat_display` fixed the placement but still left the chips
+          and the bar visible — so the button still did not hide the UI.
+
+        Hiding the overlay sidesteps the stretch trap entirely (nothing inside
+        the layout changes) and is what "fullscreen face" actually means.
+
+        Getting back matters as much as leaving: this is a frameless,
+        always-on-top kiosk, so once the overlay is hidden there is no visible
+        control to restore it. Two independent paths exist — F11 (an
+        ApplicationShortcut, so it fires even if the web view holds focus) and
+        ANY other key press (see keyPressEvent). PTT/TTS/SNAP keep working
+        while hidden, which makes this a usable face-only voice mode rather
+        than a dead end.
+        """
+        if self.overlay.isVisible():
+            self.overlay.hide()
+            self.fs_btn.setText("○")
+            self.setFocus()          # so keyPressEvent reaches the window
         else:
-            self.left_widget.show()
-            self.fs_btn.setText("👁️")
-            self.text_input.setFocus()
+            self._restore_overlay()
+
+    def _restore_overlay(self):
+        """Bring the glass UI back and put the caret where the operator left it."""
+        self.overlay.show()
+        self.overlay.raise_()        # the face must never composite over it
+        self.fs_btn.setText("◐")
+        self.text_input.setFocus()
 
     def handle_input(self):
         text = self.text_input.text().strip()

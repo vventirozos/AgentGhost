@@ -46,7 +46,7 @@
     <a class="card" href="#memory"><h3>Long-term memory</h3><p>Remembers preferences, facts, and hard-won procedures across sessions.</p></a>
     <a class="card" href="#schedule"><h3>Scheduling &amp; autonomy</h3><p>Cron-style recurring tasks that run the agent against a stored prompt.</p></a>
     <a class="card" href="#db"><h3>Database admin</h3><p>Query and introspect Postgres instances with safety rails.</p></a>
-    <a class="card" href="#voice"><h3>Voice I/O</h3><p>Talk to the agent through a TTS/STT server on a companion box.</p></a>
+    <a class="card" href="#voice"><h3>Voice I/O</h3><p>Push-to-talk in the browser. Speech in and out, entirely on hardware already running.</p></a>
   </div>
 
   <h2 id="research">Research &amp; synthesis</h2>
@@ -115,10 +115,10 @@
   <p><strong>Tools:</strong> <a href="tools/database.html"><code>database</code></a>.</p>
 
   <h2 id="voice">Voice I/O</h2>
-  <p>When the voice server is reachable (<code>$PI_VOICE_URL</code>) the agent can answer spoken prompts and stream TTS audio back. Works great on a Raspberry Pi with a USB mic on the desk.</p>
+  <p>Push-to-talk in the web interface: the agent answers spoken prompts and streams TTS audio back. Both halves run on infrastructure that is already live and need no extra hardware, API key, or egress — <strong>STT</strong> on nova's Gemma 4 audio node over the tailnet, <strong>TTS</strong> via the local macOS <code>say</code> binary (<code>Ava (Premium)</code>). The former Raspberry-Pi voice server and its <code>$PI_VOICE_URL</code> setting are gone.</p>
   <pre><code>🎙  "Hey ghost, what's the weather in Athens and what's on my calendar?"</code></pre>
-  <p><strong>Under the hood:</strong> STT captures the prompt → normal agent turn → TTS streams the reply. All memory and tools are available as usual.</p>
-  <p><strong>See also:</strong> <a href="interfaces/voice_server.html">Voice server</a>.</p>
+  <p><strong>Under the hood:</strong> browser <code>MediaRecorder</code> → <code>/api/stt</code> (<code>ffmpeg</code> transcode → Gemma 4 audio node, verbatim transcript) → normal agent turn → <code>/api/tts</code> (<code>say</code> → WAV, buffered not streamed). All memory and tools are available as usual.</p>
+  <p><strong>See also:</strong> <a href="interfaces/voice_server.html">Voice loop</a>.</p>
 
   <h2 id="self">Self-improvement</h2>
   <p>During idle time, the <a href="core/dream.html">dream cycle</a> drains the journal into long-term stores, extracts reusable tool sequences as new "skills", and ranks them by observed utility. Skills that repeatedly fail get auto-retired to <code>acquired_skills/retired/</code>.</p>

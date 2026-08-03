@@ -346,8 +346,11 @@ switches per call so benches can A/B via env.
 call asks the judge for a single acceptability digit 0-9 with
 top-logprobs (`entropy.request_logprobs` handles field selection); the
 EXPECTATION over the digit distribution (`_digit_expectation`) is a
-continuous p(acceptable) that blends 50/50 into `confidence`
-(verdict-aligned: inverted for REFUTED). Motivation: self-reported
+continuous p(acceptable) blended into `confidence` (verdict-aligned:
+inverted for REFUTED) at weight `GHOST_VERIFY_LOGIT_EXPECT_WEIGHT`
+(default 0.25 — the first bench A/B showed w=0.5 drags nearly all
+verdicts below the 0.7 actionable gate; clamped [0,1], read per call so
+benches can sweep it). Motivation: self-reported
 confidence saturates (bench mean-conf ≈ 0.96-1.0 even on wrong
 verdicts), so the actionable-confidence gates get no separation.
 Verdicts are never changed; probe failure leaves the result untouched;
