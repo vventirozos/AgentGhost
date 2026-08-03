@@ -19,6 +19,9 @@ import qasync
 
 from webface import WebFaceWidget
 from chatlog import ChatLog
+from turnstatus import (
+    TurnTicker, caption_html as _caption_html, log_ws_url, stream_log_lines,
+)
 
 audio_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
@@ -43,6 +46,14 @@ VOICE_BASE_URL = os.environ.get("GHOST_VOICE_BASE", f"https://{GHOST_HOST}:8080"
 TTS_SERVER_URL = f"{VOICE_BASE_URL}/api/tts"
 STT_SERVER_URL = f"{VOICE_BASE_URL}/api/stt"
 VOICE_VERIFY_TLS = os.environ.get("GHOST_VOICE_VERIFY_TLS", "0").lower() in ("1", "true", "yes")
+
+# ── Live turn status (2026-08-03) ───────────────────────────────────────────
+# The waiting bubble narrates the agent's CURRENT step instead of showing a
+# static "cogitating". The step names come from the interface's log broadcast —
+# same host, port and self-signed cert as the voice endpoints above, so the same
+# TLS switch applies. See turnstatus.py for why the chat stream cannot supply
+# this itself.
+LOG_WS_URL = os.environ.get("GHOST_LOG_WS")
 
 
 def _resolve_ghost_api_key() -> str:
@@ -201,6 +212,15 @@ FILEDIALOG_STYLE = f"""
 # Chat bubbles moved to chatlog.py (2026-08-02, second pass): they are
 # real QLabel widgets now, so they get true rounded/notched corners and
 # hug their content — neither of which QTextDocument can do.
+
+def caption_html(ticker):
+    """Waiting-bubble caption, in this client's palette.
+
+    The building (field order, escaping, one-line elide) lives in turnstatus.py
+    where it is Qt-free and unit-tested; this only supplies the theme.
+    """
+    return _caption_html(ticker, dim=T.TEXT_DIM, mono=T.FONT)
+
 
 NOTE_DIM = f"<div style='color:{T.TEXT_DIM};'><i>"
 NOTE_OK = f"<div style='color:{T.OK};'><i>"
@@ -429,9 +449,12 @@ class MainWindow(QWidget):
         self.show_image_signal.connect(self._show_image_popup)
         self.update_workspace_signal.connect(self.update_workspace_btn_state)
         
+        # The waiting bubble's caption: elapsed clock + what the agent is doing
+        # right now, fed by the log socket (see turnstatus.py). The timer only
+        # advances the CLOCK — the description changes when a log line arrives.
+        self.ticker = TurnTicker()
         self.thinking_timer = QTimer(self)
         self.thinking_timer.timeout.connect(self._animate_thinking)
-        self.thinking_dots = 0
         self.is_thinking = False
 
         # Monitor TTS queue drain to return faces to idle after speak mode
@@ -1120,20 +1143,42 @@ class MainWindow(QWidget):
 
     def _animate_thinking(self):
         if getattr(self, 'is_thinking', False):
-            self.thinking_dots = (self.thinking_dots % 3) + 1
             self._render_thinking()
 
     def _render_thinking(self):
-        dots = "·" * self.thinking_dots
-        self.chat_display.update_agent(
-            f"<span style='color:{T.TEXT_DIM};'><i>cogitating {dots}</i></span>")
+        """Paint the waiting caption into the streaming bubble."""
+        # `/clear` mid-turn drops the streaming bubble but leaves this timer
+        # running — without the guard, update_agent() would open a BRAND NEW
+        # bubble and paint the caption into the transcript the operator just
+        # wiped.
+        if not self.chat_display.has_open_agent():
+            return
+        self.chat_display.update_agent(caption_html(self.ticker))
+
+    def note_log_line(self, line):
+        """One line from the interface's log broadcast (the ticker's only feed).
+
+        Runs on the qasync loop, i.e. the Qt main thread, so it touches widgets
+        directly. Repaint only when the caption actually changed: the socket
+        carries every line the agent logs (including other corridors' and the
+        continuation lines of long thinking blocks), and re-fitting the bubble
+        on each one would be constant churn for no visible difference.
+        """
+        if self.ticker.note_line(line) and getattr(self, 'is_thinking', False):
+            self._render_thinking()
+
+    def note_log_state(self, connected):
+        """Log socket came up / went down — swap the pre-corridor placeholder."""
+        if self.ticker.set_connected(connected) and getattr(self, 'is_thinking', False):
+            self._render_thinking()
 
     def _close_thinking(self):
-        """Stop the dots and discard the bubble if nothing ever arrived.
+        """Stop the caption and discard the bubble if nothing ever arrived.
 
-        The placeholder holds "cogitating …", so it is never literally empty —
-        it has to be blanked before the log can decide to drop it.
+        The placeholder holds the status caption, so it is never literally
+        empty — it has to be blanked before the log can decide to drop it.
         """
+        self.ticker.stop()
         if getattr(self, 'is_thinking', False):
             self.is_thinking = False
             self.thinking_timer.stop()
@@ -1154,13 +1199,18 @@ class MainWindow(QWidget):
             self.current_response_text = ""
             self.chat_display.start_agent()
             self.is_thinking = True
-            self.thinking_dots = 1
+            # start() BEFORE the first render: it resets the elapsed clock and
+            # re-arms corridor adoption, so the caption belongs to THIS turn.
+            self.ticker.start()
             self._render_thinking()
-            self.thinking_timer.start(500)
+            # 1 s — the clock has second granularity and each repaint re-fits
+            # the bubble, which is not free on the CM4.
+            self.thinking_timer.start(1000)
         elif action == "update_response":
             if getattr(self, 'is_thinking', False):
                 self.is_thinking = False
                 self.thinking_timer.stop()
+                self.ticker.stop()
             self.current_response_text += data
 
             processed_text = re.sub(
@@ -1279,6 +1329,16 @@ if __name__ == "__main__":
     
     loop.create_task(audio_fetch_task())
     loop.create_task(audio_worker_task())
+    # Live turn status. Started unconditionally: the reader reconnects forever
+    # and never raises, so an interface that is down (or a device without the
+    # `websockets` package) just leaves the waiting bubble on its offline
+    # placeholder — chat itself talks to the agent directly and is unaffected.
+    loop.create_task(stream_log_lines(
+        LOG_WS_URL or log_ws_url(GHOST_HOST, GHOST_API_KEY),
+        on_line=window.note_log_line,
+        on_state=window.note_log_state,
+        verify_tls=VOICE_VERIFY_TLS,
+    ))
 
     with loop:
         loop.run_forever()

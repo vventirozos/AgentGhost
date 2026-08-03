@@ -35,7 +35,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -86,6 +88,94 @@ def _trial_score(trial: BenchTrial, verdict: Optional[str]) -> float:
     return 0.0
 
 
+class StatusBoard:
+    """Glanceable run status. Written ATOMICALLY to <run-dir>/status.txt
+    (human) and status.json (machine) on every event — monitoring is
+    `cat status.txt` / `watch -n 30 cat status.txt`, no log spelunking,
+    no \\r-unwrapping, no grep patterns. Fed by BOTH the adapter (every
+    evaluation batch) and gepa's own log stream (iteration decisions)."""
+
+    def __init__(self, run_dir: Optional[str]):
+        self.dir = Path(run_dir) if run_dir else None
+        self.t0 = time.time()
+        self.d: Dict[str, Any] = {
+            "run": "verifier-optimization", "phase": "starting",
+            "incumbent_private_balanced": None, "best_public_valset": None,
+            "proposals": 0, "subsample_accepted": 0,
+            "subsample_rejected": 0, "cap_zeroed_batches": 0,
+            "new_best_count": 0, "batches": 0, "trials_evaluated": 0,
+            "last_event": "", "verdict": "(pending)",
+        }
+        self.write()
+
+    def event(self, **kw) -> None:
+        for k, v in kw.items():
+            if k.startswith("inc_"):
+                key = k[4:]
+                self.d[key] = int(self.d.get(key) or 0) + v
+            else:
+                self.d[k] = v
+        self.write()
+
+    def gepa_log(self, message: str) -> None:
+        m = str(message)
+        if "Proposed new text" in m:
+            self.d["proposals"] += 1
+        elif "is not better than old score" in m:
+            self.d["subsample_rejected"] += 1
+        elif "is better than old score" in m:
+            self.d["subsample_accepted"] += 1
+        elif "Found a better program" in m:
+            self.d["new_best_count"] += 1
+        bm = re.search(r"Best valset aggregate score so far: ([0-9.]+)", m)
+        if bm:
+            self.d["best_public_valset"] = round(float(bm.group(1)), 4)
+        self.d["last_event"] = (time.strftime("%H:%M:%S") + " "
+                                + m.strip()[:180])
+        self.write()
+
+    def write(self) -> None:
+        if self.dir is None:
+            return
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            el = int(time.time() - self.t0)
+            hum = (
+                f"verifier optimization — {self.d['phase']} — "
+                f"elapsed {el // 3600}h{(el % 3600) // 60:02d}m\n"
+                f"incumbent (private, balanced): "
+                f"{self.d['incumbent_private_balanced']}   "
+                f"best public valset: {self.d['best_public_valset']}\n"
+                f"proposals {self.d['proposals']} | subsample "
+                f"{self.d['subsample_accepted']} accepted / "
+                f"{self.d['subsample_rejected']} rejected | cap-zeroed "
+                f"{self.d['cap_zeroed_batches']} | new-best "
+                f"{self.d['new_best_count']}\n"
+                f"trials evaluated {self.d['trials_evaluated']} "
+                f"(batches {self.d['batches']})\n"
+                f"last: {self.d['last_event']}\n"
+                f"VERDICT: {self.d['verdict']}\n"
+            )
+            tmp = self.dir / ".status.tmp"
+            tmp.write_text(hum)
+            tmp.rename(self.dir / "status.txt")
+            (self.dir / "status.json").write_text(
+                json.dumps({**self.d, "elapsed_s": el}))
+        except Exception:
+            pass
+
+
+class _GepaLogger:
+    """gepa LoggerProtocol shim: passthrough to stdout + StatusBoard."""
+
+    def __init__(self, board: StatusBoard):
+        self.board = board
+
+    def log(self, message: str) -> None:
+        print(message, flush=True)
+        self.board.gepa_log(message)
+
+
 def _is_nonrefute(trial: BenchTrial) -> bool:
     return trial.expected in ("CONFIRMED", "NOT_REFUTED")
 
@@ -124,16 +214,55 @@ class VerifierBenchAdapter:
 
     def __init__(self, base_url: str, *, timeout: float = 90.0,
                  model: str = "", concurrency: int = 2,
-                 refute_weight: float = 1.0):
+                 refute_weight: float = 1.0,
+                 length_caps: Optional[Dict[str, int]] = None,
+                 seed_texts: Optional[Dict[str, str]] = None):
         self.base_url = base_url
         self.timeout = timeout
         self.model = model
         self.concurrency = concurrency
         self.refute_weight = refute_weight
+        # Compression constraint (2026-08-03): the E4B judge FAILS TO FOLLOW
+        # rules it carries in a ~5.4KB prompt (capacity-bound rule-following
+        # — 100% of its refutes overturned by the 35B on the SAME prompt).
+        # MUTATED components longer than their cap score zero with explicit
+        # feedback, so GEPA must compress to compete. The seed (live
+        # incumbent) is exempt — it's the reference to beat, not a candidate.
+        self.length_caps = length_caps or {}
+        self.seed_texts = seed_texts or {}
+        self.board: Optional[StatusBoard] = None
 
     def evaluate(self, batch: List[BenchTrial], candidate: Dict[str, str],
                  capture_traces: bool = False):
         from gepa.core.adapter import EvaluationBatch
+
+        # A mutated component over its length cap defeats the whole point
+        # (the small judge can't follow long rule lists) — fail the batch
+        # with feedback the reflector can act on.
+        too_long = [
+            (name, len(tmpl)) for name, tmpl in candidate.items()
+            if self.length_caps.get(name)
+            and tmpl != self.seed_texts.get(name)
+            and len(tmpl) > self.length_caps[name]
+        ]
+        if too_long:
+            from gepa.core.adapter import EvaluationBatch
+            fb = ("TEMPLATE TOO LONG: " + "; ".join(
+                f"{n} is {ln} chars, cap {self.length_caps[n]}"
+                for n, ln in too_long)
+                + ". The judge model cannot reliably follow long rule "
+                  "lists — COMPRESS: keep the decision procedure and the "
+                  "false-alarm protections, cut redundancy and examples.")
+            # Loud on stdout: run 3a burned 37 iterations on silently
+            # zeroed over-cap candidates before anyone saw the pattern.
+            print(f"[cap-guard] zeroing candidate: {fb[:160]}", flush=True)
+            if self.board:
+                self.board.event(inc_cap_zeroed_batches=1)
+            traj = [{"trial": t, "verdict": None, "suspects": None,
+                     "reasoning": fb, "score": 0.0} for t in batch]
+            return EvaluationBatch(
+                outputs=[None] * len(batch), scores=[0.0] * len(batch),
+                trajectories=traj if capture_traces else None)
 
         # A candidate that lost a placeholder can never run — fail the
         # whole batch with feedback GEPA's reflector can act on.
@@ -170,6 +299,9 @@ class VerifierBenchAdapter:
         finally:
             verifier_mod._TEMPLATE_OVERRIDES.clear()
             verifier_mod._TEMPLATE_OVERRIDES.update(prev)
+        if self.board:
+            self.board.event(inc_batches=1,
+                             inc_trials_evaluated=len(results))
 
         scores, outputs, trajectories = [], [], []
         for r in results:
@@ -283,6 +415,12 @@ def main() -> int:
     ap.add_argument("--run-dir", default="",
                     help="gepa state directory — enables checkpointing so a "
                          "killed run resumes instead of losing its candidates")
+    ap.add_argument("--cap-enumerate", type=int, default=0,
+                    help="length cap (chars) for MUTATED enumerate "
+                         "candidates; 0 = off")
+    ap.add_argument("--cap-adjudicate", type=int, default=0,
+                    help="length cap (chars) for MUTATED adjudicate "
+                         "candidates; 0 = off")
     args = ap.parse_args()
 
     cases = load_cases_jsonl(args.cases)
@@ -316,9 +454,6 @@ def main() -> int:
     refute_weight = (n_nr / n_rf) if n_rf else 1.0
     print(f"class mix (public): {n_rf} refute-expecting / {n_nr} non-refute "
           f"-> refute_weight {refute_weight:.3f}")
-    adapter = VerifierBenchAdapter(
-        args.base_url, timeout=args.timeout, model=args.model,
-        concurrency=args.concurrency, refute_weight=refute_weight)
 
     # Seed from the LIVE templates when valid artifacts exist — GEPA refines
     # the incumbent instead of re-deriving from the hand-written baseline,
@@ -338,17 +473,57 @@ def main() -> int:
         seed_candidate[name] = text
         print(f"seed {name}: {src} ({len(text)} chars)")
 
+    caps = {k: v for k, v in {
+        "verifier.enumerate": args.cap_enumerate,
+        "verifier.adjudicate": args.cap_adjudicate,
+    }.items() if v > 0}
+    if caps:
+        print(f"length caps on MUTATED candidates: {caps}")
+    adapter = VerifierBenchAdapter(
+        args.base_url, timeout=args.timeout, model=args.model,
+        concurrency=args.concurrency, refute_weight=refute_weight,
+        length_caps=caps, seed_texts=dict(seed_candidate))
+    board = StatusBoard(args.run_dir or None)
+    adapter.board = board
+    if args.run_dir:
+        print(f"monitor: cat {args.run_dir}/status.txt")
+    board.event(phase="incumbent private eval")
+
     baseline_eval = adapter.evaluate(priv_trials, seed_candidate,
                                      capture_traces=True)
     baseline_raw = [t["score"] for t in baseline_eval.trajectories]
     baseline_bal = balanced_score(priv_trials, baseline_raw)
     print(f"INCUMBENT on PRIVATE trials: balanced={baseline_bal:.3f} "
           f"raw-mean={sum(baseline_raw) / len(baseline_raw):.3f}")
+    board.event(phase="optimizing (gepa loop)",
+                incumbent_private_balanced=round(baseline_bal, 4))
 
     iterations = min(args.max_iterations, MAX_OPT_ITERATIONS)
     max_metric_calls = iterations * len(pub_trials)
 
     import gepa
+    # The length constraint must be visible where proposals are BORN:
+    # gepa's reflector composes new text from the PARENT's eval traces,
+    # so a cap enforced only by zero-scoring failures is invisible to it
+    # (run 3a: 37 straight ~5KB proposals, all silently zeroed). Append
+    # the constraint to the proposal prompt itself.
+    reflection_template = None
+    if caps:
+        from gepa.strategies.instruction_proposal import (
+            InstructionProposalSignature,
+        )
+        cap_min = min(caps.values())
+        reflection_template = (
+            InstructionProposalSignature.default_prompt_template
+            + f"\n\nHARD CONSTRAINT: your new instruction MUST be UNDER "
+              f"{cap_min} characters (aim for ~{int(cap_min * 0.75)}). The "
+              "judge model that follows it is SMALL and cannot reliably "
+              "apply long rule lists — that failure is the very disease "
+              "being treated. Compress: keep the decision procedure and "
+              "EVERY false-alarm protection, cut redundancy, repetition "
+              f"and worked examples. Proposals over {cap_min} characters "
+              "score ZERO."
+        )
     result = gepa.optimize(
         seed_candidate=seed_candidate,
         trainset=pub_trials,
@@ -359,7 +534,10 @@ def main() -> int:
         display_progress_bar=True,
         seed=args.seed,
         run_dir=args.run_dir or None,
+        reflection_prompt_template=reflection_template,
+        logger=_GepaLogger(board),
     )
+    board.event(phase="candidate private eval (ship gate)")
     best = dict(result.best_candidate)
 
     cand_eval = adapter.evaluate(priv_trials, best, capture_traces=True)
@@ -368,10 +546,17 @@ def main() -> int:
     delta = cand_bal - baseline_bal
     valid = all(verifier_mod._validate_stage_template(n, t)
                 for n, t in best.items())
-    ships = valid and delta > args.min_delta
+    fits = all(best[n] == seed_candidate.get(n) or len(best[n]) <= cap
+               for n, cap in caps.items() if n in best)
+    ships = valid and fits and delta > args.min_delta
     print(f"A/B (PRIVATE trials, n={len(priv_trials)}, BALANCED metric): "
           f"incumbent={baseline_bal:.3f} candidate={cand_bal:.3f} "
-          f"delta={delta:+.3f} valid={valid} ships={ships}")
+          f"delta={delta:+.3f} valid={valid} fits_caps={fits} "
+          f"ships={ships}")
+    board.event(phase="done", verdict=(
+        f"{'SHIPPED' if ships else 'REJECTED'} — candidate {cand_bal:.3f} "
+        f"vs incumbent {baseline_bal:.3f} (delta {delta:+.3f}, "
+        f"fits_caps={fits})"))
 
     optim_dir.mkdir(parents=True, exist_ok=True)
     for name, template in best.items():

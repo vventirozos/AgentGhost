@@ -34,6 +34,9 @@
       <tr><td><code>POST $STT_SERVER_URL</code> → <code>https://eva:8080/api/stt</code></td><td>multipart audio upload (<code>arecord</code> writes 16&nbsp;kHz mono WAV — already the wanted format). Needs <code>X-Ghost-Key</code>.</td></tr>
       <tr><td><code>POST $TTS_SERVER_URL</code> → <code>https://eva:8080/api/tts</code></td><td>JSON text → <code>audio/wav</code>, piped to <code>aplay -q -</code>. Needs <code>X-Ghost-Key</code>.</td></tr>
       <tr><td><code>GET /api/download/{image_path}</code></td><td>Fetch agent-generated images.</td></tr>
+      <tr><td><code>WS wss://eva:8080/ws?key=…</code></td><td>The interface's log broadcast — the
+        only source of the waiting bubble's <a href="#turn-status">turn-status caption</a>.
+        Read-only, reconnecting, never fatal.</td></tr>
     </tbody>
   </table>
 
@@ -103,6 +106,55 @@
     <code>tests/test_clockwork_client_ui.py</code>.
   </div>
 
+  <h3 id="turn-status">Live turn status — what replaced "cogitating" (2026-08-03)</h3>
+  <p>
+    The waiting bubble used to read <code>cogitating ···</code> for the whole 30–90&nbsp;s a turn
+    takes. It now carries the same caption the web UI shows under <em>its</em> waiting bubble —
+    elapsed clock, a plain-English description of the current step, and that step's icon:
+  </p>
+  <pre>0:34   reading a file · notes.md   📖
+1:02   delegating to the worker node · verify → Worker Node (Nova)   🔧
+1:19   thinking…   💭</pre>
+  <p>
+    <strong>The chat stream cannot supply this.</strong> <code>/api/chat</code> carries content
+    tokens only — nothing about tools, memory or thinking — so the description comes from a SECOND
+    channel, exactly as it does in the browser: the interface server tails the agent's pretty log and
+    rebroadcasts every line over <code>wss://eva:8080/ws?key=…</code>, and the client turns those
+    lines into captions. Same host, port and self-signed cert as the voice endpoints, so
+    <code>GHOST_VOICE_VERIFY_TLS</code> applies here too; <code>GHOST_LOG_WS</code> overrides the
+    whole URL. The key rides in the <em>query string</em> because the endpoint is gated the way the
+    web UI is and WebSockets take no custom headers.
+  </p>
+  <ul>
+    <li><strong><code>turnstatus.py</code></strong> (new file — remember it in
+      <code>deploy.sh</code>) holds the caption logic and the socket reader. It is deliberately
+      Qt-free, so unlike the rest of the client it is unit-tested for real:
+      <code>tests/test_clockwork_turnstatus.py</code>.</li>
+    <li><strong>Corridor filtering.</strong> Dreams, self-play and other clients stream over the same
+      socket. The ticker adopts the id of the first <code>request started</code> corridor to open
+      <em>after</em> the operator sends and ignores every line that does not carry it — otherwise the
+      handheld narrates the agent's dreams while the operator waits on their own question. A corridor
+      already open at send time can never be adopted.</li>
+    <li><strong>Degradation is the design.</strong> The reader reconnects forever with exponential
+      backoff and never raises; if the interface is down (or <code>websockets</code> is missing from
+      <code>~/gui_env</code>) the caption falls back to the old <code>cogitating</code> and chat —
+      which talks to the agent directly on :8000 — is unaffected.</li>
+    <li><strong>One line, always.</strong> The description is elided at 46 characters
+      (<code>caption_html</code>). The web UI one-lines with <code>white-space: nowrap</code> +
+      <code>text-overflow: ellipsis</code>; a QLabel has no equivalent, and a caption that wraps
+      also changes the bubble's <em>height</em> every few seconds, which reads as the transcript
+      twitching. The description is raw log text and is escaped — the bubble is in RichText mode,
+      so an unescaped <code>&lt;</code> from a tool's output swallows the rest of the line.</li>
+    <li><strong>Repaints are gated on change.</strong> Every mutator returns whether the caption
+      actually moved; each repaint re-measures and re-fits a QLabel, and the socket carries every
+      line the agent logs. The clock ticks at 1&nbsp;s (second granularity — 500&nbsp;ms bought
+      nothing but fits).</li>
+    <li><strong>Hand-synced tables.</strong> <code>ICON_CLASS</code> / <code>TICKER_VERBS</code> /
+      <code>TICKER_NOISE</code> are ports of the tables in <code>interface/static/app.js</code>. The
+      device never sees app.js, so nothing at runtime can catch drift — the test parses both files
+      and fails when they diverge. Change the JS and the Python together.</li>
+  </ul>
+
   <h3>Voice queues</h3>
   <ul>
     <li><code>audio_queue</code> (<code>asyncio.Queue</code>) — text chunks to TTS.</li>
@@ -137,6 +189,39 @@
     dive, pulses and error flinches — and future work on the web face lands here for free instead
     of the two drifting into forks. The <code>◈</code> chip now cycles <em>forms</em> rather than
     swapping renderers.
+  </p>
+  <h3 id="face-memory">The face opens on the last form you chose (2026-08-03)</h3>
+  <p>
+    A <code>◈</code> press is remembered and applied at the next start. Precedence:
+    <code>GHOST_FACE_FORM</code> (explicit, this run only) &gt; the remembered form &gt;
+    <code>facestate.FALLBACK_FORM</code> = <code>descent</code> on a device that has never been
+    cycled.
+  </p>
+  <div class="note warn">
+    <strong>Why <code>localStorage</code> could not do this.</strong> <code>matrix_graph.js</code>
+    already persists the choice and restores it at load, and on the handheld that mechanism can
+    never work — for two independent reasons, either one fatal:
+    <ul>
+      <li>The client's <code>QWebEngineView</code> uses the <strong>default, off-the-record</strong>
+        profile (there is no <code>~/.local/share/**/QtWebEngine</code> directory on the device), so
+        web storage dies with the process.</li>
+      <li>localStorage is keyed by <strong>origin</strong>, and the face is served from
+        <code>http://127.0.0.1:&lt;free port&gt;</code> — a different port, so a different origin,
+        every boot. Even a persistent profile would look the value up under a key it never
+        wrote.</li>
+    </ul>
+    So the memory is one line of text in <code>~/.ghost_face_form</code>, written by
+    <code>cycle_form</code> and read by <code>startup_form</code> —
+    <code>facestate.py</code> (new file; <em>add it to deploy.sh</em>), Qt-free and unit-tested in
+    <code>tests/test_clockwork_facestate.py</code>. A corrupt, over-long or no-longer-existing form
+    name is ignored rather than handed to <code>setForm</code>, which no-ops silently on an unknown
+    name.
+  </div>
+  <p>
+    The startup choice is <strong>printed</strong> (<code>[face] opening on 'lattice'
+    (remembered='lattice')</code> in <code>/tmp/ghost_ui.log</code>), because otherwise which form
+    the face opened on is observable only by looking at the panel — no help over ssh, and none at
+    all when the screen is asleep.
   </p>
   <ul>
     <li><strong>Why a browser and not a port:</strong> reimplementing ~2,700 lines of particle
@@ -276,6 +361,25 @@
     no <code>-D</code> flag is needed. STT errors now surface the server's own message instead of a bare
     status code — "HTTP 503" alone sent one diagnosis down entirely the wrong path.
   </p>
+
+  <div class="note warn"><strong>Two traps found while deploying on 2026-08-03, both of which
+  looked like broken builds:</strong>
+  <ul>
+    <li><strong>A hand-started client survives every deploy.</strong> <code>deploy.sh</code> used to
+      <code>pkill -f 'bin/client.py'</code>, which does <em>not</em> match <code>python3
+      client.py</code> (launched from <code>~/bin</code> by hand). One such instance ran alongside
+      five successive deploys. Two clients is not cosmetic: they compete for the CM4's single GPU,
+      the newer face never gets a WebGL context, and <code>grim</code> screencopy starts failing.
+      The pattern is now <code>'client\.py'</code> and the deploy reports the client COUNT.</li>
+    <li><strong>A powered-off panel stalls the face.</strong> <code>swayidle -w timeout 600 wlopm
+      --off '*'</code> blanks the screen after 10 minutes idle; while the output is off,
+      <code>grim</code> fails with "failed to copy output DSI-1" <em>and</em> the webview never
+      finishes WebGL init, so no <code>[face]</code> line appears and the remembered form is never
+      applied. <code>wlopm</code> reports the truth (<code>DSI-1 off</code>) where
+      <code>wlr-randr</code> still says <code>Enabled: yes</code>; <code>wlopm --on '*'</code> wakes
+      it and the face comes up immediately.</li>
+  </ul>
+  </div>
 
   <div class="note warn"><strong>Deploy note:</strong> the LIVE client on the device is
   <code>~/bin/client.py</code> (launched by <code>~/bin/launch_ghost.sh</code>, which sources the

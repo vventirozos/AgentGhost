@@ -719,6 +719,17 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    well; the metric defends against regressions but may carry no improvement signal. RULE AT
    GATE-CLEAR: run the full-set incumbent fidelity check FIRST; if ≥0.95, CLOSE 2b as "no
    measurable problem" (the B4 precedent) — and flip recording OFF either way.
+   **EARLY CEILING CHECK RUN 2026-08-03 evening (operator-approved shortcut): fidelity 0.772
+   (44/57, 0 unreplayable) — 2b STAYS ALIVE, real headroom.** The 12/12 smoke was small-n luck.
+   Miss pairs name the fixable confusions: browser↔file_system, execute→file_system,
+   manage_projects over-selected (wrong wins + introspect/web_search misrouted into it), 3
+   no-tool stalls, workspace/notify_operator→system_utility. Recording stays ON to the 200-positive
+   gate (~08-08); the optimization runs there with genuine signal.
+   **Compression-constrained verifier round LAUNCHED same evening** (operator green-light):
+   caps 1200/2000 chars on MUTATED enumerate/adjudicate candidates (seed exempt as reference;
+   over-cap candidates zero-scored with compress-feedback; ship condition enforces fits_caps) —
+   targets capacity-bound rule-following on the E4B judge. Same balanced private gate vs the
+   0.840 incumbent.
 
 **Queued behind evidence (do NOT start early):**
 3. Next verifier optimization round MUST use a rebalanced trial mix first (clean/NOT_REFUTED

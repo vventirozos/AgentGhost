@@ -139,3 +139,23 @@ def test_toggle_is_reachable_from_its_button(name):
     """A layout fix is worthless if the button stops being wired to it."""
     src = _CLIENT.read_text()
     assert f"self.fs_btn.clicked.connect(self.{name})" in src
+
+
+# ── webface.py ──────────────────────────────────────────────────────────────
+_WEBFACE = _ROOT / "interface" / "externals" / "clockwork_ghost" / "webface.py"
+
+
+def test_the_face_form_is_never_hardcoded_at_the_call_site():
+    """The startup form is resolved by facestate (remembered ◈ choice → env
+    override → fallback). A literal here would quietly outrank the operator's
+    last pick — which is precisely the bug the memory was added to fix.
+
+    The FALLBACK_FORM-is-a-real-form guard lives with the rest of that logic in
+    tests/test_clockwork_facestate.py, where the FORMS list is already parsed.
+    """
+    src = _WEBFACE.read_text()
+    assert "facestate.startup_form(FACE_DIR)" in src
+    assert 'os.environ.get("GHOST_FACE_FORM"' not in src, (
+        "the env override belongs in facestate.startup_form, which weighs it "
+        "against the remembered form"
+    )

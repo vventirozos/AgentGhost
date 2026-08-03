@@ -36,6 +36,8 @@ from pathlib import Path
 from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 
+import facestate
+
 # MODULE-LEVEL import, and it must stay that way. Qt refuses to create a
 # QWebEngineView unless QtWebEngineWidgets was imported (or
 # AA_ShareOpenGLContexts was set) BEFORE the QCoreApplication exists —
@@ -59,7 +61,13 @@ FACE_DIR = Path(__file__).resolve().parent / "webface"
 # 2.0 -> 640x329 CSS viewport -> mobile profile -> ~32 fps on the CM4.
 # Lower it for a crisper face on stronger hardware.
 ZOOM = float(os.environ.get("GHOST_FACE_ZOOM", "2.0"))
-DEFAULT_FORM = os.environ.get("GHOST_FACE_FORM", "vortex")
+
+# The face opens on whatever the ◈ chip last selected (2026-08-03). The JS
+# already persists that choice to localStorage — and on this device that can
+# never survive a restart: the profile is off-the-record AND the loopback
+# origin's port changes every boot. facestate.py keeps the memory on the Python
+# side instead; see its docstring.
+DEFAULT_FORM = facestate.FALLBACK_FORM
 
 
 def _free_port() -> int:
@@ -130,10 +138,25 @@ class WebFaceWidget(QWidget):
             return
 
         def _cb(val):
-            if val:
+            # `not self._ready` is load-bearing: runJavaScript is ASYNC, so the
+            # 500 ms poll can fire again before the first answer comes back and
+            # a second callback would apply (and log) the form twice. The
+            # doubled `[face]` line is what revealed it.
+            if val and not self._ready:
                 self._ready = True
                 self._poll.stop()
-                self.set_form(DEFAULT_FORM)
+                # Resolved HERE, not at import: the operator may have cycled
+                # the form during a previous run seconds ago, and this is the
+                # last moment before the face is visible.
+                form = facestate.startup_form(FACE_DIR)
+                # Printed, not just applied: which form the face opened on —
+                # and whether it came from the remembered choice — is otherwise
+                # only observable by LOOKING at the panel, which is no help
+                # over ssh (and none at all when the screen is blanked).
+                print(f"[face] opening on {form!r} "
+                      f"(remembered={facestate.load_form(FACE_DIR)!r})",
+                      flush=True)
+                self.set_form(form)
 
         self._view.page().runJavaScript("!!window.__faceReady", _cb)
 
@@ -174,12 +197,29 @@ class WebFaceWidget(QWidget):
         self._js(f"window.ghostFace && ghostFace.form({name!r})")
 
     def cycle_form(self, on_name=None):
-        """Advance to the next form. ``on_name`` (optional) receives the new
-        form's name asynchronously — handy for a button tooltip."""
+        """Advance to the next form and REMEMBER it for the next start.
+
+        The name has to be read back from the face rather than tracked here:
+        the JS owns the FORMS order, and duplicating it on this side is exactly
+        the kind of second copy that drifts the first time a form is added.
+        ``on_name`` (optional) receives the new form's name — handy for a
+        button tooltip.
+        """
         self._js("window.ghostFace && ghostFace.cycle()")
-        if on_name and self._view is not None:
-            QTimer.singleShot(120, lambda: self._view.page().runJavaScript(
-                "window.__face ? window.__face.getForm() : ''", on_name))
+        if self._view is None:
+            return
+
+        def _got(name):
+            # Persist unconditionally, not only when a caller wants the name:
+            # the ◈ press IS the operator choosing a face, and it is the only
+            # thing this memory exists to capture.
+            saved = facestate.save_form(name)
+            print(f"[face] cycled to {name!r} (remembered={saved})", flush=True)
+            if on_name:
+                on_name(name)
+
+        QTimer.singleShot(120, lambda: self._view.page().runJavaScript(
+            "window.__face ? window.__face.getForm() : ''", _got))
 
     def set_rendering(self, active: bool):
         """Pause/resume the render loop.
