@@ -507,11 +507,14 @@ def mark_trigger(context, req_id: str, key: str, fired: bool) -> None:
     try:
         entry = ring.get(req_id)
         if not isinstance(entry, dict):
-            entry = {"arms": {}, "flags": {}}
-            ring[req_id] = entry
-            ring.move_to_end(req_id)
-            while len(ring) > _RECENT_ARMS_MAX:
-                ring.popitem(last=False)
+            # ONLY enrolled requests hold ring slots. Creating one here
+            # re-opened the eviction that `_stash_arms` was changed to close:
+            # sub-agents run the same turn loop on a SHALLOW-COPIED context
+            # (so the ring is shared) and hit the same risk-governor block, so
+            # 40 sub-turns could evict a live user turn whose streamed drain
+            # had not yet written its trajectory — recording it with no arm,
+            # which is the exact loss the ring exists to prevent.
+            return
         entry.setdefault("flags", {})[str(key)] = bool(fired)
         # Refresh LRU position: an entry being actively marked is the LAST
         # one that should be evicted, and creation-only ordering made
@@ -741,7 +744,11 @@ def _regularised_sigma(vals: Sequence[float]) -> float:
         scale = 1.0
     else:
         rng = hi - lo
-        scale = rng if rng > 0 else max(abs(sum(vals) / n), 1.0)
+        # `max(..., 1.0)`: without it a single out-of-range value flipped the
+        # scale from the bounded rule to a small observed range and made the
+        # interval NARROWER than for the same data fully inside [0,1].
+        scale = max(rng, abs(sum(vals) / n), 1.0) if hi <= 1.0 and lo >= -1.0 \
+            else (rng if rng > 0 else max(abs(sum(vals) / n), 1.0))
     v0 = 0.25 * scale * scale
     running_sum = 0.0
     acc = 0.0
@@ -810,6 +817,12 @@ def asymp_cs_radius(vals: Sequence[float], *, alpha: float = 0.05,
         r = float(rho)
         if not (0.0 < a < 1.0) or r <= 0.0:
             return None
+        if not all(math.isfinite(v) for v in vals):
+            # `max(0.0, nan)` returns 0.0, so a single NaN yielded a
+            # ZERO-WIDTH interval — precisely the failure the regularised
+            # variance exists to prevent. Everything upstream is a tolerant
+            # parser, so refuse rather than trust it.
+            return None
         sigma = _regularised_sigma(vals)
         inner = (2.0 * (n * r * r + 1.0)) / (n * n * r * r)
         radius = sigma * math.sqrt(inner * math.log(math.sqrt(n * r * r + 1.0) / a))
@@ -858,11 +871,19 @@ class MetricComparison:
 
 # §4I Phase 3 — pre-treatment covariates usable for variance reduction.
 #
-# STRICTLY pre-treatment: each of these is computed at turn 0, BEFORE the arm
+# Pre-treatment WITHIN A REQUEST: computed at turn 0, before this request's arm
 # can have changed anything. That is what makes the adjustment unbiased — a
 # post-treatment covariate would bake the treatment's own effect into the
 # correction and quietly destroy the comparison (the same trap as conditioning
 # `failure_rate` on the UNKNOWN rate).
+#
+# ⚠ HONEST LIMIT: it is NOT strictly pre-treatment ACROSS a conversation. The
+# router is passed the previous assistant message, and arms are per-request, so
+# turn k's covariate is a function of turn k-1's possibly-TREATED output. The
+# leakage is second-order (one prior message into a coarse difficulty label)
+# but it is real, and it is exactly the trap this comment used to claim was
+# impossible. Anything stronger — a covariate derived from the agent's own
+# recent behaviour — must not be added here without a per-session design.
 _COVARIATE_KEYS: Tuple[str, ...] = ("router_confidence",)
 
 
@@ -874,7 +895,10 @@ def _covariate_of(traj) -> Optional[float]:
             return None
         for key in _COVARIATE_KEYS:
             if key in extra:
-                v = float(extra[key])
+                raw = extra[key]
+                if isinstance(raw, bool):   # True would read as 1.0
+                    return None
+                v = float(raw)
                 return v if math.isfinite(v) else None
     except (TypeError, ValueError):
         return None
@@ -891,6 +915,13 @@ def cuped_adjust(values: Sequence[float],
     Records with no covariate pass through untouched, so a partially-stamped
     corpus degrades gracefully instead of dropping rows.
     """
+    if len(values) != len(covariates):
+        # The invariant holds today (one `ArmStats.add` writes both lists),
+        # but `zip` would truncate SILENTLY, and CUPED is not a place where a
+        # short read announces itself.
+        logger.warning("cuped_adjust: %d values vs %d covariates — adjustment "
+                       "skipped", len(values), len(covariates))
+        return [float(y) for y in values]
     out: List[float] = []
     for y, x in zip(values, covariates):
         if x is None:
@@ -1083,7 +1114,13 @@ def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
             # Require the covariate on most rows: adjusting a handful while
             # passing the rest through mixes two populations for no gain.
             covered = len(pooled) / max(1, len(c_vals) + len(t_vals))
-            if len(pooled) >= _MIN_VERDICT_N and covered >= 0.8:
+            # Per-ARM minimum, matching the verdict gate. A pooled count let
+            # CUPED engage at 15/arm — printing a variance reduction on a row
+            # whose verdict was "insufficient data", which is exactly where
+            # in-sample theta overfits worst.
+            enough = (len(c_vals) >= _MIN_VERDICT_N
+                      and len(t_vals) >= _MIN_VERDICT_N)
+            if enough and covered >= 0.8:
                 theta, xbar = cuped_theta(pooled)
                 if theta != 0.0:
                     c_adj = cuped_adjust(c_vals, c_cov, theta=theta, cov_mean=xbar)
@@ -1092,12 +1129,33 @@ def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
                     t_r2 = asymp_cs_radius(t_adj, alpha=arm_alpha)
                     if c_r2 is not None and t_r2 is not None:
                         before, after = c_rad + t_rad, c_r2 + t_r2
-                        # Only adopt a NARROWER interval — a covariate that
-                        # happens to widen it on this sample is noise, and
-                        # keeping the wider one is the conservative side.
+                        # ⚠ THE CENTRE MOVES WITH THE WIDTH. The adjusted
+                        # series has mean `Ybar_arm - theta*(Xbar_arm -
+                        # Xbar_pool)`, and that re-centring IS the variance
+                        # reduction — it removes the realised covariate
+                        # imbalance from the ESTIMATOR. Taking the shrunken
+                        # width while keeping the RAW mean made the interval
+                        # too narrow by 1/sqrt(1-rho^2) around an estimator
+                        # whose sampling variability had not changed, and
+                        # `variance_reduction` advertised the shortfall as a
+                        # win. Measured with ZERO true effect: 12/300 false
+                        # "TREATMENT BETTER/WORSE" verdicts (4.0% on one
+                        # metric, against a 5% budget for all three), rising
+                        # with rho^2 — i.e. dormant until the covariate
+                        # becomes worth having. Re-centring takes it to 0/300.
+                        #
+                        # Adopted unconditionally, not on `after < before`:
+                        # taking min(raw, adjusted) per sample is the
+                        # better-of-two-draws effect, measured consistently
+                        # anti-conservative (25:2 across paired trials) for
+                        # no benefit, since the in-sample residual variance is
+                        # <= total variance by construction anyway.
+                        c_mean = sum(c_adj) / len(c_adj)
+                        t_mean = sum(t_adj) / len(t_adj)
+                        diff = t_mean - c_mean
+                        c_rad, t_rad = c_r2, t_r2
                         if after < before:
                             reduction = 1.0 - (after / before)
-                            c_rad, t_rad = c_r2, t_r2
 
         lo = hi = None
         if diff is not None and c_rad is not None and t_rad is not None:
@@ -1358,6 +1416,13 @@ def report_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
 # Where the "already announced" markers live, relative to $GHOST_HOME/system.
 _ANNOUNCED_FILE = "experiments_announced.json"
 
+# Process-local mirror of the marker, KEYED BY MARKER PATH. Bounds
+# re-announcement to once per boot when the durable marker cannot be written
+# (see `announce_new_verdicts`). Keyed rather than global because two contexts
+# can share one process — a test harness, or a future multi-home deployment —
+# and an unkeyed set would let one silence the other.
+_ANNOUNCED_THIS_PROCESS: Dict[str, set] = {}
+
 
 def _announce_key(experiment: str, scope: str, metric: str, verdict: str) -> str:
     return f"{experiment}|{scope}|{metric}|{verdict}"
@@ -1381,6 +1446,14 @@ def pending_announcements(all_stats: Dict[str, Dict[str, ArmStats]],
             for cmp_ in compare_arms(summary[name], alpha=alpha):
                 v = cmp_.verdict
                 if not v.startswith("TREATMENT "):
+                    continue
+                # Never PUSH a metric whose own annotation says the result is
+                # circular or confounded. `n_steps`/`duration_s` move by
+                # construction for any treatment that ends turns earlier —
+                # measured, the first tick pushed 4 verdicts of which 2 were
+                # "TREATMENT BETTER — ⚠ mechanism, not outcome". They stay
+                # visible in the report; they just do not interrupt.
+                if cmp_.confound:
                     continue
                 key = _announce_key(name, scope, cmp_.metric, v.split(" —")[0])
                 if key in seen:
@@ -1428,9 +1501,22 @@ def announce_new_verdicts(context, *, alpha: float = 0.05) -> List[str]:
             collector.iter_trajectories())
         marker = system_dir / _ANNOUNCED_FILE
         try:
-            already = set(json.loads(marker.read_text(encoding="utf-8")))
-        except Exception:  # noqa: BLE001 — a missing/corrupt marker means "none"
+            _raw = json.loads(marker.read_text(encoding="utf-8"))
+            # A bare JSON string would iterate into single CHARACTERS and get
+            # written back as junk keys; only a list of strings is valid.
+            already = ({str(k) for k in _raw} if isinstance(_raw, list)
+                       else set())
+        except Exception:  # noqa: BLE001 — missing/corrupt marker means "none"
             already = set()
+        # In-process guard, ALWAYS consulted. If the marker cannot be
+        # persisted (a root-owned file under a UserName launchd daemon is a
+        # documented failure mode in this project), the durable record is lost
+        # but the process-local one still bounds re-announcement to ONCE PER
+        # BOOT instead of once per tick. The first version treated a failed
+        # write as "re-announce later"; measured, that was four notify-severity
+        # pushes every hour, indefinitely.
+        _proc_seen = _ANNOUNCED_THIS_PROCESS.setdefault(str(marker), set())
+        already |= _proc_seen
         fresh = pending_announcements(all_stats, trig_stats, already=already,
                                       alpha=alpha)
         if not fresh:
@@ -1441,15 +1527,21 @@ def announce_new_verdicts(context, *, alpha: float = 0.05) -> List[str]:
             if log is not None:
                 log.record("experiment_verdict", line, severity=SEVERITY_NOTIFY)
             already.add(key)
+            _proc_seen.add(key)
             lines.append(line)
+        if log is None:
+            # Nothing was actually delivered; do not mark it announced or the
+            # verdict is lost for good.
+            return []
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps(sorted(already), indent=2),
                               encoding="utf-8")
         except Exception:  # noqa: BLE001
-            # Could not persist → better to re-announce later than to lose the
-            # verdict entirely, so the in-memory add is simply not durable.
-            logger.debug("experiment announce marker not persisted")
+            logger.warning(
+                "experiment verdict marker could not be written to %s — "
+                "verdicts will re-announce once after each restart until this "
+                "is fixed (check ownership/permissions)", marker)
         return lines
     except Exception as e:  # noqa: BLE001 — telemetry must never break a tick
         logger.debug("experiment verdict check skipped: %s: %s",

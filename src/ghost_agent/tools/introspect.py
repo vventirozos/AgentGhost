@@ -338,7 +338,11 @@ async def tool_introspect(
             _md = getattr(context, "memory_dir", None)
             if _md is None:
                 return "Learning health: memory_dir unavailable."
-            return render_learning_health(_md)
+            # Off the event loop: this now includes a full trajectory-corpus
+            # walk (the experiment stamp-coverage block), exactly like the
+            # sibling 'experiments' action below.
+            import asyncio as _asyncio
+            return await _asyncio.to_thread(render_learning_health, _md)
         except Exception as e:
             return f"Learning health unavailable: {type(e).__name__}: {e}"
 

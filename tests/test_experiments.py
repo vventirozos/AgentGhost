@@ -7,6 +7,7 @@ outcome analysis is anytime-valid, and the framework can be killed.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -697,21 +698,56 @@ def test_cuped_narrows_the_interval_when_the_covariate_predicts():
         ex.summarize_trajectories(trajs)["risk_steer"])
         if c.metric == "failure_rate")
     assert cmp_.variance_reduction > 0.05, cmp_.variance_reduction
-    # ...and the MEANS are untouched — CUPED narrows, it does not move.
-    assert 0.3 < cmp_.control_mean < 0.7
+    # The CENTRE MOVES WITH THE WIDTH. The previous version of this test
+    # asserted the means were untouched, which locked in a defect worth
+    # 12/300 false verdicts: the adjusted series' re-centring IS the variance
+    # reduction, so keeping the raw mean left the interval too narrow around
+    # an estimator whose variability had not changed.
+    assert cmp_.control_mean is not None and cmp_.treatment_mean is not None
+    raw_c = sum(ex.summarize_trajectories(trajs)["risk_steer"]
+                [ex.CONTROL].values["failure_rate"]) / 150
+    assert abs(cmp_.control_mean - raw_c) > 1e-9, (
+        "means must be the ADJUSTED ones once CUPED is applied")
 
 
 def test_cuped_does_not_fire_without_enough_covariate_coverage():
-    trajs = ([_traj("control") for _ in range(60)]
-             + [_traj("treatment") for _ in range(60)]
-             + [_traj_cov("control", "failed", 0.2) for _ in range(5)])
+    """The COVERAGE gate specifically — the previous version of this test was
+    blocked by the sample-size arm instead, so removing the coverage check
+    survived mutation."""
+    import random
+    rng = random.Random(3)
+    trajs = []
+    for arm in (ex.CONTROL, ex.TREATMENT):
+        for i in range(60):          # well past the per-arm minimum
+            cov = rng.random()
+            outcome = "failed" if rng.random() < cov else "passed"
+            # Only half the rows carry a covariate → 50% coverage, under 0.8.
+            trajs.append(_traj_cov(arm, outcome, cov) if i % 2 == 0
+                         else _traj(arm, outcome))
     for c in ex.compare_arms(ex.summarize_trajectories(trajs)["risk_steer"]):
         assert c.variance_reduction == 0.0
 
 
-def test_cuped_never_widens_the_interval():
-    """A covariate that happens to correlate badly on this sample must not
-    make the interval WORSE — keeping the wider one is the safe side."""
+def test_cuped_needs_the_minimum_sample_in_EACH_arm():
+    """A pooled count let CUPED engage at 15/arm and print a variance
+    reduction on a row whose verdict was 'insufficient data'."""
+    import random
+    rng = random.Random(4)
+    trajs = []
+    for arm, k in ((ex.CONTROL, 45), (ex.TREATMENT, 15)):
+        for _ in range(k):
+            cov = rng.random()
+            trajs.append(_traj_cov(
+                arm, "failed" if rng.random() < cov else "passed", cov))
+    for c in ex.compare_arms(ex.summarize_trajectories(trajs)["risk_steer"]):
+        assert c.variance_reduction == 0.0
+
+
+def test_cuped_reports_zero_gain_rather_than_a_negative_one():
+    """`variance_reduction` is a REPORTED number, so it must never go
+    negative even when the adjusted interval is (marginally) wider — the
+    adjustment is adopted unconditionally, because min(raw, adjusted) is the
+    better-of-two-draws effect and measured consistently anti-conservative."""
     import random
     rng = random.Random(7)
     trajs = []
@@ -724,8 +760,165 @@ def test_cuped_never_widens_the_interval():
         assert c.variance_reduction >= 0.0
 
 
+def test_zero_true_effect_with_a_strong_covariate_yields_no_verdict():
+    """The regression that matters: keeping the raw mean while adopting the
+    adjusted width produced 12/300 false 'TREATMENT BETTER/WORSE' verdicts at
+    zero true effect. Re-centring takes it to 0/300."""
+    import random
+    for rep in range(12):
+        rng = random.Random(1000 + rep)
+        trajs = []
+        for arm in (ex.CONTROL, ex.TREATMENT):
+            for _ in range(150):
+                cov = rng.random()
+                trajs.append(_traj_cov(
+                    arm, "failed" if rng.random() < cov else "passed", cov))
+        c = next(x for x in ex.compare_arms(
+            ex.summarize_trajectories(trajs)["risk_steer"])
+            if x.metric == "failure_rate")
+        assert not c.verdict.startswith("TREATMENT"), (rep, c.verdict, c.diff)
+
+
+def test_nan_never_yields_a_zero_width_interval():
+    assert ex.asymp_cs_radius([0.5, float("nan"), 0.5] * 20) is None
+    assert ex.asymp_cs_radius([0.5, float("inf")] * 20) is None
+
+
+def test_cuped_adjust_refuses_mismatched_lengths():
+    assert ex.cuped_adjust([1.0, 2.0, 3.0], [0.5], theta=2.0, cov_mean=0.0) == \
+        [1.0, 2.0, 3.0]
+
+
+def test_a_bool_is_not_a_covariate():
+    assert ex._covariate_of(SimpleNamespace(
+        extra={"router_confidence": True})) is None
+
+
 def test_covariate_is_read_from_the_trajectory_stamp():
     assert ex._covariate_of(_traj_cov("control", "passed", 0.42)) == 0.42
     assert ex._covariate_of(_traj("control")) is None
     assert ex._covariate_of(SimpleNamespace(extra={"router_confidence": "nope"})) is None
     assert ex._covariate_of(SimpleNamespace(extra=None)) is None
+
+
+# ── review round 5: fixes-of-fixes ────────────────────────────────────
+
+def test_mark_trigger_cannot_evict_a_live_turn(tmp_path, monkeypatch):
+    """`_stash_arms` was changed to ring only ENROLLED requests, but
+    `mark_trigger` still created an entry for ANY req_id — and sub-agents run
+    the same turn loop on a shallow-copied (shared-ring) context, so 40
+    sub-turns could evict a user turn whose streamed drain had not yet written
+    its trajectory. It would then be recorded with no arm."""
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    ctx = _ctx(tmp_path)
+    ex.enroll_request(ctx, "user-1")
+    for i in range(40):
+        ex.mark_trigger(ctx, f"sub-{i}", "risk_steer_fired", True)
+    assert ex.assignments_for_request(ctx, "user-1") != {}
+    # ...and an unenrolled id never becomes a phantom ring entry.
+    assert ex.trigger_flags(ctx, "sub-0") == {}
+
+
+def test_marker_read_rejects_a_non_list():
+    """A marker containing a bare JSON string iterated into single CHARACTERS
+    and wrote them back as junk keys."""
+    import json as _json
+    from types import SimpleNamespace
+    from ghost_agent.core.autonomous_activity import ActivityLog
+
+    # Exercised through announce_new_verdicts' loader via a corrupt file.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "memory").mkdir()
+        (root / "experiments_announced.json").write_text(_json.dumps("abc"))
+        ctx = SimpleNamespace(memory_dir=root / "memory",
+                              activity_log=ActivityLog(root / "a.jsonl"))
+        # No trajectories → nothing to announce, but the loader must not choke
+        # or write junk back.
+        assert ex.announce_new_verdicts(ctx) == []
+
+
+def test_unwritable_marker_bounds_announcements_to_once_per_boot(tmp_path):
+    """An unwritable marker (a root-owned file under a UserName launchd
+    daemon — a documented failure mode here) used to mean FOUR notify-severity
+    pushes every hour, forever."""
+    from types import SimpleNamespace
+    from ghost_agent.core.autonomous_activity import ActivityLog
+    from ghost_agent.distill.collector import TrajectoryCollector
+    from ghost_agent.distill.schema import Trajectory
+
+    ex._ANNOUNCED_THIS_PROCESS.clear()
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    collector = TrajectoryCollector(root=tmp_path / "trajectories",
+                                    session_id="s")
+    for _ in range(200):
+        collector.append(Trajectory(user_request="q", final_response="a",
+                                    task_kind="user_request", outcome="failed",
+                                    n_steps=3,
+                                    extra={ex.EXTRA_KEY: {"risk_steer": "control"}}))
+        collector.append(Trajectory(user_request="q", final_response="a",
+                                    task_kind="user_request", outcome="passed",
+                                    n_steps=3,
+                                    extra={ex.EXTRA_KEY: {"risk_steer": "treatment"}}))
+    pushed = []
+    ctx = SimpleNamespace(
+        memory_dir=memory_dir,
+        activity_log=ActivityLog(tmp_path / "a.jsonl",
+                                 on_notify=lambda r: pushed.append(r.summary)))
+    # Make the marker unwritable by putting a DIRECTORY at its path.
+    (tmp_path / "experiments_announced.json").mkdir()
+
+    first = ex.announce_new_verdicts(ctx)
+    assert first and pushed
+    n_first = len(pushed)
+    for _ in range(5):                      # five more ticks
+        assert ex.announce_new_verdicts(ctx) == []
+    assert len(pushed) == n_first           # not once per tick
+    ex._ANNOUNCED_THIS_PROCESS.clear()
+
+
+def test_confounded_metrics_are_never_pushed():
+    """`n_steps`/`duration_s` move BY CONSTRUCTION for a treatment that ends
+    turns earlier — the first tick measured 4 pushes, 2 of them
+    'TREATMENT BETTER — ⚠ mechanism, not outcome'."""
+    summary = ex.summarize_trajectories(
+        [_traj("control", steps=9, dur=9.0) for _ in range(200)]
+        + [_traj("treatment", steps=2, dur=2.0) for _ in range(200)])
+    lines = [line for _, line in ex.pending_announcements(summary, {})]
+    assert not any("n_steps" in line or "duration_s" in line for line in lines)
+
+
+def test_no_verdict_is_pushed_when_nothing_can_deliver_it(tmp_path):
+    """Marking a verdict announced while no ledger exists loses it for good."""
+    from types import SimpleNamespace
+    from ghost_agent.distill.collector import TrajectoryCollector
+    from ghost_agent.distill.schema import Trajectory
+
+    ex._ANNOUNCED_THIS_PROCESS.clear()
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    collector = TrajectoryCollector(root=tmp_path / "trajectories",
+                                    session_id="s")
+    for _ in range(200):
+        collector.append(Trajectory(user_request="q", final_response="a",
+                                    task_kind="user_request", outcome="failed",
+                                    n_steps=3,
+                                    extra={ex.EXTRA_KEY: {"risk_steer": "control"}}))
+        collector.append(Trajectory(user_request="q", final_response="a",
+                                    task_kind="user_request", outcome="passed",
+                                    n_steps=3,
+                                    extra={ex.EXTRA_KEY: {"risk_steer": "treatment"}}))
+    ctx = SimpleNamespace(memory_dir=memory_dir, activity_log=None)
+    assert ex.announce_new_verdicts(ctx) == []
+    assert not (memory_dir.parent / "experiments_announced.json").exists()
+    ex._ANNOUNCED_THIS_PROCESS.clear()
+
+
+def test_bounded_data_scale_has_no_discontinuity():
+    """One out-of-range value used to flip the scale rule and make the
+    interval NARROWER than for the same data fully inside [0,1]."""
+    inside = ex.asymp_cs_radius([0.3] * 40)
+    edge = ex.asymp_cs_radius([-0.001] + [0.3] * 39)
+    assert edge >= inside * 0.99

@@ -331,7 +331,9 @@ def shape_triage_score(traj) -> float:
     calibration sample exists for the turn. Higher = worse."""
     try:
         steps = int(getattr(traj, "n_steps", 0) or 0)
-    except Exception:  # noqa: BLE001 — any hostile attribute, not just Type/Value
+    except Exception as e:  # noqa: BLE001 — any hostile attribute
+        logger.debug("triage: n_steps unreadable (%s) — treated as shallow",
+                     type(e).__name__)
         steps = 0
     depth = depth_failure_prior(max(1, steps))
     struggle = 0.0
@@ -451,7 +453,13 @@ def rank_for_triage(trajectories: Iterable[Any], *,
             try:
                 score = (_clamp01(calibrated[str(getattr(t, "session_id", "") or "")])
                          if use_calibrated else shape_triage_score(t))
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                # Sorts LAST in a worst-first queue, which is the right place
+                # for something that could not be assessed — but say so, or an
+                # unparseable record silently reads as the safest turn in the
+                # corpus.
+                logger.debug("triage: record %r unscoreable (%s: %s) — ranked "
+                             "last", getattr(t, "id", "?"), type(e).__name__, e)
                 score = 0.0
             scored.append((score, i, t))
         # Sort on (-score, original index): explicit, so stability does not

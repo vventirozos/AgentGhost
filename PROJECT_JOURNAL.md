@@ -1889,7 +1889,114 @@ and a one-shot verdict announcement into the autonomous-activity ledger at `noti
 actionable. Persisted marker keys make it fire at most once per (experiment, scope, metric,
 direction).
 
-**Suite after both rounds: 10718 passed / 13 skipped.**
+**═══ ROUND 3: THE MERGE GATE IS REMOVED, NOT FIXED (same day) ═══**
+
+A fifth review re-derived the merge gate's claimed numbers with its own generator and they **did
+not reproduce**. Worse: **both error rates move the WRONG way as the corpus grows** —
+false positives 0.0% → 11.7% → 50.1% (n=400 → 3000 → 6000) while power fell 74.7% → 3.9% → 0.0%.
+Three independent causes, each worth keeping as a lesson:
+
+1. **The marginal null was BIASED, not noisy.** `obs/exp` for the hottest pair converged to a
+   constant **1.20** under skewed tool usage instead of decaying to 1.0, because
+   `P(pick=b | truth=a) = q_b/(1−q_a)` makes the miss-table column marginal `q_b·K` with K>1 —
+   so the renormalisation was wrong, and wrongest for the busiest tools, i.e. exactly the hot
+   pair. A constant multiplicative bias makes a Poisson p decay exponentially in n, so the gate
+   eventually fires on pure noise with certainty.
+2. **One condition ACCEPTED a null.** `p_sym >= alpha` requires FAILING TO REJECT exact 50/50 —
+   an acceptance region that shrinks to nothing as n grows, so any genuinely two-way pair is
+   rejected once there is enough data to see it. Measured on a fixed injected defect: c3 pass
+   rate 95.4% at n=57 → 0.0% at n=10000.
+3. **The Poisson tail underflowed to a constant 1.0** above λ≈745 (`math.exp(-lam)` → 0.0),
+   switching the route off in silence at ~17k rows — and just BELOW the cliff it returned 0.0,
+   i.e. falsely maximally significant.
+
+**DECISION: the statistical adjudication of two-way pairs is REMOVED, not repaired.** Five gates,
+five refutations by measurement. `poisson_excess_p`, `expected_pair_misses`, the dominance route
+and the symmetry condition are deleted. A bidirectional pair is now reported with its raw shape
+(both directions, share of all confusion) under `evidence="observed"`, with no tier that could be
+mistaken for a mandate. The one-way `describe` test SURVIVES because it REJECTS a null rather than
+accepting one — valid inference, and the only part of the design that held up across three reviews.
+**This is a deliberate scope reduction.** The instrument's job is to surface candidates for a human
+decision; adjudicating them was an addition that never earned its place, and dead-or-biased
+statistical machinery is worse than none.
+
+Same round, four more real defects — three of them in code from the previous round:
+- **`mark_trigger` re-opened the ring eviction `_stash_arms` had just closed.** Sub-agents run the
+  same turn loop on a shallow-copied (shared-ring) context, so 40 sub-turns evicted a live user
+  turn whose streamed drain had not yet written its trajectory — recorded with no arm, the exact
+  loss the ring exists to prevent.
+- **An unwritable marker was a push-notification storm**: four notify-severity records per tick,
+  **every hour, forever** (realistic trigger: a root-owned file under a UserName launchd daemon —
+  this project already has a memory note for that failure). Now bounded to once per boot with a
+  loud warning naming the path.
+- **Mechanism-confounded metrics were being PUSHED as wins.** `n_steps`/`duration_s` move by
+  construction for a stop-early treatment; the first tick measured 4 pushes, 2 of them
+  "TREATMENT BETTER — ⚠ mechanism, not outcome". Confounded metrics no longer interrupt (they stay
+  in the report).
+- A marker containing a bare JSON string iterated into single CHARACTERS and wrote them back; a
+  verdict could be marked announced with no ledger to deliver it; the learning-health corpus walk
+  was left on the event loop while its sibling was deliberately threaded; and an unscoreable
+  trajectory ranked as the SAFEST item in a worst-first queue without saying so.
+
+**Two docstring claims failed their spot-check and are corrected in place:** the noise
+hottest-pair share ("peaked at 0.343" — measured max 0.625 at n=57) and the savings overstatement
+("1.75–3.4×" — measured 1.34× corpus-total after the cursor fix, median per-candidate ratio 1.00).
+The per-sequence cursor fix itself was independently re-verified and reproduced exactly.
+
+**═══ ROUNDS 4-5: the CUPED centring defect, and a transposition that would
+have sent an operator at the wrong tool ═══**
+
+Two more reviews, on the §4I router work and on the ontology removal. Both found
+CRITICAL/MAJOR defects in code written the same day.
+
+**CUPED narrowed the interval but never re-centred the estimate** (`compare_arms`).
+`cuped_adjust` produces a series whose mean is `Ȳ_arm − θ(X̄_arm − X̄_pool)`, and that
+RE-CENTRING IS THE VARIANCE REDUCTION — it removes the realised covariate imbalance from
+the estimator. The code adopted the shrunken width and threw the correction away, leaving
+the interval too narrow by `1/√(1−ρ²)` around an estimator whose variability had not
+changed, while `variance_reduction` advertised the shortfall as a win. Measured with ZERO
+true effect, monitored 30→300/arm: **12/300 false "TREATMENT BETTER/WORSE" verdicts (4.0%
+on ONE metric, against a 5% budget for all three)**, growing with ρ² — i.e. dormant
+exactly until Phase 2 says the covariate is worth having. Re-centring takes it to
+**0/300**, re-verified here. The test asserting "the MEANS are untouched" had LOCKED THE
+BUG IN, and the docstring plus `docs/core/experiments.html` both stated it as a safety
+property; all three corrected.
+Also from that round: the `min(raw, adjusted)` adoption rule really is the
+better-of-two-draws effect (consistently signed, 25:2 across paired trials) but worth only
+0.05–0.13pp — so it was replaced with unconditional adoption, which is simpler and honest.
+In-sample θ turned out NOT to be a problem (coverage indistinguishable from baseline with
+a useless or moderate covariate), which is the opposite of what I expected going in.
+
+**The backtest's DISCRIMINATES gate had no uncertainty control.** A bare spread threshold
+over point estimates said "DISCRIMINATES" on **perfectly FLAT ground truth 88.0% of the
+time** at the default bucket size (99.8% when re-run as the corpus grows) — and the FLAT
+branch is what stops §4I. It already computed the per-bucket confidence sequence and
+ignored it. Now the best and worst buckets' intervals must be DISJOINT (Bonferroni across
+buckets): measured **88–90% → 0.0%** across every cell, with a real separation still
+detected.
+
+**The ontology's merge detail transposed its two direction counts.** `tools` is sorted for
+stable identity while `count` belongs to `truth→picked`, so whenever `truth > picked`
+lexicographically the numbers printed against the wrong names — "browser lost 25 times"
+when in fact `file_system` was right and `browser` stole it. An operator would rework the
+tool that was CORRECT, and `--json` was equally blind. Each count now names its own
+direction and the verdict carries `directions`.
+Same round: verdict order depended on replay-row arrival order (61.5% of matrices reordered
+under a shuffle — with a `top` cutoff the same corpus hid a different finding each run);
+the "N verdicts above" sentence counted rows the render never showed; and
+`OntologyVerdict.evidence` defaulted to `"significant"`, so any future call site omitting it
+would silently claim a rejected null. Four docstring claims were also measured and found
+overstated, and are corrected in place.
+
+**Also fixed this round:** `mark_trigger` re-opened the ring eviction `_stash_arms` had just
+closed (sub-agents share the ring through `copy.copy`); an unwritable marker meant four
+pushes per tick FOREVER, now once per boot with a warning; mechanism-confounded metrics were
+being PUSHED as wins; a NaN produced a zero-width interval; `cuped_adjust`'s `zip` truncated
+silently; CUPED's sample gate was pooled rather than per-arm; and `router_confidence` is
+NOT strictly pre-treatment across a conversation (the router sees the previous — possibly
+treated — assistant message), which is now documented rather than claimed impossible.
+
+**Suite after all rounds: 10718 passed / 13 skipped.**
 
 **What to do next:** let it collect. No verdict is emitted below 30 turns/arm, and the triggered
 block needs ~30 triggered turns per arm (~7.6% of traffic, so a few weeks). Read it with

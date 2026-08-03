@@ -46,9 +46,9 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.j
   <table>
     <thead><tr><th>Verdict</th><th>Pattern</th><th>What it means</th></tr></thead>
     <tbody>
-      <tr><td><code>merge_or_redraw</code></td><td>A→B and B→A both frequent</td><td>The two tools answer the same question for the model. Rewording either one MOVES the error rather than removing it — redraw the boundary or merge.</td></tr>
-      <tr><td colspan="3"><strong>Every verdict is tiered by evidence</strong> — <code>significant</code> / <code>suggestive</code> / <code>insufficient</code>. A merge directive needs FOUR conditions: enough misses for power, the quieter direction attested, symmetry not rejected (exact binomial), AND the pair hotter than its tools' usage share already predicts (Poisson excess vs a marginal null, Bonferroni'd across pairs) — or, covering that null's blind spot, the pair being ≥40% of ALL confusion. Measured against a pure-noise corpus: <strong>0% spurious merges up to n=1000, 2% at n=3000</strong>, versus 92.8% with a count threshold alone and 98.5% with a bare <code>observed &gt; expected</code> comparison. Power on an injected real pattern: 64–97%.</td></tr>
-      <tr><td><code>describe</code></td><td>A→B only</td><td>A genuine one-way over/under-selection. This is what Phase 2b's description work actually targets: say what B is NOT for, or what A uniquely owns.</td></tr>
+      <tr><td><code>merge_or_redraw</code><br><span class="footnote">evidence: <code>observed</code></span></td><td>A→B and B→A both frequent</td><td><strong>A question raised, not a conclusion.</strong> The two tools may be answering one question for the model — in which case rewording either MOVES the error rather than removing it. Reported with each direction's own count and the pair's share of all confusion; deliberately never adjudicated (see below). Below 4 total misses the pair is dropped from the proposal list — at the default that is the 2-vs-1 shape, whose symmetry p is exactly 1.000 — and survives in the raw pair data (<code>--json</code>) and the per-tool "lost to:" line.</td></tr>
+      <tr><td colspan="3"><strong>Two-way pairs are DESCRIBED, never adjudicated</strong> (<code>evidence="observed"</code>). See "Why there is no merge verdict" below — five statistical gates were built for this and every one was refuted by simulation. One-way pairs ARE adjudicated, by an exact binomial that <em>rejects</em> "this split is 50/50"; that test rejects a null rather than accepting one, and is the only part of the original design that survived three review rounds.</td></tr>
+      <tr><td><code>describe</code></td><td>A→B only</td><td>A one-way over/under-selection — what Phase 2b's description work actually targets: say what B is NOT for, or what A uniquely owns. <code>significant</code> when the exact binomial rejects a 50/50 split, <code>suggestive</code> when it does not (emitted, but explicitly unsupported).</td></tr>
       <tr><td><code>missing_affordance</code></td><td>no tool called at all</td><td>The request had no affordance the model recognised — a missing tool, not a confused one.</td></tr>
     </tbody>
   </table>
@@ -58,6 +58,34 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.j
     <code>fidelity(all rows)</code> is what the Phase 2b runner prints, since a GEPA metric must
     not reward a candidate for skipping hard fixtures. On a 57-row dump with 5 unreplayable they
     differ by ~7 points — the first version claimed they were the same number.
+  </p>
+
+  <h2>Why there is no merge verdict</h2>
+  <p>
+    The obvious feature — "tell me when two tools should be merged" — was attempted five times.
+    Each attempt was killed by measurement, not by argument:
+  </p>
+  <table>
+    <thead><tr><th>#</th><th>Gate</th><th>Measured failure</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>count threshold alone</td><td>92.8% spurious directives at n=400</td></tr>
+      <tr><td>2</td><td><code>observed &gt; expected</code></td><td>98.5% — a comparison is not a test</td></tr>
+      <tr><td>3</td><td>Poisson excess, naive marginal null</td><td>42.8% at n=1000 — the null ignored that a miss can never land on the TRUE tool</td></tr>
+      <tr><td>4</td><td>leave-one-out marginals</td><td>90% false positives — over-corrected</td></tr>
+      <tr><td>5</td><td>marginal null + symmetry + dominance</td><td><strong>both error rates moved the wrong way with corpus size</strong>: FP 0.0% → 11.7% → 50.1% (n=400 → 3000 → 6000) while power fell 74.7% → 3.9% → 0.0%</td></tr>
+    </tbody>
+  </table>
+  <p>Attempt 5 failed for three independent reasons, each worth remembering:</p>
+  <ul>
+    <li>the marginal null was <strong>biased, not noisy</strong> — <code>obs/exp</code> converged to a constant 1.20 under skewed tool usage instead of decaying to 1.0, so the Poisson p decayed exponentially in n and eventually fired on noise with certainty;</li>
+    <li>one condition <strong>ACCEPTED a null</strong> (<code>p_sym ≥ α</code>) — an acceptance region that shrinks to nothing as n grows, so any genuinely two-way pair is rejected once there is enough data to see it;</li>
+    <li>the Poisson tail <strong>underflowed to a constant 1.0</strong> above λ≈745, switching the route off in silence at ~17k rows.</li>
+  </ul>
+  <p>
+    The instrument's job is to SURFACE candidates for a human decision, not to authorise "merge two
+    tools" on its own. So a two-way pair is now reported with its raw shape — both directions, share
+    of all confusion — and no tier that could be mistaken for a mandate. That is a deliberate scope
+    reduction, and it keeps the part that was actually useful.
   </p>
 
   <h2>2. Sequences — what should have been ONE call?</h2>
@@ -109,8 +137,11 @@ file_system ×2 → execute occ=61  turns=33   steps=122  cohesion=0.34
     windows belonging to another: that understated the corpus total by <strong>49.6%</strong> and
     did so DIRECTIONALLY — same-tool runs claim the cursor first, starving exactly the cross-tool
     sequences a macro proposal is for (<code>file_system → execute</code> read 45 against a true
-    110). The cursor is now per-sequence. The three <code>file_system</code> rows still describe
-    the same underlying calls, so they must not be summed.
+    110). The cursor is now per-sequence — independently re-verified against the live corpus, which
+    reproduced both numbers exactly. With it fixed, the raw window count overstates the corpus total
+    by <strong>1.34×</strong> (median per-candidate ratio 1.00), not the 1.75–3.4× an earlier note
+    claimed against the broken version. The three <code>file_system</code> rows still describe the
+    same underlying calls, so they must not be summed.
   </p>
 
   <h2>Scope: this proposes, it never applies</h2>

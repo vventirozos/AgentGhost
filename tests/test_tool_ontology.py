@@ -55,39 +55,50 @@ def _noise_rows(n=200):
     return rows
 
 
-def test_bidirectional_confusion_is_a_boundary_verdict():
-    """A pair that IS most of the confusion earns the merge directive.
-
-    This is the marginal null's blind spot, covered by a second route: such a
-    pair cannot show statistical "excess" because it *is* the marginals.
-    Measured on a pure-noise corpus the hottest pair never exceeded 34% of all
-    misses, so the 40% dominance bar is above anything noise produces.
-    """
+def test_two_way_pairs_are_described_never_adjudicated():
+    """Five statistical gates for this were each refuted by simulation — the
+    last with BOTH error rates degrading as the corpus grew (FP 0%→50%, power
+    75%→0%). The pair is surfaced with its raw shape and no verdict tier that
+    could be mistaken for a mandate."""
     rows = _noise_rows() + _rows(*([("browser", "file_system", "")] * 25
                                    + [("file_system", "browser", "")] * 24))
     rep = ont.analyze_confusion(rows)
     v = next(v for v in rep.verdicts if v.kind == "merge_or_redraw"
              and set(v.tools) == {"browser", "file_system"})
     assert v.count == 49
-    assert v.evidence == "significant"
+    assert v.evidence == "observed"          # never "significant"
+    assert "not adjudicated here" in v.detail
     assert "of all confusion" in v.detail
-    assert "redraw the boundary or merge" in v.detail
-    # ...and it is reported ONCE, not once per direction.
+    # Each count must name ITS OWN direction — printing them against the
+    # sorted pair transposed them whenever truth > picked lexicographically,
+    # which sends an operator to rework the tool that was RIGHT.
+    assert v.directions == {"browser->file_system": 25,
+                            "file_system->browser": 24}
+    assert "browser -> file_system 25x" in v.detail
+    assert "file_system -> browser 24x" in v.detail
+    # ...reported ONCE, not once per direction.
     assert sum(1 for x in rep.verdicts if x.kind == "merge_or_redraw") == 1
 
 
-def test_thin_bidirectional_pair_is_watch_not_act():
-    """3-vs-2 has exact symmetry p=1.000 — indistinguishable from one-way
-    noise. Simulated at the real corpus size, pure noise produces a spurious
-    merge directive 39.6% of the time, so this tier must never read as one."""
-    rows = _rows(*([("browser", "file_system", "")] * 3
-                   + [("file_system", "browser", "")] * 2))
+def test_no_corpus_size_can_make_a_two_way_pair_significant():
+    """The regression that matters: the old gate's false-positive rate climbed
+    to 50% at n=6000. No amount of data may promote a two-way pair now."""
+    for scale in (1, 10, 50):
+        rows = _noise_rows(200 * scale) + _rows(
+            *([("browser", "file_system", "")] * (25 * scale)
+              + [("file_system", "browser", "")] * (24 * scale)))
+        assert not [v for v in ont.analyze_confusion(rows).verdicts
+                    if v.kind == "merge_or_redraw" and v.evidence == "significant"]
+
+
+def test_tiny_two_way_pairs_stay_out_of_the_verdict_list():
+    """A 2-vs-1 pair (symmetry p=1.000) is raw-data material, not a proposal —
+    but the data must survive where a reader can still find it."""
+    rows = _noise_rows() + _rows(("a_tool", "b_tool", ""), ("a_tool", "b_tool", ""),
+                                 ("b_tool", "a_tool", ""))
     rep = ont.analyze_confusion(rows)
-    v = next(v for v in rep.verdicts if v.kind == "merge_or_redraw")
-    assert v.evidence == "insufficient"
-    assert "WATCH, do not act" in v.detail
-    assert "redraw the boundary or merge them" not in v.detail
-    assert rep.n_inconclusive_pairs == 1
+    assert not [v for v in rep.verdicts if set(v.tools) == {"a_tool", "b_tool"}]
+    assert any(pp.truth == "a_tool" for pp in rep.pairs)   # still in raw data
 
 
 def test_unidirectional_confusion_is_a_description_verdict():
@@ -112,12 +123,13 @@ def test_symmetry_p_matches_the_exact_binomial():
     assert ont.binomial_symmetry_p(0, 0) == 1.0
 
 
-def test_supported_verdicts_sort_above_unsupported():
+def test_adjudicated_verdicts_sort_above_merely_observed():
     rows = _rows(*([("a", "b", "")] * 6                    # significant one-way
-                   + [("c", "d", "")] * 2 + [("d", "c", "")] * 1))  # thin two-way
+                   + [("c", "d", "")] * 3 + [("d", "c", "")] * 3))  # two-way
     rep = ont.analyze_confusion(rows)
     assert rep.verdicts[0].evidence == "significant"
-    assert rep.verdicts[-1].evidence == "insufficient"
+    assert {v.evidence for v in rep.verdicts} <= {"significant", "observed",
+                                                  "suggestive", "counted"}
 
 
 def test_no_tool_stalls_are_their_own_class():
@@ -422,55 +434,56 @@ def test_unrelated_neighbour_does_not_change_a_sequence_count():
     assert a.collapsible == b.collapsible
 
 
-def test_merge_verdict_needs_more_than_a_count_threshold():
-    """`p_sym` was computed, printed and never read on this branch — at n=400
-    a pure-noise pair earned a "merge these two tools" directive 92.8% of the
-    time. A pair no hotter than its tools' usage share already predicts must
-    stay in the WATCH tier however many misses it has."""
-    rows = _noise_rows() + _rows(*([("browser", "file_system", "")] * 5
-                                   + [("file_system", "browser", "")] * 4))
-    v = next(v for v in ont.analyze_confusion(rows).verdicts
-             if v.kind == "merge_or_redraw"
-             and set(v.tools) == {"browser", "file_system"})
-    assert v.evidence == "insufficient"
-    assert "WATCH, do not act" in v.detail
-    assert "excess p=" in v.detail
 
 
-def test_noise_corpus_produces_no_significant_merge_directive():
-    """The whole point. Misses spread across MANY pairs with none dominant
-    contain no boundary problem. Measured spurious rate under this shape:
-    0% up to n=1000, 2% at n=3000 — against 92.8% before the excess test and
-    98.5% with a bare `observed > expected` comparison.
-    """
-    tools = ["file_system", "browser", "execute", "manage_projects",
-             "web_search", "introspect", "vision_analysis", "system_utility"]
-    rows = [{"truth": t, "picked": t, "err": ""}
-            for i in range(600) for t in [tools[i % len(tools)]]]
-    # 168 misses spread over every ordered pair — no pair above ~4% of the
-    # table, and none symmetric beyond chance.
-    for rep_i in range(3):
-        for i, a in enumerate(tools):
-            for j, b in enumerate(tools):
-                if a != b:
-                    rows.append({"truth": a, "picked": b, "err": ""})
-    verdicts = ont.analyze_confusion(rows).verdicts
-    assert not [v for v in verdicts
-                if v.kind == "merge_or_redraw" and v.evidence == "significant"]
+
+def test_direction_counts_are_not_transposed_either_way():
+    """The MAJOR defect: `tools` is sorted for stable identity while `count`
+    belongs to truth->picked, so the two orderings are independent. Both
+    matrices below must render distinguishably."""
+    a = ont.analyze_confusion(_noise_rows() + _rows(
+        *([("file_system", "browser", "")] * 25
+          + [("browser", "file_system", "")] * 24)))
+    b = ont.analyze_confusion(_noise_rows() + _rows(
+        *([("browser", "file_system", "")] * 25
+          + [("file_system", "browser", "")] * 24)))
+    va = next(v for v in a.verdicts if v.kind == "merge_or_redraw")
+    vb = next(v for v in b.verdicts if v.kind == "merge_or_redraw")
+    assert va.directions == {"file_system->browser": 25, "browser->file_system": 24}
+    assert vb.directions == {"browser->file_system": 25, "file_system->browser": 24}
+    assert va.detail != vb.detail
 
 
-def test_poisson_excess_p_is_a_real_test_not_a_comparison():
-    """`observed > expected` is true about half the time by construction — it
-    suppressed nothing (98.5% spurious at n=400)."""
-    assert ont.poisson_excess_p(10, 10.0) > 0.3      # right at the mean
-    assert ont.poisson_excess_p(30, 10.0) < 1e-6     # a real excess
-    assert ont.poisson_excess_p(0, 5.0) == 1.0
-    assert ont.poisson_excess_p(5, 0.0) == 0.0
+def test_verdict_order_is_independent_of_row_arrival_order():
+    """Equal-magnitude verdicts kept Counter insertion order — i.e. ROW order —
+    so with a `top` cutoff the same corpus hid a different finding per run."""
+    import random
+    base = _noise_rows()
+    for i in range(8):
+        base += _rows(*([(f"t{i}a", f"t{i}b", "")] * 4))
+    orders = []
+    for seed in range(6):
+        rows = list(base)
+        random.Random(seed).shuffle(rows)
+        orders.append([tuple(v.tools) for v in ont.analyze_confusion(rows).verdicts])
+    assert len({tuple(o) for o in orders}) == 1
 
 
-def test_expected_pair_misses_excludes_the_true_tool():
-    from collections import Counter
-    counts = Counter({("a", "b"): 10, ("c", "b"): 10, ("b", "a"): 1})
-    exp = ont.expected_pair_misses(counts, "a", "b")
-    assert exp > 5.0
-    assert ont.expected_pair_misses(Counter(), "a", "b") == 0.0
+def test_evidence_defaults_to_the_weakest_claim():
+    """A verdict built without an explicit tier must not assert that a null
+    was rejected."""
+    assert ont.OntologyVerdict(kind="x", tools=("a",), count=1,
+                               detail="").evidence == "observed"
+
+
+def test_inconclusive_sentence_counts_only_what_is_shown():
+    rows = _noise_rows()
+    for i in range(14):
+        rows += _rows(*([(f"p{i}a", f"p{i}b", "")] * 3
+                        + [(f"p{i}b", f"p{i}a", "")] * 3))
+    rep = ont.analyze_confusion(rows)
+    out = ont.render_confusion(rep, top=5)
+    shown = sum(1 for v in rep.verdicts[:5]
+                if v.evidence in ("observed", "suggestive"))
+    assert f"({shown} PAIR verdict(s) above" in out
+    assert "further verdict(s) not shown" in out

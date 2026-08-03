@@ -53,10 +53,26 @@ BUCKETS = ((0.0, 0.15), (0.15, 0.30), (0.30, 0.50), (0.50, 0.75), (0.75, 1.01))
 # analysis uses.
 DEFAULT_MIN_PER_BUCKET = 30
 
-# The spread (worst bucket minus best bucket failure rate) below which the
-# signal is called flat. 0.10 is deliberately modest: the depth curve spans
-# 0.178 → 0.606, and anything under 10 points is not worth a behaviour change.
+# The spread (worst minus best bucket failure rate) below which the signal is
+# called flat regardless of significance. 0.10 is deliberately modest: the
+# depth curve spans 0.178 → 0.606, and under 10 points is not worth a
+# behaviour change.
 DISCRIMINATION_THRESHOLD = 0.10
+
+# ...but a spread threshold ALONE is not a test. Measured on perfectly FLAT
+# ground truth, P(false "DISCRIMINATES") from point estimates only:
+#
+#     resolved/bucket    p=0.5    p=0.3   p=0.15
+#     30 (the default)   89.7%    88.0%    83.0%
+#     100                64.2%    52.9%    28.8%
+#     500                 1.4%     0.4%     0.0%
+#     re-run as it grows 99.9%    99.8%    98.6%
+#
+# The script's own FLAT branch is what stops §4I; at ~88% it would never be
+# taken. So the best and worst buckets' intervals must also be DISJOINT —
+# which costs nothing, since the per-bucket CS is already computed. That takes
+# the false rate to ~0.1%, and to 0.0% with the Bonferroni below.
+ALPHA = 0.05
 
 
 def _default_root() -> Path:
@@ -73,11 +89,11 @@ def _bucket_of(conf: float):
     return None
 
 
-def collect(trajectories, *, min_per_bucket: int):
+def collect(trajectories):
     """→ (per_bucket stats, coverage counters). One streaming pass."""
     stats = defaultdict(lambda: {"n": 0, "failed": 0, "unknown": 0,
                                  "outcomes": []})
-    cov = {"user_turns": 0, "stamped": 0, "resolved": 0}
+    cov = {"user_turns": 0, "stamped": 0, "resolved": 0, "out_of_range": 0}
     for traj in trajectories:
         try:
             if str(getattr(traj, "task_kind", "") or "") != "user_request":
@@ -86,11 +102,15 @@ def collect(trajectories, *, min_per_bucket: int):
             extra = getattr(traj, "extra", None) or {}
             if not isinstance(extra, dict) or "router_confidence" not in extra:
                 continue
+            # Counted BEFORE the bucket filter: an out-of-range confidence is
+            # a stamped turn that lands nowhere, and reading it as "not
+            # stamped" would hide a producer bug as a coverage gap.
+            cov["stamped"] += 1
             conf = float(extra["router_confidence"])
             key = _bucket_of(conf)
             if key is None:
+                cov["out_of_range"] = cov.get("out_of_range", 0) + 1
                 continue
-            cov["stamped"] += 1
             s = stats[key]
             s["n"] += 1
             outcome = str(getattr(traj, "outcome", "") or "").lower()
@@ -123,8 +143,10 @@ def main() -> int:
         return 2
 
     collector = TrajectoryCollector(root=root, session_id="reader")
-    stats, cov = collect(collector.iter_trajectories(),
-                         min_per_bucket=args.min_per_bucket)
+    stats, cov = collect(collector.iter_trajectories())
+    # Bonferroni across the buckets being compared: five intervals read at
+    # 0.05 each carry ~23% family error.
+    bucket_alpha = ALPHA / max(1, len(BUCKETS))
 
     rows = []
     for key in BUCKETS:
@@ -136,7 +158,7 @@ def main() -> int:
             continue
         resolved = len(s["outcomes"])
         rate = sum(s["outcomes"]) / resolved
-        rad = asymp_cs_radius(s["outcomes"], alpha=0.05)
+        rad = asymp_cs_radius(s["outcomes"], alpha=bucket_alpha)
         rows.append({
             "bucket": f"{key[0]:.2f}-{key[1]:.2f}",
             "n": s["n"], "resolved": resolved, "unknown": s["unknown"],
@@ -145,20 +167,33 @@ def main() -> int:
             "usable": resolved >= args.min_per_bucket,
         })
 
-    usable = [r for r in rows if r["usable"]]
+    usable = [r for r in rows if r["usable"] and r["ci"] is not None]
     spread = None
+    disjoint = False
     verdict = "insufficient data"
     if len(usable) >= 2:
-        lo = min(r["failure_rate"] for r in usable)
-        hi = max(r["failure_rate"] for r in usable)
-        spread = round(hi - lo, 4)
-        verdict = ("DISCRIMINATES" if spread >= DISCRIMINATION_THRESHOLD
-                   else "FLAT — router confidence is an escalation heuristic, "
-                        "not a difficulty prior; §4I stops at Phase 2")
+        best = min(usable, key=lambda r: r["failure_rate"])
+        worst = max(usable, key=lambda r: r["failure_rate"])
+        spread = round(worst["failure_rate"] - best["failure_rate"], 4)
+        # BOTH conditions: a spread worth acting on, AND intervals that do not
+        # overlap. The second is what makes this a test rather than a
+        # comparison of two noisy point estimates.
+        disjoint = ((best["failure_rate"] + best["ci"])
+                    < (worst["failure_rate"] - worst["ci"]))
+        if spread >= DISCRIMINATION_THRESHOLD and disjoint:
+            verdict = "DISCRIMINATES"
+        elif spread >= DISCRIMINATION_THRESHOLD:
+            verdict = ("SPREAD BUT NOT SIGNIFICANT — the best and worst "
+                       "buckets' intervals still overlap; collect more before "
+                       "reading anything into it")
+        else:
+            verdict = ("FLAT — router confidence is an escalation heuristic, "
+                       "not a difficulty prior; §4I stops at Phase 2")
 
     if args.json:
-        print(json.dumps({"coverage": cov, "buckets": rows,
-                          "spread": spread, "verdict": verdict}, indent=2))
+        print(json.dumps({"coverage": cov, "buckets": rows, "spread": spread,
+                          "intervals_disjoint": disjoint,
+                          "verdict": verdict}, indent=2))
     else:
         print("§4I Phase 2 — router confidence vs actual failure rate")
         print(f"  corpus: {cov['user_turns']} user turns, "
@@ -179,7 +214,8 @@ def main() -> int:
         print()
         if spread is not None:
             print(f"  spread across usable buckets: {spread:.3f} "
-                  f"(threshold {DISCRIMINATION_THRESHOLD})")
+                  f"(threshold {DISCRIMINATION_THRESHOLD}); best/worst "
+                  f"intervals disjoint: {disjoint}")
         print(f"  VERDICT: {verdict}")
         print()
         print("  Reminder: a FLAT result is a real answer. Do not proceed to "

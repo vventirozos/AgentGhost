@@ -58,35 +58,52 @@ logger = logging.getLogger("GhostAgent")
 # rather than noise. The threshold is a parameter so it can rise with supply.
 DEFAULT_MIN_PAIR = 2
 
-# ── Why a count threshold is NOT enough ──────────────────────────────
-# Simulated at the real corpus scale (8 tools, fidelity 0.772), the
-# probability that pure noise produces at least one "merge_or_redraw":
+# ── Why bidirectional pairs are DESCRIBED, not adjudicated ───────────
+# Five attempts were made to decide statistically whether a two-way confusion
+# pair is a real boundary problem. Every one was refuted by simulation:
 #
-#     corpus   min_pair=2 (uniform / skewed tool usage)
-#     n=57         9.0%  /  39.6%
-#     n=120       56.9%  /  86.0%
-#     n=180       91.8%  /  97.5%
+#   1. count threshold alone        92.8% spurious "merge these" at n=400
+#   2. observed > expected          98.5%  (a comparison is not a test)
+#   3. Poisson excess, naive null   42.8% at n=1000 (null ignored that a miss
+#                                   can never land on the TRUE tool)
+#   4. leave-one-out marginals      90% FP (over-corrected)
+#   5. marginal null + symmetry     BOTH error rates move the WRONG way with
+#      + dominance route            corpus size: FP 0.0% → 11.7% → 50.1%
+#                                   (n=400 → 3000 → 6000) while power fell
+#                                   74.7% → 3.9% → 0.0%. Three independent
+#                                   causes: a biased null (obs/exp converged
+#                                   to a constant 1.20 instead of 1.0 under
+#                                   skewed tool usage), a condition that
+#                                   ACCEPTED a null (`p_sym >= alpha` — an
+#                                   acceptance region that shrinks to nothing
+#                                   as n grows, so any genuinely two-way pair
+#                                   is eventually rejected), and a Poisson
+#                                   tail that underflowed to a constant 1.0
+#                                   above lambda ~745, switching the whole
+#                                   route off in silence.
 #
-# and raising min_pair does not fix the skewed case, because the two
-# most-used tools attract misses in both directions from their marginals
-# alone. A directive as expensive as "merge these two tools" cannot rest on
-# that. So every verdict now carries an EXACT BINOMIAL test of symmetry on
-# the off-diagonal (the McNemar question: given a+b misses between this pair,
-# is the split consistent with 50/50?), plus a minimum total that gives the
-# test any power at all.
-_MIN_BIDIRECTIONAL_TOTAL = 8   # below this, symmetry is untestable
-_MIN_WEAK_DIRECTION = 2        # the quieter direction must be attested at all
-_SYMMETRY_ALPHA = 0.05         # p >= this → cannot reject symmetry
-_ASYMMETRY_ALPHA = 0.05        # p < this  → the one-way claim is supported
-_EXCESS_ALPHA = 0.05           # family-wise, Bonferroni'd across tested pairs
+# The instrument's job is to SURFACE candidates for a human decision, not to
+# authorise "merge two tools" on its own. So bidirectional pairs are now
+# reported with their raw shape — each direction's own count, and the pair's
+# share of all misses — under `evidence="observed"`. The KIND is still called
+# `merge_or_redraw` (that is the question being raised); the EVIDENCE tier is
+# what says it has not been adjudicated. The one-way (`describe`) test
+# survives because it REJECTS a null rather than accepting one, which is a
+# valid inference and measured sound across three review rounds.
+#
+# Below this total, a two-way pair is dropped from the VERDICT list — at
+# `min_pair=2` the only shape affected is 2-vs-1, which is the exact
+# symmetry-p=1.000 noise case. It survives in `report.pairs` (hence `--json`)
+# and in the per-tool "lost to:" line, so the data is not lost — but it is
+# dropped from the proposal list without a per-pair note, which is a
+# deliberate reversal of the earlier "surface everything" decision.
+_MIN_PAIR_TOTAL_TO_SHOW = 4
 
-# Second route to a merge verdict, covering the marginal null's BLIND SPOT: a
-# pair that dominates the entire miss table cannot show "excess" because it IS
-# the marginals. Measured on a pure-noise corpus (8 tools, skewed usage), the
-# hottest pair's share of all misses peaked at 0.343 (n=180) and fell with n —
-# so 0.40 sits above anything noise produced while still catching "this pair
-# is most of my confusion", which is precisely the case worth acting on.
-_DOMINANT_PAIR_SHARE = 0.40
+# The ONE surviving test. Valid because it REJECTS a null ("this split is
+# 50/50") rather than accepting one: 6-vs-0 gives p=0.031 and clears it,
+# 4-vs-0 gives p=0.125 and does not. Independently confirmed sound across
+# three review rounds, unlike every gate that was built around it.
+_ASYMMETRY_ALPHA = 0.05
 
 # An n-gram must appear in at least this many DISTINCT trajectories to count
 # as recurring. Occurrences within one turn are correlated (one debugging
@@ -144,11 +161,18 @@ class OntologyVerdict:
     # verdict is ever read as more certain than its evidence.
     symmetry_p: float = -1.0
     # How much weight this verdict can bear:
-    #   "significant"  — the direction (or symmetry) is statistically supported
-    #   "suggestive"   — leans that way, still consistent with chance
-    #   "insufficient" — too few misses to classify at all; watch, do not act
+    #   "significant"  — a null was REJECTED (one-way pairs only)
+    #   "suggestive"   — leans one-way, still consistent with chance
+    #   "observed"     — reported as-is, NOT adjudicated (two-way pairs)
     #   "counted"      — no test applies (no-tool stalls are just a count)
-    evidence: str = "significant"
+    #
+    # Defaults to the WEAKEST claim: a verdict built without an explicit
+    # evidence value must not silently assert that a null was rejected.
+    evidence: str = "observed"
+    # Per-direction miss counts, e.g. {"browser->file_system": 25, ...}.
+    # `tools` is sorted for stable identity, so direction is otherwise
+    # unrecoverable from the verdict object.
+    directions: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -160,10 +184,12 @@ class ConfusionReport:
     per_tool: Dict[str, ToolConfusionStats] = field(default_factory=dict)
     pairs: List[ConfusionPair] = field(default_factory=list)
     verdicts: List[OntologyVerdict] = field(default_factory=list)
-    # PAIR verdicts (merge_or_redraw / describe) that hit `min_pair` but could
-    # not clear their evidence test. Excludes `missing_affordance`, which is a
-    # bare count with no test attached. Reported, never dropped silently —
-    # "we saw it and could not call it" is different from "we saw nothing".
+    # PAIR verdicts carrying no statistical support: every `merge_or_redraw`
+    # (which has no test by design) plus every `suggestive` one-way pair
+    # (which had one and did not clear it). Excludes `missing_affordance`, a
+    # bare count with no test attached. Note this counts EMITTED verdicts —
+    # two-way pairs below `_MIN_PAIR_TOTAL_TO_SHOW` are not emitted and so are
+    # not counted here either.
     n_inconclusive_pairs: int = 0
 
     @property
@@ -263,107 +289,29 @@ def binomial_symmetry_p(a: int, b: int) -> float:
         return 1.0
 
 
-def poisson_excess_p(observed: int, expected: float) -> float:
-    """P(X >= observed) for X ~ Poisson(expected). 1.0 on degenerate input.
-
-    The question a marginal null actually poses: is this pair hotter than its
-    tools' usage share ALREADY predicts? Comparing `observed > expected` is
-    not a test — it is true about half the time by construction, which is why
-    the first version of this gate suppressed nothing (measured: 98.5%
-    spurious "significant" merges at n=400, vs 92.8% with no gate at all).
-    """
-    try:
-        obs = int(observed)
-        lam = float(expected)
-    except (TypeError, ValueError):
-        return 1.0
-    if obs <= 0:
-        return 1.0
-    if lam <= 0.0:
-        return 0.0 if obs > 0 else 1.0
-    # P(X >= obs) = 1 - sum_{k<obs} e^-lam lam^k / k!, accumulated in a form
-    # that stays stable for the small lambdas this sees.
-    try:
-        term = math.exp(-lam)
-        cum = term
-        for k in range(1, obs):
-            term *= lam / k
-            cum += term
-        return max(0.0, min(1.0, 1.0 - cum))
-    except (OverflowError, ValueError):  # pragma: no cover — defensive
-        return 1.0
-
-
-def expected_pair_misses(pair_counts: Counter, a: str, b: str) -> float:
-    """Misses expected between ``a`` and ``b`` if confusion were INDEPENDENT
-    of the pair — i.e. driven only by how often each tool is the truth and how
-    often each is picked.
-
-    This is the null model the classifier was missing. Without it, the two
-    most-used tools attract two-way misses from their marginals alone and the
-    instrument reports a boundary problem that is really a usage-share
-    artefact.
-    """
-    # FULL marginals, deliberately — the pair's own cells are included in the
-    # totals that predict it. That is CONSERVATIVE: a hot pair inflates its
-    # own expectation, so the excess test under-fires rather than over-fires.
-    # Leave-one-out marginals were tried and are the wrong trade here — they
-    # lifted detection of a real pattern to ~95% but took false positives on a
-    # pure-noise corpus to 90% at n=400 and 100% at n=1000. For a directive as
-    # expensive as "merge two tools", under-firing is the correct failure
-    # direction: the pair stays visible in the WATCH tier and in the raw pair
-    # table either way.
-    total = sum(pair_counts.values())
-    if total <= 0:
-        return 0.0
-    truth_tot: Counter = Counter()
-    pick_tot: Counter = Counter()
-    for (t, p), c in pair_counts.items():
-        truth_tot[t] += c
-        pick_tot[p] += c
-    # Renormalise the pick distribution to EXCLUDE the true tool. A miss can
-    # never land on the tool it should have been, so the naive
-    # row*col/total product systematically under-predicts every pair and the
-    # excess test then fires on structure the null itself failed to model
-    # (measured: 42.8% spurious "significant" at n=1000, 91.2% at n=3000).
-    exp = 0.0
-    for t, pk in ((a, b), (b, a)):
-        denom = total - pick_tot.get(t, 0)
-        if denom <= 0:
-            continue
-        exp += (truth_tot.get(t, 0) * pick_tot.get(pk, 0)) / denom
-    return exp
-
-
 def _classify_pairs(pair_counts: Counter, *,
                     min_pair: int) -> Tuple[List[OntologyVerdict], int]:
-    """Turn a confusion matrix into ontology proposals, TIERED BY EVIDENCE.
+    """Turn a confusion matrix into ontology proposals.
 
-    The distinction that matters: a pair confused in BOTH directions is a
-    boundary problem (neither description can win — clarifying one just
-    pushes the error the other way), while a one-way miss is exactly what
-    better description text fixes.
+    Two kinds of claim, with deliberately different force:
 
-    At the corpus sizes this runs on, that classification is a coin flip
-    unless it is tested. A 2-vs-1 split has exact symmetry p=1.000; 3-vs-2 the
-    same; 5-vs-2 gives 0.453. Simulated at n=57 with realistic skewed tool
-    usage, pure noise produces a spurious "merge these two tools" **39.6%** of
-    the time. So each verdict carries an evidence tier and detail text matched
-    to it — SUPPRESSING them was the first fix and it was wrong, because the
-    pattern is still the right thing to look at; what must not survive is the
-    directive tone on three data points.
+    * **one-way** (`describe`) is TESTED — the exact binomial either rejects
+      "this split is 50/50" (`significant`, the case Phase 2b description work
+      targets) or does not (`suggestive`, emitted but explicitly unsupported);
+    * **two-way** (`merge_or_redraw`) is DESCRIBED ONLY. See the constants
+      block: five attempts to adjudicate it were each refuted by simulation,
+      the last one failing in three independent ways with both error rates
+      degrading as the corpus grew. Surfacing the pair is the useful part;
+      deciding it is the operator's call.
 
-    Returns (verdicts, n_insufficient).
+    Returns (verdicts, n_unadjudicated) — the second number counts pair
+    verdicts carrying no statistical support, and is reported rather than
+    dropped.
     """
     verdicts: List[OntologyVerdict] = []
     seen: set = set()
-    insufficient = 0
-    # Multiplicity denominator: how many distinct unordered tool pairs are
-    # even eligible for a verdict in this matrix.
-    n_pairs_tested = len({
-        tuple(sorted((t, p))) for (t, p), c in pair_counts.items()
-        if p != "<none>" and c >= min_pair
-    }) or 1
+    unadjudicated = 0
+    all_misses = sum(pair_counts.values()) or 1
     for (truth, picked), count in pair_counts.most_common():
         if count < min_pair:
             continue
@@ -387,62 +335,38 @@ def _classify_pairs(pair_counts: Counter, *,
         two_way = reverse > 0 and weak >= _BIDIRECTIONAL_RATIO * strong
 
         if two_way:
-            # FOUR conditions, because a count threshold alone is not
-            # evidence. The first version gated on `total >= 8` and computed
-            # `p_sym` without ever reading it, so at n=400 a pair produced by
-            # pure noise earned a "significant" MERGE THESE TWO TOOLS
-            # directive 92.8% of the time.
-            #   1. enough misses for any test to have power;
-            #   2. the quieter direction is attested, not a single stray;
-            #   3. the split is CONSISTENT with symmetric confusion (a
-            #      rejected symmetry means it is really one-way);
-            #   4. the pair is HOTTER THAN ITS MARGINALS PREDICT — without
-            #      this there is no null model at all, and the two busiest
-            #      tools attract two-way misses from their marginals alone.
-            expected = expected_pair_misses(pair_counts, key[0], key[1])
-            p_excess = poisson_excess_p(total, expected)
-            all_misses = sum(pair_counts.values()) or 1
+            if total < _MIN_PAIR_TOTAL_TO_SHOW:
+                continue                      # raw pair table still has it
+            unadjudicated += 1
             share = total / all_misses
-            dominant = share >= _DOMINANT_PAIR_SHARE
-            # Bonferroni across every pair eligible for a verdict: with 8
-            # tools there are 28 candidate pairs, so testing each at 0.05
-            # would fire on noise most runs.
-            excess_alpha = _EXCESS_ALPHA / max(1, n_pairs_tested)
-            strong_enough = (
-                total >= _MIN_BIDIRECTIONAL_TOTAL
-                and weak >= _MIN_WEAK_DIRECTION
-                and p_sym >= _SYMMETRY_ALPHA
-                and (p_excess < excess_alpha or dominant)
-            )
-            evidence = "significant" if strong_enough else "insufficient"
-            if not strong_enough:
-                insufficient += 1
-                detail = (f"{key[0]} / {key[1]} missed in both directions "
-                          f"({count} / {reverse}) — WATCH, do not act. "
-                          f"symmetry p={p_sym:.2f}; marginals predict "
-                          f"{expected:.1f} of the {total} misses "
-                          f"(excess p={p_excess:.3f}, {share:.0%} of all "
-                          "confusion). Not distinguishable from one-way "
-                          "noise, or from what these tools' usage share "
-                          "already implies.")
-            else:
-                detail = (f"{key[0]} and {key[1]} are confused in BOTH "
-                          f"directions ({count} / {reverse}, symmetry "
-                          f"p={p_sym:.2f}; {total} misses = {share:.0%} of all "
-                          f"confusion, vs {expected:.1f} predicted by their "
-                          f"marginals, excess p={p_excess:.4f}). The model is "
-                          f"answering one "
-                          "question with two tools — redraw the boundary or "
-                          "merge them; rewording either one moves the error, "
-                          "it does not remove it.")
+            # `key` is SORTED for stable identity; `count` belongs to
+            # truth->picked. Printing "(count / reverse)" against the sorted
+            # names transposed them whenever truth > picked lexicographically,
+            # so an operator read "browser lost 25 times" when in fact
+            # file_system was right and browser stole it — i.e. reworked the
+            # wrong tool. Each number now names its own direction, and the
+            # directional counts ride the verdict so --json consumers can see
+            # them too.
             verdicts.append(OntologyVerdict(
                 kind="merge_or_redraw", tools=key, count=total,
-                symmetry_p=p_sym, evidence=evidence, detail=detail))
+                symmetry_p=p_sym, evidence="observed",
+                directions={f"{truth}->{picked}": count,
+                            f"{picked}->{truth}": reverse},
+                detail=(f"{truth} -> {picked} {count}x and "
+                        f"{picked} -> {truth} {reverse}x; {total} misses = "
+                        f"{share:.0%} of all confusion. A boundary question "
+                        "to LOOK AT — deliberately not adjudicated here: "
+                        "five statistical gates for this were each refuted "
+                        "by simulation, the last with both error rates "
+                        "degrading as the corpus grew. Judge it against the "
+                        "per-tool recall table and what the two tools are "
+                        "for."),
+            ))
         else:
             significant = p_sym < _ASYMMETRY_ALPHA
             evidence = "significant" if significant else "suggestive"
             if not significant:
-                insufficient += 1
+                unadjudicated += 1
             lead = (f"{count}x {picked} was picked where {truth} was right "
                     f"(reverse: {reverse}, symmetry p={p_sym:.3f}).")
             if significant:
@@ -458,13 +382,10 @@ def _classify_pairs(pair_counts: Counter, *,
             verdicts.append(OntologyVerdict(
                 kind="describe", tools=(truth, picked), count=count,
                 symmetry_p=p_sym, evidence=evidence, detail=detail))
-    # Significant findings first, then by size — an operator reading the top
-    # of the list must see the supported claims, not the loudest counts.
     # Secondary key is TOTAL misses for the pair in every branch — `count`
     # means "both directions" for a merge and "forward only" for a describe,
-    # so sorting on it directly ranked an 11-total merge above a 9-vs-1
-    # describe on incomparable numbers.
-    _rank = {"significant": 0, "counted": 1, "suggestive": 2, "insufficient": 3}
+    # so sorting on it directly compared incomparable numbers.
+    _rank = {"significant": 0, "observed": 1, "counted": 2, "suggestive": 3}
 
     def _magnitude(v: OntologyVerdict) -> int:
         if v.kind == "describe" and len(v.tools) == 2:
@@ -472,8 +393,13 @@ def _classify_pairs(pair_counts: Counter, *,
                     + pair_counts.get((v.tools[1], v.tools[0]), 0))
         return v.count
 
-    verdicts.sort(key=lambda v: (_rank.get(v.evidence, 9), -_magnitude(v)))
-    return verdicts, insufficient
+    # `, v.tools` tail: without it, equal-magnitude verdicts kept
+    # `Counter.most_common()` insertion order — i.e. ROW ORDER — so 61.5% of
+    # matrices reordered under nothing but a shuffle, and with a `top` cutoff
+    # the same corpus hid a different finding on each run.
+    verdicts.sort(key=lambda v: (_rank.get(v.evidence, 9), -_magnitude(v),
+                                 v.tools))
+    return verdicts, unadjudicated
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -513,11 +439,18 @@ class MacroCandidate:
     def steps_collapsed(self) -> int:
         """Loop steps a macro would ACTUALLY remove across the corpus.
 
-        Computed from NON-OVERLAPPING matches. Using the raw window count
-        overstates the saving by 1.75–3.4×, because a macro can only be
+        Computed from NON-OVERLAPPING matches, because a macro can only be
         applied to disjoint windows: five identical consecutive calls contain
-        four overlapping 2-grams but can only be collapsed into two macro
-        calls, saving 2 steps, not 4.
+        four overlapping 2-grams but collapse into only two macro calls,
+        saving 2 steps rather than 4.
+
+        Scale of the correction, MEASURED on the live corpus after the
+        per-sequence cursor fix: the raw window count overstates the corpus
+        total by **1.34×**, with a median per-candidate ratio of 1.00 — most
+        candidates are unaffected and a few long same-tool runs carry the
+        whole difference. (An earlier docstring here claimed "1.75–3.4×";
+        that was computed against the shared-cursor version and only 3% of
+        310 live candidates fall in that band.)
 
         Still an upper bound in one respect: the same calls are also mined as
         3- and 4-grams, so candidates are NOT additive — collapsing one
@@ -749,12 +682,19 @@ def render_confusion(report: ConfusionReport, *, top: int = 12) -> str:
             lines.append(f"    [{v.kind}: {v.evidence}] {' / '.join(v.tools)}  "
                          f"(n={v.count}){p}")
             lines.append(f"        {v.detail}")
-    if report.n_inconclusive_pairs:
-        lines.append(f"  ({report.n_inconclusive_pairs} PAIR verdict(s) above "
-                     "are not statistically supported at this corpus size — "
-                     "read them as things to watch, not decisions to make. "
-                     "missing_affordance rows carry no test and are not "
-                     "counted here.)")
+    shown_unadjudicated = sum(
+        1 for v in report.verdicts[:top]
+        if v.evidence in ("observed", "suggestive"))
+    if shown_unadjudicated:
+        lines.append(f"  ({shown_unadjudicated} PAIR verdict(s) above "
+                     "carry NO statistical support — two-way pairs are "
+                     "described, never adjudicated, and 'suggestive' one-way "
+                     "pairs did not clear their test. Read them as things to "
+                     "look at, not decisions to make. missing_affordance rows "
+                     "carry no test and are not counted here.)")
+    if len(report.verdicts) > top:
+        lines.append(f"  ({len(report.verdicts) - top} further verdict(s) not "
+                     f"shown — raise --top to see them.)")
     return "\n".join(lines)
 
 
@@ -830,6 +770,6 @@ __all__ = [
     "ConfusionPair", "ToolConfusionStats", "OntologyVerdict", "ConfusionReport",
     "MacroCandidate", "analyze_confusion", "mine_sequences",
     "render_confusion", "render_sequences", "load_replay_rows",
-    "binomial_symmetry_p", "poisson_excess_p", "expected_pair_misses",
+    "binomial_symmetry_p",
     "report_to_dict", "DEFAULT_MIN_PAIR", "DEFAULT_MIN_SUPPORT", "NGRAM_SIZES",
 ]
