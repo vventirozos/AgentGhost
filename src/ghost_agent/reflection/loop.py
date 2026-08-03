@@ -53,6 +53,13 @@ _RECOVERY_SCAFFOLD_MARKERS = (
     "SYSTEM ALERT: Your previous turn entered a self-repeating",
 )
 
+# Risk-ranked triage (§4H item 2) collects this many times `max_failures`
+# before ranking. Bounded on purpose: an unbounded pool would walk the whole
+# corpus on every tick to reorder 3 items. 6× keeps the pool at ~18 records —
+# enough for the ranking to have something to choose between, small enough
+# that the walk stays as cheap as the old early-break.
+_TRIAGE_POOL_FACTOR = 6
+
 
 def _is_recovery_scaffold(traj: Trajectory) -> bool:
     """True when the trajectory's user prompt is agent self-recovery
@@ -103,6 +110,12 @@ class ReflectionOutcome:
 class ReflectionRunReport:
     """Aggregate of one reflection tick."""
 
+    # Failures SCANNED, not failures queued. With risk-ranked triage on
+    # (default) the walk collects `max_failures * _TRIAGE_POOL_FACTOR`
+    # candidates and reflects the worst of them, so this counts up to 18
+    # where it used to stop at 3. `summary()` spells the denominator out —
+    # an operator watching the live stream would otherwise read the ratio
+    # collapsing from 100% to 17% as a regression.
     seen_failures: int = 0
     reflected_ok: int = 0
     reflected_errors: int = 0
@@ -111,7 +124,7 @@ class ReflectionRunReport:
 
     def summary(self) -> str:
         return (
-            f"reflected {self.reflected_ok}/{self.seen_failures} "
+            f"reflected {self.reflected_ok} of {self.seen_failures} scanned "
             f"(dup-skipped {self.skipped_duplicate}, errors {self.reflected_errors})"
         )
 
@@ -138,8 +151,15 @@ class Reflector:
         session_id_prefix: str = "reflect",
         verify_fn: Optional[VerifyCallable] = None,
         verify_timeout_s: float = 60.0,
+        calibration_source: Optional[Callable[[], Iterable[Any]]] = None,
     ):
         self.critique_fn = critique_fn
+        # §4H item 2: zero-arg callable returning recent CalibrationSamples,
+        # used to rank the triage pool by the REAL calibrated score instead of
+        # the trajectory-shape proxy. Optional and lazily called (once per
+        # run) so the Reflector keeps no dependency on the calibration spine
+        # and a deployment without one is unaffected.
+        self.calibration_source = calibration_source
         # Optional plan-verification backend (proposal #6: ground the
         # one learning path that previously had zero correctness
         # grounding). When set, each revised plan is checked and the
@@ -151,6 +171,27 @@ class Reflector:
         self.max_failures = int(max_failures)
         self.model = model
         self.session_id_prefix = session_id_prefix
+
+    async def _calibrated_index(self) -> dict:
+        """{req_id: risk} from the injected calibration source ({} without one).
+
+        Never raises and never blocks the run: a missing/failing calibration
+        store simply drops the ranking back to the trajectory-shape proxy.
+        """
+        src = self.calibration_source
+        if src is None:
+            return {}
+        try:
+            from ..core.risk import calibrated_risk_index
+            # Off the event loop: the source reads an unpruned JSONL store
+            # (~1800 rows and growing) with a synchronous readlines(), and
+            # this runs inside the async reflection tick.
+            samples = await asyncio.to_thread(src)
+            return calibrated_risk_index(samples or [])
+        except Exception as e:  # noqa: BLE001
+            logger.debug("calibration index unavailable: %s: %s",
+                         type(e).__name__, e)
+            return {}
 
     async def run(
         self,
@@ -181,6 +222,22 @@ class Reflector:
             iterable = failed_source
 
         candidates: List[Trajectory] = []
+        # §4H item 2 — RISK-RANKED TRIAGE. Reflection used to take the first
+        # `max_failures` failed trajectories in corpus order, i.e. the OLDEST
+        # ones, treating every failure as equally worth a scarce LLM critique.
+        # A graded risk score is strictly more informative than the binary
+        # flag, so collect a bounded POOL and reflect on the worst of it.
+        # Ranking only ever reorders trajectories that were already
+        # reflectable — it can never widen the candidate set — and with
+        # `GHOST_TRIAGE_RANKING=0` (or an empty pool) the behaviour is exactly
+        # the old chronological one, since the sort is stable.
+        try:
+            from ..core.risk import triage_ranking_enabled
+            _rank = triage_ranking_enabled()
+        except Exception:  # noqa: BLE001 — ranking is an optimisation
+            _rank = False
+        pool_cap = max(self.max_failures,
+                       self.max_failures * _TRIAGE_POOL_FACTOR) if _rank else self.max_failures
         for t in iterable:
             if not self._is_reflectable(t):
                 continue
@@ -189,8 +246,18 @@ class Reflector:
                 report.skipped_duplicate += 1
                 continue
             candidates.append(t)
-            if len(candidates) >= self.max_failures:
+            if len(candidates) >= pool_cap:
                 break
+        if _rank and len(candidates) > self.max_failures:
+            try:
+                from ..core.risk import rank_for_triage
+                candidates = rank_for_triage(candidates,
+                                             calibrated=await self._calibrated_index(),
+                                             limit=self.max_failures)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("triage ranking skipped: %s: %s",
+                             type(e).__name__, e)
+                candidates = candidates[:self.max_failures]
 
         for traj in candidates:
             # Candidates were vetted at collection time; a concurrent

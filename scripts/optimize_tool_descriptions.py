@@ -223,6 +223,34 @@ class ToolDescAdapter:
         return out
 
 
+def _dump_confusion(trajectories: List[Dict[str, Any]], path: Path) -> int:
+    """Persist per-fixture replay results for ontology analysis.
+
+    Deliberately light: the tool names, the error flag, and enough request
+    context to eyeball a pair. The full payload stays in the recordings.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    n = 0
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for t in trajectories or []:
+            fx = t.get("fx") or {}
+            fh.write(json.dumps({
+                "fixture_id": fx.get("fixture_id", ""),
+                "request_id": fx.get("request_id", ""),
+                "tier": fx.get("tier", ""),
+                "user_request": (fx.get("user_request") or "")[:300],
+                "advertised_tools": fx.get("advertised_tools") or [],
+                "truth": t.get("truth"),
+                "picked": t.get("picked"),
+                "score": t.get("score"),
+                "err": t.get("err", ""),
+            }, ensure_ascii=False) + "\n")
+            n += 1
+    tmp.replace(path)
+    return n
+
+
 def _make_reflection_lm(url: str):
     base = url.rstrip("/")
     if not base.endswith("/v1"):
@@ -265,6 +293,14 @@ def main() -> int:
                          "exit — de-risks the replay path without an "
                          "optimization run")
     ap.add_argument("--run-dir", default="")
+    ap.add_argument("--confusion-out", default="",
+                    help="dump the INCUMBENT private-tier replay rows as JSONL "
+                         "({truth, picked, err, ...}) for "
+                         "scripts/tool_ontology_report.py. The 0.772 ceiling "
+                         "check printed its misses and threw them away; the "
+                         "structure of those misses is the evidence for "
+                         "whether the toolbox needs re-carving or just "
+                         "re-wording.")
     args = ap.parse_args()
 
     ghost_home = Path(os.getenv("GHOST_HOME", str(Path.home() / "ghost_llamacpp")))
@@ -323,6 +359,10 @@ def main() -> int:
     n_err = sum(1 for t in inc_eval.trajectories if t.get("err"))
     print(f"INCUMBENT tool-choice fidelity on PRIVATE: {inc_acc:.3f} "
           f"({n_err} unreplayable)")
+    if args.confusion_out:
+        _dump_confusion(inc_eval.trajectories, Path(args.confusion_out))
+        print(f"wrote {len(inc_eval.trajectories)} replay rows to "
+              f"{args.confusion_out}")
     if args.smoke:
         for t in inc_eval.trajectories[:8]:
             print(f"  {t['truth']:<18} -> {str(t['picked']):<18} "

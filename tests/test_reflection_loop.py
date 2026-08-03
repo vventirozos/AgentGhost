@@ -76,12 +76,35 @@ async def test_reflector_skips_already_reflected_ids():
 
 
 async def test_reflector_respects_max_failures():
+    """At most `max_failures` REFLECTIONS, whatever the pool size.
+
+    `seen_failures` now counts the whole scanned pool rather than stopping at
+    the quota: risk-ranked triage (§4H item 2) collects a bounded pool and
+    reflects its worst members, so "seen 5, reflected 2" is the accurate
+    reading. The invariant that matters — never more than `max_failures`
+    LLM critiques per tick — is unchanged and asserted here; the old
+    early-break contract is pinned separately under GHOST_TRIAGE_RANKING=0.
+    """
     async def critique(_p):
         return _VALID_RESPONSE
     refl = Reflector(critique_fn=critique, max_failures=2)
     fails = [_failed_trajectory(tid=f"f{i}") for i in range(5)]
     report = await refl.run(failed_source=fails)
-    assert report.seen_failures == 2  # stops pulling after max
+    assert report.reflected_ok == 2
+    assert report.seen_failures == 5
+
+
+async def test_reflector_early_break_preserved_without_ranking(monkeypatch):
+    """With ranking off the walk is byte-for-byte the old one: stop pulling
+    from the source as soon as the quota is full."""
+    monkeypatch.setenv("GHOST_TRIAGE_RANKING", "0")
+
+    async def critique(_p):
+        return _VALID_RESPONSE
+    refl = Reflector(critique_fn=critique, max_failures=2)
+    fails = [_failed_trajectory(tid=f"f{i}") for i in range(5)]
+    report = await refl.run(failed_source=fails)
+    assert report.seen_failures == 2
     assert report.reflected_ok == 2
 
 
@@ -254,7 +277,11 @@ async def test_run_report_summary_string_includes_counts():
         failed_source=[_failed_trajectory(tid="a"), _failed_trajectory(tid="b")],
     )
     s = report.summary()
-    assert "2/2" in s
+    # Spelled out rather than "2/2": with triage ranking the denominator is
+    # the SCANNED pool (up to max_failures x 6), and an operator reading a
+    # bare ratio would see it collapse from 100% to 17% and call it a
+    # regression.
+    assert "reflected 2 of 2 scanned" in s
 
 
 async def test_reflected_trajectory_fields_populated_correctly():

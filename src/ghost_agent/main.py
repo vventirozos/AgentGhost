@@ -1234,6 +1234,15 @@ async def lifespan(app):
                 per_call_timeout_s=120.0,
                 max_failures=3,
                 model=args.model,
+                # §4H item 2 — rank the triage pool by the calibrated
+                # post-hoc score (AUC 0.727) instead of corpus order.
+                # Resolved lazily off the context because the calibration
+                # tracker is wired AFTER the Reflector is constructed.
+                calibration_source=lambda: (
+                    context.calibration_tracker.recent_samples(500)
+                    if getattr(context, "calibration_tracker", None) is not None
+                    else []
+                ),
                 # Proposal F (accept_low_novelty_passes) was removed
                 # 2026-07-20: it was dead-by-construction — no producer
                 # ever wrote extra["solution_novelty"] into collector
@@ -1898,6 +1907,38 @@ async def lifespan(app):
     except Exception as _cfge:
         logger.debug("resolved-config dump skipped: %s", _cfge)
         app.state.resolved_config = {}
+
+    # WHICH EXPERIMENTS ARE LIVE — one line per boot, next to the config dump.
+    # An A/B that runs invisibly is the "built and silently never ran" failure
+    # inverted: the operator sees behaviour change with no way to know a
+    # randomizer is behind it. Emitted even when the framework is OFF, so the
+    # live stream always answers "is anything being experimented on right now".
+    try:
+        from .core import experiments as _exp
+        from .core import risk as _risk
+        if str(os.getenv(_exp.ENV_KILL, "1")).strip().lower() in (
+                "0", "false", "off", "no"):
+            pretty_log("Experiments",
+                       f"DISABLED ({_exp.ENV_KILL}=0) — every request takes the "
+                       "control path", icon=Icons.BOOT_AWAKE)
+        else:
+            _reg = _exp.load_registry(_exp.registry_path_for_context(context))
+            _live = [sp for sp in _reg.specs.values() if sp.enabled]
+            if _live:
+                _desc = "; ".join(
+                    f"{sp.name} [{'/'.join(sp.arms)}] traffic={sp.traffic:g}"
+                    for sp in _live)
+                pretty_log(
+                    "Experiments",
+                    f"{len(_live)} live: {_desc} · steer="
+                    f"{'on' if _risk.steer_enabled() else 'OFF'} · read with "
+                    "introspect action='experiments'",
+                    icon=Icons.BOOT_AWAKE)
+            else:
+                pretty_log("Experiments", "none enabled",
+                           icon=Icons.BOOT_AWAKE)
+    except Exception as _expe:
+        logger.debug("experiment boot line skipped: %s", _expe)
 
     pretty_log("System Ready", "Listening for requests", icon=Icons.SYSTEM_READY)
 

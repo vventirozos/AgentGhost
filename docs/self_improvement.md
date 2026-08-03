@@ -265,6 +265,44 @@ Tests: `tests/test_verifier_tuned_templates.py` (baseline self-probe
 regression, placeholder/brace rejection, override/artifact resolution
 order, activation counting, formats-cleanly end check).
 
+### Tool ONTOLOGY analysis (§4F Phase 2b+, 2026-08-05)
+
+Phase 2b optimizes description PROSE. The 0.772 ceiling check
+(44/57, 2026-08-03) says that may be the wrong lever: the misses cluster
+into specific pairs (browser↔file_system, execute→file_system,
+manage_projects over-selected, 3 no-tool stalls), and a pair confused in
+BOTH directions is a boundary problem no rewording fixes — it just moves
+the error to the other direction.
+
+`ghost_agent/optim/tool_ontology.py` + `scripts/tool_ontology_report.py`
+measure the two structural questions:
+
+* **Confusion** — aggregate replay rows (dump them with the runner's new
+  `--confusion-out`) into a matrix and classify each hot pair as
+  `merge_or_redraw` (bidirectional), `describe` (one-way — Phase 2b's
+  real target set), or `missing_affordance` (no tool called at all).
+* **Sequences** — consecutive tool-call n-grams over the trajectory
+  corpus, ranked by `steps_collapsed × cohesion`. Depth is the agent's
+  strongest measured failure predictor (17.8% at step 1 → 60.6% at 12,
+  §4H), so collapsing the common path attacks the failure RATE, not just
+  latency. Support counts DISTINCT turns (one grind session must not
+  mint a proposal); cohesion counts occurrences whose calls share a
+  TARGET, with enum fields (`operation=read`) and the redaction sentinel
+  excluded and containment matching so
+  `path="app.py"` ↔ `command="python3 app.py"` counts as one target.
+
+First live run: `file_system` runs dominate (787 pair-occurrences over
+107 turns, cohesion 0.73; ×4 runs would collapse 1431 steps) — a batch
+affordance gap. Read-only: it proposes, promotion stays operator-gated.
+See `docs/algorithms/tool_ontology.html`.
+
+**Experiment isolation.** Fixtures now exclude turns whose prompt context
+was mutated by a live A/B treatment (`core.experiments`), counted as
+`experiment_context_excluded` — the optimizer replays payloads verbatim,
+so a steered turn would tune descriptions against a context only one arm
+sees. `--include-experiment-context` overrides for a post-experiment
+re-mine.
+
 ### Tool-description optimization (§4F Phase 2b, 2026-08-01)
 
 Tool descriptions are the second always-live GEPA surface. Both halves

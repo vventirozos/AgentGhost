@@ -55,6 +55,17 @@ def main() -> int:
     parser.add_argument("--min-fixtures", type=int, default=200,
                         help="Warn (exit 1) below this supply — the GEPA run "
                              "should wait for more days of recording instead.")
+    parser.add_argument("--force-write", action="store_true",
+                        help="write the fixtures file even when the supply "
+                             "gates fail (overwrites the live GEPA input).")
+    parser.add_argument("--include-experiment-context", action="store_true",
+                        help="Keep turns whose prompt context was mutated by a "
+                             "live A/B treatment (core.experiments). Excluded "
+                             "by default: the optimizer replays recorded "
+                             "payloads verbatim, so those fixtures would tune "
+                             "descriptions against a context only one arm "
+                             "sees. See the drop accounting line "
+                             "'experiment_context_excluded'.")
     args = parser.parse_args()
 
     recordings_dir = args.recordings or _ghost_home() / "system" / "llm_recordings"
@@ -73,11 +84,9 @@ def main() -> int:
         era_cutoff_local=args.era_cutoff,
         private_pct=args.private_pct,
         max_result_chars=args.max_result_chars,
+        exclude_mutated_context=not args.include_experiment_context,
     )
 
-    n = write_fixtures_jsonl(fixtures, out_path)
-
-    print(f"Wrote {n} fixtures -> {out_path}")
     print("Drop accounting (no silent caps):")
     for key, val in stats.items():
         print(f"  {key:26s} {val}")
@@ -93,6 +102,12 @@ def main() -> int:
     # Supply gates (exit 1 = wait for more recording days): a GEPA run on a
     # one-class corpus cannot discriminate descriptions in EITHER direction,
     # so both zero-negative and zero-positive block, not just low volume.
+    #
+    # EVALUATED BEFORE THE WRITE. The write is an atomic replace of the LIVE
+    # GEPA input, and it used to happen first: a mistyped --trajectories, an
+    # unmounted corpus, or an era-cutoff typo replaced a good fixture file
+    # with an EMPTY one and then exited 1. Verified live — 116 bytes -> 0.
+    n = len(fixtures)
     ready = True
     for cls in ("positive", "negative"):
         if labels.get(cls, 0) == 0:
@@ -103,6 +118,17 @@ def main() -> int:
         print(f"⚠ Supply {n} < --min-fixtures {args.min_fixtures} — "
               "recommend waiting for more recording days before the GEPA run.")
         ready = False
+
+    if ready or args.force_write:
+        written = write_fixtures_jsonl(fixtures, out_path)
+        print(f"Wrote {written} fixtures -> {out_path}")
+    else:
+        # Leave the live artifact alone; park the mine next to it so the
+        # result is still inspectable.
+        parked = out_path.with_suffix(out_path.suffix + ".notready")
+        write_fixtures_jsonl(fixtures, parked)
+        print(f"Gates NOT met — live artifact left untouched at {out_path}; "
+              f"this mine parked at {parked} (--force-write to overwrite).")
     return 0 if ready else 1
 
 

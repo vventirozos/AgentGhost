@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.experiments — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Measurement</h3>
+    <a class="current" href="experiments.html">experiments</a>
+    <a href="risk.html">risk</a>
+    <a href="calibration.html">calibration</a>
+    <a href="confidence.html">confidence</a>
+    <a href="../algorithms/tool_ontology.html">tool ontology</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / experiments.py — live randomized arms</h1>
+  <p class="subtitle">Every eligible request is assigned, blind and deterministically, to one arm of each running experiment. Production traffic becomes the controlled experiment that stopped-prod ablations and synthetic batteries could no longer provide.</p>
+
+  <h2>Why this exists</h2>
+  <p>
+    Every "is this actually better?" question in this project had been blocked on the same
+    missing instrument. Paired ablation (<code>scripts/ablation_paired.py</code>) is the gold
+    standard but needs prod stopped and a synthetic battery to drive; those batteries
+    <strong>ceilinged twice in one day</strong> (B4 single-step 33/33, compositional 10/10), so
+    they can no longer discriminate. The §4F fallback — a two-week observational watch — has no
+    control arm, which is why its own caveat (e) admits the T+14d verdict can report "the stack
+    improved" but cannot attribute it.
+  </p>
+  <p>
+    The earn-keep post-mortem pre-approved exactly one revival route: <em>change the
+    instrument</em>. This is that change.
+  </p>
+
+  <h2>Assignment</h2>
+  <pre>
+arm = f(sha256(salt | "arm" | experiment | req_id))
+enrolled = f(sha256(salt | "enroll" | experiment | req_id)) &lt; traffic
+  </pre>
+  <p>
+    A pure function of the request id — so a retry, a replay, or a late verdict lands on the
+    <em>same</em> arm as the original, and no assignment state is persisted or synchronized.
+    The enrollment draw uses a different hash prefix from the arm draw, so a partial-traffic
+    experiment does not correlate the two. The 53-bit mantissa mapping avoids modulo bias;
+    measured split over 4000 units sits inside 47–53%.
+  </p>
+
+  <h2>Configuration</h2>
+  <p>Built-in defaults live in <code>DEFAULT_SPECS</code>. An optional file overrides them wholesale:</p>
+  <pre>
+$GHOST_HOME/system/experiments.json
+
+{"salt": "2026-08",
+ "experiments": [
+   {"name": "risk_steer", "arms": ["control", "treatment"],
+    "traffic": 1.0, "enabled": true}
+ ]}
+  </pre>
+  <p>
+    Reloaded on mtime change. A malformed file falls back to the defaults with a warning —
+    assignment sits on the request hot path and may never raise. Kill everything with
+    <code>GHOST_EXPERIMENTS=0</code>; consumers then see <code>""</code> and take the control
+    path, which is the same code path as a genuine control assignment (one branch to reason
+    about, by design).
+  </p>
+  <p>
+    An experiment name that collides with the trajectory redactor's sensitive-key list
+    (<code>auth_token</code>, <code>…_key</code>, …) is <strong>rejected at load</strong>: its arm
+    would be stored as <code>&lt;REDACTED&gt;</code> in every trajectory and the whole run would
+    be unanalysable after the fact.
+  </p>
+
+  <h2>Recording</h2>
+  <p>
+    The arm is stamped on the turn's trajectory as
+    <code>extra["experiments"] = {"&lt;experiment&gt;": "&lt;arm&gt;"}</code> by
+    <code>_record_turn_trajectory</code>, which both the streamed and non-streamed finalize
+    paths reach. Treatments that actually fire also stamp a <strong>compliance</strong> key
+    (<code>risk_steer_fired</code>) — without it, an arm whose trigger never fired reads as a
+    null result rather than as a non-event, which is the easiest way to misread an A/B.
+  </p>
+  <p>
+    Both the arm and the compliance flag are held in a small <strong>req_id-keyed ring</strong>,
+    not in a single context slot. A streamed turn hands back a generator and writes its
+    trajectory after the semaphore is released, so a single slot belongs to whichever request is
+    running <em>then</em>: that both leaked a treatment bit onto a control turn (poisoning the
+    triggered-only block and dropping a clean GEPA fixture) and lost it from a steered one
+    (defeating the GEPA isolation on the common path). Ineligible turns — internal requests,
+    simulated/self-play turns, and anything running without a trajectory collector — are never
+    enrolled at all: a turn whose arm cannot be recorded must not be perturbed by one.
+  </p>
+
+  <h2>Reading the results</h2>
+  <pre>
+introspect action='experiments'
+PYTHONPATH=src python scripts/experiment_report.py [--day YYYY-MM-DD] [--alpha 0.05] [--json]
+  </pre>
+  <p>
+    Metrics: <code>failure_rate</code> (UNKNOWN turns excluded — an unverifiable turn is not
+    evidence either way), <code>n_steps</code>, <code>duration_s</code>. All are
+    lower-is-better.
+  </p>
+
+  <h2>Why confidence SEQUENCES, not a t-test — and what they do not promise</h2>
+  <p>
+    The operator <em>will</em> peek. A fixed-n p-value checked daily is not a valid test; a
+    confidence sequence is built for continuous monitoring, so "the interval excludes 0" is a
+    legitimate stopping rule. The implementation is the <strong>asymptotic</strong> CS of
+    Waudby-Smith &amp; Ramdas (2023):
+  </p>
+  <pre>
+radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
+  </pre>
+  <p>
+    <strong>Asymptotic is load-bearing.</strong> There is no finite-sample guarantee, and the
+    first version of this page claimed one. Measured miscoverage at a nominal 5%, 3000
+    simulated streams:
+  </p>
+  <table>
+    <thead><tr><th>Data</th><th>plain SD, from n=2</th><th>regularised SD, from n=30</th></tr></thead>
+    <tbody>
+      <tr><td>Bernoulli p=0.5</td><td>52%</td><td><strong>2.5%</strong></td></tr>
+      <tr><td>Bernoulli p=0.3</td><td>58%</td><td><strong>3.3%</strong></td></tr>
+      <tr><td>Bernoulli p=0.1</td><td>82%</td><td>9.2%</td></tr>
+      <tr><td>Normal(0,1)</td><td>21%</td><td><strong>1.8%</strong></td></tr>
+    </tbody>
+  </table>
+  <p>Three guards follow, and all three are load-bearing:</p>
+  <ul>
+    <li><strong>Regularised variance</strong> (<code>_regularised_sigma</code>). The plain sample SD is 0 on constant input, which collapsed the interval to a POINT — six Bernoulli observations that happen to be constant per arm then "prove" a difference. At p=0.5 that shape occurs 12.2% of the time at 2 turns/arm.</li>
+    <li><strong>No verdict below n=30/arm.</strong> The numbers and the interval are still shown; only the conclusion waits.</li>
+    <li><strong>α split across metrics</strong> (Bonferroni ÷3) as well as arms (÷2). Without it, "stop when ANY of three intervals crosses" runs at ~15% against a nominal 5%.</li>
+  </ul>
+  <p>
+    The p=0.1 row is the honest weak spot, and a low failure rate is exactly this agent's
+    regime — treat a just-crossed interval on a rare event as a reason to keep collecting.
+  </p>
+  <p>
+    The difference interval is the conservative union of the two per-arm sequences:
+    <code>[lo_t − hi_c, hi_t − lo_c]</code> — the exact Minkowski difference of the two boxes,
+    ~40% wider than a purpose-built two-sample CS, but an argument that cannot go subtly wrong.
+  </p>
+
+  <h2>The dilution trap: read the TRIGGERED block</h2>
+  <p>
+    The risk-steer trigger fires on ~7.6% of turns. Averaging the effect over all enrolled
+    traffic dilutes it roughly <strong>13×</strong>, so the headline comparison would read
+    "no difference detected yet" indefinitely while the treatment was really changing
+    behaviour. The report therefore renders two blocks per experiment, and points at the
+    second:
+  </p>
+  <pre>
+■ risk_steer  (n=1200)
+    [all enrolled turns]        ← safety net: would catch harm to turns the trigger never touched
+    ── trigger fired on 91/1200 turns (7.6%) — READ THIS BLOCK
+    [triggered turns only]      ← the comparison with power
+  </pre>
+  <p>
+    Conditioning on the trigger is legitimate because the trigger is evaluated from state that
+    does not depend on the arm: both arms compute the same reading and stamp the same key, and
+    only the action differs. The key's <em>presence</em> means the gate tripped; its
+    <em>value</em> means the treatment actually ran.
+  </p>
+
+  <h2>Variance reduction (§4I Phase 3)</h2>
+  <p>
+    Time-to-verdict is the binding constraint: at ~16 resolved turns/day against an n≥30/arm gate,
+    anything that narrows the interval shortens every future answer. So a <strong>pre-treatment</strong>
+    covariate (today: the complexity router's turn-0 confidence, stamped by
+    <code>core/turn_facts.py</code>) is regressed out of the residual series that feeds the
+    confidence sequence — CUPED. The reported MEANS are untouched; only the interval narrows.
+  </p>
+  <p>
+    Safe by construction: pre-treatment, so unbiased; <code>θ ≈ 0</code> for a useless covariate
+    makes it a no-op; a covariate that would <em>widen</em> the interval on the current sample is
+    discarded rather than adopted; and it needs the covariate on ≥80% of rows before it engages.
+  </p>
+  <p>
+    <strong>Measured, not assumed</strong> — and smaller than the textbook figure. CUPED's usual
+    20–50% comes from a pre-period version of the <em>same</em> metric (correlation 0.6–0.9); a
+    turn-0 difficulty score against a BINARY outcome cannot reach that. At n=200/arm:
+  </p>
+  <table>
+    <thead><tr><th>Covariate strength</th><th>CS half-width reduction</th></tr></thead>
+    <tbody>
+      <tr><td>none / weak</td><td>0.0–0.3%</td></tr>
+      <tr><td>moderate</td><td>1.3%</td></tr>
+      <tr><td>strong</td><td>4.1%</td></tr>
+      <tr><td>very strong</td><td><strong>8.6%</strong></td></tr>
+    </tbody>
+  </table>
+  <p>
+    A real but small win that costs nothing, and every report line prints what it actually bought
+    (<code>[CS −8% via covariate]</code>) rather than claiming a benefit it did not deliver.
+  </p>
+
+  <h2>Guards in the report</h2>
+  <table>
+    <thead><tr><th>Warning</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td>stamp coverage</td><td><code>N of M recorded user turns carry an arm</code>. The number that separates "shipped 10 minutes ago" from "the stamp has been broken for three weeks" — without it an empty report reassures in both cases.</td></tr>
+      <tr><td>enrollment skew</td><td>Fires on an <strong>exact binomial tail</strong> (p &lt; 0.001), not a fixed ±20% tolerance: hash assignment is fair in EXPECTATION and the realised split is Binomial, so the old rule falsely accused the stamp 11.9% of the time at its own minimum n. Computed in log space — the direct form overflowed float64 past n=1023 and silently disabled the alarm on any large corpus.</td></tr>
+      <tr><td>unknown_rate</td><td>Printed above failure_rate on every block, because failure_rate CONDITIONS on it.</td></tr>
+      <tr><td>arm reads <code>&lt;REDACTED&gt;</code></td><td>The experiment name collides with the redactor. Those rows are unrecoverable; rename it.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Honest caveats</h2>
+  <ul>
+    <li><strong>Carryover / SUTVA violation.</strong> Cross-session memory means a lesson learned on a treatment turn can help a later control turn. That contaminates the control arm and biases the measured effect <em>toward zero</em> — a positive reading is conservative, a null one is genuinely ambiguous.</li>
+    <li><strong>The outcome label is a proxy</strong> (verifier + structural signal): process health, not correctness. Same caveat <code>grade_turn_outcome</code> carries.</li>
+    <li><strong>Differential attrition is the sharpest trap.</strong> <code>failure_rate</code> conditions on the turn resolving to PASSED/FAILED — a POST-treatment variable. A treatment that makes turns end unverifiable (the risk steer literally says "STOP. Report what is known") changes WHICH turns are scored; simulated with <em>zero</em> true effect that manufactured a 14-point "improvement". The report tests the UNKNOWN rate itself and flags <code>failure_rate</code> CONFOUNDED when the arms differ on it.</li>
+    <li><strong><code>n_steps</code> and <code>duration_s</code> are mechanism, not outcome</strong>, for any treatment that ends turns earlier. "TREATMENT BETTER" on those two is tautological, so they carry that annotation permanently.</li>
+    <li><strong>Traffic is not iid.</strong> Requests arrive in correlated bursts; randomization balances that in expectation, but the variance estimate is optimistic when one session contributes many turns.</li>
+    <li><strong>The measured population is narrower than "all traffic".</strong> Trivial greetings take <code>_handle_trivial_chat</code>, which bypasses the turn loop and the finalize chain — those turns write no trajectory, so they are assigned an arm that is never recorded. Correct (nothing under test can affect a one-shot "thanks"), but arm counts will always run below the raw request count.</li>
+    <li>Between-request only: it cannot measure anything that differs only WITHIN a request, nor a change that alters the corpus both arms read from.</li>
+  </ul>
+
+  <h2>Interaction with the GEPA optimizer</h2>
+  <p>
+    A treatment that mutates the prompt context contaminates the §4F Phase 2b fixture corpus,
+    because that optimizer replays recorded payloads verbatim. Turns carrying a
+    <code>CONTEXT_MUTATING_KEYS</code> flag are therefore excluded from mined fixtures by
+    default (counted as <code>experiment_context_excluded</code>, never silent;
+    <code>--include-experiment-context</code> overrides). <strong>Any future experiment whose
+    treatment alters what the model sees must register its compliance key there</strong>, or the
+    exclusion silently rots.
+  </p>
+
+  <p class="footnote">Not to be confused with <code>core/prune_overrides.py</code>, whose "arm" means an ablation MATRIX CONFIG (a whole-process boot flag). These arms are per-request.</p>
+</main>
+</body>
+</html>

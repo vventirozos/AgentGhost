@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tool ontology — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Self-improvement</h3>
+    <a class="current" href="tool_ontology.html">tool ontology</a>
+    <a href="../core/experiments.html">experiments</a>
+    <a href="../core/risk.html">risk</a>
+    <a href="metacognition.html">metacognition</a>
+  </nav>
+</aside>
+<main>
+  <h1>optim / tool_ontology.py — is the toolbox carved right, or just badly labelled?</h1>
+  <p class="subtitle">§4F Phase 2b optimizes tool DESCRIPTIONS: same tools, better prose. This asks the two structural questions prose cannot answer.</p>
+
+  <h2>The evidence that prompted it</h2>
+  <p>
+    The 2026-08-03 early ceiling check measured incumbent tool-choice fidelity at
+    <strong>0.772 (44/57)</strong> on never-seen fixtures — and the misses are not scattered.
+    They cluster into a handful of specific pairs: browser↔file_system, execute→file_system,
+    manage_projects over-selected (introspect/web_search misrouted into it), three no-tool
+    stalls, workspace/notify_operator→system_utility.
+  </p>
+  <p>
+    When a model keeps confusing the same two affordances, "the description is unclear" competes
+    with "the boundary is drawn in the wrong place" — and only the second is fixed by moving the
+    boundary. The verifier rounds already taught the general lesson the expensive way: two
+    candidates rejected by the private gate, and the diagnosis revised to capacity-bound
+    rule-following. More prompt text cannot fix a problem that is not about text.
+  </p>
+
+  <h2>1. Confusion — where are the boundaries wrong?</h2>
+  <pre>
+PYTHONPATH=src python scripts/optimize_tool_descriptions.py --confusion-out /tmp/confusion.jsonl …
+PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.jsonl
+  </pre>
+  <table>
+    <thead><tr><th>Verdict</th><th>Pattern</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr><td><code>merge_or_redraw</code></td><td>A→B and B→A both frequent</td><td>The two tools answer the same question for the model. Rewording either one MOVES the error rather than removing it — redraw the boundary or merge.</td></tr>
+      <tr><td colspan="3"><strong>Every verdict is tiered by evidence</strong> — <code>significant</code> / <code>suggestive</code> / <code>insufficient</code>. A merge directive needs FOUR conditions: enough misses for power, the quieter direction attested, symmetry not rejected (exact binomial), AND the pair hotter than its tools' usage share already predicts (Poisson excess vs a marginal null, Bonferroni'd across pairs) — or, covering that null's blind spot, the pair being ≥40% of ALL confusion. Measured against a pure-noise corpus: <strong>0% spurious merges up to n=1000, 2% at n=3000</strong>, versus 92.8% with a count threshold alone and 98.5% with a bare <code>observed &gt; expected</code> comparison. Power on an injected real pattern: 64–97%.</td></tr>
+      <tr><td><code>describe</code></td><td>A→B only</td><td>A genuine one-way over/under-selection. This is what Phase 2b's description work actually targets: say what B is NOT for, or what A uniquely owns.</td></tr>
+      <tr><td><code>missing_affordance</code></td><td>no tool called at all</td><td>The request had no affordance the model recognised — a missing tool, not a confused one.</td></tr>
+    </tbody>
+  </table>
+  <p>
+    <strong>Two fidelity numbers, both reported.</strong> <code>fidelity(replayable)</code>
+    excludes unreplayable rows (they measure the replay plumbing, not the toolbox);
+    <code>fidelity(all rows)</code> is what the Phase 2b runner prints, since a GEPA metric must
+    not reward a candidate for skipping hard fixtures. On a 57-row dump with 5 unreplayable they
+    differ by ~7 points — the first version claimed they were the same number.
+  </p>
+
+  <h2>2. Sequences — what should have been ONE call?</h2>
+  <pre>
+PYTHONPATH=src python scripts/tool_ontology_report.py --min-support 5
+  </pre>
+  <p>
+    Consecutive tool-call n-grams (n = 2..4) over the trajectory corpus, ranked by
+    <code>steps_collapsed × cohesion</code>. This matters beyond ergonomics: depth is the
+    agent's strongest measured failure predictor (17.8% at step 1 → 60.6% at step 12), so
+    shortening the common path attacks the failure RATE, not just latency.
+  </p>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>support</code></td><td>DISTINCT trajectories containing the sequence. Counted per-turn, never per-occurrence — otherwise one pathological grind session mints a macro proposal on its own.</td></tr>
+      <tr><td><code>cohesion</code></td><td>Fraction of occurrences whose calls share a TARGET. Enum fields (<code>operation=read</code>, <code>action=ledger</code>) and the redaction sentinel are excluded — counting them read 0.89 on every same-tool run, which is "doing the same KIND of thing", not "working on one thing".</td></tr>
+      <tr><td><code>steps_collapsed</code></td><td>Loop steps a macro would ACTUALLY remove, computed from <strong>non-overlapping</strong> matches. Counting windows overstated the saving by 1.75–3.4×: five identical consecutive calls contain four overlapping 2-grams but collapse into only two macro calls. Candidates are also <strong>not additive</strong> — the same calls are mined at 2-, 3- and 4-gram sizes.</td></tr>
+      <tr><td><code>priority</code></td><td>Ranking uses a per-turn cap on collapsible occurrences. Without it a single 50-call grind session (support 3) outranked a genuine 9-turn macro by 5.7× — the exact "one pathological turn redesigns the toolbox" failure <code>min_support</code> exists to prevent, leaking back in through the ranking.</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Target matching runs two passes: exact, then CONTAINMENT for path/identifier-shaped tokens —
+    because the same target is spelled differently by different tools
+    (<code>file_system(path="app.py")</code> vs <code>execute(command="python3 app.py")</code>).
+    Restricted to token-shaped strings so an English word cannot match inside a sentence.
+  </p>
+
+  <h2>First run on the live corpus (2026-08-05, 1326 user turns)</h2>
+  <pre>
+file_system ×4          occ=477  turns=58   steps=471  cohesion=0.69
+file_system ×3          occ=595  turns=78   steps=500  cohesion=0.69
+file_system ×2          occ=789  turns=108  steps=456  cohesion=0.72
+file_system → execute   occ=110  turns=44   steps=110  cohesion=0.51
+browser ×2              occ=136  turns=48   steps=90   cohesion=0.53
+file_system ×2 → execute occ=61  turns=33   steps=122  cohesion=0.34
+  </pre>
+  <p>
+    The dominant finding is a <strong>batch affordance gap</strong>: the agent reads and writes
+    files one at a time, across 108 distinct turns, at 0.72 cohesion — i.e. usually on the same
+    file. A batch/multi-path <code>file_system</code> call is the single highest-value macro on
+    the board.
+  </p>
+  <p class="footnote">
+    This table has been wrong twice, in opposite directions, and both are worth knowing.
+    v1 read <code>steps=1431</code> for the ×4 row — the overlapping-window count,
+    <strong>3.6× the achievable saving</strong>. v2 fixed that with a greedy non-overlapping
+    cursor but shared ONE cursor across all n-gram sizes, so a match of one sequence consumed
+    windows belonging to another: that understated the corpus total by <strong>49.6%</strong> and
+    did so DIRECTIONALLY — same-tool runs claim the cursor first, starving exactly the cross-tool
+    sequences a macro proposal is for (<code>file_system → execute</code> read 45 against a true
+    110). The cursor is now per-sequence. The three <code>file_system</code> rows still describe
+    the same underlying calls, so they must not be summed.
+  </p>
+
+  <h2>Scope: this proposes, it never applies</h2>
+  <p>
+    Everything here is read-only analysis over data already on disk — no LLM, no replay, no prod
+    involvement for the sequence half. Promotion of any proposal stays an operator decision
+    behind the same private-tier gate Phase 2b uses. A self-modifying tool registry with no gate
+    is precisely the failure mode this project's own history warns about.
+  </p>
+</main>
+</body>
+</html>

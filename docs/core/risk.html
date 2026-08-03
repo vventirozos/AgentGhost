@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.risk — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Measurement</h3>
+    <a href="experiments.html">experiments</a>
+    <a class="current" href="risk.html">risk</a>
+    <a href="calibration.html">calibration</a>
+    <a href="confidence.html">confidence</a>
+    <a href="../algorithms/tool_ontology.html">tool ontology</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / risk.py — the throttle that finally consumes the risk estimate</h1>
+  <p class="subtitle">Depth predicts failure. The calibrated composite predicts failure. Neither had a consumer. This module is the consumer — live (a steer) and offline (triage ranking).</p>
+
+  <h2>The gap</h2>
+  <p>Two failure predictors were measured on this agent and then used for nothing:</p>
+  <table>
+    <thead><tr><th>Signal</th><th>Measured</th><th>Consumer before this</th></tr></thead>
+    <tbody>
+      <tr><td>Turn DEPTH</td><td>17.8% failure at step 1 → 35.6% at 4 → 42.3% at 6 → 52.0% at 8 → <strong>60.6% at 12</strong> (§4H, 342 labelled trajectories)</td><td>none</td></tr>
+      <tr><td>Calibrated composite</td><td>AUC 0.727 post-hoc</td><td>none — <code>_METACOG_ARBITER_ENABLED = False</code>; logged, never acted on</td></tr>
+    </tbody>
+  </table>
+  <p>So the agent could tell you it was probably failing, and did nothing differently.</p>
+
+  <h2>Live half — the risk governor</h2>
+  <pre>
+score = 0.5·depth_prior + 0.3·effort_struggle + 0.2·failure_pressure
+steer  ⟺  step ≥ 6  AND  score ≥ 0.50
+  </pre>
+  <p>Worked examples (verified against the implementation):</p>
+  <table>
+    <thead><tr><th>Turn</th><th>score</th><th>steer?</th></tr></thead>
+    <tbody>
+      <tr><td>step 6, 5 clean calls</td><td>0.30</td><td>no — a normal working turn</td></tr>
+      <tr><td>step 8, 8 calls, 1 failure</td><td>0.44</td><td>no</td></tr>
+      <tr><td>step 10, 10 calls, 2-repeat, 1 failure</td><td>0.51</td><td>yes (measured ~56% failure)</td></tr>
+      <tr><td>step 12, 12 calls, 3-repeat, 2 failures</td><td>0.63</td><td>yes</td></tr>
+    </tbody>
+  </table>
+  <p>
+    The steer is one appended user-role message, fired at most once per request, telling the
+    model to (1) state what is CONFIRMED vs ASSUMED, (2) run the single smallest
+    distinguishing check, (3) <strong>stop and report honestly</strong> if it cannot name one.
+    Option 3 is the point — at step 8 the agent is at ~52% and its best move is often to raise
+    its hand, which it otherwise never does.
+  </p>
+  <p>
+    It <em>yields</em> to the futility breaker: that guard fires on the same pathology but NAMES
+    THE FILE, so it is strictly better advice when it applies. The deference is one-way on
+    purpose — a futility trip after a generic steer still carries new information and is allowed
+    to fire. It is also withheld once the turn is already forced to finalize, because a turn told
+    to write its final answer has its tool calls dropped downstream, and "run one small check"
+    would then instruct an action the loop discards.
+  </p>
+
+  <h2>Backtest on the real corpus (1323 user turns, 2026-08-05)</h2>
+  <p>
+    Before trusting a trigger, check it fires at all — and on the right turns. Replaying the
+    gate over every recorded user turn:
+  </p>
+  <table>
+    <thead><tr><th>Measure</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>turns the steer would fire on</td><td><strong>101 / 1323 = 7.6%</strong> — the tail, not everything</td></tr>
+      <tr><td>first-fire step</td><td>6 (29), 7 (14), 8 (26), 9 (12), 10 (10), 11 (9), 12 (1)</td></tr>
+      <tr><td>failure rate, all resolved turns</td><td>0.277</td></tr>
+      <tr><td>failure rate, fired-on turns</td><td><strong>0.543</strong></td></tr>
+    </tbody>
+  </table>
+  <p>
+    So the gate selects a population with roughly <strong>double</strong> the base failure rate.
+    That is a targeting result, not an effect: it says the steer is aimed at the right turns, not
+    that it improves them. The experiment answers the second question.
+  </p>
+  <p class="footnote">Approximation: the backtest slices the end-of-turn tool list to each step
+    index rather than replaying the live accumulation, so it is an upper bound on how EARLY the
+    steer fires. The fire RATE is unaffected.</p>
+
+  <h2>What the numbers claim</h2>
+  <p>
+    <code>depth_failure_prior</code> is <strong>empirical</strong> — those five points are
+    measured on this agent's own corpus, linearly interpolated between them and held flat
+    outside (extrapolating past step 12 would fabricate a number the corpus never supported).
+    The <strong>blend is not</strong>: it is a documented heuristic ordering over three
+    correlated signals (a deep turn has, by construction, made many tool calls), deliberately
+    not called a probability. Its reachable range is <code>[0.089, 0.803]</code>, not [0, 1].
+  </p>
+  <p>
+    <strong>A weight is not an importance.</strong> Measured decision spans: depth (w=0.5)
+    contributes 0.214, effort (w=0.3) contributes 0.300, failures (w=0.2) contribute 0.200 —
+    so the only <em>calibrated</em> term has the SMALLEST span and mostly acts as a constant
+    offset. Depth alone cannot cross the threshold at any step (a 30-step turn that ran no
+    tools scores 0.303). That is deliberate — a long turn making steady progress is not in
+    trouble — but it means the gate is driven by the two uncalibrated terms, which is exactly
+    why the steer text quotes the measured prior and never the blend.
+  </p>
+  <p>
+    The steer text also refuses two temptations: past step 12 it says "at 12 steps or more"
+    rather than laundering a held-flat value as a measurement at the current depth, and it
+    says "one common pattern" rather than "the cause is almost always" — the 342-trajectory
+    result is an observational conditional rate, and no causal decomposition supports the
+    stronger claim.
+  </p>
+
+  <h2>Whether it helps is not asserted here</h2>
+  <p>
+    The steer ships as the treatment arm of the <a href="experiments.html"><code>risk_steer</code></a>
+    experiment. The answer comes from randomized live traffic, not from this page.
+    <code>introspect action='experiments'</code> reads it.
+  </p>
+
+  <h2>Offline half — triage ranking (§4H item 2)</h2>
+  <p>
+    Reflection used to take the first <code>max_failures</code> failed trajectories in corpus
+    order — the OLDEST ones — treating every failure as equally worth a scarce LLM critique.
+    It now collects a bounded pool (6× the quota) and reflects its worst members.
+  </p>
+  <ul>
+    <li><strong>One scale, always.</strong> The obvious implementation — calibrated score where it exists, shape proxy elsewhere — sorts one list on two incommensurable quantities, and measured <em>worse than either input alone</em>: Kendall τ <strong>0.605</strong> mixed vs <strong>0.766</strong> shape-only and <strong>0.763</strong> calibrated-only. On the live corpus 7 of the 8 joinable failures scored LOWER under the calibrated path than under their own shape proxy, so having a calibration sample <em>demoted</em> a trajectory and a real 12-step disaster fell out of the queue. The calibrated scale is now used only when it covers the ENTIRE pool (~5% join rate today, so shape in practice); it arms itself if coverage ever completes.</li>
+    <li>The stored <code>composite</code> is the RAW pre-Platt score, not a calibrated probability — a monotone transform of one, enough to rank within itself and not enough to compare against anything else.</li>
+    <li>Ranking only reorders trajectories that were already reflectable — it can never widen the candidate set, and never exceeds <code>max_failures</code> critiques.</li>
+    <li>The sort is stable, so an all-equal corpus degrades to exactly the old chronological behaviour.</li>
+    <li><code>seen_failures</code> in the run report now counts the scanned pool ("reflected 3/18"), which is the accurate reading. With ranking off it is byte-for-byte the old early-break.</li>
+  </ul>
+
+  <h2>Kill switches</h2>
+  <table>
+    <thead><tr><th>Env</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_RISK_STEER=0</code></td><td>Live steer off outright (beats the arm assignment).</td></tr>
+      <tr><td><code>GHOST_EXPERIMENTS=0</code></td><td>Every request on the control path — also disables the steer, and stops all arm stamping.</td></tr>
+      <tr><td><code>GHOST_TRIAGE_RANKING=0</code></td><td>Reflection reverts to chronological selection.</td></tr>
+    </tbody>
+  </table>
+</main>
+</body>
+</html>

@@ -30,7 +30,7 @@ logger = logging.getLogger("GhostAgent")
 
 
 _VALID_ACTIONS = frozenset({"summary", "stats", "narrative", "recent",
-                            "recall", "activity", "learning"})
+                            "recall", "activity", "learning", "experiments"})
 
 _DEFAULT_RECENT = 5
 _DEFAULT_RECALL = 5
@@ -341,6 +341,26 @@ async def tool_introspect(
             return render_learning_health(_md)
         except Exception as e:
             return f"Learning health unavailable: {type(e).__name__}: {e}"
+
+    # 'experiments' reads the trajectory corpus (arms are stamped on each
+    # turn's record), not the SelfModel — so it branches before the selfhood
+    # gate too. This is the read-side of the live randomized-arm framework:
+    # "is the change I shipped actually better, on real traffic?"
+    if raw_action == "experiments":
+        try:
+            from pathlib import Path as _Path
+            from ..core.experiments import report_from_trajectories
+            _md = getattr(context, "memory_dir", None)
+            if _md is None:
+                return "Experiments: memory_dir unavailable."
+            # Off the event loop: the walk touches every day partition, and
+            # this tool is called from an async handler that also serves SSE.
+            import asyncio as _asyncio
+            return await _asyncio.to_thread(
+                report_from_trajectories,
+                _Path(str(_md)).parent / "trajectories")
+        except Exception as e:
+            return f"Experiment report unavailable: {type(e).__name__}: {e}"
 
     if self_model is None or not getattr(self_model, "enabled", False):
         return (

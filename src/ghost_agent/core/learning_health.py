@@ -954,4 +954,51 @@ def render_learning_health(memory_dir) -> str:
             lines.append(
                 f"  {name}: {state}; applied {applied} / fallback {fallback}{flag}")
 
+    lines.extend(_experiment_health_lines(memory_dir))
     return "\n".join(lines)
+
+
+def _experiment_health_lines(memory_dir) -> List[str]:
+    """Live-experiment arm counts + STAMP COVERAGE, folded into the same
+    report the operator already reads for "is my learning working".
+
+    Coverage is the load-bearing number: without it an empty experiment
+    report reassures identically whether the framework shipped ten minutes
+    ago or the stamp has been silently broken for three weeks — the exact
+    "built and silently never ran" failure this project keeps hitting,
+    applied to its own instrument.
+    """
+    try:
+        from pathlib import Path as _P
+        from .experiments import TRIGGER_KEYS, summarize_streaming
+        from ..distill.collector import TrajectoryCollector
+        root = _P(str(memory_dir)).parent / "trajectories"
+        if not root.exists():
+            return []
+        collector = TrajectoryCollector(root=root, session_id="reader")
+        all_stats, trig_stats, coverage = summarize_streaming(
+            collector.iter_trajectories())
+        seen = int(coverage.get("user_turns", 0))
+        stamped = int(coverage.get("stamped", 0))
+        if not seen and not stamped:
+            return []
+        out = ["\nLIVE EXPERIMENTS (randomized arms → core/experiments.py):"]
+        pct = (100.0 * stamped / seen) if seen else 0.0
+        out.append(f"  stamp coverage: {stamped}/{seen} recorded user turns "
+                   f"({pct:.1f}%)")
+        if not all_stats:
+            out.append("  ⚠ NO arms stamped — either nothing is enrolled or the "
+                       "stamp has regressed (check enrollment + "
+                       "_record_turn_trajectory)")
+            return out
+        for name in sorted(all_stats):
+            arms = all_stats[name]
+            counts = ", ".join(f"{a}={arms[a].n}" for a in sorted(arms))
+            trig = trig_stats.get(name) or {}
+            fired = sum(s.n for s in trig.values())
+            tail = f"; trigger fired on {fired}" if name in TRIGGER_KEYS else ""
+            out.append(f"  {name}: {counts}{tail}")
+        out.append("  full report: introspect action='experiments'")
+        return out
+    except Exception:  # noqa: BLE001 — telemetry must never break the report
+        return []

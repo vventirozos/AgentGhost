@@ -346,6 +346,115 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 
 ## 4. WHAT REMAINS TO DO
 
+### 4I. Router confidence — the last unused prospective signal (2026-08-05) ⏳ PHASES 1-3 ACTIVE, PHASE 4 GATED
+
+**What it is.** `complexity router: hard (confidence 0.10) ESCALATED` is computed on EVERY request
+at turn 0 (`core/agent.py` ~12460, `router/dispatch.py`), gates MCTS + the strategic planner, is
+written to the durable log — and is then discarded. It is the only **PROSPECTIVE** difficulty
+signal in the stack: available BEFORE the turn runs, where the depth curve (§4H) is retrospective
+and cannot say anything before step 6.
+
+**Audit that found it (2026-08-05).** Checked which recorded-but-unconsumed signals exist:
+| signal | state | note |
+|---|---|---|
+| router confidence/label | computed every request, **never stored** | this section |
+| `Trajectory.tokens_in/out` | **0 of 183** recent trajectories populated | dead fields; upstream carries usage |
+| `Trajectory.validator_signal` | 0 of 183 populated | dead on chat turns |
+| `repair_round` | drives the repair loop, never a feature | CONFIRMED trouble (verifier refuted), unlike depth's prior |
+| UNKNOWN rate | now monitored as an attrition confound | latent LABEL TIER: "stopped and reported honestly" ≠ "silently failed" |
+
+**Phase 1 — make it durable (no behaviour change). ✅ SHIPPED 2026-08-05.** `router_label`,
+`router_confidence` and `router_escalated` are stamped into `Trajectory.extra` at the decision
+site, via a new `core/turn_facts.py` — a bounded req_id-keyed ring, because the streamed path
+writes its trajectory AFTER the semaphore is released and a plain context attribute belongs to
+whichever request is running then (the exact defect found live on the experiment-arm stamp; the
+module is that lesson extracted so the next mid-turn fact does not rediscover it). Deliberately NOT
+folded into `core.experiments`' ring: that one holds only ENROLLED requests, so facts would vanish
+whenever the framework was killed.
+
+**`tokens_in`/`tokens_out` NOT done — deliberately, with a reason.** They read 0 of 183 on recent
+trajectories, but nothing in the stack captures upstream `usage` at all (`grep '"usage"'` over
+`core/llm.py` + `core/agent.py`: no hits), so filling them means touching the LLM response hot
+path. That is a bigger change than a recording-only phase should carry. Left as its own item.
+
+**Phase 2 — VALIDATE BEFORE TRUSTING. ✅ INSTRUMENT BUILT 2026-08-05
+(`scripts/router_confidence_backtest.py`), verdict awaits supply.** Buckets stamped turns by
+turn-0 confidence (keeping the router's own 0.30 escalation threshold as a bucket edge — if the
+signal is real the split should be visible right there), reports each bucket's actual failure rate
+with an anytime-valid interval, and exits 1 unless the spread across usable buckets clears 0.10.
+Run against the live corpus today it correctly reports `0 carry a router stamp` — Phase 1 has only
+just deployed, so there is nothing to measure yet. Re-run after ~a week of traffic. Full design: The same backtest the
+depth curve had to pass: bucket historical turns by router confidence, measure the ACTUAL failure
+rate per bucket. Two outcomes, different destinations — if it discriminates (e.g. 15% failure at
+high confidence vs 45% at low) it is a real prior; if it is flat, it is an escalation heuristic
+that happens to be logged, **and the plan stops at Phase 2**. Do not skip this: the depth curve
+earned its place because 342 trajectories said so, and this project's history is full of signals
+that looked usable and measured dead (`uncertainty_pressure`: 2 distinct values across a whole
+epoch; competence: separation 0.0023).
+
+**Phase 3 — variance reduction. ✅ BUILT 2026-08-05, and the expected size was OVERSTATED.**
+Uses the stamp as a PRE-TREATMENT covariate (CUPED) in `compare_arms`: pooled
+`theta = Cov(Y,X)/Var(X)`, applied to the residual series that feeds the confidence sequence, never
+to the reported means. Safe by construction — pre-treatment, so unbiased; `theta ~ 0` for a
+useless covariate makes it a no-op; and a covariate that would WIDEN the interval on the current
+sample is discarded rather than adopted.
+
+⚠ **MEASURED BENEFIT, correcting my own earlier claim.** I wrote "typically cuts variance 20-50%".
+That figure comes from CUPED's usual setting — a pre-period version of the SAME metric, correlation
+0.6-0.9. A turn-0 difficulty score against a BINARY outcome cannot reach that. Measured on
+synthetic data at n=200/arm:
+
+| covariate strength | CS half-width reduction |
+|---|---|
+| none | 0.3% |
+| weak (0.2) | 0.0% |
+| moderate (0.4) | 1.3% |
+| strong (0.6) | 4.1% |
+| very strong (0.8) | **8.6%** |
+
+So: a real but SMALL win, it costs nothing, and `MetricComparison.variance_reduction` reports what
+it actually bought on every line rather than asserting a benefit. The 20-50% figure would need a
+covariate of a different KIND — a per-session prior failure rate, or a pre-period metric — which is
+worth looking for if time-to-verdict ever becomes the binding constraint it looks like today.
+
+**Phase 4 — an early gate. GATED ON PHASE 2 SAYING IT DISCRIMINATES. Do NOT start otherwise.**
+
+*The gap it fills.* The risk governor cannot fire before step 6 (`_MIN_STEER_STEP`), and by
+construction it cannot: its two moving terms are turn shape and the strike ledger, both of which
+need a turn to have already happened. A request that is hard **from the first token** therefore
+gets no adaptation at all until it is already six steps deep and ~42% likely to fail. Router
+confidence is the only signal that could act at step 0.
+
+*What it would do.* One of two treatments, chosen by what Phase 2 measures — NOT both:
+- **budget** — a router-hard request gets a larger turn budget and/or a raised
+  `_MIN_STEER_STEP`, on the theory that hard tasks legitimately run long and the current gate
+  punishes them for it (this is the "mechanism, not outcome" worry in reverse: if the steer's
+  effect is mostly "ends turns earlier", a hard request is exactly where that is harmful);
+- **early frame** — a gentler turn-0 nudge than the step-6 steer: state the plan, name the
+  single riskiest assumption, and say what would falsify it. Deliberately NOT the "STOP and
+  report" text, which is wrong at step 0.
+
+*Ship rules, non-negotiable:*
+1. It ships as its OWN experiment arm (`router_budget` or `router_frame`) in
+   `core/experiments.py` — never as a default. "Obviously better" is the claim that keeps being
+   wrong here (two GEPA verifier rounds rejected by the private gate; the earn-keep harness
+   pruning zero subsystems).
+2. It must register a compliance key in `TRIGGER_KEYS` so the powered (triggered-only) comparison
+   exists, and — if it mutates the prompt — in `CONTEXT_MUTATING_KEYS`, or it silently
+   contaminates the §4F Phase 2b fixture corpus.
+3. Turn-0 assignment means the treatment applies to the WHOLE turn, so `n_steps`/`duration_s`
+   are mechanism metrics for it too. Read `failure_rate` on the triggered block, and read the
+   `unknown_rate` line above it first.
+4. **Two live steers must not stack.** If `router_frame` fires at step 0 and the risk governor
+   fires at step 6, that is two SYSTEM ALERTs in one request — the exact thing the governor
+   already yields to the futility breaker to avoid. Decide the precedence BEFORE building, and
+   make the deference explicit in code rather than in a comment (a one-way claim in a comment
+   was already found false once, §6 2026-08-05).
+
+*Kill criterion.* If the triggered comparison shows no effect after the arm reaches n>=30/arm on
+both sides, retire it rather than leaving it default-off in the tree — the "built but unwired"
+inventory is already long enough.
+
 ### 4H. Confidence-score follow-ups (2026-08-02) — 2 items, both OPEN, neither blocking
 
 Left over from the calibration epoch/objective fix (§6 2026-08-02, DEPLOYED + live-verified). Both are
@@ -367,7 +476,14 @@ either**, especially the measured verdict that the score has no behavioural cons
    `and _separation_sigmas(...) >= _MIN_SEPARATION_SIGMAS` conjunct the other two weights use.
    Documented as "Known asymmetry" in `docs/core/calibration.html`.
 
-2. **Offline triage is unbuilt** — the one use the measurement actually supports. Rank trajectories
+2. **Offline triage — ✅ BUILT 2026-08-05** (§6 that date). Reflection now ranks a bounded pool
+   worst-first instead of taking the OLDEST failures. ⚠ NOT as designed here: ranking by the
+   calibrated score *where it exists* and the shape proxy elsewhere mixes two incommensurable
+   scales and measured WORSE than either alone (Kendall τ 0.605 vs 0.766 shape-only / 0.763
+   calibrated-only); on the live corpus it DEMOTED 7 of the 8 joinable failures. Shipped as ONE
+   scale always — calibrated only at full pool coverage (~5% join rate today, so shape in
+   practice). The design intent below is kept as the record of what was asked for.
+   The original plan: rank trajectories
    for reflection / postmortem / self-play attention by the calibrated post-hoc score (**AUC 0.727**
    on 342 labelled trajectories) instead of the binary "failed" flag those selectors use today. A
    graded calibrated probability is strictly more informative than a boolean, it is exactly where the
@@ -379,6 +495,9 @@ either**, especially the measured verdict that the score has no behavioural cons
    flowing or the ranking drifts toward rewarding "did not visibly break".
    **Free adjunct needing no model at all:** turn DEPTH predicts failure on its own — 17.8% at step 1,
    35.6% at 4, 42.3% at 6, 52.0% at 8, 60.6% at 12. Usable for budget/escalation policy directly.
+   ✅ CONSUMED 2026-08-05 by `core/risk.py` (the live steer quotes this curve; the blend around it
+   is explicitly a heuristic ordering, not a probability). Backtest: the gate fires on 7.6% of user
+   turns and those turns fail at 0.543 vs a 0.277 baseline.
 
 ### 4G. Project-aware services + port leases — 3-phase plan (2026-07-30) ✅ IMPLEMENTED same day
 
@@ -730,6 +849,32 @@ noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix 
    over-cap candidates zero-scored with compress-feedback; ship condition enforces fits_caps) —
    targets capacity-bound rule-following on the E4B judge. Same balanced private gate vs the
    0.840 incumbent.
+   **RESULT (2026-08-04 ~19:09): REJECTED — candidate 0.637 vs incumbent 0.756 balanced
+   (−0.119, caps satisfied).** Two run-craft defects found+fixed en route: (a) run 3a burned 37
+   iterations on SILENTLY zeroed over-cap candidates — the cap lived only in post-hoc scoring,
+   invisible to gepa's reflector which composes from the PARENT's traces; fix = constraint
+   embedded in `reflection_prompt_template` (where proposals are born) + loud cap-guard prints
+   (operator's raw-stream observation caught it, not my grep summaries); (b) monitoring rebuilt
+   as a StatusBoard (`<run-dir>/status.txt|json`, atomic, adapter+gepa-logger fed — phases,
+   accept/reject/cap counters, verdict line); runs now resume via --run-dir. ALSO MEASURED:
+   private-gate noise ±~0.08 across sessions on the 4-case private tier (incumbent re-read 0.840
+   → 0.756, same templates) — **grow the private case pool before any further verifier prompt
+   round.** VERDICT MEANING: two strategies now cleanly refuted by the gate (uncapped rebalanced
+   −0.131, capped compressed −0.119); the 07-30 incumbent stays the best measured configuration;
+   compression to ≤2 KB costs real bench accuracy on this judge — the remaining lever from the
+   capacity diagnosis is VERDICT-TIER ROUTING (architecture, not prompt text; T+7d discussion),
+   plus the standing FP churn stays escalation-bounded (~18/day, latency-only).
+
+**Phase 2b+ — tool ONTOLOGY analysis (2026-08-05, §6).** `optim/tool_ontology.py` +
+`scripts/tool_ontology_report.py` measure the two structural questions description prose cannot
+answer: which confusion pairs are BOUNDARY problems (bidirectional, evidence-tiered by an exact
+binomial symmetry test) versus wording problems (one-way), and which recurring consecutive
+tool-sequences are macro candidates. Read-only; promotion stays operator-gated. `--confusion-out`
+on the 2b runner persists the misses the 08-03 ceiling check discarded. **First run: the
+`file_system` batch gap dominates** (789 pair-occurrences over 108 turns, cohesion 0.72).
+**Fixture isolation:** turns whose prompt context a live A/B treatment mutated are now excluded
+from mined fixtures by default and COUNTED (`experiment_context_excluded`) — the optimizer replays
+payloads verbatim, so a steered turn would tune descriptions against a context only one arm sees.
 
 **Queued behind evidence (do NOT start early):**
 3. Next verifier optimization round MUST use a rebalanced trial mix first (clean/NOT_REFUTED
@@ -1546,6 +1691,210 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-08-05 — THE INSTRUMENT: live randomized arms + the risk governor that finally consumes the depth signal + tool-ontology analysis (3 features, 16+9+3 review findings fixed)
+
+**Origin.** Operator asked for three high-impact ideas, then *"proceed with all 3 ... Make sure you
+review your own changes using fresh-eye agents. be very careful"*. Three fresh-eye reviewers
+(correctness/wiring, statistics/claims, data-integrity/tests) ran against the finished code. They
+returned **28 findings, 8 of them critical, ALL past a green 10.6k suite** — including one defect
+that one of my own fixes had created. Everything below is post-review.
+
+**⚠ ALREADY LIVE.** launchd restarted prod mid-session (21:34 and 21:42), so the running agent
+picked these changes up without an explicit deploy. Verified healthy: no tracebacks from the new
+modules, and 6 real turns are stamped in the corpus. Kills: `GHOST_EXPERIMENTS=0` (whole
+framework), `GHOST_RISK_STEER=0` (steer only), `GHOST_TRIAGE_RANKING=0` (reflection ranking) —
+each needs a restart.
+
+**1. `core/experiments.py` — live randomized arms. The instrument every parked item was waiting for.**
+Each eligible request is assigned, blind and deterministically (`sha256(salt|kind|exp|req_id)`), to
+one arm of each running experiment; the arm is stamped on the turn's trajectory; the outcomes that
+already exist become a randomized comparison over REAL traffic. This is the earn-keep post-mortem's
+pre-approved "change the instrument" route: no prod stop, no synthetic ceiling (B4 saturated twice),
+no attribution ambiguity (the §4F watch has no control arm). Registry at
+`$GHOST_HOME/system/experiments.json` (mtime-reloaded, malformed → built-in defaults). Read via
+`introspect action='experiments'` or `scripts/experiment_report.py`.
+
+**2. `core/risk.py` — the consumer for two measured-but-unused predictors.** §4H recorded that turn
+DEPTH predicts failure (17.8% at step 1 → 60.6% at 12) and that the calibrated composite (AUC 0.727)
+has NO behavioural consumer. Live half: a one-shot steer on deep+struggling turns whose third
+instruction is the one the agent never takes alone — stop and report honestly. Offline half: §4H
+item 2, reflection now ranks a bounded pool worst-first instead of taking the OLDEST failures.
+**Backtested before trusting it:** fires on 101/1323 user turns (7.6%), first-fire clustered at
+steps 6–8, and those turns fail at **0.543 vs a 0.277 baseline** — a targeting result, not an
+effect. Whether it helps is the `risk_steer` experiment's job to answer, not this entry's.
+
+**3. `optim/tool_ontology.py` + `scripts/tool_ontology_report.py` — is the toolbox carved right?**
+Phase 2b optimizes description PROSE; the 0.772 ceiling check says the misses CLUSTER into pairs,
+which is a boundary question prose cannot answer. Two read-only analyses: confusion classification
+(bidirectional = merge/redraw, one-way = describe, no-tool = missing affordance, every verdict
+tiered by an exact binomial symmetry test) and consecutive-n-gram macro mining. Proposes only —
+promotion stays operator-gated. `--confusion-out` added to the Phase 2b runner (opt-in) so the
+misses that the 08-03 run printed and discarded are now persisted.
+**First live run:** `file_system` runs dominate — 789 pair-occurrences across **108 distinct turns**
+at 0.72 cohesion; the 2/3/4-grams describe the same calls and would remove ~400 loop steps each. A
+batch/multi-path `file_system` call is the highest-value macro on the board, and since depth drives
+failure it attacks the failure RATE, not just latency.
+
+**GEPA / §4F Phase 2b interaction — closed deliberately.** The steer mutates the prompt context, and
+`GHOST_LLM_RECORD=1` is on for 2b supply, so a steered turn's later payloads would enter the fixture
+corpus that the optimizer replays VERBATIM. Handled like the era filter: `tool_fixtures.py` excludes
+turns with a mutated context by default, COUNTED as `experiment_context_excluded` (plus
+`experiment_filter_unavailable` when the import fails, since "0 excluded" and "filter never ran" must
+not look alike). `--include-experiment-context` overrides. `core.experiments.CONTEXT_MUTATING_KEYS`
+is the extension point and carries the contract. Verified: miner unchanged, 180 fixtures / 62
+positives, exclusions 0. **`optim/trainset.py` reads only user_request/final_response/cluster/tier —
+the new `extra` keys cannot leak into GEPA examples.**
+
+**═══ THE REVIEW FINDINGS (all fixed; each was invisible to the suite) ═══**
+
+*Statistics — the instrument would have produced WRONG VERDICTS:*
+- **Zero-width intervals.** The plain sample SD is 0 on constant input → the CS collapsed to a
+  point → six Bernoulli observations "proved" a difference. Measured single-arm miscoverage
+  **52% (p=0.5) / 82% (p=0.1)** at a nominal 5%. Fixed with a running-mean regularised variance
+  (WSR's ¼ pseudo-observation generalised to arbitrary scale). Re-measured after the fix, from
+  n=30: **2.5% / 3.3% / 9.2% / 1.8%** (Bernoulli .5/.3/.1, Normal). The p=0.1 row is the honest
+  weak spot and is documented as such.
+- **"Valid under continuous monitoring" was an overclaim** — the CS is ASYMPTOTIC, no
+  finite-sample guarantee. Added `_MIN_VERDICT_N=30`/arm (numbers still shown, conclusion
+  withheld) and the word asymptotic everywhere.
+- **No multiplicity correction:** three metrics × "stop when any crosses" ran at ~15% vs nominal
+  5%. α now splits ÷3 across metrics as well as ÷2 across arms.
+- **Differential attrition, the sharpest trap and the LIKELY failure mode here:** `failure_rate`
+  conditions on a POST-treatment variable, and the steer literally instructs "STOP. Report what is
+  known" — which produces ungradeable turns. Simulated with ZERO true effect this manufactured a
+  **14-point "improvement"**. Now the UNKNOWN rate is itself compared and `failure_rate` is flagged
+  CONFOUNDED; `n_steps`/`duration_s` carry a permanent "mechanism, not outcome" annotation.
+- **Balance alarm falsely accused the stamp 11.9% of the time** at its own minimum n (fixed ±20%
+  rule vs a Binomial reality) → exact two-sided binomial tail, p<0.001. And it **died silently at
+  n≥1024** (`2**n` overflows float64 → OverflowError → p=1.0) — now log-space. Same fix in
+  `binomial_symmetry_p`.
+- **`merge_or_redraw` fired on noise** — 2-vs-1 has symmetry p=1.000, and at n=57 with skewed tool
+  usage pure noise produced a spurious merge directive **39.6%** of the time. Verdicts are now
+  tiered significant/suggestive/insufficient with the exact p reported; thin pairs read "WATCH, do
+  not act" (suppressing them entirely was my first fix and it was wrong — the pattern is still
+  worth seeing).
+- **`steps_collapsed` overstated savings 1.75–3.4×** (overlapping windows vs what a macro can
+  actually replace) → non-overlapping counting; the live table was 1431→402 and is corrected in the
+  doc with a footnote. Ranking also gained a per-turn cap: one 50-call grind session outranked a
+  genuine 9-turn macro by 5.7×.
+- **Two different "fidelity" numbers** were claimed to be the same; both are now reported.
+
+*Wiring — the live path:*
+- **Self-play/dream solver turns were being enrolled and steered.** `dream.py` calls `handle_chat`
+  without a `request_id`, so `is_internal_request` (prefix test) missed them → ~50% got the
+  treatment steer → this randomizes self-play outcomes, frontier scoring, and the **lesson
+  keep/kill verdict** — and their context has no collector, so no arm is ever stamped: the
+  experiment was perturbing a population it could not see. Now gated on collector-present +
+  not-simulation + not-selfplay + not-read-only-memory. General rule: **a turn whose arm cannot be
+  recorded must never be enrolled.**
+- **The steer could contradict `force_final_response`** — a turn already told to write its final
+  answer has tool calls dropped, so "run one small check" instructs a discarded action (and a
+  dropped MUTATION surfaces a user-visible "not applied" note). Now withheld.
+- **The futility mutual-exclusion claim was false in one direction.** Rather than suppress the
+  more-specific breaker, the comment now states the actual (correct) policy: deference is one-way.
+
+*Data integrity — and the defect MY OWN FIX created:*
+- **The compliance bit was not request-scoped, and the arms ring made it worse.** A streamed turn
+  writes its trajectory after the semaphore is released, so a context-attribute flag belongs to
+  whichever request is running THEN. Both directions reproduced: a control turn stamped as steered
+  (poisoning the triggered-only block AND dropping a clean GEPA fixture), and a steered turn
+  stamped without its bit (defeating the GEPA isolation on the common path). Flags now live in the
+  same req_id-keyed ring as the arms.
+- **~13× dilution.** The trigger fires on 7.6% of turns; averaging over all traffic would have read
+  "no difference detected yet" for ~4 months while the treatment was really changing behaviour.
+  The report now renders a TRIGGERED-ONLY block and points the reader at it. Conditioning is
+  legitimate: the gate is evaluated identically in both arms, only the action differs.
+- **No zero-enrollment detector** — an empty report reassured identically whether the framework
+  shipped 10 minutes ago or the stamp had been broken for weeks. Added stamp coverage
+  (`N/M recorded user turns carry an arm`) to the header and a warning to the empty case.
+- **`mine_tool_fixtures.py` destroyed the live GEPA artifact before its own gates ran** (verified:
+  a wrong `--trajectories` took it 116 bytes → 0). Gates now run first; a failed mine is parked at
+  `.notready` and the live file is left alone (`--force-write` overrides).
+- **`tool_ontology_report.py` printed a CONCLUSION with no corpus** ("no recurring sequences") —
+  this project's own "measured the corpus, not the signal" failure in miniature. Now exit 2 with
+  an explicit error in `--json` too, and its GHOST_HOME fallback matches the miner's.
+- `report_from_trajectories` materialised the whole corpus on the event loop → single streaming
+  pass + `asyncio.to_thread` at the introspect site. `recent_samples` moved off the loop too.
+- `seen_failures` silently changed meaning on an operator-facing line (pool, not quota):
+  `summary()` now says "reflected 3 of 18 scanned".
+- Registry now validates ARM names/counts (it is a file the agent itself can write, and arms ride
+  into `extra` on every trajectory); null/NaN calibration composites are skipped rather than
+  scoring **maximum** risk.
+
+*The triage defect BOTH reviewers found independently:* mixing the calibrated score with the shape
+proxy in one ranking measured **worse than either alone** (Kendall τ 0.605 vs 0.766 / 0.763), and on
+the live corpus 7 of 8 joinable failures scored LOWER under the calibrated path — a real 12-step
+disaster fell out of the reflection queue in favour of a milder turn with no sample. Now ONE scale
+always: calibrated only when it covers the whole pool (~5% join today → shape in practice).
+
+**Tests.** +99 across `test_experiments.py` (42), `test_risk_governor.py` (30), `test_tool_ontology.py`
+(30), `test_experiment_wiring.py` (14 — includes the trivial-greeting fast-path trap that made an
+earlier version pass vacuously). The third reviewer mutation-tested the suite; every surviving
+mutation it found is now pinned, including a real coverage test (the old one *named* coverage and
+never measured it, which is exactly how the 52% variance bug stayed green). One flaky test
+(3.1% by design) fixed by pinning req_ids. **Suite: 10704 passed / 13 skipped.** One honest gap
+recorded in-file: the `force_final_response` guard has no automated test, because every cheap way to
+reach that state asserts the mock rather than the guard.
+
+**Docs.** `docs/core/experiments.html`, `docs/core/risk.html`, `docs/algorithms/tool_ontology.html`
+(all three carry the measured numbers AND the corrections), index + `self_improvement.md` updated.
+
+**═══ ROUND 2: A FOURTH REVIEW OF THE FIXES THEMSELVES (same day) ═══**
+
+Because one round-1 fix had CREATED a defect, the fixes got their own fresh-eye review. It found
+12 more, **3 MAJOR — two of them inside round-1 fixes**. Worth internalising: *a fix is a change,
+and changes are what this project's defect history is made of.*
+
+- **The non-overlapping counter I added to stop OVERSTATING savings then UNDERSTATED them by
+  49.6%** — one greedy cursor was shared across all n-gram sizes, so a match of sequence X
+  consumed windows belonging to Y. Directional, too: same-tool runs claim the cursor first, so
+  cross-tool sequences — the ones a macro proposal is actually for — were starved
+  (`file_system → execute` read 45 against a true 110). Cursor is now per-sequence.
+- **The evidence tier I added computed `p_sym`, printed it, and never read it** on the merge
+  branch; `_SYMMETRY_ALPHA` was dead code. Measured against the noise model: a spurious "merge
+  these two tools" directive fired **92.8% of the time at n=400**. Fixing it took FOUR attempts,
+  each measured rather than reasoned about: (1) `observed > expected` — 98.5% spurious, because a
+  comparison is not a test; (2) Poisson excess vs marginals — 42.8% at n=1000, the null failed to
+  model that a miss can never land on the true tool; (3) leave-one-out marginals — power 95% but
+  **90% false positives**, over-corrected; (4) shipped: full (conservative) marginals + Poisson
+  excess + Bonferroni, plus a second route for the null's blind spot (a pair that IS ≥40% of all
+  confusion cannot show "excess" because it *is* the marginals; noise never exceeded 34%).
+  **Final: 0% spurious to n=1000, 2% at n=3000; power 64–97%.**
+- **The arms ring was ALIASED into every shallow-copied context** (`subagent.py`, `dream.py` do
+  `copy.copy(context)`), so a self-play cycle or delegate fan-out could evict a live user turn's
+  entry before its streamed drain wrote the trajectory — recreating the exact loss the ring was
+  added to prevent. Fixed by only ringing ENROLLED requests (background turns produce `{}`).
+- `arm_for` was the only reader that skipped the ring, so a turn could take the control path while
+  being RECORDED as treatment. `_regularised_sigma` did not reduce to WSR's ¼ for non-binary
+  [0,1] data (anti-conservative by 2.5× for a clustered rate metric — latent, since `_METRICS` is
+  the documented extension point). Plus: FIFO ring eviction, one malformed record disabling
+  ranking for a whole pool, a learning-health corpus walk left on the event loop, and two
+  reporting-consistency nits.
+
+**Also verified by that round (worth recording as confirmed-good):** the log-space binomials are
+exact to 4.4e-14 against `Fraction` and cost 2.7 ms at n=20000; both ring races behave; a
+`mark_trigger` on an evicted id can never read as enrolled; `summarize_streaming` is byte-identical
+to the two-pass form it replaced and genuinely single-pass; `compare_arms` really uses α/6 per arm;
+`rank_for_triage` never drops or duplicates; the miner leaves a live artifact byte-identical when
+its gates fail; and a full before/after stat of `system/` (362 files) confirmed the three scripts
+write NOTHING to operator data.
+
+**Monitoring added (operator request):** a boot line naming every live experiment and the steer
+state; the control arm's "WOULD have steered, withheld" counterfactual promoted to INFO so both
+arms are visible in the live stream; stamp coverage folded into `introspect action='learning'`;
+and a one-shot verdict announcement into the autonomous-activity ledger at `notify` severity
+(digest + push) — chosen because that ledger's two severities already encode the operator's
+"auto-surface only actionable events" preference, and a decided verdict is the definition of
+actionable. Persisted marker keys make it fire at most once per (experiment, scope, metric,
+direction).
+
+**Suite after both rounds: 10718 passed / 13 skipped.**
+
+**What to do next:** let it collect. No verdict is emitted below 30 turns/arm, and the triggered
+block needs ~30 triggered turns per arm (~7.6% of traffic, so a few weeks). Read it with
+`introspect action='experiments'`. If the 2b GEPA run wants a totally steer-free corpus, run it
+before this collects much, or leave the default exclusion on and accept slightly slower supply.
 
 ### 2026-08-02 (later 2) — uCONSOLE UI: the web UI's face ported to the handheld, three QPainter faces DELETED, whole client restyled to glass + real bubble typography (deployed live)
 

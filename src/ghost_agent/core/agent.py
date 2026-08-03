@@ -35,6 +35,11 @@ from .triggers import (
 from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print
 from ..utils import logging as _glog
 from ..utils.constraints import extract_constraints, render_constraint_block
+# Live randomized arms + the risk governor that is measured by one of them.
+# Imported as modules (not names) so a test can monkeypatch either surface in
+# one place, and so the turn loop pays no per-iteration import lookup.
+from . import experiments as _experiments_mod
+from . import risk as _risk_mod
 
 # Sampling parameters for the current upstream model
 # (HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive). The model
@@ -4373,6 +4378,22 @@ class GhostAgent:
             if (since_last_calib >= _calib_cooldown
                     and isinstance(tracker, _CalibTrackerCls)):
                 self._last_calib_refit_at = datetime.datetime.now()
+                # Piggyback on the same cooldown: has any live experiment
+                # reached a DECIDED verdict since we last looked? Only
+                # decided ones announce — "no difference yet" is the normal
+                # state and would be pure noise. Rides the activity ledger at
+                # `notify` severity (digest + push), which is the channel
+                # this agent already has for "actionable while you were
+                # away"; routine progress stays queryable via
+                # `introspect action='experiments'` instead of interrupting.
+                try:
+                    _verdicts = await asyncio.to_thread(
+                        _experiments_mod.announce_new_verdicts, ctx)
+                    for _v in _verdicts:
+                        pretty_log("Experiment Verdict", _v,
+                                   level="WARNING", icon=Icons.BRAIN_SUM)
+                except Exception as _expv:  # noqa: BLE001
+                    logger.debug("experiment verdict check skipped: %s", _expv)
                 try:
                     params = await asyncio.to_thread(tracker.fit)
                     if params is not None:
@@ -9699,6 +9720,13 @@ class GhostAgent:
                                 for _bn, _rec in _si.items():
                                     if _bn in _blob:
                                         _rec["runs"] += 1
+                            # NOTE: deliberately does NOT check the risk
+                            # governor's latch. The deference is one-way by
+                            # design — this breaker names the specific file
+                            # being rewritten, so when it trips after a
+                            # generic risk steer it carries NEW information
+                            # and should still fire. The reverse is not true,
+                            # which is why the governor yields to this one.
                             if not getattr(self.context, "_futility_steer_done", False):
                                 for _bn, _rec in _si.items():
                                     if _rec["writes"] >= 3 and _rec["runs"] >= 2:
@@ -12193,6 +12221,44 @@ class GhostAgent:
                 # not outlive its request either).
                 self.context._calib_pending = None
                 self.context._entropy_norm_pending = None
+                # LIVE RANDOMIZED ARMS (core/experiments.py). Assign this
+                # request to one arm of every running experiment, blind and
+                # deterministically (a pure function of req_id). Done HERE —
+                # inside the semaphore, right next to the other per-request
+                # state resets — so the stash can never be clobbered by an
+                # overlapping turn, and every downstream reader (the steer
+                # below, the trajectory stamp at finalize) sees one stable
+                # assignment for the whole request. Internal requests and a
+                # `GHOST_EXPERIMENTS=0` kill both yield {} → control path.
+                # ELIGIBILITY. Two independent reasons a turn must not take
+                # part, both learned the hard way:
+                #  * NO COLLECTOR → the turn writes no trajectory, so its arm
+                #    can never be recorded or analysed. Enrolling it perturbs
+                #    a population the experiment cannot see. This is the
+                #    general rule; the self-play/dream solver hits it (dream
+                #    nulls the collector on its isolated context).
+                #  * SIMULATION/self-play → these turns have no user to
+                #    report to, and their outcome feeds frontier scoring and
+                #    the lesson keep/kill verdict. A coin-flip steer there
+                #    would randomize the LEARNING SIGNAL, not just a reply.
+                #    Every other nudge on this path already honours these
+                #    three markers.
+                _exp_eligible = (
+                    getattr(self.context, "trajectory_collector", None) is not None
+                    and not getattr(self, "suppress_meta_task_nudges", False)
+                    and getattr(self, "thinking_budget_override", None) != "selfplay"
+                    and getattr(getattr(self.context, "skill_memory", None),
+                                "is_read_only", False) is not True
+                )
+                _experiments_mod.enroll_request(self.context, req_id,
+                                                eligible=_exp_eligible)
+                # Risk-governor one-shot latch (core/risk.py). Reset per
+                # request like every other steer flag. `_risk_steer_fired` is
+                # the treatment-compliance bit the trajectory stamp reads; it
+                # is always written next to `_done`, but reset it here too so
+                # a stale True can never outlive its request.
+                self.context._risk_steer_done = False
+                self.context._risk_steer_fired = False
                 # Clear turn-scoped uncertainty state from a previous
                 # request that died before its finalize (the only reset
                 # used to be at finalize-END, so an aborted turn leaked
@@ -12402,6 +12468,22 @@ class GhostAgent:
                             "escalated": decision.escalated,
                             "reason": decision.reason,
                         }
+                        # §4I Phase 1 — make the one PROSPECTIVE difficulty
+                        # signal durable. It is computed on every request at
+                        # turn 0, gates MCTS + the planner, and was then
+                        # discarded; nothing downstream (risk, experiments,
+                        # variance reduction) can use it until the corpus
+                        # carries it. Recording only — no behaviour change,
+                        # and deliberately NOT consumed until Phase 2
+                        # measures whether it discriminates at all.
+                        from . import turn_facts as _turn_facts
+                        _turn_facts.record(
+                            self.context, req_id,
+                            router_label=str(decision.label or ""),
+                            router_confidence=round(
+                                float(decision.confidence), 4),
+                            router_escalated=bool(decision.escalated),
+                        )
                         # Durable diagnostic: this decision gates MCTS lookahead
                         # + the strategic planner, so it's the "why did/didn't
                         # deep-reasoning fire" record. INFO (durable-only; a
@@ -13151,6 +13233,93 @@ class GhostAgent:
 
                     if turn > 2: was_complex_task = True
                     if force_stop: break
+
+                    # --- RISK GOVERNOR (core/risk.py, experiment-gated) ------
+                    # Depth is this agent's strongest measured failure
+                    # predictor (17.8% at step 1 → 60.6% at step 12, §4H) and
+                    # nothing consumed it. Score the in-flight turn from depth
+                    # + turn shape + the strike ledger; on a deep AND
+                    # struggling turn, inject ONE steer whose third option is
+                    # the one the agent never takes on its own: stop and
+                    # report honestly.
+                    #
+                    # Yields to the futility breaker: that guard fires on the
+                    # same pathology (rewrite/rerun churn) but NAMES THE FILE,
+                    # so it is strictly better advice when it applies. The
+                    # deference is one-way on purpose — a futility trip after
+                    # a generic steer still carries new information and is
+                    # allowed to fire. The reading is computed in BOTH arms (so
+                    # the control arm measures how often it WOULD have fired);
+                    # only the treatment arm appends the message.
+                    #
+                    # `force_final_response` is checked because a turn already
+                    # told to WRITE ITS FINAL ANSWER has its tool calls dropped
+                    # downstream — steering it to "run one small check" would
+                    # instruct an action the loop then discards, and a dropped
+                    # MUTATION even surfaces a user-visible "not applied" note.
+                    try:
+                        if (not getattr(self.context, "_risk_steer_done", False)
+                                and not getattr(self.context,
+                                                "_futility_steer_done", False)
+                                and not force_final_response
+                                and not force_stop
+                                and _risk_mod.steer_enabled()):
+                            _risk_reading = _risk_mod.turn_risk(
+                                step=turn + 1,
+                                tool_names=[t.get("name") for t in tools_run_this_turn
+                                            if isinstance(t, dict) and t.get("name")],
+                                execution_failures=execution_failure_count,
+                                transient_failures=transient_failure_count,
+                            )
+                            if _risk_reading.should_steer:
+                                self.context._risk_steer_done = True
+                                _risk_arm = _experiments_mod.arm_for(
+                                    self.context, _risk_mod.EXPERIMENT, req_id)
+                                self.context._risk_steer_fired = (
+                                    _risk_arm == _experiments_mod.TREATMENT)
+                                # Record compliance REQUEST-SCOPED. A streamed
+                                # turn writes its trajectory after the
+                                # semaphore is released, so a context-attribute
+                                # flag is read at stamp time from whichever
+                                # request is running THEN — which both leaked a
+                                # treatment bit onto a control turn and lost it
+                                # from a steered one.
+                                _experiments_mod.mark_trigger(
+                                    self.context, req_id, "risk_steer_fired",
+                                    self.context._risk_steer_fired)
+                                if self.context._risk_steer_fired:
+                                    pretty_log(
+                                        "Risk Governor",
+                                        f"step {_risk_reading.step}: risk "
+                                        f"{_risk_reading.score:.2f} (measured "
+                                        f"{_risk_reading.depth_prior:.0%} failure "
+                                        "rate at this depth) — steering toward "
+                                        "confirm/shrink/report",
+                                        level="WARNING", icon=Icons.WARN,
+                                    )
+                                    messages.append({
+                                        "role": "user",
+                                        "content": _risk_mod.risk_steer_message(
+                                            _risk_reading),
+                                    })
+                                else:
+                                    # Visible, not debug: this is the CONTROL
+                                    # arm's counterfactual, and seeing both
+                                    # arms in the live stream is how the
+                                    # operator confirms the randomizer is
+                                    # actually running and roughly balanced.
+                                    # INFO (not WARNING) — nothing is wrong,
+                                    # the turn is simply the control side.
+                                    pretty_log(
+                                        "Risk Governor",
+                                        f"step {_risk_reading.step}: risk "
+                                        f"{_risk_reading.score:.2f} — WOULD have "
+                                        "steered, withheld (control arm)",
+                                        icon=Icons.BRAIN_SUM,
+                                    )
+                    except Exception as _rg_exc:
+                        logger.debug("risk governor skipped: %s: %s",
+                                     type(_rg_exc).__name__, _rg_exc)
 
                     # --- DETERMINISTIC TERMINAL-TOOL DISPATCH (turn 0) -------
                     # A bare "self play" / "self play again" (and likewise
@@ -17511,13 +17680,45 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # turns are globally serialized). When a future counterfactual
         # flags a regression, this is the candidate set; without it,
         # attribution is unrecoverable after the fact.
+        _extra: Dict[str, Any] = {}
         try:
             _sm_h = getattr(self.context, "skill_memory", None)
             _trigs = list(getattr(_sm_h, "last_playbook_triggers", []) or [])
             if _trigs:
-                traj_kwargs["extra"] = {"hydrated_lessons": _trigs[:10]}
+                _extra["hydrated_lessons"] = _trigs[:10]
         except Exception:
             pass
+        # EXPERIMENT STAMP (core/experiments.py). Without this the arm is
+        # unrecoverable after the turn ends and the whole randomization is
+        # inert — the analysis reads exactly this key. Stamped on BOTH
+        # delivery paths because both land here. `_risk_steer_fired` records
+        # TREATMENT COMPLIANCE: an arm that never actually triggered its
+        # change would otherwise read as a null result rather than as a
+        # non-event, which is the single easiest way to misread an A/B.
+        # §4I Phase 1: per-request facts recorded mid-turn (router verdict).
+        # Read through the req_id-keyed ring for the same reason the
+        # experiment stamp is — this method runs after the semaphore on the
+        # streamed path, where a context attribute belongs to whichever
+        # request is running now.
+        try:
+            from . import turn_facts as _turn_facts
+            _extra.update(_turn_facts.facts_for(self.context, req_id))
+        except Exception:
+            pass
+        try:
+            _arms = _experiments_mod.assignments_for_request(self.context, req_id)
+            if _arms:
+                _extra[_experiments_mod.EXTRA_KEY] = _arms
+                # Compliance flags come from the req_id-keyed ring, NOT from a
+                # context attribute: this method runs after the semaphore on
+                # the streamed path, where a context attribute belongs to
+                # whichever request is running now.
+                _extra.update(
+                    _experiments_mod.trigger_flags(self.context, req_id))
+        except Exception:
+            pass
+        if _extra:
+            traj_kwargs["extra"] = _extra
         # Use the pre-allocated id from `handle_chat` when present so
         # in-turn writers (Perfection-Protocol's lesson save) and the
         # eventual on-disk record share one stable id. Falls back to

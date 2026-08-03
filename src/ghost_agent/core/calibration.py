@@ -763,6 +763,22 @@ class CalibrationTracker:
     def sample_count(self) -> int:
         return len(self._load_samples())
 
+    def recent_samples(self, limit: int = 500) -> List[CalibrationSample]:
+        """The most recent ``limit`` samples, ALL epochs.
+
+        Public read for consumers that only need the per-turn scores keyed by
+        ``req_id`` (offline triage ranking, `core.risk`) rather than a fit.
+        Epoch is deliberately NOT filtered here: ranking compares turns
+        against each other within one recent window, and dropping older-epoch
+        rows would silently shrink that window — whereas a FIT must never mix
+        epochs, which is why `fit` uses `_load_epoch` instead.
+        """
+        try:
+            n = max(1, int(limit))
+        except (TypeError, ValueError):
+            n = 500
+        return self._load_samples(limit=n)
+
     # ----------------------------------------------------------- metrics
 
     def brier_score(self, *, window: Optional[int] = None) -> Optional[float]:

@@ -39,6 +39,14 @@ one (PROJECT_JOURNAL §4F Phase 2b):
 - **Split**: public/private tier by ``request_id`` hash
   (``holdout_tier("toolfx:<request_id>")``) so every fixture from one turn
   shares a tier — membership can never migrate as the corpus grows.
+- **Experiment isolation** (added with `core.experiments`): turns where a
+  live A/B treatment MUTATED the prompt context are excluded by default
+  (``exclude_mutated_context``). The optimizer replays recorded payloads
+  verbatim, so a steered turn's later payloads carry the steer text — mixing
+  them in would tune descriptions against a context only half of production
+  sees, and would make the fixture corpus quietly non-stationary while the
+  experiment runs. Same class of hazard as the era filter above, which is
+  why it is handled the same way: excluded, counted, never silent.
 
 Memory: the mine is ONE streaming pass. Only the light fixtures and a
 pending-pair index are retained — full records (each ~100 KB with the
@@ -224,6 +232,34 @@ def _label_for(traj) -> Optional[float]:
     return None
 
 
+# Set when `core.experiments` could not be imported, so the caller can report
+# that the exclusion was UNAVAILABLE rather than that nothing was excluded.
+_FILTER_UNAVAILABLE = {"hit": False}
+
+
+def _context_was_mutated(traj) -> bool:
+    """Did a live A/B treatment alter this turn's prompt context?
+
+    Lazy import so the miner keeps working if `core.experiments` is absent (a
+    trimmed deployment, an older checkout replaying a STAMPED archive).
+
+    An ImportError is NOT the same as "nothing was stamped": replaying a
+    stamped archive with the module missing would drop the exclusion and print
+    `experiment_context_excluded 0`, indistinguishable from a clean corpus —
+    which violates this file's own "no silent caps" contract. It is recorded
+    and reported instead.
+    """
+    try:
+        from ..core.experiments import context_was_mutated
+    except ImportError:
+        _FILTER_UNAVAILABLE["hit"] = True
+        return False
+    try:
+        return context_was_mutated(traj)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _trajectory_index(trajectory_root: Path) -> Dict[str, Any]:
     """request_id (== Trajectory.session_id) -> trajectory, overlay applied.
     On duplicate session_ids the latest timestamp wins."""
@@ -246,14 +282,17 @@ def mine_fixtures(
     era_cutoff_local: str = DEFAULT_ERA_CUTOFF_LOCAL,
     private_pct: int = 30,
     max_result_chars: int = 1500,
+    exclude_mutated_context: bool = True,
 ) -> Tuple[List[ToolChoiceFixture], Dict[str, int]]:
     """Mine labeled tool-choice fixtures in one streaming pass.
 
     Returns (fixtures, stats). ``stats`` reports every drop reason —
     nothing is silently truncated: scanned / bad_ts / pre_era / malformed /
     no_choice / no_request_context / unjoined / honest_failure_excluded /
-    unlabeled_outcome / positive / negative / paired_results.
+    unlabeled_outcome / experiment_context_excluded / positive / negative /
+    paired_results.
     """
+    _FILTER_UNAVAILABLE["hit"] = False
     cutoff = era_cutoff_utc(era_cutoff_local)
     index = _trajectory_index(trajectory_root)
 
@@ -261,6 +300,10 @@ def mine_fixtures(
         "scanned": 0, "bad_ts": 0, "pre_era": 0, "malformed": 0,
         "no_choice": 0, "no_request_context": 0, "unjoined": 0,
         "honest_failure_excluded": 0, "unlabeled_outcome": 0,
+        "experiment_context_excluded": 0,
+        # 1 when core.experiments could not be imported, so the exclusion did
+        # not run at all — a zero above then means "unknown", not "none".
+        "experiment_filter_unavailable": 0,
         "positive": 0, "negative": 0, "paired_results": 0,
     }
 
@@ -316,6 +359,12 @@ def mine_fixtures(
             if traj is None:
                 stats["unjoined"] += 1
                 continue
+            if exclude_mutated_context and _context_was_mutated(traj):
+                # A live experiment's treatment rewrote this turn's context.
+                # Replaying it would optimize against a prompt only one arm
+                # ever sees. Counted, never silent.
+                stats["experiment_context_excluded"] += 1
+                continue
             label = _label_for(traj)
             if label is None:
                 if getattr(traj, "outcome", "") == Outcome.PASSED.value:
@@ -361,6 +410,10 @@ def mine_fixtures(
             logger.debug("tool-fixture miner: record skipped (%s: %s)",
                          type(e).__name__, e)
 
+    if _FILTER_UNAVAILABLE["hit"]:
+        stats["experiment_filter_unavailable"] = 1
+        logger.warning("tool-fixture miner: core.experiments unavailable — "
+                       "steered-context exclusion did NOT run")
     return fixtures, stats
 
 
