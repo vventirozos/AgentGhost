@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Measurement</h3>
     <a class="current" href="experiments.html">experiments</a>
     <a href="risk.html">risk</a>
@@ -20,6 +23,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / experiments.py — live randomized arms</h1>
   <p class="subtitle">Every eligible request is assigned, blind and deterministically, to one arm of each running experiment. Production traffic becomes the controlled experiment that stopped-prod ablations and synthetic batteries could no longer provide.</p>
 
@@ -122,7 +127,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
     first version of this page claimed one. Measured miscoverage at a nominal 5%, 3000
     simulated streams:
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Data</th><th>plain SD, from n=2</th><th>regularised SD, from n=30</th></tr></thead>
     <tbody>
       <tr><td>Bernoulli p=0.5</td><td>52%</td><td><strong>2.5%</strong></td></tr>
@@ -130,7 +135,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
       <tr><td>Bernoulli p=0.1</td><td>82%</td><td>9.2%</td></tr>
       <tr><td>Normal(0,1)</td><td>21%</td><td><strong>1.8%</strong></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Three guards follow, and all three are load-bearing:</p>
   <ul>
     <li><strong>Regularised variance</strong> (<code>_regularised_sigma</code>). The plain sample SD is 0 on constant input, which collapsed the interval to a POINT — six Bernoulli observations that happen to be constant per arm then "prove" a difference. At p=0.5 that shape occurs 12.2% of the time at 2 turns/arm.</li>
@@ -186,7 +191,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
     20–50% comes from a pre-period version of the <em>same</em> metric (correlation 0.6–0.9); a
     turn-0 difficulty score against a BINARY outcome cannot reach that. At n=200/arm:
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Covariate strength</th><th>CS half-width reduction</th></tr></thead>
     <tbody>
       <tr><td>none / weak</td><td>0.0–0.3%</td></tr>
@@ -194,14 +199,14 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
       <tr><td>strong</td><td>4.1%</td></tr>
       <tr><td>very strong</td><td><strong>8.6%</strong></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     A real but small win that costs nothing, and every report line prints what it actually bought
     (<code>[CS −8% via covariate]</code>) rather than claiming a benefit it did not deliver.
   </p>
 
   <h2>Guards in the report</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Warning</th><th>Means</th></tr></thead>
     <tbody>
       <tr><td>stamp coverage</td><td><code>N of M recorded user turns carry an arm</code>. The number that separates "shipped 10 minutes ago" from "the stamp has been broken for three weeks" — without it an empty report reassures in both cases.</td></tr>
@@ -209,7 +214,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
       <tr><td>unknown_rate</td><td>Printed above failure_rate on every block, because failure_rate CONDITIONS on it.</td></tr>
       <tr><td>arm reads <code>&lt;REDACTED&gt;</code></td><td>The experiment name collides with the redactor. Those rows are unrecoverable; rename it.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Honest caveats</h2>
   <ul>
@@ -234,7 +239,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
   </p>
 
   <h2>Registered experiments</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>name</th><th>trigger key</th><th>context-mutating key</th><th>what differs</th></tr></thead>
     <tbody>
       <tr>
@@ -250,7 +255,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
         <td>The <a href="../tools/file_system.html">file_system batch macro</a> (§4F item 1): multi-path <code>paths</code> read + the post-edit view on <code>replace</code>.</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     <code>fs_batch</code> is the first experiment to need <strong>two different keys</strong>, and
     the reason is worth stating because the next schema-changing arm will hit it too.

@@ -10,6 +10,11 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
+    <h3>Guide</h3>
+    <a href="index.html">&larr; Back to the guide</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Reference index</a>
+
     <h3>Overview</h3>
     <a href="index.html">Home</a>
     <a href="capabilities.html">Capabilities</a>
@@ -35,6 +40,8 @@
 </aside>
 
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="index.html">the guide</a>, or check the <a href="glossary.html">glossary</a>.</p>
+
   <section class="hero">
     <div class="eyebrow">Tooling &amp; scripts</div>
     <h1>Claude trainer</h1>
@@ -62,13 +69,13 @@
   <p>The agent only learns from a correction when
   <code>distill/user_correction.py::classify_user_correction</code> returns
   <code>is_correction=True</code>, which requires <strong>both</strong> signals:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Signal</th><th>Requirement</th></tr></thead>
     <tbody>
       <tr><td>A — phrase</td><td>An <em>anchored</em> correction phrase ("No, that's not right…") at the very start of the message.</td></tr>
       <tr><td>B — rephrase</td><td>Jaccard token overlap ≥ 0.40 between the prior user question and the correction (the correction must restate the ask).</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>A naive "you're wrong, the answer is X" satisfies A but misses B, so it
   <strong>silently fails to record any lesson</strong>. <code>build_correction_message()</code>
   therefore restates the question and is <em>trigger-first</em>: it appends the correct answer
@@ -116,7 +123,7 @@ ANTHROPIC_API_KEY=sk-... \
 .trainer.venv/bin/python scripts/claude_trainer.py --topic "TCP/IP" --report /tmp/train.json</code></pre>
 
   <h2>Configuration</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Env</th><th>Default</th></tr></thead>
     <tbody>
       <tr><td>--ghost-url</td><td>GHOST_URL</td><td>http://127.0.0.1:8000</td></tr>
@@ -128,7 +135,7 @@ ANTHROPIC_API_KEY=sk-... \
       <tr><td>--retention-delay</td><td>—</td><td>20 (seconds)</td></tr>
       <tr><td>--no-retention</td><td>—</td><td>off</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>The report</h2>
   <p>The console summary (and the optional <code>--report</code> JSON) tracks:

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a class="current" href="tool_failure.html">tool_failure</a>
@@ -18,11 +21,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / tool_failure.py</h1>
   <p class="subtitle">Failure classification taxonomy. Decides whether a failed tool should retry, replan, or self-correct.</p>
 
   <h2>Classes</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Class</th><th>Patterns (regex)</th><th>Agent action</th></tr></thead>
     <tbody>
       <tr><td><strong>RETRYABLE</strong></td><td>timeout · rate-limit · connection reset · 502/503/504</td><td>Retry with exponential backoff up to <code>MAX_RETRIES = 3</code>.</td></tr>
@@ -30,7 +35,7 @@
       <tr><td><strong>DIAGNOSTIC</strong></td><td>AssertionError · RuntimeError · SyntaxError · Traceback · FileNotFoundError · ImportError · EXIT CODE: [1-9]</td><td>Inject the full error into context for LLM self-correction.</td></tr>
       <tr><td><strong>UNKNOWN</strong></td><td>none of the above</td><td>Inject a short error notice.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Retry delay</h2>
   <pre><code>delay = min(base · 2^attempt, 30s)

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="dream.html">dream</a>
     <a href="frontier_selection.html">frontier_selection</a>
@@ -20,6 +23,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / challenge_templates.py</h1>
   <p class="subtitle">Fast deterministic challenge library used as a drop-in replacement for slow LLM-generated self-play challenges.</p>
 
@@ -27,7 +32,7 @@
   <p>Asking the LLM to invent a self-contained challenge round-trips at 120–150 s with ~30% failure-to-validate rate. The template library produces deterministic, validator-clean challenges in milliseconds. The dream loop falls back to LLM generation when no template matches the seeded cluster, or — under saturation — on the 80%-weighted branch of the 20/80 coin-flip (the minority 20% path still picks a non-saturated template so the expert concurrency / algo / regex-parse shapes keep rotating).</p>
 
   <h2>Clusters</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Cluster</th><th>Template(s)</th><th>Basic shape</th><th>Advanced+ twist</th></tr></thead>
     <tbody>
       <tr><td><code>data_analysis</code></td><td><code>_data_analysis_csv_aggregation</code></td><td>CSV: filter by date, group, sum, sort.</td><td>Injects ~15% rows with <code>value="NA"</code>; solver must skip them before summing.</td></tr>
@@ -38,7 +43,7 @@
       <tr><td><code>bash</code></td><td><code>_bash_filter_and_count</code></td><td>Count ERROR / WARN across log files.</td><td>Adds a third log level <code>FATAL</code>; output shape grows from 2 to 3 lines.</td></tr>
       <tr><td><code>concurrency</code></td><td><code>_concurrency_router</code> → 8 variants</td><td>Tier-gated variant pool (see below).</td><td>—</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Difficulty tiers</h2>
   <p>Every template accepts a <code>tier=</code> keyword argument (<code>basic</code> | <code>intermediate</code> | <code>advanced</code> | <code>expert</code>). The tier drives two things:</p>
@@ -50,7 +55,7 @@
 
   <h2>Concurrency variant bank</h2>
   <p>The <code>concurrency</code> entry in <code>TEMPLATES</code> dispatches through <code>_concurrency_router(tier=...)</code>. When a tier is known the router draws from <code>_CONCURRENCY_POOLS_BY_TIER</code>; without a tier it falls back to uniform sampling over the full 8-variant bank.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Tier</th><th>Pool</th></tr></thead>
     <tbody>
       <tr><td><code>basic</code></td><td><code>parallel_sum</code>, <code>parallel_max_with_source</code></td></tr>
@@ -58,7 +63,7 @@
       <tr><td><code>advanced</code></td><td><code>shared_counter</code>, <code>bounded_pool</code>, <code>first_hit_racer</code>, <code>ordered_parallel_map</code></td></tr>
       <tr><td><code>expert</code></td><td><code>first_hit_racer</code>, <code>ordered_parallel_map</code>, <code>producer_consumer_exact_once</code>, <code>cancel_losers</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Pool membership is monotonic in difficulty: the basic pool is disjoint from the expert pool, so promoting a cluster to expert actually changes the variant distribution.</p>
   <p>Variant behaviour:</p>
   <ul>
@@ -73,7 +78,7 @@
   </ul>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>try_template(cluster_key, tier=None) → Optional[ChallengeTriple]</code></td><td>Lookup + instantiate for a specific cluster at the given tier. <code>tier=None</code> renders at basic.</td></tr>
@@ -83,7 +88,7 @@
       <tr><td><code>_is_hard_mode(tier)</code></td><td>True for <code>advanced</code> / <code>expert</code>; gates the twist injection inside each template.</td></tr>
       <tr><td><code>_invoke_template(fn, tier)</code></td><td>Call <code>fn(tier=...)</code> when accepted, else <code>fn()</code> — preserves zero-arg callers (and zero-arg template monkey-patches in legacy tests).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Design rules</h2>
   <ol>

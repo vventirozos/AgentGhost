@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -36,6 +39,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / darkweb_search.py</h1>
   <p class="subtitle">Discovery of Tor hidden services (<code>.onion</code>) via dedicated <strong>onion search engines</strong>, with per-attempt circuit rotation, cross-engine corroboration ranking, and an optional deep-read research mode.</p>
 
@@ -45,13 +50,13 @@
   </p>
 
   <h2>Tools</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>darkweb_search</code></td><td>Fan a query across the onion-engine set over Tor, parse the <code>.onion</code> result links/titles/snippets, de-dup by onion host, rank by cross-engine corroboration, and return a ranked list. List-only — pair with <code>browser</code> / <code>darkweb_research</code> to actually read a result.</td></tr>
       <tr><td><code>darkweb_research</code></td><td>The dark-web analogue of <code>deep_research</code>: runs <code>darkweb_search</code>, then fetches the top onion pages over Tor and distils each via the worker LLM into a synthesised report.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Onion-engine registry (<code>_ONION_ENGINES</code>)</h2>
   <p>
@@ -75,7 +80,7 @@
     Candidates were measured with <em>this module's own</em> <code>_fetch_raw_html</code> + <code>_parse_onion_results</code> + <code>_diagnose_empty_body</code>, over live Tor on rotated circuits — not by reading engine lists. A directory page saying an engine is up is not evidence that our fetch and our parser can get results out of it.
   </p>
   <div style="overflow-x:auto">
-  <table>
+  <div class="scroll"><table>
     <tr><th>Engine</th><th>Reachable</th><th>Result</th></tr>
     <tr><td><code>torch</code> (new address + Omega path)</td><td>4/4</td><td><strong>Adopted</strong> — 28 onions/page, 1.6–6.6&nbsp;s, fastest in the set</td></tr>
     <tr><td><code>torgle</code></td><td>4/4</td><td><strong>Adopted</strong> — 19–20 onions, 9–25&nbsp;s, third independent index</td></tr>
@@ -83,7 +88,7 @@
     <tr><td><code>torch</code> (old <code>torchdeed…</code>)</td><td>0/10</td><td>Removed — dead service</td></tr>
     <tr><td><code>haystak</code>, <code>onionland</code>, <code>tor66</code></td><td>0/2 each</td><td>Rejected — timeout</td></tr>
     <tr><td><code>phobos</code></td><td>0/2</td><td>Rejected — SOCKS "cannot complete", i.e. no descriptor</td></tr>
-  </table>
+  </table></div>
   </div>
   <p>
     Net effect: three independent indexes instead of one, and a typical search dropped from <strong>38&nbsp;s</strong> (dominated by torch's timeout) to <strong>17–28&nbsp;s</strong>. The rejected addresses are recorded in a comment beside the registry so the next person re-measures rather than re-discovers them; all of them are re-addable via <code>GHOST_ONION_ENGINES</code> if they come back.

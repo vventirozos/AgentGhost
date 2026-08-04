@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="dream.html">dream</a>
     <a href="frontier_selection.html">frontier_selection</a>
@@ -20,17 +23,19 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / self_play_scoring.py</h1>
   <p class="subtitle">Correctness-weighted curriculum metric that replaces the naive compression-delta score (which used to reward wrong one-shot solves).</p>
 
   <h2>Functions</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>count_tool_errors(messages) → int</code></td><td>Count tool-result messages that indicate tool <em>failures</em> (three-tier discrimination, below).</td></tr>
       <tr><td><code>correctness_weighted_score(passed, compression_delta, tool_errors, alpha=0.4, beta=0.1, novelty=None, attempts_used=None, gamma_novelty=0.6, delta_attempts=0.3) → float</code></td><td>Multi-signal score consumed by the frontier tracker, the adaptive cooldown, and the skill-write gate.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Formula (post 2026-05-17)</h2>
   <pre><code>if passed:

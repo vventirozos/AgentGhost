@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -36,6 +39,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / introspect.py</h1>
   <p class="subtitle">Read-only handle the agent reaches for when asked to describe itself, recall what it has been working on, or surface specific past turns.</p>
 
@@ -44,7 +49,7 @@
   <p>Counterpart to <code>self_state</code>: <em>introspect</em> reads, <em>self_state</em> writes. The two are deliberately split so a single tool description does not conflate "introspect myself" with "author my forward-looking continuity slot".</p>
 
   <h2>Tool: <code>introspect</code></h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Returns</th><th>Backed by</th></tr></thead>
     <tbody>
       <tr><td><code>summary</code> (default)</td><td><code>stats()</code> + the running first-person diary + operating principles + the most recent 5 experiences, rendered as one first-person block — the natural answer to "tell me about yourself".</td><td><code>SelfModel.stats()</code>, <code>NarrativeSummariser.latest()</code>, <code>SelfModel.principles_text()</code>, <code>AutobiographicalMemory.recent()</code></td></tr>
@@ -55,10 +60,10 @@
       <tr><td><code>activity</code></td><td>The background-activity ledger over a bounded recent window (ALL severities — the on-demand home of the routine maintenance the finalize banner stopped auto-surfacing 2026-07-17). Newest first, ×N-collapsed, age-stamped; annotates when the tail scan could not cover the requested window.</td><td><code>core/autonomous_activity.py</code> ledger (not the SelfModel — works with selfhood disabled)</td></tr>
       <tr><td><code>learning</code></td><td>The LEARNING-HEALTH report (lessons, competence, episodes, calibration, background-phase counts, cognitive wiring).</td><td><code>core/learning_health.py</code> (not the SelfModel — works with selfhood disabled)</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Parameters</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td><code>action</code></td><td>enum</td><td>One of <code>summary</code>, <code>stats</code>, <code>narrative</code>, <code>recent</code>, <code>recall</code>, <code>activity</code>, <code>learning</code>. Defaults to <code>summary</code>. Every action is described in the tool description — <code>learning</code> was enum-only until 2026-07-27, i.e. undiscoverable by the model.</td></tr>
@@ -66,7 +71,7 @@
       <tr><td><code>limit</code></td><td>int</td><td>Optional for <code>recent</code> / <code>recall</code>. Defaults to 5; clamped to <code>[1, 25]</code>. For <code>activity</code>: ledger lines, default 30, cap 100.</td></tr>
       <tr><td><code>hours</code></td><td>number</td><td>For <code>activity</code>: look-back window. Default 24; clamped to <code>[0.25, 336]</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Failure semantics</h2>
   <ul>

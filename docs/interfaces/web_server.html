@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Interfaces</h3>
     <a class="current" href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
@@ -21,11 +24,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>interface / server.py</h1>
   <p class="subtitle">Browser-facing FastAPI proxy on port 8080. Handles auth, streaming, file I/O, log tailing, voice forwarding.</p>
 
   <h2>Endpoints</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td>GET /</td><td>Auth gate (<code>?key=…</code>). Renders index.html and injects the API key into a script.</td></tr>
@@ -40,7 +45,7 @@
       <tr><td>POST /api/tts</td><td>Text → <code>audio/wav</code> <strong>locally</strong> via the macOS <code>say</code> synthesiser (was: Raspberry Pi voice server). Buffered, not streamed — the client needs the whole blob anyway.</td></tr>
       <tr><td>Agent passthrough proxies</td><td>Explicit allowlist added 2026-07-28 for the workspace UI (browser only ever talks to :8080; the proxy injects the key): <code>GET /api/health</code>, <code>GET|POST /api/sessions</code>, <code>GET|DELETE /api/sessions/{id}</code>, <code>GET /api/turns</code>, <code>POST /api/turn/cancel</code>, <code>GET /api/notifications/pending</code>, <code>POST /api/notifications/ack</code>, <code>POST /api/memory/correct</code>, <code>POST /api/memory/delete</code>. Query params + raw body forwarded, upstream status propagated, path params re-quoted. Deliberately NOT a <code>/{path:path}</code> catch-all — the LAN-reachable agent surface stays enumerated. Pins: <code>tests/test_interface_agent_proxies.py</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Streaming model</h2>
   <ul>

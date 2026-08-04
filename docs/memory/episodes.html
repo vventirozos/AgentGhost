@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / episodes.py — EpisodicMemory</h1>
   <p class="subtitle">Structured episodes — sequences of actions and outcomes — with optional vector search for trigger similarity.</p>
 
@@ -34,7 +39,7 @@
 
   <h2>Tables</h2>
   <h3>episodes</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Column</th><th>Type</th></tr></thead>
     <tbody>
       <tr><td>id</td><td>INTEGER PK</td></tr>
@@ -43,11 +48,11 @@
       <tr><td>timestamp</td><td>REAL</td></tr>
       <tr><td>consolidated</td><td>0/1</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Indexes on trigger, cluster_id, timestamp.</p>
 
   <h3>episode_actions</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Column</th><th>Type</th></tr></thead>
     <tbody>
       <tr><td>id</td><td>INTEGER PK</td></tr>
@@ -58,7 +63,7 @@
       <tr><td>result</td><td>TEXT</td></tr>
       <tr><td>success</td><td>0/1</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Retention</h2>
   <p><code>MAX_EPISODES = 500</code>. When exceeded the oldest non-lesson, non-consolidated episodes are deleted first; a fallback then deletes the oldest of any kind so the cap is always enforced. <code>MAX_ACTIONS_PER_EPISODE = 20</code>.</p>
@@ -66,7 +71,7 @@
   <p><strong>Orphan reaping (2026-06-11):</strong> <code>episode_actions</code> has a declared but un-enforced FK (no cascade), so deleting an episode leaves its action rows orphaned. <code>record_episode</code> now reaps orphans <em>unconditionally</em> on every write via an indexed anti-join (<code>idx_ea_episode</code>) — not only when an insert breaches the cap, as before — so orphans from non-cap delete paths (consolidation, external deletes) can no longer accumulate unboundedly. Covered by <code>tests/test_memory_growth_bounds.py</code>.</p>
 
   <h2>Public API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>record_episode(trigger, context, actions, outcome, success, lesson, cluster_id) -&gt; int</code></td><td>Insert episode + action rows; return id.</td></tr>
@@ -82,7 +87,7 @@
       <tr><td><code>format_for_context(episodes, max_chars)</code></td><td>LLM-injection blob (kept for legacy callers).</td></tr>
       <tr><td><code>count()</code></td><td>Total episodes.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Semantic recall wiring (2026-07-07)</h2>
   <p>The write path ingests every episode's trigger into the vector store expressly so this tier can recall episodes by <em>meaning</em>. The <code>MemoryBus._fetch_episodic</code> read path now passes its vector store to <code>search_similar</code>, activating <code>_vector_search</code> (relevance-gated, best-distance-per-episode). Previously the bus called <code>search_similar</code> with no <code>vector_memory</code>, so recall always used the substring fallback over only the 100 most-recent episodes — episodes with no keyword overlap to the query (nearly half the live collection) were unreachable. <code>search_recoveries</code> (System-3 crisis pivots) inherits the same fix wherever it is called with the store.</p>

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="llm.html">llm</a>
@@ -27,6 +30,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / dream.py</h1>
   <p class="subtitle">Idle-time consolidation, synthetic challenge generation, and the full self-play orchestration pipeline.</p>
 
@@ -155,7 +160,7 @@
   <p>Retry prompts now force the solver to reason from the diff and the original task description. Some complex challenges will fail their second attempt that previously "succeeded" via copying — that is the intended behaviour: a genuine failure is better training signal than a cheated pass.</p>
 
   <h2>Public functions</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>validate_challenge_quality(setup, validator) → (bool, reason)</code></td><td>Pattern-based quality gate.</td></tr>
@@ -171,7 +176,7 @@
       <tr><td><code>Dreamer._generalization_guard(lesson, …) → (bool, reason)</code></td><td>Overfit-lesson rejection.</td></tr>
       <tr><td><code>Dreamer.dream(model_name)</code></td><td>Journal → long-term consolidation (the REM path).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Concurrency</h2>
   <p>Async orchestration; the temp agent loop runs synchronously inside the simulation. Triggered by the lifespan-spawned biological watchdog, by the <code>self_play</code> tool (one-shot), or by <code>self_play_loop</code> (continuous). Validator probe / self-test / solver run on the sandbox via <code>asyncio.to_thread</code>.</p>

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / skills.py — SkillMemory</h1>
   <p class="subtitle">Lessons learned from past mistakes. Vector-backed retrieval with BM25 re-rank; utility-driven retention; verified-first pinning.</p>
 
@@ -142,7 +147,7 @@
   <p>Surfaced to the LLM via the <code>list_lessons</code> tool (see <a href="../tools/memory_tools.html">tools / memory</a>). Phrases like <em>"what did you learn today?"</em> / <em>"what have you learned so far?"</em> are routed to this tool via <a href="../core/prompts.html">SYSTEM_PROMPT</a>.</p>
 
   <h2>Public methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>build_lesson(task, trigger, anti_pattern, correct_pattern, domains, confidence, source_challenge_hash, verified, source) → dict</code></td><td>Factory.</td></tr>
@@ -155,7 +160,7 @@
       <tr><td><code>get_recent_failures(limit) → str</code></td><td>Format for LLM injection.</td></tr>
       <tr><td><code>find_by_trigger(trigger)</code> / <code>mark_verified</code> / <code>remove_by_trigger</code></td><td>Index helpers used by the verification-grounded lesson flow in <a href="../core/dream.html">dream.py</a>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
 
   <h2>Audit fixes (2026-07-26)</h2>

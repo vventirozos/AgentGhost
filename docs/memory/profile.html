@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / profile.py — ProfileMemory</h1>
   <p class="subtitle">Canonical user profile with multi-value merge semantics.</p>
 
@@ -70,7 +75,7 @@
   <p>Tests: <code>tests/test_project_state_memory_hygiene.py</code> (backstop + workflow cue), <code>tests/test_agent_smart_updates.py</code> (sink guard), <code>tests/test_memory_store_durability.py</code> (log levels).</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>load() / save(data)</code></td><td>Whole-file read / write.</td></tr>
@@ -79,7 +84,7 @@
       <tr><td><code>prune_value(category, key, target) -&gt; str</code></td><td>Remove list items / a scalar that <em>mention</em> <code>target</code> (token-boundary match); drops the key/category when emptied. Lets <code>forget</code> reach entities stored as values.</td></tr>
       <tr><td><code>get_context_string() -&gt; str</code></td><td>Format for LLM injection.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
 
   <h2>Audit fixes (2026-07-26)</h2>

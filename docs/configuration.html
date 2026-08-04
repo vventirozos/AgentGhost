@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings that matter — Ghost Agent</title>
+<meta name="description" content="The Ghost Agent settings worth knowing about, grouped by what they change — out of 64 command-line flags.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a class="current" href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Running it</span>
+  <h1>Settings that matter</h1>
+  <p class="subtitle">There are 64 command-line flags. About twenty are worth knowing; the rest exist to run experiments. This page is the twenty.</p>
+
+  <div class="note">
+    <strong>The defaults are the recommended configuration.</strong> Almost everything here is already set the way it should be. Change things when you have a reason — a second machine to use, a feature you want off, a problem to diagnose.
+  </div>
+
+  <h2>The ones you have to set</h2>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>--upstream-url</code></td><td><code>http://127.0.0.1:8080</code></td><td>Where your LLM server is. Wrong value here and nothing works.</td></tr>
+      <tr><td><code>--model</code></td><td><code>qwen-3.6-35b-a3</code></td><td>The model name to request. Must match what your LLM server actually serves.</td></tr>
+      <tr><td><code>--host</code></td><td><code>0.0.0.0</code></td><td>What address to listen on. Use <code>127.0.0.1</code> unless you need remote access.</td></tr>
+      <tr><td><code>--port</code></td><td><code>8000</code></td><td>Which port.</td></tr>
+      <tr><td><code>--api-key</code></td><td>from <code>GHOST_API_KEY</code></td><td>The key clients must send. Required on a non-loopback bind.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Using more than one machine</h2>
+
+  <p>Ghost can hand different kinds of work to different LLM servers. This is the single biggest change you can make to how it feels, because your main model has one inference slot — every background check competes with your actual conversation for it.</p>
+
+  <p>Each flag takes a comma-separated list of <code>url|model</code> pairs:</p>
+
+  <pre class="shell">--worker-nodes "http://192.168.1.20:8088|gemma-4-e4b"
+--critic-nodes "http://192.168.1.20:8088|gemma-4-e4b"</pre>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Sends what to the other machine</th></tr></thead>
+    <tbody>
+      <tr><td><code>--worker-nodes</code></td><td>Background and small jobs: summarising, classifying, compacting the conversation.</td></tr>
+      <tr><td><code>--critic-nodes</code></td><td>The self-check. <strong>The one worth doing first</strong> — it moves an entire extra model call per turn off your main model, and makes the check non-blocking as a side effect.</td></tr>
+      <tr><td><code>--coding-nodes</code></td><td>Code generation, if you have a model that's better at it.</td></tr>
+      <tr><td><code>--vision-nodes</code></td><td>Image analysis.</td></tr>
+      <tr><td><code>--image-gen-nodes</code></td><td>Image generation. Without this, the image tool doesn't exist.</td></tr>
+      <tr><td><code>--swarm-nodes</code></td><td>Parallel fan-out when a task is split across several models.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note warn">
+    <strong>Use a stable address.</strong> Point these at a tailnet address or a hostname that doesn't move, not a DHCP-assigned LAN IP. A node whose address changes shows up as a stream of connection failures, and the circuit breaker will eventually stop trying it. Check <code>nodes</code> and <code>node_health</code> on <code>/api/health</code> to see which are configured and which are actually answering.
+  </div>
+
+  <h2>Turning background work off</h2>
+
+  <p>All on by default. Each one is an off switch so you can measure whether the thing is worth its cost. <a href="self-improvement.html">What each of these does →</a></p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-dream</code></td><td>Stops memory consolidation.</td></tr>
+      <tr><td><code>--no-self-play</code></td><td>Stops practice sessions.</td></tr>
+      <tr><td><code>--no-reflection</code></td><td>Stops reviewing failed turns.</td></tr>
+      <tr><td><code>--no-trajectories</code></td><td>Stops recording turns. Also disables reflection, which reads them.</td></tr>
+      <tr><td><code>--no-self-model</code></td><td>Stops the first-person diary and cross-session continuity.</td></tr>
+      <tr><td><code>--no-workspace-model</code></td><td>Stops watching your files for changes.</td></tr>
+      <tr><td><code>--no-memory</code></td><td>Disables everything above and all memory. Ghost becomes a plain chat wrapper.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>And two that are off by default</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--postmortem</code></td><td>Analyses its worst failed runs and files defect reports about its own tooling. Proposed patches are stored for review, never applied.</td></tr>
+      <tr><td><code>--autoadvance-idle</code></td><td>Lets Ghost push one active project forward by one step while idle, unprompted.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Safety</h2>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>--mandatory-tor</code></td><td><span class="badge good">on</span></td>
+        <td>Boot fails if Tor is unreachable, and direct connections to public addresses are blocked for the life of the process. Turn off with <code>--no-mandatory-tor</code> — you need this exactly once, on a fresh install, so the embedding model can download.</td>
+      </tr>
+      <tr>
+        <td><code>--no-redact-logs</code></td><td><span class="badge">redaction on</span></td>
+        <td>Passing this shows raw content in the logs. Debugging only.</td>
+      </tr>
+      <tr>
+        <td><code>--enable-preflight-guard</code></td><td><span class="badge good">on</span></td>
+        <td>Blocks a tool call that already failed the same way recently, and hands the model the previous error instead. Stops the loop where it retries a broken thing forever.</td>
+      </tr>
+      <tr>
+        <td><code>--no-verifier</code></td><td><span class="badge good">check is on</span></td>
+        <td>Disables the self-check entirely. Not recommended outside an experiment.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Quality and cost</h2>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>--max-context</code></td><td><code>65536</code></td><td>How much conversation Ghost keeps in front of the model. Must fit what your LLM server was started with — setting it higher than the server's actual window causes failures deep into long conversations.</td></tr>
+      <tr><td><code>--native-tools</code></td><td><span class="badge good">on</span></td><td>Sends tool definitions in the standard OpenAI format as well as in the prompt. Turn off with <code>--no-native-tools</code> if your model handles it badly.</td></tr>
+      <tr><td><code>--deep-reason</code></td><td><span class="badge">off</span></td><td>Adds lookahead and parallel hypothesis testing on hard problems. Costs extra model calls.</td></tr>
+      <tr><td><code>--perfect-it</code></td><td><span class="badge">off</span></td><td>Offers optimisation suggestions after a heavy task succeeds.</td></tr>
+      <tr><td><code>--verbose</code></td><td><span class="badge">off</span></td><td>Stops truncating log lines. Turn on while you're getting set up.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Opt-in subsystems</h2>
+
+  <p>These are complete features that are off by default because they add cost or need a trained file to exist first.</p>
+
+  <dl class="kv">
+    <dt>--enable-metacog</dt>
+    <dd>Turns on the metacognition stack: output validators, host-health monitoring, a competence profile, uncertainty tracking, and a second-solver arbiter for low-confidence answers. Several other flags (all the <code>--metacog-*</code> ones) only do anything when this is on.</dd>
+
+    <dt>--principle-gate</dt>
+    <dd>After each answer, checks it against the operating principles Ghost has written for itself and appends a note if it contradicts one. Never blocks — annotates. One extra model call per turn.</dd>
+
+    <dt>--router-model</dt>
+    <dd>Path to a trained request classifier. When set, Ghost routes cheap requests to cheap machines. When unset — the default — every request gets the full pool.</dd>
+
+    <dt>--prm-model</dt>
+    <dd>Path to a trained plan-scoring model, used to evaluate partial reasoning paths. Ghost trains this itself during idle time; this flag points at an existing checkpoint.</dd>
+
+    <dt>--notify-webhook<br>--notify-ntfy</dt>
+    <dd>Where to push notifications when something needs you. A LAN or tailnet target is reached directly; a public one only over Tor, and skipped if Tor is down.</dd>
+  </dl>
+
+  <h2>Environment variables</h2>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Variable</th><th>Default</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_HOME</code></td><td><code>~/ghost_llamacpp</code></td><td>Where everything lives. The one directory to back up.</td></tr>
+      <tr><td><code>GHOST_API_KEY</code></td><td>unset</td><td>Default for <code>--api-key</code>.</td></tr>
+      <tr><td><code>GHOST_MODEL</code></td><td><code>qwen-3.6-35b-a3</code></td><td>Default for <code>--model</code>.</td></tr>
+      <tr><td><code>TOR_PROXY</code></td><td><code>socks5://127.0.0.1:9050</code></td><td>Where Tor's SOCKS proxy is.</td></tr>
+      <tr><td><code>GHOST_SANDBOX_MEM</code></td><td><code>4g</code></td><td>Memory ceiling for the sandbox container.</td></tr>
+      <tr><td><code>GHOST_EMBED_MODEL</code></td><td><code>BAAI/bge-small-en-v1.5</code></td><td>The embedding model. Changing this invalidates your entire vector store — Ghost refuses to start until you re-embed.</td></tr>
+      <tr><td><code>GHOST_MANDATORY_TOR</code></td><td><code>1</code></td><td>Set to <code>0</code> to default mandatory Tor off.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note warn">
+    <strong>Environment variables are read at boot only.</strong> If you run Ghost under launchd or systemd, they must be set inside the service definition — a background service doesn't inherit your shell profile. The failure mode is quiet and confusing: Ghost starts fine on a brand-new empty memory at the default path, and looks like it forgot everything.
+  </div>
+
+  <h2>The other 44 flags</h2>
+  <p>Mostly cooldown timings, thresholds for the metacognition stack, and switches that exist to run controlled experiments (<code>--bio-time-scale</code> compresses hours-long idle windows into minutes so the background loops can be tested in an afternoon — never set it in production). They're all documented in <a href="cli_reference.html">the full CLI reference</a>, and every one carries its own help text:</p>
+
+  <pre class="shell">python -m src.ghost_agent.main --help</pre>
+
+  <div class="pager">
+    <a class="prev" href="safety.html">
+      <span class="dir">Previous</span>
+      <span class="to">Safety and privacy</span>
+    </a>
+    <a class="next" href="troubleshooting.html">
+      <span class="dir">Next</span>
+      <span class="to">When something breaks</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>src/ghost_agent/main.py</code> on 2026-08-04 (64 flags at that commit).</p>
+  </footer>
+</main>
+</body>
+</html>

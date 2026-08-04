@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="llm.html">llm</a>
@@ -28,6 +31,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / frontier_selection.py</h1>
   <p class="subtitle">Pure-function weighting layer that turns PRM uncertainty + trajectory rarity into a frontier-aware cluster pick for self-play.</p>
 
@@ -48,7 +53,7 @@
   </ul>
 
   <h2>Public API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>representative_state(cluster_key) → (PlanState, ActionFeatures)</code></td><td>Synthesise a stand-in (state, action) pair for "a fresh attempt at this cluster".</td></tr>
@@ -58,7 +63,7 @@
       <tr><td><code>pick_weighted(weights, *, rng=None) → Optional[str]</code></td><td>Sample a single cluster_key in proportion to its weight. Returns <code>None</code> when every weight is zero (caller falls back to cold-start).</td></tr>
       <tr><td><code>count_trajectories_by_cluster(trajectories) → {cluster: int}</code></td><td>Group an iterable of <code>Trajectory</code> by their <code>.cluster</code> attribute. Trajectories with None / empty / missing cluster are skipped.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Composition (as wired in dream.py)</h2>
   <pre><code>candidate_clusters = sorted(set(TEMPLATES.keys()) | tracker.clusters)

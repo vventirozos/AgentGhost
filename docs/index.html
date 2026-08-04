@@ -3,240 +3,201 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ghost Agent — Documentation</title>
+<title>Ghost Agent — a self-hosted AI agent</title>
+<meta name="description" content="Ghost Agent is a self-hosted AI agent. It runs on your own hardware, remembers what you tell it, does the work in a sandbox, and checks its own answers.">
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <h3>Overview</h3>
-    <a class="current" href="index.html">Home</a>
-    <a href="capabilities.html">Capabilities</a>
-    <a href="architecture.html">System Architecture</a>
-    <a href="installation.html">Install &amp; Run</a>
-    <a href="cli_reference.html">CLI Reference</a>
-    <a href="audit_fixes.html">Audit &amp; hardening</a>
-    <a href="logging.html">Logging &amp; monitoring</a>
+    <h3>Start here</h3>
+    <a class="current" href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
 
-    <h3>Core</h3>
-    <a href="core/agent.html">agent</a>
-    <a href="core/llm.html">llm</a>
-    <a href="core/planning.html">planning</a>
-    <a href="core/prompts.html">prompts</a>
-    <a href="core/bus.html">bus (memory)</a>
-    <a href="core/context_manager.html">context_manager</a>
-    <a href="core/dream.html">dream</a>
-    <a href="core/failure_dimension.html">failure_dimension</a>
-    <a href="core/frontier_selection.html">frontier_selection</a>
-    <a href="core/mcts.html">mcts</a>
-    <a href="core/hypothesis.html">hypothesis</a>
-    <a href="core/verifier.html">verifier</a>
-    <a href="core/uncertainty.html">uncertainty</a>
-    <a href="core/entropy.html">entropy (uplift)</a>
-    <a href="core/confidence.html">confidence (uplift)</a>
-    <a href="core/experiments.html">experiments (live A/B arms)</a>
-    <a href="core/risk.html">risk (governor + triage)</a>
-    <a href="core/triggers.html">triggers (uplift)</a>
-    <a href="core/arbiter.html">arbiter (uplift)</a>
-    <a href="core/workspace_model.html">workspace_model</a>
-    <a href="core/self_play_scoring.html">self_play_scoring</a>
-    <a href="core/solution_novelty.html">solution_novelty</a>
-    <a href="core/adversarial_generator.html">adversarial_generator</a>
-    <a href="core/challenge_templates.html">challenge_templates</a>
-    <a href="core/journal_challenges.html">journal_challenges</a>
-    <a href="core/project_advancer.html">project_advancer</a>
-    <a href="core/project_safety.html">project_safety</a>
-    <a href="core/project_research.html">project_research</a>
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
 
-    <h3>Memory</h3>
-    <a href="memory/vector.html">vector</a>
-    <a href="memory/graph.html">graph</a>
-    <a href="memory/profile.html">profile</a>
-    <a href="memory/skills.html">skills</a>
-    <a href="memory/journal.html">journal</a>
-    <a href="memory/scratchpad.html">scratchpad</a>
-    <a href="memory/episodes.html">episodes</a>
-    <a href="memory/frontier.html">frontier</a>
-    <a href="memory/projects.html">projects</a>
-    <a href="memory/adaptive_threshold.html">adaptive_threshold</a>
-    <a href="memory/competence.html">competence (uplift)</a>
-    <a href="memory/contradiction_log.html">contradiction_log</a>
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
 
-    <h3>Tools</h3>
-    <a href="tools/registry.html">registry</a>
-    <a href="tools/execute.html">execute</a>
-    <a href="tools/browser.html">browser</a>
-    <a href="tools/file_system.html">file_system</a>
-    <a href="tools/search.html">search</a>
-    <a href="tools/darkweb_search.html">darkweb_search</a>
-    <a href="tools/database.html">database</a>
-    <a href="tools/memory_tools.html">memory tools</a>
-    <a href="tools/system.html">system</a>
-    <a href="tools/vision.html">vision</a>
-    <a href="tools/image_gen.html">image_gen</a>
-    <a href="tools/report_pdf.html">report_pdf</a>
-    <a href="tools/swarm.html">swarm</a>
-    <a href="tools/tasks.html">tasks (scheduler)</a>
-    <a href="tools/projects.html">projects</a>
-    <a href="tools/acquired_skills.html">acquired_skills</a>
-    <a href="tools/composed_skills.html">composed_skills</a>
-    <a href="tools/tool_failure.html">tool_failure</a>
-    <a href="tools/fallback_chains.html">fallback_chains</a>
-
-    <h3>Sandbox &amp; API</h3>
-    <a href="sandbox/docker.html">Docker sandbox</a>
-    <a href="api/routes.html">HTTP routes</a>
-    <a href="api/projects_routes.html">Projects routes</a>
-
-    <h3>Interfaces</h3>
-    <a href="interfaces/web_server.html">Web server</a>
-    <a href="interfaces/slack_bot.html">Slack bot</a>
-    <a href="interfaces/voice_server.html">Voice (TTS/STT)</a>
-    <a href="interfaces/image_gen_server.html">Image-gen server</a>
-    <a href="interfaces/clockwork_ghost.html">Clockwork Ghost</a>
-    <a href="interfaces/cli.html">CLI</a>
-
-    <h3>Algorithms</h3>
-    <a href="algorithms/request_lifecycle.html">Request lifecycle</a>
-    <a href="algorithms/memory_hydration.html">Memory hydration (RRF)</a>
-    <a href="algorithms/cross_project_map.html">Cross-project map</a>
-    <a href="algorithms/dream_cycle.html">Dream / self-play</a>
-    <a href="algorithms/skill_acquisition.html">Skill acquisition</a>
-    <a href="algorithms/circuit_breaker.html">Circuit breaker</a>
-    <a href="algorithms/selfhood.html">Selfhood (unified self)</a>
-    <a href="algorithms/selfhood_functional_report.html">Selfhood — functional test report</a>
-    <a href="algorithms/workspace.html">Workspace continuity (world-model)</a>
-
-    <h3>Stage-1 self-improvement</h3>
-    <a href="self_improvement.md">Overview (eval → distill → router → optim → skills_auto → reflection)</a>
-    <a href="algorithms/tool_ontology.html">Tool ontology (is the toolbox carved right?)</a>
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
   </nav>
 </aside>
 
 <main>
   <section class="hero">
-    <div class="eyebrow">Documentation</div>
+    <span class="eyebrow">Documentation</span>
     <h1>Ghost Agent</h1>
-    <p class="subtitle">An autonomous FastAPI service that wraps an OpenAI-compatible LLM with multi-tier memory, Docker-isolated tool execution, swarm inference, and biological-rhythm self-play.</p>
+    <p class="subtitle">A self-hosted AI agent. It runs on your own hardware, remembers what you tell it, does the work in a sandbox, and checks its own answer before it replies.</p>
     <div class="hero-meta">
-      <span class="badge">Qwen 3.6 35B-A3</span>
-      <span class="badge">Tor-only egress</span>
       <span class="badge">Python 3.10+</span>
-      <span class="badge">FastAPI</span>
-      <span class="badge">Docker</span>
-      <span class="badge good">Reference</span>
+      <span class="badge">Runs locally</span>
+      <span class="badge">Docker sandbox</span>
+      <span class="badge good">Tor-only egress</span>
+      <span class="badge">No accounts, no API keys</span>
     </div>
   </section>
 
-  <div class="note">
-    <strong>Runtime stance.</strong> Ghost Agent is designed and tuned around an
-    <strong>uncensored Qwen 3.6 35B-A3</strong> upstream model, and every outbound
-    network request the agent issues is mandated through <strong>Tor</strong>.
-    Anonymity is not an add-on — it is enforced at the HTTP layer for every tool
-    that reaches the open internet, with automatic circuit rotation on refusal.
-    See <a href="#anonymity">Anonymity &amp; Tor routing</a> for the mechanics.
+  <p class="lede">Most AI assistants are a website you send text to. Ghost is a program you run. Nothing leaves your machine unless you asked for something that needs the internet — and when it does, it goes out through Tor.</p>
+
+  <figure class="shot">
+    <img src="assets/img/webui.png" alt="The Ghost Agent web interface: a session list on the left, and a dark chat view whose background is a slowly moving 3D graph."
+         width="1100" height="688" loading="lazy">
+    <figcaption>The web interface. The graph behind the conversation is driven by what the agent is doing — see <a href="interfaces.html">Ways to talk to it</a>.</figcaption>
+  </figure>
+
+  <h2>What actually happens when you send a message</h2>
+  <p>This is the whole product in five steps. Everything else in these docs is a detail of one of them.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>You send a message</h4>
+        <p>From the web page, Slack, your voice, or a plain HTTP request. It all arrives at the same place.</p>
+      </li>
+      <li>
+        <h4>Ghost looks up what it already knows</h4>
+        <p>It searches everything it has stored about you and about past conversations, and puts the most relevant pieces in front of the model — before the model starts thinking.</p>
+      </li>
+      <li>
+        <h4>The model decides what to do</h4>
+        <p>Answer directly, or reach for a tool: run some code, read a file, search the web, look at an image. Tools that touch your machine run inside a Docker container, not on your actual system.</p>
+      </li>
+      <li>
+        <h4>It repeats until the job is done</h4>
+        <p>Tool result goes back to the model, which decides the next step. Most questions take one pass. Real tasks take several.</p>
+      </li>
+      <li>
+        <h4>A second model checks the answer</h4>
+        <p>Before you see it — or just after, if the reply is streaming — a separate check asks "does this actually answer what was asked, and is it supported by what the tools returned?" If not, Ghost gets a bounded chance to fix it.</p>
+      </li>
+    </ol>
+    <p class="caption">The turn loop. Steps 3 and 4 repeat; step 5 runs once.</p>
   </div>
 
-  <p>Ghost Agent wraps an upstream OpenAI-compatible LLM endpoint (llama.cpp / Ollama / vLLM) with a full agentic stack: a hierarchical task planner, a six-tier memory subsystem backed by ChromaDB and SQLite, a Docker-API container sandbox for code execution, a swarm router for fanning work out across specialised LLM pools, and three separate user-facing interfaces (web UI, Slack bot, desktop "Clockwork Ghost").</p>
+  <p><a href="how-it-works.html">One message, end to end</a> walks through the same five steps with the parts named, for when you need to debug one of them.</p>
 
-  <p>This documentation set was reverse-engineered directly from the source under <code>src/ghost_agent/</code> and <code>interface/</code>. Use the navigation on the left to drill into individual modules, or follow the links below for a guided tour.</p>
+  <h2>Is this for you?</h2>
 
-  <h2>Quick links</h2>
+  <div class="cols">
+    <div>
+      <h4>A good fit if</h4>
+      <ul>
+        <li>You want an assistant that keeps working when your internet or a vendor's API doesn't.</li>
+        <li>You care that your conversations stay on your own disk.</li>
+        <li>You're comfortable running a couple of background services and reading a log.</li>
+        <li>You want it to remember your projects across weeks, not just the current chat.</li>
+      </ul>
+    </div>
+    <div>
+      <h4>A poor fit if</h4>
+      <ul>
+        <li>You don't have a machine that can run a large language model locally, or a spare box to run one on.</li>
+        <li>You want zero setup. This needs Docker, Tor, and an LLM server running before it will start.</li>
+        <li>You need frontier-model reasoning quality. Ghost is built around a local model and trades some raw capability for privacy and control.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2>What you need before you start</h2>
+  <dl class="kv">
+    <dt>An LLM server</dt>
+    <dd>Anything that speaks the OpenAI chat API — llama.cpp, vLLM, or Ollama. Ghost is tuned around <strong>Qwen 3.6 35B-A3</strong>, and the prompts assume a model of roughly that capability.</dd>
+
+    <dt>Docker</dt>
+    <dd>The daemon must be running. Every piece of code Ghost executes goes into a container, so without Docker the tools that matter won't work.</dd>
+
+    <dt>Tor</dt>
+    <dd>A local Tor daemon on port <code>9050</code>. Ghost refuses to start without it — see <a href="safety.html">Safety and privacy</a> for why that's deliberate.</dd>
+
+    <dt>Python 3.10+</dt>
+    <dd>Plus the packages in <code>requirements.txt</code>. A virtual environment is strongly recommended.</dd>
+  </dl>
+
+  <p><a href="getting-started.html">Install and run it</a> has the full sequence, in order, with the environment variables spelled out.</p>
+
+  <h2>Start here</h2>
   <div class="card-grid">
-    <a class="card" href="architecture.html"><h3>System Architecture</h3><p>End-to-end diagram of how interfaces, API, core, memory and sandbox interact.</p></a>
-    <a class="card" href="algorithms/request_lifecycle.html"><h3>Request lifecycle</h3><p>What happens when a user message hits <code>/api/chat</code>.</p></a>
-    <a class="card" href="installation.html"><h3>Install &amp; Run</h3><p>Environment variables, dependencies, container prerequisites.</p></a>
-    <a class="card" href="cli_reference.html"><h3>CLI flags</h3><p>Every <code>python -m src.ghost_agent.main</code> argument explained.</p></a>
-    <a class="card" href="audit_fixes.html"><h3>Audit &amp; hardening</h3><p>May–June 2026 correctness/security passes — 5 rounds, 55+ fixes, all unit-tested.</p></a>
-    <a class="card" href="logging.html"><h3>Logging &amp; monitoring</h3><p>How to read the live stream, the icon catalog, and the May-2026 logging overhaul (failures now visible, distinct icons).</p></a>
-    <a class="card" href="core/agent.html"><h3>The reasoning loop</h3><p><code>agent.py</code> — streaming, tool dispatch, sampling profiles.</p></a>
-    <a class="card" href="memory/vector.html"><h3>Vector memory</h3><p>ChromaDB-backed semantic store with spaced-repetition.</p></a>
-    <a class="card" href="tools/registry.html"><h3>Tool registry</h3><p>How tools are advertised, dispatched, and validated.</p></a>
-    <a class="card" href="sandbox/docker.html"><h3>Docker sandbox</h3><p>Container lifecycle, mounts, Tor networking, resource limits.</p></a>
-    <a class="card" href="#anonymity"><h3>Anonymity &amp; Tor</h3><p>Identity-rotation policy, what's routed through Tor, and the fetch pipeline.</p></a>
-    <a class="card" href="algorithms/selfhood.html"><h3>Selfhood (unified self)</h3><p>First-person autobiographical memory, self-state thread, recognition / wake-up prefix, periodic narrative consolidation. Five components that stitch episodic instances into one continuous self. Now with an <a href="tools/introspect.html"><code>introspect</code></a> tool for deterministic "tell me about yourself" reads.</p></a>
-    <a class="card" href="algorithms/workspace.html"><h3>Workspace continuity (world-model)</h3><p>Counterpart to selfhood for the user's external world: file watcher, scheduled-task outcome ledger, research artifact dedup, command outcomes. Wakes the agent with a "what changed while I was away" prefix. Exposed via the <a href="tools/workspace.html"><code>workspace</code></a> and <a href="tools/workspace_track.html"><code>workspace_track</code></a> tools.</p></a>
+    <a class="card" href="getting-started.html">
+      <h3>Install and run it</h3>
+      <p>Prerequisites, environment variables, first start, and how to tell it's actually working.</p>
+    </a>
+    <a class="card" href="interfaces.html">
+      <h3>Ways to talk to it</h3>
+      <p>The interfaces — web UI, Slack, voice, desktop client, CLI and the HTTP API. Includes clips of the web UI reacting to a live request.</p>
+    </a>
+    <a class="card" href="how-it-works.html">
+      <h3>One message, end to end</h3>
+      <p>The turn loop in detail — what runs, in what order, and what to look for in the log when it goes wrong.</p>
+    </a>
+    <a class="card" href="memory.html">
+      <h3>What it remembers</h3>
+      <p>Six kinds of memory, what goes in each, and how to correct something it got wrong about you.</p>
+    </a>
+    <a class="card" href="tools.html">
+      <h3>What it can do</h3>
+      <p>The toolbox — code, files, web, browser, images, projects, scheduled tasks — and when it reaches for each.</p>
+    </a>
+    <a class="card" href="safety.html">
+      <h3>Safety and privacy</h3>
+      <p>What leaves your machine, what can't, and how the sandbox and Tor rules are enforced.</p>
+    </a>
+    <a class="card" href="glossary.html">
+      <h3>Glossary</h3>
+      <p>Plain-English definitions for the terms this project uses — dream cycle, hydration, verifier, trajectory.</p>
+    </a>
   </div>
 
-  <h2>Source map</h2>
-  <table>
-    <thead><tr><th>Path</th><th>Purpose</th><th>Doc section</th></tr></thead>
-    <tbody>
-      <tr><td><code>src/ghost_agent/main.py</code></td><td>CLI entrypoint &amp; FastAPI lifespan</td><td><a href="cli_reference.html">CLI reference</a></td></tr>
-      <tr><td><code>src/ghost_agent/core/</code></td><td>Reasoning loop, planning, dream, MCTS, swarm router</td><td><a href="core/agent.html">Core</a></td></tr>
-      <tr><td><code>src/ghost_agent/memory/</code></td><td>Vector + graph + profile + skill + journal + episodic stores</td><td><a href="memory/vector.html">Memory</a></td></tr>
-      <tr><td><code>src/ghost_agent/tools/</code></td><td>Tool registry &amp; per-tool implementations</td><td><a href="tools/registry.html">Tools</a></td></tr>
-      <tr><td><code>src/ghost_agent/sandbox/</code></td><td>Docker container manager</td><td><a href="sandbox/docker.html">Sandbox</a></td></tr>
-      <tr><td><code>src/ghost_agent/api/</code></td><td>FastAPI routes</td><td><a href="api/routes.html">API</a></td></tr>
-      <tr><td><code>src/ghost_agent/utils/</code></td><td>Logging, sanitiser, token counter, helpers</td><td><a href="cli_reference.html#utils">Utilities</a></td></tr>
-      <tr><td><code>interface/</code></td><td>Web UI (incl. the in-process voice loop), Slack bot, image-gen server, desktop client</td><td><a href="interfaces/web_server.html">Interfaces</a></td></tr>
-    </tbody>
-  </table>
+  <h2>The unusual parts</h2>
 
-  <h2>Conceptual model</h2>
-  <p>Ghost Agent is best understood as <strong>five concentric layers</strong>:</p>
-  <ol>
-    <li><strong>Interface layer</strong> — web/Slack/desktop clients that talk HTTP/SSE to the FastAPI core.</li>
-    <li><strong>API layer</strong> — Ollama-compatible HTTP routes that authenticate (<code>X-Ghost-Key</code>) and stream agent responses.</li>
-    <li><strong>Reasoning core</strong> — <code>GhostAgent</code> drives a streaming chat loop, parses tool calls from <code>&lt;tool_call&gt;</code> XML, dispatches tools, and re-injects results.</li>
-    <li><strong>Memory + planning</strong> — six memory tiers fused via Reciprocal Rank Fusion, plus a hierarchical <code>TaskTree</code> with postcondition gating, MCTS lookahead, and uncertainty tracking.</li>
-    <li><strong>Execution substrate</strong> — Docker containers for tool calls, swarm/worker LLM pools for parallel inference, and Tor for anonymous outbound traffic.</li>
-  </ol>
+  <p>Most of what Ghost does is what you'd expect from an agent. These are the parts that aren't, with a pointer to the mechanism behind each.</p>
 
-  <p>The <a href="architecture.html">Architecture page</a> contains the full diagram.</p>
+  <h3>It remembers across sessions, in six different shapes</h3>
+  <p>Closing the chat wipes nothing. Facts, relationships between things, a profile of you, lessons from its own mistakes, a running journal, and full past episodes are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. All six are searched at once and merged by rank rather than score. <a href="memory.html">How memory works →</a></p>
 
-  <h2 id="anonymity">Anonymity &amp; Tor routing</h2>
-  <p>Ghost Agent treats Tor as the default transport for outbound traffic — not as an optional flag. The proxy endpoint is declared once via the <code>TOR_PROXY</code> env var (canonical value: <code>socks5h://127.0.0.1:9050</code>) and is honoured by every HTTP-touching tool in the codebase. The <code>--anonymous</code> CLI switch is enabled by default and additionally routes <code>web_search</code> through DuckDuckGo, which keeps no query logs.</p>
+  <h3>It refuses its own answers</h3>
+  <p>A second model reads the final answer against the evidence the tools actually returned, and asks whether it answers the question <em>before</em> asking whether it's correct — because answering a different question is the more common failure. A high-confidence refusal sends Ghost back to fix it rather than shipping. <a href="self-improvement.html">How the self-check works →</a></p>
 
-  <h3>The fetch pipeline</h3>
-  <p>Every outbound call funnels through <code>utils/helpers.helper_fetch_url_content()</code>, which wraps <code>curl_cffi</code> and <code>httpx</code> with:</p>
-  <ul>
-    <li><strong>SOCKS5h routing</strong> — DNS is resolved <em>over Tor</em>, not by the local resolver, so the operator's DNS server never sees the target hostname.</li>
-    <li><strong>SSRF guards</strong> — private, link-local, and loopback ranges are refused before the SOCKS layer is touched. A tool call can't become a host-network scanner.</li>
-    <li><strong>5 MB body cap</strong> and <strong>20 s timeout</strong> — bounds the damage a hostile exit node or target server can do by serving slow or unbounded bodies.</li>
-    <li><strong>3-retry budget</strong> — transient failures are retried with a fresh Tor identity between attempts.</li>
-  </ul>
+  <h3>It rewrites its own prompts, and mostly declines to</h3>
+  <p>Three internal prompts — task decomposition, tool choice, and self-critique — are tuned by an optimizer trained on the agent's own successful turns, using the same local model with no teacher and no external service. It's capped at 16 rounds because longer optimization drifts toward gaming the metric, and a tuned prompt only ships if it beats the hand-written one. <a href="self-improvement.html">How prompt tuning works →</a></p>
 
-  <h3>Identity rotation (NEWNYM)</h3>
-  <p><code>request_new_tor_identity()</code> in <code>utils/helpers.py</code> is the agent's circuit-burn primitive. Mechanically, it speaks the Tor control protocol to the local daemon and issues a <code>SIGNAL NEWNYM</code>: Tor marks the current circuit dirty, and every subsequent stream opens through a brand-new entry-guard / middle / exit chain. The agent's previous exit node is no longer reachable from the next hop.</p>
-  <p>Rotation fires:</p>
-  <ul>
-    <li><strong>Automatically on HTTP 503</strong> from page <em>fetches</em> (<code>helper_fetch_url_content</code>) and file downloads — a gateway/exit-node rate-limit usually clears on a different chain. Note <code>401</code>/<code>403</code> do <em>not</em> rotate: those are application-level refusals (auth, geo-block) that a new exit won't fix.</li>
-    <li><strong>Between retries</strong> in <a href="tools/system.html"><code>check_weather</code></a> (3 attempts with identity refresh) and any tool that elects to re-enter the pool rather than hammer the same circuit.</li>
-    <li><strong>On explicit agent intent</strong> — the agent can invoke rotation as a tool step when a task's anonymity posture demands it (e.g. before re-visiting a site that just saw traffic).</li>
-  </ul>
-  <p class="note">The <a href="tools/search.html"><code>web_search</code></a> / <code>deep_research</code> path deliberately does <strong>not</strong> use NEWNYM. Each query instead rides its own circuit via per-query SOCKS-auth isolation (<code>IsolateSOCKSAuth</code>), which is cheaper than a global re-circuit and doesn't serialize searches behind a slow rotation. See <a href="tools/search.html">search</a>.</p>
+  <h3>It turns repeated work into named skills</h3>
+  <p>When several separate successful turns solve something with the same sequence of tools, that becomes a reusable skill — keeping the shortest validated path as the exemplar. Skills are re-tested later rather than trusted forever, since tools get renamed and models drift. <a href="self-improvement.html">How skills are extracted →</a></p>
 
-  <h3>What is and isn't routed through Tor</h3>
-  <table>
-    <thead><tr><th>Traffic</th><th>Transport</th><th>Notes</th></tr></thead>
-    <tbody>
-      <tr><td>Web search (<code>ddgs</code> → DuckDuckGo)</td><td><span class="badge good">Tor</span></td><td>Every request; identity rotated on refusal or rate-limit.</td></tr>
-      <tr><td>Page / document fetch (<code>fetch_url</code>)</td><td><span class="badge good">Tor</span></td><td>SOCKS5h — DNS also leaves via Tor.</td></tr>
-      <tr><td>Weather &amp; geolocation</td><td><span class="badge good">Tor</span></td><td>Open-Meteo primary, <code>wttr.in</code> fallback; both honour <code>TOR_PROXY</code>.</td></tr>
-      <tr><td>Sandbox container egress</td><td><span class="badge good">Tor</span></td><td>When the container has network access, it inherits the Tor SOCKS namespace.</td></tr>
-      <tr><td>Upstream LLM inference</td><td><span class="badge">Local</span></td><td>llama.cpp / vLLM runs on <code>127.0.0.1</code>. Never traverses a network boundary, Tor or otherwise.</td></tr>
-      <tr><td>Slack / image-gen servers</td><td><span class="badge">LAN</span></td><td>Operator-owned companion services on the private network; intentionally direct so the agent can reach them behind Tor's default deny.</td></tr>
-      <tr><td>Voice (STT / TTS)</td><td><span class="badge good">Tailnet + local</span></td><td>No companion service since 2026-08-02. Speech-to-text posts to a worker node over the tailnet; text-to-speech is a local <code>say</code> subprocess. Audio never leaves the tailnet and no key or account is involved — the only speech path compatible with the no-identity-egress rule.</td></tr>
-    </tbody>
-  </table>
+  <h3>It can search Tor hidden services</h3>
+  <p>Normal search engines don't index <code>.onion</code> sites, so there's a separate path through the dedicated onion engines. Each retry is forced onto a fresh Tor circuit, because whether an engine answers depends on which exit you drew — and engines that share a search index are counted once, so corroboration means independent sources. <a href="tools.html">How onion search works →</a></p>
 
-  <h3>Sanity check &amp; failure mode</h3>
-  <p>The <a href="tools/system.html"><code>check_health</code></a> tool probes the configured circuit on demand and reports whether <code>check.torproject.org</code> sees the request as Tor traffic, plus the current exit-node country. The probe is part of the default health readout — if the circuit is down or leaking to clearnet, the tool surfaces it loudly rather than silently degrading.</p>
-  <div class="note warn">
-    <strong>Fail-closed, not fail-open.</strong> If <code>TOR_PROXY</code> is unset or the Tor daemon is unreachable at startup, outbound tools refuse to fire rather than fall back to clearnet. This is intentional: a silently-cleartext agent is worse than a stalled one.
+  <h3>It fails closed on the network</h3>
+  <p>Outbound traffic goes through Tor, and this is enforced rather than intended: a boot-time probe plus a process-wide block on direct connections to public addresses. If Tor is unreachable, Ghost won't start. A silently-cleartext agent is worse than a stopped one. <a href="safety.html">How that's enforced →</a></p>
+
+  <h3>It works while you're away</h3>
+  <p>Given a quiet stretch, Ghost consolidates memory, reviews turns that failed, extracts skills, retrains two small local models, and practises against problems it invents for itself. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
+
+  <div class="note">
+    <strong>New to the project?</strong> Read this page, then <a href="getting-started.html">Install and run it</a>, then <a href="how-it-works.html">One message, end to end</a>. That's about twenty minutes and covers everything you need to run Ghost day to day. The <a href="reference.html">deep reference</a> is there when you need to change the code.
+  </div>
+
+  <div class="pager">
+    <span></span>
+    <a class="next" href="getting-started.html">
+      <span class="dir">Next</span>
+      <span class="to">Install and run it</span>
+    </a>
   </div>
 
   <footer>
-    <p>2026-06-10 (latest): <strong>verifier-gate AUTO-REPAIR</strong> (<a href="self_improvement.md">self_improvement.md</a>) &mdash; the verifier gate used to only <em>annotate</em> a REFUTED final answer (auditor note + confidence drop + lesson retraction) and ship it; now the agent gets up to <code>_MAX_VERIFIER_REPAIRS</code> (default 1) bounded in-loop re-attempts to actually FIX it. On a high-confidence REFUTED verdict (or finalising on an unverified <code>file_system</code> write) the critique is injected and the existing <code>for turn</code> loop <code>continue</code>s &mdash; no outer loop / re-indent. The finalisation verdict is cached and reused post-loop so a clean success still costs exactly one verifier pass; anti-loop accumulators + strike caps are preserved across repair (bounded); error/abort answers are never repaired; trajectory records once on the final answer. The in-run counterpart to the post-mortem engine. Verdict computation extracted to <code>_compute_verifier_verdict</code>. Tests: <code>tests/test_verifier_auto_repair.py</code> (6). Closes the last open self-improvement loop.</p>
-    <p>2026-06-10 (later): <strong>in-run no-progress loop breaker</strong> (<a href="self_improvement.md">self_improvement.md</a>) &mdash; the live dual of the post-mortem engine. Catches the ungrounded-verification loop (same SUCCEEDING action on the same target returning the same result, e.g. double-click icon → screenshot → "no change" → repeat) that the error-strike counter (no errors) and the reasoning-similarity breaker (varied prose) both miss. <code>_note_repeated_action</code> keys on <code>(tool, target, result-fingerprint)</code> over successful, non-mutating calls; on the 3rd identical repeat it forces a grounded final answer (trust DOM/state, or say how to verify), hard-stopping at 5. Mutating writes + errored calls are exempt. Surfaced by the Browser-OS build that narrated ~8 failed verification attempts with no conclusion. Tests: <code>tests/test_no_progress_loop_breaker.py</code> (15).</p>
-    <p>2026-06-10: whole-transcript <strong>post-mortem engine</strong> (<a href="self_improvement.md">self_improvement.md</a>, <a href="cli_reference.html">CLI <code>--postmortem</code></a>) &mdash; biological phase 2.5c reads the full tool-call sequence of the worst recent FAILED runs and files durable, classified <strong>defect reports</strong> (<code>behavioural</code> &rarr; SkillMemory; <code>configuration</code>; <code>code_defect</code> with an optional reproducing-test + diff <em>proposal</em>, never auto-applied) to a <code>DefectQueue</code>. Run selection + evidence are LLM-free (a structural signature: repeated-identical-error / two-tool-oscillation / same-target read-loop counts &rarr; severity), so no model call is spent on a healthy run and findings are grounded. Read via the new read-only <code>postmortem</code> tool. Raises the learning loop from "adjust my prompt" to "diagnose my own tooling". Tests: <code>tests/test_postmortem_engine.py</code> (34).</p>
-    <p>Generated from source on 2026-04-19. Self-play section refreshed 2026-04-20 &mdash; continuous-loop tool, saturation detection, validator self-test gate, <code>list_lessons</code> surface, tool-error discrimination.</p>
-    <p>2026-04-28 (later): wrong-question detection &mdash; verifier prompt now audits user-request <em>alignment</em> as the highest-priority check (constraint satisfaction comes first, output correctness second), with the agent's user-facing response threaded into <code>verify_code_output(response=...)</code> so the rubric can refute "user asks for code, agent returns a number" shapes; <code>SkillMemory</code> lessons gain <code>source_trajectory_id</code> provenance (JSON playbook + vector metadata); <code>retract_lessons_from_trajectory()</code> scrubs poisoned lessons via two callsites &mdash; the verifier-REFUTED branch (preventive) and the user-correction promotion (recovery). The Perfection-Protocol's eager <code>learn_lesson</code> can no longer leave a poisoned entry on disk when the verifier disagreed.</p>
-    <p>2026-04-28: real-time self-improvement loop closure (<a href="self_improvement.md">self_improvement.md</a>) &mdash; user-correction promotion path on every user turn (anchored correction phrase + Jaccard token-overlap rephrase, both required), <code>asyncio.create_task</code> post-turn <code>Reflector.reflect_one</code> with done-callback observability, append-only <code>corrections.jsonl</code> sidecar with read-time overlay (audit trail preserved), <code>Reflector.per_call_timeout_s</code> raised 45s &rarr; 120s for reasoning-model headroom. The biological watchdog phase 2.5 stays in place as the idle-time backstop; both paths share the composite reflection sink and the <code>_reflected_trajectory_ids</code> dedup set.</p>
-    <p>2026-04-24 patch series: stage-1 self-improvement substrate wired end-to-end (<a href="self_improvement.md">self_improvement.md</a>); <a href="sandbox/docker.html"><code>docker.py</code></a> provisioning marker bumped to <code>.v2</code> with <code>_chromium_binary_present()</code> gate; <a href="tools/browser.html"><code>browser</code></a> grew a <code>dblclick</code> sub-action and aborts on failed <code>goto</code>; <a href="core/verifier.html"><code>verifier</code></a> reconstructs executed code from <code>tool_call_id</code>; <a href="tools/execute.html">Jupyter</a> waits for kernel-ready before first execute; <a href="memory/skills.html"><code>get_playbook_context</code></a> has a BM25 fallback when vector retrieval is unwired; <a href="tools/acquired_skills.html">acquired skills</a> moved canonical storage to <code>$GHOST_HOME/system/memory/acquired_skills/</code> (outside the sandbox) with one-time migration, tool description hardened to "CALL BY NAME", <code>python_code</code> normalized at entry (CDATA / HTML-entity / markdown rescues), and TDD failures surface their cause in the trace; <a href="tools/file_system.html"><code>_get_safe_path</code></a> strips <code>/workspace/</code> prefix; <a href="tools/memory_tools.html"><code>self_play</code> / <code>self_play_loop</code></a> have a user-intent guard; <a href="cli_reference.html#utils"><code>sanitizer</code></a> rescues CDATA + HTML-entity leaks from the XML tool-call parser; <a href="core/uncertainty.html"><code>UncertaintyTracker</code></a> accepts either returned object or int index; <code>qwen_bridge</code> pins <code>soundfile</code> and surfaces an actionable ImportError.</p>
-    <p>Treat <code>README.md</code> and <code>CLAUDE.md</code> as historical artefacts; this documentation set is the canonical reference.</p>
+    <p>These pages are written from the source in <code>src/ghost_agent/</code> and <code>interface/</code>, and were last checked against it on <strong>2026-08-04</strong>.</p>
+    <p>Where a page says something the code contradicts, the code is right — please open an issue.</p>
   </footer>
 </main>
 </body>

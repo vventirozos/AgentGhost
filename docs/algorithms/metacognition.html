@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration</a>
@@ -27,6 +30,8 @@
 </aside>
 
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Metacognition uplift — calibrated confidence, telemetry, and dual-solver arbitration</h1>
   <p class="subtitle">
     Six new modules that close the four metacognitive gaps identified by the
@@ -113,7 +118,7 @@
   </ol>
 
   <h3>Decision routing</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Decision</th><th>Agent behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>execute</code></td><td>Logged; original dispatch proceeds. Arbiter agreed with the original plan.</td></tr>
@@ -121,7 +126,7 @@
       <tr><td><code>ask_user</code></td><td><b>Hard block.</b> Dispatch is replaced with a synthetic tool result that surfaces the divergence to the model. The model's next turn produces a clarification request.</td></tr>
       <tr><td><code>skipped</code></td><td>Empty prompt; treated as if the gate returned <code>None</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Pre-flight repeat-failure guard <span class="badge">feature 1A</span></h2>
   <p class="subtitle">
@@ -210,7 +215,7 @@
   </p>
 
   <h2>CLI flags</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>--enable-preflight-guard</code> / <code>--no-…</code></td><td><b>on</b></td><td>Pre-flight repeat-failure guard (independent of the rest of the uplift). Blocks a tool call whose <code>(tool, target)</code> already failed the same way ≥2× in the recent window. Idempotent setters exempt. See the section above.</td></tr>
@@ -224,7 +229,7 @@
       <tr><td><code>--metacog-disk-high</code></td><td><code>90.0</code></td><td>Disk usage %% above which a host signal fires.</td></tr>
       <tr><td><code>--metacog-host-heartbeat-s</code></td><td><code>300.0</code></td><td>Re-emit a steady-state host signal every N seconds even when state hasn't changed. Default 5 min. Set to <code>0</code> to disable dedup entirely (every poll emits).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Host-signal dedup</h3>
   <p>
@@ -246,7 +251,7 @@
   </p>
 
   <h2>Integration points (live)</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Wire-point</th><th>File:line</th><th>Behaviour when <code>--enable-metacog</code> is off</th></tr></thead>
     <tbody>
       <tr>
@@ -320,7 +325,7 @@
         <td>Bundle never receives the reading → arbiter gate stays in cold-start state forever (which itself returns <code>None</code>).</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Why</h2>
   <p>
@@ -343,7 +348,7 @@
   </ol>
 
   <h2>Module map</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Module</th><th>Phase</th><th>Role</th></tr></thead>
     <tbody>
       <tr>
@@ -439,7 +444,7 @@
         </td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Pipeline diagram</h2>
   <pre>
@@ -534,7 +539,7 @@
   </p>
 
   <h2>Test surface</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Test file</th><th>Cases</th></tr></thead>
     <tbody>
       <tr><td><code>tests/test_host_telemetry.py</code></td><td>16</td></tr>
@@ -552,7 +557,7 @@
       <tr><td><code>tests/test_metacog_log_polish.py</code></td><td>17 (CLI thresholds, dedup, noop suppression, distinct icons)</td></tr>
       <tr><td><b>Total new tests</b></td><td><b>253</b></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Functional check</h2>
   <p>
@@ -585,7 +590,7 @@
 metacog &lt;subsystem&gt;    key=value key=value ...
   </pre>
   <h3>Subsystems</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Icon</th><th>Subsystem</th><th>Fired by</th><th>Level</th></tr></thead>
     <tbody>
       <tr><td>🌱</td><td><code>metacog boot</code></td><td>Lifespan enable / disable / init_failed</td><td>INFO / ERROR</td></tr>
@@ -596,7 +601,7 @@ metacog &lt;subsystem&gt;    key=value key=value ...
       <tr><td>🖥️</td><td><code>metacog host</code></td><td>Each HostSignal — telemetry threshold crossing (post-dedup)</td><td>severity-matched (INFO / WARNING / ERROR)</td></tr>
       <tr><td>🔀</td><td><code>metacog replan</code></td><td>ACTIONABLE replan attempts only (<code>revised</code> / <code>revision_rejected</code> / <code>error</code>)</td><td>INFO on <code>revised</code>, WARNING otherwise</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     Each subsystem gets a distinct emoji so a quick visual scan separates
     metacog activity from the agent's own brain-think (💭), planner (📋),
@@ -624,7 +629,7 @@ metacog summary   arbitrations=1 ask_user=1 validator_blocks=1 host_signals=1 ho
   </pre>
 
   <h3>Monitoring grep recipes</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Question</th><th>Recipe</th></tr></thead>
     <tbody>
       <tr><td>Any uplift activity?</td><td><code>grep "metacog " logfile</code></td></tr>
@@ -634,7 +639,7 @@ metacog summary   arbitrations=1 ask_user=1 validator_blocks=1 host_signals=1 ho
       <tr><td>Per-tool block frequency</td><td><code>grep "metacog valid" | awk -F'tool=' '{print $2}' | awk '{print $1}' | sort | uniq -c</code></td></tr>
       <tr><td>End-of-day rollup</td><td><code>grep "metacog summary" logfile | tail -1</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Operator quickstart</h2>
   <pre>
@@ -653,7 +658,7 @@ python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080 \
   </pre>
 
   <h2>Metacognitive scoring delta</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Level</th><th>Pre-uplift</th><th>Post-uplift</th></tr></thead>
     <tbody>
       <tr><td>L0 — Atomic Self-Knowledge / Calibration</td><td>5/10</td><td><b>8/10</b></td></tr>
@@ -661,7 +666,7 @@ python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080 \
       <tr><td>L2 — Compositional Prediction</td><td>6/10</td><td><b>7/10</b> (unc-penalty in MCTS)</td></tr>
       <tr><td>L3 — Adaptive Self-Regulation</td><td>5/10</td><td><b>8/10</b></td></tr>
     </tbody>
-  </table>
+  </table></div>
 </main>
 </body>
 </html>

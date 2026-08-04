@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a href="selfhood.html">Selfhood (unified self)</a>
     <a class="current" href="workspace.html">Workspace continuity</a>
@@ -21,6 +24,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Workspace Continuity</h1>
   <p class="subtitle">The world-model counterpart to selfhood. Selfhood tracks "who I am"; workspace continuity tracks "what I'm looking at."</p>
 
@@ -36,7 +41,7 @@
   </ul>
 
   <h2>What it tracks</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Kind</th><th>What gets recorded</th><th>How</th></tr></thead>
     <tbody>
       <tr><td><code>file_changed</code></td><td>One entry per tracked file whose stat changed since the last scan (newly tracked / modified / appeared / deleted).</td><td>On every <code>build_wakeup_prefix()</code> call: <code>scan_tracked()</code> stats every <code>TrackedFile</code> against its cached <code>FileSnapshot</code>. The diff is what the wake-up prefix surfaces.</td></tr>
@@ -45,10 +50,10 @@
       <tr><td><code>command</code></td><td>Significant <code>execute</code>-tool outcomes (long-running, failed, mutating). Caller decides what's significant.</td><td><code>WorkspaceModel.record_command_outcome</code>. Wiring into <code>tool_execute</code> is the next phase.</td></tr>
       <tr><td><code>note</code></td><td>Free-form workspace events authored by the agent via the <code>workspace_track</code> tool.</td><td><code>WorkspaceModel.note</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Module layout</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
     <tbody>
       <tr><td><code>src/ghost_agent/workspace/schema.py</code></td><td>Dataclasses: <code>FileSnapshot</code>, <code>TrackedFile</code>, <code>TaskOutcome</code>, <code>ResearchArtifact</code>, <code>CommandOutcome</code>, <code>WorkspaceEvent</code>, <code>WorkspaceState</code>.</td></tr>
@@ -59,7 +64,7 @@
       <tr><td><code>src/ghost_agent/workspace/narrative.py</code></td><td><code>WorkspaceNarrative</code> — periodic LLM-rewritten "running summary of the workspace". Template fallback when no critique function is supplied, same pattern as <code>selfhood.narrative</code>. Also exposes <code>render_changelog()</code> <span class="badge">2B</span> — rolls the activity log into a dated, project-scoped markdown changelog; <code>WorkspaceModel.write_changelog()</code> persists it as <code>CHANGELOG.&lt;project&gt;.md</code> during the idle Phase 2.9 consolidation (alongside the prose narrative).</td></tr>
       <tr><td><code>src/ghost_agent/workspace/model.py</code></td><td><code>WorkspaceModel</code> — single facade. Capture hooks (<code>record_task_outcome</code>, <code>record_research_artifact</code>, <code>record_command_outcome</code>, <code>note</code>), file watcher (<code>track_file</code>, <code>untrack_file</code>, <code>scan_tracked</code>), prefix builder (<code>build_wakeup_prefix</code>), idle consolidator (<code>consolidate_narrative</code> → also writes the changelog), introspection (<code>stats</code>). <code>record_navigation()</code> <span class="badge">2C</span> counts same-URL visits this session and, on the 3rd, returns a "cache it / switch strategy" nudge that the browser tool appends to its result (and records as a workspace note).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Wiring into the agent</h2>
   <ol>
@@ -71,14 +76,14 @@
   </ol>
 
   <h2>CLI flags</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Default</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>--no-workspace-model</code></td><td>off</td><td>Disable the workspace continuity module entirely. Facade is still attached as a no-op so call sites don't branch on availability.</td></tr>
       <tr><td><code>--no-memory</code></td><td>off</td><td>Disables persistent stores (including this one) regardless of the flag above.</td></tr>
       <tr><td><code>--workspace-narrative-cooldown N</code></td><td>3600</td><td>Seconds between biological-phase-2.9 workspace-narrative regenerations.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Agent-callable tools</h2>
   <ul>

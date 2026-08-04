@@ -10,6 +10,11 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
+    <h3>Guide</h3>
+    <a href="index.html">&larr; Back to the guide</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Reference index</a>
+
     <a href="index.html">Home</a>
     <a href="capabilities.html">Capabilities</a>
     <a href="architecture.html">System Architecture</a>
@@ -25,11 +30,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="index.html">the guide</a>, or check the <a href="glossary.html">glossary</a>.</p>
+
   <h1>CLI Reference</h1>
   <p class="subtitle">Every flag accepted by <code>python -m src.ghost_agent.main</code>, sourced from <code>main.py:61-138</code>.</p>
 
   <h2>Networking &amp; identity</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>--host</code></td><td>str</td><td><code>0.0.0.0</code></td><td>uvicorn bind address.</td></tr>
@@ -39,30 +46,30 @@
       <tr><td><code>--api-key</code></td><td>str</td><td><code>$GHOST_API_KEY</code> (no fallback)</td><td>Value the agent expects in the <code>X-Ghost-Key</code> header. No hardcoded default: unset + loopback bind &rarr; auth disabled; unset + non-loopback bind &rarr; refuses to boot; explicit <code>''</code> &rarr; auth disabled with a warning. <strong>Prod since 2026-07-13:</strong> auth ENABLED — the launcher exports <code>GHOST_API_KEY</code> from the mode-600 secret file <code>~/Data/AI/.ghost_api_key</code> (env, not argv, so the secret stays out of <code>ps</code>); the same file feeds the web interface, Slack bot, <code>ghost</code> CLI, and uConsole client.</td></tr>
       <tr><td><code>--default-db</code></td><td>str</td><td><code>$GHOST_DEFAULT_DB</code> or local Postgres DSN</td><td>Default DSN for the <code>postgres_admin</code> tool.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Logging &amp; verbosity</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Type</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>-d / --daemon</code></td><td>flag</td><td>Suppress stdout logging (file-only).</td></tr>
       <tr><td><code>--debug</code></td><td>flag</td><td>Set log level to DEBUG.</td></tr>
       <tr><td><code>-v / --verbose</code></td><td>flag</td><td>Disable per-line truncation; raises <code>LOG_TRUNCATE_LIMIT</code> from 60 chars to 1M.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Memory behaviour</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>--no-memory</code></td><td>off</td><td>Skip vector / graph / profile / episodic / adaptive-threshold / contradiction-log initialisation. Useful for regression tests.</td></tr>
       <tr><td><code>--smart-memory</code></td><td><code>0.0</code></td><td>Initial value for the <code>AdaptiveThreshold</code> recall gate. The store self-tunes from observations once recording begins (window=100, MIN_OBSERVATIONS=20).</td></tr>
       <tr><td><code>--max-context</code></td><td><code>65536</code></td><td>Maximum tokens before <code>ContextManager</code> escalates compression (L0..L4).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Tool surface</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>--native-tools</code> / <code>--no-native-tools</code></td><td>on</td><td>Whether to advertise OpenAI-style <code>tools</code> array on outbound LLM calls. When on, the equivalent XML <code>&lt;tool_def&gt;</code> schema is suppressed from the prompt to avoid double-shipping the same definitions (~7,800 token saving per turn). The XML format scaffolding stays so the parser still accepts the legacy <code>&lt;tool_call&gt;</code> shape as fallback. Off forces XML-only tool dispatch (no native channel; full schema in prompt). See <a href="core/agent.html#context-compaction">Context compaction</a> in <code>core.agent</code>.</td></tr>
@@ -77,11 +84,11 @@
       <tr><td><code>--principle-gate</code></td><td>off</td><td>After a final response, run an independent LLM check against the agent's own authored operating principles (<code>selfhood/values</code>) and append a self-note if the response contradicts one. Annotates only, never blocks; adds one LLM call per final turn. See <a href="algorithms/selfhood.md">Selfhood — operating principles</a>.</td></tr>
       <tr><td><code>--autoadvance-idle</code></td><td>off</td><td>Biological-watchdog phase 2.95: when idle, autonomously advance ONE ACTIVE project by a single <code>advance_once</code> tick (previously the autoadvancer was only reachable via the <code>manage_projects</code> tool / HTTP, so background project progress never happened). Runs on the existing hard per-project budgets + human gates; coding tasks generate+run real code instead of the old no-op stub. One project / one tick per 30-min cooldown. See <a href="core/project_advancer.html">project_advancer</a>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Stage-1 self-improvement pipeline</h2>
   <p>Local-only trajectory logging, self-critique reflection, and complexity-routed dispatch. All three default to ON (opt-out shape) when <code>--no-memory</code> is not set; the pipeline is fully local — no external teacher, no hosted embedder. See <a href="self_improvement.md">self-improvement pipeline</a> for the architecture.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>--no-trajectories</code></td><td>flag</td><td>off</td><td>Disable the JSONL trajectory log at <code>$GHOST_HOME/system/trajectories/</code>. Also implicitly disables reflection (which reads from the log).</td></tr>
@@ -101,11 +108,11 @@
       <tr><td><code>--postmortem-min-severity</code></td><td>float</td><td><code>0.4</code></td><td>Minimum structural severity (0..1) a failed run must score before it earns a post-mortem LLM call. Lower = more runs analysed (and more model calls). Only active under <code>--postmortem</code>.</td></tr>
       <tr><td><code>--postmortem-propose-patch</code></td><td>flag</td><td>off</td><td>For <code>code_defect</code> findings, also ask the coding model for a reproducing test + unified diff and attach them to the defect report as a <strong>proposal</strong> (stored for human review via the <code>postmortem</code> tool — <em>never</em> applied automatically). Adds one coding-model call per code-defect finding. Requires <code>--postmortem</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Helper scripts</h2>
   <p>Python entry points under <code>scripts/</code>:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Script</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>scripts/eval_baseline.py freeze|compare</code></td><td>Run the offline eval suite (<code>--suite {default,post_learning}</code>) via a stub runner or HTTP against a running agent. Freeze the result as a baseline or diff a subsequent run. Flags: <code>--runner {stub,http}</code>, <code>--base-url</code>, <code>--api-key</code>, <code>--model</code>, <code>--timeout N</code> (default 300s — template tasks on a local Qwen-scale model commonly run 80–250s).</td></tr>
@@ -117,11 +124,11 @@
       <tr><td><code>scripts/build_sandbox_image.sh</code></td><td>Build <code>ghost-agent-base:latest</code> from <code>sandbox/Dockerfile</code> — bakes apt deps, Python stack, and Playwright Chromium (with <code>--with-deps</code>) into the image. Runs a Chromium smoke test at the end. One-shot per Ghost version; the runtime sandbox wrapper picks up the freshly-built image on next <code>ensure_running</code>.</td></tr>
       <tr><td><code>scripts/ablation_monitor.py [report-dir]</code></td><td>Read-only progress monitor for a running <code>ablation_trackb4.py</code> pilot or full run. Auto-detects pilot vs full mode and shows: task x/y within the current arm/pass, which arm of which repeat, an overall % bar, driver-turn rate, and a rough ETA. Counts only DRIVER-tagged turns (the <code>dv</code> request-id prefix) so interleaved self-play turns aren't miscounted. Reads only files the harness already writes (the <code>&lt;report-dir&gt;.log</code> driver stdout + per-arm agent logs) — never touches the run. Flags: <code>--watch [SECS]</code> (live refresh, default 20s), <code>--battery N</code> (override detected size), <code>--driver-log PATH</code>. With no arg, monitors the newest <code>ablation_out/b4-*</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Swarm topology</h2>
   <p>Each value is a comma-separated list of <code>url|model</code> pairs. Pools are independent and routed by <code>LLMClient</code>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Used for</th><th>Selector</th></tr></thead>
     <tbody>
       <tr><td><code>--swarm-nodes</code></td><td>Parallel inference / planning fan-out</td><td><code>chat_completion(use_swarm=True)</code></td></tr>
@@ -131,11 +138,11 @@
       <tr><td><code>--image-gen-nodes</code></td><td>SDXL image generation</td><td><code>generate_image()</code></td></tr>
       <tr><td><code>--critic-nodes</code></td><td>Self-evaluation verifier on a dedicated (often slower, off-host) judge model — e.g. a spare Mac Mini running a 9B. Kept off the worker pool so a slow verdict never blocks fast routing chores, and off the foreground slot so it never competes with the main model for the KV-cache.</td><td><code>chat_completion(use_critic=True)</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2 id="critic-gate">Non-blocking verifier gate</h2>
   <p>The self-evaluation verifier normally runs <em>after</em> the answer is assembled and the turn blocks on its verdict. When <code>--critic-nodes</code> is set the verdict runs on that pool (a slower off-host model), so the gate goes <strong>non-blocking</strong>: the verdict is spawned as a background task and the response ships without waiting on it. A high-confidence <code>REFUTED</code> that lands late can no longer amend the (already-sent) response, but still scrubs any lesson that turn produced, so the next query can't retrieve a poisoned lesson.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Env var</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>GHOST_CRITIC_GATE_TIMEOUT</code></td><td>Seconds the gate waits inline for the verdict before releasing the response. <code>0</code> = pure async (never wait); a positive value gates inline up to that budget then falls through to async; unset defaults to <code>0</code> when <code>--critic-nodes</code> is configured and to "block forever" (legacy behaviour) when it is not.</td></tr>
@@ -145,11 +152,11 @@
       <tr><td><code>GHOST_CRITIC_ASYNC</code></td><td>Default <code>0</code> (off). When <code>1</code>, the verifier never sits on the critical path: the in-loop repair-before-ship is skipped and the verdict runs purely <em>after</em> the response ships. A high-confidence REFUTED then scrubs the turn's lessons and queues a correction surfaced at the top of the <em>next</em> turn <strong>of the same conversation</strong> ("⚠️ Correction to my previous answer…"). Trades before-ship repair of the rare wrong answer for not paying the slow off-host verdict latency (~58s) on every turn. With this on, keep the accurate thinking verdict (<code>GHOST_CRITIC_NO_THINK=0</code>) — its latency no longer hurts. <strong>Conversation scoping (fix):</strong> the agent is a process-wide singleton, so a naive queue leaked one conversation's correction into the <em>next</em> turn of an <em>unrelated</em> conversation (or a different user). Each queued correction is now tagged with a <em>conversation fingerprint</em> (a hash of the conversation's first user message, stable across that conversation's turns) and a timestamp; a correction surfaces only when the incoming turn shares that fingerprint, is held for its own conversation otherwise, dropped after a TTL (<code>_CORRECTION_TTL</code>, 900&nbsp;s) if that conversation never returns, and the queue is capped (<code>_CORRECTION_MAX</code>, 3, newest win) so a busy multi-conversation process can't accumulate a runaway banner chain. Covered by <code>tests/test_critic_async.py</code>.</td></tr>
       <tr><td><code>GHOST_PIN_TOOL_SCHEMAS</code></td><td>Default <code>0</code> (off). When <code>1</code>, pins the byte-stable per-turn block (tool schemas + persona + playbook + hydrated memory + continuity) to the first user message — a fixed position — so the upstream KV-cache reuses it across the turns of one request instead of re-prefilling the ~23k-char block every turn (~15s). Only the volatile <code>dynamic_state</code> rides the moving last message. Native tool defs still travel in the payload <code>tools</code> field, so tool-calling is unaffected. Opt-in / reversible A/B for the per-turn prefill latency.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2 id="utils">Utility modules</h2>
   <p>The <code>src/ghost_agent/utils/</code> package centralises cross-cutting helpers:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Module</th><th>Highlights</th></tr></thead>
     <tbody>
       <tr><td><code>helpers.py</code></td><td><code>request_new_tor_identity()</code> rotates Tor circuits; <code>helper_fetch_url_content()</code> wraps curl_cffi/httpx with SSRF guards, 5 MB body cap, 20 s timeout, and 3 retry attempts; <code>recursive_split_text</code> + <code>semantic_split_text</code> chunk text for ingestion; <code>get_utc_timestamp</code> / <code>parse_utc_timestamp</code> for ISO timestamps.</td></tr>
@@ -157,7 +164,7 @@
       <tr><td><code>sanitizer.py</code></td><td><code>extract_code_from_markdown</code>, <code>fix_python_syntax</code> (AST-driven repair loop, max 20 retries), and <code>sanitize_code</code> chain that scrubs control characters and heals partial Python before exec.</td></tr>
       <tr><td><code>token_counter.py</code></td><td><code>load_tokenizer</code> caches Qwen3 35B tokenizer locally with a 15 s download timeout fallback; <code>estimate_tokens</code> uses a bounded LRU cache; <code>check_budget</code> reports per-message token usage.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <footer><a href="index.html">← Back to index</a></footer>
 </main>

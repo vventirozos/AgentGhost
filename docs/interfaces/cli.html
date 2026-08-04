@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
@@ -21,6 +24,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>interface / externals / cli</h1>
   <p class="subtitle">Terminal client: streaming Markdown chat, durable sessions, real turn cancellation, files/workspace, projects, and ops — one PEP-723 script.</p>
 
@@ -42,7 +47,7 @@
   (releasing the global turn lock) instead of just closing the socket.</p>
 
   <h2>Feature surface</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Command</th><th>Backend</th></tr></thead>
     <tbody>
       <tr><td>chat (plain text)</td><td><code>POST /v1/chat/completions</code> (SSE stream, rendered live as rich Markdown; <code>session_id</code> persists the conversation server-side)</td></tr>
@@ -55,7 +60,7 @@
       <tr><td><code>/projects · /project …</code></td><td><code>/api/projects</code> list/info/switch/resume/advance/tasks</td></tr>
       <tr><td>one-shot: <code>ghost -p "q"</code> / pipe stdin</td><td>same chat stream; Markdown when stdout is a tty, raw text when piped</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Streaming render — tail-cropped live view (2026-07-26)</h2>
   <p>Replies stream into a rich <code>Live</code> region re-rendered as Markdown ~12×/s. The

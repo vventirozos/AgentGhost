@@ -10,6 +10,11 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
+    <h3>Guide</h3>
+    <a href="index.html">&larr; Back to the guide</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Reference index</a>
+
     <h3>Overview</h3>
     <a href="index.html">Home</a>
     <a href="capabilities.html">Capabilities</a>
@@ -36,6 +41,8 @@
 </aside>
 
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="index.html">the guide</a>, or check the <a href="glossary.html">glossary</a>.</p>
+
   <h1>System Architecture</h1>
   <p class="subtitle">A bird's-eye view of how the Ghost Agent runtime fits together.</p>
 
@@ -371,7 +378,7 @@
 
   <h2>Process &amp; thread model</h2>
   <p>The Ghost Agent process is a single FastAPI / uvicorn instance running on port 8000. All work happens inside one Python interpreter; concurrency comes from <code>asyncio</code> for I/O and threads for blocking operations:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Subsystem</th><th>Concurrency</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td>FastAPI request handlers</td><td>asyncio</td><td>Streaming responses use Server-Sent Events.</td></tr>
@@ -382,7 +389,7 @@
       <tr><td>Biological watchdog</td><td>asyncio daemon task</td><td>Idle dream + skill graduation; cancelled at shutdown.</td></tr>
       <tr><td>APScheduler</td><td>internal AsyncIO scheduler</td><td>Cron / interval triggers for user-defined tasks.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Data flow on a chat request</h2>
   <p>Detailed walkthrough lives in <a href="algorithms/request_lifecycle.html">Request lifecycle</a>. The short version:</p>

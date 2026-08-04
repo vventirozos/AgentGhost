@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a class="current" href="acquired_skills.html">acquired_skills</a>
@@ -19,20 +22,22 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / acquired_skills.py</h1>
   <p class="subtitle">Runtime Python tool creation with TDD validation, persistent file + registry storage, vector embedding, and degradation tracking.</p>
 
   <h2>Tools</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>create_skill</code></td><td>Validate test_payload, write the skill to <code>acquired_skills/&lt;name&gt;.py</code>, run TDD via <a href="execute.html"><code>tool_execute</code></a>, persist to <code>skills_registry.json</code>, and embed the description in vector memory.</td></tr>
       <tr><td><code>manage_skills</code></td><td>List active skills or delete by name. This tool is the canonical answer to "show me your skills" / "list your skills" / "what skills do you have" — a SKILL means a tool the agent has acquired, NOT a lesson it has learned. Lesson-shaped queries route to <a href="memory_tools.html"><code>list_lessons</code></a> instead. <strong>action='list' (2026-07-15)</strong> returns the COMPLETE custom inventory in one compact call — acquired tools <em>and</em> composed macros (read from <code>composed_skills/composed_skills.json</code>) — followed by a footer reminding the model that the built-in tools are standing capabilities to summarise by category. This fixes a truncation: asked to "list all skills" the model used to re-tabulate every built-in tool with its full schema and ran out of token budget before reaching the custom skills (the verifier late-refuted the truncated answer).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>AcquiredSkillManager</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>save_skill(name, desc, params_schema, python_code)</code></td><td>Validate <code>name</code> against <code>[A-Za-z_][A-Za-z0-9_]{0,63}</code>, then write <code>.py</code> file, MD5-hash <code>code+schema</code> for dedup, update registry, embed description in vector memory only if content changed — <strong>replacing</strong> the previous embedding for that name (delete-before-add, 2026-07-26; see below).</td></tr>
@@ -42,7 +47,7 @@
       <tr><td><code>delete_skill(name)</code></td><td>Manual remove + delete file + clean vector store (via <code>$and</code> filter — see below).</td></tr>
       <tr><td><code>purge_orphaned_skill_embeddings()</code></td><td>Delete (by id) any <code>type=acquired_skill</code> embedding whose <code>name</code> is no longer in the registry, and collapse same-name duplicates to one embedding (prefer the one matching the registry's current description, else the newest insert). Swept best-effort on every <code>tool_manage_skills</code> call, alongside the retirement sweep. Never raises; returns the count removed.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Vector-store deletion uses <code>$and</code> (2026-07-26)</h2>
   <p>Chroma rejects flat multi-key <code>where</code> filters with <em>"Expected where to have exactly one operator"</em> — multiple conditions must be wrapped in <code>{"$and": [...]}</code>. Both <code>delete_skill</code> and <code>retire_degraded_skills</code> passed <code>where={"name": ..., "type": "acquired_skill"}</code>, so the vector-store cleanup <strong>never worked</strong>: manual deletes logged the warning the operator saw, and the retirement path swallowed the error silently (<code>except: pass</code> — now logs a warning instead), leaving stale skill embeddings behind on every delete/retire since inception. Fixed to <code>where={"$and": [{"name": name}, {"type": "acquired_skill"}]}</code>, matching the pattern already used in <code>memory/skills.py</code>. Regression tests capture the filter passed to the (mock) collection and run it through <code>chromadb.api.types.validate_where</code>, so a mock can never again accept a shape real Chroma rejects — <code>tests/test_acquired_skills.py::test_acquired_skill_manager_delete</code> + <code>tests/test_acquired_skill_retirement.py::test_retirement_with_vector_store</code>.</p>

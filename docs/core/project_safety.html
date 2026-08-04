@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="project_advancer.html">project_advancer</a>
     <a href="coding_executor.html">coding_executor</a>
@@ -21,11 +24,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / project_safety.py</h1>
   <p class="subtitle">Budget enforcement, human-gate postconditions, contradiction detection, and chat→project promotion heuristics.</p>
 
   <h2>Functions</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>check_budget(proj_metadata) -&gt; BudgetDecision</code></td><td>Multi-dimensional budget check — steps · runtime_seconds · tool_calls (line 39).</td></tr>
@@ -34,7 +39,7 @@
       <tr><td><code>route_contradiction(contradiction_log, new_fact, prior_facts, reason)</code></td><td>Append a revision event to the contradiction log (line 162).</td></tr>
       <tr><td><code>should_suggest_promotion(...)</code></td><td>Decide whether the in-flight chat warrants becoming a tracked project (line 203).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Budget knobs</h2>
   <p>Stored in <code>project_metadata</code>:</p>

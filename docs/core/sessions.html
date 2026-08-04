@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a class="current" href="sessions.html">sessions &amp; turns</a>
     <a href="delegation.html">delegation &amp; jobs</a>
@@ -20,6 +23,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Durable sessions &amp; real turn cancellation</h1>
   <p class="subtitle">core/sessions.py · core/turns.py — 2026-07-11. The two
   things that stood between this agent and being a daily driver: conversations
@@ -83,14 +88,14 @@
   </ul>
 
   <h3>Endpoints</h3>
-  <table>
+  <div class="scroll"><table>
     <tbody>
       <tr><td><code>GET /api/sessions</code></td><td>summaries (id / title / timestamps / message_count), newest first — no bodies, so the list stays cheap</td></tr>
       <tr><td><code>POST /api/sessions</code></td><td>create (optional <code>title</code>); a client may equally just POST <code>/api/chat</code> with a fresh <code>session_id</code></td></tr>
       <tr><td><code>GET /api/sessions/{id}</code></td><td>full conversation — this is how a session is RESUMED on a different client than the one that started it</td></tr>
       <tr><td><code>DELETE /api/sessions/{id}</code></td><td>delete</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>1b. Hydration tier (2026-07-14)</h2>
   <p>Stored sessions are now a retrieval source, not just replay state: <code>SessionStore.search_messages(query, limit=5)</code> keyword-searches the most-recently-updated <code>_SEARCH_MAX_SESSIONS</code> (50) sessions and feeds <code>MemoryBus._fetch_session</code> as the fifth hydration tier (see <a href="bus.html">bus</a>). Bounded by design: per-file mtime cache (unchanged sessions are never re-parsed), a 2s summaries memo (one glob scan per hydration, not per sub-query), 240-char snippets, and a ≥2-distinct-term floor for multi-term queries so one shared common word can't surface an unrelated conversation. Fail-safe — returns <code>[]</code> on any error. Tests: <code>tests/test_session_hydration_tier.py</code>.</p>
@@ -109,12 +114,12 @@
   <strong>before</strong> acquiring the semaphore, so a request QUEUED behind a
   runaway turn is cancellable too.</p>
 
-  <table>
+  <div class="scroll"><table>
     <tbody>
       <tr><td><code>GET /api/turns</code></td><td>what is running and for how long, plus anything queued behind it — this is how you see WHY the agent appears unresponsive</td></tr>
       <tr><td><code>POST /api/turn/cancel</code></td><td><code>{request_id?, hard?}</code> — <code>request_id</code> defaults to the running turn</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Cooperative vs hard</h3>
   <ul>

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Metacognition uplift</h3>
     <a href="entropy.html">entropy</a>
     <a class="current" href="confidence.html">confidence</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / confidence.py — CompositeConfidence</h1>
   <p class="subtitle">Fuses token-level entropy (one-shot generation signal) and per-domain competence (long-term capability prior) into one tunable confidence score.</p>
 
@@ -45,7 +50,7 @@ if r.below_threshold:
   </pre>
 
   <h2>ConfidenceReading fields</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>composite</code></td><td>Final C ∈ [0, 1].</td></tr>
@@ -55,7 +60,7 @@ if r.below_threshold:
       <tr><td><code>below_threshold</code></td><td>Precomputed decision the caller acts on.</td></tr>
       <tr><td><code>uncertainty_pressure</code></td><td>The verbalised-uncertainty signal that fed this reading (0 = nothing flagged → 1 = heavy unresolved high-impact unknowns). Recorded by the <a href="calibration.html">calibration spine</a>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Why additive, not geometric?</h2>
   <p>The two signals are asymmetric: entropy is per-generation; competence is historical. Weighted additive lets operators tune the balance per deployment — an edge build with a thin model raises <code>w_c</code> because token entropy is noisier there.</p>
@@ -110,7 +115,7 @@ if r.below_threshold:
   <h3>What was measured first</h3>
   <p>296 labelled trajectories (246 passed / 50 failed) were scanned for turn-shape signals before
   any code was written:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Signal</th><th>mean (passed)</th><th>mean (failed)</th><th>AUC</th></tr></thead>
     <tbody>
       <tr><td>tool calls in the turn</td><td>2.39</td><td>11.70</td><td>0.334</td></tr>
@@ -118,7 +123,7 @@ if r.below_threshold:
       <tr><td>distinct tools</td><td>1.39</td><td>2.08</td><td>0.377</td></tr>
       <tr><td><em>any tool errored</em></td><td><em>0.10</em></td><td><em>0.64</em></td><td><em>0.229</em></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>The last row is the strongest raw correlate and is <strong>deliberately excluded</strong>: "a
   tool errored" is literally a term of the calibration label
   (<code>execution_failure_count &gt; 0</code>), so feeding it back would predict the label from

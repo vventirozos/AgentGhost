@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What it can do — Ghost Agent</title>
+<meta name="description" content="Ghost Agent's toolbox: running code, reading files, browsing, research, projects and scheduled tasks — and how it chooses between them.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a class="current" href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">How it works</span>
+  <h1>What it can do</h1>
+  <p class="subtitle">Ghost has around thirty-five tools. You never pick one — you describe what you want and it chooses. This page is about what's actually possible.</p>
+
+  <h2>Things you can ask for</h2>
+
+  <h3>Run code and work with files</h3>
+  <p>Ghost can write a script, run it, read the output, and fix it when it breaks. It can read your files, search across them, and write new ones. All of it happens inside a Docker container that shares one directory with your machine.</p>
+  <p>You can also ask it to keep state between steps — variables, dataframes, a loaded model — so a long analysis works like a notebook rather than restarting each time.</p>
+  <div class="note warn">
+    <strong>The sandbox is a real boundary.</strong> Ghost cannot see or touch files outside the shared directory, and it cannot stop, start or reach a process you're running on your own machine. If you ask it to restart your server, it will tell you to do it yourself. That's not a limitation to work around — it's the point.
+  </div>
+
+  <h3>Look things up on the web</h3>
+  <p>Plain search for simple facts, and a deeper mode that pulls several sources and writes up what they say. All of it goes over Tor.</p>
+  <p>One practical thing worth knowing: <strong>use plain keywords</strong>. The search backends Ghost reaches over Tor don't support <code>site:</code>, quoted phrases, or <code>AND</code>/<code>OR</code>. Including them returns nothing at all. To bias toward a source, name it as a keyword — "python asyncio docs", not "site:python.org".</p>
+
+  <h3>Search Tor hidden services</h3>
+  <p>Ordinary web search can't reach <code>.onion</code> sites — the scraper backends Ghost queries simply don't index them. So there's a separate path that queries the dedicated onion search engines (Ahmia, Torch, Haystak and others) and parses their result pages. One tool returns a ranked list of services; another fetches and synthesises the pages behind them.</p>
+
+  <p>Two design details, because they're what makes this work at all:</p>
+  <ul>
+    <li><strong>Every retry takes a different route.</strong> Whether an onion engine answers you depends on which Tor exit you happen to be using — the same query can fail and then succeed with no change but the circuit. So each attempt folds its number into the proxy credentials, which forces Tor to build a fresh circuit rather than reusing the one that just failed.</li>
+    <li><strong>Engines that share an index count once.</strong> Some endpoints are different front doors onto the same underlying search index — a clearnet mirror and an onion address, for instance. Each engine is tagged with which index it serves, so when a result appears in several places, corroboration only counts <em>independent</em> sources instead of the same index reached two ways.</li>
+  </ul>
+
+  <p>The engine list is configuration, not code (<code>GHOST_ONION_ENGINES</code>), and deliberately wide — onion endpoints rotate and die far more often than clearnet ones, so breadth beats betting on any single engine.</p>
+
+  <div class="note warn">
+    <strong>Expect empty results, and don't trust what you get.</strong> Zero results is a normal outcome here, not an error — it usually means the engines were unreachable from your current exit, and retrying the same query verbatim won't help. Ghost is told to drop to fewer keywords or fall back to normal search instead. And everything returned is an unverified hidden service: the agent is instructed to treat it as uncorroborated and say so, rather than reporting it as fact.
+  </div>
+
+  <h3>Drive a real browser</h3>
+  <p>For pages that need clicking, typing and logging in rather than just reading. The browser runs inside the sandbox, so it can reach the internet through Tor and any service the sandbox itself is hosting — but not the rest of your network.</p>
+
+  <h3>Read documents, PDFs and recordings</h3>
+  <p>Hand it a file and it goes into memory as searchable passages. Audio and video are transcribed locally first, and each passage keeps its timestamp — so you can ask "what did they say about pricing?" and get an answer that points at the moment in the recording.</p>
+  <p>You don't need to ask it to write transcription code. It has this built in, and asking for a script instead gets a worse result.</p>
+
+  <h3>Look at images</h3>
+  <p>Screenshots, diagrams, photos, PDF pages. Useful for "why does this look wrong?" — including checking its own work when it has generated an image or built a web page.</p>
+
+  <h3>Keep track of ongoing work</h3>
+  <p>Projects are a durable to-do structure: tasks, dependencies, and status that survive restarts. This is how Ghost handles work that spans weeks rather than one conversation, and how it answers "where are we on X?" honestly instead of guessing.</p>
+
+  <h3>Do things on a schedule, or when something happens</h3>
+  <p>Two different shapes here, and the distinction is useful:</p>
+  <div class="cols">
+    <div>
+      <h4>Scheduled</h4>
+      <p>Fires on a clock. "Every morning at nine, summarise what changed." Standard cron syntax or a plain interval.</p>
+      <p><strong>Cron times are UTC.</strong> Convert first if you want a local time.</p>
+    </div>
+    <div>
+      <h4>Reactive</h4>
+      <p>Fires on a condition. "When errors show up in the deploy log, investigate." Ghost polls a shell command and acts the moment it first succeeds.</p>
+      <p>Edge-triggered — it won't spam you while the condition stays true.</p>
+    </div>
+  </div>
+
+  <h3>Query a Postgres database</h3>
+  <p>Ghost has a dedicated database tool rather than making it write connection code by hand. Point it at a database and ask questions in English.</p>
+
+  <h3>Tell you about itself</h3>
+  <p>Ghost can report what it's been doing, what it has learned, what it's unsure about, and what it thinks is broken in its own tooling. This isn't the model improvising — these read from real stored records. Worth asking after a long stretch of unattended running.</p>
+
+  <h2>How it decides which tool to use</h2>
+  <p>Each tool carries a description telling the model when to use it and — often more importantly — when <em>not</em> to. Much of the tuning in this project is negative instruction: don't write a script to read a PDF, don't use the deep-research tool for a one-line fact, don't use the general search when the question is about one specific document.</p>
+  <p>That means a lot of "Ghost picked the wrong tool" problems are description problems, and they're fixed by editing text rather than code. The descriptions live in <code>src/ghost_agent/tools/registry.py</code>.</p>
+
+  <div class="note">
+    <strong>If it reaches for the wrong tool repeatedly,</strong> tell it directly in the moment ("use the document search, not general recall"). It records corrections like this as lessons, so the same mistake is less likely next time. <a href="memory.html">How lessons work →</a>
+  </div>
+
+  <h2>The full toolbox</h2>
+  <p>Grouped by what they're for. You won't call these by name — this is here so you know what's available.</p>
+
+  <h3>Doing work</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>execute</code></td><td>Runs Python, Node or shell inside the sandbox. Can keep state between calls like a notebook cell.</td></tr>
+      <tr><td><code>file_system</code></td><td>Read, write, search and list files in the shared directory.</td></tr>
+      <tr><td><code>browser</code></td><td>Drives a real browser — navigate, click, type, screenshot.</td></tr>
+      <tr><td><code>postgres_admin</code></td><td>Queries and administers a PostgreSQL database.</td></tr>
+      <tr><td><code>manage_services</code></td><td>Runs a long-lived service inside the sandbox (a dev server, say) and keeps track of its port.</td></tr>
+      <tr><td><code>report_pdf</code></td><td>Turns a result into a formatted PDF.</td></tr>
+      <tr><td><code>image_generation</code></td><td>Generates an image. Only available if you've configured an image-generation node.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Finding things out</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>web_search</code></td><td>Web search over Tor. The default for simple factual questions.</td></tr>
+      <tr><td><code>deep_research</code></td><td>Searches several sources and synthesises a report. Slower — for genuinely complex topics.</td></tr>
+      <tr><td><code>fact_check</code></td><td>Verifies a specific claim against external sources.</td></tr>
+      <tr><td><code>darkweb_search</code> / <code>darkweb_research</code></td><td>Searches Tor hidden services. Results are unverified by definition — Ghost is told to treat them as such.</td></tr>
+      <tr><td><code>vision_analysis</code></td><td>Looks at an image or PDF page.</td></tr>
+      <tr><td><code>system_utility</code></td><td>Weather, your location, and a full health check of Ghost's own subsystems.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Memory</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>recall</code></td><td>Searches everything Ghost knows.</td></tr>
+      <tr><td><code>knowledge_base</code></td><td>Ingests documents and recordings, asks a question against <em>one</em> document, records a fact, or forgets a topic.</td></tr>
+      <tr><td><code>update_profile</code></td><td>Saves or deletes a durable fact about you.</td></tr>
+      <tr><td><code>scratchpad</code></td><td>Parks a note for the current conversation only. Expires after a day.</td></tr>
+      <tr><td><code>learn_skill</code> / <code>list_lessons</code></td><td>Records a mistake-and-fix, and reads the lesson list back.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Tracking work</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>manage_projects</code></td><td>Durable projects with tasks, dependencies and status.</td></tr>
+      <tr><td><code>manage_tasks</code></td><td>Scheduled tasks (a clock) and reactive watchers (a condition).</td></tr>
+      <tr><td><code>workspace</code> / <code>workspace_track</code></td><td>Watches files for changes and records what happened in your world while Ghost was away.</td></tr>
+      <tr><td><code>notify_operator</code></td><td>Pushes you a notification when something needs you.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Its own state</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>introspect</code></td><td>Reads back its diary, recent activity, what it learned, and how its experiments are going. The honest answer to "what did you do while I was away?"</td></tr>
+      <tr><td><code>self_state</code></td><td>Records open questions and unfinished threads to carry into the next session.</td></tr>
+      <tr><td><code>postmortem</code></td><td>The queue of defects it has diagnosed in its own tooling.</td></tr>
+      <tr><td><code>flag_uncertainty</code></td><td>Registers something it doesn't know. A high-impact unknown triggers a clarifying question instead of a guess.</td></tr>
+      <tr><td><code>replan</code> / <code>abort_attempt</code></td><td>Rethinks the approach, or declares a task impossible as specified rather than spiralling.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Extending and delegating</h3>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>create_skill</code> / <code>manage_skills</code></td><td>Writes a new reusable tool for itself, test-first, and manages the ones it has.</td></tr>
+      <tr><td><code>manage_composed_skills</code></td><td>Chains existing skills into a bigger one.</td></tr>
+      <tr><td><code>delegate</code> / <code>delegate_to_swarm</code> / <code>jobs</code></td><td>Farms work out to other LLM machines, if you've configured any.</td></tr>
+      <tr><td><code>dream_mode</code> / <code>self_play</code></td><td>Triggers memory consolidation or practice on demand — normally these run on their own. <a href="self-improvement.html">More →</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="memory.html">
+      <span class="dir">Previous</span>
+      <span class="to">What it remembers</span>
+    </a>
+    <a class="next" href="self-improvement.html">
+      <span class="dir">Next</span>
+      <span class="to">How it improves itself</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>src/ghost_agent/tools/registry.py</code> on 2026-08-04. Some tools only appear when the matching hardware is configured. Per-tool detail is in <a href="reference.html">the deep reference</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

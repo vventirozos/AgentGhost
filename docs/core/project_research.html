@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="project_advancer.html">project_advancer</a>
     <a href="coding_executor.html">coding_executor</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / project_research.py</h1>
   <p class="subtitle">Auto-research for long-term projects (any domain, not just code): search → summarise → persist a Markdown brief in the project workspace → index it → surface it in the briefing.</p>
 
@@ -29,7 +34,7 @@
   <p>Projects are multi-session efforts of any kind. While working one — on demand or during background auto-advance — the agent should be able to research relevant topics, keep the <em>findings</em> (not just raw search dumps), and stay aware of what it has already looked into. This module turns a web search into a durable, summarised brief inside the project's own <code>workspace_dir</code>, and records it so every later turn sees it.</p>
 
   <h2>Entry points</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>async research_topic(context, project_id, topic, *, tool_runner=None, llm_summarizer=None, queries=None, task_id=None)</code></td><td>Research ONE topic: run web search(es), summarise, persist the brief. Falls back to the tool registry for search and to <code>context.llm_client</code> for summarisation; with neither it still writes a (sourceless) brief so the topic is recorded.</td></tr>
@@ -38,7 +43,7 @@
       <tr><td><code>async persist_research_from_output(context, project_id, topic, search_output, *, task_id=None)</code></td><td>Turn a search output already in hand into a brief — used by the autoadvancer so it doesn't search twice.</td></tr>
       <tr><td><code>get_research_index(store, project_id) -&gt; list[dict]</code></td><td>The project's research index (read by the briefing).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>What a run produces</h2>
   <ul>

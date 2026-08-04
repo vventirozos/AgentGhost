@@ -10,6 +10,11 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
+    <h3>Guide</h3>
+    <a href="index.html">&larr; Back to the guide</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Reference index</a>
+
     <h3>Overview</h3>
     <a href="index.html">Home</a>
     <a href="capabilities.html">Capabilities</a>
@@ -53,6 +58,8 @@
 </aside>
 
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="index.html">the guide</a>, or check the <a href="glossary.html">glossary</a>.</p>
+
   <section class="hero">
     <div class="eyebrow">Maintenance</div>
     <h1>Audit &amp; hardening — May 2026</h1>
@@ -80,7 +87,7 @@
   those files (<code>core/sessions.py</code>, <code>tools/composed_skills.py</code>) shipped
   <em>after</em> the last full static sweep and had never been audited at all. Every
   finding below was reproduced at source before it was fixed.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Defect</th><th>Why it mattered</th><th>Sev</th></tr></thead>
     <tbody>
       <tr><td>The destructive-SQL guard was inoperative in production</td><td><code>validate_sql</code> delegated multi-statement splitting to <code>sqlparse</code>, which was never a declared dependency and is not installed — so the <code>ImportError</code> fallback (all <code>^</code>-anchored regexes) was the only path that ever ran. <code>SELECT 1; DROP TABLE …</code>, a CTE-wrapped <code>DELETE</code>, a <code>DO $$…$$</code> block and <code>/* c */ DROP TABLE t</code> all validated clean, and psycopg2's autocommit connection executes the whole batch. Rewritten self-contained: structural checks now run against a masked copy of the SQL (literals, comments and dollar-quoted bodies blanked), verbs are matched at statement level rather than position 0, and dollar-quoted bodies require <code>confirm</code>.</td><td>high</td></tr>
@@ -97,7 +104,7 @@
       <tr><td>Composed-skill failures reported "unknown error"</td><td>Tools signal failure by returning an error string (no <code>error</code> key), so the formatter discarded the real diagnostic and the model could not recover or re-route. Invalid legacy macro names could also reach the LLM function catalogue via <code>approve</code>.</td><td>med</td></tr>
       <tr><td>Game explanations came from the discarded draft</td><td><code>extract_move_text</code> is last-wins but <code>extract_labeled</code> was first-wins, so with the live thinking model the played move and its stated reasoning came from different candidate moves.</td><td>med</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Regression tests: <code>tests/test_bughunt_fixes_2026_07_27.py</code> (64). Full suite
   9389 passed / 0 failed.</p>
 
@@ -108,7 +115,7 @@
   (one read-only finder per cohort, then one adversarial refuter per finding) surfaced
   33 candidates; 32 were confirmed against the code and fixed here, each with a
   regression test. Highlights:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Sev</th></tr></thead>
     <tbody>
       <tr><td>Session hydration self-hit</td><td>The new PAST CONVERSATIONS tier searched <em>all</em> recent sessions incl. the ACTIVE one, so a follow-up turn surfaced its own earlier messages under a header asserting they are NOT the current conversation → false "in a past conversation you said…" provenance. <code>hydrate_context</code> now threads the active <code>session_id</code> and excludes it. → <code>core/bus.py</code></td><td>MED</td></tr>
@@ -124,7 +131,7 @@
       <tr><td>GAIA number overstated</td><td><code>accuracy</code> excluded errored tasks from the denominator (a real submission scores an empty answer wrong), and <code>--boot</code> had no port-free / liveness preflight — a stale listener made the whole run score a foreign agent. Errored tasks now count as scored-incorrect with a details row; boot bind-tests the port and confirms the child is alive. Track-B3/B4 also read the wrong learning-artifact filenames (hardwiring two counters to 0), wrote records only at end-of-run (a crash lost the whole multi-hour dataset — now checkpointed per repeat), rendered boot-failed arms as silent zero-yield (now flagged, keep/flip verdict warns), and injected a non-dominant "top user" fixture (correct answers scored FAILED — winner burst raised, verified 0 losses/ties over 2000 seeds). → <code>scripts/gaia_eval.py</code>, <code>ablation_trackb3.py</code>, <code>ablation_trackb4.py</code>, <code>trackb4_tasks.py</code></td><td>MED</td></tr>
       <tr><td>Image-gen node had no auth</td><td>The Jetson image node bound <code>0.0.0.0</code> on the LAN with no auth while a generation monopolises the GPU for ~30–60s. It now requires the fleet <code>X-Ghost-Key</code> (same key the agent API uses; <code>/health</code>/<code>/ready</code> stay open); the agent's image-gen pool sends it. Also hardened the post-restart CUDA-teardown OOM into a retry-with-backoff loader instead of parking until a manual bounce. → <code>core/llm.py</code>, <code>interface/externals/image_generation/img_gen_server.py</code></td><td>MED</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p class="tiny">* HIGH within the offline measurement harness (it can flip a pre-registered keep/flip verdict); not a live-serving defect.
   New test files: <code>test_unreviewed_cohorts_20260715.py</code>, <code>test_ablation_scripts_20260715.py</code>,
   <code>test_imggen_node_auth.py</code>, <code>test_web_icon_map_drift.py</code>. One finding
@@ -231,7 +238,7 @@
     So <code>action</code> becomes a giant invalid string and the turn is wasted (and the pre-flight
     dedup guard then blocks the retry). The trace above is verbatim from session <code>e260ae3e</code>.
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr>
@@ -247,7 +254,7 @@
         <td>high (broke every multi-tool native turn)</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     <strong>Why it's safe.</strong> Clean tool_calls pass through byte-for-byte. Content that merely
     <em>mentions</em> framing text (code, docs) has no close-then-open pair, or names no real tool, so it is
@@ -286,7 +293,7 @@
     <code>{}</code>, so <code>progress=cost=risk</code> all defaulted to 0.5 → a flat 0.50 score for every
     candidate. MCTS still paid for N candidate simulations but ranked nothing (it just kept the first).
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr>
@@ -299,7 +306,7 @@
         <td>med (deep-reason paid for lookahead it never used)</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Pinned by <code>tests/test_mcts.py::test_simulate_disables_thinking_and_scores</code>.</p>
 
   <h2>Functional hunt (2026-07-04): a quoted <code>&lt;tool_call&gt;</code> mention truncated the <code>&lt;think&gt;</code> strip</h2>
@@ -318,7 +325,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
     <code>&lt;tool_call&gt;` per turn…&lt;/think&gt;\n&lt;tool_call&gt;…</code> as the parse target. The tool parser read
     the leading tag-soup as a malformed call → <code>system_parse_error</code>, a wasted turn, and an execution strike.
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr>
@@ -332,7 +339,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
         <td>med (recurring wasted turns on coding tasks)</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Pinned by <code>tests/test_think_strip_toolcall_mention.py</code> (12 tests, incl. the verbatim log shape and the unclosed-think design case).</p>
 
   <h2>Functional hunt (2026-07-04): <code>insert_fact</code> hung the turn and dropped the fact</h2>
@@ -351,7 +358,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
     written (only the raw journal logged it, so recall found nothing). The legacy direct path had always
     backgrounded this extraction; the bus path had regressed to a blocking inline await.
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr>
@@ -366,14 +373,14 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
         <td>high (turn hang + silent data loss)</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Verified live: "store … Kestrel …" returned in 7&nbsp;s and a follow-up recall quoted the fact back
   (match 0.76). Pinned by <code>tests/test_insert_fact_hang.py</code> (4 tests: a 1-hour-hang client returns
   the turn fast with the fact published; a fast extractor lands triplets in the graph via the background
   task with <code>is_background=True</code>; no-LLM and empty-text paths).</p>
 
   <h2>Critical — security &amp; data integrity</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
     <tbody>
       <tr><td>Trajectory redaction</td><td>Only top-level string tool-args were redacted; secrets nested in list/dict args and the <code>extra</code>/<code>validator_signal</code> metadata reached the on-disk SFT corpus verbatim. Now recurses through nested containers, redacts both metadata dicts, and scrubs values under sensitive key names (<code>password</code>, <code>authorization</code>, …).</td><td><code>distill/redact.py</code></td></tr>
@@ -382,10 +389,10 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Sandbox escape</td><td>The <code>forget</code> tool's containment check used <code>str.startswith</code>, so a sibling dir like <code>…/sandbox_evil</code> looked "inside" <code>…/sandbox</code> — and a symlink could delete out-of-sandbox files. Now path-component containment (<code>is_relative_to</code>) and refuses to delete through symlinks.</td><td><a href="tools/memory_tools.html">tools/memory</a></td></tr>
       <tr><td>DB connection safety</td><td>One shared psycopg2 connection per URI used concurrently across <code>to_thread</code> workers (protocol corruption). Now serialized behind a per-URI lock, with a one-shot reconnect on a dropped idle connection.</td><td><a href="tools/database.html">tools/database</a></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>High — a defect that silently defeated a whole subsystem</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
     <tbody>
       <tr><td>MCTS simulation</td><td><code>route()</code> returns a content <em>string</em>, but the simulator called <code>.get()</code> on it → <code>AttributeError</code> swallowed → every candidate collapsed to the 0.3 default, defeating ranking whenever worker nodes were configured. Added the <code>isinstance(result, str)</code> guard the verifier already had.</td><td><a href="core/mcts.html">core/mcts</a></td></tr>
@@ -395,10 +402,10 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Autobiographical recall</td><td>Search scored on substring containment ("art" matched "smart") while IDF was token-based. Now token-set membership. Also closed two lock gaps (template-rollup rewrite, reference-count RMW) that lost updates under the watchdog.</td><td><code>selfhood/autobiographical.py</code></td></tr>
       <tr><td>Eval integrity</td><td>The post-learning "discover-first" validator matched <code>ls</code> as a bare substring (fired inside "ca<strong>ls</strong>"/"fa<strong>ls</strong>e"), corrupting the pre/post-learning delta. Now word-boundary matching.</td><td><code>eval/tasks.py</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Concurrency — races on shared state</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
     <tbody>
       <tr><td>Docker sandbox</td><td><code>ensure_running()</code> had no lock; concurrent tool calls raced container creation (409 name conflict, double ~2-min provisioning). Now lock-guarded, and a 409 is treated as "another process won" → adopt the existing container.</td><td><a href="sandbox/docker.html">sandbox/docker</a></td></tr>
@@ -406,10 +413,10 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Reflection loop</td><td><code>run()</code> added a trajectory to the shared dedup set only after awaiting, so a concurrent <code>reflect_one()</code> double-reflected it. Now claimed before the await.</td><td><code>reflection/loop.py</code></td></tr>
       <tr><td>Agent loop</td><td>Per-domain metacog competence was recorded once post-loop with the last tool's name + the turn-wide failure flag (mis-attributed on multi-tool turns) → now recorded per result. Plus: the Context-Shield summarizer no longer clobbers the loop-level <code>payload</code> (which truncated the Perfect-It generation), and the episode-archive write is tracked + drained on shutdown.</td><td><a href="core/agent.html">core/agent</a></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Medium &amp; lower-confidence</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
     <tbody>
       <tr><td>Text chunking</td><td><code>recursive_split_text</code> stepped by <code>chunk_size − chunk_overlap</code>; when overlap ≥ size the step went ≤ 0 and silently dropped all content. Step clamped to ≥ 1.</td><td><code>utils/helpers.py</code></td></tr>
@@ -431,13 +438,13 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>API auth</td><td>The API key was compared with <code>!=</code> (timing side-channel). Now <code>secrets.compare_digest</code>, plus a startup warning when the default key is used on a non-loopback bind.</td><td><a href="api/routes.html">api/routes</a></td></tr>
       <tr><td>Arbiter convergence</td><td>Two whitespace-only candidates tokenised to empty sets and scored "fully converged" (1.0). <code>similarity()</code> now strips first, scoring 0.</td><td><a href="core/arbiter.html">core/arbiter</a></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 2 — full-codebase gap sweep (2026-05-30)</h2>
   <p>A 14-agent parallel audit of the whole codebase surfaced a further set of gaps; all were fixed in this round. The dominant theme was <em>built-but-unwired features</em> (advertised/tested but never reached at runtime) and <em>SSRF / isolation</em> sinks where one guard existed but sibling sinks were missed.</p>
 
   <h3>Security &amp; isolation</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Area</th><th>Fix</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>SSRF (shared guard) <span class="badge">critical</span></td><td>New <code>utils.helpers.url_ssrf_reason()</code> blocks non-http(s) schemes (<code>file://</code>, <code>gopher://</code>…) and any host that is/resolves to loopback / private / link-local / <code>169.254.169.254</code>. Wired into <code>file_system</code> download (also removed <code>verify=False</code>), <code>vision</code>, <code>browser</code> (http(s) only; <code>file://</code> fixtures preserved), and <code>helper_fetch_url_content</code>.</td><td>utils/helpers, file_system, vision, browser</td></tr>
@@ -448,13 +455,13 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Sandbox hardening</td><td>Always-on <code>pids_limit</code> (fork-bomb defense); opt-in network isolation (<code>GHOST_SANDBOX_NETWORK</code>) and capability drop (<code>GHOST_SANDBOX_DROP_CAPS</code>) — opt-in because host-net is load-bearing for the in-sandbox Tor proxy.</td><td><a href="sandbox/docker.html">sandbox/docker</a></td></tr>
       <tr><td>Front-end XSS</td><td>The sanitizer chain (<code>marked</code> + <code>DOMPurify</code>) and <code>mermaid</code>/<code>chart.js</code> are now <strong>vendored locally</strong> (no unpinned CDN / SRI gap); the mermaid error path uses <code>textContent</code>.</td><td>interface/static</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Secret redaction (trajectory corpus + journal)</h3>
   <p>The distill redactor missed high-value formats it is the last line of defense for. Added rules for <code>github_pat_*</code>, Google <code>AIza…</code>, Stripe <code>sk_live/test_…</code>, JWTs, PEM private-key blocks, DB-URI passwords, and a generic <code>*_KEY/TOKEN/SECRET/PASSWORD</code> env rule; ported phone / credit-card / IPv6 from the diary; fixed the nested-sensitive-key leak (a secret under a sensitive key whose value was a list/dict). The <strong>journal</strong> now redacts tool-output on write and sidecar-preserves a corrupt file instead of silently discarding queued consolidation work.</p>
 
   <h3>Built-but-unwired features</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Feature</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Skill graduation</td><td><code>graduate_lessons</code> discarded the generated tool and marked lessons graduated forever (a landmine) — and had no caller. Now it creates the skill via the TDD-gated path, only marks graduated on success, and is wired into the dream cycle.</td><td><a href="core/dream.html">core/dream</a></td></tr>
@@ -464,7 +471,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Selfhood boot</td><td><code>mark_session_boot</code> was wired for workspace but not selfhood; now symmetric.</td><td>main / selfhood</td></tr>
       <tr><td>Dead duplicate</td><td>Deleted <code>core/workspace_model.py</code> — a ~250-line shadow of the live <code>workspace/</code> package.</td><td>core</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Correctness &amp; leaks</h3>
   <ul>
@@ -484,7 +491,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
 
   <h2>Round 3 — residuals completed (2026-05-30)</h2>
   <p>The deferred residuals from Round 2 were subsequently wired (or, for pure-dead code, removed). Each was mapped first, then implemented with tests.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Skill-vector orphans (M18)</td><td><code>_delete_lesson_twin</code> deletes a lesson's embedded vector twin (keyed by <code>{type:skill, trigger[:200]}</code>, source-id fallback) whenever a lesson is trimmed (in <code>learn_lesson</code>), pruned (<code>prune_low_utility</code>), or removed (<code>remove_by_trigger</code>). The dream prune caller threads <code>memory_system</code> through.</td><td><a href="memory/skills.html">memory/skills</a>, core/dream</td></tr>
@@ -496,24 +503,24 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Uncertainty lifecycle</td><td>The resolve-side is now wired: unknowns the agent answered for itself via an info tool this turn are <code>resolve_unknown</code>'d (so they drop from the clarifying-question gate and risk footer); clean turns <code>verify_assumption</code> the turn's auto-flagged assumptions.</td><td>core/agent, core/uncertainty</td></tr>
       <tr><td>Dead public methods</td><td>Deleted (pure-dead / duplicates): <code>arbiter.confidence_gated</code>, <code>project_safety.has_human_gate</code>, <code>fallback_chains.get_fallback_tool_name</code>, <code>mcts.backtrack</code>/<code>has_alternatives</code>, <code>verifier.adversarial_probe</code> — with their tests trimmed.</td><td>core/{arbiter,mcts,verifier}, project_safety, fallback_chains</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 4 — live-log regressions (2026-06-08)</h2>
   <p>Two defects surfaced by a long agent session log: each silently defeated a whole subsystem rather than crashing, so neither showed up as an error. Both fixed with tests.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Arbiter never arbitrated</td><td>The dual-solver per-sample timeout defaulted to <code>10.0 s</code>, but each candidate is a full LLM completion over Tor (20&ndash;40 s). Both candidates timed out <em>every</em> turn (<code>both candidates failed: timeout after 10.0s</code>), so the arbiter degenerated into a constant <code>ask_user</code> while still paying two completions of latency. Default raised to <code>60 s</code> and threaded through as operator-tunable <code>--metacog-arbiter-timeout-s</code>; the bundle now passes it explicitly instead of inheriting the bare class default.</td><td><a href="core/arbiter.html">core/arbiter</a>, core/metacog, main</td></tr>
       <tr><td>Reflection learned from its own error-recovery</td><td>Idle reflection promoted <code>AUTO-DIAGNOSTIC</code> / self-repeating-loop turns to FAILED and distilled them into saved <em>skills</em> &mdash; keyed on the system banner itself (e.g. a lesson triggered by a one-off malformed diagnostic command), polluting the playbook with recovery trivia instead of task knowledge. Added a narrow <code>_is_recovery_scaffold</code> gate in <code>reflection/loop.py</code>, applied in both <code>_is_reflectable</code> (batch path) and <code>reflect_one</code> (post-turn path). Deliberately narrower than the autobiographical template-marker set: synthetic-training and judge-rejection turns remain legitimate self-play learning signal.</td><td><a href="self_improvement.md">reflection/loop</a></td></tr>
       <tr><td>Verifier confirmed a still-broken VISUAL fix</td><td>The text verifier audits words, so a visual bug report ("blocks look transparent") got CONFIRMED at 90% off the agent's self-claim while the screenshot still showed the defect &mdash; the truth lives in pixels it never saw. Added <code>Verifier.verify_visual</code> (vision node via <code>use_vision=True</code>, before/after when available) plus a cheap <code>_is_visual_intent</code> gate and <code>_select_visual_evidence</code> in <code>agent.py</code>. A confident visual REFUTED overrides an optimistic text CONFIRMED and feeds the existing <code>outcome_penalty</code>; missing/unreadable renders skip with no penalty. Verdict judges claim-vs-pixels honesty, so a truthful "still broken" is not penalized. Live testing against the running agent caught three integration bugs unit tests missed: evidence selection broke on mid-turn synthetic user messages; <code>self.sandbox_dir</code> doesn't exist on <code>GhostAgent</code> (it's on the context) so the block silently <code>AttributeError</code>'d; and the symptom-only prompt would have refuted honest failure reports.</td><td><a href="core/verifier.html">core/verifier</a>, core/agent</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 5 — cross-codebase bug hunt (2026-06-09)</h2>
   <p>A five-reviewer parallel sweep over core / tools / memory / selfhood / interface. Every finding was re-verified against the source (two empirically reproduced) before fixing; all fixes are covered by <code>tests/test_bug_hunt_fixes.py</code> plus updates to the existing twin/graduation/reflection tests. Full suite green (4850 tests).</p>
 
   <h3>High — silently defeated subsystems</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Chunks ingested backwards</td><td><code>recursive_split_text</code> appended fitting chunks while iterating <code>reversed(temp_chunks)</code> — every document ingest stored its chunks in <em>reverse document order</em> (reproduced empirically). All chunks now route back through the LIFO stack so they pop in document order.</td><td><code>utils/helpers.py</code></td></tr>
@@ -526,10 +533,10 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Graduation destroyed concurrent lessons</td><td><code>graduate_lessons</code> wrote back a playbook snapshot taken <em>minutes</em> earlier (across LLM + sandbox awaits), erasing lessons learned concurrently. It now re-loads under the lock and flips <code>graduated</code> only on the key-matched lesson.</td><td><a href="core/dream.html">core/dream</a></td></tr>
       <tr><td>Ollama-style streaming always 500</td><td><code>/api/generate</code> forwarded <code>stream: true</code> upstream then called <code>resp.json()</code> on the SSE body. The upstream call is now always non-streaming (the route fakes streaming locally anyway).</td><td><a href="api/routes.html">api/routes</a></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Concurrency &amp; resource safety</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Calibration mispairing</td><td>A streaming turn's confidence reading was stashed on the shared context <em>after</em> <code>handle_chat</code> returned, so the next turn paired it with <em>its own</em> outcome — systematically corrupting the calibration JSONL. <code>_calib_pending</code> is now cleared at request start.</td><td><a href="core/agent.html">core/agent</a></td></tr>
@@ -542,10 +549,10 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Proxy connection leaks</td><td>workspace-save / download / TTS proxies leaked the streamed response + per-request client when <code>raise_for_status()</code> failed before the <code>StreamingResponse</code> took ownership. Both are now closed on the pre-stream error path.</td><td><code>interface/server.py</code></td></tr>
       <tr><td>Fire-and-forget task GC</td><td><code>tool_remember</code>'s graph-extraction <code>create_task</code> kept no strong reference (the loop holds only weak refs), so the task could be GC'd mid-flight. Now tracked in a module set with a done-callback discard.</td><td><a href="tools/memory_tools.html">tools/memory</a></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Medium</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td><code>--no-memory</code> still persisted</td><td>Journal / SkillMemory / FrontierTracker were constructed against the real memory dir regardless of the flag (SkillMemory writes on construction; reflection keeps appending lessons). They're dereferenced un-guarded across the codebase, so under <code>--no-memory</code> they're now backed by a session-scoped throwaway temp dir.</td><td><code>main.py</code></td></tr>
@@ -560,13 +567,13 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Deferred-findings closure</td><td>The four findings deliberately parked in the first sweep: a stateful <code>execute</code> with a dead container raised a bare <code>AttributeError</code> out of the tool instead of the formatted error every other path returns (now guarded, with a boot-failure catch); the eval suite stripped a sandbox runner's <code>{"passed": …}</code> verdict dict to <code>["output"]</code>, making <code>ChallengeTemplateTask</code>'s documented contract unreachable and <em>inverting</em> template results (verdict dicts now pass through, scoped to template tasks); <code>chat_resume</code>'s <code>offset</code> (a chunk index) is clamped and documented; <code>DockerSandbox.execute</code>'s <code>memory_limit</code> parameter was accepted but silently ignored (memory is container-level) — removed.</td><td>tools/execute, eval/suite, interface/server, <a href="sandbox/docker.html">sandbox/docker</a></td></tr>
       <tr><td>Calibration history hygiene</td><td>The 337 samples recorded before the mispairing fix went live (2026-06-09 19:28 UTC) were archived to <code>calibration.jsonl.pre-mispairing-fix.20260609.bak</code> and removed from the live JSONL — the idle Brier/ECE refit would otherwise train on confidence/outcome pairs from <em>different turns</em>. The refit's 40-sample floor means current fitted params stay active until enough clean samples accumulate; <code>fit()</code> re-reads the file, so no restart was needed.</td><td>data (<code>system/calibration</code>)</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 6 — unswept-module audit: distill / workspace / optim / skills_auto (2026-06-09)</h2>
   <p>A focused review of the modules no prior round had covered. The redaction findings are the high-stakes ones — <code>distill/redact.py</code> is the last line of defense keeping secrets out of the on-disk SFT corpus, and <strong>six verified leak shapes</strong> got through it. All fixes covered by <code>tests/test_distill_optim_audit_fixes.py</code> (28 tests); full suite green (4886).</p>
 
   <h3>Secret-redaction leaks (all empirically reproduced, then fixed)</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Leak shape</th><th>Fix</th></tr></thead>
     <tbody>
       <tr><td><code>{"GHOST_API_KEY": "…"}</code> / <code>{"AWS_SECRET_ACCESS_KEY": "…"}</code> — the key's closing quote sat between the name and the colon, so the named-env rule never matched the JSON form its own comment claimed to cover. AWS secrets have no self-identifying prefix, so nothing else caught them.</td><td>Optional closing quote before the separator in <code>env_assignment_secret</code> and <code>generic_secret_assignment</code>.</td></tr>
@@ -576,10 +583,10 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td><code>client_secret=…</code> in curl bodies / URLs — OAuth and login forms are conventionally lowercase; the ALL-CAPS and JSON rules both missed the <code>key=value</code> spelling.</td><td>New case-insensitive <code>form_secret_assignment</code> rule.</td></tr>
       <tr><td><code>{"env": {"GHOST_API_KEY": "…"}}</code> in structured tool args — <code>_SENSITIVE_KEYS</code> was exact-match, missing every compound env-style name (including the agent's own key).</td><td>Suffix matching (<code>_key/_token/_secret/_password/…</code>) with a benign-compound allowlist (<code>sort_key</code>, <code>public_key</code>, …).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>Other fixes</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>GEPA never ran (3 stacked bugs)</td><td>Verified against the project venv (dspy 3.2.0): <code>dspy.GEPA(max_iterations=…)</code> is not a valid kwarg → TypeError before optimizing, and the <code>hasattr</code> guard made the MIPROv2 fallback unreachable (now <code>max_full_evals</code> + the mandatory <code>reflection_lm</code>, reflecting via the same Ghost adapter — the only model a Tor-only deployment can reach). The LM adapter's positional-<code>prompt</code> signature didn't match dspy 3.x's <code>lm(messages=…)</code> convention → TypeError on every call (now accepts both). <code>choices[0]</code> raised IndexError on the real <code>{"choices": []}</code> failure shape (now guarded).</td><td><code>optim/run_gepa.py</code></td></tr>
@@ -587,11 +594,11 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Corrections sidecar bypassed redaction</td><td><code>update_outcome</code> wrote <code>reason</code> raw, violating the package's "redaction runs on every write" contract; <code>iter_trajectories</code> copies it into yielded trajectories. Now routed through <code>redact_text</code>.</td><td><code>distill/collector.py</code></td></tr>
       <tr><td>Unstable skill dedupe key</td><td>A merged candidate inherited the <code>signature_hash</code> of whichever member had the most support <em>that run</em>, so the same skill graduated under different store keys across runs, splitting verification counts. The hash is now recomputed from the merged identity (sequence-only).</td><td><code>skills_auto/consolidator.py</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 7 — production-log audit (2026-06-11)</h2>
   <p>Analysis of <code>ghost-agent.log</code> / <code>.err</code> from a live run surfaced two silent-degradation failure modes — both cases where a subsystem keeps running with WRONG state instead of failing. Covered by <code>tests/test_embedder_degradation_guard.py</code> and <code>tests/test_router_nan_guard.py</code>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Embedder silently degrades to an untrained model</td><td>When the <code>all-MiniLM-L6-v2</code> config can't be resolved (HF unreachable + not forced offline — newly common under default-on fail-closed Tor), sentence-transformers does NOT raise: it logs "Creating a new one with mean pooling" and builds an UNTRAINED Transformer+Pooling model with no <code>Normalize</code> module. It still returns 384-d vectors, so nothing errors, but the embeddings are wrong and poison every retrieval (the log showed this ×60). The trained model emits L2-normalised vectors (norm≈1.0); the fallback does not (observed ~7.7). <code>VectorMemory</code> now probes the embedder once at boot (<code>_embedding_degradation_reason</code>) and <strong>fails loud</strong> (<code>sys.exit(1)</code> with a remediation message) rather than serve garbage — consistent with the project's "a stalled agent beats a silently-wrong one" stance.</td><td><code>memory/vector.py</code></td></tr>
@@ -599,21 +606,21 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Web search failed constantly over Tor (the 8&nbsp;s timeout killed the only working engine)</td><td>The log showed deep-research / web-search burning minutes and failing with <code>error sending request for url (mojeek…)</code> and "ZERO results". <strong>Measured directly over Tor</strong> (circuit rotation already worked — distinct exits confirmed): <code>mojeek</code>, the engine that actually returns results, takes <strong>~10–18&nbsp;s</strong> through a circuit, but the ddgs request timeout was <code>8&nbsp;s</code> — so the only working engine was killed mid-request and every search came back empty even when results were reachable. Raised <code>_DDGS_TOR_TIMEOUT</code> to 18&nbsp;s (8&nbsp;s ⇒ fail every trial; 15–25&nbsp;s ⇒ succeed every trial in the measurement). Validated live: two queries that returned zero in the field now return 8 sources. Also de-blamed the dead-end error message (it said "DuckDuckGo" when mojeek is the workhorse) and steered it toward fewer-keyword retry / proceed-with-knowledge. The engine set and per-attempt circuit rotation were left unchanged — both were already correct; the timeout was the lever.</td><td><code>tools/search.py</code></td></tr>
       <tr><td>Chunked-read out-of-range pages struck repeatedly (<code>section 75 of 2</code>)</td><td>Section counts are computed from file size, so small files are 1&ndash;2 sections, yet the model kept requesting wildly out-of-range pages and each returned a bare <code>Error:</code> &rarr; a wasted strike with no recovery path. Two causes: (1) every section footer said "Use page=N+1 to continue" <em>even on the last section</em>, literally instructing the model to request a non-existent page — now end-aware; (2) the out-of-range path no longer strikes — a single-section file is served in FULL (the model jumped past it, so the turn still makes progress), and a genuinely-chunked overshoot returns a terminal <strong>non-erroring</strong> <code>NOTE</code> with the valid range instead of an "Error" that invites a higher-page retry loop. PDF pages get the same treatment. (Also fixed a closure <code>UnboundLocalError</code> introduced by rebinding <code>page</code> inside the nested reader.)</td><td><code>tools/file_system.py</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 8 — partial-failure stale-context bug (2026-06-25)</h2>
   <p>A live transcript showed the agent giving a <strong>non-sensical reply after a partial tool failure</strong>: asked to <code>delete `ecef207c0d4b` and `516217d294cc`</code>, it deleted the first, hit "project not found" on the second (already gone), then — instead of reporting that outcome — re-answered the <em>previous</em> turn's "what's the difference between these projects?" question. Root-caused to two independent defects that compound; the partial failure merely buys the model an extra turn to act on the contamination. Covered by <code>tests/test_partial_failure_context.py</code> and a new regression in <code>tests/test_contextual_memory.py</code>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Contextual query expansion contaminated self-contained commands</td><td>The memory-hydration query for any message under 10 words was prefixed with the previous assistant reply as <code>Context: &lt;prev 200 chars&gt; | User intent: &lt;msg&gt;</code> — a deliberate anaphor-resolver for pronoun follow-ups ("run it then"). But it fired for self-contained imperatives too: for <code>delete `…`</code> the 200-char prior reply (a long project comparison) <strong>dominated the embedding</strong>, so vector retrieval surfaced the previous topic and the injected memory described the comparison, not the delete. New gate <code>GhostAgent._has_concrete_reference()</code> skips the prepend when the short message already names its subject — backticks, double-quotes, or id-like tokens (long hex / alphanumeric-with-digit). Anaphors with no concrete subject ("run it then", "what's it doing?") still get the prepend, so the existing follow-up behaviour is preserved. The hydrated context is also injected on every loop turn, so this contamination rode along into the post-failure recovery turns.</td><td><code>core/agent.py</code></td></tr>
       <tr><td>Partial multi-id failure collapsed into one generic strike</td><td>A multi-id command is N separate tool calls (there is no batch project delete). A turn that mixed one success and one error was booked as a single undifferentiated <code>unknown</code>-class strike whose <code>AUTO-DIAGNOSTIC</code> named only the <em>last</em> error (the turn-wide <code>last_error_*</code> is last-write-wins) — the model never saw a clean "A deleted, B not found" picture. Each call's outcome is now recorded uniformly (<code>op_outcomes</code>), and a new pure helper <code>summarize_multi_op_outcomes()</code> emits an explicit "<em>N of M succeeded</em>" summary prepended to the diagnostic, stating that the successful ops took effect, must not be retried, and that this live outcome is <strong>AUTHORITATIVE over prior context/memory</strong>. Previously that authoritative-override steer only fired on the 3rd <em>identical</em> failure; now it lands on the first partial failure. Single-op and uniform all-success/all-fail turns produce no summary, so existing terse diagnostics are unchanged.</td><td><code>core/agent.py</code>, <code>tools/tool_failure.py</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Round 9 — resumable system-wide bug hunt, unit 1: utils/ (2026-07-03)</h2>
   <p>First unit of the resumable, ledger-driven bug hunt tracked in <code>BUGHUNT.md</code> at the repo root (28 units, foundations first). All eight files under <code>src/ghost_agent/utils/</code> were reviewed; eight confirmed bugs fixed, each with a regression test in <code>tests/test_bughunt_unit1_utils.py</code>; full suite green (5874 passed).</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Quadratic fence-scan DoS (regression of the Round-1 ReDoS fix)</td><td>The "de-ambiguated" tolerant fence regex was still quadratic: with no closing fence, a space run after <code>```</code> could be split between the prefix's <code>[ \t]*</code> and the DOTALL lazy body, and the engine retried every split (measured 16&nbsp;K spaces ≈ 1.2&nbsp;s; ~minutes at the 200&nbsp;KB cap — reachable from any code the model writes). The loose pass now matches only the opening prefix (greedy, unambiguous) and finds the closing fence with <code>str.find</code> — verified equivalent semantics, O(n) total.</td><td><code>utils/sanitizer.py</code></td></tr>
@@ -625,12 +632,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td><code>setup_logging</code> crash on bare filename</td><td><code>os.makedirs(os.path.dirname(log_file))</code> raises on a filename with no directory component (<code>makedirs("")</code> fails even with <code>exist_ok=True</code>). Guarded; unreachable from the current prod caller but a latent boot crash for any future caller.</td><td><code>utils/logging.py</code></td></tr>
       <tr><td><code>HostSnapshot.healthy</code> ignored disk and could drift</td><td>The property hardcoded CPU/RAM thresholds and never looked at <code>disk_percent</code>, so a 95%-full disk was "healthy" while the poller emitted a disk warning. It now references the <code>HostTelemetry</code> defaults at call time (no drift) and includes the disk axis.</td><td><code>utils/telemetry.py</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (recorded in <code>BUGHUNT.md</code>): <code>telemetry.stop()</code> can swallow a <em>caller's</em> cancellation (rare, needs careful shutdown-semantics work); <code>is_removal_or_negation_text</code> substring matching false-positives are by design (fail-safe direction, documented as cheap).</p>
 
   <h2>Round 10 — deferred-findings backlog (2026-07-04+)</h2>
   <p>After the 28-unit sweep completed, the confirmed-but-deferred findings in <code>BUGHUNT.md</code> are being worked highest-impact first. Each entry here resolves (fully or in its high-severity core) one deferred item.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>skills_auto graduation had no producer — the async late verdict never reached the corpus (2026-07-05)</strong></td><td>The graduation pipeline (extract → consolidate → verify → store, idle phase 2.6) was structurally unreachable: the extractor needs PASSED trajectories with ≥2 tool calls and no producer emitted one. The chat recorder (the only producer with real tool calls) writes UNKNOWN, and in async-critic mode — the production config — the verifier verdict lands AFTER the record with no corpus backfill (the sync path folds it in at write time via <code>resolve_turn_outcome</code>). Live corpus: 2058 UNKNOWN (1116 with ≥2 tools) / 502 tool-less reflection PASSED / 0 eligible. Fix: <code>_record_late_verdict</code> → new <code>_backfill_trajectory_outcome</code> — late CONFIRMED ≥0.7 promotes UNKNOWN→PASSED, late REFUTED ≥0.7 marks FAILED (Reflector/PRM negative), via the corrections-sidecar overlay (last-write-wins, so a next-turn user correction still overrides; PASSED requires a provably-UNKNOWN cache hit, FAILED always lands). Also fixed the three latent bugs that would have surfaced on first graduation: consolidator single-member passthrough kept a cluster-specific signature (same skill → two store keys across runs; now sequence-only in both branches), <code>support</code> counted N same-batch self-consistency samples as N supports (now deduped by batch-or-id, failures/triggers symmetric), and <code>_signature_hash</code> delimiter injection (<code>repr</code> encoding now; store was empty in prod so nothing migrates). <code>tests/test_critic_async.py</code> (+5), <code>tests/test_graduation_producer_wiring.py</code> (3), extractor/consolidator regressions (+6). <strong>Root cause found during live verification:</strong> the backfill never fired because the production launcher (<code>bin/start-ghost-agent.sh</code>, edited Jul 4) passed <code>--no-verifier</code> — unintended, and invisible in the logs: the async branch printed "verdict deferred — verifying asynchronously" every turn for a verdict that was never spawned. Resolution: the flag is permanently removed (verifier runs in production; the <code>--postmortem</code> flags dropped in the same edit stay off — that half was a deliberate cost decision). Fixes that stand regardless of config: an ablated verifier now logs "verifier is ABLATED (--no-verifier); nothing will land late" (live-verified); the done-callback no longer swallows a dying verdict task silently; and a SIGUSR2 handler was added (<code>kill -USR2</code> → dump every live asyncio task + await stack to the log) — the tool that proved the task was never spawned. End-to-end live-verified on the final config: LATE CONFIRMED → sidecar <code>verifier_late</code> → trajectory reads back PASSED with its tool sequence.</td><td>med-high</td></tr>
@@ -639,12 +646,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td><strong>Router matmul warning spam was Accelerate FPE noise; predict-side features unsanitised (2026-07-05)</strong></td><td>Two residues of the earlier NaN-guard round. (1) The boot/idle-retrain log still filled with <code>divide by zero / overflow / invalid value encountered in matmul</code> at the train-accuracy line — inputs there are provably finite (design matrix sanitised, per-epoch divergence guard raises before it), and this venv's numpy runs on Apple's Accelerate BLAS, which raises spurious FPE flags on matmul even with finite data; that one matmul sat OUTSIDE the loop's <code>errstate</code> suppression. Wrapped (real divergence is still detected explicitly, and warnings were reconfirmed live at the 17:17 boot). (2) <code>fit()</code> sanitised its design matrix but <code>predict_proba</code>/<code>partial_fit</code>/<code>bce_loss</code> took raw vectors — one NaN feature meant a blanket 0.5 at predict, a silently-dropped online step, or a NaN holdout loss. Sanitisation moved to the <code>_vectorize</code> choke point every path flows through, so a bad component zeroes out while the remaining features stay informative. <code>tests/test_router_nan_guard.py</code> (+4, incl. a no-RuntimeWarning fit pin).</td><td>low-med</td></tr>
       <tr><td><strong>Browser redirect / loopback SSRF + Tor-bypass (core resolved)</strong></td><td>The sandbox runs under HOST networking, and the host-side guard only vetted the INITIAL url — so a page the agent navigated to that <code>302</code>-redirected to an internal address (<code>http://127.0.0.1:9051</code> Tor control, <code>169.254.169.254</code> cloud metadata, a LAN host), or that pulled an internal subresource (blind SSRF via <code>&lt;img&gt;</code>/<code>&lt;iframe&gt;</code>/<code>fetch</code>), reached host-local services (agent API, postgres, Tor control). Chromium does not re-vet redirects and bypasses the proxy for loopback (the Tor-bypass half). Fix: a Playwright request interceptor in the in-sandbox runner (<code>context.route("**/*")</code>, installed before the first navigation) that aborts EVERY http(s) request whose host classifies as loopback / private / link-local / reserved / metadata. It covers the redirect chain, cross-origin subresources, AND the <code>.last_url</code> re-navigation in one place; <code>file://</code> fixtures and external hosts pass through. Classifies by URL host only (no DNS → no Tor leak). Pinned in <code>tests/test_bughunt_browser_ssrf.py</code> (33 tests, exercising the real embedded-runner decision function + route handler with playwright mocked, since it isn't installed in CI).</td><td>high</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Residual (still in <code>BUGHUNT.md</code>): <code>file://</code> can still read a container file outside the sandbox subtree when NOT project-scoped (container-internal read, lower severity — the always-heal fix risks the working fixture path); and DNS-rebind of a SUBRESOURCE hostname (public host → internal IP) in non-Tor mode isn't caught by the URL-host classifier (Tor mode's DNS-over-SOCKS already prevents it). Both are smaller residuals of this finding.</p>
 
   <h2>Round 9, units 27–28: interface + scripts — FINAL units (2026-07-04)</h2>
   <p>The last two units close the sweep: the user-facing interface layer (<code>interface/server.py</code>, <code>slack_project_commands.py</code>, and the external integration servers) and the offline <code>scripts/</code> tooling (~5.4k lines of eval / ablation / probe / optimization drivers). Reviewed by four scoped lenses. Twelve fixes landed, pinned in <code>tests/test_bughunt_unit27to28.py</code> (12 tests). This pass also RESOLVED the long-deferred GEPA adoption-ordering finding. With this, all 28 units are CLEAR.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Unauthenticated live-log WebSocket (cross-site hijackable)</strong></td><td>The interface gated <code>/</code> and every <code>/api/*</code> proxy behind the shared key, but <code>/ws</code> called <code>accept()</code> unconditionally and then broadcast every line of the live agent log (tool outputs, file contents) to any connected socket — and because WebSockets bypass CORS, any website the operator visited could <code>new WebSocket("ws://localhost:8080/ws")</code> and exfiltrate the stream. Now key-gated (the browser passes the injected key as <code>?key=</code>; <code>app.js</code> updated to match).</td><td>high</td></tr>
@@ -654,12 +661,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Interface robustness</td><td>Timing-unsafe <code>!=</code> secret compares on the interface key (both <code>verify_interface_key</code> and the <code>/</code> route) — the main API mandates <code>secrets.compare_digest</code> with a regression test; the interface now matches. A non-object JSON body to <code>/api/chat</code> or <code>/api/tts</code> raised <code>AttributeError</code> → 502 + leaked <code>str(e)</code>; now a clean 400.</td><td>low–med</td></tr>
       <tr><td>Probe / script robustness</td><td><code>introspective_consistency</code> medianed <code>mode_share</code> over parsed-only samples unweighted by parse-rate, so a probe where most requests failed reported a spurious 1.0 that could flip the headline "stable inner state" verdict — the band summary now excludes under-parsed (&lt;2) probes from the consistency median. <code>selfhood_functional_test</code> Section G read <code>state.json</code> before its <code>try</code> with no existence guard (crashed <code>--only g</code>); now guarded + cleans up. <code>claude_trainer.load_curriculum</code> raised a bare <code>KeyError</code> on a dict lacking <code>"tasks"</code>; now a clear error.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (recorded in <code>BUGHUNT.md</code>): the external integration servers (TTS/STT, image-gen) bind <code>0.0.0.0</code> with no auth on expensive GPU endpoints — a home-lab threat-model item needing coordinated client-key changes; the clockwork-ghost desktop client's SSE parse uses <code>aiter_text</code> on non-line-aligned chunks (token misframing) and ships a placeholder <code>X-Ghost-Key</code>; <code>eval_baseline</code>'s default <code>--runner stub</code> makes <code>compare</code> an unconditional green gate (CI footgun); <code>ablation_eval</code> folds stale/foreign result JSONs from a fixed report dir and treats each (task,repeat) as independent in its Wilson CIs; the GEPA A/B runner feeds the instruction as a bare system prompt (out-of-distribution vs how the agent embeds the signature); and assorted best-effort-script perf/path nits (load_tokens O(n²) filler, non-expanduser'd report paths, same-second timestamp collisions, functional-test writes racing the live selfhood store).</p>
 
   <h2>Round 9, units 19–26: prm / reflection / selfhood / distill / eval / optim / skills_auto / entrypoint (2026-07-04)</h2>
   <p>Eight subsystems (~9.9k lines, ~40 files) reviewed one-lens-per-unit in parallel. Sixteen fixes landed, pinned in <code>tests/test_bughunt_unit19to26.py</code> (18 tests) plus updates to three existing tests that encoded the pre-fix behaviour. A dominant cross-cutting theme recurred: the <code>**d</code> dataclass-from-dict silent-drop / wipe pattern (a schema-drift field either crashes the load — swallowed into a dropped record or an empty-then-overwritten file — or is silently mislabelled) and fragile substring/heuristic matching. Several dspy-dependent optim findings and latent/architectural items were deferred (see <code>BUGHUNT.md</code>).</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Schema-divergent selfhood state.json silently wiped</strong></td><td><code>SelfState.from_dict</code> built its nested items with bare <code>OpenQuestion(**q)</code>/<code>UnfinishedThread(**t)</code>/<code>Mood(**m)</code> (unlike the sibling <code>Experience</code>/<code>Principle.from_dict</code>, which filter keys). Any extra key on disk (a newer build, a hand edit, a future field) raised <code>TypeError</code> → <code>_read_or_empty</code> swallowed it to an empty state → the next turn's <code>touch_session</code> OVERWROTE the good file empty, destroying all open questions / threads / mood. Now filters unknown keys.</td><td>med</td></tr>
@@ -672,12 +679,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Reference-count inflation polluted selfhood recall</td><td><code>detect_referenced_experiences</code> declared a <code>prefix_text</code> parameter but never read it — it matched the response against all 50 recent experiences, bumping <code>reference_count</code> (a recall relevance prior) for memories never shown to the model (e.g. one overlapping the echoed-back user request). Now only credits experiences actually present in the wake-up prefix.</td><td>low-med</td></tr>
       <tr><td>Smaller correctness / robustness</td><td>optim <code>split_train_eval</code> left the train split EMPTY for a 1-example corpus (GEPA then "optimized" on nothing) → now keeps ≥1 in train; reflection post-mortem routed an empty-content behavioural lesson into the playbook → now bails on empty solution; <code>_split_patch_output</code> split test/patch on naive substrings ("patch" in "dispatch") → now word-boundary; <code>outcome_heuristics</code> missed non-zero exit codes (127/130/…) as failures → now detected; eval <code>SuiteResult</code> didn't honour its "summary recomputed on construction" comment (empty summary → spurious baseline regression) → added <code>__post_init__</code>; skills-auto <code>graduate</code> returned an evicted-on-overflow entry as if persisted (caller counted + minted a macro for a skill the store dropped) → returns None; main.py never uninstalled the process-wide Tor egress guard on shutdown (leaked/stacked the socket monkeypatch across in-process lifespan cycles) → now uninstalled in the finally.</td><td>low–med</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (recorded in <code>BUGHUNT.md</code>): the optim GEPA pipeline is opt-in and its A/B ship-gate is off by default (adopts an unproven prompt) and it isn't dspy-<code>Example</code>-compatible (crashes on a real dspy run) — both need a dspy env to fix+test, and the adoption ordering spans <code>scripts/</code> (unit 28); the skills-auto graduation pipeline is built-but-unwired (no PASSED trajectory carries tool_calls today) so its consolidator dedup-key and support-inflation findings are latent; distill <code>user_correction</code> can false-positive a correction on an affirming follow-up (heuristic tuning); the reflection selection is oldest-first with non-persistent dedup ("recent" contract + re-reflect on restart); eval's <code>network_guard</code> doesn't cover <code>getaddrinfo</code> (DNS-name leak) and its per-task timeout isn't enforced for a sync runner (both latent); main.py leaks a <code>--no-memory</code> tempdir and reports hardcoded (not configured) metacog thresholds; and assorted low items (prm binary-floor vs continuous-label training, prm/selfhood train↔serve feature skew, hash-delimiter collisions, unbounded numeric CLI args).</p>
 
   <h2>Round 9, unit 18: core-agent — agent.py (2026-07-03)</h2>
   <p>The 10.5k-line <code>agent.py</code> (plus the 19-line <code>agent_qwen.py</code>) — the most central file, home of <code>handle_chat</code> (~5.6k lines on its own). Reviewed by five focused lenses (module helpers, init/idle-watchdog, verifier/correction, the <code>handle_chat</code> loop first half, and its finalize tail + trajectory/PRM/agent_qwen). Ten fixes landed, pinned in <code>tests/test_bughunt_unit18_agent.py</code> (16 tests). Two carried-over findings from unit 15 were re-examined here: the competence EXIT-CODE gap was <strong>confirmed and fixed</strong>; the "streaming outcome-penalty finalize skip" was <strong>disproven</strong> (see below) and reclassified as a deferred design gap.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Competence profile poisoned by non-1/2 exit codes (carried from unit 15)</strong></td><td>The per-tool metacog competence detector classified a shell/SQL run as failed only via the <code>"EXIT CODE: 1"</code>/<code>"2"</code> substring, so exit codes 3–9 and multi-digit (127, 130, …) were recorded as competence <em>SUCCESS</em> — poisoning the per-domain profile that feeds confidence + calibration. Now uses <code>re.search(r"EXIT CODE:\s*(\d+)")</code> and treats any non-zero as failure (the same regex the <code>execute</code> result-classifier just below already used). The identical substring gap in the fallback-hint injector was fixed too.</td><td>med</td></tr>
@@ -689,12 +696,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Dream-eligibility store read could abort a whole idle tick</td><td>The <code>collection.get(where={"type":"auto"})</code> that decides whether to dream sat outside any try/except; a ChromaDB error / locked store propagated out of <code>_biological_tick</code>, starving phases 2.5–3 (reflection, post-mortem, skills-auto, PRM, calibration, autoadvance) for that idle session. Now guarded so a store error skips only the dream.</td><td>low-med</td></tr>
       <tr><td><em>Disproven:</em> streaming outcome-penalty finalize skip</td><td>The unit-15 carry-over claimed a streamed final generation stashes <code>_calib_pending</code> without the outcome penalty, causing the finalize block (guarded on <code>_calib_pending is None</code>) to skip the penalty so a REFUTED streamed build logs <code>below=no</code>. Tracing the control flow disproved the mechanism: <code>handle_chat</code> <em>returns the stream generator</em> before the finalize block is ever reached, and the stash runs lazily as the SSE drains — after the function returned. On every turn that reaches finalize, <code>_calib_pending</code> is <code>None</code> (reset at turn start), so the penalty branch ALWAYS fires. A speculative patch was written and then reverted.</td><td>n/a</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (recorded in <code>BUGHUNT.md</code>): the real residue of the disproven finding — streamed turns write NO calibration JSONL pair and log a competence-only <code>below=</code> because the finalize tail is bypassed and the verdict is deferred to a next-turn banner (an async-verification design gap, not a finalize skip); the correction-lookup fingerprint mismatch on turns that PREPEND a clarifying-question / autoadvance-digest / correction banner (the store keys on the pre-prepend text, the next-turn lookup on the returned text — a med self-improvement-loop gap whose fix touches the two-mode finalize+return hot path); the singleton <code>_active_correction</code> / <code>_pending_corrections</code> and streaming <code>_calib_pending</code> cross-request races (same class as the tracked <code>current_project_id</code> race); fingerprint collision across conversations with identical openers; verifier-REFUTED not lowering the trajectory-collector outcome (only self_model — arguably intentional given verifier noise); PRM online-update holdout containing the just-trained sample; <code>_record_episode_safe</code> success heuristics; trajectory tool-result pairing on id-less duplicate tool names; and assorted low heuristic over-matches (<code>.js</code> in <code>.json</code> coding-intent, thinking-budget keyword substrings, <code>"tell me a"</code> vs "tell me about", think-tag fragment display drop).</p>
 
   <h2>Round 9, units 13–17: core (llm, planning, verify, projects, dream) (2026-07-03)</h2>
   <p>Five core units (~18k lines, 32 files) reviewed by seven lenses. Two high-severity plus ~20 med/low fixed, each pinned in <code>tests/test_bughunt_unit13to17.py</code> (18 tests); the rest deferred. This pass also closed the unit-8 deferred <code>get_swarm_node</code> item.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Failed build marked DONE (theatrical completion)</strong></td><td><code>project_advancer._looks_like_failure</code> only inspected the FIRST line, but the <code>execute</code> tool signals failure with a BANNER (<code>--- EXECUTION RESULT ---</code> line 1, <code>EXIT CODE: 1</code> line 2), so a failed build/verify command was classified as SUCCESS and its task marked DONE with a broken deliverable. Now parses the EXIT CODE and the <code>[SYSTEM ERROR]</code> sentinel anywhere in the result.</td><td>high</td></tr>
@@ -705,12 +712,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>calibration threshold degeneracy</td><td><code>_best_threshold</code>'s documented 0.5 fallback was missing, so on non-separable data (Youden J ≤ 0 — the miscalibrated case it exists to catch) it picked a DEGENERATE rail (τ=1.0 → "below threshold" ALWAYS true → log flood + every turn treated low-confidence). Now returns 0.5.</td><td>med</td></tr>
       <tr><td>Smaller correctness/robustness</td><td>prompts: a null <code>updated_at</code> crashed the whole system-prompt build (now coerced); verifier: a null verdict / non-numeric confidence raised out of the verifier and confidence was unclamped (now guarded + clamped); strikes: the clean-streak counter wasn't reset on unfreeze (a later re-freeze unfroze on a single success); mcts: LLM sim scores weren't clamped (a NaN corrupted the ranking); hypothesis: a non-numeric confidence discarded EVERY hypothesis; workspace_cleanup: a <code>.htaccess</code>/<code>.env</code> deliverable was deleted as a "dotfile" (now an allow-list); the self-play data-analysis template sorted by the raw float but displayed the rounded value (a correct solution could be marked FAILED); the dream empty-domain lesson was dropped because the cluster-key domain-fill ran AFTER the generalization guard (now before); bus RRF source-order and None-payload guards.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): the agent.py competence-detector EXIT-CODE gap and the streaming outcome-penalty skip (both belong to unit 18, agent.py); calibration/uncertainty JSONL log rotation; project_research topic-strip / slug-collision; project_concepts short-alias false matches; project_safety substring contradiction detection; project_digest cross-project watermark; the ContextManager emergency-prune tool-pairing bug (dead code — unwired); the NodeCircuitBreaker half-open concurrency and route()/streaming worker-fallback nuances; and several dream low-severity items (graduation direct-index KeyError, schema-regex paren miscount, template_key mislabel).</p>
 
   <h2>Round 9, units 9–12: projects + memory + router + api (2026-07-03)</h2>
   <p>Four units in one pass: the <code>manage_projects</code> tool, the whole <code>memory/</code> subsystem (13 stores, ~5.9k lines), the learned request <code>router/</code>, and the FastAPI <code>api/</code> surface. Six review lenses produced ~40 findings; the high + clear-med + cheap-low were fixed (17 changes), each pinned in <code>tests/test_bughunt_unit9to12.py</code> (17 tests); the rest deferred to <code>BUGHUNT.md</code>. The API auth (constant-time), traversal containment (<code>resolve</code>+<code>relative_to</code>), and router label-leakage direction were verified clean.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Wrong-project hard delete</strong></td><td><code>manage_projects</code> auto-fills <code>project_id</code> from the active project for every non-create action. For <code>delete</code>/<code>archive</code> that <em>shadowed</em> an explicit <code>title</code> — <code>delete title="chess"</code> with any project active resolved to and HARD-DELETED the ACTIVE project (row + workspace) because <code>_resolve_project_ref</code> short-circuits on a valid id. The auto-fill now yields to an explicit title for title-resolvable actions.</td><td>high</td></tr>
@@ -722,12 +729,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>api: workspace-load bomb + wipe-before-validate</td><td><code>/api/workspace/load</code> cleared the sandbox BEFORE parsing <code>session.json</code>, so a malformed archive destroyed the workspace with no rollback; and the 100 MB cap was on the COMPRESSED input only, so a zip-of-zeroes could inflate to tens of GB. Now validates (and size-caps the decompressed total at 500 MB) BEFORE wiping.</td><td>med</td></tr>
       <tr><td>api: internal-error leakage + input bounds</td><td>The streaming chat path and <code>/api/generate</code> shipped the raw <code>str(e)</code> (upstream URLs, file paths, Python internals) to the client — now an opaque <code>error_id</code> (matching the non-streaming path). The events <code>limit</code> query param is clamped (a negative value means "unlimited" in SQLite); and the API-key check compares BYTES so a non-ASCII header returns 403 instead of a 500 + traceback.</td><td>low–med</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): the process-global <code>current_project_id</code> cross-conversation race (spans projects + api; structural — same class already tracked); the projects metadata split-lock RMW and skills cross-process lock (multi-process JSON stores need file locks like frontier's <code>fcntl</code>); the unwired <code>graph.execute_graph_compression</code> resurrecting expired facts; the vector <code>smart_update</code> template over-match and <code>correct_fragment</code> id-collision; the router serve-only <code>context_turn_coupling</code> feature (inert, needs training-data plumbing) and its raw-count feature scaling (needs a retrain); and a handful of low store nits (scratchpad connection reuse, competence fractional evidence, episode float timestamp, load <code>UnicodeDecodeError</code> guards).</p>
 
   <h2>Round 9, units 7 &amp; 8: tools-knowledge + tools-skills (2026-07-03)</h2>
   <p>Two units in one pass: the knowledge tools (memory, database, report_pdf, postmortem_review) and the self-authored-tooling layer (composed_skills, acquired_skills, swarm, qwen_bridge). Four review lenses produced ~35 findings; ~30 fixed, each pinned in <code>tests/test_bughunt_unit78_tools_knowledge_skills.py</code> (19 tests); the rest deferred. This pass also resolved a unit-4 deferred item.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Composed macro reported all-failed as success</strong></td><td>Both <code>_execute_sequential</code>/<code>_execute_parallel</code> marked a step <code>success=True</code> whenever the executor didn't RAISE — but step tools return error STRINGS (<code>"[error] …"</code>, <code>"Error: …"</code>), so a macro whose every step failed was recorded as a success (inflating <code>success_rate</code>) and reported to the model as working. Added <code>_step_result_ok</code> (mirrors the acquired-skill result gate) to classify from the string. Also: an unresolved <code>$var</code> now resolves to <code>""</code> (was the literal <code>"$var"</code>), and a branch loop is bounded by a step-execution cap.</td><td>high</td></tr>
@@ -739,12 +746,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>report_pdf robustness</td><td>Source files are now size-checked BEFORE <code>read_text</code> (a 1 GB file OOM'd before the char cap could fire), the fallback path got a containment check, a native <code>dict</code> section is accepted (was rejected as "missing"), the 200-page cap now emits a TRUNCATION warning instead of a silent SUCCESS, and the post-render <code>stat()</code> is guarded.</td><td>low–med</td></tr>
       <tr><td>Smaller robustness</td><td>postmortem: a <code>None</code> severity no longer <code>TypeError</code>s and hides the whole defect queue; qwen_bridge coerces a non-str/malformed <code>params</code> to <code>{}</code>; several action-dispatch normalisations (<code>str().strip().lower()</code>) to honour never-raises contracts; composed load skips one malformed macro instead of dropping all; database "Unknown action" gets an <code>Error:</code> prefix.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): composed step-to-step output threading (a missing feature, not a bug); the per-instance <code>AcquiredSkillManager</code> lock (structural — a shared/module-level lock is needed for cross-thread serialization); qwen_bridge's fresh-event-loop-per-call (cross-loop resource risk, structural); and the swarm node-selection issues (dead-node retry, no circuit-breaker consult, silent <code>target_model</code> fallthrough) which live in <code>core/llm.py</code> <code>get_swarm_node</code> and belong to unit 13 (core-llm).</p>
 
   <h2>Round 9, unit 6: tools-web (2026-07-03)</h2>
   <p>Sixth unit of the ledger-driven hunt: the web-facing tools (browser, search, darkweb_search, vision, image_gen) — a security-sensitive surface (deanonymization, SSRF, OOM). Three review lenses + an independent pass over the browser anonymity/injection surfaces produced ~25 findings; 17 fixed, each pinned in <code>tests/test_bughunt_unit6_tools_web.py</code> (22 tests); the rest deferred to <code>BUGHUNT.md</code>. Runner injection (JSON+shlex) and per-attempt circuit isolation were verified clean.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Browser SSRF guard leaked DNS in Tor mode</strong></td><td><code>_browser_blocked_url</code> → <code>url_ssrf_reason</code> resolved the target hostname via <code>getaddrinfo</code> on the HOST even in anonymous mode — a plaintext DNS query for the site about to be visited, defeating the browser's own DNS-over-SOCKS hardening. Now passes <code>resolve=False</code> when a <code>tor_proxy</code> is set (Tor can't reach internal hosts anyway; literal-IP targets are still blocked). Also: non-http/https/file/about/data schemes are refused, and the guard fails CLOSED on an unparseable URL (was fail-open).</td><td>high</td></tr>
@@ -755,12 +762,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>deep_research fetch dropped the proxy + fired global NEWNYM</td><td>The per-URL fetch used <code>helper_fetch_url_content</code>, which ignored the per-query identity proxy (read env instead) and fired a global Tor <code>NEWNYM</code> on 503/error — re-circuiting Tor mid-run and sabotaging the concurrently-running sibling fetches. The helper gained <code>proxy_override</code> + <code>renew_identity</code> params (defaults preserve behaviour); deep_research passes its proxy and suppresses NEWNYM. The per-source extract is also sized to <code>max_context</code> instead of a hardcoded 40k.</td><td>med</td></tr>
       <tr><td>Browser numeric args + darkweb cache</td><td>LLM-supplied <code>timeout_ms</code>/<code>max_chars</code> are now safely coerced (a non-numeric string used to raise out of the tool) and <code>max_chars</code> is clamped to the (previously dead) <code>_MAX_TEXT_CHARS</code> ceiling so one op can't flood the context. <code>darkweb_research</code> no longer caches an all-errors run (every onion down) for 300 s. <code>fact_check</code> guards a <code>None</code> tool-definitions list; vision content-null is coerced and its path-prefix strip is leading-only (not <code>str.replace</code>-all).</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p><strong>Deferred — top priority security item:</strong> the browser <strong>redirect / loopback SSRF + Tor bypass</strong> (recorded in <code>BUGHUNT.md</code>). Chromium bypasses the proxy for loopback and does not re-check redirects, so a <code>302 → http://127.0.0.1:9051</code> (Tor control), <code>169.254.169.254</code> (metadata), or a LAN host reaches host-local services under host networking, and the host-side guard only vetted the first URL (DNS-rebind TOCTOU is the same class). The <code>.last_url</code> sidecar re-navigation also skips the SSRF check, and <code>file://</code> can read any container-readable file. The correct fix is runner-side Playwright request interception (mode-aware) or a <code>--proxy-bypass-list</code> change — both need a live Chromium to verify, so they're deferred rather than shipped untested. Other deferrals: darkweb onion body-cap applied after the full download (untrusted-engine OOM); vision cross-project read fallback (by-design).</p>
 
   <h2>Round 9, unit 5: tools-fs-exec (2026-07-03)</h2>
   <p>Fifth unit of the ledger-driven hunt: the sandbox-write + code-execution surface (file_system, execute, system, workspace, workspace_track). Three review lenses plus an independent read of the path-scoping core produced ~20 findings; 13 fixed (one high-severity), each pinned in <code>tests/test_bughunt_unit5_fs_exec.py</code> (24 tests); the rest deferred to <code>BUGHUNT.md</code>. The core traversal/symlink containment (<code>_get_safe_path</code> resolves then checks <code>is_relative_to</code>) was verified sound.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td><strong>Destructive op could wipe the whole workspace</strong></td><td>Every path heal intentionally collapses <code>.</code> / <code>/workspace</code> / <code>''</code> / <code>projects/&lt;active-id&gt;</code> to the sandbox/project ROOT — fine for a read, catastrophic for <code>delete</code>/<code>rename</code>/<code>copy</code>: <code>file_system(operation='delete', path='/workspace')</code> <code>rmtree</code>'d the entire workspace. <code>_get_safe_path</code> gained an <code>allow_root</code> flag; the three destructive ops pass <code>allow_root=False</code> and now get a Security Error when the target resolves to the root. Reads/lists unaffected.</td><td>high</td></tr>
@@ -772,12 +779,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Smaller file_system correctness</td><td>The empty-content guard rejected the legit word <q>none</q> (now only the literal Python <code>None</code> repr / truly-empty); the whitespace-flexible replace path lacked <code>count=1</code> (could clobber a later identical block); <code>inspect</code> peeked with the platform-default encoding; and the Python&lt;3.9 containment fallback used bare <code>str.startswith</code> (the sibling-dir bug class) — hardened with a trailing-separator check.</td><td>low</td></tr>
       <tr><td>workspace tool never-raises</td><td><code>workspace</code> / <code>workspace_track</code> normalised <code>action</code> BEFORE their try block, so a non-string action raised <code>AttributeError</code> and escaped the documented never-raises contract. Coerced with <code>str()</code>.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): the SSRF-redirect gap (above); the <code>_inline_py</code> <q>-c body</q> detector false-blocking a chained command with a trailing quoted segment (a false-block, never a wrong execution; the <code>$</code>-anchored regex needs a shlex-based rework); stateful-Jupyter args silently dropped; the file-not-found retry re-running a command that already did work; and the single global stateful kernel racing / leaking namespace across concurrent calls and projects (documented tradeoff — kernel pinned to <code>/workspace</code>).</p>
 
   <h2>Round 9, unit 4: tools-infra (2026-07-03)</h2>
   <p>Fourth unit of the ledger-driven hunt: the tool dispatch/registry/validation layer (registry, validators, tool_failure, fallback_chains, tasks, self_state, introspect, uncertainty_tool). Three review lenses + an independent read produced ~20 findings; 12 fixed, each pinned in <code>tests/test_bughunt_unit4_tools_infra.py</code> (31 tests); the rest deferred to <code>BUGHUNT.md</code>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td>Destructive-SQL guard bypassed by qualified/quoted tables</td><td><code>validate_sql</code>'s DELETE/UPDATE guards matched the table with a bare <code>\w+</code>, so <code>DELETE FROM public.users</code> / <code>DELETE FROM "users"</code> with no WHERE passed validation and dispatched a full-table delete. The table pattern now accepts schema-qualified and quoted identifiers.</td><td>med</td></tr>
@@ -792,12 +799,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Composed-skill known-tools set stale</td><td>The <code>known_tools</code> set passed to <code>manage_composed_skills</code> was a frozen <code>TOOL_DEFINITIONS</code> snapshot omitting acquired skills, so a macro step calling an acquired skill got a spurious "not a recognised built-in" warning. Now derived from the fully-populated dispatch table at call time.</td><td>low</td></tr>
       <tr><td>self_state / uncertainty polish</td><td><code>resolve_question</code>/<code>close_unfinished</code> now require a match target (no more <q>matched 'None'</q>); a dead <code>get_critical_unknowns</code> assignment in the uncertainty renderer was removed.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): tool_failure's other loose FATAL patterns (<code>invalid arg</code>, <code>tool.*not found</code>) can still pre-empt a diagnostic (tightening risks making genuinely-fatal errors retry); the unwired <code>get_retry_delay</code>/<code>should_retry</code> helpers (dead, with a latent off-by-one); the <code>deep_research</code>↔<code>web_search</code> advisory fallback ping-pong (by design — hints, not actions); and two stale/fragile swarm hint needles (better fixed against swarm's real output strings in unit 8).</p>
 
   <h2>Round 9, unit 3: workspace/ (2026-07-03)</h2>
   <p>Third unit of the ledger-driven hunt. Two review lenses (model/state, aux modules) produced 18 findings; 15 confirmed and fixed, each pinned in <code>tests/test_bughunt_unit3_workspace.py</code> (23 tests); 3 deferred to <code>BUGHUNT.md</code>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td>Broken-file check disagreed with the interpreter</td><td><code>reactions.check_changed_python_files</code> read source with <code>read_text(errors="ignore")</code>: a valid file saved with a UTF-8 BOM was flagged <q>DOES NOT PARSE</q> (ast.parse rejects U+FEFF), and a file with an invalid byte the real import would reject was silently passed (the byte dropped). Now decodes <code>utf-8-sig</code> with <code>errors="replace"</code>.</td><td>med</td></tr>
@@ -812,12 +819,12 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>Changelog scoping dropped legacy + agnostic events</td><td><code>render_changelog</code> scoped on the bare <code>project_id</code> stamp, unlike the prefix path — dropping project-agnostic notes and legacy events whose project is derivable from a <code>projects/&lt;id&gt;/</code> path. Now uses <code>derive_event_project_id</code> like the prefix. Also: the <q>undated</q> bucket no longer sorts above real dates.</td><td>low</td></tr>
       <tr><td>Prefix-strip / cross-project matcher edge cases</td><td><code>strip_workspace_prefix</code> searched the CLOSE marker from position 0 (a stray earlier marker duplicated the block instead of removing it) → now searches after OPEN. <code>_narrative_is_cross_project</code> required an exact hex-id match, dropping a correct narrative whenever the LLM truncated/extended the path id → now prefix-tolerant.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): the process-global <code>current_project_id</code> event-stamping race under concurrent chats (same documented race class as <code>context.current_project_id</code>; a proper fix threads the project through each record call); <code>narrative.regenerate</code> read→await→persist staleness under overlapping idle consolidations; and <code>_PROJECTS_PATH_RE</code> matching a <code>projects/&lt;hex&gt;</code> segment inside an unrelated URL.</p>
 
   <h2>Round 9, unit 2: sandbox/docker.py (2026-07-03)</h2>
   <p>Second unit of the ledger-driven hunt. Two independent review lenses (concurrency/lifecycle, logic/security) produced 15 findings; 11 confirmed and fixed, each pinned in <code>tests/test_bughunt_unit2_sandbox.py</code> (17 tests); 3 deferred to <code>BUGHUNT.md</code>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td>Stale image cache never refreshed</td><td>The commit guard <code>if self.image != "ghost-agent-base:latest"</code> skipped the post-provision commit exactly when the container had booted from a <em>stale</em> cached image (e.g. v2-era forced a full reinstall) — so every future recreation re-paid the multi-minute provision, forever. The cache is now committed after every successful provision.</td><td>med</td></tr>
@@ -831,7 +838,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td><code>GHOST_SANDBOX_CPU_QUOTA=0</code> bricked creation</td><td>0 reached the daemon and was rejected ("CPU cfs quota cannot be less than 1ms"). <code>&le;0</code> now means "no cap", mirroring <code>GHOST_SANDBOX_PIDS=0</code>.</td><td>low</td></tr>
       <tr><td><code>get_stats()</code> race on the container handle</td><td>Read <code>self.container</code> twice with no snapshot; a concurrent reprovision could reassign it mid-call. Now snapshots the handle.</td><td>low</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Deferred (in <code>BUGHUNT.md</code>): the remove-while-exec race (a concurrent recreate can kill another thread's in-flight command — structural, self-heals with a clear error); docker client-level timeouts on the probes (risk killing legitimate long execs); and the Linux-only exec-as-host-uid vs root-provisioned environment mismatch (Playwright/<code>sudo</code>/runtime-<code>pip</code> broken for non-root exec; masked on macOS where exec runs as root).</p>
 
   <h2>Round 10 — metacognitive-stack review (2026-07-20)</h2>
@@ -842,7 +849,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
   with regression tests. The recurring shapes: <em>finalize-extraction broke <code>locals()</code>
   lookups</em>, <em>producer/consumer string-contract drift</em>, <em>isolation wrappers leaking
   mutations</em>, and <em>fail-open exception swallowing hiding dead features</em>.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td>Counterfactual replay never persisted</td><td><code>persist_challenge</code> required exact <code>"SUCCESS"/"FAILURE"</code> while dream passes decorated strings ("SUCCESS (in 2 attempts)") — zero challenges persisted since the 2026-07-17 ship. Status now normalizes by prefix; <code>classify</code> had the same bug (a fixed persist would have graded every successful replay a regression and quarantined good lessons); non-decisive replays (infra flake, solver abort) now classify "inconclusive" — no quarantine, bounded retry. Quarantine attribution now prefers a sim-scoped trigger snapshot (<code>last_selfplay_hydrated_triggers</code>) over the shared mutable attribute a concurrent user turn can re-stamp.</td><td>critical</td></tr>
@@ -862,7 +869,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>REM/dream churn + idempotency holes</td><td>Unparseable REM replies no longer poison the fragment cache; the churn cap is namespace-aware (seed-source oscillation no longer re-dreams unchanged material); the fetch window now equals the prompt slice (ids 151-300 were stamped without ever being shown); setup-created <em>directories</em> survive snapshot/restore; template saturation and adversarial-generator feedback are attributed to the actual generation path; background self-play calls carry <code>is_background</code>.</td><td>med</td></tr>
       <tr><td>~35 further minors</td><td>Full-string strike fingerprints (progressing polls no longer hard-abort); two-tier loop-breaker backstop (read/write tools hard-stop at 5 per the documented contract); SYSTEM BLOCK results skipped in competence; <code>execution_failed</code> = strikes ∧ final-tool-failed; batched SSE deltas feed every token to entropy; replan counters wired; boot log reports the arbiter's <em>effective</em> (module-toggle-gated) state; host-signal logs report configured thresholds; journal <code>load()</code> re-raises transient OSErrors instead of wiping the queue; adaptive-threshold ratchet bounded; error-keyed "No module named…" lessons pass the quality gate; reflection double-reflect race + plan-header regex + postmortem section anchoring + perma-failed analysis starvation; narrative/mood history compaction + persist-gated idempotency (agent + workspace twins); MCTS no-think expansion + bounded backtrack stack; sync-runner timeouts in arbiter/self-consistency; collector newline re-sync; dead code removed (adversarial-probe prompt, proposal-F novelty branch).</td><td>low-med</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Verification: each fix batch ran its focused suites green (573 dream/self-play, 401 verifier-adjacent,
   315 metacog, 293 reflection, 208 memory, 197 selfhood, 188 skills/distill, 166 distill-package, 48
   frontier, 23 counterfactual, plus the agent-level and streaming suites); the full suite was run at the
@@ -880,7 +887,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
   streaming</em> (anything that must run per-turn can't live only in finalize) and <em>the
   project-autonomy stack failed open toward "theatrical completion"</em> (work marked DONE having
   verified nothing).</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
     <tbody>
       <tr><td>cleanup path-traversal into destructive delete</td><td><code>manage_projects action=cleanup project_id="../.."</code> was the one destructive action skipping <code>_resolve_project_ref</code>; the id flowed into <code>_project_dir</code> and resolved to the sandbox <em>parent</em> (reproduced), which the tidy then walked and deleted from. Fixed at the tool boundary (routed through <code>_resolve_project_ref</code>) AND with a containment assertion in sweep/tidy that rejects any id bearing separators/<code>..</code> or resolving outside <code>&lt;sandbox&gt;/projects/</code> (status "skipped: path escape", zero deletions).</td><td>critical</td></tr>
@@ -895,7 +902,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
       <tr><td>streaming-replace + prune third return</td><td>The &gt;1 MB streaming-replace path bypassed the marker-leak/syntax guards (merged-args markers written verbatim) — now routed through the same guard chain. Separately, the <code>&lt;=5</code>-message branch of <code>_prune_context</code> returned the tail VERBATIM (the other two returns were wrapped) — a few huge tool results still shipped oversize → HTTP 400 → destructive recovery; it now caps via <code>_cap_oversized_tail</code>, and pruning reserves per-turn injection headroom (ramped in only above a 32k window so small budgets are untouched).</td><td>high</td></tr>
       <tr><td>~20 mediums</td><td>Post-batch failure bookkeeping attributed to the batch's LAST tool, not the failing one (strike/hint/dimension mis-keyed → the ≥3-repeat breaker fired late/never) — now keyed to the failing tool. <code>is_mutating</code> re-aligned with <code>is_sandbox_mutation</code> (unzip/git_clone/image_generation), so the world-changed reset fires after a clone and those calls aren't dedup-collapsed; batch dedup no longer collapses stateful tools (browser/manage_projects/notify_operator/delegate). Per-turn scratchpad injection capped at source (was raw/uncapped, invisible to governor estimates). <code>task_update</code> with a <code>result</code> but no <code>status</code> now persists the result (was a success-shaped no-op that spun the gate-clear loop); bulk <code>task_update</code> no longer blocks a fileless sibling on the first task's constraint verdict; <code>reconcile_conversation</code> fails CLOSED on an evicted sentinel (parks the stale project). The dead ReplanBridge now PERSISTS via <code>ProjectPlan.request_revision</code>; the now-live plan gate coerces string/null fields instead of emitting per-char garbage/crashing; a <code>HUMAN_GATE:</code> postcondition forces NEEDS_USER (not FAILED). <code>_maybe_rollup_project_status</code> is status-guarded against a concurrent ARCHIVE; FAILED/PAUSED projects can reactivate; <code>delete_task</code> rolls up. <code>execute</code> reports the real exit code (a 124 timeout is no longer flattened to 1) and its heredoc egress-guard covers interpreter-fed bodies; <code>coding_executor</code> appends from live file content (not a stale/absent snapshot), refreshes between retries, and inserts a single-anchor fragment once. API routes canonicalize the pid and offload blocking work.</td><td>medium</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Verification: each fix batch ran its focused suites green (536 file_system, 258 planning, 222
   coding-executor, 197 advancer-fail-closed, 166 store-consumer, 68 safety/digest/concepts, plus the
   API/Slack/agent/streaming suites); the full suite was run twice at the end (the second run caught a

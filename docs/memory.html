@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What it remembers — Ghost Agent</title>
+<meta name="description" content="Ghost Agent's memory: the six kinds of store, how they're searched together, and how to correct something it got wrong.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a class="current" href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">How it works</span>
+  <h1>What it remembers</h1>
+  <p class="subtitle">Ghost keeps several different kinds of memory because they answer different questions. Here's what's in each, and what to do when one of them is wrong.</p>
+
+  <p class="lede">The short version: closing the chat doesn't erase anything. Everything lives in files under <code>$GHOST_HOME/system/memory/</code>. Delete that directory and Ghost forgets you completely.</p>
+
+  <h2>Why more than one store</h2>
+  <p>A single searchable pile of text is bad at some very ordinary questions. "What do I know about Postgres?" and "Who is Anna to me?" and "What went wrong last time I tried this?" want different shapes of answer. So Ghost keeps them separately and searches all of them at once.</p>
+
+  <h2>The six kinds</h2>
+
+  <h3>1. Facts — the searchable pile</h3>
+  <p>Individual pieces of knowledge, stored so they can be found by meaning rather than by exact words. Ask about "the database migration" and it will find a note that said "moving the schema over" — different words, same idea.</p>
+  <p>This is also where documents go. When you feed Ghost a PDF, a transcript, or a recording, it gets split into passages and lands here. Search this and you're searching everything at once, which is powerful and also why there's a more precise way to ask about <em>one specific document</em> — see below.</p>
+  <span class="badge">memory/vector.py</span> <span class="badge">ChromaDB</span>
+
+  <h3>2. Relationships — how things connect</h3>
+  <p>A graph of entities and the links between them. "Anna is my wife", "the NetMon project runs on the ghost machine", "this script depends on that service". Questions about <em>connections</em> are answered badly by a pile of text and well by a graph.</p>
+  <span class="badge">memory/graph.py</span>
+
+  <h3>3. Your profile — the things that are always true</h3>
+  <p>Your name, where you live, what you work on, how you like things done. This one is special: it isn't searched, it's <strong>always present</strong>. It gets written into the instructions at the top of every conversation, so Ghost never has to look it up.</p>
+  <p>That's also why a wrong entry here is more annoying than anywhere else — it follows every single turn until you fix it.</p>
+  <span class="badge">memory/profile.py</span>
+
+  <h3>4. Lessons — mistakes it doesn't want to repeat</h3>
+  <p>When Ghost gets something wrong and then gets it right, it can record the pair: what it tried, why it failed, what worked. Later, when a similar task comes up, the relevant lessons are pulled in alongside the facts.</p>
+  <p>Ask it <em>"what have you learned this week?"</em> and it will read this store back to you rather than making something up.</p>
+  <span class="badge">memory/skills.py</span>
+
+  <h3>5. Episodes — what happened, in order</h3>
+  <p>Facts are isolated statements. Episodes are sequences: <em>I was asked to do X, I tried Y, it failed because Z, so I switched to W and that worked.</em> Causal chains, not trivia. This is what lets Ghost say "last time we hit this, the fix was…" instead of starting from scratch.</p>
+  <span class="badge">memory/episodes.py</span>
+
+  <h3>6. The journal — the short-term buffer</h3>
+  <p>Not really a memory so much as an inbox. Things that happened during a conversation get queued here immediately, and a background pass later works through the queue, decides what's worth keeping, and files it into the stores above.</p>
+  <p>This is why something you mentioned thirty seconds ago might not be findable yet, but will be tomorrow. The queue drains after about two minutes of quiet.</p>
+  <span class="badge">memory/journal.py</span>
+
+  <div class="note">
+    <strong>Also there, but not memory exactly:</strong> the <em>scratchpad</em> holds notes for the current conversation only and expires after a day — useful for parking a long tool result without burning context. Stored <em>sessions</em> are full past conversations, kept so Ghost can re-read one rather than rely on a summary of it.
+  </div>
+
+  <h2>How they're searched together</h2>
+  <p>On every message, Ghost queries the stores <strong>in parallel</strong> and then has to merge five ranked lists into one. The problem: the stores don't share a scoring scale. A similarity score of 0.8 from the fact store means nothing in particular relative to a 0.8 from the episode store.</p>
+  <p>So Ghost ignores the scores and uses the <em>positions</em> instead. Something that came 1st in one list and 3rd in another beats something that came 2nd in one list and nowhere in the others. Appearing in several lists is itself evidence of relevance.</p>
+
+  <div class="diagram">
+    <ol class="flow tight">
+      <li>
+        <h4>Your question gets broken into a few sub-questions</h4>
+        <p>Asking three narrower versions of a question finds more than asking the broad one once.</p>
+      </li>
+      <li>
+        <h4>Every store is searched for every sub-question, all at once</h4>
+        <p>Five stores × a few sub-questions, run in parallel — so this costs about as long as the slowest single search.</p>
+      </li>
+      <li>
+        <h4>The ranked lists are merged by position, not by score</h4>
+        <p>Items found by several sub-questions rise to the top. Duplicates collapse into one entry with a combined score.</p>
+      </li>
+      <li>
+        <h4>The top results are written above your message</h4>
+        <p>Budgeted by length — a short question gets a small block, a long complex one gets up to three times as much.</p>
+      </li>
+    </ol>
+    <p class="caption">This whole process is called "hydration" in the logs and the source.</p>
+  </div>
+
+  <h2>Asking about one specific document</h2>
+  <p>If you've fed Ghost a 400-page manual, searching <em>all</em> memory for an answer buried in it works badly — the manual competes with everything else for a fixed budget. There's a separate path for this that searches one document only and returns more of it, with the section headings each passage came from.</p>
+  <p>In practice: ask <em>"in the Postgres manual, how do I…"</em> rather than just <em>"how do I…"</em>, and Ghost will scope the search. It's a large difference in answer quality on big documents.</p>
+
+  <h2>Fixing what it got wrong</h2>
+  <p>Four situations, four different fixes.</p>
+
+  <dl class="kv terms">
+    <dt>It has a wrong fact about you</dt>
+    <dd>Just tell it. "Actually my wife is Maria, not Anna." Single-valued facts like <code>wife</code> or <code>car</code> get <em>replaced</em> on correction rather than accumulating — an early version of Ghost ended up with "wife: Anna, Maria" permanently in its prompt, which is exactly the bug this prevents.</dd>
+
+    <dt>It keeps repeating something wrong</dt>
+    <dd>If telling it doesn't stick, the entry is probably in the profile (always present) rather than the searchable stores. The web UI exposes a memory-correction control for this, and there's an HTTP endpoint behind it — <code>POST /api/memory/correct</code>.</dd>
+
+    <dt>You want a topic gone entirely</dt>
+    <dd>Ask it to forget the topic by name. This removes the stored passages rather than just suppressing them.</dd>
+
+    <dt>It learned the wrong lesson</dt>
+    <dd>Lessons are recorded automatically, so a bad one can get in. If the self-check later refuses the answer a lesson came from, Ghost removes that lesson on its own. You can also list them (<em>"show me your lessons"</em>) and ask it to drop a specific one.</dd>
+  </dl>
+
+  <div class="note warn">
+    <strong>Before you conclude the memory is broken.</strong> "It forgot" usually means one of two very different things: the fact was never stored, or it was stored and the search didn't surface it. These have opposite fixes. Ask Ghost to search for the fact directly first — if it can find it on request but didn't bring it up on its own, that's a retrieval-ranking issue, not a lost memory.
+  </div>
+
+  <h2>Where it all lives on disk</h2>
+  <dl class="kv">
+    <dt>system/memory/</dt>
+    <dd>Every store. The vector database, the graph, your profile, lessons, episodes, the journal queue.</dd>
+    <dt>system/memory/embedder.json</dt>
+    <dd>Records which embedding model built the vector store. If you change the embedding model, Ghost <strong>refuses to start</strong> rather than silently returning nonsense — the old vectors would still load, they'd just stop meaning anything. There's a re-embed script for when you genuinely want to switch.</dd>
+    <dt>sessions/</dt>
+    <dd>Full past conversations.</dd>
+  </dl>
+
+  <p>Backing up <code>$GHOST_HOME</code> backs up the agent's entire mind. It's all plain files — no external database to dump.</p>
+
+  <div class="pager">
+    <a class="prev" href="how-it-works.html">
+      <span class="dir">Previous</span>
+      <span class="to">One message, end to end</span>
+    </a>
+    <a class="next" href="tools.html">
+      <span class="dir">Next</span>
+      <span class="to">What it can do</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>src/ghost_agent/memory/</code> and <code>core/bus.py</code> on 2026-08-04. Per-store detail is in <a href="reference.html">the deep reference</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

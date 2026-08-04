@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="acquired_skills.html">acquired_skills</a>
@@ -18,17 +21,19 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / composed_skills.py</h1>
   <p class="subtitle">Compile recurring tool-call sequences into reusable macros with conditional branching and parameter templating.</p>
 
   <h2>Data shapes</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>SkillStep</code></td><td>tool_name · description · param_template · branch_condition · branch_target · optional · <strong>save_as</strong></td></tr>
       <tr><td><code>ComposedSkill</code></td><td>name · trigger_description · steps · branches · <strong>execution_mode</strong> · <strong>status</strong> · usage_count · success_count · last_used · created_at</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Templates &amp; data-flow (<code>save_as</code>, 2026-07-11)</h2>
   <p><code>param_template</code> uses <code>$variable</code> syntax, resolved when the macro is dispatched against a live <strong>binding scope</strong>: the macro's runtime params PLUS any earlier step's result bound via that step's <code>save_as</code>. Two forms — whole-value (<code>"$page"</code>, substituted as-is) and interpolated (<code>"Summarise: $page"</code> / <code>"${page}"</code>). An unresolved name becomes <code>""</code>, never the literal <code>"$var"</code>.</p>

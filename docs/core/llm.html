@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="agent_qwen.html">agent_qwen</a>
@@ -34,12 +37,14 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / llm.py</h1>
   <p class="subtitle">Multi-pool LLM orchestrator. Owns httpx async clients, round-robin scheduling, and per-node circuit breakers.</p>
 
   <h2>Pool topology</h2>
   <p>Six logical pools, each backed by zero-or-more <code>(url, model)</code> nodes plus the always-present foreground client.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Pool</th><th>Used for</th><th>Selector</th></tr></thead>
     <tbody>
       <tr><td>foreground</td><td>Default chat completion</td><td><code>chat_completion()</code> with no flags</td></tr>
@@ -49,7 +54,7 @@
       <tr><td>coding</td><td>Code-specialist generation</td><td><code>chat_completion(use_coding=True)</code></td></tr>
       <tr><td>image_gen</td><td>SDXL image generation</td><td><code>generate_image()</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Routing tasks</h2>
   <p>The <code>RoutingTask</code> enum at line 71 advertises the labels worker pools can fulfil:</p>
@@ -116,7 +121,7 @@
   </div>
 
   <h2>Public methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>async chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, timeout)</code></td><td>Pool-aware dispatch. Falls back across nodes when a circuit is OPEN.</td></tr>
@@ -125,7 +130,7 @@
       <tr><td><code>get_*_node()</code></td><td>Round-robin selection helpers (worker / vision / coding / image_gen).</td></tr>
       <tr><td><code>async close()</code></td><td>Closes all underlying httpx clients on lifespan shutdown.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Concurrency model</h2>
   <ul>
@@ -136,25 +141,25 @@
 
   <h2>Streaming idle timeouts</h2>
   <p><code>_do_stream_chat_completion</code> guards each SSE read with <code>asyncio.wait_for</code> so a genuinely hung upstream can't hold the event-loop slot forever (which keeps <code>foreground_tasks &gt; 0</code> and parks the biological watchdog). The budget is <b>split</b> because the first token of a turn is legitimately slow — the upstream must prefill (prompt-eval) the whole context before emitting any bytes, and on a large context (e.g. 120k tokens) or a loaded/CPU node that prefill routinely takes longer than the inter-token gap, with <em>zero</em> bytes during it:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Constant</th><th>Env var</th><th>Default</th><th>Applies to</th></tr></thead>
     <tbody>
       <tr><td><code>_STREAM_FIRST_BYTE_TIMEOUT</code></td><td><code>GHOST_STREAM_FIRST_BYTE_TIMEOUT</code></td><td>180s</td><td>Time to the FIRST byte (prompt prefill / time-to-first-token).</td></tr>
       <tr><td><code>_STREAM_IDLE_TIMEOUT</code></td><td><code>GHOST_STREAM_IDLE_TIMEOUT</code></td><td>60s</td><td>Gap between subsequent bytes (catches a real mid-stream hang).</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Any received line — including SSE keepalive/blank lines — ends the first-byte wait and resets the gap timer. A timeout yields an error SSE event + <code>[DONE]</code>; the agent then sees a turn with thinking but no actionable output and forces a retry. The earlier flat <b>30s</b> tripped that false "stall → forced retry" whenever a turn's prefill exceeded 30s, wastefully re-prefilling the whole (growing) context. The httpx client timeout (1200s) bounds the overall request above these. Tune the env vars for very slow or very fast nodes. Covered by <code>tests/test_stream_idle_timeout.py</code>.</p>
 
   <h2>Foreground-request yield (2026-06-11)</h2>
   <p>Background LLM callers (<code>is_background=True</code>) used to wait only on <code>foreground_tasks</code> — LLM calls <em>in flight</em> — capped at 30s. But a user turn spends much of its wall-clock <em>between</em> LLM calls (tools, file I/O, browser); in those gaps the counter reads 0, a background turn grabs the single llama slot, and the user's next turn queues behind a full background generation. Post-req-70 this starved the prompt for ~12 minutes while consolidation/self-play churned.</p>
   <p>Two-signal policy in <code>_wait_for_foreground_clear</code> (shared by <code>chat_completion</code> and <code>stream_chat_completion</code>):</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Signal</th><th>Meaning</th><th>Background waits</th></tr></thead>
     <tbody>
       <tr><td><code>foreground_tasks &gt; 0</code></td><td>a foreground LLM call is in flight</td><td>up to 30s, then proceed (stale result beats none)</td></tr>
       <tr><td><code>foreground_requests &gt; 0</code></td><td>a USER REQUEST is anywhere in its <code>handle_chat</code> lifecycle</td><td>as long as it takes (600s hard ceiling against a leaked counter)</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p><code>foreground_requests</code> is bracketed at the API layer by <code>routes._mark_foreground(agent, ±1)</code> around both chat handlers (the streaming one spans the whole SSE generator, agent loop + final-answer streaming). The helper only touches a counter that is actually an <code>int</code>, so mocked test apps and partial contexts no-op instead of raising. Self-play's isolated <code>handle_chat</code> runs never pass the API layer, so background cycles cannot deadlock themselves. Covered by <code>tests/test_foreground_yield.py</code>.</p>
 
   <h2>Priority routing fixes — inline self-stall &amp; off-main skip (2026-07-07)</h2>

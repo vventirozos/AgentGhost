@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Ghost Agent</title>
+<meta name="description" content="Plain-English definitions for the terms Ghost Agent's code, logs and reference docs use.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a class="current" href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Reference</span>
+  <h1>Glossary</h1>
+  <p class="subtitle">This project's logs and source use a lot of shorthand. Here's what it all means, in ordinary words.</p>
+
+  <div class="note">
+    <strong>Reading the deep reference?</strong> Keep this page open beside it. The module pages assume every term below.
+  </div>
+
+  <h2>The core loop</h2>
+
+  <dl class="kv terms">
+    <dt>Turn</dt>
+    <dd>One complete exchange: your message in, Ghost's answer out. A turn can contain many model calls and many tool calls internally. Capped at 40 passes.</dd>
+
+    <dt>Hydration</dt>
+    <dd>Searching memory and pasting the relevant results above your message <em>before</em> the model sees it. "The hydration was empty" means the memory search found nothing useful, not that memory is broken.</dd>
+
+    <dt>RRF · Reciprocal Rank Fusion</dt>
+    <dd>How several memory stores get merged into one ranked list. Each result is scored by its <em>position</em> in each list rather than its raw similarity score, because the stores don't share a scale. Something ranked highly by several stores beats something ranked highly by one.</dd>
+
+    <dt>Tool call</dt>
+    <dd>The model's request to do something — run code, read a file, search. Ghost accepts two formats and will attempt one repair on a malformed one.</dd>
+
+    <dt>Trajectory</dt>
+    <dd>The recorded log of one turn: what was asked, what tools ran, what came back, how it ended. This is the raw material every background learning pass reads.</dd>
+
+    <dt>Streaming vs non-streaming</dt>
+    <dd>Whether the answer arrives word by word or in one piece. It matters more than it sounds: streamed answers are self-checked <em>after</em> they reach you, so a correction shows up on the next turn.</dd>
+  </dl>
+
+  <h2>Memory</h2>
+
+  <dl class="kv terms">
+    <dt>Vector memory</dt>
+    <dd>The searchable pile of facts and document passages. "Vector" because text is stored as a list of numbers representing its meaning, which is what makes searching by meaning possible.</dd>
+
+    <dt>Embedding / embedder</dt>
+    <dd>The model that turns text into those numbers. Changing it invalidates everything already stored — the old numbers stay valid-looking but stop meaning anything, which is why Ghost refuses to start on a mismatch.</dd>
+
+    <dt>Graph memory</dt>
+    <dd>Entities and the relationships between them. Answers "how is X connected to Y?" where the searchable pile can't.</dd>
+
+    <dt>Episode</dt>
+    <dd>A stored sequence of actions and their outcome — <em>I tried X, it failed because Y, so I did Z</em>. Unlike a fact, it has causality and order.</dd>
+
+    <dt>Journal</dt>
+    <dd>The short-term queue. Things noticed during a conversation land here first, and a background pass files them into long-term memory a couple of minutes later.</dd>
+
+    <dt>Scratchpad</dt>
+    <dd>Notes for the current conversation only. Expires after a day. Used to park a long tool result without carrying it in the context.</dd>
+
+    <dt>Profile</dt>
+    <dd>Durable facts about you. Special because it's <em>always present</em> in the prompt rather than searched — which is why a wrong entry here is so persistent.</dd>
+
+    <dt>Lesson</dt>
+    <dd>A recorded mistake-and-fix pair. Retrieved alongside facts when a similar task comes up. Sometimes called a playbook entry.</dd>
+
+    <dt>Skill</dt>
+    <dd>Confusingly, two things. An <em>acquired skill</em> is a reusable tool Ghost wrote for itself. A <em>lesson</em> is stored in something called SkillMemory. When someone says "show me your skills" they usually mean the first; "what have you learned" means the second.</dd>
+  </dl>
+
+  <h2>Checking itself</h2>
+
+  <dl class="kv terms">
+    <dt>Verifier</dt>
+    <dd>The second model that reads a final answer against the evidence and decides whether it holds up.</dd>
+
+    <dt>Verdict · confirmed / refuted</dt>
+    <dd>The verifier's decision. "Refuted" means it thinks the answer doesn't hold — either it doesn't answer the question, or the evidence doesn't support it.</dd>
+
+    <dt>Escalation</dt>
+    <dd>When a cheap judge refuses an answer, the main model re-examines it and <em>its</em> verdict wins. This exists because the cheap judge refuses more often than it should.</dd>
+
+    <dt>Auto-repair</dt>
+    <dd>Ghost getting a bounded second attempt at an answer the verifier refused, with the critique in hand — rather than shipping something that just failed.</dd>
+
+    <dt>Calibration</dt>
+    <dd>Making Ghost's stated confidence match how often it's actually right. An agent that says "90% sure" and is right 60% of the time is badly calibrated, and its confidence numbers are worse than useless.</dd>
+
+    <dt>Loop breaker</dt>
+    <dd>A guard that stops Ghost repeating the same successful-but-useless action forever — clicking the same button, taking the same screenshot, concluding nothing. Fires on the third identical repeat.</dd>
+
+    <dt>Pre-flight guard</dt>
+    <dd>Blocks a tool call that already failed the same way recently, handing the model the previous error instead of re-running a known failure.</dd>
+  </dl>
+
+  <h2>Background work</h2>
+
+  <dl class="kv terms">
+    <dt>Biological watchdog</dt>
+    <dd>The background loop that runs the idle-time passes. The name is a metaphor — sleep, dreaming, memory consolidation. If it dies, Ghost keeps answering but stops learning.</dd>
+
+    <dt>Dream cycle · REM</dt>
+    <dd>Memory consolidation. Reviews recent memories, merges duplicates, generalises repeated patterns. Runs after about ten minutes of quiet.</dd>
+
+    <dt>Self-play</dt>
+    <dd>Ghost inventing a challenge for itself, attempting it, and scoring the result. Practice. Runs after about an hour of quiet.</dd>
+
+    <dt>Reflection</dt>
+    <dd>Re-reading recent failed turns and writing down what went wrong, which becomes lessons.</dd>
+
+    <dt>Post-mortem</dt>
+    <dd>Deeper than reflection: reads the <em>whole transcript</em> of a bad run and files a classified defect report — bad choice, bad setting, or broken tool. Off by default.</dd>
+
+    <dt>Frontier</dt>
+    <dd>The edge of what Ghost is uncertain about. Self-play aims here rather than practising things it already handles.</dd>
+
+    <dt>Distillation</dt>
+    <dd>Compressing many recorded turns into something smaller and reusable — a lesson, a skill, a trained scorer.</dd>
+
+    <dt>GEPA</dt>
+    <dd>The optimizer used to rewrite Ghost's own internal prompts from its successful turns. Run offline by you, not during the idle loop. A tuned prompt only replaces the hand-written one if it wins an A/B comparison.</dd>
+
+    <dt>Signature</dt>
+    <dd>An internal prompt that's treated as tunable rather than fixed, described by its inputs, outputs and a baseline instruction. There are three: task decomposition, tool choice, and self-critique.</dd>
+
+    <dt>Proxy gaming</dt>
+    <dd>An optimizer learning to score well on the measurement instead of doing the task. It gets worse the longer optimization runs, which is why the round cap here is low and deliberate.</dd>
+
+    <dt>Tool ontology</dt>
+    <dd>The question of whether the toolbox is divided up correctly in the first place — as opposed to being divided correctly but described badly. Repeated confusion between the same two tools is evidence for the former, and better wording won't fix it.</dd>
+  </dl>
+
+  <h2>Models and machines</h2>
+
+  <dl class="kv terms">
+    <dt>Upstream</dt>
+    <dd>The LLM server Ghost talks to. Ghost is not a model; it's a program that uses one.</dd>
+
+    <dt>Node pool</dt>
+    <dd>A group of extra LLM machines assigned to one kind of work. Ghost has six: worker, critic, coding, vision, image-gen, swarm.</dd>
+
+    <dt>Worker node</dt>
+    <dd>A machine for background and small jobs, so they don't compete with your conversation for the main model.</dd>
+
+    <dt>Critic node</dt>
+    <dd>A machine dedicated to the self-check. Usually the most valuable one to add.</dd>
+
+    <dt>Swarm</dt>
+    <dd>Fanning one task out across several models in parallel.</dd>
+
+    <dt>Circuit breaker</dt>
+    <dd>After a node fails repeatedly, Ghost stops sending it work for a while instead of retrying into a dead machine. "Open" means it's been taken out of rotation. Nothing to do with Tor circuits.</dd>
+
+    <dt>PRM · Process Reward Model</dt>
+    <dd>A small local model that scores whether a partial plan looks like it's heading somewhere useful — judging the working, not just the answer. Ghost trains it on its own recorded turns.</dd>
+
+    <dt>Router</dt>
+    <dd>A small local classifier that predicts how hard a request is, so easy ones can go to a cheap machine. Off unless you point at a trained one.</dd>
+
+    <dt>MCTS · Monte Carlo Tree Search</dt>
+    <dd>Exploring several possible next actions and looking a step ahead before committing, rather than taking the first plausible one. Only on hard problems, and only with <code>--deep-reason</code>.</dd>
+  </dl>
+
+  <h2>Network and sandbox</h2>
+
+  <dl class="kv terms">
+    <dt>Tor circuit</dt>
+    <dd>The chain of relays your traffic takes. The last one — the exit node — is what the destination site sees.</dd>
+
+    <dt>NEWNYM</dt>
+    <dd>Tor's "give me a fresh circuit" signal. Ghost sends it after a 503, on the theory that a rate-limited exit will clear on a different route. Not sent for 401 or 403, which a new exit wouldn't fix.</dd>
+
+    <dt>SOCKS5h</dt>
+    <dd>A proxy mode where the <em>proxy</em> resolves hostnames, not your machine. The "h" is the whole point: without it your own DNS server sees every site you visit, even though the traffic itself is anonymous.</dd>
+
+    <dt>Egress guard</dt>
+    <dd>The process-wide block on direct connections to public addresses. Makes "everything goes through Tor" enforced rather than merely intended.</dd>
+
+    <dt>Fail closed</dt>
+    <dd>When something's wrong, stop rather than degrade. Ghost refuses to boot without Tor instead of quietly using a normal connection.</dd>
+
+    <dt>Sandbox</dt>
+    <dd>The Docker container where all code runs. It shares exactly one directory with your machine and has its own network and process namespaces.</dd>
+
+    <dt>SSRF guard</dt>
+    <dd>Refuses fetches aimed at private or loopback addresses, so a tool call can't be turned into a scanner of your own network.</dd>
+
+    <dt>Hidden service · .onion</dt>
+    <dd>A site reachable only through Tor, with no ordinary domain name. Normal search engines don't index them, which is why searching for one needs a separate set of engines.</dd>
+
+    <dt>Circuit isolation</dt>
+    <dd>Deliberately sending each request over a different Tor route. Used for search because whether an engine answers depends on which exit node you happen to have — the same query can fail then succeed with nothing changed but the circuit.</dd>
+
+    <dt>Independent corroboration</dt>
+    <dd>Counting a result as confirmed only when genuinely separate sources report it. Several onion engines share one underlying search index, so they're tagged and counted once rather than mistaken for agreement.</dd>
+  </dl>
+
+  <h2>Sense of self</h2>
+
+  <dl class="kv terms">
+    <dt>Selfhood</dt>
+    <dd>The group of features that give Ghost continuity across sessions: a first-person diary, a running narrative, and state it carries forward.</dd>
+
+    <dt>Self-state</dt>
+    <dd>What Ghost writes for its future self — open questions, unfinished threads, its current mood, and operating principles it has chosen. Shown back to it at the start of the next session.</dd>
+
+    <dt>Narrative consolidation</dt>
+    <dd>Periodically rewriting many individual experiences into one running summary, so "what have you been doing?" has an answer that isn't a list of a thousand events.</dd>
+
+    <dt>Workspace model</dt>
+    <dd>The counterpart to selfhood, pointed outward: what changed in <em>your</em> files, what scheduled tasks did, which URLs it has already read.</dd>
+
+    <dt>Wake-up prefix</dt>
+    <dd>The block Ghost is shown at the start of a session summarising where things left off and what changed while it was away.</dd>
+  </dl>
+
+  <h2>Measurement</h2>
+
+  <dl class="kv terms">
+    <dt>Ablation</dt>
+    <dd>Turning a feature off to measure whether it was helping. Most of the <code>--no-*</code> flags exist for this.</dd>
+
+    <dt>Arm</dt>
+    <dd>One side of a comparison. "Control arm" is the current behaviour; "treatment arm" is the change being tested.</dd>
+
+    <dt>Bench</dt>
+    <dd>A fixed set of test cases used to score a component in isolation, so two versions can be compared fairly.</dd>
+
+    <dt>Metacognition uplift</dt>
+    <dd>The optional stack that has Ghost monitor its own state — confidence, uncertainty, host health, competence at different task types. Off unless you pass <code>--enable-metacog</code>.</dd>
+  </dl>
+
+  <div class="pager">
+    <a class="prev" href="troubleshooting.html">
+      <span class="dir">Previous</span>
+      <span class="to">When something breaks</span>
+    </a>
+    <a class="next" href="reference.html">
+      <span class="dir">Next</span>
+      <span class="to">Deep reference</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>If a term in the reference pages isn't here, it's worth adding — the deep pages are written for people who already know all of this.</p>
+  </footer>
+</main>
+</body>
+</html>

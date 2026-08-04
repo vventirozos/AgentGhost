@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -35,11 +38,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / database.py</h1>
   <p class="subtitle">PostgreSQL administration with parameterised queries, schema introspection, plan analysis, and pooled connections.</p>
 
   <h2>Tool: <code>postgres_admin</code></h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>query</code></td><td>Run arbitrary SQL with a 15 s statement timeout (configurable). Output clamped to 300 rows. Returns tabulated results from a <code>RealDictCursor</code>.</td></tr>
@@ -47,7 +52,7 @@
       <tr><td><code>explain_analyze</code></td><td>Prepend <code>EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)</code> if not already present; runs with the same timeout.</td></tr>
       <tr><td><code>activity</code></td><td>Selects from <code>pg_stat_activity</code>; bounded to 50 longest-running rows.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Security</h2>
   <ul>

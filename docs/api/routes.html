@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>API</h3>
     <a class="current" href="routes.html">routes</a>
     <a href="projects_routes.html">projects routes</a>
@@ -21,6 +24,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>api / routes.py</h1>
   <p class="subtitle">All HTTP routes mounted on the FastAPI app. Ollama-compatible plus Ghost-specific.</p>
 
@@ -31,7 +36,7 @@
   <p>Wildcard origin (<code>allow_origins=["*"]</code>) with credentials disabled. No cookies — auth is header-only.</p>
 
   <h2>Endpoints</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Auth</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>GET / · HEAD /</td><td>—</td><td>Returns plain text <code>"Ollama is running"</code>. Compatibility shim.</td></tr>
@@ -56,7 +61,7 @@
       <tr><td>GET /api/download/{filename:path}</td><td>X-Ghost-Key</td><td>Stream a sandbox file. Path traversal guard. A bare filename is resolved under the active project's dir; pass <code>?project_id=&lt;id&gt;</code> for a race-free resolution (same rationale as upload).</td></tr>
       <tr><td>{any other path}</td><td>X-Ghost-Key</td><td><strong>Catch-all proxy</strong> — forwards unknown requests upstream via <code>agent.context.llm_client.http_client</code>. Detects streaming from <code>stream: true</code> JSON body. Sets <code>X-Accel-Buffering: no</code> for SSE so nginx doesn't buffer.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Sequence diagram</h2>
   <div class="diagram">

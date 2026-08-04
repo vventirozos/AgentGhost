@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="llm.html">llm</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / failure_dimension.py + failure_distill.py</h1>
   <p class="subtitle">Harness-dimension failure attribution and the dream-side failure-cluster distillation pass (MemoHarness adaptation, 2026-07-19).</p>
 
@@ -33,7 +38,7 @@
   <p>Three multi-day debugging episodes in this project's history were rooted in the same mistake — a <em>harness</em> failure read as a <em>model</em> failure: the verifier "not in evidence" refutes (evidence-packer truncation, not the judge), the code-correction failures (fail-open SEARCH/REPLACE parser, not the LLM), and the introspect breakage (native-tools arg corruption). Every failure record now carries a <code>dimension</code> naming the harness layer it was attributed to, so the debugging prior is <strong>audit the harness before blaming the model</strong> — and so recurring failures can be grouped and distilled into preventive lessons.</p>
 
   <h2>Taxonomy (adapted from MemoHarness D1–D6, arXiv:2607.14159)</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Dimension</th><th>Covers</th><th>Example signals</th></tr></thead>
     <tbody>
       <tr><td><code>context_assembly</code></td><td>hydration, briefing, evidence packing, context pruning/overflow, prompt assembly</td><td>"evidence … truncated" · "context overflow" · "[truncated"</td></tr>
@@ -45,7 +50,7 @@
       <tr><td><code>model</code></td><td>base-model reasoning error despite correct context/tooling</td><td>"hallucinated" · "miscalculated" · "refused"</td></tr>
       <tr><td><code>unknown</code></td><td>no signal matched — offline-adjudication candidates</td><td>—</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p><strong>Precedence:</strong> first-match-wins over the tables in the order <code>output_processing → memory → context_assembly → orchestration → tool_interaction → generation_control → model</code>. Harness dimensions are deliberately checked before <code>model</code>, and specific beats generic — a <em>network</em> timeout (ETIMEDOUT) lands on tool_interaction while an <em>LLM</em> timeout (ReadTimeout) lands on generation_control.</p>
   <p><strong>The tag is a prior, not a verdict.</strong> Regex over failure text sees where a failure <em>surfaced</em>, not necessarily where it originated. Individual tags can be wrong; the aggregate distribution (a month of tags showing one dimension spiking) is the reliable signal. The matched signal is debug-logged at each write for spot audits.</p>
 
@@ -97,7 +102,7 @@
   it is re-enabled, or distillation's own output is deleted by design.</p>
 
   <h2>Knobs</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Env var</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>GHOST_FAILURE_DIM</code></td><td>1</td><td>Attribution at record time (lessons + work_logs). <code>0</code> kills.</td></tr>
@@ -105,7 +110,7 @@
       <tr><td><code>GHOST_FAILURE_ADJUDICATE</code></td><td>1</td><td>Worker-LLM re-classification of unknowns during the pass.</td></tr>
       <tr><td><code>GHOST_FAILURE_DISTILL_MAX</code></td><td>2</td><td>Distilled pattern lessons per dream cycle.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>All read per call (no restart needed) — the <code>GHOST_VERIFY_TWO_STAGE</code> idiom. Routing labels: <code>CLASSIFY_FAILURE</code> (adjudication, 8 tokens) and <code>DISTILL_PATTERN</code> (synthesis, 400 tokens, 60s) — both worker-only via <a href="../algorithms/node_offload.html"><code>LLMClient.route()</code></a>, falling back to the heuristic / skipping on any failure.</p>
 
   <h2>Tests</h2>

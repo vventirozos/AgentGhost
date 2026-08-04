@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -35,12 +38,14 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / file_system.py</h1>
   <p class="subtitle">Unified file operations with binary sniffing, PDF chunking, downloads, and path-traversal guards.</p>
 
   <h2>Tool: <code>file_system</code></h2>
   <p>One LLM-facing tool that dispatches to a sub-handler by the <code>operation</code> argument.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Operation</th><th>Handler</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>read</td><td><code>tool_read_file</code></td><td>Binary sniff first 8 KB; errors on binary; clamps to <code>max_context · 3.5 · 0.5</code> chars. <strong>Line-ranged read (2026-07-07):</strong> pass <code>start_line</code>/<code>end_line</code> for a 1-based, line-number-prefixed slice that is <em>exempt</em> from the whole-file size cap and streamed (stops at <code>end_line</code>, ≤ 2000-line span) — the cheap recovery after a failed replace or a too-large-file error, and it chains directly from <code>search</code> line numbers. Both the too-large error and the large-file replace-failure guidance now point at it. Accepts aliases (<code>start</code>/<code>from_line</code>, <code>end</code>/<code>to_line</code>).</td></tr>
@@ -54,7 +59,7 @@
       <tr><td>copy / rename / move / delete</td><td><code>shutil</code>-backed</td><td>Refuses overwrite on copy — and on rename/move since 2026-07-20 (see below).</td></tr>
       <tr><td>list</td><td><code>tool_list_files</code></td><td>Walks sandbox; extracts AST signatures for <code>.py</code> files. <strong>2026-07-14:</strong> accepts an optional <code>path</code> to list ONE subdirectory (it used to be silently dropped — every "list &lt;subdir&gt;" re-listed the truncated root); walk order is sorted (deterministic across calls); the 200-entry cap now <em>reports</em> how many files were hidden and how to see them, instead of truncating silently; an empty project-scoped listing names root-level files (with their <code>/workspace/...</code> paths) instead of a bare <code>[Empty]</code>. Aliases <code>ls</code>/<code>dir</code>/<code>tree</code>/<code>list_dir</code>/<code>list_directory</code> are healed.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Replace matching ladder &amp; the full-rewrite footgun (2026-06-07)</h2>
   <p><code>tool_replace_text</code> tries progressively looser matches before giving up: <strong>(1)</strong> exact substring, <strong>(2)</strong> flexible whitespace (tokens joined by <code>\s+</code>, with replacement indentation re-anchored to the match — see the 2026-06-12 section), <strong>(3)</strong> a <em>fuzzy</em> contiguous-block match (<code>_fuzzy_block_match</code>), and only then <strong>(4)</strong> a failure with a nearest-snippet hint. Every landing path is wrapped by a syntax-regression rollback guard.</p>
@@ -107,7 +112,7 @@
   <p>Two changes close the hole:</p>
   <ul>
     <li><strong>Lower the per-file factor.</strong> <code>read_byte_budget(max_context) = max(150000, int(max_context&nbsp;*&nbsp;3.5&nbsp;*&nbsp;0.40))</code> &mdash; down from <code>0.5</code> (which let one read eat ~70% of the window). At a 131&nbsp;K window the per-file cap drops from ~229&nbsp;KB to ~183&nbsp;KB.</li>
-    <li><strong>Cumulative <code>ReadBudget</code> per batch.</strong> The agent resets a <code>ReadBudget</code> (same byte allowance) before dispatching each assistant message's tool&nbsp;calls; every <code>file_system</code> read charges it by the content length actually injected (wired through the <a href="../core/registry.html">registry</a> closure as <code>context._read_budget</code>). The FIRST read always proceeds (already bounded by the per-file cap), but a later read whose size exceeds the <em>remaining</em> allowance is refused <strong>before</strong> injecting &mdash; with a message steering the model to <code>execute</code> (load + summarise the data in a script), <code>read_chunked</code>, <code>search</code>, or <code>inspect</code>. Scope is one batch; cross-turn accumulation is handled by context compaction, so the budget deliberately does not persist. Passing no budget (<code>read_budget=None</code>) preserves the legacy per-file-only behaviour.</li>
+    <li><strong>Cumulative <code>ReadBudget</code> per batch.</strong> The agent resets a <code>ReadBudget</code> (same byte allowance) before dispatching each assistant message's tool&nbsp;calls; every <code>file_system</code> read charges it by the content length actually injected (wired through the <a href="registry.html">registry</a> closure as <code>context._read_budget</code>). The FIRST read always proceeds (already bounded by the per-file cap), but a later read whose size exceeds the <em>remaining</em> allowance is refused <strong>before</strong> injecting &mdash; with a message steering the model to <code>execute</code> (load + summarise the data in a script), <code>read_chunked</code>, <code>search</code>, or <code>inspect</code>. Scope is one batch; cross-turn accumulation is handled by context compaction, so the budget deliberately does not persist. Passing no budget (<code>read_budget=None</code>) preserves the legacy per-file-only behaviour.</li>
   </ul>
   <p>Result on the live scenario: <code>experiment1</code> reads (charges ~178&nbsp;KB), then <code>experiment3</code> is refused (would breach the ~183&nbsp;KB batch budget) instead of overflowing the window. Covered by <code>tests/test_read_budget_overflow.py</code>.</p>
   <p>The budget is the <em>backstop</em>; the <a href="../core/prompts.html">report-path prompt steering</a> is the proactive half — it tells the model to <code>execute</code> a digest script for report/synthesis tasks so it never reaches the refusal.</p>
@@ -284,14 +289,14 @@ SyntaxError: Unexpected identifier 't'</pre>
   <h2>The BATCH macro — <code>paths</code> + the post-edit view (2026-08-04, §4F item 1)</h2>
   <p><b>Why.</b> Turn DEPTH is this project's strongest measured failure predictor (17.8% failure at step 1 rising to 60.6% at step 12) and the risk governor cannot fire before step 6 by construction — both its terms need a turn to have already happened. Removing loop steps therefore attacks the failure RATE, not just latency. Over 1336 live user turns, 1138 <code>file_system</code> calls and 983 of them sat inside runs of ≥2 consecutive calls.</p>
   <p><b>"Batch file_system" is three different macros, not one.</b> The adjacent-pair split with the same-file share is what decides the shape:</p>
-  <table>
+  <div class="scroll"><table>
     <tr><th>pair</th><th>count</th><th>same file</th><th>what it actually is</th></tr>
     <tr><td><code>read_chunked → read_chunked</code></td><td>181</td><td>86%</td><td>PAGINATION — a smarter/larger read, <b>not built</b></td></tr>
     <tr><td><code>read → read</code></td><td>168</td><td>26%</td><td>MULTI-FILE READ — <code>paths</code></td></tr>
     <tr><td><code>read → replace</code></td><td>95</td><td>88%</td><td>look-before-you-leap, <b>not a batching problem</b></td></tr>
     <tr><td><code>replace → replace</code></td><td>66</td><td>88%</td><td>already one call via concatenated <code>&lt;&lt;&lt;&lt; SEARCH</code> envelopes</td></tr>
     <tr><td><code>replace → read</code></td><td>43</td><td>91%</td><td>the trailing verify-read — the post-edit view</td></tr>
-  </table>
+  </table></div>
   <p><b>Built.</b> (1) <code>paths</code>: several files in ONE <code>operation='read'</code>, each entry optionally carrying an inline range (<code>train.py:120-180</code>) so several REGIONS of one file also cost one call. (2) <code>post_edit_view</code>: a successful <code>replace</code> returns the changed lines as they now are ON DISK, with line numbers, so the follow-up read is unnecessary. It is derived by diffing prev vs new inside <code>_write_replace_guarded</code> — the single write site every rung of the matching ladder passes through — so it can never claim a change that was rolled back, and it reports what was actually written rather than what the matcher intended.</p>
   <p><b>Deliberately NOT built.</b> Paging (a different fix). Cross-FILE multi-edit: only ~8 of the 204 edit-cycle pairs cross a file boundary, which does not buy a change to the most defect-prone regex in this codebase (the SEARCH/REPLACE marker parser and its three fallback rungs). Batching any MUTATING operation: a batch delete/write is a data-loss shape with no measured demand behind it, so only <code>read</code> fans out.</p>
   <p><b>Multi-edit atomicity, stated rather than assumed.</b> The multi-block form is BEST-EFFORT per block and ATOMIC per file: every block that matched is spliced into one in-memory copy and written in a single <code>write_text</code>, and every block that did not match is named in the result. A partially-applied set therefore never reports a clean success — it reports "Applied N blocks" AND "M blocks failed". The rollback guards (marker leak, syntax regression) are all-or-nothing for the whole call.</p>

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -36,6 +39,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / workspace.py</h1>
   <p class="subtitle">Read-only view of the user's workspace state — file watchlist, scheduled-task outcomes, research artifacts, command outcomes, running narrative.</p>
 
@@ -44,7 +49,7 @@
   <p>It is the world-model counterpart to <a href="introspect.html"><code>introspect</code></a> (which reads the agent's selfhood). The writable counterpart is <a href="workspace_track.html"><code>workspace_track</code></a>.</p>
 
   <h2>Tool: <code>workspace</code></h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Returns</th><th>Backed by</th></tr></thead>
     <tbody>
       <tr><td><code>summary</code> (default)</td><td>Stats + running narrative + recent file changes + recent task outcomes + recent research — the natural "tell me what's been happening" snapshot.</td><td><code>WorkspaceModel.stats()</code>, <code>WorkspaceNarrative.latest()</code>, <code>scan_tracked()</code>, <code>activity.recent()</code></td></tr>
@@ -58,17 +63,17 @@
       <tr><td><code>recent</code></td><td>The full activity log, mixed kinds, newest last.</td><td><code>activity.recent()</code></td></tr>
       <tr><td><code>search</code> (alias <code>recall</code>)</td><td>Relevance-ranked keyword search over the whole activity log — pass <code>query</code>. IDF-weighted token overlap (the same zero-dependency scoring as selfhood's <code>search_my_past</code>), so a rare, distinctive term (a filename, a URL component) dominates a common one. Matches summaries, kinds, project ids and payload values. Added because models repeatedly <em>guessed</em> <code>action="search"</code> and burned a failure strike; the guess is now correct. The no-match reply redirects to the <code>recall</code> tool (stored facts / ingested docs) and <code>manage_projects</code> (project state).</td><td><code>activity.search()</code> via <code>WorkspaceModel.search_events()</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Parameters</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td><code>action</code></td><td>enum</td><td>One of <code>summary</code>, <code>stats</code>, <code>files</code>, <code>changes</code>, <code>tasks</code>, <code>research</code>, <code>commands</code>, <code>narrative</code>, <code>recent</code>, <code>search</code>. Defaults to <code>summary</code>. (<code>recall</code> is accepted as an unadvertised alias for <code>search</code> — kept out of the schema enum to stay lean.)</td></tr>
       <tr><td><code>limit</code></td><td>int</td><td>For <code>tasks</code> / <code>research</code> / <code>commands</code> / <code>recent</code> / <code>search</code>: how many entries to return. Defaults to 10; clamped to <code>[1, 50]</code>.</td></tr>
       <tr><td><code>query</code></td><td>string</td><td>Required for <code>search</code>: keywords to find in past workspace events. The near-miss arg names <code>q</code> / <code>text</code> / <code>keywords</code> are accepted too — the point of the action is to absorb guessed calls, not strike on them.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Failure semantics</h2>
   <ul>

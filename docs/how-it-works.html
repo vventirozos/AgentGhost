@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One message, end to end — Ghost Agent</title>
+<meta name="description" content="What happens between sending Ghost Agent a message and getting a reply: memory lookup, the tool loop, and the self-check.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a class="current" href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">How it works</span>
+  <h1>One message, end to end</h1>
+  <p class="subtitle">The same five steps from the home page, with the parts named — so when something goes wrong you know which one to look at.</p>
+
+  <h2>Where the pieces live</h2>
+  <p>Ghost is one process. Everything in the middle happens inside it; the bottom row is what it reaches out to.</p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 920 452" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Layer diagram: interfaces talk to the HTTP API, which drives the turn loop, which uses memory, the Docker sandbox, and the LLM server.">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path class="d-arrow" d="M0,1 L9,5 L0,9 Z"/>
+        </marker>
+      </defs>
+
+      <text class="d-title" x="20" y="14">What you talk to</text>
+      <rect class="d-box" x="20"  y="24" width="205" height="46" rx="7"/>
+      <text class="d-label" x="122" y="52" text-anchor="middle">Web page</text>
+      <rect class="d-box" x="245" y="24" width="205" height="46" rx="7"/>
+      <text class="d-label" x="347" y="52" text-anchor="middle">Slack</text>
+      <rect class="d-box" x="470" y="24" width="205" height="46" rx="7"/>
+      <text class="d-label" x="572" y="52" text-anchor="middle">Voice</text>
+      <rect class="d-box" x="695" y="24" width="205" height="46" rx="7"/>
+      <text class="d-label" x="797" y="52" text-anchor="middle">HTTP / curl</text>
+
+      <line class="d-line" x1="460" y1="70" x2="460" y2="98" marker-end="url(#ar)"/>
+
+      <rect class="d-box accent" x="20" y="106" width="880" height="46" rx="7"/>
+      <text class="d-label" x="460" y="128" text-anchor="middle">HTTP API — checks your key, then hands the message to the agent</text>
+      <text class="d-sub"   x="460" y="144" text-anchor="middle">port 8000</text>
+
+      <line class="d-line accent" x1="460" y1="152" x2="460" y2="182" marker-end="url(#ar)"/>
+
+      <text class="d-title" x="20" y="176">The turn loop</text>
+      <rect class="d-group" x="20" y="190" width="880" height="104" rx="9"/>
+      <rect class="d-box" x="41"  y="212" width="196" height="60" rx="7"/>
+      <text class="d-label" x="139" y="238" text-anchor="middle">Recall</text>
+      <text class="d-sub"   x="139" y="256" text-anchor="middle">what do I know?</text>
+      <rect class="d-box" x="255" y="212" width="196" height="60" rx="7"/>
+      <text class="d-label" x="353" y="238" text-anchor="middle">Think</text>
+      <text class="d-sub"   x="353" y="256" text-anchor="middle">answer or use a tool?</text>
+      <rect class="d-box" x="469" y="212" width="196" height="60" rx="7"/>
+      <text class="d-label" x="567" y="238" text-anchor="middle">Act</text>
+      <text class="d-sub"   x="567" y="256" text-anchor="middle">run the tool</text>
+      <rect class="d-box accent" x="683" y="212" width="196" height="60" rx="7"/>
+      <text class="d-label" x="781" y="238" text-anchor="middle">Check</text>
+      <text class="d-sub"   x="781" y="256" text-anchor="middle">is this answer real?</text>
+
+      <line class="d-line" x1="237" y1="242" x2="249" y2="242" marker-end="url(#ar)"/>
+      <line class="d-line" x1="451" y1="242" x2="463" y2="242" marker-end="url(#ar)"/>
+      <line class="d-line" x1="665" y1="242" x2="677" y2="242" marker-end="url(#ar)"/>
+
+      <path class="d-line" d="M567 272 L567 284 L353 284 L353 274" marker-end="url(#ar)"/>
+      <text class="d-sub" x="460" y="300" text-anchor="middle">repeat until done</text>
+
+      <line class="d-line" x1="160" y1="294" x2="160" y2="348" marker-end="url(#ar)"/>
+      <line class="d-line" x1="460" y1="308" x2="460" y2="348" marker-end="url(#ar)"/>
+      <line class="d-line" x1="760" y1="294" x2="760" y2="348" marker-end="url(#ar)"/>
+
+      <rect class="d-box" x="20"  y="356" width="280" height="70" rx="7"/>
+      <text class="d-label" x="160" y="384" text-anchor="middle">Memory</text>
+      <text class="d-sub"   x="160" y="404" text-anchor="middle">six stores, on your disk</text>
+
+      <rect class="d-box" x="320" y="356" width="280" height="70" rx="7"/>
+      <text class="d-label" x="460" y="384" text-anchor="middle">Docker sandbox</text>
+      <text class="d-sub"   x="460" y="404" text-anchor="middle">where code actually runs</text>
+
+      <rect class="d-box" x="620" y="356" width="280" height="70" rx="7"/>
+      <text class="d-label" x="760" y="384" text-anchor="middle">LLM server</text>
+      <text class="d-sub"   x="760" y="404" text-anchor="middle">called by every Think and Check</text>
+    </svg>
+    <p class="caption">Memory is files on your disk. The sandbox is a container. The LLM server is a separate process, usually on the same machine.</p>
+  </div>
+
+  <h2>The five steps in detail</h2>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>Your message arrives</h4>
+        <p>Whatever you used to send it, the message lands on the same HTTP endpoint. Ghost checks your key, attaches the message to a session so the conversation has history, and starts a turn.</p>
+        <span class="where">POST /api/chat &nbsp;·&nbsp; src/ghost_agent/api/routes.py</span>
+      </li>
+
+      <li>
+        <h4>Ghost recalls what it knows — before the model sees anything</h4>
+        <p>This is the step people miss. Ghost doesn't hand your message straight to the model. First it searches its memory stores <em>in parallel</em> — facts, relationships, lessons it has learned, and past episodes — and merges the results into a single ranked list.</p>
+        <p>Merging matters because the stores disagree. A fact that ranks 1st in one store and 4th in another should probably beat something that ranked 2nd in only one place. Ghost scores each result by its <em>position</em> in each list rather than by raw similarity, which lets it combine stores that don't share a scoring scale. The best few thousand characters get pasted in above your message.</p>
+        <span class="where">MemoryBus.hydrate_context() &nbsp;·&nbsp; src/ghost_agent/core/bus.py</span>
+        <p>If Ghost answers as though it forgot something it clearly knows, this is the step that failed — not the model. <a href="memory.html">What it remembers</a> covers how to inspect and correct it.</p>
+      </li>
+
+      <li>
+        <h4>The model decides: answer, or reach for a tool</h4>
+        <p>The model gets your message, the recalled context, and a description of every tool available. It either writes an answer or emits a tool call — a small structured request like "run this Python" or "read this file".</p>
+        <p>Ghost accepts tool calls in two formats, because local models are inconsistent about which they emit: the standard OpenAI <code>tool_calls</code> field, and an XML-ish <code>&lt;tool_call&gt;</code> block in the text. A malformed call gets one repair attempt before it's treated as a failure.</p>
+        <span class="where">src/ghost_agent/core/agent.py &nbsp;·&nbsp; src/ghost_agent/tools/registry.py</span>
+      </li>
+
+      <li>
+        <h4>The tool runs, and the result goes back to the model</h4>
+        <p>Anything that executes code or touches files runs inside the Docker container, not on your machine directly. Anything that reaches the internet goes through Tor. The result is appended to the conversation, and the model gets another go.</p>
+        <p>This loop repeats up to <strong>40 times</strong> in one turn. Most messages use one or two passes; a real task might use a dozen. If it hits the ceiling, Ghost stops and tells you it ran out of budget rather than looping forever.</p>
+        <span class="where">Tool implementations live in src/ghost_agent/tools/</span>
+      </li>
+
+      <li>
+        <h4>A second model checks the answer</h4>
+        <p>Before the answer is final, a separate check reads it against the evidence the tools actually produced and asks two questions, in this order: <em>does this answer what was asked?</em> and <em>is it supported by the evidence?</em></p>
+        <p>Order matters. The most common real failure isn't a wrong number — it's answering a different question than the one asked, or claiming a file was written when nothing was. If the check refuses with high confidence, Ghost gets a bounded number of attempts to fix the answer before it ships.</p>
+        <span class="where">src/ghost_agent/core/verifier.py</span>
+      </li>
+    </ol>
+  </div>
+
+  <h2>Two things that behave differently than you'd expect</h2>
+
+  <h3>Streaming answers are checked <em>after</em> they reach you</h3>
+  <p>When the reply streams word by word (the web UI does this), the text has already left before the check finishes. Blocking it would buy nothing — the words are on your screen. So the check runs in the background instead, and if it refuses the answer, you get a correction notice at the top of the <em>next</em> reply rather than a silent edit of the last one.</p>
+
+  <h3>Nothing happens instantly after you stop typing</h3>
+  <p>Ghost's background work is gated on you being idle. Two minutes of quiet before it starts consolidating its journal; ten minutes before memory consolidation; an hour before it starts practising. If you're chatting constantly, none of it runs — and it will never interrupt a turn in progress. <a href="self-improvement.html">How it improves itself</a> has the full schedule.</p>
+
+  <h2>Reading the log when a turn goes wrong</h2>
+  <p>The live console is designed to be watched. Each subsystem logs with its own icon, so you can follow a turn without reading every line. What to look for, by symptom:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Symptom</th><th>Which step failed</th><th>Where to look</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>"It forgot something I told it last week"</td>
+        <td>Step 2 — recall</td>
+        <td>The hydration line for that turn. If the fact isn't in the merged list, the retrieval missed it; if it is, the model ignored it.</td>
+      </tr>
+      <tr>
+        <td>It described running a tool but nothing happened</td>
+        <td>Step 3 — the tool call didn't parse</td>
+        <td>Look for a repair warning. A malformed call that fails repair becomes text, not an action.</td>
+      </tr>
+      <tr>
+        <td>A tool errored and it kept going anyway</td>
+        <td>Step 4</td>
+        <td>Tool failures are logged loudly. Repeated identical failures trip a guard that blocks the retry and hands the model the previous error instead.</td>
+      </tr>
+      <tr>
+        <td>"Done!" but the file isn't there</td>
+        <td>Step 5 should have caught it</td>
+        <td>Look for the verdict line. A refused answer that still shipped means the check ran late (streaming) — the correction is on the next turn.</td>
+      </tr>
+      <tr>
+        <td>It stopped mid-task</td>
+        <td>Step 4 hit the ceiling</td>
+        <td>A turn-budget message. The task needed more than 40 passes; break it into smaller asks.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="interfaces.html">
+      <span class="dir">Previous</span>
+      <span class="to">Ways to talk to it</span>
+    </a>
+    <a class="next" href="memory.html">
+      <span class="dir">Next</span>
+      <span class="to">What it remembers</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>core/agent.py</code>, <code>core/bus.py</code> and <code>api/routes.py</code> on 2026-08-04. The module-level detail lives in <a href="reference.html">the deep reference</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

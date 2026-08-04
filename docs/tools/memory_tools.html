@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -35,10 +38,12 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / memory.py — memory tool wrappers</h1>
   <p class="subtitle">LLM-facing wrappers around the underlying memory subsystem, plus the self-play control surface.</p>
 
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Tool</th><th>Backend</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>knowledge_base</code> (insert_fact)</td><td><a href="../memory/vector.html">vector</a> + optionally <a href="../memory/graph.html">graph</a></td><td>Insert fact with MD5 dedup; if <code>memory_bus</code> is present, asynchronously extracts <code>(subject, PREDICATE, object)</code> triplets via the worker LLM.</td></tr>
@@ -55,7 +60,7 @@
       <tr><td><code>stop_self_play</code></td><td>—</td><td>Signals the running loop to exit after its current cycle. No-op if no loop is running.</td></tr>
       <tr><td><code>list_lessons(scope="today", limit=20)</code></td><td><a href="../memory/skills.html">skills</a></td><td>Surface learned LESSONS (mistakes-and-fixes) filtered by local-time window. <code>scope ∈ {today, week, all, self_play_only}</code>. Routed automatically when the user asks "what did you learn today / so far?", "show me your lessons", "show me the lesson playbook". Distinct from <code>manage_skills</code>: a SKILL is a tool, a LESSON is a fix; "show me your skills" routes to <code>manage_skills</code>, NOT here.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2><code>unified_forget</code> — four-store sweep</h2>
   <p><code>forget(target)</code> sweeps four stores in order: disk (sandbox files), vector memory (fuzzy filename match + semantic sweep), the <a href="../memory/profile.html">profile</a>, and the <a href="../memory/graph.html">knowledge graph</a>. The profile pass is the one users notice, because the profile is injected into the system prompt every turn — so anything it misses keeps being "remembered".</p>

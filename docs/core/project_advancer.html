@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="planning.html">planning</a>
     <a class="current" href="project_advancer.html">project_advancer</a>
@@ -22,11 +25,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / project_advancer.py</h1>
   <p class="subtitle">Single autoadvance tick for long-running projects. Classifies the next task, runs one constrained step, and bookkeeps budget / runtime / contradictions.</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>classify_task(description) -&gt; "needs_user" | "coding" | "research"</code></td><td>Keyword-driven classifier (line 85).</td></tr>
@@ -36,7 +41,7 @@
       <tr><td><code>default_llm_classifier(context)</code> · <code>default_code_generator(context)</code></td><td>Build the LLM-backed per-task executors (or <code>None</code>); shared by the tool path and the idle autoadvancer.</td></tr>
       <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a <code>dream_digest</code>. Since 2026-07-19 it finally has its promised caller (every REM cycle, <a href="dream.html">core/dream.py</a>), an event-id watermark (only events since the last digest count — re-digestion spam was the failure mode of wiring it without one), and failure-outcome <code>work_log</code> events join the digest with a <code>failures</code> count in the payload.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Pacing — single turn vs. bounded batch (2026-06-20)</h2>
   <p>A user saying <em>"proceed" / "next"</em> is handled as a full agent turn

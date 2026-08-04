@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Metacognition uplift</h3>
     <a class="current" href="entropy.html">entropy</a>
     <a href="confidence.html">confidence</a>
@@ -21,11 +24,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / entropy.py — token-level Shannon entropy</h1>
   <p class="subtitle">Pure-function entropy math + a streaming-friendly rolling tracker. The objective-calibration half of the composite confidence score.</p>
 
   <h2>Public API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Symbol</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>compute_token_entropy(top_logprobs) -&gt; float</code></td><td>Shannon entropy (nats) of one token's top-K logprobs. Re-normalises the truncation, ignores non-finite inputs.</td></tr>
@@ -34,7 +39,7 @@
       <tr><td><code>extract_top_logprobs(chunk) -&gt; list[float] | None</code></td><td>Pulls top-K logprobs out of an OpenAI-compatible streaming chunk. Recognises both <code>logprobs.content[*].top_logprobs</code> and llama.cpp's flat <code>logprobs.top_logprobs</code>. Lenient on shape; returns None on mismatch.</td></tr>
       <tr><td><code>request_logprobs(payload, top_k=5, native_nprobs_ok=True) -&gt; bool</code></td><td>Shapes a chat payload so the upstream returns token logprobs, picking the field set it will accept: no <code>tools</code> → portable OAI <code>logprobs</code>/<code>top_logprobs</code>; <code>tools</code> attached → the llama.cpp-native <code>n_probs</code> sidestep (llama-server 400s the OAI flag on tools+stream but its formatter emits logprobs whenever the slot sampled with <code>n_probs&gt;0</code> — verified live + master source, 2026-07-27). Kill: <code>GHOST_ENTROPY_TOOLS_NPROBS=0</code>; callers pass <code>native_nprobs_ok=False</code> after a live rejection (the agent latches <code>context._nprobs_rejected</code>).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Invariants</h2>
   <ul>

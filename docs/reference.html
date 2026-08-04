@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deep reference — Ghost Agent</title>
+<meta name="description" content="Index of the module-level Ghost Agent reference pages: core, memory, tools, sandbox, API, interfaces and algorithms.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a class="current" href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Reference</span>
+  <h1>Deep reference</h1>
+  <p class="subtitle">A page per module, written for people changing the code. Dense, precise, and assumes you know the vocabulary.</p>
+
+  <div class="note warn">
+    <strong>Read this first.</strong> These pages are an engineering record, not a user guide. They record <em>why</em> a mechanism is shaped the way it is — including the bugs that shaped it — which makes them invaluable when you're modifying something and impenetrable when you're trying to learn the system. If you're new, use the guide pages in the sidebar; come back here when you need to change code.
+    <br><br>
+    Keep the <a href="glossary.html">glossary</a> open beside them.
+  </div>
+
+  <h2>System-level</h2>
+  <div class="card-grid">
+    <a class="card" href="architecture.html"><h3>System architecture</h3><p>How the layers fit together, with the full component diagram.</p></a>
+    <a class="card" href="capabilities.html"><h3>Capabilities</h3><p>The complete feature inventory.</p></a>
+    <a class="card" href="installation.html"><h3>Install &amp; run</h3><p>Every environment variable and dependency.</p></a>
+    <a class="card" href="cli_reference.html"><h3>CLI reference</h3><p>All 64 flags, in full.</p></a>
+    <a class="card" href="logging.html"><h3>Logging &amp; monitoring</h3><p>Reading the live stream and the icon catalog.</p></a>
+    <a class="card" href="audit_fixes.html"><h3>Audit &amp; hardening</h3><p>The correctness and security passes, with what each one found.</p></a>
+    <a class="card" href="self_improvement.md"><h3>Self-improvement substrate</h3><p>eval → distill → router → optim → skills_auto → reflection.</p></a>
+    <a class="card" href="claude_trainer.html"><h3>Claude trainer</h3><p>The offline training harness.</p></a>
+  </div>
+
+  <h2>Algorithms</h2>
+  <p>Cross-cutting mechanisms, each spanning several modules. Usually the best place to start in this section.</p>
+  <div class="card-grid">
+    <a class="card" href="algorithms/request_lifecycle.html"><h3>Request lifecycle</h3><p>The turn loop in full detail.</p></a>
+    <a class="card" href="algorithms/memory_hydration.html"><h3>Memory hydration</h3><p>Retrieval fan-out and rank fusion.</p></a>
+    <a class="card" href="algorithms/dream_cycle.html"><h3>Dream &amp; self-play</h3><p>The idle-time learning cycle.</p></a>
+    <a class="card" href="algorithms/skill_acquisition.html"><h3>Skill acquisition</h3><p>How a repeated procedure becomes a tool.</p></a>
+    <a class="card" href="algorithms/selfhood.html"><h3>Selfhood</h3><p>Autobiographical memory and continuity.</p></a>
+    <a class="card" href="algorithms/workspace.html"><h3>Workspace continuity</h3><p>The outward-facing world model.</p></a>
+    <a class="card" href="algorithms/metacognition.html"><h3>Metacognition</h3><p>The optional self-monitoring stack.</p></a>
+    <a class="card" href="algorithms/mandatory_tor.html"><h3>Mandatory Tor</h3><p>How fail-closed egress is enforced.</p></a>
+    <a class="card" href="algorithms/circuit_breaker.html"><h3>Circuit breaker</h3><p>Taking failing nodes out of rotation.</p></a>
+    <a class="card" href="algorithms/node_offload.html"><h3>Node offload</h3><p>Moving work to secondary machines.</p></a>
+    <a class="card" href="algorithms/cross_project_map.html"><h3>Cross-project map</h3><p>Relating work across projects.</p></a>
+    <a class="card" href="algorithms/tool_ontology.html"><h3>Tool ontology</h3><p>Whether the toolbox is carved up correctly.</p></a>
+    <a class="card" href="algorithms/selfhood_functional_report.html"><h3>Selfhood test report</h3><p>Functional test results for the selfhood stack.</p></a>
+    <a class="card" href="algorithms/prm.md"><h3>PRM notes</h3><p>The process reward model.</p></a>
+  </div>
+
+  <h2>Core <span class="card-count">the reasoning loop</span></h2>
+  <div class="card-grid">
+    <a class="card" href="core/agent.html"><h3>agent</h3><p>The turn loop, tool dispatch, streaming, sampling.</p></a>
+    <a class="card" href="core/llm.html"><h3>llm</h3><p>Upstream client, node pools, routing, failover.</p></a>
+    <a class="card" href="core/bus.html"><h3>bus</h3><p>Memory fan-out and rank fusion.</p></a>
+    <a class="card" href="core/verifier.html"><h3>verifier</h3><p>The self-check, escalation and repair.</p></a>
+    <a class="card" href="core/planning.html"><h3>planning</h3><p>Task trees and postcondition gating.</p></a>
+    <a class="card" href="core/prompts.html"><h3>prompts</h3><p>The system prompt and its assembly.</p></a>
+    <a class="card" href="core/context_manager.html"><h3>context_manager</h3><p>Context budgeting and compaction.</p></a>
+    <a class="card" href="core/dream.html"><h3>dream</h3><p>Consolidation and synthetic self-play.</p></a>
+    <a class="card" href="core/sessions.html"><h3>sessions</h3><p>Conversation storage.</p></a>
+    <a class="card" href="core/coding_executor.html"><h3>coding_executor</h3><p>The code-generation path.</p></a>
+    <a class="card" href="core/mcts.html"><h3>mcts</h3><p>Lookahead over candidate actions.</p></a>
+    <a class="card" href="core/hypothesis.html"><h3>hypothesis</h3><p>Parallel hypothesis testing.</p></a>
+    <a class="card" href="core/uncertainty.html"><h3>uncertainty</h3><p>Tracking what it doesn't know.</p></a>
+    <a class="card" href="core/confidence.html"><h3>confidence</h3><p>The composite confidence score.</p></a>
+    <a class="card" href="core/calibration.html"><h3>calibration</h3><p>Making confidence match reality.</p></a>
+    <a class="card" href="core/entropy.html"><h3>entropy</h3><p>Token-level uncertainty signals.</p></a>
+    <a class="card" href="core/risk.html"><h3>risk</h3><p>The risk governor and triage.</p></a>
+    <a class="card" href="core/arbiter.html"><h3>arbiter</h3><p>Dual-solver arbitration.</p></a>
+    <a class="card" href="core/triggers.html"><h3>triggers</h3><p>Trigger taxonomy and replan bus.</p></a>
+    <a class="card" href="core/experiments.html"><h3>experiments</h3><p>Live randomised arms.</p></a>
+    <a class="card" href="core/strikes.html"><h3>strikes</h3><p>Error-strike accounting.</p></a>
+    <a class="card" href="core/failure_dimension.html"><h3>failure_dimension</h3><p>Classifying how a run failed.</p></a>
+    <a class="card" href="core/frontier_selection.html"><h3>frontier_selection</h3><p>Choosing what to practise.</p></a>
+    <a class="card" href="core/self_play_scoring.html"><h3>self_play_scoring</h3><p>Scoring a practice attempt.</p></a>
+    <a class="card" href="core/solution_novelty.html"><h3>solution_novelty</h3><p>Detecting repeated solutions.</p></a>
+    <a class="card" href="core/adversarial_generator.html"><h3>adversarial_generator</h3><p>Generating hard challenges.</p></a>
+    <a class="card" href="core/challenge_templates.html"><h3>challenge_templates</h3><p>The challenge template set.</p></a>
+    <a class="card" href="core/journal_challenges.html"><h3>journal_challenges</h3><p>Challenges mined from the journal.</p></a>
+    <a class="card" href="core/project_advancer.html"><h3>project_advancer</h3><p>Autonomous project ticks.</p></a>
+    <a class="card" href="core/project_safety.html"><h3>project_safety</h3><p>Budgets and human gates.</p></a>
+    <a class="card" href="core/project_research.html"><h3>project_research</h3><p>Research inside a project.</p></a>
+    <a class="card" href="core/autonomous_activity.html"><h3>autonomous_activity</h3><p>The background activity ledger.</p></a>
+    <a class="card" href="core/workspace_cleanup.html"><h3>workspace_cleanup</h3><p>Tidying the sandbox.</p></a>
+    <a class="card" href="core/delegation.html"><h3>delegation</h3><p>Sub-agents, jobs and pipelines.</p></a>
+  </div>
+
+  <h2>Memory <span class="card-count">the stores</span></h2>
+  <div class="card-grid">
+    <a class="card" href="memory/vector.html"><h3>vector</h3><p>The semantic store, ingestion and re-ranking.</p></a>
+    <a class="card" href="memory/graph.html"><h3>graph</h3><p>Entities and relationships.</p></a>
+    <a class="card" href="memory/profile.html"><h3>profile</h3><p>Durable facts about the user.</p></a>
+    <a class="card" href="memory/skills.html"><h3>skills</h3><p>The lesson playbook.</p></a>
+    <a class="card" href="memory/journal.html"><h3>journal</h3><p>The short-term queue.</p></a>
+    <a class="card" href="memory/episodes.html"><h3>episodes</h3><p>Action sequences and outcomes.</p></a>
+    <a class="card" href="memory/scratchpad.html"><h3>scratchpad</h3><p>Per-conversation notes.</p></a>
+    <a class="card" href="memory/projects.html"><h3>projects</h3><p>The project store.</p></a>
+    <a class="card" href="memory/frontier.html"><h3>frontier</h3><p>Uncertainty tracking for practice.</p></a>
+    <a class="card" href="memory/competence.html"><h3>competence</h3><p>Per-task-type competence profile.</p></a>
+    <a class="card" href="memory/adaptive_threshold.html"><h3>adaptive_threshold</h3><p>Self-tuning retrieval thresholds.</p></a>
+    <a class="card" href="memory/contradiction_log.html"><h3>contradiction_log</h3><p>Recording conflicting facts.</p></a>
+    <a class="card" href="memory/readonly.html"><h3>readonly</h3><p>The read-only memory view.</p></a>
+  </div>
+
+  <h2>Tools</h2>
+  <div class="card-grid">
+    <a class="card" href="tools/registry.html"><h3>registry</h3><p>How tools are declared, dispatched and validated.</p></a>
+    <a class="card" href="tools/execute.html"><h3>execute</h3><p>Running code in the sandbox.</p></a>
+    <a class="card" href="tools/file_system.html"><h3>file_system</h3><p>Reads, writes, search and path safety.</p></a>
+    <a class="card" href="tools/browser.html"><h3>browser</h3><p>Driving a real browser.</p></a>
+    <a class="card" href="tools/search.html"><h3>search</h3><p>Web search and deep research over Tor.</p></a>
+    <a class="card" href="tools/darkweb_search.html"><h3>darkweb_search</h3><p>Onion search engines.</p></a>
+    <a class="card" href="tools/database.html"><h3>database</h3><p>The Postgres admin tool.</p></a>
+    <a class="card" href="tools/memory_tools.html"><h3>memory tools</h3><p>recall, knowledge_base, profile, scratchpad.</p></a>
+    <a class="card" href="tools/system.html"><h3>system</h3><p>Health, weather, location.</p></a>
+    <a class="card" href="tools/vision.html"><h3>vision</h3><p>Image and PDF analysis.</p></a>
+    <a class="card" href="tools/image_gen.html"><h3>image_gen</h3><p>Image generation.</p></a>
+    <a class="card" href="tools/report_pdf.html"><h3>report_pdf</h3><p>PDF report generation.</p></a>
+    <a class="card" href="tools/swarm.html"><h3>swarm</h3><p>Fan-out delegation.</p></a>
+    <a class="card" href="tools/tasks.html"><h3>tasks</h3><p>Scheduled and reactive tasks.</p></a>
+    <a class="card" href="tools/projects.html"><h3>projects</h3><p>The project management tool.</p></a>
+    <a class="card" href="tools/introspect.html"><h3>introspect</h3><p>Reading its own state.</p></a>
+    <a class="card" href="tools/workspace.html"><h3>workspace</h3><p>Reading the world model.</p></a>
+    <a class="card" href="tools/workspace_track.html"><h3>workspace_track</h3><p>Writing to the world model.</p></a>
+    <a class="card" href="tools/acquired_skills.html"><h3>acquired_skills</h3><p>Tools Ghost wrote for itself.</p></a>
+    <a class="card" href="tools/composed_skills.html"><h3>composed_skills</h3><p>Chaining skills together.</p></a>
+    <a class="card" href="tools/tool_failure.html"><h3>tool_failure</h3><p>Failure classification.</p></a>
+    <a class="card" href="tools/fallback_chains.html"><h3>fallback_chains</h3><p>What to try when a tool fails.</p></a>
+  </div>
+
+  <h2>Sandbox, API and interfaces</h2>
+  <div class="card-grid">
+    <a class="card" href="sandbox/docker.html"><h3>Docker sandbox</h3><p>Container lifecycle, mounts, limits, networking.</p></a>
+    <a class="card" href="sandbox/services.html"><h3>Sandbox services</h3><p>Long-lived services and port leases.</p></a>
+    <a class="card" href="api/routes.html"><h3>HTTP routes</h3><p>Every endpoint.</p></a>
+    <a class="card" href="api/projects_routes.html"><h3>Project routes</h3><p>The project API.</p></a>
+    <a class="card" href="api/game_routes.html"><h3>Game routes</h3><p>The game endpoints.</p></a>
+    <a class="card" href="interfaces/web_server.html"><h3>Web server</h3><p>The web UI process.</p></a>
+    <a class="card" href="interfaces/slack_bot.html"><h3>Slack bot</h3><p>Socket-mode bot.</p></a>
+    <a class="card" href="interfaces/voice_server.html"><h3>Voice</h3><p>Speech in and out.</p></a>
+    <a class="card" href="interfaces/image_gen_server.html"><h3>Image-gen server</h3><p>The GPU companion service.</p></a>
+    <a class="card" href="interfaces/clockwork_ghost.html"><h3>Desktop client</h3><p>The standalone app.</p></a>
+    <a class="card" href="interfaces/cli.html"><h3>CLI</h3><p>The terminal client.</p></a>
+  </div>
+
+  <h2 id="coverage">What this reference doesn't cover</h2>
+  <p>Being straight about the gaps, so you don't go looking for a page that isn't here. As of 2026-08-04 these parts of <code>src/ghost_agent/</code> have no page in this section — though <a href="self-improvement.html">How it improves itself</a> now explains what the learning-stack packages among them actually do:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Package</th><th>What's in it</th></tr></thead>
+    <tbody>
+      <tr><td><code>selfhood/</code></td><td>The implementation behind the <a href="algorithms/selfhood.html">selfhood algorithm page</a> — autobiographical store, narrative, recognition, values.</td></tr>
+      <tr><td><code>workspace/</code></td><td>Likewise for <a href="algorithms/workspace.html">workspace continuity</a> — activity ledger, reactions, state.</td></tr>
+      <tr><td><code>distill/</code></td><td>Trajectory collection, redaction, outcome heuristics, user-correction promotion.</td></tr>
+      <tr><td><code>reflection/</code></td><td>The reflection loop and post-mortem engine.</td></tr>
+      <tr><td><code>skills_auto/</code></td><td>Automatic skill extraction, consolidation and verification.</td></tr>
+      <tr><td><code>prm/</code> · <code>router/</code></td><td>The two self-trained local models — features, labels, training, scoring.</td></tr>
+      <tr><td><code>optim/</code></td><td>Prompt and tool-description optimisation, A/B evaluation.</td></tr>
+      <tr><td><code>eval/</code></td><td>The evaluation suite, baselines and benches.</td></tr>
+      <tr><td><code>utils/</code></td><td>Logging, redaction, the egress guard, tokenisation, constraint handling.</td></tr>
+      <tr><td>~20 <code>core/</code> modules</td><td>Including <code>metacog</code>, <code>turns</code>, <code>subagent</code>, <code>jobs</code>, <code>counterfactual</code>, <code>learning_health</code>, <code>rrf_weights</code>, <code>stream_guards</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The <a href="self_improvement.md">self-improvement overview</a> is the best single entry point for the packages in the top half of that table.</p>
+
+  <div class="note">
+    <strong>Two pages describe modules that no longer exist:</strong> <a href="core/workspace_model.html">core/workspace_model</a> (the code now lives in <code>workspace/model.py</code>) and <a href="tools/qwen_bridge.html">tools/qwen_bridge</a> (removed). <a href="core/agent_qwen.html">core/agent_qwen</a> is an intentional tombstone. They're kept so existing links don't break — treat their contents as historical.
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="glossary.html">
+      <span class="dir">Previous</span>
+      <span class="to">Glossary</span>
+    </a>
+    <span></span>
+  </div>
+
+  <footer>
+    <p>Coverage checked against <code>src/ghost_agent/</code> on 2026-08-04. Individual pages carry their own dates and may be older.</p>
+  </footer>
+</main>
+</body>
+</html>

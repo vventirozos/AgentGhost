@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Measurement</h3>
     <a href="experiments.html">experiments</a>
     <a class="current" href="risk.html">risk</a>
@@ -20,18 +23,20 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / risk.py — the throttle that finally consumes the risk estimate</h1>
   <p class="subtitle">Depth predicts failure. The calibrated composite predicts failure. Neither had a consumer. This module is the consumer — live (a steer) and offline (triage ranking).</p>
 
   <h2>The gap</h2>
   <p>Two failure predictors were measured on this agent and then used for nothing:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Signal</th><th>Measured</th><th>Consumer before this</th></tr></thead>
     <tbody>
       <tr><td>Turn DEPTH</td><td>17.8% failure at step 1 → 35.6% at 4 → 42.3% at 6 → 52.0% at 8 → <strong>60.6% at 12</strong> (§4H, 342 labelled trajectories)</td><td>none</td></tr>
       <tr><td>Calibrated composite</td><td>AUC 0.727 post-hoc</td><td>none — <code>_METACOG_ARBITER_ENABLED = False</code>; logged, never acted on</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>So the agent could tell you it was probably failing, and did nothing differently.</p>
 
   <h2>Live half — the risk governor</h2>
@@ -40,7 +45,7 @@ score = 0.5·depth_prior + 0.3·effort_struggle + 0.2·failure_pressure
 steer  ⟺  step ≥ 6  AND  score ≥ 0.50
   </pre>
   <p>Worked examples (verified against the implementation):</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Turn</th><th>score</th><th>steer?</th></tr></thead>
     <tbody>
       <tr><td>step 6, 5 clean calls</td><td>0.30</td><td>no — a normal working turn</td></tr>
@@ -48,7 +53,7 @@ steer  ⟺  step ≥ 6  AND  score ≥ 0.50
       <tr><td>step 10, 10 calls, 2-repeat, 1 failure</td><td>0.51</td><td>yes (measured ~56% failure)</td></tr>
       <tr><td>step 12, 12 calls, 3-repeat, 2 failures</td><td>0.63</td><td>yes</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     The steer is one appended user-role message, fired at most once per request, telling the
     model to (1) state what is CONFIRMED vs ASSUMED, (2) run the single smallest
@@ -70,7 +75,7 @@ steer  ⟺  step ≥ 6  AND  score ≥ 0.50
     Before trusting a trigger, check it fires at all — and on the right turns. Replaying the
     gate over every recorded user turn:
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Measure</th><th>Value</th></tr></thead>
     <tbody>
       <tr><td>turns the steer would fire on</td><td><strong>101 / 1323 = 7.6%</strong> — the tail, not everything</td></tr>
@@ -78,7 +83,7 @@ steer  ⟺  step ≥ 6  AND  score ≥ 0.50
       <tr><td>failure rate, all resolved turns</td><td>0.277</td></tr>
       <tr><td>failure rate, fired-on turns</td><td><strong>0.543</strong></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     So the gate selects a population with roughly <strong>double</strong> the base failure rate.
     That is a targeting result, not an effect: it says the steer is aimed at the right turns, not
@@ -136,14 +141,14 @@ steer  ⟺  step ≥ 6  AND  score ≥ 0.50
   </ul>
 
   <h2>Kill switches</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Env</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>GHOST_RISK_STEER=0</code></td><td>Live steer off outright (beats the arm assignment).</td></tr>
       <tr><td><code>GHOST_EXPERIMENTS=0</code></td><td>Every request on the control path — also disables the steer, and stops all arm stamping.</td></tr>
       <tr><td><code>GHOST_TRIAGE_RANKING=0</code></td><td>Reflection reverts to chronological selection.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 </main>
 </body>
 </html>

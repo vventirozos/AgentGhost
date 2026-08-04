@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="dream.html">dream</a>
     <a href="frontier_selection.html">frontier_selection</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / solution_novelty.py</h1>
   <p class="subtitle">Structural novelty of a candidate <code>solution.py</code> against prior winning solutions for the same cluster — closes the 2026-05-17 "no learning signal" gap.</p>
 
@@ -31,14 +36,14 @@
   <p>This module gives the scorer a real gradient: when a solver passes the same template a second time, did it find a <em>structurally different</em> solution, or did it just reproduce the prior winning shape verbatim? The former is real generalization; the latter is memorization and should not award learning credit.</p>
 
   <h2>Functions</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>canonical_hash(source) → str</code></td><td>16-char sha1 of the AST canonical form. Empty string when source doesn't parse.</td></tr>
       <tr><td><code>jaccard_novelty(source, prior_sources) → float</code></td><td>Novelty in [0, 1] of the new solution vs. a list of prior winning solutions for the same cluster.</td></tr>
       <tr><td><code>attempts_efficiency(attempts_used, max_attempts=3) → float</code></td><td>Maps attempts-to-pass onto a [0.2, 1.0] efficiency score: <code>{1 → 1.0, 2 → 0.5, 3 → 0.2}</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>What "canonical" means</h2>
   <p>The AST walker replaces variable names, attribute names, and literal values with placeholders before hashing. Two solutions that differ only in identifier names → same canonical hash → novelty 0.0.</p>

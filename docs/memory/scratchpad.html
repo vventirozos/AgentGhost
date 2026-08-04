@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / scratchpad.py — Scratchpad</h1>
   <p class="subtitle">In-memory LRU + optional SQLite persistence with per-entry TTL (default 24 h).</p>
 
@@ -39,7 +44,7 @@
   </ul>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__(max_entries=50, persist_path=None, ttl=86400, max_echo_chars=500)</code></td><td>LRU + TTL config; <code>max_echo_chars</code> bounds the <code>set()</code> ack only.</td></tr>
@@ -48,7 +53,7 @@
       <tr><td><code>list_all(namespace=_UNSET) / count() / delete(key) / clear()</code></td><td>Standard helpers; <code>list_all</code> can render one scope.</td></tr>
       <tr><td><code>clear_namespace(ns, protect=None) / keys_in_namespace(ns) / namespaces() / namespace_of(key) / keys()</code></td><td>Scope operations (2026-07-22). <code>clear_namespace</code> deletes exactly ONE scope, sparing <code>protect</code>ed keys.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Eviction model</h2>
   <ul>

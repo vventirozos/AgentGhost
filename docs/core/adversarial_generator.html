@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="dream.html">dream</a>
     <a href="frontier_selection.html">frontier_selection</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / adversarial_generator.py</h1>
   <p class="subtitle">Per-prompt-fingerprint solver pass-rate tracker. Biases the next challenge-generation prompt toward families that have been stumping the solver.</p>
 
@@ -31,7 +36,7 @@
   <p>This module is the tiny state store for proposal G in the 2026-05-17 redesign. It tracks, per generator-prompt fingerprint, the recent solver pass rate on challenges produced under that prompt. The dreamer reads this score and biases the next generator prompt toward families with <em>low</em> solver pass rates — i.e. toward what's actually stumping the agent.</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function / method</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>fingerprint_prompt(prompt_fragment) → str</code></td><td>Stable 12-char sha1 of the variable part of the generator prompt (typically the frontier hint).</td></tr>
@@ -41,7 +46,7 @@
       <tr><td><code>.worst_fingerprints(limit=3) → list[(fp, rate, top_cluster)]</code></td><td>The N fingerprints with the lowest pass rates.</td></tr>
       <tr><td><code>.suggest_bias() → str</code></td><td>A short prose block to inject into the challenge-generator prompt. Empty when no signal yet.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Wiring</h2>
   <p><code>core/dream.synthetic_self_play</code> calls <code>suggest_bias()</code> at the top of the system prompt and appends the returned block <em>before</em> the saturation override. The challenge-gen LLM sees something like:</p>

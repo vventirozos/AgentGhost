@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -35,12 +38,14 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / vision.py</h1>
   <p class="subtitle">Multi-modal analysis via the visual LLM pool. PDF rasterisation to JPEG; URL or file inputs.</p>
 
   <h2>Tool: <code>vision_analysis</code></h2>
   <p>Auto-registered when the LLM client supports vision.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Default prompt</th></tr></thead>
     <tbody>
       <tr><td><code>graph_analysis</code></td><td>Analyse this graph/chart. Extract key data points, trends, legends, and conclusions.</td></tr>
@@ -49,7 +54,7 @@
       <tr><td><code>extract_text_pdf</code></td><td>Extract all text and describe any diagrams from these document pages exactly as written.</td></tr>
       <tr><td><code>verify_ui</code></td><td><em>No default — <code>prompt</code> is REQUIRED.</em> Answers the caller's ONE specific question about the image as a JSON verdict <code>{answer, confidence, evidence, details}</code>, judged strictly from the pixels.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2><code>verify_ui</code>: the question channel (2026-07-31)</h2>
   <p><strong>The incident.</strong> Debugging its own pinball game (req <code>66d64313</code>), the agent verified five successive geometry fixes with bare <code>describe_picture</code> calls. Each ~30&nbsp;s round-trip returned a generic caption; the agent had to <em>infer</em> "is the ball out of the launcher channel?" from prose, misjudged one frame, and the late verifier REFUTED the turn because the coordinates its claim leaned on were <q>not found in the vision</q> output — a caption structurally cannot carry them.</p>

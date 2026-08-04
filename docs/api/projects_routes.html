@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>API</h3>
     <a href="routes.html">routes</a>
     <a class="current" href="projects_routes.html">projects routes</a>
@@ -21,13 +24,15 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>api / projects_routes.py</h1>
   <p class="subtitle">REST surface over the <code>ProjectStore</code>. Used by the Slack <code>project</code> commands and the web UI's Projects tab.</p>
 
   <p>All endpoints require <code>X-Ghost-Key</code>.</p>
 
   <h2>Project endpoints</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>GET /api/projects</td><td>List, optionally filtered by status.</td></tr>
@@ -40,10 +45,10 @@
       <tr><td>POST /api/projects/{pid}/advance</td><td>Run one task-advancement cycle via <a href="../core/project_advancer.html"><code>advance_once()</code></a> with a project-pinned tool runner; 503 when no runner can be built (2026-07-20 — see below).</td></tr>
       <tr><td>GET /api/projects/{pid}/events</td><td>List project events. Query: <code>limit</code>, <code>type</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Task endpoints</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>GET /api/projects/{pid}/tasks</td><td>List with optional <code>status</code> filter.</td></tr>
@@ -51,7 +56,7 @@
       <tr><td>PATCH /api/projects/{pid}/tasks/{tid}</td><td>Update. Status transitions go through <code>ProjectPlan.update_status()</code> so postconditions / parent propagation fire.</td></tr>
       <tr><td>DELETE /api/projects/{pid}/tasks/{tid}</td><td>Cascade-delete descendants.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Route hardening (2026-07-20)</h2>
   <ul>

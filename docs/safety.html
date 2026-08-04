@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Safety and privacy — Ghost Agent</title>
+<meta name="description" content="What leaves your machine when Ghost Agent runs, what can't, and how the Tor and sandbox rules are actually enforced.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a class="current" href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Running it</span>
+  <h1>Safety and privacy</h1>
+  <p class="subtitle">Three boundaries: what reaches the internet, what reaches your filesystem, and who can reach Ghost. Each one is enforced by a mechanism, not by a promise.</p>
+
+  <h2>What leaves your machine</h2>
+
+  <p>Start with the honest version of the answer, because "nothing leaves your machine" would be a lie:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Traffic</th><th>Goes where</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Your conversations</td>
+        <td><span class="badge good">Nowhere</span></td>
+        <td>Stored as files under <code>$GHOST_HOME</code>. Never uploaded.</td>
+      </tr>
+      <tr>
+        <td>Model inference</td>
+        <td><span class="badge good">Your LLM server</span></td>
+        <td>Usually <code>127.0.0.1</code>. It doesn't cross a network boundary unless you put the model on another machine yourself.</td>
+      </tr>
+      <tr>
+        <td>Web search and page fetches</td>
+        <td><span class="badge">Tor</span></td>
+        <td>Including DNS — hostnames are resolved by the Tor exit, so your own DNS server never sees what you looked at.</td>
+      </tr>
+      <tr>
+        <td>Weather and location lookups</td>
+        <td><span class="badge">Tor</span></td>
+        <td>Same path as any other fetch.</td>
+      </tr>
+      <tr>
+        <td>Sandbox network access</td>
+        <td><span class="badge">Tor</span></td>
+        <td>When the container has network access at all.</td>
+      </tr>
+      <tr>
+        <td>Extra LLM machines you configured</td>
+        <td><span class="badge">Your LAN</span></td>
+        <td>Direct, on purpose. LAN traffic doesn't deanonymise anything.</td>
+      </tr>
+      <tr>
+        <td>Push notifications, if you set one up</td>
+        <td><span class="badge">Depends</span></td>
+        <td>A LAN or tailnet target is reached directly. A <em>public</em> target only ever over Tor, and skipped entirely if Tor is down.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>There is no vendor account anywhere in this list. Ghost holds no API keys for third-party services and has no ability to authenticate as you to anything. Search runs against scrapers over Tor rather than a keyed search API — which costs some result quality, and is a deliberate trade.</p>
+
+  <h2>How "everything goes through Tor" is actually enforced</h2>
+
+  <p>Asking every tool nicely to use the proxy doesn't work — one helper that forgets, and you have a silent cleartext leak that looks identical to working. So there are two mechanisms.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>At boot: a liveness probe</h4>
+        <p>Ghost checks that Tor is actually reachable before it finishes starting. If it isn't, Ghost <strong>refuses to start</strong> rather than starting in a state where the network tools would quietly fall back to direct connections.</p>
+      </li>
+      <li>
+        <h4>At runtime: a process-wide socket guard</h4>
+        <p>The outbound socket calls are patched for the life of the process. Any attempt to connect <em>directly to a public address</em> raises an error instead of connecting.</p>
+        <p>Note what this does <em>not</em> block: loopback and LAN addresses are fine. That's not a hole — Tor traffic leaves via the local SOCKS proxy on <code>127.0.0.1</code>, so from the socket layer's point of view all anonymised traffic <em>is</em> a loopback connection. The only thing the guard can see and block is a connection that bypassed Tor, which is exactly the leak worth blocking.</p>
+      </li>
+    </ol>
+  </div>
+
+  <p>Both are on by default. Turn them off with <code>--no-mandatory-tor</code> or <code>GHOST_MANDATORY_TOR=0</code>.</p>
+
+  <div class="note warn">
+    <strong>The one time you need to turn it off.</strong> On a completely fresh install, the embedding model hasn't been downloaded yet — and the guard blocks that download, because it's a direct connection to a public host. Boot once with <code>--no-mandatory-tor</code> to let it cache, then run normally forever after. If your very first boot hangs or fails while loading the embedder, this is why.
+  </div>
+
+  <h3>Bounds on any single fetch</h3>
+  <p>A hostile exit node or a slow server shouldn't be able to hang the agent or exhaust its memory. Every outbound fetch is capped:</p>
+  <dl class="kv">
+    <dt>5 MB</dt>
+    <dd>Maximum response body. Anything larger is refused or truncated.</dd>
+    <dt>20 seconds</dt>
+    <dd>Request timeout.</dd>
+    <dt>Private ranges refused</dt>
+    <dd>A fetch aimed at a loopback, private or link-local address is rejected before the request is made — so a tool call can't be turned into a scanner of your own network.</dd>
+  </dl>
+
+  <h3>Changing Tor circuits</h3>
+  <p>When a page fetch comes back <strong>503</strong>, Ghost asks Tor for a fresh circuit and retries — a gateway rate-limit usually clears on a different exit node. <strong>401 and 403 do not</strong> trigger this: those mean "you're not allowed", and a new exit node won't change that.</p>
+  <p>Search works differently. Each query rides its own circuit through per-query proxy isolation rather than burning the whole circuit, which is cheaper and doesn't serialise searches behind a rotation.</p>
+
+  <h2>The sandbox</h2>
+
+  <p>Every piece of code Ghost runs goes into a Docker container. The boundary is real, and it's worth understanding its shape because it explains several behaviours that otherwise look like bugs.</p>
+
+  <div class="cols">
+    <div>
+      <h4>What the container can reach</h4>
+      <ul>
+        <li>One directory: <code>$GHOST_HOME/sandbox</code>, mounted as <code>/workspace</code>.</li>
+        <li>The internet, via Tor.</li>
+        <li>Services it started itself.</li>
+      </ul>
+    </div>
+    <div>
+      <h4>What it cannot</h4>
+      <ul>
+        <li>Any other part of your filesystem.</li>
+        <li>Processes you're running — it has its own PID namespace.</li>
+        <li>Your machine's <code>localhost</code>. The container's <code>127.0.0.1</code> is its own.</li>
+      </ul>
+    </div>
+  </div>
+
+  <p>That last one surprises people. If you ask Ghost to check the app you're running on <code>localhost:3000</code>, it genuinely cannot — it will reach its own empty loopback instead. Ghost is told this explicitly and will ask you to restart your own services rather than pretending to.</p>
+
+  <h3>Resource limits</h3>
+  <dl class="kv">
+    <dt>Memory</dt>
+    <dd>4 GB by default. Change with <code>GHOST_SANDBOX_MEM</code>.</dd>
+    <dt>Processes</dt>
+    <dd>Capped at 1024, so a fork bomb takes down the container rather than the host.</dd>
+    <dt>Base image</dt>
+    <dd><code>python:3.11-slim-bookworm</code>, with a cached provisioned image built after first use so later starts are fast.</dd>
+  </dl>
+
+  <div class="note">
+    <strong>The sandbox is not a security boundary against a determined attacker.</strong> It's a containment boundary against an agent that makes mistakes — which is the realistic threat when a language model is choosing the commands. Don't run Ghost as root, and don't mount anything into the sandbox that you'd mind losing.
+  </div>
+
+  <h2>Who can reach Ghost</h2>
+
+  <p>Requests carry an <code>X-Ghost-Key</code> header matching your <code>GHOST_API_KEY</code>.</p>
+
+  <dl class="kv terms">
+    <dt>Bound to localhost, no key</dt>
+    <dd>Runs with auth disabled. Fine — only processes on your machine can reach it.</dd>
+    <dt>Bound to anything else, no key</dt>
+    <dd><strong>Refuses to start.</strong> An unset key on a public bind is indistinguishable from a misconfiguration, so Ghost treats it as one. Pass <code>--api-key ''</code> if you genuinely want auth off on a trusted network.</dd>
+    <dt>Using the old default key</dt>
+    <dd>Ghost warns loudly. <code>ghost-secret-123</code> was a hardcoded default in an early version and is publicly known — anyone who has read the source can use it.</dd>
+  </dl>
+
+  <h2>The logs</h2>
+
+  <p>Ghost's live log is designed to be watched, which historically made it the largest cleartext sink in the system — everything the agent handled scrolled past in the clear. So <strong>redaction is on by default</strong>: secrets, API keys, <code>.onion</code> addresses, home directory paths and personal details are masked in both the console stream and the log file.</p>
+  <p>Pass <code>--no-redact-logs</code> when you're debugging and need to see the raw content. Don't leave it on.</p>
+
+  <h2>Sensible defaults, in one place</h2>
+  <ul>
+    <li>Run it as an ordinary user, never root.</li>
+    <li>Bind to <code>127.0.0.1</code> unless you actually need remote access — and if you do, use a tailnet rather than exposing the port.</li>
+    <li>Set a real <code>GHOST_API_KEY</code>, long and random.</li>
+    <li>Back up <code>$GHOST_HOME</code>. It's the whole agent, and nothing in it is recoverable from anywhere else.</li>
+    <li>Leave mandatory Tor and log redaction on.</li>
+  </ul>
+
+  <div class="pager">
+    <a class="prev" href="self-improvement.html">
+      <span class="dir">Previous</span>
+      <span class="to">How it improves itself</span>
+    </a>
+    <a class="next" href="configuration.html">
+      <span class="dir">Next</span>
+      <span class="to">Settings that matter</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>utils/egress_guard.py</code>, <code>utils/helpers.py</code>, <code>sandbox/docker.py</code> and <code>main.py</code> on 2026-08-04.</p>
+  </footer>
+</main>
+</body>
+</html>

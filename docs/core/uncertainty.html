@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="verifier.html">verifier</a>
@@ -18,20 +21,22 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / uncertainty.py — UncertaintyTracker</h1>
   <p class="subtitle">Metacognitive monitor that records unknowns and assumptions so the agent can decide when to ask the user vs. proceed.</p>
 
   <h2>Data shapes</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>Unknown</code> (line 21)</td><td>what · impact (1-5) · resolution · resolved · resolved_value · timestamp</td></tr>
       <tr><td><code>Assumption</code> (line 40)</td><td>claim · confidence (0.0-1.0) · basis · verified · was_correct · timestamp</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>flag_unknown(what, impact=3, resolution="ask user") -&gt; Unknown</code></td><td>Record an unknown the agent encountered. Returns the <code>Unknown</code> object so the caller can resolve it later without tracking indices.</td></tr>
@@ -42,7 +47,7 @@
       <tr><td><code>get_risk_summary() -&gt; str</code></td><td>Human-readable summary appended to the agent's final response.</td></tr>
       <tr><td><code>get_context_for_prompt() -&gt; str</code></td><td>Markdown for prompt injection (critical unknowns + risky assumptions).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Dual-dispatch API (object-or-index)</h2>
   <p>Before the fix, <code>flag_unknown</code> returned an <code>Unknown</code> but <code>resolve_unknown</code> only accepted an int. Holding the returned object and passing it back — the natural call shape — raised <code>TypeError: '&lt;=' not supported between instances of 'int' and 'Unknown'</code>.</p>

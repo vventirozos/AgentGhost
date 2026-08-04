@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ways to talk to it — Ghost Agent</title>
+<meta name="description" content="The web UI, Slack, voice, the desktop client, the CLI and the raw HTTP API — what each one is good for and how to start it.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a class="current" href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Start here</span>
+  <h1>Ways to talk to it</h1>
+  <p class="subtitle">The agent itself has no user interface — it's an HTTP service. Everything below is a separate program that talks to it, and you can run as many or as few as you like.</p>
+
+  <div class="note">
+    <strong>They all share one brain.</strong> Memory, projects and learned lessons are the agent's, not the interface's. Start something in Slack and finish it in the web UI and Ghost knows it's the same work.
+  </div>
+
+  <h2>Pick one</h2>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Interface</th><th>Best for</th><th>Runs as</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Web UI</strong></td><td>Day-to-day use. The most complete one.</td><td>A separate process on port 8080</td></tr>
+      <tr><td><strong>Slack</strong></td><td>Reaching it from your phone without setting up anything else.</td><td>A separate process</td></tr>
+      <tr><td><strong>Voice</strong></td><td>Hands-free. Speak, hear the answer.</td><td>Built into the web UI</td></tr>
+      <tr><td><strong>Desktop client</strong></td><td>A dedicated always-on screen.</td><td>A separate app</td></tr>
+      <tr><td><strong>CLI</strong></td><td>Scripting, quick one-off questions.</td><td>A command</td></tr>
+      <tr><td><strong>HTTP API</strong></td><td>Building something of your own.</td><td>The agent itself</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h2>Web UI</h2>
+  <p>The main way to use Ghost. A chat interface with the things a local agent needs: file upload, generated-file download, a live view of the agent's log while it works, memory correction controls, and a project view.</p>
+
+  <figure class="shot">
+    <img src="assets/img/webui.png" alt="The Ghost Agent web interface: a session list on the left, and a dark chat view whose background is a slowly moving 3D graph."
+         width="1100" height="688" loading="lazy">
+    <figcaption>Sessions on the left, the conversation in the middle, and the agent's state rendered behind it.</figcaption>
+  </figure>
+
+  <pre class="shell">python interface/server.py</pre>
+
+  <p>Then open <code>http://localhost:8080</code>. It's a separate process from the agent, so you can restart either without losing the other — and if the page loads but nothing responds, that tells you the agent is down rather than the UI.</p>
+
+  <h3>The background is a status display</h3>
+
+  <p>The moving graph behind the chat isn't decoration — it's driven by what the agent is actually doing. At rest it drifts slowly and stays cold. When you send something, the camera <em>dives into</em> the graph and it runs hot until the work finishes, then pulls back out.</p>
+
+  <p>Both clips below are one real turn — asking about the weather, which sends the agent out through Tor to fetch it. Watch the status line at the bottom left: it names the step as it happens.</p>
+
+  <div class="clips">
+    <figure class="shot">
+      <img src="assets/img/webui-vortex.gif" alt="Animation: the vortex form is sparse and blue at rest, then brightens to red and engulfs the camera while the agent fetches the weather."
+           width="440" height="283" loading="lazy">
+      <figcaption><strong>vortex</strong> — the default. A collapse toward a dark centre; the request pulls you into it.</figcaption>
+    </figure>
+    <figure class="shot">
+      <img src="assets/img/webui-cube.gif" alt="Animation: the cube form is a dark grid at rest, then one region wakes and spreads through it in red while the agent works."
+           width="440" height="283" loading="lazy">
+      <figcaption><strong>cube</strong> — a dark lattice with something living in it. A turn wakes one region, which spreads and re-weaves the grid.</figcaption>
+    </figure>
+  </div>
+
+  <p>There are ten forms in total. Four are organic — <code>abyssal</code>, <code>horizon</code>, <code>cortex</code>, <code>vortex</code> — and five borrow the machine's own internals as anatomy: <code>lattice</code> (a weight tensor), <code>stack</code> (transformer layers with a residual column running through them), <code>embedding</code> (concept clusters, with a query comet igniting the one it recalls), <code>descent</code> (a loss landscape with an optimizer bead rolling downhill), and <code>cube</code>. The tenth, <code>empty</code>, turns it off.</p>
+
+  <p>The button in the header cycles them and your choice sticks. The colour scheme is deliberately two-pole — deep blue for cold analysis, dark red for hot intent — so the only thing your eye has to track is temperature. If you have reduced motion enabled in your OS, the dive is capped to a slight lean.</p>
+
+  <h3>The live log panel</h3>
+  <p>The most useful and least obvious feature. It streams the agent's own log next to the conversation, so when a turn takes forty seconds you can see which tool it's sitting in rather than watching a spinner. If you're ever unsure whether Ghost is working or stuck, look here first.</p>
+
+  <h3>On a phone</h3>
+  <p>The UI installs as a home-screen app. That needs HTTPS with a certificate the phone will trust, which in practice means putting it behind a tailnet with a real certificate rather than a self-signed one. Once installed, a turn that was in flight when you closed the app resumes when you reopen it rather than being lost.</p>
+
+  <h2>Slack</h2>
+  <p>A bot that connects out to Slack, so it works from anywhere without exposing a port to the internet.</p>
+
+  <pre class="shell">python interface/externals/slack_bot/main.py</pre>
+
+  <div class="note warn">
+    <strong>It only answers its owner.</strong> The bot is locked to a single Slack user ID — mentions from anyone else in the workspace are ignored. This is deliberate: the bot can run code on your machine, and a shared Slack channel is not an access-control boundary.
+  </div>
+
+  <p>A healthy Slack bot is <em>quiet</em>. Its error log staying empty is the signal that it's fine; check the info log for its heartbeat if you want positive confirmation it's alive.</p>
+
+  <h2>Voice</h2>
+  <p>Built into the web UI rather than a separate service. Speech-to-text runs on a worker node over your tailnet; text-to-speech is the local <code>say</code> command on macOS.</p>
+  <p>Both halves are local or tailnet-only, which matters: no cloud speech service means no account, no API key, and your voice never leaves your own network. That constraint is why it's built this way rather than using a hosted transcription API.</p>
+
+  <h2>Desktop client</h2>
+  <p>A standalone app that renders the same interface in a native window, built for a dedicated always-on device. It keeps a local chat log and remembers which face it was last showing.</p>
+  <p>Lives in <code>interface/externals/clockwork_ghost/</code> with its own deploy script.</p>
+
+  <h2>CLI</h2>
+  <p>A small command for asking a question from a terminal or a shell script.</p>
+  <pre class="shell">interface/externals/cli/ghost "what's the disk usage on the server?"</pre>
+  <p>Useful in a pipeline, or when you want an answer without leaving the terminal.</p>
+
+  <h2>The HTTP API</h2>
+  <p>Everything above is a client of this. The API is Ollama-compatible, so tools that already speak Ollama can point at Ghost with no changes.</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Endpoint</th><th>What it's for</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/chat</code></td><td>Send a message. Streaming or not.</td></tr>
+      <tr><td><code>POST /v1/chat/completions</code></td><td>The OpenAI-shaped equivalent, for OpenAI-compatible clients.</td></tr>
+      <tr><td><code>GET /api/health</code></td><td>Is it alive, and is it healthy? See <a href="getting-started.html">Install and run it</a>.</td></tr>
+      <tr><td><code>GET /api/sessions</code></td><td>List, read and delete stored conversations.</td></tr>
+      <tr><td><code>POST /api/upload</code> · <code>GET /api/download/…</code></td><td>Move files in and out of the sandbox.</td></tr>
+      <tr><td><code>POST /api/memory/correct</code></td><td>Fix something Ghost has stored wrong.</td></tr>
+      <tr><td><code>POST /api/turn/cancel</code></td><td>Stop a turn that's in progress.</td></tr>
+      <tr><td><code>GET /api/notifications/pending</code></td><td>Anything the agent needs you for.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>Every one of these needs the <code>X-Ghost-Key</code> header unless you're on localhost with no key configured. The full route list is in <a href="api/routes.html">the API reference</a>.</p>
+
+  <h2>Image generation</h2>
+  <p>Not an interface — a companion service. If you have a machine with a GPU, run the image-generation server on it and point Ghost at it with <code>--image-gen-nodes</code>. Without one configured, the image tool simply doesn't appear in Ghost's toolbox, and it won't offer to make pictures it can't make.</p>
+
+  <div class="pager">
+    <a class="prev" href="getting-started.html">
+      <span class="dir">Previous</span>
+      <span class="to">Install and run it</span>
+    </a>
+    <a class="next" href="how-it-works.html">
+      <span class="dir">Next</span>
+      <span class="to">One message, end to end</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>interface/</code> and <code>src/ghost_agent/api/routes.py</code> on 2026-08-04. Per-interface detail is in <a href="reference.html">the deep reference</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

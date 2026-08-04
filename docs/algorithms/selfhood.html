@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Selfhood</h1>
   <p class="subtitle">A five-component module that stitches the agent's episodic instances into one continuous first-person self. Each new process boot reads back what prior instances wrote — autobiographical experiences, open questions, mood, the running diary — and frames them as <em>mine</em> rather than as external knowledge.</p>
 
@@ -97,7 +102,7 @@
   <ul>
     <li><strong>Local-only.</strong> Same rule as every other Stage-1 module — no external teacher, no hosted embedder. The narrative summariser calls Ghost's own upstream LLM (the same one that serves user turns), no API key, no third-party model.</li>
     <li><strong>JSON / JSONL on disk.</strong> Human-diffable, no pickle, easy to inspect, easy to migrate. Schema versioned via <code>SCHEMA_VERSION = "v1"</code> on <code>SelfState</code>; future migrations bump to <code>v2</code>.</li>
-    <li><strong>Sink failures swallowed.</strong> Every disk write is wrapped — a failed autobio append must never break a user turn. Same discipline as <a href="../distill/collector.html">distill.TrajectoryCollector</a>.</li>
+    <li><strong>Sink failures swallowed.</strong> Every disk write is wrapped — a failed autobio append must never break a user turn. Same discipline as <code>distill.TrajectoryCollector</code>.</li>
     <li><strong>Anchor-before-await invariant.</strong> The biological phase 2.8 consolidation advances <code>_last_narrative_at</code> BEFORE the LLM call, matching phases 2 / 2.5 / 2.6 / 2.7. A crash mid-consolidation cannot pin the cooldown un-advanced and cause re-fire every tick.</li>
     <li><strong>Disable paths.</strong> <code>--no-self-model</code> is a kill switch; <code>--no-memory</code> also disables the whole module. Disabled mode attaches a no-op facade so call sites never branch on availability — the inner methods short-circuit on <code>enabled=False</code>.</li>
   </ul>
@@ -116,7 +121,7 @@
   <p><code>$GHOST_HOME/system/selfhood/</code> mirrors the shape of <code>$GHOST_HOME/system/memory/</code> — same parent directory, same non-sandboxed location (the autobiographical record survives sandbox wipes / <code>docker volume rm</code>).</p>
 
   <h3>Bounded growth (2026-07-07)</h3>
-  <p>The diary had <em>no</em> cap and grew monotonically, while the per-turn hot path did 3-4 full-file O(n) parses plus one O(n) rewrite — quadratic over the agent's lifetime. It now follows the same compaction pattern as <a href="../workspace/activity.html">workspace/activity.jsonl</a>: on append, once the file passes <code>_COMPACT_MAX_BYTES</code> (2 MB) it is rewritten keeping the newest <code>_COMPACT_KEEP_LINES</code> (2000) entries, with the dropped entries rolled into a single <code>[Consolidated] N earlier entries…</code> summary record at the head so the narrative layer still knows earlier history existed. Compaction clears the IDF/search cache so the next search rebuilds against the compacted contents. <code>recent(N)</code> now reads only the tail (a bounded <code>deque</code> over the lines, parsing only the last N) instead of materialising and parsing the whole log on every wake-up prefix / reference-note call. Covered by <code>tests/test_autobiographical_bounds.py</code>.</p>
+  <p>The diary had <em>no</em> cap and grew monotonically, while the per-turn hot path did 3-4 full-file O(n) parses plus one O(n) rewrite — quadratic over the agent's lifetime. It now follows the same compaction pattern as <code>workspace/activity.jsonl</code>: on append, once the file passes <code>_COMPACT_MAX_BYTES</code> (2 MB) it is rewritten keeping the newest <code>_COMPACT_KEEP_LINES</code> (2000) entries, with the dropped entries rolled into a single <code>[Consolidated] N earlier entries…</code> summary record at the head so the narrative layer still knows earlier history existed. Compaction clears the IDF/search cache so the next search rebuilds against the compacted contents. <code>recent(N)</code> now reads only the tail (a bounded <code>deque</code> over the lines, parsing only the last N) instead of materialising and parsing the whole log on every wake-up prefix / reference-note call. Covered by <code>tests/test_autobiographical_bounds.py</code>.</p>
 
   <h2>The capture path (per turn)</h2>
   <pre><code>        handle_chat(messages)
@@ -190,7 +195,7 @@ Recent things I remember doing:
   <p>The narrative is no longer purely experiential. <code>consolidate_narrative()</code> accepts <code>meta_insights</code>, and phase 2.8 gathers recent failure patterns from <code>SkillMemory</code> — the convergence point where both dream-extracted heuristics and reflection-phase failure patterns land. Combined with the autobiographical <code>cluster</code> counts, this lets the diary say <em>"I keep making type-coercion mistakes in SQL"</em> rather than only <em>"I did a SQL task"</em>. The wake-up prefix therefore carries genuine self-knowledge, not just a log.</p>
 
   <p>Phase positioning is deliberate:</p>
-  <table>
+  <div class="scroll"><table>
     <thead>
       <tr><th>Phase</th><th>Idle window</th><th>Reads</th><th>Writes</th></tr>
     </thead>
@@ -203,7 +208,7 @@ Recent things I remember doing:
       <tr><td><strong>2.8: Narrative</strong></td><td><strong>900–3600 s</strong></td><td><strong>autobio + state + SkillMemory failures</strong></td><td><strong>narrative.md</strong></td></tr>
       <tr><td>3: Self-play</td><td>&gt;3600 s</td><td>frontier</td><td>synthetic challenges</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>The narrative phase is CPU-cheap (one LLM round-trip on a small prompt). Side effects are local files only.</p>
 
   <h2>Public API surface</h2>
@@ -269,7 +274,7 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
   <p>Reads go through <code>SelfModel.stats()</code>, <code>SelfModel.recall_relevant()</code>, <code>autobio.recent()</code>, and <code>narrative.latest()</code>; nothing is mutated. Disabled selfhood returns a clear "unavailable" message rather than crashing the turn. Source: <a href="../tools/introspect.html"><code>tools/introspect.py</code></a>.</p>
 
   <h2>CLI flags</h2>
-  <table>
+  <div class="scroll"><table>
     <thead>
       <tr><th>Flag</th><th>Default</th><th>Behaviour</th></tr>
     </thead>
@@ -278,7 +283,7 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
       <tr><td><code>--no-memory</code></td><td>off</td><td>Already disabled persistent stores; also disables selfhood.</td></tr>
       <tr><td><code>--self-narrative-cooldown N</code></td><td>3600</td><td>Seconds between biological-phase-2.8 narrative regenerations.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Testing</h2>
   <p>Per-module unit tests under <code>tests/</code>:</p>

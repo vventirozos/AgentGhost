@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
@@ -21,12 +24,14 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>interface / externals / clockwork_ghost</h1>
   <p class="subtitle">PyQt6 desktop client (Raspberry Pi cyberdeck) with 3D visualisation, voice I/O, camera capture, and TTS playback.</p>
 
   <h2>client.py</h2>
   <h3>Outbound HTTP</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>POST /api/chat</code></td><td>Streaming chat. SSE chunks accumulated in <code>conversation_history</code>; sentence boundaries (<code>.?!</code>) push to TTS queue.</td></tr>
@@ -38,7 +43,7 @@
         only source of the waiting bubble's <a href="#turn-status">turn-status caption</a>.
         Read-only, reconnecting, never fatal.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>UI layout</h3>
   <p>
@@ -86,7 +91,7 @@
   <div class="note warn">
     <strong>Two wrong targets, both shipped before the right one (2026-08-03).</strong>
     "Hide the UI" looks like it should hide a panel; it has to hide the sheet.
-    <table>
+    <div class="scroll"><table>
       <thead><tr><th>Hiding…</th><th>Result</th></tr></thead>
       <tbody>
         <tr><td><code>left_widget</code></td><td>Chips and bar stayed up, <strong>and the bar jumped
@@ -100,7 +105,7 @@
         <tr><td><code>overlay</code> ✓</td><td>Everything goes, and the stretch trap cannot fire at
           all because nothing <em>inside</em> the layout changes.</td></tr>
       </tbody>
-    </table>
+    </table></div>
     <strong>General rule for this file: never hide a widget that carries a stretch factor — hide
     its contents, or hide the whole sheet.</strong> Guarded by
     <code>tests/test_clockwork_client_ui.py</code>.

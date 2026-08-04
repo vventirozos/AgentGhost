@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -35,18 +38,20 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / system.py</h1>
   <p class="subtitle">Diagnostics, weather, location, Tor / Internet connectivity.</p>
 
   <h2>Tool: <code>system_utility</code></h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Handler</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>check_health</code></td><td><code>tool_check_health</code> (line 208-404)</td><td>Platform / CPU / memory / disk via <code>psutil</code>; Docker version via subprocess; Internet ping (Cloudflare 1.1.1.1); Tor anonymity check; agent internals (LLM client, memory, graph, sandbox, biological-watchdog status).</td></tr>
       <tr><td><code>check_weather</code></td><td><code>tool_get_weather</code> (line 12-160)</td><td>Open-Meteo first (geolocation + forecast), <code>wttr.in</code> fallback. Looks up location in <a href="../memory/profile.html">profile_memory</a>. 3 retries with Tor identity refresh.</td></tr>
       <tr><td><code>check_location</code></td><td><code>tool_check_location</code> (line 186-196)</td><td>Searches profile for location/city/address keys.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <p>All HTTP calls honour the configured Tor SOCKS proxy when <code>TOR_PROXY</code> is set.</p>
 

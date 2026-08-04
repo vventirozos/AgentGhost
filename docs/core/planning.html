@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="agent_qwen.html">agent_qwen</a>
@@ -34,11 +37,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / planning.py</h1>
   <p class="subtitle">Hierarchical task tree with dependency types, postcondition gating, alternatives, and revision tracking.</p>
 
   <h2>Data model</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Variants / fields</th></tr></thead>
     <tbody>
       <tr><td><code>TaskStatus</code> enum (line 9)</td><td>PENDING · READY · IN_PROGRESS · DONE · FAILED · BLOCKED · PAUSED · NEEDS_USER</td></tr>
@@ -46,10 +51,10 @@
       <tr><td><code>TaskNode</code> (line 32)</td><td>id, description, status, parent_id, children, dependency_type, alternatives, postconditions, <strong>depends_on</strong>, estimated_cost, actual_cost, revision_count, result_summary, failure_reason, actual_tool_used, depth, position</td></tr>
       <tr><td><code>depends_on</code></td><td>Sibling-DAG prerequisites — task ids that must be DONE before this node is eligible. Distinct from <code>dependency_type</code> (which governs parent/child rollup); <code>depends_on</code> orders <em>peers</em>. Empty = no prerequisites.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>add_task(description, parent_id, status, dependency_type, alternatives, postconditions)</code></td><td>Insert task, return id (line 60).</td></tr>
@@ -62,7 +67,7 @@
       <tr><td><code>request_revision(task_id, failure_reason)</code></td><td>Increment revision_count, reset to PENDING if &lt;3 (line 394); also unblocks a parent BLOCKED by this task. <code>ProjectPlan</code> overrides this with a persistent counterpart (2026-07-20, see <em>Plan-gate hardening</em> below).</td></tr>
       <tr><td><code>load_from_json(json_data)</code></td><td>Stateful merge (no clear) so concurrent edits survive; coerces malformed planner fields (2026-07-20, see below).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Example tree</h2>
   <div class="diagram">

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="hypothesis.html">hypothesis</a>
@@ -19,11 +22,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / verifier.py — Verifier</h1>
   <p class="subtitle">Reflective self-evaluation: a separate LLM call (worker pool when possible) confirms / refutes the agent's conclusion before it reaches the user.</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields / signature</th></tr></thead>
     <tbody>
       <tr><td><code>VerifyVerdict</code> (line 24)</td><td>CONFIRMED · REFUTED · UNCERTAIN</td></tr>
@@ -33,7 +38,7 @@
       <tr><td><code>async verify_visual(symptom, claim, after_image, before_image=None)</code></td><td>Look at the rendered pixels and decide whether the agent's RESPONSE honestly matches them (catches false "it's fixed" claims; an honest "still broken" is CONFIRMED, not penalized). Returns <code>None</code> (skip, no penalty) when nothing renderable is available.</td></tr>
       <tr><td><code>async adversarial_probe(problem, solution) -&gt; List[dict]</code></td><td>Generate 3-5 edge cases the solution might fail on (line 259).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Routing</h2>
   <p>Tries <code>llm_client.route(task="VERIFY", max_tokens=2048, ...)</code> against the worker pool first — both cheaper and a different "perspective" than the foreground model. Falls back to a direct foreground call if the worker pool is empty or its circuit is open. When a dedicated critic pool is configured (<code>--critic-nodes</code>) it takes precedence over both, with its own budget (<code>GHOST_CRITIC_CALL_TIMEOUT</code>, default 120&nbsp;s).</p>
@@ -63,13 +68,13 @@
 
   <h4>Two directions, four arms</h4>
   <p>Escalation is <strong>two-directional</strong> since the CONFIRM escalation landed, and the directions are independent, so an arm that names only "escalated" can mislead in either direction:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>direction</th><th>fires on</th><th>effect</th><th>moves</th></tr></thead>
     <tbody>
       <tr><td><code>_escalate_refute</code></td><td>any cheap <code>REFUTED</code></td><td>main model re-adjudicates; <em>its verdict wins</em></td><td>FPR and TPR</td></tr>
       <tr><td><code>_escalate_confirm</code></td><td>a <strong>HIGH-STAKES</strong> cheap <code>CONFIRMED</code> (a tool failed this turn)</td><td>verdict never flips; confidence capped to 0.6, below every ≥0.7 gate</td><td>the actionable false-CONFIRM rate only</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>The CONFIRM direction fires only when the caller passes <code>high_stakes=</code>, and <code>run_trials</code> never did — so it was structurally dead in the bench even with the two-leg client installed, the same shape as the missing worker route. Bench cases now carry the flag: <code>BenchCase.high_stakes</code> is <strong>tri-state</strong> (<code>None</code> = derive, an explicit bool pins the case), and derivation runs <code>looks_like_tool_error</code> — production's own sniffer, not a second copy — over each segment of the packed evidence digest. Segmenting matters because that sniffer only scans the first 120 characters for its text markers, so one blob check sees only the first tool's head: measured on the 86-case mined pool, <strong>segmented 14 (16.3%) vs blob-only 10 (11.6%)</strong>. It is an honest <em>lower</em> bound — the digest is budget-truncated, so a failed tool trimmed out entirely is invisible.</p>
   <p>Derivation is resolved <em>per trial, after the fault</em>. That is deliberate: <code>silent_failure</code> replaces the evidence with a tool error under an unchanged success claim, which IS the population <code>_escalate_confirm</code> exists for, and it is what makes the hand-authored seed set exercise the direction at all (0 of 21 seed cases are naturally high-stakes; 70 of 107 <code>silent_failure</code> trials are — not 107, because one of the three injected failure bodies is <code>(empty output)</code>, which production does not class as an error either).</p>
   <p>So the arm has <strong>four</strong> values — <code>raw_judge</code>, <code>judge+escalation(refute)</code>, <code>judge+escalation(confirm)</code>, <code>judge+escalation</code> — and only the last is production-equivalent. A stale reader comparing <code>arm == "judge+escalation"</code> therefore <em>fails</em> on a half-escalated run instead of silently accepting it.</p>

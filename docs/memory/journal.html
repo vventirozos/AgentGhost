@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / journal.py — MemoryJournal</h1>
   <p class="subtitle">FIFO work queue consumed by the dream consolidator.</p>
 
@@ -61,7 +66,7 @@
   <p><strong>Consequence for the "is there work?" checks:</strong> the biological watchdog's phase-1 gate and the self-play inter-cycle drain now ask <code>pending_count()</code> (hot + overflow), <em>not</em> <code>len(load())</code> — otherwise overflow-only work (a burst that spilled, or a preemption requeue) would sit undrained forever. Tests: <code>tests/test_journal.py</code> (burst-loses-nothing, push-front-to-overflow, crash-recovery-to-overflow), <code>tests/test_memory_audit_fixes.py</code>, <code>tests/test_smart_memory_requeue.py</code>.</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__(path, max_capacity=256)</code></td><td>Bind path, set the HOT-buffer cap. Surplus spills to <code>memory_journal.overflow.json</code>, never dropped.</td></tr>
@@ -75,7 +80,7 @@
       <tr><td><code>RetryableConsolidationError</code> / <code>is_upstream_transient(exc)</code> / <code>JOURNAL_MAX_RETRIES</code></td><td>The bounded re-queue contract for the drain loop (2026-07-09). A journal item is removed by <code>pop_all()</code> <em>before</em> processing, so a task failure after that used to be a permanent, invisible loss: an upstream 503 during the smart-memory consolidation was retried at the HTTP layer (worker failover + one 2s 5xx retry in the client) but on final failure the item was swallowed by a bare <code>logger.error</code> — and a main-node <em>timeout</em> got no HTTP-layer retry at all. Now <code>run_smart_memory_task</code> classifies upstream-transient failures (5xx / timeout / connection, via <code>is_upstream_transient</code>) and raises <code>RetryableConsolidationError</code> <em>before any memory write</em>; <code>process_journal_queue</code> catches it, re-queues the item with an incremented <code>retries</code> counter (visible <code>WARNING</code> + 🔄), and drops it — with a visible <code>WARNING</code> + 🔶 — only past <code>JOURNAL_MAX_RETRIES</code> (2). Definitive failures (4xx, parse errors) keep the old log-and-drop path since a re-run would fail identically. Tests: <code>tests/test_smart_memory_requeue.py</code>.</td></tr>
       <tr><td><code>load()</code></td><td>Read current journal without clearing.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
 
   <h2>Audit fixes (2026-07-26)</h2>

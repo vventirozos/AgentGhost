@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Selfhood — functional test report</h1>
   <p class="subtitle">End-to-end behavioural verification of the selfhood module against the live Ghost Agent process. 2026-05-11. Companion to <a href="selfhood.html">the architecture doc</a>.</p>
 
@@ -40,7 +45,7 @@
 
   <h2>Phase 1 — main suite (selfhood enabled, freshly wiped state)</h2>
   <p><strong>Result: 17 / 18 checks PASS.</strong></p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Section</th><th>Checks</th><th>Detail</th></tr></thead>
     <tbody>
       <tr><td>A. Capture pipeline</td><td>5/5 PASS</td><td>5 prompts → 5 autobio entries, all <code>subject="self"</code>, all share trajectory id, all first-person framed, all <code>user_first_words</code> populated</td></tr>
@@ -51,7 +56,7 @@
       <tr><td>G. Corrupt-state recovery</td><td>2/2 PASS</td><td>Corrupting <code>state.json</code> does not crash; module recovers to empty state and is immediately writeable</td></tr>
       <tr><td>H. Unity probe</td><td>1/3 PASS, 2 soft</td><td>Agent describes its persistence mechanism. ON ITS OWN it recalled the exact "9 word count" turn from Section B — strong concrete recall</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>The Section C failure — substantive, not a bug</h3>
   <p>The wake-up prefix correctly <strong>rendered</strong> the injected open question ("Why do trapdoor functions feel asymmetric?") alongside the recent experiences (HTTP, banana, 2+2). Both pieces of content went into the system prompt as intended.</p>
@@ -84,13 +89,13 @@
   <h2><code>introspective_consistency</code> probe</h2>
   <p>Full report: <code>introspective_consistency_runs/run_20260511T195757.md</code>.</p>
   <p>Adversarial paraphrase test, N=5 paraphrases per probe, two bands:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>band</th><th>n_probes</th><th>median mode-share</th><th>median entropy</th><th>median parse rate</th></tr></thead>
     <tbody>
       <tr><td>introspective</td><td>4</td><td>0.600</td><td>1.371 bits</td><td>1.000</td></tr>
       <tr><td>factual</td><td>4</td><td><strong>1.000</strong></td><td><strong>0.000 bits</strong></td><td>1.000</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <div class="note">
     <strong>Verdict (from the probe script):</strong> introspective consistency materially below factual (gap = +0.40). Supports the confabulation hypothesis.

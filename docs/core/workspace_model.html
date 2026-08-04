@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="planning.html">planning</a>
@@ -18,20 +21,22 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / workspace_model.py — WorkspaceModel</h1>
   <p class="subtitle">Structured snapshot of sandbox state so the agent doesn't re-read every file every turn.</p>
 
   <h2>Data shapes</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>FileState</code> (line 21)</td><td>path · size · content_hash · file_type · last_modified · last_read_turn · summary · columns · row_count</td></tr>
       <tr><td><code>WorkspaceDiff</code> (line 47)</td><td>added · removed · modified lists, plus a <code>summary()</code> helper</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>scan(sandbox_dir) -&gt; WorkspaceDiff</code></td><td>Walk filesystem, stat files, return diff vs. last snapshot.</td></tr>
@@ -43,7 +48,7 @@
       <tr><td><code>get_context_for_prompt(max_files=20) -&gt; str</code></td><td>Markdown section for prompt injection.</td></tr>
       <tr><td><code>advance_turn()</code></td><td>Increment internal turn counter.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Skip rules</h2>
   <p>The scanner ignores hidden directories, <code>__pycache__</code>, <code>node_modules</code>, and <code>.git</code>. Synchronous.</p>

@@ -1,48 +1,63 @@
 /* =========================================================================
-   Ghost Agent — documentation theme
-   A calm, dark, documentation-first design. Typography-led hierarchy,
-   refined spacing, subtle depth. Every existing class name from the
-   generated HTML is preserved; styles are refined, not renamed.
+   Ghost Agent — documentation theme  ·  "night shift"
+   -------------------------------------------------------------------------
+   The agent runs on your own hardware, mostly while you're not watching.
+   The theme is that room: a cool dark desk, one warm lamp.
+
+   Design rules this file follows:
+     · One accent (ember). Everything else is neutral. Green/red are
+       reserved for on/off and safe/unsafe — never for decoration.
+     · Prose is never coloured. Links are body-coloured with an ember
+       underline, so a paragraph reads as a paragraph.
+     · Monospace is the "system chrome" face: step numbers, eyebrows,
+       table headings, captions. Sans is for prose. Nothing else.
+     · Zero external requests. No web fonts, no CDN. The docs fail closed
+       the same way the agent does.
+     · Body text is 17px / 1.7 at a ~68ch measure. Readability is the brief.
+
+   The signature is the CIRCUIT NODE: a small ring with a dark centre.
+   It's the logo mark, and it's every numbered step on every flow diagram.
    ========================================================================= */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
 :root {
-  /* Surface palette — flat navy softened with a trace of warmth. */
-  --bg:         #0b0d12;
-  --bg-soft:    #10141c;
-  --bg-card:    #161b26;
-  --bg-hover:   #1c2230;
-  --border:     #242b3c;
-  --border-soft:#1c2230;
+  /* ---- Surfaces: cool dark slate, never pure black (pure black + white
+         text haloes badly over long reading sessions). ---- */
+  --bg:         #16181f;
+  --bg-2:       #1c1f28;   /* cards, callouts, sidebar */
+  --bg-3:       #232733;   /* hover, inline code, raised chips */
+  --bg-code:    #11131a;   /* code blocks sit BELOW the page, not above */
+  --line:       #2b3040;
+  --line-soft:  #232732;
 
-  /* Text */
-  --fg:         #e8ecf4;
-  --fg-muted:   #b4bccc;
-  --fg-dim:     #7d8699;
-  --fg-faint:   #535c6e;
+  /* ---- Text: four steps, all of them legible. ---- */
+  --text:       #f2f4f9;   /* headings                    15.5:1 */
+  --body:       #c9cfdd;   /* body copy                   11.0:1 */
+  --muted:      #99a1b3;   /* captions, meta, sublabels    6.2:1 */
+  --faint:      #6d7488;   /* markers + rules only — not for text */
 
-  /* Accents — a narrower, more editorial set. */
-  --accent:     #8ab4ff;
-  --accent-2:   #c0a7ff;
-  --accent-soft:rgba(138,180,255,0.12);
-  --good:       #6fd4a4;
-  --warn:       #f0b96a;
-  --bad:        #f07070;
+  /* ---- Accent: one lamp. ---- */
+  --ember:      #ffa657;
+  --ember-lo:   rgba(255, 166, 87, 0.14);
+  --ember-mid:  rgba(255, 166, 87, 0.40);
 
-  /* Code */
-  --code-bg:    #0a0d13;
-  --code-fg:    #d9e2f5;
+  /* ---- Semantics: on/off, safe/unsafe. Nothing else. ---- */
+  --mint:       #67d9a8;
+  --gold:       #f0c674;
+  --rose:       #ff8b8b;
 
-  /* Type */
-  --sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* ---- Type ---- */
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text",
+          "Segoe UI", system-ui, Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, "Cascadia Mono",
+          "Segoe UI Mono", "Roboto Mono", Consolas, monospace;
 
-  /* Motion */
-  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  /* ---- Metrics ---- */
+  --measure: 68ch;
+  --rail:    2.15rem;      /* diameter of a circuit node */
+  --ease:    cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 
-* { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: border-box; }
 
 html {
   scroll-behavior: smooth;
@@ -53,210 +68,239 @@ html, body {
   margin: 0;
   padding: 0;
   background: var(--bg);
-  color: var(--fg);
+  color: var(--body);
   font-family: var(--sans);
-  font-size: 15px;
-  line-height: 1.6;
-  font-feature-settings: 'cv11', 'ss01', 'ss03', 'cv02';
+  font-size: 17px;
+  line-height: 1.7;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
 }
 
 body {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 268px minmax(0, 1fr);
   min-height: 100vh;
-  background:
-    radial-gradient(1200px 600px at -10% -10%, rgba(138,180,255,0.04), transparent 60%),
-    radial-gradient(1000px 500px at 110% 10%, rgba(192,167,255,0.035), transparent 55%),
-    var(--bg);
-  background-attachment: fixed;
 }
 
-::selection { background: rgba(138,180,255,0.28); color: #fff; }
+::selection { background: rgba(255, 166, 87, 0.26); color: #fff; }
 
-/* Custom scrollbars (webkit) — thin, tonal, fades out. */
-::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar { width: 11px; height: 11px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,0.06);
-  border-radius: 10px;
-  border: 2px solid transparent;
+  background: #2f3547;
+  border-radius: 99px;
+  border: 3px solid transparent;
   background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.12); background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #3d445a; background-clip: padding-box; }
+
 
 /* =========================================================================
    Sidebar
    ========================================================================= */
 
 aside.sidebar {
-  background: linear-gradient(180deg, rgba(255,255,255,0.015), transparent 40%), var(--bg-soft);
-  border-right: 1px solid var(--border-soft);
-  padding: 1.5rem 0.9rem 2.5rem;
+  background: var(--bg-2);
+  border-right: 1px solid var(--line-soft);
+  padding: 1.6rem 0.85rem 3rem;
   position: sticky;
   top: 0;
   height: 100vh;
   overflow-y: auto;
-  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
 }
 
 aside.sidebar h1 {
-  font-family: var(--sans);
   font-size: 0.95rem;
   font-weight: 600;
   letter-spacing: -0.01em;
-  margin: 0.2rem 0.6rem 1.4rem;
-  color: var(--fg);
+  margin: 0.15rem 0.65rem 1.5rem;
+  color: var(--text);
   display: flex;
   align-items: center;
-  gap: 0.55rem;
+  gap: 0.6rem;
 }
 
-/* Little "ghost dot" mark before the product name. */
+/* The circuit node — same mark as every numbered step below. */
 aside.sidebar h1::before {
   content: "";
-  width: 9px;
-  height: 9px;
+  width: 11px;
+  height: 11px;
   border-radius: 50%;
-  background: radial-gradient(circle at 30% 30%, #c0d4ff 0%, var(--accent) 55%, #4d6fb3 100%);
-  box-shadow:
-    0 0 0 2px rgba(138,180,255,0.08),
-    0 0 12px rgba(138,180,255,0.5);
+  background: var(--bg);
+  border: 2px solid var(--ember);
   flex-shrink: 0;
 }
 
 aside.sidebar nav h3 {
-  font-size: 0.68rem;
+  font-family: var(--mono);
+  font-size: 0.66rem;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
-  color: var(--fg-faint);
-  margin: 1.5rem 0.6rem 0.4rem;
-  padding-top: 0.9rem;
-  border-top: 1px solid var(--border-soft);
+  letter-spacing: 0.15em;
+  color: var(--faint);
+  margin: 1.7rem 0.65rem 0.45rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line-soft);
 }
-aside.sidebar nav h3:first-of-type { border-top: none; padding-top: 0; margin-top: 0.2rem; }
+aside.sidebar nav h3:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+  margin-top: 0.2rem;
+}
 
 aside.sidebar nav a {
   display: block;
-  color: var(--fg-muted);
+  color: var(--body);
   text-decoration: none;
-  padding: 0.32rem 0.6rem;
+  padding: 0.3rem 0.65rem;
   margin: 1px 0;
-  border-radius: 5px;
-  font-size: 0.88rem;
-  font-weight: 400;
-  letter-spacing: -0.005em;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  line-height: 1.45;
   position: relative;
   transition: background 0.12s var(--ease), color 0.12s var(--ease);
 }
-aside.sidebar nav a:hover {
-  background: var(--bg-hover);
-  color: var(--fg);
-}
+aside.sidebar nav a:hover { background: var(--bg-3); color: var(--text); }
+
 aside.sidebar nav a.current {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--ember-lo);
+  color: var(--ember);
   font-weight: 500;
 }
 aside.sidebar nav a.current::before {
   content: "";
   position: absolute;
-  left: -0.9rem;
-  top: 0.55rem;
-  bottom: 0.55rem;
+  left: -0.85rem;
+  top: 0.4rem;
+  bottom: 0.4rem;
   width: 2px;
-  background: var(--accent);
   border-radius: 2px;
+  background: var(--ember);
 }
+
+/* Small note at the foot of a nav group (e.g. "expert material"). */
+aside.sidebar nav .nav-note {
+  display: block;
+  margin: 0.4rem 0.65rem 0;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: var(--faint);
+}
+
 
 /* =========================================================================
    Main column
    ========================================================================= */
 
 main {
-  padding: 3rem 3.5rem 4rem;
-  max-width: 1040px;
-  min-width: 0;          /* prevents grid overflow on wide pre blocks */
+  padding: 3.5rem 4rem 5rem;
+  max-width: 1140px;
+  min-width: 0;
 }
 
-main h1, main h2, main h3, main h4 {
+main h1, main h2, main h3, main h4, main h5 {
+  color: var(--text);
   scroll-margin-top: 1.5rem;
-  font-family: var(--sans);
+  text-wrap: balance;
+  /* Reference headings routinely contain a long CONSTANT_NAME; let it break
+     rather than widen the page. */
+  overflow-wrap: anywhere;
 }
 
 main h1 {
-  font-size: 2.1rem;
+  font-size: 2.6rem;
   font-weight: 700;
-  letter-spacing: -0.022em;
-  line-height: 1.2;
-  margin: 0 0 0.5rem;
-  color: var(--fg);
-  padding-bottom: 0.75rem;
-  border-bottom: 1px solid var(--border);
+  letter-spacing: -0.032em;
+  line-height: 1.12;
+  margin: 0 0 0.75rem;
 }
 
+/* Section headings finish with a hairline that runs out to the column edge. */
 main h2 {
-  margin-top: 2.8rem;
-  font-size: 1.35rem;
-  font-weight: 600;
-  letter-spacing: -0.012em;
-  color: var(--fg);
-  padding-bottom: 0.4rem;
-  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  gap: 1.1rem;
+  margin: 3.4rem 0 1.1rem;
+  font-size: 1.55rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+main h2::after {
+  content: "";
+  flex: 1 1 auto;
+  min-width: 1.5rem;
+  height: 1px;
+  background: var(--line);
 }
 
 main h3 {
-  color: var(--accent);
-  margin-top: 1.9rem;
-  font-size: 1.05rem;
-  font-weight: 600;
-  letter-spacing: -0.005em;
+  margin: 2.4rem 0 0.6rem;
+  font-size: 1.16rem;
+  font-weight: 650;
+  letter-spacing: -0.012em;
 }
 
 main h4 {
-  color: var(--fg);
-  margin-top: 1.3rem;
-  font-size: 0.95rem;
-  font-weight: 600;
+  margin: 1.7rem 0 0.4rem;
+  font-size: 1rem;
+  font-weight: 650;
 }
 
-p, li { color: var(--fg-muted); }
-main p { margin: 0.6rem 0 0.9rem; }
+main p { margin: 0 0 1.05rem; }
+main > p, main > ul, main > ol, main > dl, main > blockquote { max-width: var(--measure); }
 
-strong { color: var(--fg); font-weight: 600; }
-em { color: var(--fg); }
+strong { color: var(--text); font-weight: 650; }
+em { color: var(--text); font-style: italic; }
 
-a {
-  color: var(--accent);
-  text-decoration: none;
-  text-underline-offset: 3px;
-  text-decoration-thickness: 1px;
-  transition: color 0.12s var(--ease);
+/* Links: body-coloured with an ember underline. A paragraph full of links
+   still reads as a paragraph, and the underline (not the hue) is the signal. */
+main a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--ember-mid);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 0.22em;
+  transition: color 0.12s var(--ease), text-decoration-color 0.12s var(--ease);
 }
-main a { border-bottom: 1px solid rgba(138,180,255,0.25); padding-bottom: 1px; }
-main a:hover { color: #b8cfff; border-bottom-color: rgba(138,180,255,0.65); }
-
-ul, ol { padding-left: 1.3rem; }
-li { margin: 0.25rem 0; }
-li::marker { color: var(--fg-faint); }
-
-hr {
-  border: 0;
-  border-top: 1px solid var(--border-soft);
-  margin: 2.2rem 0;
+main a:hover {
+  color: var(--ember);
+  text-decoration-color: var(--ember);
 }
+
+ul, ol { padding-left: 1.35rem; margin: 0 0 1.05rem; }
+li { margin: 0.3rem 0; }
+li::marker { color: var(--faint); }
+li > ul, li > ol { margin-top: 0.3rem; margin-bottom: 0.4rem; }
+
+hr { border: 0; border-top: 1px solid var(--line-soft); margin: 2.6rem 0; }
 
 .subtitle {
-  color: var(--fg-dim);
-  font-size: 1.02rem;
+  color: var(--muted);
+  font-size: 1.2rem;
   line-height: 1.55;
-  font-weight: 400;
-  margin: 0 0 1.8rem;
-  max-width: 72ch;
+  margin: 0 0 2.2rem;
+  padding-bottom: 1.6rem;
+  border-bottom: 1px solid var(--line);
+  max-width: 64ch;
+  text-wrap: pretty;
 }
+
+/* Small mono kicker above a heading. */
+.eyebrow {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.19em;
+  text-transform: uppercase;
+  color: var(--ember);
+  margin: 0 0 0.85rem;
+}
+
+.lede { font-size: 1.1rem; line-height: 1.65; color: var(--body); }
+
 
 /* =========================================================================
    Code
@@ -264,64 +308,55 @@ hr {
 
 code {
   font-family: var(--mono);
-  background: var(--code-bg);
-  border: 1px solid var(--border-soft);
-  padding: 0.08em 0.38em;
-  border-radius: 4px;
+  background: var(--bg-3);
+  border: 1px solid var(--line-soft);
+  padding: 0.1em 0.4em;
+  border-radius: 5px;
   font-size: 0.84em;
-  font-weight: 500;
-  color: var(--code-fg);
-  word-break: break-word;
+  color: #e4e9f5;
+  /* Long identifiers and paths appear inline constantly here; let them break
+     anywhere rather than push the page sideways on a phone. */
+  overflow-wrap: anywhere;
 }
-
 main a code { color: inherit; }
 
 pre {
-  background: var(--code-bg);
-  border: 1px solid var(--border);
+  background: var(--bg-code);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ember-mid);
   border-radius: 8px;
-  padding: 1rem 1.1rem;
+  padding: 1.1rem 1.2rem;
+  margin: 1.3rem 0 1.5rem;
   overflow-x: auto;
-  font-size: 0.82rem;
-  line-height: 1.55;
-  position: relative;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.02),
-    0 1px 2px rgba(0,0,0,0.2);
-}
-pre::before {
-  /* window dots — ambient, not decorative-only. */
-  content: "";
-  position: absolute;
-  top: 0.75rem;
-  left: 1rem;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: rgba(255,255,255,0.10);
-  box-shadow:
-    14px 0 0 rgba(255,255,255,0.07),
-    28px 0 0 rgba(255,255,255,0.05);
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  line-height: 1.65;
+  color: #dbe2f0;
+  tab-size: 2;
 }
 pre code {
   background: transparent;
   border: 0;
-  padding: 1.25rem 0 0;
-  display: block;
-  color: var(--code-fg);
+  padding: 0;
   font-size: inherit;
+  color: inherit;
+  white-space: pre;
 }
+
+/* A shell prompt marker for copy-paste blocks. */
+pre.shell { border-left-color: var(--mint); }
 
 kbd {
   font-family: var(--mono);
   font-size: 0.78em;
-  padding: 0.1em 0.45em;
-  border-radius: 4px;
-  background: linear-gradient(180deg, #1e2434, #161b26);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  box-shadow: 0 1px 0 rgba(0,0,0,0.3), inset 0 -1px 0 rgba(255,255,255,0.04);
+  padding: 0.15em 0.45em;
+  border-radius: 5px;
+  background: var(--bg-3);
+  color: var(--text);
+  border: 1px solid var(--line);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
 }
+
 
 /* =========================================================================
    Tables
@@ -330,31 +365,271 @@ kbd {
 table {
   border-collapse: collapse;
   width: 100%;
-  margin: 1.1rem 0 1.5rem;
-  font-size: 0.88rem;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  overflow: hidden;
+  margin: 1.3rem 0 1.7rem;
+  font-size: 0.94rem;
+  line-height: 1.55;
 }
 th, td {
-  border-bottom: 1px solid var(--border-soft);
-  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--line-soft);
+  padding: 0.7rem 0.9rem 0.7rem 0;
   text-align: left;
   vertical-align: top;
 }
 th {
-  background: rgba(255,255,255,0.02);
-  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 0.7rem;
   font-weight: 600;
-  font-size: 0.78rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  border-bottom: 1px solid var(--border);
+  letter-spacing: 0.13em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.55rem;
 }
+td:first-child { padding-left: 0; }
 tbody tr:last-child td { border-bottom: 0; }
-tbody tr { transition: background 0.12s var(--ease); }
-tbody tr:hover td { background: rgba(138,180,255,0.025); }
+tbody tr { transition: background 0.1s var(--ease); }
+tbody tr:hover td { background: rgba(255, 255, 255, 0.018); }
+/* Identifiers in a table cell must not break mid-token — `delegate_to_swarm`
+   split across two lines is unreadable, and it also lets the column collapse. */
 td code { font-size: 0.82em; white-space: nowrap; }
+
+/* Wrap a wide table in this so the page never scrolls sideways. */
+.scroll { overflow-x: auto; margin: 1.3rem 0 1.7rem; }
+.scroll table { margin: 0; }
+
+
+/* =========================================================================
+   The circuit node & the step rail  —  the signature element
+   -------------------------------------------------------------------------
+   <ol class="flow">
+     <li><h4>You send a message</h4><p>…</p></li>
+     …
+   </ol>
+   Plain HTML: it reflows on a phone, the text is selectable and searchable,
+   and it never drifts out of sync with the prose beside it.
+   ========================================================================= */
+
+.flow {
+  list-style: none;
+  counter-reset: step;
+  padding: 0;
+  margin: 1.9rem 0 2.2rem;
+  max-width: none;
+}
+
+.flow > li {
+  counter-increment: step;
+  position: relative;
+  padding: 0 0 1.7rem 3.4rem;
+  margin: 0;
+}
+
+/* The node. */
+.flow > li::before {
+  content: counter(step, decimal-leading-zero);
+  position: absolute;
+  left: 0;
+  top: -0.1rem;
+  width: var(--rail);
+  height: var(--rail);
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--ember);
+  background: var(--bg);
+  border: 1.5px solid var(--ember-mid);
+  z-index: 1;
+}
+
+/* The rail between nodes. */
+.flow > li::after {
+  content: "";
+  position: absolute;
+  left: calc(var(--rail) / 2 - 0.5px);
+  top: calc(var(--rail) - 0.1rem);
+  bottom: 0;
+  width: 1px;
+  background: linear-gradient(to bottom, var(--ember-mid), rgba(255, 166, 87, 0.10));
+}
+.flow > li:last-child { padding-bottom: 0; }
+.flow > li:last-child::after { display: none; }
+
+.flow > li > h4 {
+  margin: 0 0 0.35rem;
+  font-size: 1.06rem;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+.flow > li > p { margin: 0 0 0.7rem; max-width: 62ch; }
+.flow > li > p:last-child { margin-bottom: 0; }
+
+/* A mono aside inside a step — the file, route, or command behind it. */
+.flow .where {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: var(--muted);
+  margin: 0 0 0.65rem;
+}
+.flow .where::before { content: "↳ "; color: var(--faint); }
+
+/* A step that only happens sometimes. */
+.flow > li.optional::before {
+  color: var(--muted);
+  border-color: var(--line);
+  border-style: dashed;
+}
+.flow > li.optional > h4 { color: var(--body); }
+
+/* Dense variant for long sequences. */
+.flow.tight > li { padding-bottom: 1.05rem; }
+.flow.tight > li > h4 { font-size: 1rem; }
+
+
+/* =========================================================================
+   Diagram frame
+   -------------------------------------------------------------------------
+   Holds either an SVG (structural diagrams) or plain HTML (flows).
+   ========================================================================= */
+
+.diagram {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1.9rem 1.9rem 1.6rem;
+  margin: 2rem 0;
+  overflow-x: auto;
+}
+.diagram > svg {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  height: auto;
+}
+.diagram > .flow { margin: 0; }
+.diagram > :first-child { margin-top: 0; }
+.diagram > :last-child { margin-bottom: 0; }
+
+.caption {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.55;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  text-align: center;
+  margin: 1.1rem auto 0;
+  max-width: 60ch;
+}
+
+/* --- Vocabulary for hand-written SVG in the new pages. -------------------
+   Every structural diagram uses these classes so they stay consistent. */
+/* Set the family on the <svg> so it INHERITS — a font-family attribute on an
+   individual <text> still wins. Never set font-size here: legacy diagrams size
+   their text with presentation attributes, and a CSS font-size would override
+   every one of them and burst the hand-placed boxes. */
+.diagram svg { font-family: var(--sans); }
+.diagram svg text { fill: var(--body); }
+.diagram svg .d-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  fill: var(--faint);
+}
+.diagram svg .d-label { fill: var(--text); font-size: 13px; font-weight: 500; }
+.diagram svg .d-sub   { font-family: var(--mono); font-size: 10.5px; fill: var(--muted); }
+.diagram svg .d-box   { fill: var(--bg-3); stroke: var(--line); stroke-width: 1; }
+.diagram svg .d-box.accent { stroke: var(--ember-mid); }
+.diagram svg .d-group { fill: none; stroke: var(--line-soft); stroke-width: 1; }
+.diagram svg .d-line  { stroke: var(--faint); stroke-width: 1.25; fill: none; stroke-linecap: round; }
+.diagram svg .d-line.accent { stroke: var(--ember); }
+.diagram svg .d-arrow { fill: var(--faint); }
+.diagram svg .d-arrow.accent { fill: var(--ember); }
+
+/* --- Legacy SVG (the deep-reference pages, authored against the old
+       palette) is normalised here so it stays legible under this theme
+       without touching ~100 files. ------------------------------------- */
+.diagram svg rect[fill="#131822"] { fill: transparent; }
+.diagram svg rect[fill="#1a2030"] { fill: var(--bg-3); stroke: var(--line); }
+.diagram svg rect[fill="#0c0f14"] { fill: var(--bg-code); }
+.diagram svg rect[stroke="#2a3245"] { stroke: var(--line); }
+.diagram svg rect[stroke="#7aa7ff"],
+.diagram svg rect[stroke="#b894ff"] { stroke: var(--ember-mid); }
+.diagram svg rect[stroke="#5dd39e"] { stroke: rgba(103, 217, 168, 0.5); }
+.diagram svg rect[stroke="#ffb454"] { stroke: rgba(240, 198, 116, 0.5); }
+.diagram svg rect[stroke="#ff6e6e"] { stroke: rgba(255, 139, 139, 0.5); }
+.diagram svg line { stroke-linecap: round; }
+.diagram svg marker path { fill: var(--faint); }
+
+/* Some legacy diagrams ship their own <style> block with gradients, glows
+   and drop-shadows. Higher specificity here flattens them into this theme
+   without editing the SVG. The colour FAMILIES are kept — they encode which
+   layer a box belongs to — just remapped onto this palette. */
+.diagram svg rect[fill^="url(#glow"] { display: none; }
+.diagram svg .panel {
+  fill: rgba(255, 255, 255, 0.022);
+  stroke: var(--line-soft);
+}
+.diagram svg .card {
+  fill: var(--bg-3);
+  filter: none;
+  stroke: var(--line);
+}
+.diagram svg .card.blue   { stroke: var(--ember-mid); }
+.diagram svg .card.purple { stroke: var(--line); }
+.diagram svg .card.green  { stroke: rgba(103, 217, 168, 0.45); }
+.diagram svg .card.amber  { stroke: rgba(240, 198, 116, 0.45); }
+.diagram svg .card.red    { stroke: rgba(255, 139, 139, 0.45); }
+/* Colour only — these legacy classes already carry their own font metrics. */
+.diagram svg .section-title { fill: var(--faint); }
+.diagram svg .label         { fill: var(--text); }
+.diagram svg .sublabel      { fill: var(--muted); }
+.diagram svg .flow-line { stroke: var(--faint); }
+
+
+/* =========================================================================
+   Screenshots & clips
+   ========================================================================= */
+
+.shot {
+  margin: 1.8rem 0 2rem;
+  max-width: none;
+}
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #000;
+}
+.shot figcaption {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.6;
+  color: var(--muted);
+  margin-top: 0.7rem;
+  max-width: 62ch;
+}
+.shot figcaption strong { color: var(--ember); font-weight: 600; }
+
+/* Side-by-side clips. They cap at their native width so a 440px capture is
+   never upscaled into mush on a wide screen. */
+.clips {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.6rem;
+  margin: 1.8rem 0 2rem;
+  max-width: none;
+}
+.clips .shot { margin: 0; }
+.clips .shot img { max-width: 440px; }
+
 
 /* =========================================================================
    Cards
@@ -362,50 +637,55 @@ td code { font-size: 0.82em; white-space: nowrap; }
 
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(255px, 1fr));
   gap: 0.9rem;
-  margin: 1.4rem 0 2rem;
+  margin: 1.6rem 0 2.2rem;
+  max-width: none;
 }
+
 .card {
-  position: relative;
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.022), rgba(255,255,255,0.005)),
-    var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1.05rem 1.1rem 1rem;
-  text-decoration: none;
-  color: var(--fg);
   display: block;
-  transition: border-color 0.15s var(--ease), transform 0.15s var(--ease), box-shadow 0.15s var(--ease);
-  overflow: hidden;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1.15rem 1.2rem;
+  color: var(--body);
+  text-decoration: none;
+  transition: border-color 0.14s var(--ease), background 0.14s var(--ease);
 }
-.card::after {
-  /* subtle top highlight — a touch of depth, not a glare. */
-  content: "";
-  position: absolute;
-  top: 0; left: 0; right: 0; height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
-  opacity: 0.6;
-}
-.card:hover {
-  border-color: rgba(138,180,255,0.45);
-  transform: translateY(-2px);
-  box-shadow:
-    0 1px 0 rgba(255,255,255,0.03) inset,
-    0 10px 24px -12px rgba(0,0,0,0.6),
-    0 0 0 1px rgba(138,180,255,0.08);
-}
+main a.card { text-decoration: none; }
+.card:hover { border-color: var(--ember-mid); background: var(--bg-3); }
 .card h3 {
-  margin: 0 0 0.35rem;
-  color: var(--accent);
-  font-size: 0.95rem;
-  font-weight: 600;
-  letter-spacing: -0.005em;
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: -0.008em;
+  color: var(--text);
 }
-.card p { margin: 0; color: var(--fg-dim); font-size: 0.85rem; line-height: 1.5; }
-main .card { border-bottom: 1px solid var(--border); }  /* cancel main a border */
-.card:hover p { color: var(--fg-muted); }
+.card:hover h3 { color: var(--ember); }
+.card p { margin: 0; font-size: 0.92rem; line-height: 1.55; color: var(--muted); }
+
+/* Small mono annotation. In a card it sits in the corner; in an h2 it becomes
+   a kicker beside the heading (h2 is a flex row, so the float is inert there). */
+.card .card-count {
+  float: right;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--faint);
+  margin-left: 0.5rem;
+}
+main h2 .card-count {
+  float: none;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin: 0;
+  white-space: nowrap;
+}
+
 
 /* =========================================================================
    Badges & callouts
@@ -413,248 +693,250 @@ main .card { border-bottom: 1px solid var(--border); }  /* cancel main a border 
 
 .badge {
   display: inline-block;
-  padding: 0.12rem 0.55rem;
-  border-radius: 999px;
+  font-family: var(--mono);
   font-size: 0.68rem;
-  font-weight: 500;
-  background: rgba(138,180,255,0.08);
-  color: var(--accent);
-  border: 1px solid rgba(138,180,255,0.22);
-  margin-right: 0.35rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  padding: 0.15rem 0.5rem;
+  border-radius: 5px;
+  background: var(--bg-3);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  margin-right: 0.3rem;
   vertical-align: middle;
+  white-space: nowrap;
 }
-.badge.good { color: var(--good); border-color: rgba(111,212,164,0.28); background: rgba(111,212,164,0.07); }
-.badge.warn { color: var(--warn); border-color: rgba(240,185,106,0.28); background: rgba(240,185,106,0.07); }
-.badge.bad  { color: var(--bad);  border-color: rgba(240,112,112,0.28); background: rgba(240,112,112,0.07); }
+.badge.good { color: var(--mint); border-color: rgba(103, 217, 168, 0.32); background: rgba(103, 217, 168, 0.08); }
+.badge.warn { color: var(--gold); border-color: rgba(240, 198, 116, 0.32); background: rgba(240, 198, 116, 0.08); }
+.badge.bad  { color: var(--rose); border-color: rgba(255, 139, 139, 0.32); background: rgba(255, 139, 139, 0.08); }
 
 .note {
-  border-left: 3px solid var(--accent);
-  background:
-    linear-gradient(90deg, rgba(138,180,255,0.04), transparent 60%),
-    var(--bg-card);
-  padding: 0.85rem 1.1rem;
-  margin: 1.2rem 0;
-  border-radius: 0 6px 6px 0;
-  font-size: 0.92rem;
-  color: var(--fg-muted);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ember);
+  background: var(--bg-2);
+  padding: 1rem 1.2rem;
+  margin: 1.5rem 0;
+  border-radius: 0 8px 8px 0;
+  font-size: 0.97rem;
+  max-width: var(--measure);
 }
-.note strong { color: var(--accent); }
-.note.warn { border-left-color: var(--warn); background: linear-gradient(90deg, rgba(240,185,106,0.05), transparent 60%), var(--bg-card); }
-.note.warn strong { color: var(--warn); }
-.note.bad  { border-left-color: var(--bad);  background: linear-gradient(90deg, rgba(240,112,112,0.05), transparent 60%), var(--bg-card); }
-.note.bad strong { color: var(--bad); }
+.note > :first-child { margin-top: 0; }
+.note > :last-child { margin-bottom: 0; }
+.note strong:first-child { color: var(--ember); }
+
+.note.warn { border-left-color: var(--gold); }
+.note.warn strong:first-child { color: var(--gold); }
+.note.bad  { border-left-color: var(--rose); }
+.note.bad strong:first-child { color: var(--rose); }
+.note.good { border-left-color: var(--mint); }
+.note.good strong:first-child { color: var(--mint); }
+
+
+/* Orientation strip at the top of every deep-reference page. Quiet — it is
+   signposting for someone who arrived from a search, not a warning. */
+.ref-banner {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: var(--muted);
+  background: var(--bg-2);
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  padding: 0.55rem 0.85rem;
+  margin: 0 0 2.2rem;
+  max-width: none;
+}
+main .ref-banner a { color: var(--muted); text-decoration-color: var(--line); }
+main .ref-banner a:hover { color: var(--ember); text-decoration-color: var(--ember); }
+
 
 /* =========================================================================
-   Hero block (index page)
+   Hero  —  the top of the home page
    ========================================================================= */
 
-.hero {
-  margin: 0 0 2.2rem;
-  padding: 2rem 2rem 1.8rem;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background:
-    radial-gradient(800px 300px at 100% 0%, rgba(192,167,255,0.09), transparent 60%),
-    radial-gradient(700px 300px at 0% 100%, rgba(138,180,255,0.08), transparent 60%),
-    linear-gradient(180deg, rgba(255,255,255,0.02), transparent 70%),
-    var(--bg-card);
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.04),
-    0 24px 60px -40px rgba(0,0,0,0.9);
-  position: relative;
-  overflow: hidden;
-}
-.hero::before {
-  content: "";
-  position: absolute; inset: 0;
-  background-image:
-    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
-  background-size: 28px 28px;
-  mask-image: radial-gradient(ellipse at 50% 0%, #000 0%, transparent 70%);
-  pointer-events: none;
-  opacity: 0.7;
-}
-.hero > * { position: relative; }
+.hero { margin: 0 0 3rem; max-width: none; }
 .hero h1 {
+  font-size: 3.1rem;
+  letter-spacing: -0.038em;
+  margin: 0 0 0.9rem;
+}
+.hero .subtitle {
+  font-size: 1.3rem;
   border-bottom: 0;
   padding-bottom: 0;
-  margin: 0 0 0.6rem;
-  font-size: 2.3rem;
-  letter-spacing: -0.025em;
+  margin-bottom: 1.4rem;
+  color: var(--body);
+  max-width: 58ch;
 }
-.hero .subtitle { margin-bottom: 1rem; font-size: 1.05rem; color: var(--fg-muted); }
 .hero-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
-  margin-top: 0.2rem;
+  padding-top: 1.4rem;
+  border-top: 1px solid var(--line);
 }
 
-.eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-  font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--fg-dim);
-  margin-bottom: 0.9rem;
-}
-.eyebrow::before {
-  content: "";
-  width: 20px; height: 1px;
-  background: var(--accent);
-  display: inline-block;
-}
 
 /* =========================================================================
-   Diagrams (kept from previous theme — refined edges only)
+   Definition grid  (term → meaning)
    ========================================================================= */
-
-.diagram {
-  position: relative;
-  background:
-    radial-gradient(ellipse at 20% 0%, rgba(138,180,255,0.07) 0%, transparent 55%),
-    radial-gradient(ellipse at 80% 100%, rgba(192,167,255,0.05) 0%, transparent 55%),
-    linear-gradient(180deg, #0f1522 0%, #090c13 100%);
-  border: 1px solid rgba(138,180,255,0.16);
-  border-radius: 14px;
-  padding: 2rem 1.8rem 1.4rem;
-  margin: 2rem 0;
-  overflow-x: auto;
-  box-shadow:
-    inset 0 1px 0 rgba(255,255,255,0.04),
-    inset 0 0 0 1px rgba(255,255,255,0.02),
-    0 24px 60px -30px rgba(0,0,0,0.9),
-    0 6px 20px -10px rgba(0,0,0,0.6);
-}
-.diagram::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: 14px;
-  background: linear-gradient(135deg,
-    rgba(138,180,255,0.05) 0%,
-    transparent 30%,
-    transparent 70%,
-    rgba(192,167,255,0.04) 100%);
-  pointer-events: none;
-  z-index: 0;
-}
-.diagram > svg {
-  position: relative;
-  z-index: 1;
-  display: block;
-  margin: 0 auto;
-  max-width: 100%;
-  height: auto;
-  filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.35));
-}
-.diagram svg text {
-  font-family: var(--sans);
-  font-weight: 500;
-  letter-spacing: 0.015em;
-  -webkit-font-smoothing: antialiased;
-}
-.diagram svg text[font-weight="700"] {
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  font-size: 11px;
-  opacity: 0.9;
-}
-.diagram svg rect { stroke-width: 1; }
-.diagram svg rect[fill="#131822"] { fill: transparent; }
-.diagram svg rect[fill="#1a2030"] {
-  fill: rgba(255, 255, 255, 0.028);
-  stroke: rgba(255, 255, 255, 0.08);
-}
-.diagram svg rect[fill="#0c0f14"] { fill: rgba(255, 255, 255, 0.05); }
-.diagram svg line {
-  stroke-width: 1.25;
-  opacity: 0.78;
-  stroke-linecap: round;
-}
-.diagram svg path { stroke-linejoin: round; stroke-linecap: round; }
-.diagram svg marker path { fill: rgba(138,180,255,0.85); }
-.diagram svg rect[stroke="#7aa7ff"] { stroke: rgba(138,180,255,0.75); }
-.diagram svg rect[stroke="#b894ff"] { stroke: rgba(192,167,255,0.72); }
-.diagram svg rect[stroke="#5dd39e"] { stroke: rgba(111,212,164,0.72); }
-.diagram svg rect[stroke="#ffb454"] { stroke: rgba(240,185,106,0.72); }
-.diagram svg rect[stroke="#ff6e6e"] { stroke: rgba(240,112,112,0.72); }
-.diagram svg rect[stroke="#2a3245"] { stroke: rgba(255, 255, 255, 0.09); }
-
-.caption {
-  position: relative;
-  z-index: 1;
-  color: var(--fg-dim);
-  text-align: center;
-  font-size: 0.8rem;
-  margin-top: 0.9rem;
-  letter-spacing: 0.04em;
-  font-style: italic;
-  opacity: 0.75;
-}
-
-/* =========================================================================
-   Footer & misc
-   ========================================================================= */
-
-footer {
-  margin-top: 4rem;
-  padding-top: 1.2rem;
-  border-top: 1px solid var(--border-soft);
-  color: var(--fg-dim);
-  font-size: 0.82rem;
-  line-height: 1.6;
-}
-footer a { color: var(--fg-muted); border-bottom: 0; }
-footer a:hover { color: var(--accent); }
 
 .kv {
   display: grid;
-  grid-template-columns: 200px 1fr;
-  gap: 0.4rem 1rem;
-  margin: 1rem 0;
+  grid-template-columns: minmax(140px, 210px) 1fr;
+  gap: 0.75rem 1.5rem;
+  margin: 1.4rem 0 1.8rem;
+  max-width: none;
 }
-.kv dt { color: var(--fg-dim); font-family: var(--mono); font-size: 0.82rem; }
-.kv dd { margin: 0; color: var(--fg-muted); }
+.kv dt {
+  font-family: var(--mono);
+  font-size: 0.84rem;
+  line-height: 1.6;
+  color: var(--ember);
+  word-break: break-word;
+}
+.kv dd { margin: 0; color: var(--body); }
+.kv dd :last-child { margin-bottom: 0; }
 
-/* Focus ring for keyboard nav. */
+/* Glossary variant: term in prose, not mono. */
+.kv.terms dt { font-family: var(--sans); font-size: 1rem; font-weight: 650; color: var(--text); }
+
+
+/* =========================================================================
+   Two-column comparison
+   ========================================================================= */
+
+.cols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 1.4rem 2rem;
+  margin: 1.5rem 0 1.9rem;
+  max-width: none;
+}
+.cols > * { min-width: 0; }
+.cols h4:first-child { margin-top: 0; }
+
+
+/* =========================================================================
+   Footer
+   ========================================================================= */
+
+footer {
+  margin-top: 5rem;
+  padding-top: 1.4rem;
+  border-top: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.65;
+  max-width: var(--measure);
+}
+footer p { margin: 0 0 0.6rem; }
+
+/* Previous/next pager at the foot of a guide page. */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  justify-content: space-between;
+  margin-top: 3.5rem;
+  padding-top: 1.6rem;
+  border-top: 1px solid var(--line);
+  max-width: none;
+}
+main .pager a {
+  display: block;
+  flex: 1 1 240px;
+  padding: 0.85rem 1.1rem;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-2);
+  text-decoration: none;
+  transition: border-color 0.14s var(--ease), background 0.14s var(--ease);
+}
+main .pager a:hover { border-color: var(--ember-mid); background: var(--bg-3); color: var(--body); }
+.pager .dir {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 0.15rem;
+}
+.pager .to { color: var(--text); font-weight: 600; }
+.pager a.next { text-align: right; }
+
+
+/* =========================================================================
+   Accessibility & motion
+   ========================================================================= */
+
 :focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: 2px solid var(--ember);
+  outline-offset: 3px;
   border-radius: 3px;
 }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
 
 /* =========================================================================
    Responsive
    ========================================================================= */
 
-@media (max-width: 1024px) {
-  body { grid-template-columns: 240px 1fr; }
-  main { padding: 2.2rem 2rem 3rem; }
+@media (max-width: 1180px) {
+  body { grid-template-columns: 240px minmax(0, 1fr); }
+  main { padding: 3rem 2.6rem 4rem; }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 860px) {
+  html, body { font-size: 16px; }
   body { grid-template-columns: 1fr; }
+
   aside.sidebar {
     position: static;
     height: auto;
-    padding: 1rem 1rem 1.4rem;
+    max-height: 45vh;          /* never push the page off-screen */
+    padding: 1rem 1.1rem 1.2rem;
     border-right: 0;
-    border-bottom: 1px solid var(--border-soft);
+    border-bottom: 1px solid var(--line);
   }
-  aside.sidebar nav { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0 0.5rem; }
-  aside.sidebar nav h3 { grid-column: 1 / -1; }
-  main { padding: 1.6rem 1.2rem 2.5rem; }
-  main h1 { font-size: 1.75rem; }
-  .hero { padding: 1.4rem 1.2rem; }
-  .hero h1 { font-size: 1.85rem; }
+  aside.sidebar nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 0.6rem;
+  }
+  aside.sidebar nav h3 { grid-column: 1 / -1; margin-top: 1.1rem; }
+  aside.sidebar nav a.current::before { display: none; }
+
+  /* Long module names in the two-column mobile nav, and the ad-hoc .mono
+     spans some reference pages use, must break rather than overflow. */
+  aside.sidebar nav a { overflow-wrap: anywhere; }
+  main .mono, main span.mono { overflow-wrap: anywhere; }
+
+  main { padding: 2rem 1.3rem 3rem; }
+  main h1 { font-size: 2rem; }
+  .hero h1 { font-size: 2.2rem; }
+  .hero .subtitle, .subtitle { font-size: 1.08rem; }
+  /* Drop the finishing rule on a phone — it costs real width next to a long
+     heading and buys nothing at this size. */
+  main h2 { font-size: 1.32rem; margin-top: 2.6rem; display: block; }
+  main h2::after { display: none; }
+
+  .kv { grid-template-columns: 1fr; gap: 0.2rem; }
+  .kv dd { margin-bottom: 0.9rem; }
+  .diagram { padding: 1.2rem 1rem; }
+  .flow > li { padding-left: 2.9rem; }
+  table { font-size: 0.88rem; }
 }
+
 
 /* =========================================================================
    Print
@@ -662,9 +944,9 @@ footer a:hover { color: var(--accent); }
 
 @media print {
   body { grid-template-columns: 1fr; background: #fff; color: #111; }
-  aside.sidebar { display: none; }
+  aside.sidebar, .pager { display: none; }
   main { padding: 0; max-width: none; }
-  .card, .note, .diagram, pre { break-inside: avoid; }
-  a { color: inherit; text-decoration: none; border-bottom: 0; }
-  pre, code { background: #f5f5f7 !important; color: #111 !important; border-color: #ddd !important; }
+  main a { color: inherit; text-decoration: none; }
+  .card, .note, .diagram, pre, .flow > li { break-inside: avoid; }
+  pre, code { background: #f4f4f6 !important; color: #111 !important; border-color: #ddd !important; }
 }

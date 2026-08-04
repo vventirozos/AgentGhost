@@ -10,6 +10,11 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
+    <h3>Guide</h3>
+    <a href="index.html">&larr; Back to the guide</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Reference index</a>
+
     <a href="index.html">Home</a>
     <a href="capabilities.html">Capabilities</a>
     <a href="architecture.html">System Architecture</a>
@@ -25,6 +30,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="index.html">the guide</a>, or check the <a href="glossary.html">glossary</a>.</p>
+
   <h1>Installation &amp; Runtime Setup</h1>
   <p class="subtitle">What to install, which environment variables to set, and how to start every process.</p>
 
@@ -39,7 +46,7 @@
 
   <h2>Python dependencies</h2>
   <p>Pinned in <code>requirements.txt</code> at the repo root. Headline packages:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Package</th><th>Used by</th></tr></thead>
     <tbody>
       <tr><td><code>fastapi</code>, <code>uvicorn</code></td><td>API + lifespan</td></tr>
@@ -55,11 +62,11 @@
       <tr><td><code>dspy-ai</code></td><td>Prompt optimisation (<code>ghost_agent.optim</code>, <code>scripts/run_gepa.py</code>). <code>_require_dspy()</code> surfaces a clear install error if the transitive chain (litellm / gepa / asyncer) is broken.</td></tr>
       <tr><td><code>black</code>, <code>pylint</code>, <code>pytest</code>, <code>pytest-asyncio</code></td><td>Dev tooling</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Environment variables</h2>
   <p>The CLI reads arguments first, then falls back to environment variables. See <a href="cli_reference.html">CLI Reference</a> for argument-by-argument detail.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Variable</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>GHOST_API_KEY</code></td><td><em>unset</em></td><td>Value matched against the <code>X-Ghost-Key</code> header on every authed route. Mandatory for <code>interface/server.py</code>. The agent ships <strong>no default key</strong>: unset on a loopback bind means auth disabled; unset on a non-loopback bind refuses to boot (pass <code>--api-key ''</code> to explicitly disable auth on a trusted network).</td></tr>
@@ -74,7 +81,7 @@
       <tr><td><code>SLACK_BOT_TOKEN</code> / <code>SLACK_APP_TOKEN</code></td><td>unset</td><td>Slack bot bot/app credentials. Required by <code>interface/externals/slack_bot/main.py</code>.</td></tr>
       <tr><td><code>GHOST_AUDIO_NODE_URL</code></td><td><code>http://100.83.184.117:8088</code></td><td>Audio node backing speech-to-text (Gemma 4 E4B with an audio projector). Replaced <code>PI_VOICE_URL</code> and its dead Raspberry-Pi voice server on 2026-08-02. Text-to-speech is local (<code>say</code>) and needs no URL. Full voice knobs: <a href="interfaces/voice_server.html">Voice loop</a>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Filesystem layout at runtime</h2>
 <pre><code>$GHOST_HOME/

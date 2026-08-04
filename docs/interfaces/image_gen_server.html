@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
@@ -21,17 +24,19 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>interface / externals / image_generation / img_gen_server.py</h1>
   <p class="subtitle">SD1.5 image-generation node on the Jetson Orin Nano (8GB, CUDA). Current checkpoint: <strong>DreamShaper&nbsp;8</strong>.</p>
 
   <h2>Endpoints</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>POST /generate · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps", "width", "height", "size", "seed", "clip_skip"}</code>. Requires <code>X-Ghost-Key</code>. Size clamped to a VRAM-safe pixel budget. Returns <code>{"data": [{"b64_json": ...}]}</code>.</td></tr>
       <tr><td>GET /health · GET /ready</td><td>Unauthenticated. <code>/health</code> reports <code>{ok, ready, load_error}</code>; <code>/ready</code> is 200 when the model is loaded, 503 while warming, 500 on load failure.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Model &amp; scheduler</h2>
   <ul>

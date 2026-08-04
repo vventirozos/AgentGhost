@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a class="current" href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / graph.py — GraphMemory</h1>
   <p class="subtitle">SQLite-persisted knowledge graph mirrored into NetworkX for spreading-activation retrieval. Temporal triplet versioning handles belief updates.</p>
 
@@ -36,7 +41,7 @@
   </ul>
 
   <h2>Schema</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td>subject / predicate / object</td><td>TEXT</td><td>UNIQUE composite key. Subjects/objects lowercased; predicates uppercased.</td></tr>
@@ -45,11 +50,11 @@
       <tr><td>valid_from</td><td>REAL</td><td>Creation time.</td></tr>
       <tr><td>valid_until</td><td>REAL nullable</td><td>NULL until superseded.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Indexes on <code>subject</code> and <code>object</code>.</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>add_triplets(triplets) -&gt; int</code></td><td>Bulk insert / reinforce. Functional predicates (see below) auto-expire prior values — each expiry logged via <code>logger.warning</code>. Multi-valued predicates like <code>USES_LIBRARY</code> / <code>USES_TECHNIQUE</code> — the cross-project map (see <a href="../algorithms/cross_project_map.html">Cross-project map</a>) — plus <code>OWNS</code> / <code>IS</code> / the <code>HAS_*</code> family accumulate instead.</td></tr>
@@ -62,7 +67,7 @@
       <tr><td><code>propose_merge_candidates(max_candidates=12, neighbor_window=5, fuzzy_cutoff=0.90)</code></td><td>Read-only, deterministic near-duplicate node pairs for dream-time compression. Two tiers: <code>kind="safe"</code> (identical after stripping punctuation/whitespace — mergeable without confirmation) and <code>kind="fuzzy"</code> (high-similarity sorted-neighbor pairs: plurals/typos — the dream step merges these only after a worker same-entity confirmation, since string similarity alone conflates "new"/"news"). Bounded to each node's <code>neighbor_window</code> lexicographic neighbors (~O(n log n) on the only uncapped tier). Canonical direction: higher-degree node survives as <code>new_node</code>, ties to the longer name. Tests: <code>tests/test_dream_graph_compression_wiring.py</code>.</td></tr>
       <tr><td><code>get_neighborhood(words, global_limit)</code></td><td>Spreading-activation BFS retrieval.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Spreading-activation retrieval</h2>
   <ol>

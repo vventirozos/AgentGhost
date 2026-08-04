@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="agent_qwen.html">agent_qwen</a>
@@ -20,11 +23,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / prompts.py</h1>
   <p class="subtitle">System-prompt templates and per-budget thinking instructions.</p>
 
   <h2>Templates</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Constant</th><th>Use</th></tr></thead>
     <tbody>
       <tr><td><code>SYSTEM_PROMPT</code> (line 231)</td><td>Main identity, persona rules, anti-hallucination guard, tool-use protocol.</td></tr>
@@ -35,7 +40,7 @@
       <tr><td><code>THINK_BUDGET_EXTENDED</code> (line 130)</td><td>~15 sentences for debugging / SQL / algorithm work; forbid drafting code in the think block.</td></tr>
       <tr><td><code>THINK_BUDGET_SELFPLAY</code> (line 158)</td><td>≤6 bullet points for fast bounded self-play exercises.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Native tool_call corruption root cause — the header split (2026-07-31)</h2>
   <p><strong>Symptom:</strong> the "Repaired corrupt native tool_call(s): upstream merged a multi-tool reply into one call's arguments" repair guard fired 18 times in one 2.5&nbsp;h log window — effectively on <em>every</em> reply that stacked two tool calls (browser+vision, read+read). The repaired first call sometimes carried leaked XML (<code>&lt;/parameter&gt; &lt;/function&gt;…</code>) as an argument value, producing garbage-path tool failures and spurious strikes.</p>
@@ -45,12 +50,12 @@
   <p><strong>Fix:</strong> the native branch splices <code>QWEN_TOOL_PROMPT_NATIVE</code> (no XML format instruction at all), the legacy branch keeps <code>QWEN_TOOL_PROMPT</code> (there the XML rules <em>are</em> the parser contract), and <code>SYSTEM_PROMPT</code>'s CRITICAL INSTRUCTION became path-aware instead of unconditionally ordering "XML tags". The agent's XML <em>parser</em> and the repair guard remain as fallbacks for stragglers — the prompt just no longer teaches the dialect that broke. Covered by <code>tests/test_native_tool_header.py</code>; contract reversal recorded in <code>tests/test_context_compaction.py::test_native_tools_drops_xml_format_scaffolding</code>.</p>
 
   <h2>Helpers</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>build_project_briefing(store, project_id, max_events=3, max_open_tasks=8, max_done_tasks=5, suppress_next_task=False) -&gt; str</code></td><td>Render the project's cross-turn working memory for prompt injection (line 4): goal, <strong>DESIGN LEDGER</strong>, next/open tasks, <strong>DONE SO FAR</strong> digest, <strong>RESEARCH NOTES</strong>, recent events. Leads with the <strong>ONE TASK AT A TIME</strong> directive. <code>suppress_next_task=True</code> (set by the turn loop once a task closed this request) replaces the <code>NEXT TASK</code> pointer with a hard stop. See below.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Project working memory — DESIGN LEDGER &amp; DONE SO FAR (2026-06-20)</h2>
   <p>The dominant cost on long projects was a fresh turn <em>re-deriving the

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a class="current" href="slack_bot.html">Slack bot</a>
@@ -21,6 +24,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>interface / externals / slack_bot / main.py</h1>
   <p class="subtitle"><strong>OWNER-LOCKED</strong> async Slack client
   (<code>slack_bolt</code> Socket Mode), rewritten 2026-07-11. Replies to
@@ -53,13 +58,13 @@
   </ul>
 
   <h2>Event handlers</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Event</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>app_mention</code></td><td>Owner gate → owner-filtered thread context → <code>_process_message()</code>.</td></tr>
       <tr><td><code>message</code> (DM only)</td><td>Same flow; <code>channel_type == "im"</code> plus the owner gate.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Per-message flow</h2>
   <ol>

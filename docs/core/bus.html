@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="agent_qwen.html">agent_qwen</a>
@@ -34,32 +37,34 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / bus.py — MemoryBus</h1>
   <p class="subtitle">In-memory pub/sub façade over Vector / Graph / Skill / Profile / Episodic stores. Hydrates context with Reciprocal Rank Fusion; publishes facts in parallel.</p>
 
   <h2>Public surface</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Member</th><th>Signature</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__</code></td><td><code>(vector_memory, graph_memory, skill_memory, profile_memory, episodic_memory, session_store)</code></td><td>All tiers are optional — missing ones are skipped at fan-out time.</td></tr>
       <tr><td><code>async hydrate_context</code></td><td><code>(query, max_chars=6000, rrf_k=60, context_budget=0, llm_client=None) -&gt; str</code></td><td>Fetch all tiers in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
       <tr><td><code>async publish_fact</code></td><td><code>(event_type, fact_data) -&gt; Dict[str, Any]</code></td><td>Fan-out write to vector, graph, profile, skill stores in parallel. Dedup-LRU gate prevents replays.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>RRF (Reciprocal Rank Fusion)</h2>
   <p>For each ranker (vector, graph, skill, episodic) the bus computes:</p>
   <pre><code>score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)</code></pre>
   <p><code>k = rrf_k</code>: <code>_reciprocal_rank_fusion</code> keeps <strong>60</strong> as its classmethod default, but the hydration path now passes <code>_RRF_K = 10</code> (2026-07-22, see the review section below). Per-source weights depend on a query intent classification; the table below is the hand-set <em>prior</em> that a learned matrix (<code>core.rrf_weights</code>) now scales multiplicatively within a bounded band:</p>
 
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Intent</th><th>graph</th><th>vector</th><th>skill</th><th>episodic</th></tr></thead>
     <tbody>
       <tr><td>factual</td><td>2.0</td><td>1.0</td><td>0.5</td><td>0.3</td></tr>
       <tr><td>procedural</td><td>0.5</td><td>1.0</td><td>2.0</td><td>1.5</td></tr>
       <tr><td>contextual</td><td>1.0</td><td>1.5</td><td>1.0</td><td>1.0</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Global budget + per-item emission (2026-07-07)</h2>
   <p>There are <strong>no</strong> fixed per-source budgets. <code>_format_markdown_with_survivors</code> emits items <strong>strictly in descending fused-score order</strong> under one global <code>max_chars</code> (headers printed lazily on first sight of a source), with a <code>_PER_SOURCE_CAP</code> (6) so one tier can't monopolise the budget. An earlier redesign moved off the old 25/40/20/15 % section split because fixed quotas discarded the fused ranking; this section previously still documented the dead quotas.</p>

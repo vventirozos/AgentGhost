@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / frontier.py — FrontierTracker</h1>
   <p class="subtitle">Per-cluster self-play telemetry. Detects mastery, ranks brittleness, scaffolds difficulty tiers, and rotates away from saturated clusters.</p>
 
@@ -141,7 +146,7 @@
   <p>Gate conditions in <a href="../core/dream.html"><code>Dreamer.synthetic_self_play</code></a> use <code>isinstance()</code> rather than truthiness because MagicMock-backed test contexts return Mocks for any attribute access — type-checks fail closed for both <code>ctx.prm_scorer</code> and <code>ctx.trajectory_collector</code>.</p>
 
   <h2>Methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>get_cluster_stats(key)</code></td><td>Stats blob.</td></tr>
@@ -157,7 +162,7 @@
       <tr><td><code>cluster_run_weights(candidates) → dict</code></td><td>2026-07-27: inverse-frequency weights <code>1/(1+runs)</code> per candidate cluster (unseen = top weight 1.0). Passed by the dream loop into <code>pick_random_template(cluster_weights=…)</code> so template draws favour under-practiced clusters.</td></tr>
       <tr><td><code>least_practiced_clusters(limit=3, extra_candidates=None) → list</code></td><td>2026-07-27: <code>[(cluster, runs)]</code> ascending over tracked ∪ extra candidates, mastered clusters excluded. Feeds the LLM generator's COVERAGE TARGET prompt block.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Curriculum-balance fixes (2026-07-27 log eval)</h2>
   <p>The overnight eval found 82% of 154 recorded runs in the two most-practiced clusters

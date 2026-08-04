@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="llm.html">llm</a>
@@ -28,6 +31,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / context_manager.py</h1>
   <p class="subtitle">Progressive context compression. Avoids the binary "fits" / "emergency-prune" cliff by compressing in five graduated levels.</p>
 
@@ -36,7 +41,7 @@
   </div>
 
   <h2>Levels</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Level</th><th>Used-token ratio</th><th>Effect</th><th>Full-fidelity turns</th></tr></thead>
     <tbody>
       <tr><td>L0</td><td>&lt; 60 %</td><td>No compression.</td><td>all</td></tr>
@@ -45,10 +50,10 @@
       <tr><td>L3</td><td>&lt; 95 %</td><td>Compress user messages too.</td><td>last 2</td></tr>
       <tr><td>L4</td><td>≥ 95 %</td><td>Emergency prune — keep only system + last user + last tool output.</td><td>1</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__(max_tokens=65536, token_estimator=None)</code></td><td>Inject estimator (defaults to ~4 chars per token).</td></tr>
@@ -57,7 +62,7 @@
       <tr><td><code>_emergency_prune(messages)</code></td><td>L4 emergency strategy.</td></tr>
       <tr><td><code>_summarize_tool_output(msg)</code></td><td>L1 — keep error / first-3 / last-3 lines.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Configuration constants</h2>
   <p><code>FULL_FIDELITY_TURNS = {0: 999, 1: 6, 2: 4, 3: 2, 4: 1}</code></p>

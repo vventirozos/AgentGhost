@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="dream.html">dream</a>
     <a href="frontier_selection.html">frontier_selection</a>
@@ -20,19 +23,21 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / journal_challenges.py</h1>
   <p class="subtitle">Mine production failures from the journal into standalone self-contained challenges.</p>
 
   <h2>Data shape</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>MinedChallenge</code> (line 37)</td><td>challenge · setup_script · validation_script · source_task · journal_hash · domains</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>mine_challenges(journal_entries, max_out=3) -&gt; List[MinedChallenge]</code></td><td>Extract up to 3 deduplicated challenges from journal post-mortems / failures (line 201).</td></tr>
@@ -40,7 +45,7 @@
       <tr><td><code>_guess_domains(text) -&gt; List[str]</code></td><td>Tag by keywords: csv → data_analysis, regex → regex_parse, sql → sql, …</td></tr>
       <tr><td><code>pick_journal_challenge(journal) -&gt; Optional[MinedChallenge]</code></td><td>Convenience wrapper used as a self-play entry point (line 228).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Source filter</h2>
   <p>Only journal entries of type <code>post_mortem</code> or <code>failure</code> are considered. The miner scans for failure markers (<code>error · failed · traceback · assertionerror · timeout · unresolved</code>) and synthesises a tiny deterministic <code>input.txt</code> (typically 4 lines). The validator is intentionally lenient — it accepts any exit-0 output that references the expected file tokens.</p>

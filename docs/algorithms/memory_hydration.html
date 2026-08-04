@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a class="current" href="memory_hydration.html">Memory hydration (RRF)</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Memory hydration with Reciprocal Rank Fusion</h1>
   <p class="subtitle">How a query becomes a sectioned markdown injection of vector + graph + skill + episodic results.</p>
 
@@ -32,14 +37,14 @@ k = 60  (rrf_k default)</code></pre>
 
   <h2>Intent weights</h2>
   <p>The bus first classifies the query as <em>factual</em>, <em>procedural</em>, or <em>contextual</em> using the <a href="../core/llm.html">worker pool</a> (<code>RoutingTask.CLASSIFY_INTENT</code>). The weight matrix:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Intent</th><th>graph</th><th>vector</th><th>skill</th><th>episodic</th></tr></thead>
     <tbody>
       <tr><td>factual</td><td>2.0</td><td>1.0</td><td>0.5</td><td>0.3</td></tr>
       <tr><td>procedural</td><td>0.5</td><td>1.0</td><td>2.0</td><td>1.5</td></tr>
       <tr><td>contextual</td><td>1.0</td><td>1.5</td><td>1.0</td><td>1.0</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Global budget &amp; fused-score ordering</h2>
   <p>Final markdown is capped at <code>max_chars</code> (default 6000). <strong>The fused RRF ranking now drives inclusion and order.</strong> Items are emitted in <em>descending fused score</em> (interleaved across sources) under a single global budget — source headers are emitted lazily on first sight so a tier's items still cluster under its header. The earlier fixed per-section budget map (<code>_SECTION_BUDGETS</code>, graph 25 % / vector 40 % / skill 20 % / episodic 15 %) was removed: it re-grouped items by source and silently discarded the fused score / intent weights / learned weights, making them cosmetic.</p>

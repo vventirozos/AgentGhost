@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a class="current" href="agent.html">agent</a>
     <a href="agent_qwen.html">agent_qwen</a>
@@ -34,6 +37,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / agent.py</h1>
   <p class="subtitle">The reasoning loop. Drives streaming chat completion, parses tool-call XML, dispatches tools, and re-injects results.</p>
 
@@ -41,7 +46,7 @@
   <p><code>GhostAgent</code> is the orchestrator that the FastAPI route hands a chat payload to. It owns the turn loop: it asks the upstream LLM for a streaming completion, watches the stream for <code>&lt;tool_call&gt;</code> XML blocks, parses arguments, runs the tool against the registry, captures output, and folds the result back into the conversation as a tool message. Sampling temperature, top-p, and the size of the "thinking" budget are all derived dynamically from a query classifier.</p>
 
   <h2>Public surface (selected)</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Symbol</th><th>Signature / type</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>GhostAgent.__init__</code></td><td><code>(context: GhostContext)</code></td><td>Captures all subsystems via <code>context</code>: LLM client, sandbox, memory bus, planner, MCTS, verifier, uncertainty tracker, scratchpad, scheduler, project store.</td></tr>
@@ -54,17 +59,17 @@
       <tr><td><code>_find_substantive_tool_for_verifier</code></td><td><code>(tools_run) -&gt; Optional[dict]</code></td><td>Skips bookkeeping tools (<code>scratchpad</code>, <code>manage_projects</code>, …) when picking evidence to hand the verifier.</td></tr>
       <tr><td><code>_collect_verifier_evidence</code></td><td><code>(tools_run, max_items=3, budget=4000) -&gt; str</code></td><td>Multi-tool evidence digest for claim-shaped verdicts (2026-07-16): last 3 substantive outputs, chronological, <code>[tool_name]</code>-labelled, newest-weighted budgets, total ≤ budget. Same skip rules as the selector above — see <a href="verifier.html">verifier</a> "Widened evidence window".</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Sampling profiles</h2>
   <p>Pinned to the Qwen 3.6 35B-A3 model card. Two thinking profiles:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Profile</th><th>Temperature</th><th>top_p</th><th>top_k / extras</th><th>When</th></tr></thead>
     <tbody>
       <tr><td><code>CODING_SAMPLING_PARAMS</code></td><td>0.6</td><td>0.95</td><td>top_k=20</td><td>Every coding turn; any tool turn.</td></tr>
       <tr><td><code>GENERAL_SAMPLING_PARAMS</code></td><td>1.0</td><td>0.95</td><td>top_k=20, presence_penalty=1.5</td><td>Conversational / free-form turns.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p><strong>Coding sub-profiles pinned to the model card (2026-06-22).</strong>
   The <code>_classify_coding_task</code> → <code>_CODING_TASK_PROFILES</code>
   (creative / precise / balanced) mechanism stays WIRED for future per-sub-task
@@ -268,7 +273,7 @@
 
   <h2 id="context-compaction">Context compaction (per-turn payload)</h2>
   <p>Before every upstream LLM call, <code>handle_chat</code> assembles a transient block (tool header + persona + memory hydration + dynamic state) that rides at the top of the last user message. Two predicates decide how aggressively to trim that block <em>before</em> serialisation:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Predicate</th><th>Trigger</th><th>What it suppresses</th><th>Per-turn saving</th></tr></thead>
     <tbody>
       <tr>
@@ -284,7 +289,7 @@
         <td>~7,800 tokens.</td>
       </tr>
     </tbody>
-  </table>
+  </table></div>
   <p>The hoisted predicate runs before the dynamic-state block that <em>also</em> sets <code>force_final_response=True</code>, so it mirrors that line's <code>next_action_id</code> check directly to stay in sync. The canonical <code>is_final_generation</code> assignment further down the loop is unchanged — the schema-skip is a strictly upstream short-circuit. Verified end-to-end by <code>tests/test_context_compaction.py</code> (9 cases pinning XML-only path, native-only path, savings floor, planner-driven final-gen, and the cross-cutting native-suppression on final turns).</p>
 
   <h3>Byte-stable advertised tool set (2026-07-07, #7)</h3>

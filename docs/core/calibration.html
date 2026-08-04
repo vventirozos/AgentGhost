@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Metacognition uplift</h3>
     <a href="entropy.html">entropy</a>
     <a href="confidence.html">confidence</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / calibration.py — Calibration Spine</h1>
   <p class="subtitle">Closes the loop on confidence: pair each turn's composite confidence with the realized outcome, measure Brier / ECE, and re-fit τ + weights + λ to the data. Roadmap phase 2.5.</p>
 
@@ -43,7 +48,7 @@
   </ol>
 
   <h2>Wiring</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Stage</th><th>Where</th></tr></thead>
     <tbody>
       <tr><td>Construct tracker</td><td><code>main.lifespan</code> — <code>context.calibration_tracker</code> (unconditional; only fed under <code>--enable-metacog</code>)</td></tr>
@@ -51,7 +56,7 @@
       <tr><td>Startup load</td><td><code>main.lifespan</code> — <code>confidence.apply_fitted(load_params())</code></td></tr>
       <tr><td>Idle refit (phase 2.7c)</td><td><code>core.agent._biological_tick</code> — <code>fit()</code> then hot-swap, 60-min cooldown (<code>--calib-refit-cooldown</code>)</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Design non-negotiables</h2>
   <ul>
@@ -74,7 +79,7 @@
   was "WORSE than always predicting the base rate". Both were true of the pooled corpus and false of
   the signal.</p>
   <p>Three era shifts compounded:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Era</th><th>n</th><th>mean competence</th><th>mean outcome</th><th>labels</th></tr></thead>
     <tbody>
       <tr><td>07-07 → 07-11</td><td>209</td><td>0.757</td><td>0.952</td><td>binary</td></tr>
@@ -82,7 +87,7 @@
       <tr><td>07-20 → 07-27</td><td>398</td><td>0.867</td><td>0.939</td><td>binary</td></tr>
       <tr><td>07-28 → 08-02</td><td>411</td><td>0.898</td><td>0.838</td><td><strong>graded</strong></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <ul>
     <li>The <strong>label</strong> changed on 2026-07-27 — binary <code>{0,1}</code> at base rate 0.955 became graded at 0.855. The drop is a redefinition, not a decline in turn quality.</li>
     <li>The <strong>features</strong> changed the same day: <code>effort_component</code> and real logprob entropy are observed only from then on, so 1298 of 1709 rows (76&nbsp;%) collapse to competence alone under <code>_composite_for</code> and outvote the informative ones 3:1.</li>
@@ -91,13 +96,13 @@
   <p>Pooled, the score rises exactly as the labels fall — a textbook Simpson's paradox that forces a
   <em>negative</em> Platt slope, so the map was rejected as inverted on every refit and Brier stayed
   on the raw scale. Measured both ways on the same 1709 rows with the same code:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Scope</th><th>AUC</th><th>Platt slope</th><th>Map</th><th>Brier</th><th>vs base rate</th></tr></thead>
     <tbody>
       <tr><td>Pooled (all epochs)</td><td>0.530</td><td>−0.077</td><td>REJECTED</td><td>0.0542</td><td>0.0365 — <strong>loses</strong></td></tr>
       <tr><td>Current epoch only</td><td>0.722</td><td>+1.917</td><td>applied</td><td>0.0244</td><td>0.0255 — <strong>beats, −4.6&nbsp;%</strong></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>So <code>CURRENT_EPOCH</code> gates the fit, and every row carries an <code>epoch</code> tag.
   Untagged legacy rows get theirs <em>derived</em> from <code>ts</code> (<code>epoch_for_ts</code>),
   never defaulted to the current value — silently promoting them is the contamination the field
@@ -254,13 +259,13 @@
   <h2>2026-07-27 (later 4) — probability recalibration, and the diagnosis it produced</h2>
   <p>The composite was measured against the only baseline that matters — always predicting the
   base rate:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Predictor</th><th>Brier</th></tr></thead>
     <tbody>
       <tr><td>Raw composite</td><td>0.0656</td></tr>
       <tr><td>Always predict the base rate (0.961)</td><td><strong>0.0374</strong></td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>As a probability, the confidence number was <em>worse than a constant</em>. The weight search
   decides how to COMBINE signals but cannot set their level, so a two-parameter Platt stage
   (<code>p = sigmoid(a·composite + b)</code>) now runs after the weight fit, with the raw and
@@ -291,14 +296,14 @@
   <h3>Feature health: 0 of 3 inputs are alive</h3>
   <p>Recalibration cannot fix a score with nothing in it. Measuring each input for whether it
   <em>varies</em> AND <em>separates</em> the outcome classes:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Feature</th><th>Distinct values</th><th>Separation (success − failure)</th><th></th></tr></thead>
     <tbody>
       <tr><td><code>entropy_component</code></td><td>2</td><td>+0.0002</td><td>DEAD — upstream refuses logprobs on tools+stream</td></tr>
       <tr><td><code>competence_component</code></td><td>270</td><td><strong>−0.0008</strong></td><td>DEAD — varies plenty, predicts nothing</td></tr>
       <tr><td><code>uncertainty_pressure</code></td><td>1</td><td>0.0</td><td>DEAD — the tracker logged 2 records in 20 days</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>This is now reported every run by <a href="../tools/introspect.html">learning-health
   telemetry</a> (<code>features: 0/3 live — NONE discriminate</code>), so a dead input is visible
   immediately rather than inferred from a bad Brier months later. Note that "few distinct values"
@@ -418,13 +423,13 @@
   <h3>Measured — and it contradicted the hypothesis</h3>
   <p>Replaying the real production mix (1028 turns, 726 of them unverified) through the real feature and the
   real fit:</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Label</th><th>Distinct values</th><th>Variance</th><th>Brier vs base rate</th></tr></thead>
     <tbody>
       <tr><td>Binary</td><td>2</td><td>0.0986</td><td>0.0666 vs 0.0986 — beats by 33%</td></tr>
       <tr><td>Graded</td><td>8</td><td>0.0446</td><td>0.0395 vs 0.0446 — beats by 11%</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Grading gives a far richer target but a <em>smaller</em> edge over the baseline. The reason is that the
   binary label is partly CIRCULAR with the turn-effort feature: effort counts tool calls and repeats, tool
   errors drive both the effort signal and the binary label, so the model was partly predicting itself. Grading

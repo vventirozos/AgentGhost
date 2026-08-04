@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="llm.html">llm</a>
@@ -24,6 +27,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / mcts.py — MCTSReasoner</h1>
   <p class="subtitle">Monte Carlo Tree Search for action selection with cached alternatives and backtracking.</p>
 
@@ -43,19 +48,19 @@
   </ol>
 
   <h2>Data structures</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>ActionCandidate</code> (line 31)</td><td>description, tool_name, tool_args, simulated_outcome, score, risk_notes, selected</td></tr>
       <tr><td><code>MCTSNode</code> (line 52)</td><td>action, depth, children, visits, total_score, <code>avg_score</code> property</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Constructor</h2>
   <pre><code>MCTSReasoner(llm_client, max_candidates=3, max_depth=2)</code></pre>
 
   <h2>Public methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>async select_best_action(task, plan_state, available_tools, context)</code></td><td>Run the full Generate → Simulate → Score → Select pipeline (line 127).</td></tr>
@@ -63,7 +68,7 @@
       <tr><td><code>has_alternatives() -&gt; bool</code></td><td>Whether the stack still has candidates (line 181).</td></tr>
       <tr><td><code>clear()</code></td><td>Reset (line 185).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Diagram</h2>
   <div class="diagram">

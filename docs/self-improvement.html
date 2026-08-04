@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it improves itself — Ghost Agent</title>
+<meta name="description" content="Ghost Agent checks its own answers and runs background learning passes while idle. What each one does, when it fires, and how to see what happened.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a class="current" href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">How it works</span>
+  <h1>How it improves itself</h1>
+  <p class="subtitle">Two separate things: a check that runs on every answer, and a set of background passes that only run when you've left it alone.</p>
+
+  <div class="note">
+    <strong>To be clear about what this isn't.</strong> None of this retrains the language model. The model file never changes. What changes is what Ghost <em>remembers</em>, what it has <em>learned to avoid</em>, and a few small local models it trains itself for scoring and routing. Everything happens on your machine.
+  </div>
+
+  <h2>Part one: checking its own answers</h2>
+
+  <p>The failure this exists to catch is specific and common: a model announces "I've created the file and it works" when nothing ran, or answers a subtly different question than the one you asked. It reads confidently either way, which is what makes it dangerous.</p>
+
+  <p>So before an answer is final, a second pass reads it against the evidence the tools actually produced.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>The evidence is collected</h4>
+        <p>What the tools returned this turn — command output, file contents, what the browser saw. Not the model's description of them; the actual results.</p>
+      </li>
+      <li>
+        <h4>Two questions, in this order</h4>
+        <p>First: <em>does this answer the question that was asked?</em> Second: <em>is it supported by the evidence?</em> Alignment comes first deliberately — "you asked for code and got a number" is a worse failure than a wrong number, and a check that only looks at correctness misses it entirely.</p>
+      </li>
+      <li>
+        <h4>A verdict, with a confidence</h4>
+        <p>Confirmed, or refused. A cheap local judge does the first pass; if it refuses, the main model re-examines the case, and <em>its</em> verdict wins. That second look exists because the cheap judge refuses more often than it should.</p>
+      </li>
+      <li class="optional">
+        <h4>If refused with high confidence — repair</h4>
+        <p>Ghost gets a bounded number of attempts (one by default) to fix the answer with the critique in hand, rather than shipping something it just failed. Error messages and aborts are never "repaired".</p>
+      </li>
+      <li>
+        <h4>Whatever happens is recorded</h4>
+        <p>A refused answer also un-learns anything it taught. If Ghost recorded a lesson during a turn whose answer got refused, that lesson is removed — otherwise a single bad turn poisons future ones.</p>
+      </li>
+    </ol>
+  </div>
+
+  <h3>Streaming answers are checked late</h3>
+  <p>If the reply streams word by word, the text has already reached you by the time the check finishes. Blocking would buy nothing. So the check runs in the background and, if it refuses, you get a correction notice at the top of the <em>next</em> reply. It's not silent — but it is after the fact.</p>
+
+  <h3>When you correct it yourself</h3>
+  <p>Telling Ghost it got something wrong is a much stronger signal than anything it can generate on its own, and it's treated that way: the turn gets marked as failed, and it goes into the material the background passes learn from. It needs both a recognisable correction phrase and genuine overlap with the previous message, so an ordinary follow-up question isn't mistaken for a correction.</p>
+
+  <h2>Part two: what it does while you're away</h2>
+
+  <p>A background loop wakes up periodically and checks whether it's allowed to do anything. Two rules govern all of it:</p>
+  <ul>
+    <li><strong>It never interrupts you.</strong> If a request is in flight — even paused between model calls — every phase is skipped.</li>
+    <li><strong>Each phase needs both idle time and a cooldown.</strong> "It's been quiet for an hour" isn't enough if that phase already ran twenty minutes ago.</li>
+  </ul>
+
+  <p>So on a busy day, almost none of this runs. That's intended.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>After ~2 minutes — file away what just happened</h4>
+        <p>Things noted during the conversation are sitting in a queue. This pass works through them and decides what's worth keeping, then writes it into long-term memory. Until this runs, something you just mentioned may not be findable.</p>
+      </li>
+      <li>
+        <h4>After ~10 minutes — consolidate memory</h4>
+        <p>The project calls this the dream cycle, or REM. It reviews recent memories, merges duplicates, generalises repeated patterns into something reusable, and tunes how much each memory store is trusted for different kinds of question.</p>
+        <p>It skips itself when there's nothing new, and backs off further each time it skips — so a quiet afternoon doesn't produce a log full of "nothing to do".</p>
+      </li>
+      <li>
+        <h4>After ~15 minutes — review what went wrong</h4>
+        <p>Recent failed turns get re-read and critiqued, and what comes out of that becomes lessons. Around the same window, Ghost also updates its running first-person account of what it's been doing, and its record of what changed in your files.</p>
+      </li>
+      <li>
+        <h4>Every couple of hours — extract reusable skills</h4>
+        <p>Looks across successful runs for a procedure that keeps recurring and turns it into a named, reusable skill instead of something re-derived every time.</p>
+      </li>
+      <li>
+        <h4>Every few hours — retrain its own small models</h4>
+        <p>Two little local models: one that scores whether a partial plan looks like it's going somewhere, one that routes requests to the cheapest machine that can handle them. Both are trained on Ghost's own recorded turns. Skipped entirely when nothing new has been recorded since the last retrain.</p>
+      </li>
+      <li>
+        <h4>After ~1 hour — practise</h4>
+        <p>Self-play. Ghost generates a challenge for itself, attempts it, scores the result, and keeps what it learned. It aims at the areas where it's least certain rather than picking at random, and the interval adapts: when practice is producing something, it comes back sooner.</p>
+      </li>
+    </ol>
+    <p class="caption">Times are how long you've been quiet. Each phase also has its own cooldown between runs.</p>
+  </div>
+
+  <h3>Two more that are off by default</h3>
+  <dl class="kv terms">
+    <dt>Post-mortems</dt>
+    <dd>Reads the entire transcript of its worst failed runs and files a classified defect report: <em>I chose badly</em>, <em>a setting allowed this</em>, or <em>a tool is broken</em>. The last kind can carry a proposed test and patch — stored for a human to read, <strong>never applied automatically</strong>. Turn on with <code>--postmortem</code>.</dd>
+    <dt>Advancing projects on its own</dt>
+    <dd>When idle, push one active project forward by one step without being asked. Runs on hard per-project budgets with human gates. Turn on with <code>--autoadvance-idle</code>.</dd>
+  </dl>
+
+  <h2>What all of this is actually reading</h2>
+
+  <p>Every one of those passes reads the same thing: a <strong>trajectory</strong> — one JSON line per turn recording what was asked, which tools ran in what order, what came back, and how it ended. They're written append-only to <code>$GHOST_HOME/trajectories/</code>, redacted on the way out, and if the write fails the turn carries on regardless. A logging failure must never break a user request.</p>
+
+  <p>That one log is the input to five different consumers, each asking a different question of it:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Reads trajectories to ask</th><th>Produces</th></tr></thead>
+    <tbody>
+      <tr><td>What went wrong in this turn?</td><td>A lesson.</td></tr>
+      <tr><td>What about the agent itself made this fail?</td><td>A classified defect report.</td></tr>
+      <tr><td>Which procedures keep recurring?</td><td>A new reusable skill.</td></tr>
+      <tr><td>Does a half-finished plan look like it's going somewhere?</td><td>A trained step-scorer.</td></tr>
+      <tr><td>How hard is this request likely to be?</td><td>A trained router.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>How a skill gets extracted</h3>
+  <p>Worth spelling out, because "the agent learns new abilities" is vague and the actual rule is not:</p>
+  <ul>
+    <li>Only turns that <strong>passed</strong> are considered, and only those using <strong>two or more tools</strong> — a one-tool solve isn't a reusable procedure, it <em>is</em> the tool.</li>
+    <li>Turns are grouped by the exact sequence of tools they used. A group becomes a candidate only once several <em>distinct</em> turns support it, so one lucky run can't become a skill.</li>
+    <li>The exemplar kept is the one with the <strong>fewest tool calls</strong>, ties broken by speed — the shortest validated path, not the first one found.</li>
+  </ul>
+  <p>Skills are also re-tested later rather than trusted forever. A skill is only as good as the moment it was learned, and tools get renamed, libraries upgrade, and the model itself drifts. Re-verification decides whether each one stays active, gets deprecated, or is kept under watch.</p>
+
+  <h3>The two small models it trains</h3>
+  <p>Both are plain logistic regression in numpy, saved as JSON. That's a deliberate ceiling: they're trained on a few thousand of the agent's own turns, which is not enough data to justify anything bigger, and a model you can read as a list of weights is one you can debug.</p>
+  <p>The router in particular is built to fail safe — a low-confidence prediction escalates to the full pool rather than gambling on the cheap path. The worst it can do is fail to save you a call. It never blocks a request.</p>
+
+  <h2>It tunes its own prompts — offline, and against a baseline</h2>
+
+  <p>Three prompts are treated as <em>optimizable</em> rather than hand-written and final: the one that breaks a request into sub-tasks, the one that picks a tool, and the one that critiques a failed turn. An optimizer rewrites them from the agent's own successful turns.</p>
+
+  <p>This runs <strong>offline, when you start it</strong> — it's not one of the idle-time passes. Tuned prompts land in <code>$GHOST_HOME/system/optim/</code> and are picked up at the start of the next session.</p>
+
+  <div class="diagram">
+    <ol class="flow">
+      <li>
+        <h4>Build a training set from turns that worked</h4>
+        <p>The request is the input, the validated final answer is the target. Filtered hard on <em>passed</em> — feeding an optimizer failed examples defeats the point.</p>
+      </li>
+      <li>
+        <h4>Optimize against the local model</h4>
+        <p>The optimizer points at <strong>the same local model the agent already uses</strong>. There's no teacher model and no external endpoint — consistent with the rest of the project, and a real constraint on how good the result can get.</p>
+      </li>
+      <li>
+        <h4>Stop early, on purpose</h4>
+        <p>Capped at 16 iterations. Longer optimization runs drift toward gaming the metric rather than doing the task — measured elsewhere at a 26% → 58% rate of that between 10 and 100 steps. The cap is the mitigation; raising it needs a stronger held-out test first, not just patience.</p>
+      </li>
+      <li>
+        <h4>Beat the hand-written prompt, or don't ship</h4>
+        <p>The tuned version is A/B'd against the existing one. Losing means it isn't promoted. The hand-written baseline is the thing to beat, not a formality.</p>
+      </li>
+    </ol>
+  </div>
+
+  <div class="note warn">
+    <strong>Two things this got wrong, which are worth knowing.</strong> For a while the optimizer wrote tuned prompts to disk that <em>nothing ever read</em> — it was write-only, and the loop only closed once the loading side was built. Separately, a promoted prompt turned out to have won on one scoring metric and to lose on a better one, so it had to be un-promoted. The lesson that stuck: when you change the metric or the gate, re-score the incumbent too — otherwise you're comparing a new candidate against a champion that was never measured the same way.
+  </div>
+
+  <h3>The harder question underneath</h3>
+  <p>Optimizing a tool's <em>description</em> assumes the tool boundaries are right and only the wording is off. Measured on unseen cases, the agent picks the correct tool about <strong>77% of the time</strong> — and the misses aren't scattered, they cluster into the same few pairs (browser vs. file operations, code execution vs. writing a file). When a model keeps confusing the same two things, "the description is unclear" competes with "the boundary is in the wrong place", and better prose can't fix the second one. That's an open question here, not a solved one.</p>
+
+  <h2>Seeing what actually happened</h2>
+  <p>All of this is invisible by design — routine background work doesn't interrupt your conversation. To see it, ask.</p>
+
+  <dl class="kv terms">
+    <dt>"What did you do while I was away?"</dt>
+    <dd>Reads the background activity ledger — which passes ran, what came out of them, over whatever window you name.</dd>
+    <dt>"What have you learned this week?"</dt>
+    <dd>Reads the lesson list back. This is a real read of stored records, not the model recalling from context.</dd>
+    <dt>"Is your learning actually working?"</dt>
+    <dd>Health telemetry for the learning loop itself: are lessons being used, are the retrains succeeding, is the confidence calibration fitting. This is the page to check when you suspect a subsystem has quietly stopped running.</dd>
+    <dt>"What have you found broken in yourself?"</dt>
+    <dd>The post-mortem defect queue, if you have post-mortems enabled.</dd>
+  </dl>
+
+  <div class="note warn">
+    <strong>The characteristic failure mode here is silence.</strong> A learning pass that has stopped running looks exactly like a learning pass with nothing to do — both produce no output. If you want to know whether this machinery is alive, check <code>biological_watchdog_alive</code> on the health endpoint and ask for the activity ledger. Don't infer it from the absence of errors.
+  </div>
+
+  <h2>Turning parts of it off</h2>
+  <p>Every phase has an off switch, mostly so you can measure whether it's earning its cost.</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Flag</th><th>Turns off</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-dream</code></td><td>Memory consolidation. Leaves reflection and self-play running.</td></tr>
+      <tr><td><code>--no-self-play</code></td><td>Practice. Leaves the rest running.</td></tr>
+      <tr><td><code>--no-reflection</code></td><td>Reviewing failed turns.</td></tr>
+      <tr><td><code>--no-trajectories</code></td><td>Recording turns at all. This also disables reflection, since it has nothing to read.</td></tr>
+      <tr><td><code>--no-verifier</code></td><td>The self-check. Not recommended outside an experiment — see below.</td></tr>
+      <tr><td><code>--no-memory</code></td><td>Everything. Ghost becomes a plain chat wrapper.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note">
+    <strong>Why <code>--no-verifier</code> exists.</strong> When the check runs late (on a streamed answer), it can't change what you already read — its only payoff is cross-session, by scrubbing bad lessons and queueing a correction. That's a real benefit but not an obvious one, and it costs a full extra model call per turn. The flag exists so you can measure the difference rather than assume it.
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="tools.html">
+      <span class="dir">Previous</span>
+      <span class="to">What it can do</span>
+    </a>
+    <a class="next" href="safety.html">
+      <span class="dir">Next</span>
+      <span class="to">Safety and privacy</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Checked against <code>core/agent.py</code> (the idle loop), <code>core/verifier.py</code> and <code>core/dream.py</code> on 2026-08-04. Timings are defaults and can be changed — see <a href="configuration.html">Settings that matter</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

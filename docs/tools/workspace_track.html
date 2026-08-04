@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="execute.html">execute</a>
@@ -36,6 +39,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / workspace_track.py</h1>
   <p class="subtitle">Write path into the workspace continuity module — author the watchlist of files to track, free-form workspace notes, and manual research dedup markers.</p>
 
@@ -44,7 +49,7 @@
   <p>Counterpart to the read-only <a href="workspace.html"><code>workspace</code></a> tool. Same shape as the <a href="../algorithms/selfhood.html#agent-callable-tools"><code>self_state</code> + <code>introspect</code></a> pair on the selfhood side.</p>
 
   <h2>Tool: <code>workspace_track</code></h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Effect</th><th>Backed by</th></tr></thead>
     <tbody>
       <tr><td><code>track</code></td><td>Add a file path to the watchlist (optional <code>label</code>). The next <code>build_wakeup_prefix()</code> call will stat it and emit a "newly tracked" diff event.</td><td><code>WorkspaceModel.track_file()</code></td></tr>
@@ -52,10 +57,10 @@
       <tr><td><code>note</code></td><td>Append a free-form workspace event (kind=<code>note</code>) — observations the agent wants to recall later.</td><td><code>WorkspaceModel.note()</code></td></tr>
       <tr><td><code>mark_seen</code></td><td>Record a URL as already-pulled so future research turns dedup against it without re-fetching.</td><td><code>WorkspaceStateThread.mark_url_seen()</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Parameters</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Required for</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td><code>action</code></td><td>always</td><td>One of <code>track</code>, <code>untrack</code>, <code>note</code>, <code>mark_seen</code>.</td></tr>
@@ -64,7 +69,7 @@
       <tr><td><code>text</code></td><td><code>note</code></td><td>The free-form observation to record.</td></tr>
       <tr><td><code>url</code></td><td><code>mark_seen</code></td><td>The URL to record as already-pulled.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Failure semantics</h2>
   <ul>

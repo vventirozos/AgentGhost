@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / projects.py — ProjectStore</h1>
   <p class="subtitle">Multi-session project &amp; task store. SQLite-only; no ORM. Designed for cross-process access from API, Slack bot, dream consolidator.</p>
 
@@ -38,7 +43,7 @@
 
   <h2>Tables</h2>
   <h3>projects</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Column</th><th>Type / values</th></tr></thead>
     <tbody>
       <tr><td>id</td><td>TEXT PK (12-char hex)</td></tr>
@@ -47,10 +52,10 @@
       <tr><td>metadata_json</td><td>TEXT — free-form JSON. Holds advancer budget knobs (<code>steps_cap/steps_used</code>, <code>last_autoadvance_ts</code>) and the <code>research_index</code> (list of persisted research briefs — see <a href="../core/project_research.html">core.project_research</a>).</td></tr>
       <tr><td>created_at / updated_at</td><td>REAL</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>tasks</h3>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Column</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td>id, project_id, parent_id</td><td>FKs (parent_id NULL = root).</td></tr>
@@ -62,7 +67,7 @@
       <tr><td>result_summary / failure_reason / actual_tool_used</td><td>TEXT.</td></tr>
       <tr><td>revision_count, estimated_cost, actual_cost, depth, position</td><td>numeric.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h3>task_artifacts</h3>
   <p>id · task_id · project_id · kind ∈ {file, url, note, tool_call} · payload · created_at.</p>

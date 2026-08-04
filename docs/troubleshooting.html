@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When something breaks — Ghost Agent</title>
+<meta name="description" content="Common Ghost Agent failures and what actually causes them: startup refusals, empty memory, dead background loops, sandbox surprises.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Start here</h3>
+    <a href="index.html">What Ghost Agent is</a>
+    <a href="getting-started.html">Install and run it</a>
+    <a href="interfaces.html">Ways to talk to it</a>
+
+    <h3>How it works</h3>
+    <a href="how-it-works.html">One message, end to end</a>
+    <a href="memory.html">What it remembers</a>
+    <a href="tools.html">What it can do</a>
+    <a href="self-improvement.html">How it improves itself</a>
+
+    <h3>Running it</h3>
+    <a href="safety.html">Safety and privacy</a>
+    <a href="configuration.html">Settings that matter</a>
+    <a class="current" href="troubleshooting.html">When something breaks</a>
+
+    <h3>Reference</h3>
+    <a href="glossary.html">Glossary</a>
+    <a href="reference.html">Deep reference</a>
+    <span class="nav-note">A page per module, written for maintainers.</span>
+  </nav>
+</aside>
+
+<main>
+  <span class="eyebrow">Running it</span>
+  <h1>When something breaks</h1>
+  <p class="subtitle">Sorted by what you'd notice, not by which component is at fault.</p>
+
+  <h2>Check these two things first</h2>
+  <p>Most confusing behaviour resolves into one of two states, and both are visible from one request:</p>
+
+  <pre class="shell">curl -s -H "X-Ghost-Key: $GHOST_API_KEY" \
+     http://127.0.0.1:8000/api/health | python -m json.tool</pre>
+
+  <dl class="kv">
+    <dt>memory_system_loaded</dt>
+    <dd><code>false</code> means Ghost booted <strong>degraded</strong>: HTTP answers normally, but there's no memory and every background pass is silently disabled. It will chat with you and remember nothing.</dd>
+    <dt>biological_watchdog_alive</dt>
+    <dd><code>false</code> means the background loop died. Ghost still answers, but it has stopped consolidating memory and learning. Nothing will tell you this — it just goes quiet.</dd>
+  </dl>
+
+  <h2>It won't start</h2>
+
+  <h3>"REFUSING TO START … no API key configured"</h3>
+  <p>You bound to something other than localhost without deciding about authentication. Either set <code>GHOST_API_KEY</code>, or pass <code>--api-key ''</code> to knowingly turn auth off on a trusted network, or bind to <code>127.0.0.1</code>.</p>
+
+  <h3>It aborts complaining about Tor</h3>
+  <p>Mandatory Tor is on by default and Ghost probes it at boot. Check the daemon is running and listening:</p>
+  <pre class="shell">curl --socks5-hostname 127.0.0.1:9050 -s https://check.torproject.org | grep -o "Congratulations"</pre>
+  <p>If Tor is fine but Ghost still refuses, check <code>TOR_PROXY</code> points at the right port.</p>
+
+  <h3>First-ever boot hangs or fails loading the embedder</h3>
+  <p>This one catches everybody. On a fresh install the embedding model hasn't been downloaded yet, and the Tor egress guard blocks that download because it's a direct connection to a public host. Boot once with <code>--no-mandatory-tor</code> to let it cache, then run normally from then on.</p>
+
+  <h3>It refuses to start and mentions re-embedding</h3>
+  <p>The embedding model doesn't match the one that built your vector store. Both models produce vectors of the same size, so nothing would crash — the stored vectors would simply stop meaning anything and retrieval would return plausible-looking garbage. Ghost refuses instead.</p>
+  <p>Either put <code>GHOST_EMBED_MODEL</code> back to what it was, or migrate deliberately:</p>
+  <pre class="shell">PYTHONPATH=src python scripts/reembed_memory.py</pre>
+
+  <h3>Port already in use</h3>
+  <p>Usually a previous instance that didn't shut down. If you run it under launchd with <code>KeepAlive</code>, remember that a plain <code>kill</code> restarts it — you need <code>launchctl bootout</code> to actually stop it.</p>
+
+  <h2>It started but acts like it has amnesia</h2>
+
+  <h3>It knows nothing about you at all</h3>
+  <p>Almost always <code>GHOST_HOME</code>. If it isn't set, Ghost uses <code>~/ghost_llamacpp</code> — so an agent started from a shell where you'd exported it and one started by a service manager where you hadn't are two different agents with two different memories.</p>
+  <p>Under launchd or systemd this is the default outcome, because a service doesn't inherit your shell profile. Set it inside the service definition. Confirm which path is live:</p>
+  <pre class="shell">ps -o command= -p $(pgrep -f ghost_agent.main | head -1)</pre>
+
+  <h3>It forgot one specific thing</h3>
+  <p>Two very different causes with opposite fixes. Ask it to search for the fact directly. If it <em>can</em> find it on request, the fact is stored fine and the retrieval ranking didn't surface it — that's a ranking problem, not a lost memory. If it can't find it at all, it was never stored.</p>
+  <p>Things mentioned in the last couple of minutes may genuinely not be searchable yet; the queue that files them drains after about two minutes of quiet. <a href="memory.html">More on memory →</a></p>
+
+  <h3>It keeps repeating something wrong about you</h3>
+  <p>That entry is in your profile, which is injected into every conversation rather than searched. Correct it directly ("my wife is Maria, not Anna") or use the memory-correction control in the web UI.</p>
+
+  <h2>Tools don't work</h2>
+
+  <h3>Anything involving code or files fails</h3>
+  <p>Check Docker is running. Ghost needs the daemon up; without it, <code>execute</code>, <code>browser</code> and the file tools all fail. The very first container start also pulls a base image, so it's slow once and fast afterwards.</p>
+
+  <h3>"It can't reach my app on localhost:3000"</h3>
+  <p>Correct — and not a bug. The sandbox has its own network namespace, so its <code>127.0.0.1</code> is not yours. Ghost cannot see services you run on your machine, and cannot stop or restart your processes. If you need it to test a local app, have Ghost start that app itself inside the sandbox.</p>
+
+  <h3>Web search returns nothing, repeatedly</h3>
+  <p>Usually search operators. The scraper backends Ghost reaches over Tor don't support <code>site:</code>, quoted phrases, or <code>AND</code>/<code>OR</code> — including any of them returns zero results rather than an error. Plain keywords only.</p>
+  <p>For dark-web search specifically, zero results is normal. Onion search engines are unreliable and reachability varies by exit node; an empty result is not a reason to retry the same query.</p>
+
+  <h3>A tool that used to work now refuses to run</h3>
+  <p>The pre-flight guard is doing its job. When the same tool fails the same way on the same target repeatedly, Ghost stops re-running it and hands the model the previous error instead. Fix the underlying cause and it'll clear.</p>
+
+  <h2>It's slow</h2>
+
+  <h3>Every answer is slow</h3>
+  <p>Your model has one inference slot, and Ghost competes with itself for it: the self-check, conversation compaction and background classification are all model calls. Moving the self-check to a second machine with <code>--critic-nodes</code> is the highest-value change available — see <a href="configuration.html">Settings that matter</a>.</p>
+
+  <h3>One turn takes forever</h3>
+  <p>Watch the log panel in the web UI. A turn can use up to 40 passes through the tool loop, and something like deep research legitimately takes minutes because every page is fetched over Tor. If it's stuck on the same tool repeatedly with the same result, that's a loop and Ghost's own guards should break it after three identical attempts.</p>
+
+  <h3>A configured node stopped being used</h3>
+  <p>Look at <code>node_health</code> on the health endpoint. A node that keeps failing gets its circuit breaker opened and is taken out of rotation. The most common cause is an address that moved — point node flags at tailnet addresses or stable hostnames, not DHCP-assigned LAN IPs.</p>
+
+  <h2>The answers are wrong</h2>
+
+  <h3>It claims it did something it didn't</h3>
+  <p>This is the failure the self-check exists for. If it got through, check whether the answer was <em>streamed</em> — streamed replies are checked after they reach you, and the correction arrives at the top of the next reply rather than as an edit of the last one.</p>
+  <p>If it's happening often, confirm the check is actually running: <code>--no-verifier</code> disables it, and a critic node that's down means the check falls back to the main model, which is slower but should still run.</p>
+
+  <h3>It answers a different question than the one asked</h3>
+  <p>Tell it. Corrections are a strong signal — they mark the turn as failed and feed the background review. A correction needs a recognisable correction phrase and real overlap with your previous message, so "no, I asked for the file paths, not the counts" registers where a fresh unrelated question doesn't.</p>
+
+  <h3>It got worse after learning something</h3>
+  <p>A bad lesson can get recorded. Ask to see the lessons (<em>"show me what you've learned this week"</em>) and have it drop the offending one. Ghost also removes lessons on its own when the answer that produced them is later refused by the self-check.</p>
+
+  <h2>Working out where to look</h2>
+
+  <div class="diagram">
+    <ol class="flow tight">
+      <li>
+        <h4>Is it up and healthy?</h4>
+        <p><code>/api/health</code> — the two fields at the top of this page.</p>
+      </li>
+      <li>
+        <h4>What is it doing right now?</h4>
+        <p>The live log, in the web UI panel or <code>$GHOST_HOME/system/ghost-agent.log</code>.</p>
+      </li>
+      <li>
+        <h4>What has it been doing?</h4>
+        <p>Ask it: <em>"what did you do while I was away?"</em> That reads the real background activity ledger.</p>
+      </li>
+      <li>
+        <h4>Is the learning machinery alive?</h4>
+        <p>Ask it: <em>"is your learning working?"</em> That reports whether the background passes are actually running and succeeding, which absence of errors will not tell you.</p>
+      </li>
+      <li>
+        <h4>What does it think is broken about itself?</h4>
+        <p>Ask for the post-mortem queue, if you have <code>--postmortem</code> on.</p>
+      </li>
+    </ol>
+  </div>
+
+  <div class="note">
+    <strong>A useful habit:</strong> when a subsystem seems to have stopped, check that it's <em>running</em> before you debug what it's doing. The characteristic bug in a system like this isn't a wrong answer — it's a component that silently stopped being called, which looks exactly like a component with nothing to do.
+  </div>
+
+  <div class="pager">
+    <a class="prev" href="configuration.html">
+      <span class="dir">Previous</span>
+      <span class="to">Settings that matter</span>
+    </a>
+    <a class="next" href="glossary.html">
+      <span class="dir">Next</span>
+      <span class="to">Glossary</span>
+    </a>
+  </div>
+
+  <footer>
+    <p>Written against the code as of 2026-08-04. If a symptom here doesn't match what you're seeing, the <a href="logging.html">logging reference</a> explains how to read the stream in detail.</p>
+  </footer>
+</main>
+</body>
+</html>

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Memory</h3>
     <a class="current" href="vector.html">vector</a>
     <a href="graph.html">graph</a>
@@ -26,6 +29,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>memory / vector.py — VectorMemory</h1>
   <p class="subtitle">ChromaDB-backed semantic memory with adaptive spaced repetition, BM25 hybrid re-ranking, temporal decay, and document ingestion.</p>
 
@@ -64,7 +69,7 @@
   <p><strong>Measured live</strong>: a 6:17 recording ingested as 3 overlapping windows (<code>0:00–3:00</code>, <code>2:45–5:45</code>, <code>5:30–6:17</code>) → 8 chunks, with marker words planted at the start, middle and very end all recovered. Single-shot transcription runs ~11× faster than real-time; windowed ingest is slower per minute because each window is a separate call and seams are transcribed twice. Practical scale: a 45-minute talk is four windows. Tests: <code>tests/test_audio_ingest.py</code> (20). Config: <code>GHOST_AUDIO_NODE_URL</code>, <code>GHOST_AUDIO_WINDOW_S</code>, <code>GHOST_AUDIO_WINDOW_OVERLAP_S</code>, <code>GHOST_AUDIO_MAX_S</code>, <code>GHOST_AUDIO_MAX_TOKENS</code>.</p>
 
   <h2>Record schema</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Notes</th></tr></thead>
     <tbody>
       <tr><td><code>document</code></td><td>Raw text.</td></tr>
@@ -75,10 +80,10 @@
       <tr><td><code>metadata.source</code></td><td>Filename for document chunks.</td></tr>
       <tr><td><code>metadata.trigger / domains / verified</code></td><td>Skill-only metadata.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Public methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>add(text, meta)</code></td><td>Insert. MD5 dedup; skip if &lt; 5 chars. Every <code>_PRUNE_CHECK_EVERY</code> (200) adds, triggers <code>_prune_if_needed</code>. <strong>id-exists now REFRESHES metadata (2026-07-22)</strong> instead of a blanket early-return: skills twins are keyed on embedding text, so re-learning a lesson left the old <code>source_trajectory_id</code> and <code>retract_lessons_from_trajectory</code> silently missed — a discredited lesson stayed retrievable via the playbook's vector path. (<code>ingest_document</code> already upserted for this reason.) Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</td></tr>
@@ -94,7 +99,7 @@
       <tr><td><code>delete_by_query(query)</code></td><td>Vector lookup; delete best match if distance &lt; 0.5.</td></tr>
       <tr><td><code>get_library() -&gt; list[str]</code></td><td>List ingested filenames.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Scoring</h2>
   <p>For each candidate:</p>
@@ -105,7 +110,7 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
 
   <h3>Priority scores</h3>
   <p>Priority + threshold are now taken from <code>metadata.type</code>. The deliberately-written <code>identity</code> and <code>synthesis</code> types used to have no case in the scorer and fell into the generic <code>auto</code> else-branch (lowest priority, 0.55 threshold) unless their text happened to match the name-string heuristics — so the highest-curation tiers ranked <em>below</em> raw document chunks. Fixed 2026-07-07: <code>identity</code> scores with the identity tier, <code>synthesis</code> with the summary tier.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Priority</th><th>Max distance</th></tr></thead>
     <tbody>
       <tr><td>name_memory</td><td>−20</td><td>1.00</td></tr>
@@ -116,7 +121,7 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
       <tr><td>manual</td><td>0</td><td>0.55</td></tr>
       <tr><td>auto</td><td>1</td><td>0.55</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p class="note"><strong>Ambient hydration EXCLUDES the document corpus (2026-07-22).</strong> <code>_search_selection</code> now queries with <code>where={"type": {"$ne": "document"}}</code>, so the <code>document</code> row above is reached only via the scoped <code>search_document</code> path — never ambient recall. After the 2026-07-13 manual ingest 96.8% of the live store (7,130 of 7,366 fragments) is document chunks, and the tiering worked <em>against</em> ambient recall on two compounding axes: (1) documents carry the 1.25 threshold (2× everything else) and <code>p_score=−5</code> (−1.5 after <code>_TIER_WEIGHT</code>), so — since lower <code>combined_score</code> wins — a barely-related chunk at dist 1.0 (−0.5) beat a strong <code>auto</code> memory at dist 0.30 (+0.60); (2) with 96.8% doc chunks the 30-candidate pool was essentially all documents, which the MemoryBus then rejected wholesale at its 0.42 match floor (vs doc distances of 0.8-1.2) — so the vector tier returned <code>[]</code> and ambient memory went DARK since the manual ingest. Measured after the fix: a personal query went from 30/30 documents to 18 episodes + 6 identity + 6 skills. Covered by <code>tests/test_vector_memory_integrity_fixes.py</code>.</p>
 
   <h2>Concurrency</h2>

@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="planning.html">planning</a>
     <a href="project_advancer.html">project_advancer</a>
@@ -22,6 +25,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / workspace_cleanup.py</h1>
   <p class="subtitle">Mark-and-sweep of a finished project's scratch space. When a project completes, registered deliverables are kept and everything else under its workspace is deleted.</p>
 
@@ -62,12 +67,12 @@
   the missing registration is visible.</p>
 
   <h2>API</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>sweep_project_workspace(store, project_id, *, dry_run=False) -&gt; dict</code></td><td>Delete every file under the project workspace not registered as a <code>file</code> artifact, then prune the directories left empty. Returns <code>{project_id, status, deleted, kept, dirs_removed, freed_bytes, kept_referenced}</code>. Never raises. <code>dry_run=True</code> reports what it would delete without touching disk.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Safety guards</h2>
   <ul>

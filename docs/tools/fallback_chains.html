@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Tools</h3>
     <a href="registry.html">registry</a>
     <a href="tool_failure.html">tool_failure</a>
@@ -18,11 +21,13 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>tools / fallback_chains.py</h1>
   <p class="subtitle">Suggest alternative tools when a tool fails so the agent doesn't waste a turn.</p>
 
   <h2>Chains</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Failed tool</th><th>Fallback chain</th></tr></thead>
     <tbody>
       <tr><td><code>deep_research</code></td><td><code>web_search</code> → <code>recall</code></td></tr>
@@ -32,7 +37,7 @@
       <tr><td><code>vision_analysis</code></td><td><code>file_system</code></td></tr>
       <tr><td><code>delegate_to_swarm</code></td><td><code>execute</code></td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>API</h2>
   <ul>

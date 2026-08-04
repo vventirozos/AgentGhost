@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a class="current" href="node_offload.html">node offload</a>
     <a href="metacognition.html">metacognition</a>
@@ -20,6 +23,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Off-main node offload</h1>
   <p class="subtitle">A second box is a second inference SLOT — not a smarter
   or faster model. That is the whole value, and it is substantial.</p>
@@ -47,7 +52,7 @@
   <code>chat_completion(..., use_worker=/use_critic=/use_coding=/…)</code>.
   <strong>Every selector falls back to the main node when its pool is empty</strong>,
   so opting a call site in is a safe no-op until a node is configured.</p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Flag</th><th>Carries</th></tr></thead>
     <tbody>
       <tr><td><code>--worker-nodes url|model</code></td><td>Conversation compaction/summarization (inline — the most painful blocking call on a 240k-context agent), the mid-turn "shield" summarizer, follow-up query expansion (<strong>entirely disabled without a worker pool</strong>), smart-memory consolidation, the constraint-gate screen, the autoadvance task classifier.</td></tr>
@@ -55,7 +60,7 @@
       <tr><td><code>--swarm-nodes</code></td><td><code>delegate_to_swarm</code> fan-out (stateless, tool-less workers).</td></tr>
       <tr><td><code>--coding-nodes</code> · <code>--visual-nodes</code> · <code>--image-gen-nodes</code></td><td>Self-play coding, vision, image generation.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>LAN / Tailscale nodes work with <code>--mandatory-tor</code> on: the egress
   guard exempts loopback, RFC1918 and the CGNAT range (100.64.0.0/10).</p>
 

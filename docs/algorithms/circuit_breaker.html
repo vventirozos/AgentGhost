@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Algorithms</h3>
     <a href="request_lifecycle.html">Request lifecycle</a>
     <a href="memory_hydration.html">Memory hydration (RRF)</a>
@@ -22,18 +25,20 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>Circuit breaker for upstream LLM nodes</h1>
   <p class="subtitle">Fault isolation across the foreground and pool nodes managed by <a href="../core/llm.html">LLMClient</a>.</p>
 
   <h2>States</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>State</th><th>Behaviour</th><th>Transition out</th></tr></thead>
     <tbody>
       <tr><td>CLOSED</td><td>Healthy. Requests dispatched normally.</td><td>3 consecutive failures → OPEN.</td></tr>
       <tr><td>OPEN</td><td>Tripped. Node skipped on round-robin selection.</td><td>After 60 s cooldown → HALF.</td></tr>
       <tr><td>HALF</td><td>Probing. Single request allowed.</td><td>Success → CLOSED. Failure → OPEN.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Pool selection</h2>
   <p>Round-robin across each pool's nodes. <code>get_worker_node()</code>, <code>get_vision_node()</code>, <code>get_coding_node()</code>, <code>get_image_gen_node()</code> all skip nodes whose breaker is OPEN. If every node in a pool is OPEN, the call falls back to the foreground client (with the same circuit-breaker treatment).</p>

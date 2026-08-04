@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Self-improvement</h3>
     <a class="current" href="tool_ontology.html">tool ontology</a>
     <a href="../core/experiments.html">experiments</a>
@@ -19,6 +22,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>optim / tool_ontology.py — is the toolbox carved right, or just badly labelled?</h1>
   <p class="subtitle">§4F Phase 2b optimizes tool DESCRIPTIONS: same tools, better prose. This asks the two structural questions prose cannot answer.</p>
 
@@ -43,7 +48,7 @@
 PYTHONPATH=src python scripts/optimize_tool_descriptions.py --confusion-out /tmp/confusion.jsonl …
 PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.jsonl
   </pre>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Verdict</th><th>Pattern</th><th>What it means</th></tr></thead>
     <tbody>
       <tr><td><code>merge_or_redraw</code><br><span class="footnote">evidence: <code>observed</code></span></td><td>A→B and B→A both frequent</td><td><strong>A question raised, not a conclusion.</strong> The two tools may be answering one question for the model — in which case rewording either MOVES the error rather than removing it. Reported with each direction's own count and the pair's share of all confusion; deliberately never adjudicated (see below). Below 4 total misses the pair is dropped from the proposal list — at the default that is the 2-vs-1 shape, whose symmetry p is exactly 1.000 — and survives in the raw pair data (<code>--json</code>) and the per-tool "lost to:" line.</td></tr>
@@ -51,7 +56,7 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.j
       <tr><td><code>describe</code></td><td>A→B only</td><td>A one-way over/under-selection — what Phase 2b's description work actually targets: say what B is NOT for, or what A uniquely owns. <code>significant</code> when the exact binomial rejects a 50/50 split, <code>suggestive</code> when it does not (emitted, but explicitly unsupported).</td></tr>
       <tr><td><code>missing_affordance</code></td><td>no tool called at all</td><td>The request had no affordance the model recognised — a missing tool, not a confused one.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     <strong>Two fidelity numbers, both reported.</strong> <code>fidelity(replayable)</code>
     excludes unreplayable rows (they measure the replay plumbing, not the toolbox);
@@ -65,7 +70,7 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.j
     The obvious feature — "tell me when two tools should be merged" — was attempted five times.
     Each attempt was killed by measurement, not by argument:
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>#</th><th>Gate</th><th>Measured failure</th></tr></thead>
     <tbody>
       <tr><td>1</td><td>count threshold alone</td><td>92.8% spurious directives at n=400</td></tr>
@@ -74,7 +79,7 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --replays /tmp/confusion.j
       <tr><td>4</td><td>leave-one-out marginals</td><td>90% false positives — over-corrected</td></tr>
       <tr><td>5</td><td>marginal null + symmetry + dominance</td><td><strong>both error rates moved the wrong way with corpus size</strong>: FP 0.0% → 11.7% → 50.1% (n=400 → 3000 → 6000) while power fell 74.7% → 3.9% → 0.0%</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>Attempt 5 failed for three independent reasons, each worth remembering:</p>
   <ul>
     <li>the marginal null was <strong>biased, not noisy</strong> — <code>obs/exp</code> converged to a constant 1.20 under skewed tool usage instead of decaying to 1.0, so the Poisson p decayed exponentially in n and eventually fired on noise with certainty;</li>
@@ -98,7 +103,7 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --min-support 5
     agent's strongest measured failure predictor (17.8% at step 1 → 60.6% at step 12), so
     shortening the common path attacks the failure RATE, not just latency.
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>support</code></td><td>DISTINCT trajectories containing the sequence. Counted per-turn, never per-occurrence — otherwise one pathological grind session mints a macro proposal on its own.</td></tr>
@@ -106,7 +111,7 @@ PYTHONPATH=src python scripts/tool_ontology_report.py --min-support 5
       <tr><td><code>steps_collapsed</code></td><td>Loop steps a macro would ACTUALLY remove, computed from <strong>non-overlapping</strong> matches. Counting windows overstated the saving by 1.75–3.4×: five identical consecutive calls contain four overlapping 2-grams but collapse into only two macro calls. Candidates are also <strong>not additive</strong> — the same calls are mined at 2-, 3- and 4-gram sizes.</td></tr>
       <tr><td><code>priority</code></td><td>Ranking uses a per-turn cap on collapsible occurrences. Without it a single 50-call grind session (support 3) outranked a genuine 9-turn macro by 5.7× — the exact "one pathological turn redesigns the toolbox" failure <code>min_support</code> exists to prevent, leaking back in through the ranking.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <p>
     Target matching runs two passes: exact, then CONTAINMENT for path/identifier-shaped tokens —
     because the same target is spelled differently by different tools

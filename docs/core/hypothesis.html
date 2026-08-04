@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Core</h3>
     <a href="agent.html">agent</a>
     <a href="planning.html">planning</a>
@@ -23,6 +26,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / hypothesis.py — HypothesisTester</h1>
   <p class="subtitle">Parallel-debugging engine: generate competing hypotheses, test them concurrently, ask the LLM to rank survivors.</p>
 
@@ -30,15 +35,15 @@
   <p>Serial debugging burns 6-8 turns hopping between guesses. Parallelising the test phase collapses the same exploration into 2-3 turns: the worker pool runs every candidate test simultaneously, eliminates obvious losers via heuristic markers, then a single LLM call ranks what's left.</p>
 
   <h2>Data structures</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>Hypothesis</code> (line 21)</td><td>description · test_action · test_tool · result · consistent · confidence</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Methods</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__(llm_client, max_candidates=3, max_depth=2)</code></td><td>Bind LLM client and limits.</td></tr>
@@ -47,7 +52,7 @@
       <tr><td><code>async evaluate_results(problem, hypotheses) -&gt; dict</code></td><td>LLM ranks survivors; returns most likely root cause + remediation (line 167).</td></tr>
       <tr><td><code>async backtrack() -&gt; Optional[Hypothesis]</code></td><td>Pop next-best alternative when current pick fails (line 162).</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Heuristic consistency check</h2>
   <p>If the test result lacks any of <code>error · exception · traceback · not found</code>, the hypothesis is provisionally marked consistent and forwarded to LLM evaluation. This avoids wasting an LLM call on hypotheses that are clearly wrong.</p>

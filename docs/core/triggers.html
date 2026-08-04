@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Metacognition uplift</h3>
     <a href="entropy.html">entropy</a>
     <a href="confidence.html">confidence</a>
@@ -21,24 +24,26 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>core / triggers.py — first-class trigger taxonomy</h1>
   <p class="subtitle">Promotes the three trigger classes from the meta-cognition doc into events the planner can subscribe to, instead of scattering them across <code>agent.py</code>.</p>
 
   <h2>Event types</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Class</th><th>Kind</th><th>Carries</th></tr></thead>
     <tbody>
       <tr><td><code>LoopDetected</code></td><td><code>loop</code></td><td>repeated_item · count</td></tr>
       <tr><td><code>ResourceExhausted</code></td><td><code>resource</code></td><td>metric · observed · threshold</td></tr>
       <tr><td><code>ExecutionAnomaly</code></td><td><code>anomaly</code></td><td>tool_name · duration_s · budget_s</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Bus</h2>
   <p><code>TriggerBus.publish</code> fans out to kind-specific subscribers then wildcard <code>"*"</code> subscribers. Async coroutines are awaited; sync callables are called directly. Handler errors are isolated. The bus keeps a bounded history (default 64) for observability.</p>
 
   <h2>Helpers</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Symbol</th><th>Role</th></tr></thead>
     <tbody>
       <tr><td><code>ToolRuntimeBudget(window=50, min_samples=10, multiplier=3.0)</code></td><td>Rolling p95-runtime per tool. <code>is_anomalous(tool, dur)</code> answers the "execution anomaly" trigger. Cold-start safe.</td></tr>
@@ -46,7 +51,7 @@
       <tr><td><code>ReplanBridge</code></td><td>Wildcard-subscribes the bus and forwards <em>warning/critical</em> events to <code>ProjectPlan.request_revision</code> (or <code>plan.tree.request_revision</code>). Audit log on <code>.revisions</code>.</td></tr>
       <tr><td><code>loop_event / resource_event / anomaly_event</code></td><td>Convenience factories so producers don't manually populate every field.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Severity policy</h2>
   <ul>

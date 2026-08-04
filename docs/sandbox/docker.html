@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Sandbox</h3>
     <a class="current" href="docker.html">Docker</a>
     <a href="services.html">services</a>
@@ -20,6 +23,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>sandbox / docker.py — DockerSandbox</h1>
   <p class="subtitle">Long-lived Docker container that hosts every tool call. Workspace bind-mount, optional Tor, resource limits, output capping.</p>
 
@@ -54,7 +59,7 @@
   </div>
 
   <h2>Lifecycle</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Step</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>__init__ (line 13-54)</td><td>Container name suffix = md5(workspace)[:8] for parallel-session isolation. Auto-detects Docker/OrbStack socket on macOS.</td></tr>
@@ -62,7 +67,7 @@
       <tr><td>execute(cmd, timeout=600, workdir=None)</td><td>Wraps with <code>timeout -k 5s {timeout}s</code>. Output cap 256 KB (head + tail; middle dropped). Returns <code>(output_string, exit_code)</code>. Runs as host uid:gid on Linux, root on macOS. Trusts <code>ensure_running</code>'s readiness probe (no duplicate per-command probe).</td></tr>
       <tr><td>close(remove=False) (349-391)</td><td>Stop (fast resume) by default; <code>remove=True</code> deletes. Idempotent and exception-safe. The lifespan shutdown calls with <code>remove=False</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Provisioned packages</h2>
   <p>Preferred: build <code>ghost-agent-base:latest</code> via the authoritative Dockerfile one-shot; the runtime wrapper then only verifies and reuses it.</p>

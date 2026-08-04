@@ -10,7 +10,10 @@
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
   <nav>
-    <a href="../index.html">← Home</a>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
     <h3>Interfaces</h3>
     <a href="web_server.html">Web server</a>
     <a href="slack_bot.html">Slack bot</a>
@@ -21,6 +24,8 @@
   </nav>
 </aside>
 <main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
   <h1>interface / voice.py</h1>
   <p class="subtitle">The local voice loop: speech-to-text on the Gemma 4 audio node, text-to-speech on the macOS synthesiser in <code>Ava (Premium)</code>. No extra hardware, no API key, no egress.</p>
 
@@ -84,7 +89,7 @@
     the system <code>say</code> binary for synthesis. Design record for anyone rebuilding a GPU
     voice node, since the file is gone and this project has no version control:
   </p>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Stage</th><th>What it ran</th></tr></thead>
     <tbody>
       <tr><td>STT</td><td><code>faster-whisper</code> <code>distil-small.en</code>, CUDA,
@@ -96,7 +101,7 @@
         <code>torch.cuda.empty_cache()</code> after every request; served <code>/stt</code> and
         <code>/tts</code> on <code>0.0.0.0:8000</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <div class="note"><strong>Grep trap, now one hit shorter.</strong> Searching the tree for TTS used
   to surface that file's <code>voice='af_heart'</code> first — the wrong answer to "what voice does
   this agent use". One decoy remains: <code>src/ghost_agent/core/tts.py</code> is
@@ -104,7 +109,7 @@
   <code>interface/voice.py</code>.</div>
 
   <h2>Architecture</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Stage</th><th>Runs on</th><th>Detail</th></tr></thead>
     <tbody>
       <tr><td>Capture</td><td>Browser (PWA)</td><td><code>MediaRecorder</code> → WebM/Opus, or MP4/AAC on Safari. Needs a secure context; the tailscale cert on :8443 provides it.</td></tr>
@@ -112,19 +117,19 @@
       <tr><td>Transcribe</td><td>nova (Gemma 4 E4B)</td><td>llama-server with an audio projector (<code>-mm</code>), OpenAI <code>input_audio</code> content part.</td></tr>
       <tr><td>Speak</td><td>Interface host</td><td>macOS <code>say</code> in <code>Ava (Premium)</code> → 22.05 kHz LEI16 WAV, returned as one buffered body. Text is passed by <em>file</em> (<code>-f</code>), never argv.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Endpoints</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td>POST /api/stt</td><td>Accepts multipart <code>file</code> (any browser audio container). Transcodes, then transcribes verbatim on the audio node. Returns <code>{"text": "…"}</code>; <code>""</code> for genuine silence. Auth: <code>X-Ghost-Key</code>.</td></tr>
       <tr><td>POST /api/tts</td><td>Accepts <code>{"text": "…"}</code>. Returns <code>audio/wav</code>. Auth: <code>X-Ghost-Key</code>.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Configuration</h2>
-  <table>
+  <div class="scroll"><table>
     <thead><tr><th>Env var</th><th>Default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>GHOST_AUDIO_NODE_URL</code></td><td><code>http://100.83.184.117:8088</code></td><td>Audio node. A <strong>tailnet</strong> IP on purpose: macOS Tahoe silently drops a system daemon's packets to <code>192.168.x</code>, and mDNS/dotless names are what stranded the previous backend.</td></tr>
@@ -136,7 +141,7 @@
       <tr><td><code>GHOST_TTS_MAX_CHARS</code></td><td><code>2000</code></td><td>Per-request text cap; <code>app.js</code> already chunks replies.</td></tr>
       <tr><td><code>GHOST_FFMPEG_BIN</code> / <code>GHOST_FFPROBE_BIN</code> / <code>GHOST_SAY_BIN</code></td><td>auto-resolved</td><td>Absolute-path overrides. Normally unnecessary — see the launchd PATH trap below.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2 id="launchd-path">⚠ The launchd PATH trap (cost every STT request a 503)</h2>
   <p>
