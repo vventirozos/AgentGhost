@@ -194,6 +194,20 @@ def test_tombstone_list_stays_accurate():
         + "\n  ".join(resurrected))
 
 
+def test_readme_doc_links_point_at_pages_that_exist():
+    """The README links into the published site by URL, so a page rename
+    breaks it silently — the site keeps working and only the README rots."""
+    readme = _REPO / "README.md"
+    assert readme.exists()
+    base = "https://vventirozos.github.io/AgentGhost/"
+    broken = []
+    for url in re.findall(rf"\(({re.escape(base)}[^)\s]*)\)", readme.read_text()):
+        rel = url[len(base):] or "index.html"
+        if not (_DOCS / rel).exists():
+            broken.append(url)
+    assert not broken, "README links to missing doc pages:\n  " + "\n  ".join(broken)
+
+
 def test_theme_is_self_contained():
     """No external requests: the docs fail closed the same way the agent does."""
     css = (_DOCS / "assets" / "style.css").read_text()
