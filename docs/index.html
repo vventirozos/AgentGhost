@@ -50,12 +50,6 @@
 
   <p class="lede">Most AI assistants are a website you send text to. Ghost is a program you run. Nothing leaves your machine unless you asked for something that needs the internet — and when it does, it goes out through Tor.</p>
 
-  <figure class="shot">
-    <img src="assets/img/webui.png" alt="The Ghost Agent web interface: a session list on the left, and a dark chat view whose background is a slowly moving 3D graph."
-         width="1100" height="688" loading="lazy">
-    <figcaption>The web interface. The graph behind the conversation is driven by what the agent is doing — see <a href="interfaces.html">Ways to talk to it</a>.</figcaption>
-  </figure>
-
   <h2>What actually happens when you send a message</h2>
   <p>This is the whole product in five steps. Everything else in these docs is a detail of one of them.</p>
 
@@ -134,12 +128,16 @@
     </a>
     <a class="card" href="interfaces.html">
       <h3>Ways to talk to it</h3>
-      <p>The interfaces — web UI, Slack, voice, desktop client, CLI and the HTTP API. Includes clips of the web UI reacting to a live request.</p>
+      <p>The interfaces — web UI, Slack, voice, desktop client, CLI and the HTTP API. With clips of the web UI reacting to a live request.</p>
     </a>
     <a class="card" href="how-it-works.html">
       <h3>One message, end to end</h3>
       <p>The turn loop in detail — what runs, in what order, and what to look for in the log when it goes wrong.</p>
     </a>
+  </div>
+
+  <h2>The rest of the guide</h2>
+  <div class="card-grid">
     <a class="card" href="memory.html">
       <h3>What it remembers</h3>
       <p>Six kinds of memory, what goes in each, and how to correct something it got wrong about you.</p>
@@ -148,13 +146,29 @@
       <h3>What it can do</h3>
       <p>The toolbox — code, files, web, browser, images, projects, scheduled tasks — and when it reaches for each.</p>
     </a>
+    <a class="card" href="self-improvement.html">
+      <h3>How it improves itself</h3>
+      <p>The self-check on every answer, the background learning passes, and how it tunes its own prompts.</p>
+    </a>
     <a class="card" href="safety.html">
       <h3>Safety and privacy</h3>
       <p>What leaves your machine, what can't, and how the sandbox and Tor rules are enforced.</p>
     </a>
+    <a class="card" href="configuration.html">
+      <h3>Settings that matter</h3>
+      <p>The twenty settings worth knowing, out of sixty-four — including how to move work onto a second machine.</p>
+    </a>
+    <a class="card" href="troubleshooting.html">
+      <h3>When something breaks</h3>
+      <p>Sorted by symptom: won't start, acts like it has amnesia, tools failing, slow, or answering wrongly.</p>
+    </a>
     <a class="card" href="glossary.html">
       <h3>Glossary</h3>
-      <p>Plain-English definitions for the terms this project uses — dream cycle, hydration, verifier, trajectory.</p>
+      <p>Plain-English definitions for the terms this project uses — hydration, trajectory, dream cycle, GEPA.</p>
+    </a>
+    <a class="card" href="reference.html">
+      <h3>Deep reference</h3>
+      <p>A page per module, for changing the code. Dense, and honest about what it doesn't cover.</p>
     </a>
   </div>
 
