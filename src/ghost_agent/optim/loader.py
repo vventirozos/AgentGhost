@@ -35,6 +35,8 @@ _CACHE: Dict[str, Optional[str]] = {}
 # is precisely the signal we are after.
 _APPLIED_COUNTS: Dict[str, int] = {}
 _FALLBACK_COUNTS: Dict[str, int] = {}
+# Loaded-then-refused by the read-site's own validator. See `note_rejected`.
+_REJECTED_COUNTS: Dict[str, int] = {}
 
 
 def _optim_dir() -> Path:
@@ -81,16 +83,48 @@ def tuned_instruction(signature_name: str, default: str = "") -> str:
     return value if value else default
 
 
+def note_rejected(signature_name: str, reason: str = "") -> None:
+    """A read-site LOADED a tuned instruction and then REFUSED it.
+
+    `tuned_instruction` counts what it hands out; it cannot see what the
+    caller does next. Every read-site has its own validator (per-tool caps,
+    an aggregate-inflation ceiling, placeholder checks), so a tuned artifact
+    could be loaded, counted as "applied", and then dropped — leaving the
+    ONE instrument built to catch silent inoperativeness reporting
+    `applied: 1, fallback: 0` while nothing whatsoever reached the model.
+    Measured: 6 over-inflated tool artifacts + 1 broken verifier template
+    read as fully healthy.
+
+    Read-sites call this when they reject; the count is moved out of
+    `applied` so the telemetry describes reality.
+    """
+    if not signature_name:
+        return
+    _REJECTED_COUNTS[signature_name] = _REJECTED_COUNTS.get(signature_name, 0) + 1
+    if _APPLIED_COUNTS.get(signature_name):
+        _APPLIED_COUNTS[signature_name] -= 1
+    if reason:
+        logger.debug("GEPA: '%s' loaded but rejected by its read-site (%s)",
+                     signature_name, reason)
+
+
 def activation_stats() -> Dict[str, Dict[str, int]]:
     """Per-signature tuned-vs-baseline application counts since process
-    start: ``{signature: {"applied": n, "fallback": m}}``. A signature with
-    a tuned file on disk but zero ``applied`` means the read-site is not
-    firing — the defect class this counter exists to catch."""
-    names = set(_APPLIED_COUNTS) | set(_FALLBACK_COUNTS)
+    start: ``{signature: {"applied": n, "fallback": m, "rejected": r}}``.
+
+    ``applied`` counts artifacts that a read-site actually USED (loads minus
+    read-site rejections); ``rejected`` counts the ones it loaded and then
+    refused. A signature with a tuned file on disk and zero ``applied``
+    means the read-site is not firing — the defect class this counter exists
+    to catch — and a non-zero ``rejected`` says the artifact is reaching the
+    read-site but failing its validator, which is a different problem with a
+    different fix."""
+    names = set(_APPLIED_COUNTS) | set(_FALLBACK_COUNTS) | set(_REJECTED_COUNTS)
     return {
         n: {
-            "applied": _APPLIED_COUNTS.get(n, 0),
+            "applied": max(0, _APPLIED_COUNTS.get(n, 0)),
             "fallback": _FALLBACK_COUNTS.get(n, 0),
+            "rejected": _REJECTED_COUNTS.get(n, 0),
         }
         for n in sorted(names)
     }

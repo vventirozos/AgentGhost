@@ -66,7 +66,11 @@ class TestRemoveByTriggerDeletesTwin:
 
 
 class TestPruneDeletesTwins:
-    def test_prune_deletes_twins_of_pruned(self):
+    def test_prune_deletes_twins_of_pruned(self, monkeypatch):
+        # The prune is OFF by default since 2026-08-04 (it destroyed 13 real
+        # lessons across its first three unattended runs). This test is about
+        # twin CONSISTENCY when it does run, so it opts in explicitly.
+        monkeypatch.setenv("GHOST_SKILL_PRUNE", "1")
         sm = SkillMemory(Path(tempfile.mkdtemp()))
         # 12 lessons, low-utility + retrieved enough + unverified → eligible to prune.
         pb = []

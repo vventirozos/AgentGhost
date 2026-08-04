@@ -266,6 +266,61 @@ def _shape_specific_validator(kind: str, filename: str) -> str:
     return base + rubrics.get(kind, rubrics["text"]) + "sys.exit(0)\n"
 
 
+# A mined challenge is a REAL past user message replayed VERBATIM to a solver
+# that holds the real toolset — live Postgres, the real filesystem, the real
+# service supervisor. Anything the operator once asked for destructively
+# therefore becomes an UNATTENDED destructive action with nobody in the loop,
+# and self-play runs at journal_prob=0.75 once the frontier saturates.
+#
+# Found live, un-replayed and one pick away from execution: "Run this EXACT
+# SQL via postgres_admin action=query, do not modify it ... SELECT 1; DROP
+# TABLE web_order_line_options_old;". The only thing standing in front of it
+# was `validators.py`'s multi-statement gate — a single generic guard, doing
+# a job it was never scoped for.
+#
+# Practising a destructive request teaches nothing that a read-only variant
+# does not, so these are dropped rather than rewritten.
+_UNSAFE_CHALLENGE_RE = re.compile(
+    r"\b("
+    r"drop\s+(table|database|schema|index|view|role|user)"
+    r"|truncate\s+(table\s+)?\w"
+    r"|delete\s+from\b"
+    r"|alter\s+(table|database|schema|role|user)\b"
+    r"|update\s+\w+\s+set\b"
+    r"|insert\s+into\b"
+    r"|grant\s+\w+\s+(on|to)\b|revoke\s+\w+\s+(on|from)\b"
+    r"|rm\s+-[rRf]{1,3}\b|rmdir\b|mkfs\b|dd\s+if=|shred\b"
+    r"|git\s+(push|reset\s+--hard|clean\s+-[a-z]*f)"
+    r"|launchctl\s+(bootout|unload)|systemctl\s+(stop|disable)"
+    r"|kill(all)?\s+-9|pkill\b"
+    r"|chmod\s+-R\b|chown\s+-R\b"
+    r"|>\s*/dev/(sd|disk)"
+    r")",
+    re.IGNORECASE,
+)
+
+# The verbatim-execution framing is independently disqualifying: it exists to
+# defeat exactly the judgement the solver would otherwise apply.
+_VERBATIM_EXEC_RE = re.compile(
+    r"(exact(ly)?|verbatim|as-is|do\s+not\s+(modify|change|alter|edit))",
+    re.IGNORECASE,
+)
+
+
+def _is_unsafe_challenge(text: str) -> bool:
+    """True when a mined user message must never be replayed by self-play."""
+    if not text:
+        return False
+    if _UNSAFE_CHALLENGE_RE.search(text):
+        return True
+    # "run this exactly, do not modify it" + any SQL/shell verb.
+    if _VERBATIM_EXEC_RE.search(text) and re.search(
+            r"\b(sql|query|command|shell|bash|psql|postgres_admin|execute)\b",
+            text, re.IGNORECASE):
+        return True
+    return False
+
+
 def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
     """Turn one journal `post_mortem` / `failure` entry into a
     self-contained challenge.
@@ -291,6 +346,12 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
     if not user:
         user = (data.get("text") or data.get("summary") or "").strip()
     if not user or len(user) < 20:
+        return None
+    if _is_unsafe_challenge(user):
+        logger.warning(
+            "self-play: refusing to mine a destructive challenge from the "
+            "journal (%r...) — a replayed user message runs against the LIVE "
+            "toolset", user[:80])
         return None
 
     # Strip obvious path / email tokens so the agent can't game the

@@ -23,14 +23,22 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 from ..distill.schema import Trajectory
 
 
+# ⚠ These MUST be real registry tool names. `image_gen` and `vision` were
+# never registered (`image_generation` / `vision_analysis` are), so the two
+# heaviest turn types never tripped the heavy_used -> "hard" rule and 27
+# such trajectories were labelled "easy" in the training set. A name that
+# does not exist in the registry is a silently dead rule — the same drift
+# class as prm/features.py's taxonomy.
 _HEAVYWEIGHT_TOOLS = frozenset({
     "browser",
     "execute",
-    "image_gen",
+    "image_generation",
+    "delegate",
     "delegate_to_swarm",
     "deep_research",
-    "vision",
+    "vision_analysis",
     "knowledge_base",
+    "darkweb_research",
 })
 
 

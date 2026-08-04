@@ -356,7 +356,8 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
         # so a verifier-caught wrong answer becomes a lesson / PRM negative
         # instead of silently staying UNKNOWN.
         try:
-            from ..distill.outcome_heuristics import resolve_turn_outcome
+            from ..distill.outcome_heuristics import (
+                resolve_turn_outcome, STRUCTURAL_FAILURE_REASON)
             from ..distill.schema import Outcome
         except Exception as e:
             return False, f"cannot import resolve_turn_outcome: {e}"
@@ -366,6 +367,17 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
             (resolve_turn_outcome(current=U, execution_failed=True) == F, "structural → FAILED"),
             (resolve_turn_outcome(current=F, verifier="passed") == F, "FAILED not upgraded away"),
             (resolve_turn_outcome(current=U, verifier="passed") == P, "verifier-passed → PASSED"),
+            # 2026-08-04 shape rule (rule 2b) and the 2026-07-31 rule it
+            # narrows — pinned as a mutually discriminating PAIR so neither
+            # can be silently reverted into the other.
+            (resolve_turn_outcome(
+                current=U, verifier="passed", execution_failed=True,
+                unacked_total_failure=True) == F,
+             "unacknowledged total tool failure must NOT pass"),
+            (resolve_turn_outcome(
+                current=F, current_reason=STRUCTURAL_FAILURE_REASON,
+                verifier="passed") == P,
+             "honest structural failure must still upgrade to PASSED"),
         ]
         bad = [msg for ok, msg in checks if not ok]
         return (not bad, "outcome consolidation wrong: " + "; ".join(bad) if bad else "")
@@ -527,10 +539,20 @@ def _load_post_learning_tasks() -> List[CuratedRequestTask]:
     not full correctness. The point is to expose a measurable delta
     between a pre-learning baseline and a post-learning run.
     """
+    # Words that indicate the model went LOOKING before acting.
+    #
+    # "first step" was removed: 3 of 5 prompts in this suite contain the
+    # phrase "FIRST step", so it scored a pure prompt echo 3/5, and the
+    # anti-pattern "My first step is to open /data/input.csv and read it
+    # straight away" passed 5/5 while a genuine "I would enumerate the folder
+    # to see what exists" failed 5/5. Measured stub-runner floor with the
+    # keyword present: pass_rate 0.600 with ZERO agent involvement — so any
+    # pre/post-learning delta from this suite was noise around 0.6. A keyword
+    # that appears in the PROMPT can never be evidence about the RESPONSE.
     DISCOVER_KEYWORDS = [
         "list", "listing", "ls", "find", "search",
         "locate", "directory", "workspace", "verify", "check",
-        "first step",
+        "enumerate", "inspect", "explore",
     ]
     # Word-boundary match, NOT bare substring. The old `"ls" in low` test
     # fired inside "ca`ls`", "fa`ls`e", "too`ls`", "a`ls`o" — so responses

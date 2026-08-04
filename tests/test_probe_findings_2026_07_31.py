@@ -43,9 +43,16 @@ def test_turn_outcome_failed_requires_terminal_failure():
     correction) so the printed line and its correction cannot drift."""
     src = _source()
     assert "recovered {execution_failure_count} strike(s)" in src
-    # Terminality is still coupled to the ledger…
-    assert ("_exec_terminal = (execution_failure_count > 0\n"
-            "                              and bool(last_was_failure))" in src)
+    # Terminality is still coupled to the ledger… (whitespace-insensitive
+    # since 2026-08-04: the assignment moved earlier in finalize so the
+    # shape rule can read it, and pinning its exact continuation indent
+    # made a reformat look like a behaviour change).
+    import re as _re
+    assert _re.search(
+        r"_exec_terminal\s*=\s*\(execution_failure_count\s*>\s*0\s*"
+        r"and bool\(last_was_failure\)\)", src), (
+            "the Turn Outcome line's terminality must stay coupled to the "
+            "strike ledger AND the last call's failure")
     # …the finalize line resolves its state through the shared helper…
     assert "_state = self._turn_outcome_label(" in src
     # …and the truthful suffix survives.

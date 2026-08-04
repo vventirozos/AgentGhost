@@ -144,6 +144,40 @@ file_system ×2 → execute occ=61  turns=33   steps=122  cohesion=0.34
     same underlying calls, so they must not be summed.
   </p>
 
+  <h2>The <code>fs_batch</code> acceptance instrument (2026-08-04)</h2>
+  <p>
+    "The n-grams must collapse" is the acceptance test for the
+    <a href="../tools/file_system.html">file_system batch macro</a>, and it has a timing problem:
+    <code>mine_sequences</code> reads a corpus of turns that have ALREADY happened, so on the day
+    the macro ships the report cannot move no matter how good the macro is.
+    <code>simulate_fs_batch</code> closes that gap — it rewrites the existing corpus as if the
+    macro had been available and always used, so the same miner runs over both and the two
+    reports are diffable:
+  </p>
+  <pre>PYTHONPATH=src python scripts/tool_ontology_report.py                     # observed
+PYTHONPATH=src python scripts/tool_ontology_report.py --simulate-fs-batch  # upper bound</pre>
+  <p>
+    It applies exactly the two rewrites the macro implements — merge a run of consecutive
+    <code>read</code> calls into one (in chunks of 12), and drop a <code>read</code> that
+    immediately follows a <code>replace</code> on the SAME target — and nothing else. Notably it
+    does NOT collapse <code>read_chunked</code> runs (pagination is a different fix) or cross-file
+    edit runs (not implemented); claiming those would overstate the macro.
+  </p>
+  <p>
+    <strong>It is an UPPER BOUND, and that is the point.</strong> It assumes full model uptake,
+    which is the one thing a simulation cannot establish — that is what the live randomized arm
+    measures. Read it as "here is the ceiling, and here is the instrument that will tell you how
+    much of it was realised".
+  </p>
+  <p>
+    Measured on the live corpus (1336 user turns, 2026-08-04): file_system calls 1138 → 934
+    (−17.9%), all tool calls 3568 → 3364 (−5.7%), touching 51 turns (5.8%). Those 51 turns are not
+    a random sample — their mean depth is <strong>24.4 steps against 5.8</strong> for the rest, and
+    their failure rate is <strong>58.3% against 23.7%</strong>. The macro is small in aggregate and
+    concentrated exactly on the failing tail, which is what a depth intervention is supposed to
+    look like.
+  </p>
+
   <h2>Scope: this proposes, it never applies</h2>
   <p>
     Everything here is read-only analysis over data already on disk — no LLM, no replay, no prod

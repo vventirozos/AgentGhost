@@ -133,7 +133,11 @@ def test_enroll_and_read_back(tmp_path, monkeypatch):
     monkeypatch.delenv(ex.ENV_KILL, raising=False)
     ctx = _ctx(tmp_path)
     arms = ex.enroll_request(ctx, "req-1")
-    assert set(arms) == {"risk_steer"}
+    # Derived from DEFAULT_SPECS rather than hard-coded: a new arm is a
+    # deliberate registration, not a reason to edit this assertion (it read
+    # {"risk_steer"} until `fs_batch` shipped).
+    assert set(arms) == {s.name for s in ex.DEFAULT_SPECS if s.enabled}
+    assert "risk_steer" in arms
     assert ex.arm_for(ctx, "risk_steer", "req-1") == arms["risk_steer"]
     assert ex.assignments_for_request(ctx, "req-1") == arms
 

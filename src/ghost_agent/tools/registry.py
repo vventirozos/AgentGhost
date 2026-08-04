@@ -185,8 +185,19 @@ def _tuned_tool_description(name: str, baseline: str) -> str:
             f"reject:{name}",
             f"GEPA tool_description.{name} rejected by validator — "
             "baseline kept")
+        _note_optim_rejection(f"{TOOL_DESC_SIGNATURE_PREFIX}{name}",
+                              "per-tool validator")
         return baseline
     return tuned
+
+
+def _note_optim_rejection(signature: str, reason: str) -> None:
+    """Best-effort: telemetry must never break prompt assembly."""
+    try:
+        from ..optim.loader import note_rejected
+        note_rejected(signature, reason)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -199,6 +210,7 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any
     out = []
     inflation = 0
     swapped = False
+    _swapped_names = []
     for t in tools:
         fn = t.get("function") or {}
         name = fn.get("name") or ""
@@ -207,6 +219,7 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any
         if tuned != baseline:
             inflation += len(tuned) - len(baseline)
             swapped = True
+            _swapped_names.append(name)
             out.append({**t, "function": {**fn, "description": tuned}})
         else:
             out.append(t)
@@ -217,6 +230,21 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any
             f"inflation {inflation} chars exceeds "
             f"{_TOOL_DESC_AGGREGATE_SLACK} — every baseline kept (the "
             "KV-pinned tools block must not silently balloon)")
+        # Tell the instrument. Without this the whole set reads as "applied"
+        # in learning-health while zero descriptions reach the model.
+        #
+        # Attributed to the descriptions ACTUALLY SWAPPED IN THIS CALL, not
+        # to `_tuned_desc_names()` (every artifact on disk). `tools` here is
+        # the per-request `_intent_filter`ed subset, so the disk-wide loop
+        # charged rejections to signatures that were never even loaded —
+        # measured, 5 phantom names for a one-tool subset — and it also
+        # DOUBLE-COUNTED any signature the per-tool validator had already
+        # rejected at `_tuned_tool_description`. `rejected` means "the
+        # artifact reached the read-site and failed its validator", so both
+        # errors point the operator at healthy artifacts.
+        for _n in _swapped_names:
+            _note_optim_rejection(f"{TOOL_DESC_SIGNATURE_PREFIX}{_n}",
+                                  "aggregate inflation ceiling")
         return tools
     return out
 
@@ -698,6 +726,91 @@ _NON_CODING_DROP_TOOLS = frozenset({"postgres_admin"})
 _NON_VISION_DROP_TOOLS = frozenset({"vision_analysis"})
 
 
+# ──────────────────────────────────────────────────────────────────────
+# §4F NEXT STEPS item 1 — `fs_batch` treatment schema.
+#
+# The macro ships as a live randomized arm (`core/experiments.py`), never as a
+# default: the TREATMENT arm sees the two extra affordances below, the CONTROL
+# arm sees today's schema byte-for-byte. Both the schema and the dispatch
+# lambda read the same arm, so a control turn cannot get treatment behaviour
+# by hallucinating `paths`.
+#
+# ⚠ This mutates the advertised tool block, i.e. the model's prompt context —
+# which is why `fs_batch_context` is registered in
+# `experiments.CONTEXT_MUTATING_KEYS`. Without that the §4F Phase 2b fixture
+# corpus (recorded live under GHOST_LLM_RECORD, replayed VERBATIM by the
+# optimizer) would silently mix two different tool blocks.
+_FS_BATCH_PATHS_PROP = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Optional for operation='read': read SEVERAL files in ONE call "
+        "instead of one call per file. Pass every file you need — "
+        "paths=['model.py', 'train.py', 'config.json'] — and you get all of "
+        "them back in one result, in request order. A path may carry an "
+        "inline line range ('train.py:120-180') to pull just that region, so "
+        "several regions of one file also cost one call. Up to 12 paths; the "
+        "usual read budget still applies per file. If one path fails the "
+        "others are still returned — the result says per path what happened."
+    ),
+}
+
+_FS_BATCH_DESC_SUFFIX = (
+    " FEWER CALLS, SAME WORK: when you need several files, pass them all in "
+    "ONE operation='read' via 'paths' rather than one call each. When you "
+    "need several edits to ONE file, put every `<<<< SEARCH … ==== … >>>>` "
+    "envelope in ONE operation='replace' 'content'. A successful 'replace' "
+    "hands back the post-edit view of the changed lines, so you do NOT need "
+    "a follow-up read to check it landed."
+)
+
+
+def _fs_batch_active(context) -> bool:
+    """Is THIS request in the `fs_batch` treatment arm?
+
+    Resolved per request via the request-id ContextVar rather than the bare
+    stash slot: `arm_for` documents that a turn reading its arm after the
+    slot has moved on would take the control path while still being RECORDED
+    as treatment. Never raises — a broken experiment framework must degrade
+    to the incumbent tool, not to a failed turn.
+    """
+    try:
+        from ..core.experiments import TREATMENT, arm_for
+        from ..utils.logging import request_id_context
+        req_id = str(request_id_context.get() or "")
+        return arm_for(context, "fs_batch", req_id) == TREATMENT
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _apply_fs_batch_schema(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copy-on-write the file_system definition into its batch-capable form.
+
+    Same discipline as `_apply_tuned_descriptions`: the shared
+    TOOL_DEFINITIONS dicts are never mutated, so a treatment request cannot
+    leak its schema into the next control request.
+    """
+    out: List[Dict[str, Any]] = []
+    for t in tools:
+        fn = t.get("function") or {}
+        if fn.get("name") != "file_system":
+            out.append(t)
+            continue
+        params = dict(fn.get("parameters") or {})
+        props = dict(params.get("properties") or {})
+        props["paths"] = _FS_BATCH_PATHS_PROP
+        params["properties"] = props
+        # 'path' stops being mandatory: a pure `paths` read has no single
+        # path, and advertising it as required makes that call schema-invalid.
+        params["required"] = ["operation"]
+        out.append({**t, "function": {
+            **fn,
+            "description": str(fn.get("description", "")) + _FS_BATCH_DESC_SUFFIX,
+            "parameters": params,
+        }})
+    return out
+
+
 def _intent_filter(tools: list, query: str | None, *, drop_unconfigured: set | None = None) -> list:
     """Trim tools that require explicit configuration the agent doesn't have.
 
@@ -965,8 +1078,17 @@ def get_active_tool_definitions(context, query: str = None):
         default_db = getattr(getattr(context, "args", None), "default_db", None)
         if not default_db:
             unconfigured.add("postgres_admin")
-    return _apply_tuned_descriptions(
+    active_tools = _apply_tuned_descriptions(
         _intent_filter(active_tools, query, drop_unconfigured=unconfigured))
+    # §4F item 1: the batch-capable file_system schema, treatment arm only.
+    # Runs AFTER the GEPA swap on purpose. `_tuned_tool_description` REPLACES
+    # a description wholesale and validates it against the BASELINE, so
+    # appending first would (a) let the tuned text drop the batch prose and
+    # (b) hand the validator a different baseline in each arm — a second,
+    # unintended difference between the arms.
+    if _fs_batch_active(context):
+        active_tools = _apply_fs_batch_schema(active_tools)
+    return active_tools
 
 def get_available_tools(context):
     from .memory import (
@@ -1050,7 +1172,11 @@ def get_available_tools(context):
     
     tools = {
         "system_utility": lambda **kwargs: tool_system_utility(tor_proxy=context.tor_proxy, profile_memory=context.profile_memory, context=context, **kwargs),
-        "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, read_budget=getattr(context, "_read_budget", None), project_store=getattr(context, "project_store", None), **kwargs),
+        # `fs_batch_enabled` is resolved AT CALL TIME (like `_read_budget`
+        # above), so it tracks the request actually running rather than the
+        # request that happened to build this dispatch table. It is injected,
+        # never model-supplied: the model only ever sees `paths`.
+        "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, read_budget=getattr(context, "_read_budget", None), project_store=getattr(context, "project_store", None), fs_batch_enabled=_fs_batch_active(context), **{k: v for k, v in kwargs.items() if k != "fs_batch_enabled"}),
         # project_id: the bound project OWNS services started during it —
         # lifecycle coupling, scoped names, and the briefing all key on it
         # (2026-07-30, §4G port-lease redesign).

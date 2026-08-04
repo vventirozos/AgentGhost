@@ -54,12 +54,59 @@
   <h2>Fault-injection calibration bench (2026-07-18)</h2>
   <p>The verifier's catch rate was previously unmeasured — its blind spots (the WEB-EXEC fail-open, the evidence-packer truncation refutes) were each found <em>reactively</em>, in production. <code>src/ghost_agent/eval/verify_bench.py</code> + <code>scripts/verify_bench.py</code> make it a measured component: take known-good (claim, evidence, context) triples, inject a KNOWN corruption, run <code>verify_claim</code> against the live judge endpoint, and report detection at a controlled false-positive rate (the injection methodology of arXiv:2603.21396, applied at system level). "Actionable" rates use the same ≥0.7 confidence gate as the production repair/consumption sites, so the bench reports what the agent would actually have acted on.</p>
   <p><strong>Fault library</strong> (typed, each with an expected verdict): <code>fact_swap</code> (a number the claim shares with the evidence is perturbed), <code>fabrication</code> (concrete fact appended that appears in no output), <code>wrong_topic</code> (donor case's claim swapped in — the alignment failure), <code>silent_failure</code> (evidence replaced with a 403/empty/timeout body under an unchanged success claim), <code>artifact_leak</code> (SEARCH/REPLACE markers injected into the reply — the 2026-07-14 parser-leak shape), <code>constraint_violation</code> (request gains "answer with a single word only") — all expected REFUTED — and <code>evidence_truncation</code> (evidence hard-cut under a still-true claim, expected <em>NOT</em> refuted: the packer-noise robustness class).</p>
-  <p><strong>Case sources:</strong> a hand-authored seed set (<code>scripts/verify_bench_cases.jsonl</code>, 12 cases across the live task mix) plus real turns minted from <code>GHOST_LLM_RECORD</code> day-files — <code>extract_cases_from_recordings</code> inverts the rendered claim prompt using the live template's own literal segments, so recorded VERIFY calls become bench cases for free (and extraction survives template edits).</p>
-  <p><strong>A/B arms:</strong> <code>--two-stage both</code> runs every trial under the two-stage prompt AND the classic prompt (toggled via <code>GHOST_VERIFY_TWO_STAGE</code>, restored afterwards), producing per-fault TPR/FPR deltas — the measurement that says whether the two-stage change actually pays. Typical run against the production judge (worker node):</p>
-  <pre>PYTHONPATH=src python scripts/verify_bench.py --base-url http://100.83.184.117:8088 --two-stage both
-python scripts/verify_bench.py --base-url http://127.0.0.1:8080 \
-    --recordings "$GHOST_HOME/system/llm_recordings" --max-cases 40</pre>
-  <p>Outputs <code>verify_bench_out/&lt;UTC-ts&gt;/results.json</code> + <code>report.md</code> (per-fault table + headline TPR/FPR, paste-able into the journal). The bench talks only to the judge endpoint — never the live agent or its data. Covered by <code>tests/test_verify_bench.py</code> (fault applicability, extraction round-trip, scoring math incl. the 0.7 gate, env hygiene of the arm runner).</p>
+  <p><strong>Case sources:</strong> a hand-authored seed set (<code>scripts/verify_bench_cases.jsonl</code>, 21 cases across the live task mix) plus real turns minted from <code>GHOST_LLM_RECORD</code> day-files — <code>extract_cases_from_recordings</code> inverts the rendered claim prompt using the live template's own literal segments, so recorded VERIFY calls become bench cases for free (and extraction survives template edits).</p>
+  <p><strong>Prompt A/B arms:</strong> <code>--two-stage both</code> runs every trial under the two-stage prompt AND the classic prompt (toggled via <code>GHOST_VERIFY_TWO_STAGE</code>, restored afterwards), producing per-fault TPR/FPR deltas — the measurement that says whether the two-stage change actually pays.</p>
+
+  <h3>The escalation axis: which verdict pipeline was measured (2026-08-04)</h3>
+  <p><strong>The gap.</strong> Production runs verify as TWO models — a cheap judge on the worker route, then a MAIN-model re-adjudication. The bench's single-endpoint <code>HttpChatClient</code> exposes no <code>critic_clients</code> and no <code>worker_clients</code>, so <code>_escalate_refute</code> returned immediately ("main model already judged it") and every bench number scored the <em>cheap judge standalone</em>. Measured on <code>$GHOST_HOME/system/llm_recordings</code> (2026-07-30..08-04), joining recorded verify prompts on the claim and reading which model served each verdict: <strong>50 cheap-judge refutes reached the main model and 42 (84%) were overturned</strong>; the durable log's own <code>GhostAgent</code> lines read <strong>80 overturned / 19 stood = 81%</strong> over a longer window. So a raw-arm false-alarm rate is an <em>upper bound</em> on production's, not production's.</p>
+  <p><strong>The fix.</strong> <code>EscalatingChatClient</code> reproduces the production topology with two endpoints and no new verifier code: <code>route()</code> → the judge (where <code>_call_llm</code> sends the cheap leg), <code>chat_completion()</code> → the main model (where <code>force_main=True</code> lands), plus a truthy <code>worker_clients</code> so the escalation has a cheap route to have escalated from. Its <code>route()</code> degrades to <code>fallback</code> instead of raising, exactly like <code>LLMClient.route</code>, so a sick judge node falls through to the main leg as it does live. Both legs carry the verifier's OWN bounds (45&nbsp;s route, 90&nbsp;s main) — the main-leg timeout was arriving via <code>_bounded_fallback_kwargs</code> and being swallowed.</p>
+
+  <h4>Two directions, four arms</h4>
+  <p>Escalation is <strong>two-directional</strong> since the CONFIRM escalation landed, and the directions are independent, so an arm that names only "escalated" can mislead in either direction:</p>
+  <table>
+    <thead><tr><th>direction</th><th>fires on</th><th>effect</th><th>moves</th></tr></thead>
+    <tbody>
+      <tr><td><code>_escalate_refute</code></td><td>any cheap <code>REFUTED</code></td><td>main model re-adjudicates; <em>its verdict wins</em></td><td>FPR and TPR</td></tr>
+      <tr><td><code>_escalate_confirm</code></td><td>a <strong>HIGH-STAKES</strong> cheap <code>CONFIRMED</code> (a tool failed this turn)</td><td>verdict never flips; confidence capped to 0.6, below every ≥0.7 gate</td><td>the actionable false-CONFIRM rate only</td></tr>
+    </tbody>
+  </table>
+  <p>The CONFIRM direction fires only when the caller passes <code>high_stakes=</code>, and <code>run_trials</code> never did — so it was structurally dead in the bench even with the two-leg client installed, the same shape as the missing worker route. Bench cases now carry the flag: <code>BenchCase.high_stakes</code> is <strong>tri-state</strong> (<code>None</code> = derive, an explicit bool pins the case), and derivation runs <code>looks_like_tool_error</code> — production's own sniffer, not a second copy — over each segment of the packed evidence digest. Segmenting matters because that sniffer only scans the first 120 characters for its text markers, so one blob check sees only the first tool's head: measured on the 86-case mined pool, <strong>segmented 14 (16.3%) vs blob-only 10 (11.6%)</strong>. It is an honest <em>lower</em> bound — the digest is budget-truncated, so a failed tool trimmed out entirely is invisible.</p>
+  <p>Derivation is resolved <em>per trial, after the fault</em>. That is deliberate: <code>silent_failure</code> replaces the evidence with a tool error under an unchanged success claim, which IS the population <code>_escalate_confirm</code> exists for, and it is what makes the hand-authored seed set exercise the direction at all (0 of 21 seed cases are naturally high-stakes; 70 of 107 <code>silent_failure</code> trials are — not 107, because one of the three injected failure bodies is <code>(empty output)</code>, which production does not class as an error either).</p>
+  <p>So the arm has <strong>four</strong> values — <code>raw_judge</code>, <code>judge+escalation(refute)</code>, <code>judge+escalation(confirm)</code>, <code>judge+escalation</code> — and only the last is production-equivalent. A stale reader comparing <code>arm == "judge+escalation"</code> therefore <em>fails</em> on a half-escalated run instead of silently accepting it.</p>
+  <pre># raw judge (cheap judge standalone — neither direction can fire)
+PYTHONPATH=src python scripts/verify_bench.py --base-url http://100.83.184.117:8088 --two-stage both
+
+# judge+escalation — the pipeline production acts on (both directions)
+PYTHONPATH=src python scripts/verify_bench.py \
+    --base-url http://100.83.184.117:8088 \
+    --main-base-url http://127.0.0.1:8088 --two-stage both
+
+# one direction at a time, for an ablation
+GHOST_VERIFY_ESCALATE_CONFIRM=0 PYTHONPATH=src python scripts/verify_bench.py ...</pre>
+  <p><strong>The report refuses to mix them.</strong> Two headline numbers are emitted under <em>arm-qualified</em> keys, each keyed on the direction that can actually move it — never a bare <code>fpr</code>, so a stale reader gets a <code>KeyError</code> rather than a wrong number:</p>
+  <ul>
+    <li><code>fpr_raw_judge</code> / <code>fpr_escalated</code> — clean trials refuted. Keyed on the REFUTE direction only: <code>_escalate_confirm</code> provably never emits a <code>REFUTED</code>, so it cannot move FPR or TPR, and keying on the full arm would be false precision that blocks a legitimate comparison.</li>
+    <li><code>false_confirm_actionable_raw</code> / <code>_escalated</code> — <em>corrupted</em> trials that came back CONFIRMED, with the ≥0.7 actionable rate. This is what the 0.6 cap removes, and the bench reported it nowhere at all before.</li>
+  </ul>
+  <p><code>report["provenance"]["escalation"]</code> records the arm, a per-direction block (live / enabled / why-not / high-stakes trial count), which pool supplied the cheap route, and both endpoint/model identities; <code>metrics["escalation_events"]</code> counts refutes overturned, confirms withheld, and confirms <em>eligible</em> — the last because <code>withheld == 0</code> otherwise reads the same whether the main model agreed every time or the direction was never invoked. All three are read off the verdicts, so "the direction fired" is evidence rather than inference. A live confirm direction with zero high-stakes trials is called out explicitly — that run measured nothing about it. Pre-2026-08-04 bundles carry a bare <code>fpr</code> and render as <code>arm UNRECORDED</code>; they are not back-dated to "raw".</p>
+
+  <h4>A cheap-leg timeout is not a verdict</h4>
+  <p>When <code>route()</code> fails it returns <code>fallback</code>, <code>_call_llm</code> falls through to the direct call, and that call lands on the <strong>main model</strong>. The trial still produces a verdict — the <em>strong</em> judge's. That is production-faithful, but a run that scores it as a cheap-judge verdict is reporting a blend it never names, and the failure is real: the durable log carries 9 <code>worker node failed — Nova: ReadTimeout</code> events, 5 of them at exactly +12.0/12.1&nbsp;s, dead on <code>_ROUTE_TIMEOUT_S</code>. (Verify passes its own 45&nbsp;s budget rather than that 12&nbsp;s ceiling, so the bench's exposure is smaller — but "smaller" is an argument, not a measurement.) <code>EscalatingChatClient</code> therefore counts every cheap-leg call and logs failures at <strong>WARNING</strong>, not debug; <code>provenance.escalation.route_health</code> carries <code>route_calls</code> / <code>route_failures</code> / <code>route_timeouts</code> / <code>route_empty_replies</code> / <code>fell_through_to_main</code>, the rendered report leads with a loud warning when any call fell through, and <code>optimize_verifier --incumbent-only</code> both records the block and prints a "this baseline is a BLEND, re-record it" warning to stderr.</p>
+
+  <h4>The bench cannot write to the production ledger</h4>
+  <p><code>verifier.record_escalation()</code> appends to <code>$GHOST_HOME/system/verifier/escalations.jsonl</code>, the §4F false-positive watch ledger — and the bench drives <code>_escalate_refute</code> hundreds of times per run in the operator's shell, where <code>GHOST_HOME</code> is exported. Folding bench refutes on <em>curated fault cases</em> into that ledger would corrupt the exact rate it measures (the same shape as self-play writing the production calibration corpus). The gate is a required live-turn <code>req_id</code>, which the bench never has. Verified from the bench side with a control: five bench escalations create no ledger file at all, while a <code>record_escalation(trace={"req_id": …})</code> immediately after writes one row — without that control, "no file" would also pass if the ledger were simply broken. Fenced by <code>test_a_bench_escalation_never_reaches_the_production_ledger</code>.</p>
+  <p>Outputs <code>verify_bench_out/&lt;UTC-ts&gt;/results.json</code> + <code>report.md</code> (per-fault table + headline TPR/arm-qualified FPR, paste-able into the journal). The bench talks only to the judge endpoint and, on the escalated arm, the main model it escalates to — never the live agent or its data. Covered by <code>tests/test_verify_bench.py</code> (fault applicability, extraction round-trip, scoring math incl. the 0.7 gate, env hygiene of the arm runner), <code>tests/test_verify_bench_case_pool.py</code>, and <code>tests/test_verify_bench_escalation_arm.py</code> (the arm label is checked against OBSERVED call sequences through the real <code>Verifier</code>, so a change to the escalation predicate fails a test instead of mislabelling a report).</p>
+
+  <h3>The mined case pool</h3>
+  <p>The volume lives in <code>$GHOST_HOME/system/eval/verify_bench_cases_mined.jsonl</code> (86 cases), kept out of the repo because it derives from live user turns. It is the CLI's default pool; <code>--no-mined</code> reproduces the seed-only pool, whose private tier is too coarse to resolve a 0.02 ship gate.</p>
+  <pre># regenerate the pool (nothing else in the repo could, before 2026-08-04)
+PYTHONPATH=src python scripts/verify_bench.py --refresh-mined
+
+# clean measurement AFTER an optimize_verifier run
+PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</pre>
+  <p><strong>Why <code>--refresh-mined</code> exists:</strong> the pool is a durable artifact, so before this it silently kept whatever extraction and redaction bugs were live on the day it was minted — it was still serving a case whose evidence had been mangled by a credit-card false positive. The refresh <strong>refuses to write</strong> a zero-yield mint or one that shrinks the pool by more than half (<code>--force</code> overrides): silent extraction failure is this pipeline's characteristic bug, and overwriting the pool with its output takes the private tier back to 4 cases.</p>
+  <p><strong>Why <code>--tier</code> matters:</strong> <code>optimize_verifier.py</code> trains on the <em>public</em> tier of this same pool, so the default <code>--tier all</code> measures partly on cases the optimizer has already seen. The loader prints how many public-tier cases it pulled in; use <code>--tier private</code> for a post-optimization number.</p>
+  <p><strong>Provenance</strong> (<code>report["provenance"]</code>) is what makes two runs comparable: case-set sha256, case count, duplicate-id count, the fault set and its hash, the judge endpoint + model, the <strong>escalation arm</strong> (raw judge vs judge+escalation, with both routes' endpoint/model), <code>GHOST_HOME</code>, and the enumerate / adjudicate / <em>classic</em> template hashes. Compare two reports only when it matches — two runs over the same pool against the same judge are still <em>not</em> comparable if one escalated and the other did not.</p>
 
   <h2>Streaming turns now get a (late) verdict too (2026-07-18)</h2>
   <p><strong>The gap:</strong> the gated verdict was invoked only from <code>_finalize_and_return</code> — the non-streaming finalization chain — so every STREAMED answer (the web interface, project auto-advance turns) shipped unverified, silently: no verdict, no unverified-mutation check, no log line. Found when the operator asked why a project turn had no verdict: the late recorder logs every outcome yet the log had none, and a <code>kill -USR2</code> task dump showed no verdict task alive. Verdicts had only ever fired for non-streaming clients.</p>
@@ -211,6 +258,136 @@ python scripts/verify_bench.py --base-url http://127.0.0.1:8080 \
   because the adjective appears in no tool output. This trims a recognizable false-refute class before the
   expensive escalation path has to catch it.
   Tests: <code>tests/test_log_audit_fixes_2026_07_29.py::TestSubjectiveGlossRule</code>.</p>
+
+  <h2>Confirm escalation: the other direction was ungated (2026-08-04)</h2>
+  <p><strong>Symptom (measured over the live stores, not inferred):</strong> escalation was
+  one-directional by construction — <code>_escalate_refute</code> returns immediately on anything
+  that is not <code>REFUTED</code>. Over the recorded window that is <strong>50</strong> REFUTED
+  escalations (<strong>84%</strong> overturned by the main model) against <strong>0</strong>
+  CONFIRMED escalations. Two further measurements make the asymmetry load-bearing:
+  the ≥0.7 consumption gate is a <em>no-op</em> on the cheap judge — <strong>130 of 130</strong>
+  recorded cheap verdicts came back at 0.9 or 1.0, so nothing was ever filtered by it — and since
+  the 2026-07-31 honest-failure decision a CONFIRMED <em>outranks</em> a structural execution
+  failure (<code>resolve_turn_outcome</code> rule 3 before rule 4). Result:
+  <strong>61 of 1488</strong> live trajectories (4.1%) are <code>outcome=passed</code> with a
+  failed tool call in the turn, each certified by a cheap 4B judge that nothing checked.</p>
+  <p><em>Still load-bearing after the 2026-08-04 shape rule.</em> That rule
+  (<a href="../core/agent.html">rule 2b</a>) withholds a PASS only from the narrow subset where
+  <em>every</em> tool call failed and the reply never said so — 8 of 1488 live trajectories.
+  The far larger "some calls failed, the reply reads clean" population is exactly what this
+  escalation exists for, and no shape rule can reach it: it needs a model to read the answer
+  against the evidence.</p>
+  <p><strong>Fix:</strong> a CONFIRMED is re-adjudicated on the main model when the caller marks
+  the turn <em>high-stakes</em> — <code>agent._turn_had_tool_failure(tools_run_this_turn)</code>,
+  i.e. some tool actually failed, which is exactly when the verdict is what keeps the turn out of
+  a FAILED label. The trigger is computed inside <code>_compute_verifier_verdict</code>, the one
+  place every verdict is produced, so it cannot be live on the finalize path and dark on the
+  in-loop/streamed ones. Firing rate on the live corpus: ~4% of turns, about two extra
+  main-model calls a day — <em>less</em> often than the refute escalation it mirrors.</p>
+  <p><strong>Deliberately NOT symmetric:</strong> a refute is punitive (auditor note to the user,
+  lesson retraction, FAILED corpus label, auto-repair round), and "the strong judge would not
+  confirm this" is weaker evidence than "the strong judge says this is wrong". So when the main
+  model declines, the verdict KEEPS its CONFIRMED label and its confidence is capped at
+  <strong>0.6</strong> — below every ≥0.7 consumption gate, the same idiom as
+  <code>_WEB_EXEC_SKIP_CONF_CAP</code>. The turn is then recorded as <em>unverified</em>: no
+  fabricated PASSED, no manufactured failure. On any error, an unparseable strong verdict, or a
+  missing cheap route the original verdict stands (3 of 10 live replays came back unparseable —
+  those are no-ops). A verdict already overturned by <code>_escalate_refute</code> is never
+  re-escalated. The withheld case sets <code>confirm_withheld</code>, the mirror of
+  <code>escalated_overturn</code> — both now recorded in the escalation ledger below (the
+  <code>to_dict()</code> keys they were originally written to never reach production; see
+  the next section).</p>
+  <p><strong>Replay evidence:</strong> 10 of those live cheap CONFIRMEDs re-run on the 35B —
+  6 agreed, 1 was overturned (an explicit output-format constraint the cheap judge missed),
+  3 unparseable. Kill switch: <code>GHOST_VERIFY_ESCALATE_CONFIRM=0</code> restores the exact
+  one-directional behaviour. Default ON, because the failure it prevents (a fabricated success
+  taught to every downstream learner) is durable while its own worst case is a turn recorded as
+  unverified. Tests: <code>tests/test_verifier_confirm_escalation.py</code> (22).</p>
+
+  <h2>The escalation ledger: where the watch metrics actually live (2026-08-04)</h2>
+  <p><strong>Symptom.</strong> <code>escalated_overturn</code> (the §4F false-positive watch
+  metric) and its twin <code>confirm_withheld</code> were "persisted" into
+  <code>VerifyResult.to_dict()</code> — a serializer with <strong>zero production callers</strong>
+  (AST sweep of <code>src/</code>: the only <code>to_dict</code> reads belong to other classes;
+  nothing in the turn loop ever calls the verifier's). Live proof: <strong>160</strong>
+  "OVERTURNED a cheap-judge refute" lines in <code>ghost-agent.log</code> against
+  <strong>0</strong> occurrences of <code>escalated_overturn</code> anywhere under
+  <code>$GHOST_HOME/system/</code>. The fix was recorded as done; it was inoperative.</p>
+  <p><strong>Why not the trajectory record</strong>, the obvious candidate. On the STREAMED
+  delivery path <code>_record_turn_trajectory</code> runs in the SSE drain <em>before</em> the
+  stream verifier gate spawns the verdict at all — so a <code>turn_facts</code> stamp (the right
+  tool for a fact known mid-turn) cannot carry a late verdict's flags there, and the web UI always
+  streams. Stamping it anyway would have produced the usual defect: live on one path, dark on the
+  other, with the darkness invisible because "no flag" and "no escalation" look identical.</p>
+  <p><strong>Fix.</strong> One append-only JSONL at
+  <code>$GHOST_HOME/system/verifier/escalations.jsonl</code>, written at the point the escalation
+  RESOLVES — inside <code>_escalate_refute</code> / <code>_escalate_confirm</code>. That is
+  path-independent by construction: finalize, in-loop auto-repair, and the streamed late verdict
+  all funnel through those two methods. One line per escalation:
+  <code>{ts, kind: refute|confirm, route: claim|code, outcome:
+  overturned|upheld|withheld|unavailable, cheap_verdict, cheap_confidence, strong_verdict,
+  final_confidence, req_id, trajectory_id}</code>. <code>req_id</code>/<code>trajectory_id</code>
+  are threaded down as call ARGUMENTS from <code>_compute_verifier_verdict</code> (never read off
+  the context — on the streamed path this code runs after the turn semaphore is released, the
+  lesson <code>core/turn_facts.py</code> exists for), so every row joins back to the trajectory
+  corpus.</p>
+  <p><strong>Both outcomes are recorded, not just the interesting one.</strong> The watch metric is
+  a RATE; a ledger of numerators cannot produce one — which is why "84% of refutes are overturned"
+  previously needed hand-run log archaeology. <code>unavailable</code> (the strong model errored or
+  came back unparseable, so the original verdict stood) is recorded too: a call was spent and
+  changed nothing, and an escalation that silently no-ops is indistinguishable from one that never
+  ran.</p>
+  <p>Read it with:
+  <code>jq -r '.route+"/"+.kind+"/"+.outcome' $GHOST_HOME/system/verifier/escalations.jsonl | sort
+  | uniq -c</code> — the cheap judge's false-positive rate is <em>overturned / (overturned +
+  upheld)</em> within <code>kind=refute</code>. Kill switch:
+  <code>GHOST_VERIFY_ESCALATION_LOG=0</code>; default ON, because the write is one short line on
+  the rare escalation path (not per verdict), it never raises, and the whole finding is that the
+  metric had nowhere durable to live. The file rotates to <code>.jsonl.1</code> past 4&nbsp;MB —
+  rotation, never truncation.</p>
+  <p><strong>Bench and self-play are excluded, deliberately.</strong> A row is written only when
+  the caller supplies a live-turn <code>req_id</code>.
+  <code>scripts/verify_bench.py</code> and <code>optimize_verifier.py</code> drive
+  <code>verify_claim</code> through a two-legged client precisely so <code>_escalate_refute</code>
+  fires — dozens of times per run, in a shell where GHOST_HOME is exported — and self-play/dream
+  turns run the whole turn loop on a shallow-copied context. Either would corrupt the exact rate
+  the ledger measures; the simulation gate is the same
+  <code>skill_memory.is_read_only</code> marker the calibration corpus uses, for the same
+  live reason (§4J). Tests:
+  <code>tests/test_verifier_escalation_ledger.py</code> (36).</p>
+
+  <h2>Code-path refute escalation: measured, and deliberately left OFF (2026-08-04)</h2>
+  <p><code>verify_claim</code> escalates REFUTED verdicts to the main model;
+  <code>verify_code_output</code> never did, and the execute-shaped turns it judges are exactly
+  the ones carrying structural failures. The gap was real. The <em>fix</em> was not — measured
+  before changing anything:</p>
+  <ul>
+    <li><code>system/llm_recordings/</code> 2026-07-30 → 08-04 holds <strong>19</strong>
+    code-auditor verdicts, all on the cheap route: 12 CONFIRMED, <strong>7 REFUTED</strong>, and
+    <strong>0</strong> main-model code-auditor calls — proof the escalation never fired here.</li>
+    <li>All 7 cheap REFUTES replayed on the main 35B with the identical prompt and payload,
+    <strong>twice</strong>: <strong>14/14 upheld, 0 overturned.</strong></li>
+    <li>Same recordings, claim path: 42 CONFIRMED vs 8 REFUTED main-model adjudications =
+    <strong>84% overturned</strong>. The instrument is calibrated; the rate simply does not
+    transfer.</li>
+    <li>Mechanism, not luck: claim-path false refutes are DERIVED-FACT failures (49152 bytes →
+    "48 KB", "the latest PostgreSQL is 18.4") needing world knowledge the 4B judge lacks. Every
+    live code-path refute was a CONSTRAINT/COMPLETENESS failure ("didn't run step 3", "didn't start
+    with the mandated phrase", "only one of the two price checks") — a text comparison the small
+    judge gets right.</li>
+    <li>Cost if enabled: one main-model call per refute at 7–26&nbsp;s measured, on the
+    latency-visible in-loop auto-repair path; and 2 of the 14 replays returned EMPTY at the classic
+    2048-token budget (<code>finish_reason=length</code> — the 35B thinks), i.e. ~14% pure waste.</li>
+    <li>Population: 10 code-shaped refutes in 1488 live trajectories over 28 days (99 verifier
+    refutes total), so the replayed sample is a large fraction of the whole population.</li>
+  </ul>
+  <p><strong>Disposition:</strong> wired, <strong>default OFF</strong> —
+  <code>GHOST_VERIFY_ESCALATE_CODE_REFUTE=1</code> enables it. When on, it re-judges with the CODE
+  prompt (re-asking the claim prompt would adjudicate a different question) and composes with the
+  confirm escalation exactly as the claim path does — an overturned refute is never
+  re-escalated. The escalation ledger labels the <code>code</code> route either way, so the
+  decision stays measurable without another bespoke probe. Tests:
+  <code>tests/test_verifier_escalation_ledger.py::TestCodeRefuteEscalation</code>.</p>
 
   <h2>Live project-ledger evidence on project turns (2026-08-01)</h2>
   <p>The Mini AI incident's last line of defense failed politely: the reply claimed the project

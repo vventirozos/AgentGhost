@@ -152,3 +152,35 @@ class TestAdjudicate:
         stub = _RouteStub(["not-a-label"])
         assert await adjudicate_dimension(
             stub, "text", "made-up-dim") == DIM_UNKNOWN
+
+
+class TestStreamLabelIsNotReadableAsAnOutcome:
+    """`CLASSIFY_FAILURE` lowercases to "classify failure", which renders as
+    `🔧 worker compute  classify failure → Worker Node (Nova)` — an INFO
+    DISPATCH line that reads like a failure report. The operator asked what
+    "these worker failures" were about seven consecutive healthy dispatches
+    (2026-08-04). The routing label is unchanged; only the stream label is.
+    """
+
+    def test_failure_tasks_do_not_render_as_failures(self):
+        from ghost_agent.core.llm import RoutingTask, _task_display_label
+        for task in (RoutingTask.CLASSIFY_FAILURE, RoutingTask.DISTILL_PATTERN):
+            label = _task_display_label(task)
+            assert not label.startswith("classify failure")
+            # "failure-dimension"/"failure-pattern" are fine — a bare trailing
+            # "failure" is what reads as an outcome.
+            assert not label.endswith(" failure")
+
+    def test_routing_label_is_untouched(self):
+        """Tests, docs and timeout lines assert on the canonical string."""
+        from ghost_agent.core.llm import RoutingTask
+        assert RoutingTask.CLASSIFY_FAILURE == "CLASSIFY_FAILURE"
+        assert RoutingTask.DISTILL_PATTERN == "DISTILL_PATTERN"
+
+    def test_unmapped_tasks_keep_the_2026_07_12_rule(self):
+        """Echo the REAL task rather than a hardcoded guess — a hardcoded
+        "query expansion" once made a DECOMPOSE_QUERY timeout read as the
+        anaphora expander."""
+        from ghost_agent.core.llm import RoutingTask, _task_display_label
+        assert _task_display_label(RoutingTask.EXPAND_QUERY) == "expand query"
+        assert _task_display_label("DECOMPOSE_QUERY") == "decompose query"

@@ -298,6 +298,30 @@ class RoutingTask:
     DISTILL_PATTERN = "DISTILL_PATTERN"
 
 
+# Human-readable stream labels. The ROUTING label stays the canonical string
+# above (tests and docs assert on it, and it is what a timeout logs) — this map
+# only changes what the operator reads in the live stream.
+#
+# Why it exists: `CLASSIFY_FAILURE` mechanically lowercases to "classify
+# failure", which renders as
+#     🔧  worker compute      classify failure → Worker Node (Nova)
+# and reads as "the classify call FAILED" — the operator asked exactly that
+# about seven consecutive INFO dispatch lines (2026-08-04). A genuine node
+# failure is a different line entirely: "worker node failed  Nova: ReadTimeout
+# — trying next", WARNING level, ⚠ icon. Any task label whose words could be
+# read as an outcome belongs here; the fallback stays the 2026-07-12 rule of
+# echoing the real task rather than a hardcoded guess.
+_TASK_DISPLAY_LABELS = {
+    "CLASSIFY_FAILURE": "tag failure-dimension",
+    "DISTILL_PATTERN": "distill failure-pattern",
+}
+
+
+def _task_display_label(task) -> str:
+    key = str(task)
+    return _TASK_DISPLAY_LABELS.get(key, key.replace("_", " ").lower())
+
+
 
 class LLMClient:
     def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None, node_api_key: Optional[str] = None):
@@ -545,7 +569,7 @@ class LLMClient:
                 # "expand query", …). A hardcoded "query expansion" here made
                 # a DECOMPOSE_QUERY timeout read as the anaphora expander and
                 # sent the debugging down the wrong path (2026-07-12).
-                task_label=str(task).replace("_", " ").lower(),
+                task_label=_task_display_label(task),
             )
         except OffMainNodeUnavailable:
             logger.debug(f"route({task}): worker pool down — using fallback")

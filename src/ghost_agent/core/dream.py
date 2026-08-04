@@ -12,6 +12,7 @@ from typing import List, Dict, Any, Optional
 
 from .agent import extract_json_from_text
 from .self_play_scoring import correctness_weighted_score, count_tool_errors
+from ..utils.component_guard import _is_real_component
 from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
@@ -1674,7 +1675,7 @@ class Dreamer:
         try:
             from .project_advancer import project_dream_pass
             _pstore = getattr(self.context, "project_store", None)
-            if _pstore is not None and type(_pstore).__module__.startswith("ghost_agent"):
+            if _pstore is not None and _is_real_component(_pstore):
                 project_digests = await asyncio.to_thread(
                     project_dream_pass, _pstore)
                 if project_digests:
@@ -2095,7 +2096,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                     prune_fn = getattr(sm, 'prune_low_utility', None)
                     if callable(prune_fn) and not isinstance(
                         type(sm).__name__, type(None)
-                    ) and type(sm).__module__.startswith("ghost_agent"):
+                    ) and _is_real_component(sm):
                         # Pass memory_system so pruned lessons' vector twins are
                         # deleted too (no orphan vectors drifting from the JSON).
                         raw_count = await asyncio.to_thread(prune_fn, 5, 0.25, self.memory)
@@ -2298,7 +2299,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
         cycle, head-only excerpts. Returns files described.
         """
         store = getattr(self.context, "project_store", None)
-        if store is None or not type(store).__module__.startswith("ghost_agent"):
+        if store is None or not _is_real_component(store):
             return 0
         candidates = []  # (project_id, rel, host_path)
         try:
@@ -2309,9 +2310,17 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # projects were starved forever (2026-07-25 review: 6 legacy
             # DONE projects with zero manifest entries, unreachable).
             # max_projects now counts projects that CONTRIBUTE candidates.
+            # RELEASED joins ARCHIVED as off-limits. A released project's
+            # workspace is chmod 0555 BY DESIGN, so `describe_file` writes the
+            # DB manifest and bumps `updated_at` while the paired
+            # PROJECT_MAP.md write fails at logger.debug — leaving DB and disk
+            # permanently disagreeing, with the INFO line reporting success.
+            # An idle backfill must not be the thing that breaks an
+            # immutability guarantee.
             projects = [
                 p for p in store.list_projects()
-                if str(p.get("status", "")).upper() not in ("ARCHIVED",)
+                if str(p.get("status", "")).upper() not in ("ARCHIVED",
+                                                            "RELEASED")
             ]
         except Exception:
             return 0
@@ -2343,12 +2352,29 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             return 0
 
         blocks = []
-        for i, (pid, rel, host) in enumerate(candidates):
+        described_candidates = []
+        for pid, rel, host in candidates:
+            # BOUNDED read. This used to be `read_text()[:1500]`, which pulls
+            # the whole file into RAM to keep 1.5 KB of it — a registered
+            # 483 KB minified bundle costs 483 KB to describe.
             try:
-                head = host.read_text(encoding="utf-8", errors="replace")[:1500]
+                with host.open("rb") as fh:
+                    raw = fh.read(4096)
             except Exception:
-                head = "(unreadable)"
-            blocks.append(f"FILE {i + 1}: {rel}\n---\n{head}\n---")
+                continue
+            # A NUL byte means binary (registered deliverables include
+            # `data.db`, head `SQLite format 3\x00…`). Feeding that to the LLM
+            # buys a hallucinated description that is then stored PERMANENTLY
+            # in the manifest, which is worse than no description at all.
+            if b"\x00" in raw:
+                logger.debug("manifest backfill: skipping binary %s", rel)
+                continue
+            head = raw.decode("utf-8", errors="replace")[:1500]
+            described_candidates.append((pid, rel, host))
+            blocks.append(f"FILE {len(blocks) + 1}: {rel}\n---\n{head}\n---")
+        candidates = described_candidates
+        if not candidates:
+            return 0
         prompt = (
             "For each file below, write ONE line (max 25 words) describing "
             "what the file IS and DOES in its project — concrete nouns "
@@ -2906,7 +2932,7 @@ Return ONLY a JSON object with:
                 pick_journal_challenge, pick_stashed_challenge,
             )
             mined = pick_journal_challenge(journal)
-            if mined is None and type(journal).__module__.startswith("ghost_agent"):
+            if mined is None and _is_real_component(journal):
                 # Live journal empty/unmineable — the normal case:
                 # phase-1 process_journal_queue drains the queue ~2min
                 # into idle, hours before this phase-3 tick. Fall back
@@ -5235,6 +5261,19 @@ Return ONLY a JSON object with:
 
                     # Early abort if the agent gets hopelessly stuck or blows out context
                     if "SYSTEM ALERT: You have failed" in final_ai_content or "CRITICAL:" in final_ai_content:
+                        # "CRITICAL:" is what agent.py emits for "the upstream
+                        # LLM server is unreachable" — an INFRA outage, not a
+                        # solver failure. Breaking without the flag recorded a
+                        # llama-server restart as the agent failing the
+                        # challenge, with all the durable consequences above.
+                        if "CRITICAL:" in final_ai_content:
+                            validator_infra_crash = True
+                            pretty_log(
+                                "Self-Play Infra",
+                                "upstream LLM unreachable mid-cycle — NOT "
+                                "charging this to the agent",
+                                level="WARNING", icon=Icons.WARN,
+                            )
                         pretty_log("Self-Play Abort", "Agent hit a hard failure state. Aborting loop early.", level="WARNING", icon=Icons.STOP)
                         break
 
@@ -5301,6 +5340,27 @@ Return ONLY a JSON object with:
                             #     because the solver can't fix a hidden
                             #     validator; now we detect and abort
                             #     after attempt 1.
+                            # SANDBOX/DOCKER INFRA FAULT. `docker.execute()`
+                            # never raises — on any infra fault it RETURNS
+                            # "[SANDBOX INFRA ERROR — not your code] ...". That
+                            # became passed=False and was recorded as a genuine
+                            # self-play failure: compression_delta -1.0,
+                            # `mastered` flipped True->False, the cluster
+                            # re-entered the brittle pool, the cooldown
+                            # doubled, the adversarial generator was told that
+                            # family is "hard", and a playbook lesson could be
+                            # written whose only source material is an outage
+                            # banner. All durable. The existing crash detector
+                            # below requires ".validator.py" in the text, which
+                            # this banner does not contain.
+                            if "[SANDBOX INFRA ERROR" in feedback:
+                                validator_infra_crash = True
+                                pretty_log(
+                                    "Self-Play Infra",
+                                    "sandbox/docker fault during validation — "
+                                    "NOT charging this to the agent",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
                             is_validator_crash = False
                             fatal_markers = (
                                 # Structural crashes — validator can't even start.

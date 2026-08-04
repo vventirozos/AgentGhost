@@ -89,12 +89,14 @@ def _agent_confirming_at(conf):
     class StubVerifier:
         llm_client = object()
 
-        async def verify_claim(self, claim, evidence, context=""):
+        async def verify_claim(self, claim, evidence, context="",
+                               *, high_stakes=False, trace=None):
             return VerifyResult(verdict=VerifyVerdict.CONFIRMED,
                                 confidence=conf, reasoning="looks right")
 
         async def verify_code_output(self, code, output, intent, *,
-                                     response=""):
+                                     response="", high_stakes=False,
+                                     trace=None):
             return VerifyResult(verdict=VerifyVerdict.CONFIRMED,
                                 confidence=conf, reasoning="looks right")
 

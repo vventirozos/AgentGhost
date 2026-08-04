@@ -394,6 +394,15 @@
   PASSED/FAILED remain the hard 1.0/0.0 anchors; execution failures subtract 0.15 each down to a 0.15 floor
   (0.0 is reserved for "checked and WRONG"); budget exhaustion scores 0.2, since the agent itself flags that
   reply PARTIAL.</p>
+  <p><strong>One narrowing of the PASSED anchor (2026-08-04).</strong> A verifier <code>passed</code> no longer
+  buys the 1.0 when the turn's SHAPE says the answer cannot be honest — every tool call failed and the reply
+  never said so (<code>outcome_heuristics.unacknowledged_total_failure</code>, the same rule the trajectory
+  corpus applies; kill switch <code>GHOST_UNACKED_FAILURE_GATE=0</code>). Live case req <code>03b96c28</code>:
+  three failed tools, a fabricated one-character answer, an escalation-overturned CONFIRMED. Grading that a
+  perfect 1.0 teaches the confidence model that a confident answer over three broken tools is what success
+  looks like. Such a turn falls through to the graded execution-failure path instead — the shape says
+  "unverified and something broke", not "checked and wrong", so it is never a hard 0.0. An honest failure
+  report keeps its 1.0.</p>
   <p>Two supporting changes were required, and either one missing would have silently defeated the feature:</p>
   <ul>
     <li><strong>Binarisation removed from BOTH the write and read paths.</strong>

@@ -17,6 +17,7 @@ honest-failure turns excluded, split by request_id hash.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from collections import Counter
@@ -53,8 +54,27 @@ def main() -> int:
                         help="Private holdout percentage (request_id-hash split).")
     parser.add_argument("--max-result-chars", type=int, default=1500)
     parser.add_argument("--min-fixtures", type=int, default=200,
-                        help="Warn (exit 1) below this supply — the GEPA run "
-                             "should wait for more days of recording instead.")
+                        help="Warn (exit 1) below this TOTAL supply — the GEPA "
+                             "run should wait for more recording days instead. "
+                             "This is a volume floor, NOT the consumer's gate; "
+                             "see --min-positives.")
+    parser.add_argument("--min-positives", type=int, default=200,
+                        help="Warn (exit 1) below this many POSITIVE fixtures. "
+                             "This is the gate that actually binds: "
+                             "optimize_tool_descriptions.py scores "
+                             "positives-only, and its own --min-fixtures counts "
+                             "positives under the same flag name. Measured "
+                             "2026-08-04: 183 fixtures / 65 positives — gating "
+                             "on the total alone would have declared 'ready' "
+                             "and overwritten the live pool at ~71 positives "
+                             "while the runner still refused to start.")
+    parser.add_argument("--min-delta", type=float, default=0.02,
+                        help="Advisory only: the ship threshold the runner will "
+                             "use, so this mine can report whether the PRIVATE "
+                             "positive tier is fine enough to resolve it. The "
+                             "runner refuses to start when it is not; reporting "
+                             "it here is what makes 'is it time yet?' "
+                             "answerable without starting a run.")
     parser.add_argument("--force-write", action="store_true",
                         help="write the fixtures file even when the supply "
                              "gates fail (overwrites the live GEPA input).")
@@ -108,6 +128,7 @@ def main() -> int:
     # unmounted corpus, or an era-cutoff typo replaced a good fixture file
     # with an EMPTY one and then exited 1. Verified live — 116 bytes -> 0.
     n = len(fixtures)
+    n_pos = labels.get("positive", 0)
     ready = True
     for cls in ("positive", "negative"):
         if labels.get(cls, 0) == 0:
@@ -118,6 +139,35 @@ def main() -> int:
         print(f"⚠ Supply {n} < --min-fixtures {args.min_fixtures} — "
               "recommend waiting for more recording days before the GEPA run.")
         ready = False
+    # The gate the CONSUMER applies. `optimize_tool_descriptions.py` scores
+    # positives-only and calls that count `--min-fixtures` too, so a total-only
+    # gate here reads "ready" while the runner refuses — and this gate is the
+    # one guarding an atomic overwrite of the live pool.
+    if n_pos < args.min_positives:
+        print(f"⚠ Positives {n_pos} < --min-positives {args.min_positives} — "
+              "the runner scores positives only and will refuse to start.")
+        ready = False
+
+    # Advisory: the runner's resolution refusal, reported BEFORE a run is
+    # started. The private share is hashed per REQUEST and a request emits
+    # 1-40 fixtures, so the realised private share is not --private-pct and
+    # has to be measured on the positives themselves rather than assumed.
+    priv_pos = sum(1 for f in fixtures
+                   if f.tier == "private" and f.label >= 0.5)
+    if priv_pos and args.min_delta > 0:
+        resolution = 1.0 / priv_pos
+        share = priv_pos / n_pos if n_pos else 0.0
+        verdict = "OK" if resolution <= args.min_delta else "TOO COARSE"
+        print(f"Private positives: {priv_pos}/{n_pos} "
+              f"(realised share {share:.0%}, requested {args.private_pct}%); "
+              f"smallest step {resolution:.3f} vs --min-delta "
+              f"{args.min_delta} — {verdict}")
+        if resolution > args.min_delta:
+            need_priv = math.ceil(1.0 / args.min_delta)
+            need_pos = math.ceil(need_priv / share) if share else 0
+            print(f"  → needs ~{need_priv} private positives "
+                  f"(~{need_pos} positives at today's realised share) "
+                  "or a larger --min-delta; the runner refuses below this.")
 
     if ready or args.force_write:
         written = write_fixtures_jsonl(fixtures, out_path)

@@ -233,6 +233,54 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
     exclusion silently rots.
   </p>
 
+  <h2>Registered experiments</h2>
+  <table>
+    <thead><tr><th>name</th><th>trigger key</th><th>context-mutating key</th><th>what differs</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>risk_steer</code></td>
+        <td><code>risk_steer_fired</code></td>
+        <td><code>risk_steer_fired</code></td>
+        <td>The depth/effort steer on deep struggling turns. Trigger fires on ~7.6% of turns and is computed from state the arm cannot touch, so the triggered-only block is the powered comparison.</td>
+      </tr>
+      <tr>
+        <td><code>fs_batch</code></td>
+        <td><code>fs_batch_fired</code></td>
+        <td><code>fs_batch_context</code></td>
+        <td>The <a href="../tools/file_system.html">file_system batch macro</a> (§4F item 1): multi-path <code>paths</code> read + the post-edit view on <code>replace</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    <code>fs_batch</code> is the first experiment to need <strong>two different keys</strong>, and
+    the reason is worth stating because the next schema-changing arm will hit it too.
+    <code>fs_batch_context</code> is True on EVERY turn of a treatment request, because the
+    treatment changes the ADVERTISED TOOL SCHEMA — the rendered tool block differs from the first
+    turn onward whether or not the model ever calls <code>file_system</code>. Conditioning the
+    fixture exclusion on "did it actually batch" would leave the rest of the treatment arm in the
+    Phase 2b corpus carrying a payload only half of production ever saw.
+    <code>fs_batch_fired</code> is the narrower TRIGGER — "this turn used file_system at all" —
+    and it is what makes the triggered-only comparison powered.
+  </p>
+  <p>
+    <strong>An honest limit on that trigger.</strong> The contract above says a trigger must be
+    computed from state that does not depend on the arm. <code>fs_batch_fired</code> meets that to
+    first order only: a changed schema can in principle change whether the tool is chosen at all.
+    It is still much closer to pre-treatment than the obvious alternative ("the turn made ≥2
+    file_system calls"), which is precisely the quantity the treatment reduces and would condition
+    the comparison on a POST-treatment variable — the same trap as reading
+    <code>failure_rate</code> without <code>unknown_rate</code>. If the trigger RATE diverges
+    between the arms, read the triggered-only block as confounded.
+  </p>
+  <p>
+    <strong>Standing cost, so the operator can price it.</strong> Registering
+    <code>fs_batch_context</code> excludes the whole treatment arm from newly mined Phase 2b
+    fixtures — roughly half of new supply while the arm runs at <code>traffic: 1.0</code>. That is
+    the correct trade (a contaminated corpus is worse than a slower one), and it is dialable
+    without a deploy: lower <code>traffic</code> or set <code>enabled: false</code> for
+    <code>fs_batch</code> in <code>$GHOST_HOME/system/experiments.json</code>.
+  </p>
+
   <p class="footnote">Not to be confused with <code>core/prune_overrides.py</code>, whose "arm" means an ablation MATRIX CONFIG (a whole-process boot flag). These arms are per-request.</p>
 </main>
 </body>

@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=8.9';
+import * as matrixGraphFace from './matrix_graph.js?v=9.0';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -134,6 +134,7 @@ const ICON_CLASS = {
     // --- memory / filesystem ---
     '💾': 'memory',   // TOOL_FILE_W
     '📖': 'memory',   // TOOL_FILE_R
+    '📙': 'memory',   // TOOL_FILE_M — multi-path batch read
     '🔍': 'memory',   // TOOL_FILE_S
     '👀': 'memory',   // TOOL_FILE_I
     '📝': 'memory',   // MEM_SAVE

@@ -40,6 +40,13 @@ logger = logging.getLogger("GhostDistill")
 # iterating.
 CORRECTIONS_FILENAME = "corrections.jsonl"
 
+# The outcome value that may NEVER carry a ``failure_reason``. Kept as a
+# local constant rather than importing ``schema.Outcome`` into the read
+# loop's hot path; asserted equal to ``Outcome.PASSED.value`` by the tests.
+# `unknown` is deliberately NOT included: the operator-overlay source uses
+# (unknown, reason) to de-label a record while saying why.
+_PASSED = "passed"
+
 
 def _default_root() -> Path:
     # $GHOST_HOME/system/trajectories — matching where prod actually writes
@@ -173,10 +180,17 @@ class TrajectoryCollector:
             # caller passing the user's correcting message — would put
             # raw user text in the training corpus through the overlay.
             from .redact import redact_text
+            # `passed` + a failure reason is an incoherent record. Enforced at
+            # BOTH ends (here and in the iter_trajectories overlay) so the
+            # pair cannot exist on disk or after read — the live f78c8b33
+            # record had it only because the overlay re-applied a reason the
+            # writer had already cleared.
+            _out = str(new_outcome or "")
+            _reason = "" if _out == _PASSED else str(reason or "")
             record = {
                 "trajectory_id": trajectory_id,
-                "outcome": str(new_outcome or ""),
-                "reason": redact_text(str(reason or ""), self.redaction)[:500],
+                "outcome": _out,
+                "reason": redact_text(_reason, self.redaction)[:500],
                 "source": str(source or "")[:100],
                 "timestamp": ts,
             }
@@ -282,11 +296,34 @@ class TrajectoryCollector:
                                 new_outcome = corr.get("outcome") or ""
                                 if new_outcome:
                                     traj.outcome = new_outcome
-                                # Preserve any pre-existing failure_reason on
-                                # the original record; only fill in from the
-                                # correction when the original was empty.
                                 reason = corr.get("reason") or ""
-                                if reason and not (traj.failure_reason or ""):
+                                if new_outcome == _PASSED:
+                                    # A PASSED outcome cannot carry a
+                                    # failure reason. The overlay used to keep
+                                    # the on-disk reason no matter what the
+                                    # correction said, so a late CONFIRMED on
+                                    # a structurally-failed turn read back as
+                                    # `outcome=passed` WITH
+                                    # `failure_reason="structural failure"`
+                                    # still stamped (live: trajectory
+                                    # f78c8b33, req 03b96c28, 2026-08-04).
+                                    # The writer had cleared it in memory; only
+                                    # the read path re-applied it. An
+                                    # incoherent record is its own defect —
+                                    # every consumer that branches on
+                                    # failure_reason (the honest-failure
+                                    # upgrade guard, postmortem fingerprints,
+                                    # the fixture miner) saw a contradiction.
+                                    # Cleared unconditionally, not copied from
+                                    # the correction: legacy sidecar rows
+                                    # predating the writer-side guard can still
+                                    # carry (passed, reason).
+                                    traj.failure_reason = ""
+                                elif reason and not (traj.failure_reason or ""):
+                                    # FAILED: preserve any pre-existing reason
+                                    # on the original record; only fill in from
+                                    # the correction when the original was
+                                    # empty.
                                     traj.failure_reason = reason
                             yield traj
                 except OSError as e:

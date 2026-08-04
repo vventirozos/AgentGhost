@@ -12,11 +12,13 @@ Two capabilities:
 
 import asyncio
 import base64
+import datetime
 import inspect
 import json
 import logging
 import mimetypes
 import os
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -139,6 +141,230 @@ def _escalate_refute_enabled() -> bool:
         not in ("0", "false", "no")
 
 
+def _escalate_confirm_enabled() -> bool:
+    """Re-adjudicate a CHEAP judge's CONFIRMED verdict on the main model
+    when that CONFIRMED is HIGH-STAKES — i.e. a tool actually failed this
+    turn, so the verdict is the only thing standing between the turn and a
+    structural FAILED label (`resolve_turn_outcome` rule 3 outranks rule 4
+    since the 2026-07-31 honest-failure decision).
+
+    Measured on the live stores 2026-08-04, why this exists:
+      * escalation was ONE-DIRECTIONAL — 50 REFUTED escalations in the
+        recorded window (84% overturned by the main model), **0** CONFIRMED
+        escalations, by construction (`_escalate_refute` returns early on
+        anything that is not REFUTED);
+      * the ≥0.7 consumption gate is a NO-OP on the cheap judge: 130/130
+        recorded cheap verdicts came back at 0.9 or 1.0, none below 0.7, so
+        a cheap CONFIRMED is consumed unconditionally;
+      * 61 of 1488 live trajectories (4.1%) are `outcome=passed` with a
+        failed tool call in the turn — the load-bearing population;
+      * replaying 10 of those cheap CONFIRMEDs on the main model: 6 agreed,
+        1 was overturned (REFUTED — an explicit format constraint the cheap
+        judge missed), 3 came back unparseable (which is a no-op here: the
+        original verdict stands).
+
+    Read per call so it can be flipped without a restart, same idiom as
+    ``_escalate_refute_enabled``. Kill switch: GHOST_VERIFY_ESCALATE_CONFIRM=0
+    restores the one-directional behaviour exactly.
+    """
+    return os.getenv("GHOST_VERIFY_ESCALATE_CONFIRM", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+def _escalate_code_refute_enabled() -> bool:
+    """Re-adjudicate a CHEAP judge's REFUTED verdict on the MAIN model for
+    the CODE-shaped path (``verify_code_output``) too.
+
+    **DEFAULT OFF, and that is the measured answer, not an oversight.**
+    ``verify_claim`` escalates refutes because the cheap judge false-refutes
+    there; the code path was assumed to inherit the same problem. Measured on
+    the live stores 2026-08-04 instead of assumed:
+
+      * `system/llm_recordings/` 2026-07-30 → 08-04 holds **19** code-auditor
+        verdicts, ALL on the cheap route: 12 CONFIRMED, **7 REFUTED**. Zero
+        main-model code-auditor calls — proof the escalation never fired here.
+      * Replaying all 7 cheap REFUTES on the main model (identical prompt,
+        temperature 0.1, the exact payload `force_main=True` would send),
+        TWICE: **14/14 upheld, 0 overturned.** Against 84% overturned on the
+        claim path in the same recordings (42 CONFIRMED vs 8 REFUTED
+        main-model adjudications) — the claim-path rate does NOT transfer.
+      * Mechanism, not luck: the claim path's false refutes are DERIVED-FACT
+        failures (49152 bytes → "48 KB", "latest PostgreSQL is 18.4") that
+        need world knowledge the 4B judge lacks. Every live code-path refute
+        was a CONSTRAINT/COMPLETENESS failure ("didn't run step 3", "didn't
+        start with the mandated phrase", "only one of the two price checks"),
+        which is a text-comparison the small judge gets right.
+      * Cost if enabled: one main-model call per refute at 7–26s measured, on
+        the latency-visible in-loop auto-repair path — and 2 of the 14
+        replays came back EMPTY at the classic path's 2048-token budget
+        (`finish_reason=length`: the 35B is a thinking model), i.e. ~14% of
+        those calls would be pure waste that changes nothing.
+      * Population is small: 10 code-shaped refutes in 1488 live trajectories
+        over 28 days (99 verifier refutes total), so the sample above is a
+        large fraction of the whole population, not a thin slice of it.
+
+    The switch exists so the decision is revisitable, and the escalation
+    ledger (`record_escalation`) now counts the code path continuously — flip
+    GHOST_VERIFY_ESCALATE_CODE_REFUTE=1 and the ledger measures it live.
+    """
+    return os.getenv("GHOST_VERIFY_ESCALATE_CODE_REFUTE", "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+# ── Escalation ledger ────────────────────────────────────────────────
+#
+# WHY A FILE AND NOT `VerifyResult.to_dict()`: `escalated_overturn` is the
+# §4F false-positive watch metric and `confirm_withheld` is its CONFIRMED-
+# direction twin, and both were "persisted" into `to_dict()` — a serializer
+# with **zero production callers** (2026-08-04 AST sweep of `src/`: the only
+# `to_dict` reads are other classes'; nothing in the turn loop ever calls the
+# verifier's). Live proof at the time of this fix: 160 "OVERTURNED a
+# cheap-judge refute" lines in `ghost-agent.log`, and **0** occurrences of
+# `escalated_overturn` anywhere under `$GHOST_HOME/system/`. A metric that
+# only exists in a log line whose formatter carries no date is not a metric.
+#
+# WHY NOT THE TRAJECTORY RECORD (the obvious candidate): on the STREAMED
+# delivery path the trajectory is written in the SSE drain BEFORE the verdict
+# is even spawned (`core/agent.py`: `_record_turn_trajectory` in
+# `stream_wrapper`, then the stream verifier gate spawns
+# `_compute_verifier_verdict` further down the same drain and hands it to the
+# late handler). A `turn_facts` stamp — the right tool for a fact known
+# mid-turn — therefore CANNOT carry a late verdict's flags there, and the web
+# UI always streams. Stamping it anyway would have produced the exact defect
+# this project keeps shipping: live on one path, dark on the other, with the
+# darkness invisible because "no flag" and "no escalation" look identical.
+# Writing where the escalation RESOLVES is path-independent by construction:
+# streamed, non-streamed, in-loop auto-repair and late-verdict all funnel
+# through these two methods.
+#
+# Both OUTCOMES are recorded (upheld as well as overturned) because the watch
+# metric is a RATE and a ledger of numerators only cannot produce one.
+_ESCALATION_LOG_FILENAME = "escalations.jsonl"
+# One escalation record is ~250 bytes and the live rate is ~10/day, so this
+# cap is years of headroom; it exists so a runaway loop cannot fill the disk.
+# On overflow the file ROTATES to `.1` (one generation kept) — a durable
+# store is never truncated in place here.
+_ESCALATION_LOG_MAX_BYTES = 4_000_000
+_ESCALATION_LOG_LOCK = threading.Lock()
+
+
+def _escalation_log_enabled() -> bool:
+    """Kill switch: GHOST_VERIFY_ESCALATION_LOG=0 stops the ledger writes.
+
+    Defaulted ON: the write is one short appended line on the RARE escalation
+    path only (not per verdict), it never blocks a verdict — and the finding
+    that produced this module is precisely that the metric had nowhere
+    durable to live. Read per call, same idiom as the other verifier flags.
+    """
+    return os.getenv("GHOST_VERIFY_ESCALATION_LOG", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+def _escalation_log_path() -> Optional[Path]:
+    """``$GHOST_HOME/system/verifier/escalations.jsonl``; None when
+    GHOST_HOME is unset (tests, ad-hoc imports) so nothing is written
+    outside the operator's store."""
+    home = os.getenv("GHOST_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home) / "system" / "verifier" / _ESCALATION_LOG_FILENAME
+
+
+def record_escalation(*, kind: str, route: str, outcome: str,
+                      cheap_verdict: str = "",
+                      cheap_confidence: Optional[float] = None,
+                      strong_verdict: str = "",
+                      final_confidence: Optional[float] = None,
+                      trace: Optional[Dict[str, Any]] = None) -> bool:
+    """Append one escalation event to the ledger. Returns True iff written.
+
+    ``kind``    — "refute" | "confirm" (which direction escalated).
+    ``route``   — "claim" | "code" (which verifier entry point produced it).
+    ``outcome`` — "overturned" | "upheld" | "withheld" | "unavailable"
+                  ("unavailable" = the strong model errored or came back
+                  unparseable, so the ORIGINAL verdict stood; it is a real
+                  escalation that cost a call and must not be silently
+                  dropped from the denominator).
+    ``trace``   — {"req_id", "trajectory_id"} identifying the LIVE TURN this
+                  escalation belongs to. Passed DOWN the call chain as an
+                  argument, never read off the context: on the streamed path
+                  this code runs after the turn semaphore is released, where
+                  a context attribute belongs to whichever request is running
+                  then (the lesson `core/turn_facts.py` exists for).
+
+    **A non-empty ``req_id`` is REQUIRED to write.** This is the ledger's
+    simulation/bench gate, and it is load-bearing, not hygiene:
+    `scripts/verify_bench.py` and `scripts/optimize_verifier.py` drive
+    `verify_claim` through a deliberately two-legged client so
+    `_escalate_refute` fires — dozens to hundreds of times per run, in the
+    operator's shell where GHOST_HOME is exported. Those are BENCH refutes on
+    curated fault cases; folding them in would corrupt the exact
+    false-positive RATE this ledger exists to measure. Self-play/dream turns
+    are excluded the same way, by their caller withholding the trace (see
+    `agent._compute_verifier_verdict`) — the same rule, and the same live
+    lesson, as the calibration corpus's simulation gate (§4J: self-play was
+    writing the production calibration corpus for weeks).
+    The turn loop always has an id (`handle_chat`: ``request_id or
+    uuid4()[:8]``), so this never suppresses a real turn.
+
+    Never raises — a diagnostic write must not break a verdict.
+    """
+    try:
+        if not _escalation_log_enabled():
+            return False
+        trace = trace if isinstance(trace, dict) else {}
+        if not str(trace.get("req_id") or "").strip():
+            logger.debug(
+                "escalation not recorded: no live-turn identity "
+                "(bench, self-play or ad-hoc caller)")
+            return False
+        path = _escalation_log_path()
+        if path is None:
+            return False
+        rec = {
+            "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            "kind": str(kind or ""),
+            "route": str(route or ""),
+            "outcome": str(outcome or ""),
+            "cheap_verdict": str(cheap_verdict or ""),
+            "strong_verdict": str(strong_verdict or ""),
+            "req_id": str(trace.get("req_id") or "")[:64],
+            "trajectory_id": str(trace.get("trajectory_id") or "")[:64],
+        }
+        if cheap_confidence is not None:
+            rec["cheap_confidence"] = round(float(cheap_confidence), 3)
+        if final_confidence is not None:
+            rec["final_confidence"] = round(float(final_confidence), 3)
+        line = json.dumps(rec, ensure_ascii=False)
+        with _ESCALATION_LOG_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if path.stat().st_size + len(line) > _ESCALATION_LOG_MAX_BYTES:
+                    os.replace(str(path), str(path) + ".1")
+            except FileNotFoundError:
+                pass
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.write("\n")
+                f.flush()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("verifier escalation ledger write skipped: %s", exc)
+        return False
+
+
+# Confidence a high-stakes CONFIRMED is capped to when the main model
+# declines to confirm it. Deliberately NOT a flip to REFUTED: a refute is
+# punitive (user-visible auditor note, lesson retraction, FAILED corpus
+# label, auto-repair) and the strong model saying "not confirmed" is not
+# the same as it saying "wrong". Capping below the 0.7 gate means the turn
+# is recorded as UNVERIFIED — no fabricated PASSED, no manufactured
+# failure. Same value and same rationale as agent.py's
+# `_WEB_EXEC_SKIP_CONF_CAP`, which is this codebase's existing idiom for
+# "keep the verdict, deny it load-bearing status".
+_CONFIRM_WITHHELD_CONF_CAP = 0.6
+
+
 # Suspect hygiene caps: a runaway stage-1 response must not blow the
 # stage-2 prompt (which re-embeds claim + evidence + suspects).
 _MAX_SUSPECTS = 3
@@ -187,7 +413,21 @@ class VerifyResult:
     issues: List[str] = field(default_factory=list)
     # True when a cheap judge's REFUTED verdict was overturned by the
     # main-model escalation (see verify_claim). Diagnostic only.
+    #
+    # ⚠ IN-PROCESS ONLY. These two flags do NOT reach disk through
+    # `to_dict()` — that serializer has zero production callers (verified by
+    # AST sweep 2026-08-04; only tests and the bench call it). The DURABLE
+    # record of an escalation is the ledger written by `record_escalation`
+    # at the escalation site — see its comment block for why the escalation
+    # site, and not the trajectory record, is the only place that works on
+    # BOTH delivery paths. Read the ledger, not these fields, to count
+    # overturns.
     escalated_overturn: bool = False
+    # True when a HIGH-STAKES cheap CONFIRMED was escalated and the main
+    # model declined to confirm it, so the confidence was capped below the
+    # 0.7 consumption gate (see _escalate_confirm). The mirror-image watch
+    # metric to `escalated_overturn` — and, like it, in-process only.
+    confirm_withheld: bool = False
     # Two-stage path only: the forced-identification suspects that stage 2
     # adjudicated ([{"quote","check","reason"}, ...]). None on the classic
     # single-stage path so downstream dict shapes are unchanged there.
@@ -209,6 +449,10 @@ class VerifyResult:
         }
         if self.suspects is not None:
             d["suspects"] = self.suspects
+        if self.escalated_overturn:
+            d["escalated_overturn"] = True
+        if self.confirm_withheld:
+            d["confirm_withheld"] = True
         return d
 
 
@@ -436,6 +680,14 @@ def _stage_template(name: str, baseline: str) -> str:
         logger.warning(
             "Verifier: tuned template %s failed placeholder probe — "
             "using baseline", name)
+        # The activation counter counts what the LOADER handed out; without
+        # this it would report a rejected template as "applied", which is
+        # exactly the blindness that instrument exists to prevent.
+        try:
+            from ..optim.loader import note_rejected
+            note_rejected(name, "placeholder probe")
+        except Exception:  # noqa: BLE001
+            pass
         return baseline
     return tuned
 
@@ -998,7 +1250,10 @@ class Verifier:
         return result
 
     async def verify_claim(self, claim: str, evidence: str,
-                           context: str = "") -> Optional[VerifyResult]:
+                           context: str = "",
+                           *, high_stakes: bool = False,
+                           trace: Optional[Dict[str, Any]] = None
+                           ) -> Optional[VerifyResult]:
         """Check whether *claim* is supported by *evidence*.
 
         Default path (GHOST_VERIFY_TWO_STAGE, on unless =0) is two LLM
@@ -1020,6 +1275,18 @@ class Verifier:
         one main-model call on the RARE refute path only. Screen cheap,
         confirm expensive — the same gate discipline used elsewhere here.
         Kill switch: GHOST_VERIFY_ESCALATE_REFUTE=0.
+
+        CONFIRM ESCALATION (2026-08-04): the mirror image, but only when
+        the caller marks the turn ``high_stakes`` (a tool failed this turn,
+        so a CONFIRMED is what turns a structural FAILED into a PASSED).
+        See `_escalate_confirm_enabled` for the live measurements and
+        `_escalate_confirm` for why a withheld confirmation caps confidence
+        instead of flipping the verdict.
+        Kill switch: GHOST_VERIFY_ESCALATE_CONFIRM=0.
+
+        ``trace`` — optional {"req_id", "trajectory_id"} carried into the
+        escalation ledger so an escalation can be joined back to the turn
+        that produced it. Diagnostic only; never affects the verdict.
         """
         # Head+tail packing, not a blunt cut — see pack_claim's rationale.
         claim_t = pack_claim(claim)
@@ -1037,11 +1304,34 @@ class Verifier:
             )
             data = await self._call_llm(prompt, temperature=0.1)
             result = self._build_verify_result(data)
-        return await self._escalate_refute(result, claim_t, evidence_t, context_t)
+        result = await self._escalate_refute(
+            result, claim_t, evidence_t, context_t,
+            route="claim", trace=trace)
+
+        async def _reverify_on_main() -> Optional[VerifyResult]:
+            strong = None
+            if _two_stage_enabled():
+                strong = await self._verify_claim_two_stage(
+                    claim_t, evidence_t, context_t, force_main=True)
+            if strong is None:
+                data2 = await self._call_llm(
+                    _VERIFY_CLAIM_PROMPT.format(
+                        claim=claim_t, evidence=evidence_t,
+                        context=context_t),
+                    temperature=0.1, force_main=True)
+                strong = self._build_verify_result(data2)
+            return strong
+
+        return await self._escalate_confirm(
+            result, high_stakes=high_stakes, retry=_reverify_on_main,
+            route="claim", trace=trace)
 
     async def _escalate_refute(self, result: Optional[VerifyResult],
                                claim: str, evidence: str,
-                               context: str) -> Optional[VerifyResult]:
+                               context: str, *, route: str = "claim",
+                               retry=None,
+                               trace: Optional[Dict[str, Any]] = None
+                               ) -> Optional[VerifyResult]:
         """Confirm a REFUTED verdict on the MAIN model before returning it.
 
         No-op unless the verdict is REFUTED, escalation is enabled, and a
@@ -1050,7 +1340,18 @@ class Verifier:
         nothing to escalate to. On disagreement the main model's verdict
         wins (it is the stronger judge); on any error the original
         verdict stands, so escalation can only ever reduce false refutes,
-        never make the gate less available."""
+        never make the gate less available.
+
+        ``retry`` is the strong-model re-adjudication coroutine factory,
+        mirroring ``_escalate_confirm``'s parameter of the same name. None
+        keeps the claim-path default (two-stage on the main model, classic
+        prompt as fallback) so this method's historical behaviour and its
+        ``claim``/``evidence``/``context`` positional signature are
+        unchanged; ``verify_code_output`` injects its own so the CODE prompt
+        is re-judged with the CODE prompt (re-asking the claim prompt about
+        an execute turn would adjudicate a different question).
+        ``route``/``trace`` are ledger metadata only — they never affect the
+        verdict."""
         if result is None or result.verdict != VerifyVerdict.REFUTED:
             return result
         if not _escalate_refute_enabled():
@@ -1061,36 +1362,163 @@ class Verifier:
         if not cheap_route:
             return result  # main model already judged it
         try:
-            strong = None
-            if _two_stage_enabled():
-                strong = await self._verify_claim_two_stage(
-                    claim, evidence, context, force_main=True)
-            if strong is None:
-                prompt = _VERIFY_CLAIM_PROMPT.format(
-                    claim=claim, evidence=evidence, context=context)
-                data = await self._call_llm(prompt, temperature=0.1,
-                                            force_main=True)
-                strong = self._build_verify_result(data)
+            if retry is not None:
+                strong = await retry()
+            else:
+                strong = None
+                if _two_stage_enabled():
+                    strong = await self._verify_claim_two_stage(
+                        claim, evidence, context, force_main=True)
+                if strong is None:
+                    prompt = _VERIFY_CLAIM_PROMPT.format(
+                        claim=claim, evidence=evidence, context=context)
+                    data = await self._call_llm(prompt, temperature=0.1,
+                                                force_main=True)
+                    strong = self._build_verify_result(data)
         except Exception as exc:
             logger.debug("Verifier refute-escalation failed (keeping "
                          "original verdict): %s", exc)
+            record_escalation(
+                kind="refute", route=route, outcome="unavailable",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=result.confidence, trace=trace)
             return result
         if strong is None:
+            # A call was spent and produced nothing parseable. Recorded, not
+            # dropped: 2 of 14 live main-model code-path replays came back
+            # empty at the classic 2048-token budget, and an escalation that
+            # silently no-ops is indistinguishable from one that never ran.
+            record_escalation(
+                kind="refute", route=route, outcome="unavailable",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=result.confidence, trace=trace)
             return result
         if strong.verdict == VerifyVerdict.REFUTED:
             logger.info("Verifier escalation: main model CONFIRMED the "
                         "refute — verdict stands.")
+            record_escalation(
+                kind="refute", route=route, outcome="upheld",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=result.confidence,
+                strong_verdict=strong.verdict.value,
+                final_confidence=strong.confidence, trace=trace)
             return strong
         logger.warning(
             "Verifier escalation OVERTURNED a cheap-judge refute: main "
             "model says %s. Original issues: %s",
             strong.verdict.value, "; ".join(result.issues or [])[:160])
         strong.escalated_overturn = True
+        record_escalation(
+            kind="refute", route=route, outcome="overturned",
+            cheap_verdict=result.verdict.value,
+            cheap_confidence=result.confidence,
+            strong_verdict=strong.verdict.value,
+            final_confidence=strong.confidence, trace=trace)
         return strong
+
+    async def _escalate_confirm(self, result: Optional[VerifyResult], *,
+                                high_stakes: bool,
+                                retry, route: str = "claim",
+                                trace: Optional[Dict[str, Any]] = None
+                                ) -> Optional[VerifyResult]:
+        """Re-adjudicate a HIGH-STAKES cheap CONFIRMED on the MAIN model.
+
+        No-op unless the verdict is CONFIRMED, the caller flagged the turn
+        high-stakes, escalation is enabled, and a cheap route actually
+        produced the verdict (an already-escalated verdict or a main-model
+        verdict has nothing stronger to appeal to).
+
+        On agreement the main model's result replaces the cheap one. On
+        DISAGREEMENT the verdict is NOT flipped to REFUTED — it keeps its
+        CONFIRMED label and its confidence is capped below every ≥0.7
+        consumption gate (`_CONFIRM_WITHHELD_CONF_CAP`), so the turn is
+        recorded as unverified rather than as a pass or as a failure. That
+        asymmetry is deliberate: a REFUTED is punitive (auditor note to the
+        user, lesson retraction, FAILED corpus label, auto-repair round),
+        and "the strong judge would not confirm this" is weaker evidence
+        than "the strong judge says this is wrong". Capping removes the
+        fabricated PASSED without manufacturing a failure.
+
+        On any error, unparseable strong verdict, or missing cheap route,
+        the original verdict stands — escalation can only ever remove a
+        load-bearing confirmation, never make the gate less available.
+
+        ``route``/``trace`` are ledger metadata only (see
+        ``record_escalation``); they never affect the verdict.
+        """
+        if result is None or result.verdict != VerifyVerdict.CONFIRMED:
+            return result
+        if not high_stakes or not _escalate_confirm_enabled():
+            return result
+        if result.escalated_overturn:
+            # Already adjudicated on the main model by _escalate_refute —
+            # escalating it again would just re-ask the same judge.
+            return result
+        client = self.llm_client
+        cheap_route = bool(getattr(client, "critic_clients", None)) or bool(
+            getattr(client, "worker_clients", None))
+        if not cheap_route:
+            return result  # main model already judged it
+        # Snapshot BEFORE the withheld branch caps it, so the ledger records
+        # what the cheap judge actually said, not the capped value.
+        cheap_confidence_before = float(result.confidence)
+        try:
+            strong = await retry()
+        except Exception as exc:
+            logger.debug("Verifier confirm-escalation failed (keeping "
+                         "original verdict): %s", exc)
+            record_escalation(
+                kind="confirm", route=route, outcome="unavailable",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=cheap_confidence_before, trace=trace)
+            return result
+        if strong is None:
+            record_escalation(
+                kind="confirm", route=route, outcome="unavailable",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=cheap_confidence_before, trace=trace)
+            return result
+        if strong.verdict == VerifyVerdict.CONFIRMED:
+            logger.info("Verifier escalation: main model CONFIRMED the "
+                        "high-stakes pass — verdict stands.")
+            record_escalation(
+                kind="confirm", route=route, outcome="upheld",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=cheap_confidence_before,
+                strong_verdict=strong.verdict.value,
+                final_confidence=strong.confidence, trace=trace)
+            return strong
+        logger.warning(
+            "Verifier escalation WITHHELD a high-stakes cheap-judge "
+            "CONFIRMED: main model says %s. A tool failed this turn, so "
+            "this pass would have overridden a structural failure — "
+            "confidence capped at %.2f. Main-model issues: %s",
+            strong.verdict.value, _CONFIRM_WITHHELD_CONF_CAP,
+            "; ".join(strong.issues or [])[:160])
+        result.confidence = min(float(result.confidence),
+                                _CONFIRM_WITHHELD_CONF_CAP)
+        result.confirm_withheld = True
+        result.reasoning = (
+            (result.reasoning or "")
+            + f" [CONFIRM escalation: a tool failed this turn and the main "
+              f"model would not confirm this pass (said "
+              f"{strong.verdict.value}), so it is not execution-backed; "
+              f"confidence capped.]"
+        ).strip()
+        record_escalation(
+            kind="confirm", route=route, outcome="withheld",
+            cheap_verdict=VerifyVerdict.CONFIRMED.value,
+            cheap_confidence=cheap_confidence_before,
+            strong_verdict=strong.verdict.value,
+            final_confidence=result.confidence, trace=trace)
+        return result
 
     async def verify_code_output(self, code: str, output: str,
                                  intent: str,
-                                 *, response: str = "") -> Optional[VerifyResult]:
+                                 *, response: str = "",
+                                 high_stakes: bool = False,
+                                 trace: Optional[Dict[str, Any]] = None
+                                 ) -> Optional[VerifyResult]:
         """Check whether the agent's *response* actually answers
         *intent*, given the *code* it ran and the *output* it
         observed.
@@ -1103,6 +1531,20 @@ class Verifier:
         code, agent gives a number; user asks for format X, agent
         replies in format Y). Those failure shapes are the dominant
         wrong-but-confidently-confirmed mode in practice.
+
+        ``high_stakes`` carries the same CONFIRM-escalation contract as
+        ``verify_claim`` — and it matters MORE here: this path judges the
+        execute-shaped turns, which are exactly the turns that have a
+        structural failure for a CONFIRMED to override.
+
+        REFUTE escalation on this path is WIRED BUT DEFAULT-OFF, and that is
+        a measured decision — see `_escalate_code_refute_enabled` for the
+        live numbers (14/14 live code-path refutes upheld by the main model,
+        against 84% overturned on the claim path). Flip
+        GHOST_VERIFY_ESCALATE_CODE_REFUTE=1 to enable; the escalation ledger
+        records the code route either way, so the decision stays measurable.
+
+        ``trace`` — optional {"req_id", "trajectory_id"} for the ledger.
         """
         prompt = _VERIFY_CODE_PROMPT.format(
             intent=intent[:1000],
@@ -1111,7 +1553,24 @@ class Verifier:
             response=(response or "(response not provided to verifier)")[:4000],
         )
         data = await self._call_llm(prompt, temperature=0.1)
-        return self._build_verify_result(data)
+        result = self._build_verify_result(data)
+
+        async def _reverify_on_main() -> Optional[VerifyResult]:
+            data2 = await self._call_llm(prompt, temperature=0.1,
+                                         force_main=True)
+            return self._build_verify_result(data2)
+
+        if _escalate_code_refute_enabled():
+            # Same CODE prompt on the main model — re-asking the CLAIM
+            # prompt here would adjudicate a different question than the one
+            # the cheap judge answered.
+            result = await self._escalate_refute(
+                result, "", "", "", route="code", trace=trace,
+                retry=_reverify_on_main)
+
+        return await self._escalate_confirm(
+            result, high_stakes=high_stakes, retry=_reverify_on_main,
+            route="code", trace=trace)
 
     async def _call_llm_vision(self, prompt: str, image_paths: List[str],
                                temperature: float = 0.1) -> dict:

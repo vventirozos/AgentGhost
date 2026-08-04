@@ -34,6 +34,7 @@ them together with the storage layer.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -190,9 +191,33 @@ def count_trajectories_by_cluster(
     on-disk store.
     """
     counts: Dict[str, int] = {}
+    seen = 0
     for t in trajectories:
+        seen += 1
         key = getattr(t, "cluster", None)
         if not key:
             continue
         counts[key] = counts.get(key, 0) + 1
+    if seen and not counts:
+        # MEASURED 2026-08-04: `Trajectory.cluster` is None on all 1488 live
+        # trajectories — NO producer sets it (the only writers,
+        # agent._record_turn_trajectory and reflection/loop.py, pass the
+        # field through from a Trajectory that was never given one). So
+        # `compute_cluster_rarity` returns the cold-start 1.0 for EVERY
+        # cluster and the rarity half of the frontier weight is a constant:
+        # the product collapses to uncertainty-only, silently.
+        #
+        # This warning is the difference between "a signal that is a
+        # constant" and "a signal that is a constant and nobody can tell".
+        # It costs nothing today because this whole path is dark
+        # (--frontier-selfplay default False since 2026-07-09, #27b: tied
+        # uniform in two instrumented ablations) — it fires the moment
+        # someone turns it back on without adding a producer.
+        logging.getLogger("GhostAgent").warning(
+            "frontier rarity is INERT: %d trajectories carry no `cluster` "
+            "field, so every cluster gets the cold-start rarity 1.0 and the "
+            "frontier weight reduces to PRM uncertainty alone. Set "
+            "Trajectory.cluster at record time before trusting this signal.",
+            seen,
+        )
     return counts

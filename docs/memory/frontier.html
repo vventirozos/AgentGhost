@@ -64,11 +64,22 @@
     <dt>SATURATION_WINDOW</dt><dd>2 — last N runs all first-try wins with near-zero delta (lowered from 3 after a 13-cycle loop produced 0 net lessons; at 2 the cluster rotates out one clean cycle after a struggle)</dd>
     <dt>SATURATION_DELTA_EPSILON</dt><dd>0.001</dd>
   </div>
+  <p><strong>The compression signal is dead at the floor — measured, 2026-08-04.</strong> Over the
+  live 200-run ring there is exactly <strong>1</strong> positive <code>delta</code> (and 1 above
+  the 0.05 mastery bar); the census is 83 zeros and 116 negatives (−0.5 ×86, −1.0 ×17 — the
+  failure sentinel — plus a tail at −1.5/−2/−2.5). All <strong>8</strong> tracked clusters sit at
+  <code>best_length=4</code>. That is arithmetic, not a bug: <code>description_length</code> is a
+  tool-invocation count whose minimal viable solve is 3-4 calls, so a cluster can improve at most
+  once and never again. The floor waiver already keeps mastery reachable, but any consumer that
+  treats <code>compression_delta</code> as a live learning signal is reading a constant. Making it
+  informative means changing <em>what is measured</em> (solution token count, AST size, the
+  existing novelty score) — an operator decision, not a code cleanup.</p>
 
   <h2>Dedup behaviour on duplicate challenges</h2>
   <p>Deterministic templates (shop.db GROUP BY, data.csv aggregation, logs/ ERROR+WARN counting, etc.) produce byte-identical challenge text on every re-roll, so every re-roll hits <code>recent_hashes</code> as a duplicate. The dedup path splits two concerns:</p>
   <ul>
     <li><strong>Protect mastery counters</strong>: <code>runs</code>, <code>total_first_try_wins</code>, <code>best_length</code>, and <code>unlocked_tier_index</code> do NOT advance on a duplicate. Without this guard a deterministic template would ratchet any cluster to "mastered" in a handful of re-rolls.</li>
+    <li><strong>…and mastery itself, since 2026-08-04.</strong> The guard above protected the counters but not the <em>verdict</em>: <code>mastered</code> is decided from the last <code>MASTERED_STREAK</code> entries of <code>recent_outcomes</code>, which duplicates necessarily join (saturation reads the same ring) — so a re-rolled challenge counted toward mastery through the back door. Measured on the live frontier file: <code>data_analysis</code> was stored <code>mastered</code> on a 5-run window containing 2 duplicates, and <code>regex_parse</code> had <strong>10 of 10</strong> recent outcomes flagged duplicate — one real run away from mastering on a streak of pure re-rolls. The streak now filters <code>duplicate=True</code> entries out. This cannot re-create the "pinned unmastered and re-picked forever" pathology the floor waiver fixed: duplicates carry <code>passed=True, delta=0.0</code>, so they keep <code>_cluster_is_saturated</code> true and <code>pick_seed</code> skips the cluster regardless of mastery.</li>
     <li><strong>Preserve saturation signal</strong>: the outcome IS still appended to <code>recent_outcomes</code> (tagged <code>duplicate=True</code>, <code>delta=0.0</code>) and state IS persisted. This is what lets <code>_cluster_is_saturated</code> and the brittle-pool decay guard observe that the agent is now acing a template it previously struggled on.</li>
   </ul>
   <p>The earlier implementation returned early on dedup without any state update. For deterministic templates the hash is stable across every re-roll, so a single struggled-then-won run would fossilise the cluster's <code>recent_outcomes[-1]</code> forever — no amount of subsequent clean wins could rotate the cluster out of the brittle pool. Incident 2026-04-21 11:56: 5 consecutive sql cycles all targeted the same template because the 09:06 DD struggled-then-won entry was pinned as the most-recent outcome.</p>

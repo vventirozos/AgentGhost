@@ -252,7 +252,8 @@ _TASK_REOPENED_GRADE = 0.15
 
 
 def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 0,
-                       budget_exhausted: bool = False) -> float:
+                       budget_exhausted: bool = False,
+                       unacked_total_failure: bool = False) -> float:
     """Map a finished turn's observable signals onto a quality label in [0, 1].
 
     IMPORTANT — this is a PROXY, not ground truth. Only the verifier arms
@@ -264,13 +265,25 @@ def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 
     on. Sample provenance (`CalibrationSample.source`) exists so the two can
     always be told apart.
 
+    ``unacked_total_failure`` is the 2026-08-04 shape rule
+    (``distill.outcome_heuristics.resolve_turn_outcome`` rule 2b) in this
+    function's currency: when every tool call this turn failed and the reply
+    never said so, the verifier's PASS is not evidence the turn went well, so
+    it does not buy the 1.0. This mirror is load-bearing — the corpus label
+    and the calibration label are two different consumers of the same ladder,
+    and grading req 03b96c28's fabricated ``0`` as a perfect 1.0 would teach
+    the confidence model that a confident answer over three broken tools is
+    exactly what success looks like. The turn falls through to the graded
+    execution-failure path instead of getting a hard 0.0: the shape says
+    "unverified and something broke", not "checked and wrong".
+
     Pure and total: never raises, always returns a value in [0, 1].
     """
     try:
         verdict = str(verifier_verdict or "").strip().lower()
         if verdict == "failed":
             return 0.0            # checked and WRONG — the one hard negative
-        if verdict == "passed":
+        if verdict == "passed" and not unacked_total_failure:
             return 1.0            # checked and RIGHT
         if budget_exhausted:
             return _BUDGET_EXHAUSTED_GRADE

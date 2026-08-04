@@ -292,7 +292,10 @@ class TestRetrievalFeedback:
         for entry in playbook[:2]:
             assert entry["retrievals"] == 1
 
-    def test_prune_low_utility_drops_bottom_quartile(self, tmp_path):
+    def test_prune_low_utility_drops_bottom_quartile(self, tmp_path,
+                                                     monkeypatch):
+        # Prune is opt-in since 2026-08-04; this test exercises its ranking.
+        monkeypatch.setenv("GHOST_SKILL_PRUNE", "1")
         sm = SkillMemory(tmp_path)
         # Populate 12 lessons. Half are retrieved a lot but never credited
         # (low hit rate), the other half are verified (should be kept).

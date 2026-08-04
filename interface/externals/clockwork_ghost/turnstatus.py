@@ -90,6 +90,7 @@ ICON_CLASS = {
     # --- memory / filesystem ---
     "💾": "memory",
     "📖": "memory",
+    "📙": "memory",   # TOOL_FILE_M — multi-path batch read
     "🔍": "memory",
     "👀": "memory",
     "📝": "memory",

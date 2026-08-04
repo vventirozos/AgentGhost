@@ -164,6 +164,19 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
             "(treatment) vs no steer (control)."
         ),
     ),
+    ExperimentSpec(
+        name="fs_batch",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "file_system macro: multi-path read (`paths`) + post-edit "
+            "verification state on replace (treatment) vs one path per call "
+            "and no post-edit view (control). §4F NEXT STEPS item 1 — the "
+            "target is turn DEPTH, which is this project's strongest measured "
+            "failure predictor."
+        ),
+    ),
 )
 
 
@@ -605,7 +618,17 @@ def is_treatment(context, name: str, req_id: str = "") -> bool:
 # tool-description optimizer is the live example — has to be able to exclude
 # those turns, or it optimizes against a context that only half of production
 # ever sees, and the exclusion silently rots as experiments come and go.
-CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired",)
+#
+# `fs_batch_context` is stamped True on EVERY turn of a treatment request, not
+# only on the turns that used the macro: the treatment changes the ADVERTISED
+# file_system SCHEMA (an extra `paths` property + amended prose), so the
+# rendered tool block differs from the first turn onward whether or not the
+# model ever calls the tool. Conditioning the exclusion on "did it batch"
+# would leave the other treatment turns in the fixture corpus with a payload
+# only half of production ever sees. It over-claims in one direction only
+# (a treatment turn that never built a tool block is excluded anyway), which
+# is the conservative side for a corpus the optimizer replays VERBATIM.
+CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context")
 
 # experiment -> the `extra` key stamped when that experiment's TRIGGER fired.
 #
@@ -618,7 +641,20 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired",)
 # behaviour. Conditioning on the trigger is legitimate here because the
 # trigger is evaluated from state that does NOT depend on the arm — both arms
 # compute the same reading and stamp the same key; only the action differs.
-TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired"}
+#
+# `fs_batch_fired` fires on "this turn made at least one file_system call".
+# ⚠ HONEST LIMIT, stated because the contract above promises arm-independence:
+# that reading is arm-independent to FIRST ORDER only. The treatment changes
+# the advertised schema, and a changed schema can in principle change whether
+# file_system is chosen at all — unlike `risk_steer`, whose depth/effort
+# reading is computed from state the arm cannot touch. It is still far closer
+# to pre-treatment than the obvious alternative ("the turn made ≥2 file_system
+# calls"), which is the very quantity the treatment exists to reduce and would
+# condition the comparison on a POST-treatment variable. If the trigger RATE
+# itself diverges between arms, treat the triggered-only block as confounded —
+# the arm counts in the report are what shows that.
+TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
+                                "fs_batch": "fs_batch_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:

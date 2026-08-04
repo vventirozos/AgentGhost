@@ -377,6 +377,20 @@ class StepValueModel:
                 f"PRM checkpoint weight length {int(m.weights_.shape[0])} != "
                 f"{len(PRM_FEATURE_NAMES)} current features — retrain before loading."
             )
+        # Reject a persisted NaN/inf checkpoint. `json` writes and reads bare
+        # NaN tokens, so a diverged training run round-trips silently: the
+        # model then loads with has_model=True, logs "Loaded idle-trained
+        # Process Reward Model" at INFO, and returns 0.5 for EVERY candidate
+        # forever — at which point MCTS stable-sorts to candidates[0] and
+        # skips LLM simulation entirely, i.e. strictly worse than no PRM.
+        # The length guard immediately above exists for the same collapse
+        # state; this is the other route into it. `router/model.py` already
+        # does exactly this, and its docstring says it mirrors this class.
+        if not (np.all(np.isfinite(m.weights_)) and math.isfinite(m.bias_)):
+            raise ValueError(
+                f"PRM checkpoint has non-finite weights/bias — "
+                "refusing to load a corrupt (diverged) model"
+            )
         m.feature_names_ = tuple(saved_names) if saved_names else PRM_FEATURE_NAMES
         if raw.get("report"):
             m.report_ = PRMTrainingReport(**raw["report"])

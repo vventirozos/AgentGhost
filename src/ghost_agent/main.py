@@ -1288,6 +1288,16 @@ async def lifespan(app):
                 # from the same source — keeping provenance unified
                 # under one id per turn.
                 src_traj_id = reflected_trajectory.extra.get("reflected_from", "") or ""
+                # The plan judge's verdict must reach the LESSON, not just the
+                # trajectory outcome. `Reflector` documents that a verified
+                # plan "upgrades the outcome AND tags the lesson verified" —
+                # it only ever did the first, so every reflection lesson was
+                # written unverified: no +0.3 utility, unpinned by
+                # `_trim_playbook_by_utility`, and prunable. Live evidence: 96
+                # trajectories with plan_verified=True, 3 reflection lessons,
+                # all verified=False.
+                _plan_verified = bool(
+                    reflected_trajectory.extra.get("plan_verified") is True)
                 try:
                     _skill_memory.learn_lesson(
                         task=(reflected_trajectory.user_request or "")[:400],
@@ -1296,6 +1306,7 @@ async def lifespan(app):
                         memory_system=_vector_memory,
                         source_trajectory_id=str(src_traj_id),
                         source="reflection",
+                        verified=_plan_verified,
                     )
                 except Exception as e:
                     logger.warning(f"reflection → SkillMemory write failed: {e}")

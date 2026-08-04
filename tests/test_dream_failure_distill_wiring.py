@@ -48,7 +48,12 @@ class TestDreamWiring:
         assert await distill_failure_clusters(MagicMock()) == 0
 
     def test_project_pass_is_magicmock_guarded(self):
+        # The guard used to be an inline
+        # `__module__.startswith("ghost_agent")`, which was always FALSE
+        # under the production import shape (`src.ghost_agent.*`) and so
+        # disabled this pass entirely on the live agent. It is now the
+        # shared `_is_real_component`, which accepts both shapes.
         src = inspect.getsource(Dreamer.dream)
-        guard = src.index('__module__.startswith("ghost_agent")')
+        guard = src.index("_is_real_component(_pstore)")
         call = src.index("project_dream_pass, _pstore")  # the invocation
         assert guard < call

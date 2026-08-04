@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
+import shutil
+import json as _json_mod
 import re
 import sys
 from pathlib import Path
@@ -114,6 +117,18 @@ async def main() -> int:
     # output fields (e.g. planning_output → "plan"): the metric grades
     # against those fields, and an example without them can only score via
     # the weaker final_response fallback.
+    #
+    # ⚠ KNOWN COMPOSITION CONSEQUENCE, measured 2026-08-04 on the live corpus
+    # (1488 trajectories): `planning_output` is populated on reflection
+    # trajectories and NOWHERE ELSE (157 of 157), so for `planning.decompose`
+    # this filter keeps 96 examples that are 100% reflection-sourced and
+    # discards all 410 clean PASSED user_request examples. §4J's headline was
+    # "19% of the GEPA train set was reflection plans"; after the per-field
+    # fix in `build_trainset` the poisoned FIELD (a reflection's diagnosis
+    # final_response) is gone, but the surviving planning corpus is entirely
+    # revised plans from failed attempts. That is defensible — a revised plan
+    # IS a plan — and it is NOT what the journal line describes. Do not read
+    # a planning.decompose run as trained on ordinary user turns.
     keyed = [e for e in examples
              if any((e.expected_output or {}).get(f) for f in sig.outputs)]
     if len(keyed) >= 20:
@@ -125,6 +140,16 @@ async def main() -> int:
         print(f"only {len(keyed)} examples carry a signature-output target "
               f"(<20) — keeping all {len(examples)}; metric falls back to "
               f"final_response overlap")
+    else:
+        # `elif keyed:` is ALSO false at zero, so the total-collapse case
+        # printed nothing and the run silently optimized + ship-gated the
+        # signature against whole final replies instead of its own outputs.
+        # Zero is the loudest case, not the quietest.
+        print(f"⚠ NONE of {len(examples)} examples carry a "
+              f"{sorted(sig.outputs)} target — every example will be graded "
+              f"by final_response overlap, INCLUDING the private ship gate. "
+              f"That is a different objective from {sig.name}; check the "
+              f"corpus before trusting a promotion.", file=sys.stderr)
     examples = examples[:args.max_examples]
 
     # PUBLIC/PRIVATE first: the private tier is hash-assigned per trajectory
@@ -137,6 +162,29 @@ async def main() -> int:
     print(f"{len(train_set)} train / {len(eval_set)} val (public) / "
           f"{len(private_set)} PRIVATE holdout examples for {sig.name}")
 
+    # ── RESOLUTION CHECK, *BEFORE* the expensive part ─────────────────
+    # The gate's smallest possible non-zero delta is 1/n. Shipping on a
+    # `min_delta` FINER than the metric can resolve means a single flipped
+    # example decides the run — measured on the sibling verifier gate, whose
+    # 6-case non-refute arm has a 0.083 step against a 0.02 threshold, which
+    # is the arithmetic cause of the journal's "+-0.08 private-gate noise".
+    #
+    # This depends ONLY on `len(private_set)` and `--ab-min-delta`, both
+    # known here — it used to sit after `run_gepa(...)`, so a run that could
+    # never ship burned the whole optimization first and then exited 1. The
+    # sibling optimize_verifier.py gates before `gepa.optimize` and says
+    # "REFUSING TO RUN"; this now matches.
+    _resolution = 1.0 / max(1, len(private_set))
+    if _resolution > args.ab_min_delta:
+        _need = math.ceil(1.0 / args.ab_min_delta)
+        print(f"REFUSING TO RUN: the A/B gate cannot resolve its own "
+              f"threshold. {len(private_set)} private examples give a "
+              f"smallest step of {_resolution:.3f}, coarser than "
+              f"--ab-min-delta {args.ab_min_delta}. One flipped example "
+              f"would decide the run. Collect at least {_need} private "
+              f"examples, or raise --ab-min-delta.", file=sys.stderr)
+        return 1
+
     # Build LLM client + metric
     from ghost_agent.core.llm import LLMClient
     llm_client = LLMClient(args.upstream_url)
@@ -147,11 +195,53 @@ async def main() -> int:
     # substring check scored ~everything 0. Replaced by real benches
     # (verify_bench / replay fixtures) in §4F Phase 2.
     def _overlap(want: str, got: str) -> float:
+        """Token F1 — NOT recall.
+
+        Recall (`|w & g| / |w|`) makes VERBOSITY the optimum. Re-measured
+        2026-08-04 against a real 87-token gold plan from the live corpus
+        (`planning.decompose`, n=96 plan targets, median 35 distinct tokens):
+
+            candidate                 recall     F1
+            terse correct subset       0.333    0.500
+            gold + 300 filler tokens   1.000    0.367
+            that soup vs UNRELATED gold 0.250   0.047
+
+        Recall ranks the soup ABOVE the correct answer and still gives it
+        0.250 against a gold it never addressed; F1 inverts both. A hidden
+        holdout defends against memorising items — it cannot defend against
+        a metric whose optimum generalises.
+
+        The cost of F1 is length sensitivity in the OTHER direction: a
+        perfectly-recalling answer much longer than the gold falls under the
+        0.3 pass bar. That is survivable here only because the gold is a
+        PLAN (n=96, median 35 distinct tokens, p90 58 — re-measured
+        2026-08-04; an earlier revision said p90 61) rather than a whole
+        final reply — which is exactly why `build_trainset` must keep
+        yielding plan targets (see the per-field kind filter there). If that
+        ever collapses to the `final_response` fallback, revisit this bar.
+
+        ⚠ THIS METRIC CHANGE INVALIDATES THE PROMOTED planning.decompose
+        ARTIFACT AS A MEASURED WIN. Re-run 2026-08-04 on the same hash-stable
+        28-example private tier, both arms at temp 0 / no-think: under RECALL
+        the promoted artifact scores 0.857 vs the seed's 0.429 (+0.429 —
+        reproducing the 2026-07-29 promotion, journal 0.45 -> 0.80); under F1
+        it scores 0.071 vs 0.500 (-0.429). Its outputs run a median 111
+        distinct tokens against a 32-token median gold. Neither metric
+        measures plan QUALITY, so this is a correctness-of-record finding,
+        not proof the artifact is bad — but the promotion decision does not
+        reproduce under the objective this function now implements. The
+        read-site is dark (no `--use-planning` on the live exec line).
+        """
         w = set(re.findall(r"[a-z0-9_]+", want.lower()))
         g = set(re.findall(r"[a-z0-9_]+", got.lower()))
         if not w or not g:
             return 0.0
-        return len(w & g) / len(w)
+        hits = len(w & g)
+        if not hits:
+            return 0.0
+        recall = hits / len(w)
+        precision = hits / len(g)
+        return 2.0 * precision * recall / (precision + recall)
 
     def _expected_target(fields_obj) -> str:
         """First non-empty signature-output field on the gold (falling back
@@ -214,7 +304,49 @@ async def main() -> int:
 
     def _promote_staging():
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep the incumbent. `os.replace` onto the live path used to be the
+        # ONLY copy operation, so a candidate that beat a stale baseline
+        # silently destroyed a better artifact (measured: the live
+        # planning.decompose scored 0.80 on its own private gate; a 0.50
+        # candidate beating the hard-coded 200-char baseline by +0.05 would
+        # have replaced it, unrecoverably).
+        if output_path.exists():
+            backup = output_path.with_suffix(output_path.suffix + ".prev")
+            try:
+                shutil.copy2(output_path, backup)
+                print(f"incumbent backed up to {backup}")
+            except OSError as e:
+                print(f"WARNING: could not back up incumbent ({e}) — "
+                      "promotion aborted", file=sys.stderr)
+                raise
         os.replace(staging_path, output_path)
+
+
+    def _live_incumbent() -> str:
+        """The instruction production ACTUALLY runs for this signature.
+
+        The gate must compare against what is deployed, not against the
+        hard-coded seed: `result.baseline_instruction` is
+        `signature.instruction`, which on any signature that has already been
+        optimized is a DIFFERENT, unrelated string. Both sibling runners
+        (optimize_verifier.py, optimize_tool_descriptions.py) already seed
+        from and gate against the live artifact; this one did not.
+        """
+        try:
+            data = _json_mod.loads(output_path.read_text(encoding="utf-8"))
+            live = data.get("optimized_instruction")
+            # `isinstance(str)` — matching optim/loader.py:69 EXACTLY. A
+            # bare `str(...)` accepted artifacts the loader rejects: an
+            # artifact holding `42` became the 2-char baseline "42" here
+            # while production ran the hand-written instruction, so any
+            # candidate trivially "beat the live artifact" and shipped.
+            # A gate that models a different production state than the one
+            # that exists is worse than no gate.
+            if isinstance(live, str) and live.strip():
+                return live.strip()
+        except Exception:
+            pass
+        return result.baseline_instruction
 
     # A/B ship-gate — ON BY DEFAULT. Only let the tuned prompt supersede the
     # baseline at inference if it actually wins on the held-out eval split.
@@ -268,12 +400,30 @@ async def main() -> int:
         passed = bool(want) and _overlap(want, got) >= 0.3
         return {"passed": passed, "output": got}
 
+    incumbent = _live_incumbent()
+    if incumbent != result.baseline_instruction:
+        print(f"gating against the LIVE artifact ({len(incumbent)} chars), "
+              f"not the seed baseline ({len(result.baseline_instruction)} chars)")
+
     cmp = await compare_prompts(
-        result.baseline_instruction, result.optimized_instruction,
+        incumbent, result.optimized_instruction,
         private_set, _ab_runner, min_delta=args.ab_min_delta,
+        # `compare_prompts` defaults to 30s and a timeout is scored as a
+        # FAILED example, so the default made the verdict partly a latency
+        # race — and it raced the two arms UNEQUALLY, because the arm that
+        # produces more tokens is the slower one, which is exactly the arm a
+        # prompt-length change moves. Measured 2026-08-04 re-running this
+        # gate on the live 28-example planning.decompose private tier
+        # (qwen-3.6-35b-a3 on the local upstream, no-think, max_tokens 8192):
+        # 56 calls, median 1.2s incumbent / 4.0s candidate WARM, but the
+        # cache-cold calls hit 12.3s / 32.2s and two warm calls reached
+        # 27.5s and 28.5s — a 5% margin on the default, breached on the
+        # cold head of every run. The ceiling only has to be above a real
+        # stall: 8192 tokens at the measured ~25 tok/s is ~330s.
+        per_example_timeout_s=360.0,
     )
     print(f"A/B (PRIVATE holdout, n={len(private_set)}): "
-          f"baseline={cmp.baseline_pass_rate:.2f} "
+          f"incumbent={cmp.baseline_pass_rate:.2f} "
           f"candidate={cmp.candidate_pass_rate:.2f} "
           f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
     if not cmp.candidate_ships:

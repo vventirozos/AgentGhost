@@ -52,6 +52,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..utils.leaked_framing import call_has_leaked_framing as _leaked
+
 logger = logging.getLogger("GhostAgent")
 
 # A pair must miss at least this many times before it is called a pattern
@@ -549,6 +551,140 @@ def _shares_target(calls: Sequence[Any]) -> Optional[str]:
     return sorted(common, key=lambda v: (-len(v), v))[0]
 
 
+# ──────────────────────────────────────────────────────────────────────
+# The `fs_batch` acceptance instrument (§4F NEXT STEPS item 1)
+# ──────────────────────────────────────────────────────────────────────
+#
+# The acceptance test for the batch macro is "the file_system n-grams
+# collapse". That can only be OBSERVED after the arm has run live for a
+# while, because `mine_sequences` reads a corpus of turns that have already
+# happened. `simulate_fs_batch` answers the question the day the macro
+# ships: it rewrites the EXISTING corpus as if the macro had been available
+# and always used, so the same miner can be run over both and the two
+# reports diffed.
+#
+# It is an UPPER BOUND — full model uptake, which is exactly what the live
+# arm exists to measure — and it is honest about which collapses it claims:
+# only the two the macro actually implements.
+_FS_TOOL = "file_system"
+_FS_BATCH_READ_OP = "read"
+_FS_POST_EDIT_OPS = frozenset({"replace"})
+
+
+def _call_field(call: Any, key: str) -> Any:
+    args = getattr(call, "arguments", None)
+    if args is None and isinstance(call, dict):
+        args = call.get("arguments")
+    return (args or {}).get(key) if isinstance(args, dict) else None
+
+
+def _call_name(call: Any) -> str:
+    nm = getattr(call, "name", None)
+    if nm is None and isinstance(call, dict):
+        nm = call.get("name")
+    return str(nm or "")
+
+
+def _call_op(call: Any) -> str:
+    return str(_call_field(call, "operation") or "")
+
+
+def _call_target(call: Any) -> str:
+    for k in ("path", "filename", "file"):
+        v = _call_field(call, k)
+        if v:
+            return str(v).strip()
+    return ""
+
+
+@dataclass
+class _MergedCall:
+    """A synthetic call standing in for one batched `file_system` invocation."""
+    name: str
+    arguments: Dict[str, Any] = field(default_factory=dict)
+    result: str = ""
+    error: str = ""
+
+
+def collapse_fs_batch(calls: Sequence[Any], *,
+                      max_batch: int = 12) -> List[Any]:
+    """The macro's collapse rule, applied to one turn's tool-call sequence.
+
+    Exactly two rewrites, matching what shipped:
+
+    1. a run of consecutive ``file_system(operation='read')`` calls becomes
+       ONE call (the `paths` batch), in chunks of ``max_batch``;
+    2. a ``file_system(operation='read')`` immediately following a
+       ``file_system(operation='replace')`` on the SAME target is DROPPED —
+       the post-edit view makes that verify-read unnecessary.
+
+    Everything else is passed through untouched. Notably NOT collapsed:
+    ``read_chunked`` runs (pagination, out of scope) and cross-file edit
+    runs (not implemented).
+    """
+    out: List[Any] = []
+    i = 0
+    n = len(calls)
+    while i < n:
+        call = calls[i]
+        # (2) trailing verify-read after an edit of the same file
+        if (out and _call_name(call) == _FS_TOOL
+                and _call_op(call) == _FS_BATCH_READ_OP
+                and _call_name(out[-1]) == _FS_TOOL
+                and _call_op(out[-1]) in _FS_POST_EDIT_OPS
+                and _call_target(call)
+                and _call_target(call) == _call_target(out[-1])):
+            i += 1
+            continue
+        # (1) consecutive whole-file reads
+        if _call_name(call) == _FS_TOOL and _call_op(call) == _FS_BATCH_READ_OP:
+            j = i
+            while (j < n and _call_name(calls[j]) == _FS_TOOL
+                   and _call_op(calls[j]) == _FS_BATCH_READ_OP):
+                j += 1
+            run = list(calls[i:j])
+            if len(run) >= 2:
+                for k in range(0, len(run), max_batch):
+                    chunk = run[k:k + max_batch]
+                    if len(chunk) == 1:
+                        out.append(chunk[0])
+                    else:
+                        out.append(_MergedCall(
+                            name=_FS_TOOL,
+                            arguments={"operation": _FS_BATCH_READ_OP,
+                                       "paths": [_call_target(c) for c in chunk],
+                                       "path": _call_target(chunk[0])},
+                        ))
+            else:
+                out.extend(run)
+            i = j
+            continue
+        out.append(call)
+        i += 1
+    return out
+
+
+def simulate_fs_batch(trajectories: Iterable[Any], *,
+                      max_batch: int = 12) -> Iterable[Any]:
+    """Yield each trajectory with `collapse_fs_batch` applied to its calls.
+
+    Lightweight stand-ins, not real `Trajectory` objects: `mine_sequences`
+    reads only ``task_kind``, ``id`` and ``tool_calls``, and materialising
+    full records would defeat the streaming walk the miner is built around.
+    """
+    from types import SimpleNamespace
+    for traj in trajectories or []:
+        try:
+            calls = list(getattr(traj, "tool_calls", None) or [])
+            yield SimpleNamespace(
+                id=str(getattr(traj, "id", "") or ""),
+                task_kind=str(getattr(traj, "task_kind", "") or ""),
+                tool_calls=collapse_fs_batch(calls, max_batch=max_batch),
+            )
+        except Exception:  # noqa: BLE001 — one bad record must not stop the walk
+            continue
+
+
 def mine_sequences(trajectories: Iterable[Any], *,
                    sizes: Sequence[int] = NGRAM_SIZES,
                    min_support: int = DEFAULT_MIN_SUPPORT,
@@ -570,6 +706,7 @@ def mine_sequences(trajectories: Iterable[Any], *,
     cohesive: Counter = Counter()
     examples: Dict[Tuple[str, ...], List[str]] = defaultdict(list)
     traj_index = 0
+    dropped_corrupt = 0
 
     for traj in trajectories or []:
         try:
@@ -578,6 +715,18 @@ def mine_sequences(trajectories: Iterable[Any], *,
                 if kind not in task_kinds:
                     continue
             calls = list(getattr(traj, "tool_calls", None) or [])
+            # Drop calls whose ARGUMENTS carry leaked tool-call framing. These
+            # are mis-RECORDED calls, not real agent behaviour: the operation
+            # or path value contains another call's XML, so their `operation`
+            # and target are fiction and they pollute both the n-gram counts
+            # and the cohesion denominator. Measured 2026-08-04: 16 calls of
+            # 3579 (0.45%), ALL of them before the 2026-07-31 native-dialect
+            # fix — immaterial to today's macro conclusions, but the corpus is
+            # append-only, so leaving them in means every future run inherits
+            # them. Counted in `dropped_corrupt_calls`, never silently.
+            _pre = len(calls)
+            calls = [c for c in calls if not _leaked(c)]
+            dropped_corrupt += _pre - len(calls)
             if len(calls) < 2:
                 continue
             names: List[str] = []
@@ -644,6 +793,13 @@ def mine_sequences(trajectories: Iterable[Any], *,
             example_targets=list(examples.get(seq, [])),
         ))
     out.sort(key=lambda c: (-c.priority, -c.support, c.sequence))
+    if dropped_corrupt:
+        # Not silent: a corpus impurity that changes the counts must be
+        # announced wherever it is applied. The report prints the same number
+        # in its header; this covers programmatic callers.
+        logger.info("tool_ontology: dropped %d tool call(s) carrying leaked "
+                    "tool-call framing (mis-recorded, not agent behaviour)",
+                    dropped_corrupt)
     return out
 
 

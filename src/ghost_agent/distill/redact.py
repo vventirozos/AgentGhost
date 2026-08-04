@@ -32,6 +32,88 @@ from .schema import Trajectory
 _BuiltinRule = Tuple[str, Pattern[str], Union[str, Callable[["re.Match[str]"], str]]]
 
 
+# Words that precede a dotted-numeric run which is NOT a host. `7.2.1.2` is a
+# structurally valid dotted quad, so no pattern can separate it from an
+# address — the context can. These are the false-positive classes MEASURED in
+# the live corpus (the PostgreSQL manual is a known RAG source), encoded the
+# same way `_BENIGN_COMPOUND_KEYS` encodes its own.
+# Deliberately ONLY document-structure and versioning words. `rule`, `item`,
+# `step`, `table` and bare `v` were here and were removed: each doubles as a
+# plausible config KEY (`rule: 10.0.0.5`), so keeping them traded a corrupted
+# manual section number for a leaked host. When the two error directions
+# conflict in a redactor, the leak is the one that matters.
+_IPV4_NON_HOST_CUES = (
+    "section", "chapter", "figure", "appendix", "clause",
+    "version", "release", "rev",
+)
+
+# `Name/1.2.3.4` is a version only for these names. Everything else before a
+# `/` is treated as a path segment and the quad is redacted — see
+# `_ipv4_repl`. Kept short and explicit on purpose: the one measured false
+# positive was a Chrome UA inside stored Python source, and guessing at the
+# shape instead of the name is what leaked real hosts.
+_UA_PRODUCT_TOKENS = frozenset((
+    "mozilla", "chrome", "chromium", "safari", "firefox", "edge", "edg",
+    "opera", "applewebkit", "gecko", "webkit", "trident", "msie",
+    "curl", "wget", "python-requests", "okhttp", "httpx", "urllib",
+    "postman", "insomnia", "node-fetch", "axios", "go-http-client",
+))
+
+
+def _ipv4_repl(m) -> str:
+    """Redact a dotted quad unless the context says it is not a host.
+
+    A quad preceded by `/` is redacted, FULL STOP, unless the token before
+    the slash is a known user-agent product name. `/` must not simply be
+    excluded by a lookbehind — doing that spared `http://<host>`,
+    `https://<host>:8080/api` and `/var/log/<host>.log`.
+
+    The first attempt at the exception was structural ("a product token is a
+    word not itself preceded by a separator") and leaked broadly: any path
+    segment containing `-`, `_`, `.` or `:` defeated it, so
+    `/var/log/my-app/10.0.0.9`, `http://example.com/10.0.0.9` and
+    `/opt/ghost_agent/10.0.0.9` all passed through verbatim — 36 of 83 real
+    directories on the live box were leak-triggering prefixes, and a path
+    segment of 39+ chars leaked regardless of content. There is no
+    structural difference between `logs/10.0.0.9` and `Chrome/120.0.0.0`;
+    only the NAME distinguishes them. So the exception is an explicit
+    allowlist, and everything not on it is treated as a host.
+
+    That deliberately re-corrupts nothing measured except unknown product
+    tokens, and it errs toward redaction: a false positive mangles stored
+    text, a false negative publishes an address.
+    """
+    head = m.string[:m.start()]
+    # Never scan across a line break: `rstrip()` used to eat `\n`, so a
+    # markdown heading ("## Section\n10.0.0.9") suppressed redaction on the
+    # NEXT line. A cue only speaks for its own line.
+    line = head.rsplit("\n", 1)[-1][-60:]
+    if line.endswith("/"):
+        stem = line[:-1]
+        word = ""
+        for ch in reversed(stem):
+            if ch.isalnum():
+                word = ch + word
+            else:
+                break
+        return (m.group(0) if word.lower() in _UA_PRODUCT_TOKENS
+                else "<REDACTED_IP>")
+    # Last alphabetic token before the match, ignoring punctuation/space.
+    tail = line.rstrip()
+    tail = tail.rstrip(".:#§-_ \t")
+    word = ""
+    for ch in reversed(tail):
+        if ch.isalpha():
+            word = ch + word
+        elif word:
+            break
+        else:
+            break
+    if word.lower() in _IPV4_NON_HOST_CUES:
+        return m.group(0)
+    return "<REDACTED_IP>"
+
+
 def _luhn_ok(digits: str) -> bool:
     """True when `digits` passes the Luhn checksum (every real PAN does)."""
     if not digits.isdigit() or not 13 <= len(digits) <= 19:
@@ -177,11 +259,51 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     ), "<REDACTED_EMAIL>"),
 
     # IPv4 addresses outside loopback. Loopback is kept readable for debugging.
+    #
+    # STRUCTURE GUARD (added after measuring the live corpus): the sibling
+    # `credit_card` rule got a Luhn check and `phone` got a separator
+    # requirement precisely to stop numeric false positives corrupting stored
+    # text — `ipv4` had neither, and most of the 41 live `<REDACTED_IP>` hits
+    # were NOT hosts. It ate PostgreSQL manual section numbers ("see Section
+    # 7.2.1"), a Chrome UA version inside stored Python source
+    # ("Chrome/120.0.0.0"), part of a loopback ("127.0.0.1" -> the last octet),
+    # and digits inside an opaque CDN token.
+    #
+    # (An earlier version of this comment said "33 of 41". Re-measured
+    # 2026-08-04 by classifying every marker: the split is ~22 non-host /
+    # ~19 host-shaped, and of those only one — 192.168.215.2, in the Flask
+    # `* Running on` line — is a genuine host on this box; the rest are
+    # synthetic fixture addresses from coding exercises. The false-positive
+    # problem was real; its size was overstated.)
+    #
+    # The guards, all cheap and all lossless for real addresses:
+    #   * not preceded by a digit or a dot — kills the tail of a longer
+    #     dotted-numeric run (section numbers, version strings, and
+    #     "127.0.0.1" whose 127. prefix the negative lookahead already spares).
+    #     Slash and hyphen were in this class and were REMOVED: they leaked
+    #     every URL host, every path-embedded address, and the second address
+    #     of an "a-b" range. Those shapes are now separated by context in
+    #     `_ipv4_repl`, which is where a judgement call belongs;
+    #   * not followed by a dot+digit — kills "1.2.3.4.5" style enumerations;
+    #   * at least one octet > 255-impossible-as-a-version, i.e. reject the
+    #     all-small-numbers shape that version strings take, UNLESS it is
+    #     preceded by an address-ish cue. Rather than guess, require that the
+    #     match is not immediately inside a word character on either side.
     ("ipv4", re.compile(
-        r"\b(?!127\.)(?!0\.0\.0\.0\b)"
+        # No leading `\b`. `(?<![\d.])` already prevents matching the tail of
+        # a longer dotted-numeric run, and the word boundary additionally
+        # required a NON-word char before the first octet — which a
+        # JSON-escaped newline does not provide. Measured on the live corpus:
+        # `"STDOUT/STDERR:\\n10.0.0.2 12\\n10.0.0.4 11..."` left seven
+        # addresses in the clear, because the `n` of the literal `\n` escape
+        # is a word character. Serialized tool output is exactly where
+        # addresses live.
+        r"(?<![\d.])"
+        r"(?!127\.)(?!0\.0\.0\.0\b)"
         r"((?:25[0-5]|2[0-4]\d|[01]?\d\d?)"
         r"(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3})\b"
-    ), "<REDACTED_IP>"),
+        r"(?![\d.]*\d)"
+    ), _ipv4_repl),
 
     # IPv6 addresses: full form (>=4 hextet groups so `::1` loopback stays
     # readable) PLUS `::`-compressed forms — most real-world IPv6 is
@@ -201,7 +323,27 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # alphanumeric token (32-hex trajectory/request ids) is an identifier,
     # not a card — Luhn alone passes ~10% of those and the redaction
     # corrupts referential ids downstream.
-    ("credit_card", re.compile(r"(?<![0-9A-Za-z])(?:\d[ -]?){13,19}(?![0-9A-Za-z])"), _redact_cc_if_luhn),
+    # The DOT matters, but ASYMMETRICALLY. A long float in stored JSON —
+    # e.g. `"ballY": 1863.6640967916142` — has a 13+ digit run after the
+    # decimal point that passes Luhn ~10% of the time, and redacting it
+    # corrupts the record. So a dot BEFORE the run disqualifies it.
+    # After the run the guard must be `(?!\.\d)`, not `(?!\.)`: a plain
+    # trailing-dot veto let a card at the end of a sentence — "my card is
+    # 4111111111111111." — escape redaction ENTIRELY, which is the failure
+    # direction that actually matters here. `\.\d` still vetoes the other
+    # float shape (`12345678901234.5`).
+    # Boundaries also exclude `-`, `_` and `|`. Luhn passes ~10% of long
+    # digit runs by chance, and the corpus is full of them INSIDE delimited
+    # identifiers — measured, 95 of 147 Luhn-valid runs in the live corpus
+    # were redacted and NONE was a card:
+    #   `unsplash.com/photo-1504567991286-3a325b4b0e98`  (53 occurrences)
+    #   `1785569266492|E105|START|5`                     (epoch-millis logs)
+    #   `linkedin.com/.../activity-7395082818684583936-PW89`
+    # A real PAN is written after a space, `:` or start-of-line, never
+    # welded into a hyphen- or pipe-delimited token. Cards written WITH
+    # dashes (`4111-1111-1111-1111`) are unaffected: the separators are
+    # consumed inside the match, not at its edges.
+    ("credit_card", re.compile(r"(?<![0-9A-Za-z._|-])(?:\d[ -]?){13,19}(?![0-9A-Za-z_|-])(?!\.\d)"), _redact_cc_if_luhn),
     # A phone match must carry phone STRUCTURE — a leading `+`, a
     # parenthesised area code, or internal space/dash separators. The old
     # pattern's core (`\d{3}[ -]?\d{4}` with everything else optional)
@@ -209,8 +351,15 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # SQL trajectory became `LIMIT <REDACTED_PHONE>`. Bare unseparated
     # digit runs are now left alone — code corpora are full of them and
     # an unformatted local number is not recoverable PII worth that cost.
+    # Boundaries exclude letters, `_` and `-`, not just digits. A bare `\d`
+    # boundary let the pattern eat a digit group out of the MIDDLE of a
+    # hyphenated identifier: measured in the mined bench pool,
+    # `…/renecannao_postgresql-184-1710-16…` became
+    # `…/renecannao_postgresql-<REDACTED_PHONE>-16…`, corrupting a URL inside
+    # a case whose `fact_swap` fault operates on exactly those digits. A real
+    # phone number is not preceded or followed by `-`/`_`/a letter.
     ("phone", re.compile(
-        r"(?<!\d)(?:"
+        r"(?<![\dA-Za-z_-])(?:"
         # +country, optional area code, separators optional: +1 (212) 555-0123, +306912345678
         r"\+\d{1,3}[ -]?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}"
         # parenthesised area code: (212) 555-0123
@@ -219,7 +368,7 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r"|(?:\d{1,3}[ -])?\d{2,4}[ -]\d{3}[ -]?\d{4}"
         # 7-digit local WITH separator: 555-0123
         r"|\d{3}[ -]\d{4}"
-        r")(?!\d)"
+        r")(?![\dA-Za-z_-])"
     ), "<REDACTED_PHONE>"),
 ]
 

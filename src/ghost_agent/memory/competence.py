@@ -67,10 +67,24 @@ class _Cell:
 
     @property
     def n(self) -> int:
-        if self.samples:
-            return int(self.samples)
-        # Legacy cell (no persisted sample count): fall back to the mass.
-        return max(0, int((self.alpha - 1.0) + (self.beta - 1.0)))
+        """Observations behind this cell.
+
+        The Beta MASS is the ground truth — `alpha`/`beta` are exactly
+        additive and survive every round trip. `samples` is a convenience
+        counter that older files do not carry, so it falls back to the mass.
+
+        ⚠ The fallback used to be ONE-SHOT: `_save()` only ever runs after a
+        `record()`, so the derived value was never persisted, and the FIRST
+        record on a legacy cell wrote `n=1` and threw the history away.
+        Measured live: `fs|file_system` reported 889 against 2533 real
+        observations, `*|*` 2355 against 6347 — a 2.7x under-report feeding
+        `shrink = n/(n+5)` in the confidence composite AND printed into the
+        model's own system prompt as "fs: 96% (n=889)". `max()` against the
+        mass makes the counter monotone in reality rather than in write
+        order.
+        """
+        from_mass = max(0, int(round((self.alpha - 1.0) + (self.beta - 1.0))))
+        return max(int(self.samples or 0), from_mass)
 
     @property
     def mean(self) -> float:

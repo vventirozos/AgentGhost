@@ -159,7 +159,11 @@ def test_kill_switch_disables_outcome_arm(monkeypatch):
 # ------------------------------------------------------- end-to-end prune
 
 
-def test_present_on_failure_lesson_gets_pruned(tmp_path):
+def test_present_on_failure_lesson_gets_pruned(tmp_path, monkeypatch):
+    # The prune is OFF by default since 2026-08-04 (it destroyed 13 real
+    # lessons on its first unattended runs). This test is about the
+    # outcome-gated LOOP, so it opts the mechanism in explicitly.
+    monkeypatch.setenv("GHOST_SKILL_PRUNE", "1")
     """The loop closes: a lesson repeatedly surfaced on FAILING turns loses
     utility and is removed by prune_low_utility, while a never-failing peer
     (kept below the retrieval gate) survives untouched."""
@@ -209,6 +213,7 @@ def test_record_surfaced_outcomes_logs_info_line(tmp_path, caplog):
 
 
 def test_prune_attributes_outcome_gated_cause(tmp_path, monkeypatch):
+    monkeypatch.setenv("GHOST_SKILL_PRUNE", "1")
     """When the loop retires a present-on-failure lesson, the SKILL PRUNE
     pretty-stream line must name it as outcome-gated (not generic
     'low-utility'), so the operator sees the loop act."""

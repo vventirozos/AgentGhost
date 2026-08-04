@@ -283,3 +283,94 @@ def test_cognitive_wiring_section(tmp_path):
     # 2026-07-27: retired (module removed); the entry stays to document
     # the decision.
     assert "RETIRED" in cw["self_consistency"]["status"]
+
+
+class TestVerifierEscalationHealth:
+    """§4F false-positive watch metric surfaced from the durable ledger.
+
+    Before this, the rate lived only in `VerifyResult.to_dict()` — which has
+    no production caller — so reading it meant grepping the log, where a
+    naive count is 9 points high (the OVERTURNED line is a WARNING mirrored
+    to a second logger; "verdict stands" is INFO).
+    """
+
+    def _ledger(self, md: Path, rows):
+        p = md.parent / "verifier" / "escalations.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows),
+                     encoding="utf-8")
+        return p
+
+    def test_absent_ledger_names_which_silence(self, tmp_path):
+        md = tmp_path / "memory"
+        _seed(md)
+        r = collect_learning_health(md)
+        esc = r["verifier_escalation"]
+        assert esc["present"] is False
+        assert esc["reason"] == "no ledger file"
+        out = render_learning_health(md)
+        assert "no ledger file" in out
+        assert "first escalation after a boot" in out
+
+    def test_empty_ledger_is_distinct_from_absent(self, tmp_path):
+        md = tmp_path / "memory"
+        _seed(md)
+        self._ledger(md, [])
+        assert collect_learning_health(md)["verifier_escalation"]["reason"] \
+            == "ledger empty"
+
+    def test_rate_is_per_route_and_kind(self, tmp_path):
+        """claim-refute and code-refute are different populations: measured
+        2026-08-04, claim refutes overturn 84% while all 7 live code refutes
+        were upheld on replay. Averaging them hides both."""
+        md = tmp_path / "memory"
+        _seed(md)
+        self._ledger(md, (
+            [{"route": "claim", "kind": "refute", "outcome": "overturned"}] * 42
+            + [{"route": "claim", "kind": "refute", "outcome": "upheld"}] * 8
+            + [{"route": "code", "kind": "refute", "outcome": "upheld"}] * 7))
+        arms = collect_learning_health(md)["verifier_escalation"]["arms"]
+        assert arms["claim/refute"]["overturn_rate"] == 0.84
+        assert arms["code/refute"]["overturn_rate"] == 0.0
+        out = render_learning_health(md)
+        assert "claim/refute: 50 escalations — 84% overturned" in out
+
+    def test_unavailable_stays_in_the_denominator_of_n(self, tmp_path):
+        """A strong-model error still spent a call. It must not vanish from
+        the count — but it cannot be scored as overturned or upheld either,
+        so it is excluded from the RATE and reported separately."""
+        md = tmp_path / "memory"
+        _seed(md)
+        self._ledger(md, [
+            {"route": "claim", "kind": "refute", "outcome": "overturned"},
+            {"route": "claim", "kind": "refute", "outcome": "upheld"},
+            {"route": "claim", "kind": "refute", "outcome": "unavailable"},
+        ])
+        arm = collect_learning_health(md)["verifier_escalation"]["arms"]["claim/refute"]
+        assert arm["n"] == 3
+        assert arm["overturn_rate"] == 0.5
+        assert "unavailable (call spent)" in render_learning_health(md)
+
+    def test_withheld_confirmations_are_reported(self, tmp_path):
+        md = tmp_path / "memory"
+        _seed(md)
+        self._ledger(md, [
+            {"route": "claim", "kind": "confirm", "outcome": "withheld"},
+            {"route": "claim", "kind": "confirm", "outcome": "upheld"},
+        ])
+        out = render_learning_health(md)
+        assert "claim/confirm" in out
+        assert "1 withheld" in out
+
+    def test_malformed_rows_do_not_break_the_report(self, tmp_path):
+        md = tmp_path / "memory"
+        _seed(md)
+        p = md.parent / "verifier" / "escalations.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"route": "claim", "kind": "refute", '
+                     '"outcome": "overturned"}\nnot json at all\n{}\n',
+                     encoding="utf-8")
+        arms = collect_learning_health(md)["verifier_escalation"]["arms"]
+        assert arms["claim/refute"]["overturned"] == 1
+        assert "?/?" in arms  # the bare {} row is counted, not dropped
+        render_learning_health(md)

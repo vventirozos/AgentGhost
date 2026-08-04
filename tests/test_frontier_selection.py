@@ -223,8 +223,29 @@ class TestCountTrajectoriesByCluster:
         out = count_trajectories_by_cluster(trajs)
         assert out == {"sql": 1}
 
-    def test_empty_iterable_returns_empty(self):
+    def test_empty_iterable_returns_empty(self, caplog):
         assert count_trajectories_by_cluster([]) == {}
+        # No trajectories at all is a cold store, not an inert signal.
+        assert "INERT" not in caplog.text
+
+    def test_all_unclassified_warns_that_rarity_is_inert(self, caplog):
+        """MEASURED 2026-08-04: `Trajectory.cluster` is None on all 1488
+        live trajectories, so rarity is the constant 1.0 for every cluster
+        and the frontier weight silently collapses to uncertainty-only.
+        A constant is allowed; a constant nobody can see is the defect."""
+        import logging
+        trajs = [MagicMock(cluster=None) for _ in range(5)]
+        with caplog.at_level(logging.WARNING, logger="GhostAgent"):
+            out = count_trajectories_by_cluster(trajs)
+        assert out == {}
+        assert "INERT" in caplog.text and "5 trajectories" in caplog.text
+
+    def test_partial_classification_does_not_warn(self, caplog):
+        import logging
+        trajs = [MagicMock(cluster=None), MagicMock(cluster="sql")]
+        with caplog.at_level(logging.WARNING, logger="GhostAgent"):
+            count_trajectories_by_cluster(trajs)
+        assert "INERT" not in caplog.text
 
 
 # ──────────────────────────────────────────────────────────────────────

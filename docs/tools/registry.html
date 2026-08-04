@@ -177,6 +177,23 @@
   dispatches — <code>turn outcome verified · tools: news_headlines · 804 chars</code>, returning real RSS
   headlines, no scrub fallback.</p>
 
+  <h2>Per-arm schema: <code>_apply_fs_batch_schema</code> (2026-08-04)</h2>
+  <p>The first experiment arm to change the ADVERTISED schema rather than an injected message. In the
+  <code>fs_batch</code> TREATMENT arm the <code>file_system</code> definition gains a <code>paths</code>
+  property, loses <code>path</code> from <code>required</code> (a pure <code>paths</code> read has no single
+  path), and gains a short "fewer calls, same work" clause; the CONTROL arm sees today's definition
+  byte-for-byte. Same copy-on-write discipline as <code>_apply_tuned_descriptions</code> — the shared
+  <code>TOOL_DEFINITIONS</code> dicts are never mutated, or a treatment request would leak its schema into
+  the next control request.</p>
+  <p>Two ordering decisions are load-bearing. It runs <b>after</b> <code>_apply_tuned_descriptions</code>,
+  because a GEPA-tuned description REPLACES the baseline wholesale and is validated against it — appending
+  first would let the tuned text drop the batch prose AND hand the validator a different baseline per arm,
+  i.e. a second unintended difference between the arms. And the arm is resolved through the request-id
+  ContextVar, not the bare stash slot, for the reason <code>arm_for</code> documents: a turn reading its arm
+  after the slot moved on would take the control path while still being RECORDED as treatment.</p>
+  <p>Known cost: the boot prefix warmup primes the CONTROL tool block, so a treatment request re-prefills that
+  block. It is bounded (~1.2 KB of the head) and it is the price of measuring a schema change at all.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

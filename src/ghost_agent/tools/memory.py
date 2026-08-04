@@ -1751,7 +1751,26 @@ def _maybe_retrain_prm(context) -> None:
     Skips silently when the trajectory collector or PRM scorer aren't
     wired (e.g. test harnesses that monkey-patch the context with a
     MagicMock).
+
+    ⚠ CONSUMER GATE. This is the twin of the biological-tick PRM phase, and
+    it was missing that phase's `_prm_consumer_live` check — so a
+    model-invocable `self_play_loop` could retrain every 20 cycles, OVERWRITE
+    the pinned checkpoint, hot-swap the live scorer, and log
+    "In-loop value-model refit" at INFO, all while no consumer reads PRM
+    scores at all (`_MCTS_TURNSTART_ENABLED` is False and
+    `--frontier-selfplay` is off). That log line reads as learning progress
+    for work that changes nothing — exactly what the 2026-07-27 fix removed
+    from the other path.
     """
+    from ..core.agent import _MCTS_TURNSTART_ENABLED
+    _consumer_live = bool(
+        _MCTS_TURNSTART_ENABLED
+        or getattr(getattr(context, "args", None), "frontier_selfplay", False) is True
+    )
+    if not _consumer_live:
+        logger.debug("PRM retrain skipped — no live consumer reads PRM scores "
+                     "(MCTS turn-start off, --frontier-selfplay off)")
+        return
     from ..distill.collector import TrajectoryCollector
     from ..prm.scorer import PRMScorer
     from ..prm.trainer import PRMTrainer

@@ -313,6 +313,47 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
     return None
 
 
+def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
+    """True when ANY tool output this turn looks like a failure.
+
+    This is the HIGH-STAKES flag for the verifier's CONFIRM escalation
+    (verifier._escalate_confirm): when a tool failed, a CONFIRMED verdict is
+    the only thing keeping the turn out of a structural FAILED label
+    (`resolve_turn_outcome` rule 3 outranks rule 4 since the 2026-07-31
+    honest-failure decision), so that particular CONFIRMED is worth a
+    main-model second opinion.
+
+    Still ANY-failure and still worth escalating after the 2026-08-04 shape
+    rule (`resolve_turn_outcome` rule 2b): that rule only covers the subset
+    where EVERY call failed AND the reply never said so. The far larger
+    "some calls failed, the reply reads clean" population is exactly what
+    this escalation exists for, and the shape rule cannot reach it.
+
+    Uses the SAME sniffer the trajectory corpus uses to decide "this tool
+    call failed" (`outcome_heuristics.looks_like_tool_error`) rather than a
+    second local rule — a duplicated failure definition is how the corpus
+    and the operator line came to disagree before. Synthetic entries (parse
+    errors, blocked calls, malformed tool calls) are INCLUDED: they are real
+    strikes on `execution_failure_count`, which is the counter rule 4 reads.
+
+    Deliberately ANY-failure rather than "the last call failed": rule 4's own
+    trigger (`execution_failure_count > 0 and last_was_failure`) is a subset,
+    so this never misses a load-bearing case. Live cost on the corpus
+    (2026-08-04): 140 of 1488 turns (9.4%) have a failed tool call at all,
+    61 of which (4.1%) ended `outcome=passed` — that is the escalation's
+    firing rate, roughly 2 extra main-model calls a day.
+    """
+    if not tools_run:
+        return False
+    from ..distill.outcome_heuristics import looks_like_tool_error
+    for tool in tools_run:
+        if not tool:
+            continue
+        if looks_like_tool_error(str(tool.get("content", "") or "")):
+            return True
+    return False
+
+
 # Newest-heavy evidence budget splits for _collect_verifier_evidence,
 # indexed by (item count - 1). A single-tool turn keeps the FULL budget —
 # behaviourally identical to the old single-output evidence path. The
@@ -6230,7 +6271,7 @@ class GhostAgent:
 
     async def _compute_verifier_verdict(
         self, *, tools_run_this_turn, messages, final_ai_content,
-        last_user_content, lc,
+        last_user_content, lc, req_id: str = "", trajectory_id: str = "",
     ):
         """Pure verifier verdict computation — NO side effects.
 
@@ -6242,6 +6283,15 @@ class GhostAgent:
         ``(v_result_or_None, last_tool_or_None)``. Side effects (note,
         retraction, backfill, trajectory) stay at the post-loop call site so
         they run once, on the truly-final (possibly repaired) answer.
+
+        ``req_id`` / ``trajectory_id`` are IDENTITY, not behaviour: they are
+        handed to the verifier so its escalation ledger
+        (`verifier.record_escalation`) can be joined back to this turn. They
+        are PARAMETERS rather than context reads on purpose — the streamed
+        delivery path calls this method from the SSE drain, after the turn
+        semaphore is released, where a context attribute belongs to whichever
+        request is running then (the `core/turn_facts.py` lesson). Empty
+        strings are fine; the ledger simply records no identity.
         """
         from .verifier import VerifyVerdict
         verifier = getattr(self.context, "verifier", None)
@@ -6307,6 +6357,30 @@ class GhostAgent:
             _room = 4000 - len(ledger_block) - 1
             claim_evidence = ((claim_evidence[:_room] + "\n" + ledger_block)
                               if _room > 0 else ledger_block)
+        # HIGH-STAKES flag for the CONFIRM escalation. Computed HERE — the
+        # single place every verdict is produced (finalize gate, in-loop
+        # auto-repair, and the streamed late-verdict path all funnel through
+        # this method and share its cached result) — so the escalation can
+        # never be live on one delivery path and dark on another.
+        _high_stakes = _turn_had_tool_failure(tools_run_this_turn)
+        # Ledger identity for the verifier's escalation records. Built here,
+        # next to _high_stakes, for the same reason: this is the ONE place
+        # every verdict is produced, so an escalation can never be joinable
+        # on one delivery path and anonymous on another.
+        #
+        # SIMULATION GATE, identical to `_record_calibration_safe`'s and for
+        # the identical reason: self-play/dream solver turns run the full turn
+        # loop on a shallow-copied context, so without this their escalations
+        # would land in the production ledger and bias the very false-positive
+        # rate it exists to measure (§4J: self-play was writing the production
+        # calibration corpus). Withholding the identity is what suppresses the
+        # row — `verifier.record_escalation` requires a live-turn req_id.
+        _is_sim = getattr(getattr(self.context, "skill_memory", None),
+                          "is_read_only", False) is True
+        _trace = None if _is_sim else {
+            "req_id": str(req_id or ""),
+            "trajectory_id": str(trajectory_id or ""),
+        }
         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
             code_text = _reconstruct_executed_code(messages, last_tool)
             if code_text:
@@ -6326,18 +6400,24 @@ class GhostAgent:
                     output=_code_output,
                     intent=request_view,
                     response=_claim_src,
+                    high_stakes=_high_stakes,
+                    trace=_trace,
                 )
             else:
                 v_result = await verifier.verify_claim(
                     claim=_claim_src,
                     evidence=claim_evidence,
                     context=request_view[:1000],
+                    high_stakes=_high_stakes,
+                    trace=_trace,
                 )
         else:
             v_result = await verifier.verify_claim(
                 claim=_claim_src,
                 evidence=claim_evidence,
                 context=request_view[:1000],
+                high_stakes=_high_stakes,
+                trace=_trace,
             )
         # Visual ground-truth override (unchanged from the inline gate).
         try:
@@ -6808,7 +6888,7 @@ class GhostAgent:
 
     async def _compute_verifier_verdict_gated(
         self, *, tools_run_this_turn, messages, final_ai_content,
-        last_user_content, lc, trajectory_id, conv_fp=None,
+        last_user_content, lc, trajectory_id, conv_fp=None, req_id="",
     ):
         """Non-blocking front door to ``_compute_verifier_verdict``.
 
@@ -6850,6 +6930,8 @@ class GhostAgent:
                 final_ai_content=final_ai_content,
                 last_user_content=last_user_content,
                 lc=lc,
+                req_id=req_id,
+                trajectory_id=trajectory_id,
             )
 
         task = _glog.spawn_task(self._compute_verifier_verdict(
@@ -6858,6 +6940,8 @@ class GhostAgent:
             final_ai_content=final_ai_content,
             last_user_content=last_user_content,
             lc=lc,
+            req_id=req_id,
+            trajectory_id=trajectory_id,
         ))
 
         if gate > 0:
@@ -6991,11 +7075,16 @@ class GhostAgent:
         safe) and mutates the in-process correction cache so next-turn
         logic sees the current state.
 
-        Direction guards mirror ``resolve_turn_outcome``'s priorities:
-        FAILED always lands (a refute is never upgraded away by ordering);
-        PASSED lands only when the recorded outcome is still UNKNOWN — a
-        shape-heuristic or structural FAILED must never be upgraded, so a
-        cache miss (can't prove UNKNOWN) skips conservatively. A later
+        Direction guards ARE ``resolve_turn_outcome`` since 2026-08-04 —
+        this site calls it rather than restating its priorities (they were
+        hand-mirrored here for a year, and a hand-mirrored ladder is how a
+        fix lands live on one delivery path and dark on the other). FAILED
+        always lands (a refute is never upgraded away by ordering); PASSED
+        lands only when the ladder says PASSED given the cached outcome, its
+        reason, and the turn's shape — so a shape-heuristic FAILED is never
+        upgraded, a structural-only FAILED is (2026-07-31), and an
+        unacknowledged total tool failure is not (2026-08-04). A cache miss
+        (can't inspect the record) skips conservatively. A later
         user-correction still wins either way: the sidecar is last-write-
         wins per id and the user's message arrives after this. Never
         raises — corpus backfill must not break the done-callback.
@@ -7012,6 +7101,32 @@ class GhostAgent:
                 if getattr(t, "id", None) == trajectory_id:
                     cached = t
                     break
+            # The direction guards are NO LONGER hand-mirrored here: this
+            # site now calls `resolve_turn_outcome` itself (2026-08-04). It
+            # used to re-state rule 2 plus the 07-31 structural exception in
+            # local code, and a second copy of a priority ladder is this
+            # project's signature defect — the shape rule added the same day
+            # would otherwise have been live at write time and dark on the
+            # ASYNC path, which is production.
+            from ..distill.outcome_heuristics import (
+                resolve_turn_outcome as _resolve_late,
+                unacknowledged_total_failure_for_trajectory as _unacked_late,
+            )
+            # Decided BEFORE the flush below but WITHOUT returning early —
+            # the cache-miss return must stay after it (see the flush's own
+            # comment; moving it earlier silently re-opened the 2026-07-26
+            # lost-success-tick bug, which its regression test caught).
+            # A cache miss leaves this True: the shape rule cannot be
+            # evaluated without the record, and the pre-2026-08-04 behaviour
+            # was to tick the lesson success.
+            _late_pass_ok = True
+            if outcome == _Outcome.PASSED.value and cached is not None:
+                _late_pass_ok = _resolve_late(
+                    current=cached.outcome or _Outcome.UNKNOWN.value,
+                    current_reason=cached.failure_reason or "",
+                    verifier="passed",
+                    unacked_total_failure=_unacked_late(cached),
+                ) == _Outcome.PASSED.value
             # Outcome-gated lesson feedback: drain any surfaced-trigger set
             # stashed for this turn at finalize (async-critic mode), now that
             # the verdict has landed. No-op when the turn recorded inline.
@@ -7021,31 +7136,32 @@ class GhostAgent:
             # heuristic-promoted returned early here and the stashed lesson
             # success-tick was silently lost — FAILED verdicts always got
             # through, so succeeded_retrievals systematically undercounted.
+            # It books the RESOLVED outcome, not the raw verdict: a PASS the
+            # shape rule withheld must not still tick the lesson as a success.
             self._flush_stashed_lesson_outcome(
-                trajectory_id, outcome == _Outcome.PASSED.value)
+                trajectory_id,
+                outcome == _Outcome.PASSED.value and _late_pass_ok)
             if outcome == _Outcome.PASSED.value:
                 if cached is None:
                     return
-                if cached.outcome != _Outcome.UNKNOWN.value:
-                    # Honest-failure upgrade (2026-07-31): in async-critic
-                    # mode the trajectory is written BEFORE the verdict, so a
-                    # turn whose only tool call failed lands FAILED/"structural
-                    # failure" here and the late CONFIRMED could never correct
-                    # it — the sync path resolved the same turn to PASSED, so
-                    # the two delivery paths disagreed on identical evidence.
-                    # A structural-only FAILED is upgradable; a refuted or
-                    # shape-heuristic FAILED is NOT (same guard as
-                    # resolve_turn_outcome rule 2).
-                    from ..distill.outcome_heuristics import (
-                        STRUCTURAL_FAILURE_REASON,
-                    )
-                    if not (cached.outcome == _Outcome.FAILED.value
-                            and (cached.failure_reason or "")
-                            == STRUCTURAL_FAILURE_REASON):
-                        return
-                    # The stale reason must not survive the upgrade.
-                    cached.failure_reason = ""
-                    reason = ""
+                if not _late_pass_ok:
+                    if _unacked_late(cached):
+                        pretty_log(
+                            "Verifier",
+                            f"late CONFIRMED WITHHELD for trajectory "
+                            f"{trajectory_id[:8]}: every tool call this turn "
+                            f"failed and the reply never said so — the "
+                            f"structural FAILED stands "
+                            f"(GHOST_UNACKED_FAILURE_GATE=0 disables)",
+                            icon=Icons.WARN, level="WARNING",
+                        )
+                    return
+                if cached.outcome == _Outcome.PASSED.value:
+                    return          # already there — nothing to correct
+                # The stale reason must not survive the upgrade: `passed`
+                # carrying `structural failure` is an incoherent record.
+                cached.failure_reason = ""
+                reason = ""
             if cached is not None:
                 cached.outcome = outcome
                 if reason and outcome == _Outcome.FAILED.value \
@@ -7295,7 +7411,8 @@ class GhostAgent:
 
     @staticmethod
     def _turn_outcome_label(*, verifier_failed: bool, verifier_passed: bool,
-                            budget_exhausted: bool, exec_terminal: bool) -> str:
+                            budget_exhausted: bool, exec_terminal: bool,
+                            unacked_total_failure: bool = False) -> str:
         """The operator-facing label for a finished turn.
 
         SHARED by the finalize line and the late-verdict correction so the
@@ -7308,12 +7425,20 @@ class GhostAgent:
         refute > budget-exhaustion > verifier PASS > terminal execution
         failure. A verifier PASS outranking a broken tool is the
         honest-failure rule — see that function's docstring.
+
+        ``unacked_total_failure`` is that function's rule 2b
+        (2026-08-04): when every tool call failed and the reply never said
+        so, the verifier PASS is ignored here exactly as it is in the corpus
+        — the line then falls through to the terminal-execution-failure test
+        and reads ``failed``. Without this the operator's stream would keep
+        announcing ``verified`` for a turn the corpus records as FAILED,
+        which is the disagreement the shared helper exists to prevent.
         """
         if verifier_failed:
             return "failed"
         if budget_exhausted:
             return "partial (budget exhausted)"
-        if verifier_passed:
+        if verifier_passed and not unacked_total_failure:
             return "verified"
         if exec_terminal:
             return "failed"
@@ -7345,6 +7470,10 @@ class GhostAgent:
                 verifier_passed=(verdict_tag == "passed"),
                 budget_exhausted=bool(snap.get("budget_exhausted")),
                 exec_terminal=bool(snap.get("exec_terminal")),
+                # From the snapshot, not recomputed: the tools and the reply
+                # are gone by the time a late verdict lands.
+                unacked_total_failure=bool(
+                    snap.get("unacked_total_failure")),
             )
             old_state = str(snap.get("state") or "")
             # Emit only on a VALENCE FLIP — the label going from
@@ -9488,7 +9617,17 @@ class GhostAgent:
                             # recording it as success inflated p(success)
                             # for statements that were rejected. Skip the
                             # sample entirely.
-                            if not _lstr.startswith("SYSTEM BLOCK"):
+                            # Same simulation gate as the calibration write:
+                            # a self-play solver turn must not move the
+                            # per-domain competence prior that the confidence
+                            # composite reads on REAL user turns. The solver
+                            # generates hundreds of shell/file_system calls a
+                            # day against a handful of real ones, so without
+                            # this the prior becomes majority-synthetic.
+                            _is_sim = getattr(
+                                getattr(self.context, "skill_memory", None),
+                                "is_read_only", False) is True
+                            if not _lstr.startswith("SYSTEM BLOCK") and not _is_sim:
                                 _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
                         except Exception as _mcexc:
                             logger.debug("metacog outcome hook failed: %s", _mcexc)
@@ -10181,6 +10320,22 @@ class GhostAgent:
                         pretty_log("Failure Cap", "Forcing final response", icon=Icons.STOP)
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed. Provide a final response explaining the situation."})
                         force_final_response = True
+                        # Tell the LATE episode write that this turn ended at
+                        # the cap. It cannot re-derive that: the cap is
+                        # `execution_failure_count >= 6 OR total_fail >= 8`,
+                        # and `transient_failure_count` is not in scope at
+                        # either finalize site — so a turn capped purely on
+                        # the transient arm (exec=4, transient=4) emitted the
+                        # "I hit a hard limit" sentinel and was still stored
+                        # as a SUCCESS. That is the exact defect the episode
+                        # label was rewritten to kill, surviving through the
+                        # other arm.
+                        try:
+                            from . import turn_facts as _tf
+                            _tf.record(self.context, str(getattr(ts, "req_id", "") or ""),
+                                       failure_cap_hit=True)
+                        except Exception as _e:  # noqa: BLE001
+                            logger.debug("failure-cap fact not recorded: %s", _e)
                 else:
                     # Only reset transient failures on success; structural
                     # failures require consecutive successes to decay.
@@ -10943,6 +11098,7 @@ class GhostAgent:
                     lc=lc,
                     trajectory_id=current_trajectory_id,
                     conv_fp=_stable_conv_fp,
+                    req_id=req_id,
                 )
             from .verifier import VerifyVerdict
             # Consumption guard mirrors the original gate exactly: only
@@ -11144,7 +11300,13 @@ class GhostAgent:
                 if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0 and not forget_was_called:
 
                     await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
-                    await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
+                    await self._record_episode_safe(
+                        last_user_content, list(tools_run_this_turn),
+                        final_ai_content,
+                        verifier_verdict=(verifier_backfill[0]
+                                          if verifier_backfill else None),
+                        execution_failure_count=execution_failure_count,
+                        req_id=str(req_id or ''))
         # Post-turn hydration usefulness judge (fire-and-forget, worker-
         # hosted): scores which injected memories the reply actually used.
         self._judge_hydration_safe(final_ai_content, turn_id=str(req_id or ""))
@@ -11243,6 +11405,7 @@ class GhostAgent:
             execution_failure_count=execution_failure_count,
             budget_exhausted=bool(getattr(fs, "turn_budget_exhausted", False)),
             final_ai_content=final_ai_content,
+            user_request=last_user_content or "",
         )
 
 
@@ -11698,6 +11861,25 @@ class GhostAgent:
         except Exception as _refexc:
             logger.debug(f"selfhood reference-count skipped: {_refexc}")
 
+        # Shape rule (2026-08-04) for this turn, computed ONCE here and
+        # reused by the selfhood backfill and the Turn Outcome line below.
+        # Deliberately BEFORE the deferred-correction prepend a few lines
+        # down: that banner is the verifier's prose, not the agent's answer,
+        # and its failure vocabulary would make an unacknowledged turn read
+        # as acknowledged. See outcome_heuristics.unacknowledged_total_failure.
+        _exec_terminal = (execution_failure_count > 0
+                          and bool(last_was_failure))
+        try:
+            from ..distill.outcome_heuristics import (
+                unacknowledged_total_failure as _unacked_fn)
+            _unacked_turn = _exec_terminal and _unacked_fn(
+                tools=tools_run_this_turn,
+                final_response=final_ai_content or "",
+                user_request=last_user_content or "",
+            )
+        except Exception:  # noqa: BLE001 — labelling must not break finalize
+            _unacked_turn = False
+
         # Selfhood outcome backfill (proposal item #3): the
         # autobiographical record was just written `outcome=
         # "unknown"` by `_record_turn_trajectory`. If the verifier
@@ -11710,6 +11892,15 @@ class GhostAgent:
                 _sm_bf = getattr(self.context, 'self_model', None)
                 if isinstance(_sm_bf, _SelfModelBF) and getattr(_sm_bf, 'enabled', False):
                     _bf_outcome, _bf_reason = verifier_backfill
+                    # Same ladder as the corpus: a PASS the shape rule
+                    # withheld must not enter the agent's own diary as a
+                    # success either (the diary is read back into the
+                    # wake-up prefix and the competence prior).
+                    if _bf_outcome == "passed" and _unacked_turn:
+                        from ..distill.outcome_heuristics import (
+                            STRUCTURAL_FAILURE_REASON as _SFR_SELF)
+                        _bf_outcome = "failed"
+                        _bf_reason = _bf_reason or _SFR_SELF
                     # to_thread: at the autobiographical log's steady-state
                     # byte cap this is a full-file read+rewrite — inline it
                     # stalls every concurrent SSE stream on the event loop.
@@ -11748,14 +11939,16 @@ class GhostAgent:
             # late-verdict correction so the printed line and its correction
             # can never disagree. It mirrors resolve_turn_outcome: refute >
             # budget-exhaustion > verifier PASS > terminal execution failure.
-            _exec_terminal = (execution_failure_count > 0
-                              and bool(last_was_failure))
+            # `_exec_terminal` and `_unacked` were both computed above, before
+            # the deferred-correction prepend; never re-derived here.
             _budget_exhausted = bool(getattr(fs, "turn_budget_exhausted", False))
+            _unacked = _unacked_turn
             _state = self._turn_outcome_label(
                 verifier_failed=_verifier_failed,
                 verifier_passed=_verifier_passed,
                 budget_exhausted=_budget_exhausted,
                 exec_terminal=_exec_terminal,
+                unacked_total_failure=_unacked,
             )
             # Name what actually happened. "recovered" is only true when a
             # later call succeeded; when the LAST call failed and the answer
@@ -11800,6 +11993,12 @@ class GhostAgent:
                         "exec_failures": execution_failure_count,
                         "exec_terminal": _exec_terminal,
                         "budget_exhausted": _budget_exhausted,
+                        # Carried so the LATE correction re-renders under the
+                        # same shape rule the printed line used. Recomputing
+                        # it there is impossible (the tool list and reply are
+                        # gone by then) and re-deriving it differently is the
+                        # drift this ring exists to avoid.
+                        "unacked_total_failure": _unacked,
                     }
                     while len(_ring) > 32:
                         _ring.popitem(last=False)
@@ -11813,7 +12012,8 @@ class GhostAgent:
     async def _record_calibration_safe(self, *, req_id, tools_run,
                                        verifier_backfill,
                                        execution_failure_count,
-                                       budget_exhausted, final_ai_content):
+                                       budget_exhausted, final_ai_content,
+                                       user_request=""):
         """Record ONE calibration sample pairing this turn's confidence
         reading with its realized outcome. Extracted from the finalize
         chain (2026-07-26) so the STREAMED drain can call it too — the
@@ -11826,6 +12026,20 @@ class GhostAgent:
         entropy reaches calibration on BOTH delivery paths. Never
         raises."""
         try:
+            # SIMULATION GATE. Self-play/dream solver turns run the full turn
+            # loop on a shallow-copied context, so without this they append to
+            # the production `calibration.jsonl` — and the fit that scores REAL
+            # user turns then trains on synthetic ones. Live evidence at the
+            # time of the fix: 26 samples in the current epoch carried no
+            # `req_id` (dream calls `handle_chat` without one) against 29
+            # self-play runs in the same window, with the solver's exact tool
+            # profile (shell/memory) — indistinguishable after the fact.
+            #
+            # Same rule the experiment framework already states: a turn whose
+            # outcome cannot be attributed must not enter the corpus.
+            if getattr(getattr(self.context, "skill_memory", None),
+                       "is_read_only", False) is True:
+                return
             _ct = getattr(self.context, "calibration_tracker", None)
             _pending = getattr(self.context, "_calib_pending", None)
             # The stash is (req_id, reading): accept only a reading this
@@ -11985,11 +12199,30 @@ class GhostAgent:
                 # See `calibration.grade_turn_outcome` — it is a PROXY, which
                 # is why the sample records its provenance.
                 from .calibration import grade_turn_outcome as _grade
+                # Shape rule (2026-08-04) — computed HERE rather than at the
+                # two call sites so both delivery paths (finalize and the
+                # streamed drain) get it from the same line of code.
+                # Gated on the strike ledger for the same non-manufacturing
+                # reason `resolve_turn_outcome` gates rule 2b: a turn whose
+                # execution was clean keeps its 1.0 even if the corpus text
+                # sniffer thinks every result looks like an error.
+                try:
+                    from ..distill.outcome_heuristics import (
+                        unacknowledged_total_failure as _unacked_calib)
+                    _calib_unacked = int(execution_failure_count or 0) > 0 \
+                        and _unacked_calib(
+                            tools=tools_run,
+                            final_response=final_ai_content or "",
+                            user_request=user_request or "",
+                        )
+                except Exception:  # noqa: BLE001 — labelling must not break
+                    _calib_unacked = False
                 _calib_outcome = _grade(
                     verifier_verdict=(verifier_backfill[0]
                                       if verifier_backfill else None),
                     execution_failure_count=execution_failure_count,
                     budget_exhausted=budget_exhausted,
+                    unacked_total_failure=_calib_unacked,
                 )
                 await asyncio.to_thread(
                     _ct.record,
@@ -15425,6 +15658,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     final_ai_content=final_ai_content,
                                                     last_user_content=last_user_content,
                                                     lc=lc,
+                                                    req_id=req_id,
+                                                    trajectory_id=current_trajectory_id,
                                                 ))
                                             _vdone, _ = await asyncio.wait(
                                                 {_vtask}, timeout=_rbudget)
@@ -15463,6 +15698,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         final_ai_content=final_ai_content,
                                         last_user_content=last_user_content,
                                         lc=lc,
+                                        req_id=req_id,
+                                        trajectory_id=current_trajectory_id,
                                     )
                                     _verifier_verdict_cache = (_vr, _lt)
                                     _verdict_is_fresh = True
@@ -16979,7 +17216,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             and not forget_was_called):
                         await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
                     if self.context.args.smart_memory > 0.0 and not forget_was_called:
-                        await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
+                        # No verdict is available on the streamed path — the
+                        # verifier runs as a LATE handler after the drain — so
+                        # the structural signals carry the label here. That is
+                        # still strictly better than the 80-char substring
+                        # guess this replaced; a late REFUTED corrects the
+                        # trajectory record, which is the durable one.
+                        await self._record_episode_safe(
+                            last_user_content, stream_tools_snapshot,
+                            full_content,
+                            execution_failure_count=execution_failure_count,
+                            req_id=str(req_id or ''))
 
             # Post-turn hydration usefulness judge (fire-and-
             # forget, worker-hosted) — every finalized turn,
@@ -17125,6 +17372,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 execution_failure_count=execution_failure_count,
                 budget_exhausted=False,
                 final_ai_content=full_content,
+                user_request=last_user_content or "",
             )
 
             # Streamed-turn tracker reset (2026-07-27): the finalize
@@ -17212,6 +17460,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             final_ai_content=_sv_claim,
                             last_user_content=last_user_content,
                             lc=lc,
+                            # Ledger identity on the STREAMED path too. This
+                            # drain runs after the turn semaphore is
+                            # released, so both values are passed from this
+                            # closure's captures — never read off the
+                            # context, which by now belongs to whichever
+                            # request is running.
+                            req_id=req_id,
+                            trajectory_id=current_trajectory_id,
                         ))
                     self._attach_late_verdict_handler(
                         _sv_task, current_trajectory_id,
@@ -17392,7 +17648,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as e:
             logger.debug(f"hydration judge spawn skipped: {e}")
 
-    async def _record_episode_safe(self, user_text, tools, ai_text) -> None:
+    async def _record_episode_safe(self, user_text, tools, ai_text,
+                                   *, verifier_verdict=None,
+                                   execution_failure_count: int = 0,
+                                   req_id: str = "") -> None:
         """Best-effort episodic-memory write for a completed significant turn.
 
         EpisodicMemory.record_episode previously had no caller, so the store
@@ -17432,8 +17691,84 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _first_real_tool = _name
                     if not _ok:
                         _fail_tools.append(_name)
-            ai_head = str(ai_text or "")[:80].lower()
-            success = bool(ai_text) and "error" not in ai_head and "failed" not in ai_head
+            # OUTCOME LABEL. This used to be `"error" not in ai_text[:80]` —
+            # an 80-character substring guess made while the verifier verdict,
+            # the strike ledger and the per-tool failure flags were all in
+            # scope and unused. Measured on the live store: 250/259 episodes
+            # (96.5%) labelled success, ALL NINE "failures" were false
+            # negatives (e.g. "In Python, 0/0 raises a ZeroDivisionError"),
+            # and the agent's own total-failure sentinel ("I hit a hard limit
+            # after repeated failures...") was stored as SUCCESS three times.
+            #
+            # That label feeds the LLM that mints playbook lessons, gates
+            # `search_recoveries`, and is rendered into hydrated prompts — so
+            # the agent was being told its worst turns succeeded and mining
+            # "recoveries" from turns that never recovered. Use the same
+            # signals the rest of the finalize chain already agrees on.
+            # Shape rule (2026-08-04): a `passed` verdict does not make a
+            # turn a success when every tool call failed and the reply never
+            # said so. Without this the episode store — which feeds the LLM
+            # that mints playbook lessons and gates `search_recoveries` —
+            # would still record req 03b96c28's fabricated `0` as a success
+            # and offer it as a reusable recovery. Falls through to the
+            # structural branch below rather than hard-coding False, because
+            # that branch already knows how to read a turn with no verdict.
+            # Gated on the strike ledger for the same non-manufacturing
+            # reason `resolve_turn_outcome` gates rule 2b.
+            try:
+                from ..distill.outcome_heuristics import (
+                    unacknowledged_total_failure as _unacked_ep_fn)
+                _unacked_ep = int(execution_failure_count or 0) > 0 \
+                    and _unacked_ep_fn(
+                        tools=tools, final_response=ai_text or "",
+                        user_request=user_text or "")
+            except Exception:  # noqa: BLE001 — labelling must not break a turn
+                _unacked_ep = False
+            _verdict = str(verifier_verdict or "").strip().lower()
+            if _verdict == "failed":
+                success = False
+            elif _verdict == "passed" and not _unacked_ep:
+                success = True
+            else:
+                try:
+                    _fails = max(0, int(execution_failure_count or 0))
+                except (TypeError, ValueError):
+                    _fails = 0
+                # No verdict: fall back to observable structure — an empty
+                # reply, every tool having failed, the failure CAP having
+                # fired, or the strike ledger sitting at the same level the
+                # post-mortem already calls a complete failure.
+                #
+                # `_fails` is a DECAYING STRIKE LEDGER, not a failure count:
+                # a System-3 pivot subtracts 2 and each clean success
+                # subtracts 1. So `_fails == 0` as a success precondition was
+                # wrong in both directions — its real meaning is "no strikes
+                # OUTSTANDING right now", which a turn that failed six times
+                # and then recovered also satisfies.
+                #
+                # The threshold is 3, matching `is_complete_failure` in the
+                # post-mortem gate above. An earlier version used 6 (the
+                # dispatch cap) and left the label CONTRADICTING every other
+                # consumer of this same ledger for `_fails` in 3-5: the
+                # post-mortem said COMPLETE FAILURE, `risk.py` treated the
+                # turn as saturated, `confidence.py` recorded a negative
+                # label — and the episode store said success. One ledger
+                # should not mean four things.
+                #
+                # The cap itself is read from `turn_facts`, not re-derived:
+                # it fires on `exec >= 6 OR total >= 8`, and the transient
+                # arm is invisible here.
+                _all_tools_failed = bool(actions) and not any(
+                    a.get("success") for a in actions)
+                _capped = False
+                try:
+                    from . import turn_facts as _tf
+                    _capped = bool(_tf.facts_for(
+                        self.context, str(req_id or "")).get("failure_cap_hit"))
+                except Exception:  # noqa: BLE001
+                    pass
+                success = (bool(ai_text) and _fails < 3
+                           and not _all_tools_failed and not _capped)
 
             # cluster_id: the domain of the FIRST substantive tool
             # (shell/code/fetch/fs/sql/memory/vision/other) — aligns
@@ -17705,6 +18040,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             _extra.update(_turn_facts.facts_for(self.context, req_id))
         except Exception:
             pass
+        # §4F item 1 — `fs_batch` compliance, stamped HERE rather than in the
+        # turn loop for two reasons: the reconstructed `tool_calls` above is
+        # the authoritative record of what this turn actually ran (a loop-side
+        # hook misses the FINAL turn's calls), and both keys are then written
+        # by the one `trigger_flags` read below.
+        #   fs_batch_context — the treatment's advertised file_system SCHEMA
+        #     differs on every turn of the request, so this is True for the
+        #     whole treatment arm. It is what excludes those turns from the
+        #     Phase 2b fixture corpus (CONTEXT_MUTATING_KEYS).
+        #   fs_batch_fired   — the trigger: this turn used file_system at all.
+        #     Deliberately NOT "used it twice", which is the very thing the
+        #     treatment reduces and would be a post-treatment condition.
+        try:
+            _fs_arm = _experiments_mod.arm_for(self.context, "fs_batch", req_id)
+            if _fs_arm:
+                _fs_treat = _fs_arm == _experiments_mod.TREATMENT
+                _experiments_mod.mark_trigger(
+                    self.context, req_id, "fs_batch_context", _fs_treat)
+                if any(getattr(tc, "name", "") == "file_system"
+                       for tc in (tool_calls or [])):
+                    _experiments_mod.mark_trigger(
+                        self.context, req_id, "fs_batch_fired", _fs_treat)
+        except Exception:
+            pass
         try:
             _arms = _experiments_mod.assignments_for_request(self.context, req_id)
             if _arms:
@@ -17763,10 +18122,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         try:
             from ..distill.outcome_heuristics import (
                 resolve_turn_outcome, STRUCTURAL_FAILURE_REASON,
+                unacknowledged_total_failure_for_trajectory,
             )
+            # Shape rule (2026-08-04): every tool call failed and the reply
+            # never said so → a verifier PASS may not lift the structural
+            # FAILED. Computed FROM THE TRAJECTORY, which both delivery paths
+            # build identically, so the streamed site (which passes
+            # verifier=None and relies on the late backfill) and this one
+            # cannot derive it differently. Kill switch lives inside the
+            # helper — see `unacked_failure_gate_enabled`.
             _resolved = resolve_turn_outcome(
                 current=traj.outcome, verifier=verifier,
                 execution_failed=bool(execution_failed),
+                current_reason=traj.failure_reason or "",
+                unacked_total_failure=(
+                    unacknowledged_total_failure_for_trajectory(traj)),
             )
             if _resolved != traj.outcome:
                 if not traj.failure_reason and _resolved == Outcome.FAILED.value:

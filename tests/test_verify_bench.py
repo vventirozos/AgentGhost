@@ -20,6 +20,7 @@ import pytest
 from ghost_agent.core.verifier import Verifier, _VERIFY_CLAIM_PROMPT
 from ghost_agent.eval.verify_bench import (
     ACTIONABLE_CONF,
+    ARM_RAW,
     BenchCase,
     BenchTrial,
     FAULTS,
@@ -267,7 +268,11 @@ def test_score_trials_overall_tpr_fpr():
     ]
     o = score_trials(results)["overall"]
     assert o["tpr"]["rate"] == pytest.approx(0.5)
-    assert o["fpr"]["rate"] == pytest.approx(0.5)
+    # Arm-QUALIFIED key: the default arm is the raw cheap judge, and there
+    # is deliberately no bare `fpr` to compare across arms. See
+    # tests/test_verify_bench_escalation_arm.py.
+    assert o["arm"] == ARM_RAW
+    assert o["fpr_raw_judge"]["rate"] == pytest.approx(0.5)
     assert o["degraded_evidence_fp"]["rate"] == pytest.approx(0.5)
 
 
@@ -304,7 +309,10 @@ async def test_run_bench_report_shape_and_env_hygiene(monkeypatch):
         fault_names=["silent_failure"], seed=1)
     assert report["n_cases"] == 2
     arm = report["arms"]["two_stage_off"]
-    assert arm["metrics"]["overall"]["fpr"]["n"] == 2  # two clean trials
+    # two clean trials; the stub client exposes no cheap route, so the
+    # report's arm is raw_judge and the key is arm-qualified.
+    assert arm["metrics"]["overall"]["fpr_raw_judge"]["n"] == 2
+    assert report["provenance"]["escalation"]["arm"] == ARM_RAW
     assert len(arm["trials"]) == report["n_trials"]
     # env restored to what the caller had set
     assert os.environ["GHOST_VERIFY_TWO_STAGE"] == "1"

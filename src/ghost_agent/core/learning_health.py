@@ -362,6 +362,13 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
     # -- GEPA prompt-optimization activation (§4F Phase 0) ----------------
     report["optim"] = _optim_activation(md.parent / "optim")
 
+    # -- verifier escalation rate (§4F false-positive watch metric) -------
+    report["verifier_escalation"] = _escalation_health(
+        md.parent / "verifier" / "escalations.jsonl")
+
+    # -- tool-call framing leak: RECURRENCE watch ------------------------
+    report["framing_leak"] = _framing_leak_health(md.parent / "trajectories")
+
     return report
 
 
@@ -391,6 +398,95 @@ def _optim_activation(optim_dir: Path) -> Dict[str, Any]:
         out["activation"] = activation_stats()
     except Exception:
         pass
+    return out
+
+
+def _escalation_health(ledger_path: Path) -> Dict[str, Any]:
+    """Verifier escalation outcomes from the durable ledger.
+
+    This is the §4F false-positive-rate watch metric. It spent weeks being
+    "recorded" into `VerifyResult.to_dict()`, which has no production caller,
+    so the only way to read it was hand-run log archaeology — and a naive grep
+    over-counts by 9 points because the OVERTURNED line is a WARNING mirrored
+    to a second logger while "verdict stands" is INFO. The ledger writes both
+    outcomes at the point escalation RESOLVES, which is what makes a rate
+    computable at all.
+
+    Reported per (route, kind) — claim-refute and code-refute are different
+    populations and averaging them hides both (measured 2026-08-04: claim
+    refutes overturn 84%, all 7 live code refutes were upheld on replay).
+    ``unavailable`` stays in the denominator: the call was spent.
+    """
+    out: Dict[str, Any] = {"present": False, "arms": {}, "total": 0}
+    rows = _load_jsonl(ledger_path, limit=5000)
+    if not rows:
+        # Distinguish "no ledger yet" from "ledger with nothing in it" — the
+        # file is created on the FIRST escalation after a restart, so absence
+        # right after a deploy is expected, not a broken instrument.
+        out["reason"] = ("no ledger file" if not Path(ledger_path).exists()
+                         else "ledger empty")
+        return out
+    out["present"] = True
+    out["total"] = len(rows)
+    for rec in rows:
+        arm = f"{rec.get('route') or '?'}/{rec.get('kind') or '?'}"
+        slot = out["arms"].setdefault(
+            arm, {"overturned": 0, "upheld": 0, "withheld": 0,
+                  "unavailable": 0, "n": 0})
+        outcome = str(rec.get("outcome") or "").strip()
+        if outcome in slot:
+            slot[outcome] += 1
+        slot["n"] += 1
+    for arm, slot in out["arms"].items():
+        decided = slot["overturned"] + slot["upheld"]
+        slot["overturn_rate"] = (round(slot["overturned"] / decided, 3)
+                                 if decided else None)
+    return out
+
+
+# The native-dialect fix (`QWEN_TOOL_PROMPT_NATIVE` split) deployed
+# 2026-07-31 ~18:54 local. Every one of the 17 known framing leaks predates
+# it; 161 trajectories recorded after it carry zero. So the watch is not
+# "is the count above zero" — the corpus is append-only, so it never will be —
+# it is "is the LATEST occurrence newer than the fix".
+_FRAMING_FIX_TS = "2026-07-31T19:00"
+
+
+def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
+    """Recurrence watch for tool-call framing leaking into argument values.
+
+    The journal recorded "repair fires ≈0 now, each one is news" — and then
+    nothing WATCHED, so 17 historical cases were re-discovered by hand four
+    days later and briefly mistaken for a live defect. This is the listener
+    that note assumed existed.
+
+    Verdict is keyed on the newest occurrence, not the count.
+    """
+    out: Dict[str, Any] = {"available": False}
+    try:
+        from ..utils.leaked_framing import scan_trajectories
+        from ..distill.collector import TrajectoryCollector
+        if not Path(traj_root).is_dir():
+            out["reason"] = "no trajectory corpus"
+            return out
+        stats = scan_trajectories(
+            TrajectoryCollector(root=Path(traj_root),
+                                session_id="reader").iter_trajectories())
+    except Exception as e:  # noqa: BLE001 — telemetry never breaks a turn
+        out["reason"] = f"scan failed ({e})"
+        return out
+    out.update({
+        "available": True,
+        "scanned": stats["scanned"],
+        "calls": stats["calls"],
+        "corrupt_calls": stats["corrupt_calls"],
+        "by_tool": stats["by_tool"],
+        "last_seen": stats["last_seen"],
+        # The load-bearing field. A post-fix timestamp means the dual-dialect
+        # corruption is BACK, which historically wasted whole turns.
+        "regression": bool(stats["last_seen"]
+                           and stats["last_seen"] > _FRAMING_FIX_TS),
+    })
     return out
 
 
@@ -953,6 +1049,47 @@ def render_learning_health(memory_dir) -> str:
                 flag = ""
             lines.append(
                 f"  {name}: {state}; applied {applied} / fallback {fallback}{flag}")
+
+    esc = r.get("verifier_escalation") or {}
+    if esc.get("present"):
+        lines.append("\nVERIFIER ESCALATION (§4F false-positive watch):")
+        for arm in sorted(esc.get("arms") or {}):
+            s = esc["arms"][arm]
+            rate = s.get("overturn_rate")
+            rate_s = "n/a" if rate is None else f"{rate:.0%} overturned"
+            extra = ""
+            if s.get("withheld"):
+                extra += f", {s['withheld']} withheld"
+            if s.get("unavailable"):
+                extra += f", {s['unavailable']} unavailable (call spent)"
+            lines.append(f"  {arm}: {s['n']} escalations — {rate_s} "
+                         f"({s['overturned']}/{s['overturned'] + s['upheld']} "
+                         f"decided){extra}")
+    elif esc:
+        # An absent ledger is only news once the agent has been up a while;
+        # say WHICH silence it is rather than printing nothing.
+        lines.append(f"\nVERIFIER ESCALATION: {esc.get('reason', 'unknown')} "
+                     "— the file appears on the first escalation after a boot")
+
+    fl = r.get("framing_leak") or {}
+    if fl.get("available"):
+        n, tot = fl["corrupt_calls"], fl["calls"]
+        if fl.get("regression"):
+            lines.append("\n⚠ TOOL-CALL FRAMING LEAK — REGRESSION:")
+            lines.append(
+                f"  {n}/{tot} calls carry leaked framing; newest "
+                f"{fl['last_seen'][:16]} is AFTER the 2026-07-31 fix "
+                f"— the dual-dialect corruption is back {fl.get('by_tool')}")
+        elif n:
+            lines.append(
+                f"\nTOOL-CALL FRAMING LEAK: {n}/{tot} calls, all historical "
+                f"(newest {fl['last_seen'][:16]}, pre-fix) — no action")
+        else:
+            lines.append(
+                f"\nTOOL-CALL FRAMING LEAK: none in {tot} calls "
+                f"across {fl['scanned']} trajectories")
+    elif fl:
+        lines.append(f"\nTOOL-CALL FRAMING LEAK: {fl.get('reason', 'unknown')}")
 
     lines.extend(_experiment_health_lines(memory_dir))
     return "\n".join(lines)

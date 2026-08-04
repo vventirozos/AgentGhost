@@ -66,6 +66,36 @@
     <li>Capped at <code>GHOST_FAILURE_DISTILL_MAX</code> (default 2) lessons per cycle; every path fails open to 0.</li>
   </ul>
 
+  <h3>Every cycle leaves its arithmetic behind (2026-08-04)</h3>
+  <p>§4J recorded this gate as <em>"structurally unreachable"</em> — <code>PLAYBOOK_MAX=50</code>
+  caps the corpus, the 14-day and mistake-less filters take two thirds, and 69% of the survivors
+  classify <code>unknown</code>. Measured against the live stores the claim is <strong>false</strong>:
+  42 playbook rows → 27 dropped (11 mistake-less, 14 outside the window, 2 already distilled) →
+  15 survive, plus 4 work_log records = <strong>19 corpus records</strong>; 7 unattributed (37%,
+  <em>before</em> the LLM adjudication that runs first in production, not 69%); 6 groups formed;
+  <strong>2 at or over the 3-case threshold</strong>. The live
+  <code>failure_distill_state.json</code> shows three clusters fired on 2026-08-04
+  (<code>model/python_general</code> 4 cases, <code>output_processing/python_general</code> 3,
+  <code>orchestration/python_general</code> 3), producing two <code>source=distilled</code>
+  playbook rows.</p>
+  <p>The reason a false claim survived: a pass that produces nothing was indistinguishable from a
+  pass that never ran — the barren paths returned 0 behind <code>logger.debug</code>, and the only
+  evidence either way was whether the state file existed. Every cycle now stamps a reserved
+  <code>_last_run</code> key (corpus size, unattributed count, groups, largest group vs the
+  threshold, eligible clusters, clusters skipped as unchanged, lessons written, and the binding
+  <code>reason</code>) and logs one line when the cycle was barren for a <em>structural</em>
+  reason (<code>empty_corpus</code> / <code>no_cluster_reached_threshold</code>).
+  "Every eligible cluster is unchanged since last pass" is the healthy steady state and stays at
+  debug. Trade-off taken deliberately: the file's mere existence is no longer proof that a lesson
+  was written — the per-cluster keys are.</p>
+  <p><strong>Still open (operator decision):</strong> distillation mints lessons that measure far
+  below the prune's cutoff. Live today: bottom-quartile cutoff <strong>1.0716</strong>; the two
+  distilled rows score <strong>0.3633</strong> (7 retrievals — already prune-eligible one day
+  after being minted) and <strong>0.7943</strong>. Broad pattern lessons hydrate often and are
+  rarely marked helpful, so <code>compute_lesson_utility</code>'s stale penalty halves them. The
+  prune stays OFF (<code>GHOST_SKILL_PRUNE</code>); the two subsystems must be reconciled before
+  it is re-enabled, or distillation's own output is deleted by design.</p>
+
   <h2>Knobs</h2>
   <table>
     <thead><tr><th>Env var</th><th>Default</th><th>Effect</th></tr></thead>

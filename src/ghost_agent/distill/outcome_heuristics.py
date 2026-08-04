@@ -47,9 +47,10 @@ a future ``session_telemetry.py`` keyed by ``session_id``.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from .schema import Trajectory, Outcome
 
@@ -128,6 +129,18 @@ def tool_call_failed(tc) -> bool:
     return _tool_call_failed(tc)
 
 
+def looks_like_tool_error(result: str) -> bool:
+    """Public alias for ``_looks_like_tool_error``.
+
+    Same rationale as ``tool_call_failed``: the turn loop's
+    ``tools_run_this_turn`` entries are plain dicts (``{"name", "content"}``)
+    rather than ``ToolCall`` objects, and the verifier's high-stakes gate
+    needs THE failure sniffer, not a second one that can drift from the
+    label the corpus writes.
+    """
+    return _looks_like_tool_error(result)
+
+
 def _looks_like_tool_error(result: str) -> bool:
     """Cheap text detector for "this tool call failed" — the FALLBACK when the
     structured ``ToolCall.error`` flag isn't set (legacy trajectories).
@@ -154,6 +167,213 @@ def _looks_like_tool_error(result: str) -> bool:
             "operation failed",
         )
     )
+
+
+# -------------------------------------------- unacknowledged-failure shape
+#
+# Operator decision 2026-08-04 ("add the shape rule, structural failure
+# shouldn't pass"), narrowing the 2026-07-31 honest-failure rule.
+#
+# Live case that produced it — req 03b96c28, trajectory f78c8b33…: the user
+# asked for a line count of a file OUTSIDE the sandbox; `file_system`,
+# `execute` and `file_system` ALL failed; the agent replied `0` — a
+# fabrication, one character, with no acknowledgment of any failure. The
+# cheap judge REFUTED it correctly (conf 1.0), `_escalate_refute` sent it to
+# the main model, which overturned to CONFIRMED, and the honest-failure rule
+# then rewrote the corpus label failed → passed. A fabricated answer was
+# laundered into a positive training example by the exact rule built to
+# protect honest ones.
+#
+# This is a SHAPE rule: it asks no model anything. It only ever WITHHOLDS a
+# verifier PASS from a turn that is already structurally failed — it never
+# manufactures a FAILED label that was not already there (see
+# `resolve_turn_outcome`). The acknowledgment check is what keeps the
+# 2026-07-31 rule alive: "that file does not exist" must still PASS, or the
+# incentive gradient that produces fabrication is recreated.
+
+UNACKED_FAILURE_GATE_ENV = "GHOST_UNACKED_FAILURE_GATE"
+
+
+def unacked_failure_gate_enabled() -> bool:
+    """Kill switch for the unacknowledged-total-failure shape rule.
+
+    Default ON — the operator asked for the behaviour.
+    ``GHOST_UNACKED_FAILURE_GATE=0`` restores the EXACT pre-2026-08-04
+    behaviour: a verifier ``passed`` outranks a structural execution failure
+    unconditionally (the 2026-07-31 honest-failure rule with no shape
+    narrowing), on every path — the write-time consolidation, the late
+    verdict backfill, the operator's Turn Outcome line, and the calibration
+    grade.
+
+    Read per call (not at import) so the flag can be flipped without a
+    restart — same idiom as ``verifier._escalate_refute_enabled``. Read in
+    exactly ONE place (this function is called from
+    :func:`unacknowledged_total_failure`, which every site goes through) so
+    the switch cannot be live on one path and dark on another.
+    """
+    return os.getenv(UNACKED_FAILURE_GATE_ENV, "1").strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+# Vocabulary of "the reply told the user something went wrong". Deliberately
+# BROAD: "acknowledged" is the PERMISSIVE verdict here (it lets the turn keep
+# its verifier PASS), so a false positive costs nothing but a false negative
+# re-punishes honest failure-reporting — the exact 2026-07-31 regression.
+# Matched anywhere in the reply, case-insensitively.
+_FAILURE_ACK_RE = re.compile(
+    r"""
+      (?:does|did)\s*n[o']?t\s+(?:exist|support|work|return|find|contain)
+    | doesn't\s+(?:exist|support|work|return|find|contain)
+    | no\s+such\s+(?:file|directory|table|column|command|key|entry)
+    | not\s+found | no\s+match(?:es|ing)? | nothing\s+(?:found|to\s+\w+)
+    | \berrors?\b | \bexceptions?\b | traceback | stderr
+    | \bfail(?:ed|s|ing|ure|ures)?\b
+    | (?:un|not\s+)able\s+to | \bcould\s*n[o']?t\b | couldn't
+    | \bcan\s*not\b | \bcan't\b | \bcannot\b | \bunsuccessful\b
+    | \bno\s+results?\b | zero\s+results? | returned\s+(?:nothing|empty)
+    | permission\s+denied | \bdenied\b | \bforbidden\b
+    | blocked\s+by\s+(?:the\s+)?(?:egress|guard|policy|firewall|proxy|allowlist)
+    | timed\s+out | \btimeout\b
+    | not\s+supported | unsupported | \binvalid\b | \bmalformed\b
+    | outside\s+(?:the\s+|my\s+|its\s+)?(?:sandbox|workspace|project)
+    | not\s+access(?:ible)? | inaccessible
+    | no\s+access | \bmissing\b | \bunavailable\b | not\s+available
+    | already\s+(?:removed|deleted|gone) | never\s+created
+    | hard\s+limit | gave\s+up | did\s+not\s+complete | \bcrash(?:ed|es)?\b
+    | \bbroke(?:n)?\b | \brefused\b | \brejected\b
+    | (?:is|was|were|are|returned|came\s+back|came\s+up)\s+empty
+    | empty\s+(?:result|response|output|set|list|string|file|director)
+    | exit\s+code | non-?zero
+    | i\s+(?:do\s*n[o']?t|don't)\s+have | i\s+have\s+no
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# "just reply with exactly the word: NOPE" — an instruction that FIXES the
+# reply text. The reply then carries the user's own token instead of prose,
+# so the acknowledgment lives in the REQUEST, not the response. Without this
+# escape the 2026-07-31 rule's own live-validation probe (req F0/85a2d9ce,
+# reply "NOPE") would regress to FAILED. Bounded to a short span after the
+# instruction so an unrelated later sentence can't donate the literal.
+_EXACT_REPLY_INSTRUCTION_RE = re.compile(
+    r"(?:reply|respond|answer|say|output|return)\b[^.\n]{0,40}?"
+    r"\b(?:exactly|only|just|verbatim|literally)\b[^.\n]{0,80}",
+    re.IGNORECASE,
+)
+
+# An instructed literal is a SHORT token, not a paragraph. Longer replies are
+# prose and must earn their acknowledgment from the vocabulary above.
+_INSTRUCTED_LITERAL_MAX_CHARS = 64
+
+
+def _reply_is_instructed_literal(final_response: str, user_request: str) -> bool:
+    """True when the user's own request pins the exact reply text and the
+    reply is that text.
+
+    Shape-only: the literal has to appear inside an explicit
+    "reply with exactly/only/just …" span of the USER's message, as a whole
+    token. ``"reply with just the number"`` therefore does NOT license the
+    fabricated ``"0"`` of req 03b96c28 (the span contains no ``0``), while
+    ``"just reply with exactly the word: NOPE"`` does license ``"NOPE"``.
+    """
+    reply = (final_response or "").strip().strip("`\"'*. ")
+    if not reply or len(reply) > _INSTRUCTED_LITERAL_MAX_CHARS:
+        return False
+    req = user_request or ""
+    if not req:
+        return False
+    for m in _EXACT_REPLY_INSTRUCTION_RE.finditer(req):
+        span = m.group(0)
+        if re.search(r"(?<!\w)" + re.escape(reply) + r"(?!\w)", span,
+                     re.IGNORECASE):
+            return True
+    return False
+
+
+def response_acknowledges_failure(final_response: str,
+                                  user_request: str = "") -> bool:
+    """Does this reply tell the user that something went wrong?
+
+    Content-based, never length-based: a two-word reply that says "not
+    found" acknowledges; a five-paragraph reply that never mentions a
+    problem does not. Conservative in the direction that PRESERVES the
+    2026-07-31 honest-failure rule — when in doubt, say yes.
+    """
+    text = final_response or ""
+    if not text.strip():
+        return False          # an empty reply reports nothing
+    if _FAILURE_ACK_RE.search(text):
+        return True
+    return _reply_is_instructed_literal(text, user_request)
+
+
+def tool_failure_flags(tools: Optional[Iterable[Any]]) -> List[bool]:
+    """Per-call "did this fail?" flags for EITHER tool-call shape.
+
+    The corpus carries ``ToolCall`` objects (``.result`` / ``.error``); the
+    turn loop carries plain dicts (``{"name", "content"}``). One function
+    knows both, so the shape rule cannot mean one thing on the corpus path
+    and another on the operator-line path — the drift that made the corpus
+    and the Turn Outcome line disagree before. Uses THE shared sniffer, not
+    a third copy of it.
+    """
+    flags: List[bool] = []
+    for t in tools or ():
+        if t is None:
+            continue
+        if isinstance(t, dict):
+            flags.append(_looks_like_tool_error(str(t.get("content", "") or "")))
+        else:
+            flags.append(_tool_call_failed(t))
+    return flags
+
+
+def unacknowledged_total_failure(*, tools: Optional[Iterable[Any]] = None,
+                                 final_response: str = "",
+                                 user_request: str = "",
+                                 tool_failures: Optional[Sequence[bool]] = None,
+                                 ) -> bool:
+    """THE shape rule: every tool call this turn failed and the reply never
+    said so.
+
+    ``tools`` accepts either shape (see :func:`tool_failure_flags`);
+    ``tool_failures`` lets a caller pass pre-computed flags.
+
+    ALL, never ANY — a turn where one tool fails and the agent recovers via
+    another and answers correctly is a GOOD turn and must keep its PASS. A
+    turn with no tool calls at all can't have "all of them" fail, so it is
+    never flagged.
+
+    Returns False whenever the kill switch is off, which is why every call
+    site routes through here rather than testing the env var itself.
+    """
+    if not unacked_failure_gate_enabled():
+        return False
+    flags = list(tool_failures) if tool_failures is not None \
+        else tool_failure_flags(tools)
+    if not flags or not all(flags):
+        return False
+    return not response_acknowledges_failure(final_response, user_request)
+
+
+def unacknowledged_total_failure_for_trajectory(traj) -> bool:
+    """:func:`unacknowledged_total_failure` read off a ``Trajectory``.
+
+    Used by the write-time consolidation AND the late-verdict backfill, so
+    both delivery paths compute the flag from the same fields of the same
+    record instead of two hand-mirrored derivations.
+    """
+    if traj is None:
+        return False
+    try:
+        return unacknowledged_total_failure(
+            tools=getattr(traj, "tool_calls", None) or [],
+            final_response=getattr(traj, "final_response", "") or "",
+            user_request=getattr(traj, "user_request", "") or "",
+        )
+    except Exception:  # noqa: BLE001 — labelling must never break a turn
+        return False
 
 
 # ---------------------------------------------------------------- main API
@@ -308,6 +528,8 @@ def resolve_turn_outcome(
     current: str,
     verifier: Optional[str] = None,
     execution_failed: bool = False,
+    current_reason: str = "",
+    unacked_total_failure: bool = False,
 ) -> str:
     """Combine a turn's quality signals into ONE outcome — the single source
     of truth for the trajectory corpus, calibration, and selfhood.
@@ -322,7 +544,13 @@ def resolve_turn_outcome(
       1. a REFUTED verifier verdict (already thresholded at conf ≥ 0.7 by the
          caller)                                                     → FAILED;
       2. an existing FAILED (from the shape heuristics or a prior signal) is
-         never upgraded away                                         → FAILED;
+         never upgraded away                                         → FAILED
+         — EXCEPT one stamped exactly ``STRUCTURAL_FAILURE_REASON``, which is
+         upgradable by a late verifier PASS (the 2026-07-31 async half; pass
+         ``current_reason`` to enable it, which is what makes the late
+         backfill and this function ONE ladder rather than two);
+      2b. …but that PASS is WITHHELD when
+         ``unacked_total_failure`` is set (2026-08-04, below);
       3. a SUPPORTED verifier verdict                                → PASSED;
       4. a STRUCTURAL execution failure (non-zero exit / tool error) → FAILED;
       5. otherwise keep ``current`` (UNKNOWN for a signal-free chat turn).
@@ -342,17 +570,56 @@ def resolve_turn_outcome(
     the shape heuristics intact: a turn that thrashed a selector 4× or hit a
     runtime abort marker stays FAILED no matter how honestly it says so.
 
+    **Rule 2b added 2026-08-04 (operator decision), narrowing the above.**
+    The 07-31 rule assumed a CONFIRMED verdict means the reply handled the
+    broken tool honestly. Req 03b96c28 disproved it: three tool calls, all
+    three failed, the reply was the single character ``0`` — a fabricated
+    answer with no acknowledgment — the cheap judge refuted it correctly, the
+    main model overturned to CONFIRMED, and the label was rewritten
+    ``failed → passed`` into the learning corpus. So the PASS is now withheld
+    when the turn's SHAPE says the answer cannot be honest: **every** tool
+    call failed AND the reply never mentioned a failure (see
+    :func:`unacknowledged_total_failure`). "Every", not "any" — a turn that
+    recovers through a second tool is a good turn and still passes.
+
+    The withholding is deliberately NON-manufacturing: it can only stop an
+    upgrade, never invent a FAILED. It applies only when the turn is ALREADY
+    structurally failed — ``execution_failed`` (write time) or a
+    ``current`` of FAILED/``STRUCTURAL_FAILURE_REASON`` (late backfill). A
+    turn whose strike ledger is clean keeps its PASS even if the corpus text
+    sniffer thinks every result looks like an error, which bounds the cost of
+    that sniffer's known false positives (an ``EXIT CODE: 1`` banner nested
+    deep inside an otherwise successful tool payload).
+
     ``verifier`` is the ``verifier_backfill`` tag: ``"passed"`` | ``"failed"``
     | ``None``. ``current`` is the outcome already on the trajectory (after the
-    shape heuristics ran).
+    shape heuristics ran); ``current_reason`` is its ``failure_reason``.
     """
     cur = current or Outcome.UNKNOWN.value
     if verifier == "failed":
         return Outcome.FAILED.value
-    if cur == Outcome.FAILED.value:
+    # An existing FAILED is never upgraded away — except a STRUCTURAL-ONLY
+    # one, which the 2026-07-31 async half is allowed to lift. Callers that
+    # don't pass `current_reason` get the pre-07-31 "never upgrade" behaviour
+    # unchanged, so this is additive.
+    structural_failed = (
+        cur == Outcome.FAILED.value
+        and (current_reason or "").strip() == STRUCTURAL_FAILURE_REASON
+    )
+    if cur == Outcome.FAILED.value and not structural_failed:
         return Outcome.FAILED.value
-    if verifier == "passed":
+    # Rule 2b: withhold the PASS from an already-structurally-failed turn
+    # whose every tool call broke and whose reply never said so.
+    withhold_pass = (
+        bool(unacked_total_failure)
+        and (bool(execution_failed) or structural_failed)
+    )
+    if verifier == "passed" and not withhold_pass:
         return Outcome.PASSED.value
     if execution_failed:
+        return Outcome.FAILED.value
+    if cur == Outcome.FAILED.value:
+        # A structural FAILED whose upgrade was withheld (or that had no
+        # verdict at all) stays FAILED.
         return Outcome.FAILED.value
     return cur

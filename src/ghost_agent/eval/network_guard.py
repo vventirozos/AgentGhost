@@ -60,18 +60,38 @@ def _is_loopback_host(host: str, allow: Iterable[str]) -> bool:
 
 @contextlib.contextmanager
 def no_external_network(extra_allow: Iterable[str] = ()):
-    """Context manager that makes `socket.socket.connect` raise on any
-    non-loopback destination.
+    """Block non-loopback egress from THIS PROCESS for the duration.
 
-    Use for eval runs where we want a hard guarantee no bytes leave the
-    machine. Skip for tests that genuinely need the network (we don't
-    have any — Ghost is fully local — but the knob exists).
+    ⚠ SCOPE — read before relying on this. It is a best-effort guard over the
+    Python socket layer, **not** "a hard guarantee no bytes leave the
+    machine" (which is what this docstring used to claim, wrongly):
+
+    * It patches `socket.socket.{connect,connect_ex,sendto,sendmsg}` plus
+      `socket.create_connection` and `getaddrinfo`. That covers stdlib
+      sockets, `httpx`, and anything built on them.
+    * It CANNOT stop a subprocess (`curl`, `git`, a sandboxed command) — a
+      child process has its own address space and its own libc.
+    * It CANNOT stop a library that opens sockets outside CPython's socket
+      module. **`curl_cffi` is exactly that**, and `curl_cffi` is what
+      `tools/search.py`, `tools/darkweb_search.py`, `tools/file_system.py`,
+      `tools/system.py` and `utils/helpers.py` use — i.e. every real egress
+      path in this agent is exempt. Measured: raw socket / create_connection
+      / httpx blocked; curl_cffi, subprocess curl and uvloop all LEAKED.
+    * Under `--runner http` the code under test is the LIVE AGENT in another
+      process; the only socket in this one is the allowlisted driver
+      connection, so the guard is structurally moot there.
+
+    Use it as a tripwire for accidental stdlib egress in a driver process,
+    and rely on `--mandatory-tor` / the sandbox egress guard for anything
+    that must actually hold.
     """
     allow: Set[str] = set(_DEFAULT_ALLOW_HOSTS) | set(extra_allow)
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
     original_sendto = socket.socket.sendto
     original_sendmsg = socket.socket.sendmsg
+    original_create_connection = socket.create_connection
+    original_getaddrinfo = socket.getaddrinfo
 
     def guarded_connect(self, addr):
         host = _host_from_addr(addr)
@@ -117,6 +137,24 @@ def no_external_network(extra_allow: Iterable[str] = ()):
             return original_sendmsg(self, buffers, ancdata, flags, address)
         return original_sendmsg(self, buffers, ancdata, flags)
 
+    def guarded_create_connection(address, *a, **kw):
+        host = _host_from_addr(address)
+        if not _is_loopback_host(host, allow):
+            raise NetworkEgressError(
+                f"eval guard blocked create_connection to {address!r}; "
+                "Ghost eval is strictly offline")
+        return original_create_connection(address, *a, **kw)
+
+    def guarded_getaddrinfo(host, *a, **kw):
+        # Resolution itself leaves the machine on most resolvers.
+        if not _is_loopback_host(str(host or ""), allow):
+            raise NetworkEgressError(
+                f"eval guard blocked DNS resolution of {host!r}; "
+                "Ghost eval is strictly offline")
+        return original_getaddrinfo(host, *a, **kw)
+
+    socket.create_connection = guarded_create_connection
+    socket.getaddrinfo = guarded_getaddrinfo
     socket.socket.connect = guarded_connect         # type: ignore[assignment]
     socket.socket.connect_ex = guarded_connect_ex   # type: ignore[assignment]
     socket.socket.sendto = guarded_sendto           # type: ignore[assignment]
@@ -124,6 +162,8 @@ def no_external_network(extra_allow: Iterable[str] = ()):
     try:
         yield
     finally:
+        socket.create_connection = original_create_connection
+        socket.getaddrinfo = original_getaddrinfo
         socket.socket.connect = original_connect           # type: ignore[assignment]
         socket.socket.connect_ex = original_connect_ex     # type: ignore[assignment]
         socket.socket.sendto = original_sendto             # type: ignore[assignment]

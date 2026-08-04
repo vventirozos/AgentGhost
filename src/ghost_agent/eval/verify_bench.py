@@ -27,15 +27,28 @@ Case sources:
     template's own literal segments — real production turns become bench
     cases for free.
 
-Offline by design on the data side; the ONE thing it talks to is the
-judge model endpoint (the system under test). See scripts/verify_bench.py
-for the CLI runner.
+TWO ARMS, and every report says which one it ran (`provenance.escalation`):
+  - `raw_judge` — a single-endpoint `HttpChatClient`. `_escalate_refute`
+    is a no-op there, so this measures the cheap judge STANDALONE;
+  - `judge+escalation` — an `EscalatingChatClient` (cheap endpoint on the
+    worker route + main endpoint for `force_main`), which is the pipeline
+    production actually acts on. The difference is not cosmetic: on the
+    live recorded corpus the main model overturned 42 of 50 (84%) of the
+    cheap judge's refutes, so a raw-arm false-alarm rate is an UPPER
+    BOUND on production's. `score_trials` therefore emits `fpr_raw_judge`
+    or `fpr_escalated` — never a bare `fpr` that could be mixed.
+
+Offline by design on the data side; the only things it talks to are the
+judge endpoint (the system under test) and, on the escalated arm, the
+main model it escalates to. See scripts/verify_bench.py for the CLI
+runner.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -55,6 +68,120 @@ logger = logging.getLogger("GhostAgent")
 # REFUTED below this is visible in logs but changes nothing the user sees.
 ACTIONABLE_CONF = 0.7
 
+# ── The verdict pipeline a run measured ──────────────────────────────
+#
+# Escalation is TWO-DIRECTIONAL since 2026-08-04, and the directions are
+# independent: `_escalate_refute` re-adjudicates a cheap REFUTED (main
+# model wins, verdict can flip), `_escalate_confirm` re-adjudicates a
+# HIGH-STAKES cheap CONFIRMED (verdict never flips — confidence is capped
+# to 0.6, below every >=0.7 consumption gate). A run where only one
+# direction fires is NOT production-equivalent, so the arm names all four
+# states rather than collapsing to "escalated".
+ARM_RAW = "raw_judge"
+ARM_ESC_REFUTE = "judge+escalation(refute)"
+ARM_ESC_CONFIRM = "judge+escalation(confirm)"
+ARM_ESCALATED = "judge+escalation"           # BOTH directions live
+_ARM_DIRECTIONS: Dict[str, Tuple[bool, bool]] = {
+    ARM_RAW: (False, False),
+    ARM_ESC_REFUTE: (True, False),
+    ARM_ESC_CONFIRM: (False, True),
+    ARM_ESCALATED: (True, True),
+}
+
+
+def arm_for(refute: bool, confirm: bool) -> str:
+    """The arm label for a (refute, confirm) escalation state."""
+    for name, dirs in _ARM_DIRECTIONS.items():
+        if dirs == (bool(refute), bool(confirm)):
+            return name
+    raise ValueError(f"no arm for {(refute, confirm)!r}")  # unreachable
+
+
+# Arm-QUALIFIED metric keys. There is deliberately no plain `fpr` key: a
+# raw-judge false-alarm rate is an upper bound on production's, and the
+# two were previously reported under one name, so a report comparison
+# could silently mix them. A consumer that wants "the FPR" must now say
+# which arm it means — and a KeyError is the point.
+#
+# Each metric is keyed on the direction that can ACTUALLY move it, not on
+# the whole arm — false precision would block legitimate comparisons:
+#   * FPR counts REFUTED verdicts on clean trials. `_escalate_confirm`
+#     provably never emits a REFUTED (it returns the main model's
+#     CONFIRMED, or caps the cheap one's confidence), so the confirm
+#     direction cannot move FPR or TPR. FPR is keyed on REFUTE only.
+#   * the false-CONFIRM rate counts corrupted trials CONFIRMED at
+#     actionable confidence — exactly what the confirm direction's
+#     0.6 cap removes. It is keyed on CONFIRM only.
+FPR_KEY: Dict[str, str] = {
+    arm: ("fpr_escalated" if refute else "fpr_raw_judge")
+    for arm, (refute, _c) in _ARM_DIRECTIONS.items()
+}
+CONFIRM_KEY: Dict[str, str] = {
+    arm: ("false_confirm_actionable_escalated" if confirm
+          else "false_confirm_actionable_raw")
+    for arm, (_r, confirm) in _ARM_DIRECTIONS.items()
+}
+# Measured 2026-08-04 over $GHOST_HOME/system/llm_recordings (day-files
+# 2026-07-30..08-04): joining recorded verify prompts on the CLAIM and
+# reading which model served each verdict (worker = Gemma 4 E4B,
+# main = Qwen3.6-35B), 50 cheap-judge REFUTEs reached the main model and
+# 42 were overturned to CONFIRMED. The durable log's own GhostAgent lines
+# over a longer window read 80 overturned / 19 stood = 81% (a naive grep
+# gives 89% because WARNING lines are mirrored to the GhostStream logger
+# and the "verdict stands" line is INFO — count one logger only).
+ESCALATION_OVERTURN_MEASURED = "42 of 50 (84%) on the recorded corpus"
+
+
+# ── High stakes (the CONFIRM direction's trigger) ────────────────────
+
+# Segment marker of the packed evidence digest: `_collect_verifier_
+# evidence` emits `"\n\n".join(f"[{tool_name}] {content}")`, so this
+# recovers the per-tool-output boundaries.
+_EVIDENCE_SEGMENT_RE = re.compile(r"(?:\A|\n\n)(\[[^\]\n]{1,80}\] )")
+
+
+def _evidence_segments(evidence: str) -> List[str]:
+    """Split a packed evidence digest back into its per-tool outputs."""
+    starts = [m.start(1) for m in _EVIDENCE_SEGMENT_RE.finditer(evidence or "")]
+    if not starts:
+        return [evidence or ""]
+    return [evidence[a:b] for a, b in zip(starts, starts[1:] + [len(evidence)])]
+
+
+def derive_high_stakes(evidence: str) -> bool:
+    """Would production have marked this turn HIGH-STAKES?
+
+    Production computes it as `_turn_had_tool_failure(tools_run_this_turn)`
+    — `looks_like_tool_error` applied to EACH tool output's content. A
+    bench case has no `tools_run`; what it has is the packed evidence
+    digest the verifier was actually shown, which is those same outputs
+    joined as `[tool] content`. So this splits the digest back into its
+    segments and applies THE SAME sniffer per segment — not a second
+    failure definition (a duplicated one is what made the corpus and the
+    operator line disagree before), and not one blob check either:
+    `looks_like_tool_error` only scans the first 120 chars for its text
+    markers, so a blob check sees only the FIRST tool's head. Measured
+    2026-08-04 on the 86-case mined pool: segmented 14 (16.3%) against
+    blob-only 10 (11.6%) — 4 real failures the blob check missed.
+
+    ⚠ HONEST BOUND: the digest is budget-truncated (newest-heavy, 4-way
+    split), so a failed tool whose output was trimmed out entirely is
+    invisible here. This is therefore a LOWER bound on production's flag,
+    never an upper one. For reference, production measured 140 of 1488
+    turns (9.4%) with a failed tool call across the whole corpus; the
+    mined pool is a biased subset of that (production-REFUTED turns are
+    excluded by construction), so the two rates are not expected to match
+    and neither validates the other.
+    """
+    try:
+        from ..distill.outcome_heuristics import looks_like_tool_error
+    except Exception:  # noqa: BLE001 — never lose a trial to this
+        logger.debug("verify_bench: outcome_heuristics unavailable; "
+                     "high_stakes derivation off")
+        return False
+    return any(looks_like_tool_error(seg)
+               for seg in _evidence_segments(evidence or ""))
+
 # Literal segments of the live claim template, split around its
 # placeholders. Parsing rendered prompts with these (instead of
 # hand-copied header strings) keeps extraction correct automatically when
@@ -63,6 +190,55 @@ ACTIONABLE_CONF = 0.7
 def _unescape(seg: str) -> str:
     return seg.replace("{{", "{").replace("}}", "}")
 
+
+def _invertible_templates() -> List[Tuple[str, str, str, str]]:
+    """Every verify template whose rendered form can be reversed into a case.
+
+    Deliberately includes the two-stage ENUMERATE template, not just the
+    classic fallback — see `parse_rendered_claim_prompt`. Adjudicate is
+    excluded: it interpolates `{suspects}` between the fields, so a recovered
+    "evidence" would carry stage-1 output.
+    """
+    from ..core import verifier as _v
+    candidates = [_VERIFY_CLAIM_PROMPT, _v._VERIFY_ENUMERATE_PROMPT]
+    # ...AND the LIVE (tuned) forms. Recorded prompts were rendered with
+    # whatever template was deployed at the time, which since 2026-07-30 is a
+    # GEPA artifact — not the baseline string in this source file. When the
+    # deployed enumerate template DIVERGED from the baseline, inverting only
+    # the baselines matched 0 of 580 verify-shaped records on the live corpus
+    # even though the opening sentence was identical, because the two differ
+    # further down. Resolving through `_stage_template` picks up the artifact
+    # when $GHOST_HOME has one, so both eras invert.
+    #
+    # (As of 2026-08-04 `verifier.enumerate.json` is byte-identical to the
+    # baseline again, so baseline-only inversion currently matches 336 of 580.
+    # The 0-of-580 figure describes the DIVERGED state this guards against,
+    # not today's.)
+    try:
+        for name, base in (("verifier.enumerate", _v._VERIFY_ENUMERATE_PROMPT),):
+            live = _v._stage_template(name, base)
+            if live and live != base:
+                candidates.append(live)
+    except Exception:  # noqa: BLE001 — baseline-only is a valid degraded mode
+        pass
+    out = []
+    seen = set()
+    for tpl in candidates:
+        parts = _split_template(tpl)
+        # Keyed on the WHOLE 4-tuple, not `parts[0]`. Keying on the pre-claim
+        # prefix alone dropped precisely the shape described above — a tuned
+        # artifact whose opening sentence is identical to the baseline but
+        # which diverges after `{claim}` — so the deployed template lost the
+        # tie-break to the baseline and its prompts stopped inverting. Dormant
+        # only while `verifier.enumerate.json` happens to be byte-identical to
+        # the baseline; the next promotion would re-arm the 0-of-580 failure.
+        if parts is not None and parts not in seen:
+            seen.add(parts)
+            out.append(parts)
+    return out
+
+
+_INVERTIBLE_TEMPLATES: List[Tuple[str, str, str, str]] = []
 
 _PRE_CLAIM, _rest = _VERIFY_CLAIM_PROMPT.split("{claim}")
 _PRE_EVIDENCE, _rest2 = _rest.split("{evidence}")
@@ -77,18 +253,34 @@ _POST_CONTEXT = _unescape(_POST_CONTEXT)
 
 @dataclass
 class BenchCase:
-    """One known-good (claim, evidence, context) triple."""
+    """One known-good (claim, evidence, context) triple.
+
+    ``high_stakes`` is the CONFIRM-escalation trigger (a tool failed this
+    turn). ``None`` — the default, and what every mined case carries —
+    means DERIVE it per trial from that trial's own evidence, so a fault
+    that turns the evidence into a tool failure (`silent_failure`) makes
+    the trial high-stakes exactly as production would. An explicit
+    True/False is an author pinning the case and overrides derivation for
+    all of its trials; the hand-authored seed set uses that field when a
+    fixture needs to assert its own stakes.
+    """
     case_id: str
     claim: str
     evidence: str
     context: str
     source: str = "seed"       # "seed" | "recording"
     notes: str = ""
+    high_stakes: Optional[bool] = None
 
 
 @dataclass
 class BenchTrial:
-    """One verify call to make: a case, possibly corrupted by a fault."""
+    """One verify call to make: a case, possibly corrupted by a fault.
+
+    ``high_stakes`` is resolved at build time (see `build_trials`) and is
+    passed straight through to `verify_claim`, which is the only way the
+    CONFIRM-direction escalation can fire at all.
+    """
     case_id: str
     fault: str                 # "clean" or a fault-library name
     expected: str              # "CONFIRMED" | "REFUTED" | "NOT_REFUTED"
@@ -96,6 +288,7 @@ class BenchTrial:
     evidence: str
     context: str
     note: str = ""
+    high_stakes: bool = False
 
 
 @dataclass
@@ -108,12 +301,21 @@ class TrialResult:
     suspects: Optional[List[Dict[str, str]]] = None
     elapsed_s: float = 0.0
     error: str = ""
+    # Whether each escalation direction actually BIT on this trial, read
+    # off the VerifyResult rather than inferred. Inference would be a
+    # second copy of the escalation's own rules; these two flags are the
+    # only direct evidence a run has that a direction fired at all, and
+    # they are what makes "GHOST_VERIFY_ESCALATE_CONFIRM=0 restores the
+    # old behaviour" a checkable statement instead of a claim.
+    escalated_overturn: bool = False
+    confirm_withheld: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "case_id": self.trial.case_id,
             "fault": self.trial.fault,
             "expected": self.trial.expected,
+            "high_stakes": self.trial.high_stakes,
             "verdict": self.verdict,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
@@ -122,6 +324,8 @@ class TrialResult:
             "elapsed_s": round(self.elapsed_s, 2),
             "error": self.error,
             "note": self.trial.note,
+            "escalated_overturn": self.escalated_overturn,
+            "confirm_withheld": self.confirm_withheld,
         }
 
 
@@ -147,6 +351,12 @@ def load_cases_jsonl(path: str | Path) -> List[BenchCase]:
             logger.warning("verify_bench: %s:%d missing claim/evidence",
                            path, lineno)
             continue
+        # `high_stakes` is TRI-STATE: absent/null => derive per trial.
+        # `bool(obj.get(...))` would collapse "absent" into an explicit
+        # False and freeze every case at not-high-stakes, which is exactly
+        # how the CONFIRM direction would stay dark in the bench while
+        # looking configured.
+        hs = obj.get("high_stakes")
         cases.append(BenchCase(
             case_id=str(obj.get("case_id") or obj.get("id")
                         or f"seed-{lineno}"),
@@ -155,44 +365,259 @@ def load_cases_jsonl(path: str | Path) -> List[BenchCase]:
             context=str(obj.get("context") or ""),
             source="seed",
             notes=str(obj.get("notes") or ""),
+            high_stakes=(None if hs is None else bool(hs)),
         ))
     return cases
 
 
-def parse_rendered_claim_prompt(text: str) -> Optional[Dict[str, str]]:
-    """Invert ``_VERIFY_CLAIM_PROMPT.format(...)``: given the rendered
-    prompt of a recorded VERIFY call, recover claim/evidence/context.
-    Returns None when the text is not a rendered claim prompt."""
-    if not text or not text.startswith(_PRE_CLAIM):
+def _split_template(template: str) -> Optional[Tuple[str, str, str, str]]:
+    """(pre_claim, pre_evidence, pre_context, post_context) for a template
+    whose placeholders are claim/evidence/context in that order."""
+    try:
+        pre_claim, rest = template.split("{claim}", 1)
+        pre_evidence, rest = rest.split("{evidence}", 1)
+        pre_context, post = rest.split("{context}", 1)
+    except ValueError:
         return None
-    body = text[len(_PRE_CLAIM):]
-    i = body.find(_PRE_EVIDENCE)
+    # `_unescape` is not optional: these templates carry `{{`/`}}` for the
+    # literal JSON braces in their output spec, and `.format()` collapses them
+    # to single braces. Matching the RAW segments against a RENDERED prompt
+    # therefore fails ~800 chars into the tail — which is exactly why the
+    # first version of this inverter matched 0 of 580 verify-shaped records
+    # while its opening sentence matched perfectly.
+    return (_unescape(pre_claim), _unescape(pre_evidence),
+            _unescape(pre_context), _unescape(post))
+
+
+def _invert(text: str, parts: Tuple[str, str, str, str]) -> Optional[Dict[str, str]]:
+    pre_claim, pre_evidence, pre_context, post_context = parts
+    if not text or not text.startswith(pre_claim):
+        return None
+    body = text[len(pre_claim):]
+    i = body.find(pre_evidence)
     if i < 0:
         return None
     claim = body[:i]
-    body = body[i + len(_PRE_EVIDENCE):]
-    j = body.find(_PRE_CONTEXT)
+    body = body[i + len(pre_evidence):]
+    j = body.find(pre_context)
     if j < 0:
         return None
     evidence = body[:j]
-    body = body[j + len(_PRE_CONTEXT):]
-    k = body.rfind(_POST_CONTEXT)
+    body = body[j + len(pre_context):]
+    k = body.rfind(post_context) if post_context else len(body)
     if k < 0:
         return None
     return {"claim": claim, "evidence": evidence, "context": body[:k]}
 
 
-def extract_cases_from_recordings(
-        paths: Iterable[str | Path]) -> List[BenchCase]:
-    """Mint bench cases out of GHOST_LLM_RECORD day-files: any recorded
-    exchange whose first message is a rendered claim prompt yields one
-    (claim, evidence, context) triple. Deduplicates on content hash.
+def parse_rendered_claim_prompt(text: str) -> Optional[Dict[str, str]]:
+    """Recover claim/evidence/context from ANY recorded verify prompt.
 
-    NOTE: these come from real turns, so the claim is what the agent
-    actually said — treat them as *presumed-good* cases. A turn the
-    verifier refuted in production will look like a clean-case false
-    positive here; prune those from the seed set by hand if they recur.
+    ⚠ This used to invert ONLY `_VERIFY_CLAIM_PROMPT` — the CLASSIC path.
+    Measured on 618 recorded verify calls: 281 enumerate, 244 adjudicate, 38
+    code, **55 classic**. And classic is by construction the two-stage
+    FALLBACK (`verifier.py` drops to it when stage 1 yields no usable
+    suspects), so harvesting only it SELECTED CASES ON TWO-STAGE FAILURE —
+    a bench built from the 9% of traffic where the real pipeline had already
+    broken down. The enumerate template carries the same three fields, so it
+    is inverted too, which is where the volume is.
     """
+    if not _INVERTIBLE_TEMPLATES:
+        _INVERTIBLE_TEMPLATES.extend(_invertible_templates())
+    for parts in _INVERTIBLE_TEMPLATES:
+        got = _invert(text, parts)
+        if got is not None:
+            return got
+    return None
+
+
+_VERDICT_RE = re.compile(r'"verdict"\s*:\s*"([A-Z_]+)"')
+
+
+def _claim_extractors() -> List[Tuple[str, str]]:
+    """(prefix, terminator) pairs that isolate `{claim}` in ANY verify prompt.
+
+    Broader than `_invertible_templates`: adjudicate cannot yield a usable
+    *evidence* field (it interpolates `{suspects}` between the fields), but
+    its claim is recoverable, and adjudicate is where the verdicts are.
+    """
+    from ..core import verifier as _v
+    tpls = [_VERIFY_CLAIM_PROMPT, _v._VERIFY_ENUMERATE_PROMPT]
+    for name, base in (("verifier.enumerate", _v._VERIFY_ENUMERATE_PROMPT),
+                       ("verifier.adjudicate",
+                        getattr(_v, "_VERIFY_ADJUDICATE_PROMPT", ""))):
+        if not base:
+            continue
+        tpls.append(base)
+        try:
+            live = _v._stage_template(name, base)
+            if live and live != base:
+                tpls.append(live)
+        except Exception:  # noqa: BLE001
+            pass
+    out, seen = [], set()
+    for tpl in tpls:
+        if not tpl or "{claim}" not in tpl:
+            continue
+        pre, rest = tpl.split("{claim}", 1)
+        m = re.search(r"\{[a-z_]+\}", rest)
+        # FULL terminator segment, not a 120-char slice: `_invert` matches on
+        # the whole thing, and a claim that happens to contain the truncated
+        # prefix would make the two disagree about where the claim ends.
+        term = _unescape(rest[:m.start()] if m else rest)
+        # `{claim}` is not guaranteed to be the FIRST placeholder —
+        # `_validate_stage_template` checks presence, not order. When it is
+        # not, `pre` holds `{evidence}`/`{context}` literals that no rendered
+        # text can start with, and `startswith` silently matched nothing at
+        # all. Anchor on the literal run immediately before `{claim}` and
+        # search for it instead of requiring a prefix.
+        pre = _unescape(pre)
+        m_pre = None
+        for m_pre in re.finditer(r"\{[a-z_]+\}", pre):
+            pass
+        anchored = m_pre is not None
+        if anchored:
+            pre = pre[m_pre.end():]
+        if not term.strip() or not pre.strip() or (pre, term) in seen:
+            continue
+        seen.add((pre, term))
+        out.append((pre, term))
+    # LONGEST prefix first. `_claim_of` returns on the first extractor that
+    # matches, so a baseline whose pre-claim is a PREFIX of a tuned one would
+    # shadow it and hand back the tuned template's extra preamble as part of
+    # the claim — the same shadowing bug the 4-tuple dedupe above just fixed,
+    # and here it cannot self-correct because all templates share a
+    # terminator. A wrong claim key is silent: every case reverts to
+    # `prod_verdict=unknown` and `exclude_refuted` stops excluding.
+    out.sort(key=lambda pt: len(pt[0]), reverse=True)
+    return out
+
+
+_CLAIM_EXTRACTORS: List[Tuple[str, str]] = []
+
+
+def _claim_of(text: str) -> str:
+    """The `{claim}` a recorded verify prompt was rendered with ("" if none)."""
+    if not _CLAIM_EXTRACTORS:
+        _CLAIM_EXTRACTORS.extend(_claim_extractors())
+    for pre, term in _CLAIM_EXTRACTORS:
+        # `find`, not `startswith`: the anchor is the literal run immediately
+        # before `{claim}`, which is at position 0 only when `{claim}` is the
+        # template's first placeholder.
+        start = text.find(pre)
+        if start < 0:
+            continue
+        body = text[start + len(pre):]
+        i = body.find(term)
+        if i > 0:
+            return body[:i].strip()
+    return ""
+
+
+def _claim_key(claim: str) -> str:
+    return hashlib.sha256(" ".join(claim.split()).encode("utf-8")).hexdigest()
+
+
+def _production_verdicts(paths: Iterable[str | Path]) -> Dict[str, str]:
+    """claim-hash -> the verdict production actually reached FOR THAT CLAIM.
+
+    Read from the ADJUDICATE/classic responses, which are the only records
+    that carry one (an enumerate response is a suspects list). Used to keep
+    claims the verifier REFUTED out of the clean-case pool.
+
+    ⚠ Keyed on the CLAIM, not on `request_id`, and taking the LAST verdict
+    rather than letting a REFUTED win. `request_id` is per-TURN — measured on
+    the live corpus 2026-08-04, 348 distinct ids over 12,047 records with a
+    single `"SYSTEM"` id holding 9,780 of them — so a request-level join is
+    not "conservative but safe", it is wrong three ways. Of the 62 deduped
+    cases the old join excluded:
+
+      * 43 were `['REFUTED', 'CONFIRMED']` within one request, which is the
+        `_escalate_refute` SIGNATURE (cheap judge false-refutes, main model
+        overturns — all 43 multi-verdict requests are exactly this shape).
+        Production did NOT refute those turns, and they are the *best* clean
+        cases available because they survived two judges;
+      * 16 were dropped on a verdict the CODE AUDITOR reached about a
+        different claim in the same turn;
+      * 3 fell in the shared `"SYSTEM"` bucket, poisoned by one REFUTED
+        anywhere in 9,780 records.
+
+    Net: 106 candidates → 44 kept under the old join, 86 under this one. The
+    survivors were biased toward turns that never triggered a refutation
+    anywhere — the same selection-bias class as the two-stage fallback bug
+    that `parse_rendered_claim_prompt` exists to fix.
+
+    ⚠ Known gap: a claim REFUTED in its own turn and CONFIRMED later in an
+    UNRELATED turn would be admitted as clean. Zero instances on the live
+    corpus today (the 42 conflicting claims are 41 same-request escalation
+    pairs plus one cross-day claim that resolves REFUTED), and it is
+    unguarded — day-files are read in `sorted()` i.e. chronological order,
+    so "last" is genuinely last.
+    """
+    out: Dict[str, str] = {}
+    for path in paths:
+        p = Path(path)
+        if not p.exists():
+            continue
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msgs = (rec.get("payload") or {}).get("messages") or []
+            if not msgs:
+                continue
+            claim = _claim_of(str(msgs[0].get("content") or ""))
+            if not claim:
+                continue
+            resp = rec.get("response")
+            if not isinstance(resp, dict):
+                continue
+            choices = resp.get("choices") or [{}]
+            first = choices[0] if isinstance(choices, list) and choices else {}
+            content = ""
+            if isinstance(first, dict):
+                content = str((first.get("message") or {}).get("content") or "")
+            m = _VERDICT_RE.search(content)
+            if m:
+                # LAST verdict wins: an escalation's final answer is the one
+                # production acted on.
+                out[_claim_key(claim)] = m.group(1)
+    return out
+
+
+def extract_cases_from_recordings(
+        paths: Iterable[str | Path],
+        *, exclude_refuted: bool = True) -> List[BenchCase]:
+    """Mint bench cases out of GHOST_LLM_RECORD day-files.
+
+    Cases are PRESUMED-GOOD by construction: every trial built from them
+    treats the recovered claim as correct, so a `clean` trial expects
+    CONFIRMED and every fault expects the corruption to be caught.
+
+    ⚠ `exclude_refuted` is on by default and is load-bearing. A turn the
+    verifier REFUTED in production is NOT a clean case, and admitting one
+    enters a known-bad claim as `expected="CONFIRMED"` — which inflates the
+    measured false-positive rate and steers the optimizer toward a MORE
+    PERMISSIVE judge, i.e. the bench would actively reward the failure mode
+    it exists to detect. Measured on the live corpus at the time this was
+    added: 69 REFUTED verdicts among the recorded verify calls. The verdict
+    is in the same day-file (`_production_verdicts`), joined on the CLAIM —
+    it was simply never read. (The first version of this join used
+    `request_id`, which is per-TURN and wrong; see `_production_verdicts`.)
+    """
+    # Computed unconditionally: it is the exclusion key when
+    # `exclude_refuted` is on, and the `prod_verdict=` provenance note in
+    # every case either way.
+    verdicts = _production_verdicts(paths)
+    dropped_refuted = 0
     seen: set = set()
     cases: List[BenchCase] = []
     for path in paths:
@@ -220,20 +645,50 @@ def extract_cases_from_recordings(
             if not parsed or not parsed["claim"].strip() \
                     or not parsed["evidence"].strip():
                 continue
+            if exclude_refuted and verdicts.get(
+                    _claim_key(parsed["claim"])) == "REFUTED":
+                dropped_refuted += 1
+                continue
             digest = hashlib.sha256(
                 (parsed["claim"] + "\x00" + parsed["evidence"] + "\x00"
                  + parsed["context"]).encode("utf-8")).hexdigest()
             if digest in seen:
                 continue
             seen.add(digest)
+            # REDACT. `GHOST_LLM_RECORD` day-files are unredacted by design
+            # (that is why the journal marks them local-disk-only), but a
+            # bench case file is a durable artifact that gets copied into
+            # ablation bundles and compared across weeks. Every other corpus
+            # write in this codebase redacts; this one did not, because until
+            # now it produced almost nothing.
+            # Resolve the verdict BEFORE redaction: the claim hash must be
+            # taken from the same text `_production_verdicts` hashed.
+            # `verdicts` is empty under exclude_refuted=False, so read the
+            # map directly rather than annotating all 106 cases
+            # `prod_verdict=unknown` — that note is the only provenance a
+            # mined case carries, and claiming "unknown" for a verdict that
+            # is sitting in the same day-file is a lie about the data.
+            _pv = verdicts.get(_claim_key(parsed["claim"]), "unknown")
+            try:
+                from ..distill.redact import redact_text, RedactionConfig
+                _cfg = RedactionConfig()
+                parsed = {k: redact_text(v, _cfg) for k, v in parsed.items()}
+            except Exception:  # noqa: BLE001 — never lose a case to redaction
+                pass
             cases.append(BenchCase(
                 case_id=f"rec-{digest[:10]}",
                 claim=parsed["claim"],
                 evidence=parsed["evidence"],
                 context=parsed["context"],
                 source="recording",
-                notes=str(rec.get("ts") or ""),
+                notes=(f"{rec.get('ts') or ''} "
+                       f"prod_verdict={_pv}").strip(),
             ))
+    if dropped_refuted:
+        logger.info(
+            "verify_bench: dropped %d recording-derived case(s) whose turn was "
+            "REFUTED in production — they are not clean cases",
+            dropped_refuted)
     return cases
 
 
@@ -312,7 +767,8 @@ def fault_fabrication(case: BenchCase, rng: random.Random,
 
 
 def fault_wrong_topic(case: BenchCase, rng: random.Random,
-                      pool: List[BenchCase]) -> Optional[Tuple[str, str, str, str]]:
+                      pool: List[BenchCase], seed: int = 0
+                      ) -> Optional[Tuple[str, str, str, str]]:
     """Answer a different question: swap in another case's claim wholesale.
     Needs a non-empty user request (the alignment check is skipped when
     the request is blank) and a donor case."""
@@ -322,7 +778,24 @@ def fault_wrong_topic(case: BenchCase, rng: random.Random,
               if c.case_id != case.case_id and c.claim != case.claim]
     if not donors:
         return None
-    donor = rng.choice(donors)
+    # Donor chosen by RANK, not by `rng.choice(donors)`. An index into a list
+    # whose length changes reshuffles on every pool growth; ranking each
+    # candidate by hash(this_case, donor) keeps the pick stable across
+    # growth. `rng` is unused on purpose: the choice must not depend on how
+    # many draws earlier faults made.
+    #
+    # `seed` IS mixed in, so --seed varies this fault like every other one.
+    # Without it the donor was a pure function of the case-id pair and
+    # `--seed 0` vs `--seed 999` produced identical wrong_topic trials while
+    # the report recorded `seed` as if it parameterised the whole trial set.
+    #
+    # Note this is stability under growth, not immunity: for a pool growing
+    # 21 -> 65 the chance a new case outranks the incumbent donor is
+    # m/(n+m) ~ 69%, and 16 of 21 wrong_topic trials (76%) did change. The
+    # pool hash in `bench_provenance` is what makes that safe, by refusing
+    # the comparison rather than by preventing the change.
+    donor = min(donors, key=lambda c: hashlib.sha256(
+        f"{seed}|{case.case_id}|{c.case_id}".encode("utf-8")).hexdigest())
     return (donor.claim, case.evidence, case.context,
             f"claim replaced with {donor.case_id}'s")
 
@@ -392,34 +865,95 @@ FAULTS: Dict[str, Tuple[str, Callable]] = {
 }
 
 
+def _takes_seed(fn) -> bool:
+    """True when a fault function accepts the run seed as a 4th argument.
+
+    Deliberately NOT `lru_cache`d: the argument is a callable, so an
+    unhashable one would raise inside the cache wrapper BEFORE this
+    function's own error handling, `maxsize=None` would pin every fault
+    function for the process lifetime, and equal-but-distinct callables
+    would collide onto one arity. Callers resolve arity once per
+    `build_trials`, so there is nothing to cache.
+    """
+    try:
+        return len(inspect.signature(fn).parameters) >= 4
+    except (TypeError, ValueError):
+        return False
+
+
 def build_trials(cases: List[BenchCase],
                  fault_names: Optional[List[str]] = None,
                  seed: int = 0,
                  include_clean: bool = True) -> List[BenchTrial]:
-    """Expand cases into the trial list: one clean trial per case plus
-    one trial per applicable fault. Deterministic for a given seed."""
-    rng = random.Random(seed)
+    """Expand cases into the trial list: one clean trial per case plus one
+    trial per applicable fault.
+
+    ⚠ Seeded PER CASE, not once for the whole run. A single shared `rng` made
+    every trial depend on how many cases preceded it, so ADDING a case
+    silently rewrote earlier ones: measured, re-running the identical command
+    after the pool grew from 13 to 21 cases changed the content of 19 of the
+    original 97 trials (20%) — while the report still looked like the same
+    benchmark. Since T0/T+7d comparisons are the whole point of this
+    instrument, that made corpus growth indistinguishable from a real
+    regression. Per-case seeding keeps a case's faults stable for life.
+
+    (`wrong_topic` still draws its donor from the pool, so its content can
+    change when pool MEMBERSHIP changes. That is why the report records a
+    hash of the case set — see `run_bench` — so two runs are only ever
+    compared when they were built from the same pool.)
+
+    HIGH STAKES is resolved here, per trial: an explicit `case.high_stakes`
+    pins every trial of that case, otherwise it is DERIVED from the
+    trial's own (post-fault) evidence. Deriving after the fault is the
+    point, not a side effect — `silent_failure` replaces the evidence with
+    a tool error under an unchanged success claim, which IS the population
+    `_escalate_confirm` exists for, and it is the only thing that makes the
+    hand-authored seed set exercise the CONFIRM direction at all (measured
+    2026-08-04: 0 of 21 seed cases derive high-stakes from their own clean
+    evidence, but 70 of 107 `silent_failure` trials do).
+    """
     names = list(fault_names) if fault_names else list(FAULTS)
     unknown = [n for n in names if n not in FAULTS]
     if unknown:
         raise ValueError(f"unknown fault(s): {unknown}")
+    # Arity resolved ONCE per call, not per trial.
+    _seed_arity = {n: _takes_seed(FAULTS[n][1]) for n in names}
     trials: List[BenchTrial] = []
+    def _stakes(case: BenchCase, evidence: str) -> bool:
+        return (derive_high_stakes(evidence) if case.high_stakes is None
+                else bool(case.high_stakes))
+
     for case in cases:
         if include_clean:
             trials.append(BenchTrial(
                 case_id=case.case_id, fault="clean", expected="CONFIRMED",
                 claim=case.claim, evidence=case.evidence,
-                context=case.context))
+                context=case.context,
+                high_stakes=_stakes(case, case.evidence)))
         for name in names:
             expected, fn = FAULTS[name]
-            out = fn(case, rng, cases)
+            # Per (case, FAULT). Per-case alone was not enough: the faults
+            # share one rng in sequence, so a fault whose draw count depends
+            # on the pool (`wrong_topic` picks a donor) shifted the stream for
+            # every fault after it — growing the pool still rewrote unrelated
+            # trials. An independent stream per fault makes each trial's
+            # content a pure function of (seed, case_id, fault).
+            fault_seed = int(hashlib.sha256(
+                f"{seed}:{case.case_id}:{name}".encode("utf-8")
+            ).hexdigest()[:8], 16)
+            rng = random.Random(fault_seed)
+            # Explicit arity check, NOT try/except TypeError — the latter
+            # would silently swallow a genuine TypeError raised INSIDE a
+            # fault and retry it with fewer arguments.
+            out = (fn(case, rng, cases, seed) if _seed_arity[name]
+                   else fn(case, rng, cases))
             if out is None:
                 continue
             claim, evidence, context, note = out
             trials.append(BenchTrial(
                 case_id=case.case_id, fault=name, expected=expected,
                 claim=claim, evidence=evidence, context=context,
-                note=note))
+                note=note, high_stakes=_stakes(case, evidence)))
     return trials
 
 
@@ -429,12 +963,36 @@ def _rate(num: int, denom: int) -> Optional[float]:
     return round(num / denom, 3) if denom else None
 
 
-def score_trials(results: List[TrialResult]) -> Dict[str, Any]:
+def score_trials(results: List[TrialResult],
+                 arm: str = ARM_RAW) -> Dict[str, Any]:
     """Aggregate trial results into per-fault and overall metrics.
 
     Rates are computed over JUDGED trials (verdict produced); skips and
     errors are reported alongside, never silently folded into a rate.
+
+    ``arm`` names the VERDICT PIPELINE these results came from (see
+    `escalation_arm`) and is not cosmetic. Two headline numbers are
+    emitted under ARM-QUALIFIED keys, each keyed on the escalation
+    direction that can actually move it:
+
+      * `fpr_raw_judge` / `fpr_escalated` — clean trials REFUTED. Only
+        the REFUTE direction moves this (it overturns refutes, which
+        lowers FPR — and lowers TPR whenever it overturns a genuine
+        catch). `_escalate_confirm` never emits a REFUTED, so it cannot.
+      * `false_confirm_actionable_raw` / `_escalated` — CORRUPTED trials
+        that came back CONFIRMED, with the actionable (>=0.7) rate. This
+        is the quantity the CONFIRM direction removes, by capping a
+        withheld confirmation at 0.6. §4J item 2 measured 8% of corrupted
+        trials CONFIRMED at >=0.7, each able to upgrade a structural
+        FAILED into a fabricated PASSED — the bench reported that number
+        nowhere at all before.
+
+    There is no bare `fpr`, and no unqualified false-confirm key, so a
+    stale reader gets a KeyError instead of a number from the wrong arm.
     """
+    if arm not in FPR_KEY:
+        raise ValueError(f"unknown arm {arm!r}; expected one of "
+                         f"{sorted(FPR_KEY)}")
     by_fault: Dict[str, List[TrialResult]] = {}
     for r in results:
         by_fault.setdefault(r.trial.fault, []).append(r)
@@ -464,6 +1022,14 @@ def score_trials(results: List[TrialResult]) -> Dict[str, Any]:
             entry["catch_rate"] = _rate(len(refuted), len(judged))
             entry["catch_rate_actionable"] = _rate(
                 len(refuted_act), len(judged))
+            # The MISS side, at the confidence the agent would act on.
+            # A corrupted trial CONFIRMED at >=0.7 is a fabricated pass
+            # that can upgrade a structural FAILED (§4J item 2) — the
+            # exact population the CONFIRM escalation caps to 0.6.
+            entry["false_confirm_rate"] = _rate(len(confirmed), len(judged))
+            entry["false_confirm_rate_actionable"] = _rate(
+                len([r for r in confirmed
+                     if r.confidence >= ACTIONABLE_CONF]), len(judged))
         elif expected == "CONFIRMED":
             entry["false_alarm_rate"] = _rate(len(refuted), len(judged))
             entry["false_alarm_rate_actionable"] = _rate(
@@ -487,29 +1053,121 @@ def score_trials(results: List[TrialResult]) -> Dict[str, Any]:
             "rate_actionable": _rate(len(hit_act), len(judged)),
         }
 
+    hs = [r for r in results if r.trial.high_stakes]
     return {
+        "arm": arm,
         "per_fault": per_fault,
+        # Did each direction actually BITE? Read off the verdicts, not
+        # inferred. `high_stakes_trials == 0` means the run carries no
+        # evidence about the CONFIRM direction whatever the arm says.
+        #
+        # `confirm_eligible` exists because `confirm_withheld == 0` is
+        # otherwise ambiguous between "the main model agreed every time"
+        # (evidence) and "no high-stakes trial ever reached a CONFIRMED,
+        # so the direction was never invoked" (no evidence). Silence that
+        # reads as success is the defect class this whole review keeps
+        # turning up. Eligible = high-stakes AND ended CONFIRMED AND was
+        # not already adjudicated by the refute escalation (which
+        # `_escalate_confirm` skips via its `escalated_overturn` guard).
+        "escalation_events": {
+            "high_stakes_trials": len(hs),
+            "refute_overturned": sum(1 for r in results
+                                     if r.escalated_overturn),
+            "confirm_eligible": sum(1 for r in hs
+                                    if r.verdict == "CONFIRMED"
+                                    and not r.escalated_overturn),
+            "confirm_withheld": sum(1 for r in results
+                                    if r.confirm_withheld),
+        },
         "overall": {
+            # Which pipeline produced every rate below. Repeated here
+            # because `overall` is what gets pasted into comparisons.
+            "arm": arm,
             # TPR: corrupted trials refuted.
             "tpr": _overall(("REFUTED",), "REFUTED"),
-            # FPR: clean trials refuted.
-            "fpr": _overall(("CONFIRMED",), "REFUTED"),
+            # FPR: clean trials refuted — keyed on the REFUTE direction.
+            FPR_KEY[arm]: _overall(("CONFIRMED",), "REFUTED"),
+            # Corrupted trials CONFIRMED — keyed on the CONFIRM direction,
+            # whose whole job is to strip these of actionable confidence.
+            CONFIRM_KEY[arm]: _overall(("REFUTED",), "CONFIRMED"),
             # Robustness false alarms: degraded-evidence trials refuted.
+            # REFUTE-direction sensitive; `arm` above is what qualifies it.
             "degraded_evidence_fp": _overall(("NOT_REFUTED",), "REFUTED"),
         },
     }
 
 
+def _keyed_entry(overall: Dict[str, Any], escalated_key: str,
+                 raw_key: str, legacy_key: str = ""
+                 ) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """(direction-state, metric block) for one arm-qualified metric.
+
+    Returns "escalated" / "raw" / "unrecorded" — the state of the ONE
+    direction that keys this metric, not the whole arm. Looked up by KEY
+    NAME, not by iterating arms: two arms map to the same key by design
+    (a confirm-only run's FPR is a raw-judge FPR), so an arm-first search
+    would report whichever arm happened to be first in the dict.
+    """
+    if escalated_key in overall:
+        return "escalated", overall[escalated_key]
+    if raw_key in overall:
+        return "raw", overall[raw_key]
+    if legacy_key and legacy_key in overall:
+        return "unrecorded", overall[legacy_key]
+    return "unrecorded", None
+
+
+def fpr_entry(overall: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """(refute-direction state, false-alarm block) for a report's `overall`.
+
+    Tolerates the pre-2026-08-04 shape, whose bare `fpr` key carries no
+    arm at all — those reports are raw-judge numbers by construction (no
+    bench client had an escalation route before this), but they are
+    labelled `unrecorded` rather than back-dated, because "we know what
+    it must have been" is how an unlabelled number becomes a comparison.
+    """
+    return _keyed_entry(overall, "fpr_escalated", "fpr_raw_judge", "fpr")
+
+
+def false_confirm_entry(overall: Dict[str, Any]
+                        ) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """(confirm-direction state, false-CONFIRM block) for `overall`.
+
+    No legacy key: pre-2026-08-04 reports do not carry this metric at
+    all, so there is nothing to be tolerant of and `unrecorded` here means
+    genuinely absent.
+    """
+    return _keyed_entry(overall, "false_confirm_actionable_escalated",
+                        "false_confirm_actionable_raw")
+
+
 # ── Runner ───────────────────────────────────────────────────────────
 
 class HttpChatClient:
-    """Minimal OpenAI-compatible chat client duck-typing the single
-    surface Verifier needs when no critic pool / router is present:
-    ``chat_completion(payload)``. Deliberately defines neither
-    ``critic_clients`` truthy nor ``route``, so ``Verifier._call_llm``
-    goes straight to the direct path against the given endpoint."""
+    """Single-endpoint OpenAI-compatible chat client — the RAW-JUDGE arm.
+
+    Duck-types the one surface ``Verifier`` needs when no critic pool /
+    worker route is present: ``chat_completion(payload)``. It defines
+    neither ``critic_clients`` nor ``worker_clients`` truthy and has no
+    ``route``, so ``Verifier._call_llm`` goes straight to the direct path
+    against the given endpoint.
+
+    ⚠ That also means ``Verifier._escalate_refute`` RETURNS IMMEDIATELY
+    (`cheap_route` is False — "the main model already judged it"), so a
+    run on this client measures the judge STANDALONE. Production runs
+    cheap-judge-screens / main-model-adjudicates, and the main model
+    overturned 42 of 50 (84%) of the cheap judge's refutes on the live
+    recorded corpus. Use `EscalatingChatClient` for the arm production
+    actually runs; `escalation_arm()` labels whichever one is in play and
+    `score_trials` refuses to emit an unqualified `fpr` because of it.
+    """
 
     critic_clients: Any = None
+    # Declared explicitly, not left to `getattr(..., None)`: this is the
+    # attribute `_escalate_refute` reads to decide whether a cheap route
+    # existed, so "the raw arm has no worker pool" is a stated contract
+    # rather than an accident of which attributes were never set.
+    worker_clients: Any = None
 
     def __init__(self, base_url: str, timeout: float = 90.0,
                  api_key: str = "", model: str = ""):
@@ -518,11 +1176,26 @@ class HttpChatClient:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self._model = model
+        self._timeout = timeout
+        # Public, for `bench_provenance`. The judge IS the system under test,
+        # so "which endpoint/model produced these numbers" belongs in the
+        # block that decides whether two reports are comparable — and a field
+        # that is always "" is worse than an absent one, because it looks
+        # like the question was answered.
+        self.base_url = base_url.rstrip("/")
+        self.model = model
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), timeout=timeout,
             headers=headers)
 
     async def chat_completion(self, payload: dict, **_kw) -> dict:
+        # `timeout=` arrives here from `_bounded_fallback_kwargs` and is
+        # DELIBERATELY ignored on this client: the raw arm is a harness for
+        # measuring one endpoint, so `--timeout` is the operator's patience
+        # and must stay effective. (`EscalatingChatClient` honours it,
+        # because that client's contract is to reproduce production, whose
+        # main leg is bounded by GHOST_VERIFY_FALLBACK_TIMEOUT.) At the
+        # default `--timeout 90` the two are the same number anyway.
         body = dict(payload)
         if self._model:
             body.setdefault("model", self._model)
@@ -534,7 +1207,191 @@ class HttpChatClient:
         await self._client.aclose()
 
 
+class EscalatingChatClient(HttpChatClient):
+    """Two-endpoint client that reproduces PRODUCTION's verify topology.
+
+    Production (measured on the live process 2026-08-04: `--worker-nodes
+    http://100.83.184.117:8088|Nova`, `--upstream-url http://127.0.0.1:8088`,
+    no `--critic-nodes`) runs verify as TWO models:
+
+      1. the CHEAP judge on the worker route — `Verifier._call_llm` calls
+         `route("VERIFY", …)`, which returns the content STRING;
+      2. on REFUTED, `_escalate_refute` re-adjudicates on the MAIN model
+         via `force_main=True`, which skips both pools and lands on
+         `chat_completion`. On disagreement the main model wins.
+
+    So the mapping is exact and needs no new verifier code: `route()` →
+    cheap endpoint, `chat_completion()` → main endpoint, and a truthy
+    `worker_clients` so `_escalate_refute` sees a cheap route to have
+    escalated FROM. Everything else (which template, which timeout,
+    force_main semantics) is the verifier's own production code path.
+
+    Failure semantics mirror `LLMClient.route`: it never raises — a failed
+    cheap call returns `fallback`, and the verifier then falls through to
+    the direct (main) call, exactly as in production.
+
+    SCOPE: this mirrors the REFUTE-direction escalation. `verify_claim`
+    also grew a `high_stakes=` CONFIRMED-direction escalation
+    (`_escalate_confirm_enabled`, §4J item 2); `run_trials` never passes
+    it, so the bench does not exercise that path. Whoever wires it into
+    production consumers needs a matching bench knob, or the two arms
+    will diverge again in the other direction.
+    """
+
+    def __init__(self, base_url: str, main_base_url: str,
+                 timeout: float = 90.0, api_key: str = "", model: str = "",
+                 main_model: str = "", main_api_key: str = "",
+                 main_timeout: Optional[float] = None):
+        super().__init__(base_url, timeout=timeout, api_key=api_key,
+                         model=model)
+        import httpx
+        headers = {}
+        if main_api_key or api_key:
+            headers["Authorization"] = f"Bearer {main_api_key or api_key}"
+        self.main_base_url = main_base_url.rstrip("/")
+        self.main_model = main_model
+        self._main_timeout = (main_timeout if main_timeout is not None
+                              else timeout)
+        self._main_client = httpx.AsyncClient(
+            base_url=self.main_base_url, timeout=self._main_timeout,
+            headers=headers)
+        # Truthy => `_escalate_refute` treats the verdict as cheap-judge
+        # output worth re-adjudicating. Shaped like `LLMClient.worker_clients`
+        # entries so anything that introspects it gets something real.
+        self.worker_clients = [{"url": self.base_url,
+                                "model": model or "(unnamed)"}]
+        # ROUTE HEALTH. A failed cheap leg is NOT a neutral event here:
+        # `route()` returns `fallback` (None), `_call_llm` falls through to
+        # the direct call, and that call lands on the MAIN model — so the
+        # trial still produces a verdict, but it is the STRONG judge's, not
+        # the cheap judge's. Production does the same thing (this is the
+        # faithful behaviour), yet a run that silently scores such trials as
+        # cheap-judge verdicts is measuring a blend it never names. The live
+        # log shows the failure mode is real: 9 `worker node failed — Nova:
+        # ReadTimeout` events, 5 of them at exactly +12.0/12.1s, dead on
+        # `_ROUTE_TIMEOUT_S`. Verify passes its own 45s budget rather than
+        # that 12s ceiling, so the bench's exposure is smaller — but "smaller"
+        # is an argument, and this is a measurement.
+        self.route_calls = 0
+        self.route_failures = 0
+        self.route_timeouts = 0
+        self.route_empty = 0
+
+    def route_health(self) -> Dict[str, Any]:
+        """Cheap-leg call outcomes for the provenance block.
+
+        `fell_through_to_main` is the number the reader actually needs: those
+        trials were judged by the MAIN model, so they did not measure the
+        cheap judge at all.
+        """
+        fell = self.route_failures + self.route_empty
+        return {
+            "route_calls": self.route_calls,
+            "route_failures": self.route_failures,
+            "route_timeouts": self.route_timeouts,
+            "route_empty_replies": self.route_empty,
+            "fell_through_to_main": fell,
+            "clean": fell == 0,
+        }
+
+    async def route(self, task: str, payload: dict, max_tokens: int = 128,
+                    temperature: float = 0.0, fallback: Any = None,
+                    timeout: Optional[float] = None, **_kw) -> Any:
+        """The CHEAP leg. Same contract as `LLMClient.route`: size the
+        payload, return the extracted content string, and degrade to
+        `fallback` (never raise) so the verifier's fall-through is the
+        production one."""
+        sized = dict(payload)
+        sized.setdefault("temperature", temperature)
+        sized.setdefault("max_tokens", max_tokens)
+        sized["stream"] = False
+        if self._model:
+            sized.setdefault("model", self._model)
+        self.route_calls += 1
+        try:
+            resp = await self._client.post(
+                "/v1/chat/completions", json=sized,
+                timeout=(timeout if timeout is not None else self._timeout))
+            resp.raise_for_status()
+            data = resp.json()
+            content = ((data.get("choices") or [{}])[0]
+                       .get("message", {}).get("content", ""))
+        except Exception as exc:  # noqa: BLE001 — route() never raises
+            self.route_failures += 1
+            if "timeout" in type(exc).__name__.lower():
+                self.route_timeouts += 1
+            # WARNING, not debug: this is the event that quietly turns a
+            # cheap-judge trial into a main-model one, and a diagnostic
+            # nobody sees is how the escalation axis went unmeasured for
+            # weeks in the first place.
+            logger.warning(
+                "verify_bench cheap leg FAILED (%s: %s) — this trial's "
+                "verdict will come from the MAIN model, not the judge "
+                "under test", type(exc).__name__, exc)
+            return fallback
+        if not content:
+            self.route_empty += 1
+            logger.warning(
+                "verify_bench cheap leg returned an EMPTY reply — this "
+                "trial falls through to the MAIN model")
+            return fallback
+        return content
+
+    async def chat_completion(self, payload: dict, timeout: Any = None,
+                              **_kw) -> dict:
+        """The MAIN leg — where `force_main=True` lands, i.e. the
+        escalation's adjudicator (and the verifier's last-resort fallback
+        when the cheap leg returns nothing parseable, same as prod).
+
+        ``timeout`` is HONOURED, not swallowed. `_bounded_fallback_kwargs`
+        passes the verifier's own ceiling here (`GHOST_VERIFY_FALLBACK_
+        TIMEOUT`, 90s) whenever the client's `chat_completion` accepts the
+        keyword — and a `**kw`-only signature counts as accepting it, so
+        the value was arriving and being dropped. Production's LLMClient
+        applies it, so an escalated bench run that used the CLI
+        `--timeout` instead would be measuring a more (or less) patient
+        adjudicator than production has. Both legs of this client are now
+        bounded by the verifier exactly as they are live: 45s on the
+        route leg, 90s here.
+        """
+        body = dict(payload)
+        if self.main_model:
+            body.setdefault("model", self.main_model)
+        kw = {"timeout": timeout} if timeout is not None else {}
+        resp = await self._main_client.post(
+            "/v1/chat/completions", json=body, **kw)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+        await self._main_client.aclose()
+
+
 ARM_ENV = {"two_stage_on": "1", "two_stage_off": "0"}
+
+
+def verify_claim_accepts_high_stakes(verifier) -> bool:
+    """Does this verifier's ``verify_claim`` take ``high_stakes=``?
+
+    The CONFIRM-direction escalation fires ONLY when the caller passes it,
+    so a verifier (or a test double) without the parameter makes that
+    direction structurally dead — the same shape as the missing worker
+    route that made the REFUTE direction dead. Probed rather than assumed,
+    and reported in `provenance.escalation`, so the report can never claim
+    a direction the call site could not reach. Also keeps `run_trials`
+    working against older stubs instead of turning every trial into a
+    TypeError the per-trial handler would swallow as an ERROR row.
+    """
+    fn = getattr(verifier, "verify_claim", None)
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "high_stakes" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 async def run_trials(verifier: Verifier, trials: List[BenchTrial],
@@ -542,16 +1399,25 @@ async def run_trials(verifier: Verifier, trials: List[BenchTrial],
                      on_result: Optional[Callable] = None
                      ) -> List[TrialResult]:
     """Run every trial through ``verifier.verify_claim``. Exceptions are
-    captured per-trial (error + verdict None), never raised out."""
+    captured per-trial (error + verdict None), never raised out.
+
+    ``trial.high_stakes`` is forwarded as ``high_stakes=`` when the
+    verifier accepts it — without that the CONFIRM-direction escalation
+    can never fire, however the client is wired.
+    """
     sem = asyncio.Semaphore(max(1, concurrency))
     results: List[Optional[TrialResult]] = [None] * len(trials)
+    # Resolved ONCE per run, not per trial: the signature cannot change
+    # mid-run and `inspect.signature` is not free.
+    pass_stakes = verify_claim_accepts_high_stakes(verifier)
 
     async def _one(i: int, t: BenchTrial) -> None:
         async with sem:
             t0 = time.monotonic()
             try:
+                kw = {"high_stakes": t.high_stakes} if pass_stakes else {}
                 vr = await verifier.verify_claim(
-                    t.claim, t.evidence, t.context)
+                    t.claim, t.evidence, t.context, **kw)
                 res = TrialResult(
                     trial=t,
                     verdict=vr.verdict.value if vr else None,
@@ -560,6 +1426,10 @@ async def run_trials(verifier: Verifier, trials: List[BenchTrial],
                     issues=list(vr.issues) if vr else [],
                     suspects=vr.suspects if vr else None,
                     elapsed_s=time.monotonic() - t0,
+                    escalated_overturn=bool(
+                        getattr(vr, "escalated_overturn", False)),
+                    confirm_withheld=bool(
+                        getattr(vr, "confirm_withheld", False)),
                 )
             except Exception as exc:
                 res = TrialResult(
@@ -571,6 +1441,193 @@ async def run_trials(verifier: Verifier, trials: List[BenchTrial],
 
     await asyncio.gather(*(_one(i, t) for i, t in enumerate(trials)))
     return [r for r in results if r is not None]
+
+
+def _judge_identity(verifier) -> Dict[str, str]:
+    """Endpoint + model of the judge actually under test ({} when unknown).
+
+    Walks to the client, because `Verifier` holds no endpoint of its own.
+    Returns `{"unresolved": ...}` rather than empty strings when it cannot
+    tell — a provenance block must never quietly assert "no model".
+    """
+    client = getattr(verifier, "llm_client", None)
+    if client is None:
+        return {"unresolved": "verifier has no llm_client"}
+    for url_attr, model_attr in (("base_url", "model"),
+                                 ("_base_url", "_model")):
+        url = getattr(client, url_attr, "")
+        model = getattr(client, model_attr, "")
+        if url or model:
+            return {"base_url": str(url or ""), "model": str(model or "")}
+    inner = getattr(client, "_client", None)
+    url = str(getattr(inner, "base_url", "") or "")
+    model = str(getattr(client, "_model", "") or "")
+    if url or model:
+        return {"base_url": url, "model": model}
+    return {"unresolved": type(client).__name__}
+
+
+def escalation_arm(verifier,
+                   trials: Optional[List[BenchTrial]] = None
+                   ) -> Dict[str, Any]:
+    """Which VERDICT PIPELINE this run measures — the report's load-bearing
+    provenance field.
+
+    Recomputes exactly the predicates `Verifier._escalate_refute` and
+    `_escalate_confirm` apply (kill switch enabled AND a truthy
+    `critic_clients`/`worker_clients` on the client; the confirm direction
+    additionally needs `verify_claim` to accept `high_stakes=` and at
+    least one high-stakes trial to exercise it), because the bench's job
+    is to say what it measured, not what it was configured to measure.
+    `tests/test_verify_bench_escalation_arm.py` fences these against the
+    verifier by OBSERVING call sequences through it, so a change to either
+    predicate fails a test instead of silently mislabelling a report.
+
+    Why it matters (§4J items 1 and 2). Escalation is TWO-DIRECTIONAL and
+    each direction was dark in the bench for its own reason:
+
+      * REFUTE — with a single-endpoint client `_escalate_refute` is a
+        no-op. Measured on `$GHOST_HOME/system/llm_recordings`
+        (2026-07-30..08-04): of 50 recorded cheap-judge REFUTEs that
+        reached the main model, 42 (84%) were overturned to CONFIRMED;
+        independently the durable log's `GhostAgent` lines read 80
+        overturned / 19 stood = 81%. A raw arm's false-alarm rate is an
+        UPPER BOUND on production's.
+      * CONFIRM — `run_trials` never passed `high_stakes=`, so
+        `_escalate_confirm` could not fire at all even with the two-leg
+        client installed. Re-measured independently over the same day-files
+        (2026-08-04, and it reproduces exactly): 62 CONFIRMED / 68 REFUTED
+        cheap verdicts = 130, of which **0 sit below the 0.7 actionable
+        gate** — the distribution is 1.0 (79), 0.95 (32), 0.9 (19), i.e.
+        the cheap judge never expresses uncertainty, that gate filters
+        nothing, and every cheap CONFIRMED was consumed unconditionally.
+        Capping a withheld confirmation to 0.6 is therefore the ONLY thing
+        that can make the gate bind.
+
+    ``trials`` is optional; pass it and the block also records how many
+    trials could exercise the confirm direction. A run with zero
+    high-stakes trials carries NO evidence about that direction, whatever
+    the arm says, and the report says so out loud.
+    """
+    from ..core.verifier import (_escalate_confirm_enabled,
+                                 _escalate_refute_enabled)
+
+    client = getattr(verifier, "llm_client", None)
+    cheap = None
+    if getattr(client, "critic_clients", None):
+        cheap = "critic"
+    elif getattr(client, "worker_clients", None):
+        cheap = "worker"
+
+    ref_enabled = bool(_escalate_refute_enabled())
+    con_enabled = bool(_escalate_confirm_enabled())
+    stakes_ok = verify_claim_accepts_high_stakes(verifier)
+    n_hs = (sum(1 for t in trials if t.high_stakes)
+            if trials is not None else None)
+
+    refute_live = bool(cheap) and ref_enabled
+    confirm_live = bool(cheap) and con_enabled and stakes_ok
+    arm = arm_for(refute_live, confirm_live)
+
+    def _why(enabled: bool, switch: str, extra: str = "") -> str:
+        why = []
+        if not enabled:
+            why.append(f"{switch} is off")
+        if not cheap:
+            why.append("the client exposes no cheap route "
+                       "(critic_clients/worker_clients falsy), so the "
+                       "escalation returns immediately")
+        if extra:
+            why.append(extra)
+        return "; ".join(why)
+
+    out: Dict[str, Any] = {
+        "arm": arm,
+        "cheap_route": cheap,
+        "judge": _judge_identity(verifier),
+        "directions": {
+            "refute": {
+                "live": refute_live,
+                "enabled": ref_enabled,
+                "effect": "main model re-adjudicates a cheap REFUTED and "
+                          "its verdict wins — moves FPR and TPR",
+                "why_not": "" if refute_live else _why(
+                    ref_enabled, "GHOST_VERIFY_ESCALATE_REFUTE"),
+            },
+            "confirm": {
+                "live": confirm_live,
+                "enabled": con_enabled,
+                "high_stakes_supported": stakes_ok,
+                "high_stakes_trials": n_hs,
+                "effect": "main model re-adjudicates a HIGH-STAKES cheap "
+                          "CONFIRMED; the verdict never flips, confidence "
+                          "is capped to 0.6 — moves the actionable "
+                          "false-CONFIRM rate only",
+                "why_not": "" if confirm_live else _why(
+                    con_enabled, "GHOST_VERIFY_ESCALATE_CONFIRM",
+                    "" if stakes_ok else
+                    "verify_claim does not accept high_stakes=, so "
+                    "_escalate_confirm can never be reached"),
+            },
+        },
+        # Retained for readers written against the one-directional block.
+        "escalate_refute_enabled": ref_enabled,
+    }
+
+    if arm == ARM_ESCALATED:
+        measures = ("the verdict production acts on: cheap judge screens, "
+                    "the main model re-adjudicates every REFUTED and every "
+                    "high-stakes CONFIRMED")
+    elif arm == ARM_ESC_REFUTE:
+        measures = ("only HALF of production's escalation — refutes are "
+                    "re-adjudicated, high-stakes CONFIRMEDs are not, so "
+                    "the actionable false-CONFIRM rate here is an upper "
+                    "bound on production's")
+    elif arm == ARM_ESC_CONFIRM:
+        measures = ("only HALF of production's escalation — high-stakes "
+                    "CONFIRMEDs are re-adjudicated, refutes are not, so "
+                    "the false-alarm rate here is an upper bound on "
+                    "production's")
+    else:
+        measures = ("the CHEAP JUDGE STANDALONE. Production re-adjudicates "
+                    "every REFUTED on the main model and overturned "
+                    f"{ESCALATION_OVERTURN_MEASURED}, so false-alarm rates "
+                    "here are an upper bound on production's")
+    out["measures"] = measures
+
+    if refute_live or confirm_live:
+        out["main"] = {
+            "base_url": str(getattr(client, "main_base_url", "") or ""),
+            "model": str(getattr(client, "main_model", "") or ""),
+        }
+        if not out["main"]["base_url"]:
+            # A client that claims a cheap route but exposes no main
+            # endpoint escalates onto whatever `chat_completion` is — the
+            # provenance must not imply it knows which model that was.
+            out["main"] = {"unresolved": type(client).__name__}
+        elif out["main"]["base_url"] == str(getattr(client, "base_url", "")):
+            # Legitimate ablation ("does a second look help at all?"), but
+            # it is NOT production's shape — production's strong leg is a
+            # different, larger model.
+            out["same_endpoint"] = True
+    if arm != ARM_ESCALATED:
+        # Kept under the old name so existing readers of `why_raw` still
+        # get a reason string; it now covers "half-escalated" too.
+        out["why_raw"] = "; ".join(
+            f"{d}: {out['directions'][d]['why_not']}"
+            for d in ("refute", "confirm")
+            if out["directions"][d]["why_not"])
+    if confirm_live and n_hs == 0:
+        out["confirm_unexercised"] = (
+            "the CONFIRM direction is live but NO trial is high-stakes, so "
+            "this run measured nothing about it")
+    health = getattr(client, "route_health", None)
+    if callable(health):
+        try:
+            out["route_health"] = health()
+        except Exception:  # noqa: BLE001 — provenance must not break a run
+            pass
+    return out
 
 
 async def run_bench(cases: List[BenchCase],
@@ -588,11 +1645,34 @@ async def run_bench(cases: List[BenchCase],
     if unknown:
         raise ValueError(f"unknown arm(s): {unknown}")
     trials = build_trials(cases, fault_names=fault_names, seed=seed)
+    # Resolved ONCE, before any trial runs, and threaded into both the
+    # provenance block and every metric key. `_escalate_refute_enabled()`
+    # is read per verify call, so a mid-run flag flip would split the
+    # results across two pipelines — pinning it here at least makes the
+    # report state which one it claims to be, and the env-var arm loop
+    # below never touches the escalation switch.
+    esc = escalation_arm(verifier, trials)
     report: Dict[str, Any] = {
         "n_cases": len(cases),
         "n_trials": len(trials),
         "seed": seed,
         "actionable_conf": ACTIONABLE_CONF,
+        # PROVENANCE — what this run actually measured.
+        #
+        # Without it, two runs were compared on nothing but a file PATH: the
+        # T0 bundle records n_cases=13/n_trials=97 against a case file that
+        # later held 21 cases, and template identity silently depends on
+        # $GHOST_HOME (unset -> the BASELINE template is used instead of the
+        # deployed artifact). A verifier verdict that "carries the §4F weight"
+        # cannot rest on that. Compare two reports only when `provenance`
+        # matches.
+        # The judge lives on the CLIENT, not on the Verifier — reading it off
+        # `verifier` produced `{"base_url": "", "model": ""}` for a fully
+        # configured run, i.e. a provenance field that always claimed to
+        # answer a question it never answered.
+        "provenance": bench_provenance(
+            cases, fault_names=fault_names,
+            judge=_judge_identity(verifier), escalation=esc),
         "arms": {},
     }
     prev = os.environ.get("GHOST_VERIFY_TWO_STAGE")
@@ -603,7 +1683,7 @@ async def run_bench(cases: List[BenchCase],
                 verifier, trials, concurrency=concurrency,
                 on_result=on_result)
             report["arms"][arm] = {
-                "metrics": score_trials(results),
+                "metrics": score_trials(results, arm=esc["arm"]),
                 "trials": [r.to_dict() for r in results],
             }
     finally:
@@ -611,12 +1691,124 @@ async def run_bench(cases: List[BenchCase],
             os.environ.pop("GHOST_VERIFY_TWO_STAGE", None)
         else:
             os.environ["GHOST_VERIFY_TWO_STAGE"] = prev
+    # Route health is only meaningful AFTER the trials have run — the block
+    # built above was for the arm, whose counters were all zero then.
+    _post = escalation_arm(verifier, trials).get("route_health")
+    if _post is not None:
+        report["provenance"]["escalation"]["route_health"] = _post
+        if not _post.get("clean"):
+            logger.warning(
+                "verify_bench: %d cheap-leg call(s) fell through to the MAIN "
+                "model (%d timeouts) — those trials did not measure the "
+                "judge under test",
+                _post.get("fell_through_to_main"), _post.get("route_timeouts"))
     return report
+
+
+def bench_provenance(cases: List[BenchCase],
+                     fault_names: Optional[List[str]] = None,
+                     judge: Optional[Dict[str, Any]] = None,
+                     escalation: Optional[Dict[str, Any]] = None
+                     ) -> Dict[str, Any]:
+    """Everything that must match before two bench reports are comparable.
+
+    ``escalation`` (from `escalation_arm`) is part of that list: two runs
+    against the same pool, faults and judge are STILL not comparable if
+    one measured the cheap judge standalone and the other measured
+    judge+escalation. Absent, it records `unrecorded` rather than
+    assuming — an unlabelled arm is the defect this field exists to stop.
+    """
+    case_digest = hashlib.sha256()
+    # Sorted by the FULL identity, not by `case_id` alone. A duplicate
+    # case_id (which a stale mined pool produced) made the sort order — and
+    # therefore the digest — depend on input ordering, so the one field whose
+    # entire job is deciding "are these two runs comparable?" disagreed with
+    # itself on identical case sets.
+    for c in sorted(cases, key=lambda x: (x.case_id, x.claim, x.evidence,
+                                          x.context)):
+        case_digest.update(
+            (c.case_id + "\x00" + c.claim + "\x00" + c.evidence + "\x00"
+             + c.context + "\x00").encode("utf-8"))
+    _ids = [c.case_id for c in cases]
+    prov: Dict[str, Any] = {
+        "cases_sha256": case_digest.hexdigest()[:16],
+        "n_cases": len(cases),
+        "duplicate_case_ids": len(_ids) - len(set(_ids)),
+        # The fault library IS part of the experiment: a report built from a
+        # different fault set is not comparable, and the names appeared
+        # nowhere in the report at all.
+        "faults": sorted(fault_names) if fault_names else sorted(FAULTS),
+        "faults_sha256": hashlib.sha256(
+            "|".join(sorted(fault_names) if fault_names else sorted(FAULTS)
+                     ).encode("utf-8")).hexdigest()[:16],
+        # The judge is the system under test; it was recorded outside
+        # `provenance`, so a provenance match could still be a different model.
+        "judge": dict(judge or {}),
+        # WHICH PIPELINE ran: raw cheap judge, or judge+escalation (what
+        # production acts on). Two reports whose `escalation.arm` differs
+        # are measuring two different systems.
+        "escalation": dict(escalation) if escalation else {
+            "arm": "unrecorded",
+            "why_raw": "run_bench was not given an escalation_arm() block",
+        },
+        "ghost_home": os.environ.get("GHOST_HOME") or "<unset>",
+        "templates": {},
+    }
+    try:
+        from ..core import verifier as _v
+        for name, base in (
+            ("verifier.enumerate", _v._VERIFY_ENUMERATE_PROMPT),
+            ("verifier.adjudicate", _v._VERIFY_ADJUDICATE_PROMPT),
+            # The CLASSIC template — the ONLY one the `two_stage_off` arm
+            # uses. Half the report's arms ran on a template whose hash the
+            # provenance block never recorded.
+            ("verifier.claim", _VERIFY_CLAIM_PROMPT),
+        ):
+            live = _v._stage_template(name, base)
+            prov["templates"][name] = {
+                "sha256": hashlib.sha256(live.encode("utf-8")).hexdigest()[:16],
+                "chars": len(live),
+                "tuned": live != base,
+            }
+    except Exception as exc:  # noqa: BLE001 — provenance must not break a run
+        prov["templates"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return prov
+
+
+# Labels are keyed on the DIRECTION STATE returned by `fpr_entry` /
+# `false_confirm_entry` ("escalated" / "raw" / "unrecorded"), not on the
+# arm: two arms share one FPR key by design.
+# No nested `**` in any of these: the caller already wraps the label in
+# bold, and a nested pair renders as literal asterisks in the .md the
+# journal gets pasted from.
+_FPR_LABEL = {
+    "escalated": "FPR (clean refuted — refute escalation LIVE, "
+                 "production-equivalent)",
+    "raw": "FPR-RAW (clean refuted by the CHEAP JUDGE ALONE — "
+           "NOT a production FPR)",
+    "unrecorded": "FPR (arm UNRECORDED — pre-2026-08-04 report, "
+                  "not comparable to a labelled one)",
+}
+_CONFIRM_LABEL = {
+    "escalated": "false-CONFIRM @≥0.7 (corrupted trials passed — confirm "
+                 "escalation LIVE, production-equivalent)",
+    "raw": "false-CONFIRM-RAW @≥0.7 (corrupted trials passed by the CHEAP "
+           "JUDGE ALONE — NOT a production rate)",
+    "unrecorded": "false-CONFIRM (not measured by this report)",
+}
 
 
 def render_report_md(report: Dict[str, Any]) -> str:
     """Human-readable summary: one table per arm plus the headline
-    TPR/FPR line — paste-able into PROJECT_JOURNAL.md."""
+    TPR/FPR line — paste-able into PROJECT_JOURNAL.md.
+
+    The false-alarm headline is LABELLED WITH ITS ARM and, on the raw
+    arm, refuses the name "FPR" outright: a cheap-judge false-alarm rate
+    is an upper bound on production's, and printing the two under one
+    name is how the §4J item-1 gap survived a written report.
+    """
+    esc = (report.get("provenance") or {}).get("escalation") or {}
+    esc_arm = str(esc.get("arm") or "unrecorded")
     lines = [
         "# Verifier fault-injection bench",
         "",
@@ -624,21 +1816,92 @@ def render_report_md(report: Dict[str, Any]) -> str:
         f" · seed: {report['seed']}"
         f" · actionable conf ≥ {report['actionable_conf']}",
         "",
+        f"**verdict pipeline measured: `{esc_arm}`**"
+        + (f" — cheap route `{esc.get('cheap_route')}` "
+           f"{(esc.get('judge') or {}).get('base_url', '?')}"
+           f" → main {(esc.get('main') or {}).get('base_url', '?')}"
+           if esc.get("main") else ""),
+        "",
     ]
+    _dirs = esc.get("directions") or {}
+    if _dirs:
+        lines += [
+            "| escalation direction | live | moves |",
+            "|---|---|---|",
+        ] + [
+            f"| {name} | {'YES' if d.get('live') else 'no'}"
+            + (f" ({d['why_not']})" if not d.get("live")
+               and d.get("why_not") else "")
+            + f" | {d.get('effect', '')} |"
+            for name, d in _dirs.items()
+        ] + [""]
+    if esc_arm != ARM_ESCALATED:
+        lines += [
+            f"> ⚠ this run measures {esc.get('measures') or 'an UNRECORDED arm'}"
+            + (f" ({esc.get('why_raw')})" if esc.get("why_raw") else "")
+            + ". Do not quote the numbers below as production rates, and "
+              "do not compare them with a `judge+escalation` report.",
+            "",
+        ]
+    if esc.get("confirm_unexercised"):
+        lines += [f"> ⚠ {esc['confirm_unexercised']}.", ""]
+    _rh = esc.get("route_health") or {}
+    if _rh and not _rh.get("clean"):
+        lines += [
+            f"> ⚠ **{_rh.get('fell_through_to_main')} of "
+            f"{_rh.get('route_calls')} cheap-leg calls FAILED** "
+            f"({_rh.get('route_timeouts')} timeouts, "
+            f"{_rh.get('route_empty_replies')} empty replies). Each one "
+            f"fell through to the MAIN model, so those trials were judged "
+            f"by the strong model rather than the judge under test — "
+            f"production-faithful, but they are not cheap-judge "
+            f"measurements. Treat the rates below as a blend until the "
+            f"judge node is healthy.",
+            "",
+        ]
+    elif _rh:
+        lines += [f"cheap leg: {_rh.get('route_calls')} calls, 0 failures.",
+                  ""]
+    if esc.get("same_endpoint"):
+        lines += [
+            "> ⚠ the escalation's main leg is the SAME endpoint as the "
+            "judge. That is a second-look ablation, not production's "
+            "shape (production escalates a small judge to a larger model).",
+            "",
+        ]
     for arm, data in report["arms"].items():
         m = data["metrics"]
         o = m["overall"]
+        fpr_state, fpr = fpr_entry(o)
+        con_state, con = false_confirm_entry(o)
+        ev = m.get("escalation_events") or {}
         lines.append(f"## {arm}")
         lines.append("")
         lines.append(
             f"**TPR (catch rate)**: {o['tpr']['rate']} raw / "
             f"{o['tpr']['rate_actionable']} actionable "
             f"({o['tpr']['judged']}/{o['tpr']['n']} judged) — "
-            f"**FPR (clean refuted)**: {o['fpr']['rate']} raw / "
-            f"{o['fpr']['rate_actionable']} actionable — "
+            f"**{_FPR_LABEL.get(fpr_state, fpr_state)}**: "
+            f"{(fpr or {}).get('rate')} raw / "
+            f"{(fpr or {}).get('rate_actionable')} actionable — "
             f"**degraded-evidence FP**: "
             f"{o['degraded_evidence_fp']['rate']}")
         lines.append("")
+        if con is not None:
+            lines.append(
+                f"**{_CONFIRM_LABEL.get(con_state, con_state)}**: "
+                f"{con.get('rate_actionable')} "
+                f"({con.get('rate')} at any confidence, "
+                f"{con.get('judged')}/{con.get('n')} judged)")
+            lines.append("")
+        if ev:
+            lines.append(
+                f"escalation events — high-stakes trials: "
+                f"{ev.get('high_stakes_trials')} · refutes overturned: "
+                f"{ev.get('refute_overturned')} · confirms withheld: "
+                f"{ev.get('confirm_withheld')} of "
+                f"{ev.get('confirm_eligible')} eligible")
+            lines.append("")
         lines.append("| fault | expected | n | judged | skipped | "
                      "confirmed | refuted | uncertain | rate | "
                      "actionable | mean conf |")

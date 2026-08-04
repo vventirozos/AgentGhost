@@ -708,7 +708,17 @@ class SkillMemory:
     def _find_duplicate_lesson(self, task: str, mistake: str, solution: str,
                                memory_system=None,
                                vector_threshold: float = 0.15) -> dict:
-        """Check if a semantically similar lesson already exists.
+        """Check if a semantically similar NON-QUARANTINED lesson exists.
+
+        ⚠ Quarantined entries are skipped, and that exclusion is load-bearing.
+        `quarantine_lesson` leaves the row in the playbook so an operator can
+        review it, so without this a later CORRECT re-learn of the same
+        situation matched the quarantined row, returned "reinforced", and
+        bumped ITS frequency — the new lesson was written nowhere and
+        retrievable nowhere, while `_filter_quarantined` kept the old one out
+        of every prompt. The topic became permanently un-learnable, and each
+        bump raised the quarantined row's utility, protecting it from
+        `prune_low_utility`. Nothing in the system could clear it.
 
         Returns the matching lesson dict (with 'index' key) if found, else None.
         Uses vector search first (fast, semantic), then falls back to JSON
@@ -743,6 +753,12 @@ class SkillMemory:
                                 _dup_trig = str((_metas[0][i] or {}).get("trigger") or "")
                             except (IndexError, AttributeError, TypeError):
                                 _dup_trig = ""
+                            # A QUARANTINED twin must not absorb the re-learn
+                            # (see the method docstring): the vector store has
+                            # no quarantine flag, so check the playbook row
+                            # this twin points at.
+                            if _dup_trig and self._is_quarantined(_dup_trig):
+                                continue
                             return {
                                 "id": results['ids'][0][i],
                                 "text": results['documents'][0][i],
@@ -760,6 +776,8 @@ class SkillMemory:
         # collide so the frequency counter accumulates and graduation can fire.
         task_key = _normalize_trigger(task or "")
         for idx, p in enumerate(playbook):
+            if p.get("quarantined"):
+                continue  # a quarantined row must never absorb a re-learn
             existing_key = _normalize_trigger(p.get("task") or p.get("trigger") or "")
             if existing_key and existing_key == task_key:
                 return {"index": idx, "lesson": p, "source": "json"}
@@ -1203,6 +1221,7 @@ class SkillMemory:
             with self._get_lock():
                 playbook = self._load_playbook()
                 kept = []
+                dropped = []
                 removed_triggers = []
                 for entry in playbook:
                     src = (
@@ -1211,12 +1230,24 @@ class SkillMemory:
                     )
                     if isinstance(src, str) and src == trajectory_id:
                         removed += 1
+                        dropped.append(entry)
                         if isinstance(entry, dict):
                             removed_triggers.append(
                                 entry.get("trigger") or entry.get("task") or "")
                         continue
                     kept.append(entry)
                 if removed:
+                    # ARCHIVE BEFORE DELETE, failing closed — same invariant
+                    # as the prune. A retraction is a judgement about
+                    # PROVENANCE (the trajectory turned out bad), not about
+                    # the lesson's content, so the content is exactly what an
+                    # operator may want back.
+                    if not self._archive_lessons(dropped, "retract:" + trajectory_id):
+                        logger.error(
+                            "skills: retraction of %d lesson(s) from %s "
+                            "ABORTED — archive unwritable, nothing deleted",
+                            removed, trajectory_id)
+                        return 0
                     self._save_playbook_unlocked(kept)
         except Exception as e:
             logger.warning(
@@ -1426,6 +1457,41 @@ class SkillMemory:
                 self._save_playbook_unlocked(playbook)
         return credited
 
+    def _archive_lessons(self, lessons, reason: str) -> bool:
+        """Append `lessons` to the pruned-lesson archive. False on failure.
+
+        The archive-before-delete invariant belongs to EVERY destructive
+        path, not just `prune_low_utility` — `retract_lessons_from_trajectory`
+        has four live call sites in agent.py and dropped rows with no record
+        at all. Callers must treat False as "do not delete".
+        """
+        if not lessons:
+            return True
+        try:
+            import json as _json
+            arch = self.file_path.parent / "skills_pruned_archive.jsonl"
+            try:
+                if arch.is_file() and arch.stat().st_size > 8_000_000:
+                    arch.replace(arch.with_suffix(".jsonl.1"))
+            except OSError:
+                pass
+            with arch.open("a", encoding="utf-8") as fh:
+                for lesson in lessons:
+                    fh.write(_json.dumps(
+                        {"pruned_at": datetime.now().isoformat(),
+                         "reason": reason,
+                         "utility": compute_lesson_utility(lesson)
+                         if isinstance(lesson, dict) else None,
+                         "lesson": lesson},
+                        ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error("skills: could not archive %d lesson(s) for %s (%s)",
+                         len(lessons), reason, e)
+            return False
+
     def prune_low_utility(self, min_retrievals: int = 5, max_drop_fraction: float = 0.25,
                           memory_system=None) -> int:
         """Drop lessons whose utility score is in the bottom quartile
@@ -1438,6 +1504,22 @@ class SkillMemory:
         When `memory_system` is given, each pruned lesson's embedded vector
         twin is also deleted so the stores don't drift (orphan vectors).
         """
+        # OFF BY DEFAULT, and that is a calibration verdict, not caution.
+        # This path never executed in production until the 2026-08-04
+        # component-guard fix armed it; its first three unattended runs
+        # destroyed 13 lessons, one of them scoring retrievals=277 succ=77
+        # fail=32 — a 70%-success lesson pruned as "low utility". Two
+        # separate reasons it must stay off until recalibrated:
+        #   * the cutoff is a RELATIVE bottom-quartile, so it always finds
+        #     victims no matter how good the playbook is;
+        #   * failure-distillation mints lessons at utility ~0.77 against a
+        #     measured live cutoff of 1.1183, so every distilled lesson is
+        #     structurally guaranteed to be deleted once it reaches
+        #     `min_retrievals` — the two subsystems fight each other.
+        # Re-enable with GHOST_SKILL_PRUNE=1 only after both are fixed.
+        if os.getenv("GHOST_SKILL_PRUNE", "0").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            return 0
         removed = 0
         _pruned_lessons = []
         with self._get_lock():
@@ -1461,6 +1543,13 @@ class SkillMemory:
                     score <= cutoff
                     and int(lesson.get("retrievals") or 0) >= min_retrievals
                     and not lesson.get("verified")
+                    # A quarantined row is *deliberately* held on disk for the
+                    # operator to review or reinstate, and it is excluded from
+                    # prompt injection — so its retrievals stop accruing and
+                    # its utility decays toward the bottom quartile by
+                    # construction. Pruning it would silently discard the
+                    # very thing quarantine exists to preserve.
+                    and not lesson.get("quarantined")
                     and len(pruned) < cap
                 ):
                     pruned.append(lesson)
@@ -1472,6 +1561,24 @@ class SkillMemory:
             survivors.sort(
                 key=lambda l: l.get("timestamp", ""), reverse=True
             )
+            # ARCHIVE BEFORE DELETE. This is a DESTRUCTIVE, unattended
+            # operation — it runs from the REM cycle and takes the vector
+            # twins with it — and it kept no record of what it dropped: the
+            # log line said "Dropped 8 low-utility lesson(s)" and nothing
+            # else, so the content was unrecoverable. (Learned the hard way:
+            # this path had never actually executed in production until the
+            # 2026-08-04 component-guard fix armed it, and its first real run
+            # dropped 8 lessons with no way to review them.)
+            # FAILS CLOSED. `except: warn and delete anyway` would
+            # reintroduce the exact unrecoverable loss this archive was
+            # written to prevent — a fix whose only purpose is
+            # recoverability must not proceed when recoverability is what
+            # failed. Keeping every lesson is always the safe side of this
+            # branch: the prune is an optimisation, the data is not
+            # replaceable.
+            if not self._archive_lessons(pruned, "prune:low_utility"):
+                logger.error("skills: ABORTING the prune, nothing deleted")
+                return 0
             self._save_playbook_unlocked(survivors)
             removed = len(pruned)
             _pruned_lessons = list(pruned)
@@ -1534,6 +1641,29 @@ class SkillMemory:
         )
         return self._filter_quarantined(items)
 
+    def _is_quarantined(self, trigger: str) -> bool:
+        """True when ``trigger`` names a quarantined playbook row.
+
+        Compared on the FIRST 200 CHARS of both sides: the vector dedup path
+        calls this with an already-truncated `trigger[:200]`, so an exact
+        match silently returned False for every trigger longer than that —
+        defeating exactly the quarantine-awareness this guard exists for.
+        (Latent today: live triggers top out around 140 chars.)
+        """
+        try:
+            key = (trigger or "").strip().lower()[:200]
+            if not key:
+                return False
+            with self._get_lock():
+                playbook = self._load_playbook()
+            return any(
+                p.get("quarantined")
+                and (p.get("trigger") or p.get("task")
+                     or "").strip().lower()[:200] == key
+                for p in playbook)
+        except Exception:  # noqa: BLE001 — never break a write
+            return False
+
     def _filter_quarantined(self, items):
         """Drop lessons a counterfactual regression QUARANTINED (2026-07-17).
         Quarantine, not deletion: the lesson body and its history stay in
@@ -1546,13 +1676,56 @@ class SkillMemory:
                 return items
             with self._get_lock():
                 playbook = self._load_playbook()
-            bad = {(p.get("trigger") or p.get("task") or "").strip().lower()
-                   for p in playbook if p.get("quarantined")}
-            bad.discard("")
+            # Keyed on (trigger, solution) — NOT trigger alone. Quarantine is
+            # a verdict on ONE LESSON, not on a topic: once dedup was made
+            # quarantine-aware, a corrected re-learn correctly produced a new
+            # row under the same trigger, and a trigger-only filter then
+            # suppressed the corrected row too — leaving the topic just as
+            # un-learnable as before, one layer down.
+            # BOTH content fields, separately. This preferred `solution` while
+            # `render_lesson_for_prompt` prefers `correct_pattern` — so a row
+            # whose two fields DIFFER was matched against the wrong one and
+            # reached the prompt anyway. They happen to be equal on every
+            # live row and nothing enforces that.
+            bad = set()
+            for p in playbook:
+                if not p.get("quarantined"):
+                    continue
+                trig = (p.get("trigger") or p.get("task") or "").strip().lower()
+                if not trig:
+                    continue
+                # `anti_pattern`/`mistake` are included so a quarantined row
+                # carrying only an anti-pattern is still blocked on its OWN
+                # content rather than falling through to trigger-only.
+                for fld in ("solution", "correct_pattern",
+                            "anti_pattern", "mistake"):
+                    val = (p.get(fld) or "").strip().lower()
+                    # EMPTY values must not enter the set. `_blocked` treats
+                    # an empty `b_sol` as "cannot distinguish -> fail closed",
+                    # so adding `(trigger, "")` for a row missing one of the
+                    # two fields silently restored TRIGGER-ONLY blocking —
+                    # re-creating the permanently-un-learnable topic this
+                    # whole mechanism exists to prevent. (`_load_playbook`
+                    # does not normalise and `_normalize_lesson` uses
+                    # setdefault, so a present-but-empty field stays empty.)
+                    if val:
+                        bad.add((trig, val))
             if not bad:
                 return items
-            return [it for it in items
-                    if (it.get("trigger") or "").strip().lower() not in bad]
+            def _blocked(it) -> bool:
+                trig = (it.get("trigger") or "").strip().lower()
+                sol = (it.get("solution") or it.get("correct_pattern")
+                       or it.get("text") or "").strip().lower()
+                for b_trig, b_sol in bad:
+                    if trig != b_trig:
+                        continue
+                    # Same trigger: block only when the CONTENT matches the
+                    # quarantined row (or the item carries no content to
+                    # distinguish it, in which case fail closed).
+                    if not sol or not b_sol or b_sol in sol or sol in b_sol:
+                        return True
+                return False
+            return [it for it in items if not _blocked(it)]
         except Exception:
             return items
 

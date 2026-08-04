@@ -312,6 +312,56 @@ class TestDedupPreservesSaturationSignal:
         assert outcomes[-1].get("duplicate") is True
 
 
+class TestDuplicatesDoNotInflateMastery:
+    """The dedup branch says its own contract out loud — "don't let a
+    repeated prompt inflate mastery counters" — but it protects only
+    `runs` / `total_first_try_wins` / `best_length`. Mastery itself is
+    decided from `recent_outcomes`, which duplicates MUST join (saturation
+    and the decay guard read the same ring), so a re-rolled identical
+    challenge counted toward the 5-run mastery streak through the back
+    door.
+
+    Measured on the live frontier file (2026-08-04): `data_analysis` is
+    stored mastered on a window containing 2 duplicates, and `regex_parse`
+    has 10 of 10 recent outcomes flagged duplicate — one real run away from
+    mastering on a streak of pure re-rolls.
+    """
+
+    CHALLENGE = "Deterministic template challenge text (always identical)."
+
+    def test_duplicate_streak_cannot_master_a_cluster(self, tmp_path):
+        ft = FrontierTracker(tmp_path)
+        # One real run, then four re-rolls of the SAME challenge, then one
+        # more real run to trigger the mastery recomputation.
+        ft.record_run("sql", self.CHALLENGE, 1, True, 4)
+        for _ in range(4):
+            ft.record_run("sql", self.CHALLENGE, 1, True, 4)
+        r = ft.record_run("sql", "a genuinely different sql challenge",
+                          1, True, 4)
+        assert r["mastered"] is False, (
+            "5 outcomes of which 4 are re-rolls of one challenge is not a "
+            "mastery streak")
+
+    def test_five_distinct_first_try_wins_still_master(self, tmp_path):
+        """The fix must not re-create the "pinned unmastered forever"
+        pathology the floor waiver was written for."""
+        ft = FrontierTracker(tmp_path)
+        for i in range(5):
+            r = ft.record_run("sql", f"distinct challenge {i}", 1, True, 4)
+        assert r["mastered"] is True
+
+    def test_duplicates_still_feed_saturation(self, tmp_path):
+        """Excluding duplicates from MASTERY must not exclude them from
+        saturation — that is what keeps a duplicate-only cluster out of the
+        pick pool even though it can no longer master."""
+        ft = FrontierTracker(tmp_path)
+        ft.record_run("sql", self.CHALLENGE, 1, True, 4)
+        ft.record_run("sql", self.CHALLENGE, 1, True, 4)
+        stats = ft.get_cluster_stats("sql")
+        assert stats["mastered"] is False
+        assert ft._cluster_is_saturated(stats) is True
+
+
 class TestPartialClusterSchemaBackfill:
     """Regression tests for the live 2026-07-08 failure: a cluster entry
     created with a PARTIAL shape (note_reflection_failure writes into a

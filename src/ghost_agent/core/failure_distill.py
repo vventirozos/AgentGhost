@@ -33,6 +33,8 @@ import asyncio
 import hashlib
 import json
 import logging
+
+from ..utils.component_guard import _is_real_component
 import os
 import re
 import time
@@ -64,13 +66,30 @@ _ADJUDICATION_CAP = 8      # LLM re-classifications per cycle
 _DISTILL_TIMEOUT_S = 60.0  # route() ceiling for the synthesis call
 _TRIGGER_PREFIX = "distilled"
 
+# Reserved state key holding the LAST CYCLE'S accounting. Real keys are
+# always "<dimension>/<cluster>", so a leading-underscore key can never
+# collide with one (and the lookups are all exact `.get(f"{dim}/{cluster}")`).
+#
+# Why it exists: §4J recorded this gate as "structurally unreachable" and the
+# only evidence either way was the ABSENCE of this file — a pass that runs and
+# writes nothing was indistinguishable from a pass that never ran, which is
+# this project's signature defect class. Measured 2026-08-04 the claim was
+# FALSE (19 live corpus records → 6 groups → 2 at/over _MIN_CLUSTER=3, and the
+# state file shows three clusters fired that day), but nothing in the code
+# said so. Now every cycle leaves its arithmetic behind: which constraint
+# bound, how big the biggest group was, and how many clusters were skipped as
+# unchanged. Note the trade-off, deliberately taken: the file's mere existence
+# is no longer proof that a lesson was ever written — the per-cluster keys are
+# (each is stamped only on a real write or an explicit no-pattern verdict).
+_STATE_META_KEY = "_last_run"
+
 
 def _is_real(obj) -> bool:
     """MagicMock guard (dream.py idiom): only trust objects from this
     package — a mocked context auto-creates attribute children that would
     otherwise duck-type their way into file writes."""
     try:
-        return type(obj).__module__.startswith("ghost_agent")
+        return _is_real_component(obj)
     except Exception:
         return False
 
@@ -130,6 +149,48 @@ def _save_state(context, state: Dict[str, Any]) -> None:
         os.replace(tmp, path)
     except Exception as e:
         logger.debug("failure_distill state write failed: %s", e)
+
+
+def _report_cycle(context, state: Dict[str, Any], report: Dict[str, Any],
+                  ) -> None:
+    """Emit ONE honest line about what this cycle did, and stamp the
+    accounting into the state file.
+
+    Always saves: the stamp itself makes every cycle a write, which is the
+    point — an unwritten cycle is an invisible one.
+
+    A barren cycle is only interesting when it is barren for a STRUCTURAL
+    reason (no corpus, or no group big enough) — "every eligible cluster is
+    unchanged since last pass" is the healthy steady state and would be pure
+    noise every REM cycle, so it stays at debug. Nothing here is a warning:
+    producing no lesson is not an error, it is a fact that must be visible.
+    """
+    written = int(report.get("written") or 0)
+    report["ts"] = datetime.now().isoformat()
+    state[_STATE_META_KEY] = dict(report)
+    _save_state(context, state)   # never raises; logs its own failures
+
+    if written:
+        return  # the per-lesson pretty_log already said it
+    reason = str(report.get("reason") or "")
+    detail = (
+        f"corpus {report.get('corpus', 0)} record(s) "
+        f"({report.get('unknown_dim', 0)} unattributed), "
+        f"{report.get('groups', 0)} group(s), biggest "
+        f"{report.get('largest', 0)}/{report.get('min_cluster', _MIN_CLUSTER)}, "
+        f"{report.get('eligible', 0)} eligible, "
+        f"{report.get('skipped_unchanged', 0)} unchanged"
+    )
+    if reason in ("empty_corpus", "no_cluster_reached_threshold"):
+        # The two ways this subsystem can be alive but unable to fire.
+        pretty_log(
+            "Dream Distill",
+            f"no pattern lesson this cycle — {reason.replace('_', ' ')}: "
+            f"{detail}",
+            icon=Icons.BRAIN_SUM,
+        )
+    else:
+        logger.debug("failure_distill: 0 lessons (%s) — %s", reason, detail)
 
 
 # --- corpus ------------------------------------------------------------
@@ -329,7 +390,15 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
             return 0
 
         corpus = gather_failure_corpus(context)
+        report: Dict[str, Any] = {
+            "corpus": len(corpus), "unknown_dim": 0, "groups": 0,
+            "largest": 0, "eligible": 0, "skipped_unchanged": 0,
+            "attempted": 0, "written": 0, "reason": "",
+            "min_cluster": max(1, int(min_cluster)),
+        }
         if not corpus:
+            report["reason"] = "empty_corpus"
+            _report_cycle(context, _load_state(context), report)
             return 0
 
         try:
@@ -345,6 +414,7 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
         for rec in corpus:
             dim = (rec.get("dimension") or "").strip()
             if dim in ("", DIM_UNKNOWN):
+                report["unknown_dim"] += 1
                 continue
             groups.setdefault((dim, rec.get("cluster") or "python_general"),
                               []).append(rec)
@@ -354,11 +424,16 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
              if len(recs) >= max(1, int(min_cluster))),
             key=lambda kv: (-len(kv[1]), kv[0]))
         cap = distill_max() if max_lessons is None else max(0, int(max_lessons))
+        report["groups"] = len(groups)
+        report["largest"] = max((len(r) for r in groups.values()), default=0)
+        report["eligible"] = len(eligible)
         if not eligible or cap <= 0:
+            report["reason"] = ("cap_zero" if cap <= 0
+                                else "no_cluster_reached_threshold")
+            _report_cycle(context, _load_state(context), report)
             return 0
 
         state = _load_state(context)
-        state_dirty = False
         written = 0
         attempts = 0
         for (dim, cluster), recs in eligible:
@@ -375,8 +450,11 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
             state_key = f"{dim}/{cluster}"
             prior = state.get(state_key) or {}
             if prior.get("fingerprint") == fingerprint:
-                continue  # same evidence → same lesson; nothing new to say
+                # same evidence → same lesson; nothing new to say
+                report["skipped_unchanged"] += 1
+                continue
             attempts += 1
+            report["attempted"] = attempts
 
             cases = "\n".join(
                 f"{i}. {r['text'][:400]}"
@@ -425,7 +503,6 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                                     "ts": datetime.now().isoformat(),
                                     "cases": len(recs),
                                     "no_pattern": True}
-                state_dirty = True
                 continue
             pattern = str(data.get("pattern") or "").strip()
             anti = str(data.get("anti_pattern") or "").strip() or pattern
@@ -462,7 +539,6 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
             state[state_key] = {"fingerprint": fingerprint,
                                 "ts": datetime.now().isoformat(),
                                 "cases": len(recs)}
-            state_dirty = True
             written += 1
             pretty_log(
                 "Dream Distill",
@@ -471,8 +547,14 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                 icon=Icons.BRAIN_SUM,
             )
 
-        if state_dirty:
-            _save_state(context, state)
+        report["written"] = written
+        if not report["reason"]:
+            report["reason"] = (
+                "wrote_lessons" if written
+                else ("all_clusters_unchanged"
+                      if report["skipped_unchanged"] >= report["eligible"]
+                      else "synthesis_produced_nothing"))
+        _report_cycle(context, state, report)
         return written
     except Exception as e:
         logger.debug("failure_distill pass skipped: %s", e)

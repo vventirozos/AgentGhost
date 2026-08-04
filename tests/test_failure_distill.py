@@ -338,3 +338,85 @@ class TestAdjudication:
         assert await distill_failure_clusters(ctx) == 0
         assert stub.calls == []
         assert sm.list_lessons(scope="all", limit=10)[0]["dimension"] == ""
+
+
+# ------------------------------------------------- barren-cycle accounting
+
+class TestCycleReport:
+    """§4J item 4 recorded this gate as "structurally unreachable"; measured
+    over the live stores 2026-08-04 it was NOT (19 corpus records → 6 groups
+    → 2 at/over the 3-case threshold, and the live state file shows three
+    clusters fired that day). The reason the claim survived is that a pass
+    which produces nothing was indistinguishable from a pass that never ran.
+    These pin the accounting that makes the difference visible."""
+
+    def _meta(self, tmp_path):
+        path = tmp_path / "system" / "failure_distill_state.json"
+        assert path.exists(), "every cycle must leave its accounting behind"
+        return json.loads(path.read_text())["_last_run"]
+
+    async def test_empty_corpus_says_so(self, tmp_path):
+        ctx, _, _, _ = _ctx(tmp_path, [])
+        assert await distill_failure_clusters(ctx) == 0
+        meta = self._meta(tmp_path)
+        assert meta["reason"] == "empty_corpus"
+        assert meta["corpus"] == 0 and meta["written"] == 0
+        assert meta["ts"]
+
+    async def test_below_threshold_reports_the_binding_arithmetic(
+            self, tmp_path):
+        ctx, sm, _, _ = _ctx(tmp_path, [])
+        _seed(sm, _SQL_FAILURES[:2], dimension="output_processing")
+        assert await distill_failure_clusters(ctx) == 0
+        meta = self._meta(tmp_path)
+        assert meta["reason"] == "no_cluster_reached_threshold"
+        assert meta["corpus"] == 2
+        assert meta["groups"] == 1
+        assert meta["largest"] == 2      # the number that must reach 3
+        assert meta["eligible"] == 0
+
+    async def test_unattributed_records_are_counted_not_hidden(self, tmp_path):
+        """69% unknown was the journal's headline reason the gate could not
+        fire — so the count has to be in the report, not inferable."""
+        ctx, sm, _, _ = _ctx(tmp_path, [])
+        monkey = "frobnicator assembly calibration"
+        sm.learn_lesson(monkey, "the frobnicator produced wrong colours",
+                        "Calibrate it.", dimension="unknown")
+        assert await distill_failure_clusters(ctx) == 0
+        meta = self._meta(tmp_path)
+        assert meta["unknown_dim"] == 1
+        assert meta["groups"] == 0
+
+    async def test_successful_cycle_records_what_it_wrote(self, tmp_path):
+        ctx, sm, _, _ = _ctx(tmp_path, [_PATTERN_REPLY])
+        _seed(sm, _SQL_FAILURES)
+        assert await distill_failure_clusters(ctx) == 1
+        meta = self._meta(tmp_path)
+        assert meta["reason"] == "wrote_lessons"
+        assert meta["written"] == 1
+        assert meta["eligible"] == 1 and meta["largest"] == 3
+
+    async def test_unchanged_evidence_is_the_quiet_steady_state(
+            self, tmp_path):
+        ctx, sm, _, _ = _ctx(tmp_path, [_PATTERN_REPLY])
+        _seed(sm, _SQL_FAILURES)
+        assert await distill_failure_clusters(ctx) == 1
+        assert await distill_failure_clusters(ctx) == 0
+        meta = self._meta(tmp_path)
+        assert meta["reason"] == "all_clusters_unchanged"
+        assert meta["skipped_unchanged"] == 1
+
+    async def test_meta_key_cannot_collide_with_a_cluster_key(self, tmp_path):
+        """Cluster keys are always "<dim>/<cluster>" — the reserved key must
+        never be read back as a fingerprint record."""
+        from ghost_agent.core.failure_distill import _STATE_META_KEY
+        assert "/" not in _STATE_META_KEY
+        ctx, sm, _, _ = _ctx(tmp_path, [_PATTERN_REPLY, _PATTERN_REPLY])
+        _seed(sm, _SQL_FAILURES)
+        assert await distill_failure_clusters(ctx) == 1
+        state = json.loads((tmp_path / "system" /
+                            "failure_distill_state.json").read_text())
+        assert "output_processing/sql" in state
+        assert _STATE_META_KEY in state
+        # the watermark still works with the meta key present
+        assert await distill_failure_clusters(ctx) == 0

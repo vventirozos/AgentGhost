@@ -242,14 +242,21 @@ def _agent_with_stub_verifier(captured):
     class StubVerifier:
         llm_client = object()  # non-None: gate must not skip
 
-        async def verify_claim(self, claim, evidence, context=""):
+        async def verify_claim(self, claim, evidence, context="",
+                               *, high_stakes=False, trace=None):
             captured["claim"] = claim
             captured["evidence"] = evidence
+            captured["high_stakes"] = high_stakes
+            captured["trace"] = trace
             return None
 
-        async def verify_code_output(self, code, output, intent, *, response=""):
+        async def verify_code_output(self, code, output, intent, *,
+                                     response="", high_stakes=False,
+                                     trace=None):
             captured["code"] = code
             captured["output"] = output
+            captured["high_stakes"] = high_stakes
+            captured["trace"] = trace
             return None
 
     agent = GhostAgent.__new__(GhostAgent)

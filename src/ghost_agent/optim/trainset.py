@@ -15,7 +15,7 @@ most faithful to the instruction).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Sequence
 
 from ..distill.schema import Trajectory, Outcome
 
@@ -37,23 +37,46 @@ class TrainExample:
     weight: float = 1.0  # for class imbalance / source weighting
 
 
+# Only REAL user turns are gold. A `reflection` trajectory's `final_response`
+# is a DIAGNOSIS-and-revised-plan block, and its outcome is upgraded to PASSED
+# by the plan judge — so without this filter the optimizer was being taught
+# that the correct answer to "deep research X" is a critique of a previous
+# attempt. Re-measured on the live corpus 2026-08-04: 96 of 506 PASSED
+# trajectories (19.0%) are reflection records. `core/experiments.py` and
+# `optim/tool_ontology.py` both already filter on task_kind; this module and
+# learning_health did not.
+#
+# This tuple is the DEFAULT of `filter_by_outcome` (506 -> 410 today) and is
+# what analysis callers get. `build_trainset` deliberately passes
+# `task_kinds=None` and filters per FIELD instead — see its docstring. So the
+# shipped behaviour is NOT the "505 -> 409 whole-record filter" the §4J
+# write-up describes; that was the first, reverted fix.
+_GOLD_TASK_KINDS: Tuple[str, ...] = ("user_request",)
+
+
 def filter_by_outcome(
     trajectories: Iterable[Trajectory],
     *,
     require_passed: bool = True,
     min_steps: int = 0,
     max_steps: Optional[int] = None,
+    task_kinds: Optional[Sequence[str]] = _GOLD_TASK_KINDS,
 ) -> List[Trajectory]:
-    """Drop trajectories that fail the outcome / shape filters.
+    """Drop trajectories that fail the outcome / shape / kind filters.
 
-    Defaults: keep only PASSED. `min_steps` can exclude trivial turns
-    (plain "hi" echoed back — no signal for planning); `max_steps`
-    excludes abnormally long sessions that may reflect a stuck run.
+    Defaults: keep only PASSED **user turns**. `min_steps` can exclude
+    trivial turns (plain "hi" echoed back — no signal for planning);
+    `max_steps` excludes abnormally long sessions that may reflect a stuck
+    run. Pass ``task_kinds=None`` to keep every kind (analysis only — never
+    for building gold).
     """
     kept: List[Trajectory] = []
     for t in trajectories:
         if require_passed and t.outcome != Outcome.PASSED.value:
             continue
+        if task_kinds is not None:
+            if str(getattr(t, "task_kind", "") or "") not in task_kinds:
+                continue
         n = int(t.n_steps or 0)
         if n < min_steps:
             continue
@@ -104,17 +127,36 @@ def build_trainset(
     as primary output. Signature-specific shaping is the GEPA optimizer's
     job, not ours.
     """
+    # PER-FIELD kind filtering, not per-record. The thing that poisons a
+    # trainset is a reflection's `final_response` — a DIAGNOSIS block taught
+    # as the answer to the original request. Its `planning_output` is a
+    # revised PLAN, which is exactly what a planning signature wants.
+    #
+    # Filtering whole records instead cost 100% of the plan targets:
+    # `planning_output` is populated ONLY on reflection trajectories (157 of
+    # 157 on the live corpus), so `planning.decompose` went from 96 keyed
+    # examples to 0 and silently fell back to grading whole final replies as
+    # "the plan" — a worse failure than the one being fixed, and one that
+    # printed no message at all because run_gepa's `elif keyed:` branch is
+    # also skipped at zero.
     kept = filter_by_outcome(
         trajectories,
         require_passed=require_passed,
         min_steps=min_steps,
         max_steps=max_steps,
+        task_kinds=None,
     )
     deduped = _dedupe_self_consistency(kept)
 
     examples: List[TrainExample] = []
     for t in deduped:
         if not t.user_request or not t.final_response:
+            continue
+        _is_gold = str(getattr(t, "task_kind", "") or "") in _GOLD_TASK_KINDS
+        _plan = t.planning_output or ""
+        # A record that contributes NEITHER a trustworthy final_response nor
+        # a plan carries no target at all.
+        if not _is_gold and not _plan:
             continue
         examples.append(TrainExample(
             signature_name=signature_name,
@@ -126,8 +168,8 @@ def build_trainset(
                 "tier": t.tier or "",
             },
             expected_output={
-                "final_response": t.final_response,
-                "plan": t.planning_output or "",
+                "final_response": t.final_response if _is_gold else "",
+                "plan": _plan,
             },
             source_trajectory_id=t.id,
             weight=1.0,

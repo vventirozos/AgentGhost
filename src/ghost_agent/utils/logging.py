@@ -250,6 +250,7 @@ class Icons:
     TOOL_SHELL   = "🐚"
     TOOL_FILE_W  = "💾"
     TOOL_FILE_R  = "📖"
+    TOOL_FILE_M  = "📙"   # MULTI-path batch read (distinct from the single 📖)
     TOOL_FILE_S  = "🔍"
     TOOL_FILE_I  = "👀"
     TOOL_DOWN    = "📥"   # download / incoming (wide-base; was ⬇️)
@@ -361,8 +362,13 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
     level = logging.DEBUG if debug else logging.INFO
     # File log keeps a plain, grep-friendly format — now WITH the logger name
     # so subsystem lines (GhostSelfhood vs GhostAgent) are distinguishable.
+    # DATE INCLUDED. The durable log is the instrument several §4F watch
+    # readings are taken from, and a time-only stamp made every window label
+    # a guess — the journal records one reading whose window was wrong for
+    # exactly this reason, across a log that had also rotated mid-window.
     formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
 
     # A bare filename has no dirname and os.makedirs("") raises even with

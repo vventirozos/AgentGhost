@@ -991,7 +991,26 @@ class FrontierTracker:
                 # the first-try streak alone decides. Without this, floor
                 # clusters could never master and the brittle pool kept
                 # re-serving material the agent aces (see constant above).
-                recent = cluster["recent_outcomes"][-self.MASTERED_STREAK:]
+                #
+                # Duplicates are EXCLUDED from the streak (2026-08-04). The
+                # dedup branch above states its own contract — "don't let a
+                # repeated prompt inflate mastery counters (runs,
+                # total_first_try_wins, best_length)" — but the streak is
+                # read off `recent_outcomes`, which duplicates DO join (they
+                # have to: saturation and the decay guard read the same
+                # ring). So a re-rolled identical challenge counted toward
+                # mastery through the back door. Measured on the live
+                # frontier file: `data_analysis` is stored mastered on a
+                # 5-run window containing 2 duplicates, and `regex_parse`
+                # has 10 of 10 recent outcomes marked duplicate — one real
+                # run away from mastering on a streak of re-rolls. Excluding
+                # them cannot re-create the "cluster pinned unmastered and
+                # re-picked forever" pathology the floor waiver fixed:
+                # duplicates carry delta=0.0 and passed=True, so they keep
+                # `_cluster_is_saturated` True, and pick_seed skips saturated
+                # clusters regardless of mastery.
+                recent = [r for r in cluster["recent_outcomes"]
+                          if not r.get("duplicate")][-self.MASTERED_STREAK:]
                 if len(recent) >= self.MASTERED_STREAK:
                     all_first_try = all(
                         r["passed"] and r["attempts_used"] == 1 for r in recent

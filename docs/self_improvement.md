@@ -143,11 +143,17 @@ trajectories. Covered by `tests/test_trajectory_failure_heuristic.py`.
 
 Every turn produces a single quality verdict via
 `distill.outcome_heuristics.resolve_turn_outcome(current, verifier,
-execution_failed)`, applied in `_record_turn_trajectory` before the trajectory
-is appended. Priority (strongest first): a **structural** execution failure
-(non-zero exit / tool error) is ground truth → FAILED; a **verifier**-REFUTED
-verdict (conf ≥ 0.7) → FAILED; an existing FAILED (shape heuristics) is never
-upgraded away; a verifier-SUPPORTED verdict → PASSED; otherwise UNKNOWN.
+execution_failed, current_reason, unacknowledged_total_failure)`, applied in
+`_record_turn_trajectory` before the trajectory is appended — and *called*
+(not re-stated) by the late-verdict backfill, so both delivery paths share one
+ladder. Priority (strongest first): a **verifier**-REFUTED verdict (conf ≥ 0.7)
+→ FAILED; an existing FAILED (shape heuristics) is never upgraded away, except
+one stamped exactly `structural failure`, which a late CONFIRMED may lift
+(2026-07-31 honest-failure rule); a verifier-SUPPORTED verdict → PASSED —
+**unless** every tool call in the turn failed and the reply never said so
+(2026-08-04 shape rule, `unacknowledged_total_failure`, kill switch
+`GHOST_UNACKED_FAILURE_GATE=0`); a **structural** execution failure (non-zero
+exit / tool error) → FAILED; otherwise UNKNOWN.
 
 This matters because the outcome is what the whole spine keys off: the Reflector
 only reflects on FAILED trajectories, and the PRM only trains on
@@ -247,9 +253,51 @@ The two-stage verifier templates (`_VERIFY_ENUMERATE_PROMPT`,
   `Verifier.verify_claim` against the judge endpoint that serves VERIFY
   in production (`--base-url`, the worker node). Scores are graded
   verdict-correctness; reflective feedback names the injected fault the
-  verdict missed. A fresh `HttpChatClient` is built per evaluation loop
-  (httpx pools are loop-affine; the adapter runs one `asyncio.run` per
+  verdict missed. A fresh client is built per evaluation loop (httpx
+  pools are loop-affine; the adapter runs one `asyncio.run` per
   candidate).
+* **Which pipeline the gate measures — `--escalate` (2026-08-04).**
+  Production verifies with two models: a cheap judge, then a MAIN-model
+  re-adjudication of every `REFUTED` **and** of every high-stakes
+  `CONFIRMED`. A single-endpoint judge client cannot escalate, so the
+  default `--escalate off` gates on the **cheap judge standalone** — and
+  on the live recorded corpus (2026-07-30..08-04) the main model
+  overturned **42 of 50 (84%)** of that judge's refutes, i.e. most of the
+  false-alarm mass a candidate could be credited for is mass production
+  already removes. `--escalate gate` (with `--main-base-url`) runs the
+  *ship-gate* private evaluations through `EscalatingChatClient`, making
+  the promotion decision production-equivalent while GEPA still trains
+  against the cheap judge; `--escalate all` escalates everywhere (much
+  slower). The CLI refuses `gate`/`all` without a main URL rather than
+  silently running the raw arm, and every promoted artifact records
+  `gate_arm` / `train_arm` / `gate_judge` / `gate_main`, so two artifacts
+  judged by different pipelines can never be read as one series of
+  `private_candidate_balanced` numbers.
+  > ⚠ **The CONFIRM direction cannot move this gate's metric.**
+  > `_trial_score` is verdict-only and `_escalate_confirm` never changes a
+  > verdict — it caps confidence. So under `--escalate gate` the confirm
+  > direction costs one main-model call per high-stakes CONFIRMED private
+  > trial and contributes nothing to `balanced_score`. It is kept anyway,
+  > because a gate that measures a *different* pipeline from production is
+  > the defect being closed; making the score actionable-confidence aware
+  > is a deliberate design change, not something to slip in silently.
+* **Recording the baseline — `--incumbent-only <path>`.** Evaluates the
+  LIVE incumbent templates on the private tier and exits without running
+  GEPA, writing the balanced score with full provenance: pool sha256,
+  fault set, template hashes, class mix, smallest resolvable delta, the
+  escalation arm, both endpoints, the observed escalation events
+  (refutes overturned / confirms eligible / confirms withheld), the
+  cheap-leg `route_health`, and one row per trial so the number is
+  re-scorable without re-running. That file is the number the next
+  round's ship gate compares against — re-record it whenever the pool,
+  the templates, the judge or the arm changes, because a baseline
+  without those is not comparable to anything.
+  > ⚠ **A cheap-leg timeout is not a verdict.** A failed `route()` call
+  > falls through to the MAIN model, so that trial was judged by the
+  > strong model, not the judge under test. `route_health.
+  > fell_through_to_main > 0` means the baseline is a BLEND; the script
+  > says so on stderr rather than letting it pass as a clean number.
+  Tests: `tests/test_optimize_verifier_arm.py`.
 * **Hygiene** — bench CASES hash-split public/private via
   `holdout_tier("vbcase:<id>")`; the optimizer trains on public trials
   only; the ship-gate compares baseline vs candidate on PRIVATE trials
@@ -259,11 +307,275 @@ The two-stage verifier templates (`_VERIFY_ENUMERATE_PROMPT`,
   Iterations clamp to `MAX_OPT_ITERATIONS`.
 * Run `scripts/verify_bench.py` against the same judge BEFORE
   optimizing (baseline TPR/FPR) — the standing rule for any verifier
-  change, including judge-model swaps.
+  change, including judge-model swaps. Run it in the **same arm** you
+  intend to gate in: a `raw_judge` baseline and a `judge+escalation`
+  post-measurement are two different systems, and since 2026-08-04 the
+  report names the arm and refuses to emit an unqualified `fpr` key.
 
 Tests: `tests/test_verifier_tuned_templates.py` (baseline self-probe
 regression, placeholder/brace rejection, override/artifact resolution
 order, activation counting, formats-cleanly end check).
+
+### verify_bench case pool (2026-08-04)
+
+`verify_bench` is the one controlled instrument the §4F verifier work is
+judged on, so its case pool has to represent production. Four things were
+wrong and are now fixed:
+
+| | before | after |
+|---|---|---|
+| harvest | classic prompt only — the two-stage **fallback**, 55 of 618 calls | + enumerate (281 calls) |
+| poisoning | turns production REFUTED entered as clean `CONFIRMED` cases | verdict read from the same day-file; **62 of 106 (58.5%) excluded** |
+| determinism | one shared RNG — growing the pool rewrote 20% of existing trials | seeded per (case, fault); only `wrong_topic` can move |
+| provenance | a file **path** in `results.json` | `cases_sha256`, `n_cases`, `GHOST_HOME`, live template hashes |
+
+The inversion needed one non-obvious thing: the templates carry `{{`/`}}` for
+their JSON output spec, which `.format()` collapses, so matching raw template
+segments against a rendered prompt fails ~800 characters into the tail. Before
+the unescape, **0 of 580** live verify records inverted while their opening
+sentence matched perfectly.
+
+**Why it mattered:** the private tier was 4 cases / 30 trials, whose smallest
+resolvable delta is `0.5/6 = 0.0833` — more than **four times** the
+`--min-delta` of 0.02 it was being compared against. That is the arithmetic
+behind the journal's "±0.08 private-gate noise", and it means the +0.087 ship
+of 2026-07-30 was roughly one flipped trial. With the mined pool the private
+tier is **29 cases / 220 trials** and the step is **0.0093**, finer than the
+gate. **All three optimizer runners** — `optimize_verifier.py`,
+`scripts/run_gepa.py` and (since 2026-08-04) `optimize_tool_descriptions.py` —
+now REFUSE to run when a private tier cannot resolve its own threshold, and
+`optimize_verifier.py` loads the mined pool **by default**, because without it
+the gate resolved to 0.0833 and refused to run at its own default flags.
+
+> The Phase 2b runner was the one that still had no such check, and its
+> private tier is the coarsest of the three. Its tier is hashed per *request*
+> and one request emits many fixtures, so the realised private share is not
+> `--private-pct`: measured 2026-08-04 on the real mine, **13 of 65 positives
+> are private (20%, against 30% requested)** — a step of `1/13 = 0.077`
+> against a `--min-delta` of 0.02, i.e. one flipped replay decides a run
+> costing `iterations × len(public)` main-model calls. `--smoke` is exempt
+> (it evaluates the incumbent and ships nothing).
+
+> Measured 2026-08-04 at the real `--private-pct 30` default. An earlier
+> version of this page claimed 7 cases / 49 trials / 0.0455 → 21 / 155 /
+> 0.0132; none of those six figures reproduced when re-measured. Only 0.0833
+> was ever right.
+
+The join that decides which mined turns count as "clean" is keyed on the
+**claim**, not the request. `request_id` is per-turn — 348 distinct ids over
+12,047 live records, with a single `"SYSTEM"` id holding 9,780 — so of the 62
+cases a request-level join excluded, **43 were wrong**: `['REFUTED',
+'CONFIRMED']` inside one request is the escalation signature (the cheap judge
+false-refutes, the main model overturns), meaning production did *not* refute
+that turn. 16 more were dropped on the code auditor's verdict about a
+different claim, and 3 sat in the shared `"SYSTEM"` bucket. Per claim, taking
+the last verdict: 106 candidates → **86 kept, 20 dropped**, each annotated
+with its real production verdict.
+
+The pool is regenerated with `scripts/verify_bench.py --refresh-mined`.
+Before that existed nothing in the repo could rebuild it, so the shipped
+artifact silently carried whatever extraction and redaction bugs were live on
+the day it was minted. The refresh **refuses to write** a zero-yield mint or
+one that shrinks the pool by more than half (`--force` overrides): silent
+extraction failure is this pipeline's characteristic bug, and overwriting the
+durable pool with its output takes the private tier back to 4 cases.
+
+> **Tier caution.** `optimize_verifier.py` trains on the **public** tier of
+> this same pool, and `verify_bench.py` loads the pool by default — so a
+> post-optimization bench run on the default `--tier all` measures partly on
+> cases the optimizer saw. Use `--tier private` for a clean measurement; the
+> loader now prints how many public-tier cases it pulled in.
+
+Mined cases are redacted before persisting (recording day-files are unredacted
+by design) and live at `$GHOST_HOME/system/eval/verify_bench_cases_mined.jsonl`
+— outside the repo, because they derive from real user turns. `--no-mined`
+reproduces the old seed-only pool.
+
+**Escalation axis — CLOSED 2026-08-04.** The bench's chat client defined no
+critic/worker route, so `Verifier._escalate_refute` returned immediately: the
+bench scored the raw cheap judge while production scores judge+escalation.
+Re-measured before fixing, two ways: joining recorded verify prompts on the
+claim across `$GHOST_HOME/system/llm_recordings` (2026-07-30..08-04) and
+reading which model served each verdict gives **42 of 50 (84%)** cheap-judge
+refutes overturned by the main model; the durable log's `GhostAgent` lines over
+a longer window give **80 / 99 = 81%** — the journal's figure, reproduced. (A
+naive `grep` of the log says 89%: the OVERTURNED line is a `WARNING` mirrored
+to the `GhostStream` logger while "verdict stands" is `INFO`, so warnings
+double-count. Count one logger.)
+
+Now closed on both sides:
+
+* `verify_bench.EscalatingChatClient` gives the bench the production topology —
+  `route()` to the judge, `chat_completion()` to the main model, truthy
+  `worker_clients`. `scripts/verify_bench.py --main-base-url <main>` selects it;
+  verified live end-to-end, where a refuted trial shows the leg sequence
+  cheap→cheap→main→main (two-stage on both legs) against 15 s / 24 s runtimes.
+* Every report records `provenance.escalation` (arm, kill-switch state, cheap
+  route, both endpoint/model identities), and `score_trials` emits
+  `fpr_raw_judge` **or** `fpr_escalated` — there is no bare `fpr` key any more,
+  so two arms cannot be silently compared. The raw arm's rendered report says
+  "NOT a production FPR" in the headline.
+* `optimize_verifier.py --escalate gate` makes the SHIP DECISION
+  production-equivalent (see above), and the arm is written into the promoted
+  artifact.
+
+**Both directions — closed 2026-08-04, same session.** The CONFIRM escalation
+landed while the above was being written, and it re-opened the same gap in the
+other direction: it fires only on `high_stakes=`, which `run_trials` never
+passed, so it was structurally dead in the bench. Bench cases now carry a
+tri-state `high_stakes` field (`None` = derive, explicit bool pins), derived by
+running production's own `looks_like_tool_error` over each segment of the
+packed evidence digest — segmented, because that sniffer scans only the first
+120 chars and a blob check therefore sees just the first tool's head (mined
+pool: 14/86 segmented vs 10/86 blob). Derivation is resolved per trial *after*
+the fault, so `silent_failure` — a tool error under an unchanged success claim
+— exercises the direction, which is the only thing that reaches it from the
+seed set (0 of 21 seed cases are naturally high-stakes). The arm now has four
+values (`raw_judge`, `judge+escalation(refute)`, `judge+escalation(confirm)`,
+`judge+escalation`), a new `false_confirm_actionable_{raw,escalated}` metric is
+keyed on the confirm direction, and `metrics["escalation_events"]` counts what
+actually fired. `GHOST_VERIFY_ESCALATE_CONFIRM=0` is checked by A/B — same
+verdict, same confidence, same call sequence as before the feature — rather
+than asserted.
+
+See `docs/core/verifier.html` for the full two-direction table and the metric
+keying rationale.
+
+**Where the escalation metrics actually live (2026-08-04).** `escalated_overturn`
+and `confirm_withheld` were written into `VerifyResult.to_dict()`, which has zero
+production callers — 160 "OVERTURNED" log lines, zero occurrences anywhere under
+`$GHOST_HOME/system/`. They are now appended to
+`$GHOST_HOME/system/verifier/escalations.jsonl` at the point the escalation
+resolves (inside `_escalate_refute` / `_escalate_confirm`), which is the only
+place that covers BOTH delivery paths: on the streamed path the trajectory is
+written in the SSE drain *before* the verdict is even spawned, so no
+`turn_facts` stamp could carry it. Upheld outcomes are recorded alongside
+overturned ones — the watch metric is a rate. Kill switch
+`GHOST_VERIFY_ESCALATION_LOG=0`. The same measurement pass showed the REFUTE
+escalation should NOT be extended to `verify_code_output`: all 7 live code-path
+cheap refutes were upheld by the main model on two independent replays (14/14),
+against 84% overturned on the claim path. Wired but default OFF behind
+`GHOST_VERIFY_ESCALATE_CODE_REFUTE=1`.
+
+### Stack audit (2026-08-04) — what was silently not running
+
+Six parallel fresh-eye reviews over the whole self-learning stack found ~100
+defects past a green 10.7k-test suite. The generalisable lesson, and the
+highest-value fix, was not a logic bug:
+
+**`type(x).__module__.startswith("ghost_agent")` is always False in
+production.** The launcher runs `python -m src.ghost_agent.main`, so modules
+are `src.ghost_agent.*`; the test suite runs `PYTHONPATH=src`, so they are
+`ghost_agent.*`. That guard was used at six sites to mean "not a test double",
+and it silently disabled five subsystems on the live agent — including
+failure-cluster distillation and the outcome-gated lesson prune, both of which
+§3 recorded as `live`. Use `utils.component_guard._is_real_component`, which
+accepts both shapes; `tests/test_component_guard.py` fails on any new
+occurrence.
+
+Other corrections that changed what the learning loops actually learn from:
+
+* **Episode outcome labels** were `"error" not in ai_text[:80]` — 96.5% of the
+  live store read success, and all nine "failures" were false negatives. That
+  label feeds the LLM that mints playbook lessons.
+* **Self-play was writing the production calibration corpus** and the
+  competence prior that the confidence composite reads on real user turns.
+* **Infra outages were charged to the agent** as genuine self-play failures,
+  with durable consequences (mastery flips, cooldown doubling, lessons minted
+  from an outage banner).
+* **19% of the GEPA train set** was reflection records presented as gold
+  answers (96 of 506 PASSED trajectories, re-measured 2026-08-04). The fix is
+  per-FIELD, not per-record: a reflection's `final_response` is a DIAGNOSIS
+  block and is blanked; its `planning_output` is a revised PLAN and is kept.
+  Filtering whole records instead cost 100% of the plan targets, because
+  `planning_output` is populated on reflection trajectories and **nowhere
+  else** (157 of 157 live). Consequence worth naming: `run_gepa.py` keeps only
+  examples carrying a signature-output target once there are ≥20, so a
+  `planning.decompose` run now trains and ship-gates on **96 examples that are
+  100% reflection-sourced**, discarding all 410 clean user turns. Defensible
+  (a revised plan is a plan) but not what "19% contamination removed" implies.
+* The **activation counter** — the instrument built to catch exactly this class
+  — counted artifact LOADS, not applications, so rejected artifacts read as
+  healthy.
+* The **generic GEPA metric was recall-only**, which makes VERBOSITY the
+  optimum: a token soup scores 1.000 against the gold it padded and still
+  0.250 against a gold it never addressed, while a terse correct subset scores
+  0.333. It is now token **F1** (`scripts/run_gepa.py::_overlap`), which
+  inverts that ranking (0.367 vs 0.500 on the same 87-token gold).
+
+#### The metric change invalidates the one artifact it promoted
+
+`planning.decompose` was optimized and A/B-gated on 2026-07-29 **under the
+recall-only metric** — the only artifact that loop ever promoted. Re-scored
+2026-08-04 on the same hash-stable 28-example private tier, both arms at
+temperature 0 / no-think against the live upstream:
+
+| metric | seed | promoted artifact | delta | verdict |
+|---|---|---|---|---|
+| RECALL (the metric that promoted it) | 0.429 | **0.857** | +0.429 | ships |
+| F1 (the metric now shipped) | **0.500** | 0.071 | −0.429 | rejected |
+
+The promoted prompt's outputs run a median **111 distinct tokens against a
+32-token median gold** — 3.5×, exactly the verbosity the old objective paid
+for. The recall column also *reproduces the original promotion* (journal:
+0.45 → 0.80), which is what makes the F1 column evidence rather than noise.
+
+Read this as **correctness-of-record, not a live emergency**: neither metric
+measures plan QUALITY, and the read-site is dark (no `--use-planning` on the
+live exec line, activation counter 0). The artifact is kept, not deleted —
+its promotion is simply no longer a measured win, and re-promoting it would
+require a bench that grades plans rather than token overlap.
+
+The full list, including ~12 clusters deliberately left unfixed with reasons,
+is `PROJECT_JOURNAL.md` §4J.
+
+#### Arming a never-run subsystem is a deploy, not a fix
+
+The module-guard correction made five never-executed subsystems live at once,
+and that turned out to be the more dangerous half of the fix.
+
+`prune_low_utility` — destructive, unattended, vector-twin deleting — ran for
+the first time in its life and **destroyed 13 lessons across two REM cycles**,
+one of them scoring `retrievals=277 succ=77 fail=32` (a 70%-success lesson
+dropped as "low utility"). Its archive-before-delete safety net had been
+written four minutes *after* the live process started, so that process never
+loaded it. **Check module mtime against process start before believing a fix
+is deployed.**
+
+It is now **off by default** (`GHOST_SKILL_PRUNE=1` to enable), and that is a
+calibration verdict rather than caution:
+
+* the cutoff is a *relative* bottom quartile, so it always finds victims
+  however good the playbook is — quality never satisfies it;
+* failure-distillation mints lessons at utility ≈0.77 against a measured live
+  cutoff of 1.1183, so every distilled lesson is structurally guaranteed to be
+  deleted once it reaches `min_retrievals`. Two subsystems spending LLM time
+  fighting each other, both "working as designed".
+
+The archive now **fails closed** — an unwritable archive aborts the operation
+and deletes nothing. A fix whose only purpose is recoverability must not
+proceed when recoverability is what failed; the first version warned and
+deleted anyway, losing seven more lessons in a probe. The same
+archive-before-delete invariant now covers
+`retract_lessons_from_trajectory` (four live call sites), which had been
+deleting with no record at all. Quarantined rows are exempt from the prune:
+quarantine stops their retrievals accruing, so they decay into the bottom
+quartile *by construction*.
+
+**Recovery precedent:** 5 of the 13 were reconstructed from
+`GHOST_LLM_RECORD` day-files — rendered prompts carry
+`TRIGGER/ANTI-PATTERN/CORRECT-PATTERN`, so prompts written before the prune
+contain the lesson bodies. Before declaring data unrecoverable, enumerate
+every store that ever *rendered* it.
+
+Same batch: journal-mined self-play replays real past user messages **verbatim**
+against the real toolset, and the live stash held one instructing
+`postgres_admin` to run `SELECT 1; DROP TABLE web_order_line_options_old;` —
+un-replayed, at a 75% selection probability. `_is_unsafe_challenge` now refuses
+destructive shapes and the "run this exactly, do not modify it" framing at
+synthesis time. Any subsystem that replays recorded user input needs a content
+gate: the recording is trusted input from a context where a human was present,
+and the replay is a context where none is.
 
 ### Tool ONTOLOGY analysis (§4F Phase 2b+, 2026-08-05)
 
@@ -318,7 +630,10 @@ of the loop exist; the GEPA run itself waits for fixture supply
   `payload.tools` AND structured `message.tool_calls` (never
   content-parsed); **ground truth** joined from
   `TrajectoryCollector.iter_trajectories()` (corrections overlay
-  applied — half the verifier-late labels only exist in the sidecar)
+  applied — measured 2026-08-04, 214 of 1488 trajectories read a
+  different outcome after the overlay and for 212 of those the on-disk
+  line says `unknown`, so the sidecar is the ONLY source of a label;
+  reading the raw JSONL would discard them as unlabeled)
   on recording `request_id` == `Trajectory.session_id`; the `SYSTEM`
   request sentinel (idle/background work, >80% of records) is excluded
   — no per-request trajectory exists to join. Polarity: clean PASSED =
@@ -338,10 +653,52 @@ of the loop exist; the GEPA run itself waits for fixture supply
   session_id, ordinal) lets the eval adapter rehydrate the full
   recorded payload and swap candidate descriptions in (adapter gotcha:
   `RequestState._active_tool_defs_cache` and the XML schema cache key
-  on tool NAMES, so build a fresh RequestState per candidate). The CLI
+  on tool NAMES, so build a fresh RequestState per candidate — the
+  shipped runner sidesteps this entirely by replaying the recorded
+  payload instead of rebuilding a RequestState). The CLI
   prints full drop accounting (no silent caps); exit 1 = supply not
   ready (below `--min-fixtures` OR one-class corpus — zero positives
   and zero negatives both block), exit 2 = no day-files at all.
+  `experiment_context_excluded == 0` means "nothing excluded" only when
+  `experiment_filter_unavailable == 0` beside it; that flag is resolved
+  **eagerly**, before the scan, so it reports an unimportable
+  `core.experiments` (or `--include-experiment-context`) even when no
+  record survives the earlier filters. `experiment_filter_errors`
+  counts turns the filter RAISED on — those are included unchecked.
+
+  ⚠ **`--min-fixtures` means different things in the two tools.** The
+  miner's counts ALL fixtures; `optimize_tool_descriptions.py`'s counts
+  POSITIVES only (negatives cannot score a tool-choice replay). Both
+  default to 200. Measured 2026-08-04: **183 fixtures / 65 positives**,
+  so a total-only gate reports "ready" — and atomically overwrites the
+  live fixture pool — at roughly 71 positives, while the runner still
+  refuses.
+
+  **Closed 2026-08-04 (same day):** the miner now carries
+  `--min-positives` (default 200, the gate that actually binds) beside
+  the volume floor, so its exit code agrees with its consumer. The flag
+  names still differ deliberately — renaming the runner's would break
+  every recorded invocation — so the miner's help text names the
+  collision at both flags.
+
+  The miner also reports the runner's **resolution** refusal before a
+  run is started, because "is it time yet?" should be answerable without
+  launching one:
+
+  ```
+  Private positives: 13/65 (realised share 20%, requested 30%);
+  smallest step 0.077 vs --min-delta 0.02 — TOO COARSE
+    → needs ~50 private positives (~250 positives at today's realised
+      share) or a larger --min-delta; the runner refuses below this.
+  ```
+
+  The realised private share is **measured, not assumed**: the tier is
+  hashed per *request* and one request emits 1–40 fixtures, so
+  `--private-pct 30` landed 20% on positives. This line is **advisory
+  and does not block the write** — the runner owns the refusal, and
+  blocking here would freeze the pool at whatever it held on the day the
+  tier happened to be coarse, when more supply is precisely the fix.
+  Gates fenced in `tests/test_mine_tool_fixtures_gates.py`.
 * **Read-site** — `tools/registry._apply_tuned_descriptions` at the
   tail of `get_active_tool_definitions`: a promoted
   `$GHOST_HOME/system/optim/tool_description.<tool>.json` artifact
@@ -370,7 +727,12 @@ choice detection, polarity + EXIT-CODE-0 gotcha, honest-failure
 exclusion, overlay flip, tier determinism, result pairing, round-trip),
 `tests/test_tool_desc_readsite.py` (artifact swap, no-mutation,
 activation counters, validator, override precedence, identity fast
-path, dynamically-appended tools).
+path, dynamically-appended tools), `tests/test_gepa_optim_reaudit.py`
+(incumbent backup + abort-on-failed-backup, gate-judges-the-live-artifact,
+resolution refusal in both runners, token-F1 driven end-to-end through
+the real gate, over-cap zero-scoring + reflector feedback,
+no-cross-candidate-bleed, gate-vs-read-site aggregate agreement,
+applied-vs-loaded activation counts, experiment-filter reporting).
 
 ### Trajectory-level test-time scaling (§4F Phase 3, 2026-07-30)
 

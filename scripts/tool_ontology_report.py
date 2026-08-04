@@ -36,6 +36,7 @@ from ghost_agent.distill.collector import TrajectoryCollector  # noqa: E402
 from ghost_agent.optim.tool_ontology import (  # noqa: E402
     DEFAULT_MIN_PAIR, DEFAULT_MIN_SUPPORT, analyze_confusion, load_replay_rows,
     mine_sequences, render_confusion, render_sequences, report_to_dict,
+    simulate_fs_batch,
 )
 
 
@@ -62,6 +63,12 @@ def main() -> int:
                     help="include self-play/reflection trajectories too "
                          "(default: real user turns only)")
     ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--simulate-fs-batch", action="store_true",
+                    help="rewrite the corpus as if the `fs_batch` macro had "
+                         "been available and always used, then mine that. "
+                         "Diff against the plain run to see which n-grams "
+                         "the macro collapses (an UPPER BOUND: it assumes "
+                         "full model uptake, which the live arm measures).")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -79,8 +86,11 @@ def main() -> int:
         print(msg, file=sys.stderr)
         return 2
     collector = TrajectoryCollector(root=root, session_id="reader")
+    _stream = collector.iter_trajectories()
+    if args.simulate_fs_batch:
+        _stream = simulate_fs_batch(_stream)
     macros = mine_sequences(
-        collector.iter_trajectories(),
+        _stream,
         min_support=args.min_support,
         task_kinds=None if args.all_kinds else ("user_request",),
     )
@@ -100,6 +110,28 @@ def main() -> int:
     if confusion is not None:
         print(render_confusion(confusion, top=args.top))
         print()
+    if args.simulate_fs_batch:
+        print("*** SIMULATED corpus: `fs_batch` macro applied to every turn "
+              "(upper bound — assumes full uptake) ***\n")
+    # Corpus purity, stated before the numbers rather than assumed. `scanned`
+    # is printed even at zero so "no corruption" and "the scan never ran" can
+    # never read the same — the distinction this project keeps relearning.
+    try:
+        from ghost_agent.utils.leaked_framing import scan_trajectories
+        _pur = scan_trajectories(
+            TrajectoryCollector(root=root, session_id="reader")
+            .iter_trajectories())
+        _n, _c = _pur["calls"], _pur["corrupt_calls"]
+        _line = (f"corpus purity: {_c} of {_n} tool calls carried leaked "
+                 f"tool-call framing and were EXCLUDED "
+                 f"({(_c / _n if _n else 0):.2%})")
+        if _c:
+            _line += (f"; last seen {_pur['last_seen'][:16]} — all known cases"
+                      f" predate the 2026-07-31 native-dialect fix, so a LATER"
+                      f" timestamp here is a REGRESSION")
+        print(_line + "\n")
+    except Exception as _e:  # noqa: BLE001 — a purity line must not kill the report
+        print(f"corpus purity: unavailable ({_e})\n")
     print(render_sequences(macros, top=args.top))
     return 0
 
