@@ -99,7 +99,7 @@
   </ul>
 
   <h2>Live log stream — path + resilience (2026-07-12)</h2>
-  <p>The tail target defaults to <code>/Users/vasilis/Data/AI/Logs/ghost-agent.log</code>,
+  <p>The tail target defaults to <code>~/Data/AI/Logs/ghost-agent.log</code>,
   overridable via the <strong><code>GHOST_AGENT_LOG</code> env var</strong> — the
   <code>--agent-log</code> flag can never arrive in the prod deployment because
   <code>uvicorn server:app</code> owns <code>sys.argv</code>. The previous default was
@@ -136,7 +136,7 @@
   <ul>
     <li><strong>Trusted front door.</strong> <code>tailscale serve --bg --https=8443
     https+insecure://127.0.0.1:8080</code> fronts the self-signed uvicorn with a real LE
-    cert at <code>https://eva.taila2b1d.ts.net:8443/?key=…</code> (tailnet-only). Service
+    cert at <code>https://&lt;your-host&gt;.ts.net:8443/?key=…</code> (tailnet-only). Service
     workers and APNs web push both require trusted HTTPS, so the phone must use this URL.
     Disable with <code>tailscale serve --https=8443 off</code>.</li>
     <li><strong>PWA install.</strong> <code>GET /manifest.webmanifest</code> (key-gated

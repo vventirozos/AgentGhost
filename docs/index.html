@@ -106,7 +106,7 @@
   <h2>What you need before you start</h2>
   <dl class="kv">
     <dt>An LLM server</dt>
-    <dd>Anything that speaks the OpenAI chat API — llama.cpp, vLLM, or Ollama. Ghost is tuned around <strong>Qwen 3.6 35B-A3</strong>, and the prompts assume a model of roughly that capability.</dd>
+    <dd>Anything that speaks the OpenAI chat API — llama.cpp, vLLM, or Ollama. Ghost is tuned around <strong>Qwen 3.6 35B-A3</strong>, and the prompts assume a model of roughly that capability. See the note on model choice below.</dd>
 
     <dt>Docker</dt>
     <dd>The daemon must be running. Every piece of code Ghost executes goes into a container, so without Docker the tools that matter won't work.</dd>
@@ -117,6 +117,12 @@
     <dt>Python 3.10+</dt>
     <dd>Plus the packages in <code>requirements.txt</code>. A virtual environment is strongly recommended.</dd>
   </dl>
+
+  <div class="note">
+    <strong>A note on model choice.</strong> Ghost is developed and tested against <em>uncensored</em> models — for the main model and for the verifier that checks its answers. It works with a standard aligned model, but expect refusals on operations that are routine for an agent running on your own machine and unusual for a chat assistant: clearing out its own sandbox, deleting files you asked it to delete, searching Tor hidden services, or handling security material.
+    <br><br>
+    A refusal doesn't look like an error. The tool never runs, the model explains why it won't, and the turn completes normally — so it reads as "the feature is broken" when the model simply declined. If something won't work, check the log for the model refusing rather than the tool failing. The verifier matters here too: an aligned judge can reject a perfectly good answer on subject matter alone, which shows up as unexplained retries.
+  </div>
 
   <p><a href="getting-started.html">Install and run it</a> has the full sequence, in order, with the environment variables spelled out.</p>
 

@@ -99,6 +99,10 @@
   <p>Usually search operators. The scraper backends Ghost reaches over Tor don't support <code>site:</code>, quoted phrases, or <code>AND</code>/<code>OR</code> — including any of them returns zero results rather than an error. Plain keywords only.</p>
   <p>For dark-web search specifically, zero results is normal. Onion search engines are unreliable and reachability varies by exit node; an empty result is not a reason to retry the same query.</p>
 
+  <h3>It won't do something, and explains why instead</h3>
+  <p>If the model declines rather than the tool failing, that's model alignment, not a bug. Ghost is developed against uncensored models; a standard aligned one will refuse operations that are routine for an agent on your own machine — wiping its sandbox, deleting files on request, searching Tor hidden services, handling security material.</p>
+  <p>Tell them apart in the log: a broken tool logs a failure with its own icon, while a refusal shows the model reasoning (💭) and then a normal <code>✅ turn outcome</code> with no tool line at all. The second one means nothing ran. The same applies to the verifier — an aligned judge can refuse a sound answer on subject matter alone, which surfaces as retries you can't otherwise explain.</p>
+
   <h3>A tool that used to work now refuses to run</h3>
   <p>The pre-flight guard is doing its job. When the same tool fails the same way on the same target repeatedly, Ghost stops re-running it and hands the model the previous error instead. Fix the underlying cause and it'll clear.</p>
 
@@ -124,6 +128,125 @@
 
   <h3>It got worse after learning something</h3>
   <p>A bad lesson can get recorded. Ask to see the lessons (<em>"show me what you've learned this week"</em>) and have it drop the offending one. Ghost also removes lessons on its own when the answer that produced them is later refused by the self-check.</p>
+
+  <h2>Reading the log</h2>
+
+  <p>The log is the primary debugging tool here, and it's built to be read by a person rather than parsed by one. Almost every question on this page is answered faster by looking at it than by guessing.</p>
+
+  <h3>There are two of them, and they're for different jobs</h3>
+
+  <dl class="kv terms">
+    <dt>The live stream</dt>
+    <dd>What the agent prints as it works — boxed per request, colour-coded, one icon per subsystem. This is for <strong>watching</strong>. The web UI shows it in a panel beside the conversation, which is the easiest way to see it. If you run Ghost under a service manager, that manager captures it (with <code>launchd</code>, whatever you set as <code>StandardOutPath</code>).</dd>
+
+    <dt>The durable file</dt>
+    <dd><code>$GHOST_HOME/system/ghost-agent.log</code>. Same events, one line each, timestamped and with a log level. This is for <strong>grepping</strong> — after the fact, when you know roughly what you're looking for.</dd>
+  </dl>
+
+  <h3>What one request looks like</h3>
+
+  <p>A request is framed top and bottom, so you can always see where one ends and the next begins. This is a real turn — asking for the weather, which makes the agent call a tool and then check its own answer:</p>
+
+  <pre>┌─ 11 1165839c  request started  19:35:16 ─────────────────────────────────
+│  11  🧩  +0.08s  prefill cache       sys h=9ab1b534 chars=16757 · stable-prefix h=013475b7…
+│  11  💬  +0.08s  llm request         Turn 1 | Temp 0.20
+│  11  💭  +7.78s  thinking            The user is asking for the weather in Reykjavik. I need to
+                                       use the system_utility tool with action="check_weather".
+│  11  🧠  +7.78s  thought             reasoning: 37 tokens / 141 chars | content: 0 chars | 7.7s
+│  11  🌐  +7.79s  system weather      Location: Reykjavik
+│  11  🧩  +9.41s  prefill cache       sys h=9ab1b534 chars=16757 · stable-prefix h=013475b7…
+│  11  💬  +9.41s  llm request         Turn 2 | Temp 0.60
+│  11  💭  +12.2s  thinking            The result shows it's overcast, 12.5°C, wind 10.4 km/h,
+                                       humidity 70%. I can provide this directly to the user.
+│  11  🧠  +12.2s  thought             reasoning: 68 tokens / 241 chars | content: 115 chars | 2.8s
+│  11  🔧  +12.2s  worker compute      verify → Worker Node (worker-1)
+│  11  🧪  +26.0s  verifier            CONFIRMED (100%) — All facts in the claim are directly…
+│  11  📈  +26.0s  metacog conf        below=no C=0.87 entropy=0.99 competence=0.97 n=129…
+│  11  ✅  +26.0s  turn outcome        verified · confidence 0.87 · tools: system_utility · 115…
+└─ 11  request finished  +26.0s ───────────────────────────────────────────</pre>
+
+  <p>Reading a line left to right:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Part</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td><code>11</code></td><td>A short tag for this request, repeated on every line and given its own colour. When two requests overlap, this is how you tell their lines apart.</td></tr>
+      <tr><td><code>1165839c</code></td><td>The full request id, on the opening frame only. Grep the durable file for this to pull one turn out of everything.</td></tr>
+      <tr><td><code>🧩</code></td><td>Which subsystem produced the line. One glyph per subsystem, deliberately all distinct.</td></tr>
+      <tr><td><code>+7.78s</code></td><td>Elapsed since <em>this request</em> started — not wall-clock. This is what you read to find where the time went.</td></tr>
+      <tr><td><code>thinking</code></td><td>A short fixed label, aligned into a column so you can scan down it.</td></tr>
+      <tr><td>the rest</td><td>The detail, wrapped and indented to stay inside the column.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>In that turn the useful reading is the <strong>timing</strong>: 7.8 seconds of thinking before the tool call, the tool itself returning in 10 milliseconds, and then 14 seconds waiting on the verifier. If this felt slow, the model and the self-check are the cost — not the weather lookup.</p>
+
+  <h3>The icons worth recognising</h3>
+
+  <p>There are 73 of them, all deliberately distinct. These carry most of the signal:</p>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Icon</th><th>Means</th><th>Read it when</th></tr></thead>
+    <tbody>
+      <tr><td>🧩</td><td>Memory hydration — what it recalled before thinking</td><td>It "forgot" something</td></tr>
+      <tr><td>💭 🧠</td><td>Model reasoning, then a summary of it</td><td>Working out where time went</td></tr>
+      <tr><td>💬 🤖</td><td>A request to the model, and its reply</td><td>Turn count is climbing</td></tr>
+      <tr><td>🐍 🐚 💾 📖 🌐 🌎 🧅</td><td>Tools: Python, shell, file write, file read, web search, browser, onion search</td><td>Checking what it actually did</td></tr>
+      <tr><td>🔧 🛸</td><td>Work sent to a worker or swarm node</td><td>Confirming node offload is live</td></tr>
+      <tr><td>🧪</td><td>The verifier's verdict</td><td>It claimed something it didn't do</td></tr>
+      <tr><td>✅ ❌</td><td>How the turn ended</td><td>Always</td></tr>
+      <tr><td>🔶 🛑</td><td>Warning, and a hard stop</td><td>Always — these are rare by design</td></tr>
+      <tr><td>🔄</td><td>A retry</td><td>Something is flaky</td></tr>
+      <tr><td>🌙 🎓 📡</td><td>Dream cycle, a lesson graduating, background activity</td><td>Checking the idle loop ran</td></tr>
+      <tr><td>🔒</td><td>A guard refused something</td><td>A tool won't fire</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The <a href="logging.html">logging reference</a> has the full catalog.</p>
+
+  <h3>A warning, and why they're worth reading</h3>
+
+  <p>Warnings are deliberately rare, so when one appears it usually says something real. This one is from the same session:</p>
+
+  <pre>│  48  🔶  +37.1s  agent               Verifier escalation OVERTURNED a cheap-judge refute:
+                                       main model says CONFIRMED. Original issues:
+                                       Memory usage is 90.7%, not 91%.
+│  48  🧪  +37.1s  verifier            CONFIRMED (95%) — All suspects are false alarms; claim…</pre>
+
+  <p>Read that as: the cheap judge rejected the answer for rounding 90.7% to 91%, the main model was asked to re-examine, and it overruled the rejection. Nothing is broken — but this is exactly the line that tells you the cheap judge is being too strict, which is worth knowing before you trust its refusals.</p>
+
+  <h3>Grepping the durable file</h3>
+
+  <p>The file has one line per event, so ordinary tools work:</p>
+
+  <pre class="shell"># everything from one request
+grep 1165839c "$GHOST_HOME/system/ghost-agent.log"
+
+# just the warnings and errors
+grep -E "WARNING|ERROR" "$GHOST_HOME/system/ghost-agent.log" | tail -40
+
+# how did recent turns end?
+grep "turn outcome" "$GHOST_HOME/system/ghost-agent.log" | tail -20
+
+# did the background loop do anything last night?
+grep "\[SYSTEM\]" "$GHOST_HOME/system/ghost-agent.log" | tail -40</pre>
+
+  <p>Lines in that file look like this — same events, flattened for grep:</p>
+
+  <pre>2026-08-04 19:35:16 - GhostStream - INFO  - [1165839c +0.08s] llm request — Turn 1 | Temp 0.20
+2026-08-04 19:35:24 - GhostStream - DEBUG - [1165839c +7.78s] thinking — The user is asking for the…
+2026-08-04 19:35:24 - GhostStream - INFO  - [1165839c +7.79s] system weather — Location: Reykjavik
+2026-08-04 20:10:41 - GhostStream - INFO  - [SYSTEM] hippocampus — Waking up to process 1 buffered memories...</pre>
+
+  <p><code>[SYSTEM]</code> in place of a request id means the agent did that on its own — background work, not something you asked for. Filtering on it is the quickest way to see what the idle loop has been doing.</p>
+
+  <div class="note warn">
+    <strong>The log is redacted by default.</strong> Secrets, API keys, <code>.onion</code> addresses, home directory paths and personal details are masked in both sinks, because the log is the thing you leave on screen. If you're chasing a bug and need to see the raw content, <code>--no-redact-logs</code> turns it off — and should be turned back on afterwards.
+  </div>
 
   <h2>Working out where to look</h2>
 

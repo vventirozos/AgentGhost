@@ -94,7 +94,7 @@
   until the END frame, and disarms — sound because agent turns are globally
   serialized (exactly one foreground request per BEGIN/END window). Default
   log path corrected to the agent's live stream
-  (<code>/Users/vasilis/Data/AI/Logs/ghost-agent.log</code>; override with
+  (<code>~/Data/AI/Logs/ghost-agent.log</code>; override with
   <code>GHOST_AGENT_LOG</code> or <code>--log-file</code>). The emoji map is
   synced to the current <code>Icons</code> set.</p>
 
@@ -139,7 +139,7 @@
     <dt>GHOST_SLACK_OWNER_EMAIL</dt><dd>email fallback for the owner lock (needs <code>users:read.email</code>).</dd>
     <dt>GHOST_API_URL</dt><dd>Default <code>http://localhost:8000/api/chat</code>.</dd>
     <dt>GHOST_API_KEY</dt><dd>Same value the agent expects. <strong>Since 2026-07-13 prod ENFORCES a real key</strong> — set this to the value in the canonical secret file on eva (<code>~/Data/AI/.ghost_api_key</code>, shared by the agent/interface/CLI launchers; the prod <code>.env</code> was updated during the rollout). Must be SET (no default); an <strong>explicitly empty</strong> value (<code>GHOST_API_KEY=</code>) remains valid only against an agent running with auth disabled (<code>--api-key ""</code>) — then no <code>X-Ghost-Key</code> header is sent at all. Do NOT pad it with a space: whitespace reaches httpx as an illegal header value and breaks every call (<code>Illegal header value b' '</code> — observed live 2026-07-11, now stripped + guarded).</dd>
-    <dt>GHOST_AGENT_LOG</dt><dd>agent pretty-log stream for live status (default <code>/Users/vasilis/Data/AI/Logs/ghost-agent.log</code>).</dd>
+    <dt>GHOST_AGENT_LOG</dt><dd>agent pretty-log stream for live status (default <code>~/Data/AI/Logs/ghost-agent.log</code>).</dd>
     <dt>GHOST_NOTIFY_SLACK_CHANNEL</dt><dd>notification destination; default = owner DM; <code>off</code> disables.</dd>
     <dt>GHOST_NOTIFY_POLL_SECONDS</dt><dd>poll cadence (default 30).</dd>
   </div>
@@ -162,8 +162,8 @@ sudo cp com.local.ghost-slackbot.plist /Library/LaunchDaemons/
 sudo chown root:wheel /Library/LaunchDaemons/com.local.ghost-slackbot.plist
 sudo chmod 644       /Library/LaunchDaemons/com.local.ghost-slackbot.plist
 # logs MUST be writable by UserName — see the trap below
-sudo touch /Users/vasilis/Data/AI/Logs/ghost-slack-bot.{log,err}
-sudo chown vasilis:staff /Users/vasilis/Data/AI/Logs/ghost-slack-bot.{log,err}
+sudo touch ~/Data/AI/Logs/ghost-slack-bot.{log,err}
+sudo chown "$USER":staff ~/Data/AI/Logs/ghost-slack-bot.{log,err}
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.plist</pre>
   <p>Status: <code>sudo launchctl print system/com.local.ghost-slackbot</code> ·
   deploy: <code>sudo launchctl kickstart -k system/com.local.ghost-slackbot</code> ·
@@ -180,7 +180,7 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.
   shows nothing new, and only
   <code>launchctl print … | grep -E 'runs|last exit'</code> reveals
   <code>runs = 10, last exit code = 78</code>. Bit us live on this exact
-  install. Fix: <code>sudo chown vasilis:staff</code> the two log files.</p>
+  install. Fix: <code>sudo chown "$USER":staff</code> the two log files.</p>
 
   <h2>Notification-workflow review fixes (2026-08-01)</h2>
   <p>A code review of the outbound pipeline (activity ledger → <code>/api/notifications</code> →
