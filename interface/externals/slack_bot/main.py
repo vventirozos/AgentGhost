@@ -139,6 +139,7 @@ EMOJI_MAP = {
     "💭": "Thinking...",
     "🧠": "Reasoning...",
     "📋": "Planning...",
+    "🔮": "Consulting precedent...",
     "🧩": "Recalling context...",
     "🧭": "Routing...",
     "🎯": "Targeting...",

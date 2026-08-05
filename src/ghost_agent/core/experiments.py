@@ -177,6 +177,21 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
             "failure predictor."
         ),
     ),
+    ExperimentSpec(
+        name="foresight_note",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "§4K Phase 3: on a FAILED tool call with strong failing "
+            "precedent (foresight index: exact/class basis, support ≥3, "
+            "≥2 real precedent failures), the treatment appends the "
+            "precedent to the result so recovery uses history instead of "
+            "blind retries; control gets the unmodified result. Unlocked "
+            "by the offline Phase-2 replay verdict (DISCRIMINATES, spread "
+            "0.306, monotone, 2026-08-05)."
+        ),
+    ),
 )
 
 
@@ -628,7 +643,8 @@ def is_treatment(context, name: str, req_id: str = "") -> bool:
 # only half of production ever sees. It over-claims in one direction only
 # (a treatment turn that never built a tool block is excluded anyway), which
 # is the conservative side for a corpus the optimizer replays VERBATIM.
-CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context")
+CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context",
+                                          "foresight_note_fired")
 
 # experiment -> the `extra` key stamped when that experiment's TRIGGER fired.
 #
@@ -653,8 +669,15 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context"
 # condition the comparison on a POST-treatment variable. If the trigger RATE
 # itself diverges between arms, treat the triggered-only block as confounded —
 # the arm counts in the report are what shows that.
+#
+# `foresight_note_fired` fires on "a FAILED call had ≥2 real precedent
+# failures in the foresight index". Same first-order-only caveat: the index is
+# shared and graded pre-note (identical for both arms at any instant), but a
+# WORKING treatment changes follow-up behaviour, which feeds the index, so the
+# trigger rate can drift between arms over time. Watch the arm counts.
 TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
-                                "fs_batch": "fs_batch_fired"}
+                                "fs_batch": "fs_batch_fired",
+                                "foresight_note": "foresight_note_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:

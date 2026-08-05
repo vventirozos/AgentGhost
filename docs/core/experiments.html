@@ -19,6 +19,7 @@
     <a href="risk.html">risk</a>
     <a href="calibration.html">calibration</a>
     <a href="confidence.html">confidence</a>
+    <a href="foresight.html">foresight</a>
     <a href="../algorithms/tool_ontology.html">tool ontology</a>
   </nav>
 </aside>
@@ -253,6 +254,12 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
         <td><code>fs_batch_fired</code></td>
         <td><code>fs_batch_context</code></td>
         <td>The <a href="../tools/file_system.html">file_system batch macro</a> (§4F item 1): multi-path <code>paths</code> read + the post-edit view on <code>replace</code>.</td>
+      </tr>
+      <tr>
+        <td><code>foresight_note</code></td>
+        <td><code>foresight_note_fired</code></td>
+        <td><code>foresight_note_fired</code></td>
+        <td>§4K Phase 3: on a FAILED tool call with strong failing precedent in the <a href="foresight.html">foresight</a> index (exact/class basis, support ≥ 3, ≥ 2 real precedent failures), the treatment appends the precedent to the result. Trigger is arm-independent (both arms compute it; only the note is treatment-gated). Kill: <code>GHOST_FORESIGHT_NOTE=0</code>.</td>
       </tr>
     </tbody>
   </table></div>

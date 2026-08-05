@@ -121,6 +121,7 @@ ICON_CLASS = {
     "🧭": "plan",
     "🎯": "plan",
     "🌳": "plan",
+    "🔮": "plan",
     "🔗": "plan",
 
     # --- raw thinking (the floor) ---

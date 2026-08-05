@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.foresight — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Measurement</h3>
+    <a href="experiments.html">experiments</a>
+    <a href="risk.html">risk</a>
+    <a href="calibration.html">calibration</a>
+    <a href="confidence.html">confidence</a>
+    <a class="current" href="foresight.html">foresight</a>
+    <a href="../algorithms/tool_ontology.html">tool ontology</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / foresight.py — a shadow world model over tool calls</h1>
+  <p class="subtitle">Predicts each tool call's outcome <em>before</em> it runs, then grades the prediction against what actually happened. Phase&nbsp;1 is strictly shadow: no steer, no veto, no consumer — an instrument measuring whether this agent's environment is predictable enough for foresight to earn one. (Not the <a href="../algorithms/workspace.html">workspace</a> subsystem, which is a <em>descriptive</em> state tracker — this one is predictive.)</p>
+
+  <h2>The gap it measures</h2>
+  <p>Every quality mechanism in the stack is retrospective — the verifier, auto-repair, strikes, loop-breakers, reflection, postmortem all fire <em>after</em> the damage. The <a href="risk.html">risk governor</a> cannot fire before step&nbsp;6 by construction, and the measured depth curve (17.8% failure at step&nbsp;1 → 60.6% at step&nbsp;12) is the price of stepping blind. MCTS turn-start was parked with the comment "OFF until it has an execution-grounded value fn" — its lookahead scored the model's <em>self-prediction</em> of un-executed actions. A transition model built from <em>executed</em> outcomes is the grounding it was parked to wait for.</p>
+  <p>The training signal costs nothing: predict → execute → compare is self-labelling on every tool call, sidestepping the negative-label supply problem (§4E) that constrains every other learning signal here.</p>
+
+  <h2>How it predicts (counting, not an LLM)</h2>
+  <p>Retrieval over the agent's own executed transitions, three-level backoff, most specific level with support ≥ 3 wins; Laplace-smoothed failure rate <code>(fails+1)/(n+2)</code>. Microseconds per call, zero LLM cost. An LLM-assisted predictor is a later phase <em>if</em> the counting floor proves out.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Level</th><th>Key</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>exact</code></td><td>(tool, op, normalized target)</td><td><code>file_system | read | src/x.py</code></td></tr>
+      <tr><td><code>class</code></td><td>(tool, op, target class)</td><td><code>file_system | read | ext:py</code></td></tr>
+      <tr><td><code>tool</code></td><td>(tool, op)</td><td><code>file_system | read</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Target classes: file extension (<code>ext:py</code>), URL scheme (<code>scheme:https</code>), command head for execute (<code>cmd:python3</code>), <code>dir</code>, <code>redacted</code>, <code>other</code>. A call with no supported level still yields a record (<code>basis:"none"</code>) — coverage is measurable, and the resolution becomes the first observation. Cells are LRU-bounded (4096/1024/512 per level).</p>
+
+  <div class="diagram"><svg viewBox="0 0 640 150" xmlns="http://www.w3.org/2000/svg" font-size="12">
+    <rect x="8" y="55" width="118" height="40" rx="6" fill="#1a2030" stroke="#7aa7ff"/>
+    <text x="67" y="72" fill="#e6e9ef" text-anchor="middle">predict</text>
+    <text x="67" y="87" fill="#9aa3b2" text-anchor="middle">3-level backoff</text>
+    <rect x="180" y="55" width="118" height="40" rx="6" fill="#1a2030" stroke="#ffb454"/>
+    <text x="239" y="72" fill="#e6e9ef" text-anchor="middle">execute</text>
+    <text x="239" y="87" fill="#9aa3b2" text-anchor="middle">dispatch pipeline</text>
+    <rect x="352" y="55" width="118" height="40" rx="6" fill="#1a2030" stroke="#5dd39e"/>
+    <text x="411" y="72" fill="#e6e9ef" text-anchor="middle">grade</text>
+    <text x="411" y="87" fill="#9aa3b2" text-anchor="middle">shared failure rule</text>
+    <rect x="524" y="20" width="108" height="34" rx="6" fill="#1a2030" stroke="#9aa3b2"/>
+    <text x="578" y="41" fill="#e6e9ef" text-anchor="middle">ledger</text>
+    <rect x="524" y="96" width="108" height="34" rx="6" fill="#1a2030" stroke="#9aa3b2"/>
+    <text x="578" y="117" fill="#e6e9ef" text-anchor="middle">index</text>
+    <line x1="126" y1="75" x2="180" y2="75" stroke="#9aa3b2"/>
+    <line x1="298" y1="75" x2="352" y2="75" stroke="#9aa3b2"/>
+    <line x1="470" y1="70" x2="524" y2="40" stroke="#9aa3b2"/>
+    <line x1="470" y1="80" x2="524" y2="110" stroke="#9aa3b2"/>
+    <path d="M 524 122 C 300 150 90 130 65 95" stroke="#7aa7ff" fill="none" stroke-dasharray="4 3"/>
+  </svg><p class="caption">Figure 1 — the shadow loop: every resolution both appends a durable ledger row and becomes the index's next observation (dashed: what the next prediction reads).</p></div>
+
+  <h2>Where it hooks (agent.py dispatch pipeline)</h2>
+  <p>Two guarded blocks inside <code>_dispatch_and_process_tool_batch</code>: predictions are minted after the batch's metadata is assembled and <em>before</em> Phase-1 mutations run; each is graded in the results loop where the dispatch verdict lands. Batch-dedup placeholders carry no prediction, so a collapsed duplicate is never double-graded. Both blocks are try/except-bounded — a prediction that fails to record must never break a turn.</p>
+
+  <h2>Invariants</h2>
+  <ul>
+    <li><strong>One failure definition.</strong> The live grade is the dispatch loop's verdict ORed with the shared corpus sniffer (<code>outcome_heuristics.looks_like_tool_error</code> — the prefix check alone misses execute's non-zero <code>EXIT CODE:</code> banners), and trajectory seeding labels with the same package's <code>tool_call_failed</code>. Live rows and seeded rows cannot disagree about what "failed" means; the fence test pins this.</li>
+    <li><strong>Simulation gate.</strong> Dream/self-play/subagent turns (read-only skill store) are flagged at predict time; their resolutions update <em>nothing</em> — not the ledger, not the index. The §4J lesson (self-play wrote the production calibration corpus) applied at build time instead of found live.</li>
+    <li><strong>The instrument stays shadow; consumers are arm-gated.</strong> Nothing in this module alters dispatch, ordering, budgets, or prompts. The ONE live consumer — the <code>foresight_note</code> arm (see below) — was unlocked by the Phase-2 verdict, ships only as a <a href="experiments.html">core/experiments.py</a> arm, and touches only the text of a result that had <em>already failed</em>. Any further consumer must clear the same gate on the live ledger.</li>
+    <li><strong>Applications, not loads.</strong> Telemetry counts resolved predictions off the durable ledger (the activation-counter lesson: an artifact on disk with zero applies is a dead read-site).</li>
+    <li>The ledger is durable, so its error strings are redacted like every other durable corpus write (recordings day-files are unredacted <em>by design</em>; this is not one of them).</li>
+  </ul>
+
+  <h2>Seeding</h2>
+  <p>The first prediction of a process kicks off a one-shot daemon thread that seeds the index from the trajectory corpus (newest days first, <code>user_request</code> turns only, capped at 20k calls) — day-one predictions carry real support instead of waiting weeks for live accrual. Self-play and reflection trajectories are excluded as synthetic.</p>
+
+  <h2>The ledger</h2>
+  <p><code>$GHOST_HOME/system/foresight/predictions.jsonl</code> — one line per <em>resolved</em> prediction, rotates to <code>.1</code> at 8&nbsp;MB, absent GHOST_HOME nothing is written (tests, ad-hoc imports). Appears on the first resolved prediction after a boot.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ts, req_id, step, tool, op, tclass, sig</code></td><td>When, which turn, which call shape. <code>step</code> = tool messages so far this request (depth proxy).</td></tr>
+      <tr><td><code>basis, support</code></td><td>Which backoff level answered, on how many observations. <code>basis:"none"</code> rows carry no probability — coverage, not a claim.</td></tr>
+      <tr><td><code>p_fail, ok, match</code></td><td>Claimed failure probability, what actually happened, and whether <code>p_fail ≥ 0.5</code> agreed with it. <code>match</code> exists only where a probability was claimed.</td></tr>
+      <tr><td><code>pred_err, err</code></td><td>Most common historical error head vs the normalized actual one (both redacted).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Kill switches</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Env</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_FORESIGHT</code></td><td>1 (shadow only)</td><td><code>0</code> disables predict and resolve entirely.</td></tr>
+      <tr><td><code>GHOST_FORESIGHT_SEED_DAYS</code></td><td>14</td><td>Trajectory-seeding window; <code>0</code> disables seeding.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Reading it</h2>
+  <p><code>introspect action='learning'</code> renders the FORESIGHT block (rows, coverage, accuracy, predicted-fail precision, basis mix, seed state). The <em>verdict</em> belongs to the Phase-2 gate, not that screen:</p>
+  <pre>PYTHONPATH=src python scripts/foresight_backtest.py          # human
+PYTHONPATH=src python scripts/foresight_backtest.py --json</pre>
+  <p>The backtest buckets resolved rows by claimed p(fail) and measures each bucket's <em>actual</em> failure rate: DISCRIMINATES needs a ≥ 0.10 spread <em>and</em> disjoint anytime-valid intervals between best and worst usable buckets (≥ 30 rows each, Bonferroni-corrected) — the same bar the depth curve passed and the router backtest applies. Exit codes: 0 discriminates, 1 flat/insufficient, 2 no ledger.</p>
+
+  <div class="note warn">If the verdict is FLAT, the plan STOPS — that is a result, not a failure. This project's history is full of signals that looked usable and measured dead (<code>uncertainty_pressure</code>: 2 distinct values across an epoch; competence separation 0.0023). A consumer built on a flat signal would be another dark module.</div>
+
+  <h2>Phase 2 result (2026-08-05) and the one consumer it unlocked</h2>
+  <p>The offline replay — run twice, before and after a fresh-eye review fixed two instrument defects that both biased toward a false FLAT (execute had no target so the highest-variance tool collapsed into one cell; seeding ingested never-executed guard rejections with inverted labels) — returned <strong>DISCRIMINATES</strong> both times. Post-fix: 3,558 graded predictions, actual failure rate monotone in the prediction (0.036 → 0.119 → 0.233 → 0.346 → 0.778), spread 0.310, best/worst intervals disjoint, exact-basis accuracy 0.964 (n=1,835), Brier 0.066.</p>
+  <p>That unlocked <strong>Phase 3</strong>: the <code>foresight_note</code> experiment arm. On a FAILED call whose prediction had exact/class basis, support ≥ 3, and at least <strong>2 real precedent failures</strong> (the raw cell count carried on the prediction — a Laplace inversion was measured to drift at high support), the treatment appends: <em>"[FORESIGHT] N of M similar past calls failed like this; most common error: … address that cause — do not retry the identical call."</em> The trigger condition is arm-independent at any instant (both arms read the same pre-note-graded index; a working treatment can still drift the trigger <em>rate</em> over time — watch the arm counts), the fired key is context-mutating (Phase 2b fixture isolation), and <code>GHOST_FORESIGHT_NOTE=0</code> kills it.</p>
+  <p><strong>The note never reaches the corpus.</strong> A second fresh-eye round found that recording the note verbatim would have un-labelled treatment-arm repeated failures — the growing "N of M" counter made three identical retries look like three <em>distinct</em> errors to the same-error-3× outcome rule (FAILED on control, UNKNOWN on treatment), biasing the experiment's own headline metric. <code>strip_foresight_note()</code> now removes the block at trajectory reconstruction, so the corpus stores what the tool returned, not what the treatment decorated onto it. The foresight ledger itself always graded pre-note. Read the arm verdict in the triggered-only block of the <a href="experiments.html">experiment report</a>; the live-ledger backtest remains the confirmatory instrument for prediction quality itself.</p>
+
+  <h2>What the numbers claim (and don't)</h2>
+  <ul>
+    <li>Accuracy/precision in learning-health are ledger-tail aggregates — screening numbers, not the gate.</li>
+    <li>The ledger only sees calls that reached the dispatch pipeline; pre-flight-blocked calls are invisible to it (they never executed, so there is nothing to grade).</li>
+    <li>A turn that crashes mid-batch drops that batch's unresolved predictions — the ledger undercounts by design rather than fabricating a resolution.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

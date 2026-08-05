@@ -369,6 +369,16 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
     # -- tool-call framing leak: RECURRENCE watch ------------------------
     report["framing_leak"] = _framing_leak_health(md.parent / "trajectories")
 
+    # -- foresight shadow world model (§4K Phase 1) ----------------------
+    # Live-imported from the mechanism (same rule as the gates above) so
+    # the instrument cannot drift from what the module actually records.
+    try:
+        from .foresight import ledger_stats as _foresight_stats
+        report["foresight"] = _foresight_stats(
+            md.parent / "foresight" / "predictions.jsonl")
+    except Exception:
+        pass
+
     return report
 
 
@@ -1090,6 +1100,31 @@ def render_learning_health(memory_dir) -> str:
                 f"across {fl['scanned']} trajectories")
     elif fl:
         lines.append(f"\nTOOL-CALL FRAMING LEAK: {fl.get('reason', 'unknown')}")
+
+    fs = r.get("foresight") or {}
+    if fs.get("present"):
+        acc = fs.get("accuracy")
+        acc_s = "n/a" if acc is None else f"{acc:.0%}"
+        pf = fs.get("predicted_fail_precision")
+        pf_s = ("" if pf is None
+                else f"; predicted-fail precision {pf:.0%} "
+                     f"(n={fs.get('predicted_fail_n')})")
+        lines.append(
+            f"\nFORESIGHT (§4K shadow — no consumer by design):")
+        lines.append(
+            f"  {fs.get('ledger_rows', 0)} resolved predictions, coverage "
+            f"{fs.get('coverage', 0.0):.0%} claimed a probability; accuracy "
+            f"{acc_s}{pf_s}")
+        lines.append(
+            f"  actual tool-fail rate {fs.get('actual_fail_rate', 0.0):.0%}; "
+            f"basis mix {fs.get('by_basis')}; seed {fs.get('seed_state')} "
+            f"({fs.get('seeded_calls', 0)} calls) — verdict belongs to "
+            f"scripts/foresight_backtest.py, not this screen")
+    elif fs:
+        lines.append(
+            f"\nFORESIGHT: {fs.get('reason', 'unknown')} "
+            f"(seed {fs.get('seed_state', '?')}, enabled "
+            f"{fs.get('enabled', '?')})")
 
     lines.extend(_experiment_health_lines(memory_dir))
     return "\n".join(lines)

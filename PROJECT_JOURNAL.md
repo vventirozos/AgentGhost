@@ -348,6 +348,130 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 
 ## 4. WHAT REMAINS TO DO
 
+### 4K. Foresight — execution-grounded world model (2026-08-05) ✅ PHASES 1-3 BUILT · PHASE 2 OFFLINE VERDICT: DISCRIMINATES · staged for the next restart; live-ledger confirmation + `foresight_note` arm verdict PENDING
+
+**What it is.** `core/foresight.py` predicts every tool call's outcome BEFORE dispatch (retrieval +
+counting over the agent's own executed transitions — NOT an LLM) and grades the prediction where
+the result lands. Strictly shadow: no steer, no veto, no consumer. It exists to answer ONE
+question with a gate, not a vibe: is this environment predictable enough from (tool, op, target)
+precedent for foresight to earn a consumer?
+
+**Why this feature (operator asked for "the one missing SOTA feature", 2026-08-05).** A fresh web
+survey (WorldEvolver arXiv 2606.30639 — frozen-model, context-only world models; SafePred
+2602.01725 — predictive guardrails for computer-use agents; Text World Models 2606.09032) and an
+independent full-codebase capability inventory converged on the same absence: nothing here learns
+P(outcome | state, action). The 2026-08-02 five-area survey never covered world models. The stack's
+own artifacts argue for it: every quality mechanism is retrospective; the risk governor cannot fire
+before step 6 BY CONSTRUCTION while the depth curve runs 17.8% → 60.6%; and
+`_MCTS_TURNSTART_ENABLED = False` is annotated "OFF until it has an execution-grounded value fn" —
+this is that grounding, built shadow-first. Bonus: predict→execute→compare is SELF-LABELLING, so
+this signal is immune to the §4E negative-label supply famine.
+
+**Phase 1 — SHIPPED 2026-08-05 (this session, §6). Zero behaviour change, deliberately, because
+the §4F watch window is still open.**
+- 3-level backoff index (exact (tool,op,target-sig) → class (tool,op,target-class) → (tool,op)),
+  support floor 3, Laplace `(fails+1)/(n+2)`, LRU-bounded cells. No-precedent calls still record
+  (`basis:"none"`) — coverage is measurable and the resolution becomes observation #1.
+- Hooks in `_dispatch_and_process_tool_batch`: predict after batch metadata assembly (before
+  Phase-1 mutations), grade in the results loop. Batch-dedup placeholders carry no prediction (no
+  double-grading). Both blocks try/except-bounded.
+- **One failure definition (invariant, fence-tested):** live grade = the dispatch verdict OR the
+  shared `outcome_heuristics.looks_like_tool_error` — the dispatch prefix check alone misses
+  execute's non-zero `EXIT CODE:` banners, and seeding labels with the same package's
+  `tool_call_failed`, so a narrower live rule would make live and seeded rows disagree about what
+  "failed" means.
+- **Simulation gate (invariant):** dream/self-play/subagent turns (read-only skill store — same
+  derivation as finalize's `is_simulation`) resolve to NOTHING, ledger and index both. The §4J
+  self-play/calibration lesson applied at build time instead of found live.
+- Ledger `$GHOST_HOME/system/foresight/predictions.jsonl` (8 MB → `.1`, redacted error heads,
+  absent GHOST_HOME writes nothing). Seeding: first predict spawns a one-shot daemon thread over
+  ≤14 days / ≤20k calls of `user_request` trajectories. `GHOST_FORESIGHT=0` kills;
+  `GHOST_FORESIGHT_SEED_DAYS=0` disables seeding. `introspect action='learning'` renders the
+  FORESIGHT block — counts APPLICATIONS off the ledger (the activation-counter lesson), and its
+  own text says the verdict belongs to the backtest, not that screen.
+- ⚠ Known reading caveats: rows from background/autonomous turns can carry `req_id:"SYSTEM"`
+  (kept — real executions — but req_id joins must expect it); pre-flight-BLOCKED calls never reach
+  the ledger (nothing executed, nothing to grade); a mid-batch crash drops that batch's unresolved
+  predictions (undercount, never fabrication).
+
+**Phase 2 — the gate. ✅ OFFLINE VERDICT 2026-08-05: DISCRIMINATES (twice, bracketing the
+instrument fixes).** The backtest gained `--offline-replay` (leave-future-out walk of the
+existing trajectory corpus: predict each call strictly from earlier calls, then observe it), so
+the question did not have to wait a week of ledger accrual. Result, post-fix: **3,558 graded
+predictions; actual failure rate MONOTONE in the prediction — 0.036 / 0.119 / 0.233 / 0.346 /
+0.778 across the five p(fail) buckets; spread 0.310 (threshold 0.10); best/worst intervals
+disjoint (Bonferroni); exact-basis accuracy 0.964 (n=1,835); Brier 0.066.** The pre-fix run said
+DISCRIMINATES too (spread 0.306) — both MAJOR instrument defects biased TOWARD false-FLAT, so the
+two runs bracket the truth from the conservative side. ⚠ Replay caveats (printed by the script):
+within-turn calls are not independent (intervals optimistic), corpus spans label/prompt eras,
+offline labels approximate the live grade. **The LIVE-ledger backtest (~1 week post-restart) is
+the confirmatory instrument:**
+```
+PYTHONPATH=src python scripts/foresight_backtest.py          # exit 0 discriminates / 1 flat / 2 no data
+```
+
+**Fresh-eye review (operator-requested, same day) — shadow guarantee CONFIRMED sound; 2 MAJOR +
+4 MINOR + 4 NIT instrument findings, ALL FIXED except two accepted NITs.** The two MAJORs are the
+reason the replay was re-run: (1) `execute` never got a target from either feed
+(`_PRIMARY_ARG_KEYS` has no `command`; ALL execute calls collapsed into one index cell and the
+`cmd:` classifier branch was dead) — fixed via shared `call_target()` (also covers fs_batch
+`paths`), consumed by the live hook (batch-parallel targets list), seeding, and the replay;
+(2) seeding ingested pipeline-minted REJECTION messages as executed transitions, some with
+INVERTED labels (a pre-flight block on a repeatedly-failing target read as success) — fixed via
+`is_synthetic_result()` banner filter in seed + replay. Also fixed: seed/replay label now ORs the
+dispatch error prefixes (`offline_call_failed` — parity with the live grade as far as truncated
+data allows, docstring corrected from "can never disagree"); one corrupt ledger row no longer
+blanks the whole learning-health section; seed day-window regex-filters `YYYY-MM-DD` dirs (a
+stray `archive/` would have silently evicted the entire window); digit "extensions" (`v1.2`,
+IPs) no longer pollute class buckets; env-assignment prefixes stripped from command heads;
+ledger rotation compares bytes not chars; armed-log race closed; Slack `EMOJI_MAP` got 🔮.
+Accepted NITs: tail-boundary first-line drop in `ledger_stats` (conservative), subagent
+read-only-wrap fallback hole (pre-existing, shared with the finalize gate).
+
+**Phase 3 — ✅ BUILT 2026-08-05 (same session): the `foresight_note` experiment arm** — the
+least-invasive consumer first, per the ship rules. On a FAILED call (same grade the ledger uses)
+whose prediction has exact/class basis, support ≥3, and ≥2 REAL precedent failures (recovered by
+inverting the Laplace estimate — so one echoed-content false positive cannot mint a note), the
+TREATMENT appends: `[FORESIGHT] N of M similar past <tool> calls failed like this; most common
+error: … address that cause — do not retry the identical call.` Registered: `DEFAULT_SPECS`
+(traffic 1.0), `TRIGGER_KEYS` + `CONTEXT_MUTATING_KEYS` (`foresight_note_fired` — the note
+mutates result text, so fired treatment turns are excluded from Phase 2b fixtures). Trigger is
+arm-independent (both arms compute+stamp; only the note is treatment-gated) — the risk_steer
+pattern. Kill: `GHOST_FORESIGHT_NOTE=0`. Tests drive the REAL dispatch pipeline
+(treatment/control/no-precedent/env-kill/success paths). Why this one first: it touches only the
+text of an already-failed result — it cannot block, reorder, or veto anything — and the
+depth-curve mechanism it targets (failed call → blind identical retry → deeper turn) is the
+measured killer. **(b) the MCTS value fn / BoN screening stays gated on the LIVE-ledger
+confirmation.** Kill criterion: triggered-only comparison flat at n≥30/arm both sides → retire
+the arm, do not leave it default-off in the tree.
+
+**Round-2 fresh-eye review (operator-requested, on the Phase-3 delta) — runtime CLEAN, but it
+caught the arm CORRUPTING ITS OWN READOUT before it ever ran. All findings fixed 2026-08-05:**
+1. **MAJOR — the note was recorded into the corpus verbatim, and its GROWING "N of M" counter
+   made identical treatment-arm retries look like DISTINCT errors**: probe showed the
+   same-error-3× outcome rule reading FAILED on control and UNKNOWN on treatment (UNKNOWN is
+   excluded from `failure_rate`), i.e. the headline metric biased pro-treatment by a labeling
+   artifact, concentrated in the triggered-only block. Also poisoned postmortem
+   `repeated_error_count`, per-call sniffer flags, and next-boot seeding. FIX:
+   `strip_foresight_note()` at `_reconstruct_tool_calls` — the corpus records what the TOOL
+   returned. (The live ≥3-strike breaker and the foresight ledger were confirmed pre-note
+   already — my own round-1 fragmentation hypothesis was half right, corpus-side not live-side.)
+2. MINOR — the hooks read `request_id_context`, which on a client-req-id COLLISION names the
+   PREVIOUS request (set before `register()` uniquifies). FIX: `TurnState.req_id` (the
+   uniquified id) used by both hook blocks.
+3. MINOR — the Laplace inversion for "real fails" drifts at support ≥ ~10k (probe: can claim 2
+   where 1 exists from n≈12.5k). FIX: `Prediction.fails` carries the raw cell count; the ledger
+   records it.
+4. MINOR — `SYSTEM ESCAPE HATCH` banner missing from the synthetic filter (would seed as an ok
+   "transition"). FIXED. ⚠ **Baseline follow-up surfaced by the same scan, NOT fixed here (shared-
+   sniffer change needs its own review): `SYSTEM INSTRUCTION: … REPLACE REJECTED` (~35 live
+   calls) and `[SYSTEM ERROR]:` (bracketed, 4 calls) are labelled OK by the corpus sniffer — real
+   failures learned as successes, exactly the file_system-replace class the note targets.**
+5. NIT — replay walk now day-dir-filtered like seeding (leave-future-out safe against stray
+   dirs); 6. NIT — replay no longer mutates `os.environ`; 7. NIT — the arm-independence claim
+   carries the same first-order-only honest-limit comment as `fs_batch` (a working treatment
+   feeds the shared index and can drift the trigger RATE between arms — watch arm counts).
+
 ### 4J. Self-learning stack audit (2026-08-04) — 6 fresh-eye reviews, ~100 findings, CRITICALs FIXED, rest triaged
 
 Six parallel reviewers over the whole self-learning stack: GEPA/optim, reflection+distill,
@@ -1224,7 +1348,7 @@ have been silently retargeted (tolerant-parser false positive — the recurring 
 and `post_edit_view` used quadratic difflib on an otherwise linear path (now O(n) above 20k lines).
 **Cross-surface guards tripped by ONE new log icon:** `app.js` ICON_CLASS coverage, the uConsole
 `turnstatus.py` hand-synced copy, and the `app.js`/`matrix_graph.js` cache-bust lockstep — all
-synced (`?v=8.9 → 9.0`). ⚠ **The uConsole client still needs a deploy to pick up `turnstatus.py`.** **Why it outranks everything else:** depth is the strongest failure predictor measured here
+synced (`?v=8.9 → 9.0`). ~~⚠ The uConsole client still needs a deploy to pick up `turnstatus.py`.~~ ✅ deployed 2026-08-05 (§6 that date, together with the 🔮 foresight icon sync). **Why it outranks everything else:** depth is the strongest failure predictor measured here
 (17.8% at step 1 → 60.6% at step 12) and the risk governor CANNOT fire before step 6 by
 construction — both its terms need a turn to have already happened. Every other lever steers a turn
 that is already deep; this one makes turns shorter. It improves failure rate and latency with one
@@ -2346,6 +2470,108 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-08-05 (later) — §4K FORESIGHT SHIPPED: a shadow world model over tool calls (predict → execute → grade), zero behaviour change
+
+**Origin.** Operator asked for "the one missing SOTA feature". A fresh paper sweep (WorldEvolver
+2606.30639, SafePred 2602.01725, Text World Models 2606.09032) and an independent whole-codebase
+capability inventory converged: nothing here learns P(outcome | action) — every quality mechanism
+is retrospective, and MCTS is annotated "OFF until it has an execution-grounded value fn". World
+models were NOT in the 2026-08-02 five-area survey, so this collides with no prior direction.
+Full rationale + phase gates: §4K.
+
+**What shipped (suite-verified, all shadow — no live path reads a prediction):**
+- `core/foresight.py` — 3-level backoff transition index (exact/class/tool, support ≥3, Laplace
+  `(fails+1)/(n+2)`, LRU-bounded), `predict_for_call`/`resolve_prediction`, durable ledger
+  `$GHOST_HOME/system/foresight/predictions.jsonl` (8 MB → `.1`, redacted, no-GHOST_HOME silent),
+  one-shot daemon seeding from ≤14 d of `user_request` trajectories. Kills: `GHOST_FORESIGHT=0`,
+  `GHOST_FORESIGHT_SEED_DAYS=0`.
+- Hooks in `agent.py _dispatch_and_process_tool_batch`: predict after batch-metadata assembly
+  (before Phase-1 mutations), grade in the results loop; dedup placeholders carry no prediction;
+  both blocks try/except-bounded. **Grade = dispatch verdict OR shared
+  `looks_like_tool_error`** (prefix rule alone misses execute's non-zero `EXIT CODE:` banners;
+  seeding labels with the same package's `tool_call_failed`) — live and seeded rows share ONE
+  failure definition, fence-tested. **Simulation gate:** read-only-skill-store turns
+  (dream/self-play/subagent) resolve to NOTHING — ledger and index both (§4J lesson, applied at
+  build time).
+- `scripts/foresight_backtest.py` — the Phase-2 gate (spread ≥0.10 AND disjoint CS intervals,
+  ≥30/bucket, Bonferroni; exits 0/1/2). `introspect action='learning'` FORESIGHT block counts
+  APPLICATIONS off the ledger. New icon `Icons.FORESIGHT` 🔮.
+- **Live-fidelity probe (read-only against the real corpus):** seeding = 1,639 calls / 440 user
+  turns in **0.13 s**; day-one predictions carry real support (`execute` basis=tool n=214
+  p_fail=0.245, top predicted error = a traceback head; `file_system/replace` class n=31
+  p_fail=0.06); predict cost **3.6 µs/call**. Quirk recorded: a predicted-error head can read as
+  success-text when the shared sniffer fired on content ECHOED inside a result (e.g. a non-zero
+  `EXIT CODE:` inside a post-edit view) — consistent between seed and live labels by
+  construction, so noise, not drift.
+- Tests: `tests/test_foresight.py` (27 — backoff math, simulation gate, ledger contract/rotation,
+  kill switches, seeding via the shared sniffer incl. an EXIT-CODE-only failure, hook fence,
+  backtest verdicts both directions). Docs: `docs/core/foresight.html` (Measurement group;
+  named *foresight*, not world_model — docs already call `workspace/` "the outward-facing world
+  model") + nav/reference-card updates. **The one-new-log-icon cross-surface guard tripped
+  exactly as §4F predicted** — first full-suite pass 11,259 passed / 1 failed
+  (`test_web_icon_map_drift`: 🔮 unclassified) — fixed by classifying 🔮 as `plan` in `app.js`
+  ICON_CLASS + the hand-synced uConsole `turnstatus.py`, with the `?v=` cache-bust chain bumped
+  9.0 → 9.1 in lockstep. Confirmation re-run: **11,260 passed / 14 skipped / 0 failures**.
+  ✅ **uConsole deployed same session** (`deploy.sh` → compile OK on-device, single client, face
+  on remembered form, 🔮 verified in `~/bin/turnstatus.py`) — this also cleared the 08-04
+  pending `turnstatus.py` deploy noted in §4F item 1.
+
+**(later, same session) Phase 2 ANSWERED + Phase 3 BUILT — see §4K for the full record.**
+- `--offline-replay` added to the backtest (leave-future-out over the existing corpus) →
+  **DISCRIMINATES**, run twice bracketing the review fixes: pre-fix spread 0.306, post-fix
+  **0.310, monotone 0.036→0.778, disjoint intervals, exact-basis accuracy 0.964, Brier 0.066**
+  on 3,558 graded predictions.
+- **Fresh-eye review (operator-requested): shadow guarantee CONFIRMED** (no path from prediction
+  to behaviour; simulation gate character-identical to the finalize site; thread-safe under a
+  6-thread hammer). 2 MAJOR instrument defects — execute target collapse (`call_target()` fix,
+  shared by hook/seed/replay) and synthetic-rejection seeding (`is_synthetic_result()` filter) —
+  plus 4 MINOR + 4 NIT, all fixed except two accepted NITs. Both MAJORs biased toward
+  false-FLAT, the direction that would have killed a real signal.
+- **Phase 3 shipped as the `foresight_note` arm** (traffic 1.0, trigger-key +
+  context-mutating-key registered, env kill `GHOST_FORESIGHT_NOTE=0`, functional tests through
+  the real dispatch pipeline): FAILED call + ≥2 real precedent failures → treatment appends the
+  precedent and "do not retry the identical call".
+- uConsole deployed (see above); Slack `EMOJI_MAP` 🔮 added.
+
+**(later still) Round-2 fresh-eye review on the Phase-3 delta → 1 MAJOR + 3 MINOR + 3 NIT, all
+fixed (see §4K):** the headline catch is that the note's growing counter, recorded verbatim,
+would have UN-LABELLED treatment-arm repeated failures (FAILED→UNKNOWN via the same-error-3×
+rule) and biased the arm's own readout — closed with `strip_foresight_note()` at trajectory
+reconstruction, plus `TurnState.req_id` for the hooks (collision-safe), raw `Prediction.fails`
+(Laplace inversion drifted at high n), `SYSTEM ESCAPE HATCH` in the synthetic filter, day-dir
+filter + no env mutation in the replay, and the honest-limit arm-independence comment. A
+BASELINE follow-up was surfaced and deliberately NOT fixed (shared-sniffer change): `REPLACE
+REJECTED` (~35 calls) and bracketed `[SYSTEM ERROR]:` results are labelled OK corpus-wide.
+
+**✅ DEPLOYED 2026-08-05 15:02 (operator-directed restart) and LIVE-VERIFIED.** Final suite before
+the kill: **11,279 passed / 14 skipped / 0 failures**. Boot line: `experiments — 3 live:
+risk_steer; fs_batch; foresight_note` all traffic=1. A probe turn then exercised the whole path:
+🔮 armed mid-request (+13.2 s), **seeding = 1,620 calls / 439 turns** (vs 1,639 pre-filter — the
+synthetic exclusion visibly at work), and the ledger's first two rows are textbook — a no-precedent
+`file_system/list_files` (basis none, coverage row) and an `execute` predicted at class level
+(`cmd:find`, support 13, `fails` 1, p_fail 0.133, match=true) with a redacted `pred_err`.
+
+**✅ TREATMENT PATH DEMO-VERIFIED live, 15:07 (operator-requested).** Method is reusable: the arm
+is a pure hash of the request id, so `enroll_request()` was probed offline to mint a
+treatment-landing id (`X-Request-ID: fsnote-demo-2`), and the message targeted a key the seeded
+index holds strong failing precedent for (`file_system|read|ext:py` — 37 obs / 9 fails): "read
+demo_missing_module_xyz.py". Every layer confirmed: ledger row (basis class, support 37, fails 9,
+p_fail 0.256, redacted pred_err/err); log line `foresight note — file_system: 9/37 precedent
+failures surfaced to the model`; the model's own thinking referenced "a foresight note about
+similar failures" while composing an honest no-retry reply; trajectory stamped
+`foresight_note_fired: true`; and the recorded tool result carries **no `[FORESIGHT]` text** —
+the round-2 recorder strip working in production. ⚠ Bookkeeping: the demo turn is an
+intentionally-failed turn ON THE TREATMENT ARM (outcome `failed`), so it slightly costs treatment
+in the raw numbers — one row, noise at the n≥30 gate, but know it is there when reading early
+arm counts.
+
+**NEXT:** after ~a week: `foresight_backtest.py` on the LIVE ledger (confirmatory) + the
+`foresight_note` triggered-only block in the experiment report (watch the arm counts for
+trigger-rate drift, per the honest-limit note). The MCTS value-fn/BoN consumer stays gated on the
+live confirmation. Do not flip `--use-planning`/MCTS on the offline verdict alone. Baseline
+follow-up parked in §4K round-2 item 4: the shared sniffer's `REPLACE REJECTED` / bracketed
+`[SYSTEM ERROR]:` blind spots.
 
 ### 2026-08-05 — three token slots, zero producers: upstream `usage` captured; tool-choice fidelity re-measured (0.821, and the CLUSTERING CLAIM DIED)
 

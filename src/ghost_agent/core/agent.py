@@ -2769,6 +2769,13 @@ class TurnState:
     tool_usage: Any
     tools_run_this_turn: Any
     request_state: Any
+    # The UNIQUIFIED turn id (post `register()` collision handling) —
+    # the id enrollment/ring/stamping key on. The contextvar is set
+    # BEFORE uniquification, so on a client-req-id collision it names
+    # the PREVIOUS request; anything in the dispatch pipeline that
+    # keys experiment state must read this field instead (round-2
+    # foresight review finding #2). Defaulted for older constructions.
+    req_id: Any = ""
 
     MUTATED_FIELDS = ('_constraint_steer_pending', '_proj_task_closed_this_req', '_request_sys3_fired_once', '_request_sys3_prev_justification', 'consecutive_parse_errors', 'current_plan_json', 'execution_failure_count', 'final_ai_content', 'fname', 'force_final_response', 'force_stop', 'forget_was_called', 'last_was_failure', 'preflight_blocks_this_request', 'request_sandbox_state', 'transient_failure_count')
 
@@ -8610,6 +8617,13 @@ class GhostAgent:
 
             tool_tasks, tool_call_metadata = [], []
             tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
+            # Parallel to tool_call_metadata: the foresight TARGET of each
+            # call, computed where t_args is still in scope. The metadata
+            # tuple's ptarget/path fields are NOT enough — execute's
+            # `command` and fs_batch's `paths` are outside
+            # `_PRIMARY_ARG_KEYS`, which collapsed the highest-variance
+            # tool into one index cell (fresh-eye review finding #1).
+            _fs_call_targets = []
             # Idempotent setters dispatched in THIS batch. The guard
             # checks it alongside `executed_idempotent` so two
             # identical calls in one response still dedupe, while
@@ -9182,6 +9196,15 @@ class GhostAgent:
                                         or t_args.get("cmd") or "")))
                         )
                         tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or ""), _pf_world_mut))
+                        try:
+                            from .foresight import call_target as _fs_ct
+                            _fs_call_targets.append(_fs_ct(
+                                fname,
+                                str(t_args.get("operation")
+                                    or t_args.get("action") or ""),
+                                t_args))
+                        except Exception:  # noqa: BLE001 — stay aligned
+                            _fs_call_targets.append("")
                         # The DURABLE idempotency hash is recorded at
                         # the RESULT-processing site, and only when
                         # the call actually SUCCEEDED. Recording it
@@ -9224,6 +9247,34 @@ class GhostAgent:
             if tool_tasks:
                 # CRITICAL FIX: Run mutating tools (like file writes) BEFORE execution tools to prevent race conditions
                 results = [None] * len(tool_tasks)
+
+                # ── Foresight (SHADOW — §4K): predict each call's outcome
+                # BEFORE it runs; graded at the result site below. Changes
+                # no behaviour, costs microseconds (counting, no LLM).
+                # Simulation turns (dream/self-play/subagent run with a
+                # read-only skill store) are flagged so their resolutions
+                # never write the production corpus — the §4J lesson.
+                _foresight_preds = [None] * len(tool_tasks)
+                try:
+                    from .foresight import predict_for_call as _fs_predict
+                    _fs_simulation = getattr(
+                        getattr(self.context, "skill_memory", None),
+                        "is_read_only", False) is True
+                    for _fs_i, (_fs_task, _fs_meta) in enumerate(
+                            zip(tool_tasks, tool_call_metadata)):
+                        if _fs_task is None:
+                            continue   # batch-dedup placeholder — the
+                                       # executed instance carries the grade
+                        _fs_target = (_fs_call_targets[_fs_i]
+                                      if _fs_i < len(_fs_call_targets)
+                                      else "")
+                        _foresight_preds[_fs_i] = _fs_predict(
+                            tool=_fs_meta[0], operation=_fs_meta[6],
+                            target=str(_fs_target
+                                       or _fs_meta[7] or _fs_meta[4] or ""),
+                            simulation=_fs_simulation)
+                except Exception as _fs_e:  # noqa: BLE001
+                    logger.debug(f"foresight predict skipped: {_fs_e}")
 
                 # Phase 1: Mutations
                 mutation_coros = []
@@ -9347,6 +9398,31 @@ class GhostAgent:
                         "preview": (str_res.replace("Error:", "").strip()[:140]
                                     if _res_is_error else None),
                     })
+
+                    # ── Foresight (SHADOW — §4K): grade the pre-dispatch
+                    # prediction. The grade is the loop's own verdict ORed
+                    # with the shared corpus failure sniffer — the dispatch
+                    # prefix check alone misses execute's non-zero
+                    # `EXIT CODE:` banners, and the index is SEEDED from
+                    # trajectories labelled by that sniffer, so grading
+                    # with a narrower rule here would make live rows and
+                    # seeded rows disagree about what "failed" means.
+                    try:
+                        if _foresight_preds[i] is not None:
+                            from .foresight import (
+                                resolve_prediction as _fs_resolve)
+                            from ..distill.outcome_heuristics import (
+                                looks_like_tool_error as _fs_looks_err)
+                            _fs_resolve(
+                                _foresight_preds[i],
+                                ok=not (_res_is_error
+                                        or _fs_looks_err(str_res)),
+                                result_head=str_res[:200],
+                                req_id=str(getattr(ts, "req_id", "")
+                                           or request_id_context.get() or ""),
+                                step=len(tools_run_this_turn))
+                    except Exception as _fs_e:  # noqa: BLE001
+                        logger.debug(f"foresight resolve skipped: {_fs_e}")
 
                     # Feed the pre-flight repeat-failure guard (feature
                     # 1A): remember FAILED calls keyed by (tool, primary
@@ -9699,6 +9775,77 @@ class GhostAgent:
                                 safe_res = safe_res + f"\n\n[FALLBACK HINT for {fname}] {hint}"
                         except Exception:
                             pass
+
+                    # ── Foresight Phase 3 (§4K, experiment `foresight_note`):
+                    # a FAILED call with strong FAILING precedent gets the
+                    # precedent appended, so recovery uses history instead of
+                    # blind retries. Unlocked by the offline Phase-2 replay
+                    # verdict (DISCRIMINATES: spread 0.310, monotone,
+                    # 2026-08-05). `pred.fails` is the RAW cell count (the
+                    # Laplace inversion drifted at high support — round-2
+                    # review finding #3); ≥2 real failures required so one
+                    # echoed-content false positive cannot mint a note.
+                    # The note is STRIPPED before trajectory recording
+                    # (`_reconstruct_tool_calls`) — its growing counter
+                    # otherwise un-labels treatment-arm repeated failures
+                    # (round-2 finding #1).
+                    # Honest limit on arm-independence (round-2 finding #7):
+                    # the trigger CONDITION is arm-independent at any
+                    # instant (both arms read the same shared index and the
+                    # index is graded pre-note), but a working treatment
+                    # changes the model's follow-up behaviour, which feeds
+                    # the index and can drift the trigger RATE between arms
+                    # over time — same first-order-only caveat as
+                    # `fs_batch_fired`; the arm counts in the report are
+                    # what shows it.
+                    try:
+                        _fsn_pred = _foresight_preds[i]
+                        if (_fsn_pred is not None
+                                and not _fsn_pred.simulation
+                                and _fsn_pred.basis in ("exact", "class")
+                                and _fsn_pred.support >= 3
+                                and _fsn_pred.fails >= 2
+                                and _fsn_pred.predicted_error
+                                and os.getenv("GHOST_FORESIGHT_NOTE", "1")
+                                .strip().lower() not in ("0", "false", "no")):
+                            from ..distill.outcome_heuristics import (
+                                looks_like_tool_error as _fsn_looks_err)
+                            if _res_is_error or _fsn_looks_err(str_res):
+                                from . import experiments as _fsn_exp
+                                from .foresight import (
+                                    FORESIGHT_NOTE_MARKER as _fsn_marker)
+                                _fsn_req = str(
+                                    getattr(ts, "req_id", "")
+                                    or request_id_context.get() or "")
+                                _fsn_arm = _fsn_exp.arm_for(
+                                    self.context, "foresight_note", _fsn_req)
+                                if _fsn_arm:
+                                    _fsn_treat = (
+                                        _fsn_arm == _fsn_exp.TREATMENT)
+                                    _fsn_exp.mark_trigger(
+                                        self.context, _fsn_req,
+                                        "foresight_note_fired", _fsn_treat)
+                                    if _fsn_treat:
+                                        safe_res = safe_res + (
+                                            f"{_fsn_marker}"
+                                            f"{_fsn_pred.fails} of "
+                                            f"{_fsn_pred.support} similar past "
+                                            f"{fname} calls "
+                                            f"({_fsn_pred.basis} precedent) "
+                                            f"failed like this; most common "
+                                            f"error: "
+                                            f"{_fsn_pred.predicted_error[:160]}"
+                                            f". If this matches, address that "
+                                            f"cause — do not retry the "
+                                            f"identical call.")
+                                        pretty_log(
+                                            "Foresight Note",
+                                            f"{fname}: {_fsn_pred.fails}/"
+                                            f"{_fsn_pred.support} precedent "
+                                            f"failures surfaced to the model",
+                                            icon=Icons.FORESIGHT)
+                    except Exception as _fsn_e:  # noqa: BLE001
+                        logger.debug(f"foresight note skipped: {_fsn_e}")
 
                     tool_msg = {"role": "tool", "tool_call_id": tool_id, "name": fname, "content": safe_res}
                     messages.append(tool_msg)
@@ -15835,6 +15982,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # finally-repack: even if a tool path raises, this frame's locals
                     # match what the inline code would have left behind.
                     _ts = TurnState(
+                        req_id=req_id,
                         _constraint_steer_pending=_constraint_steer_pending,
                         _proj_task_closed_this_req=_proj_task_closed_this_req,
                         _request_sys3_fired_once=_request_sys3_fired_once,
@@ -17905,7 +18053,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 entry = pending_calls.get(tc_id)
                 if entry is not None:
                     _n, _a, obj = entry
-                    obj.result = str(m.get("content") or "")[:4000]
+                    _content = str(m.get("content") or "")
+                    # The `foresight_note` treatment appends a counter-
+                    # bearing block that GROWS between identical retries
+                    # ("2 of 6" → "3 of 7") — recorded verbatim it made
+                    # identical treatment-arm failures look DISTINCT to
+                    # the same-error-3× outcome rule and the postmortem
+                    # signature (round-2 review finding #1). The corpus
+                    # records what the TOOL returned, not what the
+                    # treatment decorated onto it.
+                    try:
+                        from .foresight import strip_foresight_note
+                        _content = strip_foresight_note(_content)
+                    except Exception:
+                        pass
+                    obj.result = _content[:4000]
                     try:
                         from ..distill.outcome_heuristics import (
                             _looks_like_tool_error, _normalize_tool_error,

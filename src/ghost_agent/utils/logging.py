@@ -315,6 +315,7 @@ class Icons:
     VERIFIER_LAB     = "🧪"   # self-evaluation gate
     UNCERTAINTY_DIE  = "🎲"   # uncertainty tracker
     MCTS_TREE        = "🌳"   # deep-reason MCTS search tree
+    FORESIGHT        = "🔮"   # shadow world model — tool-outcome prediction
     HEARTBEAT        = "🫀"   # biological watchdog heartbeat
 
 
