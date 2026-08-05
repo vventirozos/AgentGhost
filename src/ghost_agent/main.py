@@ -279,7 +279,7 @@ def parse_args():
     # server normally sits at 90%+ free-RAM-percent so the bridge isn't
     # spammed with steady-state warnings.
     parser.add_argument("--metacog-cpu-high", type=float, default=85.0, help="CPU usage %% above which a HostSignal fires (default 85). Sustained crossings escalate severity to warning.")
-    parser.add_argument("--metacog-mem-high", type=float, default=85.0, help="RAM usage %% above which a HostSignal fires (default 85). Raise to 95-99 on hosts where the LLM server pins memory as steady state.")
+    parser.add_argument("--metacog-mem-high", type=float, default=97.0, help="RAM usage %% above which a HostSignal fires (default 97). Ghost always runs against a local LLM server, which pins memory as STEADY STATE — the old 85 default treated that resting condition as pressure and fired on a box with GBs free. Real pressure is caught by the free-RAM conjunct (--metacog-mem-warn-free-mb) and the hard floor (--metacog-mem-floor-mb), not by this percentage. Lower it only on a host that is NOT co-resident with the model.")
     parser.add_argument("--metacog-mem-floor-mb", type=float, default=800.0, help="Hard floor for free RAM in MB (default 800). Crossing emits a critical-severity signal regardless of mem-high.")
     parser.add_argument("--metacog-mem-warn-free-mb", type=float, default=1024.0, help="The RAM WARNING requires BOTH mem-high%% AND free RAM below this (default 1024 = 1 GB). On a large-RAM box a high percentage with GBs free is not real pressure and spammed a warning every heartbeat; gating on genuinely-low free memory (~97%% on a 36 GB box) fires only under real pressure. The critical floor (--metacog-mem-floor-mb) stays the harder OOM line below this.")
     parser.add_argument("--metacog-disk-high", type=float, default=90.0, help="Disk usage %% above which a HostSignal fires (default 90).")
@@ -1764,7 +1764,13 @@ async def lifespan(app):
                 # in the very signal that fired at 97.
                 metric = "ram"
                 observed = sig.snapshot.mem_percent
-                threshold = float(getattr(args, "metacog_mem_high", 85.0) or 85.0)
+                # Fall back to the SAME constant core/metacog.py builds the
+                # telemetry from — a second hardcoded number here is how the
+                # stale-threshold bug this block fixes gets reintroduced.
+                from .utils.telemetry import HostTelemetry as _HT
+                _mem_default = _HT.DEFAULT_MEM_HIGH
+                threshold = float(
+                    getattr(args, "metacog_mem_high", _mem_default) or _mem_default)
                 if "free<" in sig.reason:
                     metric = "ram_floor"
                     threshold = float(

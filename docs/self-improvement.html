@@ -193,7 +193,9 @@
   </div>
 
   <h3>The harder question underneath</h3>
-  <p>Optimizing a tool's <em>description</em> assumes the tool boundaries are right and only the wording is off. Measured on unseen cases, the agent picks the correct tool about <strong>77% of the time</strong> — and the misses aren't scattered, they cluster into the same few pairs (browser vs. file operations, code execution vs. writing a file). When a model keeps confusing the same two things, "the description is unclear" competes with "the boundary is in the wrong place", and better prose can't fix the second one. That's an open question here, not a solved one.</p>
+  <p>Optimizing a tool's <em>description</em> assumes the tool boundaries are right and only the wording is off. If the model keeps confusing the same two tools, "the description is unclear" competes with "the boundary is in the wrong place" — and better prose can't fix the second one.</p>
+  <p>Measured 2026-08-05 by replaying <strong>67 held-out choices</strong> from live traffic against the shipped descriptions: the agent picks the correct tool <strong>82% of the time</strong> (55 of 67, with none failing to replay). The 12 misses land on <strong>12 different tool pairs</strong> — not one pair occurs twice. Two of them are stalls where it picked no tool at all.</p>
+  <p>So on this sample there's no evidence that any particular boundary is mis-drawn; the errors look scattered rather than systematic. But 12 misses spread over sixteen tools is also too few to <em>rule out</em> a boundary problem — that pattern is what you'd see either way. The question stays open, and it needs a wider corpus rather than a better argument.</p>
 
   <h2>Seeing what actually happened</h2>
   <p>All of this is invisible by design — routine background work doesn't interrupt your conversation. To see it, ask.</p>

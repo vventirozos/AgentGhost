@@ -634,12 +634,37 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
 
     _persist_session(content)
 
-    return JSONResponse({
+    # Token cost for the whole turn, summed across every upstream call it
+    # made (tool rounds + verifier) — NOT one completion's usage. Surfaced
+    # because the eval harness had a `tokens_used` field whose only producer
+    # was a hardcoded 0, so every SuiteResult reported `total_tokens: 0`.
+    # Omitted entirely when unknown: an absent key is honest, a zero is not.
+    _payload = {
         "id": f"chatcmpl-{req_id}", "object": "chat.completion", "created": created_time, "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         "message": {"role": "assistant", "content": content},
         "done": True, "created_at": get_utc_timestamp()
-    })
+    }
+    try:
+        _llm = getattr(getattr(agent, "context", None), "llm_client", None)
+        _usage = _llm.usage_for(req_id) if _llm is not None else None
+        # `isinstance(dict)` + int() are load-bearing, not defensive noise: a
+        # MagicMock client returns a truthy mock whose .get() is also a mock,
+        # which serialises to a 500 rather than a reply. Real values only.
+        if isinstance(_usage, dict) and _usage:
+            _in = int(_usage.get("tokens_in") or 0)
+            _out = int(_usage.get("tokens_out") or 0)
+            _payload["usage"] = {
+                "prompt_tokens": _in,
+                "completion_tokens": _out,
+                "total_tokens": _in + _out,
+                "prompt_tokens_details": {
+                    "cached_tokens": int(_usage.get("cached_tokens") or 0)},
+                "ghost_llm_calls": int(_usage.get("calls") or 0),
+            }
+    except Exception:  # noqa: BLE001 — never fail a reply over accounting
+        pass
+    return JSONResponse(_payload)
 
 def _scratchpad_snapshot(sp) -> dict:
     """Namespace-preserving scratchpad snapshot for session export.

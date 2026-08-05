@@ -111,6 +111,15 @@
   <h3>Every answer is slow</h3>
   <p>Your model has one inference slot, and Ghost competes with itself for it: the self-check, conversation compaction and background classification are all model calls. Moving the self-check to a second machine with <code>--critic-nodes</code> is the highest-value change available — see <a href="configuration.html">Settings that matter</a>.</p>
 
+  <h4>Finding out what a turn actually cost</h4>
+  <p>Every turn now records its real token cost, summed across each model call it made — the tool rounds, the self-check, and any work sent to a worker node. It lands in the turn's trajectory record and on the reply itself:</p>
+  <pre class="shell">curl -s -X POST http://127.0.0.1:8000/api/chat \
+  -H "X-Ghost-Key: $GHOST_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"'"$GHOST_MODEL"'","messages":[{"role":"user","content":"hello"}],"stream":false}' \
+  | python -c "import sys,json; print(json.load(sys.stdin).get('usage'))"</pre>
+  <p>The interesting field is <code>cached_tokens</code>. Ghost sends a large system prompt on every call and relies on the server's prefill cache to avoid re-processing it. If <code>cached_tokens</code> is near <code>prompt_tokens</code>, the cache is working and most of that prompt costs nothing. If it's near zero, you're re-prefilling the whole prompt every round — which is the difference between a fast turn and a slow one, and it's usually caused by something changing early in the prompt between calls.</p>
+  <p><code>ghost_llm_calls</code> tells you how many model calls the turn took. A simple question that made eight calls is doing more work than you asked for.</p>
+
   <h3>One turn takes forever</h3>
   <p>Watch the log panel in the web UI. A turn can use up to 40 passes through the tool loop, and something like deep research legitimately takes minutes because every page is fetched over Tor. If it's stuck on the same tool repeatedly with the same result, that's a loop and Ghost's own guards should break it after three identical attempts.</p>
 

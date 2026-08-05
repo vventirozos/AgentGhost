@@ -18076,6 +18076,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _experiments_mod.trigger_flags(self.context, req_id))
         except Exception:
             pass
+        # Upstream token accounting. `tokens_in`/`tokens_out` were declared on
+        # the Trajectory schema from the start and read 0 on all 1515 records,
+        # because nothing ever read the upstream `usage` block. The client
+        # sums it per request across every call the turn made (tool rounds +
+        # verifier), so this is the TURN cost, not one completion's.
+        try:
+            _llm = getattr(self.context, "llm_client", None)
+            _usage = _llm.usage_for(req_id) if _llm is not None else {}
+            if _usage:
+                traj_kwargs["tokens_in"] = int(_usage.get("tokens_in") or 0)
+                traj_kwargs["tokens_out"] = int(_usage.get("tokens_out") or 0)
+                # Prefill-cache hits and the call count don't belong on the
+                # schema's two token fields, but they are what make the cost
+                # readable — a turn at 40k tokens_in with 38k cached is a
+                # different animal from one that re-prefilled every round.
+                _extra["llm_calls"] = int(_usage.get("calls") or 0)
+                _extra["cached_tokens"] = int(_usage.get("cached_tokens") or 0)
+        except Exception:  # noqa: BLE001 — accounting never breaks a turn
+            pass
         if _extra:
             traj_kwargs["extra"] = _extra
         # Use the pre-allocated id from `handle_chat` when present so

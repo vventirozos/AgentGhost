@@ -1184,6 +1184,11 @@ all measured:
 - Phase 2b's own ceiling check measured **0.772 incumbent fidelity**: its upside is prose
   refinement. `fs_batch` targets the population that fails at **47.2% against an 8.8% base rate**.
   Holding a depth intervention to protect a prose optimizer is the worse trade.
+  ⚠ **RE-MEASURED 2026-08-05 (see §6): 0.821 (55/67, 0 unreplayable).** The 0.772 was
+  `fidelity_runner`, which scores 5 replay-plumbing failures as wrong; the toolbox-only figure that
+  day was 0.846. The *sequencing* conclusion above still holds — a ~0.82 incumbent is still a prose
+  ceiling — but do not quote 0.772 as a measurement of the toolbox. **And the clustering premise
+  below is not reproducible:** 12 misses on 12 distinct pairs, none twice.
 - **The real invalidation is AHEAD, not behind.** `file_system` is **85 of ~190 fixtures** — the
   dominant tool. If `fs_batch` wins and becomes default, every file_system fixture was mined
   against a schema that no longer exists. **So when fs_batch resolves, bump
@@ -2342,6 +2347,83 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-08-05 — three token slots, zero producers: upstream `usage` captured; tool-choice fidelity re-measured (0.821, and the CLUSTERING CLAIM DIED)
+
+**1. Tool-choice fidelity re-measured — the 0.772 was two things wrong, and the clustering was a
+third.** Triggered by the operator's instinct that the number was "poisoned by a bug that is now
+fixed". It was not that bug — but it was wrong.
+- *The parser-leak corruption never reached it.* Verified two ways: the miner's era cutoff
+  (`2026-07-31T19:15`) postdates the last occurrence (~18:54, all 17 dated pre-fix on 08-04), and
+  an independent scan of all **533 tool-call arguments** in the freshly mined pool with
+  `utils/leaked_framing` returns **0 hits**. The report's own `corpus purity` header agrees. What
+  the corruption DID pollute was the macro/n-gram counts, closed 08-04.
+- *The real defect in the citation was metric choice.* `0.772 = fidelity_runner` (44/57) counts 5
+  rows that failed to REPLAY as wrong — deliberate, so a GEPA candidate cannot win by skipping hard
+  fixtures. `fidelity` (replayable-only) was 0.846. `tool_ontology.py:198` says outright *"neither
+  is 'the' fidelity"*; quoting the optimizer's gaming-resistant training metric as a measurement of
+  the toolbox was the error.
+- *Fresh measurement:* **0.821 (55/67), 0 unreplayable** — so both metrics agree for the first
+  time and there is no metric to argue about. Mined 2026-08-05, 197 fixtures / 71 positives.
+- ⚠ **THE CLUSTERING CLAIM DOES NOT REPRODUCE.** 12 misses land on **12 distinct pairs, max count
+  per pair = 1** (two are no-tool stalls). The §4F premise that the misses "cluster into a handful
+  of specific pairs (browser↔file_system, execute→file_system, manage_projects over-selected)" —
+  which is the whole evidential basis for "the boundary is drawn in the wrong place" — is not
+  visible on 67 held-out cases. Honest caveat: 12 misses over 16 tools is ALSO too few to rule a
+  boundary problem out; perfect scatter is what you would see either way. **The ontology question
+  is open on evidence, not leaning either way.** `docs/self-improvement.html` updated.
+- *Reproduce:* `mine_tool_fixtures.py --private-pct 95 --force-write` then
+  `optimize_tool_descriptions.py --smoke --force-supply --confusion-out …` then
+  `tool_ontology_report.py --replays …`. **Gotcha:** `--private-pct 100` fails with
+  `degenerate public/private fixture split` — the runner requires both tiers non-empty even under
+  `--smoke`, which only scores private. 95 gives 67 private / 4 public. The default 30% yields
+  **14** private positives (7.1 points per case; the miner prints `TOO COARSE`). Widening is
+  legitimate here because `tool_selection.pick` has **never been promoted** — no artifact on disk,
+  so the incumbent has never seen any of these fixtures.
+
+**2. Upstream token accounting — a field that read 0 on 1515 of 1515 records.** Found while
+looking for non-GEPA work. THREE token slots existed and NONE had a producer:
+`Trajectory.tokens_in/out` (0 of 1515), `eval.TaskResult.tokens_used` (only producer:
+a hardcoded `0` in `scripts/eval_baseline.py:91`), and the upstream `usage` block, which nothing
+read anywhere in `src/`. Every `SuiteResult` ever written therefore reported
+`total_tokens: 0` — summed, serialised, and sitting beside real numbers. **The paired ablation
+could only say "~1.8× latency" because the token half was never measurable.** Same shape as the
+mock-guard and the write-only optimizer: computed, aggregated, reported, structurally always zero.
+- *Captured at all three funnels.* `chat_completion` (both branches), `route` — **missed on the
+  first pass and caught by the fresh-eye review**; it serves verify / decompose / classification,
+  so omitting it under-reported the turn silently and in the direction that flatters it — and the
+  streamed path, which needs `stream_options.include_usage` (an OpenAI-compatible server sends no
+  usage on a stream without it) plus a parse of the final chunk, whose `choices` is empty.
+- *Per-REQUEST sum, not per-call*, in a bounded 32-entry LRU on the client. `usage_for()` returns
+  `{}` for an unknown request rather than zeros — "never measured" and "a cheap turn" must stay
+  distinguishable, that being the whole defect.
+- *The streaming hook is deliberately OUTSIDE the `if _rec_on:` gate* — `_stream_rec_accumulate`
+  only runs under `GHOST_LLM_RECORD=1` (off by default), so folding usage into it would have
+  shipped it dark. Pinned by an AST test that also fails if the gate is renamed, so it cannot pass
+  vacuously.
+- *Surfaced on `/api/chat`* as an OpenAI-shaped `usage` block (+ `cached_tokens`, `ghost_llm_calls`),
+  omitted entirely when unknown. Needed because the eval runner reads Ghost's API, not the
+  upstream — without it the `eval_baseline` fix would have been a second silent zero.
+- *`prompt_tokens_details.cached_tokens` carried through.* The prefill cache is reported in the log
+  as a CHARACTER count (`chars=16757`); this is the first real hit measurement.
+- *Two traps, both caught by the suite (11 failures across 4 modules):* a `MagicMock` client
+  returns a **truthy** mock whose `.get()` is also a mock → serialised to a 500 instead of a reply
+  (fix: `isinstance(dict)` + `int()`, never truthiness); and stream chunks are `str` on
+  `aiter_lines()` but `bytes` elsewhere → `TypeError` in the stream loop.
+- Tests: `tests/test_llm_token_usage.py` (25). Suite **11233 passed**. Docs: `core/llm.html`,
+  `api/routes.html`, `troubleshooting.html` (reading `cached_tokens` to diagnose slow turns).
+
+**3. `--metacog-mem-high` default 85 → 97.** Ghost always runs co-resident with a local LLM server,
+which pins RAM as steady state; 85 treated that resting condition as pressure. Real pressure is
+caught by the free-RAM conjunct and the hard floor, which fire on absolute numbers. **Live data
+that prompted it:** RAM ranged 52.4–98.0% with free 744 MB–17.5 GB, and produced **1** signal
+(info) against **15 CPU** signals (14 info, 1 warning) at the CPU default of 85 — i.e. the noisy
+metric is CPU, not RAM. The operator's launcher already passes 98, so this changes nothing live;
+it fixes the out-of-box default. Also removed a hardcoded `85.0` fallback in `main.py`'s signal
+renderer — the block whose own comment exists *because* of a stale-threshold reporting bug.
+⚠ *Open, not acted on:* `--metacog-cpu-high` is still 85 and is what actually fires. Operator call.
+⚠ *Noted, inert:* `HostSnapshot.healthy` compares against CLASS defaults, ignoring configured
+thresholds (documented limitation) — harmless today because it has **zero consumers**.
+
 ### 2026-08-04 (later) — THE FIX BROKE IT: arming four never-run subsystems destroyed 13 lessons and opened two live redaction leaks
 
 **Origin.** The audit below ended with a `component_guard` fix that ARMED four subsystems which
@@ -2819,7 +2901,11 @@ effect. Whether it helps is the `risk_steer` experiment's job to answer, not thi
 
 **3. `optim/tool_ontology.py` + `scripts/tool_ontology_report.py` — is the toolbox carved right?**
 Phase 2b optimizes description PROSE; the 0.772 ceiling check says the misses CLUSTER into pairs,
-which is a boundary question prose cannot answer. Two read-only analyses: confusion classification
+which is a boundary question prose cannot answer.
+⚠ **The clustering did NOT reproduce (2026-08-05, §6).** On 67 held-out cases the 12 misses land on
+**12 distinct pairs, none occurring twice** — so the premise this tool was built on is unsupported
+on fresh data. The tool is still the right instrument; its motivating observation is now the thing
+under test rather than a given. Too few misses to rule a boundary problem out either. Two read-only analyses: confusion classification
 (bidirectional = merge/redraw, one-way = describe, no-tool = missing affordance, every verdict
 tiered by an exact binomial symmetry test) and consecutive-n-gram macro mining. Proposes only —
 promotion stays operator-gated. `--confusion-out` added to the Phase 2b runner (opt-in) so the

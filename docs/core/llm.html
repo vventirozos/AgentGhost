@@ -120,6 +120,54 @@
     <dt>headers</dt><dd>Forwards <code>X-Ghost-Key</code> when calling other Ghost Agent instances.</dd>
   </div>
 
+  <h2>Upstream token accounting (2026-08-05)</h2>
+
+  <p><strong>The gap.</strong> <code>Trajectory.tokens_in</code> / <code>tokens_out</code> and
+  <code>eval.TaskResult.tokens_used</code> were declared fields that read <strong>0 on every
+  record</strong> — 0 of 1515 trajectories, and the only producer of <code>tokens_used</code>
+  was a hardcoded <code>0</code> in <code>scripts/eval_baseline.py</code>, so every
+  <code>SuiteResult</code> ever written reported <code>total_tokens: 0</code>, summed and
+  serialised beside real numbers. Nothing anywhere read the upstream <code>usage</code> block
+  (<code>grep '"usage"'</code> over <code>core/</code>: no hits). The paired ablation could only
+  report <em>"~1.8× latency"</em> because the token half was never measurable.</p>
+
+  <p><strong>The shape.</strong> A turn makes MANY calls — each tool round, the verifier, and
+  anything routed to a worker — so the per-turn number is a <strong>sum keyed on request id</strong>,
+  not one completion's usage. <code>LLMClient</code> keeps a bounded (32-request) LRU ring;
+  <code>usage_for(req_id)</code> reads it. An <strong>absent entry returns <code>{}</code></strong>
+  rather than zeros, so "no data" and "a genuinely cheap turn" stay distinguishable — the whole
+  defect being fixed is a zero that meant "never measured".</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Path</th><th>How usage is captured</th></tr></thead>
+    <tbody>
+      <tr><td><code>chat_completion</code></td><td><code>_note_usage(result)</code> on both the foreground and background branches, beside the existing recording hook.</td></tr>
+      <tr><td><code>route</code></td><td><code>_note_usage(data)</code> before the content extraction. <strong>Missed on the first pass</strong> — this pool serves verify / decompose / classification, so omitting it under-reported the turn silently, in the direction that flatters it.</td></tr>
+      <tr><td><code>_do_stream_chat_completion</code></td><td>Payload gains <code>stream_options.include_usage</code> (an OpenAI-compatible server sends <em>no</em> usage on a stream without it), and the final chunk — whose <code>choices</code> is empty — is parsed by <code>_note_usage_from_sse</code>.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note warn">
+    <strong>Why the streaming hook is not inside the recorder gate.</strong>
+    <code>_stream_rec_accumulate</code> only runs under <code>GHOST_LLM_RECORD=1</code>, which is
+    off by default. Folding usage capture into that block would have made it dark in production —
+    the exact silent-inoperative shape this project keeps rediscovering. It has its own call site,
+    and a test asserts structurally (via AST, not indentation) that it never moves inside an
+    <code>if _rec_on:</code> block. That test also fails if the gate is renamed, so it cannot pass
+    vacuously.
+  </div>
+
+  <p><strong>Two live traps found while wiring it.</strong> A <code>MagicMock</code> LLM client
+  returns a <em>truthy</em> mock whose <code>.get()</code> is also a mock, which serialised to a
+  500 instead of a reply — so the API-side read requires <code>isinstance(dict)</code> and
+  <code>int()</code>, not truthiness. And stream chunks are <code>str</code> on the
+  <code>aiter_lines()</code> path but <code>bytes</code> elsewhere; assuming either raised
+  <code>TypeError</code> in the stream loop and broke four unrelated test modules.</p>
+
+  <p><code>prompt_tokens_details.cached_tokens</code> is carried through as well. The prefill cache
+  is reported in the log as a CHARACTER count (<code>chars=16757</code>); this is the first real
+  hit measurement. Tests: <code>tests/test_llm_token_usage.py</code> (25).</p>
+
   <h2>Public methods</h2>
   <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>

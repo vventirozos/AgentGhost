@@ -84,11 +84,22 @@ def _http_runner_factory(base_url: str, api_key: str, model: str, timeout: float
         ) or data.get("message", {}).get("content", "")
         # Surface message count as a cheap "steps" proxy.
         msgs = payload["messages"]
+        # Real token cost when the upstream reports it. This was a hardcoded
+        # 0, and it was the ONLY producer of `tokens_used` — so every
+        # SuiteResult ever written reported `total_tokens: 0`, summed and
+        # serialised next to the real numbers. An absent field would have
+        # been honest; a zero was not.
+        _usage = data.get("usage")
+        _tokens = 0
+        if isinstance(_usage, dict):
+            _tokens = int(_usage.get("total_tokens")
+                          or (int(_usage.get("prompt_tokens") or 0)
+                              + int(_usage.get("completion_tokens") or 0)))
         return {
             "output": str(content or ""),
             "steps": len(msgs),
             "tool_calls": 0,   # actual count lives in the agent's trajectory log
-            "tokens_used": 0,
+            "tokens_used": _tokens,
         }
 
     return _runner

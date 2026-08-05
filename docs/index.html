@@ -178,9 +178,88 @@
     </a>
   </div>
 
-  <h2>The unusual parts</h2>
+  <h2>How it compares</h2>
 
-  <p>Most of what Ghost does is what you'd expect from an agent. These are the parts that aren't, with a pointer to the mechanism behind each.</p>
+  <p>Self-hosted agents are a crowded category, and most of what Ghost does has an equivalent somewhere. The table below is about <em>where the line is drawn</em> — what's built in versus bolted on, enforced versus configured, measured versus assumed.</p>
+
+  <div class="note">
+    <strong>No product names, on purpose.</strong> These projects move quickly and a name-by-name matrix goes stale within months — and it would ask you to trust a claim about someone else's code that we haven't audited. The middle column describes the <em>common design</em> across self-hosted agents and the tools built for them, not any one project. Where something is genuinely widespread, it says so.
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Capability</th><th>The usual approach</th><th>In Ghost</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Runs on your own hardware</strong></td>
+        <td>The whole point of the category. Widely available.</td>
+        <td>Same. No advantage claimed.</td>
+      </tr>
+      <tr>
+        <td><strong>Sandboxed execution</strong></td>
+        <td>Common, especially in coding agents — usually a container per session.</td>
+        <td>Same idea. One shared directory, its own process and network namespaces, memory and process caps.</td>
+      </tr>
+      <tr>
+        <td><strong>Memory across sessions</strong></td>
+        <td>A mature field now, with several dedicated frameworks. Usually one store — vectors, sometimes plus a graph — retrieved by top-<em>k</em> similarity.</td>
+        <td>Six stores queried in parallel and merged by <strong>rank rather than score</strong>, because similarity numbers from different stores aren't comparable. Source weights are learned per query intent.</td>
+      </tr>
+      <tr>
+        <td><strong>Anonymous egress</strong></td>
+        <td>Direct connections. Tor is available as an optional add-on for specific tools, so the agent's other traffic still goes out normally.</td>
+        <td>Tor is the transport for the <strong>whole process</strong>. A boot probe plus a process-wide socket guard blocks any direct connection to a public address. Unreachable Tor means Ghost <em>doesn't start</em>.</td>
+      </tr>
+      <tr>
+        <td><strong>Hidden-service (.onion) search</strong></td>
+        <td>Available — several capable bolt-on skills exist, some with identity rotation.</td>
+        <td>Built in, on the same enforced transport. Each retry takes a fresh circuit, and engines sharing one search index are tagged so corroboration counts <em>independent</em> sources.</td>
+      </tr>
+      <tr>
+        <td><strong>Checking its own answers</strong></td>
+        <td>A known pattern — a critic or reviewer agent, usually wired per workflow by the developer.</td>
+        <td>Runs on every substantive turn, unprompted. Asks whether the answer <em>addresses the question</em> before asking whether it's correct, escalates a cheap judge's refusal to the main model, and gets a bounded repair attempt. A refuted turn also un-learns whatever it taught.</td>
+      </tr>
+      <tr>
+        <td><strong>Learning from its own runs</strong></td>
+        <td>Uncommon. Memory frameworks store what happened; they don't generally change behaviour because of it.</td>
+        <td>Idle-time passes turn repeated successful tool sequences into named skills (several distinct supporting runs required) and failed turns into lessons. Skills are re-tested later rather than trusted indefinitely.</td>
+      </tr>
+      <tr>
+        <td><strong>Tuning its own prompts</strong></td>
+        <td>Real and in production use — reflective optimizers like GEPA are an established technique, typically run offline against a strong teacher model.</td>
+        <td>Same optimizer family, but pointed at <strong>your own local model with no teacher</strong> and trained on Ghost's own successful turns. Capped at 16 rounds because longer runs drift toward gaming the metric, and a tuned prompt ships only if it beats the hand-written one.</td>
+      </tr>
+      <tr>
+        <td><strong>Models it trains itself</strong></td>
+        <td>Rare in self-hosted agents.</td>
+        <td>Two, both plain logistic regression on its own recorded turns: one scores whether a partial plan is going anywhere, one predicts request difficulty. Small on purpose — readable as a list of weights.</td>
+      </tr>
+      <tr>
+        <td><strong>Acting without being asked</strong></td>
+        <td>Agents generally act when invoked. Scheduling is usually external.</td>
+        <td>A background loop runs consolidation, failure review, skill extraction and self-play during idle time, and never interrupts a turn. Scheduled and condition-triggered tasks are first-class.</td>
+      </tr>
+      <tr>
+        <td><strong>Measuring whether a change helped</strong></td>
+        <td>Rare outside published benchmarks.</td>
+        <td>Live randomised arms on real traffic with anytime-valid intervals, plus off-switches for most subsystems so they can be ablated rather than assumed.</td>
+      </tr>
+      <tr>
+        <td><strong>Third-party accounts</strong></td>
+        <td>Usually at least one key — a search API is the common case.</td>
+        <td>None. Search runs against scrapers over Tor, which costs result quality and is a deliberate trade.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>What that costs</h3>
+  <p>The same table read the other way. A local model caps reasoning quality below what a frontier API gives you. Search over Tor against scrapers is slower and less accurate than a keyed search API. The self-check spends an extra model call on every substantive turn. The idle-time learning only happens if the machine stays on. And more moving parts means more that can quietly stop working — several subsystems here have been silently inert for weeks at a time before instrumentation caught them, which is why so much of the tooling is about detecting that specific failure.</p>
+
+  <h2>The unusual parts, in detail</h2>
+
+  <p>The mechanism behind each of the rows above.</p>
 
   <h3>It remembers across sessions, in six different shapes</h3>
   <p>Closing the chat wipes nothing. Facts, relationships between things, a profile of you, lessons from its own mistakes, a running journal, and full past episodes are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. All six are searched at once and merged by rank rather than score. <a href="memory.html">How memory works →</a></p>

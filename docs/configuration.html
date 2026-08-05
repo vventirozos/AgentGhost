@@ -164,6 +164,9 @@
     <dt>--enable-metacog</dt>
     <dd>Turns on the metacognition stack: output validators, host-health monitoring, a competence profile, uncertainty tracking, and a second-solver arbiter for low-confidence answers. Several other flags (all the <code>--metacog-*</code> ones) only do anything when this is on.</dd>
 
+    <dt>--metacog-mem-high</dt>
+    <dd>RAM percentage above which a host-health signal fires. <strong>Default 97.</strong> Ghost always runs alongside a local LLM server, which pins memory as steady state — a lower threshold treats that resting condition as pressure and warns on a box with gigabytes free. Genuine pressure is caught by the free-RAM conjunct (<code>--metacog-mem-warn-free-mb</code>, default 1 GB) and the hard floor (<code>--metacog-mem-floor-mb</code>), which fire on real numbers rather than a percentage. Lower it only on a host that <em>isn't</em> co-resident with the model.</dd>
+
     <dt>--principle-gate</dt>
     <dd>After each answer, checks it against the operating principles Ghost has written for itself and appends a note if it contradicts one. Never blocks — annotates. One extra model call per turn.</dd>
 

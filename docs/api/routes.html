@@ -35,6 +35,26 @@
   <h2>CORS</h2>
   <p>Wildcard origin (<code>allow_origins=["*"]</code>) with credentials disabled. No cookies — auth is header-only.</p>
 
+  <h2>Turn cost on the chat response (2026-08-05)</h2>
+  <p>The non-streaming <code>chat_proxy</code> reply now carries an OpenAI-shaped
+  <code>usage</code> block. It is the <strong>whole turn's</strong> cost — summed across every
+  upstream call the turn made (each tool round, the verifier, anything routed to a worker) — not
+  one completion's, read from <code>LLMClient.usage_for(req_id)</code>.</p>
+  <pre>"usage": {
+    "prompt_tokens": 41230,
+    "completion_tokens": 612,
+    "total_tokens": 41842,
+    "prompt_tokens_details": {"cached_tokens": 38904},
+    "ghost_llm_calls": 6
+}</pre>
+  <p>Added because the eval harness had a <code>tokens_used</code> field whose only producer was a
+  hardcoded <code>0</code> — so every <code>SuiteResult</code> reported <code>total_tokens: 0</code>.
+  The runner reads Ghost's API, not the upstream, so exposing it here is what makes eval token
+  accounting real rather than a second silent zero.</p>
+  <p>The key is <strong>omitted entirely</strong> when the total is unknown. An absent field is
+  honest; a zero is the bug being fixed. See <a href="../core/llm.html">core/llm</a> for the
+  capture mechanism.</p>
+
   <h2>Endpoints</h2>
   <div class="scroll"><table>
     <thead><tr><th>Method · Path</th><th>Auth</th><th>Behaviour</th></tr></thead>

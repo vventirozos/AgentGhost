@@ -579,6 +579,11 @@ class LLMClient:
             return fallback
 
         try:
+            # Counted here too, not just in chat_completion: the worker route
+            # serves verify / decompose / classification, so omitting it would
+            # under-report the turn's real cost — silently, and in the
+            # direction that flatters it.
+            self._note_usage(data)
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
             self._maybe_record_call(payload, content, kind="route",
                                     task=str(task))
@@ -1402,6 +1407,7 @@ class LLMClient:
                 await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
+                self._note_usage(_result)
                 self._maybe_record_call(payload, _result,
                                         use_worker=use_worker,
                                         use_vision=use_vision,
@@ -1414,6 +1420,7 @@ class LLMClient:
                 self.foreground_tasks += 1
             try:
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
+                self._note_usage(_result)
                 self._maybe_record_call(payload, _result,
                                         use_worker=use_worker,
                                         use_vision=use_vision,
@@ -1425,6 +1432,90 @@ class LLMClient:
                     self.foreground_tasks -= 1
                     if self.foreground_tasks < 0:
                         self.foreground_tasks = 0
+
+    # ---- Upstream token accounting -----------------------------------
+    # `Trajectory.tokens_in/out` and `eval.TaskResult.tokens_used` both
+    # existed as fields for months and read 0 on every record, because
+    # nothing ever read the upstream's `usage` block. A turn makes MANY
+    # calls (each tool round-trip, plus the verifier), so the per-turn
+    # number is a SUM — keyed on request id, not stored on the client,
+    # because concurrent requests interleave here.
+    #
+    # Same ring discipline as `core/turn_facts.py`: bounded, best-effort,
+    # never raises. A failure to count tokens must never break a turn.
+    _USAGE_RING_MAX = 32
+
+    def _usage_ring(self):
+        ring = getattr(self, "_usage_by_req", None)
+        if ring is None:
+            from collections import OrderedDict
+            ring = OrderedDict()
+            self._usage_by_req = ring
+        return ring
+
+    def _note_usage(self, result: Any) -> None:
+        """Fold one response's `usage` into the current request's running
+        total. Tolerant by contract — `result` may be a str (the `route`
+        path), None, or a dict with no usage at all."""
+        try:
+            if not isinstance(result, dict):
+                return
+            usage = result.get("usage")
+            if not isinstance(usage, dict):
+                return
+            from ..utils.logging import request_id_context
+            req_id = request_id_context.get()
+            if not req_id:
+                return
+            ring = self._usage_ring()
+            slot = ring.get(req_id)
+            if slot is None:
+                slot = {"tokens_in": 0, "tokens_out": 0,
+                        "cached_tokens": 0, "calls": 0}
+                ring[req_id] = slot
+                while len(ring) > self._USAGE_RING_MAX:
+                    ring.popitem(last=False)
+            ring.move_to_end(req_id)
+            slot["tokens_in"] += int(usage.get("prompt_tokens") or 0)
+            slot["tokens_out"] += int(usage.get("completion_tokens") or 0)
+            details = usage.get("prompt_tokens_details")
+            if isinstance(details, dict):
+                # Prefill-cache hits. The log reports the system prompt's
+                # CHARACTER count today; this is the first real measure of
+                # whether that cache is actually being hit.
+                slot["cached_tokens"] += int(details.get("cached_tokens") or 0)
+            slot["calls"] += 1
+        except Exception:  # noqa: BLE001 — accounting must never break a turn
+            pass
+
+    def _note_usage_from_sse(self, line: str) -> None:
+        """Fold the usage block out of one raw SSE line. Separate from
+        `_stream_rec_accumulate` because that one is gated on the opt-in
+        recorder; token accounting has to run on every stream."""
+        try:
+            if isinstance(line, (bytes, bytearray)):
+                line = line.decode("utf-8", "replace")
+            if not line or not line.startswith("data:"):
+                return
+            body = line[5:].strip()
+            if not body or body == "[DONE]":
+                return
+            chunk = json.loads(body)
+            if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                self._note_usage(chunk)
+        except Exception:  # noqa: BLE001 — a malformed chunk is not fatal
+            pass
+
+    def usage_for(self, req_id: str) -> Dict[str, int]:
+        """Running token totals for one request. Empty dict when unknown —
+        an absent entry and a zero-token turn are different, and callers
+        must be able to tell them apart."""
+        try:
+            if not req_id:
+                return {}
+            return dict(self._usage_ring().get(req_id) or {})
+        except Exception:  # noqa: BLE001
+            return {}
 
     @staticmethod
     def _maybe_record_call(payload, result, kind: str = "chat_completion",
@@ -1565,6 +1656,18 @@ class LLMClient:
             _rec_on = False
         _rec_acc: Dict[str, Any] = {"content": [], "reasoning": [],
                                     "tool_calls": {}, "finish": None}
+        # Token accounting is NOT gated on `_rec_on` — recording is an opt-in
+        # fixture-mining feature, while usage is needed on every turn. An
+        # OpenAI-compatible server only emits the usage block on a stream when
+        # asked, and it arrives in a FINAL chunk whose `choices` is empty.
+        try:
+            _so = payload.get("stream_options")
+            if not isinstance(_so, dict):
+                _so = {}
+            _so.setdefault("include_usage", True)
+            payload["stream_options"] = _so
+        except Exception:  # noqa: BLE001 — a payload that rejects the key
+            pass
         for attempt in range(2):
             try:
                 # We use stream() to keep the connection open and read chunks.
@@ -1609,6 +1712,14 @@ class LLMClient:
                             yielded_any = True
                             if _rec_on:
                                 self._stream_rec_accumulate(chunk, _rec_acc)
+                            # Cheap pre-filter: only the final chunk carries
+                            # usage, so the common chunk costs one substring
+                            # test rather than a JSON parse. `chunk` is str on
+                            # the real `aiter_lines` path but bytes on others,
+                            # so the test must not assume either.
+                            if b'"usage"' in chunk if isinstance(chunk, (bytes, bytearray)) \
+                                    else '"usage"' in str(chunk):
+                                self._note_usage_from_sse(chunk)
                             yield f"{chunk}\n\n".encode('utf-8')
                     if _rec_on:
                         _rec_resp = self._stream_rec_response(_rec_acc)
