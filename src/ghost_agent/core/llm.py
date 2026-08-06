@@ -5,7 +5,7 @@ import copy
 import os
 from typing import List, Dict, Any, Optional
 import httpx
-from ..utils.logging import Icons, pretty_log
+from ..utils.logging import Icons, pretty_log, verify_purpose_context
 from ..utils.helpers import get_utc_timestamp
 
 logger = logging.getLogger("GhostAgent")
@@ -1028,7 +1028,11 @@ class LLMClient:
                     if _quiet:
                         logger.debug("keepalive → worker node %s", node.get("model"))
                     else:
-                        pretty_log("Worker Compute", f"{task_label or 'background task'} → Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
+                        _vp = verify_purpose_context.get()
+                        _wl = task_label or 'background task'
+                        if _vp:
+                            _wl = f"{_wl} ({_vp})"
+                        pretty_log("Worker Compute", f"{_wl} → Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
                     try:
                         node_payload = payload.copy()
                         node_payload["model"] = node["model"]
@@ -1098,7 +1102,8 @@ class LLMClient:
 
                     tried_nodes.append(node)
 
-                    pretty_log("Critic Compute", f"Routing verification to Critic Node ({node['model']})", level="INFO", icon=Icons.VERIFIER_LAB)
+                    _vp = verify_purpose_context.get()
+                    pretty_log("Critic Compute", f"Routing verification{f' ({_vp})' if _vp else ''} to Critic Node ({node['model']})", level="INFO", icon=Icons.VERIFIER_LAB)
                     try:
                         import copy as _copy, json
                         node_payload = _copy.deepcopy(payload)

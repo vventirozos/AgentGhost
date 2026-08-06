@@ -65,7 +65,9 @@
   <p>Each flag takes a comma-separated list of <code>url|model</code> pairs:</p>
 
   <pre class="shell">--worker-nodes "http://192.168.1.20:8088|gemma-4-e4b"
---critic-nodes "http://192.168.1.20:8088|gemma-4-e4b"</pre>
+--critic-nodes "http://192.168.1.20:8089|selene-mini"</pre>
+
+  <p>Worker and critic do <em>not</em> have to be the same model — and there's a good argument they shouldn't be: worker chores (summarising, query expansion) want a fast generalist, while the critic's adjudication wants a judge-trained model that applies verification rubrics well. One box can serve both as two llama-server instances on different ports; on a 16&nbsp;GB machine that takes the dual-residency recipe (raised <code>iogpu.wired_limit_mb</code>, small <code>--ubatch-size</code> on both servers) — see the verifier reference's <a href="core/verifier.html">judge-model selection</a> section. Whatever model serves the critic must return verdicts inside <code>GHOST_VERIFY_WORKER_TIMEOUT</code> (45&nbsp;s) under real load — a judge that misses the deadline silently pushes its verdicts onto your main model.</p>
 
   <div class="scroll">
   <table>

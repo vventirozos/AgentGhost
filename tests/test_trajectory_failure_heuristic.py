@@ -513,3 +513,50 @@ def test_recorder_populates_error_flag_on_chat_path():
     src = inspect.getsource(GhostAgent._reconstruct_tool_calls)
     assert "obj.error = _normalize_tool_error" in src
     assert "_looks_like_tool_error(obj.result)" in src
+
+
+# ── #12 sniffer blind-spot fix (2026-08-05) ─────────────────────────────────
+
+def test_replace_rejected_is_a_failure():
+    """file_system's replace corruption guard hard-rejects the mutation
+    ("The file was NOT modified") — labelled OK for weeks (4 live calls,
+    newest 2026-07-30), feeding skills_auto/verifier/foresight a success
+    that never happened."""
+    from ghost_agent.distill.outcome_heuristics import (
+        _looks_like_tool_error, tool_call_failed)
+    head = ("SYSTEM INSTRUCTION: REPLACE REJECTED — your 'content' and "
+            "'replace_with' arguments arrived BYTE-IDENTICAL (296 chars). "
+            "The file 'x.py' was NOT modified.")
+    assert _looks_like_tool_error(head) is True
+
+    class _TC:
+        error = ""
+        result = head
+    assert tool_call_failed(_TC()) is True
+
+
+def test_steering_system_instruction_is_not_a_failure():
+    """The marker is the specific rejection phrase, NOT a generic
+    SYSTEM INSTRUCTION / 'rejected' match — steers must stay OK."""
+    from ghost_agent.distill.outcome_heuristics import _looks_like_tool_error
+    assert _looks_like_tool_error(
+        "SYSTEM INSTRUCTION: the live sandbox is authoritative — "
+        "trust the listing above and do not re-read the same file.") is False
+
+
+def test_grep_no_match_banner_stays_ok():
+    """The OTHER shape from the same review was measured to be
+    grep-family NO-MATCH successes in costume (file_system search,
+    exit 1, no output — all pre-dating the search-op normalization).
+    Labelling them ok is CORRECT; this pins that no marker was added."""
+    from ghost_agent.distill.outcome_heuristics import _looks_like_tool_error
+    assert _looks_like_tool_error(
+        "[SYSTEM ERROR]: Process failed (Exit 1) with no output.") is False
+
+
+def test_replace_rejected_beyond_head_window_not_flipped():
+    """Documents the head-window contract: the phrase deeper than 120
+    chars (e.g. quoted inside a read) does not flip the call."""
+    from ghost_agent.distill.outcome_heuristics import _looks_like_tool_error
+    assert _looks_like_tool_error(
+        "x" * 130 + " REPLACE REJECTED appears far too late here") is False

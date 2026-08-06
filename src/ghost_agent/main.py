@@ -1181,7 +1181,9 @@ async def lifespan(app):
                     "stream": False,
                 }
                 # BACKGROUND priority — same rationale as _critique_fn.
-                res = await context.llm_client.chat_completion(payload, is_background=True)
+                from .utils.logging import verify_purpose
+                with verify_purpose("reflection plan-verify"):
+                    res = await context.llm_client.chat_completion(payload, is_background=True)
                 content = (
                     (res or {}).get("choices", [{}])[0]
                     .get("message", {}).get("content", "") or ""

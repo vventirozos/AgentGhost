@@ -463,10 +463,20 @@ caught the arm CORRUPTING ITS OWN READOUT before it ever ran. All findings fixed
    where 1 exists from n≈12.5k). FIX: `Prediction.fails` carries the raw cell count; the ledger
    records it.
 4. MINOR — `SYSTEM ESCAPE HATCH` banner missing from the synthetic filter (would seed as an ok
-   "transition"). FIXED. ⚠ **Baseline follow-up surfaced by the same scan, NOT fixed here (shared-
-   sniffer change needs its own review): `SYSTEM INSTRUCTION: … REPLACE REJECTED` (~35 live
-   calls) and `[SYSTEM ERROR]:` (bracketed, 4 calls) are labelled OK by the corpus sniffer — real
-   failures learned as successes, exactly the file_system-replace class the note targets.**
+   "transition"). FIXED. ~~⚠ Baseline follow-up: `REPLACE REJECTED` (~35 live calls) +
+   bracketed `[SYSTEM ERROR]:` (4) labelled OK — real failures learned as successes.~~
+   ✅ **CLOSED 2026-08-05 (later, operator-directed) — and HALF THE CLAIM WAS WRONG, which is
+   why sniffer changes get measured first.** Precise count: the reviewer's ~35 does not
+   reproduce — **4** REPLACE-REJECTED calls (all `error=False`, newest 07-30) and **4** bare
+   bracket-banner calls. The REPLACE-REJECTED half is real (a hard-rejected mutation, "file NOT
+   modified") → marker `replace rejected` added to `looks_like_tool_error`; corpus-wide FP audit
+   flipped EXACTLY those 4 calls and nothing else. The `[SYSTEM ERROR]` half is **successes in
+   costume**: all four are `file_system search` grep-family NO-MATCHES (exit 1, no output,
+   sandbox banner), all pre-dating the search-op normalization at `file_system.py:~3156` — the
+   correct label IS ok, no marker added, and a test pins that so nobody "fixes" it again.
+   Calibration epoch NOT bumped (label-scheme change eligible on 4 of 3,594 calls = 0.11%; same
+   reasoning and precedent as the fs_batch shape-rule decision). Tests in
+   `test_trajectory_failure_heuristic.py`; docs in `audit_fixes.html`.
 5. NIT — replay walk now day-dir-filtered like seeding (leave-future-out safe against stray
    dirs); 6. NIT — replay no longer mutates `os.environ`; 7. NIT — the arm-independence claim
    carries the same first-order-only honest-limit comment as `fs_batch` (a working treatment
@@ -1377,7 +1387,13 @@ disk with 0 applies is a dead read-site, the defect that counter exists for) →
 `GHOST_LLM_RECORD` off in the launcher and archive/delete the day-files.** Standing cost of every
 day this slips: unredacted recordings on local disk.
 
-**3. NEXT VERIFIER ROUND — unblocked, deliberately NOT next.** Target: beat
+**3. NEXT VERIFIER ROUND — ✅ the judge-model direction was TESTED AND CLOSED 2026-08-05 (evening,
+§6): Gemma 4 12B measured out on the 45s envelope; Selene-1-Mini REJECTED on measurement (raw FPR
+0.543 > E4B's 0.31-0.385; balanced 0.534 raw / ~0.70 pipeline vs 0.766).** The bench's overturn
+attribution (13 rescues vs 23 destroyed correct refutes) is the third independent measurement
+pointing at the ESCALATION layer — so the direction below (verdict-tier routing / escalation
+discipline) is now the confirmed next move, with a concrete design lead: require the overturner to
+QUOTE the evidence line contradicting the refute. Original: target beat
 `private_incumbent_balanced = 0.766` under `--escalate gate`. **Direction is VERDICT-TIER ROUTING
 (architecture), NOT another prompt round** — two prompt strategies are cleanly refuted by the gate
 (rebalanced −0.131, compression-capped −0.119) and the diagnosis is capacity-bound rule-following:
@@ -2471,6 +2487,89 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-08-05 (evening) — VERIFIER-JUDGE MODEL EXPLORATION on nova: 12B tried and measured out, MTP verdict corrected, dual-server critic architecture stood up (Selene-1-Mini), bench PENDING
+
+**Goal (operator):** reduce escalation-overturn churn — the E4B cheap judge false-refutes at FPR
+0.31-0.385 and ~84% of its refutes get overturned by the 35B (~8-18 main-slot calls/day).
+
+**1. Gemma 4 12B (QAT Q4_K_XL) as judge — measured OUT on the 45s envelope, accuracy unresolved.**
+Operator swapped it onto nova:8088. verify_bench (mined pool, escalation arms live) across several
+runs: **the 12B cannot hold the verifier's 45s cheap-leg bound under nova's normal worker role.**
+Legs run 40-70s; at `--concurrency 4` the legs mass-time-out and verdicts SILENTLY fall through to
+the MAIN model — the bench then measures the wrong model ("cheap leg FAILED" lines are that
+honesty); even 1-way with the live agent sharing nova busts via PROMPT-CACHE EVICTION (llama log:
+"making room for prompt cache entry, removing oldest entry (345 MiB)" — worker traffic evicts the
+rubric prefix, so every verdict re-pays cold prefill). `GHOST_VERIFY_WORKER_TIMEOUT` (env, 45→60)
+exists and was used for the bench. Partial accuracy (n=34, naive scoring, NO bundle — runs were
+aborted for ops reasons): clean-trial FPs 2/8 (E4B expectation 2.5-3.1) but ~9/26 faults MISSED —
+a leniency risk, unresolved. Latency mean 41.5-55s/trial. 12B retired from nova.
+
+**2. MTP verdict CORRECTED by A/B (the "12B is slow because MTP" hypothesis was wrong).**
+The 12B ran `--spec-type draft-mtp` (acceptance 0.53-0.75, mean len ~2.2). Idle A/B: **MTP-ON 16.0
+vs MTP-OFF 13.6 tok/s — MTP is a modest WIN when idle**; the 7.0 tok/s scare was slot CONTENTION.
+MTP's real cost in dual-model residency is the draft's RAM squeezing prompt caches. (E4B's own MTP
+draft is tiny (98 MB) and stays ON.) ⚠ Method lesson re-learned twice in one hour: `kickstart -k`
+restarts from launchd's CACHED job — an edited plist needs bootout+bootstrap; and a "2.3× faster"
+reading taken across a restart was contention relief, not the flag change — verify against process
+args (`ps`), not effects.
+
+**3. Direction pivot (research + operator): don't replace the worker — ADD A CRITIC.**
+8B judge-TRAINED model: **Atla Selene-1-Mini** (Llama-3.1-8B SFT+DPO evaluator; judgment in the
+WEIGHTS, so it needs less rubric — attacks BOTH the capacity-bound rule-following diagnosis AND
+the latency envelope). Deployed as a SECOND llama-server on nova:8089, to be wired via the
+agent's dormant `--critic-nodes` pool (verify rides the worker route ONLY because critic-nodes is
+unset — [[critic-nodes-parallel-verifier]]). E4B RESTORED as worker on 8088 (the task-mix winner,
+audio mmproj + MTP back). Runner-up candidates recorded: groundedness specialists
+(Bespoke-MiniCheck-7B / VERITAS-8B) via verdict-tier routing — stricter-entailment FPR risk on the
+FP-trap clean classes; Qwen3.5-9B rejected (sub-threshold generalist + same-family-as-audited).
+
+**4. DUAL-SERVER COHABITATION on the 16GB M4 — the recipe, learned the hard way:**
+- Metal working-set OOM (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) is the failure mode, and
+  it presents ASYMMETRICALLY: `/health` answers while real decodes fail `ret=-3` — the live
+  agent's circuit breaker opened on exactly that (breaker lines while "status ok"). **A real
+  decode probe is the health check; /health lies.**
+- Fixes that made it work: `sudo sysctl iogpu.wired_limit_mb=14336` (⚠ NON-PERSISTENT — nova
+  needs a boot-time daemon to reapply, TODO) + `--batch-size/--ubatch-size 2048→512 on BOTH
+  servers` (the transient compute buffers were the overflow, not the weights).
+- launchd traps hit: legacy `launchctl load` = useless "error 5"; a plist copied from the worker
+  kept `Label com.local.llama-server` (collision = the real cause) AND the worker's log paths;
+  log files pre-created as vasilis per [[launchd-username-log-ownership]].
+- Verified end state: **E4B answered a real decode in 1.7s WHILE the Selene bench loaded the
+  GPU**; bench rolling concurrently with zero timeouts.
+
+**Current nova config:** 8088 worker = E4B heretic-QAT + mmproj + MTP draft, 4×32k, batch 512;
+8089 critic = Selene-1-Mini Q4_K_M, 16k ctx, -np 2 (→ 2×8k slots — watch for evidence-heavy
+prompt squeeze), batch 512. Original E4B plist preserved at
+`Models/gemma4-E4B/com.local.llama-server.plist.gemma` (stale filenames — the live one has the
+corrected heretic-QAT paths).
+
+**✅ VERDICT (both arms benched to completion, bundles `20260805T201430Z` pipeline /
+`20260805T224443Z` raw): SELENE REJECTED — E4B stays the judge.**
+- **Raw arm:** FPR **0.543** on clean (WORSE than E4B's 0.31-0.385), degraded-evidence FP 0.667,
+  TPR 0.663, balanced 0.534. Evaluator DPO made it STRICT, not calibrated — it refutes half of
+  everything, so it would INCREASE the escalation bill it was meant to shrink.
+- **Pipeline arm (production shape):** balanced ~0.70 vs the 0.766 incumbent; FPR 0.000 only
+  because the escalation washed **82 false refutes in 340 trials** (one main call each); TPR
+  dragged to 0.471.
+- **The transferable finding — overturn attribution:** 13 overturns rescued cleans, **23
+  destroyed CORRECT refutes** (artifact_leak 14, fact_swap 7, fabrication 2 — live-caught
+  example: the cheap judge named the swapped wind figure and the 35B overturned it). Third
+  independent confirmation that the ESCALATION layer is the defect: next verifier round =
+  make the overturner EARN overturns (verdict-tier routing / require quoting the contradicting
+  evidence line), NOT another judge swap. Feeds §4F item 3 and the 0b escalation audit.
+- Operational pass worth keeping: Selene held the 45s bound flawlessly (682 route calls, 0
+  timeouts) — the dedicated-critic slot WORKS and awaits a genuinely calibrated candidate.
+- Bench-craft traps hit tonight: two bench runs killed by session-side task stops (fix:
+  nohup+disown detached run + bundle watcher); `setsid` does not exist on macOS; SANDBOXED
+  pgrep sees a restricted process view (a live process read as dead — check unsandboxed before
+  declaring death); template provenance in the bundle showed tuned adjudicate + baseline
+  enumerate/claim, i.e. exactly what production serves.
+
+**REMAINING:** (a) do NOT wire `--critic-nodes`; Selene daemon parked (operator may bootout or
+keep — RAM fine at batch 512). (b) wired-limit persistence daemon on nova. (c) ⚠ main Studio
+still `-np 4 × 64k` vs `--max-context 240000` — operator reverts. (d) 12B model dir on disk
+(operator's call).
+
 ### 2026-08-05 (later) — §4K FORESIGHT SHIPPED: a shadow world model over tool calls (predict → execute → grade), zero behaviour change
 
 **Origin.** Operator asked for "the one missing SOTA feature". A fresh paper sweep (WorldEvolver
@@ -2533,6 +2632,29 @@ Full rationale + phase gates: §4K.
   the real dispatch pipeline): FAILED call + ≥2 real precedent failures → treatment appends the
   precedent and "do not retry the identical call".
 - uConsole deployed (see above); Slack `EMOJI_MAP` 🔮 added.
+
+**(later still 2) Sniffer blind-spot follow-up CLOSED, DEPLOYED (15:30 restart; suite
+11,283/14/0; boot + health verified) and LIVE-VERIFIED — half the round-2 claim measured FALSE
+(§4K round-2 item 4 has the full correction).**
+*Live verification (15:34, probe `sniffer-probe-1`):* a diagnostic turn tripped the replace
+corruption guard on purpose (write → normal replace → BYTE-IDENTICAL replace) and provided its
+own control group in one trajectory (`6e2c41c1`): the write and the genuine replace recorded
+`error=''`, the REJECTED replace recorded
+`error="system instruction: replace rejected — …"` — the new marker stamping the structured
+flag at record time — and the foresight ledger graded the same call `ok=false` with the
+normalized head. The 4 historical instances still read `error=''` (recorded pre-fix), so the
+before/after is visible in the corpus itself. Turn outcome stayed non-failed (the model quoted
+the rejection honestly — the honest-failure rule behaving correctly around the new label). The
+rejected observation now feeds the foresight index, so repeated byte-identical corruptions on
+one key can eventually earn a `foresight_note`. Probe artifact `sniffer_probe.txt` deleted from
+the sandbox afterwards. REPLACE REJECTED: real, 4 calls (not ~35),
+marker added, FP audit flipped exactly those 4. Bracketed `[SYSTEM ERROR]`: grep-no-match
+SUCCESSES in costume (file_system search, pre-normalization era) — correctly labelled ok, no
+marker, regression-pinned. Epoch not bumped (0.11% of calls). Also read this session: escalation
+ledger at 7 decided rows (all claim/refute overturned; zero confirm-withheld — the §4F item-0
+watch reads healthy; the 0b audit stays gated ~2-3 days), and **fs_batch uptake after day 1 is
+ZERO** (no `paths` args, no post-edit-view markers in 08-04/08-05 trajectories) — thin data, but
+if uptake is still zero at the arm's n≥30 read, the verdict is "the macro did not land".
 
 **(later still) Round-2 fresh-eye review on the Phase-3 delta → 1 MAJOR + 3 MINOR + 3 NIT, all
 fixed (see §4K):** the headline catch is that the note's growing counter, recorded verbatim,

@@ -13,6 +13,30 @@ import contextvars
 from typing import Any, Optional
 
 request_id_context = contextvars.ContextVar("request_id", default="SYSTEM")
+
+# WHY a verify call is being routed ("turn gate", "reflection plan-verify",
+# …). Read by the llm-routing log lines so a burst of otherwise-identical
+# "Routing verification …" entries says which subsystem is asking. A
+# contextvar (not an argument) because the log site sits several call
+# layers below the code that knows the purpose, and it must survive
+# awaits on the async path. Empty string = untagged, renders unchanged.
+verify_purpose_context = contextvars.ContextVar("verify_purpose", default="")
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def verify_purpose(label: str):
+    """Tag verifier LLM calls made inside this block with ``label``."""
+    token = verify_purpose_context.set(str(label or ""))
+    try:
+        yield
+    finally:
+        try:
+            verify_purpose_context.reset(token)
+        except Exception:  # noqa: BLE001 — cross-context reset; never break a caller
+            pass
 LOG_TRUNCATE_LIMIT = 60
 DEBUG_MODE = False
 VERBOSE_MODE = False  # When True, raw streamed thinking tokens are printed.
@@ -185,6 +209,36 @@ def _req_tag(req_id: str) -> str:
 # BEGIN and END markers so we don't leak memory across long-running daemons.
 _REQ_STATE_LOCK = threading.Lock()
 _REQ_STATE: dict = {}  # req_id -> {"started": float}
+
+# Console repeat-collapse state (see pretty_log). One pending run at a
+# time, guarded by its own lock — atomic_print takes _STDOUT_LOCK
+# internally, so nesting that here would deadlock.
+_COLLAPSE_LOCK = threading.Lock()
+_COLLAPSE_STATE: dict | None = None
+
+
+def _collapse_enabled() -> bool:
+    return os.getenv("GHOST_LOG_COLLAPSE", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
+def _print_collapse_summary(run: dict) -> None:
+    """One dim console line closing a swallowed repeat-run. Console only
+    (every occurrence already hit the mirror); never raises."""
+    try:
+        req_id, icon, title_str, _full, _lvl = run["key"]
+        n = run["count"]
+        span = max(0.0, run["last"] - run["first"])
+        tag = _req_tag(req_id)
+        rcol = _req_color(req_id)
+        line = (
+            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
+            f"{DIM}{_format_delta(req_id)}{RESET}  "
+            f"{DIM}{_fit_title(title_str)}  ⤷ repeated ×{n} in {span:.0f}s{RESET}"
+        )
+        atomic_print(line)
+    except Exception:  # noqa: BLE001 — a summary must never break logging
+        pass
 
 
 def _req_started(req_id: str) -> Optional[float]:
@@ -710,6 +764,35 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     # stream line from the budget (💭 thinking blocks); the mirror is unaffected.
     full = _redact_log(raw.replace("\n", " ").replace("\r", ""))
     _mirror(req_id, title_str, full, level)
+
+    # ── Console repeat-collapse (2026-08-05). Consecutive IDENTICAL lines
+    # (same request, icon, title, content, level) print once; when a
+    # DIFFERENT line arrives, the swallowed run is summarised in one dim
+    # "repeated ×N" line. Motivating burst: 33 identical "Routing
+    # verification to Critic Node (Nova)" lines during one idle cycle.
+    # CONSOLE ONLY — the `_mirror` call above already recorded every
+    # occurrence, because several instruments COUNT mirror lines (the
+    # escalation-overturn double-count lesson: one logger, complete).
+    # Known small imperfection: a pending summary flushes on the next
+    # normal line, so it can appear after an intervening frame marker.
+    # GHOST_LOG_COLLAPSE=0 disables.
+    if _collapse_enabled():
+        _ck = (req_id, icon, title_str, full, level.upper())
+        _pending = None
+        with _COLLAPSE_LOCK:
+            global _COLLAPSE_STATE
+            st = _COLLAPSE_STATE
+            if st is not None and st["key"] == _ck:
+                st["count"] += 1
+                st["last"] = time.monotonic()
+                return
+            if st is not None and st["count"] > 1:
+                _pending = st
+            _COLLAPSE_STATE = {"key": _ck, "count": 1,
+                               "first": time.monotonic(),
+                               "last": time.monotonic()}
+        if _pending is not None:
+            _print_collapse_summary(_pending)
 
     stream_content = full
     if not no_truncate:

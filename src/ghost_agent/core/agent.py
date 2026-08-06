@@ -32,7 +32,7 @@ from .triggers import (
     guard_key_target,
     looks_mutating_command,
 )
-from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print
+from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print, verify_purpose
 from ..utils import logging as _glog
 from ..utils.constraints import extract_constraints, render_constraint_block
 # Live randomized arms + the risk governor that is measured by one of them.
@@ -6402,29 +6402,32 @@ class GhostAgent:
                     _lroom = 4000 - len(ledger_block) - 1
                     _code_output = ((tool_output[:_lroom] + "\n" + ledger_block)
                                     if _lroom > 0 else ledger_block)
-                v_result = await verifier.verify_code_output(
-                    code=code_text,
-                    output=_code_output,
-                    intent=request_view,
-                    response=_claim_src,
-                    high_stakes=_high_stakes,
-                    trace=_trace,
-                )
+                with verify_purpose("turn gate"):
+                    v_result = await verifier.verify_code_output(
+                        code=code_text,
+                        output=_code_output,
+                        intent=request_view,
+                        response=_claim_src,
+                        high_stakes=_high_stakes,
+                        trace=_trace,
+                    )
             else:
+                with verify_purpose("turn gate"):
+                    v_result = await verifier.verify_claim(
+                        claim=_claim_src,
+                        evidence=claim_evidence,
+                        context=request_view[:1000],
+                        high_stakes=_high_stakes,
+                        trace=_trace,
+                    )
+        else:
+            with verify_purpose("turn gate"):
                 v_result = await verifier.verify_claim(
                     claim=_claim_src,
                     evidence=claim_evidence,
                     context=request_view[:1000],
                     high_stakes=_high_stakes,
                     trace=_trace,
-                )
-        else:
-            v_result = await verifier.verify_claim(
-                claim=_claim_src,
-                evidence=claim_evidence,
-                context=request_view[:1000],
-                high_stakes=_high_stakes,
-                trace=_trace,
             )
         # Visual ground-truth override (unchanged from the inline gate).
         try:

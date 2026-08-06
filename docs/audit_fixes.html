@@ -1046,6 +1046,7 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
   <ul>
     <li><strong>Sandbox host-networking</strong> — remains the Linux default (the in-sandbox Tor proxy needs host loopback); isolation is opt-in via <code>GHOST_SANDBOX_NETWORK</code>. Not a bug; left as a deliberate, documented trade-off.</li>
     <li><strong>Reasoning-token latency cluster</strong> (94–97% of big-turn wall-clock; restatement preambles; in-token design flip-flops) — model-behavior work, needs its own design pass, not a guard.</li>
+    <li><strong>Corpus-sniffer REPLACE-REJECTED blind spot (2026-08-05)</strong> — file_system's replace corruption guard hard-rejects a mutation ("The file was NOT modified") but <code>looks_like_tool_error</code> labelled it OK (4 live calls, newest 07-30), feeding skills_auto graduation, the verifier's high-stakes gate and foresight seeding a success that never happened. Marker <code>replace rejected</code> added; corpus-wide false-positive audit flipped exactly the 4 genuine rejections and nothing else. The companion suspect from the same review — the bare <code>[SYSTEM ERROR]: Process failed (Exit 1) with no output.</code> banner — was measured to be grep-family NO-MATCH <em>successes</em> in costume (file_system search, all pre-dating the search-op normalization): labelling them ok is correct, no marker added, and a test pins that.</li>
   </ul>
 </main>
 </body>

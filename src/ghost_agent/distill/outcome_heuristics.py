@@ -165,6 +165,21 @@ def _looks_like_tool_error(result: str) -> bool:
             "failed:",
             "syntax error",
             "operation failed",
+            # file_system's replace corruption guard: "SYSTEM
+            # INSTRUCTION: REPLACE REJECTED — …The file was NOT
+            # modified." A hard-rejected mutation was labelled OK for
+            # weeks (5 live calls, newest 2026-07-30) — feeding
+            # skills_auto graduation, the verifier's high-stakes gate
+            # and foresight seeding a success that never happened.
+            # Deliberately NOT a generic "rejected"/"system
+            # instruction" marker: steering SYSTEM INSTRUCTIONs are
+            # not failures. (The other blind spot from the same
+            # review — the bare "[SYSTEM ERROR]: Process failed
+            # (Exit 1) with no output." banner — was measured to be
+            # grep-family NO-MATCH successes in costume, all
+            # pre-dating the search-op normalization; labelling them
+            # ok is CORRECT, so no marker was added.)
+            "replace rejected",
         )
     )
 
