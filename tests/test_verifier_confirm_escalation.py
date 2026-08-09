@@ -252,7 +252,13 @@ class TestWiredThroughPublicEntryPoints:
                         json_only=False, force_main=False):
             seen.append(force_main)
             if force_main:
-                return {"verdict": "CONFIRMED", "confidence": 1.0}
+                # Escalation discipline (2026-08-06): the overturn must be
+                # earned — a bare CONFIRMED is refused. fp_class, because
+                # this micro-trial's one-char evidence can't host a quote.
+                return {"verdict": "CONFIRMED", "confidence": 1.0,
+                        "reasoning": "known false-positive pattern",
+                        "rebuttals": [{"issue": 1, "kind": "fp_class",
+                                       "fp_class": "subjective_gloss"}]}
             return {"verdict": "REFUTED", "confidence": 0.9}
 
         monkeypatch.setattr(v, "_call_llm", _call)

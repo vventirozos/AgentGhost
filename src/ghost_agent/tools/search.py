@@ -512,6 +512,12 @@ def _clean_for_cpp(text: str) -> str:
     return text.replace("{", "[").replace("}", "]").replace("<", "(").replace(">", ")")
 
 async def tool_search_ddgs(query: str, tor_proxy: str):
+    # Fail-closed (§4P): under --mandatory-tor a falsy proxy is replaced with
+    # the loopback Tor default so the (always-public) search engines are never
+    # queried cleartext — the socket guard can't backstop these curl_cffi
+    # engine fetches. Outside mandatory-tor the proxy is unchanged.
+    from ..utils.egress_guard import resolve_egress_proxy as _resolve_egress_proxy
+    tor_proxy = _resolve_egress_proxy(tor_proxy)
     # Ensure proxy is in correct format for ddgs/httpx
     if tor_proxy and "socks5://" in tor_proxy and "socks5h://" not in tor_proxy:
         tor_proxy = tor_proxy.replace("socks5://", "socks5h://")
@@ -631,6 +637,12 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
             query = await neutralize_query(query, llm_client=llm_client, model=model_name) or query
         except Exception:
             pass
+    # Fail-closed (§4P): deep_research fans out to _race_search_wave DIRECTLY
+    # (it does not go through tool_search_ddgs), so it needs the same backstop —
+    # under --mandatory-tor a falsy proxy is replaced with the loopback Tor
+    # default so the engine fetches + page fetches never leak cleartext.
+    from ..utils.egress_guard import resolve_egress_proxy as _resolve_egress_proxy
+    tor_proxy = _resolve_egress_proxy(tor_proxy)
     # Ensure proxy is in correct format for ddgs/httpx
     if tor_proxy and "socks5://" in tor_proxy and "socks5h://" not in tor_proxy:
         tor_proxy = tor_proxy.replace("socks5://", "socks5h://")

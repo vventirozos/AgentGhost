@@ -165,6 +165,35 @@ class ProfileMemory:
             )
         return trimmed
 
+    # Canonicalisation table: the model often passes synonyms. Normalised
+    # once at write time so retrieval is deterministic. Module-visible via
+    # `canonicalize()` because SIBLING stores mint from the same field —
+    # §4M (Lens C MAJOR-4): the graph edge was built from the RAW key
+    # (`HAS_VEHICLE`) while the profile stored the canonical one
+    # (`assets.car`), so the two stores permanently disagreed on 11/15
+    # live pairs. Every caller composing a triplet/vector text for a
+    # profile field must canonicalise FIRST.
+    _CANONICAL_FIELD_MAP = {
+        "wife": ("relationships", "wife"),
+        "husband": ("relationships", "husband"),
+        "son": ("relationships", "son"),
+        "daughter": ("relationships", "daughter"),
+        "car": ("assets", "car"),
+        "vehicle": ("assets", "car"),
+        "science": ("interests", "science"),
+        "interest": ("interests", "general"),
+    }
+
+    @classmethod
+    def canonicalize(cls, category: str, key: str):
+        """(category, key) → the canonical (category, key) this store will
+        actually file the value under. Idempotent; safe on unmapped keys."""
+        cat = str(category or "").strip().lower()
+        k = str(key or "").strip().lower()
+        if k in cls._CANONICAL_FIELD_MAP:
+            return cls._CANONICAL_FIELD_MAP[k]
+        return cat, k
+
     def update(self, category: str, key: str, value: Any):
         with self._lock:
             data = self.load()
@@ -172,28 +201,8 @@ class ProfileMemory:
             k = str(key).strip().lower()
             v = str(value).strip()
 
-            # Canonicalisation table: the model often passes synonyms. We
-            # normalise them once at write time so retrieval is deterministic.
-            # IMPORTANT: the return value now SURFACES the rewrite so the
-            # caller (and downstream graph publish) can stay in sync. The
-            # previous silent rewrite caused confusion when the graph
-            # published `vehicle` while the profile stored it as `car`.
-            mapping = {
-                "wife": ("relationships", "wife"),
-                "husband": ("relationships", "husband"),
-                "son": ("relationships", "son"),
-                "daughter": ("relationships", "daughter"),
-                "car": ("assets", "car"),
-                "vehicle": ("assets", "car"),
-                "science": ("interests", "science"),
-                "interest": ("interests", "general")
-            }
-
             original_cat, original_key = cat, k
-            if k in mapping:
-                cat, target_key = mapping[k]
-            else:
-                target_key = k
+            cat, target_key = self.canonicalize(cat, k)
 
             # Ensure category exists as a dictionary
             if cat not in data or not isinstance(data[cat], dict):
@@ -266,18 +275,10 @@ class ProfileMemory:
             k = str(key).strip().lower()
 
             # Apply the same canonicalization mapping used by update()
-            mapping = {
-                "wife": ("relationships", "wife"),
-                "husband": ("relationships", "husband"),
-                "son": ("relationships", "son"),
-                "daughter": ("relationships", "daughter"),
-                "car": ("assets", "car"),
-                "vehicle": ("assets", "car"),
-                "science": ("interests", "science"),
-                "interest": ("interests", "general")
-            }
-            if k in mapping:
-                cat, k = mapping[k]
+            # §4M R2 MINOR-5: one canonical map (see _CANONICAL_FIELD_MAP)
+            # — this was an inline verbatim copy; the next map entry would
+            # have diverged write/delete/prune silently.
+            cat, k = self.canonicalize(cat, k)
 
             if cat in data and k in data[cat]:
                 del data[cat][k]
@@ -316,18 +317,8 @@ class ProfileMemory:
 
             # Same canonicalisation table as update()/delete() so the value
             # sweep lands on the row the writer actually created.
-            mapping = {
-                "wife": ("relationships", "wife"),
-                "husband": ("relationships", "husband"),
-                "son": ("relationships", "son"),
-                "daughter": ("relationships", "daughter"),
-                "car": ("assets", "car"),
-                "vehicle": ("assets", "car"),
-                "science": ("interests", "science"),
-                "interest": ("interests", "general"),
-            }
-            if k in mapping:
-                cat, k = mapping[k]
+            # §4M R2 MINOR-5: shared canonical map, same as delete().
+            cat, k = self.canonicalize(cat, k)
 
             if cat not in data or k not in data[cat]:
                 return f"Profile key not found: {cat}.{k}"

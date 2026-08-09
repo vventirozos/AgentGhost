@@ -77,6 +77,326 @@ ACTIONABLE_CONF = 0.7
 # to 0.6, below every >=0.7 consumption gate). A run where only one
 # direction fires is NOT production-equivalent, so the arm names all four
 # states rather than collapsing to "escalated".
+# ── Making a re-bench cheap: response cache + semantic code digest ───
+#
+# THE PROBLEM THIS SOLVES. A full live run costs hundreds of judge calls
+# plus a main-model adjudication on every REFUTED. Paying that on every
+# code change is untenable, so in practice the number goes stale and gets
+# quoted anyway — which is how the 2026-08-04 baseline came to be compared
+# against a run on a DIFFERENT route leg.
+#
+# Two mechanisms, aimed at two different questions:
+#
+#   "did MY change move the number?"  -> replay against cached responses.
+#       The judge's outputs are held FIXED, so every difference is
+#       attributable to the code. Zero LLM calls, seconds not hours.
+#
+#   "what is the number today?"       -> a fresh, uncached run.
+#       Cached replay cannot answer this and must never be reported as if
+#       it had: holding the judge fixed also hides the judge's own drift
+#       and sampling variance. `cache_mode` is recorded in provenance so a
+#       replayed report can never be mistaken for a measured one.
+#
+# The cache key covers everything the endpoint sees, so a changed prompt,
+# model or endpoint MISSES by construction — you cannot accidentally
+# replay a stale answer to a new question.
+_CACHE_MODES = ("off", "write", "read", "strict")
+
+
+class ResponseCache:
+    """Content-addressed cache of judge/main-model responses.
+
+    Modes:
+      off    — passthrough; nothing read, nothing written (a fresh run).
+      write  — live calls, every response recorded (seeds the cache).
+      read   — cache hit reused, miss falls through to a live call and is
+               recorded. This is the INCREMENTAL mode: after a prompt
+               edit only the genuinely-changed prompts cost anything.
+      strict — replay only; a miss is an ERROR. Use this to PROVE a run
+               was fully offline, so its delta is 100% attributable to
+               code rather than to the model having a different day.
+    """
+
+    def __init__(self, path: Optional[str | Path], mode: str = "off"):
+        if mode not in _CACHE_MODES:
+            raise ValueError(f"cache mode must be one of {_CACHE_MODES}")
+        self.mode = mode
+        self.path = Path(path) if path else None
+        self.hits = 0
+        self.misses = 0
+        self.writes = 0
+        # Strict misses are kept SEPARATELY and their requests are dumped.
+        # A strict miss is swallowed upstream (the verifier treats the
+        # raised KeyError as an unparseable judge reply and returns a null
+        # verdict), so without this a broken replay looks like a run with a
+        # few "skipped" trials instead of a replay that did not replay.
+        self.strict_misses: List[Dict[str, Any]] = []
+        self._hit_mtimes: List[float] = []
+        if self.path and mode != "off":
+            self.path.mkdir(parents=True, exist_ok=True)
+
+    # PER-PROCESS NONCES THAT CARRY NO MEANING FOR THE JUDGE.
+    #
+    # `agent._PACKER_NONCE` is a uuid4 minted at import and embedded in the
+    # evidence-truncation marker ("…[PACKER CUT#53d14ea5: 237 of 309 chars
+    # shown]"). It exists for a good reason — a bare substring test is
+    # forgeable by evidence the agent itself read, so the marker must be
+    # unguessable — and production must keep it.
+    #
+    # But it means every verify prompt containing a truncated digest is
+    # UNIQUE PER RUN, so those prompts could never hit the cache. Measured
+    # on the first replay: 16 of 69 calls missed, exactly one per trial,
+    # and before the strict-miss diagnostics existed this was invisible —
+    # the run simply looked like it had a few "skipped" trials.
+    #
+    # The nonce is opaque to the judge: two prompts differing only in those
+    # 8 hex characters are the same question. So it is NORMALISED OUT of
+    # the key while the real body is still stored verbatim. Narrow by
+    # construction — it matches only this exact marker shape, so it cannot
+    # collapse two genuinely different prompts.
+    _NONCE_PATTERNS = (
+        (re.compile(r"(\[PACKER CUT)#[0-9a-f]{8}(:)"), r"\1#<nonce>\2"),
+    )
+
+    @classmethod
+    def _canonical(cls, obj: Any) -> Any:
+        if isinstance(obj, str):
+            for rx, repl in cls._NONCE_PATTERNS:
+                obj = rx.sub(repl, obj)
+            return obj
+        if isinstance(obj, dict):
+            return {k: cls._canonical(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [cls._canonical(v) for v in obj]
+        return obj
+
+    @classmethod
+    def key(cls, base_url: str, body: Dict[str, Any]) -> str:
+        """Everything that can change the ANSWER goes into the key.
+
+        `stream` is excluded (it changes transport, not content), the body
+        is canonicalised with sorted keys so dict ordering cannot produce
+        two keys for one request, and per-process nonces that the judge
+        cannot read are normalised away.
+        """
+        k = cls._canonical({kk: vv for kk, vv in body.items()
+                            if kk != "stream"})
+        blob = json.dumps({"url": base_url.rstrip("/"), "body": k},
+                          sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _file(self, key: str) -> Path:
+        assert self.path is not None
+        return self.path / key[:2] / f"{key}.json"
+
+    def get(self, key: str, base_url: str = "",
+            body: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        if self.mode in ("off", "write") or not self.path:
+            return None
+        f = self._file(key)
+        if f.exists():
+            # AGE OF THE REPLAYED EVIDENCE. "MIXED live/replayed" alone
+            # conflates two very different runs: one INTERRUPTED AND RESUMED
+            # minutes later (the cached half is as current as the live half,
+            # and the blend is a fine absolute measurement) and one padded
+            # out of a week-old cache (where the replayed half describes a
+            # judge that may since have moved). Without the timestamps a
+            # reader cannot tell those apart, so the label would be the
+            # honest-looking kind of wrong.
+            try:
+                self._hit_mtimes.append(f.stat().st_mtime)
+            except OSError:
+                pass
+        if not f.exists():
+            self.misses += 1
+            if self.mode == "strict":
+                self.strict_misses.append(
+                    {"key": key, "url": base_url, "request": body})
+                raise KeyError(
+                    f"response cache MISS in strict mode ({key[:12]}). The "
+                    "run is not reproducible offline — the prompt, model or "
+                    "endpoint differs from what was recorded. Re-run with "
+                    "--cache-mode read to fill the gap with live calls.")
+            return None
+        try:
+            data = json.loads(f.read_text())
+        except Exception:  # noqa: BLE001 — a corrupt entry must not kill a run
+            self.misses += 1
+            return None
+        self.hits += 1
+        return data.get("response")
+
+    def put(self, key: str, base_url: str, body: Dict[str, Any],
+            response: Dict[str, Any]) -> None:
+        if self.mode == "off" or not self.path:
+            return
+        f = self._file(key)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        # The request is stored ALONGSIDE the response, not just its hash:
+        # without it a cache is an unauditable pile of answers and there is
+        # no way to check later what question produced one.
+        tmp.write_text(json.dumps(
+            {"url": base_url.rstrip("/"), "request": body,
+             "response": response}, ensure_ascii=False, default=str))
+        os.replace(tmp, f)        # atomic: concurrent trials share this dir
+        self.writes += 1
+
+    def stats(self) -> Dict[str, Any]:
+        """⚠ A SNAPSHOT. Call it AFTER the run, never before.
+
+        The first version was read while building the provenance block,
+        which happens before a single trial executes — so a fully replayed
+        run reported `hits: 0 … measures: "live judge"`. That is precisely
+        the mislabel this field exists to prevent, produced by the field
+        itself. `run_bench` now re-reads it once the arms are done.
+        """
+        total = self.hits + self.misses
+        _now = time.time()
+        return {
+            "mode": self.mode,
+            "path": str(self.path) if self.path else None,
+            "hits": self.hits, "misses": self.misses, "writes": self.writes,
+            "hit_rate": round(self.hits / total, 4) if total else None,
+            # A strict miss is swallowed upstream into a null verdict, so it
+            # must be counted where a reader will see it.
+            "strict_misses": len(self.strict_misses),
+            # How OLD the replayed evidence is. A resumed run (seconds to
+            # hours) is a legitimate absolute measurement; a run padded from
+            # a week-old cache is describing a judge that may have moved.
+            "replay_age_s": ({
+                "oldest": round(_now - min(self._hit_mtimes)),
+                "newest": round(_now - max(self._hit_mtimes)),
+            } if self._hit_mtimes else None),
+            # The honest label. A report built on cache hits measures the
+            # CODE against a frozen judge; it does not re-measure the judge.
+            "measures": ("not yet run" if not total and not self.writes
+                         else "code-vs-frozen-judge (replayed)"
+                         if self.hits and not self.misses
+                         else "live judge" if not self.hits
+                         else "MIXED live/replayed — NOT a clean attribution"),
+        }
+
+    def dump_misses(self, path: str | Path) -> Optional[str]:
+        """Write the requests that missed, so a broken replay is diagnosable
+        rather than merely reported."""
+        if not self.strict_misses:
+            return None
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.strict_misses, indent=1,
+                                ensure_ascii=False, default=str))
+        return str(p)
+
+
+def _strip_docstrings(tree):
+    """Drop docstrings so prose edits don't invalidate a benchmark."""
+    import ast
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None)
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(getattr(body[0], "value", None), ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def semantic_code_digest(paths: Iterable[str | Path]) -> str:
+    """Hash what the code DOES, ignoring how it reads.
+
+    A raw file hash would mark a bench stale on every comment edit — and
+    this codebase is heavily commented, so that hash would cry wolf until
+    it was ignored, which is worse than not having it. Parsing to an AST
+    with docstrings stripped and positions dropped means reformatting,
+    comments and docstrings are invisible while any change to logic,
+    constants or control flow is not.
+    """
+    import ast
+    h = hashlib.sha256()
+    for p in sorted(str(x) for x in paths):
+        try:
+            tree = _strip_docstrings(ast.parse(Path(p).read_text()))
+            h.update(Path(p).name.encode("utf-8"))
+            h.update(ast.dump(tree, annotate_fields=False,
+                              include_attributes=False).encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            # LOUD: a digest that silently skips a file it could not read
+            # would report "unchanged" for a file it never looked at.
+            h.update(f"UNREADABLE:{p}:{type(exc).__name__}".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def build_case_pool(seed_path: str | Path,
+                    mined_path: Optional[str | Path] = None,
+                    no_mined: bool = False,
+                    tier: str = "all") -> List["BenchCase"]:
+    """THE case pool, in ONE place. Both the bench and the staleness oracle
+    call this; neither may keep its own copy.
+
+    ⚠ WHY THIS EXISTS (2026-08-09, found the hard way). The oracle had a
+    hand-written replica of the bench's pool construction. It computed 35
+    cases where the bench loaded 58, because the replica got two things
+    wrong that are easy to miss and impossible to notice from the outside:
+
+      * the tier filter applies to the MINED pool ONLY — seed cases are
+        always included, since they are hand-authored rather than derived
+        from turns the optimizer may have trained on;
+      * mined cases are DEDUPED against the seed set by (claim, evidence),
+        because a mined case can be a re-recording of a seed scenario.
+
+    A fingerprint tool whose pool disagrees with the bench's reports
+    permanent false drift on `cases_sha256` — which is precisely the
+    wolf-crying the oracle was built to prevent. The test that was supposed
+    to catch this only exercised the `--no-mined, tier=all` path, where the
+    two implementations happen to agree.
+    """
+    cases = load_cases_jsonl(seed_path)
+    if no_mined or not mined_path or not Path(mined_path).exists():
+        return cases
+    extra = load_cases_jsonl(mined_path)
+    have = {(c.claim.strip(), c.evidence.strip()) for c in cases}
+    extra = [c for c in extra
+             if (c.claim.strip(), c.evidence.strip()) not in have]
+    if tier != "all":
+        from ..optim.trainset import holdout_tier
+        extra = [c for c in extra
+                 if holdout_tier(f"vbcase:{c.case_id}",
+                                 private_pct=30) == tier]
+    return cases + extra
+
+
+def verify_path_sources() -> Dict[str, List[str]]:
+    """The two source sets whose changes invalidate a bench number.
+
+    Split deliberately: a change to the VERIFIER moves the number because
+    the system got better or worse; a change to the BENCH moves it because
+    the ruler changed. Collapsing them into one digest would make those
+    indistinguishable, and only one of them is a result.
+    """
+    root = Path(__file__).resolve().parents[1]
+    return {
+        # ⚠ THE VERIFY PATH IS MORE THAN verifier.py (2026-08-09). This
+        # listed `core/verifier.py` alone, and the oracle duly reported
+        # "NO DRIFT" on a tree whose `core/objection.py` had been changed
+        # TWICE that day — both changes shipped to production, one of them
+        # verdict-affecting. A fingerprint blind to a file in the system
+        # under test is worse than no fingerprint: it does not merely fail
+        # to warn, it actively certifies a stale baseline as current.
+        #
+        # `objection.py` decides UPHOLD/DISMISS/UNRESOLVED before the
+        # escalation runs, so it moves verdicts directly. It is imported
+        # as `from . import objection as _objection`, which the
+        # import-scan below would miss — hence listed explicitly rather
+        # than inferred.
+        "verifier": [str(root / "core" / "verifier.py"),
+                     str(root / "core" / "objection.py")],
+        "bench": [str(Path(__file__).resolve())],
+    }
+
+
 ARM_RAW = "raw_judge"
 ARM_ESC_REFUTE = "judge+escalation(refute)"
 ARM_ESC_CONFIRM = "judge+escalation(confirm)"
@@ -309,6 +629,22 @@ class TrialResult:
     # old behaviour" a checkable statement instead of a claim.
     escalated_overturn: bool = False
     confirm_withheld: bool = False
+    # Escalation discipline B (2026-08-06): tier routing downgraded a
+    # gloss-shaped refute to UNCERTAIN without a main call.
+    escalation_downgraded: bool = False
+    truncation_guarded: bool = False
+    escalation_replaced: bool = False
+    # The only discipline that shipped ON (2026-08-07 review): without
+    # these two the bench could not tell a mechanically-settled trial
+    # from one where nothing fired.
+    objection_dismissed: bool = False
+    objection_upheld: bool = False
+    # Pre-escalation snapshot (replay-scorer infra, 2026-08-07): the
+    # cheap judge's verdict before the mechanical layer/escalation —
+    # what turns a policy change into an offline replay.
+    cheap_verdict: Optional[str] = None
+    cheap_confidence: Optional[float] = None
+    cheap_issues: Optional[List[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -326,6 +662,14 @@ class TrialResult:
             "note": self.trial.note,
             "escalated_overturn": self.escalated_overturn,
             "confirm_withheld": self.confirm_withheld,
+            "escalation_downgraded": self.escalation_downgraded,
+            "truncation_guarded": self.truncation_guarded,
+            "escalation_replaced": self.escalation_replaced,
+            "objection_dismissed": self.objection_dismissed,
+            "objection_upheld": self.objection_upheld,
+            "cheap_verdict": self.cheap_verdict,
+            "cheap_confidence": self.cheap_confidence,
+            "cheap_issues": self.cheap_issues,
         }
 
 
@@ -846,10 +1190,37 @@ def fault_evidence_truncation(case: BenchCase, rng: random.Random,
     claim is still true — refuting it for pipeline noise is the
     evidence-packer failure shape (spurious REFUTE on truncated output,
     fixed 2026-07-17). Expected NOT_REFUTED."""
+    # Emit the PRODUCTION marker, not a lookalike: with a bare
+    # " …[truncated]" string the truncation guard was structurally DARK
+    # in the very arm that motivates it — `evidence_was_truncated()`
+    # returned False on every degraded trial, so no bundle could ever
+    # show the mechanism working (fresh-eye MAJOR, 2026-08-06). Routing
+    # through the real packer slicer also exercises the packer itself.
+    from ..core.agent import _slice_evidence_body, evidence_was_truncated
     if len(case.evidence) < 200:
         return None
-    keep = max(80, int(len(case.evidence) * 0.35))
-    return (case.claim, case.evidence[:keep] + " …[truncated]",
+    # ⚠ VARIED cut depth (task #25, 2026-08-07): the fixed 0.35 keep
+    # made severity ~0.65 on every trial — always above the guard's
+    # 0.25 floor, so the "degraded-evidence robustness" axis was a
+    # 10-trial test of the guard's regex and NEVER tested the judge on
+    # lightly-cut evidence (where absence complaints are real evidence
+    # and the guard correctly stands down). The per-case rng keeps each
+    # case's depth stable for life (per-case seeding contract).
+    _keep_frac = rng.choice((0.35, 0.6, 0.8, 0.92))
+    keep = max(80, int(len(case.evidence) * _keep_frac))
+    sliced = _slice_evidence_body(case.evidence, keep, case.claim)
+    # ⚠ The slicer drops the marker when `keep` cannot fit it (its
+    # fail-closed cap invariant, tightened 2026-08-07) — but an UNMARKED
+    # cut is a different fault than this one claims to inject. Widen the
+    # budget once to make room for the marker (120 covers the marker +
+    # its 40-char floor for any body under ~100KB); a case whose cut
+    # STILL goes unmarked is skipped rather than emitted mislabelled.
+    if not evidence_was_truncated(sliced):
+        keep = max(120, keep)
+        sliced = _slice_evidence_body(case.evidence, keep, case.claim)
+        if not evidence_was_truncated(sliced):
+            return None
+    return (case.claim, sliced,
             case.context, "evidence hard-truncated, claim still true")
 
 
@@ -1073,6 +1444,79 @@ def score_trials(results: List[TrialResult],
             "high_stakes_trials": len(hs),
             "refute_overturned": sum(1 for r in results
                                      if r.escalated_overturn),
+            # Escalation discipline ship-gate metrics (2026-08-06): the
+            # 2026-08-05 ad-hoc overturn attribution, formalized. A
+            # RESCUE is an overturn on a trial that EXPECTED a
+            # non-refute (the escalation repaired a false alarm); DAMAGE
+            # is an overturn on a REFUTED-expected trial (the escalation
+            # destroyed a correct catch — 23 of these vs 13 rescues on
+            # the Selene pipeline run, the number that motivated the
+            # rebuttal-burden contract). Same split for tier-routing
+            # downgrades, which cost no main call.
+            "overturn_rescues": sum(
+                1 for r in results if r.escalated_overturn
+                and r.trial.expected in ("CONFIRMED", "NOT_REFUTED")),
+            "overturn_damage": sum(
+                1 for r in results if r.escalated_overturn
+                and r.trial.expected == "REFUTED"),
+            # ⚠ EXCLUSIVE of the truncation guard (2026-08-07 review):
+            # the guard sets BOTH flags, so one guard event used to
+            # increment downgrades + downgrade_rescues + the two guard
+            # counters at once — and with tier routing default-OFF,
+            # every "downgrade" the report attributed to tier routing
+            # was actually a guard event.
+            "downgrades": sum(1 for r in results
+                              if r.escalation_downgraded
+                              and not r.truncation_guarded),
+            # Split by MECHANISM: tier routing and the truncation guard
+            # have different failure modes and must not be pooled.
+            "truncation_guarded": sum(1 for r in results
+                                      if r.truncation_guarded),
+            "truncation_guard_rescues": sum(
+                1 for r in results if r.truncation_guarded
+                and r.trial.expected in ("CONFIRMED", "NOT_REFUTED")),
+            "truncation_guard_damage": sum(
+                1 for r in results if r.truncation_guarded
+                and r.trial.expected == "REFUTED"),
+            "downgrade_rescues": sum(
+                1 for r in results if r.escalation_downgraded
+                and not r.truncation_guarded
+                and r.trial.expected in ("CONFIRMED", "NOT_REFUTED")),
+            "downgrade_damage": sum(
+                1 for r in results if r.escalation_downgraded
+                and not r.truncation_guarded
+                and r.trial.expected == "REFUTED"),
+            # The shipped-ON mechanism, first-class: a dismiss on a
+            # non-refute-expected trial repaired a false alarm; an
+            # uphold on a REFUTED-expected trial protected a catch.
+            # The inverse cells are the mechanism's own damage.
+            "objection_dismissed": sum(1 for r in results
+                                       if r.objection_dismissed),
+            "objection_dismiss_rescues": sum(
+                1 for r in results if r.objection_dismissed
+                and r.trial.expected in ("CONFIRMED", "NOT_REFUTED")),
+            "objection_dismiss_damage": sum(
+                1 for r in results if r.objection_dismissed
+                and r.trial.expected == "REFUTED"),
+            "objection_upheld": sum(1 for r in results
+                                    if r.objection_upheld),
+            "objection_uphold_protects": sum(
+                1 for r in results if r.objection_upheld
+                and r.trial.expected == "REFUTED"),
+            "objection_uphold_damage": sum(
+                1 for r in results if r.objection_upheld
+                and r.trial.expected in ("CONFIRMED", "NOT_REFUTED")),
+            # A strong-UNCERTAIN replacement is neither overturn nor
+            # downgrade: the refute is gone but nothing was confirmed.
+            # Counted separately so neither pool absorbs it silently.
+            "replaced_uncertain": sum(1 for r in results
+                                      if r.escalation_replaced),
+            "replaced_rescues": sum(
+                1 for r in results if r.escalation_replaced
+                and r.trial.expected in ("CONFIRMED", "NOT_REFUTED")),
+            "replaced_damage": sum(
+                1 for r in results if r.escalation_replaced
+                and r.trial.expected == "REFUTED"),
             "confirm_eligible": sum(1 for r in hs
                                     if r.verdict == "CONFIRMED"
                                     and not r.escalated_overturn),
@@ -1170,13 +1614,15 @@ class HttpChatClient:
     worker_clients: Any = None
 
     def __init__(self, base_url: str, timeout: float = 90.0,
-                 api_key: str = "", model: str = ""):
+                 api_key: str = "", model: str = "",
+                 cache: Optional[ResponseCache] = None):
         import httpx
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         self._model = model
         self._timeout = timeout
+        self.cache = cache or ResponseCache(None, "off")
         # Public, for `bench_provenance`. The judge IS the system under test,
         # so "which endpoint/model produced these numbers" belongs in the
         # block that decides whether two reports are comparable — and a field
@@ -1187,6 +1633,25 @@ class HttpChatClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), timeout=timeout,
             headers=headers)
+
+    async def _post_cached(self, client, base_url: str, body: dict,
+                           **kw) -> dict:
+        """Single choke point for every judge/main call in the bench.
+
+        Both legs go through here so the cache cannot cover one route and
+        silently miss the other — a half-cached run would report a hit
+        rate that looked fine while still paying (and varying) on the leg
+        that mattered.
+        """
+        key = ResponseCache.key(base_url, body)
+        hit = self.cache.get(key, base_url, body)
+        if hit is not None:
+            return hit
+        resp = await client.post("/v1/chat/completions", json=body, **kw)
+        resp.raise_for_status()
+        data = resp.json()
+        self.cache.put(key, base_url, body, data)
+        return data
 
     async def chat_completion(self, payload: dict, **_kw) -> dict:
         # `timeout=` arrives here from `_bounded_fallback_kwargs` and is
@@ -1199,9 +1664,7 @@ class HttpChatClient:
         body = dict(payload)
         if self._model:
             body.setdefault("model", self._model)
-        resp = await self._client.post("/v1/chat/completions", json=body)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._post_cached(self._client, self.base_url, body)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -1241,9 +1704,26 @@ class EscalatingChatClient(HttpChatClient):
     def __init__(self, base_url: str, main_base_url: str,
                  timeout: float = 90.0, api_key: str = "", model: str = "",
                  main_model: str = "", main_api_key: str = "",
-                 main_timeout: Optional[float] = None):
+                 main_timeout: Optional[float] = None,
+                 leg: str = "worker",
+                 cache: Optional[ResponseCache] = None):
         super().__init__(base_url, timeout=timeout, api_key=api_key,
-                         model=model)
+                         model=model, cache=cache)
+        # ⚠ WHICH RUNG serves the cheap judge (2026-08-07 review). The
+        # 2026-08-04 topology this class was written against ran verify
+        # on the WORKER route (45s ceiling); the live process since
+        # 2026-08-06 boots `--critic-nodes`, so production's cheap judge
+        # rides the CRITIC branch (120s ceiling, one more fallback
+        # rung). leg="critic" mirrors that: `critic_clients` truthy and
+        # `chat_completion(use_critic=True)` served by the CHEAP
+        # endpoint. The default stays "worker" for the unit fixtures;
+        # the CLI harness passes the leg that matches the deployment and
+        # provenance records it — an unrecorded leg made two reports
+        # incomparable without either saying so.
+        self.leg = leg if leg in ("worker", "critic") else "worker"
+        if self.leg == "critic":
+            self.critic_clients = [{"url": base_url.rstrip("/"),
+                                    "model": model or "(unnamed)"}]
         import httpx
         headers = {}
         if main_api_key or api_key:
@@ -1286,6 +1766,7 @@ class EscalatingChatClient(HttpChatClient):
         """
         fell = self.route_failures + self.route_empty
         return {
+            "leg": self.leg,
             "route_calls": self.route_calls,
             "route_failures": self.route_failures,
             "route_timeouts": self.route_timeouts,
@@ -1309,11 +1790,9 @@ class EscalatingChatClient(HttpChatClient):
             sized.setdefault("model", self._model)
         self.route_calls += 1
         try:
-            resp = await self._client.post(
-                "/v1/chat/completions", json=sized,
+            data = await self._post_cached(
+                self._client, self.base_url, sized,
                 timeout=(timeout if timeout is not None else self._timeout))
-            resp.raise_for_status()
-            data = resp.json()
             content = ((data.get("choices") or [{}])[0]
                        .get("message", {}).get("content", ""))
         except Exception as exc:  # noqa: BLE001 — route() never raises
@@ -1338,10 +1817,22 @@ class EscalatingChatClient(HttpChatClient):
         return content
 
     async def chat_completion(self, payload: dict, timeout: Any = None,
-                              **_kw) -> dict:
+                              use_critic: bool = False, **_kw) -> dict:
         """The MAIN leg — where `force_main=True` lands, i.e. the
         escalation's adjudicator (and the verifier's last-resort fallback
         when the cheap leg returns nothing parseable, same as prod).
+
+        With ``leg="critic"``, a ``use_critic=True`` call (the
+        verifier's critic-branch judge call) is served by the CHEAP
+        endpoint under the verifier's own critic timeout. ⚠ On failure
+        it does NOT raise (round-2 review): production's
+        `LLMClient._do_chat_completion(use_critic=True)` swallows
+        critic-pool exhaustion and answers the SAME critic payload on
+        the MAIN upstream (`fell_back_from_node`), never touching the
+        worker rung — an earlier version of this method raised, which
+        sent the bench down a worker-retry chain with the classic
+        2048-token thinking payload that production never runs, and
+        double-counted one judge failure as two route failures.
 
         ``timeout`` is HONOURED, not swallowed. `_bounded_fallback_kwargs`
         passes the verifier's own ceiling here (`GHOST_VERIFY_FALLBACK_
@@ -1354,14 +1845,36 @@ class EscalatingChatClient(HttpChatClient):
         bounded by the verifier exactly as they are live: 45s on the
         route leg, 90s here.
         """
+        if use_critic and self.leg == "critic":
+            body = dict(payload)
+            if self._model:
+                body.setdefault("model", self._model)
+            self.route_calls += 1
+            try:
+                return await self._post_cached(
+                    self._client, self.base_url, body,
+                    timeout=(timeout if timeout is not None
+                             else self._timeout))
+            except Exception as exc:
+                self.route_failures += 1
+                if "timeout" in type(exc).__name__.lower():
+                    self.route_timeouts += 1
+                logger.warning(
+                    "verify_bench critic leg FAILED (%s: %s) — answering "
+                    "the critic payload on the MAIN endpoint, as "
+                    "production's LLMClient does (fell_back_from_node)",
+                    type(exc).__name__, exc)
+                main_body = dict(payload)
+                if self.main_model:
+                    main_body.setdefault("model", self.main_model)
+                return await self._post_cached(
+                    self._main_client, self.main_base_url, main_body)
         body = dict(payload)
         if self.main_model:
             body.setdefault("model", self.main_model)
         kw = {"timeout": timeout} if timeout is not None else {}
-        resp = await self._main_client.post(
-            "/v1/chat/completions", json=body, **kw)
-        resp.raise_for_status()
-        return resp.json()
+        return await self._post_cached(
+            self._main_client, self.main_base_url, body, **kw)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -1428,8 +1941,21 @@ async def run_trials(verifier: Verifier, trials: List[BenchTrial],
                     elapsed_s=time.monotonic() - t0,
                     escalated_overturn=bool(
                         getattr(vr, "escalated_overturn", False)),
+                    escalation_replaced=bool(
+                        getattr(vr, "escalation_replaced", False)),
+                    objection_dismissed=bool(
+                        getattr(vr, "objection_dismissed", False)),
+                    objection_upheld=bool(
+                        getattr(vr, "objection_upheld", False)),
+                    cheap_verdict=getattr(vr, "cheap_verdict", None),
+                    cheap_confidence=getattr(vr, "cheap_confidence", None),
+                    cheap_issues=getattr(vr, "cheap_issues", None),
                     confirm_withheld=bool(
                         getattr(vr, "confirm_withheld", False)),
+                    escalation_downgraded=bool(
+                        getattr(vr, "escalation_downgraded", False)),
+                    truncation_guarded=bool(
+                        getattr(vr, "truncation_guarded", False)),
                 )
             except Exception as exc:
                 res = TrialResult(
@@ -1672,7 +2198,9 @@ async def run_bench(cases: List[BenchCase],
         # answer a question it never answered.
         "provenance": bench_provenance(
             cases, fault_names=fault_names,
-            judge=_judge_identity(verifier), escalation=esc),
+            judge=_judge_identity(verifier), escalation=esc,
+            cache=getattr(getattr(verifier, "llm_client", None),
+                          "cache", None)),
         "arms": {},
     }
     prev = os.environ.get("GHOST_VERIFY_TWO_STAGE")
@@ -1702,13 +2230,31 @@ async def run_bench(cases: List[BenchCase],
                 "model (%d timeouts) — those trials did not measure the "
                 "judge under test",
                 _post.get("fell_through_to_main"), _post.get("route_timeouts"))
+    # Same reason route_health is re-read here: the provenance block is
+    # built BEFORE any trial runs, so a snapshot taken there records the
+    # state of a run that has not happened yet. A fully replayed report
+    # said `hits: 0, measures: "live judge"` until this line existed.
+    # ⚠ Kept OUTSIDE the `_post is not None` branch: the raw arm has no
+    # route health, and nesting the cache refresh under it (as a first
+    # edit did) both crashed that arm and would have left raw-arm reports
+    # with a pre-run cache snapshot.
+    _cache = getattr(getattr(verifier, "llm_client", None), "cache", None)
+    if _cache is not None:
+        report["provenance"]["cache"] = _cache.stats()
+        if _cache.strict_misses:
+            logger.warning(
+                "verify_bench: %d STRICT CACHE MISSES — this run is NOT a "
+                "clean replay. Each miss is swallowed into a null verdict, "
+                "so the scores below are computed over fewer trials than "
+                "they appear to be.", len(_cache.strict_misses))
     return report
 
 
 def bench_provenance(cases: List[BenchCase],
                      fault_names: Optional[List[str]] = None,
                      judge: Optional[Dict[str, Any]] = None,
-                     escalation: Optional[Dict[str, Any]] = None
+                     escalation: Optional[Dict[str, Any]] = None,
+                     cache: Optional[ResponseCache] = None
                      ) -> Dict[str, Any]:
     """Everything that must match before two bench reports are comparable.
 
@@ -1752,6 +2298,39 @@ def bench_provenance(cases: List[BenchCase],
             "why_raw": "run_bench was not given an escalation_arm() block",
         },
         "ghost_home": os.environ.get("GHOST_HOME") or "<unset>",
+        # ⚠ The discipline flags SELECT the pipeline (2026-08-07 review):
+        # run_bench arms only GHOST_VERIFY_TWO_STAGE itself — everything
+        # else is inherited from the operator's shell, so two reports
+        # with byte-identical provenance could be two different systems.
+        # "<unset>" is recorded distinctly from an explicit value: unset
+        # means "whatever the code default was at that commit".
+        "verify_flags": {
+            k: os.environ.get(k, "<unset>")
+            for k in ("GHOST_VERIFY_OBJECTION_CHECK",
+                      "GHOST_VERIFY_TRUNCATION_GUARD",
+                      "GHOST_VERIFY_TRUNCATION_MIN_SEVERITY",
+                      "GHOST_VERIFY_OBJECTION_DISMISS",
+                      "GHOST_VERIFY_OVERTURN_QUOTE",
+                      "GHOST_VERIFY_TIER_ROUTING",
+                      "GHOST_VERIFY_ESCALATE_REFUTE",
+                      "GHOST_VERIFY_ESCALATE_CONFIRM",
+                      "GHOST_VERIFY_TWO_STAGE")
+        },
+        # ⚠ THE GAP THIS CLOSES (2026-08-09): templates and flags were
+        # recorded, but the CODE was not. A change to `_escalate_refute`,
+        # the truncation guard or the objection parser moves every number
+        # in the report while leaving provenance byte-identical — so two
+        # genuinely different systems compared as if they were one. Split
+        # in two on purpose: `verifier` changing means the SYSTEM changed
+        # (a result); `bench` changing means the RULER changed (not a
+        # result). One digest could not tell those apart.
+        "code": {name: semantic_code_digest(paths)
+                 for name, paths in verify_path_sources().items()},
+        # Whether the judge actually answered, or was replayed from cache.
+        # A replayed report measures CODE against a frozen judge and must
+        # never be quoted as "the number today".
+        "cache": (cache.stats() if cache is not None
+                  else {"mode": "off", "measures": "live judge"}),
         "templates": {},
     }
     try:
@@ -1901,6 +2480,39 @@ def render_report_md(report: Dict[str, Any]) -> str:
                 f"{ev.get('refute_overturned')} · confirms withheld: "
                 f"{ev.get('confirm_withheld')} of "
                 f"{ev.get('confirm_eligible')} eligible")
+            # The escalation-discipline ship-gate numbers (2026-08-06) —
+            # the journal points decisions at these, so they must be in
+            # the RENDERED report, not only the JSON.
+            if any(k in ev for k in ("overturn_rescues", "downgrades")):
+                lines.append(
+                    f"discipline — overturn rescues: "
+                    f"{ev.get('overturn_rescues', 0)} · overturn DAMAGE: "
+                    f"{ev.get('overturn_damage', 0)} · downgrades: "
+                    f"{ev.get('downgrades', 0)} "
+                    f"(rescues {ev.get('downgrade_rescues', 0)} / damage "
+                    f"{ev.get('downgrade_damage', 0)})")
+            # ⚠ Every mechanism family renders, or it reads as "never
+            # fired" (round-2 review): the objection check is the ONE
+            # discipline that ships ON, and it was the one family
+            # missing from the rendered report — the exact
+            # invisible-mechanism shape this bench exists to prevent.
+            if any(k in ev for k in ("objection_dismissed",
+                                     "truncation_guarded",
+                                     "replaced_uncertain")):
+                lines.append(
+                    f"mechanical — objection dismissed: "
+                    f"{ev.get('objection_dismissed', 0)} "
+                    f"(rescues {ev.get('objection_dismiss_rescues', 0)} / "
+                    f"damage {ev.get('objection_dismiss_damage', 0)}) · "
+                    f"objection upheld: {ev.get('objection_upheld', 0)} "
+                    f"(protects {ev.get('objection_uphold_protects', 0)} / "
+                    f"damage {ev.get('objection_uphold_damage', 0)}) · "
+                    f"truncation guard: {ev.get('truncation_guarded', 0)} "
+                    f"(rescues {ev.get('truncation_guard_rescues', 0)} / "
+                    f"damage {ev.get('truncation_guard_damage', 0)}) · "
+                    f"replaced-uncertain: {ev.get('replaced_uncertain', 0)} "
+                    f"(rescues {ev.get('replaced_rescues', 0)} / damage "
+                    f"{ev.get('replaced_damage', 0)})")
             lines.append("")
         lines.append("| fault | expected | n | judged | skipped | "
                      "confirmed | refuted | uncertain | rate | "

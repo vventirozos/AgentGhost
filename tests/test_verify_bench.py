@@ -201,7 +201,12 @@ def test_evidence_truncation_is_not_refuted_class():
     out = fault_evidence_truncation(WEATHER, random.Random(0), [WEATHER])
     assert out is not None
     assert out[0] == WEATHER.claim
-    assert out[1].endswith("…[truncated]")
+    # Re-pinned 2026-08-06: the fault now emits the PRODUCTION marker via
+    # the real packer slicer. With the old lookalike string the
+    # truncation guard was structurally DARK in the arm that motivates
+    # it (evidence_was_truncated() was False on every degraded trial).
+    from ghost_agent.core.agent import evidence_was_truncated
+    assert evidence_was_truncated(out[1]) is True
     assert len(out[1]) < len(WEATHER.evidence)
     assert fault_evidence_truncation(PRIMES, random.Random(0), [PRIMES]) \
         is None  # evidence too short to degrade meaningfully

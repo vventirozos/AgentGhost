@@ -162,7 +162,7 @@ async def test_perfect_it_scrubbing(test_agent):
     assert "[Image attached and passed to vision node]" in p_req_messages[0]["content"]
 
 @pytest.mark.asyncio
-async def test_emergency_recovery_scrubbing(test_agent):
+async def test_emergency_recovery_scrubbing(test_agent, request):
     import httpx
     
     # Disable planning to prevent intercepting planner chat_completion calls
@@ -176,6 +176,13 @@ async def test_emergency_recovery_scrubbing(test_agent):
     patcher2 = patch('ghost_agent.core.agent.estimate_tokens', return_value=500)
     patcher1.start()
     patcher2.start()
+    # These patches used to LEAK: no .stop() meant they mutated
+    # estimate_tokens (→ constant 500) and process_rolling_window (→ a
+    # lambda without max_tokens) for EVERY later test in suite order —
+    # silent until a downstream test happened to call them (§4N exposed
+    # it). Always revert, pass or fail.
+    request.addfinalizer(patcher1.stop)
+    request.addfinalizer(patcher2.stop)
 
     messages = [
         {"role": "system", "content": "sys"},

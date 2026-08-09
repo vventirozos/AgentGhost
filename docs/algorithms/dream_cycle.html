@@ -172,7 +172,7 @@
   <h2>Isolation boundary</h2>
   <p>The temp sub-agent runs on an isolated copy of the real context. All memory wrappers are <strong>read-only</strong>:</p>
   <ul>
-    <li><code>ReadOnlyVectorMemory</code> — <code>add()</code> / <code>smart_update()</code> / <code>delete()</code> are no-ops.</li>
+    <li><code>ReadOnlyVectorMemory</code> — <code>add()</code> / <code>smart_update()</code> / <code>delete()</code> are no-ops. Since 2026-08-08 (§4M F1) its reads are also <em>stat-pure</em>: <code>search</code>/<code>search_advanced</code> force <code>record_retrievals=False</code> (a read that bumps retrieval stats is still a write to operator memory — the raw passthrough had booked phantom credit on every self-play hydration, stretching one live episode's ranking half-life ~7×), and <code>search_items</code> is exposed so the isolate's bus takes the floor-gated branch instead of the legacy one. Survivor-credit calls (<code>bump_retrievals</code>/<code>bump_helpful</code>) resolve to <code>None</code> through the strict whitelist — self-play earns no production credit by construction.</li>
     <li><code>ReadOnlySkillMemory</code> — carries <code>is_read_only = True</code> as a class marker so sub-agents skip expensive write-oriented paths entirely.</li>
     <li><code>ReadOnlyGraphMemory</code>, <code>journal = None</code>, <code>profile_memory = None</code>, <code>frontier_tracker = None</code>.</li>
     <li><strong>Self-play loop handles</strong> (<code>selfplay_loop_task</code>, <code>selfplay_loop_stop</code>) are stripped from the isolated context — otherwise the inner sub-agent's own <code>handle_chat</code> call would trigger the user-message interrupt hook and kill the outer loop after its first cycle.</li>

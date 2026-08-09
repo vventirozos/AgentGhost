@@ -31,9 +31,14 @@ def agent(mock_context):
 
 
 async def test_system_slot_is_byte_exact(agent):
-    """The warmup's system message must equal the exact splice a live
-    request performs: SYSTEM_PROMPT with {{PROFILE}} replaced by the
-    profile string (same _RequestState.get_profile_str path)."""
+    """The warmup's system message must equal the exact splice a LIVE
+    request performs. §4N D-MAJOR-1: this test previously asserted only
+    SYSTEM_PROMPT+{{PROFILE}} — but the live slot ALSO appends the stable
+    skill instruction and \\r-strips, so the warmup diverged at the system-
+    prompt boundary and every warmed byte after was unreusable while this
+    test stayed green (it encoded the buggy contract). The contract is the
+    live system slot: (base + _STABLE_SKILL_INSTRUCTION).replace("\\r","")."""
+    from ghost_agent.core.agent import _STABLE_SKILL_INSTRUCTION
     agent.context.llm_client.chat_completion = AsyncMock(return_value={})
     agent.context.args.perfect_it = False
     agent.context.args.native_tools = False
@@ -41,11 +46,14 @@ async def test_system_slot_is_byte_exact(agent):
     await agent.warm_up_main_prefix()
 
     payload = agent.context.llm_client.chat_completion.call_args[0][0]
-    expected = SYSTEM_PROMPT.replace("{{PROFILE}}", "User Profile Data")
+    base = SYSTEM_PROMPT.replace("{{PROFILE}}", "User Profile Data")
+    expected = (base + _STABLE_SKILL_INSTRUCTION).replace("\r", "")
     assert payload["messages"][0]["role"] == "system"
     assert payload["messages"][0]["content"] == expected
     assert payload["max_tokens"] == 1
     assert payload["stream"] is False
+    # And the warmed hash is stashed for the first-live-request comparison.
+    assert getattr(agent.context, "_warmed_sys_hash", None)
 
 
 async def test_targets_main_slot_politely(agent):

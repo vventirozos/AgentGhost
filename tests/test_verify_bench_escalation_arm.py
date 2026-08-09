@@ -52,6 +52,16 @@ REFUTED = json.dumps({"verdict": "REFUTED", "confidence": 0.9,
 CONFIRMED = json.dumps({"verdict": "CONFIRMED", "confidence": 0.9,
                         "issues": [], "reasoning": "supported"})
 
+# Escalation discipline (2026-08-06): an overturn must EARN itself — a
+# bare CONFIRMED from the main leg is refused and the refute stands. The
+# fixtures below satisfy the rebuttal contract via a valid FP-class
+# (these micro-trials' one-char evidence cannot host a ≥15-char quote).
+OVERTURN_REBUTTAL = json.dumps({
+    "verdict": "CONFIRMED", "confidence": 0.9,
+    "reasoning": "the objection is a known false-positive pattern",
+    "rebuttals": [{"issue": 1, "kind": "fp_class",
+                   "fp_class": "subjective_gloss"}]})
+
 
 def _wrap(content):
     return {"choices": [{"message": {"content": content}}]}
@@ -109,7 +119,7 @@ async def test_escalating_client_overturns_a_cheap_refute():
 
     async def _chat(payload, **kw):
         legs.append(("main", None))
-        return _wrap(CONFIRMED)
+        return _wrap(OVERTURN_REBUTTAL)
 
     client.route = _route
     client.chat_completion = _chat
@@ -177,7 +187,8 @@ async def test_the_two_legs_hit_the_two_endpoints():
 
     def _handler(request):
         seen.append(str(request.url))
-        body = REFUTED if "judge" in str(request.url) else CONFIRMED
+        body = (REFUTED if "judge" in str(request.url)
+                else OVERTURN_REBUTTAL)
         return httpx.Response(200, json=_wrap(body))
 
     client = EscalatingChatClient("http://judge.invalid",
@@ -310,9 +321,10 @@ async def test_the_refute_arm_label_matches_the_observed_pipeline(
 
 def test_a_critic_pool_client_is_also_an_escalating_arm():
     """Production can serve VERIFY from a critic pool instead of the worker
-    route (`--critic-nodes`); `_escalate_refute` accepts either. The live
-    process has no critic nodes today, which is why the worker leg is the
-    one the bench mirrors — but the label must not miss the other shape."""
+    route (`--critic-nodes`); `_escalate_refute` accepts either. ⚠ Since
+    2026-08-06 the live process DOES boot `--critic-nodes`, so the critic
+    leg is the one the CLI harness now defaults to (`--leg critic`); the
+    label must handle both shapes either way."""
     class _Critic(HttpChatClient):
         critic_clients = [{"url": "http://critic.invalid"}]
 
@@ -894,6 +906,31 @@ async def test_escalation_events_are_counted_from_the_verdicts():
     m = score_trials(results, arm=ARM_ESCALATED)
     assert m["escalation_events"] == {"high_stakes_trials": 1,
                                       "refute_overturned": 0,
+                                      "overturn_rescues": 0,
+                                      "overturn_damage": 0,
+                                      "downgrades": 0,
+                                      "downgrade_rescues": 0,
+                                      "downgrade_damage": 0,
+                                      # Split by MECHANISM (2026-08-06):
+                                      # the truncation guard and tier
+                                      # routing must not be pooled.
+                                      "truncation_guarded": 0,
+                                      "truncation_guard_rescues": 0,
+                                      "truncation_guard_damage": 0,
+                                      # strong-UNCERTAIN replacements are
+                                      # neither overturns nor downgrades
+                                      # (2026-08-07)
+                                      "replaced_uncertain": 0,
+                                      "replaced_rescues": 0,
+                                      "replaced_damage": 0,
+                                      # the shipped-ON mechanism,
+                                      # first-class (2026-08-07)
+                                      "objection_dismissed": 0,
+                                      "objection_dismiss_rescues": 0,
+                                      "objection_dismiss_damage": 0,
+                                      "objection_upheld": 0,
+                                      "objection_uphold_protects": 0,
+                                      "objection_uphold_damage": 0,
                                       "confirm_eligible": 1,
                                       "confirm_withheld": 1}
     assert results[0].to_dict()["confirm_withheld"] is True
@@ -956,7 +993,7 @@ async def test_a_bench_escalation_never_reaches_the_production_ledger(
         return REFUTED
 
     async def _chat(payload, **kw):
-        return _wrap(CONFIRMED)
+        return _wrap(OVERTURN_REBUTTAL)
 
     client.route = _route
     client.chat_completion = _chat

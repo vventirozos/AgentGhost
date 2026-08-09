@@ -16,6 +16,7 @@ from ghost_agent.utils.egress_guard import (
     is_allowed_host,
     is_installed,
     parse_socks_endpoint,
+    resolve_egress_proxy,
     tor_liveness_ok,
 )
 
@@ -54,9 +55,29 @@ def test_allowed_hosts(host):
     "8.8.8.8", "1.1.1.1", "142.250.80.46",        # public IPv4
     "2606:4700:4700::1111",                        # public IPv6
     "example.com", "duckduckgo.com",               # bare public hostnames
+    "::ffff:8.8.8.8",                              # IPv4-mapped public v4
 ])
 def test_blocked_hosts(host):
     assert is_allowed_host(host) is False
+
+
+# §4P C-LOW: 6to4 / Teredo transition addresses are globally routable but
+# CPython reports is_global=False for them → they used to be ALLOWED (fail
+# open). Red-on-revert: without the explicit range block these return True.
+@pytest.mark.parametrize("host", [
+    "2002:0808:0808::",        # 6to4 wrapping public 8.8.8.8
+    "2002:0102:0304::1",       # 6to4 wrapping 1.2.3.4
+    "2001::1",                 # Teredo (2001:0000::/32)
+    "2001:0:5ef5:79fd::1",     # Teredo server-embedded form
+])
+def test_blocked_transition_addresses(host):
+    assert is_allowed_host(host) is False
+
+
+def test_doc_range_not_mistaken_for_teredo():
+    # 2001:db8::/32 (documentation) must stay allowed — the Teredo block is
+    # precisely 2001:0000::/32, a different /32.
+    assert is_allowed_host("2001:db8::1") is True
 
 
 def test_extra_allow_passes():
@@ -174,3 +195,66 @@ def test_tor_liveness_false_when_down():
 def test_tor_liveness_false_when_no_proxy():
     assert tor_liveness_ok(None) is False
     assert tor_liveness_ok("") is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# resolve_egress_proxy — the curl_cffi/browser fail-closed backstop (§4P)
+# ──────────────────────────────────────────────────────────────────────
+
+def test_resolve_passthrough_when_proxy_given():
+    # Explicit proxy is returned unchanged whether or not the guard is on.
+    assert resolve_egress_proxy("socks5://127.0.0.1:9050", "https://x.com") == "socks5://127.0.0.1:9050"
+    u = install("socks5://127.0.0.1:9050")
+    try:
+        assert resolve_egress_proxy("socks5://127.0.0.1:9999", "https://x.com") == "socks5://127.0.0.1:9999"
+    finally:
+        u()
+
+
+def test_resolve_guard_off_never_rewrites():
+    # --no-mandatory-tor: an absent proxy stays absent (direct is the
+    # operator's explicit choice). Red-on-revert of a fix that forced Tor
+    # unconditionally would break the non-Tor deployment.
+    assert not is_installed()
+    assert resolve_egress_proxy(None, "https://example.com") is None
+    assert resolve_egress_proxy("", "https://example.com") == ""
+
+
+def test_resolve_public_defaults_to_tor_under_guard():
+    # --mandatory-tor + no proxy + PUBLIC target → loopback Tor default
+    # (fail-closed: never a direct public connect). This is the whole point.
+    u = install("socks5://127.0.0.1:9050")
+    try:
+        assert resolve_egress_proxy(None, "https://example.com") == "socks5://127.0.0.1:9050"
+        # url-less caller (weather/search only fetch public) → assume public.
+        assert resolve_egress_proxy(None) == "socks5://127.0.0.1:9050"
+    finally:
+        u()
+
+
+def test_resolve_local_target_stays_direct_under_guard():
+    # Loopback/LAN targets legitimately connect direct even under the guard
+    # (Tor can't route them; LAN doesn't deanonymise) — preserves the
+    # supervised-sandbox-service + LAN-node capability.
+    u = install("socks5://127.0.0.1:9050")
+    try:
+        assert resolve_egress_proxy(None, "http://127.0.0.1:8100/x") is None
+        assert resolve_egress_proxy(None, "http://192.168.1.5/x") is None
+        assert resolve_egress_proxy(None, "http://localhost:8100/x") is None
+    finally:
+        u()
+
+
+def test_resolve_env_tor_proxy_wins_over_default():
+    import os
+    u = install("socks5://127.0.0.1:9050")
+    prev = os.environ.get("TOR_PROXY")
+    os.environ["TOR_PROXY"] = "socks5://127.0.0.1:9150"
+    try:
+        assert resolve_egress_proxy(None, "https://example.com") == "socks5://127.0.0.1:9150"
+    finally:
+        if prev is None:
+            os.environ.pop("TOR_PROXY", None)
+        else:
+            os.environ["TOR_PROXY"] = prev
+        u()

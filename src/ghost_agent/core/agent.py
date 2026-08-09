@@ -98,6 +98,14 @@ _MCTS_TURNSTART_ENABLED = False
 #    system prompt every turn. Injects no facts/tools/constraints — cosmetic
 #    voice that only adds tokens/latency. OFF on the request path.
 _SELFHOOD_PREFIX_ENABLED = False
+
+# §4N D-MAJOR-1: the live system slot ends with this instruction, appended
+# AFTER {{PROFILE}}+working_memory and before the \r-strip (see the KV-stable
+# composition in handle_chat). The boot warmup omitted it, so every warmed
+# byte after the system prompt was shifted and unreusable — ~28s of cold
+# prefill per restart bought ~17% reuse. One shared constant so the warmup
+# and the live composition can never drift again.
+_STABLE_SKILL_INSTRUCTION = "\n\nYou have Natural-born tools and Acquired Skills. If you lack a tool for a complex repetitive task, use `create_skill` to program it permanently. It will be available on your next turn.\n"
 #  * Grounded hypothesis testing: on the post-failure replan path, don't just
 #    LIST candidate root causes — run each hypothesis's minimal test in the
 #    sandbox and keep only those consistent with the evidence. This gives
@@ -633,8 +641,176 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             take = min(need, spare)
             granted[i] += take
             spare -= take
-    parts = [lbl + b[:g] for lbl, b, g in zip(labels, bodies, granted)]
+    parts = [lbl + _slice_evidence_body(b, g, claim_text)
+             for lbl, b, g in zip(labels, bodies, granted)]
     return "\n\n".join(parts)
+
+
+# Marker appended to any tool body the packer had to cut. Two jobs, both
+# measured (2026-08-06, verify_bench degraded-evidence arm at 0.485-0.625
+# false-refute): the judge could not previously TELL that an output was
+# cut — `b[:g]` truncated SILENTLY — so "X is not in the evidence" was a
+# literally correct observation about a body whose supporting span the
+# packer had removed, and the rubric's "truncated evidence is UNCERTAIN at
+# most, never REFUTED" rule had nothing to trigger on. The marker is
+# machine-detectable (`evidence_was_truncated`) so the verifier can act on
+# it, and self-describing so the judge can reason about it.
+_EVIDENCE_TRUNCATION_MARK = "…[PACKER CUT"
+
+# Per-process nonce, and why it is REQUIRED (fresh-eye MAJOR, 2026-08-06):
+# a bare substring test is forgeable by the evidence itself, and this
+# agent reads its own source and greps its own log routinely — a probe
+# proved a plain `file_system` read of agent.py produced a digest that
+# "was truncated", silently disarming REFUTED on exactly the
+# self-modification turns. The nonce is minted at import and never
+# written to disk by the packer's own path, so echoed text (a source
+# read, an old trajectory, another process's log) cannot match it.
+# Fail-closed by construction: an unrecognised mark simply means the
+# guard does not fire and the refute stands.
+# ⚠ "Never written to disk" took a SECOND mechanism to make true
+# (2026-08-07 review): verify prompts embed the digest, and
+# GHOST_LLM_RECORD=1 stores prompts verbatim — so the LIVE nonce was
+# sitting in $GHOST_HOME/system/llm_recordings/, and a same-process
+# grep of that directory re-armed the guard (severity 0.95, refute
+# silently downgraded, zero calls). `llm_recording.record` now scrubs
+# the marker's "#<nonce>:" form before writing. Any new sink that
+# persists raw LLM payloads must do the same.
+_PACKER_NONCE = uuid.uuid4().hex[:8]
+_TRUNCATION_MARK_RE = re.compile(
+    re.escape(_EVIDENCE_TRUNCATION_MARK)
+    + r"#([0-9a-f]{8}): (\d+) of (\d+) chars shown")
+
+
+def evidence_was_truncated(evidence: str) -> bool:
+    """True when THIS PROCESS's packer cut at least one tool body out of
+    this digest — i.e. absence of a fact from it is not evidence of
+    fabrication. Nonce-checked; see `_PACKER_NONCE`."""
+    return evidence_truncation_severity(evidence) > 0.0
+
+
+def evidence_truncation_severity(evidence: str) -> float:
+    """FRACTION of the digest's SOURCE text this process's packer
+    removed (0.0 = nothing cut / not ours).
+
+    Severity, not a boolean, because "the fact is absent" means
+    different things at different cut depths: absent from a digest that
+    kept 95% of its source is decent evidence of fabrication, absent
+    from one that kept 20% is nearly no evidence at all. The consumer
+    (`verifier._guard_truncated_absence`) requires a SUBSTANTIAL cut
+    before excusing an absence complaint — measured need: even after
+    narrowing the absence regex, 21.6% of real refute issue-sets are
+    all-absence, and several are genuine fabrication catches
+    ("'Vasilis' is not mentioned in the evidence").
+
+    ⚠ GLOBAL missing fraction, not max-per-body (2026-08-07 review).
+    `max` over per-body fractions armed the guard on ORDINARY turns: an
+    even 3×1500-char research digest at budget 4000 measured 0.35
+    "severity" although ~87% of the source was visible, and one deeply
+    cut body excused absence complaints about the four INTACT bodies
+    beside it. sum(cut)/sum(source) is the honest "how much of what the
+    tools returned can we not see" number: the same 3×1500 turn scores
+    ~0.13 (below the floor), while a digest that really lost half its
+    source still arms the guard. Per-body attribution (matching the
+    cited atom to ITS body) would be stricter still, but the digest does
+    not delimit bodies reliably; the global fraction at least fails in
+    the ESCALATE direction, never the free-excuse one."""
+    text = str(evidence or "")
+    missing = 0
+    marker_chars = 0
+    for m in _TRUNCATION_MARK_RE.finditer(text):
+        if m.group(1) != _PACKER_NONCE:
+            continue
+        try:
+            shown, total = int(m.group(2)), int(m.group(3))
+        except (TypeError, ValueError):
+            continue
+        if total > shown >= 0:
+            missing += total - shown
+            marker_chars += len(m.group(0))
+    if missing <= 0:
+        return 0.0
+    kept = max(0, len(text) - marker_chars)
+    return missing / (kept + missing)
+
+
+def _slice_evidence_body(body: str, granted: int, claim_text: str) -> str:
+    """Cut ``body`` to ``granted`` chars — but keep the part the CLAIM
+    actually leans on, and say so.
+
+    Head-only truncation (`body[:granted]`) drops the claim's supporting
+    span whenever it sits past the cut, which is precisely how a true
+    claim gets refuted for "not in the evidence". When the claim's
+    significant tokens appear beyond the head, this keeps a head window
+    AND the best-overlapping later window, joined by an elision mark.
+    The marker is always inside the granted budget, so the assembled
+    digest can still never exceed the caller's cap."""
+    if granted >= len(body):
+        return body
+
+    # Deliberately TERSE (2026-08-06): the first version ran ~110 chars,
+    # which did not fit the granted budget on short bodies — so the cut
+    # went unmarked and the guard stayed dark on exactly the small-
+    # evidence cases (caught by the bench's own fault fixture). The
+    # rubric in the adjudicate + rebuttal prompts already explains what
+    # a cut means; the mark only has to be unforgeable and countable.
+    #
+    # ⚠ The mark is built LAST, from the count of source chars that
+    # actually survived (2026-08-07 review): the first version wrote
+    # "{granted} of {total}" while only granted−len(mark) chars survived
+    # (−len(gap) more on the claim-window path), so the self-describing
+    # marker the judge reads was not literally true and severity was
+    # understated by 1-2pp. `mark_budget` (the widest the mark can get)
+    # is reserved up front, which also closes the cap-violation band a
+    # `room = max(40, …)` floor used to open: output length is now
+    # ≤ granted for EVERY granted.
+    def _mk(kept: int) -> str:
+        return (f"\n{_EVIDENCE_TRUNCATION_MARK}#{_PACKER_NONCE}: {kept} of "
+                f"{len(body)} chars shown]")
+
+    mark_budget = len(_mk(len(body)))
+    # Budget invariant beats the marker: on tiny grants the mark alone
+    # would overshoot the caller's cap (measured +146 at granted=1).
+    # Drop the mark rather than break the cap — the guard then simply
+    # does not fire, which is the fail-closed direction.
+    if granted < mark_budget + 40:
+        return body[:max(0, granted)]
+    room = granted - mark_budget
+    ct = _claim_tokens(claim_text) if claim_text else set()
+    _GAP = "\n…[gap]…\n"
+    if ct and len(body) > room + 200:
+        head_room = max(40, int(room * 0.6))
+        # The separator is part of the budget — subtracting a token 1
+        # here overshot `granted` by its full width (caught by the
+        # bounded-length assertion in tests/test_escalation_discipline).
+        win_room = room - head_room - len(_GAP)
+        if win_room >= 80:
+            # Score fixed-width windows over the REMAINDER for claim
+            # overlap; keep the best one alongside the head.
+            best_i, best_score = None, 0
+            step = max(80, win_room // 2)
+            for i in range(head_room, len(body) - 1, step):
+                seg = body[i:i + win_room]
+                score = len(ct & _claim_tokens(seg))
+                # LAST max wins, not first: with `>` the earliest
+                # max-scoring window won and could start early enough
+                # that the decisive literal fell off its end (measured
+                # non-monotonic: kept at granted 800 and 1000, lost at
+                # 900).
+                if score >= best_score and score > 0:
+                    best_i, best_score = i, score
+            if best_i is not None:
+                # ⚠ Count the chars that actually SURVIVE (round-2
+                # review): a tail window can be shorter than win_room
+                # (and the last-max-wins rule prefers late windows), so
+                # `head_room + win_room` overstated the marker's
+                # shown-count by up to a full window — which understated
+                # severity by up to ~14pp and could drop a genuinely
+                # ≥25%-cut digest below the floor, letting the absence
+                # rule uphold over "intact" evidence that was not.
+                seg = body[best_i:best_i + win_room]
+                return (body[:head_room] + _GAP + seg
+                        + _mk(head_room + len(seg)))
+    return body[:room] + _mk(room)
 
 
 # Upper bound on how long the hydration-usefulness judge defers to an
@@ -869,20 +1045,52 @@ _BUG_REPORT_RE = re.compile(
 )
 
 
+def _msg_token_cost(m) -> int:
+    """Token estimate for ONE message, INCLUDING native ``tool_calls`` args.
+
+    §4N B-MAJOR-1: on the native-tools dialect an assistant message carries
+    ``content=""`` and its arguments in ``msg["tool_calls"]`` — which the
+    wire re-renders into text but every budget counter that read ``content``
+    only scored as ZERO. A write-heavy native session then accumulated
+    unbounded UNCOUNTED tokens: compaction fired late, the upstream 400'd,
+    and destructive emergency recovery kicked in. One shared helper so the
+    five counters can never diverge on this again. Never raises.
+    """
+    total = 0
+    try:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            total += estimate_tokens(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += estimate_tokens(str(part.get("text", "")))
+        tcs = m.get("tool_calls")
+        # §4N R2 MAJOR-1: count tool_calls args ONLY when they are NOT
+        # already inline in content. On the live XML dialect the agent
+        # keeps the raw `<tool_call>` XML in content AND the parsed calls
+        # in `tool_calls`, but the wire translator emits ONE copy
+        # (_render_assistant_with_tool_calls's `already_inline` short-
+        # circuit) — so adding both double-counted (~2.14× measured),
+        # firing compaction/lockdown at ~half the real occupancy every
+        # write-heavy turn. On the native dialect content is "" and the
+        # args live only in tool_calls, so this is where they must be
+        # counted. Mirror the translator's own dedup condition.
+        if tcs and "<tool_call>" not in (c if isinstance(c, str) else ""):
+            total += estimate_tokens(json.dumps(tcs, ensure_ascii=False))
+    except Exception:
+        return total
+    return total
+
+
 def _estimate_messages_tokens(messages) -> int:
-    """Rough token estimate over a message list (text parts only) — the
-    shared basis for the occupancy-aware read budget and the context-
-    pressure steers. Never raises."""
+    """Rough token estimate over a message list (text parts + native
+    tool_calls) — the shared basis for the occupancy-aware read budget and
+    the context-pressure steers. Never raises."""
     total = 0
     try:
         for m in messages or []:
-            c = m.get("content", "")
-            if isinstance(c, str):
-                total += estimate_tokens(c)
-            elif isinstance(c, list):
-                for part in c:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        total += estimate_tokens(str(part.get("text", "")))
+            total += _msg_token_cost(m)
     except Exception:
         return total
     return total
@@ -3049,11 +3257,8 @@ class GhostAgent:
         final_history = []
 
         def _msg_tokens(msg):
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_only = " ".join([str(block.get("text", "")) for block in content if isinstance(block, dict) and block.get("type") == "text"])
-                return estimate_tokens(text_only)
-            return estimate_tokens(str(content))
+            # §4N B-MAJOR-1: count native tool_calls args too (shared helper).
+            return _msg_token_cost(msg)
 
         # Pure sliding window from newest to oldest.
         # We NEVER mutate historical strings, we just drop the oldest ones if we run out of space.
@@ -3087,6 +3292,13 @@ class GhostAgent:
                 i = j
                 continue
 
+            # §4N B-MINOR-2 (evaluated, NOT dropped): a tool result reaching
+            # here is at index 0 with no caller — but a client can
+            # legitimately START a conversation with a tool result for the
+            # model to react to (see test_tool_anonymity_translation), and
+            # the request translator wraps role:"tool" into a wire-safe
+            # <tool_response> user message regardless of dialect. Dropping
+            # it loses real content for no benefit; keep it.
             if current_tokens + msg_tok > max_tokens:
                 break
             final_history.insert(0, msg)
@@ -3108,13 +3320,7 @@ class GhostAgent:
             def _estimator(msgs):
                 total = 0
                 for m in msgs:
-                    c = m.get("content", "")
-                    if isinstance(c, str):
-                        total += estimate_tokens(c)
-                    elif isinstance(c, list):
-                        for part in c:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                total += estimate_tokens(str(part.get("text", "")))
+                    total += _msg_token_cost(m)  # §4N B-MAJOR-1: incl tool_calls
                 return total
 
             cm = ContextManager(max_tokens=max_tokens, token_estimator=_estimator)
@@ -3137,18 +3343,24 @@ class GhostAgent:
         target = int(max_tokens * 0.92)
 
         def _tok(m):
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = " ".join(str(b.get("text", "")) for b in c
-                             if isinstance(b, dict) and b.get("type") == "text")
-            return estimate_tokens(str(c))
+            # §4N B-MAJOR-1: count native tool_calls args too (shared helper).
+            return _msg_token_cost(m)
+
+        # §4N C-MAJOR-3: the original GOAL must not be the center-cut
+        # victim — a big pasted spec IS the largest message, and cutting
+        # its middle loses the constraints stated there. §4N R2 MINOR-1:
+        # the goal is the first USER message (the ladder's rule), NOT the
+        # first non-system one — a conversation can legitimately START
+        # with a tool result (B-MINOR-2), and exempting THAT while
+        # center-cutting the user's actual spec was the wrong target.
+        _goal = next((m for m in msgs if m.get("role") == "user"), None)
 
         guard = 0
         while sum(_tok(m) for m in msgs) > target and guard < 64:
             guard += 1
             cand = None
             for m in msgs:
-                if m.get("role") == "system":
+                if m.get("role") == "system" or m is _goal:
                     continue
                 c = m.get("content", "")
                 if isinstance(c, str) and len(c) > 4000 and (
@@ -3170,12 +3382,7 @@ class GhostAgent:
     async def _prune_context(self, messages: List[Dict[str, Any]], max_tokens: int = 12000, model: str = "test-model") -> List[Dict[str, Any]]:
         current_tokens = 0
         for m in messages:
-            content = m.get("content", "")
-            if isinstance(content, list):
-                text_only = " ".join([str(block.get("text", "")) for block in content if isinstance(block, dict) and block.get("type") == "text"])
-                current_tokens += estimate_tokens(text_only)
-            else:
-                current_tokens += estimate_tokens(str(content))
+            current_tokens += _msg_token_cost(m)  # §4N B-MAJOR-1: incl tool_calls
         if current_tokens < max_tokens:
             return messages
 
@@ -3187,7 +3394,34 @@ class GhostAgent:
         # If we have very few messages but still hit the token limit,
         # just truncate without summarizing as it's likely a huge prompt
         if len(non_system_msgs) <= 5:
-            truncated = non_system_msgs[-3:]
+            # §4N C-MAJOR-2: the old `[-3:]` dropped the goal at index 0 —
+            # with 4-5 messages the turn ran with NO user instruction in
+            # history. Always keep the goal. §4N B-MINOR-1: don't let the
+            # kept tail START on an orphaned tool result (its <tool_call>
+            # sliced away); pull the caller in with it.
+            _n = len(non_system_msgs)
+            _keep = set(range(max(0, _n - 3), _n))       # last ~3
+            # §4N R2 MINOR-1: the goal is the first USER message, not
+            # blindly index 0 — a conversation can start with a tool
+            # result (B-MINOR-2), and keeping THAT as "the goal" while
+            # dropping the real user instruction at index 1 was the exact
+            # inversion this branch is meant to prevent.
+            _goal_i = next((i for i, m in enumerate(non_system_msgs)
+                            if m.get("role") == "user"), None)
+            if _goal_i is not None:
+                _keep.add(_goal_i)
+            # §4N R3 MINOR-1: `_goal_i or -1` treated goal-at-index-0 as
+            # "no goal" (0 is falsy) → the pull-in guard below could never
+            # fire on the commonest shape (goal at 0). Use an explicit
+            # sentinel so the caller-pull actually runs.
+            _floor = _goal_i if _goal_i is not None else -1
+            _lo = min((i for i in _keep if i > _floor), default=None)
+            while _lo is not None and _goal_i is not None and \
+                    _lo > _goal_i + 1 and \
+                    non_system_msgs[_lo].get("role") == "tool":
+                _lo -= 1
+                _keep.add(_lo)
+            truncated = [non_system_msgs[i] for i in sorted(_keep)]
             # Scrub images from the truncated fallback
             scrubbed_truncated = []
             for msg in truncated:
@@ -3213,7 +3447,16 @@ class GhostAgent:
 
         # Keep recent context (last 3 turns = 6 messages + goal)
         original_goal = non_system_msgs[0]
-        recent_context = non_system_msgs[-6:] # Keep last ~3 turns intact
+        # §4N B-MINOR-1: don't let the recent window START on an orphaned
+        # tool result (its <tool_call> got summarized into the middle) —
+        # pull the caller in with it. `recent_start` also bounds the anchor
+        # scan below so the recent window and the anchored middle never
+        # overlap.
+        recent_start = max(1, len(non_system_msgs) - 6)
+        while recent_start > 1 and \
+                non_system_msgs[recent_start].get("role") == "tool":
+            recent_start -= 1
+        recent_context = non_system_msgs[recent_start:] # last ~3 turns intact
 
         # SEMANTIC CONTEXT ANCHORING: extract key findings from middle
         # turns before they get summarized away. These anchors survive
@@ -3228,7 +3471,7 @@ class GhostAgent:
             "root cause", "the issue is", "the problem is", "discovered",
             "key finding", "important:", "note:", "exit code:",
         }
-        for m in non_system_msgs[1:-6]:
+        for m in non_system_msgs[1:recent_start]:
             content = str(m.get("content", "")).lower()[:500]
             is_tool = m.get("role") == "tool"
             is_assistant_finding = m.get("role") == "assistant" and any(kw in content for kw in _anchor_keywords)
@@ -3247,7 +3490,7 @@ class GhostAgent:
 
         # Legacy: always keep the most recent tool result from middle
         recent_tool_anchor = None
-        for m in reversed(non_system_msgs[1:-6]):
+        for m in reversed(non_system_msgs[1:recent_start]):
             if m.get("role") == "tool" and id(m) not in anchored_originals:
                 recent_tool_anchor = m
                 break
@@ -3256,7 +3499,7 @@ class GhostAgent:
         anchor_messages = anchor_messages[:4]
 
         middle_messages = [
-            m for m in non_system_msgs[1:-6]
+            m for m in non_system_msgs[1:recent_start]
             if m is not recent_tool_anchor and id(m) not in anchored_originals
         ]
 
@@ -3433,6 +3676,13 @@ class GhostAgent:
             skill_memory=getattr(self.context, 'skill_memory', None),
             profile_memory=getattr(self.context, 'profile_memory', None),
             episodic_memory=getattr(self.context, 'episodic_memory', None),
+            # §4M (Lens B MINOR): 281/765 live hydrations ran on this
+            # fallback bus (self-play/isolates) and fused with hand-tuned
+            # DEFAULT weights — a different fusion than production — because
+            # the learned matrix was never passed. The ledger path stays
+            # deliberately omitted (self-play must not write usefulness
+            # observations); the weights omission was incidental.
+            intent_weights=getattr(self.context, 'intent_weights', None),
         )
 
     async def biological_watchdog(self):
@@ -3446,7 +3696,15 @@ class GhostAgent:
         logger.debug("Biological watchdog daemon started")
         try:
             while True:
-                await asyncio.sleep(60)
+                # Tick period is SCALED too (§4Q). Under --bio-time-scale the
+                # idle windows compress, and at scale 60 the (900, 3600] window
+                # is only 45s wide — NARROWER than a fixed 60s tick, so whole
+                # idle stretches could pass with zero in-window ticks purely on
+                # alignment (~25% miss), injecting non-determinism into the very
+                # ablation arm --bio-deterministic exists to remove. At the
+                # production default (scale 1.0) this is exactly 60.0 — an
+                # identity, so live cadence is unchanged.
+                await asyncio.sleep(self._bio_scaled(60))
                 # RSS self-defense runs BEFORE the tick and independent of its
                 # memory_system guard: the known 270MB→2GB growth on a ~94%-RAM
                 # box can OOM-kill the shared llama-server, so it must fire even
@@ -3525,7 +3783,18 @@ class GhostAgent:
                     pass
             sys.stdout.flush()
             sys.stderr.flush()
-            os.execv(sys.executable, [sys.executable, "-m", "ghost_agent.main", *sys.argv[1:]])
+            # ⚠ Derive the module spelling from THIS module's own name
+            # (§4L Lens-C MAJOR-1): the hardcoded "ghost_agent.main" was
+            # the TEST spelling — prod boots `python -m src.ghost_agent
+            # .main` with no PYTHONPATH, so `find_spec("ghost_agent")`
+            # fails there and execv would have replaced the process with
+            # one that dies on ModuleNotFoundError. The except clause
+            # below can never catch that: by then this process is gone.
+            # The import-shape defect class, instance six — and dormant
+            # only because GHOST_MAX_RSS_MB defaults to 0.
+            _main_mod = __name__.replace(".core.agent", ".main")
+            os.execv(sys.executable,
+                     [sys.executable, "-m", _main_mod, *sys.argv[1:]])
         except Exception as e:
             logger.error(f"RSS-watchdog restart failed (continuing): {e}")
 
@@ -3535,6 +3804,10 @@ class GhostAgent:
     _REFLECTION_COOLDOWN = 2400   # 40 min between reflections
     _POSTMORTEM_COOLDOWN = 10800  # 3 h between whole-transcript post-mortems (phase 2.5c)
     _SKILLS_AUTO_COOLDOWN = 7200  # 2 hours between skill auto-extractions
+    # Skill-store hygiene (reconcile orphans + heal missing twins), phase 2.6b.
+    # Same 2h cadence it inherited as a rider on skills-auto — but now its OWN
+    # anchor, so it runs even when trajectory logging is off (§4Q Lens-B).
+    _STORE_HYGIENE_COOLDOWN = 7200
     _PRM_TRAIN_COOLDOWN = 10800   # 3 hours between PRM retrain passes
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
@@ -3557,13 +3830,70 @@ class GhostAgent:
         window into 1 minute so the B3 ablation harness can exercise the pure-
         idle learning loops (dream/self-play, reflection critique, skills-auto
         graduation) in accelerated epochs. Applied to EVERY inline window bound
-        and to the phase cooldowns via `_bio_cooldown`."""
+        and — since §4Q, 2026-08-08 — to the phase cooldowns via
+        `_bio_cooldown` and to the watchdog tick period.
+
+        ⚠ This claim was FALSE from the moment it was written until §4Q:
+        `_bio_cooldown` had ZERO production callers (every comparison used the
+        raw constant), so windows compressed but cooldowns did not. A unit test
+        pinning this helper's arithmetic gave false confidence the wiring
+        existed. Consequence: the B3 ablation's `--idle-epochs N` produced at
+        most ONE firing per phase regardless of N, because e.g. a 3h PRM
+        cooldown outlived the whole accelerated run. Any B3 number that assumed
+        N epochs == N firings predates this fix. Zero production exposure:
+        at the default scale 1.0 every call is an identity."""
         scale = getattr(self, "_bio_time_scale", 1.0) or 1.0
         return seconds / scale
 
     def _bio_cooldown(self, seconds: float) -> float:
         """Same scaling for a phase cooldown."""
         return self._bio_scaled(seconds)
+
+    #: A phase's REAL duration (an LLM call) is unaffected by --bio-time-scale.
+    #: Below this window width the scaled window is narrower than a single
+    #: phase takes to run, which silently makes later phases unreachable.
+    _MIN_USABLE_WINDOW_S = 120.0
+
+    def _warn_if_scale_breaks_the_window(self) -> str:
+        """Return a warning when --bio-time-scale is set so high that the idle
+        window is narrower than a phase's real runtime, else "".
+
+        MEASURED (#40/#41, 2026-08-09). At `--bio-time-scale 60` the window for
+        phases 2.5-2.95 is (15, 60] — 45 s wide — while a dream is a real LLM
+        call taking ~60 s. The observed live cycle was:
+
+            idle 1..10   nothing eligible
+            idle ~11     dream fires, runs ~60 s of REAL time
+            idle ~71     window ALREADY CLOSED; self-play (>60, no upper
+                         bound) fires and RESETS last_activity_time
+            idle 1..10   ... forever
+
+        so the (15, 60] band is never sampled at a tick boundary and EVERY
+        phase gated (900, 3600] — reflection, postmortem, skills-auto, PRM,
+        router, calibration, workspace-tidy, both narratives, stale-questions,
+        autoadvance — is structurally unreachable. The ablation silently
+        measured dream + self-play ONLY, and reported the rest as "0 firings"
+        as though that were a result.
+
+        Scaling the GATES without scaling the WORK is only sound while the
+        window stays wider than a phase. Scale <= 20 keeps it so; 60 does not.
+        """
+        scale = getattr(self, "_bio_time_scale", 1.0) or 1.0
+        if scale <= 1.0:
+            return ""
+        width = self._bio_scaled(3600) - self._bio_scaled(900)
+        if width >= self._MIN_USABLE_WINDOW_S:
+            return ""
+        return (
+            f"--bio-time-scale {scale:g} compresses the idle window to "
+            f"{width:.0f}s, which is NARROWER than a single phase's real "
+            f"runtime (an LLM call is ~60s at any scale). Dream will consume "
+            f"the window and self-play will reset the idle clock, so "
+            f"reflection / postmortem / skills-auto / PRM / router / "
+            f"calibration / tidy / narratives / autoadvance can NEVER fire — "
+            f"they will silently report 0. Use a scale <= 20 "
+            f"(window >= {self._MIN_USABLE_WINDOW_S:.0f}s) for a measurement "
+            f"that includes them.")
 
     def _bio_roll(self, p: float) -> bool:
         """Probability gate for the idle phases. Returns True deterministically
@@ -3626,6 +3956,8 @@ class GhostAgent:
             self._last_postmortem_at = datetime.datetime.min
         if not hasattr(self, '_last_skills_auto_at'):
             self._last_skills_auto_at = datetime.datetime.min
+        if not hasattr(self, '_last_store_hygiene_at'):
+            self._last_store_hygiene_at = datetime.datetime.min
         if not hasattr(self, '_last_prm_train_at'):
             self._last_prm_train_at = datetime.datetime.min
         if not hasattr(self, '_last_narrative_at'):
@@ -3673,7 +4005,7 @@ class GhostAgent:
         # Phase 1: Process Short-Term Journal (>120s idle)
         if idle_secs > self._bio_scaled(120) and getattr(ctx, 'journal', None) is not None:
             since_last_journal = (datetime.datetime.now() - self._last_journal_at).total_seconds()
-            if since_last_journal >= self._JOURNAL_COOLDOWN:
+            if since_last_journal >= self._bio_cooldown(self._JOURNAL_COOLDOWN):
                 has_items = False
                 try:
                     # Route through the guarded pending_count() (not a raw
@@ -3731,7 +4063,7 @@ class GhostAgent:
             # resets the streak below.
             _dream_cooldown_eff = self._DREAM_COOLDOWN * (
                 1 + min(int(getattr(self, "_dream_skip_streak", 0)), 3))
-            if since_last_dream >= _dream_cooldown_eff:
+            if since_last_dream >= self._bio_cooldown(_dream_cooldown_eff):
                 try:
                     res = await asyncio.to_thread(
                         ctx.memory_system.collection.get,
@@ -3807,6 +4139,18 @@ class GhostAgent:
                                 self._record_autonomous_activity(
                                     "dream",
                                     "REM cycle ran (memory consolidation / heuristic harvest)")
+                        except Exception as _dream_exc:
+                            # §4Q Lens-A: dream was the ONLY non-terminal phase
+                            # with no except. `Dreamer.dream` has unguarded
+                            # collection.get / LLM segments, so a raise here
+                            # unwound to the watchdog's tick handler and skipped
+                            # the TWELVE phases below (reflection, postmortem,
+                            # skills, PRM, router, calibration, tidy,
+                            # narratives, stale-questions, autoadvance,
+                            # self-play) for that tick. Self-play re-raises on
+                            # purpose because it is LAST; dream is not.
+                            logger.warning("Dream phase failed: %s: %s",
+                                           type(_dream_exc).__name__, _dream_exc)
                         finally:
                             # Do NOT reset ctx.last_activity_time here —
                             # see the comment in phase 1. Resetting it
@@ -3833,7 +4177,7 @@ class GhostAgent:
         # Does NOT reset `ctx.last_activity_time` — same rule as dream.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_reflection = (datetime.datetime.now() - self._last_reflection_at).total_seconds()
-            if since_last_reflection >= self._REFLECTION_COOLDOWN:
+            if since_last_reflection >= self._bio_cooldown(self._REFLECTION_COOLDOWN):
                 reflector = getattr(ctx, 'reflector', None)
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
                 # Skip-if-unchanged gate (2026-07-18): when the trajectory
@@ -3869,6 +4213,7 @@ class GhostAgent:
                     # Anchor BEFORE the await so a crash mid-reflection
                     # still advances the cooldown — same defensive
                     # pattern the dream phase uses above.
+                    _idle_ran.append("reflection")
                     self._last_reflection_at = datetime.datetime.now()
                     try:
                         # Loaded from disk once so restarts don't re-reflect
@@ -3882,8 +4227,23 @@ class GhostAgent:
                         # back to the plain collector if the composite
                         # isn't present.
                         _sink = getattr(ctx, 'reflection_sink', None) or traj_collector.append
+                        # Materialise the corpus in a THREAD (§4Q Lens-D).
+                        # `reflector.run` consumes `failed_source()` with a
+                        # plain `for` loop, so passing the raw generator did
+                        # file-open + json.loads + Trajectory.from_dict per line
+                        # ON THE EVENT LOOP — measured 143ms cold / 66ms warm on
+                        # the live 21MB / 1538-trajectory corpus, and growing
+                        # linearly. This is the steady state, not a cold-start:
+                        # once `already_reflected` absorbs the backlog the pass
+                        # walks everything and reflects nothing ("reflected
+                        # 0/60, dup-skipped 60"). Phase 2.6 already offloads the
+                        # IDENTICAL generator 130 lines below with the comment
+                        # "stalls the event loop for seconds otherwise" — this
+                        # site simply never got the same treatment.
+                        _refl_trajs = await asyncio.to_thread(
+                            lambda: list(traj_collector.iter_trajectories()))
                         report = await reflector.run(
-                            failed_source=lambda: traj_collector.iter_trajectories(),
+                            failed_source=lambda: _refl_trajs,
                             sink=_sink,
                             already_reflected=already,
                         )
@@ -3967,7 +4327,7 @@ class GhostAgent:
                 except (TypeError, ValueError):
                     pm_cooldown = float(self._POSTMORTEM_COOLDOWN)
                 since_last_pm = (datetime.datetime.now() - self._last_postmortem_at).total_seconds()
-                if since_last_pm >= pm_cooldown:
+                if since_last_pm >= self._bio_cooldown(pm_cooldown):
                     _idle_ran.append("postmortem")
                     pretty_log(
                         "Biological Hook",
@@ -4003,7 +4363,7 @@ class GhostAgent:
         # extraction passes back-to-back.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_skills = (datetime.datetime.now() - self._last_skills_auto_at).total_seconds()
-            if since_last_skills >= self._SKILLS_AUTO_COOLDOWN:
+            if since_last_skills >= self._bio_cooldown(self._SKILLS_AUTO_COOLDOWN):
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
                 if traj_collector is not None:
                     _idle_ran.append("skills-auto")
@@ -4139,20 +4499,60 @@ class GhostAgent:
                         logger.warning(f"Skills auto-extraction failed: {e}")
                     finally:
                         self._last_skills_auto_at = datetime.datetime.now()
-                    # Store-hygiene rider on the same cooldown: drop vector
-                    # skill entries whose JSON playbook twin is gone. An
-                    # orphan wins the vector-dedup race and vetoes every
-                    # future re-learn of that lesson ("no JSON twin to
-                    # bump", 2026-07-29 log audit). Cheap bounded scan;
-                    # never raises.
+
+        # Phase 2.6b: Skill-store hygiene — reconcile orphans + heal missing
+        # twins. Promoted from a RIDER inside phase 2.6 to a phase of its own
+        # (§4Q Lens-B, 2026-08-08) for two independent reasons:
+        #
+        #   1. It was nested under phase 2.6's `traj_collector is not None`
+        #      gate, but neither call touches the trajectory corpus — they read
+        #      ctx.skill_memory + ctx.memory_system. Under --no-trajectories
+        #      (a supported ablation) BOTH the orphan reconcile and the §4M
+        #      heal were dead for the whole process lifetime, so lessons whose
+        #      vector twin went missing stayed dark to retrieval forever.
+        #   2. Both calls shared ONE try whose handler logged at DEBUG. The
+        #      call site claimed "never raises", which is false:
+        #      `reconcile_vector_orphans` calls `_load_playbook` outside any
+        #      try, and that deliberately RE-RAISES OSError (fail-loud policy).
+        #      So one unreadable playbook (EIO/EACCES — this project has a live
+        #      root-owned-file failure class) propagated out of reconcile and
+        #      skipped the heal entirely, with the only trace a debug line that
+        #      does not even mention healing.
+        #
+        # Now: independent try per call, WARNING not debug, its own cooldown
+        # anchor so it cannot be starved by (or starve) skill extraction.
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
+            since_last_hygiene = (datetime.datetime.now()
+                                  - self._last_store_hygiene_at).total_seconds()
+            if since_last_hygiene >= self._bio_cooldown(self._STORE_HYGIENE_COOLDOWN):
+                _sk = getattr(ctx, "skill_memory", None)
+                _ms = getattr(ctx, "memory_system", None)
+                if _sk is not None:
+                    _idle_ran.append("store-hygiene")
+                    self._last_store_hygiene_at = datetime.datetime.now()
                     try:
-                        _sk = getattr(ctx, "skill_memory", None)
-                        _ms = getattr(ctx, "memory_system", None)
-                        if _sk is not None and hasattr(_sk, "reconcile_vector_orphans"):
+                        # Drop vector skill entries whose JSON playbook twin is
+                        # gone: an orphan wins the vector-dedup race and vetoes
+                        # every future re-learn of that lesson (2026-07-29 audit).
+                        if hasattr(_sk, "reconcile_vector_orphans"):
                             await asyncio.to_thread(
                                 _sk.reconcile_vector_orphans, _ms)
                     except Exception as e:
-                        logger.debug(f"skill-store orphan reconcile skipped: {e}")
+                        logger.warning("skill-store orphan reconcile FAILED "
+                                       "(heal still runs): %s", e)
+                    try:
+                        # §4M CRIT-1 heal: the inverse pass — re-embed playbook
+                        # lessons whose vector twin is missing (weeks of
+                        # task-first orphan deletes left 36/50 lessons dark).
+                        # Idempotent, and deliberately in its OWN try so a
+                        # reconcile failure can never suppress this recovery.
+                        if hasattr(_sk, "heal_missing_twins"):
+                            await asyncio.to_thread(
+                                _sk.heal_missing_twins, _ms)
+                    except Exception as e:
+                        logger.warning("skill-twin heal FAILED: %s", e)
+                    finally:
+                        self._last_store_hygiene_at = datetime.datetime.now()
 
         # Phase 2.7: PRM retrain on accumulated trajectories
         # (every ~3 hours during idle, configurable via
@@ -4193,7 +4593,7 @@ class GhostAgent:
                 cooldown_override = None
             cooldown = float(cooldown_override) if cooldown_override else float(self._PRM_TRAIN_COOLDOWN)
             since_last_prm = (datetime.datetime.now() - self._last_prm_train_at).total_seconds()
-            if since_last_prm >= cooldown:
+            if since_last_prm >= self._bio_cooldown(cooldown):
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
                 prm_scorer = getattr(ctx, 'prm_scorer', None)
                 # Tight isinstance check: ``ctx`` may be a MagicMock in
@@ -4326,7 +4726,7 @@ class GhostAgent:
                 _rt_cd_override = None
             _rt_cooldown = float(_rt_cd_override) if _rt_cd_override else float(self._ROUTER_TRAIN_COOLDOWN)
             since_last_router = (datetime.datetime.now() - self._last_router_train_at).total_seconds()
-            if since_last_router >= _rt_cooldown:
+            if since_last_router >= self._bio_cooldown(_rt_cooldown):
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
                 from ..distill.collector import TrajectoryCollector as _TrajColCls
                 from ..router import ComplexityDispatcher as _ComplexityDispatcher
@@ -4367,13 +4767,16 @@ class GhostAgent:
                             self._router_corpus_fp = _rt_corpus_fp
                             _new_clf = trainer.classifier
                             if (report.fit_succeeded and _new_clf is not None
-                                    and _new_clf.is_finite()):
+                                    and _new_clf.looks_sane()):
                                 # Hot-swap: the dispatcher re-reads .classifier /
                                 # .disabled on every route() call, so this takes
-                                # effect immediately (no restart). The is_finite()
-                                # gate is defence-in-depth — fit() already raises on
-                                # divergence, but a NaN classifier must NEVER reach
-                                # the live router (it would return NaN confidences).
+                                # effect immediately (no restart). looks_sane()
+                                # = finite AND not-inverted (§4O C-MAJOR-1): a
+                                # NaN model would return NaN confidences, and an
+                                # INVERTED model (negative technical/coding
+                                # weights) skips the planner on the hardest
+                                # requests — both must NEVER reach the live
+                                # router; rejection leaves it escalate-all (safe).
                                 dispatcher.classifier = _new_clf
                                 dispatcher.disabled = False
                                 pretty_log(
@@ -4385,10 +4788,12 @@ class GhostAgent:
                                 self._record_autonomous_activity(
                                     "router_train",
                                     f"complexity router refit: {report.summary()}")
-                            elif _new_clf is not None and not _new_clf.is_finite():
+                            elif _new_clf is not None and not _new_clf.looks_sane():
                                 logger.warning(
-                                    "Router idle retrain produced a non-finite model "
-                                    "— NOT hot-swapping; router stays escalate-all."
+                                    "Router idle retrain produced a non-finite OR "
+                                    "INVERTED model (negative technical/coding "
+                                    "weights) — NOT hot-swapping; router stays "
+                                    "escalate-all."
                                 )
                             else:
                                 logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")
@@ -4423,8 +4828,9 @@ class GhostAgent:
             ).total_seconds()
             tracker = getattr(ctx, 'calibration_tracker', None)
             from .calibration import CalibrationTracker as _CalibTrackerCls
-            if (since_last_calib >= _calib_cooldown
+            if (since_last_calib >= self._bio_cooldown(_calib_cooldown)
                     and isinstance(tracker, _CalibTrackerCls)):
+                _idle_ran.append("calibration")
                 self._last_calib_refit_at = datetime.datetime.now()
                 # Piggyback on the same cooldown: has any live experiment
                 # reached a DECIDED verdict since we last looked? Only
@@ -4499,7 +4905,7 @@ class GhostAgent:
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_tidy = (datetime.datetime.now()
                                - self._last_workspace_tidy_at).total_seconds()
-            if since_last_tidy >= self._WORKSPACE_TIDY_COOLDOWN:
+            if since_last_tidy >= self._bio_cooldown(self._WORKSPACE_TIDY_COOLDOWN):
                 _tidy_store = getattr(ctx, 'project_store', None)
                 if _tidy_store is not None:
                     self._last_workspace_tidy_at = datetime.datetime.now()
@@ -4540,7 +4946,8 @@ class GhostAgent:
                 and getattr(getattr(ctx, 'args', None), 'autoadvance_idle', False) is True):
             since_last_aa = (datetime.datetime.now() - self._last_autoadvance_at).total_seconds()
             store = getattr(ctx, 'project_store', None)
-            if since_last_aa >= self._AUTOADVANCE_COOLDOWN and store is not None:
+            if since_last_aa >= self._bio_cooldown(self._AUTOADVANCE_COOLDOWN) and store is not None:
+                _idle_ran.append("autoadvance")
                 self._last_autoadvance_at = datetime.datetime.now()
                 try:
                     actives = await asyncio.to_thread(store.list_projects, "ACTIVE")
@@ -4606,7 +5013,7 @@ class GhostAgent:
                                         "Output ONLY the one word.\n\nTASK: "
                                         + str(description)[:500])}],
                                     "temperature": 0.0, "max_tokens": 8, "stream": False,
-                                }, use_worker=True, is_background=True, task_label="classifier")
+                                }, use_worker=True, is_background=True, off_main_only=True, timeout=30.0, task_label="classifier")  # §4O A-MAJOR-2
                                 out = ((_r or {}).get("choices", [{}])[0]
                                        .get("message", {}).get("content", "") or "").strip().lower()
                                 for label in ("needs_user", "coding", "research"):
@@ -4701,7 +5108,7 @@ class GhostAgent:
                 cooldown_override = None
             cooldown = float(cooldown_override) if cooldown_override else float(self._NARRATIVE_COOLDOWN)
             since_last_narrative = (datetime.datetime.now() - self._last_narrative_at).total_seconds()
-            if since_last_narrative >= cooldown:
+            if since_last_narrative >= self._bio_cooldown(cooldown):
                 self_model = getattr(ctx, 'self_model', None)
                 if self_model is not None and getattr(self_model, 'enabled', False):
                     self._last_narrative_at = datetime.datetime.now()
@@ -4744,7 +5151,7 @@ class GhostAgent:
         # silently accreting. Same idle window + cooldown discipline.
         if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_sq = (datetime.datetime.now() - self._last_stale_questions_at).total_seconds()
-            if since_last_sq >= self._STALE_QUESTIONS_COOLDOWN:
+            if since_last_sq >= self._bio_cooldown(self._STALE_QUESTIONS_COOLDOWN):
                 _sm = getattr(ctx, 'self_model', None)
                 if _sm is not None and getattr(_sm, 'enabled', False):
                     self._last_stale_questions_at = datetime.datetime.now()
@@ -4784,7 +5191,7 @@ class GhostAgent:
             since_last_ws = (
                 datetime.datetime.now() - self._last_workspace_narrative_at
             ).total_seconds()
-            if since_last_ws >= ws_cooldown:
+            if since_last_ws >= self._bio_cooldown(ws_cooldown):
                 try:
                     from ..workspace import WorkspaceModel as _WorkspaceModel
                     ws = getattr(ctx, 'workspace_model', None)
@@ -4814,7 +5221,7 @@ class GhostAgent:
             # DISTINGUISHABLE in the log — this was the flagged blind spot:
             # "self-play never fired" was indistinguishable from a crash, a lost
             # dice roll, or "not idle enough".
-            if since_last_selfplay < self._current_selfplay_cooldown:
+            if since_last_selfplay < self._bio_cooldown(self._current_selfplay_cooldown):
                 logger.debug("idle self-play: skip — cooldown %d/%ds",
                              int(since_last_selfplay),
                              int(self._current_selfplay_cooldown))
@@ -4883,6 +5290,19 @@ class GhostAgent:
                                    type(_spe).__name__, _spe)
                     raise
                 finally:
+                    # ⚠ LOAD-BEARING — DO NOT "CLEAN UP" (§4Q Lens-A/C).
+                    # Every other phase carries a "do NOT reset
+                    # last_activity_time" warning, so this line reads like the
+                    # exact anti-pattern they forbid. It is the opposite: this
+                    # is the ONLY idle-time writer of the user-idle clock, and
+                    # resetting it here is what RE-OPENS the (900, 3600] window
+                    # for phases 2–2.9. Remove it and, during a long AFK
+                    # stretch, idle_secs climbs past 3600 forever: every
+                    # mid-phase (reflection, postmortem, skills, PRM, router,
+                    # calibration, tidy, narratives, autoadvance) is gated out
+                    # by its `<= 3600` ceiling and only phase 1 survives. That
+                    # is precisely what --no-self-play does today, which is why
+                    # that flag ablates far more than its name suggests.
                     ctx.last_activity_time = datetime.datetime.now()
                     self._last_selfplay_at = datetime.datetime.now()
                     # Adapt the next cooldown from the FrontierTracker:
@@ -4902,6 +5322,24 @@ class GhostAgent:
         if _idle_ran:
             logger.info("idle cycle: ran %s (idle %.0fm since last activity)",
                         ", ".join(_idle_ran), idle_secs / 60.0)
+        else:
+            # WHY THIS EXISTS (#40, 2026-08-09): across 9 ablation arm-runs the
+            # reflection phase fired ZERO times, and there was no way to tell
+            # whether the window was never sampled, a dependency was missing, or
+            # a cooldown blocked it — the tick only ever reported what it DID,
+            # never what it declined to do. Diagnosing it cost two hypotheses
+            # (both falsified: the gates are correct in isolation and the deps
+            # are wired) and still did not close.
+            #
+            # One DEBUG line with the sampled idle value makes the decisive
+            # question answerable directly: if these values jump from below the
+            # 900s lower bound to above the 3600s upper bound, the window is
+            # never sampled and no gate is at fault; if they land inside it,
+            # the fault is a per-phase gate. DEBUG so production stays quiet —
+            # run the arm with --debug to collect it.
+            logger.debug("idle tick: idle=%.0fs, no phase ran "
+                         "(window is %.0f < idle <= %.0f)",
+                         idle_secs, self._bio_scaled(900), self._bio_scaled(3600))
 
     async def process_journal_queue(self, *, respect_idle: bool = True):
         from ..memory.journal import (
@@ -4919,9 +5357,17 @@ class GhostAgent:
         # phase 3 always found an empty queue and the journal-replay
         # curriculum never ran.
         try:
-            from .journal_challenges import stash_mineable
+            from .journal_challenges import _MINEABLE_TYPES, stash_mineable
             _mineable = [i for i in items
-                         if isinstance(i, dict) and i.get("type") == "post_mortem"]
+                         # Share the miner's own type set rather than
+                         # hardcoding one member of it (§4Q Lens-B): today only
+                         # "post_mortem" is produced, but `_MINEABLE_TYPES` also
+                         # contains "failure", and a future producer of that
+                         # type would silently bypass the stash while
+                         # `pick_journal_challenge` still mined it from the live
+                         # queue — a divergence with no failing test.
+                         if isinstance(i, dict)
+                         and str(i.get("type") or "").lower() in _MINEABLE_TYPES]
             if _mineable:
                 await asyncio.to_thread(stash_mineable, _mineable)
         except Exception as _stash_exc:
@@ -5115,7 +5561,7 @@ class GhostAgent:
                     # item for up to 20 min AND holds a _bg_queue_sem slot the
                     # whole time. A ReadTimeout is upstream-transient, so it
                     # requeues below instead of dropping the consolidation.
-                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=90.0, task_label="memory extract")
+                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, timeout=90.0, task_label="memory extract")  # §4O A-MAJOR-2
                 except Exception as _ue:
                     # The in-client retries (worker failover + one 2s retry
                     # on 5xx) are exhausted and NOTHING has been stored yet,
@@ -5273,39 +5719,117 @@ class GhostAgent:
                         pass
 
                 if score >= effective_threshold and fact and len(fact) <= 200 and len(fact) >= 5 and "none" not in fact_lc:
-                    if score >= 0.9 and not (is_personal or is_technical):
+                    # These two gates key off `effective_threshold`, NOT a
+                    # hardcoded 0.9 (§4R Lens-A D2). They sit INSIDE the
+                    # `score >= effective_threshold` branch, so while the live
+                    # bar happens to be 0.9 they always applied — but the
+                    # obvious calibration change (lowering --smart-memory so the
+                    # 0.8 "general technical context" tier stops being
+                    # discarded) would have admitted that whole tier with the
+                    # generic-knowledge filter SILENTLY BYPASSED and nothing
+                    # ever routed to `identity`. A tuning knob must not disarm a
+                    # safety filter as a side effect.
+                    # The generic-knowledge filter is UNCONDITIONAL on score.
+                    #
+                    # It was `score >= 0.9`, and my first fix — `max(0.9,
+                    # effective_threshold)` — was a PROVABLE NO-OP: the gate
+                    # sits inside `score >= effective_threshold`, so when the
+                    # threshold is below 0.9 max() just returns 0.9, and when
+                    # it is above, `score >= et >= 0.9` makes both forms
+                    # vacuously true. Brute-forced over all (threshold, score)
+                    # pairs: zero cases where it changed the outcome. The
+                    # source-substring test I wrote for it passed on a no-op —
+                    # which is exactly the failure mode this session kept
+                    # finding elsewhere.
+                    #
+                    # The real fix is to stop keying a SAFETY FILTER off the
+                    # tuning knob at all: an extracted fact that is neither
+                    # personal nor technical is generic encyclopedic knowledge
+                    # and does not belong in this store at ANY confidence. At
+                    # the live 0.9 setting this is behaviour-identical (every
+                    # admitted fact already scores >= 0.9); it only bites when
+                    # --smart-memory is lowered, which is the case the old code
+                    # silently mishandled.
+                    if not (is_personal or is_technical):
                         pretty_log("Auto Memory Skip", f"Discarded generic knowledge: {fact}", icon=Icons.STOP)
                         return
+                    # `identity` still requires genuine high confidence. This
+                    # one IS a semantic judgement about what deserves to be a
+                    # profile fact, not a safety filter, so an absolute bar is
+                    # correct here rather than a threshold-relative one.
                     memory_type = "identity" if (score >= 0.9 and profile_up) else "auto"
 
                     # --- CONTRADICTION ENGINE (LLM-Driven Belief Revision) ---
                     try:
-                        # Scoped + silent: this is a background write-path
-                        # probe, not a retrieval — record_retrievals=False so
-                        # it stops phantom-bumping the 3 nearest rows' prune-
-                        # survival stats on every consolidation; the $nin
-                        # scope keeps document chunks / episode twins / skill
-                        # twins out of the candidate (and thus delete) pool.
+                        # SAME-TYPE scope (§4R Lens-B CRIT, 2026-08-08). This
+                        # was a `$nin` DENYLIST — document/episode/skill/
+                        # acquired_skill — which is NOT the complement of the
+                        # prunable set, so everything else stayed a legal
+                        # deletion victim. Measured on the live store, the
+                        # denylist left 33 rows deletable of which only **2**
+                        # were the `auto` facts this engine exists to supersede:
+                        # 28 dream `synthesis` rows (each the ONLY surviving
+                        # copy of the source fragments it merged — dream.py
+                        # deletes those on consolidation), the single
+                        # user-saved `manual` row, the single `identity` row,
+                        # and a `document_summary`. One 0.9-scoring turn plus
+                        # one small-model opinion could erase any of them.
+                        #
+                        # This is the IDENTICAL defect already fixed in the
+                        # sibling delete path (`vector.smart_update`, see its
+                        # comment naming the denylist as the bug); that fix
+                        # never propagated here. Mirror it: an identity fact
+                        # may supersede an identity fact and an auto fact an
+                        # auto fact — distinct types simply coexist, which
+                        # removes the whole cross-type deletion class.
                         candidates = await asyncio.to_thread(
                             self.context.memory_system.search_advanced, fact,
                             limit=3,
-                            where={"type": {"$nin": [
-                                "document", "episode", "skill",
-                                "acquired_skill"]}},
+                            where={"type": memory_type},
                             record_retrievals=False,
                         )
                         ids_to_delete = []
                         old_facts = []
 
                         if candidates:
+                            # 0.50 + subject-key agreement, NOT the old bare
+                            # `< 0.6` (§4R Lens-B MAJOR). Two independent
+                            # calibrations in this repo say 0.6 was too loose to
+                            # DELETE on: `search_items`' own measurements put a
+                            # genuine match under 0.40 with 0.44–0.58 being the
+                            # off-topic NOISE band, and the sibling delete gate
+                            # (`vector.smart_update`) uses 0.50. At 0.6 a row too
+                            # weakly related to be worth SHOWING the model was
+                            # still eligible to be DESTROYED.
+                            #
+                            # The key guard is the sibling's too: distance alone
+                            # over-matches on shared templates ("favourite colour
+                            # is blue" vs "favourite food is blue cheese" embed
+                            # close but are distinct facts). When both texts
+                            # expose a subject/attribute key and those keys
+                            # DISAGREE, they are not the same fact. Texts with no
+                            # extractable key fall back to distance-only, so
+                            # genuine paraphrases still collapse.
+                            from ..memory.vector import _subject_key
+                            _new_key = _subject_key(fact)
                             for c in candidates:
-                                if c.get('score', 1.0) < 0.6: # Broad threshold to catch potential semantic collisions
-                                    old_facts.append({"id": c['id'], "text": c['text']})
+                                if c.get('score', 1.0) >= 0.50:
+                                    continue
+                                _cand_key = _subject_key(c.get('text'))
+                                _keys_conflict = (
+                                    _new_key is not None and _cand_key is not None
+                                    and _new_key != _cand_key
+                                    and _new_key not in _cand_key
+                                    and _cand_key not in _new_key
+                                )
+                                if _keys_conflict:
+                                    continue
+                                old_facts.append({"id": c['id'], "text": c['text']})
 
                         if old_facts:
-                            eval_prompt = f"NEW FACT:\n{fact}\n\nOLD FACTS:\n" + "\n".join([f"ID: {f['id']} | TEXT: {f['text']}" for f in old_facts]) + "\n\nAnalyze if the NEW FACT contradicts, updates, or supersedes any OLD FACTS. Return ONLY a JSON object with a list of 'ids' to delete. If they safely coexist (e.g. they refer to different topics/projects), return an empty list.\n\nExample: {{\"ids\": [\"ID:123\"]}}"
+                            eval_prompt = f"NEW FACT:\n{fact}\n\nOLD FACTS:\n" + "\n".join([f"ID: {f['id']} | TEXT: {f['text']}" for f in old_facts]) + "\n\nAnalyze if the NEW FACT contradicts, updates, or supersedes any OLD FACTS. Return ONLY a JSON object with a list of 'ids' to delete. If they safely coexist (e.g. they refer to different topics/projects), return an empty list.\n\nExample: {\"ids\": [\"ID:123\"]}"
                             eval_payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Belief Revision Engine. Output JSON."}, {"role": "user", "content": eval_prompt}], "temperature": 0.0, "max_tokens": 1024}
-                            eval_data = await self.context.llm_client.chat_completion(eval_payload, use_worker=True, is_background=True, task_label="self-eval")
+                            eval_data = await self.context.llm_client.chat_completion(eval_payload, use_worker=True, is_background=True, off_main_only=True, timeout=90.0, task_label="self-eval")  # §4O A-MAJOR-2
                             eval_res = extract_json_from_text(eval_data["choices"][0]["message"]["content"])
 
                             raw_ids = eval_res.get("ids", [])
@@ -5317,20 +5841,97 @@ class GhostAgent:
                             _offered = {f["id"] for f in old_facts}
                             ids_to_delete = [i for i in ids_to_delete if i in _offered]
 
+                        # OBSERVABILITY (§4R Lens-A D3): the engine used to log
+                        # ONLY when it deleted something, so "never ran", "no
+                        # candidate under the bar", "judge declined" and "worker
+                        # call failed" were indistinguishable from outside —
+                        # which is why diagnosing 12 days of silence needed the
+                        # embeddings reconstructed offline. One line, every run.
+                        logger.info(
+                            "belief-revision: %d candidate(s), %d offered, "
+                            "%d to delete (type=%s)",
+                            len(candidates or []), len(old_facts),
+                            len(ids_to_delete), memory_type)
+
                         if ids_to_delete:
-                            await asyncio.to_thread(self.context.memory_system.collection.delete, ids=ids_to_delete)
-                            pretty_log("Belief Revision", f"Erased {len(ids_to_delete)} outdated/contradicting memories.", icon=Icons.CUT)
-                            # Log the contradiction for explainability
+                            # RECORD BEFORE DELETE (§4R Lens-B/D MAJOR). The old
+                            # order deleted first and wrote the audit record
+                            # best-effort afterwards, swallowing failures at
+                            # DEBUG. Since `_save` is a silent no-op on a
+                            # degraded store, an irreversible deletion could
+                            # leave NO record of what was erased, anywhere. An
+                            # unrecordable revision is not one we are willing to
+                            # perform: if the ledger cannot take the entry, keep
+                            # the memories.
                             contradiction_log = getattr(self.context, 'contradiction_log', None)
+                            # `contradiction_log is None` → proceed with the
+                            # delete. ⚠ Be honest about what that case IS: in
+                            # production main.py ALWAYS wires the ledger, so
+                            # None means its constructor RAISED (e.g. an
+                            # unwritable memory dir), which main.py logs as a
+                            # warning. It is therefore not "no audit was
+                            # promised" — it is a construction failure, and this
+                            # branch is more permissive about it than about a
+                            # runtime write failure. That inversion is
+                            # deliberate but narrow: blocking here would
+                            # silently disable belief revision for every test
+                            # and every deployment whose context lacks the
+                            # attribute, which is a much larger blast radius
+                            # than the rare unwritable-dir case.
+                            _recorded = contradiction_log is None
                             if contradiction_log is not None:
                                 try:
-                                    await asyncio.to_thread(
+                                    _recorded = bool(await asyncio.to_thread(
                                         contradiction_log.record,
                                         fact, old_facts, ids_to_delete,
                                         reason="LLM-driven belief revision"
-                                    )
+                                    ))
                                 except Exception as cl_err:
-                                    logger.debug(f"Contradiction log write failed: {cl_err}")
+                                    logger.warning(
+                                        "Contradiction log write FAILED — "
+                                        "skipping the delete to avoid an "
+                                        "unrecorded erasure: %s", cl_err)
+                            if not _recorded:
+                                pretty_log(
+                                    "Belief Revision",
+                                    f"SKIPPED erasing {len(ids_to_delete)} "
+                                    "memor(ies) — the revision could not be "
+                                    "recorded, so the deletion would be "
+                                    "unexplainable.",
+                                    level="WARNING", icon=Icons.WARN)
+                            else:
+                                try:
+                                    await asyncio.to_thread(self.context.memory_system.collection.delete, ids=ids_to_delete)
+                                except BaseException:
+                                    # Record-then-delete introduces its own
+                                    # inconsistency: the entry is already
+                                    # written, so if the delete fails the ledger
+                                    # permanently CLAIMS an erasure that never
+                                    # happened, and the next turn can surface
+                                    # "updated to X (superseded: Y)" while Y is
+                                    # still in the store. Nothing reconciles
+                                    # `deleted_ids` (it has no readers), so the
+                                    # least we owe is a loud, specific error —
+                                    # the generic handler below would report
+                                    # this as an ordinary engine error.
+                                    # BaseException, not Exception: a
+                                    # CancelledError landing here would
+                                    # otherwise slip past silently.
+                                    logger.error(
+                                        "Belief revision INCONSISTENT: ledger "
+                                        "entry for %r claims deleted_ids=%s but "
+                                        "the vector delete FAILED — those "
+                                        "memories are still present.",
+                                        fact[:60], ids_to_delete)
+                                    raise
+                                # Name the TYPE: a synthesis/identity/manual
+                                # erasure used to read identically to an
+                                # ordinary auto-fact one in the live stream.
+                                pretty_log(
+                                    "Belief Revision",
+                                    f"Erased {len(ids_to_delete)} outdated "
+                                    f"{memory_type} memor(ies).",
+                                    icon=Icons.CUT)
 
                     except Exception as ce:
                         logger.error(f"Contradiction Engine error: {ce}")
@@ -5383,7 +5984,7 @@ class GhostAgent:
                 # timeout/5xx was popped and dropped permanently. Nothing is
                 # stored before this call, so it is safe to re-run — signal the
                 # drain (process_journal_queue) to re-queue via the same path.
-                l_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=90.0, task_label="postmortem")
+                l_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, timeout=90.0, task_label="postmortem")  # §4O A-MAJOR-2
             except Exception as _ue:
                 from ..memory.journal import is_upstream_transient as _iut
                 if _iut(_ue):
@@ -5598,10 +6199,19 @@ class GhostAgent:
                     '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
                 )
 
+            # §4N D-MAJOR-1: match the live system slot byte-for-byte —
+            # append the stable skill instruction and \r-strip exactly as
+            # handle_chat's KV-stable composition does. Without this the
+            # warmed head diverged at the system-prompt boundary and every
+            # byte after was unreusable. (working_memory_context is empty on
+            # the warmup/self-play class; the one-shot hash check below
+            # reports honestly if any residual divergence remains.)
+            warmed_sys = (base_prompt + _STABLE_SKILL_INSTRUCTION).replace(
+                "\r", "")
             payload = {
                 "model": getattr(self.context.args, "model", "default"),
                 "messages": [
-                    {"role": "system", "content": base_prompt},
+                    {"role": "system", "content": warmed_sys},
                     {"role": "user", "content": "ok"},
                 ],
                 "stream": False,
@@ -5634,7 +6244,7 @@ class GhostAgent:
             # legitimately varies per conversation (query-routed
             # acquired-skill tail) and only shortens the match.
             _sys_h = hashlib.sha1(
-                base_prompt.encode("utf-8", "ignore")).hexdigest()[:8]
+                warmed_sys.encode("utf-8", "ignore")).hexdigest()[:8]
             _tools_h = hashlib.sha1(json.dumps(
                 payload.get("tools", []), sort_keys=True,
             ).encode("utf-8", "ignore")).hexdigest()[:8]
@@ -5642,7 +6252,7 @@ class GhostAgent:
                 "Main Prefix Warmup",
                 f"prefilling ~{_est_tokens} tokens of byte-stable request head "
                 f"(system slot + tool schemas) into the main node's cache · "
-                f"sys h={_sys_h} chars={len(base_prompt)} · tools h={_tools_h}",
+                f"sys h={_sys_h} chars={len(warmed_sys)} · tools h={_tools_h}",
                 icon=Icons.BOOT_AWAKE,
             )
             # Generous timeout: this IS the ~70s prefill we're absorbing.
@@ -5650,9 +6260,18 @@ class GhostAgent:
                 payload, is_background=True, timeout=240.0,
                 task_label="main-prefix-warmup",
             )
+            # §4N D-MAJOR-1 / R2 NIT-3: stash the warmed hash so the FIRST
+            # live request can actually COMPARE (the two log lines existed
+            # since 2026-07-29 but nothing ever compared them). Stash ONLY
+            # after the prefill request succeeds — a failed warmup that
+            # never touched the cache must not arm a comparison that would
+            # then "verify" a prefill which never happened.
+            self.context._warmed_sys_hash = _sys_h
             pretty_log(
                 "Main Prefix Warmup",
-                "done — first user request now pays only its unique tail",
+                "done — warmed the byte-stable head; the first live request "
+                "verifies the match (a 'prefix warmup MISS' warning means it "
+                "did not).",
                 icon=Icons.OK,
             )
         except Exception as e:  # noqa: BLE001 — warmup is best-effort
@@ -6362,8 +6981,16 @@ class GhostAgent:
             claim_text=_claim_src) or tool_output
         if ledger_block:
             _room = 4000 - len(ledger_block) - 1
-            claim_evidence = ((claim_evidence[:_room] + "\n" + ledger_block)
-                              if _room > 0 else ledger_block)
+            # Through the marked slicer, not a bare `[:_room]`: this is
+            # the SAME silent-head-cut defect the packer just fixed,
+            # one line later (fresh-eye MINOR, 2026-08-06). The digest
+            # is normally already within budget, so this is a no-op —
+            # but when it is not, the cut is now marked and
+            # claim-relevance-aware like every other cut.
+            claim_evidence = (
+                (_slice_evidence_body(claim_evidence, _room, _claim_src)
+                 + "\n" + ledger_block)
+                if _room > 0 else ledger_block)
         # HIGH-STAKES flag for the CONFIRM escalation. Computed HERE — the
         # single place every verdict is produced (finalize gate, in-loop
         # auto-repair, and the streamed late-verdict path all funnel through
@@ -7151,6 +7778,31 @@ class GhostAgent:
             self._flush_stashed_lesson_outcome(
                 trajectory_id,
                 outcome == _Outcome.PASSED.value and _late_pass_ok)
+            # ⚠ CALIBRATION CORRECTION on the late path (§4L Lens-A
+            # MAJOR-1). The sample was written at finalize with only the
+            # INLINE verdict, and with critic nodes live most verdicts
+            # land HERE — the store held 7 hard negatives against 47
+            # late REFUTED corrections, with 6 of 9 joinable late-refuted
+            # turns still sitting in the fit as positives. Re-label
+            # through the same ladder this handler already resolved:
+            # FAILED → 0.0 (checked and wrong), PASSED that survived the
+            # shape rule → 1.0. Features are reused untouched
+            # (no-leakage); source-rank supersession makes it a
+            # re-label, not a counter-weight.
+            try:
+                _ct = getattr(self.context, "calibration_tracker", None)
+                _rid = ""
+                if cached is not None:
+                    _rid = str((getattr(cached, "extra", None) or {}
+                                ).get("req_id") or "")
+                if _ct is not None and _rid:
+                    if outcome == _Outcome.FAILED.value:
+                        _ct.record_late_verdict_correction(_rid, 0.0)
+                    elif (outcome == _Outcome.PASSED.value
+                          and _late_pass_ok):
+                        _ct.record_late_verdict_correction(_rid, 1.0)
+            except Exception:  # noqa: BLE001 — must not break the handler
+                pass
             if outcome == _Outcome.PASSED.value:
                 if cached is None:
                     return
@@ -7220,8 +7872,26 @@ class GhostAgent:
         out = []
         try:
             if sm is not None:
-                out.extend(
-                    t for t in (getattr(sm, "last_playbook_triggers", []) or []) if t)
+                _pk = str(getattr(sm, "_playbook_turn_key", "") or "")
+                # Foreign-turn restamp guard (§4L R3 MINOR-2); empty key
+                # = pre-key writer or non-turn caller → fail-open.
+                if not (_pk and turn_id and _pk != str(turn_id)):
+                    out.extend(
+                        t for t in
+                        (getattr(sm, "last_playbook_triggers", []) or [])
+                        if t)
+            # ⚠ Read the bus surface from the JUDGE-IMMUNE stamp first
+            # (§4L R3 MAJOR-1): the hydration judge consumes
+            # `last_hydration = None` at coroutine ENTRY, and on the
+            # streamed path (the common case) it is scheduled before the
+            # credit read — so bus-only lessons vanished from this union
+            # exactly on the turns fix 2's dedup removed them from the
+            # playbook list. `last_bus_triggers` + its turn key are set
+            # at delivery time and consumed by nobody.
+            if sm is not None and turn_id and str(turn_id) == str(
+                    getattr(sm, "_bus_delivered_turn_key", "") or ""):
+                out.extend(t for t in
+                           (getattr(sm, "last_bus_triggers", []) or []) if t)
             bus = getattr(self.context, "memory_bus", None)
             stash = getattr(bus, "last_hydration", None) if bus is not None else None
             if stash and not (turn_id and stash.get("turn_id")
@@ -7236,7 +7906,8 @@ class GhostAgent:
 
     async def _record_lesson_outcomes(self, *, surfaced_triggers,
                                       execution_failure_count,
-                                      verifier_backfill, trajectory_id):
+                                      verifier_backfill, trajectory_id,
+                                      unacked_total_failure=False):
         """Attribute this turn's outcome to the lessons it surfaced — the
         FAILURE ARM the success-only credit path (`credit_recent_retrievals`)
         cannot produce.
@@ -7261,11 +7932,24 @@ class GhostAgent:
                 verifier_backfill and verifier_backfill[0] == "failed")
             verifier_passed = bool(
                 verifier_backfill and verifier_backfill[0] == "passed")
-            if execution_failure_count > 0 or verifier_failed:
+            # ⚠ MIRROR THE HONEST-FAILURE LADDER (§4L Lens-B MAJOR-2).
+            # The corpus label and the calibration grade both let a
+            # verifier PASS outrank structural execution failure (with
+            # the rule-2b unacked-total-failure carve-out); this arm was
+            # the un-mirrored third consumer, so lessons hydrated into
+            # honest-failure turns were BLAMED for turns the operator's
+            # own rule declares good — and `failed_retrievals` feeds
+            # prune-eligibility and the cap-trim eviction ranking.
+            # Ladder: checked-and-wrong > checked-and-right (shape
+            # guard) > structural failure > undecided.
+            if verifier_failed:
                 await asyncio.to_thread(rec, triggers, False)
                 return
-            if verifier_passed:
+            if verifier_passed and not unacked_total_failure:
                 await asyncio.to_thread(rec, triggers, True)
+                return
+            if execution_failure_count > 0:
+                await asyncio.to_thread(rec, triggers, False)
                 return
             # Undecided: clean turn, no inline verdict. Stash for the late
             # verdict; if none lands (e.g. a no-evidence chat turn) the entry
@@ -8615,8 +9299,27 @@ class GhostAgent:
                     # Second overflow this request → no more whole-file reads.
                     _cap = 0
                 self.context._read_budget = ReadBudget(_cap)
-            except Exception:
-                self.context._read_budget = None
+            except Exception as _rb_exc:
+                # §4N C-MINOR-1: this was a SILENT fail-OPEN — the steer
+                # already told the model+operator "whole-file reads
+                # DISABLED", but any exception here (including the lockdown
+                # `_cap = 0` line) dropped the budget to None = UNRESTRICTED.
+                # Make it visible, and fail CLOSED under lockdown (a zero
+                # budget, not no budget).
+                _locked = getattr(self.context, "_ctx_pressure_lockdown", False)
+                logger.warning(
+                    "read-budget construction failed (%s: %s); %s",
+                    type(_rb_exc).__name__, _rb_exc,
+                    "LOCKDOWN active → zero budget (reads refused)"
+                    if _locked else "no budget this batch")
+                try:
+                    if _locked:
+                        from ..tools.file_system import ReadBudget as _RB
+                        self.context._read_budget = _RB(0)
+                    else:
+                        self.context._read_budget = None
+                except Exception:
+                    self.context._read_budget = None
 
             tool_tasks, tool_call_metadata = [], []
             tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
@@ -10403,7 +11106,7 @@ class GhostAgent:
                     # already reset the clean-success streak regardless.
 
                     # Check for tool fallback suggestions
-                    from ..tools.fallback_chains import get_fallback_hint
+                    from ..tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
                     fallback_hint = ""
                     if _fail_fname:
                         hint = get_fallback_hint(_fail_fname, last_error_res or last_error_preview)
@@ -11482,8 +12185,8 @@ class GhostAgent:
                     await asyncio.to_thread(
                         sm.credit_recent_retrievals, 300,
                         query=str(last_user_content or ""),
-                        top_triggers=list(
-                            getattr(sm, "last_playbook_triggers", []) or []),
+                        top_triggers=self._surfaced_lesson_triggers(
+                            sm, turn_id=str(req_id or "")),
                     )
             except Exception:
                 pass
@@ -11493,6 +12196,27 @@ class GhostAgent:
         # lacks — to the lessons it surfaced. Runs on BOTH outcome classes
         # (outside the execution_failure_count==0 gate), like the calibration
         # spine below, so present-on-failure is actually recorded.
+        # Shape rule (2026-08-04) for this turn, computed ONCE here and
+        # reused by the lesson arm just below, the selfhood backfill and
+        # the Turn Outcome line further down (hoisted 2026-08-07, §4L
+        # Lens-B MAJOR-2 — the lesson arm needs it too). Deliberately
+        # BEFORE the deferred-correction prepend: that banner is the
+        # verifier's prose, not the agent's answer, and its failure
+        # vocabulary would make an unacknowledged turn read as
+        # acknowledged. See outcome_heuristics.unacknowledged_total_failure.
+        _exec_terminal = (execution_failure_count > 0
+                          and bool(last_was_failure))
+        try:
+            from ..distill.outcome_heuristics import (
+                unacknowledged_total_failure as _unacked_fn)
+            _unacked_turn = _exec_terminal and _unacked_fn(
+                tools=tools_run_this_turn,
+                final_response=final_ai_content or "",
+                user_request=last_user_content or "",
+            )
+        except Exception:  # noqa: BLE001 — labelling must not break finalize
+            _unacked_turn = False
+
         try:
             await self._record_lesson_outcomes(
                 # BOTH injection surfaces (playbook block + bus skill tier) —
@@ -11502,6 +12226,7 @@ class GhostAgent:
                 execution_failure_count=execution_failure_count,
                 verifier_backfill=verifier_backfill,
                 trajectory_id=current_trajectory_id,
+                unacked_total_failure=_unacked_turn,
             )
         except Exception:
             pass
@@ -12011,24 +12736,8 @@ class GhostAgent:
         except Exception as _refexc:
             logger.debug(f"selfhood reference-count skipped: {_refexc}")
 
-        # Shape rule (2026-08-04) for this turn, computed ONCE here and
-        # reused by the selfhood backfill and the Turn Outcome line below.
-        # Deliberately BEFORE the deferred-correction prepend a few lines
-        # down: that banner is the verifier's prose, not the agent's answer,
-        # and its failure vocabulary would make an unacknowledged turn read
-        # as acknowledged. See outcome_heuristics.unacknowledged_total_failure.
-        _exec_terminal = (execution_failure_count > 0
-                          and bool(last_was_failure))
-        try:
-            from ..distill.outcome_heuristics import (
-                unacknowledged_total_failure as _unacked_fn)
-            _unacked_turn = _exec_terminal and _unacked_fn(
-                tools=tools_run_this_turn,
-                final_response=final_ai_content or "",
-                user_request=last_user_content or "",
-            )
-        except Exception:  # noqa: BLE001 — labelling must not break finalize
-            _unacked_turn = False
+        # (Shape rule hoisted above the lesson-outcome attribution — §4L
+        # Lens-B MAJOR-2; computed once, further up this method.)
 
         # Selfhood outcome backfill (proposal item #3): the
         # autobiographical record was just written `outcome=
@@ -12163,7 +12872,7 @@ class GhostAgent:
                                        verifier_backfill,
                                        execution_failure_count,
                                        budget_exhausted, final_ai_content,
-                                       user_request=""):
+                                       user_request="", truncated=False):
         """Record ONE calibration sample pairing this turn's confidence
         reading with its realized outcome. Extracted from the finalize
         chain (2026-07-26) so the STREAMED drain can call it too — the
@@ -12175,6 +12884,14 @@ class GhostAgent:
         (`_entropy_norm_pending`) that this fallback consumes, so real
         entropy reaches calibration on BOTH delivery paths. Never
         raises."""
+        # §4O R2 MAJOR-2: a TRUNCATED (upstream-aborted) turn must not
+        # become a calibration sample — the earlier fix guarded only the
+        # STASH (_calib_pending), but this method's compute-now fallback
+        # (fires when _pending is None, exactly the aborted case) recorded
+        # the cut answer as a confident competence-based success anyway.
+        # Bail before either path. Not-a-clean-sample beats a wrong one.
+        if truncated:
+            return
         try:
             # SIMULATION GATE. Self-play/dream solver turns run the full turn
             # loop on a shallow-copied context, so without this they append to
@@ -12642,6 +13359,17 @@ class GhostAgent:
                 # a stale True can never outlive its request.
                 self.context._risk_steer_done = False
                 self.context._risk_steer_fired = False
+                # §4N C-MINOR-2: reset the cached ContextManager's level so
+                # this request's first compaction escalation is logged (the
+                # level persists across requests; repeat-pressure sessions
+                # otherwise compacted silently).
+                try:
+                    _cm_prev = getattr(self, "_context_manager", None)
+                    if _cm_prev is not None and hasattr(
+                            _cm_prev, "reset_for_request"):
+                        _cm_prev.reset_for_request()
+                except Exception:
+                    pass
                 # Clear turn-scoped uncertainty state from a previous
                 # request that died before its finalize (the only reset
                 # used to be at finalize-END, so an aborted turn leaked
@@ -13400,7 +14128,7 @@ class GhostAgent:
                 # byte-identical across turns and the upstream inference
                 # server gets free prefix-cache hits.
                 # ============================================================
-                stable_skill_instruction = "\n\nYou have Natural-born tools and Acquired Skills. If you lack a tool for a complex repetitive task, use `create_skill` to program it permanently. It will be available on your next turn.\n"
+                stable_skill_instruction = _STABLE_SKILL_INSTRUCTION
                 stable_system_prompt = (base_prompt + stable_skill_instruction).replace("\r", "")
                 for m in messages:
                     if m.get("role") == "system":
@@ -13855,6 +14583,71 @@ class GhostAgent:
                                 "strategic planner",
                                 icon=Icons.BRAIN_ROUTE,
                             )
+                    # ── use_planning EXPERIMENT ARM (§4L follow-through,
+                    # 2026-08-07). The flag is the master switch; the arm
+                    # is the measurement. Trigger condition (flag on,
+                    # router did not confident-skip, non-conversational)
+                    # is evaluated ABOVE this point from arm-independent
+                    # state; the key's presence = condition met, its
+                    # value = the planner actually ran. Control turns
+                    # stamp fired=False and skip the planner, so the
+                    # triggered-only comparison is powered. Consistent
+                    # with risk_steer: GHOST_EXPERIMENTS=0 → "" → control
+                    # → planner off even with the flag booted.
+                    if use_plan and not turn_is_conversational:
+                        try:
+                            from . import experiments as _exp_plan
+                            _plan_arm = _exp_plan.arm_for(
+                                self.context, "use_planning",
+                                str(req_id or ""))
+                            _plan_treat = _plan_arm == _exp_plan.TREATMENT
+                            # §4N MAJOR-4 (operator decision 2026-08-08:
+                            # "force self-play to TREATMENT"): self-play
+                            # MINES and VERIFIES the lesson corpus, so it
+                            # must run under the SAME regime treatment
+                            # production uses those lessons in — planner ON.
+                            # Self-play is unenrolled, so mark_trigger below
+                            # still no-ops → it contributes NO measurement
+                            # (real interactive traffic supplies the arm
+                            # data); this only fixes the training regime.
+                            # §4N R2 MAJOR-4: key ONLY on the selfplay
+                            # thinking budget — a read-only skill store also
+                            # marks delegated SUB-AGENTS (readonly wrapper),
+                            # and sweeping them into forced planner-ON ran
+                            # the turn's most expensive step on every
+                            # delegation inside its timeout budget, a regime
+                            # change the operator decision never scoped.
+                            _is_self_play = (
+                                getattr(self, "thinking_budget_override",
+                                        None) == "selfplay")
+                            if _is_self_play:
+                                _plan_treat = True
+                            _exp_plan.mark_trigger(
+                                self.context, str(req_id or ""),
+                                "use_planning_fired", _plan_treat)
+                            if not _plan_treat:
+                                use_plan = False
+                                # §4N MAJOR-4: an EMPTY arm means unenrolled
+                                # (self-play, GHOST_EXPERIMENTS=0, internal) —
+                                # it holds no ring slot, so mark_trigger
+                                # no-ops and NOTHING is measured. Only a real
+                                # "control" assignment is a measured
+                                # withholding. The old line claimed
+                                # "measured" on every self-play turn, which
+                                # was false and hid a silent regime split
+                                # (lessons mined planner-OFF vs treatment
+                                # production planner-ON).
+                                if _plan_arm == _exp_plan.CONTROL:
+                                    _msg = ("use_planning: control arm — "
+                                            "planner withheld (measured)")
+                                else:
+                                    _msg = ("use_planning: unenrolled — "
+                                            "planner off (NOT measured; no "
+                                            "ring slot)")
+                                pretty_log("Reasoning Loop", _msg,
+                                           icon=Icons.BRAIN_ROUTE)
+                        except Exception:  # noqa: BLE001
+                            pass
                     if use_plan and not turn_is_conversational:
                         pretty_log("Reasoning Loop", f"Turn {turn+1} Strategic Analysis...", icon=Icons.BRAIN_PLAN)
 
@@ -14475,6 +15268,38 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             f"volatile dyn_state len={len(dynamic_state)}",
                             icon=Icons.BRAIN_CTX,
                         )
+                        # §4N D-MAJOR-1: the ACTUAL comparison the two hash
+                        # lines were built for. Fire ONCE, on the first live
+                        # request after boot: if the warmed head is not the
+                        # bytes this request sends, the ~28s warmup bought
+                        # near-nothing — say so instead of logging a false
+                        # "done" at boot. Cleared after the check so it never
+                        # spams.
+                        # §4N R2 MAJOR-2: only compare on a MAIN-context
+                        # request. self-play/sub-agent isolates inherit this
+                        # stash via copy.copy(context) but build a
+                        # DELIBERATELY different slot (profile_memory=None,
+                        # perfect_it=False) — comparing there fired a FALSE
+                        # "MISS" on the operator stream (the instrument
+                        # lying on the stream it was built to verify). An
+                        # isolate is identifiable by its read-only skill
+                        # store; skip it and leave the stash for the first
+                        # real main-context request to consume.
+                        _iso = (getattr(getattr(self.context, "skill_memory",
+                                                None), "is_read_only",
+                                        False) is True
+                                or getattr(self.context, "profile_memory",
+                                           None) is None)
+                        _warmed = getattr(self.context, "_warmed_sys_hash", None)
+                        if _warmed is not None and not _iso:
+                            self.context._warmed_sys_hash = None
+                            if _warmed != _sys_h:
+                                logger.warning(
+                                    "prefix warmup MISS: warmed sys h=%s ≠ "
+                                    "first live sys h=%s — the boot prefill "
+                                    "does not match live bytes (warmup "
+                                    "reuse lost past the system slot)",
+                                    _warmed, _sys_h)
                     except Exception:
                         pass
 
@@ -15858,15 +16683,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         and _vr.verdict == _VV.REFUTED
                                         and _vr.confidence >= 0.7
                                     )
-                                    # No verdict OR an unconvincing (<0.7)
+                                    # No verdict, an unconvincing (<0.7)
                                     # CONFIRMED — e.g. one capped because the
-                                    # WEB-EXEC probe couldn't run — is not
-                                    # good enough to finalise on an untested
-                                    # write: force the "actually RUN it"
-                                    # re-entry, mirroring the async path's
+                                    # WEB-EXEC probe couldn't run — OR an
+                                    # UNCERTAIN (which escalation tier-routing
+                                    # now mints routinely for gloss-downgraded
+                                    # refutes, 2026-08-06) is not good enough
+                                    # to finalise on an untested write: force
+                                    # the "actually RUN it" re-entry,
+                                    # mirroring the async path's
                                     # pure-predicate behaviour.
                                     _unverified = (
                                         (_vr is None
+                                         or _vr.verdict == _VV.UNCERTAIN
                                          or (_vr.verdict == _VV.CONFIRMED
                                              and _vr.confidence < 0.7))
                                         and _is_unverified_mutation(_lt)
@@ -16778,6 +17607,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
         async def stream_wrapper():
             full_content = ""
+            # §4O B-MAJOR-1: the internal drain sets stream_errored on an
+            # upstream abort frame and recovers; this USER-FACING final
+            # stream previously only LOGGED the abort, then persisted the
+            # truncated partial as the durable final answer + fed it to
+            # calibration (the late verifier is not truncation-aware, so a
+            # plausible-but-cut answer could backfill PASS). Track it so
+            # the partial is marked truncated and kept out of calibration.
+            stream_aborted = False
             loop_detected = False
 
             # NEW: Flush intermediate text to the UI as the first stream chunk
@@ -16907,6 +17744,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # partial, but log it so a truncated
                         # user-facing answer isn't a silent gap.
                         if "error" in chunk_data and "choices" not in chunk_data:
+                            stream_aborted = True   # §4O B-MAJOR-1
                             _err_txt = str(chunk_data.get("error"))[:200]
                             # Mirror of the internal path's n_probs
                             # rejection latch (see request_logprobs).
@@ -17039,6 +17877,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             }
                             yield f"data: {json.dumps(break_chunk)}\n\n".encode('utf-8')
                             full_content += break_text
+
+            # §4O B-MAJOR-1: an upstream abort cut the final answer short.
+            # Mark the DURABLE content truncated so the episode/trajectory/
+            # work_log record it as incomplete (not a clean final answer)
+            # and a reader/verifier can see the cut — the client already
+            # saw the abort frame; this is about the persisted record.
+            if stream_aborted and full_content:
+                full_content += ("\n\n[⚠ RESPONSE TRUNCATED — upstream "
+                                 "aborted the stream mid-answer]")
 
             # --- SCRUBBED-STREAM EMPTY-OUTPUT FALLBACK ---
             # If the scrub was active and swallowed EVERY
@@ -17246,7 +18093,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # finalize reject a reading that
                                 # isn't its own instead of pairing
                                 # A's confidence with B's outcome.
-                                self.context._calib_pending = (req_id, _cr)
+                                # §4O B-MAJOR-1: a truncated turn must NOT
+                                # teach calibration "I was confident and
+                                # done" — an aborted stream isn't a clean
+                                # (confidence, outcome) sample.
+                                if not stream_aborted:
+                                    self.context._calib_pending = (req_id, _cr)
                                 # Push the reading into the
                                 # bundle so the mid-turn
                                 # arbiter gate (consulted
@@ -17524,6 +18376,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 budget_exhausted=False,
                 final_ai_content=full_content,
                 user_request=last_user_content or "",
+                truncated=stream_aborted,   # §4O R2 MAJOR-2
             )
 
             # Streamed-turn tracker reset (2026-07-27): the finalize
@@ -17663,8 +18516,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         await asyncio.to_thread(
                             sm.credit_recent_retrievals, 300,
                             query=str(last_user_content or ""),
-                            top_triggers=list(
-                                getattr(sm, "last_playbook_triggers", []) or []),
+                            # BOTH surfaces (§4L R2 NEW-1): the
+                            # delivery dedup removed co-surfaced lessons
+                            # from last_playbook_triggers, starving their
+                            # deterministic credit channel while the
+                            # denominator kept booking.
+                            top_triggers=self._surfaced_lesson_triggers(
+                                sm, turn_id=str(req_id or "")),
                         )
                 except Exception:
                     pass
@@ -17797,7 +18655,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 judge_coro = _stagger_then_judge()
             spawn_bg(judge_coro, name="hydration-judge")
         except Exception as e:
-            logger.debug(f"hydration judge spawn skipped: {e}")
+            # §4M (Lens D F3): visible at operating level — a skipped
+            # spawn is a whole turn missing from the usefulness ledger.
+            logger.warning(f"hydration judge spawn skipped "
+                           f"(turn missing from usefulness ledger): {e}")
 
     async def _record_episode_safe(self, user_text, tools, ai_text,
                                    *, verifier_verdict=None,
@@ -17989,7 +18850,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         the correction and poison future retrieval.
         """
         perfection_data = await self.context.llm_client.chat_completion(
-            p_payload, use_worker=True, is_background=not foreground, task_label="perfect-it"
+            p_payload, use_worker=True, is_background=not foreground, off_main_only=not foreground, task_label="perfect-it"  # §4O A-MAJOR-2: off-main only for the idle (background) variant
         )
         p_msg = perfection_data["choices"][0]["message"].get("content", "")
         p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
@@ -18006,6 +18867,59 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             )
             pretty_log("Internal Learning", "Saved optimization strategy to playbook.", icon=Icons.MEM_SAVE)
         return p_msg
+
+    #: §4O R2 MINOR-1: prefixes of SYNTHETIC user-role messages the turn
+    #: loop appends mid-turn (breakers/nudges). They must NOT be treated as
+    #: the turn boundary — they fire on the HARDEST/struggling turns, so
+    #: counting steps "after the last user message" reported n_steps=1 for a
+    #: genuinely multi-step turn, re-feeding the router the inversion.
+    _SYNTHETIC_USER_PREFIXES = (
+        "SYSTEM ALERT", "AUTO-DIAGNOSTIC", "SYSTEM 3 PIVOT",
+        "### ACTIVE STRATEGY", "CRITICAL:",
+    )
+
+    @staticmethod
+    def _msg_text(m) -> str:
+        c = m.get("content", "") if isinstance(m, dict) else ""
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c
+                         if isinstance(p, dict) and p.get("type") == "text")
+        return str(c)
+
+    @staticmethod
+    def _this_turn_step_count(msgs, real_request: str = "") -> int:
+        """§4O C-MAJOR-1: this turn's agentic-loop iterations — the number
+        of assistant messages AFTER this turn's REAL user message. The
+        router label / trainset / postmortem read n_steps as a per-turn
+        DIFFICULTY proxy, so counting the whole history's assistant turns
+        (conversation position) inverted the router.
+
+        §4O R3 (MINOR-1/2): the caller knows the REAL request text, so
+        prefer matching it — robust to BOTH a synthetic user-role injection
+        appended mid-turn AND a real user message that happens to look
+        synthetic. Only when the request text is unavailable/unmatched do
+        we fall back to "last non-synthetic user message" (denylist)."""
+        msgs = msgs or []
+        boundary = -1
+        rr = str(real_request or "").strip()
+        if rr:
+            for i, m in enumerate(msgs):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    c = GhostAgent._msg_text(m).strip()
+                    # exact, or either is a prefix of the other (truncation)
+                    if c and (c == rr or c.startswith(rr[:200])
+                              or rr.startswith(c[:200])):
+                        boundary = i
+        if boundary == -1:  # fallback: last NON-synthetic user message
+            for i, m in enumerate(msgs):
+                if isinstance(m, dict) and m.get("role") == "user" and \
+                        not GhostAgent._msg_text(m).lstrip().startswith(
+                            GhostAgent._SYNTHETIC_USER_PREFIXES):
+                    boundary = i
+        return sum(
+            1 for m in msgs[boundary + 1:]
+            if isinstance(m, dict) and m.get("role") == "assistant"
+        )
 
     @staticmethod
     def _reconstruct_tool_calls(msgs):
@@ -18156,10 +19070,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             system_prompt=system_prompt[:8000],
             user_request=user_request[:8000],
             tool_calls=tool_calls,
-            n_steps=sum(
-                1 for m in msgs
-                if isinstance(m, dict) and m.get("role") == "assistant"
-            ),
+            # §4O C-MAJOR-1: n_steps is a per-TURN difficulty proxy (the
+            # router label, the trainset binner, and the postmortem risk
+            # signal all read it that way). Counting assistant messages
+            # over the FULL history measured conversation POSITION, not
+            # this turn's agentic effort — so a jargon-dense technical
+            # one-shot (short history) labelled "easy" and a chatty
+            # deep-thread request labelled "hard", INVERTING the router
+            # (every technical feature got a negative weight; the planner
+            # was then skipped on exactly the requests that most need it).
+            # Count only THIS turn's iterations — the assistant messages
+            # after the last user message.
+            n_steps=self._this_turn_step_count(msgs, user_request),
             outcome=Outcome.UNKNOWN.value,  # user turns have no validator
             final_response=final_response[:16000],
         )
@@ -18181,9 +19103,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # flags a regression, this is the candidate set; without it,
         # attribution is unrecoverable after the fact.
         _extra: Dict[str, Any] = {}
+        # req_id stamped explicitly (§4L, 2026-08-07): the late-verdict
+        # path joins its calibration correction through it, and lens C
+        # found a live trajectory with req_id nowhere in extra.
+        if req_id:
+            _extra["req_id"] = str(req_id)
         try:
             _sm_h = getattr(self.context, "skill_memory", None)
             _trigs = list(getattr(_sm_h, "last_playbook_triggers", []) or [])
+            # BOTH surfaces (§4L Lens-D MINOR-2) — bus-tier lessons were
+            # invisible to the attribution stamp. Turn-key gated (R2
+            # NEW-3): a stale previous-turn list must not be inherited.
+            try:
+                from ..utils.logging import request_id_context as _ric
+                _cur_key = str(_ric.get() or "")
+            except Exception:
+                _cur_key = ""
+            if (_cur_key and _cur_key == str(getattr(
+                    _sm_h, "_bus_delivered_turn_key", "") or "")):
+                for _bt in (getattr(_sm_h, "last_bus_triggers", []) or []):
+                    if _bt not in _trigs:
+                        _trigs.append(_bt)
             if _trigs:
                 _extra["hydrated_lessons"] = _trigs[:10]
         except Exception:

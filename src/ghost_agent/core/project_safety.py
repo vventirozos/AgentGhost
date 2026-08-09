@@ -178,11 +178,20 @@ def route_contradiction(
     if contradiction_log is None:
         return False
     try:
-        contradiction_log.record(
+        # Propagate record()'s verdict instead of assuming success (§4R R2).
+        # It returns False when the ledger is degraded, so the old
+        # unconditional `return True` made this function's documented "True on
+        # success" contract falsifiable — and would have quietly misled the
+        # next caller that actually checks it.
+        _res = contradiction_log.record(
             new_fact=new_fact, old_facts=prior_facts,
             deleted_ids=[], reason=reason,
         )
-        return True
+        # `is not False`, NOT bool(): only an EXPLICIT False means "the ledger
+        # refused to record". Duck-typed logs and test doubles predating the
+        # bool return still yield None, and treating None as failure would
+        # report a successful write as a failure.
+        return _res is not False
     except Exception:
         logger.debug("contradiction_log.record failed", exc_info=True)
         return False

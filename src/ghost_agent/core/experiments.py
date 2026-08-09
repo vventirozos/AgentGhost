@@ -155,6 +155,21 @@ class ExperimentSpec:
 # though a *new* consumer always needs a code change anyway.
 DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
     ExperimentSpec(
+        name="use_planning",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "Strategic planner path (router-gated decompose, consumes the "
+            "planning.decompose GEPA artifact) on turns where it WOULD fire "
+            "(treatment) vs no planner (control). Only live when the "
+            "operator boots --use-planning; the flag is the master switch, "
+            "the arm is the measurement (§4L follow-through, 2026-08-07). "
+            "GHOST_EXPERIMENTS=0 + --use-planning = planner OFF, same "
+            "precedent as risk_steer."
+        ),
+    ),
+    ExperimentSpec(
         name="risk_steer",
         arms=(CONTROL, TREATMENT),
         traffic=1.0,
@@ -644,7 +659,8 @@ def is_treatment(context, name: str, req_id: str = "") -> bool:
 # (a treatment turn that never built a tool block is excluded anyway), which
 # is the conservative side for a corpus the optimizer replays VERBATIM.
 CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context",
-                                          "foresight_note_fired")
+                                          "foresight_note_fired",
+                                          "use_planning_fired")
 
 # experiment -> the `extra` key stamped when that experiment's TRIGGER fired.
 #
@@ -675,9 +691,16 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context"
 # shared and graded pre-note (identical for both arms at any instant), but a
 # WORKING treatment changes follow-up behaviour, which feeds the index, so the
 # trigger rate can drift between arms over time. Watch the arm counts.
+# `use_planning_fired` fires on "the flag is on, the router did not
+# confident-skip, and the turn is non-conversational" — all evaluated
+# from state the arm cannot touch THIS turn. Same first-order-only
+# caveat as foresight_note: a WORKING planner changes downstream router
+# training data, so the trigger rate can drift between arms over time —
+# watch the arm counts.
 TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
                                 "fs_batch": "fs_batch_fired",
-                                "foresight_note": "foresight_note_fired"}
+                                "foresight_note": "foresight_note_fired",
+                                "use_planning": "use_planning_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.objection — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Measurement</h3>
+    <a href="experiments.html">experiments</a>
+    <a href="risk.html">risk</a>
+    <a href="calibration.html">calibration</a>
+    <a href="confidence.html">confidence</a>
+    <a href="foresight.html">foresight</a>
+    <a class="current" href="objection.html">objection</a>
+    <a href="verifier.html">verifier</a>
+    <a href="../algorithms/tool_ontology.html">tool ontology</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / objection.py — arithmetic before opinion</h1>
+  <p class="subtitle">Resolves the judge's objections that are decidable by arithmetic or string search, so the expensive model is spent only on genuine ambiguity — and so proven-real catches can never be overturned away.</p>
+
+  <h2>Why it exists</h2>
+  <p>Four rounds of escalation policy (rebuttal burden, verdict-tier routing, truncation guard, and two calibrations) all failed the <a href="verifier.html">verifier</a>'s ship gate, because every one of them was <strong>arbitrating opinions</strong>: the cheap judge says the claim is wrong, the main model says it is fine, and any rule that trusts one of them loses whatever the other was right about. Measured, those arms traced a single false-alarm-versus-catch trade curve — 0.591, 0.717, ~0.73 balanced — and never crossed it.</p>
+  <p>The way out came from counting rather than designing. Collecting <strong>all 145 distinct false-alarm objections</strong> that the completed bench arms produced showed that <strong>43% of them are not opinions at all</strong>:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Real objection</th><th>What settles it</th></tr></thead>
+    <tbody>
+      <tr><td><q>The largest file size is 18,433 bytes, not exactly 18&nbsp;KB.</q></td><td>18433 ÷ 1024 = 18.0 — a unit conversion.</td></tr>
+      <tr><td><q>Stated as 396,000, but the evidence provides 396,960.</q></td><td>0.24% apart, and the claim is written with fewer significant figures — a rounding.</td></tr>
+      <tr><td><q>Humidity around 28% is not in the evidence.</q></td><td>Search the evidence: "28" is right there — the judge missed it.</td></tr>
+    </tbody>
+  </table></div>
+  <p>These are precisely the systematic classes the small judge gets wrong, and that <em>two</em> GEPA prompt-optimization rounds failed to fix. They do not need a better model. They need <code>float()</code> and <code>in</code>.</p>
+
+  <h2>The three proof rules</h2>
+  <p>Each rule was earned by a measured failure, and each decides in only one direction unless it can prove the other.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Rule</th><th>Dismisses (false alarm)</th><th>Upholds (proven real)</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Numeric</strong> — needs an explicit contrast frame ("X, not Y")</td><td>a rounding within its graded error budget (half-step distance, not <code>round()</code> equality), or a conversion between <em>written</em> unit tokens that actually convert — never bare numbers, never in a label context (version, port, id)</td><td>at least one strictly contradictory pair, no innocent or gray pair, and the pair <em>anchored</em>: the claim-side figure in the claim and NOT in the evidence, the evidence-side figure present in the evidence — a judge-hallucinated figure convicts nothing</td></tr>
+      <tr><td><strong>Absence</strong> — "X is not in the evidence"</td><td><em>every</em> cited atom present under boundary-anchored matching ("180" is not inside "1800", "8 GB" is not inside "18 GB", SHA-256 hosts no 256); the packer's marker is stripped first. A complaint whose SUBJECT is the reply ("the reply omits…") searches the <em>claim</em> instead — atoms present there prove it factually false</td><td>absent from <em>intact</em> evidence — a packer cut of <strong>25% or more</strong> (global missing fraction, shared floor via <code>GHOST_VERIFY_TRUNCATION_MIN_SEVERITY</code>) makes it unresolved, as does mixed presence, and a claim-side omission is never mechanically upheld: whether an omission <em>matters</em> is the strong model's question</td></tr>
+      <tr><td><strong>Machine noise</strong> — "the claim contains diff markers"</td><td>the alleged markers are not in the claim</td><td>they are literally in the claim text</td></tr>
+    </tbody>
+  </table></div>
+  <p>Everything else returns UNRESOLVED, which means "carry on as before": whatever the module cannot prove is handled exactly as it was before it existed.</p><div class="note warn"><strong>It does change verdicts</strong> — an earlier version of this page claimed it "can only remove work", which is false in both directions and is the whole risk surface. A DISMISS returns CONFIRMED <em>without</em> the main-model call the old path would have made, at a confidence floor of 0.7 (deliberate: a mechanical dismissal is proven, not a soft overturn, so the 0.6 laundering cap does not apply — but no legacy path produced a model-free CONFIRMED). An UPHOLD keeps the cheap judge's REFUTED and suppresses the escalation entirely. Both are the point; both are why every rule decides in one direction unless it can prove the other.</div>
+
+  <h2>Three discriminators that only measurement could have found</h2>
+  <ul>
+    <li><strong>Precision, not proximity.</strong> A plain 2% tolerance dismissed <q>26.7°C is not supported; evidence states 26.6°C</q> — which is a fact <em>swap</em>. A genuine rounding <em>loses</em> significant figures, so the coarser value must be written with fewer of them; equal precision plus a small gap is a real difference, however small. Precision also picks <em>which</em> value is the rounded one — deriving that from magnitude recognised only roundings that round DOWN, so <q>27, not 26.6</q> and <q>3, not 2.9</q> were reported as contradictions and upheld.</li>
+    <li><strong>Quantity, not identifier.</strong> The first version compared <code>SN851X</code> with <code>SN850X</code> (0.1% apart → "rounding") and <code>2025</code> with <code>2026</code>. A number counts only when it stands alone as a token. Bare years are excluded lexically; dates, versions, ports and ids are excluded <em>contextually</em> — one such marker anywhere in an objection disables numeric adjudication for all of it, and the exclusion applies only inside the numeric rule. The standalone-token requirement also drops any number glued to its unit, so <code>18KB</code> and <code>26.7C</code> parse as no numbers at all: the rule's reach is narrower than the examples suggest.</li>
+    <li><strong>The contrast frame is what makes a mismatch an assertion.</strong> Upholding whenever an objection merely names two differing numbers raised protection from 37 to 59 catches — but hardened false alarms from 2 to 7, because <q>34°C and humidity 28%</q> contains two numbers and asserts nothing. That rule was deleted; the reasoning stays in the source as a warning. Deleting it was not sufficient — the contrast pattern matches a bare <q>not</q>, which <em>every</em> absence complaint contains, so <q>34°C and humidity 28% are not in the evidence</q> was still adjudicated as a numeric contradiction and upheld, reviving the deleted rule's harm inside the protected no-call path. Absence complaints are now excluded from the numeric rule outright.</li>
+  </ul>
+
+  <h2>What it buys</h2>
+  <p>Measured over every completed bench arm's refutes, the cost of being wrong is <strong>2 hardened false alarms and 1 erased catch.</strong> The protection counts are deliberately not quoted: two mid-development figures survive in the record (37 upheld / 41 calls avoided, and 51 / 55), the ad-hoc script that produced them was not kept, and both predate the 2026-08-06 defect fixes above — the confirming re-bench re-derives them. In the shipped pipeline arm that becomes balanced <strong>0.808</strong> against the legacy pipeline's 0.797 — the first arm of five to clear the gate — with catches up (0.705 → 0.778), degraded-evidence false alarms down four-fold (0.242 → 0.061), overturn damage halved (59 → 31), 38 fewer main-model escalations and p50 latency down from 42.5&nbsp;s to 26.9&nbsp;s.</p>
+  <div class="note warn">The gate is cleared by <strong>+0.011</strong> on a tier with ±0.08 documented session noise, and the score decayed across the run (0.837 at 41% → 0.808 final). Read the pass as narrow and the profile as the real argument. <code>GHOST_VERIFY_OBJECTION_CHECK=0</code> disables the module; the companion policies (<code>GHOST_VERIFY_OVERTURN_QUOTE</code>, <code>GHOST_VERIFY_TIER_ROUTING</code>) ship default-OFF, and v5's measured configuration is objection-check ON with the rebuttal burden OFF.</div>
+
+  <h2>Two adversarial rounds, thirteen wrong verdicts, one shape</h2>
+  <p>After the first bench pass, two independent adversarial reviews (2026-08-07) executed the module against realistic judge sentences and found <strong>13 CRIT-grade wrong verdicts</strong> between them. Every fix is a regression test; the recurring shape is worth stating because it will recur: <em>a mechanical rule earns its verdict only from what is WRITTEN, and every shortcut past the written text was a wrong verdict waiting</em>.</p>
+  <ul>
+    <li><strong>Unit conversions need written units.</strong> A bare factor list dismissed "3 errors, not 21 errors" as a ×7 "conversion". The unit map now carries bytes, time, distance, mass, percent, speed, data-rate and frequency families — and "13 km/h vs 8 mph" (equal in reality) dismisses by actual conversion instead of convicting.</li>
+    <li><strong><code>round()</code> is not rounding.</strong> Banker's rounding over binary floats convicted "1,500 for 1,450" and "0.4 for 0.35" while dismissing "3 for 2.9". Half-step distance with graded error budgets replaced it; a round-shaped match beyond its budget is GRAY — suspicion, never proof, and one gray pair blocks the whole objection's dismissal exactly as a contradictory one does.</li>
+    <li><strong>Convictions must be anchored asymmetrically.</strong> The claim-side figure must be claim-exclusive (a hallucinated "500" that appears in neither text — or in an attacker's page — convicts nothing); the evidence-side figure need only be present, because a real fact_swap usually <em>quotes</em> the evidence number before contradicting it.</li>
+    <li><strong>Who omitted it decides where to look.</strong> "The reply omits the 28% that the evidence provides" was dismissed as "the judge missed it" because 28% was in the evidence — backwards: that is what makes the judge right. Claim-side omissions search the claim, and are never mechanically upheld.</li>
+    <li><strong>Presence needs boundaries everywhere.</strong> Substring matching found "180" in "1800 rpm", "8 GB" in "18 GB" (through the digit-unit glue), and 256 inside "SHA-256" (through hyphen collapse). Every numeric-edged atom is boundary-matched; identifier glue is refused.</li>
+    <li><strong>Flagged presentation is not leaked noise.</strong> Fenced diffs, inline code spans, a truncated opening fence, and the markdown horizontal rule are all how a claim <em>should</em> show these strings.</li>
+  </ul>
+
+  <h2>Uphold-only: the shipping configuration (2026-08-07)</h2>
+  <p>The confirming re-bench put per-direction counters on the mechanical layer for the first time, and they split it cleanly: <strong>UPHOLD measured 40 protects / 2 damage; DISMISS measured 3 rescues / 9 damage — net negative.</strong> A 12-trial splice re-run (replay scorer, ~7 minutes, zero cheap-verdict drift) then showed dismiss-OFF strictly dominates: balanced <strong>0.829</strong> vs 0.819, five of the nine erased catches recovered by the escalation, and every rescue surviving anyway because the overturner independently rescues the same false alarms the dismissal did. The cost is ~12 extra escalation calls per 340 trials.</p>
+  <p>So the module ships <strong>uphold-only</strong>: <code>GHOST_VERIFY_OBJECTION_DISMISS</code> defaults OFF (=1 re-enables; the bench sweeps it). The asymmetry is principled, not incidental: an UPHOLD's failure mode is a hardened false alarm that the rebuttal machinery was already bad at fixing, while a DISMISS's failure mode is an erased catch with <em>no</em> recovery route — and the escalation already does the dismissal's job on genuine false alarms, just more expensively and more safely.</p>
+
+  <h2>Known limits</h2>
+  <ul>
+    <li><code>artifact_leak</code> (0.5) and <code>fact_swap</code> (0.606) remain the soft columns: the machine-noise rule only fires when the judge's wording names the noise, so the rest still escalate.</li>
+    <li>Subjective gloss, semantic drift and domain judgement are deliberately <em>not</em> mechanised — they go to the strong model unburdened, which is where it measurably excels.</li>
+    <li>The module reads the packed digest the verifier received, so a fact the <a href="verifier.html">packer</a> cut is invisible to the absence rule; above the severity floor the rule returns UNRESOLVED itself. (The separate truncation guard runs <em>earlier</em>, before the escalation, and only when every issue is absence-shaped — it is not a fallback this rule hands off to.)</li><li>It runs first among the escalation policies, but only on the claim path: <code>verify_code_output</code> injects its own re-adjudication, and the check is skipped whenever that is set. It also sits behind <code>GHOST_VERIFY_ESCALATE_REFUTE</code> and the cheap-route check, so <code>GHOST_VERIFY_OBJECTION_CHECK</code> is not its only off switch.</li><li><strong>The packer's truncation marker is not evidence.</strong> It carries digits — a random 8-hex nonce and the two byte counts (<code>400 of 5400</code>) — and the absence rule was searching it, so a cited number could be "found" inside the packer's own bookkeeping and a proven catch dismissed. The byte counts made that deterministic for any objection citing them; the nonce added a ~3%-per-process-start random component that surfaced as a flaky unrelated test. Markers are now stripped before the search.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

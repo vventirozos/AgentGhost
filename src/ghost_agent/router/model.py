@@ -221,6 +221,57 @@ class ComplexityClassifier:
             float(self.bias_)
         )
 
+    #: Features whose presence should raise p(hard), not lower it. A model
+    #: that has learned NEGATIVE weights on these is inverted — it routes
+    #: jargon-dense technical/coding requests to "easy" (§4O C-MAJOR-1, the
+    #: n_steps-counts-history bug produced exactly this). Names must exist
+    #: in FEATURE_NAMES.
+    _MONOTONE_HARD_FEATURES = (
+        "technical_jargon_count_log1p", "coding_language_mentions",
+        "has_uppercase_acronym", "has_numeric_density",
+    )
+    #: The LOAD-BEARING inversion signal: "more jargon / more coding ⇒
+    #: harder" is the monotonicity that actually matters. §4O R3 MAJOR-1:
+    #: a pure net-sum over all four features had a blind spot — a model
+    #: strongly inverted on jargon+coding could PASS if acronym/numeric
+    #: carried compensating positive weight (repro: jargon -0.86 + coding
+    #: -1.43 but net +0.66). Gate on the jargon+coding SUBTOTAL directly.
+    _CORE_HARD_FEATURES = (
+        "technical_jargon_count_log1p", "coding_language_mentions",
+    )
+    #: reject only a CLEARLY inverted model, not noise near zero — a fine
+    #: model can carry a slightly-negative numeric weight (numbers ≠ hard).
+    #: A healthy fixture's jargon+coding subtotal sits ≈ 0; a truly-inverted
+    #: one ≈ -0.9 or worse. The margin sits between.
+    _INVERSION_CORE_MARGIN = -0.5
+    _INVERSION_NET_MARGIN = -1.0
+
+    def looks_sane(self) -> bool:
+        """True iff the fitted model is finite AND not CLEARLY INVERTED.
+        §4O C-MAJOR-1 fail-closed gate: reject a model whose CORE technical/
+        coding features (more jargon/coding ⇒ harder) carry a strongly
+        negative weight — deploying it skips the planner on the hardest
+        requests. Gated on the jargon+coding subtotal (§4O R3 MAJOR-1: a
+        net-sum over all four features could be rescued by compensating
+        acronym/numeric weight) AND a looser overall-net floor. A rejected
+        model leaves the router escalate-all (planner runs), the safe
+        default — it also neutralises the currently-deployed inverted
+        checkpoint until a correct model trains."""
+        if not self.is_finite():
+            return False
+        try:
+            idx = {n: i for i, n in enumerate(self.feature_names_)}
+            core = [idx[n] for n in self._CORE_HARD_FEATURES if n in idx]
+            allf = [idx[n] for n in self._MONOTONE_HARD_FEATURES if n in idx]
+            if not core or not allf:
+                return True  # can't judge → don't block
+            core_net = float(np.sum(self.weights_[core]))
+            net = float(np.sum(self.weights_[allf]))
+            return (core_net >= self._INVERSION_CORE_MARGIN
+                    and net >= self._INVERSION_NET_MARGIN)
+        except Exception:
+            return True  # never block on a guard error
+
     def clone(self) -> "ComplexityClassifier":
         """Copy with the same hyperparameters and weights — used by a
         guarded online-update path so a candidate step is applied to a

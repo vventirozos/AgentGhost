@@ -24,6 +24,9 @@ logger = logging.getLogger("GhostAgent")
 
 # signature_name -> tuned instruction str (or None when absent/invalid)
 _CACHE: Dict[str, Optional[str]] = {}
+# sha8 of each served artifact, for attribution (§4L Lens-D MINOR-1:
+# nothing anywhere recorded WHICH artifact version built a prompt).
+_ARTIFACT_SHAS: Dict[str, str] = {}
 
 # Activation telemetry: how often each signature's prompt-build actually
 # APPLIED a tuned instruction vs fell back to the hand-written baseline.
@@ -68,10 +71,31 @@ def tuned_instruction(signature_name: str, default: str = "") -> str:
             opt = data.get("optimized_instruction")
             if isinstance(opt, str) and opt.strip():
                 value = opt.strip()
-                logger.info(
-                    "GEPA: loaded tuned instruction for '%s' (%d chars)",
-                    signature_name, len(value),
-                )
+                # ⚠ PROVENANCE WARNING, once per artifact per process
+                # (§4L Lens-D MAJOR-1): a pre-gate-schema artifact (no
+                # gate identity, no scores) is served with no evidence
+                # it would still win under the CURRENT metric — the
+                # planning.decompose case: promoted under the OLD recall
+                # metric, known to LOSE on F1, and served to every
+                # planner call anyway. The promoted-artifact
+                # invalidation rule ("re-score the incumbent when the
+                # metric or gate changes") was convention only; this at
+                # least makes the un-validated state VISIBLE at apply
+                # time. sha8 gives the operator an attribution handle.
+                import hashlib as _hl
+                _sha8 = _hl.sha256(value.encode("utf-8")).hexdigest()[:8]
+                _ARTIFACT_SHAS[signature_name] = _sha8
+                if not data.get("gate_arm"):
+                    logger.warning(
+                        "GEPA: artifact '%s' (sha %s) predates the "
+                        "gate schema — no gate identity/scores recorded; "
+                        "re-promote under the current gate before "
+                        "trusting it", signature_name, _sha8)
+                else:
+                    logger.info(
+                        "GEPA: loaded tuned instruction for '%s' "
+                        "(%d chars, sha %s, gate %s)", signature_name,
+                        len(value), _sha8, data.get("gate_arm"))
     except Exception as e:
         logger.debug("GEPA tuned_instruction('%s') load failed: %s", signature_name, e)
 
@@ -140,3 +164,4 @@ def clear_cache() -> None:
     Activation counters are deliberately NOT cleared — they describe the
     process, not the cache."""
     _CACHE.clear()
+    _ARTIFACT_SHAS.clear()

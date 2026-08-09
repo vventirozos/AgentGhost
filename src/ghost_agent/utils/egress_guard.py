@@ -35,6 +35,33 @@ is set and Tor is unreachable.
 Opt-in via ``--mandatory-tor`` so existing deployments are never
 perturbed; when set, the guard is installed for the whole process
 lifetime and the liveness probe gates boot.
+
+⚠ SCOPE — what this monkeypatch does NOT cover (§4P audit, 2026-08-08):
+the patch is on ``socket.socket`` (the CPython layer). It is BLIND to:
+
+  * **curl_cffi** — opens its sockets in libcurl/C, below the Python
+    socket module (measured: a ``curl_cffi.get`` produces ZERO
+    ``socket.socket.connect`` calls). ``tools.search`` / ``darkweb_search``
+    / ``file_system`` (download) / ``system`` (weather) / ``utils.helpers``
+    all egress via curl_cffi — i.e. *every real egress path* — so for them
+    this guard enforces nothing. Their fail-closed guarantee comes from the
+    call site itself passing a proxy: see :func:`resolve_egress_proxy`,
+    which forces the loopback Tor proxy for a public target when the guard
+    is installed and no proxy was threaded (the call-site backstop this
+    socket guard cannot be).
+  * **Subprocesses** — Chromium (playwright) and the docker sandbox have
+    their own address space + libc; their egress is enforced by the
+    browser ``--proxy-server`` arg + in-runner SSRF interceptor and the
+    sandbox's internal Tor daemon, not by this patch.
+  * **libc getaddrinfo** — a cleartext DNS lookup that precedes a (blocked)
+    direct connect still leaks the target name. The real egress paths avoid
+    it by using ``socks5h`` (DNS at the Tor exit) and ``resolve=not
+    anonymous`` SSRF gates, not by this guard.
+
+So this guard is a real backstop ONLY for stdlib-socket / httpx egress
+(e.g. the notify webhook, any HF resolution call). Treat it as
+defence-in-depth, and keep every curl_cffi/browser call site independently
+fail-closed via :func:`resolve_egress_proxy`.
 """
 
 from __future__ import annotations
@@ -60,6 +87,19 @@ class MandatoryTorError(RuntimeError):
 # proxy.
 _LOCAL_HOST_NAMES: Tuple[str, ...] = ("localhost", "ip6-localhost", "ip6-loopback")
 _LOCAL_HOST_SUFFIXES: Tuple[str, ...] = (".local", ".lan", ".internal", ".localhost")
+
+# IPv6 transition ranges that embed / relay to PUBLIC IPv4 space and are
+# globally routable, but which CPython's ``ipaddress`` reports as
+# is_global=False / is_private=True (they sit in the IANA special-purpose
+# registry). Left unhandled, ``is_allowed_host`` would ALLOW a direct connect
+# to e.g. ``2002:0808:0808::`` (6to4-wrapping 8.8.8.8) — a Tor-bypassing public
+# egress. Block them explicitly. (§4P C-LOW, 2026-08-08.)
+_SIXTO4 = ipaddress.ip_network("2002::/16")   # RFC 3056 6to4
+_TEREDO = ipaddress.ip_network("2001::/32")   # RFC 4380 Teredo
+
+# Default loopback Tor SOCKS endpoint — the fail-closed fallback proxy when a
+# call site under --mandatory-tor was handed no explicit proxy.
+_DEFAULT_TOR_PROXY = "socks5://127.0.0.1:9050"
 
 
 def parse_socks_endpoint(tor_proxy: Optional[str]) -> Optional[Tuple[str, int]]:
@@ -120,12 +160,61 @@ def is_allowed_host(host: str, allow: Iterable[str] = ()) -> bool:
     # private-use registries, which would wrongly fail-close LAN discovery.
     if ip.is_multicast:
         return True
+    # 6to4 / Teredo transition addresses ARE globally routable (they wrap /
+    # relay to public v4) even though ipaddress reports is_global=False for
+    # them — block so the guard can't be bypassed via a transition wrapper.
+    if ip.version == 6 and (ip in _SIXTO4 or ip in _TEREDO):
+        return False
     # Globally-routable == public Internet == must have gone via Tor.
     if ip.is_global:
         return False
     # loopback / private (RFC1918) / link-local / reserved /
     # unspecified (0.0.0.0) are all local-or-LAN → allowed.
     return True
+
+
+def resolve_egress_proxy(tor_proxy: Optional[str], url: Optional[str] = None) -> Optional[str]:
+    """Fail-closed proxy resolution for a curl_cffi / httpx / browser egress.
+
+    Returns the SOCKS proxy the caller should use (raw ``socks5://``/
+    ``socks5h://`` form — callers normalise to what their client wants), or
+    ``tor_proxy`` unchanged when a direct connect is legitimate.
+
+    The socket-layer guard is BLIND to curl_cffi and to subprocess egress
+    (see the module docstring), so a call site that forgot to thread the proxy
+    would connect cleartext with NO backstop. This is that backstop, at the
+    only layer that can be one for curl_cffi — the call site:
+
+      * ``tor_proxy`` truthy  → return it unchanged (normal Tor path).
+      * ``tor_proxy`` falsy and the mandatory-tor guard is NOT installed
+        (``--no-mandatory-tor``) → return it unchanged; direct egress is the
+        operator's explicit choice.
+      * ``tor_proxy`` falsy, guard installed, and ``url`` targets a LOCAL /
+        LAN host (or no url given but... see below) → return unchanged; Tor
+        cannot route loopback and LAN traffic doesn't deanonymise.
+      * ``tor_proxy`` falsy, guard installed, PUBLIC target → fall back to
+        ``$TOR_PROXY`` / the loopback default so the call still routes through
+        Tor. A dead Tor daemon then yields connection-refused (fail closed),
+        never a cleartext public connect.
+
+    When ``url`` is None the target host is unknown; under the installed guard
+    we assume public (fail toward Tor) — every url-less caller here (weather,
+    search) only ever fetches public endpoints.
+    """
+    if tor_proxy:
+        return tor_proxy
+    if not is_installed():
+        return tor_proxy  # --no-mandatory-tor: unchanged (direct is allowed)
+    if url is not None:
+        try:
+            host = (urlparse(url).hostname or "").strip("[]")
+        except Exception:
+            host = ""
+        # A local/LAN target legitimately connects direct (Tor can't route it).
+        if host and is_allowed_host(host):
+            return tor_proxy
+    import os as _os
+    return _os.environ.get("TOR_PROXY") or _DEFAULT_TOR_PROXY
 
 
 # Module-level handle so install/uninstall is idempotent and testable.
@@ -248,6 +337,7 @@ __all__ = [
     "install",
     "is_installed",
     "is_allowed_host",
+    "resolve_egress_proxy",
     "tor_liveness_ok",
     "parse_socks_endpoint",
 ]

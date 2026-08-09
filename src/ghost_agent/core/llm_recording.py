@@ -54,15 +54,40 @@ def _recordings_dir() -> Optional[Path]:
     return Path(home) / "system" / "llm_recordings"
 
 
+def _scrub_live_nonce(text: str) -> str:
+    """Replace the CURRENT process's packer-nonce marker form with the
+    dead sentinel — on any string headed for a fingerprint or for disk.
+
+    ⚠ Fingerprint-before-scrub was a measured defect (§4L Lens-C
+    MINOR-1): the stored line was scrubbed but its fingerprint was
+    minted over the LIVE nonce, so every scrubbed record permanently
+    failed replay matching — the drift instrument crying wolf on
+    exactly the verify-prompt population. Both sides now converge on
+    the sentinel: record() scrubs before fingerprinting, and the replay
+    matcher scrubs the incoming payload with ITS process's nonce, so a
+    replayed run whose fresh nonce differs still matches.
+    """
+    try:
+        from .agent import _PACKER_NONCE
+        token = f"#{_PACKER_NONCE}:"
+        if token in text:
+            return text.replace(token, "#deadfeed:")
+    except Exception:
+        pass
+    return text
+
+
 def payload_fingerprint(payload: Dict[str, Any]) -> str:
     """Stable hash of the conversational content — messages only, so
-    sampling-param tweaks between record and replay don't break matching."""
+    sampling-param tweaks between record and replay don't break matching.
+    Nonce-scrubbed (see `_scrub_live_nonce`) so record and replay agree."""
     try:
         blob = json.dumps(payload.get("messages", []),
                           sort_keys=True, ensure_ascii=False, default=str)
     except Exception:
         blob = str(payload.get("messages"))
-    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
+    return hashlib.sha256(_scrub_live_nonce(blob).encode(
+        "utf-8", "replace")).hexdigest()[:16]
 
 
 # Data-URI image bodies below this size are kept verbatim (tiny stubs are
@@ -197,17 +222,42 @@ class LLMRecorder:
                 "ordinal": ordinal,
                 "request_id": str(req_id or ""),
                 "kind": kind,
-                # Fingerprint the ORIGINAL payload, store the elided one:
-                # replay matching hashes messages whole, so the stored
-                # fingerprint must match what a live caller will send.
+                # Fingerprint the SCRUBBED payload (payload_fingerprint
+                # scrubs internally), store the elided+scrubbed line:
+                # the replay matcher scrubs the incoming payload with its
+                # own process nonce, so both sides meet at the sentinel.
                 "fingerprint": payload_fingerprint(payload),
                 "payload": elide_image_data(payload),
                 "response": response,
                 "meta": {k: v for k, v in meta.items() if v},
             }
-            day = datetime.date.today().isoformat()
+            # §4O B-NIT: name the day-file by UTC date to match the UTC
+            # `ts` above — a LOCAL date split a boot spanning local midnight
+            # across two files, and replay loads one file (partial session).
+            day = datetime.datetime.utcnow().date().isoformat()
             path = root / f"{day}.jsonl"
             line = json.dumps(rec, ensure_ascii=False, default=str)
+            # ⚠ Kill the packer nonce before it touches disk (2026-08-07
+            # review). Verify prompts embed the evidence digest, whose
+            # truncation marker carries the LIVE per-process nonce — the
+            # one secret the truncation guard's anti-forgery check rests
+            # on. Recorded verbatim, a same-process read of this very
+            # day-file (the agent greps its own recordings routinely)
+            # produced a digest with a VALID marker: severity 0.95,
+            # REFUTED silently downgraded, zero model calls — the exact
+            # attack the nonce exists to stop, re-opened one directory
+            # over. Replaying a dead nonce is harmless (the guard simply
+            # does not fire), so the scrub costs replay nothing.
+            # Surgical: only the marker-shaped "#<nonce>:" form — a bare
+            # hex replace could corrupt a stored fingerprint that happens
+            # to contain the same 8 hex chars.
+            try:
+                from .agent import _PACKER_NONCE
+                token = f"#{_PACKER_NONCE}:"
+                if token in line:
+                    line = line.replace(token, "#deadfeed:")
+            except Exception:
+                pass
             with self._lock:
                 root.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as f:

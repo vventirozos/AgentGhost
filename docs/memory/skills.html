@@ -120,7 +120,7 @@
   <p>When a lesson is surfaced, <code>record_retrieval</code> increments the counter and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — so the "is this self-play lesson ever actually used?" question has data to answer.</p>
 
   <h2>Dedup</h2>
-  <p>Vector similarity check (distance &lt; 0.15; <strong>&lt; 0.25 for mistake-less rules</strong> since 2026-07-20 — dream/reflection re-emit the same "When X, do Y" heuristic reworded every cycle, and rewordings measure 0.07–0.17 apart on the live bge-small store while genuinely distinct rules stay ≥ 0.29, so the single 0.15 cutoff let the reworded tail through: 10+ copies of two rules saved overnight 07-19→20; override with <code>GHOST_RULE_DEDUP_DIST</code>, tests <code>tests/test_skill_dedup.py::TestMistakeLessWideThreshold</code>) or a <strong>normalized trigger match</strong> merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate. The JSON fallback no longer requires an exact lowercased string: <code>_normalize_trigger()</code> lowercases, strips punctuation, drops stopwords and sorts the remaining significant tokens, so paraphrased triggers (<em>"How do I parse JSON?"</em> ≡ <em>"parse JSON"</em>) collapse onto the same key and <code>frequency</code> actually accumulates toward graduation.</p>
+  <p>Vector similarity check (distance &lt; 0.20; <strong>&lt; 0.21 for mistake-less rules</strong> — recalibrated 2026-08-08 (§4M): the live corridor between "reworded twin" and "distinct rule" shrank to [0.192, 0.213] (rewordings reach 0.1921, distinct rules come as close as 0.2134), leaving the original 2026-07-20 pair 0.15/0.25 outside it from both ends — reworded twins re-saved AND a distinct-rule pair sat inside the admit zone. The metric is chroma-default squared-L2 on normalized embeddings (= 2× cosine distance). Override with <code>GHOST_RULE_DEDUP_DIST</code>, tests <code>tests/test_skill_dedup.py::TestMistakeLessWideThreshold</code> + the §4M corridor pin) or a <strong>normalized trigger match</strong> merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate. The JSON fallback no longer requires an exact lowercased string: <code>_normalize_trigger()</code> lowercases, strips punctuation, drops stopwords and sorts the remaining significant tokens, so paraphrased triggers (<em>"How do I parse JSON?"</em> ≡ <em>"parse JSON"</em>) collapse onto the same key and <code>frequency</code> actually accumulates toward graduation.</p>
   <p><strong>Vector-hit twin lookup + orphan self-heal (2026-07-29):</strong> the vector-dedup bump used to
   search the playbook under the <em>incoming</em> trigger only — but a reworded near-duplicate's JSON twin is
   stored under <em>its own</em> trigger, so every reworded re-learn logged "no JSON twin to bump" and silently
@@ -135,6 +135,19 @@
   with no playbook twin — the twin test is token-<em>subset</em> so a metadata trigger truncated at 200 chars
   still matches its full twin, and entries with no recoverable trigger are never deleted blind.
   Tests: <code>tests/test_log_audit_fixes_2026_07_29.py</code>, <code>tests/test_skill_dedup.py</code>.</p>
+  <p><strong>§4M twin-destruction fix + heal (2026-08-08):</strong> the twin's metadata stores the row's
+  <em>trigger</em>, but both cleaners above keyed the playbook <em>task</em>-first — self-play/dream rows have
+  <code>task ≠ trigger</code> by design, so their <em>healthy</em> twins tested as orphans and were deleted
+  (~1 per idle cycle live; 36/50 lessons went dark to bus retrieval, which has no BM25 fallback when the
+  vector branch answers). Three facets fixed: the reconcile now indexes <strong>both fields</strong> per
+  lesson; an <em>untruncated</em> metadata trigger must cover ≥ half of the matched field's token set
+  (a bare subset let a TRUE orphan hide forever behind any unrelated lesson containing its few tokens);
+  and the reworded-twin re-locate gained the <code>or trigger ==</code> clause the primary lookups already
+  had. The inverse pass, <code>heal_missing_twins(memory_system, limit=2000)</code>, runs on the same idle
+  cooldown: it re-embeds playbook lessons whose vector twin is missing (matched by normalized
+  trigger-or-task at the write's own <code>[:200]</code> truncation), preserving the lesson's original
+  timestamp so healed twins don't jump the eviction queue. Idempotent — the stores converge from both
+  directions. Pins: <code>tests/test_learning_stack_audit.py</code> (§4M block).</p>
 
   <h2>Listing lessons (user-facing surface)</h2>
   <p><code>list_lessons(scope, source, limit)</code> returns lessons filtered by time window and source, most-recent first. Boundaries use <strong>local wall-clock</strong>:</p>

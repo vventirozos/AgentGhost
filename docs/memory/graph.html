@@ -89,6 +89,17 @@
   <h2>Forgetting — decay for the only uncapped tier (2026-07-07, #27c)</h2>
   <p>Unlike vector (5000-cap), episodes (500) and skills (50), the graph had <em>no</em> bound: every non-functional predicate accumulated forever, and weight-1 edges (one-off extractor noise) diluted retrieval as the graph grew. <code>prune_stale_edges(max_age_days=45, keep_min_weight=1)</code> deletes currently-valid edges whose <code>weight &le; keep_min_weight</code> AND whose <code>timestamp</code> is older than the age threshold — from both SQLite and the mirror. Reinforced edges (weight &gt; threshold) survive regardless of age: <strong>weight IS the decay signal</strong>, previously stored but never used for forgetting. It runs from the <a href="../algorithms/dream_cycle.html">dream cycle</a> (best-effort, never fails a dream) and reports the count in the Dream-Complete line. Covered by <code>tests/test_graph_forgetting.py</code>. (A persistent token→node inverted index — replacing the substring/difflib scan entirely — remains a further optimization.)</p>
 
+  <h2>Archive-before-delete (§4M, 2026-08-08)</h2>
+  <p>Every destructive path now appends the doomed triplets to <code>graph_pruned_archive.jsonl</code>
+  (fsync'd, one JSON object per row with <code>archived_at</code> + <code>reason</code>) <em>before</em>
+  deleting — the invariant the skill playbook learned the hard way, applied to the tier that suffered the
+  July data loss (884 live rows vs 1407 in the 07-22 backup, unattributable precisely because no archive
+  existed). Failure semantics differ by intent: <code>prune_stale_edges</code> (unattended, dream-driven)
+  fails <strong>closed</strong> — no archive, no prune; <code>delete_by_target</code> falls back to
+  recoverable soft-expiry (<code>valid_until</code>) when the archive write fails; <code>wipe_all</code>
+  (explicit operator reset) archives best-effort and proceeds. Pins:
+  <code>tests/test_learning_stack_audit.py</code> (§4M block).</p>
+
   <h2>Concurrency</h2>
   <p><code>threading.RLock</code> guards both SQLite and the networkx mirror. <code>initialize_graph()</code> rebuilds the entire mirror from disk.</p>
 

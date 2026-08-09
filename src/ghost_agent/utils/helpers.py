@@ -372,13 +372,20 @@ _REMOVAL_NEGATION_PHRASES = (
     "(removed)", "[removed]", "(deleted)", "[deleted]", "(former)",
 )
 
-#: Graph-predicate fragments that encode the same removal/past-tense
-#: semantics. Predicates are uppercase verbs (e.g. ``PREVIOUSLY_OWNED``,
-#: ``NO_LONGER_HAS``, ``REMOVED``) — matched case-insensitively as substrings.
-_REMOVAL_PREDICATE_FRAGMENTS = (
-    "PREVIOUSLY", "FORMER", "REMOVED", "NO_LONGER", "NOLONGER",
-    "NOT_", "NEVER", "DELETED", "USED_TO", "PAST_",
-)
+#: Graph-predicate tokens that encode removal/past-tense semantics.
+#: Predicates are uppercase verbs (``PREVIOUSLY_OWNED``, ``NO_LONGER_HAS``,
+#: ``REMOVED``). §4M R2 MINOR-3: these were matched as raw SUBSTRINGS, so
+#: legitimate predicates false-positived through embedded fragments —
+#: ``PERFORMER``/``USES_TRANSFORMERS`` (FORMER), ``WHENEVER_RUNS`` (NEVER).
+#: Now matched on ``_``-token boundaries; the multi-token phrases below
+#: are checked as substrings still (no embedding risk measured for them).
+_REMOVAL_PREDICATE_TOKENS = frozenset({
+    "PREVIOUSLY", "FORMER", "REMOVED", "NEVER", "DELETED", "NOT", "PAST",
+})
+_REMOVAL_PREDICATE_PHRASES = ("NO_LONGER", "NOLONGER", "USED_TO")
+# Back-compat alias for external readers of the old tuple name.
+_REMOVAL_PREDICATE_FRAGMENTS = tuple(_REMOVAL_PREDICATE_TOKENS) + \
+    _REMOVAL_PREDICATE_PHRASES
 
 
 def is_removal_or_negation_text(text) -> bool:
@@ -399,7 +406,9 @@ def is_removal_triplet(triplet) -> bool:
     if not isinstance(triplet, dict):
         return False
     pred = str(triplet.get("predicate", "")).upper()
-    if any(frag in pred for frag in _REMOVAL_PREDICATE_FRAGMENTS):
+    if _REMOVAL_PREDICATE_TOKENS & set(pred.split("_")):
+        return True
+    if any(phrase in pred for phrase in _REMOVAL_PREDICATE_PHRASES):
         return True
     for field in ("subject", "object"):
         if is_removal_or_negation_text(triplet.get(field, "")):

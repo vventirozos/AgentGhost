@@ -95,6 +95,31 @@ def _now_iso() -> str:
     return datetime.now().isoformat()
 
 
+def _twin_ts(ts) -> str:
+    """Playbook-internal timestamps are naive LOCAL (`_now_iso`) and must
+    stay that way (fromisoformat consumers on py3.10 can't parse "Z", and
+    all rows compare against each other). The VECTOR store's convention is
+    UTC-"Z" everywhere — §4M (Lens C MINOR): the 14 live skill twins were
+    the only naive rows among 8559, sitting +3h ahead of UTC rows in the
+    eviction tie-break's string sort. Convert at the twin-write boundary."""
+    from datetime import timezone as _tz
+    try:
+        raw = str(ts)
+        # §4M R2 MINOR-2: py3.10 fromisoformat rejects "Z", so an input
+        # already in the store's own convention fell into the except
+        # branch and was REPLACED WITH NOW — defeating the "healed twin
+        # must not look newer" invariant. Strip it and mark UTC.
+        if raw.endswith("Z"):
+            dt = datetime.fromisoformat(raw[:-1]).replace(tzinfo=_tz.utc)
+        else:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()  # naive = local wall-clock
+        return dt.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:
+        return datetime.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _extract_code_block(text: str) -> str:
     """Pull the first fenced code block (```lang\n...\n```) out of `text`.
 
@@ -570,7 +595,21 @@ class SkillMemory:
         can't run the save's write + ``os.replace`` at the same time and
         promote a torn temp file. No-op fallback on platforms without fcntl,
         or when ``file_path`` was monkeypatched past ``__init__`` (tests).
-        Mirrors FrontierTracker._crossproc_lock."""
+        Mirrors FrontierTracker._crossproc_lock.
+
+        ⚠ SINGLE-WRITER CONTRACT (§4M Lens A MAJOR-1, operator-accepted
+        2026-08-08): this lock covers only the SAVE — the load half of
+        every read-modify-write runs outside it, so a SECOND WRITER
+        PROCESS loses whole lessons/counters to last-write-wins (scratch
+        repro: 2 procs × 20 learn_lesson → 19/40 lessons lost; no torn
+        file — the lock does its narrow job). The live deployment has
+        exactly one writer process; dream/self-play/sub-agents get
+        ReadOnlySkillMemory, and external scripts must treat the playbook
+        as read-only while the agent runs. Widening the lock to span
+        load→save was rejected: fcntl locks are not thread-reentrant and
+        every RMW nests inside the RLock — a rushed refactor risks
+        deadlocking the live writer over a hazard no current caller can
+        trigger. Revisit ONLY when adding a second writer process."""
         memory = self
 
         class _Ctx:
@@ -625,7 +664,15 @@ class SkillMemory:
         temp_path = self.file_path.with_suffix(f'.{os.getpid()}.tmp')
         with self._crossproc_lock():
             try:
-                temp_path.write_text(json.dumps(playbook, indent=2))
+                # §4M (Lens A MINOR): fsync BEFORE the rename — os.replace
+                # is atomic in the namespace but the temp file's content
+                # may still be in the page cache, so a power loss could
+                # promote an empty/torn file (journal.py documents the
+                # same rationale).
+                with open(temp_path, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(playbook, indent=2))
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(temp_path, self.file_path)
             finally:
                 # os.replace consumes temp_path on success; this only fires
@@ -707,7 +754,8 @@ class SkillMemory:
 
     def _find_duplicate_lesson(self, task: str, mistake: str, solution: str,
                                memory_system=None,
-                               vector_threshold: float = 0.15) -> dict:
+                               vector_threshold: float = 0.20,
+                               trigger: str = "") -> dict:
         """Check if a semantically similar NON-QUARANTINED lesson exists.
 
         ⚠ Quarantined entries are skipped, and that exclusion is load-bearing.
@@ -724,13 +772,17 @@ class SkillMemory:
         Uses vector search first (fast, semantic), then falls back to JSON
         playbook exact-task matching if no vector store is available.
 
-        ``vector_threshold`` — cosine-distance cutoff for the vector match.
-        The 0.15 default suits mistake-ful lessons; MISTAKE-LESS rules get a
-        wider cutoff from the caller (see learn_lesson), measured 2026-07-20
-        on the live bge-small store: rewordings of the SAME rule land at
-        0.07-0.17 (so 0.15 let the tail through — the overnight churn saved
-        10+ copies of two rules), while genuinely DIFFERENT rules never come
-        closer than 0.29."""
+        ``vector_threshold`` — distance cutoff for the vector match. The
+        metric is chroma's default squared-L2 on normalized embeddings
+        (= 2× cosine distance; the old "cosine-distance" label here was
+        wrong — §4M Lens B NIT). Recalibrated 2026-08-08 on the live
+        store: rewordings of the SAME lesson now reach 0.1921 apart while
+        genuinely DISTINCT rules come as close as 0.2134 — the corridor
+        shrank from [0.17, 0.29] to [0.192, 0.213], leaving the old
+        0.15/0.25 pair on the wrong side of real data from both ends
+        (reworded twins re-saved; distinct rules at risk of over-merge).
+        The 0.20 default sits inside the corridor for mistake-ful lessons;
+        MISTAKE-LESS rules get 0.21 from the caller (see learn_lesson)."""
         lesson_text = f"SITUATION: {task}\nMISTAKE: {mistake}\nSOLUTION: {solution}"
 
         if memory_system and hasattr(memory_system, 'collection') and memory_system.collection:
@@ -775,11 +827,23 @@ class SkillMemory:
         # paraphrased triggers ("parse JSON" / "How do I parse JSON?") now
         # collide so the frequency counter accumulates and graduation can fire.
         task_key = _normalize_trigger(task or "")
+        # ⚠ The TRIGGER field must be compared too (§4L R2, escalated
+        # from D-MINOR-3): self-play writes a distinct `task` (the
+        # concrete challenge text) with an identical generalized
+        # `trigger`, so three byte-identical-trigger twins coexisted —
+        # while every exact-match CONSUMER keys trigger-first, booking
+        # ×3 counters per surfacing (feeding the cap-trim ranking) and
+        # deleting/retracting only the first. The dedup must match its
+        # consumers' key.
+        trig_key = _normalize_trigger(trigger or "")
         for idx, p in enumerate(playbook):
             if p.get("quarantined"):
                 continue  # a quarantined row must never absorb a re-learn
             existing_key = _normalize_trigger(p.get("task") or p.get("trigger") or "")
             if existing_key and existing_key == task_key:
+                return {"index": idx, "lesson": p, "source": "json"}
+            existing_trig = _normalize_trigger(p.get("trigger") or "")
+            if trig_key and existing_trig and existing_trig == trig_key:
                 return {"index": idx, "lesson": p, "source": "json"}
         return None
 
@@ -811,11 +875,17 @@ class SkillMemory:
             return 0
         with self._get_lock():
             playbook = self._load_playbook()
+        # §4M CRIT-1: the vector twin's metadata stores the row's TRIGGER
+        # (the learn_lesson write), but this set was built task-first —
+        # self-play/dream rows have task ≠ trigger by design, so their
+        # healthy twins failed the subset test and were DELETED (~1 per
+        # idle cycle live; 36/50 lessons went dark). Index BOTH fields.
         pb_token_sets = []
         for p in playbook:
-            toks = _trigger_token_set(p.get("task") or p.get("trigger") or "")
-            if toks:
-                pb_token_sets.append(toks)
+            for field in ("trigger", "task"):
+                toks = _trigger_token_set(p.get(field) or "")
+                if toks:
+                    pb_token_sets.append(toks)
         orphans = []
         for i, vid in enumerate(ids):
             meta = metas[i] if i < len(metas) else None
@@ -824,15 +894,24 @@ class SkillMemory:
                 _dup_trigger_from_vector_text(str(doc or ""))
             if not raw_trig:
                 continue  # unidentifiable — never delete blind
-            if len(raw_trig) >= 200 and len(raw_trig.split()) > 1:
+            was_truncated = len(raw_trig) >= 200
+            if was_truncated and len(raw_trig.split()) > 1:
                 # Metadata trigger is truncated at 200 chars — the final
                 # word may be cut mid-token; drop it before tokenizing.
                 raw_trig = " ".join(raw_trig.split()[:-1])
             toks = _trigger_token_set(raw_trig)
             if not toks:
                 continue
-            if any(toks <= pb for pb in pb_token_sets):
-                continue  # has (or is subset of) a live twin — keep
+            # §4M CRIT-1b: bare subset let a TRUE orphan hide behind any
+            # unrelated lesson whose trigger happened to contain its few
+            # tokens. An untruncated metadata trigger is the lesson's
+            # trigger verbatim, so a real twin covers (nearly) the whole
+            # field set — require ≥half coverage unless the metadata was
+            # truncated (where low coverage vs a long trigger is honest).
+            if any(toks <= pb
+                   and (was_truncated or 2 * len(toks) >= len(pb))
+                   for pb in pb_token_sets):
+                continue  # has a live twin (or truncated prefix of one) — keep
             orphans.append(str(vid))
         if not orphans:
             return 0
@@ -848,6 +927,93 @@ class SkillMemory:
             icon=Icons.SKIP,
         )
         return len(orphans)
+
+    def heal_missing_twins(self, memory_system, limit: int = 2000) -> int:
+        """Re-embed playbook lessons whose vector twin is MISSING — the
+        inverse of :meth:`reconcile_vector_orphans`. A twin-less lesson is
+        invisible to per-turn retrieval (the bus skill fetch queries the
+        vector branch and does not fall back to BM25), so it can never
+        surface via hydration. §4M CRIT-1 deleted real twins for weeks
+        (task-first key vs trigger-keyed metadata); this pass restores
+        them and self-heals any future divergence. Idempotent: a lesson
+        whose twin exists (matched by normalized trigger OR task, the
+        same [:200] truncation the write applies) is left alone.
+        Returns the number of twins re-embedded.
+        """
+        coll = getattr(memory_system, "collection", None) if memory_system else None
+        if coll is None:
+            return 0
+        try:
+            got = coll.get(where={"type": "skill"}, limit=int(limit),
+                           include=["metadatas", "documents"])
+        except Exception as exc:
+            logger.debug("twin heal: vector scan failed: %s", exc)
+            return 0
+        metas = got.get("metadatas") or []
+        docs = got.get("documents") or []
+        vec_keys = set()
+        for i, meta in enumerate(metas):
+            doc = docs[i] if i < len(docs) else ""
+            raw = str((meta or {}).get("trigger") or "") or \
+                _dup_trigger_from_vector_text(str(doc or ""))
+            # §4M R2 MINOR-1: the doc-recovered SITUATION line is
+            # untruncated while the playbook-side keys below are [:200] —
+            # asymmetric keys made a >200-char legacy twin unmatched every
+            # cycle (perpetual "re-embedded 1" heal). Truncate to match.
+            key = _normalize_trigger(raw[:200])
+            if key:
+                vec_keys.add(key)
+        with self._get_lock():
+            playbook = self._load_playbook()
+        healed = 0
+        for p in playbook:
+            lesson = _normalize_lesson(p)
+            # The twin write stores trigger[:200] — key the existence
+            # check on the same truncation so long triggers still match.
+            keys = [_normalize_trigger((lesson.get(f) or "")[:200])
+                    for f in ("trigger", "task")]
+            keys = [k for k in keys if k]
+            if not keys:
+                continue  # unidentifiable — cannot verify, do not double-write
+            if any(k in vec_keys for k in keys):
+                continue  # twin present
+            try:
+                text = lesson_embedding_text(lesson)
+                meta = {
+                    "type": "skill",
+                    # Preserve the lesson's own timestamp: eviction
+                    # tie-breaks sort by it, and a healed twin should not
+                    # look newer than the knowledge it mirrors. Converted
+                    # to the store's UTC-"Z" convention (see _twin_ts).
+                    "timestamp": _twin_ts(lesson.get("timestamp") or _now_iso()),
+                    # §4M R2 MINOR-1: fall back to task — an empty-string
+                    # trigger minted a keyless twin the existence check
+                    # could never match (phantom heal every idle cycle).
+                    "trigger": (lesson.get("trigger")
+                                or lesson.get("task") or "")[:200],
+                    "domains": ",".join(lesson.get("domains") or [])[:200],
+                    "verified": bool(lesson.get("verified")),
+                    "source_trajectory_id": lesson.get("source_trajectory_id", "") or "",
+                    "source_refs": ",".join(lesson.get("source_refs") or [])[:400],
+                    "dimension": lesson.get("dimension", "") or "",
+                }
+                memory_system.add(text, meta)
+            except Exception as exc:
+                logger.debug("twin heal: re-embed failed: %s", exc)
+                continue
+            healed += 1
+            # Mark healed within this run too — duplicate-trigger rows
+            # must not each mint a twin.
+            for k in keys:
+                vec_keys.add(k)
+        if healed:
+            pretty_log(
+                "Skill Store Heal",
+                f"re-embedded {healed} missing vector twin(s) for playbook "
+                f"lessons dark to retrieval (scanned {len(playbook)})",
+                icon=Icons.MEM_REINFORCE,
+            )
+        return healed
 
     def learn_lesson(
         self,
@@ -936,21 +1102,24 @@ class SkillMemory:
             # playbooks & vector entries written before the redesign.
             # MISTAKE-LESS rules ("When X, do Y" heuristics from dream/
             # reflection) dedup at a WIDER distance: their producers re-emit
-            # the same rule reworded every cycle, and rewordings measure up
-            # to 0.17 apart on the live embedder — past the 0.15 default —
-            # while distinct rules stay >= 0.29. GHOST_RULE_DEDUP_DIST
-            # overrides (set 0.15 to restore the old single-threshold
-            # behavior).
+            # the same rule reworded every cycle. Recalibrated 2026-08-08
+            # (§4M Lens B): live rewordings reach 0.1921 and distinct rules
+            # come as close as 0.2134 — the old 0.15/0.25 pair sat outside
+            # that corridor from both ends (reworded twins re-saved AND a
+            # distinct-rule pair inside the 0.25 admit zone). Now 0.20
+            # default / 0.21 rules. GHOST_RULE_DEDUP_DIST still overrides
+            # the rule cutoff.
             from .lesson_quality import _is_mistake_less as _ml
-            _thresh = 0.15
+            _thresh = 0.20
             if _ml(effective_anti):
                 try:
-                    _thresh = float(os.getenv("GHOST_RULE_DEDUP_DIST", "0.25") or 0.25)
+                    _thresh = float(os.getenv("GHOST_RULE_DEDUP_DIST", "0.21") or 0.21)
                 except (TypeError, ValueError):
-                    _thresh = 0.25
+                    _thresh = 0.21
             duplicate = self._find_duplicate_lesson(
                 effective_trigger, effective_anti, effective_correct,
                 memory_system, vector_threshold=_thresh,
+                trigger=effective_trigger,
             )
             if duplicate:
                 if duplicate.get("source") == "json":
@@ -962,9 +1131,18 @@ class SkillMemory:
                         # entries, shifting every index. Trusting the stale
                         # index could merge into an unrelated lesson.
                         key = _normalize_trigger(effective_trigger or "")
+                        # ⚠ Same key the finder uses (§4L R2): this
+                        # re-locate compared `task or trigger` only, so a
+                        # duplicate FOUND via the trigger field was lost
+                        # here (idx None) and fell through to a fresh
+                        # write — the twin leak survived the finder fix.
                         idx = next(
                             (i for i, p in enumerate(playbook)
-                             if _normalize_trigger(p.get("task") or p.get("trigger") or "") == key),
+                             if _normalize_trigger(
+                                 p.get("task") or p.get("trigger") or "")
+                             == key
+                             or (key and _normalize_trigger(
+                                 p.get("trigger") or "") == key)),
                             None,
                         )
                         if idx is not None:
@@ -976,6 +1154,23 @@ class SkillMemory:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
                                 existing["code_example"] = _extract_code_block(effective_correct)
+                                # §4L R3 MINOR-3: the row's CONTENT now
+                                # comes from the reinforcing trajectory —
+                                # retraction keyed by trajectory id must
+                                # find it. The old id survives in
+                                # source_refs.
+                                if source_trajectory_id:
+                                    _old_tid = existing.get(
+                                        "source_trajectory_id") or ""
+                                    if _old_tid and _old_tid != source_trajectory_id:
+                                        refs = [str(r) for r in
+                                                (existing.get("source_refs")
+                                                 or [])]
+                                        if _old_tid not in refs:
+                                            refs.append(_old_tid)
+                                        existing["source_refs"] = refs[:20]
+                                    existing["source_trajectory_id"] = \
+                                        source_trajectory_id
                             if domains:
                                 merged = sorted(set(existing.get("domains", [])) | set(_ensure_list(domains)))
                                 existing["domains"] = merged
@@ -1014,9 +1209,18 @@ class SkillMemory:
                     with self._get_lock():
                         playbook = self._load_playbook()
                         key = _normalize_trigger(effective_trigger or "")
+                        # ⚠ Same key the finder uses (§4L R2): this
+                        # re-locate compared `task or trigger` only, so a
+                        # duplicate FOUND via the trigger field was lost
+                        # here (idx None) and fell through to a fresh
+                        # write — the twin leak survived the finder fix.
                         idx = next(
                             (i for i, p in enumerate(playbook)
-                             if _normalize_trigger(p.get("task") or p.get("trigger") or "") == key),
+                             if _normalize_trigger(
+                                 p.get("task") or p.get("trigger") or "")
+                             == key
+                             or (key and _normalize_trigger(
+                                 p.get("trigger") or "") == key)),
                             None,
                         )
                         if idx is None:
@@ -1033,9 +1237,20 @@ class SkillMemory:
                                              str(duplicate.get("text") or "")))
                             _dup_key = _normalize_trigger(_dup_trig)
                             if _dup_key:
+                                # §4M (Lens C): this retry compared
+                                # `task or trigger` only — the §4L R2 fix
+                                # landed on the primary lookups but missed
+                                # this branch, so a twin stored under its
+                                # own trigger (task ≠ trigger: self-play/
+                                # dream rows) still read as "TRUE orphan"
+                                # and was deleted + rewritten fresh.
                                 idx = next(
                                     (i for i, p in enumerate(playbook)
-                                     if _normalize_trigger(p.get("task") or p.get("trigger") or "") == _dup_key),
+                                     if _normalize_trigger(
+                                         p.get("task") or p.get("trigger") or "")
+                                     == _dup_key
+                                     or _normalize_trigger(
+                                         p.get("trigger") or "") == _dup_key),
                                     None,
                                 )
                         if idx is not None:
@@ -1045,6 +1260,23 @@ class SkillMemory:
                                 existing["solution"] = effective_correct
                                 existing["correct_pattern"] = effective_correct
                                 existing["code_example"] = _extract_code_block(effective_correct)
+                                # §4L R3 MINOR-3: the row's CONTENT now
+                                # comes from the reinforcing trajectory —
+                                # retraction keyed by trajectory id must
+                                # find it. The old id survives in
+                                # source_refs.
+                                if source_trajectory_id:
+                                    _old_tid = existing.get(
+                                        "source_trajectory_id") or ""
+                                    if _old_tid and _old_tid != source_trajectory_id:
+                                        refs = [str(r) for r in
+                                                (existing.get("source_refs")
+                                                 or [])]
+                                        if _old_tid not in refs:
+                                            refs.append(_old_tid)
+                                        existing["source_refs"] = refs[:20]
+                                    existing["source_trajectory_id"] = \
+                                        source_trajectory_id
                             if verified and not existing.get("verified"):
                                 existing["verified"] = True
                                 existing["confidence"] = max(
@@ -1115,22 +1347,45 @@ class SkillMemory:
             with self._get_lock():
                 before = [new_lesson] + self._load_playbook()
                 playbook = _trim_playbook_by_utility(before, PLAYBOOK_MAX)
+                # ⚠ ARCHIVE BEFORE DELETE — on THIS path too (§4L Lens-D
+                # CRIT-1). The cap-trim fires on EVERY write once the
+                # playbook is full (it lives at 50/50), and it destroyed
+                # lessons with no archive row: 7 lessons that recordings
+                # show in live prompts on 08-05/08-06 — two of them
+                # DISTILLATION OUTPUT — were gone within a day, the
+                # 13-destroyed-lessons class through a different door,
+                # with GHOST_SKILL_PRUNE never even enabled. Fail
+                # CLOSED: if the archive write fails, keep the oversized
+                # playbook rather than destroy unrecorded (the
+                # `_archive_lessons` docstring has declared this
+                # invariant for every destructive path all along).
+                dropped_lessons = [l for l in before
+                                   if id(l) not in {id(k) for k in playbook}
+                                   and l is not new_lesson]
+                if dropped_lessons and not self._archive_lessons(
+                        dropped_lessons, "playbook_cap_trim"):
+                    logger.warning(
+                        "playbook cap-trim: archive write FAILED — "
+                        "keeping %d lessons past the cap rather than "
+                        "destroying unrecorded", len(dropped_lessons))
+                    playbook = before
+                    dropped_lessons = []
                 self._save_playbook_unlocked(playbook)
 
             # Delete the vector twins of any lessons the trim dropped, so the
             # capped JSON playbook and the vector store don't drift apart
-            # (orphans waste retrieval slots). Identity-keyed against `before`.
+            # (orphans waste retrieval slots).
             if memory_system:
-                kept_ids = {id(l) for l in playbook}
-                for dropped in before:
-                    if id(dropped) not in kept_ids and dropped is not new_lesson:
-                        _delete_lesson_twin(memory_system, dropped)
+                for dropped in dropped_lessons:
+                    _delete_lesson_twin(memory_system, dropped)
 
             if memory_system:
                 text = lesson_embedding_text(new_lesson)
                 meta = {
                     "type": "skill",
-                    "timestamp": new_lesson["timestamp"],
+                    # Store convention is UTC-"Z" (see _twin_ts) — the
+                    # playbook row keeps its own naive-local timestamp.
+                    "timestamp": _twin_ts(new_lesson["timestamp"]),
                     "trigger": new_lesson.get("trigger", "")[:200],
                     "domains": ",".join(new_lesson.get("domains", []))[:200],
                     "verified": bool(new_lesson.get("verified")),
@@ -1774,6 +2029,33 @@ class SkillMemory:
         keys = {t.strip().lower() for t in (triggers or []) if t and str(t).strip()}
         if not keys:
             return 0
+        # ⚠ PER-TURN DEDUP (§4L Lens-D MAJOR-2): the bus skill tier and
+        # the volatile playbook block BOTH book retrievals, and 242/242
+        # sampled prompts delivered at least one lesson through both —
+        # so a co-surfaced lesson booked retrievals +2/turn while
+        # success credit books at most once, structurally deflating
+        # hit-rate/utility for the MOST-surfaced lessons (the ranking
+        # the cap-trim eviction uses). Turns are globally serialized;
+        # the pretty-log request context is the turn key, so no caller
+        # plumbing is needed. No request context (dream/self-play
+        # simulation) → book normally.
+        try:
+            from ..utils.logging import request_id_context
+            _turn_key = str(request_id_context.get() or "")
+        except Exception:  # noqa: BLE001
+            _turn_key = ""
+        # NOTE: this check-then-act runs OUTSIDE self._get_lock() and is
+        # safe only by the turns-are-globally-serialized convention (the
+        # agent semaphore) — flagged by the round-2 review; if turns ever
+        # parallelize, move it under the lock.
+        if _turn_key:
+            if _turn_key != getattr(self, "_retrieval_turn_key", None):
+                self._retrieval_turn_key = _turn_key
+                self._retrieval_turn_booked = set()
+            keys -= self._retrieval_turn_booked
+            if not keys:
+                return 0
+            self._retrieval_turn_booked |= keys
         updated = 0
         try:
             with self._get_lock():
@@ -2018,6 +2300,37 @@ class SkillMemory:
             return "No lessons learned yet."
 
         items = self._filter_quarantined(items)
+        # ⚠ DELIVERY dedup against the bus skill tier (§4L Lens-D
+        # MAJOR-2): the same lesson was delivered TWICE per prompt by
+        # the two uncoordinated surfaces — the lesson channel is the
+        # largest guidance class (~4.9KB of the 7.8KB mean) and ~1.8-3KB
+        # of it was duplicate text, exactly what the capacity finding
+        # says to reclaim first. The bus tier is relevance-ranked for
+        # THIS query, so it wins; lessons it already delivered this turn
+        # drop from the volatile block. Fail-open: if this block builds
+        # BEFORE the bus ran (no bookings yet), nothing is dropped.
+        try:
+            from ..utils.logging import request_id_context
+            _tk = str(request_id_context.get() or "")
+        except Exception:  # noqa: BLE001
+            _tk = ""
+        # ⚠ Dedup against BUS DELIVERIES only, not against all bookings
+        # (§4L R2 NEW-2): under --use-planning the transient planner call
+        # books its own triggers first, and deduping against the booked
+        # set made those lessons vanish from the MAIN execution prompt —
+        # delivered only to a prompt the user never sees, eroding
+        # per-loop as the tool context changes. Only lessons the bus
+        # tier already placed in THIS prompt are duplicates.
+        if _tk and _tk == getattr(self, "_bus_delivered_turn_key", None):
+            _already = {(t or "").strip().lower()
+                        for t in (getattr(self, "last_bus_triggers", [])
+                                  or [])}
+            if _already:
+                items = [it for it in items
+                         if (it.get("trigger") or "").strip().lower()
+                         not in _already]
+                if not items:
+                    return ""
         # Hydration side-channel (counterfactual phase 1, 2026-07-17):
         # which lessons entered THIS prompt. Turns are globally
         # serialized (agent semaphore) and non-turn callers pass
@@ -2032,6 +2345,20 @@ class SkillMemory:
             _surfaced = []
         if stamp_triggers:
             self.last_playbook_triggers = _surfaced
+            # Turn key for the attribution readers (§4L R3 MINOR-2): the
+            # streamed drain reads this attribute after the semaphore
+            # releases, so a fast next turn's restamp could leak its
+            # trigger set into the PRIOR turn's attribution. Same guard
+            # the bus surface got. NOTE (§4L R4): non-turn callers stamp
+            # "SYSTEM" (the request-context default), which a real-turn
+            # reader treats as FOREIGN — fail-closed, and correctly so:
+            # a non-turn caller's triggers were not in that turn's
+            # prompt. Only an ABSENT/empty key fails open.
+            try:
+                from ..utils.logging import request_id_context
+                self._playbook_turn_key = str(request_id_context.get() or "")
+            except Exception:  # noqa: BLE001
+                self._playbook_turn_key = ""
         else:
             self.last_sim_triggers = _surfaced
 
@@ -2163,6 +2490,15 @@ class SkillMemory:
             for idx, raw in enumerate(playbook):
                 t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
                 if t == target:
+                    # ⚠ Archive before delete — the second unarchived
+                    # destructive path (§4L Lens-D CRIT-1). Fail CLOSED:
+                    # an unarchivable lesson is not removed.
+                    if not self._archive_lessons(
+                            [playbook[idx]], "removed_by_trigger"):
+                        logger.warning(
+                            "remove_by_trigger: archive write FAILED — "
+                            "keeping lesson %r", target[:60])
+                        return False
                     removed_lesson = playbook[idx]
                     del playbook[idx]
                     self._save_playbook_unlocked(playbook)

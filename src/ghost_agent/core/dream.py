@@ -1987,9 +1987,40 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                     icon=Icons.MEM_REINFORCE,
                 )
                 if merged_ids:
-                    ids_to_delete = [mid.split(":")[-1].strip() for mid in merged_ids]
-                    ids_to_delete = [i for i in ids_to_delete if i and i != _syn_id]
+                    # OFFERED-IDS WHITELIST (§4R Lens-B). This is the same
+                    # "LLM returns ids → collection.delete" move the
+                    # contradiction engine performs, but it had NO whitelist:
+                    # whatever the model emitted was deleted, so an id it
+                    # copied out of fragment TEXT (rather than the ID: field)
+                    # could erase a document/episode/skill/identity row that was
+                    # never offered. The authors already recognised this class
+                    # here — the trajectory-seed branch is disabled precisely
+                    # because "`traj:` ids must never reach collection.delete" —
+                    # but closed it by disabling rather than by whitelisting.
+                    # `ids` is the offered pool and is already in scope (it is
+                    # used for provenance a few lines above); intersect with it.
+                    # `str()` because a non-string element used to raise
+                    # mid-loop, AFTER earlier consolidations had already deleted.
+                    _offered_ids = {str(i) for i in (ids or [])}
+                    ids_to_delete = [str(mid).split(":")[-1].strip() for mid in merged_ids]
+                    ids_to_delete = [i for i in ids_to_delete
+                                     if i and i != _syn_id and i in _offered_ids]
                     if ids_to_delete:
+                        # AUDIT the destruction (§4R R2). This is the MORE
+                        # destructive of the two LLM-driven delete paths — per
+                        # the provenance comment above, these fragments are the
+                        # only surviving copies once merged — yet it had no
+                        # record of any kind, while its sibling now refuses to
+                        # delete without one. Deliberately a LOG line rather
+                        # than a ContradictionLog entry: this is memory
+                        # CONSOLIDATION, not belief revision, and the belief
+                        # ledger is injected into prompts, so writing
+                        # consolidation events there would pollute the very
+                        # surface §4R just cleaned up.
+                        logger.info(
+                            "dream consolidation: deleting %d merged "
+                            "fragment(s) into synthesis %s — ids=%s",
+                            len(ids_to_delete), _syn_id, ids_to_delete[:10])
                         await asyncio.to_thread(self.memory.collection.delete, ids=ids_to_delete)
 
             # --- HEURISTICS ---
@@ -2182,7 +2213,39 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                     level="WARNING", icon=Icons.WARN,
                 )
 
-            msg = f"Dream Complete. Synthesized {applied_consolidations} new meta-memories and extracted {h_count} heuristics.{metrics_note}"
+            # Report what THIS PATH can actually produce (2026-08-09).
+            #
+            # The old single format led with "Synthesized N new meta-memories",
+            # but on the TRAJECTORY seed path `consolidations` is forced empty
+            # a few hundred lines above — by design, since trajectory digests
+            # are not vector fragments and there is nothing to merge; that
+            # path's entire value is the heuristics harvested below. So the
+            # headline number was STRUCTURALLY ALWAYS ZERO on the path dream
+            # almost always takes (the auto pool is routinely thin), while the
+            # real output sat in the tail clause.
+            #
+            # Measured on the live log: 204 cycles → 491 heuristics, 37
+            # meta-memories, and only 2 cycles that produced nothing at all.
+            # Read leading-number-first, that same log says "Synthesized 0"
+            # 188 times and reads like a dead loop. It cost three successive
+            # wrong diagnoses ("starved of input", "fix the extraction
+            # threshold", "~92% no-op") before anyone read this function.
+            # A metric that is zero by construction must not be the headline.
+            # NOTE the wording is deliberately kept greppable: every variant
+            # still contains "extracted N heuristics", because that count is
+            # what operators and tests key off. Only the misleading HEADLINE
+            # changes.
+            if seeded_from_trajectories:
+                msg = (f"Dream Complete (trajectory seed). Extracted "
+                       f"{h_count} heuristics.{metrics_note}")
+            elif applied_consolidations or h_count:
+                msg = (f"Dream Complete. Synthesized {applied_consolidations} "
+                       f"new meta-memories and extracted "
+                       f"{h_count} heuristics.{metrics_note}")
+            else:
+                msg = ("Dream Complete — produced nothing this cycle: no "
+                       "consolidation met the compression bar and extracted "
+                       f"{h_count} heuristics.{metrics_note}")
             pretty_log("Dream Mode", msg, icon=Icons.OK)
             return msg
 
@@ -2272,6 +2335,14 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             except Exception as _rlx:
                 logger.debug("rrf refit delta log skipped: %s", _rlx)
             bus._intent_weights = fitted  # hot swap for the running process
+            # §4M (Lens B MINOR): keep the context stash in sync — the
+            # fallback bus (_get_memory_bus, used by self-play isolates)
+            # reads `context.intent_weights`, and without this refresh it
+            # fused with the boot-time matrix (or defaults) after a refit.
+            try:
+                self.context.intent_weights = fitted
+            except Exception:
+                pass
             # Trim the ledger so it can't grow unboundedly.
             if len(lines) > max_ledger_lines:
                 try:
@@ -4524,7 +4595,7 @@ Return ONLY a JSON object with:
             # mutation method added to VectorMemory would bypass the
             # wrapper by default (M1).
             _SAFE_PASSTHROUGH = frozenset({
-                "search", "search_advanced", "get_library",
+                "search", "search_advanced", "search_items", "get_library",
                 "get_embedding", "embed", "format_search_result",
             })
 
@@ -4536,8 +4607,39 @@ Return ONLY a JSON object with:
                     if real_vm and hasattr(real_vm, "collection") else None,
                 )
 
-            def search(self, *args, **kwargs): return self.real_vm.search(*args, **kwargs) if self.real_vm else []
-            def search_advanced(self, *args, **kwargs): return self.real_vm.search_advanced(*args, **kwargs) if self.real_vm else []
+            # §4M F1: a read that bumps retrieval stats is still a WRITE
+            # to operator memory (same contract as memory/readonly.py).
+            # These passed through raw, so every self-play hydration
+            # (~27/day) booked phantom `retrieval_count` credit on the
+            # production store pre-fusion — rc reached 690 on one episode,
+            # stretching its ranking half-life ~7× and self-reinforcing.
+            def search(self, *args, **kwargs):
+                if not self.real_vm:
+                    return []
+                kwargs["record_retrievals"] = False
+                return self.real_vm.search(*args, **kwargs)
+
+            def search_advanced(self, *args, **kwargs):
+                if not self.real_vm:
+                    return []
+                kwargs["record_retrievals"] = False
+                return self.real_vm.search_advanced(*args, **kwargs)
+
+            # §4M F1(b): without this the isolate's bus fell to the
+            # legacy `vector.search` branch — which both records
+            # retrievals AND bypasses the _VECTOR_MATCH_FLOOR off-topic
+            # gate. `search_items` never bumps stats by design (the bus
+            # credits survivors separately — and the strict whitelist
+            # makes those credit calls silent no-ops here, which is the
+            # point: self-play earns no production credit). Signature is
+            # mirrored explicitly so the bus's floor sniffer sees it.
+            def search_items(self, query, inject_identity=True,
+                             min_relevance_dist=None):
+                if not self.real_vm:
+                    return []
+                return self.real_vm.search_items(
+                    query, inject_identity=inject_identity,
+                    min_relevance_dist=min_relevance_dist)
             def get_library(self, *args, **kwargs): return self.real_vm.get_library(*args, **kwargs) if self.real_vm else []
 
             # Explicitly block all mutation methods

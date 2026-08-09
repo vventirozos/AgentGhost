@@ -9,6 +9,7 @@ except ImportError:
     curl_requests = None
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import request_new_tor_identity
+from ..utils.egress_guard import resolve_egress_proxy
 
 logger = logging.getLogger("GhostAgent")
 
@@ -30,7 +31,10 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
     if not location:
         return "SYSTEM ERROR: No location provided. You MUST specify a city (e.g., 'London') or update your profile."
 
-    proxy_url = tor_proxy
+    # Fail-closed (§4P): under --mandatory-tor a falsy proxy is replaced with
+    # the loopback Tor default so weather (always a public API) never connects
+    # cleartext — the socket guard can't backstop this curl_cffi call.
+    proxy_url = resolve_egress_proxy(tor_proxy)
     # Accept a loopback Tor proxy named "localhost" too, not just the
     # 127.0.0.1 literal — otherwise socks5://localhost:9050 silently ran in
     # "WEB" mode (no identity rotation, wrong failure diagnosis).
@@ -312,11 +316,14 @@ async def tool_check_health(context=None):
 
     # 6. Connectivity (Internet & Tor)
     try:
-        # Use Tor Proxy for general internet check if available, to be safe
-        check_proxy = None
+        # Use Tor Proxy for general internet check if available, to be safe.
+        # Fail-closed (§4P): under --mandatory-tor a missing context proxy is
+        # replaced with the loopback Tor default so this public probe (1.1.1.1)
+        # can't itself leak cleartext; off-guard it stays None (direct probe).
+        check_proxy = resolve_egress_proxy(getattr(context, "tor_proxy", None) if context else None)
         mode = "WEB"
-        if context and context.tor_proxy:
-             check_proxy = context.tor_proxy.replace("socks5://", "socks5h://")
+        if check_proxy:
+             check_proxy = check_proxy.replace("socks5://", "socks5h://")
              if "127.0.0.1" in check_proxy: mode = "TOR"
 
         for attempt in range(3):

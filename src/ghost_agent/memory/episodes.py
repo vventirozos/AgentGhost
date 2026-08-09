@@ -101,7 +101,9 @@ class EpisodicMemory:
                         lesson TEXT DEFAULT '',
                         cluster_id TEXT DEFAULT '',
                         timestamp REAL NOT NULL,
-                        consolidated INTEGER DEFAULT 0
+                        consolidated INTEGER DEFAULT 0,
+                        access_count INTEGER NOT NULL DEFAULT 0,
+                        last_accessed REAL NOT NULL DEFAULT 0
                     )
                 ''')
                 conn.execute('''
@@ -116,9 +118,37 @@ class EpisodicMemory:
                         FOREIGN KEY (episode_id) REFERENCES episodes(id)
                     )
                 ''')
+                # F8 usage-credit migration (2026-08-08). The columns above are
+                # in the CREATE TABLE for fresh stores; an EXISTING store
+                # predates them, and SQLite has no `ADD COLUMN IF NOT EXISTS`
+                # — so read the live column set and add only what's missing.
+                # `ADD COLUMN` with a constant DEFAULT is metadata-only in
+                # SQLite (no table rewrite), so this is safe on the live store.
+                # Idempotent: the PRAGMA check makes a second _init_db a no-op.
+                _cols = {r[1] for r in conn.execute("PRAGMA table_info(episodes)")}
+                if "access_count" not in _cols:
+                    conn.execute("ALTER TABLE episodes ADD COLUMN "
+                                 "access_count INTEGER NOT NULL DEFAULT 0")
+                if "last_accessed" not in _cols:
+                    conn.execute("ALTER TABLE episodes ADD COLUMN "
+                                 "last_accessed REAL NOT NULL DEFAULT 0")
+                    # BACKFILL, and why it matters: eviction orders by
+                    # (access_count, last_accessed, timestamp). Leaving
+                    # pre-migration rows at last_accessed=0 would rank EVERY
+                    # existing episode below every new one on the second key —
+                    # i.e. the migration itself would make the whole existing
+                    # store evict-first. Seeding from `timestamp` means "never
+                    # surfaced since we started counting" sorts as old, which
+                    # is exactly what it means.
+                    conn.execute("UPDATE episodes SET last_accessed = timestamp")
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_trigger ON episodes(trigger)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_cluster ON episodes(cluster_id)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_ts ON episodes(timestamp)')
+                # Backs the value-weighted eviction ORDER BY (F8). Created
+                # AFTER the migration above so the columns exist on an
+                # upgraded store.
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_value '
+                             'ON episodes(access_count, last_accessed)')
                 # Supports the unconditional orphan-reap anti-join in
                 # record_episode (episode_actions has no enforced FK cascade).
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ea_episode ON episode_actions(episode_id)')
@@ -179,12 +209,18 @@ class EpisodicMemory:
         evicted_ids: List[int] = []
         with self._lock:
             with closing(sqlite3.connect(self.db_path)) as conn:
+                # `last_accessed` is seeded to the insert timestamp, NOT left at
+                # its 0 default (F8): eviction's second sort key is
+                # last_accessed, so a brand-new never-surfaced episode born at 0
+                # would rank below every pre-existing row and be evicted first —
+                # the exact inversion this feature exists to remove.
+                _now = time.time()
                 cursor = conn.execute(
                     '''INSERT INTO episodes (trigger, context, outcome, outcome_success,
-                       lesson, cluster_id, timestamp)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                       lesson, cluster_id, timestamp, last_accessed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                     (trigger[:500], context[:2000], outcome[:1000],
-                     1 if success else 0, lesson[:500], cluster_id, time.time())
+                     1 if success else 0, lesson[:500], cluster_id, _now, _now)
                 )
                 episode_id = cursor.lastrowid
 
@@ -215,10 +251,21 @@ class EpisodicMemory:
                     # experience while weeks-old spent rows fossilized, and
                     # the pending pool could never reach _consolidate's
                     # min_episodes=3 again).
+                    # F8: LEAST-VALUABLE-FIRST within the tier, not pure age.
+                    # Usage credit used to land only on the vector twin's
+                    # counter, which this SQL cannot read — so a spent episode
+                    # surfaced (and useful) a dozen times was evicted at exactly
+                    # the same priority as one never retrieved. Ordering by
+                    # (access_count, last_accessed, timestamp) is a TOTAL order
+                    # that keeps the cap hard-enforceable while letting a proven
+                    # old episode outlive a never-used newer one. Deliberately
+                    # lexicographic rather than a decay score: no half-life
+                    # constant to tune (and mis-tune).
                     victims = [r[0] for r in conn.execute(
                         '''SELECT id FROM episodes
                            WHERE lesson = '' AND consolidated = 1
-                           ORDER BY timestamp ASC LIMIT ?''',
+                           ORDER BY access_count ASC, last_accessed ASC,
+                                    timestamp ASC LIMIT ?''',
                         (count - self.MAX_EPISODES,)
                     ).fetchall()]
                     if victims:
@@ -235,7 +282,9 @@ class EpisodicMemory:
                     still = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
                     if still > self.MAX_EPISODES:
                         victims2 = [r[0] for r in conn.execute(
-                            "SELECT id FROM episodes ORDER BY timestamp ASC LIMIT ?",
+                            '''SELECT id FROM episodes
+                               ORDER BY access_count ASC, last_accessed ASC,
+                                        timestamp ASC LIMIT ?''',
                             (still - self.MAX_EPISODES,)
                         ).fetchall()]
                         if victims2:
@@ -452,34 +501,44 @@ class EpisodicMemory:
                 conn.row_factory = sqlite3.Row
                 words = [w.strip().lower() for w in trigger.split() if len(w.strip()) > 3]
                 if not words:
-                    return self._get_recent(conn, limit)
+                    surfaced = self._get_recent(conn, limit)
+                else:
+                    results = []
+                    # Scan depth = the capacity cap, not a hardcoded 100: with
+                    # MAX_EPISODES=500 the old LIMIT 100 made every older episode
+                    # unreachable by this path, and unreachable FULL STOP for the
+                    # ones whose vector twin is missing.
+                    cursor = conn.execute(
+                        "SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?",
+                        (self.FALLBACK_SCAN_LIMIT,),
+                    )
+                    for row in cursor:
+                        row_dict = dict(row)
+                        trigger_lower = row_dict["trigger"].lower()
+                        overlap = sum(1 for w in words if w in trigger_lower)
+                        if overlap > 0:
+                            # Fraction of the query matched → [0, 1], directly
+                            # comparable with the vector path's 1 - distance
+                            # (the old value was a raw integer count, so callers
+                            # ranking across both paths compared 3 against 0.9).
+                            row_dict["match_count"] = overlap
+                            row_dict["relevance_score"] = self._shape_by_recency(
+                                overlap / len(words), row_dict.get("timestamp"),
+                            )
+                            results.append(row_dict)
 
-                results = []
-                # Scan depth = the capacity cap, not a hardcoded 100: with
-                # MAX_EPISODES=500 the old LIMIT 100 made every older episode
-                # unreachable by this path, and unreachable FULL STOP for the
-                # ones whose vector twin is missing.
-                cursor = conn.execute(
-                    "SELECT * FROM episodes ORDER BY timestamp DESC LIMIT ?",
-                    (self.FALLBACK_SCAN_LIMIT,),
-                )
-                for row in cursor:
-                    row_dict = dict(row)
-                    trigger_lower = row_dict["trigger"].lower()
-                    overlap = sum(1 for w in words if w in trigger_lower)
-                    if overlap > 0:
-                        # Fraction of the query matched → [0, 1], directly
-                        # comparable with the vector path's 1 - distance
-                        # (the old value was a raw integer count, so callers
-                        # ranking across both paths compared 3 against 0.9).
-                        row_dict["match_count"] = overlap
-                        row_dict["relevance_score"] = self._shape_by_recency(
-                            overlap / len(words), row_dict.get("timestamp"),
-                        )
-                        results.append(row_dict)
-
-                results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
-                return results[:limit]
+                    results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                    surfaced = results[:limit]
+        # Episode-row usage credit for the SUBSTRING path too (F8). Wiring the
+        # credit sink into only the semantic path would leave every episode that
+        # is reachable only by substring — precisely the ones whose vector twin
+        # is missing — permanently at zero credit, i.e. evict-first forever.
+        # Deliberately OUTSIDE both `with` blocks: this opens its own write
+        # connection, and issuing that write while the read cursor above is
+        # still open risks "database is locked", which the helper would swallow
+        # — credit silently lost, the failure mode that is hardest to notice.
+        self._credit_surfaced_episodes([e.get("id") for e in surfaced])
+        return surfaced
 
     @classmethod
     def _recency_decay(cls, timestamp) -> float:
@@ -575,6 +634,56 @@ class EpisodicMemory:
             hits.append({"id": mem_id, "metadata": meta or {}, "score": dist})
         return hits
 
+    def _credit_surfaced_episodes(self, episode_ids) -> None:
+        """Record that these episodes were SURFACED (returned to a caller, i.e.
+        injected into a prompt) — the eviction-facing half of usage credit.
+
+        AUTHORITY SPLIT (F8, 2026-08-08). Two counters now exist and they are
+        deliberately NOT the same one:
+
+        * the vector twin's ``retrieval_count`` / ``last_accessed`` (bumped via
+          ``bump_retrievals``) stays authoritative for retrieval stats, RRF and
+          vector prune survival;
+        * ``episodes.access_count`` / ``episodes.last_accessed`` — written ONLY
+          here — is authoritative for EPISODIC EVICTION, which is plain SQL over
+          this table and structurally cannot read the vector store.
+
+        Both are driven from the same surfacing event, so they cannot drift in
+        DIRECTION (the twin-divergence lesson); they are allowed to differ in
+        magnitude, because they answer different questions.
+
+        This is the single writer, called from EVERY path that surfaces an
+        episode (semantic and substring) — a credit sink wired into only one of
+        two paths would quietly make the other path's episodes evict-first,
+        which is the same partial-coverage defect this feature exists to fix.
+
+        Never raises: usage accounting must not break recall.
+        """
+        # Coerce PER ITEM, not as one comprehension: a single malformed id
+        # (a row dict without "id", a None) would otherwise raise out of the
+        # whole list and silently drop credit for every OTHER episode in the
+        # batch — a partial-failure-becomes-total-failure shape.
+        ids = []
+        for raw in (episode_ids or []):
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return
+        try:
+            now = time.time()
+            with self._lock:
+                with closing(sqlite3.connect(self.db_path)) as conn:
+                    conn.execute(
+                        "UPDATE episodes SET access_count = access_count + 1, "
+                        f"last_accessed = ? WHERE id IN ({','.join('?' * len(ids))})",
+                        [now, *ids],
+                    )
+                    conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("episode usage-credit skipped: %s", exc)
+
     def _vector_search(self, trigger: str, limit: int,
                        vector_memory) -> List[Dict]:
         """Semantic search using the vector memory's embedding model."""
@@ -595,7 +704,21 @@ class EpisodicMemory:
             if not callable(search_fn):
                 return []
             try:
-                hits = search_fn(trigger, limit=limit * 2)
+                # §4M (Lens B MINOR, latent): probe purity — this fallback
+                # read must not bump retrieval stats (search_advanced
+                # records by default). Signature-guarded so stubs without
+                # the parameter keep working.
+                import inspect as _insp
+                kw = {"limit": limit * 2}
+                try:
+                    _params = _insp.signature(search_fn).parameters
+                    if ("record_retrievals" in _params
+                            or any(p.kind is _insp.Parameter.VAR_KEYWORD
+                                   for p in _params.values())):
+                        kw["record_retrievals"] = False
+                except (TypeError, ValueError):
+                    kw["record_retrievals"] = False  # mock/builtin — safe
+                hits = search_fn(trigger, **kw)
             except Exception:
                 return []
             scoped_query = False
@@ -636,6 +759,7 @@ class EpisodicMemory:
             return []
         results = []
         surfaced_vec_ids: List[Any] = []
+        surfaced_ep_ids: List[int] = []
         for ep_id in ordered_ids:
             # Distance-derived relevance instead of a flat 1.0. Drop hits below
             # the floor so semantically irrelevant episodes aren't injected.
@@ -653,6 +777,7 @@ class EpisodicMemory:
                 ep["relevance_score"] = self._shape_by_recency(
                     relevance, ep.get("timestamp"))
                 results.append(ep)
+                surfaced_ep_ids.append(ep_id)
                 if ep_vec_id.get(ep_id):
                     surfaced_vec_ids.append(ep_vec_id[ep_id])
             if len(results) >= limit:
@@ -668,6 +793,15 @@ class EpisodicMemory:
                     bump(surfaced_vec_ids)
                 except Exception as exc:
                     logger.debug("episode retrieval bump failed: %s", exc)
+        # Episode-row credit (F8) is NOT gated on `scoped_query`. That gate
+        # exists solely to stop the VECTOR counter being double-bumped on the
+        # path where search_advanced already counted; nothing else writes
+        # episodes.access_count, so inheriting the gate would simply leave the
+        # fallback path's episodes permanently at zero credit — evict-first
+        # forever despite being surfaced. Same reason it is outside the
+        # `surfaced_vec_ids` check: an episode with no vector twin id is still
+        # a surfaced episode.
+        self._credit_surfaced_episodes(surfaced_ep_ids)
         return results
 
     def search_by_outcome(self, success: bool, limit: int = 10) -> List[Dict]:

@@ -78,3 +78,52 @@ class TestRenderConstraintBlock:
 
     def test_empty_renders_empty(self):
         assert render_constraint_block([]) == ""
+
+
+class TestFurnitureAndSplitting4N:
+    """§4N MAJOR-2 / MINOR-2 (2026-08-08): the self-play lesson-verify replay
+    (dream.py) prepends the rendered SKILL PLAYBOOK into the user message;
+    its label lines were mined as MUST-HOLD constraints — 6/6 slots filled,
+    ``ANTI-PATTERN: use a relative path`` rendered as an INVERTED instruction.
+    And the sentence splitter broke filenames on the dot."""
+
+    _REPLAY = (
+        "### SKILL PLAYBOOK:\n"
+        "## RELEVANT LESSONS LEARNED (Follow these to avoid repeats):\n"
+        "1. TRIGGER (✓): Relative path errors in the Docker sandbox\n"
+        "   DOMAINS: python, sandbox\n"
+        "   ANTI-PATTERN: use a relative path inside the sandbox\n"
+        "   CORRECT-PATTERN: always use an absolute path\n\n"
+        "Read /data/input.csv and MUST print the row count."
+    )
+
+    def test_injected_playbook_furniture_is_not_a_constraint(self):
+        cons = extract_constraints(self._REPLAY)
+        joined = " ".join(cons)
+        for label in ("ANTI-PATTERN", "CORRECT-PATTERN", "TRIGGER",
+                      "DOMAINS", "SKILL PLAYBOOK", "RELEVANT LESSONS"):
+            assert label not in joined, label
+        # the real user requirement survives
+        assert any("row count" in c for c in cons)
+
+    def test_real_all_caps_constraints_still_captured(self):
+        cons = extract_constraints(
+            "Build the parser but DO NOT delete the config, "
+            "and NEVER touch prod")
+        assert any("DO NOT delete" in c for c in cons)
+        assert any("NEVER touch prod" in c for c in cons)
+
+    def test_bare_markdown_header_is_furniture(self):
+        assert extract_constraints("### Some Injected Header") == []
+
+    def test_filename_not_split_on_dot(self):
+        cons = extract_constraints(
+            "read the sniffer_probe.txt file but DO NOT modify it")
+        assert any("sniffer_probe.txt" in c for c in cons)
+        assert not any(c.strip() == "txt file but DO NOT modify it"
+                       for c in cons)
+
+    def test_sentence_boundaries_still_split(self):
+        cons = extract_constraints("Build X. Do NOT delete Y. Never touch Z")
+        assert any("Do NOT delete Y" in c for c in cons)
+        assert any("Never touch Z" in c for c in cons)

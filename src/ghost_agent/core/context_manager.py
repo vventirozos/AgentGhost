@@ -112,6 +112,15 @@ class ContextManager:
 
         return self._apply_compression(messages, self._compression_level)
 
+    def reset_for_request(self) -> None:
+        """§4N C-MINOR-2: the compression level persists on this cached
+        instance ACROSS requests, and the escalation log fires only when the
+        level INCREASES vs the previous call — so the second and later
+        repeat-pressure requests compacted SILENTLY, defeating the "operator
+        sees when answers begin degrading" purpose. Reset the level at each
+        request boundary so every request's first escalation is logged."""
+        self._compression_level = 0
+
     def _apply_compression(self, messages: List[dict],
                            level: int) -> List[dict]:
         """Apply the specified compression level."""
@@ -134,8 +143,19 @@ class ContextManager:
         old_msgs = conv_msgs[:-keep_full]
         recent_msgs = conv_msgs[-keep_full:]
 
+        # §4N C-MAJOR-1: the ORIGINAL GOAL (first conversation message —
+        # always a user turn) must survive every compression stage. The LLM
+        # prune downstream deliberately preserves `original_goal`, but this
+        # deterministic ladder runs FIRST and L3 truncated it to 500 chars,
+        # destroying any constraint stated past that point. Never compress
+        # the goal message here — identify it by object identity so a later
+        # message that happens to equal it is unaffected.
+        goal_msg = next((m for m in conv_msgs if m.get("role") == "user"), None)
         compressed_old = []
         for msg in old_msgs:
+            if msg is goal_msg:
+                compressed_old.append(msg)      # goal is sacrosanct
+                continue
             compressed = self._compress_message(msg, level)
             if compressed is not None:
                 compressed_old.append(compressed)
@@ -156,6 +176,15 @@ class ContextManager:
 
         # L2: Collapse verbose assistant messages with tool calls
         if level >= 2 and role == "assistant" and len(content) > 2000:
+            # §4N C-MAJOR-4: a naive head/tail truncation of an assistant
+            # message that carries `<tool_call>` markup splices the "[...
+            # compressed ...]" marker INSIDE the JSON args while leaving
+            # both <tool_call>/</tool_call> markers intact — history that
+            # teaches the model malformed call syntax. Leave tool-call
+            # messages whole (they are bounded by the model's own output;
+            # L3 + the downstream tail-cap still bound total context).
+            if "<tool_call>" in content or "</tool_call>" in content:
+                return msg
             return {
                 **msg,
                 "content": self._truncate_with_summary(content, max_len=800),

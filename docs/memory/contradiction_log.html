@@ -57,16 +57,30 @@
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__(memory_dir)</code></td><td>Open log file; probe via <code>_load()</code> so an unreadable / corrupt log is detected (and quarantined) at boot.</td></tr>
-      <tr><td><code>record(new_fact, old_facts, deleted_ids, reason="")</code></td><td>Append revision.</td></tr>
+      <tr><td><code>record(new_fact, old_facts, deleted_ids, reason="") -&gt; bool</code></td><td>Append a revision. <strong>Returns whether it actually landed</strong> — <code>False</code> when the store is degraded and the write was skipped. It previously returned <code>None</code> either way while still logging "Belief revised", so a caller that had already performed an irreversible delete could not tell that the erasure went unrecorded.</td></tr>
       <tr><td><code>get_recent(limit=10)</code></td><td>Most recent entries.</td></tr>
-      <tr><td><code>explain_belief_change(query)</code></td><td>Search recent entries by substring.</td></tr>
+      <tr><td><code>explain_belief_change(query)</code></td><td>Find revisions relevant to a message and render the top 5, best match first. See the matching section below.</td></tr>
       <tr><td><code>clear()</code></td><td>Wipe (refused while <code>_degraded</code>, so it can't overwrite an unreadable file).</td></tr>
     </tbody>
   </table></div>
 
 
   <h2>Audit fixes (2026-07-26)</h2>
-  <p><strong><code>explain_belief_change</code> actually fires now.</strong> Matching required the WHOLE query to be a substring of a stored fact, while the production caller passes the entire user message — <code>"what car do i drive now?" in "user drives a bmw"</code> is never true, so the 2026-07-20 wiring stayed inert for any multi-word message. Matching is now significant-token overlap (stopword-screened, prefix-tolerant for inflections like drive/drives), with exact containment still honored. Saves also fsync before rename. Tests: <code>::TestBeliefChangeMatching</code>.</p>
+  <p><strong><code>explain_belief_change</code> actually fires now.</strong> Matching required the WHOLE query to be a substring of a stored fact, while the production caller passes the entire user message — <code>"what car do i drive now?" in "user drives a bmw"</code> is never true, so the 2026-07-20 wiring stayed inert for any multi-word message. Matching became significant-token overlap (stopword-screened, prefix-tolerant for inflections like drive/drives), with exact containment still honored. Saves also fsync before rename. Tests: <code>::TestBeliefChangeMatching</code>.</p>
+
+  <h2>Matching, and how it was over-corrected (2026-08-08)</h2>
+  <p>The un-inerting fix above swung the failure to the opposite extreme, and it took replaying the matcher against real data to see it. Measured on the live 96-entry ledger, it fired on <strong>67 of 67</strong> memory-hydrating turns — every one — injecting roughly 215 tokens of near-arbitrary history into the prompt under an authoritative <code>## BELIEF REVISION HISTORY:</code> heading. Four things combined to cause it:</p>
+  <ul>
+    <li><strong>One shared token was enough</strong>, taken over the full cross-product of query and entry tokens.</li>
+    <li><strong>Prefix tolerance was unbounded</strong>, so <code>code</code> matched <code>codename</code> and <code>dark</code> matched <code>darkweb</code>.</li>
+    <li><strong>Stopwords were screened on the query side only.</strong> Words like <code>user</code> (present in 50 of the 50 entries then searched) and <code>project</code> (48 of 50) therefore matched nearly any message.</li>
+    <li><strong>The five results were the five most recent</strong>, not the five best — and the search window was capped at the newest 50 entries, of which 46 were one burst of self-play churn. Every genuinely useful revision sat beyond that window and was unreachable.</li>
+  </ul>
+  <p>Matching now requires <strong>at least two shared content tokens covering at least a third of the query</strong>, screens stopwords on both sides, bounds prefix tolerance to near-equal-length pairs, ranks by relevance before truncating, searches the whole (capped) ledger, and renders the stored <code>reason</code> — which every entry carries and none previously displayed.</p>
+  <div class="note">
+    <strong>Why a ratio and not just a count.</strong> A flat two-token floor looks sufficient and isn't: long messages clear any fixed count incidentally. Replayed over 240 real user turns, a floor of two still fired on 61% of them, and on messages with 16+ content tokens it fired 98% of the time. Requiring proportional coverage brought that to 36% with the length bias gone. Both numbers came from real traffic — an earlier estimate drawn from a hand-picked sample of ten queries suggested 20% and was simply wrong.
+  </div>
+  <p>Recall is deliberately limited in exchange. A token matcher cannot connect <em>"what car do I drive?"</em> to <em>"the user owns a BMW"</em> — they share no words — and single-content-token questions no longer match at all. That is the right direction to fail: a missed explanation costs nothing, while a spurious one enters the prompt as authoritative history. Tests: <code>tests/test_belief_revision_4r.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

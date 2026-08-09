@@ -18,11 +18,14 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from . import objection as _objection
 
 logger = logging.getLogger("GhostAgent")
 
@@ -44,7 +47,7 @@ except ValueError:
 # `enable_thinking=False` hard-switch, with a small token cap since there
 # is no prelude to budget for. Override with GHOST_CRITIC_NO_THINK=0 to
 # restore a thinking verdict, GHOST_CRITIC_MAX_TOKENS to tune the cap.
-_CRITIC_NO_THINK = os.getenv("GHOST_CRITIC_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+_CRITIC_NO_THINK = os.getenv("GHOST_CRITIC_NO_THINK", "1").strip().lower() not in ("0", "false", "no", "off")
 try:
     _CRITIC_MAX_TOKENS = int(os.getenv("GHOST_CRITIC_MAX_TOKENS", "512") or 512)
 except ValueError:
@@ -99,7 +102,7 @@ _MAX_VISUAL_BYTES = 16 * 1024 * 1024
 # 0 chars of content, so every VISUAL check logged "vision returned no
 # verdict" and the whole ground-truth gate was silently inert. Same switch
 # pair as the critic/stage paths. Override with GHOST_VISUAL_NO_THINK=0.
-_VISUAL_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+_VISUAL_NO_THINK = os.getenv("GHOST_VISUAL_NO_THINK", "1").strip().lower() not in ("0", "false", "no", "off")
 try:
     _VISUAL_MAX_TOKENS = int(os.getenv("GHOST_VISUAL_MAX_TOKENS", "2048") or 2048)
 except ValueError:
@@ -138,7 +141,7 @@ def _escalate_refute_enabled() -> bool:
     before acting on it. Read per call so it can be flipped without a
     restart. Kill switch: GHOST_VERIFY_ESCALATE_REFUTE=0."""
     return os.getenv("GHOST_VERIFY_ESCALATE_REFUTE", "1").strip().lower() \
-        not in ("0", "false", "no")
+        not in ("0", "false", "no", "off")
 
 
 def _escalate_confirm_enabled() -> bool:
@@ -168,7 +171,7 @@ def _escalate_confirm_enabled() -> bool:
     restores the one-directional behaviour exactly.
     """
     return os.getenv("GHOST_VERIFY_ESCALATE_CONFIRM", "1").strip().lower() \
-        not in ("0", "false", "no")
+        not in ("0", "false", "no", "off")
 
 
 def _escalate_code_refute_enabled() -> bool:
@@ -209,6 +212,407 @@ def _escalate_code_refute_enabled() -> bool:
     """
     return os.getenv("GHOST_VERIFY_ESCALATE_CODE_REFUTE", "0").strip().lower() \
         in ("1", "true", "yes", "on")
+
+
+# ── Escalation discipline (2026-08-06, §4F item 3) ───────────────────
+#
+# WHY: the refute escalation used to RE-ADJUDICATE from scratch — the main
+# model never even saw the cheap judge's issues, and, being the AUTHOR of
+# the claim under audit, it confirmed its own work nearly always (84% of
+# live refutes overturned; the 2026-08-05 Selene bench measured the same
+# layer destroying 23 CORRECT refutes against 13 rescues, incl. a
+# fact_swap where the cheap judge named the swapped figure and the main
+# model waved it through). Several disciplines were built against it, each
+# with its own kill switch and all benchable offline. Read (C) FIRST — it is
+# the one that shipped enabled, and the only one that cleared the ship gate
+# (balanced 0.808 vs the legacy pipeline's 0.797); (A) and (B) are retained
+# default-OFF because they lost to legacy on the same seeds.
+#
+# (C) OBJECTION CHECK (`core/objection.py`, `GHOST_VERIFY_OBJECTION_CHECK`,
+#     default ON) runs BEFORE (A) and (B) and before any main-model call.
+#     43% of measured false-alarm objections are decidable by arithmetic or
+#     string search rather than judgement (unit conversions, roundings,
+#     "X is not in the evidence" when X demonstrably is). Those are settled
+#     mechanically: a DISMISS confirms without a call, an UPHOLD makes the
+#     refute STAND and immunises it from the credulous overturner. Only
+#     genuinely unprovable objections reach the strong model, and they reach
+#     it unburdened — which is where it measurably excels.
+#
+# (A) REBUTTAL BURDEN (`GHOST_VERIFY_OVERTURN_QUOTE`, default OFF since
+#     2026-08-06 — see the rationale on `_overturn_quote_enabled`): the
+#     escalation presents the refute's issues explicitly and may overturn
+#     ONLY by (a) quoting an exact evidence span that supports the claim
+#     against each issue — the quote is MECHANICALLY validated by
+#     normalized containment in the evidence the judge saw — or (b)
+#     classifying each issue into a known false-positive class (the
+#     FP-trap taxonomy). Anything else — a concession, an invalid class,
+#     a fabricated quote, unparseable output — and the refute STANDS:
+#     fail-closed toward the independent judge, not the author.
+#
+# (B) VERDICT-TIER ROUTING (`GHOST_VERIFY_TIER_ROUTING`, default OFF,
+#     same gate and rationale as (A)): a
+#     refute whose EVERY stated issue is gloss-shaped (soft-language
+#     objection carrying no digits — "not directly supported",
+#     phrasing/tone/paraphrase complaints) is downgraded to UNCERTAIN
+#     WITHOUT any main-model call. Deliberately conservative in v1: an
+#     issue containing any digit escalates normally, so the
+#     "0 mm is not 'no rain'" number-quoting-gloss class still gets the
+#     rebuttal treatment rather than a free pass. UNCERTAIN triggers no
+#     punitive path, so the worst case of a wrong downgrade is a turn
+#     recorded unverified.
+#
+# (D) A fp-class-only overturn (no validated quote) keeps CONFIRMED but
+#     is capped to `_CONFIRM_WITHHELD_CONF_CAP` — below every ≥0.7
+#     consumption gate — so soft overturns cannot launder outcome labels
+#     (the req 03b96c28 class: a fabrication backfilled to `passed`).
+
+
+def _overturn_quote_enabled() -> bool:
+    """Rebuttal-burden overturn contract (A).
+
+    ⚠ DEFAULT OFF since 2026-08-06: the three-way A/B measured v2 at
+    balanced 0.717 against the legacy pipeline's 0.797 on the same
+    seeds. It wins decisively on catches (TPR 0.824 vs 0.705, actionable
+    false-confirms 0.149 vs 0.284, 40 escalation calls vs 101, overturn
+    damage 18 vs 59) and loses on false alarms (clean FPR 0.304 vs
+    0.022) — a real trade, but the SHIP GATE is the balanced score and
+    it did not clear. Default-on would have deployed a measured-worse
+    configuration at the next restart. Enable with
+    GHOST_VERIFY_OVERTURN_QUOTE=1 (nothing does by default — the bench
+    inherits the shell's flags and records them in `bench_provenance`;
+    an earlier version of this line claimed the bench set it, which was
+    never true)."""
+    return os.getenv("GHOST_VERIFY_OVERTURN_QUOTE", "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _tier_routing_enabled() -> bool:
+    """Refute tier-routing (B): a refute that earns no main-model call.
+    Same default-OFF rationale and the same A/B gate as the contract
+    above. GHOST_VERIFY_TIER_ROUTING=1 enables."""
+    return os.getenv("GHOST_VERIFY_TIER_ROUTING", "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+# The false-positive classes an overturn may cite — the FP-trap taxonomy
+# the 2026-08-03 bench rebalance encoded (subjective gloss, derived
+# arithmetic/count/units, paraphrase, rc-vs-stable version labelling,
+# instrumentation echo, extra detail) plus formatting/style. An overturn
+# citing anything outside this list is invalid and the refute stands.
+_OVERTURN_FP_CLASSES = (
+    "subjective_gloss", "derived_value", "paraphrase",
+    "formatting_or_style", "instrumentation_echo", "version_labeling",
+    "extra_detail",
+    # v2 calibration (2026-08-06, measured on the A/B ON-arm): the
+    # evidence digest is BUDGET-TRUNCATED by design, and an objection of
+    # the shape "X is not in the evidence" is unanswerable by quote when
+    # the supporting span was truncated out — the ON arm's
+    # degraded-evidence FP hit 0.818 with no class to cite. This is the
+    # rubric's long-standing "don't punish the claim for pipeline
+    # noise" rule, expressed as a citable class (capped like every
+    # fp-class-only overturn).
+    "truncated_evidence",
+)
+
+# A rebuttal quote shorter than this (normalized) cannot anchor an
+# overturn: single words trivially "contain" in any evidence.
+_MIN_REBUTTAL_QUOTE_CHARS = 15
+
+# Soft-language shapes of a gloss refute, matched against each issue the
+# cheap judge stated and combined with the no-digit rule below. THREE
+# shapes, calibrated against 20 real overturned-refute issue texts mined
+# from the live log (scratchpad FP-audit, 2026-08-06 — zero false
+# downgrades of substantive issues; the adverb requirement in shape 1 is
+# what keeps "X is not supported by evidence" — a REAL objection —
+# escalating):
+#  1. meta-language objections ("not directly supported", phrasing/tone);
+#  2. the QUOTED-GLOSS shape — the judge's "issue" is the pleasantry
+#     itself ("It's a beautiful hot Sunday evening in Athens!"), the
+#     single most common live false refute;
+#  3. instrumentation echoes ("I've sent a notification …" flagged as
+#     unevidenced).
+# "precipitation is 0 mm, not 'no rain'" carries digits → escalates and
+# gets the rebuttal treatment instead.
+# v3 — THE EVIDENTIARY ANCHOR (2026-08-06). Replaces v1/v2's gloss
+# word-lists entirely.
+#
+# WHY the word lists had to go: they were a PROXY for "this refute has
+# no evidentiary anchor", and every A/B round found a new collision
+# (`\bword\b` inside "a single word", `\bformatting\b` inside
+# "formatting artifacts" — both real violations). The proxy is
+# replaceable by the thing itself.
+#
+# THE RULE, symmetric with the overturn contract: we made the DEFENCE
+# cite evidence; the false alarms come from the PROSECUTION having no
+# burden at all. An issue is ANCHORED when it is checkable against
+# something outside the judge's own prose:
+#   (a) it quotes the EVIDENCE (≥12-char verbatim span) — the judge
+#       pointed at the tool output;
+#   (b) it quotes the USER REQUEST (≥12-char span) — a constraint /
+#       alignment objection grounded in what was actually asked
+#       ("the reply is a list instead of a single word" ∩ "...reply
+#       with a single word...");
+#   (c) it carries a checkable literal — any digit-bearing token
+#       (version, count, size, date);
+#   (d) it alleges machine noise AND that noise is literally present in
+#       the CLAIM (diff markers, ANSI escapes, tool-call framing).
+# A refute whose EVERY issue is unanchored is pure assertion → UNCERTAIN
+# with NO main-model call.
+#
+# Deliberately TEMPLATE-INDEPENDENT: the adjudicate prompt is
+# GEPA-tuned and loaded from `$GHOST_HOME/system/optim`, so a prompt
+# instruction to cite would be silently ignored whenever a tuned
+# artifact is live. This tests the issues the judge already emits.
+_ANCHOR_MIN_SPAN = 12
+
+# ABSENCE-shaped issues: "X is not in the evidence" / "unsupported" /
+# "no mention of X". These are the only issue class the truncation guard
+# acts on — a claim that CONTRADICTS the visible evidence is judgeable on
+# a partial digest and must still refute. Calibrated on the bench's real
+# degraded-arm issue texts ("Humidity around 28% is not in the evidence",
+# "TSMC revenue percentage (31%) is unverified due to truncation").
+# ⚠ NARROWED after measurement (fresh-eye MAJOR, 2026-08-06): the first
+# version matched bare `unsupported` / `unverified` / `truncated`, and
+# replaying 89 REAL refute issue-sets mined from the live log showed it
+# downgrading **26 of them (29%)** — including two classes that are
+# CLAIM-side defects, not evidence gaps: "The claim is truncated
+# mid-sentence" and "The screenshot was never taken, so the UI claim is
+# unverified", plus the persona-fabrication class ("Unsupported greeting
+# 'Good morning Vasilis!'"). With ~31.6% of live turns producing a
+# marked digest, that was ≈9.5% of ALL live refutes neutered.
+#
+# The rule now requires the issue to name the EVIDENCE SIDE explicitly —
+# an absence complaint ABOUT the tool output, not about the claim. That
+# is the only shape a truncated digest can excuse.
+# How much of a tool body the packer must have removed before an
+# absence complaint is excusable. 0.25 = a quarter of the source gone.
+# Rationale (measured): absence from a digest that kept 95% of its
+# source is decent evidence of fabrication; absence from one that kept
+# 20% is nearly none. Env-tunable so the bench can sweep it.
+def _truncation_min_severity() -> float:
+    """The guard's floor. Delegates to `objection._truncation_floor()` so
+    the guard and the objection check can never disagree about how much
+    truncation makes an absence complaint unresolvable — they previously
+    held two independent copies, only one of which honoured the env var."""
+    return _objection._truncation_floor()
+
+# ⚠ Kept deliberately NARROWER than objection.py's `_ABSENCE_RE` — the
+# guard requires the issue to name the EVIDENCE SIDE explicitly, because
+# a truncated digest excuses only complaints about the digest (the first
+# version downgraded 29% of real refute sets, including claim-side
+# defects). But the VERB LIST must track the objection module's: the two
+# had diverged ("omits", "never mentioned", "fails to mention", "lacks"
+# matched there and not here — 2026-08-07 review), so a synonym choice
+# decided whether an absence-only refute over cut evidence got the
+# guard's mechanical UNCERTAIN or a trip through the credulous
+# re-adjudication. `_EV_NOUN` is the evidence-side requirement; the verb
+# may sit before OR after it ("X is never mentioned in the evidence" /
+# "the evidence omits X").
+_EV_NOUN = (r"\b(?:evidence|tool[- ]?output|outputs?|digest|logs?|"
+            r"results?|snippet|excerpt)\b")
+# ⚠ The gap windows exclude commas and newlines as well as ./; —
+# `[^.;]` alone let the noun-first alternation BRIDGE CLAUSES: "the
+# evidence contradicts the claim, which omits context" paired the noun
+# "evidence" with a verb belonging to the CLAIM, and the guard
+# downgraded a contradiction refute (round-2 review, 8 false matches in
+# an 11-probe battery). A comma is a clause boundary here exactly like
+# a period.
+_ABSENCE_ISSUE_RE = re.compile(
+    r"(?:not (?:in|present in|found in|mentioned in|shown in|listed in|"
+    r"stated in|supported by|corroborated by|reflected in|included in|"
+    r"provided in|given in)"
+    r"|absent from|missing from|omitted from|left out of"
+    r"|does not appear in|doesn't appear in"
+    r"|nowhere in|never (?:mentioned|stated|given|provided|shown) in"
+    r"|no (?:mention|record|trace|reference) (?:of|for|to)[^.;,\n]{0,60}\bin)"
+    # ⚠ The verb→noun gap refuses claim-nouns (round-5 F5), matching the
+    # noun-first branch below: "omitted from the reply though the
+    # evidence provides it" bridged past the claim-noun TARGET to a
+    # later evidence-noun, and the guard downgraded a claim-side refute.
+    r"(?:(?!\b(?:claim|reply|response|answer|summary|report)\b)"
+    r"[^.;,\n]){0,40}?" + _EV_NOUN
+    + r"|" + _EV_NOUN
+    + r"(?:(?!\b(?:claim|reply|response|answer|summary|report)\b)"
+    r"[^.;,\n]){0,40}?\b(?:omits?|omitted|lacks|never mentions?|"
+    r"fails? to (?:mention|state|include|note|report|provide|show)|"
+    r"makes no mention|does not (?:mention|contain|include|show|state|"
+    r"list|provide|give)|doesn't (?:mention|contain|include|show|state|"
+    r"list|provide|give)|leaves? out)\b", re.I)
+
+# Machine-noise detection for (d): ONE definition, owned by
+# objection.py. ⚠ These were two hand-maintained copies and they
+# diverged within a day (2026-08-07 review): this file still counted a
+# markdown horizontal rule ("---") and a properly ```fenced``` diff as
+# machine noise while objection.py had learned better — so the anchor
+# model and the objection check disagreed about the same claim.
+_ARTIFACT_WORDS_RE = re.compile(
+    r"artifact|diff marker|ansi|escape code|control character|"
+    r"tool[- ]call framing|markup|raw markers", re.I)
+
+
+def _longest_common_span(a: str, b: str) -> int:
+    """Length of the longest verbatim span shared by two normalized
+    strings (0 when either is empty). Bounded work: the issue side is
+    short by construction."""
+    if not a or not b:
+        return 0
+    try:
+        from difflib import SequenceMatcher
+        m = SequenceMatcher(None, a, b, autojunk=False)
+        return m.find_longest_match(0, len(a), 0, len(b)).size
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _issue_anchor(issue: str, claim: str, evidence: str,
+                  context: str) -> str:
+    """The strongest anchor an issue carries: "evidence" | "request" |
+    "checkable" | "artifact" | "" (none)."""
+    text = _normalize_for_containment(issue)
+    if not text:
+        return ""
+    if _longest_common_span(
+            text, _normalize_for_containment(evidence)) >= _ANCHOR_MIN_SPAN:
+        return "evidence"
+    if _longest_common_span(
+            text, _normalize_for_containment(context)) >= _ANCHOR_MIN_SPAN:
+        return "request"
+    if any(ch.isdigit() for ch in issue):
+        return "checkable"
+    if _ARTIFACT_WORDS_RE.search(issue) and _objection._claim_noise_markers(
+            claim or ""):
+        return "artifact"
+    return ""
+
+
+# Char budget for the evidence the REBUTTAL call ships to the MAIN
+# model. 0 disables trimming.
+#
+# Why (measured, 2026-08-06 optimization scout): the rebuttal is the
+# ONLY main-slot call on the verify path and the dominant stage —
+# REFUTED verdicts run p50 42.5s against p50 13.0s for the cheap-only
+# path, ≈+25s of main model — and it re-sent the full 4000-char digest
+# verbatim (~800 of its ~1538 prompt tokens). The window is selected
+# against the ISSUES (what this call actually argues about), NOT the
+# claim: the rebuttal must see the spans the objections concern.
+#
+# SAFETY: quote validation still runs against the FULL evidence, so a
+# trimmed view can never turn a legitimate quote into a refusal — it can
+# only cost the model sight of a span it might have quoted. That
+# asymmetry is deliberate.
+try:
+    _REBUTTAL_EVIDENCE_CHARS = int(
+        os.getenv("GHOST_VERIFY_REBUTTAL_EVIDENCE_CHARS", "1800"))
+except ValueError:
+    _REBUTTAL_EVIDENCE_CHARS = 1800
+
+
+def _rebuttal_evidence_view(evidence: str, issues_block: str) -> str:
+    """Issue-relevant view of the evidence for the rebuttal call."""
+    try:
+        ev = str(evidence or "")
+        if _REBUTTAL_EVIDENCE_CHARS <= 0 or len(ev) <= _REBUTTAL_EVIDENCE_CHARS:
+            return ev
+        from .agent import _slice_evidence_body
+        return _slice_evidence_body(ev, _REBUTTAL_EVIDENCE_CHARS,
+                                    issues_block)
+    except Exception:  # noqa: BLE001 — never break an escalation
+        return str(evidence or "")
+
+
+def _normalize_for_containment(s: str) -> str:
+    """Case + whitespace + Unicode folding (NFKC, zero-widths stripped,
+    curly quotes/dashes straightened) so a legitimately verbatim quote is
+    not refused because the evidence carried typographic punctuation
+    (fresh-eye #6 — the failure direction was closed-but-taxing)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(s or ""))
+    s = s.translate(str.maketrans({
+        "‘": "'", "’": "'", "“": '"', "”": '"',
+        "–": "-", "—": "-"}))
+    s = re.sub(r"[​‌‍﻿]", "", s)
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def _quote_supported_by_evidence(quote: str, evidence: str) -> bool:
+    """Mechanical validation of an overturn's rebuttal quote: normalized
+    containment in the evidence the judge actually saw, with a minimum
+    length so trivial fragments cannot anchor an overturn.
+
+    v2 calibration (2026-08-06): whole-quote containment refused honest
+    rescues whenever the model trimmed or lightly paraphrased the edges
+    of an otherwise-verbatim span (the A/B ON-arm's clean FPR sat at
+    0.478 largely on refused rescues). The tolerance: if the whole quote
+    is not contained, accept when the LONGEST COMMON SUBSTRING between
+    quote and evidence is itself ≥ the minimum length — i.e. the quote
+    still carries a verbatim evidence core; pure paraphrase still fails.
+    This widens the (already stated) relevance limit slightly and is
+    priced in the docs."""
+    nq = _normalize_for_containment(quote)
+    if len(nq) < _MIN_REBUTTAL_QUOTE_CHARS:
+        return False
+    ne = _normalize_for_containment(evidence)
+    if nq in ne:
+        return True
+    try:
+        from difflib import SequenceMatcher
+        m = SequenceMatcher(None, nq, ne, autojunk=False)
+        match = m.find_longest_match(0, len(nq), 0, len(ne))
+        return match.size >= _MIN_REBUTTAL_QUOTE_CHARS
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _refute_is_unanchored(issues, claim: str = "", evidence: str = "",
+                          context: str = "") -> bool:
+    """True when NO stated issue carries any evidentiary anchor — the
+    refute is pure assertion and earns no main-model call.
+
+    Empty/missing issues are NOT classifiable and escalate normally: a
+    refute the judge could not itemize is not evidence of innocence.
+    Fail-open toward escalation by construction — every uncertainty
+    here spends a call rather than silently softening a verdict."""
+    items = [str(i or "").strip() for i in (issues or [])]
+    items = [i for i in items if i]
+    if not items:
+        return False
+    return not any(_issue_anchor(i, claim, evidence, context)
+                   for i in items)
+
+
+# The rebuttal-burden escalation prompt (A). Third-party framing on
+# purpose: the main model authored the claim under audit, and "your
+# reply" framing invites self-defence — the auditor role plus the
+# mechanical quote check are the anti-self-serving devices.
+_OVERTURN_REBUTTAL_PROMPT = """You are an independent auditor. An automated agent produced the CLAIM below; a screening judge REFUTED it, citing the numbered ISSUES. You are NOT defending the claim — decide whether each objection actually holds against the EVIDENCE.
+
+CLAIM:
+{claim}
+
+EVIDENCE:
+{evidence}
+
+CONTEXT: {context}
+
+ISSUES raised by the screening judge:
+{issues}
+
+CRITICAL — an objection can be literally TRUE and still be a FALSE ALARM. Do NOT concede these; classify them:
+ - "derived_value" — the claim ROUNDS, approximates, converts units, or derives by ordinary arithmetic from the evidence. "396,000" for 396,960; "about €25" for €24.60; "about 48 MB" for 49,152,000 bytes; "1 hour" for 3600s; a count or total over listed items; "latest"/"largest" = the max the evidence lists. The evidence does NOT have to restate a derived fact word-for-word.
+ - "subjective_gloss" — a qualitative characterization of data that IS in the evidence ("warm and clear" for 27°C, "nothing looks stressed" for load 1.42 on 10 cores). Real ONLY if it contradicts the evidence (calling -5°C "warm").
+ - "truncated_evidence" — the objection is "X is not in the evidence" and the evidence digest is visibly cut off or partial. Absence from truncated evidence is not proof of fabrication.
+ - "paraphrase" / "extra_detail" / "formatting_or_style" / "instrumentation_echo" / "version_labeling" — restating in different words, answering fully and adding more, styling, echoing its own tool actions, or naming a version the evidence marks as pre-release.
+Concede ONLY a genuine defect: a fact with NO basis in any evidence, a value that CONTRADICTS the evidence beyond rounding, an explicit user constraint actually violated, or machine noise actually present in the claim.
+
+Return EXACTLY ONE rebuttal object PER numbered issue, carrying that issue's number in its "issue" field — an overturn that skips any issue number is AUTOMATICALLY refused by a machine check, regardless of your verdict. For each issue, exactly one of:
+ - "kind": "quote" — the evidence directly supports the claim here: copy the EXACT evidence span (verbatim, >= 15 characters) into "quote". A paraphrase will be rejected by literal matching.
+ - "kind": "fp_class" — the objection is one of the false-alarm patterns above: set "fp_class" to one of {fp_classes}.
+ - "kind": "concede" — a genuine defect by the standard above.
+
+Verdict rule: "CONFIRMED" ONLY if every issue is rebutted via quote or fp_class. If ANY issue is conceded or cannot be rebutted, the verdict is "REFUTED".
+
+Reply with ONE minified JSON object, nothing else:
+{{"verdict": "CONFIRMED"|"REFUTED", "confidence": 0.0-1.0, "reasoning": "<one sentence>", "rebuttals": [{{"issue": <n>, "kind": "quote"|"fp_class"|"concede", "quote": "...", "fp_class": "..."}}]}}"""
 
 
 # ── Escalation ledger ────────────────────────────────────────────────
@@ -257,7 +661,7 @@ def _escalation_log_enabled() -> bool:
     durable to live. Read per call, same idiom as the other verifier flags.
     """
     return os.getenv("GHOST_VERIFY_ESCALATION_LOG", "1").strip().lower() \
-        not in ("0", "false", "no")
+        not in ("0", "false", "no", "off")
 
 
 def _escalation_log_path() -> Optional[Path]:
@@ -275,6 +679,7 @@ def record_escalation(*, kind: str, route: str, outcome: str,
                       cheap_confidence: Optional[float] = None,
                       strong_verdict: str = "",
                       final_confidence: Optional[float] = None,
+                      rebuttal: str = "",
                       trace: Optional[Dict[str, Any]] = None) -> bool:
     """Append one escalation event to the ledger. Returns True iff written.
 
@@ -331,6 +736,12 @@ def record_escalation(*, kind: str, route: str, outcome: str,
             "req_id": str(trace.get("req_id") or "")[:64],
             "trajectory_id": str(trace.get("trajectory_id") or "")[:64],
         }
+        # How an overturn earned itself ("quote" | "fp_class") or why it
+        # was refused ("invalid" | "concede" | "unparseable"); "" for
+        # pre-discipline rows and non-overturn outcomes. Additive — every
+        # ledger consumer tolerates extra keys.
+        if rebuttal:
+            rec["rebuttal"] = str(rebuttal)[:32]
         if cheap_confidence is not None:
             rec["cheap_confidence"] = round(float(cheap_confidence), 3)
         if final_confidence is not None:
@@ -411,6 +822,18 @@ class VerifyResult:
     confidence: float  # 0.0 – 1.0
     reasoning: str = ""
     issues: List[str] = field(default_factory=list)
+    # True when tier routing downgraded a gloss-shaped cheap refute to
+    # UNCERTAIN without a main-model call (escalation discipline B).
+    # Same in-process-only caveat as `escalated_overturn` below — the
+    # durable record is the escalation ledger's outcome="downgraded".
+    escalation_downgraded: bool = False
+    # True when the TRUNCATION GUARD (not tier routing) produced the
+    # downgrade — kept distinct so the bench and the ledger can tell the
+    # two mechanisms apart.
+    truncation_guarded: bool = False
+    # True when the MECHANICAL objection check (arithmetic/string proof)
+    # dismissed every objection without any model call.
+    objection_dismissed: bool = False
     # True when a cheap judge's REFUTED verdict was overturned by the
     # main-model escalation (see verify_claim). Diagnostic only.
     #
@@ -423,6 +846,26 @@ class VerifyResult:
     # BOTH delivery paths. Read the ledger, not these fields, to count
     # overturns.
     escalated_overturn: bool = False
+    # The objection check PROVED the refute real and suppressed the
+    # escalation (mechanically_upheld). Without this flag the uphold was
+    # INVISIBLE in-process — the bench could not tell a protected refute
+    # from one where nothing fired at all (2026-08-07 review).
+    objection_upheld: bool = False
+    # PRE-ESCALATION snapshot (2026-08-07, replay-scorer infra): the
+    # cheap judge's verdict BEFORE the mechanical layer and escalation
+    # touched it. Recording this in every bench bundle is what turns a
+    # mechanical-layer change from a 3-hour live re-bench into a
+    # seconds-long offline replay — the cheap verdict is upstream of
+    # everything the escalation policies iterate on.
+    cheap_verdict: Optional[str] = None
+    cheap_confidence: Optional[float] = None
+    cheap_issues: Optional[List[str]] = None
+    # The strong model returned UNCERTAIN on an escalated refute: the
+    # refute is REPLACED (no punitive path fires) but nothing was
+    # positively confirmed — deliberately NOT an overturn (booking it as
+    # one inflated the overturn counts and exempted it from
+    # `_escalate_confirm` re-adjudication as if it had been earned).
+    escalation_replaced: bool = False
     # True when a HIGH-STAKES cheap CONFIRMED was escalated and the main
     # model declined to confirm it, so the confidence was capped below the
     # 0.7 consumption gate (see _escalate_confirm). The mirror-image watch
@@ -451,8 +894,24 @@ class VerifyResult:
             d["suspects"] = self.suspects
         if self.escalated_overturn:
             d["escalated_overturn"] = True
+        if self.escalation_downgraded:
+            d["escalation_downgraded"] = True
+        if self.truncation_guarded:
+            d["truncation_guarded"] = True
         if self.confirm_withheld:
             d["confirm_withheld"] = True
+        if self.objection_dismissed:
+            d["objection_dismissed"] = True
+        if self.escalation_replaced:
+            d["escalation_replaced"] = True
+        if self.cheap_verdict is not None:
+            d["cheap_verdict"] = self.cheap_verdict
+            d["cheap_confidence"] = self.cheap_confidence
+            d["cheap_issues"] = self.cheap_issues
+        if self.objection_upheld:
+            d["objection_upheld"] = True
+        if self.probe_score is not None:
+            d["probe_score"] = self.probe_score
         return d
 
 
@@ -1053,6 +1512,21 @@ class Verifier:
                 return parsed[0]
         except json.JSONDecodeError:
             pass
+        # Rebuttal-contract replies (2026-08-06) are the first
+        # NESTED-array JSON on this path: the non-greedy fragment walk
+        # below would return an inner rebuttal object
+        # ({"issue":…,"kind":…}) carrying no "verdict", silently voiding
+        # a legitimate overturn as "unparseable" (fresh-eye #11). When
+        # the reply mentions "rebuttals", prefer the greedy outer object.
+        if '"rebuttals"' in text:
+            match = re.search(r"\{[\s\S]*\}", text)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
         # Non-dict top-level values fall through to the fragment walk
         # (its `{...}` candidates can only parse as dicts).
         # Walk every `{...}` block from the end — some models emit a
@@ -1103,11 +1577,29 @@ class Verifier:
             conf = float(data.get("confidence", 0.5))
         except (TypeError, ValueError):
             conf = 0.5
+        # ⚠ NaN survives min/max: min(1.0, nan) is 1.0, so a model
+        # emitting `"confidence": NaN` (json.loads accepts it) minted a
+        # FULL-confidence verdict that rode every ≥0.7 punitive/backfill
+        # gate. Same hazard was fixed in `_resolve_rebuttal` (an NaN
+        # refuses the overturn) but this constructor — which every
+        # verdict path funnels through — kept the bare clamp. NaN and
+        # ±Infinity mean "the model did not state a confidence": 0.5.
+        if conf != conf or conf in (float("inf"), float("-inf")):
+            conf = 0.5
+        issues = data.get("issues", [])
+        # A str would iterate as CHARACTERS downstream (rebuttal coverage
+        # counted len(str) issues; logs showed "n; o; t"). Coerce to a
+        # clean list of non-empty strings whatever the model emitted.
+        if isinstance(issues, str):
+            issues = [issues] if issues.strip() else []
+        elif not isinstance(issues, list):
+            issues = [str(issues)] if issues else []
+        issues = [str(i) for i in issues if str(i or "").strip()]
         return VerifyResult(
             verdict=verdict,
             confidence=max(0.0, min(1.0, conf)),
             reasoning=data.get("reasoning", ""),
-            issues=data.get("issues", []),
+            issues=issues,
         )
 
     @staticmethod
@@ -1304,6 +1796,15 @@ class Verifier:
             )
             data = await self._call_llm(prompt, temperature=0.1)
             result = self._build_verify_result(data)
+        # Snapshot the cheap verdict BEFORE the mechanical layer and
+        # escalation touch it — stamped on the FINAL result below,
+        # because the guard/escalation build replacement objects that
+        # would drop fields set here.
+        _cheap = ((result.verdict.value, result.confidence,
+                   list(result.issues or []))
+                  if result is not None else None)
+        result = self._guard_truncated_absence(result, claim_t, evidence_t,
+                                               trace=trace)
         result = await self._escalate_refute(
             result, claim_t, evidence_t, context_t,
             route="claim", trace=trace)
@@ -1322,9 +1823,122 @@ class Verifier:
                 strong = self._build_verify_result(data2)
             return strong
 
-        return await self._escalate_confirm(
+        final = await self._escalate_confirm(
             result, high_stakes=high_stakes, retry=_reverify_on_main,
             route="claim", trace=trace)
+        if final is not None and _cheap is not None:
+            final.cheap_verdict, final.cheap_confidence, \
+                final.cheap_issues = _cheap
+        return final
+
+    def _guard_truncated_absence(self, result: Optional[VerifyResult],
+                                 claim: str, evidence: str,
+                                 trace: Optional[Dict[str, Any]] = None
+                                 ) -> Optional[VerifyResult]:
+        """Mechanical floor under the rubric's oldest standing rule:
+        *"tool output that is truncated but still consistent with the
+        claim is grounds for UNCERTAIN at most, never REFUTED."*
+
+        The rule was prose the judge had to remember; now it is enforced.
+        A REFUTED whose EVERY issue is an ABSENCE complaint ("X is not in
+        the evidence") over a digest the packer MARKED as truncated is
+        downgraded to UNCERTAIN before escalation — the missing span may
+        be exactly what the packer cut, so absence is not proof. Issues
+        alleging CONTRADICTION (values that disagree), constraint
+        violations or machine noise are untouched: those are judgeable on
+        a partial digest.
+
+        Kill switch: GHOST_VERIFY_TRUNCATION_GUARD=0. Costs no LLM call.
+        Motivation, measured: with the packer truncating SILENTLY the
+        bench's degraded-evidence false-refute rate ran 0.485-0.625 and
+        no rubric text moved it (2026-08-06 A/B)."""
+        try:
+            if os.getenv("GHOST_VERIFY_TRUNCATION_GUARD", "1").strip(
+                    ).lower() in ("0", "false", "no", "off"):
+                return result
+            if result is None or result.verdict != VerifyVerdict.REFUTED:
+                return result
+            from .agent import evidence_truncation_severity
+            severity = evidence_truncation_severity(evidence)
+            if severity < _truncation_min_severity():
+                return result
+            issues = [str(i or "").strip() for i in (result.issues or [])]
+            issues = [i for i in issues if i]
+            if not issues or not all(_ABSENCE_ISSUE_RE.search(i)
+                                     for i in issues):
+                return result
+            # ⚠ A provable DISMISS outranks the guard. The guard runs
+            # BEFORE `_escalate_refute`, so it used to downgrade to
+            # UNCERTAIN@0.5 even when the "missing" atom was sitting in
+            # the VISIBLE part of the digest — throwing away the
+            # objection check's mechanical proof (CONFIRMED@0.7, "judge
+            # missed it") on the ~1/3 of live turns whose digest carries
+            # a cut mark, and booking `truncation_guard` in the ledger
+            # where `mechanically_dismissed` was the true mechanism.
+            # When the objection module can settle the whole refute by
+            # LOOKING, stand aside and let the escalation path do so.
+            #
+            # ⚠ …but only when the escalation WILL follow through
+            # (round-2 review): the objection check downstream is gated
+            # on `_escalate_refute_enabled()` and a cheap route, which
+            # the guard never used to check — with the kill switch set,
+            # or on a main-model-only client, standing aside handed the
+            # raw REFUTED@0.9 to the punitive path where the guard
+            # would have made it UNCERTAIN@0.5. And the stand-aside
+            # probe gets its OWN try: an objection.py bug must not
+            # cancel the guard's independent downgrade (the outer
+            # except would have eaten both mechanisms at once).
+            if (_objection.enabled() and _escalate_refute_enabled()
+                    and (bool(getattr(self.llm_client, "critic_clients",
+                                      None))
+                         or bool(getattr(self.llm_client, "worker_clients",
+                                         None)))):
+                try:
+                    _decision, _r, _u = _objection.resolve_refute(
+                        issues, claim, evidence, severity)
+                    if (_decision == _objection.DISMISS
+                            and _objection.dismiss_enabled()):
+                        return result
+                except Exception as _se:  # noqa: BLE001
+                    logger.warning(
+                        "truncation-guard stand-aside probe failed — "
+                        "guard proceeds with its own downgrade: %s", _se)
+            logger.info(
+                "Verifier truncation guard: every issue is an ABSENCE "
+                "complaint over a digest %.0f%% cut — REFUTED downgraded "
+                "to UNCERTAIN (issues: %s)", severity * 100,
+                "; ".join(issues)[:140])
+            out = VerifyResult(
+                verdict=VerifyVerdict.UNCERTAIN,
+                confidence=min(result.confidence, 0.5),
+                reasoning=(f"truncation guard: the packer removed "
+                           f"{severity:.0%} of this evidence, so absence of "
+                           f"the cited facts is not proof of fabrication. "
+                           f"Cheap judge: "
+                           + (result.reasoning or "")[:300]),
+                issues=list(result.issues or []),
+                suspects=result.suspects,
+                probe_score=result.probe_score)
+            # Distinct from tier routing (fresh-eye MAJOR): merging the
+            # two under one flag mislabelled guard downgrades as
+            # gloss-tier ones in the bench and left the guard INVISIBLE
+            # to the escalation ledger and audit — this project's own
+            # "silent inoperative subsystem" shape.
+            out.truncation_guarded = True
+            out.escalation_downgraded = True
+            record_escalation(
+                kind="refute", route="claim", outcome="truncation_guard",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=result.confidence,
+                final_confidence=out.confidence,
+                rebuttal=f"cut{severity:.0%}", trace=trace)
+            return out
+        except Exception as exc:  # noqa: BLE001 — never break a verdict
+            # WARNING for parity with the escalation-side objection
+            # failure: a persistently-broken guard silently hands
+            # absence refutes over cut evidence to the punitive path.
+            logger.warning("truncation guard failed open: %s", exc)
+            return result
 
     async def _escalate_refute(self, result: Optional[VerifyResult],
                                claim: str, evidence: str,
@@ -1361,9 +1975,164 @@ class Verifier:
             getattr(client, "worker_clients", None))
         if not cheap_route:
             return result  # main model already judged it
+
+        # ── ARITHMETIC BEFORE OPINION (v5, 2026-08-06). Resolve what is
+        # mechanically decidable before spending a main-model call on
+        # anybody's opinion. Measured over every completed bench arm's
+        # refutes: this UPHOLDS proven-real refutes and DISMISSES
+        # proven-false ones with **no LLM call at all**, at a measured
+        # cost of 1 erased catch and 2 hardened false alarms.
+        #
+        # ⚠ THE PROTECTION COUNTS ARE UNRELIABLE AND DELIBERATELY NOT
+        # QUOTED HERE. Two mid-development figures survive in the record —
+        # "37 upheld / 41 calls avoided" (this comment, earlier) and
+        # "51 protected / 55 avoided" (journal + docs, later, probably
+        # post-rule-3) — and the ad-hoc script that produced them was not
+        # kept, so neither can be re-derived. Both in any case predate the
+        # 2026-08-06 defect fixes below, which change the rules' outcomes.
+        # The confirming re-bench re-derives them; until then treat the
+        # PROFILE (catches, calls avoided, latency) as the claim and the
+        # exact counts as unverified.
+        #
+        # The division of labour this creates is the whole design:
+        #   * PROVABLE objections (numeric contradiction beyond rounding,
+        #     a fact absent from intact evidence) are settled by
+        #     arithmetic and PROTECTED — the credulous overturner never
+        #     gets to destroy them, which is precisely where its 59
+        #     measured kills came from (fact_swap / artifact_leak /
+        #     fabrication);
+        #   * UNRESOLVED objections (subjective gloss, semantic drift,
+        #     domain judgement) go to the strong model with NO burden —
+        #     because on exactly that population the strong model is
+        #     measurably excellent (legacy arm: clean FPR 0.022).
+        if retry is None and _objection.enabled():
+            try:
+                from .agent import evidence_truncation_severity as _sev
+                _decision, _why, _unres = _objection.resolve_refute(
+                    result.issues, claim, evidence, _sev(evidence))
+                if _decision == _objection.UPHOLD:
+                    logger.info(
+                        "Verifier objection check: refute PROVEN real — "
+                        "no escalation spent (%s)", "; ".join(_why)[:160])
+                    record_escalation(
+                        kind="refute", route=route,
+                        outcome="mechanically_upheld",
+                        cheap_verdict=result.verdict.value,
+                        cheap_confidence=result.confidence,
+                        rebuttal="arithmetic:" + "; ".join(_why)[:300],
+                        trace=trace)
+                    result.objection_upheld = True
+                    return result
+                if (_decision == _objection.DISMISS
+                        and not _objection.dismiss_enabled()):
+                    # Uphold-only mode: fall through to the normal
+                    # escalation instead of confirming mechanically.
+                    _decision = None
+                if _decision == _objection.DISMISS:
+                    logger.info(
+                        "Verifier objection check: every objection PROVEN "
+                        "a false alarm — no escalation spent (%s)",
+                        "; ".join(_why)[:160])
+                    # ⚠ The dismissal CONFIRMS at the judge's OWN
+                    # confidence — never lifted. An earlier 0.7 floor
+                    # MANUFACTURED an actionable positive (backfill
+                    # "passed") out of an inert REFUTED@0.4; its
+                    # "conditional floor" replacement was dead code
+                    # (max(0.7, c) when c ≥ 0.7 is c — round-2 review).
+                    # Disproving the only objection is not stronger
+                    # evidence than the judge's own confidence in
+                    # raising it. Note a high-stakes mechanical
+                    # dismissal is still re-adjudicated by
+                    # `_escalate_confirm` (it checks only
+                    # `escalated_overturn`): a deliberate tension —
+                    # the dismissal proves the OBJECTIONS false, not
+                    # the claim true, and the affirmative check can
+                    # only cap, never flip.
+                    _conf = result.confidence
+                    record_escalation(
+                        kind="refute", route=route,
+                        outcome="mechanically_dismissed",
+                        cheap_verdict=result.verdict.value,
+                        cheap_confidence=result.confidence,
+                        final_confidence=_conf,
+                        rebuttal="arithmetic:" + "; ".join(_why)[:300],
+                        trace=trace)
+                    _ok = VerifyResult(
+                        verdict=VerifyVerdict.CONFIRMED,
+                        confidence=_conf,
+                        reasoning="objection check: " + "; ".join(_why)[:400],
+                        issues=[], suspects=result.suspects,
+                        probe_score=result.probe_score)
+                    _ok.objection_dismissed = True
+                    return _ok
+            except Exception as _oe:  # noqa: BLE001 — never break a verdict
+                # ⚠ WARNING, not debug: a persistent objection.py bug
+                # here silently strips the mechanical-uphold protection
+                # and hands every refute back to the credulous overturner
+                # (the 84%-overturn path) — the "guard that never runs"
+                # defect class. The operator watches the live stream;
+                # warnings render.
+                logger.warning("objection check failed open — refutes "
+                               "ride the legacy escalation: %s", _oe)
+
+        # ── Escalation discipline B (v3): verdict-tier routing on the
+        # EVIDENTIARY ANCHOR. A refute whose every issue is unanchored —
+        # quoting neither the evidence nor the request, naming no
+        # checkable literal, alleging no machine noise actually present
+        # in the claim — is pure assertion and never earns a main-model
+        # call. Downgraded to UNCERTAIN (no punitive path fires).
+        if retry is None and _tier_routing_enabled() \
+                and _refute_is_unanchored(result.issues, claim, evidence,
+                                          context):
+            downgraded = VerifyResult(
+                verdict=VerifyVerdict.UNCERTAIN,
+                confidence=min(result.confidence, 0.5),
+                reasoning=("tier-routed: no stated issue is anchored in the "
+                           "evidence, the request, a checkable literal or "
+                           "machine noise present in the claim; downgraded "
+                           "without escalation. Cheap judge: "
+                           + (result.reasoning or "")[:300]),
+                issues=list(result.issues or []))
+            downgraded.escalation_downgraded = True
+            logger.info(
+                "Verifier tier-routing: UNANCHORED refute DOWNGRADED to "
+                "UNCERTAIN without escalation (issues: %s)",
+                "; ".join(result.issues or [])[:140])
+            record_escalation(
+                kind="refute", route=route, outcome="downgraded",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=result.confidence,
+                final_confidence=downgraded.confidence, trace=trace)
+            return downgraded
+
+        # ── Escalation discipline A: the rebuttal burden. Claim-path
+        # overturns must engage the refute's issues and earn the overturn
+        # (validated quote or FP-class). The injected-retry (code) path
+        # keeps the historical re-adjudication — it re-judges with the
+        # CODE prompt and is default-OFF anyway.
+        use_rebuttal = retry is None and _overturn_quote_enabled()
         try:
             if retry is not None:
                 strong = await retry()
+            elif use_rebuttal:
+                issues_block = "\n".join(
+                    f"{i + 1}. {s}"
+                    for i, s in enumerate(result.issues or []))
+                if not issues_block:
+                    issues_block = ("1. (no itemized issues; the judge's "
+                                    "reasoning:) "
+                                    + (result.reasoning or "")[:400])
+                data = await self._call_llm(
+                    _OVERTURN_REBUTTAL_PROMPT.format(
+                        claim=claim,
+                        evidence=_rebuttal_evidence_view(
+                            evidence, issues_block),
+                        context=context,
+                        issues=issues_block,
+                        fp_classes=", ".join(_OVERTURN_FP_CLASSES)),
+                    temperature=0.1, force_main=True)
+                return self._resolve_rebuttal(result, data, evidence,
+                                              route=route, trace=trace)
             else:
                 strong = None
                 if _two_stage_enabled():
@@ -1403,6 +2172,25 @@ class Verifier:
                 strong_verdict=strong.verdict.value,
                 final_confidence=strong.confidence, trace=trace)
             return strong
+        if strong.verdict == VerifyVerdict.UNCERTAIN:
+            # ⚠ Not an overturn. A strong UNCERTAIN replaces the refute
+            # (no punitive path fires) but nobody CONFIRMED the claim —
+            # booking it `outcome="overturned"` with
+            # `escalated_overturn=True` inflated every naive overturn
+            # count and exempted the result from `_escalate_confirm`'s
+            # re-adjudication as if it had been positively earned.
+            logger.info(
+                "Verifier escalation: main model UNCERTAIN on the refute "
+                "— replaced without conviction. Original issues: %s",
+                "; ".join(result.issues or [])[:160])
+            strong.escalation_replaced = True
+            record_escalation(
+                kind="refute", route=route, outcome="replaced_uncertain",
+                cheap_verdict=result.verdict.value,
+                cheap_confidence=result.confidence,
+                strong_verdict=strong.verdict.value,
+                final_confidence=strong.confidence, trace=trace)
+            return strong
         logger.warning(
             "Verifier escalation OVERTURNED a cheap-judge refute: main "
             "model says %s. Original issues: %s",
@@ -1415,6 +2203,191 @@ class Verifier:
             strong_verdict=strong.verdict.value,
             final_confidence=strong.confidence, trace=trace)
         return strong
+
+    def _resolve_rebuttal(self, cheap: VerifyResult, data: Any,
+                          evidence: str, *, route: str,
+                          trace: Optional[Dict[str, Any]] = None
+                          ) -> VerifyResult:
+        """Adjudicate the rebuttal-burden reply (escalation discipline A).
+
+        FAIL-CLOSED contract: the cheap judge's REFUTED stands unless the
+        main model's reply is a parseable CONFIRMED whose EVERY rebuttal
+        is either a mechanically-validated evidence quote or a known
+        FP-class. A concession, an unknown class, a fabricated/short
+        quote, an UNCERTAIN verdict, or unparseable output all leave the
+        refute in place — the author of the claim does not get the
+        benefit of the doubt against an independent judge.
+
+        Discipline D: an overturn earned ONLY by FP-classes (no validated
+        quote) keeps CONFIRMED but is capped to
+        `_CONFIRM_WITHHELD_CONF_CAP`, below every ≥0.7 consumption gate,
+        so a soft overturn cannot launder outcome labels. Never raises.
+        """
+        try:
+            if not isinstance(data, dict) or not str(
+                    data.get("verdict") or "").strip():
+                record_escalation(
+                    kind="refute", route=route, outcome="unavailable",
+                    cheap_verdict=cheap.verdict.value,
+                    cheap_confidence=cheap.confidence,
+                    rebuttal="unparseable", trace=trace)
+                return cheap
+            verdict = str(data.get("verdict")).strip().upper()
+            # NaN survives min/max clamping (comparison ordering made
+            # float("nan") a FULL-confidence overturn — fresh-eye #5),
+            # and a missing confidence is not an earned one: both mark
+            # the confidence invalid, which refuses a CONFIRMED below.
+            conf_valid = True
+            try:
+                conf = float(data.get("confidence"))
+                if conf != conf:          # NaN
+                    conf, conf_valid = 0.0, False
+                conf = max(0.0, min(1.0, conf))
+            except (TypeError, ValueError):
+                conf, conf_valid = 0.0, False
+            reasoning = str(data.get("reasoning") or "")[:500]
+            rebuttals = data.get("rebuttals")
+            rebuttals = rebuttals if isinstance(rebuttals, list) else []
+
+            if verdict == "REFUTED":
+                strong = VerifyResult(
+                    verdict=VerifyVerdict.REFUTED,
+                    confidence=conf or cheap.confidence,
+                    reasoning=reasoning or cheap.reasoning,
+                    issues=list(cheap.issues or []))
+                logger.info("Verifier escalation: main model CONFIRMED the "
+                            "refute under the rebuttal contract — verdict "
+                            "stands.")
+                record_escalation(
+                    kind="refute", route=route, outcome="upheld",
+                    cheap_verdict=cheap.verdict.value,
+                    cheap_confidence=cheap.confidence,
+                    strong_verdict="REFUTED",
+                    final_confidence=strong.confidence, trace=trace)
+                return strong
+
+            if verdict != "CONFIRMED":
+                # UNCERTAIN (or anything else) is not a valid overturn.
+                logger.info("Verifier escalation: overturn REFUSED "
+                            "(non-CONFIRMED rebuttal verdict %r) — refute "
+                            "stands.", verdict)
+                record_escalation(
+                    kind="refute", route=route, outcome="upheld",
+                    cheap_verdict=cheap.verdict.value,
+                    cheap_confidence=cheap.confidence,
+                    strong_verdict=verdict,
+                    rebuttal="invalid", trace=trace)
+                return cheap
+
+            # CONFIRMED — validate every rebuttal mechanically, INCLUDING
+            # COVERAGE (fresh-eye CRITICAL, 2026-08-06): the model may
+            # not rebut issue 1 and silently skip issues 2..n — the old
+            # code enforced the "every issue" rule only through the
+            # honesty of the exact model this contract exists to
+            # distrust. An overturn now requires the VALIDATED rebuttals'
+            # issue indices to cover {1..n_issues}; when the model
+            # returns no usable indices at all, the fallback demands at
+            # least n_issues validated rebuttals. Partial/duplicate
+            # indexing refuses with rebuttal="coverage".
+            # KNOWN LIMIT, stated not hidden: containment + coverage are
+            # what the machine can check — a quote's RELEVANCE to its
+            # issue remains model-asserted (an irrelevant ≥15-char
+            # evidence span passes containment). The burden still forces
+            # engagement with each issue and kills fabricated quotes.
+            has_quote = False
+            refusal = ""
+            n_issues = len(cheap.issues or [])
+            covered: set = set()
+            valid_count = 0
+            if not conf_valid:
+                refusal = "invalid"       # missing/NaN confidence
+            elif not rebuttals:
+                refusal = "invalid"
+            for r in rebuttals:
+                if refusal:
+                    break
+                kind = str((r or {}).get("kind") or "").strip().lower()
+                ok_one = False
+                if kind == "quote":
+                    if _quote_supported_by_evidence(
+                            (r or {}).get("quote") or "", evidence):
+                        has_quote = True
+                        ok_one = True
+                    else:
+                        refusal = "invalid"
+                elif kind == "fp_class":
+                    if str((r or {}).get("fp_class") or "").strip() \
+                            in _OVERTURN_FP_CLASSES:
+                        ok_one = True
+                    else:
+                        refusal = "invalid"
+                elif kind == "concede":
+                    # CONFIRMED while conceding an issue contradicts the
+                    # contract's own verdict rule.
+                    refusal = "concede"
+                else:
+                    refusal = "invalid"
+                if ok_one:
+                    valid_count += 1
+                    idx = (r or {}).get("issue")
+                    if isinstance(idx, int) and 1 <= idx <= max(n_issues, 1):
+                        covered.add(idx)
+            if not refusal and n_issues > 1:
+                if covered:
+                    if covered != set(range(1, n_issues + 1)):
+                        refusal = "coverage"
+                elif valid_count < n_issues:
+                    refusal = "coverage"
+            if refusal:
+                logger.info(
+                    "Verifier escalation: overturn REFUSED (%s rebuttal) "
+                    "— refute stands. Issues: %s", refusal,
+                    "; ".join(cheap.issues or [])[:140])
+                record_escalation(
+                    kind="refute", route=route, outcome="upheld",
+                    cheap_verdict=cheap.verdict.value,
+                    cheap_confidence=cheap.confidence,
+                    strong_verdict="CONFIRMED",
+                    rebuttal=refusal, trace=trace)
+                return cheap
+
+            rebuttal_kind = "quote" if has_quote else "fp_class"
+            strong = VerifyResult(
+                verdict=VerifyVerdict.CONFIRMED,
+                confidence=conf,
+                reasoning=f"overturn earned ({rebuttal_kind}): {reasoning}",
+                issues=[])
+            if not has_quote:
+                # Discipline D: FP-class-only overturns stay below the
+                # consumption gates — CONFIRMED, but never a clean pass.
+                strong.confidence = min(strong.confidence,
+                                        _CONFIRM_WITHHELD_CONF_CAP)
+                strong.reasoning += (" [fp-class-only overturn: confidence "
+                                     f"capped at {_CONFIRM_WITHHELD_CONF_CAP}"
+                                     " — turn records unverified]")
+            strong.escalated_overturn = True
+            logger.warning(
+                "Verifier escalation OVERTURNED a cheap-judge refute: main "
+                "model says %s (rebuttal: %s). Original issues: %s",
+                strong.verdict.value, rebuttal_kind,
+                "; ".join(cheap.issues or [])[:160])
+            record_escalation(
+                kind="refute", route=route, outcome="overturned",
+                cheap_verdict=cheap.verdict.value,
+                cheap_confidence=cheap.confidence,
+                strong_verdict=strong.verdict.value,
+                final_confidence=strong.confidence,
+                rebuttal=rebuttal_kind, trace=trace)
+            return strong
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("rebuttal resolution failed (refute stands): %s",
+                         exc)
+            record_escalation(
+                kind="refute", route=route, outcome="unavailable",
+                cheap_verdict=cheap.verdict.value,
+                cheap_confidence=cheap.confidence,
+                rebuttal="unparseable", trace=trace)
+            return cheap
 
     async def _escalate_confirm(self, result: Optional[VerifyResult], *,
                                 high_stakes: bool,
@@ -1522,6 +2495,14 @@ class Verifier:
         """Check whether the agent's *response* actually answers
         *intent*, given the *code* it ran and the *output* it
         observed.
+
+        ⚠ NO mechanical layer runs on this route, by design (2026-08-07
+        review made it explicit): the objection check and truncation
+        guard are claim-vs-packed-evidence rules keyed off `retry is
+        None` and packer marks, and code output is neither packed nor
+        marked — its escalation is the injected CODE-prompt
+        re-adjudication below. If a mechanical layer is ever wanted
+        here, it needs its own rules, not these.
 
         ``response`` is the agent's user-facing reply. Defaults to
         empty for back-compat with older callers, but production

@@ -223,6 +223,20 @@ class MemoryBus:
         if not query or not str(query).strip():
             return ""
 
+        # ⚠ Turn-scoped reset (§4L R2 NEW-3): `last_bus_triggers` was set
+        # only on turns WITH skill survivors and never cleared, so a turn
+        # without any inherited the previous turn's list into its
+        # trajectory attribution stamp. Reset here — the start of the
+        # turn's hydration — with the turn key that gates every consumer.
+        try:
+            if self.skill is not None:
+                self.skill.last_bus_triggers = []
+                from ..utils.logging import request_id_context
+                self.skill._bus_delivered_turn_key = str(
+                    request_id_context.get() or "")
+        except Exception:
+            pass
+
         # Adaptive budget: the caller's budget is the BASE and scales UP with
         # query complexity. The old form was `min(max(context_budget, 6000),
         # cap)`, which with the sole prod caller's context_budget=4000
@@ -381,7 +395,17 @@ class MemoryBus:
             return 0
         if time.time() - float(state.get("ts", 0)) > max_age_s:
             return 0  # stale stash from a turn that never finalized
-        survivors = state["survivors"][:12]
+        # OPERATOR DECISION 2026-08-08: the judge remains UNCENSORED — the
+        # whole injected set is judged, not a top-12 slice. The old cap
+        # rank-censored the usefulness instrument (§4M Lens D F2): 92.5%
+        # of live turns injected more than 12 items, 301/314 ledger turns
+        # were exactly the cap, rank-13+ items could book retrievals but
+        # never helpful-credit, and the three low-weighted RRF cells sat
+        # below min_obs forever. Judging everything is the honest fix:
+        # every survivor is credit-eligible and the starved cells accrue
+        # real observations. Bounded by construction: per-source cap 6 ×
+        # 5 tiers ⇒ ≤30 items ≈ +2.7KB prompt on a background call.
+        survivors = state["survivors"]
         intent = state.get("intent", "contextual")
 
         numbered = "\n".join(
@@ -405,17 +429,32 @@ class MemoryBus:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.0,
-            "max_tokens": 128,
+            # Room for a full uncensored verdict: up to 30 two-digit
+            # indices + JSON scaffolding (128 could clip a long "used"
+            # list mid-array → unparseable → whole turn's credit lost).
+            "max_tokens": 192,
             "response_format": {"type": "json_object"},
         }
         try:
             data = await llm_client.chat_completion(
                 payload, use_worker=True, is_background=True, timeout=60.0,
+                # §4O A-MAJOR-2: a Nova ReadTimeout must NOT fall this
+                # post-turn judge onto the foreground main slot (it can
+                # overlap the next user turn). Off-main-only → skip the
+                # judge this cycle instead of dogpiling main.
+                off_main_only=True,
                 task_label="hydration-judge",
             )
             content = data["choices"][0]["message"]["content"] or ""
         except Exception as e:
-            logger.debug(f"hydration usefulness judge failed (skipped): {e}")
+            # §4M (Lens D F3): this was logger.debug on a file handler at
+            # INFO — "zero judge failures in the log" was indistinguishable
+            # from "failures on every turn". A failed judge turn is a
+            # silent no-credit, no-observation turn for the RRF refit, so
+            # it must be VISIBLE at operating log level.
+            logger.warning(
+                f"hydration usefulness judge failed (no credit, no "
+                f"observations this turn): {type(e).__name__}: {e}")
             return 0
 
         used_idx: set = set()
@@ -426,6 +465,14 @@ class MemoryBus:
                 if 0 <= idx < len(survivors):
                     used_idx.add(idx)
         except Exception:
+            # §4M (Lens D F3): was a bare silent return — same visibility
+            # contract as the call failure above. (Correct on one axis and
+            # kept: returning BEFORE the ledger append means no fabricated
+            # negatives.)
+            logger.warning(
+                "hydration usefulness judge returned an unparseable "
+                "verdict (no credit, no observations this turn): %r",
+                content[:120])
             return 0  # unparseable verdict → no credit, no observations
 
         used_vec = [s.get("mem_id") for i, s in enumerate(survivors)
@@ -452,6 +499,13 @@ class MemoryBus:
             # items/turn is arithmetically capped near 1.65/4.55 while a
             # 0.92-item tier can reach 1.0) — see rrf_weights._per_turn_lift.
             turn_key = str(state.get("turn_id") or "") or f"ts-{state.get('ts', 0)}"
+            # Since the 2026-08-08 uncensored-judge decision, rows cover
+            # the FULL injected set (the [:12] slice is gone), so
+            # injected_total == row count on new turns — kept as a
+            # self-check and to date the pre/post-uncap corpus boundary
+            # (301/314 pre-uncap turns were exactly the 12-row cap; the
+            # learning-health censoring census reads this stamp).
+            _injected_total = len(state.get("survivors") or [])
             lines = "".join(
                 json.dumps({
                     "intent": intent,
@@ -459,6 +513,7 @@ class MemoryBus:
                     "success": (i in used_idx),
                     "turn": turn_key,
                     "ts": get_utc_timestamp(),
+                    "injected_total": _injected_total,
                 }) + "\n"
                 for i, s in enumerate(survivors)
             )
@@ -508,6 +563,28 @@ class MemoryBus:
         if triggers and callable(bulk):
             try:
                 bulk(triggers)
+                # Attribution stamp for the trajectory record (§4L
+                # Lens-D MINOR-2: `hydrated_lessons` recorded only the
+                # playbook surface — bus-tier lessons were invisible).
+                # §4N MAJOR-1: stamp the REAL store, not the wrapper. On
+                # self-play `self.skill` is dream's ReadOnlySkillMemory
+                # whose `get_playbook_context` DELEGATES to `real_sm` and
+                # reads the dedup keys off THAT object — so a stamp on the
+                # wrapper was invisible to the read and the §4L delivery
+                # dedup failed open on 89/89 self-play turns (the
+                # highest-volume prompt path). The stamp is turn-key gated
+                # at every reader, so routing it to the real store cannot
+                # leak the sim's lessons into a later user turn.
+                try:
+                    _target = (getattr(self.skill, "real_sm", None)
+                               or getattr(self.skill, "_real", None)
+                               or self.skill)
+                    _target.last_bus_triggers = list(triggers)
+                    from ..utils.logging import request_id_context
+                    _target._bus_delivered_turn_key = str(
+                        request_id_context.get() or "")
+                except Exception:
+                    pass
             except Exception as e:
                 logger.debug(f"skill record_retrievals_bulk failed: {e}")
 
@@ -691,12 +768,42 @@ class MemoryBus:
                     {"source": "vector", "text": it.get("text", ""), "mem_id": it.get("id")}
                     for it in (items or [])
                     if isinstance(it, dict) and it.get("text")
+                    # §4N MAJOR-3: skill-lesson twins live in the vector
+                    # store (§4M heal) so they surface here as generic
+                    # "memories" AND again in the SKILL PLAYBOOK — a
+                    # duplicate that the §4L delivery dedup can't catch
+                    # (vector items carry no trigger) and a mis-framing
+                    # (a lesson rendered as a memory). They have their own
+                    # skill tier + playbook; drop them from the MEMORY
+                    # tier. 60/100 self-play + 2/21 interactive dedup'd.
+                    and str(it.get("type") or "").upper() != "SKILL"
                 ]
             except Exception as e:
                 logger.warning(f"MemoryBus vector fetch failed: {type(e).__name__}: {e}")
                 return []
         try:
-            mem_string = await asyncio.to_thread(self.vector.search, query)
+            # §4M (Lens B MINOR, latent): this pre-selection fetch must not
+            # book retrieval credit — the bus credits SURVIVORS after
+            # fusion, and `search` bumps every candidate by default.
+            # Unreachable on the live store today (search_items exists),
+            # but the next legacy-shaped store would silently inflate
+            # spaced-repetition stats. Kwarg is signature-guarded so
+            # legacy stubs without the parameter keep working.
+            import functools as _ft
+            import inspect as _insp
+            _search = self.vector.search
+            try:
+                _params = _insp.signature(_search).parameters
+                _takes = ("record_retrievals" in _params
+                          or any(p.kind is _insp.Parameter.VAR_KEYWORD
+                                 for p in _params.values()))
+            except (TypeError, ValueError):
+                _takes = True  # unintrospectable (mock/builtin) — safe
+            if _takes:
+                mem_string = await asyncio.to_thread(
+                    _ft.partial(_search, query, record_retrievals=False))
+            else:
+                mem_string = await asyncio.to_thread(_search, query)
         except Exception as e:
             logger.warning(f"MemoryBus vector fetch failed: {type(e).__name__}: {e}")
             return []
@@ -1016,9 +1123,26 @@ class MemoryBus:
         # cosmetic). Source headers are emitted lazily on first sight, so a
         # source's items still cluster under its header while overall
         # inclusion order follows the fused ranking.
+        # ⚠ SELECTION follows the fused ranking; PRESENTATION groups by
+        # source (§4L Lens-D MAJOR-3). Items used to append to one flat
+        # list with lazily-emitted headers, so when sources interleaved
+        # an item landed visually under the WRONG header — confirmed
+        # live: three SKILL lessons rendered inside "### MEMORY
+        # CONTEXT:" and were framed as memories instead of follow-these
+        # rules. Budget accounting and inclusion order are unchanged;
+        # only the final assembly groups each source's items under its
+        # own header, sources in first-acceptance order.
         per_source_count: Dict[str, int] = {}
         emitted_headers: set = set()
-        lines: List[str] = []
+        groups: Dict[str, List[str]] = {}
+        source_order: List[str] = []
+
+        def _emit(src: str, line: str) -> None:
+            if src not in groups:
+                groups[src] = []
+                source_order.append(src)
+            groups[src].append(line)
+
         survivors: List[Dict[str, Any]] = []
         used = 0
         for item, _score in gated:  # already sorted desc by RRF
@@ -1041,14 +1165,25 @@ class MemoryBus:
                 # item in place rather than returning empty context.
                 if used == 0:
                     if header is not None and src not in emitted_headers:
-                        lines.append(header)
                         emitted_headers.add(src)
                         used += len(header) + 1
-                    remaining = max_chars - used
-                    lines.append(text[:max(0, remaining)].rstrip() + " [...]")
+                    # §4N B-MINOR-3: DO NOT grant the whole budget to one
+                    # oversized head item and break — that silently evicted
+                    # the entire SKILL PLAYBOOK + graph block (the 2026-07-22
+                    # silent-vanish class, resurrected for the HEAD item;
+                    # vector items carry no per-item cap upstream). Cap the
+                    # head grant at half the budget and KEEP FILLING so the
+                    # other tiers still land. If the head item is genuinely
+                    # the only thing, the loop just ends naturally.
+                    head_cap = max(MemoryBus._MIN_EMITTABLE_CHARS,
+                                   (max_chars - used) // 2)
+                    marker = " [...]"
+                    body = text[:max(0, head_cap - len(marker))].rstrip()
+                    _emit(src, body + marker)
                     survivors.append(item)
-                    used = max_chars
-                    break
+                    used += len(body) + len(marker) + 1
+                    per_source_count[src] = per_source_count.get(src, 0) + 1
+                    continue
                 # Otherwise SKIP this item and keep filling. Items are ordered
                 # by fused score, NOT by length, so the old `break` (comment:
                 # "lower-ranked items can't fit either") was simply false:
@@ -1060,14 +1195,19 @@ class MemoryBus:
                 # silently, because they are emitted lazily on first sight.
                 continue
             if header is not None and src not in emitted_headers:
-                lines.append(header)
                 emitted_headers.add(src)
                 used += len(header) + 1
-            lines.append(text)
+            _emit(src, text)
             survivors.append(item)
             used += len(text) + 1
             per_source_count[src] = per_source_count.get(src, 0) + 1
 
+        lines: List[str] = []
+        for src in source_order:
+            header = headers.get(src)
+            if header is not None and src in emitted_headers:
+                lines.append(header)
+            lines.extend(groups[src])
         out = "\n".join(lines).strip()
         if len(out) > max_chars:
             out = out[:max_chars].rstrip() + "\n\n[... TRUNCATED]"
@@ -1164,7 +1304,20 @@ class MemoryBus:
                 results["graph"] = "skip"
                 return
             try:
-                added = await asyncio.to_thread(self.graph.add_triplets, triplets)
+                # §4M (Lens C MINOR): tombstone parity — the consolidation
+                # path filters removal-shaped triplets ("user REMOVED x")
+                # before they mint graph edges, but this fan-out (and thus
+                # tool_remember's background extraction) had no such
+                # filter, so a negation sentence became a positive edge.
+                try:
+                    from ..utils.helpers import is_removal_triplet
+                    kept = [t for t in triplets if not is_removal_triplet(t)]
+                except Exception:
+                    kept = triplets
+                if not kept:
+                    results["graph"] = "skip (removal-shaped)"
+                    return
+                added = await asyncio.to_thread(self.graph.add_triplets, kept)
                 results["graph"] = f"ok ({added})"
             except Exception as e:
                 results["graph"] = f"error: {e}"
@@ -1173,6 +1326,16 @@ class MemoryBus:
             update = fact_data.get("profile_update")
             if not self.profile or not update:
                 results["profile"] = "skip"
+                return
+            # §4M (Lens C): `update.get` on a non-dict raised OUTSIDE the
+            # try — gather(return_exceptions=True) swallowed it, the
+            # report simply LACKED the "profile" key, and the tool
+            # reported SUCCESS on a total drop. Malformed payloads must
+            # surface as an error the failure sniffer can see.
+            if not isinstance(update, dict):
+                results["profile"] = (
+                    f"error: malformed profile_update "
+                    f"({type(update).__name__}, expected dict)")
                 return
             # A well-formed profile write names BOTH category and key —
             # the old defaults ("notes"/"info") minted junk `<cat>.info` /
@@ -1213,4 +1376,15 @@ class MemoryBus:
             _vector(), _graph(), _profile(), _skill(),
             return_exceptions=True,
         )
+        # §4M (Lens C MAJOR-3): per-target failures were report-only — the
+        # PARTIAL state went to the model's tool result and was discarded
+        # after the turn, leaving no durable record that a fan-out write
+        # half-landed. No rollback exists (by design: best-effort targets),
+        # so the log line IS the repair breadcrumb.
+        _errs = {k: v for k, v in results.items()
+                 if isinstance(v, str) and v.startswith("error")}
+        if _errs:
+            logger.warning(
+                "publish_fact partial write (%s): %s — other targets "
+                "landed; no rollback", event_type, _errs)
         return results

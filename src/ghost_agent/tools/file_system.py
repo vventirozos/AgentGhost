@@ -2924,12 +2924,17 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     # reach link-local/metadata).
     from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
     from ..utils.helpers import aclose_curl_response as _aclose_curl
+    from ..utils.egress_guard import resolve_egress_proxy as _resolve_egress_proxy
     _ssrf = _url_ssrf_reason(url)
     if _ssrf:
         return f"Error: {_ssrf}"
 
-    # 1. Clean Proxy URL
-    proxy_url = tor_proxy
+    # 1. Clean Proxy URL. Fail-closed (§4P): under --mandatory-tor a falsy proxy
+    # is replaced with the loopback Tor default so a public download never
+    # connects cleartext (the SSRF guard above already refused internal hosts,
+    # so `url` here is public); the socket guard can't backstop this curl_cffi
+    # call. Outside mandatory-tor the proxy is unchanged (direct WEB mode).
+    proxy_url = _resolve_egress_proxy(tor_proxy, url)
     mode = "TOR" if proxy_url and "127.0.0.1" in proxy_url else "WEB"
 
     # Full URL — the [:35] pre-truncation also starved the durable mirror (it

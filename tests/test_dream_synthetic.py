@@ -105,11 +105,22 @@ async def test_synthetic_self_play_memory_proxies(mock_ghost_agent_class, mock_d
     
     # Test ReadOnlyVectorMemory
     isolated_vm = isolated_context.memory_system
-    # Forwarded methods
+    # Forwarded methods — §4M F1: reads must force the retrieval-stat
+    # bump OFF (a read that bumps stats is a write to operator memory;
+    # the raw passthrough booked phantom credit on every self-play
+    # hydration, rc up to 690 on one live episode).
     isolated_vm.search("q")
-    mock_context.memory_system.search.assert_called_with("q")
+    mock_context.memory_system.search.assert_called_with(
+        "q", record_retrievals=False)
     isolated_vm.search_advanced("q")
-    mock_context.memory_system.search_advanced.assert_called_with("q")
+    mock_context.memory_system.search_advanced.assert_called_with(
+        "q", record_retrievals=False)
+    # §4M F1(b): search_items must be exposed (it never bumps stats), or
+    # the isolate's bus falls to the legacy `vector.search` branch that
+    # both records retrievals and bypasses the off-topic floor.
+    isolated_vm.search_items("q", min_relevance_dist=0.4)
+    mock_context.memory_system.search_items.assert_called_with(
+        "q", inject_identity=True, min_relevance_dist=0.4)
     
     # Blocked methods
     isolated_vm.add("fact")

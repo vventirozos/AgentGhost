@@ -185,7 +185,16 @@ async def test_tick_phase2_advances_cooldown_when_dream_raises():
     """Regression: a crashing REM dream must still advance `_last_dream_at`
     so the watchdog doesn't re-fire the failing dream every tick.
     `last_activity_time` is deliberately NOT touched — it tracks user
-    idleness, not agent internal work."""
+    idleness, not agent internal work.
+
+    §4Q (2026-08-08): the dream exception is now CAUGHT inside the phase
+    instead of propagating. Dream is not the terminal phase — twelve more
+    phases follow it — so an escaping exception unwound to the watchdog's
+    tick handler and silently skipped all of them for that tick. (Self-play
+    re-raises deliberately precisely because it IS last; see
+    test_anchor_updates_even_when_self_play_raises.) The contract this test
+    exists for — anchor advanced, user clock untouched — is unchanged; only
+    the propagation scaffolding is gone."""
     agent = _make_agent(idle_seconds=900, memory_ids=4)
     mock_dreamer = MagicMock()
     mock_dreamer.dream = AsyncMock(side_effect=RuntimeError("llm boom"))
@@ -194,8 +203,8 @@ async def test_tick_phase2_advances_cooldown_when_dream_raises():
 
     with patch("ghost_agent.core.dream.Dreamer", return_value=mock_dreamer), \
          patch("ghost_agent.core.agent.random.random", return_value=0.1):
-        with pytest.raises(RuntimeError):
-            await agent._biological_tick()
+        # Must NOT raise: a dream crash may not abort the rest of the tick.
+        await agent._biological_tick()
 
     mock_dreamer.dream.assert_awaited_once()
     # Cooldown anchor must have advanced past the start of the tick.
@@ -237,11 +246,10 @@ async def test_tick_phase2_does_not_refire_after_failed_dream():
 
     with patch("ghost_agent.core.dream.Dreamer", return_value=mock_dreamer), \
          patch("ghost_agent.core.agent.random.random", return_value=0.1):
-        # Tick 1 — dream fires and raises. Watchdog would catch this
-        # exception in production; here we let it bubble to confirm the
-        # finally-clause still ran.
-        with pytest.raises(RuntimeError):
-            await agent._biological_tick()
+        # Tick 1 — dream fires and raises. Since §4Q the phase swallows it
+        # (dream is not terminal), so the tick completes normally and the
+        # finally-clause still advances the anchor.
+        await agent._biological_tick()
 
         # Simulate a full minute elapsing before the next tick — still
         # well inside the 30-min dream cooldown.

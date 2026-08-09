@@ -54,17 +54,37 @@ class GraduatedSkillStore:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, OSError) as e:
+        except json.JSONDecodeError as e:
+            # §4M (Lens A MAJOR-2): returning {} left the corrupt bytes in
+            # place for the NEXT graduate() to atomically overwrite — every
+            # prior graduated skill unrecoverable. Preserve the corrupt file
+            # under a timestamped sidecar first (same policy as the playbook,
+            # profile and journal stores), then start empty.
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            backup = self.path.with_suffix(self.path.suffix + f".corrupt-{ts}")
+            try:
+                self.path.replace(backup)
+                logger.warning(
+                    "auto_skills.json was corrupt (%s); preserved as %s", e, backup)
+            except OSError as rename_err:
+                logger.error(
+                    "auto_skills.json corrupt AND rename failed: %s", rename_err)
+            return {}
+        except OSError as e:
             logger.warning("auto-skill store read failed (%s); starting empty", e)
             return {}
 
     def _save(self, data: Dict[str, dict]) -> None:
         try:
+            import os
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
-            )
+            # §4M (Lens A MINOR): fsync before the rename so power loss
+            # can't promote a torn/empty file (same policy as journal).
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
             tmp.replace(self.path)
         except Exception as e:
             logger.warning("auto-skill store write failed: %s", e)

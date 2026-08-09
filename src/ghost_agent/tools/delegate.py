@@ -193,6 +193,16 @@ async def tool_jobs(action: str = None, job_id=None, context=None, **kwargs):
             # explicit by-id collect can always re-fetch one.
             done = [j for j in reg.list(status=STATUS_DONE)
                     if j.result and not j.collected]
+            # §4O D-1: per-JOB result is capped (MAX_RESULT_CHARS) but the
+            # BATCH count was not — a burst of finished jobs could dump up
+            # to 50×8000=400KB into a pressure-sensitive context in one
+            # tool result. Cap the batch; the rest stay unread for the next
+            # collect (read-marking already prevents re-dumping).
+            _COLLECT_BATCH_MAX = 8
+            _overflow = 0
+            if len(done) > _COLLECT_BATCH_MAX:
+                _overflow = len(done) - _COLLECT_BATCH_MAX
+                done = done[:_COLLECT_BATCH_MAX]
             if not done:
                 seen = [j for j in reg.list(status=STATUS_DONE)
                         if j.result and j.collected]
@@ -208,6 +218,10 @@ async def tool_jobs(action: str = None, job_id=None, context=None, **kwargs):
             for j in done:
                 out.append(f"\n--- {j.id}: {j.label[:70]} ---\n{j.result}")
             reg.mark_collected([j.id for j in done])
+            if _overflow:
+                out.append(f"\n\n[{_overflow} more finished job(s) not shown "
+                           f"— call jobs(action='collect') again to read the "
+                           f"next batch]")
             return "\n".join(out)
         job = reg.get(job_id)
         if job is None:

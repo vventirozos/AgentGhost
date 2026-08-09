@@ -223,23 +223,23 @@ class TestAdaptiveSampling:
 
 class TestFallbackChains:
     def test_get_fallback_for_deep_research(self):
-        from ghost_agent.tools.fallback_chains import get_fallback_hint
+        from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
         hint = get_fallback_hint("deep_research")
         assert hint is not None
         assert "web_search" in hint.lower()
 
     def test_get_fallback_for_execute(self):
-        from ghost_agent.tools.fallback_chains import get_fallback_hint
+        from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
         hint = get_fallback_hint("execute")
         assert hint is not None
         assert "file_system" in hint.lower()
 
     def test_no_fallback_for_unknown_tool(self):
-        from ghost_agent.tools.fallback_chains import get_fallback_hint
+        from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
         assert get_fallback_hint("unknown_tool") is None
 
     def test_skips_web_search_on_captcha(self):
-        from ghost_agent.tools.fallback_chains import get_fallback_hint
+        from ghost_agent.tools.fallback_chains import get_fallback_chain_hint as get_fallback_hint
         hint = get_fallback_hint("deep_research", "CAPTCHA detected, search blocked")
         # Should skip web_search and suggest recall instead
         assert hint is not None

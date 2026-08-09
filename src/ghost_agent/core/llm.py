@@ -1399,8 +1399,10 @@ class LLMClient:
             # the request). Only fall back to the wait when the call will
             # actually land on the main node. (If every off-main node
             # fails, _do_chat_completion may still fall back to main — a
-            # rare, already-bounded edge, same as proceeding after the
-            # 600s ceiling.)
+            # rare edge; §4O A-MAJOR-2 makes background pool callers pass
+            # off_main_only=True so that fallback RAISES instead of
+            # dogpiling the main slot, since §4O A-MAJOR-1 means this
+            # off-main branch no longer holds the _bg_queue_sem.)
             targets_main_node = not (
                 (use_worker and getattr(self, "worker_clients", None))
                 or (use_critic and getattr(self, "critic_clients", None))
@@ -1408,9 +1410,20 @@ class LLMClient:
                 or (use_swarm and getattr(self, "swarm_clients", None))
                 or (use_coding and getattr(self, "coding_clients", None))
             )
-            if targets_main_node:
-                await self._wait_for_foreground_clear()
-            async with self._bg_queue_sem:
+            # §4O A-MAJOR-1: only MAIN-targeted background calls contend for
+            # the single foreground slot, so only they wait for the
+            # foreground-clear AND queue on the 3-permit `_bg_queue_sem`. An
+            # OFF-main background call (worker/critic/…) does neither — the
+            # old code acquired the sem unconditionally, so a critical-path
+            # off-main route() (query-expansion/decompose/verify, run before
+            # hydration) could park behind up to 3 long background STREAM
+            # holders with NO timeout, defeating route()'s documented
+            # fail-fast (which bounds only the HTTP call, not the sem).
+            import contextlib as _ctxlib
+            async with _ctxlib.AsyncExitStack() as _bg_stack:
+                if targets_main_node:
+                    await self._wait_for_foreground_clear()
+                    await _bg_stack.enter_async_context(self._bg_queue_sem)
                 _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
                 self._note_usage(_result)
                 self._maybe_record_call(payload, _result,

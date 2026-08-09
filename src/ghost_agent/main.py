@@ -172,6 +172,18 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Ghost Agent: Autonomous AI Service")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0 — reachable over the network, e.g. a Tailscale host). Use 127.0.0.1 to restrict to loopback. A non-loopback bind refuses to boot without an explicit API key.")
     parser.add_argument("--port", type=int, default=8000)
+    # ⚠ §4L Lens-C MAJOR-2/3 (2026-08-07): the planner block in
+    # agent.py gated on `args.use_planning` — an attribute NO CLI flag
+    # ever set, so the router's planner-skip consumer and the promoted
+    # planning.decompose GEPA artifact were structurally unreachable in
+    # every prod configuration while their comments claimed otherwise.
+    # Default False: adding the flag changes nothing until the operator
+    # opts in; it makes the documented consumer REACHABLE.
+    parser.add_argument("--use-planning", dest="use_planning",
+                        action="store_true", default=False,
+                        help="enable the planning path (router-gated "
+                             "decompose; consumes the planning.decompose "
+                             "GEPA artifact)")
     parser.add_argument("--upstream-url", default="http://127.0.0.1:8080")
     parser.add_argument("--swarm-nodes", default=None, help="Comma-separated list of url|model nodes")
     parser.add_argument("--worker-nodes", default=None, help="Comma-separated list of url|model nodes for background/edge tasks")
@@ -209,12 +221,12 @@ def parse_args():
     parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log. Also disables idle-time self-critique on failed turns, since it depends on the log.")
     parser.add_argument("--no-reflection", action="store_true", help="Disable idle-time self-critique on failed turns even if trajectory logging is on.")
     parser.add_argument("--no-dream", action="store_true", help="Disable the idle-time Deep REM Dream phase (biological-watchdog phase 2: memory consolidation / heuristic harvest). Leaves reflection and self-play intact. The dream-off arm for the Track-B earn-keep idle-loop LOO (scripts/earn_keep.py --track B). Off by default = production dreams normally.")
-    parser.add_argument("--no-self-play", action="store_true", help="Disable the idle-time Synthetic Self-Play phase (biological-watchdog phase 3: fresh self-play + counterfactual replay, >60 min idle). Leaves reflection and dream intact. The self-play-off arm for the Track-B earn-keep idle-loop LOO. NOTE: distinct from --frontier-selfplay, which only toggles cluster SELECTION, not whether self-play fires. Off by default = production self-plays normally.")
+    parser.add_argument("--no-self-play", action="store_true", help="Disable the idle-time Synthetic Self-Play phase (biological-watchdog phase 3: fresh self-play + counterfactual replay, >60 min idle). ⚠ CONFOUNDED ARM (§4Q, 2026-08-08): this does NOT ablate self-play alone. Self-play's completion is the only idle-time reset of `last_activity_time`, and that reset is what re-opens the (900, 3600] idle window for every other phase. With it off, a long AFK stretch gets ONE window and then idle_secs climbs past 3600 permanently, gating out reflection/postmortem/skills/PRM/router/calibration/tidy/narratives/autoadvance for the rest of the stretch — only the journal phase (no upper bound) survives. Interpret any --no-self-play arm as 'idle machine mostly off', not 'self-play off'. The self-play-off arm for the Track-B earn-keep idle-loop LOO. NOTE: distinct from --frontier-selfplay, which only toggles cluster SELECTION, not whether self-play fires. Off by default = production self-plays normally.")
     parser.add_argument("--postmortem", action="store_true", default=False, help="Biological-watchdog phase 2.5c: run whole-transcript post-mortems on the worst recent FAILED runs and file durable, classified DEFECT REPORTS (behavioural / configuration / code_defect) to $GHOST_HOME/postmortem/defects.jsonl. Behavioural findings also route into SkillMemory (same channel as reflection). Code-defect findings get an LLM-proposed reproducing test + unified diff attached — stored for review, NEVER auto-applied. Read the queue with the `postmortem` tool. Opt-in, off by default. Requires the trajectory log (no effect under --no-trajectories).")
     parser.add_argument("--postmortem-cooldown", type=int, default=10800, help="Seconds between idle-time post-mortem passes (phase 2.5c). Default 3 hours. Only active under --postmortem.")
     parser.add_argument("--postmortem-min-severity", type=float, default=0.4, help="Minimum structural-severity (0..1) a failed run must score before it earns a post-mortem LLM call. Lower = more runs analysed. Default 0.4.")
     parser.add_argument("--postmortem-propose-patch", action="store_true", default=False, help="For code_defect post-mortems, also ask the coding model for a reproducing test + unified diff and attach them to the defect report (stored as a PROPOSAL, never applied). Requires --postmortem. Adds one coding-model call per code-defect finding.")
-    parser.add_argument("--bio-time-scale", type=float, default=1.0, help="B3 idle-loop ablation (IMPROVEMENTS.md #4): divide every biological-watchdog idle-window bound and phase cooldown by N, so hours-long idle windows compress into minutes. Default 1.0 = production timings. e.g. 60 → a 1h window fires after ~1min idle. Used by scripts/ablation_trackb3.py to exercise the pure-idle learning loops in accelerated epochs. DO NOT set in production.")
+    parser.add_argument("--bio-time-scale", type=float, default=1.0, help="B3 idle-loop ablation (IMPROVEMENTS.md #4): divide every biological-watchdog idle-window bound, phase cooldown and the watchdog tick period by N, so hours-long idle windows compress into minutes. Default 1.0 = production timings. e.g. 60 → a 1h window fires after ~1min idle. Used by scripts/ablation_trackb3.py to exercise the pure-idle learning loops in accelerated epochs. DO NOT set in production.")
     parser.add_argument("--bio-deterministic", action="store_true", default=False, help="B3 idle-loop ablation: make the probabilistic idle phases (dream 0.5, self-play 0.2) fire deterministically every eligible tick instead of sampling, so the ablation's control/treatment arms exercise the same phases each accelerated epoch. Default off (production sampling). Pairs with --bio-time-scale.")
     parser.add_argument("--router-model", default=None, help="Path to a persisted ComplexityClassifier JSON. When set, the router is loaded and consulted; when unset (default), the dispatcher is a no-op that always allows the full swarm pool list.")
     parser.add_argument("--router-confidence-threshold", type=float, default=0.3, help="Minimum router confidence required to route a request to a cheap path. Below this, the dispatcher escalates to the full swarm.")
@@ -887,6 +899,11 @@ async def lifespan(app):
                            icon=Icons.EVENT_BUS)
     except Exception as _rrfx:
         logger.debug("rrf weights load skipped: %s", _rrfx)
+    # §4M (Lens B MINOR): stash on the context too — the fallback bus that
+    # GhostAgent._get_memory_bus builds for self-play isolates (which drop
+    # the production bus to get read-only stores) reads this attribute;
+    # without it 281/765 live hydrations fused with hand-tuned defaults.
+    context.intent_weights = _learned_rrf
     context.memory_bus = MemoryBus(
         vector_memory=getattr(context, 'memory_system', None),
         graph_memory=getattr(context, 'graph_memory', None),
@@ -1454,11 +1471,28 @@ async def lifespan(app):
             # below OVERWRITE the bad checkpoint from the trajectory log.
             try:
                 clf = ComplexityClassifier.load(router_ckpt_path)
-                pretty_log(
-                    "Complexity Router",
-                    f"Loaded classifier from {router_ckpt_path}",
-                    icon=Icons.BRAIN_PLAN,
-                )
+                # §4O C-MAJOR-1: reject an INVERTED checkpoint at load (the
+                # n_steps-counts-history bug trained models with negative
+                # technical/coding weights → planner skipped on the hardest
+                # requests). Fall through to clf=None so the bootstrap below
+                # retrains from the (now-corrected) trajectory labels and
+                # overwrites the bad checkpoint; router stays escalate-all
+                # (planner runs) until a sane model exists.
+                if clf is not None and not clf.looks_sane():
+                    pretty_log(
+                        "Complexity Router",
+                        f"Checkpoint at {router_ckpt_path} is INVERTED "
+                        "(negative technical/coding weights) — rejecting; "
+                        "escalate-all + retraining from trajectories",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    clf = None
+                else:
+                    pretty_log(
+                        "Complexity Router",
+                        f"Loaded classifier from {router_ckpt_path}",
+                        icon=Icons.BRAIN_PLAN,
+                    )
             except Exception as load_err:  # noqa: BLE001 — boot must survive any checkpoint state
                 clf = None
                 pretty_log(
@@ -1864,6 +1898,17 @@ async def lifespan(app):
     context.biological_task = asyncio.create_task(agent.biological_watchdog())
     app.state.biological_task = context.biological_task
     pretty_log("Biological Daemon", "Native asyncio watchdog started", icon=Icons.HEARTBEAT)
+    # Loud at BOOT, not buried in a post-hoc log read: an over-aggressive
+    # --bio-time-scale makes most idle phases structurally unreachable and they
+    # report 0 firings as if that were a measurement (#40/#41). Silence here is
+    # what cost two ablation runs.
+    try:
+        _scale_warn = agent._warn_if_scale_breaks_the_window()
+        if _scale_warn:
+            pretty_log("Ablation Timing", _scale_warn,
+                       level="WARNING", icon=Icons.WARN)
+    except Exception as _swe:  # never block boot on a diagnostic
+        logger.debug("bio-time-scale window check skipped: %s", _swe)
 
     # Debug affordance: `kill -USR2 <pid>` dumps every live asyncio task
     # with the top of its await stack into the log. Built for hunting

@@ -1042,6 +1042,125 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
     <li><strong>Cosmetic</strong> — exploration seeds no longer log <code>Targeting cluster 'None'</code>.</li>
   </ul>
 
+  <h2>Round 15 — §4M memory-substrate re-audit, round 1 (2026-08-08)</h2>
+  <p>Four pre-registered lenses over the LIVE stores (integrity / retrieval math / write fan-out /
+  instrument truthfulness). Headline: <strong>active, ongoing damage</strong>, not latent risk. Nine fixes,
+  all red-on-revert pinned in <code>tests/test_learning_stack_audit.py</code> (§4M block) and
+  <code>tests/test_dream_synthetic.py</code>; design-level MAJORs (rank-censored usefulness ledger,
+  decalibrated dedup thresholds, flock-RMW lost updates, fan-out atomicity) queued in
+  <code>PROJECT_JOURNAL.md §4M</code>:</p>
+  <ul>
+    <li><strong>Skill-store twin destruction (CRIT, two independent discoveries)</strong> — both vector-twin
+    cleaners keyed the playbook <em>task</em>-first while the twin metadata stores the <em>trigger</em>;
+    task ≠ trigger rows (all of self-play/dream) lost their healthy twins: ~1 per idle cycle via
+    <code>reconcile_vector_orphans</code> plus 4 logged deletes via the reworded-twin re-locate branch the
+    §4L fix missed. 36/50 lessons were dark to bus retrieval. Fixed both-fields + a ≥half-coverage floor
+    (true orphans can no longer hide as tiny subsets of unrelated lessons) + the missing
+    <code>or trigger ==</code> clause; new idempotent <code>heal_missing_twins</code> idle rider restores
+    missing twins with original timestamps.</li>
+    <li><strong>Self-play phantom retrieval credit</strong> — the dream isolate's vector proxy now forces
+    <code>record_retrievals=False</code> and exposes <code>search_items</code> (see
+    <a href="algorithms/dream_cycle.html">dream cycle</a>).</li>
+    <li><strong>Graph archive-before-delete</strong> — <code>graph_pruned_archive.jsonl</code> wired into
+    forget (archive-or-soft-expire), prune (fail closed) and wipe (best-effort); see
+    <a href="memory/graph.html">graph</a>.</li>
+    <li><strong>Silent write drops surfaced</strong> — a malformed (non-dict) <code>profile_update</code> used
+    to vanish inside <code>gather(return_exceptions=True)</code> and report SUCCESS; it now reports
+    <code>error: malformed profile_update</code>. Corrupt <code>auto_skills.json</code> is preserved as a
+    timestamped <code>.corrupt-*</code> sidecar instead of being overwritten by the next graduation.</li>
+    <li><strong>learning-health truthfulness</strong> — one non-numeric outcome row no longer blanks the whole
+    report (coercer actually used), and the framing-regression watch constant is UTC (was local: a 3h06m
+    blind window).</li>
+    <li><strong>Batch 2 (post-restart, same day):</strong> hydration-judge failures visible at WARNING
+    (a failed judge turn = a missing usefulness observation); <code>publish_fact</code> partial writes log
+    the per-target error map; profile canonicalisation shared via <code>ProfileMemory.canonicalize()</code>
+    and consumed by both graph-edge mint sites (<code>vehicle</code> → <code>HAS_CAR</code> everywhere);
+    dedup thresholds recalibrated 0.15/0.25 → 0.20/0.21 into the measured [0.192, 0.213] corridor (see
+    <a href="memory/skills.html">skills</a>); usefulness-ledger rows stamp <code>injected_total</code> and
+    learning-health gained an <code>RRF USEFULNESS LEDGER</code> censoring + staleness section.</li>
+    <li><strong>Minor batch (same day):</strong> fallback bus carries the learned RRF intent weights
+    (self-play was fusing with hand-tuned defaults); probe purity on the bus legacy fetch + episodic
+    fallback (signature-guarded <code>record_retrievals=False</code>); tasks.py "manual" vector rows carry
+    timestamps; skill twin metadata timestamps converted to UTC-"Z" at the write boundary
+    (<code>_twin_ts</code>); removal-shaped triplets filtered on the bus graph leg and remember's
+    extraction (tombstone parity); fsync-before-rename on playbook/auto_skills/session saves; corrupt
+    session files preserved as <code>.corrupt-*</code> sidecars; the learning-health F6 mislabel cluster
+    (lifetime stamp denominator, undated escalation span, context-vs-cluster split, at-cap lesson note,
+    auto-skills naming, headless foresight disclaimer, hit-rate denominator disclosure) and the ablation
+    script's hydration counter. The flock read-modify-write gap is <strong>accepted-as-latent</strong>
+    (single-writer contract documented at the lock site) — revisit only when adding a second writer
+    process.</li>
+    <li><strong>Round 2 (fresh-eye review of the fixes, same day): 0 CRIT, 0 reachable MAJOR.</strong>
+    Six minors in the new fix code, all fixed same-pass: heal's empty-trigger/long-task phantom
+    re-embed (task-fallback mint + symmetric [:200] key truncation), <code>_twin_ts</code> now parses
+    its own "Z" output (py3.10 fromisoformat trap), removal predicates match on token boundaries
+    (PERFORMER/USES_TRANSFORMERS no longer filtered), the legacy remember path got the same filter +
+    visible failure as the bus path, the profile canonical map is now a single copy consumed by
+    update/delete/prune, and the update_profile delete path scrubs the CANONICAL vector fact. Forget
+    archives carry weight+timestamp; ledger-health excludes turn-less legacy rows. Heal↔reconcile
+    oscillation was disproven by an executed 8-case matrix; a full-source sweep found no fourth
+    task-vs-trigger site. Fix cycle <strong>converged</strong>; final suite 11,465 green.</li>
+    <li><strong>F2 resolved by operator decision (same day): the judge remains uncensored.</strong> The
+    hydration-usefulness judge's top-12 slice is removed — the whole injected set is judged (bounded ≤30
+    by the per-source caps), every survivor is helpful-credit-eligible, and the three starved RRF cells
+    accrue real observations instead of sitting frozen at their priors. <code>max_tokens</code> raised
+    128→192 so a long used-list cannot clip into an unparseable verdict. The learning-health censoring
+    census now reads as pre-uncap history.</li>
+  </ul>
+
+  <h2>Round 16 — §4N prompt-funnel audit (2026-08-08)</h2>
+  <p>Four lenses over recorded live prompts covering everything AFTER memory-bus fusion — context
+  assembly, compaction, prefill. Converged in 3 rounds; ~40 red-on-revert pins in
+  <code>tests/test_prompt_funnel_4n.py</code>. Highlights:</p>
+  <ul>
+    <li><strong>Self-play delivery-dedup was inert</strong> (booking stamped a ReadOnly wrapper while
+    the read hit the real store — the 3rd instance of that split); the bus now stamps the real store.</li>
+    <li><strong>Constraint extractor mined injected playbook furniture</strong> (rendering
+    <code>ANTI-PATTERN: …</code> as a MUST-HOLD); a case-sensitive, colon-anchored furniture filter
+    strips it without dropping real user constraints.</li>
+    <li><strong>Skill-lesson twins leaked into the MEMORY tier</strong> and duplicated the playbook —
+    dropped from the vector tier (they have their own skill tier).</li>
+    <li><strong>The boot warmup was byte-shifted and unreusable</strong> (~28s of node compute per
+    restart for ~17% reuse); it now byte-matches the live system slot via one shared constant, and
+    the dead 2026-07-29 hash instrument fires a real "prefix warmup MISS" warning.</li>
+    <li><strong>The original goal is now sacrosanct through every compaction stage</strong> (was
+    truncated to 500 chars / dropped / center-cut before the LLM prune could protect it), tool-call
+    JSON is never sliced mid-body, and native <code>tool_calls</code> args are folded into all five
+    budget counters (the <code>--native-tools</code> token-undercount landmine).</li>
+    <li><strong>Rounds 2-3 caught the fixes overshooting</strong> — a token double-count on the live
+    XML dialect, a warmup warning that lied on self-play isolates, a furniture filter that destroyed
+    real constraints, self-play planner-forcing that swept in sub-agents, and a falsy-0 that made a
+    guard dead code — all fixed same-pass. The cross-round lesson: new filters/guards need both a
+    false-positive audit and a boundary-value audit.</li>
+  </ul>
+  <p>A latent test-hygiene bug surfaced too: a test started two <code>patch()</code>es with no
+  <code>.stop()</code>, leaking mocked <code>estimate_tokens</code>/<code>process_rolling_window</code>
+  into every later test — fixed with <code>addfinalizer</code>.</p>
+
+  <h2>Round 17 — §4O LLM dialog-layer audit (2026-08-08)</h2>
+  <p>Four lenses re-verifying the (mostly-already-closed) 07-22 LLM-stack review plus the untouched
+  surface — routing, streaming, contention, delegation. Converged in 4 rounds; ~20 red-on-revert pins
+  in <code>tests/test_dialog_layer_4o.py</code>. Highlights:</p>
+  <ul>
+    <li><strong>The complexity router was inverted</strong> — its difficulty label counted
+    conversation length, not the turn's agentic steps, so technical requests routed to "easy" and the
+    strategic planner was skipped on exactly the hardest ones. Fixed the label, and added a
+    <em>fail-closed</em> sanity gate that refuses to install or persist a model with net-negative
+    jargon/coding weights — validated live: the deployed inverted checkpoint is now rejected and the
+    router stays escalate-all (planner runs) until a correctly-labeled model trains.</li>
+    <li><strong>A user-facing streamed answer cut off mid-stream</strong> was persisted as a clean
+    final answer and fed to calibration — now marked truncated and kept out of the calibration
+    sample.</li>
+    <li><strong>Background off-main calls no longer contend for the single foreground slot</strong>
+    (the shared semaphore is main-only), and seven background worker consumers a prior closure missed
+    now degrade instead of dogpiling main on a node outage.</li>
+    <li><strong>Rounds 2-4 each caught the previous round overshooting</strong> — a fix guarding only
+    the site its test greps and missing a sibling, a net-sum gate with a compensation blind spot, a
+    denylist both incomplete and over-broad — all fixed. The emphatic cross-round lesson: every new
+    guard/filter/threshold needs both a false-positive audit and a call-site-completeness sweep, and
+    over-fixing was the dominant self-inflicted defect source.</li>
+  </ul>
+
   <h2>Remaining by design</h2>
   <ul>
     <li><strong>Sandbox host-networking</strong> — remains the Linux default (the in-sandbox Tor proxy needs host loopback); isolation is opt-in via <code>GHOST_SANDBOX_NETWORK</code>. Not a bug; left as a deliberate, documented trade-off.</li>

@@ -230,7 +230,11 @@ async def main() -> int:
         measures plan QUALITY, so this is a correctness-of-record finding,
         not proof the artifact is bad — but the promotion decision does not
         reproduce under the objective this function now implements. The
-        read-site is dark (no `--use-planning` on the live exec line).
+        read-site is dark — and until 2026-08-07 was UNREACHABLE in any
+        configuration: no `--use-planning` flag existed anywhere, only
+        tests set the attribute (§4L Lens-C MAJOR-3). The flag is real
+        now; the artifact stays unapplied until the operator boots with
+        it.
         """
         w = set(re.findall(r"[a-z0-9_]+", want.lower()))
         g = set(re.findall(r"[a-z0-9_]+", got.lower()))
@@ -320,6 +324,32 @@ async def main() -> int:
                       "promotion aborted", file=sys.stderr)
                 raise
         os.replace(staging_path, output_path)
+        # ⚠ Stamp the GATE IDENTITY into the promoted artifact (§4L
+        # D-MAJOR-1 follow-through): the staging writer emits the bare
+        # schema, so even a legitimately-gated promotion produced an
+        # artifact the loader must warn about ("predates the gate
+        # schema"). The stamp is what makes "this artifact won under
+        # THIS metric" checkable later — the missing provenance that
+        # let the recall-metric planning.decompose survive the F1
+        # change unchallenged.
+        try:
+            _art = _json_mod.loads(output_path.read_text(encoding="utf-8"))
+            _art["gate_arm"] = "token-F1 A/B, private holdout"
+            _art["gate"] = {
+                "metric": "token_f1_overlap>=0.3",
+                "n_private": len(private_set),
+                "incumbent_pass_rate": round(cmp.baseline_pass_rate, 4),
+                "candidate_pass_rate": round(cmp.candidate_pass_rate, 4),
+                "delta": round(cmp.delta, 4),
+                "min_delta": args.ab_min_delta,
+                "promoted_utc": __import__("time").strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+            }
+            output_path.write_text(_json_mod.dumps(_art, indent=1),
+                                   encoding="utf-8")
+        except Exception as _se:  # noqa: BLE001 — stamp must not unship
+            print(f"WARNING: gate stamp failed ({_se}) — artifact "
+                  f"promoted without provenance", file=sys.stderr)
 
 
     def _live_incumbent() -> str:

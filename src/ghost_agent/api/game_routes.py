@@ -27,7 +27,7 @@ from fastapi import APIRouter, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from .routes import api_key_header, get_agent, verify_api_key
+from .routes import _mark_foreground, api_key_header, get_agent, verify_api_key
 from .games import (
     GameDependencyError,
     GameStateError,
@@ -198,6 +198,15 @@ async def game_move(req: GameMoveRequest, request: Request):
             "stream": False,
             "temperature": 0.6,
         }
+        # Mark this as an ACTIVE USER REQUEST for its whole duration (§4Q
+        # Lens-D). Without it, `foreground_requests` stayed 0 on this path, so
+        # a parked background call in `_wait_for_foreground_clear` saw
+        # "no request active", gave up after its 30s budget and took the main
+        # model slot — the user's next move then queued behind a full
+        # background generation. That is exactly the starvation the
+        # foreground_requests counter was introduced to prevent, and this was
+        # the one live-user endpoint that never set it.
+        _mark_foreground(agent, +1)
         try:
             data = await llm.chat_completion(payload)
             reply_text = str(
@@ -207,6 +216,8 @@ async def game_move(req: GameMoveRequest, request: Request):
             logger.warning("game_move LLM call failed: %s", e)
             raise HTTPException(status_code=502,
                                 detail=f"LLM request failed: {e}")
+        finally:
+            _mark_foreground(agent, -1)
         move_text = extract_move_text(reply_text)
         applied = adapter.apply_move(game_state, move_text) if move_text else None
         if applied is not None:

@@ -29,7 +29,13 @@ async def test_run_smart_memory_task_contradiction_engine(mock_context):
     
     # Mock advanced search to return conflicting memories
     mock_context.memory_system.search_advanced.return_value = [
-        {"id": "123", "text": "User is building a Vue app.", "score": 0.5}
+        # 0.30, not the old 0.50: §4R tightened the delete gate from `< 0.6`
+        # to `< 0.50` (matching the sibling `vector.smart_update`), because
+        # 0.44–0.58 is this embedder's measured OFF-TOPIC noise band and a row
+        # too weakly related to be worth showing must not be deletable. 0.50
+        # sat exactly ON the new boundary; 0.30 is an unambiguous match, which
+        # is what this test means to exercise.
+        {"id": "123", "text": "User is building a Vue app.", "score": 0.30}
     ]
     
     await agent.run_smart_memory_task("User: I am building a React app.\nAI: Got it.", "test-model", 0.5)

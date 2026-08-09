@@ -9,6 +9,7 @@ Three mechanisms, one goal (an optimizer that cannot grade itself):
 """
 
 import json
+import sys
 
 import pytest
 
@@ -365,6 +366,14 @@ class TestActivationTelemetry:
         memory_dir.mkdir(parents=True, exist_ok=True)
 
         from ghost_agent.core.learning_health import render_learning_health
+        # §4L Lens-C MINOR-2: the applies counter is per-process, so a
+        # HEADLESS render (argv is pytest here) must say "wrong process"
+        # instead of crying wolf; the in-process render (argv = main.py)
+        # keeps the real alarm.
         text = render_learning_health(memory_dir)
         assert "PROMPT OPTIMIZATION" in text
-        assert "0 applies since boot" in text
+        assert "per-process counter" in text
+        monkeypatch.setattr(sys, "argv",
+                            ["/repo/src/ghost_agent/main.py"])
+        text2 = render_learning_health(memory_dir)
+        assert "0 applies since boot" in text2

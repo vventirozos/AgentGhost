@@ -47,9 +47,12 @@
       <tr><td>outcome_success</td><td>0/1</td></tr>
       <tr><td>timestamp</td><td>REAL</td></tr>
       <tr><td>consolidated</td><td>0/1</td></tr>
+      <tr><td>access_count</td><td>INT — times surfaced (usage credit)</td></tr>
+      <tr><td>last_accessed</td><td>REAL — last time surfaced</td></tr>
     </tbody>
   </table></div>
-  <p>Indexes on trigger, cluster_id, timestamp.</p>
+  <p>Indexes on trigger, cluster_id, timestamp, and <code>(access_count, last_accessed)</code>.</p>
+  <p><strong>Usage columns added 2026-08-08 (F8).</strong> Added by an idempotent <code>ALTER TABLE</code> at open (a <code>PRAGMA table_info</code> check, since SQLite has no <code>ADD COLUMN IF NOT EXISTS</code>); metadata-only, so it is safe on a live store — the 269-row production database migrated in under 4&nbsp;ms. Pre-existing rows are backfilled <code>last_accessed = timestamp</code>: left at the 0 default they would all have sorted below every new row on the eviction key, i.e. the migration itself would have made the entire existing store evict-first.</p>
 
   <h3>episode_actions</h3>
   <div class="scroll"><table>
@@ -66,7 +69,8 @@
   </table></div>
 
   <h2>Retention</h2>
-  <p><code>MAX_EPISODES = 500</code>. When exceeded the oldest non-lesson, non-consolidated episodes are deleted first; a fallback then deletes the oldest of any kind so the cap is always enforced. <code>MAX_ACTIONS_PER_EPISODE = 20</code>.</p>
+  <p><code>MAX_EPISODES = 500</code>. When exceeded, spent episodes (consolidated, no lesson) are deleted first; a fallback then deletes any kind so the cap is always enforced. Within <em>both</em> tiers victims are chosen <strong>least-valuable-first</strong> — <code>ORDER BY access_count, last_accessed, timestamp</code> — not by age alone. <code>MAX_ACTIONS_PER_EPISODE = 20</code>.</p>
+  <p><strong>Why eviction reads usage (2026-08-08, F8):</strong> usage credit used to land only on the episode's vector twin, in a different database. Eviction is plain SQL over this table and structurally could not read that counter, so it fell back to pure age — an episode that had been recalled and proved useful a dozen times was discarded at exactly the same priority as one never retrieved. The store forgot by age rather than by value. Episodes now carry their own <code>access_count</code>/<code>last_accessed</code>, written by every path that surfaces an episode, and eviction orders on them. The ordering is deliberately lexicographic rather than a decay score: it expresses "used, and used recently, survives" with no half-life constant to tune or mis-tune. Note the split — the vector twin's counter stays authoritative for retrieval statistics and vector pruning; these columns are authoritative for eviction. Both are written from the same surfacing event, so they cannot disagree about <em>direction</em>. Tests: <code>tests/test_episodic_usage_credit_f8.py</code>.</p>
   <p><strong>Action truncation keeps HEAD+TAIL (2026-07-22):</strong> when an episode exceeds <code>MAX_ACTIONS_PER_EPISODE</code> the writer (<code>_truncate_actions</code>) keeps the first <code>TRUNCATION_HEAD_ACTIONS = 5</code> actions, inserts one <code>(actions elided)</code> marker row recording how many were dropped, and keeps the rest of the budget from the <em>tail</em>. The old <code>actions[:20]</code> dropped the tail where the recovery lives ("tried X, failed, switched to W") while the episode row still asserted <code>outcome_success = 1</code> — so the stored record showed only the failed exploration (16 of 139 live episodes sat at exactly 20 actions). Logs a <code>warning</code> on every truncation; the marker row is stored with <code>success = 1</code> so it never reads as a failed action to the recovery signal.</p>
   <p><strong>Orphan reaping (2026-06-11):</strong> <code>episode_actions</code> has a declared but un-enforced FK (no cascade), so deleting an episode leaves its action rows orphaned. <code>record_episode</code> now reaps orphans <em>unconditionally</em> on every write via an indexed anti-join (<code>idx_ea_episode</code>) — not only when an insert breaches the cap, as before — so orphans from non-cap delete paths (consolidation, external deletes) can no longer accumulate unboundedly. Covered by <code>tests/test_memory_growth_bounds.py</code>.</p>
 

@@ -107,6 +107,10 @@ def _card(row: Dict[str, Any], traj) -> Dict[str, Any]:
         "cheap_confidence": row.get("cheap_confidence"),
         "strong_verdict": row.get("strong_verdict", ""),
         "final_confidence": row.get("final_confidence"),
+        # Escalation discipline (2026-08-06): how an overturn earned
+        # itself (quote/fp_class) or why it was refused
+        # (invalid/concede/coverage/unparseable); "" on legacy rows.
+        "rebuttal": row.get("rebuttal", ""),
         "joined": traj is not None,
     }
     if traj is None:
@@ -176,7 +180,9 @@ def main() -> int:
     ap.add_argument("--trajectories", type=Path, default=None,
                     help="default $GHOST_HOME/system/trajectories")
     ap.add_argument("--outcome", default="overturned",
-                    help="filter: overturned|upheld|withheld|unavailable|all "
+                    help="filter: overturned|upheld|withheld|unavailable|"
+                         "downgraded|replaced_uncertain|truncation_guard|"
+                         "mechanically_upheld|mechanically_dismissed|all "
                          "(default overturned — the population in question)")
     ap.add_argument("--kind", default="all", help="refute|confirm|all")
     ap.add_argument("--route", default="all", help="claim|code|all")
@@ -206,6 +212,16 @@ def main() -> int:
         )
 
     sel = [r for r in rows if _keep(r)]
+    if not sel and args.outcome != "all":
+        # ⚠ A filter matching NOTHING must say whether the value even
+        # exists (§4L Lens-C MINOR-3): the outcome vocabulary grew 5 new
+        # strings in a month, and a typo'd/stale --outcome silently
+        # printed an empty audit.
+        vocab = sorted({str(r.get("outcome") or "") for r in rows})
+        print(f"0 of {len(rows)} rows match outcome={args.outcome!r}. "
+              f"Outcomes present in this ledger: {', '.join(vocab)}",
+              file=sys.stderr)
+        return 1
     dropped = len(rows) - len(sel)
     sel = sel[-max(1, args.limit):]
 

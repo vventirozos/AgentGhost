@@ -155,15 +155,65 @@ def _b3_report(records, artifacts, meta) -> str:
                      f"proposed_macros={a.get('proposed_macros', 0)}")
     return "\n".join(L) + "\n"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THIS HARNESS CAN AND CANNOT MEASURE (established 2026-08-09)
+#
+# `--bio-time-scale` compresses the WAITING between phases. It cannot compress
+# the WORK inside them. That distinction decides what an accelerated run is
+# allowed to conclude:
+#
+#   CPU/data-bound phases — skills-auto, PRM retrain, router retrain,
+#   calibration refit, workspace tidy. Their work is a local pass over files.
+#   Acceleration genuinely raises how many times they COMPLETE per wall-clock
+#   hour, so measuring their output under acceleration is SOUND.
+#
+#   LLM-bound phases — dream, self-play, reflection, post-mortem, the narrative
+#   consolidations, autoadvance. Each costs one or more model calls at full
+#   real speed. Acceleration makes them START sooner; it does NOT make them
+#   FINISH faster, so the number that complete per hour is unchanged. Measuring
+#   their PRODUCTION under acceleration is UNSOUND — the run ends mid-episode
+#   and reports zero, which reads as "produced nothing" rather than "was never
+#   given time to finish".
+#
+# Measured evidence: a single self-play episode was still on "Attempt 1/3"
+# after 13 minutes, longer than a whole 17-minute accelerated idle budget.
+#
+# SECOND, INDEPENDENT LIMIT — dream is input-starved on this agent's real data.
+# The live store holds 8593 rows but only TWO of type `auto`, because
+# `--smart-memory 0.9` extracts almost nothing (see journal §4R). Dream logs
+# "Auto-memory pool thin (2) / Synthesized 0 new meta-memories" no matter how
+# long it runs. No harness change fixes that; it is a property of the store.
+#
+# ⇒ For an artifact-production verdict, either measure the CPU-bound phases
+#   under acceleration, or give the LLM-bound phases REAL time (scale 1) and a
+#   budget that fits at least one complete episode per phase.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 COMMON = ["--upstream-url", "http://127.0.0.1:8088", "--api-key", "",
           "--no-mandatory-tor"]
 
 
 def _treatment_flags(time_scale: float) -> List[str]:
     # Idle loops accelerated + deterministic so they actually fire in the run.
-    # Frontier-aware self-play is ON by default (the base treatment arm).
+    #
+    # ⚠ `--frontier-selfplay` is passed EXPLICITLY. It used to be omitted, with
+    # the comment "Frontier-aware self-play is ON by default (the base treatment
+    # arm)" — true when written, FALSE since 2026-07-09, when main.py flipped
+    # that flag's default to False. From that day this arm silently ran UNIFORM
+    # seeding, i.e. byte-identical to the `treatment_uniform` arm it is compared
+    # against, so #27b was comparing a configuration with ITSELF and could only
+    # ever report a tie. Confirmed 2026-08-09 from this arm's own boot line:
+    # "Frontier Self-Play: disabled (--no-frontier-selfplay)".
+    #
+    # Never rely on a default to define an experiment ARM — state it, so a
+    # default flip cannot silently collapse two arms into one.
+    #
+    # Side effect worth knowing: with frontier ON, `_prm_consumer_live` becomes
+    # True, so the PRM retrain phase stops short-circuiting on "no live
+    # consumer" and this arm actually exercises it.
     return ["--bio-time-scale", str(time_scale), "--bio-deterministic",
-            "--enable-metacog"]
+            "--enable-metacog", "--frontier-selfplay"]
 
 
 def _treatment_uniform_flags(time_scale: float) -> List[str]:
@@ -180,8 +230,68 @@ def _control_flags() -> List[str]:
     return ["--bio-time-scale", "1"]
 
 
+#: Optional WARM-START seed. When ``GHOST_B3_SEED_HOME`` points at a GHOST_HOME
+#: snapshot, every arm's throwaway home is pre-populated from it instead of
+#: starting empty.
+#:
+#: Why this exists: with a COLD home the idle loops have nothing to work on —
+#: measured on the 2026-08-08 run, dream reported "Auto-memory pool thin (0)"
+#: and "Synthesized 0 new meta-memories", and reflection / PRM / router never
+#: fired at all because they need a trajectory corpus. A cold run therefore
+#: cannot distinguish "these loops produce no value" from "we gave them nothing
+#: to chew on", which is the question the ablation exists to answer.
+#:
+#: Copy from a SNAPSHOT, never the live home directly: the live agent is
+#: writing to chroma.sqlite3 and a concurrent read can capture a torn page.
+_SEED_SKIP_DIRS = {
+    "llm_recordings",   # 233 MB of raw payloads; nothing in the idle loops reads it
+    "sandbox",          # container workspace, and its path derives the container name
+    "logs",
+}
+
+
+#: Identities present in the seed snapshot, computed ONCE at import so every
+#: arm is compared against the same baseline. Empty for a cold run, which makes
+#: the delta identical to the old absolute count — so cold behaviour is
+#: unchanged.
+_SEED_BASELINE: Dict[str, set] = {"lessons": set(), "graduated": set(), "macros": set()}
+
+
+def _seed_arm_home(seed_home: Path, arm_home: Path) -> None:
+    """Populate a fresh arm home from a GHOST_HOME snapshot (best effort)."""
+    import shutil
+    src_sys = Path(seed_home) / "system"
+    if not src_sys.is_dir():
+        AE._log(f"  !! seed home has no system/ dir: {seed_home} — arm starts COLD")
+        return
+    dst_sys = arm_home / "system"
+    dst_sys.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for item in src_sys.iterdir():
+        if item.name in _SEED_SKIP_DIRS or item.suffix in (".log", ".bak"):
+            continue
+        try:
+            if item.is_dir():
+                shutil.copytree(item, dst_sys / item.name, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst_sys / item.name)
+            copied += 1
+        except Exception as e:
+            AE._log(f"  !! seed copy failed for {item.name}: {e}")
+    AE._log(f"  seeded {copied} store(s) into {arm_home.name} from {seed_home}")
+
+
 def _boot_arm(name, flags, port, boot_timeout, logdir):
     gh = Path(tempfile.mkdtemp(prefix=f"ghost-trackb3-{name}-"))
+    _seed = os.getenv("GHOST_B3_SEED_HOME", "").strip()
+    if _seed:
+        _seed_arm_home(Path(_seed), gh)
+        if not any(_SEED_BASELINE.values()):
+            _SEED_BASELINE.update(_artifact_identities(Path(_seed)))
+            AE._log(f"  seed baseline: {len(_SEED_BASELINE['lessons'])} lesson(s), "
+                    f"{len(_SEED_BASELINE['graduated'])} graduated, "
+                    f"{len(_SEED_BASELINE['macros'])} macro(s) — these are "
+                    f"SUBTRACTED from every arm's result")
     proc, lf = AE._boot(["--port", str(port)] + COMMON + flags, gh, logdir / f"{name}.log")
     url = f"http://127.0.0.1:{port}"
     ok = AE._wait_ready(url, boot_timeout)
@@ -197,13 +307,59 @@ def _teardown(arm):
         AE._log(f"  teardown error: {e}")
 
 
-def _learning_artifacts(home: Path) -> Dict[str, Any]:
-    """Count what the idle loops produced under this arm's GHOST_HOME."""
+def _artifact_identities(home: Path) -> Dict[str, set]:
+    """Stable identities of the artifacts already present in a GHOST_HOME.
+
+    Used to subtract the WARM SEED so a run reports what the arm PRODUCED
+    rather than what it was handed. `timestamp` is unique per lesson (verified:
+    50/50 distinct on the live playbook); graduated skills and macros are dicts
+    keyed by signature/name, so their keys are the identity.
+    """
+    ids = {"lessons": set(), "graduated": set(), "macros": set()}
+    pb = home / "system" / "memory" / "skills_playbook.json"
+    try:
+        if pb.exists():
+            for lesson in json.loads(pb.read_text()) or []:
+                ids["lessons"].add(str(lesson.get("timestamp")))
+    except Exception:
+        pass
+    grad = home / "system" / "memory" / "auto_skills.json"
+    try:
+        if grad.exists():
+            ids["graduated"] = set((json.loads(grad.read_text()) or {}).keys())
+    except Exception:
+        pass
+    macros = home / "system" / "memory" / "composed_skills" / "composed_skills.json"
+    try:
+        if macros.exists():
+            ids["macros"] = set((json.loads(macros.read_text()) or {}).keys())
+    except Exception:
+        pass
+    return ids
+
+
+def _learning_artifacts(home: Path, baseline: Dict[str, set] = None) -> Dict[str, Any]:
+    """Count what the idle loops PRODUCED under this arm's GHOST_HOME.
+
+    ⚠ `baseline` is REQUIRED for a warm-seeded run. Without it this counts the
+    ABSOLUTE contents of the home, which under warm seeding is just the seed:
+    the 2026-08-09 run reported lessons=50 / graduated=5 / macros=19 for ALL
+    THREE arms in BOTH repeats — byte-identical to the snapshot, including the
+    per-source breakdown. Two separate blindnesses stack here:
+      1. absolute counts measure the seed, not the arm's output;
+      2. `PLAYBOOK_MAX = 50` and the live playbook is AT that cap, so a new
+         lesson EVICTS an old one and the count cannot rise at all.
+    Subtracting identities fixes both — a produced lesson is one whose
+    timestamp was not in the seed, whether or not the total moved.
+    """
+    base = baseline or {"lessons": set(), "graduated": set(), "macros": set()}
     out = {"lessons_by_source": {}, "graduated_skills": 0, "proposed_macros": 0}
     pb = home / "system" / "memory" / "skills_playbook.json"
     try:
         if pb.exists():
             for lesson in json.loads(pb.read_text()):
+                if str(lesson.get("timestamp")) in base["lessons"]:
+                    continue          # present in the seed — not produced here
                 src = (lesson.get("source") or "unknown")
                 out["lessons_by_source"][src] = out["lessons_by_source"].get(src, 0) + 1
     except Exception:
@@ -215,7 +371,8 @@ def _learning_artifacts(home: Path) -> Dict[str, Any]:
     grad = home / "system" / "memory" / "auto_skills.json"
     try:
         if grad.exists():
-            out["graduated_skills"] = len(json.loads(grad.read_text()) or {})
+            out["graduated_skills"] = len(
+                set((json.loads(grad.read_text()) or {}).keys()) - base["graduated"])
     except Exception:
         pass
     # ComposedSkillRegistry writes composed_skills/composed_skills.json (a
@@ -226,7 +383,8 @@ def _learning_artifacts(home: Path) -> Dict[str, Any]:
         if macros.exists():
             data = json.loads(macros.read_text()) or {}
             out["proposed_macros"] = sum(
-                1 for m in data.values() if (m.get("status") == "proposed"))
+                1 for k, m in data.items()
+                if m.get("status") == "proposed" and k not in base["macros"])
     except Exception:
         pass
     return out
@@ -260,7 +418,11 @@ async def _run_arm(name, flags, args, items, rep, epoch_sleep):
         for _ in range(args.idle_epochs):
             await asyncio.sleep(epoch_sleep)
         recs = await _probe(arm["url"], items, args.model, args.timeout, name, rep)
-        artifacts = _learning_artifacts(arm["home"])
+        # Subtract the WARM SEED so this reports what the arm PRODUCED.
+        # Without the baseline a warm run reports the snapshot's contents for
+        # every arm (measured 2026-08-09: all three arms identical, and equal
+        # to the seed).
+        artifacts = _learning_artifacts(arm["home"], _SEED_BASELINE)
         return recs, artifacts
     finally:
         _teardown(arm)
@@ -270,7 +432,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--base-port", type=int, default=8046)
-    ap.add_argument("--time-scale", type=float, default=60.0,
+    # DEFAULT LOWERED 60 -> 15 (#40/#41, 2026-08-09). At scale 60 the idle
+    # window is 45s while a dream is a real ~60s LLM call, so dream consumed
+    # the window, self-play reset the idle clock, and EVERY phase gated
+    # (900,3600] was structurally unreachable — the ablation measured dream +
+    # self-play only and reported the rest as 0 firings. At 15 the window is
+    # 180s, comfortably wider than a phase. Scaling the GATES never scaled the
+    # WORK; the default now respects that.
+    ap.add_argument("--time-scale", type=float, default=15.0,
                     help="treatment --bio-time-scale (compresses idle windows)")
     ap.add_argument("--idle-epochs", type=int, default=6,
                     help="how many accelerated idle epochs to sleep through")
@@ -280,6 +449,16 @@ def main() -> int:
     ap.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--boot-timeout", type=float, default=300.0)
+    # A CORRECTNESS run does not need the full behavioural item set: the
+    # seed/probe pairs exist to measure behaviour change, while the artifact
+    # deltas (what the idle loops PRODUCED) come from the idle epochs. Each
+    # pair costs 2 LLM calls (~48s each measured), so 18 pairs is ~29 min of
+    # the ~54 min an arm takes — trimming them is the cheapest way to prove the
+    # harness works without buying a full measurement.
+    ap.add_argument("--max-items", type=int, default=0,
+                    help="cap the seed/probe pairs per arm (0 = all). Use a "
+                         "small value for a fast correctness check; leave at 0 "
+                         "for a real measurement.")
     ap.add_argument("--no-frontier-arm", action="store_true",
                     help="skip the #27b treatment_uniform (--no-frontier-selfplay) "
                          "sub-arm; run only treatment vs control")
@@ -287,6 +466,10 @@ def main() -> int:
     args = ap.parse_args()
 
     items = load_trackb_pairs()
+    if args.max_items and args.max_items > 0:
+        items = items[:args.max_items]
+        AE._log(f"  --max-items {args.max_items}: using {len(items)} of the full "
+                f"pair set (correctness run, NOT a behavioural measurement)")
     all_records: List[Dict[str, Any]] = []
     all_artifacts: List[Dict[str, Any]] = []
     out = Path(args.report_dir)

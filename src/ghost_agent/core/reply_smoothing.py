@@ -152,6 +152,12 @@ def _group_blocks(blocks: List[str]) -> List[List[int]]:
 # everything after a mid-reply lookalike, substance included).
 _TRAILING_NOTE_TAIL_RE = re.compile(
     r"\n*---\n(?:\*\*⚠ Unverified:\*\*|\*\*Plan check:\*\*|"
+    # "Verifier note:" was MISSING from this list (§4L Lens-A MINOR-1)
+    # while being appended BEFORE the hedge scan — a verifier note
+    # quoting first-person text survived the strip and fired the hedge
+    # regex, putting uncertainty_pressure on a refuted (label-0) turn:
+    # the same label-echo channel as the λ leak, one banner over.
+    r"\*\*Verifier note:\*\*|"
     r"\*\*Things I'm not certain about:\*\*|\*\*Assumptions I made:\*\*)"
     r"(?:(?!\n\n).)*$",
     re.DOTALL,

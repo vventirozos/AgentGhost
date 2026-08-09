@@ -150,7 +150,11 @@ def test_mediation_diff():
 
 def test_log_counts(tmp_path):
     log = tmp_path / "arm.log"
+    # §4M (Lens D F9): hydrations are counted by "Hydration tiers:" —
+    # emitted on ALL call paths — not the one-path pretty-log
+    # "Hydrated context for" (3.1% undercount live).
     log.write_text("x Auto Memory Store y\nNot enough entropy to dream\n"
+                   "Hydration tiers: vector=3 skill=2\n"
                    "Hydrated context for: q\nAuto Memory Store again\n")
     c = B4._log_counts(log)
     assert c["auto_memory_stores"] == 2

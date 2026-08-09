@@ -228,10 +228,10 @@ class TestLearnLessonReturnContract:
 
 class TestMistakeLessWideThreshold:
     """2026-07-20: mistake-less rules ("When X, do Y" dream/reflection
-    heuristics) dedup at 0.25 instead of 0.15 — measured on the live
-    embedder, rewordings of the SAME rule land at 0.07-0.17 while distinct
-    rules stay >= 0.29, so the 0.15 default let reworded re-saves through
-    all night (10+ copies of two rules)."""
+    heuristics) dedup at a wider cutoff than mistake-ful lessons.
+    RECALIBRATED 2026-08-08 (§4M Lens B): live rewordings now reach
+    0.1921 and distinct rules come as close as 0.2134, so the pair moved
+    0.15/0.25 → 0.20/0.21 (both inside the measured corridor)."""
 
     def _mem_at_distance(self, dist):
         mock_memory = MagicMock()
@@ -246,7 +246,7 @@ class TestMistakeLessWideThreshold:
         return mock_memory
 
     def test_mistakeless_rule_deduped_in_wide_band(self, skill_memory):
-        # dist 0.20: past the 0.15 default, inside the 0.25 rule cutoff.
+        # dist 0.205: past the 0.20 default, inside the 0.21 rule cutoff.
         # The stored duplicate's JSON twin exists (as in production —
         # since 2026-07-29 a twin-less vector hit is treated as an orphan
         # and healed, so an EMPTY playbook no longer models "dedup").
@@ -257,7 +257,7 @@ class TestMistakeLessWideThreshold:
             "solution": "name the location explicitly",
             "frequency": 1,
         }])
-        mem = self._mem_at_distance(0.20)
+        mem = self._mem_at_distance(0.205)
         skill_memory.learn_lesson(
             "When querying weather, ensure the query names the exact "
             "requested location to avoid ambiguity.",
@@ -272,9 +272,9 @@ class TestMistakeLessWideThreshold:
         assert int(playbook[0].get("frequency", 1)) == 2
 
     def test_mistakeful_lesson_keeps_tight_threshold(self, skill_memory):
-        # Same 0.20 distance, but a REAL mistake → 0.15 cutoff applies and
+        # Same 0.205 distance, but a REAL mistake → 0.20 cutoff applies and
         # the lesson is written as new.
-        mem = self._mem_at_distance(0.20)
+        mem = self._mem_at_distance(0.205)
         skill_memory.learn_lesson(
             "Parse the weather API response",
             "read the wrong station's data",
@@ -287,7 +287,7 @@ class TestMistakeLessWideThreshold:
 
     def test_env_override_restores_old_behavior(self, skill_memory, monkeypatch):
         monkeypatch.setenv("GHOST_RULE_DEDUP_DIST", "0.15")
-        mem = self._mem_at_distance(0.20)
+        mem = self._mem_at_distance(0.205)
         skill_memory.learn_lesson(
             "When querying weather, ensure the query names the exact "
             "requested location to avoid ambiguity.",

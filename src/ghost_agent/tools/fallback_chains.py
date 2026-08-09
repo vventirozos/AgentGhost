@@ -41,7 +41,7 @@ FALLBACK_CHAINS = {
 }
 
 
-def get_fallback_hint(failed_tool: str, error_text: str = "") -> Optional[str]:
+def get_fallback_chain_hint(failed_tool: str, error_text: str = "") -> Optional[str]:
     """Get a fallback suggestion for a failed tool.
 
     Returns a hint string suggesting the next tool to try, or None if

@@ -281,6 +281,45 @@ class GraphMemory:
     #: keep the original hard-delete semantics.
     _FORGET_SOFT_EXPIRE_MIN_ROWS = 50
 
+    #: §4M (Lens A MAJOR-3): archive-before-delete belongs to EVERY
+    #: destructive path (the playbook learned this the hard way; the graph
+    #: — the only uncapped tier and the July data-loss site — never got
+    #: it: 884 live rows vs 1407 in the 07-22 backup, unattributable
+    #: precisely because no archive existed).
+    _ARCHIVE_FILENAME = "graph_pruned_archive.jsonl"
+
+    def _archive_rows(self, reason: str, rows) -> bool:
+        """Append doomed triplets to the JSONL archive BEFORE deletion.
+        Rows are ``(subject, predicate, object[, weight[, timestamp]])``.
+        Returns True only when every row was durably appended — callers
+        on unattended paths fail closed (skip or soft-expire) on False."""
+        import json as _json
+        import os as _os
+        import time as _time
+        rows = list(rows or [])
+        if not rows:
+            return True
+        try:
+            path = Path(self.db_path).parent / self._ARCHIVE_FILENAME
+            ts = _time.time()
+            with open(path, "a", encoding="utf-8") as fh:
+                for row in rows:
+                    rec = {"archived_at": ts, "reason": reason,
+                           "subject": row[0], "predicate": row[1],
+                           "object": row[2]}
+                    if len(row) > 3:
+                        rec["weight"] = row[3]
+                    if len(row) > 4:
+                        rec["timestamp"] = row[4]
+                    fh.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.flush()
+                _os.fsync(fh.fileno())
+            return True
+        except Exception as e:
+            logger.error("graph archive-before-delete failed (%s): %s",
+                         reason, e)
+            return False
+
     def delete_by_target(self, target: str) -> int:
         if not target or len(target.strip()) < 3:
             return 0
@@ -295,7 +334,8 @@ class GraphMemory:
                 # code deleted on the raw LIKE, so `forget("tin")` hard-deleted
                 # 83 unrelated rows of the production graph with no undo.
                 candidates = conn.execute(
-                    '''SELECT rowid, subject, predicate, object FROM triplets
+                    '''SELECT rowid, subject, predicate, object,
+                              COALESCE(weight, 1), timestamp FROM triplets
                        WHERE subject LIKE ? OR object LIKE ?''',
                     (like, like)
                 ).fetchall()
@@ -319,15 +359,32 @@ class GraphMemory:
                         'UPDATE triplets SET valid_until = ? WHERE rowid = ?',
                         [(now, row[0]) for row in doomed],
                     )
-                else:
+                elif self._archive_rows(
+                        "delete_by_target",
+                        # §4M R2 NIT-2: full 5-tuples like prune/wipe — a
+                        # forget-archive row without weight/age loses what
+                        # recovery needs.
+                        [(row[1], row[2], row[3], row[4], row[5])
+                         for row in doomed]):
                     conn.executemany(
                         'DELETE FROM triplets WHERE rowid = ?',
                         [(row[0],) for row in doomed],
                     )
+                else:
+                    # Archive failed → the forget still honors the user's
+                    # intent, but RECOVERABLY: soft-expire instead of
+                    # hard-delete (same shape as the big-batch guard).
+                    logger.warning(
+                        "graph forget '%s': archive failed — soft-expiring "
+                        "%d row(s) instead of deleting", t_norm, len(doomed))
+                    conn.executemany(
+                        'UPDATE triplets SET valid_until = ? WHERE rowid = ?',
+                        [(now, row[0]) for row in doomed],
+                    )
                 deleted = len(doomed)
                 conn.commit()
-            for _, s, p, o in doomed:
-                self._remove_edge(s, p, o)
+            for row in doomed:
+                self._remove_edge(row[1], row[2], row[3])
         return deleted
 
     #: Generic hub nodes that link to nearly everything; expanding a
@@ -408,6 +465,18 @@ class GraphMemory:
     def wipe_all(self):
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
+                # Explicit operator intent ("reset all") — archive is
+                # best-effort here: proceed with the wipe either way, but
+                # a failure to preserve is logged loudly by the helper.
+                try:
+                    rows = conn.execute(
+                        """SELECT subject, predicate, object,
+                                  COALESCE(weight, 1), timestamp
+                           FROM triplets""").fetchall()
+                    self._archive_rows("wipe_all", rows)
+                except Exception as e:
+                    logger.error("graph wipe_all: pre-wipe archive read "
+                                 "failed: %s", e)
                 conn.execute('DELETE FROM triplets')
                 conn.commit()
             self.nx_graph = nx.MultiDiGraph()
@@ -432,13 +501,18 @@ class GraphMemory:
                 with sqlite3.connect(self.db_path) as conn:
                     cutoff_expr = f"datetime('now', '-{int(max_age_days)} days')"
                     rows = conn.execute(
-                        f"""SELECT subject, predicate, object FROM triplets
+                        f"""SELECT subject, predicate, object,
+                                   COALESCE(weight, 1), timestamp
+                            FROM triplets
                             WHERE valid_until IS NULL
                               AND COALESCE(weight, 1) <= ?
                               AND timestamp < {cutoff_expr}""",
                         (int(keep_min_weight),),
                     ).fetchall()
-                    for s, p, o in rows:
+                    # Unattended dream-driven scrub: archive or DON'T prune.
+                    if not self._archive_rows("prune_stale_edges", rows):
+                        return 0
+                    for s, p, o, _w, _ts in rows:
                         conn.execute(
                             "DELETE FROM triplets WHERE subject=? AND predicate=? AND object=?",
                             (s, p, o),

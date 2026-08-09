@@ -90,6 +90,25 @@
 
   <p>So on a busy day, almost none of this runs. That's intended.</p>
 
+  <p>One consequence is easy to misread. Most phases only run while you've been idle between fifteen and sixty minutes; past that the window closes. What re-opens it is self-play finishing — it is the only phase that resets the idle clock, which is what lets a three-hour or six-hour cooldown matter at all during a long absence. Turning self-play off with <code>--no-self-play</code> therefore does far more than its name suggests: nothing re-arms the window, so after the first hour away, every other phase is gated out too and only journal consolidation keeps running. Treat that flag as "most of the idle machine off", not "self-play off".</p>
+
+  <div class="note warn">
+    <strong>If you use <code>--bio-time-scale</code> to exercise these loops quickly:</strong> it now divides the phase cooldowns and the loop's own tick interval as well as the idle windows. Until 2026-08-08 it only compressed the windows — the cooldowns kept their real durations, so a phase with a three-hour cooldown could fire at most once no matter how many accelerated epochs a run claimed to cover. The helper meant to scale them existed and had a passing unit test, but nothing ever called it. Any measurement taken with this flag before that date covers roughly one epoch per phase, whatever it says.
+  </div>
+
+  <h3>There is a floor on how far you can compress time</h3>
+  <p>Accelerating the clock only works while the compressed window stays <em>wider than the work</em>. The gates shrink when you raise the scale; the work doesn't. A dream is a real model call and takes something like a minute whether the scale is 1 or 60.</p>
+  <p>At <code>--bio-time-scale 60</code> the window for the middle phases is 45 seconds — narrower than a single dream. What was actually observed, tick by tick:</p>
+  <pre><code>idle 1..10s   nothing eligible yet
+idle ~11s     dream starts — and runs for ~60 real seconds
+idle ~71s     the 15–60s window has already closed
+              self-play (no upper bound) fires and resets the idle clock
+idle 1..10s   …and round again, forever</code></pre>
+  <p>The middle of the window is never sampled, so reflection, post-mortems, skill extraction, the PRM and router retrains, calibration, the tidy pass, both narrative consolidations, stale-question surfacing and project auto-advance <strong>can never run</strong> — and they report zero firings, which reads exactly like "we measured them and they did nothing."</p>
+  <div class="note">
+    <strong>Practical rule:</strong> keep the scale at <strong>20 or below</strong> (a window of at least ~2 minutes). The agent now warns loudly at boot if the scale you chose makes the window narrower than the work, and names the phases that would silently never fire. Every ablation number recorded before 2026-08-09 measured dreaming and self-play only.
+  </div>
+
   <div class="diagram">
     <ol class="flow">
       <li>

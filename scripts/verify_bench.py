@@ -11,7 +11,13 @@ model that actually serves VERIFY in production. Measured on the live
 process 2026-08-04 (`ps eww`): the VERIFY worker is
 `--worker-nodes http://100.83.184.117:8088|Nova` (Gemma 4 E4B) and the
 main model is `--upstream-url http://127.0.0.1:8088` (Qwen3.6-35B);
-`--critic-nodes` is not set, so verify rides the WORKER route.
+`--critic-nodes` was not set THEN, so verify rode the WORKER route.
+⚠ Since 2026-08-06 the live process boots `--critic-nodes`, so today's
+cheap judge rides the CRITIC branch (120s ceiling, one extra fallback
+rung) — pass `--leg critic` (the default) to mirror that, or
+`--leg worker` to reproduce the 2026-08-04 topology. The leg is
+recorded in `bench_provenance.escalation.route_health.leg`; check it
+before comparing two reports.
 
 TWO ARMS — say which one you want, because they measure different
 systems:
@@ -56,11 +62,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ghost_agent.core.verifier import Verifier  # noqa: E402
+from ghost_agent.eval.runprogress import RunProgress  # noqa: E402
 from ghost_agent.eval.verify_bench import (  # noqa: E402
     ARM_ESCALATED,
     FAULTS,
     EscalatingChatClient,
     HttpChatClient,
+    ResponseCache,
+    build_case_pool,
     escalation_arm,
     extract_cases_from_recordings,
     load_cases_jsonl,
@@ -137,10 +146,32 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--concurrency", type=int, default=1,
                     help="parallel verify calls; keep 1 for a "
                          "single-slot llama-server")
+    ap.add_argument("--leg", choices=("critic", "worker"),
+                    default="critic",
+                    help="which production rung serves the cheap judge "
+                         "(critic = live topology since 2026-08-06)")
     ap.add_argument("--timeout", type=float, default=90.0,
                     help="per-request timeout seconds")
     ap.add_argument("--out", default="verify_bench_out",
                     help="output root directory")
+    # ── Re-bench economics. A full live run is hundreds of judge calls
+    # plus a main-model adjudication per REFUTED; paying that on every
+    # code change is why the number goes stale and gets quoted anyway.
+    ap.add_argument("--cache-mode", choices=("off", "write", "read", "strict"),
+                    default="off",
+                    help="off: fresh live run (the honest 'number today'). "
+                         "write: live, but record every response. "
+                         "read: replay hits, live-call misses (INCREMENTAL — "
+                         "after a prompt edit only changed prompts cost). "
+                         "strict: replay only, a miss is an error (PROVES "
+                         "the delta is attributable to code, not the model)")
+    ap.add_argument("--cache-dir", default="verify_bench_cache",
+                    help="where cached judge responses live")
+    ap.add_argument("--progress-file", default="",
+                    help="where to write live progress JSON (default: "
+                         "<out>/progress.json). Read it with "
+                         "scripts/runstatus.py — never infer progress from "
+                         "cache counts or log parsing.")
     return ap.parse_args()
 
 
@@ -235,21 +266,15 @@ async def _amain() -> int:
         return 0
 
     if _mined_path and _mined_path.exists() and not args.no_mined:
-        extra = load_cases_jsonl(_mined_path)
-        have = {(c.claim.strip(), c.evidence.strip()) for c in cases}
-        extra = [c for c in extra
-                 if (c.claim.strip(), c.evidence.strip()) not in have]
-        # TIER. `optimize_verifier.py` TRAINS on the public tier of this exact
-        # pool, so benching on 'all' measures partly on cases the optimizer
-        # has already seen — the same contamination the public/private split
-        # exists to prevent, reintroduced one level up by two tools sharing
-        # one artifact. Not changed silently: 'all' stays the default so
-        # existing report comparisons hold, but the overlap is now stated.
+        # ONE implementation, shared with scripts/verify_bench_status.py.
+        # This block used to be the only copy; the oracle carried a replica
+        # that computed 35 cases where this loaded 58 (it tier-filtered the
+        # SEED set, which this does not, and skipped the mined-vs-seed
+        # dedup), so the fingerprint reported permanent false drift.
         from ghost_agent.optim.trainset import holdout_tier
-        if args.tier != "all":
-            extra = [c for c in extra
-                     if holdout_tier(f"vbcase:{c.case_id}",
-                                     private_pct=30) == args.tier]
+        _before = len(cases)
+        cases = build_case_pool(args.cases, _mined_path, False, args.tier)
+        extra = cases[_before:]
         n_pub = sum(1 for c in extra
                     if holdout_tier(f"vbcase:{c.case_id}",
                                     private_pct=30) == "public")
@@ -259,7 +284,6 @@ async def _amain() -> int:
             print(f"  NOTE: {n_pub} of them are in the PUBLIC tier that "
                   f"optimize_verifier.py trains on. For a clean post-"
                   f"optimization measurement use --tier private.")
-        cases.extend(extra)
     if args.recordings:
         rec = Path(args.recordings)
         paths = sorted(rec.glob("*.jsonl")) if rec.is_dir() else [rec]
@@ -285,17 +309,38 @@ async def _amain() -> int:
     # production LLMClient does (worker route + main chat_completion), so
     # `Verifier._escalate_refute` fires exactly as it does live. Without
     # it, escalation is structurally impossible and the report says so.
+    cache = ResponseCache(args.cache_dir or None, args.cache_mode)
+    if args.cache_mode != "off":
+        print(f"  response cache: mode={args.cache_mode} dir={args.cache_dir}")
+        if args.cache_mode in ("read", "strict"):
+            print("  ⚠ a replayed report measures CODE against a FROZEN "
+                  "judge — it is not 'the number today'")
     if args.main_base_url:
         client = EscalatingChatClient(
             args.base_url, args.main_base_url, timeout=args.timeout,
             api_key=args.api_key, model=args.model,
-            main_model=args.main_model)
+            main_model=args.main_model, leg=args.leg, cache=cache)
     else:
         client = HttpChatClient(args.base_url, timeout=args.timeout,
-                                api_key=args.api_key, model=args.model)
+                                api_key=args.api_key, model=args.model,
+                                cache=cache)
     verifier = Verifier(llm_client=client)
 
     done = {"n": 0}
+
+    # PROGRESS CONTRACT (2026-08-09). This counter used to exist only as a
+    # print() to a block-buffered stdout, so a redirected run was blind for
+    # its whole duration and progress had to be GUESSED from side effects —
+    # cache file counts, call-shape ratios, log regexes. Every one of those
+    # guesses was wrong. The position is now written to a file that any
+    # reader can consult, and `--progress-file` defaults next to --out so
+    # observability is the default rather than something to remember.
+    # ⚠ Constructed AFTER `_trials` exists (below), not here: the callback is
+    # defined before the trials are built, so the TOTAL is not knowable yet.
+    # A first version read `len(trials)` at this point and died with
+    # NameError on every run — caught in 0.2s by a strict replay rather than
+    # 90 minutes into a live one, which is the whole argument for replay.
+    _prog_holder = {}
 
     def _progress(res) -> None:
         done["n"] += 1
@@ -303,7 +348,12 @@ async def _amain() -> int:
         print(f"  [{done['n']:>3}] {res.trial.case_id:<22} "
               f"{res.trial.fault:<22} -> {v:<9} "
               f"conf={res.confidence:.2f} {res.elapsed_s:5.1f}s"
-              + (f"  ({res.error[:60]})" if res.error else ""))
+              + (f"  ({res.error[:60]})" if res.error else ""), flush=True)
+        _p = _prog_holder.get("p")
+        if _p is not None:
+            _p.tick(extra={"last_case": res.trial.case_id,
+                           "last_fault": res.trial.fault,
+                           "last_verdict": v})
 
     # Built here (not inside run_bench) only so the banner can report the
     # high-stakes count before the run starts; run_bench rebuilds them
@@ -311,6 +361,14 @@ async def _amain() -> int:
     from ghost_agent.eval.verify_bench import build_trials
     _trials = build_trials(cases, fault_names=fault_names, seed=args.seed)
     _esc = escalation_arm(verifier, _trials)
+    # The DENOMINATOR comes from the built trials, never from cases*faults —
+    # not every fault injects into every case (fact_swap applied to 43 of 58
+    # on 2026-08-09), so 58*8 overstates the total by 31 and every derived
+    # percentage with it.
+    _prog_holder["p"] = RunProgress(
+        args.progress_file or (Path(args.out) / "progress.json"),
+        total=len(_trials) * len(arms),
+        label=f"verify_bench {args.tier}/{args.two_stage}")
     print(f"{len(cases)} case(s), arms: {', '.join(arms)}, "
           f"judge: {args.base_url}")
     print(f"verdict pipeline: {_esc['arm']}"
@@ -360,6 +418,20 @@ async def _amain() -> int:
     print()
     print(md)
     print(f"written: {out_dir}/results.json  {out_dir}/report.md")
+    cs = report.get("provenance", {}).get("cache", {})
+    if cs.get("mode") != "off":
+        print(f"cache: {cs.get('hits')} hits / {cs.get('misses')} misses / "
+              f"{cs.get('writes')} writes — {cs.get('measures')}")
+    # LOUD and last, because a strict miss degrades silently into a null
+    # verdict: the scores print normally and are quietly computed over
+    # fewer trials. A replay that did not replay must not look clean.
+    if cache.strict_misses:
+        dumped = cache.dump_misses(out_dir / "strict_cache_misses.json")
+        print(f"\n⚠⚠ {len(cache.strict_misses)} STRICT CACHE MISS(ES) — this "
+              f"run is NOT a clean replay.\n   The missing requests are in "
+              f"{dumped}\n   Re-run with --cache-mode read to fill them with "
+              f"live calls, then replay again.")
+        return 3
     return 0
 
 

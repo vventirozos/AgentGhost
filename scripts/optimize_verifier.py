@@ -93,6 +93,13 @@ COMPONENTS = {
 }
 
 
+# Scoring-semantics version. 2 = 2026-08-07: unjudged trials excluded
+# from the gate + imputed at judged-mean in training batches; empty
+# classes drop from the macro-average. Recorded baselines carry it;
+# comparisons across versions are invalid.
+SCORER_VERSION = 2
+
+
 def _trial_score(trial: BenchTrial, verdict: Optional[str]) -> float:
     """Graded verdict correctness. UNCERTAIN gets partial credit against
     a hard expectation (better than the opposite verdict, worse than
@@ -106,6 +113,26 @@ def _trial_score(trial: BenchTrial, verdict: Optional[str]) -> float:
     if verdict == "UNCERTAIN":
         return 0.3
     return 0.0
+
+
+def _batch_scores(results) -> "tuple[list[float], int]":
+    """Per-trial raw scores with UNJUDGED trials imputed at the batch's
+    judged mean.
+
+    ⚠ §4L Lens-B MAJOR-1: unjudged (verdict None — judge endpoint down,
+    timeout) used to score 0.0 = "wrong answer", so an infra flake
+    during one candidate's batch steered GEPA's accept/reject exactly
+    the way the ship gate was distorted before its 2026-08-07 fix.
+    Mean-imputation makes the flaky trial NEUTRAL for candidate
+    comparison; an all-unjudged batch scores 0.0 loudly rather than
+    inventing a mean from nothing.
+    """
+    judged = [_trial_score(r.trial, r.verdict)
+              for r in results if r.verdict is not None]
+    judged_mean = sum(judged) / len(judged) if judged else 0.0
+    out = [(_trial_score(r.trial, r.verdict)
+            if r.verdict is not None else judged_mean) for r in results]
+    return out, sum(1 for r in results if r.verdict is None)
 
 
 class StatusBoard:
@@ -219,7 +246,8 @@ def gate_arm_active(adapter: "VerifierBenchAdapter", escalate_mode: str):
         adapter.escalate = prev
 
 
-def balanced_score(trials: List[BenchTrial], raw_scores: List[float]) -> float:
+def balanced_score(trials: List[BenchTrial], raw_scores: List[float],
+                   verdicts: Optional[List[Optional[str]]] = None) -> float:
     """Macro-average over the two expectation classes: catch-rate mass and
     false-alarm mass count EQUALLY, however lopsided the trial mix is. This
     is the ship-gate metric — the 2026-07-30 ship optimized a mean dominated
@@ -232,12 +260,29 @@ def balanced_score(trials: List[BenchTrial], raw_scores: List[float]) -> float:
     current 107-case pool it is 3.06:1 public (428/140) and 3.07:1 private
     (166/54). And the live cost was **~8 escalation overturns/day**, not
     "~18": the recorded corpus 2026-07-30..08-04 holds 42 overturns over 5
-    days (5/17/12/4/4) — 18 was the peak day quoted as an average."""
-    nr = [s for t, s in zip(trials, raw_scores) if _is_nonrefute(t)]
-    rf = [s for t, s in zip(trials, raw_scores) if not _is_nonrefute(t)]
-    nr_m = sum(nr) / len(nr) if nr else 0.0
-    rf_m = sum(rf) / len(rf) if rf else 0.0
-    return 0.5 * nr_m + 0.5 * rf_m
+    days (5/17/12/4/4) — 18 was the peak day quoted as an average.
+
+    ⚠ Two silent distortions fixed by measurement (2026-08-07 review):
+    (a) an UNJUDGED trial (verdict None — judge endpoint down, timeout)
+    scored 0.0, identical to a WRONG verdict, while `score_trials`
+    excludes skips from every rate it reports — five unjudged non-refute
+    trials cost ≈4.6pp, four times the 0.011 ship margin, invisibly.
+    Unjudged trials are now EXCLUDED here too, and `verdicts` (when
+    supplied) is what identifies them. (b) an EMPTY class contributed
+    0.0 to the macro-average, so a single-class run capped at 0.500 and
+    read as a catastrophic regression; an empty class now DROPS out of
+    the mean. Callers must surface `unjudged` — a gate that quietly
+    excluded a third of its trials would be the same defect inverted.
+    """
+    if verdicts is not None:
+        keep = [(t, sc) for t, sc, v in zip(trials, raw_scores, verdicts)
+                if v is not None]
+    else:
+        keep = list(zip(trials, raw_scores))
+    nr = [sc for t, sc in keep if _is_nonrefute(t)]
+    rf = [sc for t, sc in keep if not _is_nonrefute(t)]
+    parts = [sum(c) / len(c) for c in (nr, rf) if c]
+    return sum(parts) / len(parts) if parts else 0.0
 
 
 class VerifierBenchAdapter:
@@ -309,7 +354,10 @@ class VerifierBenchAdapter:
         if self.escalate and self.main_base_url:
             return EscalatingChatClient(
                 self.base_url, self.main_base_url, timeout=self.timeout,
-                model=self.model, main_model=self.main_model)
+                model=self.model, main_model=self.main_model,
+                # Production rides the CRITIC leg since 2026-08-06 —
+                # the gate must measure the same rung (task #25).
+                leg="critic")
         return HttpChatClient(self.base_url, timeout=self.timeout,
                               model=self.model)
 
@@ -384,9 +432,20 @@ class VerifierBenchAdapter:
         async def _run() -> list:
             client = self.build_client()
             verifier = Verifier(llm_client=client)
+            # ⚠ Per-trial board tick (2026-08-08): gepa's initial seed
+            # evaluation runs the FULL valset as ONE silent batch —
+            # raw-judge trials log nothing and the board only ticked at
+            # batch END, so an hour-plus of healthy grinding read as a
+            # wedge. Three runs were killed for being quietly busy; the
+            # third's SIGABRT stack proved the loop healthy in select().
+            # Silence is not a stall — but only an instrument can tell
+            # you that at 2am.
+            _tick = ((lambda _res: self.board.event(inc_trials_evaluated=1))
+                     if self.board else None)
             try:
                 return await run_trials(
-                    verifier, list(batch), concurrency=self.concurrency)
+                    verifier, list(batch), concurrency=self.concurrency,
+                    on_result=_tick)
             finally:
                 _h = getattr(client, "route_health", None)
                 if callable(_h):
@@ -405,12 +464,15 @@ class VerifierBenchAdapter:
             verifier_mod._TEMPLATE_OVERRIDES.clear()
             verifier_mod._TEMPLATE_OVERRIDES.update(prev)
         if self.board:
-            self.board.event(inc_batches=1,
-                             inc_trials_evaluated=len(results))
+            # trials already ticked per-result; count only the batch.
+            self.board.event(inc_batches=1)
 
         scores, outputs, trajectories = [], [], []
-        for r in results:
-            s = _trial_score(r.trial, r.verdict)
+        raw_scores, n_unjudged = _batch_scores(results)
+        if n_unjudged:
+            print(f"⚠ batch has {n_unjudged}/{len(results)} UNJUDGED "
+                  f"trials — imputed at judged-mean, not 0.0", flush=True)
+        for r, s in zip(results, raw_scores):
             w = 1.0 if _is_nonrefute(r.trial) else self.refute_weight
             scores.append(s * w)
             outputs.append(r.verdict)
@@ -693,9 +755,16 @@ def main() -> int:
         baseline_eval = adapter.evaluate(priv_trials, seed_candidate,
                                          capture_traces=True)
     baseline_raw = [t["score"] for t in baseline_eval.trajectories]
-    baseline_bal = balanced_score(priv_trials, baseline_raw)
+    baseline_verdicts = [t["verdict"] for t in baseline_eval.trajectories]
+    baseline_bal = balanced_score(priv_trials, baseline_raw,
+                                  baseline_verdicts)
+    _unjudged = sum(1 for v in baseline_verdicts if v is None)
     print(f"INCUMBENT on PRIVATE trials: balanced={baseline_bal:.3f} "
-          f"raw-mean={sum(baseline_raw) / len(baseline_raw):.3f}")
+          f"raw-mean={sum(baseline_raw) / len(baseline_raw):.3f} "
+          f"unjudged={_unjudged}"
+          + (" ⚠ unjudged trials are EXCLUDED from the gate — infra "
+             "failures are not wrong answers, but a high count voids "
+             "the comparison" if _unjudged else ""))
     board.event(phase="optimizing (gepa loop)",
                 incumbent_private_balanced=round(baseline_bal, 4))
 
@@ -712,14 +781,28 @@ def main() -> int:
         # runner ever drops a result, and a silently shortened denominator
         # is exactly the kind of wrong-but-plausible number this file
         # exists to stop shipping.
-        _nr = [t["score"] for t in _traj if _is_nonrefute(t["trial"])]
-        _rf = [t["score"] for t in _traj if not _is_nonrefute(t["trial"])]
+        # Per-class means EXCLUDE unjudged trials, matching the gate's
+        # balanced_score semantics (§4L Lens-B MINOR-1: the same payload
+        # used to mix an unjudged-as-0.0 mean with an unjudged-excluded
+        # balanced — internally inconsistent).
+        _nr = [t["score"] for t in _traj
+               if _is_nonrefute(t["trial"]) and t["verdict"] is not None]
+        _rf = [t["score"] for t in _traj
+               if not _is_nonrefute(t["trial"]) and t["verdict"] is not None]
+        _n_unjudged = sum(1 for t in _traj if t["verdict"] is None)
         if len(_traj) != len(priv_trials):
             print(f"WARNING: {len(_traj)} trajectories for "
                   f"{len(priv_trials)} private trials — the baseline is "
                   f"not over the full tier", file=sys.stderr)
         payload = {
             "kind": "verifier-incumbent-private-baseline",
+            # ⚠ Bump whenever _trial_score/balanced_score semantics
+            # change (§4L Lens-B MINOR-2): a recorded baseline is only
+            # comparable to a run whose scorer_version matches — the
+            # 2026-08-07 unjudged/empty-class fixes silently invalidated
+            # every earlier recorded number, and nothing marked them.
+            "scorer_version": SCORER_VERSION,
+            "n_unjudged_excluded": _n_unjudged,
             "recorded_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                           time.gmtime()),
             "metric": "balanced = 0.5*mean(non-refute) + 0.5*mean(refute)",
@@ -846,7 +929,12 @@ def main() -> int:
     with gate_arm_active(adapter, args.escalate):
         cand_eval = adapter.evaluate(priv_trials, best, capture_traces=True)
     cand_raw = [t["score"] for t in cand_eval.trajectories]
-    cand_bal = balanced_score(priv_trials, cand_raw)
+    cand_verdicts = [t["verdict"] for t in cand_eval.trajectories]
+    cand_bal = balanced_score(priv_trials, cand_raw, cand_verdicts)
+    _cand_unjudged = sum(1 for v in cand_verdicts if v is None)
+    if _cand_unjudged:
+        print(f"⚠ candidate eval: {_cand_unjudged} unjudged trials "
+              f"EXCLUDED from the gate")
     delta = cand_bal - baseline_bal
     valid = all(verifier_mod._validate_stage_template(n, t)
                 for n, t in best.items())

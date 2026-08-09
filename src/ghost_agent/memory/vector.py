@@ -895,6 +895,12 @@ class VectorMemory:
                 "id": item.get("mem_id"),
                 "text": self._render_item(item),
                 "score": item.get("combined_score", 0.0),
+                # §4N MAJOR-3: expose the row type so the bus can keep
+                # skill-lesson twins out of the generic MEMORY tier (they
+                # have a dedicated skill tier + playbook). The candidate
+                # build uppercases m_type, so the bus filter compares
+                # case-insensitively (str(...).upper() != "SKILL").
+                "type": item.get("type"),
             }
             for item in selection
         ]

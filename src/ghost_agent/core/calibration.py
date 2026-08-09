@@ -47,7 +47,7 @@ import logging
 import math
 import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -295,6 +295,94 @@ def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 
         return _clamp01(max(_DEGRADED_FLOOR, grade))
     except Exception:  # noqa: BLE001 — labelling must never break a turn
         return _UNVERIFIED_PRIOR
+
+
+# Source precedence for per-request label resolution (§4L Lens-A/B,
+# 2026-08-07). Higher rank = stronger evidence, mirroring the outcome
+# ladder: a user correction outranks a late verifier verdict outranks
+# the inline turn grade; §4E's task-reopened retro-negative and the
+# failure-report tier sit between.
+_SOURCE_RANK = {"turn": 0, "verifier_late": 1, "task_reopened": 2,
+                "failure_report": 3, "user_correction": 4}
+
+
+def resolve_superseded_rows(rows):
+    """Dict-level twin of `_resolve_superseded` for raw JSONL consumers
+    (learning-health feature stats — §4L R3 MINOR-1: they counted BOTH
+    labels of a corrected request in separation sigmas while the fit saw
+    one). Same rank table, same recency tiebreak, same no-req
+    passthrough; one implementation of the ladder per data shape, both
+    reading `_SOURCE_RANK` so they cannot drift."""
+    best: dict = {}
+    passthrough = []
+    for i, r in enumerate(rows or []):
+        rid = str(r.get("req_id") or "") if isinstance(r, dict) else ""
+        if not rid:
+            passthrough.append((i, r))
+            continue
+        rank = _SOURCE_RANK.get(str(r.get("source") or "turn"), 0)
+        prev = best.get(rid)
+        if prev is None or rank >= prev[0]:
+            best[rid] = (rank, i, r)
+    keep = passthrough + [(i, r) for (_rk, i, r) in best.values()]
+    keep.sort(key=lambda t: t[0])
+    return [r for _i, r in keep]
+
+
+def _resolve_superseded(samples):
+    """One label per request: the highest-ranked source wins, recency
+    breaks ties.
+
+    ⚠ The corpus is append-only and the fit used to consume EVERY row,
+    so a §4E retro-negative (0.15) landed NEXT TO the original 1.0 turn
+    row and was averaged — the docstring said "re-label", the arithmetic
+    said "counter-weight at half strength" (measured live: req 316dc5b3
+    carried both). Rows without a req_id cannot be joined and pass
+    through untouched; file order is the recency tiebreak (append-only).
+    """
+    best: dict = {}
+    passthrough = []
+    for i, s in enumerate(samples):
+        rid = getattr(s, "req_id", "") or ""
+        if not rid:
+            passthrough.append((i, s))
+            continue
+        rank = _SOURCE_RANK.get(getattr(s, "source", "turn") or "turn", 0)
+        prev = best.get(rid)
+        if prev is None or rank >= prev[0]:
+            best[rid] = (rank, i, s)
+    keep = passthrough + [(i, s) for (_r, i, s) in best.values()]
+    keep.sort(key=lambda t: t[0])
+    return [s for _i, s in keep]
+
+
+# The model-text-only hedge scan landed 2026-08-01; before it, the
+# finalize-appended SYSTEM disclaimer ("⚠ Unverified: … I cannot
+# confirm") was scanned as the agent's own hedge — a deterministic echo
+# of the label (§4L Lens-A MAJOR-2: the live λ=0.2 was bought entirely
+# by 4 such rows, and zeroing them flips the fit to λ=0.0).
+_PRESSURE_SEMANTICS_FIX_TS = "2026-08-02T00:00:00"
+
+
+def _migrate_leaked_pressure(samples):
+    """Zero `uncertainty_pressure` on rows recorded before the
+    model-text-only scan fix.
+
+    ⚠ The feature's SEMANTICS changed mid-epoch without an epoch bump —
+    a violation of CURRENT_EPOCH's own contract. Bumping the epoch now
+    would discard 600+ comparable rows to fix 7; instead this dated
+    loader migration makes the semantics uniform: before the fix the
+    feature was unmeasurable, so it reads 0.0 (its usual value). Any
+    FUTURE feature-semantics change must either bump the epoch or add
+    its own dated migration here — this function is the precedent.
+    """
+    out = []
+    for s in samples:
+        if (getattr(s, "uncertainty_pressure", 0.0)
+                and str(getattr(s, "ts", "")) < _PRESSURE_SEMANTICS_FIX_TS):
+            s = replace(s, uncertainty_pressure=0.0)
+        out.append(s)
+    return out
 
 
 def _outcome_variance(samples) -> float:
@@ -650,6 +738,65 @@ class CalibrationTracker:
             logger.debug("CalibrationTracker.record failed: %s", exc)
             return False
 
+    def record_late_verdict_correction(self, req_id: str,
+                                       outcome: float) -> bool:
+        """Re-label a turn's calibration sample after a LATE verifier
+        verdict (§4L Lens-A MAJOR-1).
+
+        The sample is written once at finalize with only the INLINE
+        verdict — but with critic nodes live, most verdicts land late
+        via `_record_late_verdict`, which backfilled the corpus,
+        selfhood, lessons and the operator line while the calibration
+        store kept the optimistic inline grade: measured live, 47 late
+        REFUTED corrections against 7 stored hard negatives, with 6 of 9
+        joinable late-refuted turns still sitting in the fit as
+        positives. Negatives are the scarce class (18/678) — this
+        starved and mislabelled exactly the class the fit needs most.
+
+        Same no-leakage contract as the retro-negative: the stored
+        FEATURES are reused untouched, only the label differs, and
+        `_resolve_superseded` (source rank verifier_late > turn) makes
+        this a re-label, not a counter-weight. Idempotent per request.
+        """
+        try:
+            req_id = str(req_id or "")
+            if not req_id:
+                return False
+            with self._lock:
+                samples = self._load_samples()
+                base = None
+                for s in samples:
+                    if s.req_id != req_id:
+                        continue
+                    if s.source == "verifier_late":
+                        return False      # already corrected
+                    if s.source == "turn":
+                        base = s          # last write wins
+                if base is None:
+                    return False          # no join — skip, never default
+                if abs(base.outcome - outcome) < 1e-9:
+                    return False          # nothing to correct
+                return self.record(
+                    composite=base.composite,
+                    entropy_component=base.entropy_component,
+                    competence_component=base.competence_component,
+                    uncertainty_pressure=base.uncertainty_pressure,
+                    outcome=_clamp01(outcome),
+                    domain=base.domain,
+                    entropy_observed=base.entropy_observed,
+                    effort_component=base.effort_component,
+                    effort_observed=base.effort_observed,
+                    source="verifier_late",
+                    req_id=req_id,
+                    # Inherit the turn's epoch — same rationale as the
+                    # retro-negative below: reused features must not
+                    # smuggle an older feature set into the live fit.
+                    epoch=base.epoch,
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("record_late_verdict_correction failed: %s", exc)
+            return False
+
     def record_task_reopened_negative(self, closed_req_id: str) -> bool:
         """§4E Tier 3: retroactive negative for the turn that closed a task
         later REOPENED. Finds that turn's ``source="turn"`` sample by
@@ -721,7 +868,14 @@ class CalibrationTracker:
         the current epoch is 0.530.
         """
         want = CURRENT_EPOCH if epoch is None else epoch
-        return [s for s in self._load_samples(limit=limit) if s.epoch == want]
+        scoped = [s for s in self._load_samples(limit=limit)
+                  if s.epoch == want]
+        # ⚠ Same RESOLUTION as the fit (§4L R2 NEW-4): metrics used to
+        # average superseded duplicate labels (reported Brier 0.410 vs
+        # 0.810 on the fit's resolved population) — the exact
+        # "population the agent never fits" failure this docstring
+        # warns about, one filter deeper.
+        return _migrate_leaked_pressure(_resolve_superseded(scoped))
 
     def _load_samples(self, limit: Optional[int] = None) -> List[CalibrationSample]:
         if not self.history_path.exists():
@@ -859,8 +1013,19 @@ class CalibrationTracker:
         """
         floor = min_samples if min_samples is not None else self.min_samples_for_fit
         all_samples = self._load_samples(limit=self.max_history)
-        samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
-        n_excluded = len(all_samples) - len(samples)
+        epoch_samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
+        samples = _migrate_leaked_pressure(
+            _resolve_superseded(epoch_samples))
+        # ⚠ Two DIFFERENT exclusions, counted apart (§4L R2 NEW-5): the
+        # old single number folded supersede-drops into a field named
+        # "older-epoch rows excluded" — 1 "older-epoch row" on a corpus
+        # with zero of them.
+        n_excluded = len(all_samples) - len(epoch_samples)
+        n_superseded = len(epoch_samples) - len(samples)
+        if n_superseded:
+            logger.debug(
+                "calibration: %d duplicate-request row(s) resolved by "
+                "source-rank supersession before the fit", n_superseded)
         if len(samples) < floor:
             logger.debug(
                 "calibration fit bail: %d samples in epoch %s < floor %d "

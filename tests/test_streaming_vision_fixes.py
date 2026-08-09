@@ -8,6 +8,34 @@ from src.ghost_agent.core.prompts import SPECIALIST_SYSTEM_PROMPT
 from src.ghost_agent.tools.vision import tool_vision_analysis
 from src.ghost_agent.core.agent import GhostAgent, GhostContext
 
+
+@pytest.fixture(autouse=True)
+def _force_use_planning_treatment(monkeypatch):
+    """The use_planning experiment arm (2026-08-07) withholds the planner
+    on control/unenrolled turns by design; tests here that set
+    ``args.use_planning = True`` are exercising the PLANNER PATH, so pin
+    this one arm to treatment. Other experiments keep their real
+    (unenrolled → control) behavior."""
+    import importlib
+
+    # Patch BOTH module identities: tests import `ghost_agent.*` while some
+    # files (and prod) import `src.ghost_agent.*` — two distinct module
+    # objects with separate `arm_for` attributes (the production-import-
+    # shape trap). Patching only one leaves the other gate live.
+    for _modname in ("ghost_agent.core.experiments",
+                     "src.ghost_agent.core.experiments"):
+        try:
+            _exp = importlib.import_module(_modname)
+        except ImportError:
+            continue
+        _real = _exp.arm_for
+        monkeypatch.setattr(
+            _exp, "arm_for",
+            lambda ctx, name, req_id="", _e=_exp, _r=_real: (
+                _e.TREATMENT if name == "use_planning"
+                else _r(ctx, name, req_id)))
+
+
 def test_code_system_prompt_hardened():
     """Verify that the prompt requires exact Markdown formatting and raw filenames."""
     assert "![Image](/api/download/filename.ext)" in SPECIALIST_SYSTEM_PROMPT

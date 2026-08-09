@@ -1689,6 +1689,14 @@ async def tool_browser(
     if not sandbox_dir or not sandbox_manager:
         return _err("Sandbox is not initialised — cannot run browser.")
 
+    # Fail-closed (§4P): under --mandatory-tor a falsy proxy on a PUBLIC target
+    # is replaced with the loopback Tor default so Chromium (a subprocess the
+    # socket guard can't see) never navigates a public URL cleartext. A
+    # loopback/LAN target stays direct (Tor can't route it; resolve returns
+    # unchanged), preserving the supervised-sandbox-service capability.
+    from ..utils.egress_guard import resolve_egress_proxy as _resolve_egress_proxy
+    tor_proxy = _resolve_egress_proxy(tor_proxy, url)
+
     # SSRF guard: refuse http(s) navigation to internal/metadata hosts.
     # (file:// fixtures and about:/data: are allowed; loopback ports of
     # supervised sandbox services are admitted — see sandbox/services.py.)

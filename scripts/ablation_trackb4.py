@@ -177,7 +177,10 @@ def _log_counts(log_path: Path) -> Dict[str, int]:
     return {
         "auto_memory_stores": text.count("Auto Memory Store"),
         "dream_entropy_skips": text.count("Not enough entropy to dream"),
-        "bus_hydrations": text.count("Hydrated context for"),
+        # §4M (Lens D F9): "Hydrated context for" is the pretty-log on ONE
+        # call path (3.1% undercount live); "Hydration tiers:" is emitted
+        # by _log_hydration on ALL paths.
+        "bus_hydrations": text.count("Hydration tiers:"),
         "smart_memory_requeues": text.count("re-queued smart_memory"),
     }
 

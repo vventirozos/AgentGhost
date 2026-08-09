@@ -90,7 +90,7 @@
 
   <h2>How "everything goes through Tor" is actually enforced</h2>
 
-  <p>Asking every tool nicely to use the proxy doesn't work — one helper that forgets, and you have a silent cleartext leak that looks identical to working. So there are two mechanisms.</p>
+  <p>Asking every tool nicely to use the proxy doesn't work — one helper that forgets, and you have a silent cleartext leak that looks identical to working. So there are three layers, and the order matters: the last one is what actually holds for the tools you use most.</p>
 
   <div class="diagram">
     <ol class="flow">
@@ -99,9 +99,13 @@
         <p>Ghost checks that Tor is actually reachable before it finishes starting. If it isn't, Ghost <strong>refuses to start</strong> rather than starting in a state where the network tools would quietly fall back to direct connections.</p>
       </li>
       <li>
-        <h4>At runtime: a process-wide socket guard</h4>
-        <p>The outbound socket calls are patched for the life of the process. Any attempt to connect <em>directly to a public address</em> raises an error instead of connecting.</p>
-        <p>Note what this does <em>not</em> block: loopback and LAN addresses are fine. That's not a hole — Tor traffic leaves via the local SOCKS proxy on <code>127.0.0.1</code>, so from the socket layer's point of view all anonymised traffic <em>is</em> a loopback connection. The only thing the guard can see and block is a connection that bypassed Tor, which is exactly the leak worth blocking.</p>
+        <h4>At each call site: fail-closed by default</h4>
+        <p>This is the one that actually covers web search, page fetches and downloads. When one of those tools is about to reach a <em>public</em> host and it wasn't handed a proxy, it doesn't fall back to a direct connection — it fills in the local Tor proxy itself. If Tor happens to be down, the connection is refused (a stalled fetch), never sent in the clear. A LAN or loopback target is left alone, because Tor can't route those anyway.</p>
+      </li>
+      <li>
+        <h4>At runtime: a process-wide socket guard (backstop)</h4>
+        <p>The outbound socket calls are patched for the life of the process, so a direct connection to a public address raises an error instead of connecting. Loopback and LAN are fine — Tor traffic leaves via the local SOCKS proxy on <code>127.0.0.1</code>, so at the socket layer all anonymised traffic <em>is</em> a loopback connection; the only thing the guard can see and block is a connection that bypassed Tor.</p>
+        <p><strong>An honest limit:</strong> this guard sits at Python's socket layer, and the network library the fetch/search/download tools use (<code>curl_cffi</code>) opens its sockets below that layer, so the guard can't see them — nor can it see the browser or sandbox, which are separate processes. That's why layer&nbsp;2 exists and does the real work; the socket guard is a backstop for the smaller amount of traffic that <em>does</em> go through Python's own sockets.</p>
       </li>
     </ol>
   </div>
@@ -205,7 +209,7 @@
   </div>
 
   <footer>
-    <p>Checked against <code>utils/egress_guard.py</code>, <code>utils/helpers.py</code>, <code>sandbox/docker.py</code> and <code>main.py</code> on 2026-08-04.</p>
+    <p>Checked against <code>utils/egress_guard.py</code> (incl. <code>resolve_egress_proxy</code>, the layer-2 call-site backstop), <code>utils/helpers.py</code>, <code>tools/search.py</code>, <code>tools/system.py</code>, <code>tools/file_system.py</code>, <code>tools/browser.py</code>, <code>sandbox/docker.py</code> and <code>main.py</code> on 2026-08-08.</p>
   </footer>
 </main>
 </body>

@@ -100,6 +100,25 @@ class RouterTrainer:
             report.bail_reason = f"fit failed: {e}"
             return report
 
+        # §4O R2 MAJOR-1: reject an INVERTED model AT THE SOURCE — before
+        # saving and before it becomes self.classifier. A model with net-
+        # negative technical/coding weights routes the hardest requests to
+        # "easy" (the n_steps-counts-history bug produced exactly this).
+        # Guarding only the load + hot-swap call sites left the BOOTSTRAP
+        # install (main.py) and the SAVE unguarded, so a restart retrained
+        # from the frozen inverted corpus, installed it ungated, and
+        # re-poisoned the checkpoint every idle tick. Bailing here leaves
+        # fit_succeeded=False → the idle retrain won't hot-swap and the
+        # bootstrap returns (None, report) → router stays escalate-all
+        # (planner runs), and no inverted model is ever persisted.
+        if not clf.looks_sane():
+            report.bail_reason = (
+                "trained model is INVERTED (net-negative technical/coding "
+                "weights) — not installing or saving; router stays "
+                "escalate-all until a sane model can train")
+            logger.warning("router train: %s", report.bail_reason)
+            return report
+
         if save_path is not None:
             try:
                 clf.save(save_path)

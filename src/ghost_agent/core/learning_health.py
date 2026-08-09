@@ -87,10 +87,24 @@ def _live_epoch_filter(samples: List[dict]):
     try:
         from .calibration import CURRENT_EPOCH, epoch_for_ts
     except Exception:  # noqa: BLE001 — telemetry must never break on import
-        return samples, 0
+        return samples, 0, 0
     scoped = [s for s in samples
               if str(s.get("epoch") or epoch_for_ts(s.get("ts"))) == CURRENT_EPOCH]
-    return scoped, len(samples) - len(scoped)
+    n_other = len(samples) - len(scoped)
+    # Same supersession resolution as the fit (§4L R3 MINOR-1): a
+    # corrected request must contribute ONE label to separations and
+    # class counts, not both. Counted APART from the epoch exclusion
+    # (§4L R4: the combined number was reported under a key named
+    # "other_epochs" — off by exactly the superseded count).
+    n_sup = 0
+    try:
+        from .calibration import resolve_superseded_rows
+        resolved = resolve_superseded_rows(scoped)
+        n_sup = len(scoped) - len(resolved)
+        scoped = resolved
+    except Exception:  # noqa: BLE001 — telemetry must never break on import
+        pass
+    return scoped, n_other, n_sup
 
 
 def _live_stale_gates():
@@ -265,7 +279,7 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
     # what made this report contradict itself: 1709 rows on disk, of which
     # only 541 were fittable, while the feature verdicts were computed over
     # all of them and so measured a label-scheme change rather than a signal.
-    samples, n_other_epochs = _live_epoch_filter(all_samples)
+    samples, n_other_epochs, n_superseded = _live_epoch_filter(all_samples)
     if params or all_samples:
         # Count entropy variety over OBSERVED samples only. Counting all of
         # them conflated "the model was 50/50" with "no logprobs came back",
@@ -275,8 +289,6 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
         ent = [s.get("entropy_component") for s in obs
                if s.get("entropy_component") is not None]
         ent_distinct = len(set(round(float(e), 3) for e in ent)) if ent else 0
-        outs = [s.get("outcome") for s in samples if "outcome" in s]
-
         def _row_outcome(s) -> float:
             # Defensive: corrupt/hand-edited rows count as the negative
             # class rather than taking down the report.
@@ -284,6 +296,13 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
                 return float(s.get("outcome", 0) or 0)
             except (TypeError, ValueError):
                 return 0.0
+
+        # §4M (Lens D F4): this list was built UNCOERCED and compared with
+        # `o < 0.5` below — one non-numeric outcome row raised TypeError
+        # and blanked the entire report ("Learning health unavailable"),
+        # violating the module's never-raises contract while the coercer
+        # sat unused right above.
+        outs = [_row_outcome(s) for s in samples if "outcome" in s]
 
         # Mirror calibration.py's fit gate EXACTLY: >= floor observed
         # samples AND both outcome classes represented among them. The old
@@ -301,6 +320,7 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "samples_on_disk": len(all_samples),
             "samples_this_epoch": len(samples),
             "samples_other_epochs": n_other_epochs,
+            "samples_superseded": n_superseded,
             "epoch": params.get("epoch"),
             "n_fitted": params.get("n_samples"),
             "brier": params.get("brier"),
@@ -369,6 +389,10 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
     # -- tool-call framing leak: RECURRENCE watch ------------------------
     report["framing_leak"] = _framing_leak_health(md.parent / "trajectories")
 
+    # -- RRF usefulness ledger: censoring + staleness (§4M D F2/F7) ------
+    report["usefulness_ledger"] = _usefulness_ledger_health(
+        md.parent / "rrf" / "observations.jsonl")
+
     # -- foresight shadow world model (§4K Phase 1) ----------------------
     # Live-imported from the mechanism (same rule as the gates above) so
     # the instrument cannot drift from what the module actually records.
@@ -423,9 +447,12 @@ def _escalation_health(ledger_path: Path) -> Dict[str, Any]:
     computable at all.
 
     Reported per (route, kind) — claim-refute and code-refute are different
-    populations and averaging them hides both (measured 2026-08-04: claim
-    refutes overturn 84%, all 7 live code refutes were upheld on replay).
-    ``unavailable`` stays in the denominator: the call was spent.
+    populations and averaging them hides both (measured 2026-08-04 from the
+    LOG, pre-ledger: claim refutes overturned 84%, all 7 code refutes upheld
+    on replay — note a ``code/*`` arm appears HERE only once a code refute
+    escalates after the ledger shipped 2026-08-04; its absence from the file
+    is not evidence it never fires). ``unavailable`` stays in the
+    denominator: the call was spent.
     """
     out: Dict[str, Any] = {"present": False, "arms": {}, "total": 0}
     rows = _load_jsonl(ledger_path, limit=5000)
@@ -438,14 +465,29 @@ def _escalation_health(ledger_path: Path) -> Dict[str, Any]:
         return out
     out["present"] = True
     out["total"] = len(rows)
+    # §4M (Lens D F6b): the counters were undated — the ledger begins
+    # 2026-08-04 and pre-ledger history (log-only) is invisible, so an
+    # undated "100% overturned" invited trending against a population the
+    # file does not contain.
+    out["first_ts"] = min((str(r.get("ts") or "") for r in rows), default="")
+    out["last_ts"] = max((str(r.get("ts") or "") for r in rows), default="")
     for rec in rows:
         arm = f"{rec.get('route') or '?'}/{rec.get('kind') or '?'}"
         slot = out["arms"].setdefault(
             arm, {"overturned": 0, "upheld": 0, "withheld": 0,
-                  "unavailable": 0, "n": 0})
+                  "unavailable": 0, "downgraded": 0,
+                  "replaced_uncertain": 0, "truncation_guard": 0,
+                  "mechanically_upheld": 0, "mechanically_dismissed": 0,
+                  "n": 0})
         outcome = str(rec.get("outcome") or "").strip()
         if outcome in slot:
             slot[outcome] += 1
+        else:
+            # ⚠ Vocabulary drift must be VISIBLE (§4L Lens-C MINOR-3):
+            # the outcome vocabulary grew 5 new strings in one month,
+            # and an unknown string used to bump only `n` — buckets
+            # quietly stopped summing to n.
+            slot["other"] = slot.get("other", 0) + 1
         slot["n"] += 1
     for arm, slot in out["arms"].items():
         decided = slot["overturned"] + slot["upheld"]
@@ -459,7 +501,59 @@ def _escalation_health(ledger_path: Path) -> Dict[str, Any]:
 # it; 161 trajectories recorded after it carry zero. So the watch is not
 # "is the count above zero" — the corpus is append-only, so it never will be —
 # it is "is the LATEST occurrence newer than the fix".
-_FRAMING_FIX_TS = "2026-07-31T19:00"
+# §4M (Lens D F5): this constant is string-compared against trajectory
+# `last_seen` values that are UTC ("...Z"). The fix landed ~18:54 LOCAL
+# (UTC+3) = ~15:54Z — the old value 19:00 (local, unconverted) left a
+# 3h06m blind window where a real recurrence rendered "all historical".
+_FRAMING_FIX_TS = "2026-07-31T15:54"
+
+
+def _usefulness_ledger_health(ledger_path: Path) -> Dict[str, Any]:
+    """Censoring + staleness watch on the RRF usefulness ledger (§4M
+    Lens D F2/F7). The judge covers only the top-12 survivors, so a turn
+    with 12 rows usually means "the cap", not "the turn" — the
+    ``injected_total`` stamp (2026-08-08) makes that measurable. And the
+    refit re-running on a byte-identical corpus LOOKS healthy in the log
+    (same count every time), so staleness needs its own line."""
+    out: Dict[str, Any] = {"n_rows": 0}
+    rows = _load_jsonl(ledger_path, limit=20000)
+    if not rows:
+        out["reason"] = ("no ledger file" if not Path(ledger_path).exists()
+                         else "ledger empty")
+        return out
+    turns: Dict[str, list] = {}
+    legacy_rows = 0
+    for r in rows:
+        t = str(r.get("turn") or "")
+        if not t:
+            # §4M R2 NIT-3: pooling turn-less legacy rows into one
+            # pseudo-turn inflated its batch past 12 and distorted the
+            # cap census.
+            legacy_rows += 1
+            continue
+        turns.setdefault(t, []).append(r)
+    capped = 0          # exactly-12-row turns (the cap signature)
+    censored = 0        # PROVEN censored: stamp present and > rows
+    stamped = 0
+    for batch in turns.values():
+        if len(batch) == 12:
+            capped += 1
+        it = max((int(r.get("injected_total") or 0) for r in batch),
+                 default=0)
+        if it:
+            stamped += 1
+            if it > len(batch):
+                censored += 1
+    out.update({
+        "n_rows": len(rows),
+        "n_turns": len(turns),
+        "capped_turns": capped,
+        "stamped_turns": stamped,
+        "censored_turns": censored,
+        "legacy_rows": legacy_rows,
+        "last_ts": max((str(r.get("ts") or "") for r in rows), default=""),
+    })
+    return out
 
 
 def _framing_leak_health(traj_root: Path) -> Dict[str, Any]:
@@ -815,8 +909,17 @@ def render_learning_health(memory_dir) -> str:
 
     les = r.get("lessons")
     if les:
+        # §4M (Lens D F6d): at the cap, "N total" is a saturated window
+        # (the store trims on every write), not a population count — say so.
+        _cap_note = ""
+        try:
+            from ..memory.skills import PLAYBOOK_MAX as _PBMAX
+            if int(les["total"]) >= int(_PBMAX):
+                _cap_note = f" (AT CAP {_PBMAX} — trims on every write)"
+        except Exception:
+            pass
         lines.append(
-            f"\nLESSONS: {les['total']} total "
+            f"\nLESSONS: {les['total']} total{_cap_note} "
             f"({les['graduated']} graduated, {les['verified']} verified, "
             f"{les['quarantined']} quarantined)")
         if "graduation_eligible" in les:
@@ -833,8 +936,10 @@ def render_learning_health(memory_dir) -> str:
             f"fail-only {les['present_on_failure_only']}, "
             f"both {les['present_on_both']}]")
         lines.append(
-            f"  mean hit-rate: {les['mean_hit_rate']}; "
-            f"stale/prune candidates: {les['stale_prune_candidates']}")
+            f"  mean hit-rate: {les['mean_hit_rate']} (denominator includes "
+            f"the pre-2026-08-01 double-booking era — do not trend across "
+            f"that date); stale/prune candidates: "
+            f"{les['stale_prune_candidates']}")
         _fail_ticks = int(les.get("failed_ticks_total") or 0)
         _succ_ticks = int(les.get("succeeded_ticks_total") or 0)
         lines.append(
@@ -879,10 +984,13 @@ def render_learning_health(memory_dir) -> str:
             f"\nEPISODES: {epi['total']} "
             f"({epi['pending_consolidation']} pending consolidation, "
             f"{epi['success']} success)")
+        # §4M (Lens D F6c): the old single line said "context/cluster"
+        # with a context-only numerator — the two counts differ live.
         lines.append(
-            f"  context/cluster coverage: {epi['with_context']}/{epi['total']} "
-            f"({epi['context_coverage_pct']}%) — populated only on episodes "
-            f"recorded AFTER the 2026-07-26 field-population fix")
+            f"  context coverage: {epi['with_context']}/{epi['total']} "
+            f"({epi['context_coverage_pct']}%), cluster coverage: "
+            f"{epi.get('with_cluster', '?')}/{epi['total']} — populated only "
+            f"on episodes recorded AFTER the 2026-07-26 field-population fix")
 
     cal = r.get("calibration")
     if cal:
@@ -999,7 +1107,12 @@ def render_learning_health(memory_dir) -> str:
 
     au = r.get("auto_skills")
     if au:
-        lines.append(f"\nAUTO-SKILLS graduated: {au['graduated']}")
+        # §4M (Lens D F6e): "graduated" collided with LESSON graduation
+        # six lines up — different mechanism, different store. Name the
+        # store instead.
+        lines.append(
+            f"\nAUTO-SKILLS store: {au['graduated']} proven tool-sequences "
+            f"(auto_skills.json — distinct from lesson graduation above)")
 
     act = r.get("activity")
     if act:
@@ -1050,7 +1163,23 @@ def render_learning_health(memory_dir) -> str:
             fallback = c.get("fallback", 0)
             if a and a.get("valid"):
                 state = f"tuned ({a['chars']} chars)"
-                flag = "  ⚠ tuned but 0 applies since boot" if applied == 0 else ""
+                # ⚠ The applies counter is PER-PROCESS (§4L Lens-C
+                # MINOR-2): a headless `scripts/learning_health.py` run
+                # has trivially 0 for every artifact and used to render
+                # the alarm regardless of live-agent truth. Only the
+                # in-process view (introspect action='learning') can
+                # distinguish "read-site never ran" from "wrong
+                # process"; the script now says which one it is.
+                import sys as _sys
+                _headless = not _sys.argv[0].endswith(("main.py", "-m"))
+                if applied == 0 and _headless:
+                    flag = ("  (0 applies IN THIS PROCESS — per-process "
+                            "counter; run introspect action='learning' "
+                            "in the agent for live truth)")
+                elif applied == 0:
+                    flag = "  ⚠ tuned but 0 applies since boot"
+                else:
+                    flag = ""
             elif a:
                 state = "artifact INVALID"
                 flag = ""
@@ -1062,7 +1191,12 @@ def render_learning_health(memory_dir) -> str:
 
     esc = r.get("verifier_escalation") or {}
     if esc.get("present"):
-        lines.append("\nVERIFIER ESCALATION (§4F false-positive watch):")
+        _span = ""
+        if esc.get("first_ts"):
+            _span = (f" — ledger span {str(esc['first_ts'])[:10]} → "
+                     f"{str(esc['last_ts'])[:10]}; pre-ledger history is "
+                     f"log-only and NOT counted here")
+        lines.append(f"\nVERIFIER ESCALATION (§4F false-positive watch){_span}:")
         for arm in sorted(esc.get("arms") or {}):
             s = esc["arms"][arm]
             rate = s.get("overturn_rate")
@@ -1072,6 +1206,33 @@ def render_learning_health(memory_dir) -> str:
                 extra += f", {s['withheld']} withheld"
             if s.get("unavailable"):
                 extra += f", {s['unavailable']} unavailable (call spent)"
+            if s.get("downgraded"):
+                extra += (f", {s['downgraded']} downgraded "
+                          f"(gloss-tier, no call)")
+            # Every category renders or the arithmetic doesn't add up to
+            # `n` and the mechanical layer reads as "never fired"
+            # (round-2 review). ⚠ overturn_rate is conditioned on
+            # SURVIVING the mechanical layer since 2026-08-07, and
+            # strong-UNCERTAIN moved from `overturned` to
+            # `replaced_uncertain` — do not trend the rate across that
+            # date without re-baselining.
+            if s.get("mechanically_dismissed"):
+                extra += (f", {s['mechanically_dismissed']} mech-dismissed "
+                          f"(no call)")
+            if s.get("mechanically_upheld"):
+                extra += (f", {s['mechanically_upheld']} mech-upheld "
+                          f"(protected, no call)")
+            if s.get("truncation_guard"):
+                extra += f", {s['truncation_guard']} truncation-guarded"
+            if s.get("replaced_uncertain"):
+                extra += (f", {s['replaced_uncertain']} replaced-uncertain "
+                          f"(strong judge punted)")
+            if s.get("other"):
+                # §4L R2 NEW-6: the counter existed but the renderer
+                # omitted it — vocabulary drift invisible again, one
+                # layer up.
+                extra += (f", {s['other']} OTHER (unknown outcome "
+                          f"strings — vocabulary drift, investigate)")
             lines.append(f"  {arm}: {s['n']} escalations — {rate_s} "
                          f"({s['overturned']}/{s['overturned'] + s['upheld']} "
                          f"decided){extra}")
@@ -1101,6 +1262,26 @@ def render_learning_health(memory_dir) -> str:
     elif fl:
         lines.append(f"\nTOOL-CALL FRAMING LEAK: {fl.get('reason', 'unknown')}")
 
+    ul = r.get("usefulness_ledger") or {}
+    if ul.get("n_rows"):
+        lines.append(
+            f"\nRRF USEFULNESS LEDGER: {ul['n_rows']} rows / "
+            f"{ul['n_turns']} turns; last append {str(ul.get('last_ts'))[:16]}")
+        # Judge UNCAPPED 2026-08-08 (operator decision: uncensored) — new
+        # turns write one row per injected item, so cap/censoring counts
+        # describe the pre-uncap corpus and should trend to a fixed
+        # historical share as post-uncap rows accumulate.
+        lines.append(
+            f"  pre-uncap censoring history (judge uncapped 2026-08-08): "
+            f"{ul['capped_turns']}/{ul['n_turns']} turns at the old 12-row "
+            f"cap"
+            + (f"; {ul['censored_turns']}/{ul['stamped_turns']} stamped turns"
+               f" PROVEN censored (injected_total > rows)"
+               if ul.get("stamped_turns") else
+               "; no injected_total stamps yet (pre-2026-08-08 corpus)"))
+    elif ul:
+        lines.append(f"\nRRF USEFULNESS LEDGER: {ul.get('reason', 'unknown')}")
+
     fs = r.get("foresight") or {}
     if fs.get("present"):
         acc = fs.get("accuracy")
@@ -1115,16 +1296,28 @@ def render_learning_health(memory_dir) -> str:
             f"  {fs.get('ledger_rows', 0)} resolved predictions, coverage "
             f"{fs.get('coverage', 0.0):.0%} claimed a probability; accuracy "
             f"{acc_s}{pf_s}")
+        # §4M (Lens D F6): the seed reading is IN-PROCESS state — a
+        # headless run renders the import-time default as if it were the
+        # live agent's truth (the GEPA block above already disclaims
+        # this; the foresight line didn't).
+        import sys as _sys
+        _fs_headless = not _sys.argv[0].endswith(("main.py", "-m"))
+        _seed_note = (" — PER-PROCESS reading (headless run); use "
+                      "introspect action='learning' for live truth"
+                      if _fs_headless else "")
         lines.append(
             f"  actual tool-fail rate {fs.get('actual_fail_rate', 0.0):.0%}; "
             f"basis mix {fs.get('by_basis')}; seed {fs.get('seed_state')} "
-            f"({fs.get('seeded_calls', 0)} calls) — verdict belongs to "
-            f"scripts/foresight_backtest.py, not this screen")
+            f"({fs.get('seeded_calls', 0)} calls){_seed_note} — verdict "
+            f"belongs to scripts/foresight_backtest.py, not this screen")
     elif fs:
+        import sys as _sys
+        _fs_headless = not _sys.argv[0].endswith(("main.py", "-m"))
         lines.append(
             f"\nFORESIGHT: {fs.get('reason', 'unknown')} "
             f"(seed {fs.get('seed_state', '?')}, enabled "
-            f"{fs.get('enabled', '?')})")
+            f"{fs.get('enabled', '?')})"
+            + (" — PER-PROCESS reading (headless run)" if _fs_headless else ""))
 
     lines.extend(_experiment_health_lines(memory_dir))
     return "\n".join(lines)
@@ -1156,8 +1349,14 @@ def _experiment_health_lines(memory_dir) -> List[str]:
             return []
         out = ["\nLIVE EXPERIMENTS (randomized arms → core/experiments.py):"]
         pct = (100.0 * stamped / seen) if seen else 0.0
+        # §4M (Lens D F6a): this is a LIFETIME ratio over an append-only
+        # corpus that predates the stamp (shipped 2026-08-03) — without
+        # the caveat, 100%-healthy current coverage renders as ~4% and
+        # reads as broken, inverting the metric's purpose.
         out.append(f"  stamp coverage: {stamped}/{seen} recorded user turns "
-                   f"({pct:.1f}%)")
+                   f"({pct:.1f}% LIFETIME — corpus predates the 2026-08-03 "
+                   f"stamp; pre-ship turns can never be stamped, so this "
+                   f"understates current coverage)")
         if not all_stats:
             out.append("  ⚠ NO arms stamped — either nothing is enrolled or the "
                        "stamp has regressed (check enrollment + "

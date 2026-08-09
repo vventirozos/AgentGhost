@@ -265,7 +265,24 @@ class SessionStore:
                 updated_at=float(d.get("updated_at") or 0.0),
                 messages=_clean_messages(d.get("messages")),
             )
-        except Exception as e:  # noqa: BLE001 — corrupt file → treated absent
+        except json.JSONDecodeError as e:
+            # §4M (Lens A MINOR): corrupt-as-absent left the corrupt bytes
+            # in place for the NEXT save to overwrite — the conversation
+            # history unrecoverable. Preserve a timestamped sidecar first
+            # (same policy as playbook/profile/auto_skills), then absent.
+            try:
+                import time as _time
+                backup = path.with_suffix(
+                    f".corrupt-{int(_time.time())}")
+                os.replace(path, backup)
+                logger.warning(
+                    "session %s was corrupt (%s); preserved as %s",
+                    session_id, e, backup.name)
+            except OSError as rename_err:
+                logger.error("session %s corrupt AND rename failed: %s",
+                             session_id, rename_err)
+            return None
+        except Exception as e:  # noqa: BLE001 — unreadable → treated absent
             logger.debug("session %s unreadable: %s", session_id, e)
             return None
 
@@ -277,7 +294,12 @@ class SessionStore:
                 if path is None:
                     return False
                 tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(sess.to_dict(), ensure_ascii=False))
+                # §4M (Lens A MINOR): fsync before the rename so power
+                # loss can't promote a torn/empty session file.
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(sess.to_dict(), ensure_ascii=False))
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(tmp, path)
             return True
         except Exception as e:  # noqa: BLE001
@@ -411,6 +433,22 @@ class SessionStore:
                 return False
             sess = Session(id=str(session_id))
         new_msgs = _clean_messages(user_messages)
+        # A turn's new content must END in the user message that prompted
+        # the reply we are about to append. A fat client (the web UI)
+        # replays the whole conversation and optimistically renders its
+        # OWN copy of the assistant reply before the server persists — so
+        # the tail past the stored prefix can end in an assistant message.
+        # Left in place, that assistant plus the freshly generated
+        # `assistant_content` produced TWO consecutive assistant messages
+        # for the same turn (§4N/#31, reproduced 2026-08-08). merge_history's
+        # stale-tab branch already strips tail assistants; the fat-replay
+        # branch does not, and the caller slices them through to here — so
+        # this is the single site that owns the "assistant turns originate
+        # server-side" invariant for the append path. Interior assistants
+        # (followed by a later user message — a genuinely recovered missed
+        # turn) are kept; only TRAILING ones are dropped.
+        while new_msgs and new_msgs[-1].get("role") == "assistant":
+            new_msgs.pop()
         if assistant_content:
             new_msgs.append({"role": "assistant",
                              "content": str(assistant_content)})

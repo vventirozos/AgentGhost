@@ -244,6 +244,9 @@ class TestSurfacedTriggerMerge:
     def test_merges_playbook_and_bus_skill_tier(self, agent):
         sm = MagicMock()
         sm.last_playbook_triggers = ["pb-1", "shared"]
+        sm._playbook_turn_key = "T1"          # §4L R3 turn-key guards
+        sm.last_bus_triggers = []
+        sm._bus_delivered_turn_key = ""
         agent.context.memory_bus = MagicMock()
         agent.context.memory_bus.last_hydration = {
             "turn_id": "T1",
@@ -259,6 +262,9 @@ class TestSurfacedTriggerMerge:
     def test_foreign_turn_stash_excluded(self, agent):
         sm = MagicMock()
         sm.last_playbook_triggers = ["pb-1"]
+        sm._playbook_turn_key = "T1"
+        sm.last_bus_triggers = []
+        sm._bus_delivered_turn_key = ""
         agent.context.memory_bus = MagicMock()
         agent.context.memory_bus.last_hydration = {
             "turn_id": "OTHER",
@@ -269,6 +275,9 @@ class TestSurfacedTriggerMerge:
     def test_no_bus_no_crash(self, agent):
         sm = MagicMock()
         sm.last_playbook_triggers = ["pb-1"]
+        sm._playbook_turn_key = "T1"
+        sm.last_bus_triggers = []
+        sm._bus_delivered_turn_key = ""
         agent.context.memory_bus = None
         assert agent._surfaced_lesson_triggers(sm, turn_id="T1") == ["pb-1"]
 
@@ -703,7 +712,13 @@ class TestBeliefChangeMatching:
         cl.record("User drives a BMW",
                   [{"id": "1", "text": "User drives a Nissan"}],
                   ["1"], reason="test")
-        out = cl.explain_belief_change("what car do I drive now?")
+        # "what car do I drive now?" reduces to ONE content token ({drive};
+        # "car"/"now" are <4 chars), and §4R R2 raised the bar to two shared
+        # tokens after measuring a 61% false-fire rate on 240 real user turns
+        # — single-token queries were the hole. The test's INTENT (a multiword
+        # message matches a related entry, vs the old whole-substring rule
+        # that never matched) is preserved with a query that carries two.
+        out = cl.explain_belief_change("does the user still drive a Nissan?")
         assert "BELIEF REVISION HISTORY" in out
         assert "BMW" in out
 

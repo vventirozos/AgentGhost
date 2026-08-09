@@ -234,6 +234,42 @@ class TestSessionStore:
         store = SessionStore(tmp_path)
         assert store.append_turn("s", [], "") is False
 
+    def test_trailing_assistant_in_new_msgs_not_doubled(self, tmp_path):
+        # §4N/#31: a fat client that optimistically rendered its OWN copy
+        # of the reply replays a tail ending in an assistant message; the
+        # fresh reply is then appended on top → two consecutive assistants
+        # for one turn. append_turn drops the TRAILING assistant first.
+        store = SessionStore(tmp_path)
+        store.append_turn("s", [_m("user", "u1")], "a1")
+        # This turn's new content, as the route slices it, ends in the
+        # client's optimistic assistant copy of the reply being generated.
+        store.append_turn("s", [_m("user", "u2"), _m("assistant", "a2")], "a2")
+        msgs = store.get("s").messages
+        assert [m["content"] for m in msgs] == ["u1", "a1", "u2", "a2"]
+        assert sum(1 for m in msgs if m["content"] == "a2") == 1
+
+    def test_interior_assistant_in_new_msgs_is_kept(self, tmp_path):
+        # But an INTERIOR assistant (a genuinely recovered missed turn,
+        # followed by a later user message) must survive — only trailing
+        # assistants are the reply-slot the append fills.
+        store = SessionStore(tmp_path)
+        store.append_turn("s", [_m("user", "u1")], "a1")
+        store.append_turn(
+            "s",
+            [_m("user", "u2"), _m("assistant", "a2recovered"),
+             _m("user", "u3")],
+            "a3")
+        assert [m["content"] for m in store.get("s").messages] == \
+            ["u1", "a1", "u2", "a2recovered", "u3", "a3"]
+
+    def test_new_msgs_only_assistant_is_not_a_turn(self, tmp_path):
+        # A "turn" whose new content is nothing but an assistant stub has
+        # no user message → not persisted (would be a reply to nothing).
+        store = SessionStore(tmp_path)
+        store.append_turn("s", [_m("user", "u1")], "a1")
+        assert store.append_turn("s", [_m("assistant", "stray")], "") is False
+        assert [m["content"] for m in store.get("s").messages] == ["u1", "a1"]
+
     def test_derive_title_multimodal(self):
         assert derive_title([{"role": "user",
                               "content": [{"type": "text", "text": "Hi there"}]}]) \

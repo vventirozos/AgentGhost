@@ -29,6 +29,10 @@ from typing import List, Optional
 
 logger = logging.getLogger("GhostAgent")
 
+# One-shot latch so the "stash disabled" warning (see _stash_path) is emitted
+# once per process rather than on every drain.
+_WARNED_NO_HOME = False
+
 
 # Journal entry shapes we know how to mine. Everything else is ignored.
 _MINEABLE_TYPES = {"post_mortem", "failure"}
@@ -470,6 +474,26 @@ def _stash_path(ghost_home=None) -> Optional[Path]:
     when no home is available (stash disabled)."""
     home = ghost_home if ghost_home is not None else os.getenv("GHOST_HOME", "").strip()
     if not home:
+        # §4Q Lens-B flagged that returning None here makes BOTH stash_mineable
+        # and pick_stashed_challenge permanently inert on a deployment that
+        # doesn't export GHOST_HOME — the silent-inoperative-subsystem class.
+        # The complaint is right, but the FIX IS NOT to fall back to the
+        # agent's `~/ghost_llamacpp` default: this module is imported by test
+        # runs and by any tool process, and a home-relative fallback would make
+        # them WRITE INTO THE USER'S REAL HOME. `tests/test_dream_bugfixes_
+        # 2026_07_20.py::test_stash_disabled_without_home` pins that protection
+        # deliberately (it caught exactly that regression on the first attempt).
+        # So: stay disabled — but stop being SILENT about it, which was the
+        # actual defect. Warn once per process, not per call, so a hot loop
+        # can't spam the operator's stream.
+        global _WARNED_NO_HOME
+        if not _WARNED_NO_HOME:
+            _WARNED_NO_HOME = True
+            logger.warning(
+                "GHOST_HOME is not set — the self-play journal stash is "
+                "DISABLED (stash_mineable/pick_stashed_challenge are no-ops), "
+                "so the journal-replay curriculum will not run. Export "
+                "GHOST_HOME to enable it.")
         return None
     try:
         return Path(home) / "system" / "selfplay" / "journal_stash.json"

@@ -36,6 +36,17 @@ from ghost_agent.core.verifier import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _legacy_escalation_flow(monkeypatch):
+    """This suite's SUBJECT is the ledger writer and its wiring, and its
+    stubs monkeypatch `_verify_claim_two_stage` — the leg the 2026-08-06
+    rebuttal contract no longer uses. Pin the legacy flow so the stubs
+    keep reaching it; the contract's own ledger rows (rebuttal field,
+    outcome=downgraded) are covered in test_escalation_discipline.py."""
+    monkeypatch.setenv("GHOST_VERIFY_OVERTURN_QUOTE", "0")
+    monkeypatch.setenv("GHOST_VERIFY_TIER_ROUTING", "0")
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """conftest deletes GHOST_HOME; the ledger resolves it per call."""

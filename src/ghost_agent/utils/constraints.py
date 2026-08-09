@@ -53,6 +53,52 @@ _CAPS_TOKEN_RE = re.compile(r"\b[A-Z]{2,}\b")
 
 _MAX_CLAUSE_CHARS = 160
 
+# §4N MAJOR-2: the SELF-play lesson-verify replay (and any user who pastes
+# ``###``-structured text) prepends the rendered SKILL PLAYBOOK into the user
+# message. Its label lines — ``### SKILL PLAYBOOK:``, ``## RELEVANT LESSONS
+# LEARNED``, ``TRIGGER (·):``, ``DOMAINS:``, ``ANTI-PATTERN:``,
+# ``CORRECT-PATTERN:``, legacy ``SITUATION:``/``THE FIX:`` — qualify as
+# constraints (ALL-CAPS emphasis / negation words) and filled all 6 MUST-HOLD
+# slots, rendering ``- ANTI-PATTERN: use a relative path`` as an INVERTED
+# instruction and crowding out the real request. These are system furniture,
+# never a user constraint — recognised by their leading label and dropped
+# before qualification. Tolerant of list markers / numbering / indentation.
+# §4N R2 MAJOR-3: the original filter was case-INSENSITIVE, matched bare
+# label words with no colon, and dropped ANY ``#``-led clause — so it
+# destroyed REAL user constraints: ``Domain names must not contain
+# underscores`` (DOMAIN), ``### IMPORTANT: don't touch prod`` (#-led),
+# ``#1 rule: never force-push``. The playbook renders its labels ALL-CAPS
+# WITH A COLON (``TRIGGER (·):``, ``DOMAINS:``, ``ANTI-PATTERN:`` …), so a
+# CASE-SENSITIVE, colon-anchored match keeps the A-MAJOR-2 win without the
+# false positives. Markdown-header furniture is restricted to the SPECIFIC
+# injected section headers, not every ``#`` line.
+_FURNITURE_LABEL_RE = re.compile(
+    r"^[\s\-\*•>0-9.)]*"
+    r"(?:TRIGGER\s*\(|DOMAINS?:|ANTI[\s\-]?PATTERN:|CORRECT[\s\-]?PATTERN:"
+    r"|SITUATION:|PREVIOUS\s+MISTAKE:|THE\s+FIX:|CODE(?:\s+EXAMPLE)?\s*:"
+    r"|FREQUENCY:|CONFIDENCE:)"
+)  # case-SENSITIVE by design — real prose is mixed-case
+# §4N R3 MINOR-2: case-SENSITIVE — the injected section headers are
+# ALL-CAPS, but IGNORECASE dropped real user clauses that merely open with
+# the same words in prose case ("## Past conversations should not be
+# quoted", "### Memory Context: NEVER store my address"). Also covers the
+# two ALL-CAPS headers R3 found uncovered (PAST EPISODES, RECENT LESSONS).
+_FURNITURE_HEADER_RE = re.compile(
+    r"^\s*#{1,6}\s*(?:SKILL\s+PLAYBOOK|RELEVANT\s+LESSONS|RECENT\s+LESSONS"
+    r"|MEMORY\s+CONTEXT|PAST\s+CONVERSATIONS|PAST\s+EPISODES"
+    r"|TOPOLOGICAL\s+KNOWLEDGE)"
+)
+# Back-compat alias for any external reader of the old name.
+_FURNITURE_RE = _FURNITURE_LABEL_RE
+
+
+def _is_furniture(clause: str) -> bool:
+    """True for an injected system-context label line — an ALL-CAPS
+    playbook label with a colon, or one of the specific injected section
+    headers. Case-sensitive on labels so real mixed-case prose survives."""
+    return bool(_FURNITURE_LABEL_RE.match(clause)
+                or _FURNITURE_HEADER_RE.match(clause))
+
 
 def _has_caps_emphasis(clause: str) -> bool:
     return any(
@@ -68,7 +114,11 @@ def _clauses(text: str) -> List[str]:
     capture would return the whole message and dilute the signal.
     """
     out: List[str] = []
-    for sentence in re.split(r"[.!?\n;]+", text or ""):
+    # §4N MINOR-2: split sentences on .!? only at a real boundary (followed
+    # by whitespace or end), plus \n and ; — a bare `.` inside a token
+    # (``sniffer_probe.txt``, ``3.5``, ``/data/input.csv``) used to split a
+    # filename across two constraint bullets on the operator's own requests.
+    for sentence in re.split(r"(?:[.!?]+(?=\s|$)|[\n;]+)", text or ""):
         for clause in re.split(r",\s+", sentence):
             clause = clause.strip()
             if clause:
@@ -89,6 +139,8 @@ def extract_constraints(text: str, max_items: int = 6) -> List[str]:
     for clause in _clauses(text):
         if len(clause) < 8:
             continue
+        if _is_furniture(clause):
+            continue  # §4N MAJOR-2: injected playbook/context label line
         if not (
             _NEGATION_RE.search(clause)
             or _PARTICIPANT_RE.search(clause)

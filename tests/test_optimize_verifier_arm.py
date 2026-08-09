@@ -61,7 +61,9 @@ def test_escalate_with_a_main_url_builds_the_two_leg_client(ov):
     assert client.main_base_url == "http://main.invalid"
     label = a.arm_label()
     assert label["arm"] == ARM_ESCALATED
-    assert label["cheap_route"] == "worker"
+    # Production rides the CRITIC leg since 2026-08-06; the gate client
+    # measures the same rung (task #25).
+    assert label["cheap_route"] == "critic"
     assert label["judge"]["base_url"] == "http://judge.invalid"
     assert label["main"]["base_url"] == "http://main.invalid"
 

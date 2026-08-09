@@ -282,7 +282,14 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
         memory_entry = f"Scheduled task '{task_name}' is running with ID {job_id} on schedule {cron_expression}."
         if memory_system:
             try:
-                await asyncio.to_thread(memory_system.add, memory_entry, {"type": "manual", "task_id": job_id})
+                # §4M (Lens C MINOR): "manual" is a prunable type and the
+                # eviction tie-break sorts a MISSING timestamp as oldest —
+                # a timestamp-less note is the first eviction victim.
+                from ..utils.helpers import get_utc_timestamp as _uts
+                await asyncio.to_thread(
+                    memory_system.add, memory_entry,
+                    {"type": "manual", "task_id": job_id,
+                     "timestamp": _uts()})
             except Exception as mem_err:
                 pretty_log("Schedule Memory", f"note write failed (task still scheduled): {mem_err}",
                            level="WARNING", icon=Icons.WARN)
@@ -324,11 +331,13 @@ async def tool_watch_condition(task_name: str, check_command: str,
                       kind="watch", check_command=check_command)
         if memory_system:
             try:
+                from ..utils.helpers import get_utc_timestamp as _uts
                 await asyncio.to_thread(
                     memory_system.add,
                     f"Watch '{task_name}' (ID {job_id}) polls `{check_command}` every {secs}s "
                     f"and reacts when it succeeds.",
-                    {"type": "manual", "task_id": job_id})
+                    {"type": "manual", "task_id": job_id,
+                     "timestamp": _uts()})
             except Exception as mem_err:
                 pretty_log("Watch Memory", f"note write failed (watch still active): {mem_err}",
                            level="WARNING", icon=Icons.WARN)

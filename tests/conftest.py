@@ -11,6 +11,20 @@ from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
+def _reset_log_collapse():
+    """The console repeat-collapse (utils/logging, 2026-08-05) keeps one
+    module-global pending-run slot. In production that is the point; in
+    tests it leaks across files — an identical pretty_log line emitted by
+    an EARLIER test silently swallows a later test's expected console
+    output (bit test_thinking_loop_guards on 2026-08-06). Every test
+    starts collapse-cold."""
+    from ghost_agent.utils import logging as _glog
+    _glog._COLLAPSE_STATE = None
+    yield
+    _glog._COLLAPSE_STATE = None
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ghost_home(monkeypatch):
     """Tests must never resolve the operator's live GHOST_HOME.
 

@@ -86,7 +86,16 @@ class _NullCM:
 # JSON-side record and breaks that store's semantic recall). Conversational
 # fact types (auto/identity/manual/synthesis/…) remain forgettable — that
 # is the tool's job.
-_FORGET_PROTECTED_TYPES = ["document", "episode", "skill", "acquired_skill"]
+_FORGET_PROTECTED_TYPES = [
+    "document", "episode", "skill", "acquired_skill",
+    # `document_summary` added §4R R2 (2026-08-08). It is the summary TWIN of a
+    # `document` row, and `document` is protected — deleting the summary while
+    # its source document survives leaves the two stores asymmetric, which is
+    # the drift this protected list exists to prevent. (Live: 8279 documents,
+    # 1 summary.) `synthesis` deliberately stays forgettable here — see the
+    # note above and the expansion-sweep guard below.
+    "document_summary",
+]
 
 
 def _bus_write_failures(report) -> list:
@@ -166,15 +175,29 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                         prompt = f"Extract explicit entity relationships from this fact into a 'graph_triplets' array as objects with 'subject', 'predicate', and 'object' keys. Predicates MUST be uppercase verbs. Return ONLY JSON. Fact: {_payload_text}"
                         payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Graph Extractor. Output JSON."}, {"role": "user", "content": prompt}], "temperature": 0.0, "response_format": {"type": "json_object"}}
                         data = await asyncio.wait_for(
-                            llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="smart-memory"),
+                            llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, task_label="smart-memory"),  # §4O A-MAJOR-2: don't dogpile main on worker failure
                             timeout=_GRAPH_EXTRACT_TIMEOUT_S,
                         )
                         res = extract_json_from_text(data["choices"][0]["message"].get("content", ""), repair_truncated=True)
                         triplets = res.get("graph_triplets", []) or []
+                        # §4M (Lens C MINOR): tombstone parity with the
+                        # consolidation path — no positive edge from a
+                        # removal-shaped sentence.
+                        try:
+                            from ..utils.helpers import is_removal_triplet
+                            triplets = [t for t in triplets
+                                        if not is_removal_triplet(t)]
+                        except Exception:
+                            pass
                         if triplets:
                             await asyncio.to_thread(graph.add_triplets, triplets)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # §4M (Lens C): was a bare fully-silent pass — the
+                        # graph enrichment quietly never happening is the
+                        # "silent inoperative subsystem" class.
+                        logger.warning(
+                            "remember: background graph extraction failed "
+                            "(fact stored, graph not enriched): %s", e)
 
                 spawn_bg(_extract_and_add_triplets(), name="graph-extract")
 
@@ -194,12 +217,26 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                     from ..core.agent import extract_json_from_text
                     prompt = f"Extract explicit entity relationships from this fact into a 'graph_triplets' array as objects with 'subject', 'predicate', and 'object' keys. Predicates MUST be uppercase verbs. Return ONLY JSON. Fact: {text}"
                     payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Graph Extractor. Output JSON."}, {"role": "user", "content": prompt}], "temperature": 0.0, "response_format": {"type": "json_object"}}
-                    data = await llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="smart-memory")
+                    data = await asyncio.wait_for(  # §4O A-MAJOR-2: off-main + bounded (was untimed → 1200s worker default)
+                        llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, task_label="smart-memory"),
+                        timeout=_GRAPH_EXTRACT_TIMEOUT_S)
                     res = extract_json_from_text(data["choices"][0]["message"].get("content", ""), repair_truncated=True)
                     triplets = res.get("graph_triplets", [])
+                    # §4M R2 MINOR-4: parity with the bus path — the
+                    # round-1 removal filter + failure visibility landed
+                    # only there; this legacy branch kept both defects.
+                    try:
+                        from ..utils.helpers import is_removal_triplet
+                        triplets = [t for t in triplets
+                                    if not is_removal_triplet(t)]
+                    except Exception:
+                        pass
                     if triplets:
                         await asyncio.to_thread(graph_memory.add_triplets, triplets)
-                except Exception: pass
+                except Exception as e:
+                    logger.warning(
+                        "remember (legacy): background graph extraction "
+                        "failed (fact stored, graph not enriched): %s", e)
             spawn_bg(_extract_graph(), name="graph-extract-legacy")
 
         return f"Memory stored: '{text}'"
@@ -1042,6 +1079,20 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                             meta = (cand.get('metadatas') or [[]])[0][i] or {}
                             if meta.get('type') in _FORGET_PROTECTED_TYPES:
                                 continue
+                            # §4R R2: `synthesis` is forgettable when the user
+                            # NAMES the target (primary sweep — that is the
+                            # tool's job, per the note on the protected list),
+                            # but NOT here. This is the expansion sweep: `_t` is
+                            # a graph NEIGHBOUR the user never mentioned. A
+                            # synthesis is a COMPOSITE whose merged source
+                            # fragments dream.py has already deleted, so
+                            # dropping one to excise a single incidental token
+                            # destroys the only surviving copy of everything
+                            # else it merged. Deleting a composite on an
+                            # unnamed term is exactly the "semantic over-reach"
+                            # this literal-only sweep was written to avoid.
+                            if meta.get('type') == "synthesis":
+                                continue
                             if _value_mentions_target(doc_text, str(_t).strip().lower()):
                                 memory_system.collection.delete(ids=[mem_id])
                                 n += 1
@@ -1136,13 +1187,20 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
             prof = getattr(memory_bus, "profile", None)
         if prof is None or not hasattr(prof, "delete"):
             return "Error: Profile memory not loaded."
+        # §4M R2 MINOR-6: the WRITE side files under the canonical field
+        # (vehicle → assets.car) and mints the vector fact from the
+        # canonical key — this delete path read the RAW category/key, so
+        # the old-value lookup missed, delete_fragment never ran, and the
+        # derived identity fact stayed retrievable forever after deletion.
+        from ..memory.profile import ProfileMemory as _PM
+        _cat_c, _key_c = _PM.canonicalize(category, key)
         old_val = None
         try:
             data = prof.load() if hasattr(prof, "load") else None
             if isinstance(data, dict):
-                cat_data = data.get(str(category).strip().lower(), {})
+                cat_data = data.get(_cat_c, {})
                 if isinstance(cat_data, dict):
-                    old_val = cat_data.get(str(key).strip().lower())
+                    old_val = cat_data.get(_key_c)
         except Exception:
             pass
         pretty_log("Profile Update", f"delete {category}.{key}",
@@ -1156,7 +1214,8 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
                 and hasattr(memory_system, "delete_fragment")):
             try:
                 await asyncio.to_thread(
-                    memory_system.delete_fragment, f"User {key} is {old_val}")
+                    memory_system.delete_fragment,
+                    f"User {_key_c} is {old_val}")
             except Exception:
                 pass
         return msg
@@ -1186,11 +1245,18 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
 
     # --- BUS-AWARE PATH ---
     if memory_bus is not None:
-        clean_key = str(key).upper().replace(" ", "_")
+        # §4M (Lens C MAJOR-4): canonicalise BEFORE composing — the
+        # profile leg rewrites synonyms internally (vehicle → assets.car)
+        # while this triplet was minted from the RAW key (HAS_VEHICLE), so
+        # graph and profile permanently disagreed on the field name. One
+        # canonical form now feeds all three stores.
+        from ..memory.profile import ProfileMemory as _PM
+        _cat_c, _key_c = _PM.canonicalize(category, key)
+        clean_key = str(_key_c).upper().replace(" ", "_")
         _report = await memory_bus.publish_fact("update_profile", {
-            "text": f"User {key} is {value}",
+            "text": f"User {_key_c} is {value}",
             "metadata": {"timestamp": get_utc_timestamp(), "type": "identity"},
-            "profile_update": {"category": category, "key": key, "value": value},
+            "profile_update": {"category": _cat_c, "key": _key_c, "value": value},
             "triplets": [{
                 "subject": "user",
                 "predicate": f"HAS_{clean_key}",
@@ -1229,7 +1295,11 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     if graph_memory:
         try:
             # Deterministically map profile updates to graph edges without an LLM call!
-            clean_key = str(key).upper().replace(" ", "_")
+            # §4M (Lens C MAJOR-4): mint from the CANONICAL key — the
+            # profile leg above already stored under it.
+            from ..memory.profile import ProfileMemory as _PM
+            _, _key_c = _PM.canonicalize(category, key)
+            clean_key = str(_key_c).upper().replace(" ", "_")
             triplet = [{"subject": "user", "predicate": f"HAS_{clean_key}", "object": str(value).lower()}]
             await asyncio.to_thread(graph_memory.add_triplets, triplet)
         except Exception as e:
