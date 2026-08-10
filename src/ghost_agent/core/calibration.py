@@ -46,6 +46,7 @@ import json
 import logging
 import math
 import os
+import random
 import threading
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -493,6 +494,70 @@ def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-2):
     return a, b
 
 
+def _cv_brier(pairs, *, k: int = 5, seed: int = 7) -> Optional[float]:
+    """OUT-OF-SAMPLE Brier: Platt fitted on k−1 folds, scored on the held-out
+    one, averaged over every row.
+
+    ⚠ WHY THIS EXISTS (audit 2026-08-10). `brier` in the params file is the
+    IN-SAMPLE Brier of a 2-parameter Platt map on the rows it was fitted to,
+    and `learning_health` printed it as the headline next to
+    `brier_base_rate` — a comparison the model cannot lose fairly, because
+    only one side of it paid for its parameters. Measured on the live store:
+    in-sample claimed a 3.0% gain over the base rate; honest 5-fold CV gives
+    **1.0%**. The gain is real but a third the advertised size.
+
+    Deterministic (fixed seed, no shuffle-on-read) so two fits on identical
+    data produce the identical number — an audit trail that moves on its own
+    is not one.
+    """
+    rows = [(float(c), float(o)) for c, o in pairs]
+    n = len(rows)
+    if n < 2 * k:
+        return None
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)
+    total = 0.0
+    for f in range(k):
+        test = set(idx[f::k])
+        train = [rows[i] for i in range(n) if i not in test]
+        if len(train) < 2:
+            return None
+        a, b = _fit_platt(train)
+        for i in test:
+            c, o = rows[i]
+            total += (apply_platt(c, a, b) - o) ** 2
+    return total / n
+
+
+def _feature_contribution(attr: str, composites, *, rebuild) -> Optional[float]:
+    """Held-out Brier DELTA from dropping ``attr``: >0 means the feature helps.
+
+    ⚠ WHY THIS EXISTS, and why it is not `_separation_sigmas`. That gate is a
+    difference-of-means test between outcome classes, and the live store has
+    **18 negatives in 694 rows**. At that balance it can only resolve a gap of
+    ~0.60 SD of the feature, so it reports `[DEAD]` for anything subtler —
+    including features that demonstrably work.
+
+    Measured 2026-08-10: `competence_component` scores 0.05σ and is printed
+    `[DEAD]`, yet ABLATING it costs 0.021 AUC. The mean-difference verdict and
+    the ablation disagree, the ablation is the one that answers the question
+    actually being asked ("does the composite get worse without it?"), and
+    nobody had ever run it. An under-powered test reported as a verdict is
+    worse than no test, because it licenses removing something that works.
+    """
+    try:
+        without = rebuild(attr)
+        if without is None:
+            return None
+        b_with = _cv_brier(composites)
+        b_without = _cv_brier(without)
+        if b_with is None or b_without is None:
+            return None
+        return round(b_without - b_with, 6)
+    except Exception:  # noqa: BLE001 — telemetry must never break a fit
+        return None
+
+
 def _composite_for(sample, w_e: float, lam: float, w_eff: float = 0.0) -> float:
     """Recompute a sample's composite under candidate (w_e, w_eff, λ).
 
@@ -632,6 +697,24 @@ class FittedParams:
     # written before epochs existed loads unchanged.
     epoch: str = ""
     n_excluded_other_epochs: int = 0
+    # ── HONEST PERFORMANCE (audit 2026-08-10) ────────────────────────────
+    # `brier` above is IN-SAMPLE: a 2-parameter Platt map scored on the rows
+    # it was fitted to. It was printed as the headline beside
+    # `brier_base_rate`, a comparison only one side of which paid for its
+    # parameters. On the live store that overstated the gain 3x (3.0%
+    # in-sample vs 1.0% cross-validated). -1.0 = not computed (too few rows,
+    # or a params file written before this existed).
+    brier_cv: float = -1.0
+    # THE NUMBER EVERY OTHER VERDICT RESTS ON. The live store carries 18
+    # negatives in 694 rows (2.6%), and the separation gate, the weights and
+    # the Brier comparison are all estimated from those 18. Recorded so a
+    # reader can see the power behind a verdict instead of inferring it.
+    n_negative: int = 0
+    # Held-out Brier DELTA per feature (>0 = dropping it makes things worse,
+    # i.e. it helps). The mean-difference gate calls `competence_component`
+    # DEAD at 0.05sigma while ablation says removing it costs 0.021 AUC;
+    # this records the measurement that actually answers the question.
+    feature_contrib: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -1270,6 +1353,39 @@ class CalibrationTracker:
                 "score is not adding information as a probability",
                 brier, base, brier_base)
 
+        # ── HONEST PERFORMANCE (audit 2026-08-10) ────────────────────────
+        # `brier` above is IN-SAMPLE and was the headline. Cross-validate so
+        # the reported gain is one the model did not buy with its own
+        # parameters; both are stored and the renderer labels which is which.
+        # `composites` is already a list of (composite, outcome) PAIRS.
+        brier_cv = _cv_brier(composites)
+        n_negative = sum(1 for _c, y in composites if y < 0.5)
+
+        # Per-feature ABLATION. `_separation_sigmas` is a difference-of-means
+        # test and there are 18 negatives — it cannot resolve what it is
+        # asked to judge, and it calls a feature that demonstrably helps
+        # DEAD. This measures the question actually being asked.
+        def _rebuild(drop: str):
+            if drop == "entropy_component":
+                w = dict(w_e=0.0, lam=lam, w_eff=w_eff)
+            elif drop == "effort_component":
+                w = dict(w_e=w_e, lam=lam, w_eff=0.0)
+            elif drop == "competence_component":
+                # Competence is the RESIDUAL (1 - w_e - w_eff), so dropping it
+                # means handing its share to effort rather than zeroing a
+                # weight that does not exist as a variable.
+                w = dict(w_e=w_e, lam=lam, w_eff=min(1.0, w_eff + w_c))
+            else:
+                return None
+            return [(_composite_for(s, **w), s.outcome) for s in samples]
+
+        feature_contrib = {}
+        for _attr in ("entropy_component", "competence_component",
+                      "effort_component"):
+            _d = _feature_contribution(_attr, composites, rebuild=_rebuild)
+            if _d is not None:
+                feature_contrib[_attr] = _d
+
         # Threshold is picked on the CALIBRATED scores (Youden's J on the
         # "predict success when p ≥ τ" decision) — it must live on the same
         # scale `below_threshold` will compare against, or the gate fires at
@@ -1294,6 +1410,9 @@ class CalibrationTracker:
             map_status=map_status,
             epoch=CURRENT_EPOCH,
             n_excluded_other_epochs=n_excluded,
+            brier_cv=round(brier_cv, 6) if brier_cv is not None else -1.0,
+            n_negative=n_negative,
+            feature_contrib=feature_contrib or None,
         )
         self._save_params(params)
         return params
@@ -1333,6 +1452,14 @@ class CalibrationTracker:
                 map_status=str(d.get("map_status", "applied")),
                 epoch=str(d.get("epoch", "")),
                 n_excluded_other_epochs=int(d.get("n_excluded_other_epochs", 0)),
+                # Defaults keep a pre-audit params file loading unchanged;
+                # -1.0 / 0 / None each read as "not recorded", never as a
+                # measured value of zero.
+                brier_cv=float(d.get("brier_cv", -1.0)),
+                n_negative=int(d.get("n_negative", 0)),
+                feature_contrib=(d.get("feature_contrib")
+                                 if isinstance(d.get("feature_contrib"), dict)
+                                 else None),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("calibration params malformed: %s", exc)

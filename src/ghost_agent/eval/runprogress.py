@@ -81,7 +81,16 @@ class RunProgress:
         self.done += n
         self._marks.append(time.time())
         now = time.time()
-        if not force and (now - self._last_write) < self._min_interval:
+        # ⚠ THE LAST ITEM ALWAYS WRITES (2026-08-09 fresh-eyes audit). The
+        # throttle exists so a fast loop does not hammer the disk, but it
+        # also meant a run that FINISHED faster than one interval recorded
+        # only its first item: a completed 433-trial replay (3.5s) left a
+        # progress file reading `done: 1`, which `read_progress` then aged
+        # into "STALLED — the run may be wedged". A status tool reporting a
+        # confident false state is precisely what this module exists to
+        # prevent, so completion overrides the throttle.
+        at_end = bool(self.total) and self.done >= self.total
+        if not force and not at_end and (now - self._last_write) < self._min_interval:
             return
         self._write(extra)
 

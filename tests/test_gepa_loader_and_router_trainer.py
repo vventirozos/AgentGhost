@@ -60,8 +60,8 @@ def _traj(req, steps, calls, outcome="passed", heavy=False):
 class TestRouterTrainer:
     def test_fits_and_persists_and_routes(self, tmp_path):
         from ghost_agent.router import RouterTrainer, ComplexityClassifier, ComplexityDispatcher
-        trajs = [_traj(f"what is {i}", 1, 1) for i in range(13)]
-        trajs += [_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True) for i in range(13)]
+        trajs = [_traj(f"what is {i}", 1, 1) for i in range(130)]
+        trajs += [_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True) for i in range(130)]
         save = tmp_path / "router" / "checkpoint.json"
         rep = RouterTrainer(min_trajectories=15).run(trajs, save_path=save)
         assert rep.fit_succeeded
@@ -81,7 +81,7 @@ class TestRouterTrainer:
     def test_bails_on_single_class(self):
         from ghost_agent.router import RouterTrainer
         # All easy → fit would raise; the trainer must bail gracefully instead.
-        rep = RouterTrainer(min_trajectories=3).run([_traj(f"q{i}", 1, 1) for i in range(10)])
+        rep = RouterTrainer(min_trajectories=3).run([_traj(f"q{i}", 1, 1) for i in range(120)])
         assert rep.fit_succeeded is False
         assert "single-class" in rep.bail_reason
 
@@ -91,9 +91,9 @@ class TestRouterTrainer:
         from ghost_agent.tools.memory import _maybe_retrain_router
 
         coll = TrajectoryCollector(root=tmp_path / "traj", session_id="s1")
-        for i in range(13):
+        for i in range(130):
             coll.append(_traj(f"what is {i}", 1, 1))
-        for i in range(13):
+        for i in range(130):
             coll.append(_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True))
 
         class _Ctx:

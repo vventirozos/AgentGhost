@@ -29,7 +29,7 @@ class TestBootstrapTrains:
     def test_trains_when_enough_multiclass_samples(self, tmp_path):
         from ghost_agent.router import bootstrap_router, ComplexityDispatcher
         # 30 easy + 30 hard = 60 labeled, well over the default min of 50.
-        trajs = _balanced_corpus(30)
+        trajs = _balanced_corpus(120)
         save = tmp_path / "router" / "checkpoint.json"
         clf, report = bootstrap_router(trajs, save_path=save)
         assert clf is not None
@@ -43,7 +43,7 @@ class TestBootstrapTrains:
 
     def test_respects_custom_min_samples(self, tmp_path):
         from ghost_agent.router import bootstrap_router
-        trajs = _balanced_corpus(15)  # 30 labeled
+        trajs = _balanced_corpus(120)  # 30 labeled
         clf, report = bootstrap_router(trajs, min_samples=20)
         assert clf is not None
         assert report.fit_succeeded is True
@@ -53,7 +53,7 @@ class TestBootstrapStaysPassThrough:
     def test_too_few_samples(self, tmp_path):
         from ghost_agent.router import bootstrap_router
         # Only 8 labeled — far below the default min of 50.
-        clf, report = bootstrap_router(_balanced_corpus(4))
+        clf, report = bootstrap_router(_balanced_corpus(5))
         assert clf is None
         assert report.fit_succeeded is False
         assert "too few" in report.bail_reason
@@ -61,7 +61,7 @@ class TestBootstrapStaysPassThrough:
     def test_single_class(self, tmp_path):
         from ghost_agent.router import bootstrap_router
         # All easy: fit() would raise; bootstrap must bail gracefully.
-        trajs = [_traj(f"q{i}", 1, 1) for i in range(80)]
+        trajs = [_traj(f"q{i}", 1, 1) for i in range(240)]
         clf, report = bootstrap_router(trajs, min_samples=20)
         assert clf is None
         assert report.fit_succeeded is False
@@ -117,7 +117,7 @@ class TestBootstrapFromCollector:
         from ghost_agent.distill.collector import TrajectoryCollector
         from ghost_agent.router import bootstrap_router, ComplexityDispatcher
         coll = TrajectoryCollector(root=tmp_path / "traj", session_id="s1")
-        for t in _balanced_corpus(30):
+        for t in _balanced_corpus(120):
             coll.append(t)
         save = tmp_path / "router" / "checkpoint.json"
         clf, report = bootstrap_router(coll.iter_trajectories(), save_path=save)

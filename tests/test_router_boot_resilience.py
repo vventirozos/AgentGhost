@@ -196,7 +196,7 @@ class TestBootSelfHeals:
         ckpt.parent.mkdir(parents=True)
         ckpt.write_text(json.dumps({"schema": "ghost.router.logreg.v999"}))
 
-        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(30))
+        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(120))
 
         assert kept_path == ckpt  # retrain paths still know where to save
         assert dispatcher is not None  # router alive, not dead
@@ -217,7 +217,7 @@ class TestBootSelfHeals:
         ckpt.parent.mkdir(parents=True)
         ckpt.write_text("{ corrupt")
 
-        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(2))
+        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(3))
 
         assert dispatcher is not None
         assert clf is None
@@ -232,7 +232,7 @@ class TestBootSelfHeals:
     def test_missing_checkpoint_unchanged_behaviour(self, tmp_path):
         """No file at all — the pre-fix happy path must be untouched."""
         ckpt = tmp_path / "router" / "checkpoint.json"
-        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(30))
+        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(120))
         assert dispatcher is not None
         assert clf is not None
         assert ckpt.exists()  # bootstrap persisted it

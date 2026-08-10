@@ -165,6 +165,7 @@ class TestHonestFailureRecording:
         'the tool broke' and 'the answer was refuted'."""
         from ghost_agent.distill.outcome_heuristics import (
             STRUCTURAL_FAILURE_REASON,
+            is_structural_reason,
         )
         agent, col = _agent_with_collector()
         agent._record_turn_trajectory(
@@ -172,7 +173,8 @@ class TestHonestFailureRecording:
             trajectory_id="th2", user_request="q", execution_failed=True,
         )
         assert col.appended[0].outcome == F
-        assert col.appended[0].failure_reason == STRUCTURAL_FAILURE_REASON
+        # cause-qualified since 2026-08-10 — assert the contract
+        assert is_structural_reason(col.appended[0].failure_reason)
 
     def test_late_pass_upgrades_structural_failed(self):
         from ghost_agent.distill.outcome_heuristics import (

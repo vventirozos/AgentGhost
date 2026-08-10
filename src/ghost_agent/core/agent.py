@@ -4758,7 +4758,11 @@ class GhostAgent:
                                 base_mem = getattr(ctx, 'memory_dir', None)
                                 if base_mem is not None:
                                     save_path = base_mem.parent / "router" / "checkpoint.json"
-                            trainer = RouterTrainer()
+                            # §4AA: score the gate at the LIVE dispatcher
+                            # threshold, so a hot-swap is justified by the
+                            # operating point it will actually run at.
+                            _thr = getattr(dispatcher, "confidence_threshold", None)
+                            trainer = RouterTrainer(confidence_threshold=_thr)
                             report = await asyncio.to_thread(
                                 trainer.run,
                                 trajectories=traj_collector.iter_trajectories(),
@@ -14563,26 +14567,37 @@ class GhostAgent:
 
                     # Use System 2 Planner based on context arguments (Mock-safe check)
                     use_plan = getattr(self.context.args, 'use_planning', False) == True
-                    # Router-gated reasoning depth (proposal item #10):
-                    # when the complexity router is CONFIDENT the request
-                    # is easy (and never had to escalate), skip the
-                    # strategic planner. An easy request does not need a
-                    # multi-task decomposition, and the planner LLM
-                    # round-trip is the single most expensive step of the
-                    # turn — this is what makes the router decision
-                    # genuinely load-bearing on cost, not just advisory.
-                    if use_plan:
-                        _rd_plan = body.get("_router_decision") or {}
-                        if (_rd_plan.get("label") == "easy"
-                                and not _rd_plan.get("escalated")
-                                and float(_rd_plan.get("confidence") or 0.0) >= 0.75):
-                            use_plan = False
-                            pretty_log(
-                                "Reasoning Loop",
-                                "Router: confident-easy request — skipping "
-                                "strategic planner",
-                                icon=Icons.BRAIN_ROUTE,
-                            )
+                    # ⛔ ROUTER PLANNER-SKIP RETIRED 2026-08-10 (§4AN).
+                    #
+                    # This block skipped the strategic planner when the router
+                    # was CONFIDENT-easy (`label == "easy" and not escalated
+                    # and confidence >= 0.75`). It is gone because measurement
+                    # showed it could only ever fire where the router carries
+                    # NO INFORMATION:
+                    #
+                    #   family    n     majority-class  model acc   LIFT
+                    #   chess    189        0.868         0.868    +0.000
+                    #   other   1172        0.626         0.677    +0.051
+                    #
+                    # 113 of the 114 confident-easy requests in the corpus were
+                    # one chess template, and 0 of 600 non-chess requests ever
+                    # cleared 0.75 — the bar selects for "saturates every
+                    # easy-indicator feature at once", which only a synthetic
+                    # template does. On chess the model predicts "easy" for all
+                    # 189 and scores exactly the base rate, so skipping there
+                    # cannot beat "always skip on chess".
+                    #
+                    # It was not free: it was the sole source of the
+                    # false-easy-on-hard risk (0.0558 held-out), i.e. skipping
+                    # the planner on genuinely hard requests. Removing it drops
+                    # that risk for zero measurable loss.
+                    #
+                    # ⚠ THE ROUTER ITSELF IS KEPT. Its real +5.1pp lives at the
+                    # LABEL level, and the MCTS gate (§ agent.py `_is_hard`)
+                    # reads the label with NO confidence bar — that is the
+                    # consumer this signal actually fits. Do not re-add a
+                    # confidence-thresholded consumer without first showing the
+                    # model is informative in the region that clears the bar.
                     # ── use_planning EXPERIMENT ARM (§4L follow-through,
                     # 2026-08-07). The flag is the master switch; the arm
                     # is the measurement. Trigger condition (flag on,
@@ -19246,6 +19261,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         try:
             from ..distill.outcome_heuristics import (
                 resolve_turn_outcome, STRUCTURAL_FAILURE_REASON,
+                structural_cause_for_trajectory, structural_reason,
                 unacknowledged_total_failure_for_trajectory,
             )
             # Shape rule (2026-08-04): every tool call failed and the reply
@@ -19268,9 +19284,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # it marks a FAILED that a LATE verifier PASS is allowed to
                     # upgrade (see _backfill_trajectory_outcome). Keep it in
                     # sync via the shared constant.
+                    # RECORD THE CAUSE (2026-08-10). `structural failure`
+                    # was 26% of recorded failures and said only THAT
+                    # execution broke, never WHAT — so "hard task or flaky
+                    # tool?" could not be answered from the corpus, and these
+                    # labels train the complexity router. `structural_reason`
+                    # keeps the load-bearing string as a PREFIX so the late
+                    # verifier-PASS upgrade still matches.
                     traj.failure_reason = (
                         "verifier refuted" if verifier == "failed"
-                        else STRUCTURAL_FAILURE_REASON
+                        else structural_reason(
+                            structural_cause_for_trajectory(traj))
                     )
                 traj.outcome = _resolved
         except Exception as e:

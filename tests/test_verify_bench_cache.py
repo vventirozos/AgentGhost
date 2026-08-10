@@ -332,3 +332,139 @@ def test_every_fingerprinted_verify_file_exists():
     for group, paths in verify_path_sources().items():
         for p in paths:
             assert Path(p).exists(), f"{group} fingerprints a missing file: {p}"
+
+
+def test_replay_age_counts_only_REAL_hits(tmp_path):
+    """A corrupt entry EXISTS on disk but is counted a miss. An earlier
+    version appended its mtime anyway (recorded at `f.exists()` rather than
+    at the hit), so `replay_age_s` could describe evidence the run never
+    used and len(_hit_mtimes) could exceed `hits`. Found by fresh-eyes
+    audit, not by a failing test."""
+    c = ResponseCache(tmp_path, "read")
+    k = ResponseCache.key("http://a", _body())
+    f = tmp_path / k[:2] / f"{k}.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("{corrupt")
+    c.get(k)
+    assert (c.hits, c.misses, len(c._hit_mtimes)) == (0, 1, 0)
+    f.write_text(json.dumps({"response": {"ok": 1}}))
+    c.get(k)
+    assert c.hits == 1 and len(c._hit_mtimes) == c.hits, (
+        "replay_age_s describes evidence that was never used")
+    assert c.stats()["replay_age_s"] is not None
+
+
+# ── MISSING cache vs EMPTY cache ────────────────────────────────────────────
+#
+# MEASURED 2026-08-10, cost ~1h and a published wrong conclusion. `--cache-dir`
+# defaulted to the RELATIVE string "verify_bench_cache", so running the bench
+# from the repo root resolved it to <repo>/verify_bench_cache — which did not
+# exist, which `__init__` then silently created, and which missed on every
+# lookup thereafter. The real 2389-entry cache sat untouched in $GHOST_HOME.
+#
+# The report said "0 hits / 3464 misses", which is EXACTLY what a legitimately
+# invalidated cache says. Conclusion drawn and published: "the code digest
+# invalidated everything, a full 2-hour live re-bench is unavoidable". Both
+# halves false — pointed at the right directory the same run replayed in
+# SECONDS at 1595 hits / 3 misses.
+#
+# So: MISSING (you pointed somewhere wrong) and EMPTY (nothing recorded yet)
+# are different failures and must never render identically again.
+
+def test_a_replay_mode_refuses_to_create_its_own_cache(tmp_path):
+    """⚠ THE DEFECT. read/strict REPLAY a cache; they must not mint one.
+    An empty cache misses forever and reads as a stale cache."""
+    missing = tmp_path / "nope"
+    for mode in ("read", "strict"):
+        with pytest.raises(FileNotFoundError) as e:
+            ResponseCache(missing, mode)
+        assert str(missing.resolve()) in str(e.value), (
+            "the error must name the RESOLVED path — the whole bug was a "
+            "path that looked right and resolved wrong")
+    assert not missing.exists(), "a replay mode created the cache anyway"
+
+
+def test_write_mode_still_creates_the_cache(tmp_path):
+    """Seeding a NEW cache is exactly what write mode is for — the guard
+    must not break the one workflow that legitimately starts empty."""
+    fresh = tmp_path / "fresh"
+    ResponseCache(fresh, "write")
+    assert fresh.is_dir()
+
+
+def test_an_existing_but_EMPTY_cache_is_still_allowed(tmp_path):
+    """The distinction is missing-vs-empty, NOT empty-vs-populated. A run
+    that legitimately starts from an empty-but-present dir must proceed;
+    `test_unrun_cache_does_not_claim_to_have_measured_a_live_judge` depends
+    on constructing strict on exactly this."""
+    assert ResponseCache(tmp_path, "strict").entry_count() == 0
+    assert ResponseCache(tmp_path, "read").entry_count() == 0
+
+
+def test_entry_count_reports_what_is_actually_on_disk(tmp_path):
+    """The one number that makes a misdirected --cache-dir obvious BEFORE a
+    run burns an hour."""
+    c = ResponseCache(tmp_path, "write")
+    assert c.entry_count() == 0
+    for i in range(3):
+        c.put(ResponseCache.key(f"http://a{i}", _body()), f"http://a{i}",
+              _body(), {"ok": i})
+    assert c.entry_count() == 3
+
+
+def test_entry_count_ignores_half_written_puts(tmp_path):
+    """`put` writes <key>.tmp then os.replace. A .tmp is an in-flight write,
+    never a replayable entry — counting it would overstate a cache that is
+    actually empty, which is the failure this whole block exists to catch."""
+    (tmp_path / "ab").mkdir()
+    (tmp_path / "ab" / "deadbeef.tmp").write_text("{}")
+    assert ResponseCache(tmp_path, "read").entry_count() == 0
+
+
+def test_stats_carries_the_entry_count(tmp_path):
+    """Recorded in PROVENANCE so a PAST run can be re-read and its '0 hits'
+    explained — empty cache, or stale cache? Without this the question is
+    unanswerable after the fact, which is how the wrong conclusion stuck."""
+    assert ResponseCache(tmp_path, "read").stats()["entries"] == 0
+
+
+# ── the CLI default that caused it ──────────────────────────────────────────
+
+def _cli():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_vb_cli", REPO / "scripts" / "verify_bench.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_the_cache_default_is_anchored_to_ghost_home(monkeypatch, tmp_path):
+    """⚠ THE ROOT CAUSE. A CWD-relative default means the cache you get
+    depends on where you stood when you ran it."""
+    monkeypatch.setenv("GHOST_HOME", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["verify_bench.py"])
+    got = _cli()._parse_args().cache_dir
+    assert got == str(tmp_path / "system" / "eval" / "verify_bench_cache")
+    assert Path(got).is_absolute(), (
+        "a relative default resolves against the CWD — the entire defect")
+
+
+def test_the_cache_default_falls_back_without_ghost_home(monkeypatch):
+    """No GHOST_HOME is a legitimate environment (CI, a bare checkout); it
+    must degrade to the old name rather than crash on a KeyError."""
+    monkeypatch.delenv("GHOST_HOME", raising=False)
+    monkeypatch.setattr(sys, "argv", ["verify_bench.py"])
+    assert _cli()._parse_args().cache_dir == "verify_bench_cache"
+
+
+def test_the_startup_line_shows_the_resolved_path_and_entry_count():
+    """The old line printed the BASENAME, which is equally true of the right
+    cache and of an empty one minted in the CWD. The bug was on screen for
+    the whole run and unreadable."""
+    src = (REPO / "scripts" / "verify_bench.py").read_text()
+    assert "cache.path.resolve()" in src, "still printing an unresolved path"
+    assert "entry_count()" in src, "no entry count on the startup line"
+    assert "CACHE IS EMPTY" in src, (
+        "an empty cache in a replay mode must say so LOUDLY — it measures "
+        "nothing, and silence is what made this cost an hour")

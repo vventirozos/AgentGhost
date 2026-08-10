@@ -20,6 +20,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
+# §4AA held-out split. Fixed seed: a gate whose verdict wobbles between
+# runs on the same corpus is not a gate.
+_GATE_SPLIT_SEED = 7
+_GATE_TRAIN_FRACTION = 0.7
+
+# The corpus floor is DERIVED from the gate, not chosen separately. The gate
+# needs `_GATE_MIN_HELDOUT` held-out samples to mean anything; at a 70/30
+# split that implies this many labelled trajectories. Keeping these as two
+# independent numbers is how you get a trainer that looks like it should run
+# at 20 samples and silently never deploys — the same "mechanism that appears
+# to work" defect this codebase keeps finding. One number, derived.
+def _gate_min_trajectories() -> int:
+    from .model import ComplexityClassifier
+    import math
+    return int(math.ceil(ComplexityClassifier._GATE_MIN_HELDOUT
+                         / max(1e-9, 1.0 - _GATE_TRAIN_FRACTION)))
+
 logger = logging.getLogger("GhostAgent")
 
 
@@ -28,7 +45,7 @@ logger = logging.getLogger("GhostAgent")
 # real signal to beat the safe escalate-all pass-through). Below this many
 # LABELED, multi-class samples we stay pass-through and wait for an idle
 # retrain to produce a checkpoint later.
-BOOTSTRAP_MIN_SAMPLES = 50
+BOOTSTRAP_MIN_SAMPLES = 50  # superseded by the gate floor when lower
 # Cap the raw trajectory stream read at boot so a giant log can't stall
 # startup. Labeling drops the ambiguous middle, so we read generously
 # more than BOOTSTRAP_MIN_SAMPLES before the cap bites.
@@ -56,9 +73,13 @@ class RouterTrainer:
     handle) and ``run()`` returns a report with ``fit_succeeded=True``.
     """
 
-    def __init__(self, min_trajectories: int = 20, min_per_class: int = 1):
+    def __init__(self, min_trajectories: int = 20, min_per_class: int = 1,
+                 confidence_threshold: Optional[float] = None):
         # Require ≥ this many LABELED (non-ambiguous) trajectories before
         # training — below it the classifier would overfit noise.
+        # The LIVE dispatcher threshold, so the gate scores the operating
+        # point that actually ships. None => the dispatcher's own default.
+        self.confidence_threshold = confidence_threshold
         self.min_trajectories = int(min_trajectories)
         self.min_per_class = int(min_per_class)
         self.classifier = None
@@ -92,10 +113,46 @@ class RouterTrainer:
             )
             return report
 
+        # ⚠ ORDERING: this runs AFTER the too-few / single-class checks. Put
+        # first, it shadowed them — a 10-sample single-class corpus reported
+        # "needs >= 200 for the gate" instead of "single-class", replacing a
+        # precise diagnosis with a vaguer one. The most specific reason wins.
+        _floor = _gate_min_trajectories()
+        if len(pairs) < _floor:
+            report.bail_reason = (
+                f"only {len(pairs)} labelled trajectories; the held-out "
+                f"deploy gate needs >= {_floor} to be meaningful "
+                f"(router stays escalate-all — safe, and it will train "
+                f"itself once enough turns accumulate)")
+            logger.info("router train: %s", report.bail_reason)
+            return report
+
         try:
             X = [extract_features((getattr(t, "user_request", "") or "")) for t, _ in pairs]
+            # §4AA HELD-OUT SPLIT. The gate below asks an EMPIRICAL question
+            # ("does this beat doing nothing on data it never saw?"), which
+            # requires data the fit never saw. Shuffled with a FIXED seed so
+            # the same corpus always yields the same verdict — a gate whose
+            # answer wobbles run to run is not a gate.
+            #
+            # The VALIDATED model is the one deployed: we fit on the train
+            # split and ship that, rather than refitting on 100% afterwards.
+            # Refitting would ship a model whose evidence describes a
+            # *different* model — the same "measured X, shipped Y" gap this
+            # project keeps finding elsewhere. The cost is the held-out
+            # share of the data; with ~1350 labelled trajectories that is a
+            # trade worth making for an honest gate.
+            import random as _random
+            order = list(range(len(y)))
+            _random.Random(_GATE_SPLIT_SEED).shuffle(order)
+            cut = int(len(order) * _GATE_TRAIN_FRACTION)
+            tr_i, te_i = order[:cut], order[cut:]
             clf = ComplexityClassifier()
-            clf.fit(X, y)
+            clf.fit([X[i] for i in tr_i], [y[i] for i in tr_i])
+            gate_ev = clf.evaluate([X[i] for i in te_i], [y[i] for i in te_i],
+                                   confidence_threshold=self.confidence_threshold)
+            gate_ev["train_n"] = len(tr_i)
+            clf.gate_report_ = gate_ev
         except Exception as e:
             report.bail_reason = f"fit failed: {e}"
             return report
@@ -111,13 +168,14 @@ class RouterTrainer:
         # fit_succeeded=False → the idle retrain won't hot-swap and the
         # bootstrap returns (None, report) → router stays escalate-all
         # (planner runs), and no inverted model is ever persisted.
-        if not clf.looks_sane():
+        _passed, _why = ComplexityClassifier.gate_verdict(clf.gate_report_)
+        if not clf.is_finite() or not _passed:
             report.bail_reason = (
-                "trained model is INVERTED (net-negative technical/coding "
-                "weights) — not installing or saving; router stays "
-                "escalate-all until a sane model can train")
+                f"model REJECTED by the held-out gate ({_why}) — not "
+                f"installing or saving; router stays escalate-all")
             logger.warning("router train: %s", report.bail_reason)
             return report
+        logger.info("router train: held-out gate PASSED — %s", _why)
 
         if save_path is not None:
             try:
@@ -136,6 +194,7 @@ def bootstrap_router(
     save_path: Optional[Path] = None,
     min_samples: int = BOOTSTRAP_MIN_SAMPLES,
     max_trajectories: int = BOOTSTRAP_MAX_TRAJECTORIES,
+    confidence_threshold: Optional[float] = None,
 ) -> Tuple[Optional["ComplexityClassifier"], RouterTrainerReport]:  # noqa: F821
     """One-time startup bootstrap-train from the trajectory log.
 
@@ -160,7 +219,8 @@ def bootstrap_router(
         # Cap the raw stream so a giant log doesn't stall boot. islice is
         # lazy, so we never materialise the whole log.
         capped = itertools.islice(trajectories, max(0, int(max_trajectories)))
-        trainer = RouterTrainer(min_trajectories=int(min_samples), min_per_class=1)
+        trainer = RouterTrainer(min_trajectories=int(min_samples), min_per_class=1,
+                                confidence_threshold=confidence_threshold)
         report = trainer.run(trajectories=capped, save_path=save_path)
         if report.fit_succeeded and trainer.classifier is not None:
             return trainer.classifier, report

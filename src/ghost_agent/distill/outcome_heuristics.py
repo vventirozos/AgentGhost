@@ -66,6 +66,66 @@ _ATTEMPT_ABORTED_RE = re.compile(r"\[ATTEMPT_ABORTED_[A-Z_]+\]")
 STRUCTURAL_FAILURE_REASON = "structural failure"
 
 
+def structural_reason(cause: str = "") -> str:
+    """`STRUCTURAL_FAILURE_REASON`, optionally qualified with its CAUSE.
+
+    ⚠ WHY A PREFIX AND NOT A NEW STRING (2026-08-10). The bare constant is
+    LOAD-BEARING: `resolve_turn_outcome` matches it EXACTLY to decide whether
+    a late verifier PASS may upgrade this FAILED. Appending a cause naively
+    would silently stop that match and disable the 2026-07-31 honest-failure
+    rule on the async-verdict path — the exact drift the constant's own
+    comment warns about. So the cause is a SUFFIX after ": " and every
+    reader goes through `is_structural_reason()`.
+
+    Motivation: `structural failure` was 42 of 160 recorded failures (26%)
+    and said only THAT execution broke, never WHAT broke — so "was this a
+    hard task or a flaky tool/node?" was unanswerable from the corpus. That
+    question matters because these labels train the complexity router.
+    """
+    c = re.sub(r"\s+", " ", str(cause or "")).strip()
+    return f"{STRUCTURAL_FAILURE_REASON}: {c[:120]}" if c else STRUCTURAL_FAILURE_REASON
+
+
+def structural_cause_for_trajectory(traj) -> str:
+    """A short WHAT-BROKE label derived from the trajectory's failed tools.
+
+    Uses `tool_call_failed` — THE shared sniffer — rather than a second
+    "did this fail?" rule, because a duplicated one is how the corpus and
+    its consumers drift (the lesson this module already records).
+
+    Shape: ``<tool>: <first line of the error>``, or ``<tool> +N more`` when
+    several tools broke. Returns "" when nothing identifiable failed, in
+    which case the caller keeps the bare constant — an unqualified reason is
+    better than an invented one.
+    """
+    try:
+        broken = [tc for tc in (getattr(traj, "tool_calls", None) or [])
+                  if tool_call_failed(tc)]
+    except Exception:  # noqa: BLE001 — instrumentation must never break a turn
+        return ""
+    if not broken:
+        return ""
+    first = broken[0]
+    name = str(getattr(first, "name", "") or "tool").strip()
+    detail = str(getattr(first, "error", "") or getattr(first, "result", "") or "")
+    detail = re.sub(r"\s+", " ", detail).strip()
+    label = f"{name}: {detail}" if detail else name
+    if len(broken) > 1:
+        label += f" (+{len(broken) - 1} more)"
+    return label[:120]
+
+
+def is_structural_reason(reason: str) -> bool:
+    """True for the bare constant AND any cause-qualified form of it.
+
+    Every consumer of the old exact-match MUST use this, or a qualified
+    reason silently loses the late-PASS upgrade it is entitled to.
+    """
+    r = (reason or "").strip()
+    return r == STRUCTURAL_FAILURE_REASON or r.startswith(
+        STRUCTURAL_FAILURE_REASON + ":")
+
+
 @dataclass
 class FailureClassification:
     """One classification attempt's verdict and the signal that fired.
@@ -619,7 +679,7 @@ def resolve_turn_outcome(
     # unchanged, so this is additive.
     structural_failed = (
         cur == Outcome.FAILED.value
-        and (current_reason or "").strip() == STRUCTURAL_FAILURE_REASON
+        and is_structural_reason(current_reason)
     )
     if cur == Outcome.FAILED.value and not structural_failed:
         return Outcome.FAILED.value

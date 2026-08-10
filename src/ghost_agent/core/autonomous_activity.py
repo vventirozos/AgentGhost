@@ -67,7 +67,80 @@ _PHASE_LABELS = {
     "project": "project",
     "service": "service",
     "job": "background job",
+    # ⚠ These three were MISSING and rendered as raw slugs (2026-08-10).
+    "experiment_verdict": "experiment verdict",
+    "native_tool_repair": "native tool-call repair",
+    "workspace_tidy": "workspace tidy",
 }
+
+# ── LIVENESS REGISTRY ───────────────────────────────────────────────────────
+#
+# WHAT A ZERO MEANS. Counting ledger records answers "did it fire?" only if you
+# already know whether it was SUPPOSED to. Before this registry the background
+# report enumerated phases observationally — straight from whatever strings
+# happened to be in the ledger — so a loop that stopped writing, or never
+# wrote, was INDISTINGUISHABLE FROM ONE THAT DOES NOT EXIST. Measured
+# 2026-08-10: 15 phases are instrumented in source, 7 appeared in a 7-day
+# window, and the report showed seven green rows and no hint of the other
+# eight.
+#
+# It is not enough to render the zeros either: `reflection` legitimately sits
+# at 0 (it records only outcome-producing runs), while `dream` at 0 would be a
+# dead loop. A benign zero and a fatal zero MUST NOT look alike — that is the
+# whole defect, one level up. So each phase declares what its own zero means:
+#
+#   PERIODIC   — scheduled; it fires on its own. Zero over the window is an
+#                ALARM. These are the five loops measured firing continuously.
+#   ON_OUTPUT  — runs on schedule but only RECORDS when it produced something
+#                (`if stale:`, `if _tidy_deleted:`). Zero = "no new material",
+#                never "not scheduled". Alarming on these is how a monitor
+#                teaches its operator to ignore it.
+#   ON_DEMAND  — fires only when a turn, an operator or a verdict triggers it.
+#                Zero is the normal state.
+#   GATED      — needs a flag or consumer that may be off (PRM retrain skips
+#                when neither .score() nor .uncertainty() is live). Zero is
+#                expected while the gate is closed, so it reports the gate
+#                rather than crying about the count.
+EXPECT_PERIODIC = "periodic"
+EXPECT_ON_OUTPUT = "on_output"
+EXPECT_ON_DEMAND = "on_demand"
+EXPECT_GATED = "gated"
+
+PHASE_EXPECTATION = {
+    # measured firing continuously (7d/24h): 159/21, 155/22, 89/15, 99/14, 43/5
+    "self_play": EXPECT_PERIODIC,
+    "calibration": EXPECT_PERIODIC,
+    "dream": EXPECT_PERIODIC,
+    "skills_auto": EXPECT_PERIODIC,
+    "router_train": EXPECT_PERIODIC,
+    # records only when there was an outcome to record
+    "reflection": EXPECT_ON_OUTPUT,          # skips unchanged-corpus ticks
+    "selfplay_selftest_skip": EXPECT_ON_OUTPUT,   # a SKIP is the event
+    "open_questions": EXPECT_ON_OUTPUT,      # `if stale:`
+    "workspace_tidy": EXPECT_ON_OUTPUT,      # `if _tidy_deleted:`
+    "native_tool_repair": EXPECT_ON_OUTPUT,  # ~0 by design; each one is news
+    # externally triggered
+    "scheduled_task": EXPECT_ON_DEMAND,
+    "project": EXPECT_ON_DEMAND,
+    "experiment_verdict": EXPECT_ON_DEMAND,  # needs an arm to reach n>=30
+    "agent_message": EXPECT_ON_DEMAND,
+    "service": EXPECT_ON_DEMAND,
+    "job": EXPECT_ON_DEMAND,
+    # behind a flag / consumer
+    "prm_train": EXPECT_GATED,               # skips unless .score()/.uncertainty() live
+    "postmortem": EXPECT_GATED,              # --postmortem
+}
+
+
+def phase_expectation(phase: str) -> str:
+    """What a ZERO count for ``phase`` means.
+
+    Unknown phases are ON_DEMAND: a slug nobody registered must never manu-
+    facture an alarm. The `tests/test_activity_liveness.py` coverage test is
+    what keeps "unknown" from becoming a quiet dumping ground — it fails when
+    a phase literal exists in source but not in this registry.
+    """
+    return PHASE_EXPECTATION.get(str(phase or "").strip(), EXPECT_ON_DEMAND)
 
 # Internal request-id prefixes: turns the agent fires at ITSELF (cron jobs,
 # delegated sub-agents). The finalize digest must skip these — an internal

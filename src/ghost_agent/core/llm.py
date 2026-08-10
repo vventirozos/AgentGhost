@@ -5,7 +5,8 @@ import copy
 import os
 from typing import List, Dict, Any, Optional
 import httpx
-from ..utils.logging import Icons, pretty_log, verify_purpose_context
+from ..utils.logging import (Icons, pretty_log, request_id_context,
+                             verify_purpose_context)
 from ..utils.helpers import get_utc_timestamp
 
 logger = logging.getLogger("GhostAgent")
@@ -1032,7 +1033,12 @@ class LLMClient:
                         _wl = task_label or 'background task'
                         if _vp:
                             _wl = f"{_wl} ({_vp})"
-                        pretty_log("Worker Compute", f"{_wl} → Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
+                        # Same rule as the critic line below: a background
+                        # worker dispatch (failure-dimension tagging, REM,
+                        # self-play) is plumbing nobody reads — 211 of 4000
+                        # lines. Request-scoped work stays visible.
+                        _bg = request_id_context.get() == "SYSTEM"
+                        pretty_log("Worker Compute", f"{_wl} → Worker Node ({node['model']})", level="DEBUG" if _bg else "INFO", icon=Icons.NODE_WORKER)
                     try:
                         node_payload = payload.copy()
                         node_payload["model"] = node["model"]
@@ -1103,7 +1109,36 @@ class LLMClient:
                     tried_nodes.append(node)
 
                     _vp = verify_purpose_context.get()
-                    pretty_log("Critic Compute", f"Routing verification{f' ({_vp})' if _vp else ''} to Critic Node ({node['model']})", level="INFO", icon=Icons.VERIFIER_LAB)
+                    # ⚠ LEVEL DEPENDS ON WHO IS ASKING (2026-08-09 log audit).
+                    # This line announces an INTENT, and it fired 1648 times
+                    # in a 4000-line window — 41% of the operator's log —
+                    # while only 6 lines in the same window carried a verdict.
+                    # The log was 274:1 announcements-to-outcomes.
+                    #
+                    # Background callers (self-play, REM, failure-dimension
+                    # tagging) route verification constantly while idle and
+                    # nobody reads those; a real user turn is exactly what the
+                    # operator IS watching. `request_id_context` already
+                    # distinguishes them ("SYSTEM" = not request-scoped), so
+                    # background plumbing drops to DEBUG and request-scoped
+                    # routing stays visible. Failures are untouched — they are
+                    # WARNING below and always were.
+                    _bg = request_id_context.get() == "SYSTEM"
+                    # ⚠ A HEARTBEAT IS NOT A VERIFICATION (2026-08-10). The
+                    # keepalive loop (45s) and the node warmup both reach this
+                    # branch via `use_critic=(label == "critic")`, so every
+                    # ping announced itself as "Routing verification" — a line
+                    # describing work that never happened. The WORKER branch
+                    # has had `_quiet` for exactly this since the heartbeat was
+                    # added; the critic branch never got it, so the mislabel
+                    # survived. Found while checking why real verifications
+                    # produced no outcome line: they had not run at all, and
+                    # these pings were what made it look as if they had.
+                    if task_label in ("keepalive", "warmup"):
+                        logger.debug("critic %s ping → %s",
+                                     task_label, node["model"])
+                    else:
+                        pretty_log("Critic Compute", f"Routing verification{f' ({_vp})' if _vp else ''} to Critic Node ({node['model']})", level="DEBUG" if _bg else "INFO", icon=Icons.VERIFIER_LAB)
                     try:
                         import copy as _copy, json
                         node_payload = _copy.deepcopy(payload)

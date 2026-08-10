@@ -60,7 +60,12 @@
     grep-friendly format (now stamped with the logger name).
   </div>
 
-  <h2>Two sinks, and the durable narrative mirror (2026-07-24)</h2>
+    <h2>Reading the log: archive vs operator view</h2>
+  <p>The log file is a <strong>complete</strong> record by design — <code>_mirror</code> writes every <code>pretty_log</code> call at full length, DEBUG included, because a turn must be reconstructible after a restart and several instruments <em>count mirror lines</em>. That completeness is also what makes it hard to read: measured 2026-08-09 on a 4000-line window, <strong>1652 lines (41%) were the single string</strong> <code>critic compute — Routing verification to Critic Node (Nova)</code>, while only <strong>6 lines carried a verdict</strong>. The log announced an intent 275 times for every outcome it reported.</p>
+  <p>The fix is a <strong>level</strong> change, not mirror-collapse (collapsing the mirror would break the instruments that count it). Background plumbing — self-play, REM, failure-dimension tagging — routes verification constantly while idle and nobody reads it; a real user turn is exactly what the operator IS watching. <code>request_id_context</code> already distinguishes them (<code>"SYSTEM"</code> = not request-scoped), so those two routing lines now log at DEBUG when background and INFO when request-scoped. Node <em>failures</em> were untouched: they are WARNING and always were — making them visible is the point. Measured effect: the INFO view halves, <strong>3783 → 1900 lines</strong>.</p>
+  <p>Read it with <a href="cli_reference.html"><code>scripts/ghostlog.py</code></a>: INFO+ with repeats collapsed for ambient health, <code>--req &lt;id&gt;</code> for one request in full, <code>--all</code> when you want the raw archive back.</p>
+
+<h2>Two sinks, and the durable narrative mirror (2026-07-24)</h2>
   <p>There are <strong>two</strong> physical destinations, and they are NOT the same content:</p>
   <div class="scroll"><table>
     <thead><tr><th>Sink</th><th>Path</th><th>What it is</th></tr></thead>

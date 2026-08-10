@@ -13,6 +13,7 @@ Two capabilities:
 import asyncio
 import base64
 import datetime
+import functools
 import inspect
 import json
 import logging
@@ -20,6 +21,7 @@ import mimetypes
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -134,6 +136,51 @@ def _two_stage_enabled() -> bool:
     """
     return os.getenv("GHOST_VERIFY_TWO_STAGE", "1").strip().lower() not in (
         "0", "false", "no")
+
+
+def _self_consistency_n() -> int:
+    """How many times to sample the ADJUDICATION and take the majority.
+
+    1 (the default) = OFF, byte-identical to the single-sample path.
+
+    WHY, AND WHY ONLY HERE. The miss side is 0.218 false-CONFIRM, and A1
+    measured that the judge's own confidence carries NO signal about it
+    (AUC 0.5087 — chance). So the usual "act when unsure" lever does not
+    exist. Cross-sample DISAGREEMENT is a signal the judge does express and
+    the confidence field does not.
+
+    MEASURED BEFORE BUILDING (2026-08-10), because an inert mechanism is the
+    defect class this codebase keeps finding. Three identical repeat runs of
+    the real path, cache off:
+
+      * 2 of 12 trials disagreed across repeats — 17% run-to-run variance;
+      * BOTH were `artifact_leak` (36% of the miss mass), and in both the
+        majority-of-3 verdict is the CORRECT one;
+      * `clean` never varied, so the FPR gate should survive;
+      * `fact_swap` never varied and was wrong every time — a SYSTEMATIC
+        error this cannot touch. Self-consistency alone will not reach the
+        0.10 target; it takes artifact_leak down and leaves a fact_swap
+        residual.
+
+    ⚠ A SHORT SYNTHETIC PROBE SAID THE OPPOSITE — 5/5 identical verdicts at
+    temperature 0.1, 0.7 AND 1.0 — and taken alone would have killed this as
+    inert. It was the wrong instrument: a hand-written one-line prompt is not
+    the 5.4KB adjudication path, and diversity is a property of the prompt,
+    not only of the temperature.
+
+    Sampling temperature is deliberately UNCHANGED (0.1, as production). The
+    variance above was measured at that temperature; raising it would add a
+    second variable to a change that already needs a live re-bench.
+    """
+    try:
+        n = int(os.getenv("GHOST_VERIFY_SELF_CONSISTENCY", "1").strip() or "1")
+    except ValueError:
+        return 1
+    # Even n has no majority; cap at 5 so a typo cannot multiply every
+    # verification by 50 against a 120s critic ceiling.
+    if n < 1:
+        return 1
+    return min(5, n if n % 2 == 1 else n - 1) or 1
 
 
 def _escalate_refute_enabled() -> bool:
@@ -1315,6 +1362,62 @@ def _bounded_fallback_kwargs(llm_client: Any) -> Dict[str, Any]:
     return kwargs
 
 
+
+def _logged_verify(kind: str):
+    """Time a verification and emit its OUTCOME exactly once.
+
+    ⚠ A DECORATOR ON EVERY PUBLIC ENTRY POINT, not one hand-written wrapper.
+    The first version wrapped `verify_claim` alone — and `verify_code_output`
+    and `verify_visual` kept logging nothing, so the feature LOOKED complete
+    while covering one of three paths. Caught by watching the live log rather
+    than the (green) tests: two background verifications ran and produced no
+    outcome line. Decorating makes a fourth entry point impossible to forget.
+
+    `functools.wraps` keeps the signature introspectable, which is load-
+    bearing: `verify_bench.verify_claim_accepts_high_stakes` reads it to
+    decide whether the CONFIRM-escalation direction can fire at all.
+    """
+    def _decorate(fn):
+        @functools.wraps(fn)
+        async def _wrapped(self, *args, **kwargs):
+            _t0 = time.monotonic()
+            try:
+                _res = await fn(self, *args, **kwargs)
+            except asyncio.CancelledError:
+                # Shutdown/timeout cancellation is not a verifier outcome —
+                # logging it would add noise on every restart.
+                #
+                # ⚠ REDUNDANT TODAY, KEPT DELIBERATELY: CancelledError is a
+                # BaseException (not Exception) on 3.8+, so the handler below
+                # already cannot catch it, and no mutation of THIS clause
+                # alone changes behaviour — revert-testing correctly reports
+                # it as unpinnable. It is a guard against a future edit
+                # widening that `except Exception` to `except BaseException`,
+                # which would start logging every shutdown as a verifier
+                # failure. The test pins the BEHAVIOUR (cancellation is not
+                # logged), which is what actually matters.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # ⚠ A CRASH IS AN OUTCOME, and the most important one to see.
+                # The first version logged only after a successful await, so a
+                # raising verification was INVISIBLE — the exact silent-failure
+                # shape this whole line exists to remove. Log, then re-raise:
+                # the caller's error handling is unchanged.
+                try:
+                    self._log_verify_outcome(
+                        None, time.monotonic() - _t0, kind, error=exc)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            try:
+                self._log_verify_outcome(_res, time.monotonic() - _t0, kind)
+            except Exception:  # noqa: BLE001 — logging must never break a verify
+                pass
+            return _res
+        return _wrapped
+    return _decorate
+
+
 class Verifier:
     """Self-evaluation module that uses LLM introspection to check the agent's
     own work before presenting it to the user."""
@@ -1715,10 +1818,15 @@ class Verifier:
             "verifier.adjudicate", _VERIFY_ADJUDICATE_PROMPT).format(
             claim=claim, evidence=evidence, context=context,
             suspects=self._format_suspects_block(suspects))
-        stage2 = await self._call_llm(adj_prompt, temperature=0.1, force_main=force_main,
-                                      max_tokens=_STAGE_MAX_TOKENS,
-                                      json_only=True)
-        result = self._build_verify_result(stage2)
+        _n = _self_consistency_n()
+        if _n <= 1:
+            stage2 = await self._call_llm(
+                adj_prompt, temperature=0.1, force_main=force_main,
+                max_tokens=_STAGE_MAX_TOKENS, json_only=True)
+            result = self._build_verify_result(stage2)
+        else:
+            result = await self._adjudicate_self_consistent(
+                adj_prompt, n=_n, force_main=force_main)
         if result is None:
             logger.debug("Verifier two-stage: adjudication unparseable, "
                          "falling back to single-stage")
@@ -1741,11 +1849,113 @@ class Verifier:
                     (1.0 - w) * float(result.confidence) + w * aligned, 3)
         return result
 
+    async def _adjudicate_self_consistent(self, adj_prompt: str, *, n: int,
+                                          force_main: bool
+                                          ) -> Optional["VerifyResult"]:
+        """Sample the adjudication ``n`` times; the MAJORITY verdict wins.
+
+        Returns the sampled result that carries the winning verdict (highest
+        confidence among them), so `reasoning`/`issues` stay a real, coherent
+        judgement rather than a synthetic merge of several.
+
+        Unparseable samples are DROPPED, not counted — a reply the parser
+        could not read is not a vote for anything, and letting it count would
+        make the parser's failure rate a hidden thumb on the scale.
+
+        ⚠ Falls back to single-sample semantics when fewer than 2 samples
+        parse, so a flaky judge degrades to today's behaviour instead of to
+        None: this must never make a verification FAIL that would otherwise
+        have succeeded.
+        """
+        import asyncio as _asyncio
+        from collections import Counter
+
+        async def _one():
+            try:
+                raw = await self._call_llm(
+                    adj_prompt, temperature=0.1, force_main=force_main,
+                    max_tokens=_STAGE_MAX_TOKENS, json_only=True)
+                return self._build_verify_result(raw)
+            except Exception:  # noqa: BLE001 — one bad sample must not kill the vote
+                return None
+
+        # Concurrent: n sequential adjudications would multiply latency by n
+        # against the 120s critic ceiling.
+        got = await _asyncio.gather(*[_one() for _ in range(n)],
+                                    return_exceptions=True)
+        results = [r for r in got
+                   if r is not None and not isinstance(r, BaseException)]
+        if not results:
+            return None
+        if len(results) < 2:
+            return results[0]
+
+        counts = Counter(r.verdict for r in results)
+        top = counts.most_common()
+        # A tie (possible once samples are dropped) keeps the FIRST sample's
+        # verdict — today's behaviour — rather than letting ordering decide.
+        if len(top) > 1 and top[0][1] == top[1][1]:
+            winner = results[0].verdict
+        else:
+            winner = top[0][0]
+        agreeing = [r for r in results if r.verdict == winner]
+        best = max(agreeing, key=lambda r: float(getattr(r, "confidence", 0.0)))
+        # Recorded so the bench can attribute a delta to THIS mechanism and
+        # not to the judge having a different day.
+        best.self_consistency_n = len(results)
+        best.self_consistency_agree = len(agreeing)
+        return best
+
+    def _log_verify_outcome(self, result: Optional["VerifyResult"],
+                            elapsed_s: float, kind: str = "claim",
+                            error: Optional[BaseException] = None) -> None:
+        """One line carrying what the verification actually CONCLUDED.
+
+        Level follows the same rule as the LLM routing lines: a background
+        verify (self-play, REM, tagging) is plumbing at DEBUG; a
+        request-scoped one is what the operator is watching, at INFO.
+        Everything here already existed on `VerifyResult` and reached no log.
+        """
+        from ..utils.logging import (Icons, pretty_log, request_id_context,
+                                      verify_purpose_context)
+        if error is not None:
+            verdict, conf = f"ERROR {type(error).__name__}: {error}"[:120], 0.0
+        elif result is None:
+            verdict, conf = "SKIPPED", 0.0
+        else:
+            verdict = getattr(getattr(result, "verdict", None), "value",
+                              str(getattr(result, "verdict", "?")))
+            conf = float(getattr(result, "confidence", 0.0) or 0.0)
+        # WHICH mechanism settled it — the counters the bench reports as
+        # rescue/damage, finally visible per-turn instead of only in a
+        # 433-trial aggregate.
+        marks = []
+        for attr, label in (
+            ("objection_upheld", "objection upheld"),
+            ("objection_dismissed", "objection dismissed"),
+            ("truncation_guarded", "truncation guard"),
+            ("escalated_overturn", "escalation OVERTURNED"),
+            ("confirm_withheld", "confirm withheld"),
+            ("escalation_downgraded", "tier downgrade"),
+        ):
+            if getattr(result, attr, False):
+                marks.append(label)
+        _vp = verify_purpose_context.get()
+        detail = (f"{verdict} conf={conf:.2f} {elapsed_s:.1f}s"
+                  + (f" · {_vp}" if _vp else "")
+                  + (f" · {' · '.join(marks)}" if marks else ""))
+        # A crash is WARNING whoever asked — it is never routine plumbing.
+        _bg = request_id_context.get() == "SYSTEM"
+        _level = "WARNING" if error is not None else ("DEBUG" if _bg else "INFO")
+        pretty_log("Verify" if kind == "claim" else f"Verify {kind}", detail,
+                   level=_level, icon=Icons.VERIFIER_LAB)
+
+    @_logged_verify("claim")
     async def verify_claim(self, claim: str, evidence: str,
-                           context: str = "",
-                           *, high_stakes: bool = False,
-                           trace: Optional[Dict[str, Any]] = None
-                           ) -> Optional[VerifyResult]:
+                                 context: str = "",
+                                 *, high_stakes: bool = False,
+                                 trace: Optional[Dict[str, Any]] = None
+                                 ) -> Optional[VerifyResult]:
         """Check whether *claim* is supported by *evidence*.
 
         Default path (GHOST_VERIFY_TWO_STAGE, on unless =0) is two LLM
@@ -2486,6 +2696,7 @@ class Verifier:
             final_confidence=result.confidence, trace=trace)
         return result
 
+    @_logged_verify("code")
     async def verify_code_output(self, code: str, output: str,
                                  intent: str,
                                  *, response: str = "",
@@ -2625,6 +2836,7 @@ class Verifier:
             logger.warning("Visual verifier call failed: %s", exc)
             return {}
 
+    @_logged_verify("visual")
     async def verify_visual(self, *, symptom: str, claim: str,
                             after_image: str,
                             before_image: Optional[str] = None

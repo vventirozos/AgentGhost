@@ -59,17 +59,103 @@ def test_equal_values_are_neither():
     assert VBS.compare({"x": "1"}, {"x": "1"}) == ([], [])
 
 
+# ── the sentinel that is spelled like data ──────────────────────────────────
+#
+# MEASURED 2026-08-10, and it changed a decision. `bench_provenance` records
+# escalation.arm = "unrecorded" when no arm block was supplied. That is right
+# for a RUN — an unlabelled arm must never be back-dated into a claim — but it
+# is a STRING, so `compare`'s `o is None or n is None` guard slid past it and
+# scored it as a KNOWN, DIFFERENT value:
+#
+#     escalation.arm  was 'judge+escalation'  now 'unrecorded'  -> DRIFT
+#     verdict: "STALE — full live re-bench required"
+#
+# The verdict was FALSE and was acted on. A replay of that same baseline ran
+# clean at 1595 hits / 3 misses moments later. `judge` escaped only by
+# accident: `dict(None or {})` is empty, produces no key, lands in UNCOMPARABLE.
+#
+# This is the tool's own founding rule — UNKNOWN is not CHANGED — defeated by
+# a sentinel spelled like a value. Crying wolf is the one failure a staleness
+# oracle cannot survive: the next REAL stale gets waved through.
+
+def test_the_unrecorded_sentinel_is_unknown_not_a_value():
+    """On the CURRENT side: the tool synthesizes 'unrecorded' whenever it is
+    given no topology flags, which is the common invocation."""
+    old = VBS.flat_fingerprint({"escalation": {"arm": "judge+escalation",
+                                               "cheap_route": "critic"}})
+    new = VBS.flat_fingerprint({"escalation": {"arm": "unrecorded"}})
+    drift, unknown = VBS.compare(old, new)
+    assert [d["component"] for d in drift] == [], (
+        "an unlabelled arm was scored as drift — this produced a FALSE "
+        "'full live re-bench required' that was acted on")
+    assert "escalation.arm" in {u["component"] for u in unknown}
+
+
+def test_the_sentinel_is_unknown_from_the_BASELINE_side_too():
+    """Every pre-2026-08-04 baseline carries 'unrecorded' ON DISK, so the
+    same false drift fires in reverse against a labelled run."""
+    old = VBS.flat_fingerprint({"escalation": {"arm": "unrecorded"}})
+    new = VBS.flat_fingerprint({"escalation": {"arm": "judge+escalation",
+                                               "cheap_route": "critic"}})
+    drift, unknown = VBS.compare(old, new)
+    assert [d["component"] for d in drift] == []
+    assert "escalation.arm" in {u["component"] for u in unknown}
+
+
+def test_a_REAL_arm_change_is_still_drift():
+    """⚠ THE OVER-SUPPRESSION GUARD. Two genuinely-labelled, genuinely
+    different arms measure different systems and must STILL be caught —
+    silencing the sentinel must not silence the field. Without this, the
+    fix for a false positive becomes a false negative, which is worse."""
+    old = VBS.flat_fingerprint({"escalation": {"arm": "judge+escalation",
+                                               "cheap_route": "critic"}})
+    new = VBS.flat_fingerprint({"escalation": {"arm": "raw judge",
+                                               "cheap_route": "critic"}})
+    drift, _ = VBS.compare(old, new)
+    assert [d["component"] for d in drift] == ["escalation.arm"]
+
+
+def test_an_unlabelled_arm_alone_never_demands_a_FULL_rebench():
+    """The end-to-end consequence: the expensive verdict is what got acted
+    on, so pin the verdict and not merely the classification."""
+    old = VBS.flat_fingerprint({"escalation": {"arm": "judge+escalation",
+                                               "cheap_route": "critic"}})
+    new = VBS.flat_fingerprint({"escalation": {"arm": "unrecorded"}})
+    drift, _ = VBS.compare(old, new)
+    assert not any(d["restore"] == VBS._FULL for d in drift), (
+        "an absent arm label still demands the 2-hour run")
+
+
 # ── the cheapest restoring action ───────────────────────────────────────────
 
 @pytest.mark.parametrize("component", [
-    "code.verifier", "code.bench", "templates.verifier.claim",
+    "code.verifier", "code.bench",
     "cases_sha256", "faults_sha256", "verify_flags.GHOST_VERIFY_TWO_STAGE",
 ])
-def test_replayable_drift_is_labelled_replayable(component):
-    """These change the PROMPT or the SCORING; a cached response either still
-    answers the same question or misses naturally and gets a live call."""
+def test_downstream_drift_is_labelled_cheap(component):
+    """These sit DOWNSTREAM of prompt construction, so the cached judge
+    responses still answer the same questions and a replay costs seconds."""
     drift, _ = VBS.compare({component: "a"}, {component: "b"})
     assert drift[0]["restore"] == VBS._REPLAYABLE
+    assert "CHEAP" in drift[0]["restore"]
+
+
+@pytest.mark.parametrize("component", [
+    "templates.verifier.enumerate", "templates.verifier.adjudicate",
+    "templates.verifier.claim",
+])
+def test_a_PROMPT_change_is_not_advertised_as_cheap(component):
+    """⚠ THE IMPRECISION (2026-08-09): prompts were labelled "replay: only
+    changed prompts cost calls" — mechanically true, but it READS as cheap.
+    A prompt change is UPSTREAM of everything: the enumerate stage's output
+    is interpolated into adjudicate as {suspects}, whose output feeds the
+    escalation, so editing it re-keys ~100% of ~1600 calls. Measured: a
+    policy change replays in 3.5s; an enumerate change is a full ~90min run.
+    Budgeting one as the other is how a "quick test" becomes an evening."""
+    drift, _ = VBS.compare({component: "a"}, {component: "b"})
+    assert drift[0]["restore"] == VBS._PROMPT
+    assert "SAVES LITTLE" in drift[0]["restore"]
+    assert "CHEAP" not in drift[0]["restore"]
 
 
 @pytest.mark.parametrize("component", ["judge", "escalation.arm", "escalation.leg"])

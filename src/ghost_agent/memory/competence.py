@@ -29,9 +29,37 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
+
+
+def wilson_interval(p: float, n: int, z: float = 1.96) -> tuple:
+    """Wilson 95% interval ``(lo, hi)`` for a rate ``p`` seen ``n`` times.
+
+    Wilson rather than the normal approximation because these rates sit hard
+    against the boundary — `fetch` is at 0.99, where Wald returns an interval
+    running past 1.0: a precision claim that is not merely wrong but
+    impossible.
+
+    ⚠ Returns the BOUNDS, not a half-width. The first version of this fix
+    rendered "98% ±6%", which reads as [92%, 104%] — an interval that cannot
+    exist. Wilson is asymmetric near the boundary (its centre is shifted off
+    `p`), so `p ± h` is not the interval and a fix about honest precision must
+    not itself state an impossible one. Caught by a sanity check on the
+    helper, not by reading it.
+
+    (0.0, 1.0) for n <= 0, so a cell with no observations can never render as
+    precise.
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    p = min(1.0, max(0.0, float(p)))
+    d = 1.0 + z * z / n
+    centre = (p + z * z / (2.0 * n)) / d
+    half = (z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n))) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -232,10 +260,27 @@ class CompetenceProfile:
         roll = self.by_domain()
         if not roll:
             return ""
-        lines = ["### Competence (per-domain p(success), n):"]
+        lines = ["### Competence (per-domain p(success), 95% CI, n):"]
         for d in sorted(roll, key=lambda k: roll[k][0]):
             mean, n = roll[d]
-            lines.append(f"  - {d}: {mean:.0%} (n={n})")
+            lo, hi = wilson_interval(mean, n)
+            # ⚠ PRECISION TRAVELS WITH THE NUMBER (audit 2026-08-10).
+            #
+            # This rendered every cell identically — "sql: 74% (n=17)" beside
+            # "fetch: 99% (n=847)" — so the model was told a coin-flip-wide
+            # estimate as flatly as a tight one. Measured: sql's 95% CI is
+            # [0.50, 0.89], a width of 0.39. "You succeed at SQL 74% of the
+            # time" is not a fact there; it is one of many values the 17
+            # observations are consistent with.
+            #
+            # The injection gate does not save this: agent.py gates on TOTAL
+            # observations across domains (its own comment says the gate
+            # exists "so a cold profile doesn't inject noisy small-n
+            # percentages"), so 6470 observations elsewhere license a 17-
+            # observation cell to render with full authority.
+            mark = ("  ⚠ provisional" if (n < 30 or (hi - lo) > 0.20) else "")
+            lines.append(
+                f"  - {d}: {mean:.0%} (95% CI {lo:.0%}-{hi:.0%}, n={n}){mark}")
         return "\n".join(lines)
 
     # ---------------------------------------------------------- helpers

@@ -374,3 +374,70 @@ class TestVerifierEscalationHealth:
         assert arms["claim/refute"]["overturned"] == 1
         assert "?/?" in arms  # the bare {} row is counted, not dropped
         render_learning_health(md)
+
+
+# ── the lesson hit-rate's contaminated denominator ──────────────────────────
+#
+# MEASURED 2026-08-10. The report printed `mean hit-rate: 0.62` with the caveat
+# "denominator includes the pre-2026-08-01 double-booking era — do not trend
+# across that date". That gave the reader a number they were told not to use
+# and NO number they could — while a clean one was computable all along:
+# lessons CREATED after the cut accumulated every retrieval in the clean era.
+# Measured: contaminated 0.620 vs CLEAN 0.557 over 13 lessons / 600 retrievals.
+# The caveat was hiding a 0.06 OVERSTATEMENT.
+
+def _pb(tmp_path, lessons):
+    md = tmp_path / "memory"
+    md.mkdir(parents=True, exist_ok=True)
+    (md / "skills_playbook.json").write_text(json.dumps(lessons))
+    return md
+
+
+def _lesson(ts, retr, helpful):
+    return {"task": "t", "mistake": "m", "solution": "s", "timestamp": ts,
+            "retrievals": retr, "helpful_retrievals": helpful}
+
+
+def test_the_clean_hit_rate_excludes_the_double_booking_era(tmp_path):
+    """Only lessons created AFTER the cut count toward the honest figure."""
+    md = _pb(tmp_path, [
+        _lesson("2026-07-01T00:00:00", 100, 90),   # contaminated era
+        _lesson("2026-08-05T00:00:00", 10, 2),     # clean era
+    ])
+    les = collect_learning_health(md)["lessons"]
+    assert les["clean_lessons"] == 1
+    assert les["clean_retrievals"] == 10
+    # clean = (2+1)/(10+2) = 0.25 ; the all-lessons mean is dragged up by the
+    # 0.89 contaminated lesson, which is exactly the overstatement.
+    assert les["mean_hit_rate_clean"] == 0.25
+    assert les["mean_hit_rate"] > les["mean_hit_rate_clean"]
+
+
+def test_the_CLEAN_number_is_the_headline(tmp_path):
+    """⚠ The contaminated mean must not lead. It is shown, labelled, second."""
+    md = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 90),
+                        _lesson("2026-08-05T00:00:00", 10, 2)])
+    out = render_learning_health(md)
+    assert "mean hit-rate: 0.25 (CLEAN" in out
+    assert "OVERSTATES" in out and "not comparable" in out
+
+
+def test_NO_clean_lesson_says_so_rather_than_quoting_the_dirty_one(tmp_path):
+    """⚠ The state that matters most: when no post-cut lesson has retrievals,
+    there IS no honest denominator, and the report must say CONTAMINATED
+    instead of silently falling back to the number it just disowned."""
+    md = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 90)])
+    les = collect_learning_health(md)["lessons"]
+    assert les["mean_hit_rate_clean"] is None and les["clean_lessons"] == 0
+    out = render_learning_health(md)
+    assert "CONTAMINATED" in out and "no clean denominator exists" in out
+
+
+def test_an_unparseable_lesson_timestamp_is_excluded_not_assumed_clean(tmp_path):
+    """A lesson whose creation time cannot be read must NOT be counted as
+    post-cut — that would launder unknown-era data into the honest figure."""
+    md = _pb(tmp_path, [{"task": "t", "mistake": "m", "solution": "s",
+                         "timestamp": "not-a-date",
+                         "retrievals": 10, "helpful_retrievals": 9}])
+    les = collect_learning_health(md)["lessons"]
+    assert les["clean_lessons"] == 0

@@ -45,23 +45,53 @@ def test_n_steps_counts_this_turn_not_history():
 
 
 def test_router_sanity_gate_rejects_inverted_model():
-    """§4O C-MAJOR-1 fail-closed gate: a model with net-negative technical/
-    coding weights is INVERTED (routes hard requests to easy → skips the
-    planner on them). looks_sane() must reject it so the router stays
-    escalate-all (planner runs)."""
+    """§4O's INTENT, re-pinned on §4AA's mechanism (2026-08-09).
+
+    ⚠ THIS TEST USED TO ASSERT THE OPPOSITE OF WHAT IT SHOULD. It required
+    that a model with POSITIVE technical/coding weights `looks_sane()`, and
+    that a NEGATIVE-weight model does not — encoding the prior "more jargon
+    ⇒ harder". Measured on 1354 real trajectories, this agent's traffic
+    contradicts that prior (jargon 4.1x, coding 6.8x MORE common in EASY
+    turns; even LENGTH inverts). The consequence was severe and measured:
+    the gate REJECTED the fitted model (accuracy 0.695 vs escalate-all
+    0.560) and ACCEPTED a sign-flipped one (accuracy 0.305, skipping the
+    planner on 86.8% of hard requests) — the very catastrophe §4O existed
+    to prevent.
+
+    The INTENT survives unchanged: a model that would skip the planner on
+    hard requests must never deploy. Only the evidence changed — from a
+    prior about weight signs to held-out outcome.
+    """
     from ghost_agent.router.model import ComplexityClassifier
 
     m = ComplexityClassifier()
     m.weights_ = np.zeros(len(m.feature_names_))
     m.bias_ = 0.0
-    # inverted: technical features push p(hard) DOWN
-    for n in m._MONOTONE_HARD_FEATURES:
-        m.weights_[m.feature_names_.index(n)] = -0.5
-    assert m.is_finite() and not m.looks_sane()
-    # healthy: technical features push p(hard) UP
+
+    # A model with NO held-out evidence never deploys, whatever its weights.
     for n in m._MONOTONE_HARD_FEATURES:
         m.weights_[m.feature_names_.index(n)] = 0.5
-    assert m.looks_sane()
+    assert m.is_finite() and not m.looks_sane(), (
+        "weight signs alone must no longer authorise a deploy")
+
+    # Evidence that FAILS (skips the planner on 87% of hard requests — the
+    # §4O catastrophe) must be rejected even with 'healthy' weight signs.
+    m.gate_report_ = {"n": 400, "accuracy": 0.305, "baseline": 0.560,
+                      "false_easy_on_hard": 0.868, "classes": 2,
+                      "weights_sha": m.weights_fingerprint()}
+    assert not m.looks_sane()
+
+    # Evidence that PASSES deploys — even with the 'inverted' weight signs
+    # the old gate would have blocked on.
+    for n in m._MONOTONE_HARD_FEATURES:
+        m.weights_[m.feature_names_.index(n)] = -0.5
+    m.gate_report_ = {"n": 400, "accuracy": 0.695, "baseline": 0.560,
+                      "false_easy_on_hard": 0.132, "classes": 2,
+                      "weights_sha": m.weights_fingerprint()}
+    assert m.looks_sane(), (
+        "a model that beats escalate-all on held-out data must deploy, "
+        "even when its weights contradict the old prior")
+
     # unfitted → not sane
     m.weights_ = None
     assert not m.looks_sane()
@@ -195,32 +225,41 @@ def test_fallback_chain_hint_renamed_no_collision():
 # ── §4O ROUND 2: fixes-of-the-fixes (2026-08-08) ─────────────────────
 
 def test_r2_inverted_model_rejected_at_source_no_install_no_save():
-    """R2 MAJOR-1: guarding only load + hot-swap left the BOOTSTRAP install
-    and the SAVE unguarded — a restart retrained an inverted model from the
-    frozen corpus, installed it ungated, and re-poisoned the checkpoint.
-    RouterTrainer.run now rejects an inverted model AT THE SOURCE: no
-    install (fit_succeeded=False → bootstrap returns None), no save."""
+    """R2 MAJOR-1 intent, re-pinned on §4AA (2026-08-09): a model that should
+    not deploy must be rejected AT THE SOURCE — no install, no save — so a
+    restart cannot retrain it, install it ungated and re-poison the checkpoint.
+
+    ⚠ THE OLD FIXTURE WAS ITSELF THE BUG. It built `tech → easy, chat → hard`
+    and asserted the trainer call that "INVERTED" — but that is EXACTLY the
+    pattern in the real corpus (jargon 4.1x more common in easy turns). The
+    old gate condemned the true signal. The fixture is now a model that is
+    genuinely useless: labels independent of the features, so it cannot beat
+    escalate-all on held-out data.
+    """
     import os
+    import random
     import tempfile
     from ghost_agent.router.trainer import bootstrap_router
     from ghost_agent.distill.schema import Trajectory, Outcome
 
+    rng = random.Random(11)
     trajs = []
-    for i in range(40):
-        trajs.append(Trajectory(task_kind="user_request",
-                                 user_request=f"CVE OAuth JWT TLS regex SQL {i}",
-                                 n_steps=1, outcome=Outcome.UNKNOWN.value,
-                                 tool_calls=[]))            # tech → easy
-        trajs.append(Trajectory(task_kind="user_request",
-                                 user_request=f"tell me a story {i}",
-                                 n_steps=6, outcome=Outcome.UNKNOWN.value,
-                                 tool_calls=[]))            # chat → hard
+    for i in range(400):
+        # label assigned by a coin flip, independent of the text → nothing
+        # to learn → cannot beat the escalate-all baseline
+        hard = rng.random() < 0.5
+        trajs.append(Trajectory(
+            task_kind="user_request",
+            user_request=f"CVE OAuth JWT TLS regex SQL {i}" if rng.random() < 0.5
+                         else f"tell me a story {i}",
+            n_steps=6 if hard else 1,
+            outcome=Outcome.UNKNOWN.value, tool_calls=[]))
     sp = tempfile.mktemp(suffix=".json")
     clf, report = bootstrap_router(iter(trajs), save_path=sp, min_samples=10)
-    assert clf is None                       # inverted → not installed
+    assert clf is None                       # rejected → not installed
     assert not report.fit_succeeded
-    assert "INVERTED" in (report.bail_reason or "")
-    assert not os.path.exists(sp)            # inverted → not persisted
+    assert "gate" in (report.bail_reason or "").lower()
+    assert not os.path.exists(sp)            # rejected → not persisted
 
 
 def test_r2_truncated_turn_skipped_in_calibration_via_param():
@@ -269,26 +308,35 @@ def test_r2_synthetic_user_injections_dont_collapse_step_count():
 # ── §4O ROUND 3: fixes-of-the-fixes-of-the-fixes (2026-08-08) ─────────
 
 def test_r3_gate_rejects_jargon_coding_inversion_despite_compensation():
-    """R3 MAJOR-1: a net-sum over all 4 features let a model strongly
-    inverted on jargon+coding PASS if acronym/numeric compensated. Gate on
-    the jargon+coding SUBTOTAL directly."""
+    """R3 MAJOR-1 is now STRUCTURALLY OBSOLETE, and that is the point.
+
+    The original defect: a net-sum over four features let a model strongly
+    inverted on jargon+coding PASS when acronym/numeric weights compensated.
+    §4AA removed the entire class of loophole — the gate no longer reads
+    weights at all, so no arrangement of them can buy a deploy. What it asks
+    instead is whether the model beats escalate-all on data it never saw.
+
+    Kept (rather than deleted) so the property is still pinned: weight
+    tinkering must never authorise a deploy.
+    """
     from ghost_agent.router.model import ComplexityClassifier
     import numpy as np
     m = ComplexityClassifier()
     m.weights_ = np.zeros(len(m.feature_names_))
     m.bias_ = 0.0
     idx = {n: i for i, n in enumerate(m.feature_names_)}
+    # the exact compensating arrangement that used to sneak through
     m.weights_[idx["technical_jargon_count_log1p"]] = -0.863
     m.weights_[idx["coding_language_mentions"]] = -1.425
-    m.weights_[idx["has_uppercase_acronym"]] = 1.654   # compensating
-    m.weights_[idx["has_numeric_density"]] = 1.289      # compensating
-    assert float(np.sum(m.weights_[[idx[n] for n in
-                 m._MONOTONE_HARD_FEATURES]])) > 0      # net is POSITIVE
-    assert not m.looks_sane()                           # still rejected
-    # a fine model whose ONLY negative is numeric noise still passes
-    m.weights_ = np.zeros(len(m.feature_names_))
-    m.weights_[idx["has_numeric_density"]] = -0.377
-    assert m.looks_sane()
+    m.weights_[idx["has_uppercase_acronym"]] = 1.654
+    m.weights_[idx["has_numeric_density"]] = 1.289
+    assert not m.looks_sane(), "weights alone must never authorise a deploy"
+
+    # and the converse: no weight arrangement whatsoever passes without
+    # held-out evidence bound to those very weights
+    for scale in (-1.0, 0.0, 0.5, 2.0):
+        m.weights_ = np.full(len(m.feature_names_), scale)
+        assert not m.looks_sane()
 
 
 def test_r3_step_count_uses_real_request_boundary():

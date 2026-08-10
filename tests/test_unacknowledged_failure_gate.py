@@ -28,6 +28,7 @@ import pytest
 
 from ghost_agent.distill.outcome_heuristics import (
     STRUCTURAL_FAILURE_REASON,
+    is_structural_reason,
     resolve_turn_outcome,
     response_acknowledges_failure,
     tool_failure_flags,
@@ -297,7 +298,9 @@ class TestSyncFinalizePath:
             verifier="passed", execution_failed=True,
         )
         assert col.appended[0].outcome == F
-        assert col.appended[0].failure_reason == STRUCTURAL_FAILURE_REASON
+        # cause-qualified since 2026-08-10 — assert the contract, not the
+        # bare string (`is_structural_reason` is what production matches on)
+        assert is_structural_reason(col.appended[0].failure_reason)
 
     def test_honest_failure_report_still_passes(self):
         agent, col = _agent()
@@ -354,8 +357,10 @@ class TestStreamedFinalizePath:
             names=["file_system", "execute", "file_system"],
             request=_LIVE_REQUEST)
         traj = col.appended[0]
-        assert (traj.outcome, traj.failure_reason) == (
-            F, STRUCTURAL_FAILURE_REASON)
+        # The reason is now CAUSE-QUALIFIED ("structural failure: <tool>: …"),
+        # so match the CONTRACT rather than the bare string — that is the
+        # whole point of `is_structural_reason`.
+        assert traj.outcome == F and is_structural_reason(traj.failure_reason)
         agent.context._recent_trajectories_for_correction = {"k": traj}
         _backfill(agent, "f78c8b33", P)
         assert traj.outcome == F, "the late CONFIRMED laundered a fabrication"

@@ -1481,9 +1481,9 @@ async def lifespan(app):
                 if clf is not None and not clf.looks_sane():
                     pretty_log(
                         "Complexity Router",
-                        f"Checkpoint at {router_ckpt_path} is INVERTED "
-                        "(negative technical/coding weights) — rejecting; "
-                        "escalate-all + retraining from trajectories",
+                        f"Checkpoint at {router_ckpt_path} REJECTED by the "
+                        "held-out gate (no/failing evidence that it beats "
+                        "escalate-all) — retraining from trajectories",
                         level="WARNING", icon=Icons.WARN,
                     )
                     clf = None
@@ -1525,6 +1525,11 @@ async def lifespan(app):
                 boot_clf, boot_report = bootstrap_router(
                     traj_collector.iter_trajectories(),
                     save_path=router_ckpt_path,
+                    # §4AA: gate on the operating point THIS process will
+                    # deploy — the flag the dispatcher below is built with,
+                    # not a constant that drifts from it.
+                    confidence_threshold=float(
+                        args.router_confidence_threshold),
                 )
                 if boot_clf is not None:
                     clf = boot_clf

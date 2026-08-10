@@ -133,6 +133,30 @@ class ResponseCache:
         self.strict_misses: List[Dict[str, Any]] = []
         self._hit_mtimes: List[float] = []
         if self.path and mode != "off":
+            # ⚠ A REPLAY MODE MUST NOT CREATE ITS OWN CACHE (2026-08-10).
+            #
+            # `mkdir(exist_ok=True)` used to run for every non-off mode, so
+            # pointing read/strict at a path that does not exist produced a
+            # brand-new EMPTY cache and then missed on every lookup. That is
+            # indistinguishable from a cache the code digest legitimately
+            # invalidated: both report "0 hits". It cost an hour and a
+            # published wrong conclusion ("the cache is stale, a full live
+            # re-bench is unavoidable") — the run was reading an empty
+            # directory created by this line, while the real 2389-entry
+            # cache sat untouched. See scripts/verify_bench.py --cache-dir.
+            #
+            # MISSING and EMPTY are different failures and must stay
+            # distinguishable: missing = you pointed somewhere wrong (fatal
+            # for a replay); empty = nothing recorded yet (legitimate, and
+            # what `write` mode is for).
+            if mode in ("read", "strict") and not self.path.exists():
+                raise FileNotFoundError(
+                    f"cache directory does not exist: {self.path.resolve()}\n"
+                    f"  --cache-mode {mode} REPLAYS a cache; it will not "
+                    f"create one, because an empty cache misses on every\n"
+                    f"  lookup and that is indistinguishable from a stale "
+                    f"one. Check the path, or seed a new cache with\n"
+                    f"  --cache-mode write.")
             self.path.mkdir(parents=True, exist_ok=True)
 
     # PER-PROCESS NONCES THAT CARRY NO MEANING FOR THE JUDGE.
@@ -194,19 +218,6 @@ class ResponseCache:
         if self.mode in ("off", "write") or not self.path:
             return None
         f = self._file(key)
-        if f.exists():
-            # AGE OF THE REPLAYED EVIDENCE. "MIXED live/replayed" alone
-            # conflates two very different runs: one INTERRUPTED AND RESUMED
-            # minutes later (the cached half is as current as the live half,
-            # and the blend is a fine absolute measurement) and one padded
-            # out of a week-old cache (where the replayed half describes a
-            # judge that may since have moved). Without the timestamps a
-            # reader cannot tell those apart, so the label would be the
-            # honest-looking kind of wrong.
-            try:
-                self._hit_mtimes.append(f.stat().st_mtime)
-            except OSError:
-                pass
         if not f.exists():
             self.misses += 1
             if self.mode == "strict":
@@ -223,6 +234,15 @@ class ResponseCache:
         except Exception:  # noqa: BLE001 — a corrupt entry must not kill a run
             self.misses += 1
             return None
+        # ⚠ Recorded HERE, at a real hit — not at f.exists(). A corrupt
+        # entry exists on disk but is counted a MISS above, and an earlier
+        # version appended its mtime anyway, so `replay_age_s` could
+        # describe evidence the run never actually used and
+        # len(_hit_mtimes) could exceed `hits`.
+        try:
+            self._hit_mtimes.append(f.stat().st_mtime)
+        except OSError:
+            pass
         self.hits += 1
         return data.get("response")
 
@@ -242,6 +262,22 @@ class ResponseCache:
         os.replace(tmp, f)        # atomic: concurrent trials share this dir
         self.writes += 1
 
+    def entry_count(self) -> int:
+        """How many responses are actually ON DISK, right now.
+
+        The one number that makes a misdirected --cache-dir obvious BEFORE a
+        run burns an hour: "0 entries" next to a replay mode is the whole
+        bug, visible in a single line. Counting is cheap next to the run it
+        guards, and `.tmp` files are half-written puts, never entries.
+        """
+        if not self.path or not self.path.exists():
+            return 0
+        try:
+            return sum(1 for p in self.path.rglob("*")
+                       if p.is_file() and p.suffix != ".tmp")
+        except OSError:
+            return 0
+
     def stats(self) -> Dict[str, Any]:
         """⚠ A SNAPSHOT. Call it AFTER the run, never before.
 
@@ -256,6 +292,9 @@ class ResponseCache:
         return {
             "mode": self.mode,
             "path": str(self.path) if self.path else None,
+            # Recorded in PROVENANCE so a past run can be re-read and the
+            # "0 hits" question answered — empty cache, or stale cache?
+            "entries": self.entry_count(),
             "hits": self.hits, "misses": self.misses, "writes": self.writes,
             "hit_rate": round(self.hits / total, 4) if total else None,
             # A strict miss is swallowed upstream into a null verdict, so it

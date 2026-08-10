@@ -165,8 +165,23 @@ def _parse_args() -> argparse.Namespace:
                          "after a prompt edit only changed prompts cost). "
                          "strict: replay only, a miss is an error (PROVES "
                          "the delta is attributable to code, not the model)")
-    ap.add_argument("--cache-dir", default="verify_bench_cache",
-                    help="where cached judge responses live")
+    # ⚠ ANCHORED TO $GHOST_HOME, not to the CWD (2026-08-10).
+    #
+    # This was the relative string "verify_bench_cache". Run from the repo
+    # root — the normal way — it resolved to <repo>/verify_bench_cache, a
+    # directory that did not exist, which read/strict then silently CREATED
+    # and missed on forever, while the real 2389-entry cache sat untouched
+    # in $GHOST_HOME/system/eval. "0 hits" from an empty cache reads exactly
+    # like "0 hits" from an invalidated one. Same anchoring as the mined
+    # case pool below; the relative name survives only as a fallback for
+    # environments with no GHOST_HOME.
+    _cache_default = (
+        str(Path(os.environ["GHOST_HOME"]) / "system" / "eval"
+            / "verify_bench_cache")
+        if os.getenv("GHOST_HOME") else "verify_bench_cache")
+    ap.add_argument("--cache-dir", default=_cache_default,
+                    help="where cached judge responses live (default: "
+                         "$GHOST_HOME/system/eval/verify_bench_cache)")
     ap.add_argument("--progress-file", default="",
                     help="where to write live progress JSON (default: "
                          "<out>/progress.json). Read it with "
@@ -311,8 +326,19 @@ async def _amain() -> int:
     # it, escalation is structurally impossible and the report says so.
     cache = ResponseCache(args.cache_dir or None, args.cache_mode)
     if args.cache_mode != "off":
-        print(f"  response cache: mode={args.cache_mode} dir={args.cache_dir}")
+        # ⚠ RESOLVED ABSOLUTE PATH + ENTRY COUNT, not the basename. The old
+        # line printed "dir=verify_bench_cache", which is equally true of the
+        # right cache and of an empty one accidentally created in the CWD —
+        # the bug was on screen the whole time and unreadable.
+        _n = cache.entry_count()
+        _where = cache.path.resolve() if cache.path else "(none)"
+        print(f"  response cache: mode={args.cache_mode} dir={_where} "
+              f"({_n} entries)")
         if args.cache_mode in ("read", "strict"):
+            if _n == 0:
+                print("  ⚠⚠ CACHE IS EMPTY — every lookup will miss, and a "
+                      "replay against an empty cache measures NOTHING. "
+                      "Check --cache-dir.")
             print("  ⚠ a replayed report measures CODE against a FROZEN "
                   "judge — it is not 'the number today'")
     if args.main_base_url:
@@ -414,6 +440,13 @@ async def _amain() -> int:
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     md = render_report_md(report)
     (out_dir / "report.md").write_text(md, encoding="utf-8")
+
+    # ⚠ WITHOUT THIS every completed run read as STALLED forever: nothing
+    # ever recorded a terminal state, so `read_progress` aged the last tick
+    # into "the run may be wedged". Found by fresh-eyes audit, not by a test.
+    _p = _prog_holder.get("p")
+    if _p is not None:
+        _p.finish(f"results in {out_dir}")
 
     print()
     print(md)

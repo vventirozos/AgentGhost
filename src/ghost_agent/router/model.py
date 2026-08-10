@@ -68,8 +68,27 @@ class ComplexityClassifier:
         *,
         learning_rate: float = 0.1,
         l2: float = 1e-3,
-        epochs: int = 300,
-        tol: float = 1e-5,
+        # ⚠ RAISED FROM 300/1e-5 (audit 2026-08-10). At 300 epochs the fit
+        # reported `converged: False`, and an under-converged logistic
+        # regression has weights too small in magnitude, which COMPRESSES its
+        # sigmoid outputs. Measured on 800 live requests: max confidence
+        # **0.710**, so the planner-skip gate at 0.75 was UNREACHABLE and the
+        # router's only live consumer could never fire — it trained, gated and
+        # deployed correctly every idle cycle while changing nothing.
+        #
+        # 20000/1e-6 converges. Measured against the 300-epoch incumbent on the
+        # SAME held-out split (n=409):
+        #   accuracy      0.687 -> 0.704   (paired McNemar p=0.52 — a WASH)
+        #   false-easy    0.0386 -> 0.0558 (gate max 0.25, so 22% of budget)
+        #   max confidence 0.710 -> 0.912  (0 -> 123 of 800 usable skips)
+        #   fit cost      19ms -> 95ms     (irrelevant on an idle retrain)
+        #
+        # THE POINT IS NOT ACCURACY — that did not move. It is that the model
+        # is now CALIBRATED enough for its consumer to act on. 100k epochs
+        # scored marginally higher accuracy but WORSE false-easy (0.0687) and
+        # fewer usable skips, so it was rejected.
+        epochs: int = 20000,
+        tol: float = 1e-6,
         random_state: int = 0,
     ):
         self.learning_rate = float(learning_rate)
@@ -246,31 +265,182 @@ class ComplexityClassifier:
     _INVERSION_CORE_MARGIN = -0.5
     _INVERSION_NET_MARGIN = -1.0
 
+    #: Held-out gate thresholds (§4AA, 2026-08-09). Asymmetric BY DESIGN:
+    #: predicting "easy" for a genuinely hard request SKIPS THE PLANNER on
+    #: a hard task (harmful); predicting "hard" for an easy one only wastes
+    #: compute. So accuracy alone is not enough — the false-easy rate on
+    #: hard requests carries its own ceiling.
+    _GATE_MIN_HELDOUT = 60          # below this a "score" is noise
+    _GATE_MAX_FALSE_EASY = 0.25     # measured: good 0.132, sign-flipped 0.868
+
+    def weights_fingerprint(self) -> str:
+        """Hash of the exact weights+bias the evidence was measured on.
+
+        ⚠ Without this the gate is FORGEABLE (found by mutation-testing the
+        gate itself, 2026-08-09): `looks_sane()` reads a stored report, so a
+        checkpoint carrying real weights beside a passing report — a
+        hand-edited file, a partial write, a mutated in-memory copy — would
+        be waved through. The OLD prior-based gate could not be fooled that
+        way because it inspected the weights directly. Binding the evidence
+        to a fingerprint restores that property: change the weights and the
+        evidence stops applying.
+        """
+        import hashlib
+        if self.weights_ is None:
+            return ""
+        blob = ",".join(f"{float(w):.10g}" for w in self.weights_)
+        blob += f"|{float(self.bias_):.10g}"
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _deploy_confidence_threshold() -> float:
+        """The threshold the LIVE dispatcher escalates below.
+
+        ⚠ Read from `ComplexityDispatcher`, never copied. It is also a CLI
+        flag (`--router-confidence-threshold`), so the operator can move it;
+        a hardcoded copy here would silently score an operating point the
+        router does not run — the same two-copies-drift defect fixed in the
+        bench pool earlier today. Callers that KNOW the live value pass it
+        explicitly; this is only the fallback.
+
+        ⚠ AUDIT 2026-08-10 — THE FALLBACK USED TO COINCIDE WITH THE TRUTH.
+        It returned a bare 0.3, which is ALSO the dispatcher's default and
+        ALSO the live value, so a broken read produced the RIGHT answer and
+        was undetectable — right up until the operator moved
+        `--router-confidence-threshold`, at which point the gate would
+        silently score an operating point the router does not run. "Could a
+        disconnected instrument produce this same output?" was yes.
+
+        The numeric fallback is unchanged (a plausible threshold beats a
+        wrong one), but `_deploy_threshold_probe` now reports WHICH path was
+        taken, and `evaluate()` records it in the gate evidence so the
+        coincidence can never hide again.
+        """
+        return ComplexityClassifier._deploy_threshold_probe()[0]
+
+    @staticmethod
+    def _deploy_threshold_probe() -> tuple:
+        """(threshold, source) where source is 'dispatcher' or 'fallback'."""
+        try:
+            from .dispatch import ComplexityDispatcher
+            import inspect
+            v = float(inspect.signature(ComplexityDispatcher.__init__)
+                      .parameters["confidence_threshold"].default)
+            return v, "dispatcher"
+        except Exception:
+            return 0.3, "fallback"
+
+    def evaluate(self, X, y, *, confidence_threshold: float | None = None) -> dict:
+        """Score this model on held-out data. Returns the gate's evidence.
+
+        `accuracy` is compared against `baseline` = always-predict-hard,
+        which is exactly what the router does when it is escalate-all —
+        so "beats baseline" literally means "better than doing nothing".
+
+        ⚠ SCORES THE DEPLOYED DECISION, not the raw label (fresh-eye review,
+        2026-08-09). `ComplexityDispatcher` escalates when confidence < 0.3
+        WHATEVER the label says, so a low-confidence "easy" never actually
+        skips the planner in production. A first version of this method read
+        the bare label and therefore measured an operating point the router
+        does not ship — overstating false-easy, i.e. gating on a system that
+        does not exist. Simulating the escalation here is what makes "beats
+        escalate-all" a statement about the deployed router.
+        """
+        thr = (self._deploy_confidence_threshold()
+               if confidence_threshold is None else float(confidence_threshold))
+        n = len(y)
+        if n == 0:
+            return {"n": 0, "accuracy": 0.0, "baseline": 0.0,
+                    "false_easy_on_hard": 1.0, "classes": 0}
+        hard = [i for i, lab in enumerate(y) if lab == "hard"]
+        ok = fe = 0
+        for i, lab in enumerate(y):
+            pred, conf = self.predict(X[i])
+            if conf < thr:
+                pred = "hard"       # the dispatcher escalates — safe path
+            ok += (pred == lab)
+            if lab == "hard" and pred == "easy":
+                fe += 1
+        return {
+            "n": n,
+            "accuracy": ok / n,
+            "baseline": len(hard) / n,
+            "false_easy_on_hard": (fe / len(hard)) if hard else 0.0,
+            "classes": len({lab for lab in y}),
+            # Binds this evidence to the weights it was measured on.
+            "weights_sha": self.weights_fingerprint(),
+            "confidence_threshold": thr,
+            # ⚠ WHERE the threshold came from. "fallback" means the read of
+            # ComplexityDispatcher FAILED and this evidence describes an
+            # operating point that may not be the live one. Recorded because
+            # the fallback value (0.3) currently equals the truth, so the
+            # failure is otherwise invisible — and a gate that scores the
+            # wrong operating point is the §4AA defect all over again.
+            "confidence_threshold_source": (
+                "caller" if confidence_threshold is not None
+                else self._deploy_threshold_probe()[1]),
+        }
+
+    @classmethod
+    def gate_verdict(cls, ev: dict) -> tuple:
+        """(passed, reason) for a held-out evidence dict. FAIL-CLOSED."""
+        if not ev:
+            return False, "no held-out evidence recorded"
+        if int(ev.get("n", 0)) < cls._GATE_MIN_HELDOUT:
+            return False, f"held-out n={ev.get('n')} < {cls._GATE_MIN_HELDOUT}"
+        if int(ev.get("classes", 0)) < 2:
+            return False, "held-out split has only one class"
+        if ev["accuracy"] <= ev["baseline"]:
+            return False, (f"accuracy {ev['accuracy']:.3f} does not beat "
+                           f"escalate-all {ev['baseline']:.3f}")
+        if ev["false_easy_on_hard"] > cls._GATE_MAX_FALSE_EASY:
+            return False, (f"skips the planner on "
+                           f"{ev['false_easy_on_hard']:.1%} of hard requests "
+                           f"(max {cls._GATE_MAX_FALSE_EASY:.0%})")
+        return True, (f"acc {ev['accuracy']:.3f} > escalate-all "
+                      f"{ev['baseline']:.3f}, false-easy "
+                      f"{ev['false_easy_on_hard']:.1%} (n={ev['n']})")
+
     def looks_sane(self) -> bool:
-        """True iff the fitted model is finite AND not CLEARLY INVERTED.
-        §4O C-MAJOR-1 fail-closed gate: reject a model whose CORE technical/
-        coding features (more jargon/coding ⇒ harder) carry a strongly
-        negative weight — deploying it skips the planner on the hardest
-        requests. Gated on the jargon+coding subtotal (§4O R3 MAJOR-1: a
-        net-sum over all four features could be rescued by compensating
-        acronym/numeric weight) AND a looser overall-net floor. A rejected
-        model leaves the router escalate-all (planner runs), the safe
-        default — it also neutralises the currently-deployed inverted
-        checkpoint until a correct model trains."""
+        """True iff finite AND its HELD-OUT evidence clears the gate.
+
+        ⚠ REPLACES A PRIOR-BASED TEST THAT WAS ANTI-CORRELATED WITH QUALITY
+        (§4AA, 2026-08-09). The previous gate rejected a model whose
+        technical/coding weights were negative, encoding the prior "more
+        jargon ⇒ harder". Measured on 1354 labelled trajectories (92% real
+        user_request turns; self-play contamination ruled out), THIS
+        agent's traffic says the opposite — jargon is 4.1x and coding
+        mentions 6.8x MORE common in EASY turns, and even LENGTH inverts
+        (longer ⇒ easier). Vagueness, not technicality, predicts work here.
+        No labelling bug makes longer requests easier; the signal is real.
+
+        Consequences of the old gate, both measured on a 70/30 split
+        (seed 7, n=407 held out):
+          * the FITTED model — accuracy 0.695 vs escalate-all 0.560,
+            skipping the planner on 13.2% of hard requests — was REJECTED,
+            so the router sat escalate-all permanently (~29h and counting,
+            and forever, since every fit reproduces the same signs);
+          * a SIGN-FLIPPED model — accuracy 0.305, skipping the planner on
+            86.8% of hard requests, i.e. exactly the §4O catastrophe the
+            gate exists to prevent — was ACCEPTED.
+        A gate that rejects the good model and admits the catastrophic one
+        is worse than no gate, because it is trusted.
+
+        The replacement asks the only question that matters: on data the
+        model did NOT train on, does it beat doing nothing, without
+        skipping the planner too often? FAIL-CLOSED — a model carrying no
+        held-out evidence (a legacy checkpoint, a hand-built model) is
+        rejected, and rejection leaves the router escalate-all, which is
+        the safe default and today's behaviour.
+        """
         if not self.is_finite():
             return False
-        try:
-            idx = {n: i for i, n in enumerate(self.feature_names_)}
-            core = [idx[n] for n in self._CORE_HARD_FEATURES if n in idx]
-            allf = [idx[n] for n in self._MONOTONE_HARD_FEATURES if n in idx]
-            if not core or not allf:
-                return True  # can't judge → don't block
-            core_net = float(np.sum(self.weights_[core]))
-            net = float(np.sum(self.weights_[allf]))
-            return (core_net >= self._INVERSION_CORE_MARGIN
-                    and net >= self._INVERSION_NET_MARGIN)
-        except Exception:
-            return True  # never block on a guard error
+        ev = getattr(self, "gate_report_", None) or {}
+        # The evidence must describe THESE weights, not some earlier ones.
+        if ev.get("weights_sha") != self.weights_fingerprint():
+            return False
+        passed, _ = self.gate_verdict(ev)
+        return passed
 
     def clone(self) -> "ComplexityClassifier":
         """Copy with the same hyperparameters and weights — used by a
@@ -391,6 +561,10 @@ class ComplexityClassifier:
                 "random_state": self.random_state,
             },
             "report": self.report_.__dict__ if self.report_ else None,
+            # §4AA: the gate's EVIDENCE travels with the model. A checkpoint
+            # that cannot say why it was accepted is rejected on load —
+            # fail-closed, so a legacy or hand-built file cannot slip past.
+            "gate_report": getattr(self, "gate_report_", None),
         }
         tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(p)
@@ -410,6 +584,10 @@ class ComplexityClassifier:
             tol=float(hp.get("tol", 1e-5)),
             random_state=int(hp.get("random_state", 0)),
         )
+        # §4AA: the held-out evidence that justified deploying this model.
+        # Absent on a legacy checkpoint → `looks_sane()` fails closed and the
+        # router stays escalate-all until a gated model trains.
+        clf.gate_report_ = raw.get("gate_report") or None
         try:
             clf.weights_ = np.array(raw["weights"], dtype=float)
             clf.bias_ = float(raw["bias"])

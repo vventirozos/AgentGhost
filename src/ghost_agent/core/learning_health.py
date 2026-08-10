@@ -155,6 +155,35 @@ def _load_jsonl(path: Path, limit: Optional[int] = None) -> List[dict]:
     return list(buf)
 
 
+# Lessons CREATED before this date accumulated their retrieval counters
+# during the double-booking era, so their hit-rate denominator is inflated and
+# cannot be un-mixed retroactively — the counters are cumulative with no
+# per-period breakdown. Lessons created AFTER it accumulated entirely in the
+# clean era, which gives an honest denominator without discarding anything.
+#
+# ⚠ AUDIT 2026-08-10. The report printed the contaminated mean with a
+# "do not trend across that date" caveat — a number the reader was told not to
+# use, next to no number they could. Measured: contaminated 0.620 vs CLEAN
+# 0.557 over 13 lessons / 600 retrievals. The caveat was hiding a 0.06
+# OVERSTATEMENT that was computable all along.
+_LESSON_CLEAN_EPOCH = "2026-08-01"
+
+
+def _lesson_created_ts(lesson: dict):
+    """Creation time as epoch seconds, or None when unparseable."""
+    v = lesson.get("timestamp")
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) or None
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(
+            str(v).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _lesson_hit_rate(lesson: dict) -> float:
     # Laplace-smoothed hit rate, matching skills.compute_lesson_utility's
     # (helpful+1)/(retrievals+2) convention.
@@ -195,6 +224,14 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
                  if int(l.get("retrievals") or 0) >= stale_min_r
                  and _lesson_hit_rate(l) < stale_hr]
         hrs = [_lesson_hit_rate(l) for l in pb if int(l.get("retrievals") or 0) > 0]
+        # CLEAN denominator: lessons created after the double-booking era, so
+        # every retrieval they counted was counted once. See _LESSON_CLEAN_EPOCH.
+        import datetime as _dt
+        _cut = _dt.datetime.fromisoformat(_LESSON_CLEAN_EPOCH).timestamp()
+        _clean = [l for l in pb
+                  if int(l.get("retrievals") or 0) > 0
+                  and (_lesson_created_ts(l) or 0) >= _cut]
+        _clean_hrs = [_lesson_hit_rate(l) for l in _clean]
         report["lessons"] = {
             "total": len(pb),
             "graduated": sum(1 for l in pb if l.get("graduated")),
@@ -210,6 +247,14 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "present_on_both": n_mixed,
             "stale_prune_candidates": len(stale),
             "mean_hit_rate": round(sum(hrs) / len(hrs), 3) if hrs else None,
+            # The honest headline. `mean_hit_rate` above spans the
+            # double-booking era and OVERSTATES (measured 0.620 vs 0.557).
+            "mean_hit_rate_clean": (round(sum(_clean_hrs) / len(_clean_hrs), 3)
+                                    if _clean_hrs else None),
+            "clean_lessons": len(_clean_hrs),
+            "clean_epoch": _LESSON_CLEAN_EPOCH,
+            "clean_retrievals": sum(int(l.get("retrievals") or 0)
+                                    for l in _clean),
             # Raw outcome-tick totals (2026-07-27): the honest FAILURE-arm
             # liveness test. At the live ~96% turn pass rate a retrieved
             # lesson almost surely accrues ≥1 success, so the fail-ONLY
@@ -324,6 +369,13 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "epoch": params.get("epoch"),
             "n_fitted": params.get("n_samples"),
             "brier": params.get("brier"),
+            # Honest, out-of-sample counterparts (audit 2026-08-10). The
+            # renderer scores the WIN/LOSS verdict on `brier_cv` and shows
+            # `brier` explicitly labelled as in-sample.
+            "brier_cv": params.get("brier_cv"),
+            "n_negative": params.get("n_negative"),
+            "n_samples": params.get("n_samples"),
+            "feature_contrib": params.get("feature_contrib"),
             "w_entropy": params.get("w_entropy"),
             "w_competence": params.get("w_competence"),
             "threshold": params.get("threshold"),
@@ -371,6 +423,9 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
 
     # -- Background firing (dream / skills_auto / etc.) --------------------
     report["activity"] = _activity_counts(md.parent / "autonomous_activity.jsonl")
+    # Registry-driven, so a mechanism that never wrote is a ROW, not a silence.
+    report["liveness"] = activity_liveness(
+        md.parent / "autonomous_activity.jsonl")
 
     # -- Cognitive-subsystem wiring ---------------------------------------
     # Observability for the "wire-or-retire" question (improvement #5): which
@@ -888,7 +943,7 @@ def _activity_counts(ledger_path: Path, *, window_hours: float = 168.0) -> Dict[
     """
     counts: Dict[str, int] = {}
     cutoff = time.time() - max(0.0, float(window_hours)) * 3600.0
-    for rec in _load_jsonl(ledger_path, limit=2000):
+    for rec in _load_jsonl(ledger_path, limit=_ACTIVITY_READ_LIMIT):
         try:
             ts = float(rec.get("ts") or 0)
         except (TypeError, ValueError):
@@ -900,6 +955,93 @@ def _activity_counts(ledger_path: Path, *, window_hours: float = 168.0) -> Dict[
         if kind:
             counts[kind] = counts.get(kind, 0) + 1
     return counts
+
+
+# The ledger is append-only and already past 2600 records. A tail-read cap of
+# 2000 does not bite at today's ~565 records/week, but it is a SILENT cap: the
+# day it bites, phases quietly lose counts and the report keeps its confident
+# tone. Raised, and `activity_liveness` reports when the cap was actually hit.
+_ACTIVITY_READ_LIMIT = 20000
+
+
+def activity_liveness(ledger_path: Path,
+                      *, alarm_window_hours: float = 24.0,
+                      context_window_hours: float = 168.0) -> Dict[str, Any]:
+    """Did every registered background mechanism actually fire?
+
+    ⚠ WHY THIS IS NOT `_activity_counts`. That function enumerates phases
+    OBSERVATIONALLY — it can only report slugs that are already in the ledger.
+    A mechanism that stopped writing, or never wrote, produces no key and is
+    therefore invisible, which is indistinguishable from a mechanism that does
+    not exist. Measured 2026-08-10: 15 phases instrumented in source, 7 in the
+    ledger, and the report rendered seven green rows with no hint of the
+    other eight. This function iterates the REGISTRY instead, so absence is a
+    row rather than a silence.
+
+    Two windows on purpose. The alarm fires on 24h, but a phase that last ran
+    three days ago reads very differently from one dark for a week, and
+    collapsing that to a single boolean throws away the only evidence that
+    distinguishes "slow" from "dead".
+    """
+    from .autonomous_activity import (
+        EXPECT_PERIODIC, PHASE_EXPECTATION, phase_expectation,
+    )
+
+    # ⚠ MISSING LEDGER != IDLE AGENT (caught in fresh-eye review, 2026-08-10).
+    #
+    # Without this the two render IDENTICALLY: every registered phase at zero,
+    # `agent_silent` true, no alarms — the same screen for "the agent was
+    # quiet" and "this function is pointed at a path that does not exist".
+    #
+    # It is the SAME defect this file's sibling fix removed from the response
+    # cache hours earlier (an empty cache dir reading exactly like a stale
+    # one), reproduced in the code written to detect defects of that shape.
+    # Absence of the instrument is a louder fact than absence of activity, and
+    # it must never be inferable only by noticing that everything is zero.
+    ledger_missing = not Path(ledger_path).exists()
+
+    recent = _activity_counts(ledger_path, window_hours=alarm_window_hours)
+    context = _activity_counts(ledger_path, window_hours=context_window_hours)
+    n_read = len(_load_jsonl(ledger_path, limit=_ACTIVITY_READ_LIMIT))
+
+    # ⚠ AGENT-DOWN GUARD. If NOTHING fired, the agent was off or idle — that
+    # is ONE fact, not five independent dead loops. Emitting five alarms for
+    # a stopped agent is how an operator learns to scroll past this section,
+    # which would rebuild by hand exactly the blindness it exists to remove.
+    silent_everywhere = sum(recent.values()) == 0
+
+    rows = []
+    for phase in sorted(set(PHASE_EXPECTATION) | set(context) | set(recent)):
+        exp = phase_expectation(phase)
+        n24, n168 = recent.get(phase, 0), context.get(phase, 0)
+        rows.append({
+            "phase": phase,
+            "n_alarm_window": n24,
+            "n_context_window": n168,
+            "expectation": exp,
+            # Only PERIODIC can alarm: the others are at zero by design, and
+            # a monitor that cries on a benign zero gets ignored on a real one.
+            "alarm": bool(exp == EXPECT_PERIODIC and n24 == 0
+                          and not silent_everywhere),
+            "registered": phase in PHASE_EXPECTATION,
+        })
+    # Zeros FIRST. The old renderer sorted by count descending and cut to the
+    # top 8, so the dead loop — the one thing worth looking at — was
+    # structurally the first row dropped.
+    rows.sort(key=lambda r: (not r["alarm"], r["n_alarm_window"], r["phase"]))
+    return {
+        "rows": rows,
+        "alarms": [r["phase"] for r in rows if r["alarm"]],
+        "agent_silent": silent_everywhere,
+        # Distinct from `agent_silent`: no instrument, vs an instrument
+        # reporting nothing. The renderer must never merge these.
+        "ledger_missing": ledger_missing,
+        "ledger_path": str(ledger_path),
+        "alarm_window_hours": alarm_window_hours,
+        "context_window_hours": context_window_hours,
+        # Loud rather than silent if the tail-read ever truncates the window.
+        "read_truncated": n_read >= _ACTIVITY_READ_LIMIT,
+    }
 
 
 def render_learning_health(memory_dir) -> str:
@@ -935,11 +1077,26 @@ def render_learning_health(memory_dir) -> str:
             f"[pass-only {les['present_on_pass_only']}, "
             f"fail-only {les['present_on_failure_only']}, "
             f"both {les['present_on_both']}]")
+        # ⚠ The CLEAN figure leads. The all-lessons mean spans the
+        # double-booking era and overstates; printing it with a "do not trend"
+        # caveat gave the reader a number they were told not to use and no
+        # number they could — while the clean one was computable all along.
+        _chr, _cn = les.get("mean_hit_rate_clean"), les.get("clean_lessons")
+        if _chr is not None and _cn:
+            lines.append(
+                f"  mean hit-rate: {_chr} (CLEAN — {_cn} lessons created after "
+                f"{les.get('clean_epoch')}, {les.get('clean_retrievals')} "
+                f"retrievals, denominator counted once)")
+            lines.append(
+                f"    all-lessons {les['mean_hit_rate']} spans the "
+                f"double-booking era and OVERSTATES — not comparable")
+        else:
+            lines.append(
+                f"  mean hit-rate: {les['mean_hit_rate']} ⚠ CONTAMINATED — no "
+                f"post-{les.get('clean_epoch')} lesson has retrievals yet, so "
+                f"no clean denominator exists")
         lines.append(
-            f"  mean hit-rate: {les['mean_hit_rate']} (denominator includes "
-            f"the pre-2026-08-01 double-booking era — do not trend across "
-            f"that date); stale/prune candidates: "
-            f"{les['stale_prune_candidates']}")
+            f"  stale/prune candidates: {les['stale_prune_candidates']}")
         _fail_ticks = int(les.get("failed_ticks_total") or 0)
         _succ_ticks = int(les.get("succeeded_ticks_total") or 0)
         lines.append(
@@ -1001,9 +1158,17 @@ def render_learning_health(memory_dir) -> str:
         # rows no fit ever read.
         _n_epoch = cal.get("samples_this_epoch", cal["samples_on_disk"])
         _n_other = cal.get("samples_other_epochs") or 0
+        # ⚠ The HEADLINE carries the cross-validated Brier, not the in-sample
+        # one (audit 2026-08-10). This is the line an operator actually reads;
+        # leading it with a number the fit scored on its own rows is where the
+        # optimism entered every downstream quote of it.
+        _cv_hdr = cal.get("brier_cv")
+        _hdr_brier = (f"Brier {_cv_hdr} (CV)"
+                      if isinstance(_cv_hdr, (int, float)) and _cv_hdr >= 0
+                      else f"Brier {cal['brier']} (in-sample)")
         lines.append(
             f"\nCALIBRATION: {_n_epoch} samples, "
-            f"Brier {cal['brier']}, threshold {cal['threshold']}"
+            f"{_hdr_brier}, threshold {cal['threshold']}"
             + (f" · {_n_other} older-epoch rows excluded from the fit"
                if _n_other else ""))
         lines.append(
@@ -1069,17 +1234,85 @@ def render_learning_health(memory_dir) -> str:
             # base rate (the honest outcome while no feature carries weight)
             # the two are identical, and calling that "LOSES TO" reads as a
             # regression that isn't there.
-            if cal["brier"] < _bb - 1e-6:
+            # ⚠ THE VERDICT IS SCORED ON THE CROSS-VALIDATED BRIER, not the
+            # in-sample one (audit 2026-08-10). `brier` is a 2-parameter Platt
+            # map scored on the rows it was fitted to; printing it beside
+            # `brier_base_rate` is a comparison only one side of which paid
+            # for its parameters. Both are shown, labelled, and the WIN/LOSS
+            # call is made on the honest number.
+            _cv = cal.get("brier_cv")
+            _honest = (_cv if isinstance(_cv, (int, float)) and _cv >= 0
+                       else None)
+            _score = _honest if _honest is not None else cal["brier"]
+            if _score < _bb - 1e-6:
                 _verdict = "beats"
-            elif cal["brier"] > _bb + 1e-6:
+            elif _score > _bb + 1e-6:
                 _verdict = "LOSES TO"
             else:
                 _verdict = "matches"
-            lines.append(
-                f"  Brier {cal['brier']} {_verdict} the base-rate predictor "
-                f"({_bb}); raw composite {_br}"
-                + ("" if cal.get("platt_a") not in (None, 1.0)
-                   else " · probability map not applied"))
+            if _honest is not None:
+                lines.append(
+                    f"  Brier {_honest} (5-fold CV, out-of-sample) {_verdict} "
+                    f"the base-rate predictor ({_bb})")
+                lines.append(
+                    f"    in-sample {cal['brier']} · raw composite {_br} "
+                    f"— in-sample is NOT performance, it is the fit scored on "
+                    f"its own rows")
+            else:
+                lines.append(
+                    f"  Brier {cal['brier']} (IN-SAMPLE — no CV recorded, "
+                    f"treat as optimistic) {_verdict} the base-rate predictor "
+                    f"({_bb}); raw composite {_br}")
+            # THE NUMBER EVERY OTHER VERDICT RESTS ON. Every feature verdict,
+            # weight and Brier comparison here is estimated from the negative
+            # class, and the live store carries 18 of them in 694 rows.
+            _nneg, _n = cal.get("n_negative"), cal.get("n_samples")
+            if isinstance(_nneg, int) and isinstance(_n, int) and _n:
+                _pct = _nneg / _n
+                _warn = ("  ⚠ UNDER-POWERED" if _nneg < 50 else "")
+                lines.append(
+                    f"  negative class: {_nneg}/{_n} ({_pct:.1%}){_warn}"
+                    + (" — every verdict on this screen is estimated from "
+                       f"those {_nneg} rows" if _warn else ""))
+            # ⚠⚠ WHO ACTS ON THIS (audit 2026-08-10). The threshold's ONLY
+            # consumer is metacog arbitration, and that call site is hard-
+            # gated by `_METACOG_ARBITER_ENABLED` in core/agent.py — a module
+            # constant, False, independent of every flag. Measured over 209
+            # metacog summaries in the live log: confidence computed 865
+            # times, `below_threshold` fired 118 times, arbitrations **0**.
+            #
+            # Stated HERE, beside the number, because a reader who sees
+            # "threshold 0.837" reasonably assumes something happens at 0.837.
+            # Nothing does. That is not an argument for deleting the stack —
+            # the samples are what a future consumer would learn from — but
+            # quoting its quality without this line overstates what it buys.
+            try:
+                from . import agent as _agent_mod
+                _arb_on = bool(getattr(_agent_mod,
+                                       "_METACOG_ARBITER_ENABLED", False))
+            except Exception:  # noqa: BLE001
+                _arb_on = None
+            if _arb_on is False:
+                lines.append(
+                    "  ⚠ CONSUMER DEAD: the only thing that reads this "
+                    "threshold is metacog arbitration, hard-disabled by "
+                    "_METACOG_ARBITER_ENABLED in core/agent.py.")
+                lines.append(
+                    "    the score is recorded and calibrated; NOTHING acts "
+                    "on it. Treat these numbers as a measurement, not as a "
+                    "behaviour.")
+            _fc = cal.get("feature_contrib") or {}
+            if _fc:
+                lines.append("  feature ABLATION (held-out Brier delta; "
+                             ">0 = dropping it hurts, i.e. it helps):")
+                for _k, _v in sorted(_fc.items(), key=lambda kv: -kv[1]):
+                    _m = ("helps" if _v > 1e-6
+                          else "no measurable contribution")
+                    lines.append(f"    {_k:<24} {_v:+.6f}  {_m}")
+                lines.append(
+                    "    ⚠ where ABLATION and the σ-gate disagree, believe the "
+                    "ablation: the gate is a difference-of-means test and at "
+                    "this negative count it cannot resolve what it judges")
         fh = cal.get("feature_health") or {}
         if fh:
             live = cal.get("live_features") or []
@@ -1114,9 +1347,70 @@ def render_learning_health(memory_dir) -> str:
             f"\nAUTO-SKILLS store: {au['graduated']} proven tool-sequences "
             f"(auto_skills.json — distinct from lesson graduation above)")
 
+    lv = r.get("liveness")
+    if lv and lv.get("rows"):
+        aw = int(lv["alarm_window_hours"])
+        cw = int(lv["context_window_hours"] / 24)
+        lines.append(f"\nMECHANISM LIVENESS (registry-driven — every "
+                     f"registered loop appears, firing or not):")
+        if lv.get("ledger_missing"):
+            # ⚠ Checked BEFORE agent_silent: a missing ledger is also silent,
+            # so reporting idleness first would describe the symptom and hide
+            # the cause. This whole table is derived from that file — if it is
+            # not there, every zero below means nothing at all.
+            lines.append(
+                f"  ⚠⚠ LEDGER NOT FOUND at {lv.get('ledger_path')} — the "
+                f"counts below are not evidence of anything. This is a "
+                f"MISSING INSTRUMENT, not an idle agent.")
+        elif lv.get("agent_silent"):
+            lines.append(
+                f"  ⚠ NO activity of ANY kind in {aw}h — the agent was off or "
+                f"fully idle. That is ONE fact, so per-loop alarms are "
+                f"withheld; they would all be this.")
+        if lv.get("read_truncated"):
+            lines.append("  ⚠ ledger tail-read hit its cap — counts below "
+                         "UNDERSTATE the window.")
+        for row in lv["rows"]:
+            mark = "  ✗ DEAD " if row["alarm"] else "    "
+            note = "" if row["registered"] else "  ← UNREGISTERED phase"
+            lines.append(
+                f"{mark}{row['phase']:<24} {row['n_alarm_window']:>4} /{aw}h "
+                f"{row['n_context_window']:>5} /{cw}d   "
+                f"{row['expectation']}{note}")
+        if lv.get("alarms"):
+            lines.append(
+                f"  ✗ {len(lv['alarms'])} PERIODIC loop(s) silent for {aw}h: "
+                + ", ".join(lv["alarms"]))
+        else:
+            lines.append("  all periodic loops fired within the alarm window")
+        # ⚠ Only PERIODIC alarms. on_output/on_demand/gated phases sit at zero
+        # by design, and a monitor that cries on a benign zero is one the
+        # operator learns to scroll past — rebuilding by hand the blindness
+        # this section exists to remove.
+
+    # ── SUBSYSTEM LIVENESS (probe-per-mechanism) ─────────────────────────
+    # The section above covers phases that write to autonomous_activity.jsonl.
+    # This one covers everything that does NOT — the gap that let metacog
+    # arbitration sit dead and invisible (0 firings against 118 opportunities)
+    # until it was found by grepping the log by hand.
+    try:
+        from .liveness import render as _liveness_render
+        # ⚠ GHOST_HOME, not its `system/` child. `memory_dir` is
+        # $GHOST_HOME/system/memory, so the home is TWO levels up — the probes
+        # resolve "system/foresight/..." relative to it. Passing `.parent`
+        # made all 8 probes report NO_SOURCE. That the view said NO_SOURCE
+        # rather than quietly reporting zeros is the third state earning its
+        # keep on its first real outing.
+        lines.append("\n" + _liveness_render(Path(memory_dir).parent.parent))
+    except Exception as e:  # noqa: BLE001 — telemetry must never break a report
+        lines.append(f"\nSUBSYSTEM LIVENESS: unavailable ({type(e).__name__})")
+
     act = r.get("activity")
     if act:
-        top = sorted(act.items(), key=lambda kv: -kv[1])[:8]
+        # NO top-N CUT. It used to sort by count descending and slice [:8], so
+        # a phase at zero — the only kind worth acting on — sorted last and was
+        # structurally the first row dropped.
+        top = sorted(act.items(), key=lambda kv: -kv[1])
         lines.append("\nBACKGROUND ACTIVITY (recent ledger): "
                      + ", ".join(f"{k}={v}" for k, v in top))
         # These counts are NOT comparable across phases, and reading them as

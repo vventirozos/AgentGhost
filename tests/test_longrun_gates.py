@@ -276,3 +276,77 @@ def test_a_derived_denominator_cannot_satisfy_BOUNDED():
              "--measured-rate", "1", "--rate-source", "t")
     assert "[BLOCK] BOUNDED" in r.stdout
     assert "PRINTS" in r.stdout and "35 instead of 58" in r.stdout
+
+
+# ── defects found by the 2026-08-09 fresh-eyes audit ────────────────────────
+
+def test_a_run_that_finishes_inside_one_throttle_window_still_records_it(tmp_path):
+    """THE DEFECT: the write throttle (2s) meant a run FINISHING faster than
+    one interval recorded only its first item. A completed 433-trial replay
+    (3.5s) left `done: 1`, which read_progress then aged into
+    "STALLED — the run may be wedged". A status tool reporting a confident
+    FALSE state is exactly what this module exists to prevent."""
+    f = tmp_path / "p.json"
+    p = RunProgress(f, total=5, min_interval_s=999.0)   # throttle everything
+    for _ in range(5):
+        p.tick()                                        # no force=True
+    b = read_progress(f)
+    assert b["done"] == 5 and b["pct"] == 100.0, (
+        f"completion was throttled away: {b['done']}/5")
+
+
+def test_the_throttle_still_suppresses_mid_run_writes(tmp_path):
+    """The fix must not disable the throttle it overrides only at the end."""
+    f = tmp_path / "p.json"
+    p = RunProgress(f, total=100, min_interval_s=999.0)
+    for _ in range(4):
+        p.tick()
+    assert read_progress(f)["done"] == 1, "throttle no longer suppresses"
+
+
+def test_unknown_total_cannot_trigger_the_completion_override(tmp_path):
+    """`at_end` needs a real total; with none, the throttle governs."""
+    f = tmp_path / "p.json"
+    p = RunProgress(f, total=None, min_interval_s=999.0)
+    for _ in range(4):
+        p.tick()
+    assert read_progress(f)["done"] == 1
+
+
+def test_a_finished_run_never_reads_as_stalled(tmp_path):
+    """THE SECOND HALF: nothing called finish(), so every completed run aged
+    into STALLED. `finished` must win over age, permanently."""
+    import os
+    f = tmp_path / "p.json"
+    p = RunProgress(f, total=3)
+    p.tick(force=True)
+    p.finish("done")
+    old = time.time() - 86400
+    os.utime(f, (old, old))
+    b = read_progress(f)
+    assert b["status"] == "finished", (
+        "a completed run reads as STALLED once its file ages")
+    assert _status(f).returncode == 0
+
+
+def test_the_bench_actually_CALLS_finish():
+    """⚠ Structural, and it earned its place: `test_a_finished_run_never_
+    reads_as_stalled` covers the RunProgress API, so unwiring finish() from
+    the CLI broke NOTHING. The mechanism was correct and its caller was
+    unverified — the same silent-inoperative shape as the §4X fingerprint
+    blind spot. Caught by revert-testing, third weak pin of the session.
+    """
+    src = (REPO / "scripts" / "verify_bench.py").read_text()
+    assert ".finish(" in src, (
+        "verify_bench.py no longer calls RunProgress.finish() — every "
+        "completed run will read as STALLED forever")
+    assert "_prog_holder" in src, "the progress wiring is gone entirely"
+
+
+def test_the_bench_takes_its_total_from_built_trials_not_cases_x_faults():
+    """The §4X/BOUNDED lesson, pinned. Not every fault injects into every
+    case (fact_swap applied to 43 of 58 on 2026-08-09), so `cases * faults`
+    overstates the denominator by 31 and every derived percentage with it."""
+    src = (REPO / "scripts" / "verify_bench.py").read_text()
+    assert "total=len(_trials) * len(arms)" in src, (
+        "the progress total is no longer derived from the built trials")

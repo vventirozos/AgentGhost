@@ -727,6 +727,1065 @@ over-weights the refute side. **Check a shipping decision against a realistic ba
 **Pins:** 15 tests, all revert-tested (3 mutations, all red), including a structural guard against
 re-introducing variant B. Full suite **11,719 passed / 14 skipped**.
 
+### 4AO. A4 — IS LABEL NOISE WHAT CEILINGED EARN-KEEP AND SKILL-PRUNE? ✅ ANSWERED 2026-08-11
+
+**Split verdict, and the split is the finding.** Instrument: `scripts/label_noise_audit.py`
+(read-only, no LLM, ~2s). Measured against the oracle bench where truth is known:
+**false-REFUTE 0.1207** (n=58 good answers), **false-CONFIRM 0.2424** (n=330 bad answers).
+⚠ The pooled FCR spans **0.000 (wrong_topic) to 0.569 (artifact_leak)** per fault class, so it is a
+property of the bench's roughly-uniform fault mix, NOT the live failure mix. Treat it as a midpoint.
+
+**EXPOSURE — a mechanism can only be ceilinged by a label it CONSUMES. This was never checked before.**
+
+| consumer | exposure | basis |
+|---|---|---|
+| earn-keep (Track A + B4) | **0.0%** | deterministic Python validators — `answer_int()` exact match, `task.verify()`; the LLM verifier is not in that loop |
+| router (`derive_label`) | **1.8%** | 24/1361 labels where the outcome, not `n_steps`/`tool_calls`, decided "hard" |
+| skill-prune outcome arm | **100%** | `succeeded/failed_retrievals` key off `resolve_turn_outcome` |
+| live experiment arms | **100%** | `experiments.py` `failure_rate` = 1.0 iff the resolved outcome is FAILED |
+
+**⛔ For earn-keep the hypothesis is FALSE BY CONSTRUCTION.** It graded on exact integer matches
+against known answers. It never touched the noisy label, so noise cannot be what nulled it — the task
+ceiling already on record is the whole story. Half of A4 was answerable by reading the grader, and
+that read should have preceded the statistics.
+
+**✅ For skill-prune the hypothesis HOLDS, but not for the reason I first published.**
+
+⚠ **I got this backwards once and the test I wrote to check myself is what caught it.** The first
+counterfactual de-attenuated each lesson's observed rate to its noise-corrected truth and re-ran the
+deployed prune: 4 of the same 5 victims died either way, and I concluded *label noise is not what
+selects them*. **That conclusion was an artifact of the method.** `(observed − FCR)/(1 − FRR − FCR)`
+is MONOTONE in the observed rate, so de-biasing cannot reorder a rank-based prune — a bottom-quartile
+cutoff is structurally immune to the label's systematic BIAS. What corrupts a ranking is its
+**VARIANCE**, which that method removes by construction. An audit built that way can only ever
+exonerate.
+
+The corrected test simulates both worlds from the same true rates — ticks recorded perfectly vs
+passed through the measured FRR/FCR — holding sampling noise fixed so the difference is attributable
+to the label alone. **2000 replicates: the kill list differs in 96.2% of them, and 51.9% of the
+victim set is decided by label noise.**
+
+**But fixing the judge would not rescue the mechanism, because two other defects survive perfect labels:**
+
+1. **The ranking is not identifiable at this evidence level.** χ²=38.23, dof=29, **p=0.117** over the
+   30 lessons carrying any decisive outcome — the spread is consistent with every lesson sharing ONE
+   true rate, and 61% of the observed variance in per-lesson rates is exactly what binomial noise
+   predicts. Separating a lesson 6pp below the pool at 80% power needs **~418 decisive outcomes per
+   lesson; the median today is 3.** The playbook holds 324 in total, across 50 lessons.
+2. **The outcome multiplier is MIS-CENTRED, so having evidence is a penalty.** `0.4 + 0.75·out_rate`
+   crosses 1.0 at out_rate **0.80**; this playbook pools at **0.7407**. A lesson at the population
+   mean is multiplied by 0.9556 — a 4.4% demotion — while a lesson with fewer than `_OUTCOME_MIN_OBS`
+   (4) decisive outcomes is multiplied by 1.0 and pays nothing. Measured rank movement caused by the
+   multiplier alone, every one downward: **↓15, ↓15, ↓13, ↓10, ↓9, ↓6**. This is why the kill list is
+   headed by the four MOST-measured lessons in the playbook (297, 217, 27, 17 retrievals; 64–75%
+   success) — including the 297-retrieval lesson that the 2026-08-04 incident recorded as an
+   unexplained victim. It is explained now: it was condemned FOR having been measured.
+
+**Consequences for live work.** The label's composition is **37.5% verifier-decided, 62.5%
+mechanical/structural** (n=691). Attenuation therefore lands between **A=0.864 (n×1.34)** if the
+structural rules are noise-free and **A=0.637 (n×2.47)** if they are as noisy as the verifier;
+nothing measures the structural rules, so the band cannot be narrowed. **Every live experiment arm
+needs 1.34–2.47× the traffic its naive power calculation assumes, and nothing in the codebase
+accounts for this** — it bears directly on the traffic-gated reads #10 and #23.
+
+**Recommendation (NOT applied — `compute_lesson_utility` also drives the LIVE cap-trim, so
+re-centring it is an operator-visible retention decision, "decide, don't smuggle"):** skill-prune
+should stay off. Re-centring the multiplier on the playbook's own pooled rate and replacing the
+relative-quartile cutoff with an absolute one are both necessary, and neither is sufficient — at a
+median of 3 decisive outcomes per lesson there is no cutoff that ranks lessons rather than noise.
+
+**Pins:** `tests/test_label_noise_audit.py` (21). The load-bearing pair is two-sided — the
+counterfactual must CONVICT on a small-n playbook where noise decides the victims, and EXONERATE on
+one with ample evidence. ⚠ Building the exonerating fixture took three attempts and each failure was
+instructive: 8 identical lessons TIE exactly and the rank cutoff slices through the tie (36% churn,
+pure artifact); 8 lessons spaced 0.01 apart put the cutoff INSIDE that group where the spacing is
+below the n=400 standard error (32% churn, still artifact). **A rank cutoff is decided only by the
+lessons adjacent to the boundary — population-level separation is irrelevant, the boundary must fall
+in a GAP.** That property is now pinned in its own test.
+
+### 4AN. THE ROUTER IS CONFIDENT ONLY WHERE IT ADDS NOTHING — ⛔ #61 CLOSED WITHOUT RUNNING 2026-08-10
+
+The operator asked for a feasibility check before spending compute on the planner-skip A/B. The check
+killed the experiment and found something worth more than the experiment would have been.
+
+| family | n | majority-class baseline | model accuracy | **lift** |
+|---|---|---|---|---|
+| chess template | 189 | 0.868 | 0.868 | **+0.000** |
+| everything else | 1172 | 0.626 | 0.677 | +0.051 |
+
+**The router is confidently right exactly where it adds NOTHING, and marginally informative exactly
+where it CANNOT ACT.** On chess it predicts "easy" for all 189 and scores the base rate — zero
+information. On non-chess it contributes a real +5.1pp and never clears 0.75.
+
+**Why only chess clears the bar.** The template SATURATES every easy-indicator at once —
+`has_uppercase_acronym` (piece/square notation), `has_numeric_density` (coordinates),
+`technical_jargon` + `coding_language_mentions` (notation parsing as code-like). Per-feature
+contributions run **4–53×** those of genuinely-easy natural requests:
+
+```
+logit   chess -1.767 (p_hard 0.146) | other_easy +0.275 (0.568) | other_hard +0.616 (0.649)
+```
+
+Natural traffic separates by **0.081 in probability**. So the 0.75 bar does not select for "easy" — it
+selects for "looks like a synthetic template", and exactly one thing in this corpus does.
+
+**Three independent reasons the A/B was not run:**
+1. **Live arm infeasible** — 2.3 eligible turns/arm/day ⇒ **115 days** to detect a realistic −5.4pp
+   quality drop, 34 days for a −12.4pp collapse.
+2. **Eligible pool degenerate** — 113 of 114 confident-easy requests are the same chess template;
+   **0 of 600** non-chess requests clear 0.75.
+3. **The benefit is zero by construction** — skipping the planner on chess cannot beat "always skip on
+   chess", because the model carries no information there.
+
+⚠ **I would have run it and reported a clean paired latency delta.** It would have been technically
+correct and substantively misleading: a precise number for a degenerate slice. The pre-check is the
+only reason that did not happen, and it cost minutes.
+
+**Consequences.** Do NOT lower the 0.75 bar — that admits predictions where the model beats a weighted
+guess by 5pp, which does not justify the false-easy risk (0.0558 held-out). The real gap is FEATURE
+QUALITY: 17 surface features (length, punctuation, jargon counts) separate easy from hard by 0.081 on
+natural traffic. Until that improves, **no threshold makes the planner-skip worth having**.
+
+**⛔ THE CONSUMER IS NOW DELETED (2026-08-11).** The operator's call: keeping a mechanism that fires
+only where the model is uninformative costs cycles and carries the false-easy risk for no benefit. The
+block in `core/agent.py` is gone, replaced by a comment carrying the evidence table above.
+
+| | before | after |
+|---|---|---|
+| `_rd_plan` references | 3 | **0** |
+| `_router_decision` consumers | 2 (planner-skip, MCTS gate) | **1** (MCTS gate) |
+| false-easy-on-hard harm channel | live at 0.0558 | **none — nothing acts on confidence** |
+| router recording / `turn_facts` label | intact | intact |
+
+What SURVIVES is deliberate: the decision is still recorded and the label is still read by the MCTS
+depth gate (`_MCTS_TURNSTART_ENABLED = False`, #11), which uses **no confidence bar**. The model's real
++5.1pp lives at the LABEL, so a label-level consumer is the shape that fits the evidence; a
+confidence-thresholded one is not.
+
+Two-sided pins in `tests/test_router_heldout_gate.py`, both mutation-tested:
+`..._planner_skip_stays_RETIRED` (the skip must not return) and
+`..._still_RECORDED_and_the_MCTS_gate_intact` (⚠ over-removal guard — retiring the consumer must not
+take the recording or the label gate with it).
+
+⚠ **The first version of that pin was worthless and mutation-testing caught it.** Asserting
+`"_rd_plan" not in code` passes the moment the identical logic returns under any other variable name —
+verified: a `_rdx` rename sailed through. It now pins the SHAPE (no `use_plan = False` within 15 lines
+of a router *confidence* read), which catches all three rename variants while leaving the legitimate
+experiment-control-arm `use_plan = False` alone. A name-based pin protects a spelling, not a decision.
+`docs/core/planning.html` documented the removed behaviour as live and has been corrected.
+
+§4AM's retrain stands and stays — it was correct, it converged, it passes the gate, and it repaired a
+genuinely broken calibration. It simply does not make this particular consumer valuable. Repairing a
+mechanism and justifying it are different claims, and only the first was earned.
+
+### 4AM. ROUTER RETRAINED TO CONVERGENCE — ✅ SHIPPED + DEPLOYED 2026-08-10
+
+Defaults raised `epochs 300 → 20000`, `tol 1e-5 → 1e-6`. Retrained through the PRODUCTION path
+(`RouterTrainer.run`, same 70/30 split seed, same gate), checkpoint backed up first.
+
+| | before | after |
+|---|---|---|
+| `converged` | **False** | **True** |
+| held-out accuracy | 0.6870 | 0.7042 |
+| escalate-all baseline | 0.5697 | 0.5697 |
+| false-easy on hard | 0.0386 | 0.0558 (gate max **0.25**) |
+| max confidence (800 live requests) | **0.710** | **0.912** |
+| planner-skip eligible | **0 / 800** | **123 / 800** |
+| fit cost | 19 ms | 95 ms |
+
+Gate verdict: `PASS — acc 0.704 > escalate-all 0.570, false-easy 5.6% (n=409)`.
+
+⚠ **THIS IS NOT AN ACCURACY WIN, AND SHOULD NOT BE SOLD AS ONE.** Paired McNemar on the identical
+held-out split: 13 vs 9 discordant, **p = 0.52 — a wash**. What changed is that the model is now
+CALIBRATED enough for its consumer to act on. Scaling weights leaves 800/800 labels identical
+(sigmoid is monotonic), which is the proof that the compression was never a quality trade-off:
+correcting it *cannot* cost accuracy because the decisions do not move.
+
+**Why 20000 and not 100000.** 100k scored marginally higher accuracy (0.7164) but WORSE on the
+dangerous metric (false-easy 0.0687 vs 0.0558) and produced FEWER usable skips (115 vs 123). Chose the
+one that is better on both safety and utility, and ignored the one that is better on the headline.
+
+⚠ **A HYPERPARAMETER CHANGE IS INVISIBLE TO THE SKIP-IF-UNCHANGED GATE.** The idle retrain skips when
+the trajectory corpus fingerprint is unchanged — it keys on the DATA, not the model config. So this
+default would have sat dormant indefinitely; the checkpoint had to be written explicitly. Worth
+remembering for any future config change to a fingerprint-gated loop.
+
+**Pins:** 3 tests; 2 go red on revert. ⚠ The third
+(`test_a_converged_model_can_actually_REACH_the_consumer_bar`) still PASSES at epochs=300 because the
+toy fixture is separable — it is an INVARIANT, not the regression detector, and is annotated as such
+so nobody mistakes it for cover it does not give. Full suite **12,013 passed / 14 skipped**.
+
+**WHAT IS STILL UNPROVEN, and it is the important part.** The planner-skip can now fire on ~15% of
+requests. **Whether skipping the strategic planner on confident-easy turns is a WIN has never been
+measured** — the router has always assumed it. The next step is not more router work; it is measuring
+whether that skip costs quality. Until then this is a mechanism restored to working order, not a
+demonstrated improvement.
+
+### 4AL. #60 DIAGNOSED — the router's gate is unreachable because the model never converged — ✅ 2026-08-10
+
+**The chain, end to end, all measured offline for free:**
+
+`converged: False` → weights too small in magnitude → sigmoid outputs compressed → **max confidence
+0.710** → the planner-skip bar of **0.75 is unreachable** → the router's only live consumer **cannot
+fire** → the router trains, gates and deploys correctly every idle cycle and changes **nothing** in
+production.
+
+**Re-scored 800 live user requests through the DEPLOYED model:**
+
+```
+label mix : hard 501 / easy 299     confidence: median 0.322  p90 0.661  max 0.710
+>= 0.75: 0/800        >= 0.70: 2/800
+```
+
+⚠ **A correction to my own earlier reading.** From the 65 trajectory-carrying turns I reported the
+router labelling ~95% "hard". On 800 requests it is **63/37** — the 95% was **subset bias**, exactly
+the caveat I had attached. The bias warning earned its keep; the observation it qualified did not
+survive.
+
+**Is 0.75 reachable at all in this feature space?** Weight-scaling proxy (larger-magnitude solution,
+which is what continued training finds):
+
+| model | max conf | ≥ 0.75 |
+|---|---|---|
+| LIVE (300 ep, `converged: False`) | 0.710 | **0/800** |
+| weights ×2 | 0.944 | **148/800** |
+| weights ×4 | 0.998 | 631/800 |
+
+**And the fix is free.** Scaling leaves **800/800 labels identical** — sigmoid is monotonic, the 0.5
+boundary does not move. So the compression is a pure **calibration/convergence** defect, not a
+quality trade-off: correcting it cannot cost accuracy, because the decisions do not change. That
+retires my original "lower the bar / calibrate / retire the gate" framing — **the answer is train to
+convergence**, and the bar was never the problem.
+
+⚠ **PROXY, NOT A RETRAIN.** Scaling shows 0.75 is *reachable*; it does not show what a genuinely
+converged fit would score. The real experiment (raise `epochs` / loosen `tol`, re-gate) is cheap and
+offline, and is the remaining work — a behaviour change, so it wants the operator's call.
+
+### 4AK. #58 PART 2 CLOSED — the contaminated number was computable all along — ✅ 2026-08-10
+
+**Lesson hit-rate: a caveat was standing in for a fix.** The report printed `mean hit-rate: 0.62`
+with *"denominator includes the pre-2026-08-01 double-booking era — do not trend across that date"* —
+a number the reader was told not to use, beside no number they could. The counters are cumulative and
+cannot be un-mixed, **but lessons CREATED after the cut accumulated every retrieval in the clean era**:
+
+| set | n | mean hit-rate |
+|---|---|---|
+| all lessons (reported) | 36 | **0.620** |
+| pre-2026-08-01 | 23 | 0.655 |
+| **post-2026-08-01 (clean)** | 13 | **0.557** |
+
+The caveat was hiding a **0.06 OVERSTATEMENT** that was computable the whole time. The clean figure now
+leads (13 lessons, 600 retrievals, denominator counted once); the all-lessons mean is shown labelled
+and explicitly "not comparable". When no post-cut lesson has retrievals the report says
+**CONTAMINATED** rather than silently quoting the number it just disowned — pinned, because that
+fallback is exactly how the old behaviour would creep back.
+
+**Competence cell computation: CLEAN.** `record()` dual-writes leaf + per-domain `*` + global `*`,
+which is the classic derived-value drift shape. Checked against the live profile: every domain's leaf
+sum equals its roll-up exactly (fetch 847, fs 2572, memory 644, other 1108, shell 1238, sql 17,
+vision 44), and the domain roll-ups sum to the global cell (6470, delta 0). No drift. Recorded as a
+genuine pass rather than left unexamined.
+
+**Integrity sweep — three more subsystems, all alive:**
+- **RRF** — 3916 observations across 4 sources (vector 1725 / episodic 818 / graph 707 / session 431),
+  weights file current.
+- **Foresight** — 64 predictions, **100% carry a resolved outcome**, so grading genuinely runs. Its
+  weak *predicted-fail precision* is a signal-quality question for #9's backtest, not an instrument
+  defect — a distinction worth keeping.
+- **Episodic usage-credit (F8)** — `access_count` sum 150, max 13, **46/272 episodes non-zero**. The
+  credit path fires; F8 is not another built-but-unwired loop.
+
+**Pins:** 4 new hit-rate tests, both reverts red (headline reverting to the contaminated mean; and
+unparseable timestamps being laundered as post-cut — the subtler of the two, since it would quietly
+re-admit unknown-era data into the honest figure). Full suite **12,006 passed / 14 skipped**.
+
+### 4AJ. ROUTER AUDIT — it works, it is gated, and its signal is thrown away — ✅ #58 PART 2a 2026-08-10
+
+**Nine questions pre-registered before looking.** Four pass cleanly:
+
+| | |
+|---|---|
+| Q1 deployed == gated model | ✅ fingerprint `bfa2fe7531455b7e` matches |
+| Q2 beats the baseline | ✅ held-out **0.687** vs escalate-all **0.570** |
+| Q6 above the n gate | ✅ 952 train / 409 held-out, classes 426/526 |
+| Q7 gate enforced | ✅ `gate_verdict` at trainer.py:171, FAIL-CLOSED, all four thresholds genuinely cleared |
+
+⚠ **TWO OF MY OWN READS WERE WRONG, both caught by verification.** I concluded
+`dispatcher.route()` is never called — it runs on EVERY request. I then concluded nothing consumes the
+decision — there are TWO consumers. Either would have been a fabricated MAJOR. The grep that produced
+the first was matching `llm_client.route()` and Playwright's `ctx.route()`.
+
+⚠⚠ **RETRACTED — I FILED A FALSE MAJOR HERE. Corrected 2026-08-10, same day.**
+
+I originally wrote: *"the signal never reaches the durable corpus … 0 of 1552 trajectory records carry
+ANY router field … the router's real-traffic accuracy is UNMEASURABLE."* **That was wrong.**
+
+**65 of 1552 records DO carry `router_label` / `router_confidence` / `router_escalated`** — nested
+under `extra`. `agent.py` merges `turn_facts` into `_extra`, which becomes `Trajectory.extra`; the
+plumbing was there the whole time. **My scan checked TOP-LEVEL KEYS ONLY and read absence as
+evidence** — the exact defect class this audit exists to catalogue, committed inside the audit. My
+liveness probe carried the identical bug and reported ZERO, which is precisely how a search error
+becomes a "finding": the instrument agreed with me because it shared my mistake.
+
+**What is actually true, re-measured:**
+
+| | |
+|---|---|
+| trajectories carrying the decision | **65** |
+| coverage per day | **0–70%, erratic** (08-04 70%, 08-07 **0/29**, 08-10 **0/26**) |
+| label mix on those turns | **hard 62 / easy 3** |
+| escalated | 28/65 |
+| **planner-skip fired** | **0/65** |
+
+**The real finding is better evidenced than the false one: the router's only live consumer has never
+fired on real traffic.** The planner-skip needs `easy AND not escalated AND confidence ≥ 0.75`; in 65
+recorded turns that combination occurred **zero times**, because the router calls ~95% of them "hard"
+against a 45/55 training mix. So the router changes nothing in production today — not because its
+signal is lost, but because its output distribution never satisfies the one gate that reads it.
+
+⚠ **That 95% must not be over-read either.** Trajectory writes are sparse and selective, so these 65
+turns are a biased subset and probably over-represent hard ones. Validating the router on them without
+first checking that bias would produce a confidently wrong accuracy — the same trap as the
+partial-bench read in §4AG.
+
+**AND THE SHARPER ANSWER — the gate is UNREACHABLE, not merely unfired.** The confidence distribution
+over those 65 decisions:
+
+```
+min 0.000 | p25 0.028 | median 0.314 | p75 0.369 | max 0.678
+>= 0.75  (planner-skip bar) :  0/65     <-- the MAXIMUM ever observed is 0.678
+>= 0.30  (escalate bar)     : 38/65
+```
+
+**0.75 sits above the model's entire observed range.** The planner-skip cannot fire by construction —
+this is not a distribution accident, it is a threshold set beyond what the classifier's calibration
+produces. Same shape as several findings today (a bar above what the signal can reach ⇒ a permanently
+inert gate), and it is why the router has zero production effect despite training, gating and
+deploying correctly every idle cycle.
+
+The fix is cheap in code (lower the bar, or calibrate the confidence) and is a BEHAVIOUR change, so it
+wants a measurement and the operator's call — not a quiet edit.
+
+**MEDIUM — the threshold fallback coincided with the truth.** `_deploy_confidence_threshold()` fell
+back to a bare `0.3`, which is ALSO the dispatcher default and ALSO the live value — so a broken read
+returned the RIGHT answer and was undetectable, until the operator moves
+`--router-confidence-threshold`, at which point the gate silently scores an operating point the router
+does not run. Worse, the live value comes from `args.router_confidence_threshold` while the gate reads
+the *signature default*; they agree today only because the flag is not passed. Fixed: the probe now
+reports `dispatcher` / `fallback` / `caller` and `evaluate()` records it in the gate evidence.
+
+**MEDIUM — `converged: False`.** 300 epochs, no convergence, and held-out (0.687) ≥ train (0.683) —
+underfitting. Not yet acted on.
+
+**MINOR — one of the two consumers is hard-disabled.** `_MCTS_TURNSTART_ENABLED = False`, the same
+shape as the arbiter, so the router's only live effect is the planner-skip
+(`easy AND not escalated AND confidence ≥ 0.75`).
+
+**Pins:** 3 new router tests + 3 for the durability probe, all revert-tested. Full suite
+**12,002 passed / 14 skipped**. ⚠ One of my new tests initially **swallowed a real failure** in
+`except: pytest.skip(...)` — `cannot vectorize dict`, my fixture's fault, dressed as an environment
+problem. Rewritten to use the module's own `fitted` fixture. A silent skip is the "guard that never
+runs" pattern, authored by hand.
+
+**NOT DONE, deliberately:** making the signal durable is a production write-path change (persisting
+`turn_facts` into trajectories) and wants the operator's eyes, not an unattended landing.
+
+### 4AI. SUBSYSTEM LIVENESS — a probe per mechanism, and eight defects in my own probes — ✅ #58 PART 1 DONE 2026-08-10
+
+**The gap this closes.** §4AD made absence a ROW rather than a silence — for the 18 phases that write
+to `autonomous_activity.jsonl`. The most important dead loop found that day, **metacog arbitration
+(0 firings against 118 below-threshold opportunities)**, does not write there and was found by
+grepping the log BY HAND. A dead-loop detector blind to the class of thing that justified building it
+is the defect it exists to remove, one level up.
+
+`core/liveness.py` has each mechanism declare **where its own durable evidence lives** and reads it
+read-only — no production write-path changes, no new ledger volume. Nine probes: metacog arbitration,
+verifier outcomes, router decisions, router checkpoint, calibration fit, foresight predictions, RRF
+observations, experiment stamps, GEPA applies.
+
+**THE THIRD STATE IS THE POINT.** `FIRED / ZERO / NO_SOURCE / GATED`. §4AD conflates the middle two —
+a phase absent from the ledger reads as zero whether it is quiet or *unobservable*. That is the same
+missing-vs-empty conflation §4AC removed from the response cache, and it is exactly how arbitration
+stayed invisible. `NO_SOURCE` is an instrumentation GAP, reported separately and never alarmed on;
+`GATED` names *where the switch is* rather than emitting a meaningless zero.
+
+Plus a **turn denominator**: turn-driven mechanisms are correctly silent when nothing asked them to
+run, and alarms are withheld entirely at zero turns (one fact, as §4AD does for a stopped agent).
+
+**EIGHT DEFECTS FOUND IN MY OWN PROBES — none in the systems they watch.** Three review rounds, every
+one pinned:
+
+| round | defect | it would have reported |
+|---|---|---|
+| R1-a | `\bverify\b` does not match "verifier" | **false DEAD** vs 43 real verdict lines |
+| R1-b | `float(ts)` on stores writing ISO strings | two healthy stores as ZERO |
+| R1-c | probed `experiments.json`, an OPTIONAL override | healthy system as a GAP |
+| R1-d | no turn denominator | nearly a **false MAJOR** (below) |
+| R2-a | mtime freshness — a `touch` fakes it | **false GREEN** on a dead mechanism |
+| R2-b | `core.agent` import = 1.8s of a 1.97s run | (cost) |
+| R2-c | three full 14MB log scans | (cost) |
+| R3 | caller passed `$GHOST_HOME/system` | **all eight probes blind at once** |
+
+Cost **1974 ms → 232 ms**. The mtime fix reads `fitted_at` from *inside* the file; the import fix
+reads the flag as an AST literal, verified to agree with the imported module and **declining rather
+than guessing** if it ever becomes computed.
+
+⚠ **THE FALSE MAJOR I NEARLY FILED.** Trajectories, foresight and RRF had all been quiet since ~02:00
+— three subsystems dying together. Two independent guards were needed to avoid the wrong call:
+(1) the turn denominator showed 24 turns that day, so "no traffic" did not explain it; (2) the BASE
+RATE did — **08-07 had 29 turns and no trajectory directory either**, and the ratio swings 40→7,
+48→6, 33→1, 29→0, 27→1, 34→6. Sparse selective writes; a zero-day is within range. *A trend across
+three subsystems is not evidence until you know each one's base rate.*
+
+⚠ **THE WIRING DEFECT VALIDATED THE DESIGN ON ITS FIRST OUTING.** Passing the wrong root blinded every
+probe — and the view said `NO_SOURCE` for all eight rather than quietly reporting zeros. Under §4AD's
+two-state model that same bug would have rendered as "everything is at zero", i.e. a plausible,
+silent, total failure. The third state paid for itself immediately.
+
+**Pins: 26 tests, every defect revert-tested red**, including over-firing guards (NO_SOURCE must not
+alarm; the no-traffic guard must key on ZERO turns only) and a seam test for the caller's root, which
+no unit test of the probes could catch. Full suite **11,996 passed / 14 skipped**.
+
+**REMAINING on #58:** Part 2 — the nine still-unaudited subsystems (router first: live, unvalidated,
+and it consumes verifier-produced labels), and the lesson hit-rate's known-contaminated denominator.
+
+### 4AH. Capacity REJECTED — a 9× bigger judge catches LESS, and the miss rate is a price not a defect — ⛔ #51 CLOSED 2026-08-10
+
+**The cheap test that replaced a 3-hour one.** #51 wanted a critic-model swap to Qwen3.5-9B. That
+needed a ~6GB download over Tor and nova downtime — nova serves the live agent's WORKER *and* CRITIC,
+and 16GB cannot host E4B and a 9B together. Instead: use the **35B main model already running** as a
+capacity UPPER BOUND. If more capacity does not help there, a 9B cannot be the answer.
+
+Same 12 private cases, raw judge arm, both endpoints confirmed by `/props`:
+
+| judge | `artifact_leak` | `fact_swap` | `clean` false-alarm |
+|---|---|---|---|
+| Gemma 4 E4B (~4B active) | **0.750** | **0.667** | 0.417 |
+| Qwen3.6-35B-A3B (9× bigger) | **0.167** | **0.333** | 0.000 |
+
+Fisher exact: artifact_leak **p = 0.0123**, clean-FA **p = 0.0373** (both significant); fact_swap
+p = 0.15 at n=9, suggestive only.
+
+**More capacity makes a WORSE catcher.** The 35B is not incapable — it has a strong ACCEPT prior and
+essentially never refutes. Both models are `heretic` variants, so de-censoring is not the
+differentiator. A 9B would plausibly land *between* them: more conservative than E4B, catching less.
+Third independent strike, after Ornith-9B losing to E4B and SELENE rejected at FPR 0.543.
+
+**THE REFRAME — three operating points on ONE curve** (paired, same 12 cases):
+
+| configuration | mean-catch | specificity | balanced |
+|---|---|---|---|
+| E4B raw | 0.709 | 0.583 | 0.646 |
+| **E4B + escalation (production)** | 0.416 | 1.000 | **0.708** |
+| 35B raw | 0.250 | 1.000 | 0.625 |
+
+⚠ **A correction to my own framing earlier the same day.** I described escalation as "destroying
+catches". It does cost catches (−0.25 artifact_leak, −0.33 fact_swap) — but it buys a
+**0.417 → 0.000 false-alarm collapse** and IMPROVES balanced from 0.646 to 0.708. Escalation is NET
+POSITIVE and is doing exactly its job. **The 0.218 false-CONFIRM is the PRICE of the 0.121 FPR target,
+not a defect.** The production configuration is the best of the three measured.
+
+**CONSEQUENCE FOR THE WHOLE A-WORKSTREAM.** All three cheap levers are now measured dead:
+
+- **threshold** — confidence AUC 0.5087, chance (§A1);
+- **sampling** — majority-of-N amplifies the existing majority, +0.026 at a 0.552 catch rate (§A2);
+- **capacity** — a 9× larger judge catches significantly less (here).
+
+Driving false-CONFIRM under 0.10 while holding FPR ≤ 0.121 requires a genuinely better
+**discriminator**, not a configuration change. That is a research problem, and #50's "< 0.10" target
+should be re-examined as possibly unattainable with the components on hand. Three hypotheses tested in
+one day, all three eliminated on evidence — which is the useful outcome even though none of them
+shipped a gain.
+
+### 4AG. The verifier's GEPA artifacts re-scored — one was a NO-OP, the other's claim does not reproduce — ✅ DONE 2026-08-10 (task #56)
+
+**Why this ran at all.** `scripts/verify_bench_status.py` had been printing, on every invocation, that
+`verifier.enumerate` and `verifier.adjudicate` "predate the gate schema — no gate identity/scores
+recorded; re-promote under the current gate before trusting it". These are the prompts the PRODUCTION
+verifier runs. I had been filtering that warning out of my own terminal output with a `grep -v`.
+
+**FINDING 1 — `verifier.enumerate` was a NO-OP, and had been since 2026-07-30.** Its
+`optimized_instruction` is byte-identical to the baseline:
+
+```
+tuned artifact       2035 chars  sha c7b9e47a95e8
+artifact's baseline  2035 chars  sha c7b9e47a95e8
+CODE baseline const  2035 chars  sha c7b9e47a95e8
+```
+
+It loaded on every verification, changed nothing, and carried a recorded
+`private_baseline 0.7957 → private_candidate 0.8826` claim it **cannot** have earned. That explains
+why both verifier artifacts recorded *identical* numbers: the gain belonged to the ADJUDICATE change,
+and enumerate was written out beside it despite being unchanged — **a joint promotion recorded as two
+independent ones**. Retired to `.noop.retired`; the resolved prompt is unchanged because the fallback
+constant is the same bytes.
+
+**FINDING 2 — the adjudicate promotion does not reproduce.** Both arms LIVE, one session, same pool
+sha `3a030117d218245f`, same seed, same gate, one variable:
+
+| | TUNED | BASELINE | Δ |
+|---|---|---|---|
+| **balanced** | **0.7931** | **0.7866** | **−0.0065** |
+| refute_mean | 0.7482 | 0.7201 | −0.0281 |
+| nonrefute_mean | 0.8379 | 0.8530 | +0.0151 |
+
+`smallest_resolvable_delta = 0.0076` — **the 0.0065 difference is BELOW the resolution floor.** The
+prompt trades false alarms for catches and nets to a wash. The Jul-30 promotion claimed **+0.087**;
+measured today it is **+0.0065, unresolvable**. KEPT (it did not lose), with the current-gate block
+recorded so the claim is superseded rather than merely stale. `route_health.fell_through_to_main = 0`
+in BOTH arms, so the judge under test genuinely answered every call.
+
+**WHAT THIS RULES OUT, which is the point.** A bad promotion would have shown the baseline winning. It
+did not. **The GEPA artifacts are NOT the cause of the 0.448 `artifact_leak` / 0.512 `fact_swap` miss
+rates.** The capacity hypothesis (#51) survives — now on evidence rather than assumption.
+
+⚠ **A prior of mine was wrong.** I expected +415 chars to HURT, per §4Z's capacity finding (+71 chars
+cost 11 artifact catches). It did not — the longer prompt is slightly BETTER on catches. Prompt length
+alone is not the mechanism, and §4Z should not be generalised into "shorter is better".
+
+**⚠ THE EARLY-READ TRAP, recorded because it was tempting and wrong.** Asked mid-run for a partial
+result, the raw numbers showed the baseline arm CONFIRMING far more (44.7% vs the tuned arm's final
+37.7%) — which reads as "the baseline catches less". It is an ARTIFACT. Escalation fires only on
+cheap-REFUTED verdicts, so only **45 of 265** trials are "fast" (cheap-CONFIRMED, skipping the extra
+main-model call), and any partial set over-represents exactly those. Simulating run 1's OWN completed
+data at a 161-trial cutoff predicts **43.9% CONFIRMED** — against run 2's observed **44.7%**. The
+entire apparent difference is completion-order bias. *A partial read of a concurrent, unequal-cost
+benchmark measures the scheduler.*
+
+**Method note that made this cheap.** `optimize_verifier.py --incumbent-only` scores the live prompts
+under the current gate and exits without running GEPA. The baseline arm ran against a scratch
+`GHOST_HOME` with the artifacts absent (loader verified to fall back to the code constants), so the
+LIVE agent's prompts were never touched — no moving files under a running process. Both arms ~70 min.
+
+### 4AF. Calibration + competence audit — the stack measures well and decides nothing — ✅ DONE 2026-08-10 (task #57)
+
+**The finding that reframes the rest.** The threshold's ONLY consumer is metacog arbitration, and that
+call site is hard-gated by `_METACOG_ARBITER_ENABLED` in `core/agent.py` — a module constant, `False`,
+independent of every flag. Measured across **209 metacog summaries in the live log**:
+
+| counter | lifetime |
+|---|---|
+| `conf_total` (confidence computed) | 865 |
+| `conf_below` (below threshold) | **118** |
+| **`arbitrations`** | **0** |
+| `ask_user`, `replans_ok`, `host_critical` | 0 |
+
+118 opportunities, zero firings, because the consumer cannot execute. **The calibration stack is a
+measurement with no behaviour attached**, and nothing said so — an operator reading `threshold 0.837`
+reasonably assumes something happens at 0.837. The report now states it beside the number. This is
+NOT an argument for deleting the stack: the samples are what a future consumer would learn from. It is
+an argument against quoting its quality as though it bought anything today.
+
+**The headline Brier was IN-SAMPLE.** `brier` is a 2-parameter Platt map scored on the rows it was
+fitted to, printed beside `brier_base_rate` — a comparison only one side of which paid for its
+parameters. The fit now records `brier_cv` (5-fold, fixed seed, deterministic) and the verdict is
+scored on it: **in-sample +3.0% vs base rate, honest +2.4%**. ⚠ I first reported this as "3×
+optimistic" from an ad-hoc CV; that was **wrong** — I had compared against a fold-wise baseline rather
+than the global base rate. Real optimism is ~0.6pp. Corrected here so the wrong figure is not the one
+that survives.
+
+**The `[DEAD]` verdicts came from an under-powered test.** `_separation_sigmas` is a
+difference-of-means gate, and the store carries **18 negatives in 694 rows (2.6%)**; at that balance
+it can only resolve a gap of ~0.60 SD of the feature. It calls `competence_component` DEAD at 0.05σ —
+yet **ablating that feature costs 0.021 AUC**. The gate and the ablation disagree, the ablation
+answers the question actually being asked, and nobody had ever run it. `feature_contrib` (held-out
+Brier delta) is now recorded and rendered, and where the two disagree the report says believe the
+ablation.
+
+⚠ **I was wrong here too, and it matters.** My pre-registered hypothesis was that `w_competence`
+carries half the composite while being pure noise, and that the fix was to pin it to zero. `w_competence`
+IS ungated by construction — line 605, it is the residual `1 − w_entropy − w_effort`, so every feature
+gated off for being noise **donates its weight to the one feature never tested**. That part is real.
+But the ablation refuted the conclusion: removing competence makes ranking WORSE. Acting on the
+hypothesis would have degraded the thing I was auditing. The allocation is still by arithmetic accident
+rather than evidence — worth fixing later, deliberately, with the ablation as the gate.
+
+**Competence cells reached the PROMPT with no precision.** `sql: 74% (n=17)` rendered identically to
+`fetch: 99% (n=847)`; sql's 95% CI is **[0.50, 0.89]**. The injection gate does not save this — it is
+on TOTAL observations across domains, so 6470 observations elsewhere license a 17-observation cell to
+render with full authority, and the gate's own comment says it exists "so a cold profile doesn't
+inject noisy small-n percentages". Cells now carry a Wilson interval and a `⚠ provisional` marker.
+⚠ My FIRST version rendered `98% ±6%` — an upper bound of 104%, an interval that cannot exist, in a fix
+whose entire purpose was honest precision. Wilson is asymmetric near the boundary; it now prints
+bounds, not a half-width. Caught by a sanity check on the helper, not by reading it.
+
+**Q3 came back CLEAN** and is recorded as such: `_separation_sigmas` correctly uses `abs()`, so an
+anti-correlated feature would pass. `uncertainty_pressure` is DEAD because 2.22σ < 2.5σ, not because
+of its sign. Pre-registered, checked, no defect.
+
+**Pins: 23 tests, every one revert-tested**, with over-firing guards on both new warnings (a warning
+that is always on is furniture). ⚠ One pin was initially a **FALSE NEGATIVE** — it asserted
+`"wilson_interval" in source` rather than checking the rendered output, and stayed GREEN under mutation
+until rewritten. Same shape as the credential-guard false negative earlier the same day: *a guard that
+checks a symbol exists proves nothing about what the symbol reaches.* Full suite **11,945 passed / 14
+skipped**.
+
+**What this does NOT change.** No weights, no thresholds, no fitting behaviour — deliberately. The
+audit found the instruments misreporting, and one hypothesis of mine was refuted by measurement
+mid-audit; changing behaviour on the strength of numbers that were wrong an hour ago is the mistake
+this whole block exists to stop.
+
+⚠ **CORRECTION (fresh-eye review, same day).** I first wrote "no behaviour" here and that was WRONG.
+`competence.get_context_string()` feeds the SYSTEM PROMPT, and its block grew **201 → 338 chars
+(+68%)** — every turn now carries the CI text and the `⚠ provisional` marker. That is a deliberate and
+defensible change (the model was previously told a coin-flip-wide estimate as flat fact), and ~35
+tokens is cheap, but it IS a behaviour change and calling it none was a mis-statement of exactly the
+kind this journal exists to catch. Recorded rather than quietly amended.
+
+**A SECOND FRESH-EYE FINDING, in the code written to prevent it.** `activity_liveness` treated a
+**MISSING ledger identically to an idle agent** — every phase zero, `agent_silent` true, no alarms,
+the same screen for "nothing ran" and "this is pointed at a path that does not exist". That is the
+same missing-vs-empty conflation removed from the response cache in §4AC *hours earlier*, reproduced
+in the function whose entire purpose is detecting defects of that shape. Now `ledger_missing` is
+reported separately, the renderer says `MISSING INSTRUMENT` and that line WINS over the idle line (a
+missing ledger is also silent, so reporting idleness first describes the symptom and hides the cause).
+Pinned both ways. **The lesson is not "be careful" — it is that this defect class is re-introduced by
+default and only a test stops it.**
+
+### 4AE. THE FIRST EXTERNAL NUMBER — FRAMES 0.767, and three instrument bugs on the way to it — ✅ DONE 2026-08-10 (task #54)
+
+**Everything in this project was measured internally and nothing comparatively**, so "how good is this
+agent?" had no falsifiable answer. It does now.
+
+| | |
+|---|---|
+| **FRAMES (oracle mode), n=60 of 824, seed 7** | **46/60 = 0.767** |
+| 95% CI (Wilson) | **[0.646, 0.856]** |
+| answered-only (3 no-answer tasks excluded) | 0.807 [0.687, 0.889] |
+| graded by | strict 27 · judge 30 · empty 3 |
+| model / judge | Qwen3.6-35B-A3B / critic node Gemma 4 E4B (different family) |
+
+**Published baselines** ([arXiv 2409.12941](https://arxiv.org/pdf/2409.12941), Gemini-Pro-1.5-0514):
+naive 40.8%, BM25-4doc 47.4%, **multi-step retrieval & reasoning 66.0%**, **Oracle Prompt 72.9%**.
+
+⚠ **NOT apples-to-apples, and the difference cuts both ways.** The paper's Oracle Prompt puts the gold
+article TEXT in context. Ours names the gold URLs and the agent must FETCH and read them — over Tor.
+That is *harder* than the paper's oracle and *easier* than its search-from-scratch setting, so the
+honest claim is **"in the same band as the published Gemini-Pro-1.5 baselines"**, not "better than".
+The CI overlaps both 66.0% and 72.9%; at n=60 it cannot separate them, and saying otherwise would be
+the kind of over-claim the rest of this journal exists to prevent.
+
+**Why FRAMES and not GAIA.** GAIA is gated — measured, not assumed: `datasets-server` returns 401 for
+`gaia-benchmark/GAIA` and 200 for FRAMES. The gate is a **licence agreement**, so an ungated mirror
+would breach terms rather than dodge a login; that route was rejected, not merely unexplored.
+AssistantBench is open and closer to GAIA in spirit, but its tasks need live browsing of arbitrary
+commercial sites, which under Tor-only egress measures Tor reachability, and its ground truth ages.
+FRAMES ships gold document links, which is what buys oracle mode. Wikipedia-over-Tor was verified
+reachable (HTTP 200, 3.2s) *before* the design leaned on it.
+
+**THREE INSTRUMENT BUGS, none of which failed loudly.** This is the actual content of the entry:
+
+1. **The GAIA scorer reported accuracy 0.0 on two correct answers.** `"5:31"` vs
+   `"5 minutes and 31 seconds"`; `"A, B"` vs `"A and B"`. Not a bug in it — it assumes GAIA's
+   *mandated answer format* on both sides, and FRAMES ground truth is natural language. FRAMES' own
+   paper grades with an LLM judge, so exact match was never the protocol. **Caught by the readiness
+   smoke, before the full run.** Had it not been, the run would have produced a near-zero that
+   measured the ruler.
+2. **The replacement judge was returning EMPTY CONTENT** with `finish_reason='length'` at every
+   max_tokens tried — E4B spending its budget on thinking tokens that never surface. Every judgement
+   parsed as unreadable and became NO. **The validation still looked plausible**: 0 false positives,
+   agreement 0.69, which reads as "the small judge is a bit weak". It was not weak, it was ABSENT —
+   `strict_match` was doing all the work. With both no-think switches (`/no_think` + 
+   `enable_thinking: False`, the pairing this repo already uses elsewhere): **16/16, 0 FP, 0 FN.**
+3. **The judge answered YES to an EMPTY candidate answer.** All three no-answer tasks scored CORRECT,
+   inflating the headline **0.767 → 0.817** — five points of pure credit for answering nothing, in
+   exactly the direction the scorer was designed never to err in. Caught by a single arithmetic
+   consistency check: *dropping the errored rows made accuracy go DOWN*, which is impossible if those
+   rows were misses. Without that check the inflated number was entirely plausible.
+
+**The anti-flattery discipline that shaped the scorer.** The tempting fix for (1) was normalisation
+rules — treat " and " as a comma, canonicalise durations, strip units. Every one of those would have
+been written by staring at MY agent's failures, producing a scorer tuned to raise my own score.
+Exactly ONE normalisation is kept, defensible without reference to any failure: " and " is the
+natural-language form of the separator GAIA already splits on. Everything else goes to a judge from a
+different model family, told to answer NO when unsure, with unparseable and errored replies counting
+as NO — so the number errs DOWNWARD. An understated scoreboard invites a re-measure; an overstated
+one gets quoted.
+
+**Grading is decoupled from running** (`rescore_details`): the agent's answers are the expensive
+artifact and the grading has now been wrong twice. Both fixes cost zero agent time to apply.
+
+**Pins: 51 tests** across `test_frames_harness.py` and `test_frames_scorer.py`, all revert-tested,
+including a two-sided credential guard (no code path can send a token — verified by injecting one),
+both no-think switches, and the empty-answer short-circuit. Full suite **11,915 passed / 14 skipped**.
+
+**Reproduce:** `frames_fetch.py --limit 60 --seed 7 --oracle` (task digest in `.provenance.json`),
+then `gaia_eval.py --tasks-file … --boot` (isolated agent, memory off, so benchmark turns never enter
+the live learning corpus), then `rescore_details`. ⚠ `summary.json`'s own accuracy is the GAIA
+scorer's and is WRONG for FRAMES — `frames_score.json` is authoritative.
+
+### 4AD. MECHANISM LIVENESS — absence is now a row, not a silence — ✅ DONE 2026-08-10 (task #53)
+
+**The measurement that justified the work.** `BACKGROUND ACTIVITY` enumerated phases
+**observationally** — it counted whatever slugs were already in the ledger. So a loop that stopped
+writing, or never wrote, produced no key and was invisible: *indistinguishable from a mechanism that
+does not exist*. Against the live ledger:
+
+| | |
+|---|---|
+| phase literals instrumented in `src/` | **15** |
+| phases with any record in 7 days | **7** |
+| phases the report displayed | 7 — **the other 8 were not rendered at all** |
+
+Two silent caps rode along. The renderer sliced `[:8]`, so a phase at zero — the only kind worth
+acting on — sorted last and was structurally the **first row dropped**. The reader took `limit=2000`
+against a ledger already past 2,600 records: not biting yet at ~565 records/week, and silent on the
+day it does.
+
+**Why rendering the zeros is NOT the fix.** `reflection` legitimately sits at 0 (it records only
+outcome-producing runs and skips unchanged-corpus ticks — the §4-era trap that already fooled me
+once); `dream` at 0 would be a dead loop. **A benign zero and a fatal zero must not look alike** —
+that is the same defect one level up. So `PHASE_EXPECTATION` (in `core/autonomous_activity.py`) has
+each phase declare what its own zero means, and `activity_liveness()` iterates the **registry**
+rather than the ledger:
+
+- **`periodic`** — scheduled, fires on its own. Zero over 24h is an **ALARM**. The five measured
+  firing continuously: `self_play` 160/7d, `calibration` 154, `skills_auto` 98, `dream` 88,
+  `router_train` 43.
+- **`on_output`** — runs on schedule, records only when it produced something. Verified at the call
+  site, not guessed: `open_questions` records `if stale:`, `workspace_tidy` records
+  `if _tidy_deleted:`, `native_tool_repair` is ~0 by design and each occurrence is news.
+- **`on_demand`** — externally triggered (`scheduled_task`, `project`, `experiment_verdict`).
+- **`gated`** — needs a flag or consumer that may be off (`prm_train` skips while neither `.score()`
+  nor `.uncertainty()` is live; `postmortem` is behind `--postmortem`).
+
+Only `periodic` can alarm. **Alarming on a benign zero is how an operator learns to scroll past the
+section** — which would rebuild by hand the exact blindness this removes.
+
+**Agent-down guard.** If *nothing* fired, the agent was off or idle: that is ONE fact, not five dead
+loops. Per-loop alarms are withheld and the single cause is stated. It keys on **total** silence only,
+so one surviving record still lets a genuinely dead loop alarm — pinned, because the obvious
+over-suppression turns a false positive into a false negative.
+
+**Pins: 26 tests, all five reverts red.** The load-bearing ones are the **mutation tests — one per
+periodic loop**: silence exactly one mechanism, require the monitor to name it and only it. A monitor
+that has never been observed to alarm proves nothing; shipping a dead-loop detector without testing
+that it fires would be the purest possible instance of the defect class it exists to catch. Plus a
+**coverage test** that fails when a phase literal exists in `src/` but not in the registry — a
+registry that silently omits a mechanism is the original bug wearing a green report. Full suite
+**11,864 passed / 14 skipped**.
+
+Reaches the operator with no extra wiring: `introspect action='learning'` already routes through
+`render_learning_health`. Also fixed en route: `_PHASE_LABELS` was itself missing
+`experiment_verdict`, `native_tool_repair` and `workspace_tidy`, which rendered as raw slugs.
+
+**Current reading — all five periodic loops fired within 24h; no alarms.**
+
+### 4AC. Two instruments lied in the same direction, and I believed both — ✅ FIXED 2026-08-10 (task #55)
+
+**Cost: ~1h of my time, a 2-hour live run launched that was never needed, and a wrong conclusion
+published to the operator twice.** Both defects are the same shape: *a "no evidence" state rendered
+as if it were evidence.*
+
+**Defect 1 — `--cache-dir` resolved against the CWD.** The default was the bare relative string
+`"verify_bench_cache"`. Run from the repo root — the normal way — it resolved to
+`<repo>/verify_bench_cache`, which did not exist, which `ResponseCache.__init__` then silently
+`mkdir`'d and missed on forever. The real 2,389-entry cache sat untouched in `$GHOST_HOME`. The run
+reported **`0 hits / 3464 misses`** — *which is exactly what a legitimately invalidated cache
+reports.* I concluded "the semantic code digest correctly invalidated everything; a full live
+re-bench is unavoidable" and said so. Pointed at the right directory, the same run replayed in
+**seconds at 1595 hits / 3 misses**. The startup line printed `dir=verify_bench_cache` — the
+basename, equally true of the right cache and of the empty one — so the bug was on screen the entire
+time and unreadable.
+
+**Defect 2 — the staleness oracle's own founding rule, defeated by a sentinel.**
+`bench_provenance` writes `escalation.arm = "unrecorded"` when no arm block was supplied. Correct for
+a RUN (an unlabelled arm must never be back-dated into a claim) — but it is a **string**, so
+`compare()`'s `o is None or n is None` guard slid past it and scored it as a known, different value:
+
+```
+escalation.arm   was 'judge+escalation'   now 'unrecorded'   -> DRIFT
+verdict: STALE — full live re-bench required
+```
+
+**That verdict was false, and it is what I acted on.** `judge` escaped the identical fate only by
+accident: `dict(None or {})` is empty, produces no key, and lands in UNCOMPARABLE correctly. The
+sentinel bites from *both* sides too — every pre-2026-08-04 baseline carries `"unrecorded"` on disk,
+so comparing one against a labelled run invented drift in reverse. This is §4X's lesson
+(*UNKNOWN ≠ CHANGED*) re-entering through a value spelled like data. Crying wolf is the one failure
+mode a staleness oracle cannot survive: the next **real** STALE gets waved through.
+
+**Fixes.** (1) `--cache-dir` anchors to `$GHOST_HOME/system/eval/verify_bench_cache`, matching the
+mined-pool pattern beside it. (2) `read`/`strict` **refuse** to create a missing cache dir — a replay
+replays a cache, it does not mint one — while an existing-but-empty dir stays legal, because
+*missing* (wrong path) and *empty* (nothing recorded yet) are different failures. (3) The startup line
+prints the resolved **absolute** path plus `entry_count()`, and shouts `CACHE IS EMPTY` when a replay
+mode finds zero. (4) `provenance.cache.entries` records the count, so a *past* run's "0 hits" can be
+explained after the fact. (5) The oracle maps the `unrecorded` sentinel to a real unknown.
+
+**Verified end-to-end from a foreign CWD** (`cd /tmp`, the exact triggering condition): resolves to
+the canonical cache, 2,487 entries, 20 hits / 0 misses, `code-vs-frozen-judge (replayed)`. The oracle
+now reads **STALE — replayable**, with the only drift being `code.bench` — which is correct, because
+this change edited it.
+
+**Pins:** 17 tests, all revert-tested red. The oracle fix carries a **two-sided** pin: reverting it
+reddens the three sentinel tests, and *over*-suppressing (silencing the whole field — the tempting
+wrong fix) reddens `test_a_REAL_arm_change_is_still_drift`. Fixing a false positive by creating a
+false negative is worse than the original bug. Full suite **11,838 passed / 14 skipped**.
+
+**Lesson for the next instrument.** Both defects passed every existing test, because both produced a
+*plausible* reading rather than a wrong one. The question that catches this class is not "is the
+output correct?" but **"could this output also be produced by the instrument being disconnected?"** —
+0 hits, an unrecorded arm, a green liveness report with a dead loop in it. Where the answer is yes,
+the two states must be rendered differently, loudly, by construction.
+
+### 4AB. `structural failure` now records its CAUSE — and the request that prompted it was based on my wrong premise — 2026-08-10
+
+**How this started, and the correction that matters more than the change.** Explaining §4AA's open
+label question, I claimed *"21% of hard labels are FAILED turns — partly timeout noise; tonight's
+ReadTimeouts would produce exactly these"* and proposed excluding infrastructure failures from the
+router's training corpus. The operator asked for it. **Before writing code I measured the actual
+`failure_reason` values, and the premise was wrong:**
+
+| kind | n | informative about request difficulty? |
+|---|---|---|
+| `verifier refuted` (quality) | **99** | **yes** — the agent answered wrongly |
+| `structural failure` (unspecified) | 42 | **unknowable** |
+| agent pathology (thinking-loop / no-progress) | 7 | no |
+| a tool errored repeatedly | 5 | ambiguous |
+| **INFRASTRUCTURE (timeout/connection/node/OOM)** | **0** | — |
+
+**Zero of 160 failures were infrastructure.** Not one timeout. The Nova ReadTimeouts happened during
+the *bench*, which does not write agent trajectories. My "21% is partly timeout noise" was
+speculation dressed as a finding, and the filter I proposed had nothing to filter — the honest count
+of clearly-non-informative failures is **7 of 160 (4%)**, which would move the labels ~0.5%, well
+inside what the §4AA held-out gate already tolerates. **Not built.** Shipping a clean-looking diff
+justified by a premise that did not survive contact with the data would have been worse than
+shipping nothing.
+
+**WHAT WAS REAL, and what got built instead:** `structural failure` — **42 of 160 (26%)** — recorded
+only THAT execution broke, never WHAT. The one bucket where an infra-vs-task distinction could hide
+was precisely the one that could not be classified. It now records its cause, derived from the
+trajectory's own failed tool calls via `tool_call_failed` — THE shared sniffer, not a second copy:
+
+    structural failure: file_system: '/users/…/project_journal.md' does not exist in the
+                        current project's sandbox
+
+**⚠ THE TRAP THIS HAD TO NAVIGATE.** `STRUCTURAL_FAILURE_REASON` is load-bearing, not cosmetic:
+`resolve_turn_outcome` matched it **EXACTLY** to decide whether a late verifier PASS may upgrade
+that FAILED (the 2026-07-31 honest-failure rule). **Appending a cause naively would have silently
+stopped that match and disabled the rule on the async-verdict path** — with nothing failing loudly.
+The constant's own comment warns about exactly this writer/reader drift, which is why it was read
+before editing. So the constant became a **PREFIX**, the cause is a `": "` suffix, and every reader
+goes through `is_structural_reason()`. Verified end-to-end: a cause-qualified reason still earns the
+late PASS upgrade, the bare legacy string still does, `verifier refuted` still never does, and the
+rule-2b unacked-total-failure carve-out still withholds.
+
+Audited every consumer first: the two other `STRUCTURAL_FAILURE_REASON` sites are WRITERS (a
+fallback value, a self-check input), not exact-match readers, and nothing else in the tree compares
+`failure_reason` to a literal.
+
+**Pins:** 20 tests in `test_structural_failure_cause.py`, 5 revert-tested — including reverting the
+reader to exact match, i.e. the trap itself. Two pre-existing tests asserted the bare string and were
+moved to the CONTRACT (`is_structural_reason`) rather than having the feature weakened to suit them;
+their diff is the change working (`+ structural failure: file_system: … does not exist`). Full suite
+**11,801 passed / 14 skipped**. Deployed (restart 46883).
+
+**⚠ STILL OPEN — the label's real weakness is not about failures at all:** 64% of "hard" comes from
+`steps >= 4`, which conflates task difficulty with the agent flailing, and the label is an OUTCOME of
+the agent's own behaviour rather than a property of the request. Now that the router is live there is
+also a feedback loop: routing decisions change step counts, which change future labels. The quantity
+actually wanted is counterfactual — *would planning have helped?* — and **#23's `use_planning` arm
+measures exactly that**. Do not re-guess a better proxy before that data lands.
+
+### 4AA. The router gate was ANTI-CORRELATED with quality — ✅ FIXED + LIVE 2026-08-09 (task #48)
+
+⚠ **NAMING:** §4Z exhausted the single letters. This block is §4AA; continue §4AB, §4AC…
+
+**Found by the operator reading the logs**, not by an audit: `complexity router — Checkpoint is
+INVERTED … escalate-all`. The router had been doing NOTHING for ~30 hours, and it would have stayed
+that way forever.
+
+**THE MEASUREMENT (offline, 1354 labelled trajectories, 92% real `user_request` turns — self-play
+contamination RULED OUT by segmenting `task_kind`):** in THIS agent's traffic,
+`technical_jargon` is **4.1× and coding mentions 6.8× MORE common in EASY turns**, and even
+**LENGTH inverts** (longer ⇒ easier). Vagueness, not technicality, predicts work here: a precise
+"write a script that parses input.txt" resolves in 1-2 steps; "update the project and give me an
+analysis" triggers planning, many tools, many steps. **No labelling bug makes longer requests
+easier** — the signal is real, and the model that learned it was correct.
+
+`looks_sane()` hardcoded the prior "more jargon/coding ⇒ harder" (`core_net >= -0.5`); the data
+gives **-0.886**, consistently. Every model that fits is rejected. A permanent deadlock, not a bad
+checkpoint.
+
+**⚠ AND THE GATE WAS BACKWARDS.** Measured on a 70/30 split (seed 7, n=407):
+
+| model | held-out accuracy | skips planner on hard | old gate |
+|---|---|---|---|
+| escalate-all (what was running) | 0.560 | — | — |
+| **fitted** | **0.695** | 13.2% | **REJECTED** |
+| **sign-flipped** (the §4O catastrophe) | **0.305** | **86.8%** | **ACCEPTED** |
+
+It rejected the good model and would have **admitted the catastrophic one** — the exact failure §4O
+built it to prevent. A gate anti-correlated with quality is worse than no gate, because it is
+trusted. That latent hole existed for as long as the guard did.
+
+**THE FIX — gate on OUTCOME, not on a prior about weights.** Reject unless, on data the model never
+saw: (a) accuracy beats escalate-all, and (b) it skips the planner on ≤25% of hard requests.
+Asymmetric by design — predicting "easy" for a hard request skips the planner (harmful), the
+reverse only wastes compute. `is_finite()` kept. **Fail-closed:** no evidence ⇒ no deploy, and
+rejection leaves escalate-all, which was already the behaviour.
+
+**Three defects found in MY OWN change, two by the fresh-eye review the operator asked for:**
+1. **The gate scored an operating point production does not run.** `ComplexityDispatcher` escalates
+   whenever confidence < 0.3 REGARDLESS of label, so a low-confidence "easy" never skips the planner
+   live. `evaluate()` read the bare label — gating on a system that does not exist. Fixing it moved
+   the headline: **false-easy 0.131 → 0.044**.
+2. **I re-introduced the two-copies-drift defect I had fixed hours earlier**, hardcoding `0.3` when
+   the live value is a CLI flag (`--router-confidence-threshold`). Now READ from the dispatcher and
+   threaded through BOTH deploy paths (boot bootstrap + idle retrain), with the threshold recorded
+   in the evidence.
+3. **The gate was FORGEABLE** (found by mutation-testing the gate itself): `looks_sane()` reads a
+   STORED report, so a checkpoint carrying real weights beside a passing report would be waved
+   through — a forgery the OLD weight-inspecting gate was immune to. The evidence is now bound to a
+   **fingerprint of the weights it was measured on**.
+
+**Contract change, made explicit rather than silent:** the corpus floor is now DERIVED from the gate
+(60 held-out ÷ 30% = **200 labelled trajectories**), not chosen separately. Two independent numbers
+is how you get a trainer that looks like it should run at 20 samples and silently never deploys.
+
+**FOUR SUPERSEDED TESTS REWRITTEN, NOT DELETED** — including one whose FIXTURE WAS THE BUG: it built
+`tech → easy, chat → hard` (exactly the real-world pattern) and asserted the trainer condemn it as
+"INVERTED". §4O R3's compensating-weights loophole is now structurally obsolete — the gate reads no
+weights at all — and the test says so.
+
+**LIVE (restart 22:28):** `held-out gate PASSED — acc 0.691 > escalate-all 0.561, false-easy 5.2%
+(n=408)`, trained on 1358 samples. The router routes for the first time since 08-08 16:36. The
+checkpoint now carries its own justification, so a future reader can see WHY it deployed. One stale
+log line ("INVERTED (negative technical/coding weights)") corrected — it described the removed test.
+
+**Pins:** 20 tests in `test_router_heldout_gate.py`, all revert-tested. **Three more weak pins
+caught** (toy fixture too separable to exercise the confidence gate; `getsource` includes a
+docstring that made a hardcoded value look read; a grep matching a line the mutation never touched)
+— **eight weak pins this session**. Full suite **11,781 passed / 14 skipped**.
+
+**⚠ STILL OPEN, and I want it on the record:** the label ("hard" = the agent did a lot of work) is a
+good proxy for "needed the planner" but not identical to it. The gate makes the model honest about
+predicting that label; it does not prove the label is the right thing to route on.
+
+### 4Z. #47 adjudicate issues-schema — MEASURED, ROLLED BACK, and the most useful result of the day — 2026-08-09
+
+⚠ **§4Z IS THE LAST SINGLE LETTER.** The next block needs a new scheme (`§4AA`, or renumber). Decide
+it deliberately rather than improvising mid-write.
+
+**The hypothesis, and it was a good one.** The adjudicate output spec said only
+`"issues": ["each REAL problem; empty if none"]` — free text, no required form. So a small judge
+satisfies it with the CATEGORY it was thinking in (`"artifact"`) or the SPAN it objects to
+(`"average round-trip of 3.9 ms"`). Both are valid answers to "name the problem"; neither is a
+PROPOSITION, and every consumer needs one (objection rule 1 needs a contrast, rule 2 an absence
+claim, rule 3 an allegation, the main model something to adjudicate). Measured addressable
+population: **22 of 56 wrongly-overturned trials (39%)** — 19 bare quotes, 9 bare category labels.
+
+**Two traps caught BEFORE spending the 65 minutes, either of which would have wasted the run:**
+1. **A promoted GEPA artifact overrides the hand-written constant.** Editing
+   `_VERIFY_ADJUDICATE_PROMPT` changes NOTHING while an artifact is live. Caught by reading the
+   LIVE template (`_stage_template`) instead of the source — the `optimizer-sheds-pinned-rules`
+   lesson, applied in time for once. The rule was therefore pinned at RENDER time so a future
+   promotion cannot shed it either.
+2. **The first draft was a 700-char worked-examples section.** The live artifact is 5366 chars and
+   this judge is documented capacity-bound at ~5.4KB. Shipped version: **+71 chars**, in the field
+   description where the model actually fills it.
+
+**RESULT — no benefit, one rollback trigger fired:**
+
+| | incumbent | #47 |
+|---|---|---|
+| balanced | 0.8251 | **0.8063** (−0.019) |
+| TPR | 0.767 | 0.748 |
+| FPR | 0.121 | **0.103** |
+| degraded-evidence FP | 0.111 | **0.178** ← pre-registered rollback trigger |
+
+**Paired McNemar: p=0.3409 — NO DIFFERENCE RESOLVED** (31 right→wrong, 23 wrong→right).
+
+The pre-registered rule (written to `vb47/DECISION_RULE.md` BEFORE any result was visible) passed
+its ship bar on production-weighted error (0.1104 < 0.1266) but tripped rollback trigger 2. With no
+measured benefit and a safety trigger fired, shipping on one favourable derived metric is exactly
+the reasoning that would have shipped variant B. **Rolled back; production never loaded it.**
+
+**⚠ THE FINDING, and it is worth more than the change would have been: THIS JUDGE'S PROMPT IS AT A
+HARD CAPACITY CEILING.** The per-class split is not a wash — it is a trade:
+
+| class | Δ | |
+|---|---|---|
+| `fact_swap` | **+0.186** | the mechanism WORKS — numeric contradictions stated two-sided become mechanically provable |
+| `fabrication` | +0.052 | |
+| `clean` | +0.018 | FPR improved |
+| `silent_failure` | −0.052 | |
+| `evidence_truncation` | −0.067 | |
+| `artifact_leak` | **−0.190** | |
+
+Diagnosis, unambiguous: `cheap REFUTED 48/58 → 44/58` and `objection upheld 27 → 18`. **The cheap
+judge caught fewer artifacts AND the mechanical guard fired 9 fewer times.** +71 characters of
+format rule displaced 11 artifact catches. I rejected the 700-char version for exactly this reason;
+**71 was still too much.** Any addition to this prompt costs something else.
+
+**Consequences that outlive the experiment:**
+- **Capacity is the binding constraint on the critic node.** That is now MEASURED, and it is the
+  concrete argument in the model-swap question (task: Qwen 3.5 9B plausible, LFM2.5-**2.6B** wrong
+  direction — you cannot fix a capacity-bound judge by shrinking it).
+- **A v2 scoped to numeric issues is ~1-in-3 to work and was NOT run.** A scoped rule is ~+62 chars
+  vs the +71 that broke it — not meaningfully cheaper in the only currency that mattered. A
+  targeted 204-trial subset (`--faults artifact_leak,fact_swap` + clean + evidence_truncation,
+  ~30 min) is designed and ready if it is ever wanted.
+- **A CODE-side v2 was designed and KILLED at zero cost.** Enriching contentless issues from
+  stage-1's `reason` field would have replayed in 3.5s — but only **2 of 48** damaged trials have
+  both a contentless issue and a usable stage-1 reason (ceiling +0.006). Measured, then dropped,
+  before a line was written.
+
+**Method notes.** The §4U gates ran for real: preflight BLOCKED the launch on a genuinely missing
+progress directory, then cleared; the run reported its own measured ETA from `progress.json`
+throughout. My first watcher exited 0 both on completion AND on running out of loop iterations —
+an ambiguous exit reported as success, the fourth "mechanism that appears to report and does not"
+of the day; replaced with one that can only exit for a NAMED reason. And a mid-run grep read `$4`
+(the `->` arrow) and printed nonsense before I re-parsed by pattern.
+
+### 4Y. Fresh-eyes audit of the session's own output — 2026-08-09
+
+**Why:** operator asked for it after §4X (a blind spot in my own fingerprint, found by routine use).
+Scope: everything shipped 2026-08-09 (§4S–§4X). **Production-risk surface is exactly one file** —
+nothing in `src/ghost_agent/` imports `eval.*`, so the bench tooling is offline-only and
+`core/objection.py` is the only production-reaching change of the block.
+
+**THREE REAL DEFECTS FOUND, all in code I had already declared done and tested.**
+
+1. **The progress contract reported a COMPLETED run as `done: 1` / STALLED.** Two compounding
+   causes: `tick()` throttles writes to 2s, so a run finishing inside one interval (a 3.5s strict
+   replay) recorded only its first item; and **the bench never called `finish()`**, so no run ever
+   wrote a terminal state and `read_progress` aged every completed run into
+   "STALLED — the run may be wedged". A status tool confidently reporting a false state is
+   precisely what §4U exists to prevent, produced by §4U. Fixed: completion overrides the throttle,
+   and the CLI calls `finish()`.
+2. **`replay_age_s` could describe evidence the run never used.** The mtime was recorded at
+   `f.exists()`, but a corrupt entry exists on disk and is counted a MISS — so `len(_hit_mtimes)`
+   could exceed `hits`. Moved to the actual-hit point; invariant now `len(_hit_mtimes) == hits`.
+3. **A weak pin, caught by revert-testing (the third of the session).** `finish()` could be
+   unwired from the bench CLI without breaking a single test — the tests covered the
+   `RunProgress` API, never that the caller used it. Same silent-inoperative shape as §4X:
+   mechanism correct, caller unverified. Now pinned structurally.
+
+**TWO FALSE FINDINGS I nearly filed — the audit needed auditing too.**
+- *"the progress contract never fired on a real run"* — my glob looked in the timestamped subdir;
+  the file is written at the out-dir ROOT (deliberately, so `runstatus` can be pointed at a stable
+  path). It had fired on all 8 runs.
+- *"190 errors since restart"* — my `awk` matched the FIRST "system ready" in the log, spanning
+  every restart of the day. Correctly scoped to the LAST boot: **0 errors**.
+
+An unexplained 19:11 restart was chased and resolved as operator-initiated — the log shows a clean
+`system shutdown — draining background work… / shutdown complete`, not a crash.
+
+**Verified sound:** no residue from the two rejected experiments (variant B, rule 5) anywhere in
+`objection.py`; the two shipped fixes present; every numeric claim in the docs re-derived from a
+live run (core-math 26/26 live and 21/21 offline, preflight blocks 4 of 5); the baseline file
+internally consistent (balanced == mean of its halves, trials == class-mix sum, no
+`smallest_resolvable_delta`); all 7 new test files collected by the suite (11,759 collected).
+
+**Full suite 11,745 passed / 14 skipped.**
+
+**⚠ The lesson §4X taught, confirmed twice more:** every defect here was in a mechanism I had
+declared working. Two were invisible to a passing test suite because the tests exercised the
+*mechanism* and not its *caller*. **After shipping, exercise the thing end-to-end and read what it
+actually wrote** — a green suite is not evidence that a subsystem runs.
+
 ### 4X. The fingerprint was blind to the file I had just changed twice — 2026-08-09
 
 **Caught by running my own oracle as a closing sanity check.** After shipping §4V (artifact gate)

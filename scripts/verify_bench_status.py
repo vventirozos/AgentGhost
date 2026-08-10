@@ -75,13 +75,27 @@ DEFAULT_BASELINE = "system/eval/verifier_incumbent_baseline.json"
 
 # What each drifted component costs to restore. The whole point of the
 # oracle is that most drift does NOT require the expensive path.
-_REPLAYABLE = "replay (--cache-mode read): only changed prompts cost calls"
+# ⚠ THREE tiers of cost, not two (2026-08-09). "Replayable" alone was
+# misleading: it is mechanically true for any prompt/scoring change, but a
+# change UPSTREAM of prompt construction invalidates every cached response
+# downstream of it, so "only changed prompts cost calls" == "everything
+# costs calls". Measured on the 433-trial pool (~1600 calls):
+#   * policy/scoring code downstream of the prompts -> ~100% hits, 3.5s;
+#   * the ADJUDICATE template          -> ~27% hits (stage-1 survives);
+#   * the ENUMERATE template           -> 0% hits, because its OUTPUT is
+#     interpolated into adjudicate as {suspects}, whose output in turn
+#     feeds the escalation prompts. A full live run.
+_REPLAYABLE = "replay (--cache-mode read) is CHEAP: this is downstream of "\
+              "prompt construction, so cached responses still apply"
+_PROMPT = "replay works but SAVES LITTLE: a prompt change re-keys every "\
+          "call downstream of it (enumerate cascades to ~0% hits via "\
+          "{suspects}; adjudicate keeps only the stage-1 half)"
 _FULL = "FULL live re-bench: cached responses cannot apply"
 
 _COMPONENTS = {
     "code.verifier":  ("verifier logic changed (system under test)", _REPLAYABLE),
     "code.bench":     ("bench/scoring changed (the ruler, not the system)", _REPLAYABLE),
-    "templates":      ("rendered prompt changed", _REPLAYABLE),
+    "templates":      ("rendered prompt changed", _PROMPT),
     "cases_sha256":   ("case pool changed", _REPLAYABLE),
     "faults_sha256":  ("fault library changed", _REPLAYABLE),
     "verify_flags":   ("a discipline switch selects a different pipeline", _REPLAYABLE),
@@ -124,6 +138,35 @@ def honest_interval(base: dict) -> str:
             f"(±{half:.3f}, n={n_nr} non-refute / {n_rf} refute){extra}")
 
 
+def _known(v):
+    """Map bench_provenance's "no evidence" SENTINEL to a real unknown.
+
+    ⚠ MEASURED 2026-08-10. `bench_provenance` records
+    ``escalation.arm = "unrecorded"`` when no arm block was supplied — right
+    for a RUN (an unlabelled arm must never be back-dated into a claim). But
+    it is a STRING, so `compare()`'s `o is None or n is None` guard slid
+    straight past it and it was scored as a KNOWN, DIFFERENT value:
+
+        escalation.arm  was 'judge+escalation'  now 'unrecorded'  -> DRIFT
+        -> "STALE — full live re-bench required"
+
+    That verdict was FALSE and I acted on it: a replay of the same baseline
+    ran clean at 1595 hits / 3 misses seconds later. Note `judge` escaped the
+    same fate only by accident — `dict(None or {})` is empty, so it produced
+    no key at all and landed in UNCOMPARABLE correctly.
+
+    It bites from BOTH sides: the status tool synthesizes "unrecorded" when
+    given no topology flags, AND every pre-2026-08-04 baseline carries it on
+    disk, so comparing one of those to a labelled run invented drift too.
+
+    This is the tool's own founding lesson — "a field absent on either side
+    is UNCOMPARABLE, never drift" — defeated by a sentinel that is spelled
+    like data. Crying wolf is the one failure mode a staleness oracle cannot
+    survive, because the next real STALE gets ignored.
+    """
+    return None if v == "unrecorded" else v
+
+
 def flat_fingerprint(prov: dict) -> dict:
     """The comparable fingerprint, flattened to dotted keys."""
     esc = prov.get("escalation") or {}
@@ -132,7 +175,7 @@ def flat_fingerprint(prov: dict) -> dict:
         "faults_sha256": prov.get("faults_sha256"),
         "code.verifier": (prov.get("code") or {}).get("verifier"),
         "code.bench": (prov.get("code") or {}).get("bench"),
-        "escalation.arm": esc.get("arm"),
+        "escalation.arm": _known(esc.get("arm")),
         # The leg lives in two places across baseline versions; prefer the
         # explicit one and fall back rather than reporting "unknown" for a
         # run that did record it.
@@ -284,9 +327,14 @@ def main() -> int:
         print("  A cached replay CANNOT restore validity: the judge, arm or "
               "route changed,\n  so every cached response answers a different "
               "question. Run a fresh bench.")
+    elif any(d["restore"] == _PROMPT for d in drift):
+        print("  A PROMPT changed. `--cache-mode read` still works, but it "
+              "saves little:\n  every call downstream of that prompt is "
+              "re-keyed. Budget for a near-full run.")
     elif drift:
-        print("  All drift is replayable. `--cache-mode read` pays for only "
-              "the genuinely\n  changed prompts and reuses the rest.")
+        print("  All drift is downstream of prompt construction — "
+              "`--cache-mode read` reuses\n  the cached judge responses and "
+              "costs seconds.")
     else:
         print("  The recorded figure still describes the current tree.")
     print("=" * 78)
