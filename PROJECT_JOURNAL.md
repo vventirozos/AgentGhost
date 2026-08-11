@@ -727,6 +727,86 @@ over-weights the refute side. **Check a shipping decision against a realistic ba
 **Pins:** 15 tests, all revert-tested (3 mutations, all red), including a structural guard against
 re-introducing variant B. Full suite **11,719 passed / 14 skipped**.
 
+### 4AP. BM25 LESSON-RETRIEVAL FALLBACK MATCHED ANYTHING — ✅ FIXED + DEPLOYED 2026-08-11
+
+Found while scoping #62, by asking the standing question of my own pre-check: *could this same output
+be produced by the instrument being disconnected?* It could. The probe reported 100% lesson mediation
+on the B4 battery; a control query about **emperor penguins returned 5 lessons too.**
+
+**THE DEFECT.** `_bm25_like_score` returned the raw fraction of query tokens present in a trigger —
+**no IDF, no stopword filter** — and the fallback branch admitted on **`score > 0`**. One shared
+`the` scores 1/9. Measured on the live 50-lesson playbook, every one of these pulled **5 tool-use
+lessons**:
+
+```
+"what year did the treaty of westphalia end the thirty years war"   -> 5
+"describe the mating rituals of the emperor penguin in antarctica"  -> 5
+"how do i bake a sourdough loaf with a long cold ferment"           -> 5
+"I am a PostgreSQL engineer with 20+ years of experience."          -> 5
+```
+
+Only literal gibberish scored 0. **This branch is reachable in production:** `main.py` assigns
+`context.memory_system` inside a `try/except` that logs and continues, so a VectorMemory init failure
+silently routes every turn through it — precisely the degraded mode where a polluted prompt is least
+affordable.
+
+**THE FIX.** Stopword filter + standard BM25 IDF built from the playbook's own triggers
+(`ln((N−df+0.5)/(df+0.5)+1)`), scoring IDF-weighted **coverage of the query's information mass**
+rather than a token count. IDF is what makes it self-calibrating — no hand-written list tracks which
+words are boilerplate *in this playbook*, but the corpus always does. Both guards are needed: a
+stopword appearing in exactly one trigger would otherwise earn a HIGH idf and become the strongest
+match. Same IDF corpus feeds the vector path's re-ranker so a term is worth the same on both.
+
+**THE FLOOR IS CALIBRATED, NOT CHOSEN.** On the live playbook: unrelated **0.00–0.20**, genuine
+paraphrases **0.26–0.54**, near-verbatim **0.66–1.00**. `_BM25_MIN_SCORE = 0.30`
+(`GHOST_BM25_MIN_SCORE`) clears every unrelated query by 50%. The two paraphrases it drops (0.256,
+0.271) were both matching a *wrong* lexically-similar trigger — "shut down the chess server" pulling
+a chess POST-MORTEM lesson — so dropping them is correct, not collateral. Precision over recall is
+deliberate: this branch runs only when the vector store is already down.
+
+| | before | after |
+|---|---|---|
+| unrelated queries (6 tested) | **5 lessons each** | **0** |
+| real task queries | 5 (mostly wrong) | 1–2, correct lesson on top |
+| B4 mediation, vector path | 45/45 | **45/45** (unchanged) |
+| no-query recency injection | 5 | 5 (contract preserved) |
+
+**Pins:** `tests/test_bm25_fallback_relevance.py` (26), every rejection paired with a
+must-still-retrieve case so `return []` cannot pass. ⚠ **Mutation-testing caught a worthless pin:**
+the first version never exercised the floor — with IDF and stopwords in place the fixture's unrelated
+queries score EXACTLY 0.0, so reverting the gate to `score > 0` left all 23 tests green. The floor
+only matters in the band `0 < score < 0.30`, which the fixture never reached. Added a fixture that
+lands there by construction (boilerplate low-IDF term + long query, ~0.04) and asserts the band
+before asserting the rejection. All 6 mutations now red.
+
+**FOLLOW-UP, operator-chosen: the two offending lessons QUARANTINED (not deleted), 2026-08-11.**
+On the VECTOR path "westphalia" still admitted 1 lesson at **dist=0.4458** — a hair under the 0.45
+floor, pure embedding luck, NOT a domain rescue (`explicit_cluster=None`, so everything ≥0.45 was
+correctly dropped). Options were: quarantine the offenders, tighten the global floor, or delete the
+BM25 branch. Operator chose quarantine — targeted and reversible, and tightening the floor fights a
+documented fix (the strict floor once made the learning loop write-only, mediation ≈0 across all 96
+B4 probe turns, which is why the domain rescue exists).
+
+`Post-Mortem Analysis of Chess Move Selection…` and `…Chess Coaching Agent Interaction` now carry
+`quarantined: true` + reason + timestamp. Playbook still 50 rows; nothing deleted; backup taken.
+
+| | before | after |
+|---|---|---|
+| westphalia | 1 lesson | **0** |
+| "Stop the chess service." | 4 | 2 (correct lesson on top) |
+| B4 mediation | 45/45 | **45/45** |
+| quarantined rows reaching a prompt (45 tasks) | — | **0** |
+
+⚠ **I nearly reported a bug that was my own measurement error.** The first check showed quarantine
+having NO effect, and I was about to write up "`quarantined` is unenforced on the vector path". I was
+calling `_playbook_items_and_branch`, the raw internal; the PUBLIC entry points (`get_playbook_items`,
+`get_playbook_context`) apply `_filter_quarantined`. **Verify through the API production calls, not
+the private helper that happens to be convenient.**
+
+⚠ **The root cause is untouched and still live:** quarantine removed these two offenders, not the
+near-threshold behaviour. Another lesson can land at 0.44 against an unrelated query. Tightening
+`DEFAULT_RETRIEVAL_DISTANCE` is the general fix and needs B4 mediation re-measured before/after.
+
 ### 4AO. A4 — IS LABEL NOISE WHAT CEILINGED EARN-KEEP AND SKILL-PRUNE? ✅ ANSWERED 2026-08-11
 
 **Split verdict, and the split is the finding.** Instrument: `scripts/label_noise_audit.py`

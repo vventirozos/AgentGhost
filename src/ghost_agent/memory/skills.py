@@ -391,22 +391,107 @@ def _dup_trigger_from_vector_text(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _bm25_like_score(query: str, trigger: str) -> float:
-    """Tiny keyword-overlap re-ranker. Returns a score in [0, 1] — the
-    fraction of query tokens that appear in the lesson trigger.
+# Function words carry no topical signal but are everywhere, so plain token
+# overlap scores them like content. IDF alone does not remove them: a
+# stopword that happens to appear in ONE trigger gets a HIGH idf and becomes
+# the strongest "match" in the query. Both guards are needed.
+_STOPWORDS = frozenset("""
+the and for are but not you all any can had her was one our out day get has
+him his how man new now old see two way who did its let put say she too use
+that this with have from they will would there their what when which them
+then than some time very just into over also back after your only other
+some such because been being does doing done each few more most must need
+should still those through under until while about above again against
+between both during before below down here itself myself off once same
+these those under very were where whom why yours
+""".split())
 
-    Not true BM25 (no IDF corpus), but enough to break ties when two
-    lessons have similar vector distance. The retrieval pipeline uses
-    this to prefer lessons whose trigger literally mentions words from
-    the user's current task.
+_BM25_MIN_TOKEN_LEN = 3
+
+# Floor for admitting a lesson on the BM25 FALLBACK path. CALIBRATED against
+# the live 50-lesson playbook (2026-08-11), not chosen:
+#
+#   unrelated queries (penguins / Westphalia / sourdough / world cup)
+#                                     best score 0.00 – 0.20
+#   genuine paraphrases               0.26 – 0.54
+#   near-verbatim task queries        0.66 – 1.00
+#
+# 0.30 clears every unrelated query by 50% and keeps the paraphrases that
+# matched the RIGHT lesson. The two paraphrases it drops (0.256, 0.271) were
+# both matching a wrong-but-lexically-similar trigger — "shut down the chess
+# server" pulling a chess POST-MORTEM lesson — so dropping them is the
+# correct call, not collateral damage.
+#
+# ⚠ PRECISION OVER RECALL IS DELIBERATE HERE. This branch runs only when the
+# vector store is unavailable, i.e. already degraded. A missing lesson costs
+# what the outage already costs; an irrelevant one actively pollutes the
+# prompt. The surrounding code made the same choice ("Empty instead of
+# dumping recency").
+_BM25_MIN_SCORE = float(os.environ.get("GHOST_BM25_MIN_SCORE", "0.30") or 0.30)
+
+
+def _bm25_tokens(text: str) -> set:
+    """Content tokens: long enough to matter, and not function words."""
+    return {t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", (text or "").lower())
+            if len(t) >= _BM25_MIN_TOKEN_LEN and t not in _STOPWORDS}
+
+
+def _bm25_idf(triggers) -> dict:
+    """Standard BM25 IDF over the playbook's own triggers.
+
+    ln((N - df + 0.5) / (df + 0.5) + 1) — a term present in EVERY trigger
+    lands near 0, a term unique to one lands high. This is what makes the
+    score self-calibrating: no hand-maintained list can keep up with which
+    words are boilerplate *in this playbook*, but the corpus always knows.
+    """
+    docs = [_bm25_tokens(t) for t in triggers if t]
+    n = len(docs)
+    if not n:
+        return {}
+    df: dict = {}
+    for d in docs:
+        for tok in d:
+            df[tok] = df.get(tok, 0) + 1
+    return {tok: math.log((n - c + 0.5) / (c + 0.5) + 1.0) for tok, c in df.items()}
+
+
+def _bm25_like_score(query: str, trigger: str, idf: dict = None) -> float:
+    """Keyword-overlap re-ranker, in [0, 1].
+
+    ⚠ THE DEFECT THIS REPLACES (found 2026-08-11 while scoping the hydration
+    arm): the old version returned the raw fraction of query tokens present
+    in the trigger, with no IDF and no stopword filter. A single shared
+    ``the`` scored 1/9 > 0, and the BM25 FALLBACK admitted on ``score > 0``
+    — so "what year did the treaty of westphalia end the thirty years war"
+    retrieved 5 tool-use lessons. Only literal gibberish scored 0. That
+    fallback is reachable in production: ``main.py`` assigns
+    ``context.memory_system`` inside a try/except that logs and continues,
+    so a VectorMemory init failure silently routes every turn through here.
+
+    With ``idf`` supplied the score is IDF-WEIGHTED COVERAGE — the share of
+    the query's *information mass* the trigger accounts for — rather than a
+    raw token count. Without it, coverage is still stopword-filtered, so the
+    old always-nonzero behaviour cannot come back either way.
     """
     if not query or not trigger:
         return 0.0
-    q_tokens = {t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", query.lower()) if len(t) > 2}
-    t_tokens = {t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", trigger.lower()) if len(t) > 2}
+    q_tokens = _bm25_tokens(query)
+    t_tokens = _bm25_tokens(trigger)
     if not q_tokens:
         return 0.0
-    return len(q_tokens & t_tokens) / len(q_tokens)
+    hit = q_tokens & t_tokens
+    if not hit:
+        return 0.0
+    if not idf:
+        return len(hit) / len(q_tokens)
+    # Unseen query terms are maximally informative: they are rarer than
+    # anything in the corpus. Scoring them 0 would let a trigger claim full
+    # coverage of a query made entirely of words it does not contain.
+    default = max(idf.values()) if idf else 1.0
+    total = sum(idf.get(t, default) for t in q_tokens)
+    if total <= 0:
+        return 0.0
+    return sum(idf.get(t, default) for t in hit) / total
 
 
 # --- Outcome-gated utility (2026-07-24) -----------------------------------
@@ -2150,6 +2235,7 @@ class SkillMemory:
             return (lesson.get("trigger") or lesson.get("task") or "").strip().lower()
 
         vector_attempted = False
+        _vec_idf = None          # built lazily; the vector branch may not run
         try:
             if memory_system and query:
                 vector_attempted = True
@@ -2190,7 +2276,15 @@ class SkillMemory:
                                     and dist < _DOMAIN_RELAXED_DISTANCE):
                                 continue
                         trigger = (meta or {}).get("trigger", "") or _extract_trigger_from_doc(doc)
-                        bm25 = _bm25_like_score(query, trigger or doc)
+                        # Same IDF corpus as the fallback, so a term is worth
+                        # the same on both paths. Here bm25 only RE-RANKS
+                        # candidates the vector store already admitted, so
+                        # the fix mainly stops boilerplate overlap from
+                        # reordering genuinely-closer lessons.
+                        if _vec_idf is None:
+                            _vec_idf = _bm25_idf(
+                                [_trigger_of(p) for p in playbook_snapshot])
+                        bm25 = _bm25_like_score(query, trigger or doc, _vec_idf)
                         # Lower distance is better; higher bm25 is better.
                         combined = (1.0 - dist) + bm25 * 0.4
                         candidates.append((combined, dist, doc, meta or {}, trigger))
@@ -2229,10 +2323,15 @@ class SkillMemory:
         # injection for the system prompt, not a per-turn retrieval.
         if query and str(query).strip():
             scored: List[Tuple[float, dict]] = []
+            _idf = _bm25_idf([_trigger_of(p) for p in playbook_snapshot])
             for p in playbook_snapshot:
                 trig = _trigger_of(p)
-                score = _bm25_like_score(query, trig or "")
-                if score > 0:
+                score = _bm25_like_score(query, trig or "", _idf)
+                # ⚠ WAS `score > 0`, which admitted a lesson on ONE shared
+                # stopword and made this branch return 5 lessons for any
+                # query containing an English word. The floor is calibrated,
+                # not guessed — see _BM25_MIN_SCORE.
+                if score >= _BM25_MIN_SCORE:
                     scored.append((score, p))
             if scored:
                 scored.sort(key=lambda t: -t[0])
