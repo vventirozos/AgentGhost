@@ -144,6 +144,49 @@ _BATCH_COLLAPSE_UNSAFE = frozenset({
 # lives inside the tool; an unknown action errors out and never resets.
 _SERVICE_READONLY_OPS = frozenset({"", "status", "logs", "log", "list", "ls"})
 
+# Actions of `manage_composed_skills` that move the macro REGISTRY the pre-flight
+# guard reasons about: a `delete` makes a blocked `define` of the same name
+# legal again, and `approve`/`define` change what is dispatchable. `run` is
+# DELIBERATELY EXCLUDED — a macro can be entirely read-only (an ls/grep/curl
+# "status" bundle), so treating every successful run as world-mutating would
+# reintroduce the exact read-only-probe hole the `execute` branch guards
+# against, and a model interleaving such a run between failing calls could
+# reset the guard on each attempt and defeat it permanently. `list` is
+# read-only too. See `_call_mutated_world` and the 2026-08-12 deadlock.
+_COMPOSED_SKILL_MUTATING_ACTIONS = frozenset({"define", "approve", "delete"})
+
+
+def _call_mutated_world(fname: str, t_args: dict, is_mutating: bool) -> bool:
+    """True when a SUCCESSFUL dispatch of this call changed state the pre-flight
+    repeat-failure guard reasons about — the trigger for its world-changed
+    reset (`RecentFailureGuard.note_world_changed`).
+
+    Pure (no I/O, no self) so the predicate is unit-testable in isolation
+    rather than buried in the dispatch loop. `is_mutating` alone is the wrong
+    signal for `execute` (blanket-True there — every ls/grep/curl probe would
+    reset the guard), so that path uses the command heuristic; script-content
+    executions (no `command` arg) conservatively don't count.
+    """
+    if fname == "file_system":
+        return bool(is_mutating)
+    if fname == "manage_services":
+        # Service identity/op lives across several arg keys — union them,
+        # matching the tool's own arg-healing.
+        op = str(t_args.get("action") or t_args.get("operation")
+                 or t_args.get("op") or "").strip().lower()
+        return op not in _SERVICE_READONLY_OPS
+    if fname == "execute":
+        return looks_mutating_command(
+            str(t_args.get("command") or t_args.get("cmd") or ""))
+    if fname == "manage_composed_skills":
+        # ONLY the named `action` param: the tool reads no `operation`/`op`
+        # alias, so honouring one here would let `operation='delete'` (which
+        # the tool rejects as a missing-action error) be scored a mutation.
+        return (str(t_args.get("action") or "").strip().lower()
+                in _COMPOSED_SKILL_MUTATING_ACTIONS)
+    return False
+
+
 # Headroom reserved for the per-turn injection that `_compose_injection`
 # adds to the shipped payload AFTER history pruning — tool schemas (~7-8k
 # tok), hydrated playbook/memory, continuity + workspace blocks, the
@@ -10138,19 +10181,8 @@ class GhostAgent:
                         # would nullify it; the command heuristic keeps
                         # probes inert. Script-content executions (no
                         # `command` arg) conservatively don't count.
-                        _pf_world_mut = (
-                            (fname == "file_system" and is_mutating)
-                            or (fname == "manage_services"
-                                and str(t_args.get("action")
-                                        or t_args.get("operation")
-                                        or t_args.get("op") or ""
-                                        ).strip().lower()
-                                not in _SERVICE_READONLY_OPS)
-                            or (fname == "execute"
-                                and looks_mutating_command(
-                                    str(t_args.get("command")
-                                        or t_args.get("cmd") or "")))
-                        )
+                        _pf_world_mut = _call_mutated_world(
+                            fname, t_args, is_mutating)
                         tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or ""), _pf_world_mut))
                         try:
                             from .foresight import call_target as _fs_ct

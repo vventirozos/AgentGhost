@@ -504,7 +504,13 @@ class ComposedSkillRegistry:
             schema = {
                 "type": "object",
                 "properties": properties,
-                "required": [],  # composed skills don't enforce required runtime params
+                # A macro's mined runtime params ARE its inputs — every one is a
+                # `$var` the pipeline references but no step produces, so the
+                # macro cannot run without them. Marking them required stops the
+                # weak worker model from firing the macro with an empty arg set
+                # (observed 2026-08-12: `url` advertised optional, the model
+                # never supplied it and reached for the management tool instead).
+                "required": sorted(param_keys),
             }
             defs.append({
                 "type": "function",
@@ -512,6 +518,9 @@ class ComposedSkillRegistry:
                     "name": name,
                     "description": (
                         f"[COMPOSED SKILL] {skill.trigger_description} "
+                        f"To RUN it, CALL THIS TOOL DIRECTLY by name with its "
+                        f"inputs — do NOT define/re-create it and do NOT plan a "
+                        f"manage_composed_skills call to run it. "
                         f"({len(skill.steps)} steps; "
                         f"used {skill.usage_count}x with {skill.success_rate:.0%} success)"
                     ),
@@ -978,9 +987,10 @@ def register_composed_skill_runners(tools: Dict[str, Callable], context) -> int:
 async def tool_manage_composed_skills(context=None, action: str = None,
                                       name: str = None, description: str = None,
                                       steps=None, mode: str = "parallel",
-                                      known_tools=None, branches=None, **_extra):
-    """Define / list / approve / delete composed skills — named macros that
-    bundle several tool calls into ONE invocation.
+                                      known_tools=None, branches=None,
+                                      params=None, **_extra):
+    """Define / run / list / approve / delete composed skills — named macros
+    that bundle several tool calls into ONE invocation.
 
     Actions
     -------
@@ -994,12 +1004,18 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         ``branch_target`` sequence. The macro becomes a top-level tool the
         agent invokes by ``name``. An existing name is NOT overwritten —
         delete it first.
+    run    : execute an existing active macro by ``name``, passing its runtime
+        inputs in ``params`` (e.g. params={'url': '…'}). This is the
+        management-tool path for the same thing a direct ``name(...)`` call
+        does — added because the worker model reaches for this tool instead of
+        calling the macro by name (2026-08-12 postmortem). Dispatches through
+        the SAME runner a direct call uses, so there is one execution path.
     list   : show all registered macros.
     approve: activate a proposed (auto-discovered) macro.
     delete : remove one by ``name``.
     """
     if not action:
-        return "SYSTEM ERROR: 'action' is MANDATORY (define | list | delete)."
+        return "SYSTEM ERROR: 'action' is MANDATORY (define | run | list | approve | delete)."
     reg = _registry_from_context(context)
     if reg is None:
         return ("SYSTEM ERROR: composed-skill storage is unavailable "
@@ -1032,6 +1048,55 @@ async def tool_manage_composed_skills(context=None, action: str = None,
                 "reject with action='delete'."
             )
         return "\n".join(out)
+
+    if action == "run":
+        if not name:
+            return ("Error: 'name' is required for run — the macro to execute. "
+                    "See the available macros with action='list'.")
+        sk = reg.skills.get(name)
+        if sk is None:
+            return (f"Error: composed skill '{name}' not found. Check the name "
+                    f"with action='list', or define it first with "
+                    f"action='define'.")
+        if sk.status != "active":
+            return (f"Error: composed skill '{name}' is not active "
+                    f"(status={sk.status}) — approve it first: "
+                    f"manage_composed_skills(action='approve', name='{name}').")
+        # Runtime inputs: the documented shape is params={...}, but a weak
+        # model often passes them as bare top-level kwargs (url='…'), which
+        # land in **_extra. Accept both; the explicit `params` object wins on
+        # a key clash. `_extra` here is ALREADY free of the tool's control
+        # kwargs (action/name/description/steps/mode/known_tools/branches are
+        # named parameters), so it only carries genuine macro inputs.
+        run_params: Dict[str, Any] = dict(_extra or {})
+        if isinstance(params, dict):
+            run_params.update(params)
+        elif params is not None:
+            return ("Error: 'params' must be an object mapping the macro's "
+                    "runtime inputs to values, e.g. params={'url': '…'}.")
+        # Dispatch through the SAME live runner a direct `name(...)` call would
+        # use — no duplicate execution logic. Building the tool map here also
+        # picks up dynamically-appended tools and acquired skills the macro's
+        # steps may call. Lazy import: registry imports THIS module.
+        try:
+            from .registry import get_available_tools
+            tools_map = get_available_tools(context)
+        except Exception as e:  # noqa: BLE001 — surface, don't crash the turn
+            return (f"Error: could not assemble the tool set to run '{name}': "
+                    f"{type(e).__name__}: {e}")
+        runner = tools_map.get(name)
+        if runner is None:
+            return (f"Error: composed skill '{name}' is registered but not "
+                    f"dispatchable in this build (it may shadow a built-in "
+                    f"tool of the same name). Rename the macro or invoke the "
+                    f"built-in directly.")
+        pretty_log(
+            "Macro Run",
+            f"Invoking '{name}' via manage_composed_skills(action='run')"
+            + (f" with {sorted(run_params)}" if run_params else ""),
+            icon=Icons.BRAIN_PLAN,
+        )
+        return await runner(**run_params)
 
     if action == "approve":
         if not name:
@@ -1235,4 +1300,4 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             )
         return msg
 
-    return f"Error: unknown action '{action}' (use define | list | approve | delete)."
+    return f"Error: unknown action '{action}' (use define | run | list | approve | delete)."

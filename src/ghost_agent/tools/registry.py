@@ -596,7 +596,11 @@ TOOL_DEFINITIONS.append({
             "existing macros (including auto-discovered PROPOSED ones), 'approve' to "
             "activate a proposed macro, 'delete' to remove one. Once active, the macro "
             "is a TOP-LEVEL TOOL you invoke by its name like any built-in — its steps "
-            "run and the combined results come back for you to synthesise. Default "
+            "run and the combined results come back for you to synthesise. To RUN an "
+            "existing macro you can EITHER call it directly by its name (preferred) OR "
+            "use action='run' with name='<macro>' and params={...} for its inputs. "
+            "action='define' ONLY CREATES a macro — never use 'define' to run one that "
+            "already exists (it just errors 'already exists'). Default "
             "mode='parallel' fans the steps out concurrently (ideal for independent "
             "read-only steps); use mode='sequential' when a later step depends "
             "on an earlier one — a sequential step can bind its result with "
@@ -612,15 +616,23 @@ TOOL_DEFINITIONS.append({
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["define", "list", "approve", "delete"],
+                    "enum": ["define", "run", "list", "approve", "delete"],
                     "description": "What to do.",
                 },
                 "name": {
                     "type": "string",
                     "description": (
-                        "Macro name (required for define/delete). Becomes the tool "
-                        "name, so use a bare identifier like 'morning_briefing' — "
-                        "letters, digits and underscores only."
+                        "Macro name (required for define/run/delete/approve). "
+                        "Becomes the tool name, so use a bare identifier like "
+                        "'morning_briefing' — letters, digits and underscores only."
+                    ),
+                },
+                "params": {
+                    "type": "object",
+                    "description": (
+                        "For action='run': the macro's runtime inputs as an "
+                        "object, e.g. params={\"url\": \"https://…\"}. Keys are the "
+                        "macro's advertised parameters. Ignored for other actions."
                     ),
                 },
                 "description": {
