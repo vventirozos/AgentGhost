@@ -39,6 +39,54 @@ _CODE_SIGNAL_PATTERNS = (
 )
 
 
+def resolve_cluster_key(seed: dict, used_template_cluster: str,
+                        challenge: str,
+                        challenge_domains: Optional[list] = None) -> str:
+    """Which frontier cluster this self-play run's credit belongs to.
+
+    PRECEDENCE — **template key FIRST**, then the seed, then keyword-classify
+    the rendered text:
+
+    1. **The TEMPLATE's own key.** A deterministic template knows what it is.
+    2. `seed["cluster_key"]` — the caller's intent, when no template ran.
+    3. `classify_cluster(challenge)` — LLM-generated and journal-mined
+       challenges have no template identity, so text is all there is.
+
+    ⚠ Step 1 did not exist before 2026-08-11 (§4AT-B): credit was filed
+    wherever keyword-matching the RENDERED PROMPT happened to land. Measured
+    over 80 real renders, **51% misfiled** — `python_general`/`regex_parse`
+    systematically SWAPPED, `web_automation` filed as `concurrency` because
+    its prompt says `async_playwright`.
+
+    ⚠⚠ AND THE TEMPLATE OUTRANKS THE SEED, which is the second half of the
+    defect. `pick_seed` can select a cluster, find it saturated, and rotate to
+    a fresh template — `_cluster_key` is set to None on that path but the seed
+    dict is never updated, so an earlier draft that consulted the seed first
+    returned the ABANDONED target while the template that actually ran sat
+    right there. The template is what executed; intent that was rotated away
+    from is stale by construction.
+    """
+    from ..memory.frontier import CLUSTER_KEYWORDS, classify_cluster
+    if used_template_cluster:
+        return str(used_template_cluster)
+    # ⚠ A MINED CHALLENGE ALREADY KNOWS ITS DOMAIN, computed by
+    # `journal_challenges._guess_domains(cleaned)` from the ORIGINAL user
+    # request — before the wrapper prose is added. Classifying the WRAPPED
+    # prompt instead is what filed 23 of 23 journal runs as `sql` (the
+    # boilerplate contained the literal, and `\bsql\b` is tested first), so
+    # `sql` climbed to expert tier on work that was never SQL. Rewording the
+    # boilerplate stopped it DOMINATING; using the pre-computed domain is the
+    # complete fix, because it never looks at the wrapper at all.
+    _valid = {k for k, _ in CLUSTER_KEYWORDS} if CLUSTER_KEYWORDS else set()
+    for d in (challenge_domains or []):
+        d = str(d or "").strip()
+        if d and (not _valid or d in _valid):
+            return d
+    if (seed or {}).get("cluster_key"):
+        return str(seed["cluster_key"])
+    return classify_cluster(challenge)
+
+
 def _looks_mechanizable(solution: str) -> bool:
     """True when a lesson's solution carries real code structure.
 
@@ -5224,6 +5272,40 @@ Return ONLY a JSON object with:
                     "self_play", "manage_tasks", "postgres_admin",
                     "update_profile", "learn_skill", "delegate_to_swarm",
                     "system_utility", "create_skill", "manage_skills",
+                    # ⚠ `self_state` ADDED 2026-08-11 (§4AT-G). The stated
+                    # rule for this list is "any tool that writes to real,
+                    # non-isolated state must be disabled here" — and
+                    # `isolated_context.self_model` is the PRODUCTION
+                    # SelfModel (shallow-copied, and absent from the
+                    # null-out list below). A synthetic run calling
+                    # `self_state(action='note_principle'|'set_mood')` was
+                    # therefore able to author the agent's real stated
+                    # operating principles in `values.json` / `state.json`.
+                    # `subagent.py` already gets this right ("no selfhood
+                    # authoring"); self-play was the gap, and self-play is
+                    # 165 of the last 249 requests on this box.
+                    #
+                    # ⚠ AND FIXING ONE INSTANCE LEFT FIVE (review round 4).
+                    # `isolated_context` nulls/wraps profile, scheduler,
+                    # journal, trajectories, episodic, vector, skills, graph,
+                    # bus and workspace — but NEVER `project_store`. So these
+                    # bound the PRODUCTION store and were still callable:
+                    #   manage_projects  — create/close tasks, mark a project
+                    #                      DONE (which retires constraints AND
+                    #                      fires the irreversible workspace
+                    #                      sweep)
+                    #   manage_services  — real port leases and daemons
+                    #   delegate         — spawns real subagents
+                    #                      (`delegate_to_swarm` was blocked,
+                    #                      the plain one was not)
+                    #   self_play_loop / stop_self_play — recurse into, or
+                    #                      kill, the loop they run inside
+                    # `core/subagent.py` FORBIDDEN_TOOLS already lists exactly
+                    # these; self-play had drifted from its sibling. And
+                    # self-play replays mined REAL user turns verbatim, so a
+                    # `manage_projects` call here is not hypothetical.
+                    "self_state", "manage_projects", "manage_services",
+                    "delegate", "self_play_loop", "stop_self_play",
                     # C6: additional blocks.
                     # `dream_mode` is another terminal tool — calling it
                     # from within self-play nests a REM cycle inside a
@@ -5596,11 +5678,16 @@ Return ONLY a JSON object with:
                 # the run in the frontier tracker. The compression delta
                 # determines whether the resulting skill is worth writing,
                 # and feeds the adaptive self-play cooldown.
-                from ..memory.frontier import classify_cluster
-                if seed.get("cluster_key"):
-                    cluster_key = seed["cluster_key"]
-                else:
-                    cluster_key = classify_cluster(challenge)
+                # Precedence (TEMPLATE KEY → seed → text classifier) lives in
+                # `resolve_cluster_key`, which documents the 51%-misfiled
+                # measurement and why the template outranks a rotated-away
+                # seed. Landing this required the stale `bash.mastered` flag to
+                # be cleared FIRST (§4AT-B data repair) — otherwise correct
+                # attribution routed bash renders into a mastered cluster and
+                # silenced lesson extraction for ~12% of self-play cycles.
+                cluster_key = resolve_cluster_key(
+                    seed, _used_template_cluster, challenge,
+                    challenge_domains=challenge_domains)
                 # S1: description_length used to be len(transcript) — which
                 # punished solutions with verbose tool dialogues. MDL /
                 # curiosity wants the *program* description length. Count

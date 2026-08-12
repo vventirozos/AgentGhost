@@ -49,6 +49,17 @@ EXPECT_ON_OUTPUT = "on_output"
 EXPECT_ON_DEMAND = "on_demand"
 EXPECT_GATED = "gated"
 
+# WHICH DENOMINATOR EXPLAINS THIS MECHANISM'S SILENCE (2026-08-11). Separate
+# from the expectation vocabulary above, which describes CADENCE for the
+# reader; this one decides whether a zero is excusable, and the two are not the
+# same axis. `router.decisions` is rendered "periodic" but routes on EVERY
+# request including self-play, so a traffic-free box explains it while a quiet
+# *user* day does not. Getting these backwards is how a guard silences the
+# alarm it exists to raise.
+DEN_USER_TURNS = "user_turns"   # simulation-gated: only REAL turns feed it
+DEN_REQUESTS = "requests"       # any request, self-play included
+DEN_NONE = "none"               # idle-clock: no amount of quiet excuses it
+
 
 @dataclass
 class ProbeResult:
@@ -70,6 +81,9 @@ class Probe:
     # that cries on a benign zero is one the operator learns to scroll past —
     # the lesson §4AD already paid for.
     alarm_if_zero: bool = False
+    # Which absence of traffic (if any) makes this mechanism's zero benign.
+    # DEN_NONE is the deliberate default: a mechanism must EARN its excuse.
+    denominator: str = DEN_NONE
 
 
 def _home(ghost_home: Optional[Path] = None) -> Path:
@@ -298,8 +312,13 @@ def _newest_child_probe(rel: str, *, stale_h: float
     return probe
 
 
-def _count_user_turns(home: Path, window_h: float) -> Optional[int]:
-    """THE DENOMINATOR for turn-driven mechanisms.
+def _count_user_turns(home: Path, window_h: float) -> tuple:
+    """THE DENOMINATORS. Returns (user_turns, all_requests, reason).
+
+    `all_requests` counts every request line and so is always knowable;
+    `user_turns` needs the origin stamp and is None when the window cannot be
+    classified. Two numbers because two different absences excuse two
+    different silences — see DEN_* above.
 
     ⚠ ADDED IN REVIEW ROUND 1, after it nearly produced a false MAJOR. Three
     stores (trajectories, foresight, rrf) had all been quiet since ~02:00,
@@ -313,13 +332,33 @@ def _count_user_turns(home: Path, window_h: float) -> Optional[int]:
     answer came from the base rate: writes are sparse, and a zero-day had
     already occurred on 08-07 with 29 turns. Two independent guards were needed
     to avoid the wrong call.)
+
+    ⚠⚠ AND IT COUNTED THE WRONG THING UNTIL 2026-08-11, which is how it came
+    to make the exact error it was built to prevent. Self-play/dream turns
+    enter through the same `handle_chat` and emit the same `request started`
+    line, so all of them landed in this count. Measured on the live log that
+    day: 28 "user turns" in 24h of which **28 were self-play and 0 were real**
+    — while foresight/rrf/trajectories were correctly silent because their
+    simulation gates had excluded every one of those turns. The denominator
+    did not merely fail to help, it argued FOR the false MAJOR, and it can
+    reach 0 (the branch that withholds alarms) only on a box where the idle
+    self-play loop is also dead. A guard whose triggering condition is
+    unreachable in production is furniture.
+
+    Now counts `origin=user` stamps only. A window containing request lines
+    written by a pre-stamp build is reported as UNCLASSIFIED (None) rather
+    than as a number that silently means something else — missing is UNKNOWN,
+    never zero, and never an inflated count.
     """
     p = home / "system" / "ghost-agent.log"
     if not p.exists():
-        return None
+        return (None, 0, "no-log")
     cutoff = time.time() - window_h * 3600.0
     ts_rx = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*request started")
+    origin_rx = re.compile(r"\borigin=(\w+)")
     n = 0
+    total = 0
+    unstamped = 0
     try:
         with p.open(errors="replace") as fh:
             for line in fh:
@@ -331,11 +370,23 @@ def _count_user_turns(home: Path, window_h: float) -> Optional[int]:
                                                    "%Y-%m-%d %H:%M:%S"))
                 except ValueError:
                     continue
-                if ts >= cutoff:
+                if ts < cutoff:
+                    continue
+                total += 1
+                o = origin_rx.search(line)
+                if o is None:
+                    unstamped += 1
+                elif o.group(1) == "user":
                     n += 1
     except OSError:
-        return None
-    return n
+        return (None, 0, "no-log")
+    if unstamped:
+        # Mixed or wholly pre-stamp window: the stamped subset is a LOWER
+        # bound on user turns, never the count. Say so instead of quoting it.
+        return (None, total,
+                f"unclassified ({unstamped} request line(s) predate the "
+                f"origin stamp; {n} stamped user)")
+    return (n, total, "")
 
 
 def _literal_flag_from_source(path: Path, name: str) -> Optional[bool]:
@@ -507,11 +558,16 @@ PROBES: List[Probe] = [
                      window_h=24.0,
                      # The agent REASONING about the verifier is not the
                      # verifier running. 12/1370 matches were such prose.
-                     exclude=r"thinking —")),
+                     exclude=r"thinking —"),
+          denominator=DEN_REQUESTS),
     Probe("router.decisions", EXPECT_PERIODIC,
           "system/ghost-agent.log — complexity-router lines",
           _log_probe(r"complexity router", window_h=24.0),
-          alarm_if_zero=True),
+          alarm_if_zero=True,
+          # Routes on EVERY request (§4AJ: `dispatcher.route()` runs per
+          # request), self-play included — so an idle box explains it, a
+          # user-quiet one does not.
+          denominator=DEN_REQUESTS),
     # ⚠ mtime is the ONLY signal here — checked in review round 2, this file
     # carries no internal timestamp (schema/feature_names/weights/bias/
     # hyperparameters/report/gate_report). So a `touch` WOULD fake a retrain.
@@ -524,12 +580,19 @@ PROBES: List[Probe] = [
           _json_field_ts_probe("system/calibration/calibration_params.json",
                                "fitted_at", stale_h=48.0),
           alarm_if_zero=True),
+    # ⚠ BOTH ARE SIMULATION-GATED (§4K: dream/self-play/subagent turns resolve
+    # to NOTHING, ledger and index both). Measured 2026-08-11: 24h of hourly
+    # self-play produced 28 requests and ZERO rows in either — correct
+    # behaviour that reads as a dead loop against any denominator that counts
+    # self-play. DEN_USER_TURNS is what makes their zero legible.
     Probe("foresight.predictions", EXPECT_ON_OUTPUT,
           "system/foresight/predictions.jsonl",
-          _jsonl_probe("system/foresight/predictions.jsonl", window_h=24.0)),
+          _jsonl_probe("system/foresight/predictions.jsonl", window_h=24.0),
+          denominator=DEN_USER_TURNS),
     Probe("rrf.observations", EXPECT_ON_OUTPUT,
           "system/rrf/observations.jsonl",
-          _jsonl_probe("system/rrf/observations.jsonl", window_h=24.0)),
+          _jsonl_probe("system/rrf/observations.jsonl", window_h=24.0),
+          denominator=DEN_USER_TURNS),
     # ⚠ REVIEW ROUND 1: this probed `system/experiments.json` and reported
     # NO_SOURCE. That file is an OPTIONAL OVERRIDE — its absence is the NORMAL
     # state (the built-in DEFAULT_SPECS are used), so the probe was reporting a
@@ -537,7 +600,8 @@ PROBES: List[Probe] = [
     # TRAJECTORY CORPUS, which is what `introspect action='experiments'` reads.
     Probe("experiments.stamps", EXPECT_ON_DEMAND,
           "system/trajectories/<date>/ — arms are stamped per trajectory",
-          _newest_child_probe("system/trajectories", stale_h=72.0)),
+          _newest_child_probe("system/trajectories", stale_h=72.0),
+          denominator=DEN_USER_TURNS),
     # ROUTER SIGNAL COVERAGE (audit 2026-08-10, CORRECTED same day).
     #
     # ⚠ This comment previously asserted "THE SIGNAL NEVER REACHES THE CORPUS …
@@ -555,7 +619,8 @@ PROBES: List[Probe] = [
     # this subset must bound its bias first.
     Probe("router.signal_durable", EXPECT_ON_OUTPUT,
           "system/trajectories/*/* :: router_label (top level OR under `extra`)",
-          _trajectory_router_signal_probe),
+          _trajectory_router_signal_probe,
+          denominator=DEN_USER_TURNS),
     Probe("gepa.applies", EXPECT_ON_DEMAND,
           "system/ghost-agent.log — loader INFO on artifact load",
           _log_probe(r"GEPA: loaded tuned instruction", window_h=168.0)),
@@ -590,13 +655,31 @@ def probe_all(ghost_home: Optional[Path] = None) -> Dict[str, Any]:
     order = {NO_SOURCE: 0, ZERO: 1, GATED: 2, FIRED: 3}
     rows.sort(key=lambda r: (not r["alarm"], order.get(r["status"], 9),
                              r["name"]))
-    turns = _count_user_turns(home, 24.0)
+    turns, requests, turns_note = _count_user_turns(home, 24.0)
     # ⚠ NO-TRAFFIC GUARD. Turn-driven mechanisms are correctly silent when
     # nothing asked them to run; alarming then teaches the operator to ignore
     # this view. Withheld as ONE fact, exactly as activity_liveness withholds
     # per-loop alarms for a stopped agent.
-    if turns == 0:
-        for r in rows:
+    #
+    # ⚠ SCOPE, TIGHTENED 2026-08-11. This cleared EVERY row, and the only two
+    # probes that alarm at all (router.decisions, calibration.fit) are
+    # PERIODIC — they run off the idle clock, not off user traffic. So the
+    # blanket form could only ever silence alarms that a quiet day does not
+    # explain: a genuinely dead training loop over a traffic-free weekend
+    # would have rendered clean. The bug was invisible because the count
+    # included self-play and so never reached 0; fixing the count is what
+    # ARMS this branch, which is why both had to move together.
+    #
+    # UNKNOWN (None) withholds DEN_USER_TURNS alarms too: with no denominator a
+    # simulation-gated zero cannot be told from correct silence, and asserting
+    # DEAD on it is the false MAJOR this whole guard exists to prevent.
+    # DEN_NONE never gets an excuse.
+    den = {p.name: p.denominator for p in PROBES}
+    for r in rows:
+        d = den.get(r["name"], DEN_NONE)
+        if d == DEN_USER_TURNS and (turns == 0 or turns is None):
+            r["alarm"] = False
+        elif d == DEN_REQUESTS and requests == 0:
             r["alarm"] = False
     return {
         "rows": rows,
@@ -604,6 +687,8 @@ def probe_all(ghost_home: Optional[Path] = None) -> Dict[str, Any]:
         "gaps": [r["name"] for r in rows if r["status"] == NO_SOURCE],
         "n_probes": len(rows),
         "user_turns_24h": turns,
+        "requests_24h": requests,
+        "user_turns_note": turns_note,
     }
 
 
@@ -612,15 +697,22 @@ def render(ghost_home: Optional[Path] = None) -> str:
     out = ["SUBSYSTEM LIVENESS (probe-per-mechanism — covers what the "
            "activity ledger does NOT):"]
     t = r.get("user_turns_24h")
+    note = r.get("user_turns_note") or ""
     if t is None:
         out.append("  ⚠ user-turn count unavailable — turn-driven zeros below "
-                   "cannot be interpreted")
+                   "cannot be interpreted, turn-driven alarms withheld"
+                   + (f" [{note}]" if note else ""))
     elif t == 0:
-        out.append("  ⚠ ZERO user turns in 24h — turn-driven mechanisms are "
-                   "correctly silent; alarms withheld (that is ONE fact)")
+        out.append(f"  ⚠ ZERO real user turns in 24h ({r.get('requests_24h')} "
+                   f"requests total, i.e. self-play) — simulation-gated "
+                   f"mechanisms are correctly silent and their alarms are "
+                   f"withheld (that is ONE fact). Self-play does NOT count "
+                   f"here: it is gated out of the very ledgers this "
+                   f"denominator interprets")
     else:
-        out.append(f"  context: {t} user turns in 24h (the denominator for "
-                   f"turn-driven mechanisms)")
+        out.append(f"  context: {t} real user turns in 24h of "
+                   f"{r.get('requests_24h')} requests (self-play excluded — "
+                   f"the denominator for simulation-gated mechanisms)")
     for row in r["rows"]:
         mark = "  ✗ DEAD " if row["alarm"] else "    "
         cnt = "—" if row["count"] is None else str(row["count"])

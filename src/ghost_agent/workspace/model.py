@@ -348,12 +348,22 @@ class WorkspaceModel:
                 duration_seconds=float(duration_seconds or 0.0),
                 note=str(note or "")[:200],
             )
+            # The NOTE rides in the summary. The readers of this ledger take
+            # `summary` and nothing else — rendered by tools/workspace.py,
+            # workspace/narrative.py and workspace/recognition.py, indexed by
+            # workspace/activity.py, and scanned for a project id by
+            # workspace/schema.py (which cannot match on a note). So a note
+            # was write-only, and a command that
+            # is still running as a detached job (exit_code 0 by convention)
+            # rendered as a completed success. "ran X exit=0" is not the
+            # whole truth whenever the caller took the trouble to add one.
+            _summary = f"ran `{(command or '')[:80]}` exit={exit_code}"
+            if c.note:
+                _summary += f" — {c.note}"
             self.activity.append(WorkspaceEvent(
                 kind="command",
                 payload=c.to_dict(),
-                summary=(
-                    f"ran `{(command or '')[:80]}` exit={exit_code}"
-                ),
+                summary=_summary,
                 project_id=self._stamp_project_id(),
             ))
             return c

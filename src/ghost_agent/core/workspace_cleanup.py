@@ -109,6 +109,21 @@ def _normalize_rel(payload: str, project_id: str) -> Optional[str]:
     if not payload:
         return None
     rel = str(payload).strip().replace("\\", "/")
+    # ⚠ COLLAPSE REPEATED SEPARATORS, THEN STRIP EACH PREFIX EXACTLY ONCE
+    # (2026-08-11, §4AT-D). The measured divergence was narrow: a DOUBLED
+    # SLASH (`/workspace//projects/<id>/x.png`) left `projects/<id>/` in place
+    # here while the store's `_normalize_rel_path` removed it — one file, two
+    # keys, so the registration stopped protecting and the sweep deleted it.
+    #
+    # ⚠⚠ A FIXED-POINT LOOP WAS TRIED FIRST AND WAS WORSE. Stripping
+    # repeatedly also eats a LEGITIMATE top-level `workspace/` directory
+    # inside a project, so `projects/<id>/workspace/hero.png` keyed as
+    # `hero.png` and the registered deliverable was deleted — a NEW loss path
+    # with a wider blast radius than the bug being fixed. Collapsing
+    # separators addresses the actual divergence and nothing else; a repeated
+    # real directory name is DATA, not a prefix to peel.
+    while "//" in rel:
+        rel = rel.replace("//", "/")
     while rel.startswith("./"):
         rel = rel[2:]
     rel = rel.lstrip("/")
@@ -148,6 +163,11 @@ _KEEP_DOTFILES = frozenset({
     ".htaccess", ".env", ".env.example", ".gitignore", ".gitattributes",
     ".dockerignore", ".editorconfig", ".npmrc", ".nvmrc", ".babelrc",
     ".eslintrc", ".prettierrc", ".flaskenv",
+    # CI/tooling config — deliverables an operator would be startled to lose.
+    # `.gitlab-ci.yml` was measured being deleted from an ACTIVE project by the
+    # idle tidy (2026-08-11, §4AT-D).
+    ".gitlab-ci.yml", ".travis.yml", ".pre-commit-config.yaml",
+    ".ruff.toml", ".python-version", ".tool-versions", ".nojekyll",
 })
 
 
@@ -231,6 +251,42 @@ def _is_data_deliverable(rel: str) -> bool:
     return any(name.endswith(s) for s in _DATA_DELIVERABLE_SUFFIXES)
 
 
+def _tidy_is_debris(rel: str) -> bool:
+    """Debris rules for the ACTIVE-project tidy.
+
+    Identical to `_is_debris` EXCEPT that a scratch NAME PREFIX alone does not
+    condemn a source file. Everything else — scratch dirs, scaffolding names,
+    non-kept dotfiles, scratch suffixes — still outranks source-ness.
+
+    ⚠ THE SCOPE TOOK TWO CORRECTIONS. Inverting the precedence inside
+    `_is_debris` broke the DONE sweep (sweeping a finished project's
+    `temp_probe.py` is deliberate and pinned). Then a blanket
+    `if _is_source_like: continue` in the tidy kept `.browser_runner.py` —
+    browser scaffolding the tidy exists to remove, which is source-shaped only
+    because it ends in `.py`. The exemption belongs to ONE rule, not to the
+    classifier and not to the caller.
+    """
+    if not _is_debris(rel):
+        return False
+    if not _is_source_like(rel):
+        return True
+    parts = rel.split("/")
+    name = parts[-1].lower()
+    if any(p in _SCRATCH_DIRS for p in parts[:-1]):
+        return True
+    if name in _SCRATCH_NAMES:
+        return True
+    if name.startswith(".") and not _is_kept_dotfile(name):
+        return True
+    dot = name.rfind(".")
+    if dot > 0 and name[dot:] in _SCRATCH_SUFFIXES:
+        return True
+    # Only the scratch-name prefix fired, and the file is source: on a project
+    # still being WORKED ON, a name is a guess about intent and source-ness is
+    # a fact. `debug_utils.py` may well be imported by the build.
+    return False
+
+
 def _is_source_like(rel: str) -> bool:
     """True when a project-relative path looks like source/documentation —
     a candidate deliverable the agent plausibly forgot to register."""
@@ -311,6 +367,7 @@ def _recover_unregistered_sources(store, project_id: str, root: Path,
     binary files stay deletable — they are the scratch (screenshots,
     renders) this sweep exists to remove."""
     found: Set[str] = set()
+    _keep_low = _lower_keys(keep)
     for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         base = Path(dirpath)
         for fname in filenames:
@@ -321,7 +378,7 @@ def _recover_unregistered_sources(store, project_id: str, root: Path,
                 rel = fpath.relative_to(root).as_posix()
             except ValueError:
                 continue
-            if rel in keep or _is_debris(rel):
+            if rel.lower() in _keep_low or _is_debris(rel):
                 continue
             # Rescue source-like files AND binary/data deliverables
             # (databases, model weights, datasets) — both are plausibly
@@ -348,6 +405,38 @@ def _recover_unregistered_sources(store, project_id: str, root: Path,
             icon=Icons.WARN, level="WARNING",
         )
     return found
+
+
+def _lower_keys(items) -> Set[str]:
+    """Lowercase projection of a protection set, built ONCE per sweep.
+
+    Membership is then a plain `rel.lower() in keep_low` — O(1) per file, and
+    obvious at the call site rather than hidden behind an overridden operator.
+
+    ⚠ 2026-08-11 (§4AT-D). Protection was exact-case while the walk yields the
+    ON-DISK spelling, so a deliverable registered ``assets/hero.png`` and
+    written ``assets/Hero.png`` was unprotected and deleted — by the DONE
+    sweep AND the tidy. On macOS those are ONE file, so nothing else in the
+    stack ever surfaces the drift; the registration silently stops working.
+
+    Case-INSENSITIVE is the right safety bias on both filesystem types: on a
+    case-insensitive volume the two names ARE one file, and on a
+    case-sensitive one the worst case is keeping a file that could have been
+    deleted. A spare file costs disk; a deleted deliverable is irreversible
+    and unlogged.
+
+    ⚠⚠ A `set` SUBCLASS WAS TRIED FIRST AND WAS A LANDMINE. Overriding
+    `__contains__`/`add`/`__or__` left `update`, `|=`, `discard`, `remove`,
+    `pop`, `clear`, `copy`, `union`, `-`, `&`, `^` unguarded — several of
+    which silently return a PLAIN set (protection lost) or desync the mirror
+    (a present key reporting absent ⇒ deleting a kept file). It also missed
+    `_recover_deliverables`, which returns an ordinary `Set[str]`, so the
+    empty-registration recovery — the module's own safety net — stayed
+    case-sensitive. A projection built at the call site takes whatever set it
+    is handed and cannot be bypassed by an operation nobody thought to
+    override.
+    """
+    return {str(x).lower() for x in (items or ())}
 
 
 def _keep_set(store, project_id: str) -> Optional[Set[str]]:
@@ -444,6 +533,7 @@ def sweep_project_workspace(store, project_id: str, *,
     # it breaks the deliverable the sweep just protected. Same scan the
     # recurring tidy runs; symlinks stay deletable (a symlink is scratch).
     media_candidates: List[str] = []
+    _keep_low = _lower_keys(keep)
     for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         base = Path(dirpath)
         for fname in filenames:
@@ -454,7 +544,7 @@ def sweep_project_workspace(store, project_id: str, *,
                 rel = fpath.relative_to(root).as_posix()
             except (OSError, ValueError):
                 continue
-            if rel in keep or _is_debris(rel):
+            if rel.lower() in _keep_low or _is_debris(rel):
                 continue
             name = rel.split("/")[-1].lower()
             dot = name.rfind(".")
@@ -465,6 +555,8 @@ def sweep_project_workspace(store, project_id: str, *,
     # Pass 1 — delete unregistered files. topdown so we never descend into a
     # dir we're about to drop; followlinks=False so a symlink can't lead the
     # walk out of the project tree.
+    _keep_low = _lower_keys(keep)
+    _ref_low = _lower_keys(referenced)
     for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         base = Path(dirpath)
         for fname in filenames:
@@ -475,7 +567,7 @@ def sweep_project_workspace(store, project_id: str, *,
                 continue  # defensive: outside the tree, never touch it
             if _in_git_tree(rel):
                 continue  # version-control state survives even the DONE sweep
-            if rel in keep or rel in referenced:
+            if rel.lower() in _keep_low or rel.lower() in _ref_low:
                 kept.append(rel)
                 continue
             try:
@@ -600,8 +692,14 @@ def _referenced_media(root: Path, media_rels: List[str]) -> Set[str]:
                 text = fpath.read_text(errors="replace")
             except OSError:
                 continue
+            # ⚠ CASE-INSENSITIVE, same reason as the keep-set (§4AT-D). An
+            # `index.html` writing `src="assets/hero.png"` against a disk file
+            # `assets/Hero.png` found no reference and the asset was deleted —
+            # the keep-set fix alone left this sibling protection exact-case,
+            # i.e. half-applied.
+            _text_low = text.lower()
             for mrel, mname in basenames.items():
-                if mrel not in hit and mname in text:
+                if mrel not in hit and mname.lower() in _text_low:
                     hit.add(mrel)
         if len(hit) == len(basenames):
             break
@@ -653,6 +751,7 @@ def tidy_project_workspace(store, project_id: str, *,
     # Collect candidates first so the referenced-media scan runs once.
     debris: List[str] = []
     media_candidates: List[str] = []
+    _keep_low = _lower_keys(keep)
     for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         base = Path(dirpath)
         for fname in filenames:
@@ -661,11 +760,26 @@ def tidy_project_workspace(store, project_id: str, *,
                 rel = fpath.relative_to(root).as_posix()
             except ValueError:
                 continue
-            if rel in keep:
+            if rel.lower() in _keep_low:
                 continue
             if _in_git_tree(rel):
                 continue  # version-control state is never the tidy's to delete
-            if _is_debris(rel):
+            # ⚠ ON AN ACTIVE PROJECT, A NAME NEVER OUTRANKS BEING SOURCE
+            # (2026-08-11, §4AT-D). This checked `_is_debris` FIRST, so
+            # `debug_utils.py`, `temp_loader.py`, `scratch_notes.py` and
+            # `tmp_fix.py` were deleted out from under a build that imports
+            # them — while this module's contract says "Source/document files
+            # are NEVER deleted here regardless of registration".
+            #
+            # ⚠⚠ SCOPED TO THE TIDY ONLY, and the scope is the whole point.
+            # The first version of this fix inverted the precedence inside
+            # `_is_debris` itself, which also changed the DONE SWEEP — where
+            # sweeping `temp_probe.py` is deliberate and pinned by
+            # `test_partial_keepset_debris_named_sources_still_swept`. That
+            # test went red and was RIGHT: a finished project's scratch should
+            # go. The harm is deleting source from a project still being
+            # WORKED ON. Same word, two lifecycles, opposite correct answers.
+            if _tidy_is_debris(rel):
                 # Same grace period media gets: an ACTIVE project's fresh
                 # debris (a tool's live dotfile state, a log being written)
                 # must not vanish under the build; symlinks stay deletable.
@@ -687,7 +801,9 @@ def tidy_project_workspace(store, project_id: str, *,
                     continue
 
     referenced = _referenced_media(root, media_candidates)
-    to_delete = debris + [m for m in media_candidates if m not in referenced]
+    _ref_low_tidy = _lower_keys(referenced)
+    to_delete = debris + [m for m in media_candidates
+                          if m.lower() not in _ref_low_tidy]
 
     deleted: List[str] = []
     freed = 0

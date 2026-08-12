@@ -67,6 +67,55 @@
     <li><code>VERIFY</code> — used by <a href="verifier.html">Verifier</a>.</li>
   </ul>
 
+  <h2 id="node-gate">Per-node concurrency gate — one budget per node URL <span class="tag">2026-08-11</span></h2>
+  <p>
+    <strong>The defect it removes (req <code>0fb69c5f</code>).</strong> Deep research capped itself
+    with an <code>asyncio.Semaphore(3)</code> built <em>inside</em> the function — so the cap was per
+    <em>call</em>. The model issued <b>three</b> <code>deep_research</code> calls in one tool batch:
+    3 semaphores × 3 permits = <b>9 concurrent requests at a node advertising 4 slots</b> (20 worker
+    calls in 74&nbsp;s, bursts of 3/second). The excess queued on llama-server past the route timeout;
+    every one of those <code>ReadTimeout</code>s counted as a node fault; three consecutive tripped
+    the breaker and <b>ejected a perfectly healthy Nova for 60&nbsp;s</b>. It "recovered" 20&nbsp;s
+    later because nothing had ever been wrong with it — and the user's research came back degraded
+    (the model's own next thought: <em>"the deep research results are mostly timeout errors from the
+    scraper backends"</em>).
+  </p>
+  <p>
+    <strong>No tool could fix this from where it stood.</strong> On this deployment Nova serves the
+    <em>worker</em> and <em>critic</em> roles at once, and query expansion, web summaries, fact
+    distillation and the verifier all reach it by different paths. A limit scoped to a call — or to a
+    role — is individually polite and still collectively floods one box. <b>The budget is therefore
+    keyed on the node URL</b>, held in <code>LLMClient._node_slot()</code>, and every node POST in
+    <code>_do_chat_completion</code> passes through it (pinned by a seam test that counts POST sites
+    against gated sites, because an un-gated path is a hole in a budget that only works if it is
+    total).
+  </p>
+  <p>
+    <strong>Capacity comes from the node, not from configuration.</strong> The number that matters is
+    llama-server's <code>-np</code>, so it is read once from the node's own <code>/props</code>
+    (<code>total_slots</code>) and cached; a hand-set copy would drift the moment a node restarts with
+    different flags. A node that will not answer the probe falls back to <b>3</b> — the old per-call
+    value — so an unprobeable node behaves exactly as before rather than becoming unbounded. <i>A gate
+    whose failure mode is "no gate" is the defect it exists to remove.</i>
+  </p>
+  <p>
+    <strong>And saturation is ours, not the node's.</strong> Waiting now happens in <em>our</em> gate
+    rather than in llama-server's queue, which turns "is it sick or did we flood it?" from a heuristic
+    into a fact: <code>NodeSaturated</code> means the request <em>was never sent</em>, so
+    <code>_is_node_fault()</code> returns <code>False</code> and the breaker never sees it. A genuine
+    <code>ReadTimeout</code> is still a node fault — the narrowing must not swallow the case the
+    breaker exists for. Knobs: <code>GHOST_NODE_SLOT_WAIT_S</code> (default 90&nbsp;s before giving
+    up on a permit) and <code>GHOST_NODE_SLOTS_DEFAULT</code> (fallback capacity).
+  </p>
+  <p>
+    ⚠ <strong>The health probe bypasses the gate entirely.</strong>
+    <code>keepalive_workers()</code> is what prints <em>"node X stopped answering"</em>; if its ping
+    queued behind the traffic it watches, a <b>busy</b> node would report as a <b>dead</b> one — the
+    identical false alarm, reintroduced one layer down. One extra in-flight request against a 4-slot
+    node is a rounding error, and an unstarvable probe is the entire point of a probe.
+  </p>
+  <p>Tests: <code>tests/test_node_concurrency_gate.py</code> — 8 pins, 5 mutation-checked red.</p>
+
   <h2>Circuit breaker</h2>
   <p><code>NodeCircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)</code> tracks per-node state:</p>
   <div class="diagram">

@@ -28,6 +28,24 @@ system they watch. Every one produced a plausible reading:
         nearly produced a false MAJOR ("three subsystems died at 02:00").
   R2-a  mtime-based freshness: a `touch` fakes FIRED on a dead mechanism —
         a false GREEN, which nobody investigates.
+
+⚠⚠ AND A SIXTH, FOUND LIVE ON 2026-08-11 — in R1-d, the guard added to stop a
+false MAJOR, which by then was arguing FOR one. `_count_user_turns` counted
+every `request started` line, but self-play/dream turns enter through the same
+`handle_chat` and log the same line. On the live agent that day: **28 "user
+turns", of which 28 were self-play and 0 were real**, while foresight / rrf /
+trajectories were correctly silent BECAUSE their simulation gates excluded
+those same turns. The denominator and the ledgers were measuring the turn
+population in opposite directions, and the denominator is what a reader trusts.
+
+Two coupled defects, and the first hid the second:
+  D1  the count included self-play, so it could reach 0 (the branch that
+      withholds alarms) only on a box where the hourly self-play loop was ALSO
+      dead — an unreachable guard, i.e. furniture.
+  D2  the withholding cleared EVERY row, but the only two probes that alarm are
+      PERIODIC (idle-clock, not turn-driven). Had D1 ever let it fire, it would
+      have silenced exactly the alarms a quiet day does not explain. Fixing D1
+      ARMS D2, so both move together.
 """
 
 import json
@@ -226,6 +244,142 @@ def test_zero_user_turns_withholds_alarms(tmp_path):
     assert out["alarms"] == []
 
 
+def test_self_play_turns_are_NOT_user_turns(tmp_path):
+    """⚠ THE 2026-08-11 DEFECT, pinned on the live shape.
+
+    Self-play enters through the same `handle_chat` and logs the same line. If
+    those count, the denominator reports traffic on a box that had none — and
+    the turn-driven ledgers below it (foresight, rrf, trajectories) are silent
+    precisely BECAUSE their simulation gates dropped those turns. Reverting the
+    origin filter turns this into 3.
+    """
+    _log(tmp_path, [
+        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a origin=sim",
+        f"{_stamp(1)} - GhostStream - INFO - [b] request started — b origin=sim",
+        f"{_stamp(1)} - GhostStream - INFO - [c] request started — c origin=sim",
+    ])
+    out = probe_all(tmp_path)
+    assert out["user_turns_24h"] == 0, (
+        "three self-play turns are ZERO user turns — the whole point of the "
+        "denominator is which population it counts")
+    assert out["requests_24h"] == 3, (
+        "they ARE requests, and mechanisms that run per request are owed that "
+        "denominator instead")
+    assert "foresight.predictions" not in out["alarms"]
+
+
+def test_a_prestamp_log_is_UNCLASSIFIED_not_a_number(tmp_path):
+    """MISSING IS UNKNOWN, NEVER A COUNT. A log written by a build older than
+    the origin stamp cannot be split into user vs self-play. Quoting the
+    stamped subset would silently mean something different from what the label
+    says; quoting the total is the bug this fixes. Say UNCLASSIFIED instead."""
+    _log(tmp_path, [
+        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a",
+        f"{_stamp(1)} - GhostStream - INFO - [b] request started — b origin=user",
+    ])
+    out = probe_all(tmp_path)
+    assert out["user_turns_24h"] is None
+    assert "unclassified" in out["user_turns_note"]
+    assert "2" not in out["user_turns_note"].split("(")[0]
+    txt = render(tmp_path)
+    assert "cannot be interpreted" in txt and "unclassified" in txt
+
+
+def test_UNKNOWN_denominator_withholds_SIM_GATED_alarms_only(tmp_path,
+                                                             monkeypatch):
+    """An uninterpretable denominator must not license a DEAD verdict on a
+    simulation-gated mechanism — that is the false MAJOR. But it must not
+    silence a DEN_NONE one either: nothing about user traffic explains an
+    idle-clock loop that stopped."""
+    # no log at all => user-turn denominator UNKNOWN
+    d = tmp_path / "system" / "calibration"
+    d.mkdir(parents=True)
+    stale = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          time.gmtime(time.time() - 300 * 3600))
+    (d / "calibration_params.json").write_text(json.dumps({"fitted_at": stale}))
+    # a sim-gated probe that alarms, to prove the two are treated differently
+    monkeypatch.setattr(
+        LV.PROBES[0], "denominator", LV.DEN_USER_TURNS, raising=False)
+    monkeypatch.setattr(LV.PROBES[0], "alarm_if_zero", True, raising=False)
+    monkeypatch.setattr(LV.PROBES[0], "fn", lambda _h: ProbeResult(ZERO, count=0))
+
+    out = probe_all(tmp_path)
+    assert out["user_turns_24h"] is None
+    assert LV.PROBES[0].name not in out["alarms"], (
+        "sim-gated zero + unknown denominator = cannot say, not DEAD")
+    assert "calibration.fit" in out["alarms"], (
+        "a DEN_NONE mechanism runs off the idle clock — an absent user-turn "
+        "count is no excuse for its silence")
+
+
+def test_turn_origin_agrees_with_the_SIMULATION_GATE_it_borrows_from():
+    """⚠ THE SEAM. The stamp is only worth counting if it splits the same
+    population the ledgers' own gates split. Both read `skill_memory
+    .is_read_only`; a second, private notion of "real traffic" is what let the
+    denominator and the ledgers disagree for a day.
+
+    ⚠ `is True` is load-bearing and this pins it: a MagicMock context (which
+    every agent test uses) returns a truthy Mock for ANY attribute, so a plain
+    truth test would stamp every mocked turn "sim" — the §4L MagicMock trap,
+    already commented at the finalize site for the same reason.
+    """
+    from unittest.mock import MagicMock
+    from ghost_agent.core.agent import turn_origin
+
+    class _RO:
+        is_read_only = True
+
+    class _Ctx:
+        skill_memory = None
+
+    sim = _Ctx(); sim.skill_memory = _RO()
+    assert turn_origin(sim) == "sim"
+
+    real = _Ctx(); real.skill_memory = object()      # no attribute at all
+    assert turn_origin(real) == "user"
+
+    assert turn_origin(_Ctx()) == "user", "a context without a skill store"
+    assert turn_origin(MagicMock()) == "user", (
+        "a MagicMock's truthy attribute must NOT read as a simulation")
+
+
+def test_every_alarming_probe_declares_which_absence_excuses_it(tmp_path):
+    """⚠ STRUCTURAL. The default is DEN_NONE — a mechanism must EARN its
+    excuse — so this cannot be satisfied by forgetting to think about it. It
+    fails the moment someone adds an alarming probe without deciding whether a
+    quiet box explains its zero, which is the decision that was wrong here."""
+    for p in LV.PROBES:
+        assert p.denominator in (LV.DEN_NONE, LV.DEN_REQUESTS,
+                                 LV.DEN_USER_TURNS), p.name
+    sim_gated = {p.name for p in LV.PROBES
+                 if p.denominator == LV.DEN_USER_TURNS}
+    assert {"foresight.predictions", "rrf.observations"} <= sim_gated, (
+        "§4K gates both out of self-play turns — counting self-play against "
+        "them is what produced the 08-11 misreading")
+    by_name = {p.name: p for p in LV.PROBES}
+    assert by_name["router.decisions"].denominator == LV.DEN_REQUESTS, (
+        "the router routes on every request incl. self-play — a user-quiet "
+        "box does NOT explain its silence")
+
+
+def test_no_traffic_does_NOT_silence_a_dead_IDLE_CLOCK_loop(tmp_path):
+    """⚠ D2, armed by the D1 fix. The guard used to clear EVERY row. A quiet
+    weekend explains a silent trajectory writer; it does not explain a training
+    loop that stopped fitting."""
+    _log(tmp_path, [
+        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a origin=sim"])
+    d = tmp_path / "system" / "calibration"
+    d.mkdir(parents=True)
+    stale = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          time.gmtime(time.time() - 300 * 3600))
+    (d / "calibration_params.json").write_text(json.dumps({"fitted_at": stale}))
+
+    out = probe_all(tmp_path)
+    assert out["user_turns_24h"] == 0
+    assert "calibration.fit" in out["alarms"], (
+        "zero USER turns must not withhold a PERIODIC mechanism's alarm")
+
+
 def test_turns_present_means_alarms_are_LIVE_again(tmp_path):
     """⚠ OVER-SUPPRESSION GUARD: the no-traffic guard must key on ZERO turns
     only, or it silences every real finding.
@@ -236,8 +390,8 @@ def test_turns_present_means_alarms_are_LIVE_again(tmp_path):
     only state that means "this really did not run".
     """
     _log(tmp_path, [
-        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a",
-        f"{_stamp(1)} - GhostStream - INFO - [b] request started — b",
+        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a origin=user",
+        f"{_stamp(1)} - GhostStream - INFO - [b] request started — b origin=user",
     ])
     d = tmp_path / "system" / "calibration"
     d.mkdir(parents=True)
@@ -290,9 +444,10 @@ def test_the_render_names_gaps_and_the_turn_denominator(tmp_path):
     # the point (an absent denominator must not read as "zero turns").
     assert "user-turn count unavailable" in txt
 
-    _log(tmp_path, [f"{_stamp(1)} - GhostStream - INFO - [a] request started — a"])
+    _log(tmp_path, [
+        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a origin=user"])
     txt2 = render(tmp_path)
-    assert "1 user turns in 24h" in txt2
+    assert "1 real user turns in 24h" in txt2
 
 
 # ── router signal COVERAGE (the section header used to assert it "never
@@ -379,7 +534,8 @@ def test_learning_health_passes_GHOST_HOME_not_its_system_child(tmp_path):
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     (home / "system" / "calibration" / "calibration_params.json").write_text(
         json.dumps({"fitted_at": now}))
-    _log(home, [f"{_stamp(1)} - GhostStream - INFO - [a] request started — a"])
+    _log(home, [
+        f"{_stamp(1)} - GhostStream - INFO - [a] request started — a origin=user"])
 
     from ghost_agent.core import learning_health as LH
     out = LH.render_learning_health(home / "system" / "memory")

@@ -84,6 +84,7 @@ ICON_CLASS = {
     "🎲": "tool",
     "🧪": "tool",
     "📦": "tool",
+    "🏃": "tool",   # JOB_PROMOTE — long sandbox command detached as a job
     "🔧": "tool",
     "🛸": "tool",
 

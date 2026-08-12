@@ -259,17 +259,63 @@ def request_elapsed_s(req_id: str) -> Optional[float]:
     return time.monotonic() - started
 
 
-def _format_delta(req_id: str) -> str:
-    """`+12.3s` since the request began, or 6 spaces if not tracked."""
-    started = _req_started(req_id)
-    if started is None:
-        return "      "
-    delta = time.monotonic() - started
+def _fmt_secs(delta: float) -> str:
     if delta < 10:
         return f"+{delta:4.2f}s"
     if delta < 100:
         return f"+{delta:4.1f}s"
     return f"+{int(delta):4d}s"
+
+
+# Anchor for SYSTEM-scoped ("**") lines. Those carry no request, so they had
+# no delta at all — six blank spaces — which meant post-turn and idle work
+# (metacog, hippocampus, dream, reaping, the stream drain) was the only part
+# of the agent whose cost was invisible in the stream the operator actually
+# watches. The reading is time SINCE THE PREVIOUS ** LINE, i.e. how long the
+# step that just finished took; there is no request start to measure from,
+# and "since process boot" would be useless on a daemon that runs for weeks.
+_SYSTEM_ANCHOR_LOCK = threading.Lock()
+_SYSTEM_ANCHOR: dict = {"t": None}
+
+
+def _delta_from(prev: Optional[float], now: float) -> str:
+    """Rendered gap between two anchors, or blanks when there is no previous
+    one. PURE — split out from the stateful reader below so the semantics can
+    be tested deterministically: the anchor is process-global and any
+    background thread that logs (a watchdog, a scheduler, `spawn_bg` work)
+    can advance it between two statements, which made a test asserting on the
+    global pass alone and fail in a full run."""
+    if prev is None:
+        return "      "
+    return _fmt_secs(max(0.0, now - prev))
+
+
+def _system_delta() -> str:
+    """`+12.3s` since the previous SYSTEM line; 6 spaces for the first one
+    (nothing to measure against yet). Advances the anchor."""
+    now = time.monotonic()
+    with _SYSTEM_ANCHOR_LOCK:
+        prev = _SYSTEM_ANCHOR["t"]
+        _SYSTEM_ANCHOR["t"] = now
+    return _delta_from(prev, now)
+
+
+def reset_system_delta_anchor() -> None:
+    """Drop the anchor so the next SYSTEM line starts a fresh measurement.
+
+    Called when a request OPENS: the gap across a whole user turn is not the
+    duration of any background step, and reporting it as one would be the
+    same category error the request frame made."""
+    with _SYSTEM_ANCHOR_LOCK:
+        _SYSTEM_ANCHOR["t"] = None
+
+
+def _format_delta(req_id: str) -> str:
+    """`+12.3s` since the request began, or 6 spaces if not tracked."""
+    started = _req_started(req_id)
+    if started is None:
+        return _system_delta() if req_id == "SYSTEM" else "      "
+    return _fmt_secs(time.monotonic() - started)
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +417,9 @@ class Icons:
     MCTS_TREE        = "🌳"   # deep-reason MCTS search tree
     FORESIGHT        = "🔮"   # shadow world model — tool-outcome prediction
     HEARTBEAT        = "🫀"   # biological watchdog heartbeat
+    JOB_PROMOTE      = "🏃"   # a sandbox command outran its budget and was
+                              # DETACHED as a supervised job instead of killed
+                              # (sandbox/jobs.py). Kills/expiries use STOP 🛑.
 
 
 logger = logging.getLogger("GhostAgent")
@@ -678,7 +727,7 @@ def _mirror(req_id: str, title: str, content: str, level: str = "INFO") -> None:
         pass
 
 
-def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None, no_truncate: bool = False):
+def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None, no_truncate: bool = False, origin: str = None):
     req_id = request_id_context.get()
     tag = _req_tag(req_id)
     rcol = _req_color(req_id)
@@ -687,6 +736,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     if special_marker == "BEGIN":
         with _REQ_STATE_LOCK:
             _REQ_STATE[req_id] = {"started": time.monotonic()}
+        reset_system_delta_anchor()
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         # Measure the plain (ANSI-free) prefix, then fill the rest of the
         # line so the frame spans the full console width.
@@ -697,7 +747,19 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{DIM}request started  {ts}{RESET} "
             f"{rcol}{rule}{RESET}"
         )
-        _mirror(req_id, "request started", f"{req_id[:8]} at {ts}", "INFO")
+        # ORIGIN STAMP (2026-08-11). Self-play/dream turns enter through the
+        # SAME handle_chat as a human request, so the durable log could not
+        # tell them apart — and `liveness._count_user_turns` counted all of
+        # them as user turns. On 08-11 that made 28 self-play turns read as
+        # 28 user turns while the true count was ZERO, which inverts the
+        # meaning of every turn-driven silence below it. Stamped on the
+        # MIRROR line only: the console frame is parsed by the uConsole
+        # turnstatus + Slack owner-lock clients, and this is not worth a
+        # cross-client sync. Absent `origin` emits the pre-08-11 shape, and
+        # the probe reports that as UNCLASSIFIED rather than guessing.
+        suffix = f" origin={origin}" if origin else ""
+        _mirror(req_id, "request started", f"{req_id[:8]} at {ts}{suffix}",
+                "INFO")
         atomic_print(line)
         return
 

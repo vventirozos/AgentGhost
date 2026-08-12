@@ -487,3 +487,116 @@ def test_inconclusive_sentence_counts_only_what_is_shown():
                 if v.evidence in ("observed", "suggestive"))
     assert f"({shown} PAIR verdict(s) above" in out
     assert "further verdict(s) not shown" in out
+
+
+# ── fs_batch arm uptake (2026-08-11) ──────────────────────────────────
+#
+# §4F's stated verification for this arm is MECHANICAL — "re-run the ontology
+# report; those n-grams must collapse. If they do not, the macro did not land,
+# whatever the latency says." It needs no statistical power, so it is readable
+# long before the outcome comparison is. What it must never do is confuse "the
+# model refused the capability" with "the model was never offered a chance to
+# use it": both render as zero `paths` calls, and only the ELIGIBLE denominator
+# separates them. Measured on the live corpus the day this shipped: treatment
+# had 0 eligible turns and 0 `paths` calls — no finding at all.
+
+def _armed(tid, calls, arm):
+    t = _traj(tid, calls)
+    t.extra = {"experiments": {"fs_batch": arm}}
+    return t
+
+
+def _two_reads():
+    return [_call("file_system", operation="read", path="a.py"),
+            _call("file_system", operation="read", path="b.py")]
+
+
+def test_eligibility_comes_from_the_SHIPPED_collapse_rule():
+    """Not a hand-written '≥2 reads' test. `read_chunked` runs are pagination
+    and deliberately OUT of the macro's scope, so a turn full of them offers it
+    nothing — a second definition of eligibility would count them and measure a
+    macro nobody deployed."""
+    paging = [_call("file_system", operation="read_chunked", path="a.py")
+              for _ in range(4)]
+    rep = ont.fs_batch_arm_uptake([_armed("t1", paging, "treatment")])
+    assert rep["arms"]["treatment"].eligible_turns == 0
+    assert rep["corpus_eligible_turns"] == 0
+
+    rep2 = ont.fs_batch_arm_uptake([_armed("t2", _two_reads(), "treatment")])
+    assert rep2["arms"]["treatment"].eligible_turns == 1
+    assert rep2["arms"]["treatment"].removable_steps == 1
+
+
+def test_zero_uptake_on_zero_opportunity_is_NOT_a_verdict():
+    """⚠ THE LIVE SHAPE, 2026-08-11. Treatment never emitted `paths` — and
+    never once had two whole-file reads to merge. Calling that 'the macro did
+    not land' would be a finding manufactured from an empty denominator."""
+    trajs = [_armed(f"t{i}", [_call("web_search", query="x")], "treatment")
+             for i in range(20)]
+    rep = ont.fs_batch_arm_uptake(trajs)
+    assert rep["arms"]["treatment"].paths_calls == 0
+    assert rep["readable"] is False
+    out = ont.render_fs_batch_arms(rep)
+    assert "NOT READABLE" in out
+    assert "DID NOT LAND" not in out
+    assert "NO OPPORTUNITY, not refusal" in out
+
+
+def test_but_it_MUST_convict_once_the_opportunity_is_real():
+    """⚠ OVER-SUPPRESSION GUARD. A check that can only ever say 'not readable'
+    is furniture. Give the treatment arm ample eligible turns and no `paths`
+    call, and it has to say so — that is the §4F verdict this exists to
+    deliver."""
+    trajs = [_armed(f"t{i}", _two_reads(), "treatment") for i in range(12)]
+    rep = ont.fs_batch_arm_uptake(trajs)
+    assert rep["arms"]["treatment"].eligible_turns == 12
+    assert rep["readable"] is True
+    out = ont.render_fs_batch_arms(rep)
+    assert "MACRO DID NOT LAND" in out
+
+
+def test_a_used_capability_reads_as_exercised_not_condemned():
+    """The other side of the same guard: a `paths` call must flip the verdict,
+    or the report convicts a working macro."""
+    used = [_call("file_system", operation="read",
+                  paths=["a.py", "b.py"], path="a.py")]
+    trajs = ([_armed(f"e{i}", _two_reads(), "treatment") for i in range(12)]
+             + [_armed("u", used, "treatment")])
+    rep = ont.fs_batch_arm_uptake(trajs)
+    assert rep["arms"]["treatment"].paths_calls == 1
+    out = ont.render_fs_batch_arms(rep)
+    assert "DID NOT LAND" not in out
+    assert "being exercised" in out
+
+
+def test_no_eligible_turns_anywhere_invents_no_traffic_estimate():
+    """An unknown requirement is not an infinite one. With a zero eligibility
+    rate the projection is None rather than a fabricated turn count."""
+    rep = ont.fs_batch_arm_uptake(
+        [_armed("t", [_call("web_search", query="x")], "control")])
+    assert rep["eligibility_rate"] == 0
+    assert rep["enrolled_turns_needed"] is None
+    assert "would be needed" not in ont.render_fs_batch_arms(rep)
+
+
+def test_projection_uses_the_CORPUS_rate_not_the_arm_sample():
+    """The 'how much traffic' answer must not inherit the arm's own small-n
+    noise — it is computed over every trajectory, enrolled or not."""
+    trajs = [_armed("a", _two_reads(), "treatment")]
+    trajs += [_traj(f"u{i}", _two_reads()) for i in range(9)]   # unenrolled
+    rep = ont.fs_batch_arm_uptake(trajs)
+    assert rep["corpus_turns"] == 10 and rep["corpus_eligible_turns"] == 10
+    assert rep["eligibility_rate"] == 1.0
+    assert rep["enrolled_turns_needed"] == ont.FS_BATCH_MIN_ELIGIBLE * 2
+
+
+def test_an_unenrolled_corpus_says_so_rather_than_rendering_an_empty_table():
+    rep = ont.fs_batch_arm_uptake([_traj("t", _two_reads())])
+    assert rep["arms"] == {}
+    assert "not enrolled" in ont.render_fs_batch_arms(rep)
+
+
+def test_one_corrupt_record_does_not_stop_the_walk():
+    bad = SimpleNamespace(id="bad", task_kind="user_request")  # no tool_calls
+    rep = ont.fs_batch_arm_uptake([bad, _armed("t", _two_reads(), "treatment")])
+    assert rep["arms"]["treatment"].eligible_turns == 1

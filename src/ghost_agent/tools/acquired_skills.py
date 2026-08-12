@@ -829,13 +829,23 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     # old `"EXIT CODE: 0" in result` check despite exiting 1. Mirrors the
     # regex classification in registry._acquired_skill_result_class.
     import re as _re
+    from ..sandbox.jobs import is_promoted_result as _is_promoted
     _exit_m = _re.search(r"EXIT CODE:\s*(\d+)", str(execution_result))
-    _tdd_passed = bool(_exit_m and _exit_m.group(1) == "0")
+    # A test run that outran its budget was DETACHED, not killed, and reports
+    # exit 0 while STILL RUNNING (sandbox/jobs.py). Installing a skill on it
+    # would gate the TDD contract on a test that never finished.
+    _tdd_passed = bool(_exit_m and _exit_m.group(1) == "0") \
+        and not _is_promoted(execution_result)
     if not _tdd_passed or "(Process executed successfully, but no output was printed to stdout" in execution_result:
-        try:
-            test_file.unlink()
-        except Exception:
-            pass
+        # …but NEVER delete the file while a promoted job is still executing
+        # it (sandbox/jobs.py). The gate correctly refuses to pass on an
+        # unfinished run; unlinking its script on the way out is the hazard
+        # the ephemeral-cleanup path exists to avoid.
+        if not _is_promoted(execution_result):
+            try:
+                test_file.unlink()
+            except Exception:
+                pass
         logger.warning(f"TDD failure for '{name}':\n{execution_result}")
         # Surface the one-line cause in the trace so the operator
         # can diagnose without grepping the agent log. Full detail is

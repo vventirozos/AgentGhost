@@ -283,6 +283,15 @@ async def smoke_gate(tool_runner, written: List[str]) -> Optional[str]:
         logger.debug("smoke_gate execute failed (fail-open): %s", e)
         return None
     text = str(out or "")
+    # A smoke run DETACHED at its budget (sandbox/jobs.py) has not produced a
+    # verdict yet — and unlike a mangled run, it is still going. Report it as
+    # a real gate failure rather than failing open: "the smoke test has not
+    # finished" must not read as "the build is fine".
+    from ..sandbox.jobs import is_promoted_result
+    if is_promoted_result(text):
+        return ("smoke test did not finish — it outran its execution budget "
+                "and is still running as a background job; re-check it with "
+                "jobs(action='status') before treating this build as good")
     m = re.search(r"SMOKE_RESULT (\{.*\})", text)
     if not m:
         # Couldn't find our marker — the sandbox mangled the run; fail open

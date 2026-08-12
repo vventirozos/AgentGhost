@@ -188,6 +188,49 @@
     <li><strong>exception logging</strong> — a done-callback logs any non-Cancelled failure via <code>logger.warning</code> (auto-renders on the live stream). Previously a dying background coroutine vanished into an <code>except: pass</code> body — the root of the "built-but-silently-not-happening" pathology.</li>
   </ul>
   <p><code>drain_background_tasks(timeout)</code> awaits the registry at lifespan shutdown (bounded) so in-flight writes get a chance to land. The three superseded variants (bare <code>spawn_task</code> for fire-and-forget, the module-local <code>_GRAPH_EXTRACT_TASKS</code> set, and GC-unsafe bare <code>create_task</code>) are removed; the remaining legitimate strong-ref sites (the biological daemon task, the swarm task registry, the context <code>_pending_background_tasks</code> set, the self-play loop) are allow-listed. A grep-based regression guard (<code>tests/test_spawn_bg.py::test_no_bare_create_task_in_hot_modules</code>) fails the suite if a new bare <code>create_task</code> appears outside that allow-list.</p>
+  <h2>Timing: what the numbers mean <span class="tag">2026-08-12</span></h2>
+  <p>Two operations had no visible cost, and one number was being read as
+  something it never measured.</p>
+  <h3>The request frame closes at FIRST TOKEN, not at done</h3>
+  <p><code>└─ B7 request finished +23.0s</code> is emitted from
+  <code>handle_chat</code>'s <code>finally</code> — and on the STREAMING path
+  that function returns a generator the client drains afterwards. So the
+  banner measures time-to-first-token. Observed live: a turn whose frame said
+  <code>+23.0s</code> handed the terminal back about two minutes later, and
+  every second of that generation was logged nowhere.</p>
+  <p>The frame's number is KEPT — it is when output starts appearing, and
+  three clients parse that frame (uConsole <code>turnstatus.py</code>, Slack,
+  web). A second line now reports the number it was being mistaken for, from
+  the drain's own <code>finally</code> so a client that disconnects mid-stream
+  still produces it:</p>
+  <pre>└─ B7  request finished  +23.0s
+│  **  🏁  +0.2s  stream drained   b72d9978 · TOTAL 140.2s · first token 23.0s · 2,317 chunks · 178 KB</pre>
+  <p>Ordered for the console, which truncates content at
+  <code>LOG_TRUNCATE_LIMIT</code>: total and first-token survive; size and
+  rate fall into the durable mirror, which keeps the full line.</p>
+
+  <h3><code>**</code> lines now carry a duration</h3>
+  <p>SYSTEM-scoped lines had six blank spaces where a request line has
+  <code>+12.3s</code>, because <code>_format_delta</code> measures from a
+  request's BEGIN and background work has none. That made post-turn and idle
+  work — metacog, hippocampus, dream, the job reaper, the stream drain — the
+  only part of the agent whose cost was invisible in the stream the operator
+  actually watches.</p>
+  <p>The reading is <strong>time since the previous <code>**</code>
+  line</strong>, i.e. how long the step that just finished took. "Since
+  process boot" would be useless on a daemon that runs for weeks, and there
+  is no request start to measure from. A request OPENING resets the anchor,
+  so the first background line after a turn shows blanks rather than
+  reporting the turn's own length as if it were a background step.</p>
+  <p>The semantics live in a pure <code>_delta_from(prev, now)</code> —
+  split out because the anchor is process-global and any background thread
+  that logs can advance it between two statements, which is exactly how the
+  first version of its test passed alone and failed in a full run. A clock
+  that goes backwards renders <code>+0.00s</code>, never a negative: the
+  column is a fixed six characters and every line after it is aligned from
+  that width.</p>
+  <p>Tests: <code>tests/test_log_timing_visibility.py</code>.</p>
+
 </main>
 </body>
 </html>

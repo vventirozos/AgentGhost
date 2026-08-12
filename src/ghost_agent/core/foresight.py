@@ -10,7 +10,14 @@ disjoint intervals), which unlocked exactly ONE consumer — the
 `foresight_note` experiment arm in ``core/agent.py`` (a precedent note
 appended to FAILED results with ≥2 real precedent failures,
 treatment-gated, `GHOST_FORESIGHT_NOTE=0` kills). Any further consumer
-must clear the same gate on the LIVE ledger.
+must clear the same gate on the LIVE ledger — and so far it has not.
+LIVE-LEDGER HISTORY (the confirmatory instrument, `scripts/foresight_backtest.py`):
+08-11 n=222 → spread 0.099, FLAT (killed the MCTS/BoN consumer, §4AU);
+08-12 n=287 → spread 0.124, ordering correct, "SPREAD BUT NOT SIGNIFICANT"
+(intervals overlap; 0.75+ bucket still empty). The extra consumer stays
+UNBUILT, but the state is "underpowered-promising", not "measured dead" —
+re-read as the ledger grows, esp. once a high-p(fail) bucket populates.
+See PROJECT_JOURNAL §4BB.
 
 Why it exists (the gap, in this codebase's own words):
 

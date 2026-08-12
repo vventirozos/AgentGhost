@@ -96,6 +96,29 @@ def test_frame_markers_are_exempt(capsys, mirror):
     assert "request started" in out and "request finished" in out
 
 
+def test_request_start_mirror_carries_the_ORIGIN_stamp(capsys, mirror):
+    """2026-08-11. `liveness._count_user_turns` splits user traffic from
+    self-play on this stamp; without it the durable log cannot tell a human
+    request from a dream turn, and the denominator counts both.
+
+    Console frame deliberately UNCHANGED — the uConsole `turnstatus` parser and
+    the Slack owner-lock both key on it, and neither needs this.
+    """
+    glog.pretty_log("ignored", special_marker="BEGIN", origin="sim")
+    line = next(l for l in mirror.lines if "request started" in l)
+    assert "origin=sim" in line
+    assert "origin" not in capsys.readouterr().out
+
+
+def test_origin_is_OPTIONAL_and_its_absence_is_the_old_shape(mirror):
+    """A caller that does not know the origin must not fabricate one. The
+    probe reads an unstamped line as UNCLASSIFIED, which is the honest state —
+    inventing `origin=user` here would launder self-play into the count."""
+    glog.pretty_log("ignored", special_marker="BEGIN")
+    line = next(l for l in mirror.lines if "request started" in l)
+    assert "origin=" not in line
+
+
 def test_verify_purpose_contextvar_set_and_reset():
     assert glog.verify_purpose_context.get() == ""
     with glog.verify_purpose("turn gate"):

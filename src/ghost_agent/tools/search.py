@@ -679,6 +679,17 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     # of them can run at once without correlated blocking. Kept modest so a
     # research turn doesn't open a dozen Tor circuits + worker LLM calls at
     # once on the RAM-tight box.
+    #
+    # ⚠ SCOPE, 2026-08-11: this bounds ONE call and nothing more. The clause
+    # above about "worker LLM calls" was never true across calls — this object
+    # is built per invocation, so three deep_research calls in one tool batch
+    # meant 3 × 3 = NINE concurrent worker requests at a node with 4 slots
+    # (req 0fb69c5f: the excess queued past the route timeout, every timeout
+    # counted as a node fault, and the breaker ejected a healthy Nova for 60s).
+    # The worker budget now lives in `LLMClient._node_slot`, keyed by node URL
+    # so every caller and every role shares it. What remains here is what this
+    # semaphore can actually govern: Tor circuits and page fetches for THIS
+    # call.
     sem = asyncio.Semaphore(3)
     PER_URL_TIMEOUT = 55.0  # ceiling on fetch (≤2 circuits) + LLM distillation
 

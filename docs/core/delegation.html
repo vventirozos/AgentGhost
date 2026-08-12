@@ -21,6 +21,8 @@
     <h3>Tools</h3>
     <a href="../tools/composed_skills.html">composed_skills</a>
     <a href="../tools/swarm.html">swarm</a>
+    <h3>Related</h3>
+    <a href="../sandbox/jobs.html">sandbox.jobs</a>
   </nav>
 </aside>
 <main>
@@ -169,7 +171,8 @@
   <h2>3. The job registry (<code>jobs</code>)</h2>
   <p><code>core.jobs.JobRegistry</code> is the status surface every
   fire-and-forget mechanism was missing. <code>delegate</code> and
-  <code>delegate_to_swarm</code> both register into it, so the <code>jobs</code>
+  <code>delegate_to_swarm</code> both register into it — as does a promoted
+  sandbox command (below) — so the <code>jobs</code>
   tool reports them together: <code>status</code> (running + recently finished),
   <code>collect</code> (a finished job's full result — or every unread result),
   <code>cancel</code>. In-memory by design: jobs are per-process (their asyncio
@@ -179,6 +182,36 @@
   Tasks are spawned via <code>spawn_bg</code> — the codebase's one
   fire-and-forget primitive (strong ref + contextvar propagation + exception
   logging), never a bare <code>create_task</code>.</p>
+  <p class="warn"><strong>Sandbox jobs join the surface <span class="tag">2026-08-11</span>.</strong>
+  An <code>execute</code> command still working after 90&nbsp;s is detached
+  rather than left blocking the turn
+  (<a href="../sandbox/jobs.html">sandbox.jobs</a>) and appears here as kind
+  <code>sandbox</code>. When it lands, the reaper WAKES the model with its
+  result through the same internal-turn path scheduled tasks use, so the
+  work continues without the operator; this surface is for asking about it in
+  between. It breaks one assumption of the
+  registry above: the process lives in the CONTAINER, not this Python process,
+  so its row carries no asyncio task and nothing in-process can land it.
+  <code>_sync_sandbox_jobs</code> therefore reconciles against the supervisor
+  before every <code>jobs</code> answer — landing a finished job's exit code and
+  output tail, enforcing the lifetime cap via <code>reap()</code>, and ADOPTING a
+  job promoted before this process started (a promoted job survives an agent
+  restart; without adoption it would run and be reaped with nothing able to
+  report it). <code>cancel</code> on such a row kills the real process group
+  FIRST and only marks the row when the supervisor reports a VERIFIED kill —
+  a boolean, not a message prefix: "already done — nothing to cancel" carries
+  no <code>Error:</code> and was being read as a successful kill, overwriting
+  a completed job's result with CANCELLED. Cancelling the row alone
+  would leave precisely the invisible orphan the subsystem exists to prevent.
+  A row whose supervisor record has vanished is failed loudly rather than left
+  hanging RUNNING for ever, and a FAILED job still hands back its output — a
+  build that broke at minute 12 collecting as a bare "exited 1" leaves the
+  model nothing to act on but the command it was just told not to re-run. The
+  supervisor's log is deliberately NOT deleted at landing: this sync runs on
+  every <code>jobs</code> call, so forgetting there destroyed the full output
+  before anyone could read it. Test:
+  <code>tests/test_jobs_tool_sandbox.py</code>.</p>
+
   <p class="warn"><strong>Collect read-marking <span class="tag">2026-07-22</span>.</strong>
   <code>jobs(action='collect')</code> with no <code>job_id</code> (the "collect all"
   case) previously re-dumped <em>every</em> retained finished job — up to 50 ×

@@ -1363,6 +1363,24 @@ async def tool_learn_skill(task: str = None, mistake: str = None, solution: str 
 async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memory_system=None, memory_bus=None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
+    # --- ACTION ALIASES ---------------------------------------------------
+    # `transcribe` is a FIRST-CLASS name for `ingest_document`, not a typo
+    # heal. The tool is named for what it STORES while a model searching for
+    # this capability is holding a VERB: it thinks "I need to transcribe",
+    # scans the tool list for a transcriber, finds none, and plans a Whisper
+    # pipeline instead. Measured (§4AW): `knowledge_base` was advertised on
+    # all 16 tool-carrying payloads, sat 3rd of 44, and its description
+    # already forbade writing transcription code — the model installed
+    # openai-whisper anyway. Presence was never the problem; findability BY
+    # NEED was. So the tool now answers to the word the model is looking for.
+    action = str(action).strip().lower()
+    action = {
+        "transcribe": "ingest_document",
+        "transcribe_document": "ingest_document",
+        "transcription": "ingest_document",
+        "ingest": "ingest_document",
+        "ingest_file": "ingest_document",
+    }.get(action, action)
     # --- FLEXIBLE PARAMETER MAPPING ---
     # Schema advertises 'filename' (ingest_document/forget) and 'fact'
     # (insert_fact); legacy 'content'/'source'/'path'/'topic' kept for

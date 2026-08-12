@@ -3,6 +3,7 @@ import asyncio
 import logging
 import copy
 import os
+from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 import httpx
 from ..utils.logging import (Icons, pretty_log, request_id_context,
@@ -183,6 +184,21 @@ def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     return tor_proxy.replace("socks5://", "socks5h://")
 
 
+class NodeSaturated(Exception):
+    """We could not get a permit for this node before the deadline.
+
+    ⚠ THIS IS NOT A NODE FAULT AND MUST NEVER REACH THE CIRCUIT BREAKER. The
+    request never left this process — the node was not asked and cannot have
+    failed. Before the per-node gate existed the same over-subscription showed
+    up as a ReadTimeout from llama-server's queue, which `_is_node_fault()`
+    (correctly, for what it could see) counted as illness: our own fan-out
+    ejected a healthy node for 60s. Moving the wait from the server's queue
+    into our own gate is what makes the distinction PROVABLE rather than
+    heuristic — the difference between "we never asked" and "it did not
+    answer".
+    """
+
+
 def _is_node_fault(exc) -> bool:
     """True if ``exc`` indicates the NODE itself is unhealthy (→ count it
     toward the circuit breaker), False for a caller-fault that would repeat
@@ -191,7 +207,18 @@ def _is_node_fault(exc) -> bool:
     HEALTHY node for a deterministic caller bug (e.g. a verify payload
     exceeding Nova's n_ctx), taking the node out of rotation for 60s and
     forcing every routed call onto the main slot. Timeouts / connection
-    errors / 5xx stay node faults."""
+    errors / 5xx stay node faults.
+
+    ⚠ AND SATURATION IS OURS, NOT THE NODE'S (2026-08-11). `NodeSaturated`
+    means we never sent the request — no permit was free within the wait
+    budget. A node cannot fail a request it was never asked. This is the
+    second half of the req-0fb69c5f defect: before the per-node gate, that
+    same over-subscription arrived as a ReadTimeout from llama-server's own
+    queue, which is indistinguishable from real slowness, so our fan-out
+    ejected a healthy Nova for 60s. The gate does not merely prevent the
+    flood — it relocates the wait to a place where the cause is KNOWN."""
+    if isinstance(exc, NodeSaturated):
+        return False
     resp = getattr(exc, "response", None)
     code = getattr(resp, "status_code", None)
     if isinstance(code, int) and 400 <= code < 500:
@@ -204,6 +231,11 @@ def _node_error_detail(exc) -> str:
     bare class name hides the actual cause (a 400 'unsupported image format'
     reads identically to a 500 crash), so include the status code and a
     bounded body snippet; every other exception keeps its class name."""
+    if isinstance(exc, NodeSaturated):
+        # Do not let this read as node illness in the log either — the node was
+        # never contacted. Names the cause so an operator sees over-subscription
+        # rather than hunting a node that is fine.
+        return f"SATURATED — {exc} (node not contacted; not a node fault)"
     if isinstance(exc, httpx.HTTPStatusError):
         detail = f"HTTP {exc.response.status_code}"
         try:
@@ -356,6 +388,34 @@ class LLMClient:
         # all readers/writers live on the same event loop.
         self._foreground_lock = asyncio.Lock()
         self._bg_queue_sem = asyncio.Semaphore(3)  # Allow up to 3 concurrent background tasks
+        # ── PER-NODE CONCURRENCY GATE (2026-08-11) ───────────────────────────
+        # One budget per node URL, shared by EVERY caller and every role.
+        #
+        # WHY IT HAS TO LIVE HERE. Tools capped themselves: `search.py` builds
+        # an `asyncio.Semaphore(3)` INSIDE deep_research, so the cap is per
+        # CALL. Live on req 0fb69c5f the model issued THREE deep_research calls
+        # in one batch — 3 semaphores × 3 permits = **9 concurrent requests at
+        # a node advertising 4 slots** (20 worker calls in 74s). The excess
+        # queued on llama-server past the route timeout, and every one of those
+        # ReadTimeouts counted as a NODE fault, so 3 in a row tripped the
+        # breaker and ejected a perfectly healthy Nova for 60s. It "recovered"
+        # 20s later because nothing was ever wrong with it.
+        #
+        # No tool can fix this from where it stands: Nova serves the WORKER and
+        # CRITIC roles at once on this deployment, and query-expansion, web
+        # summaries, fact distillation and the verifier all reach it by
+        # different paths. Keying on URL is what makes the budget authoritative
+        # — role-keyed limits would each be individually polite and still
+        # collectively flood one box.
+        self._node_slots: Dict[str, asyncio.Semaphore] = {}
+        self._node_slot_caps: Dict[str, int] = {}
+        self._node_slots_lock = asyncio.Lock()
+        # Fallback when a node will not tell us its capacity. 3 matches the old
+        # per-call value, so an unprobeable node behaves exactly as it did
+        # before rather than becoming unbounded — a gate whose failure mode is
+        # "no gate" is the shape this whole change exists to remove.
+        self._node_slot_default = max(1, int(
+            os.getenv("GHOST_NODE_SLOTS_DEFAULT", "3") or 3))
         self._main_node_lock = asyncio.Lock()
         self.http_client = httpx.AsyncClient(
             base_url=upstream_url,
@@ -923,10 +983,96 @@ class LLMClient:
                 else:
                     raise Exception(f"Image generation failed after 3 attempts: {str(e)}")
 
+    async def _node_capacity(self, node: Dict[str, Any]) -> int:
+        """How many requests this node can genuinely serve at once.
+
+        Read from the node's OWN `/props` (`total_slots`) rather than
+        configured by hand: the number that matters is llama-server's `-np`,
+        and a hand-set copy drifts the moment the operator restarts a node with
+        different flags. Probed once per node, cached, and never retried in the
+        hot path — a probe failure falls back to the conservative default
+        instead of blocking dispatch.
+        """
+        url = node.get("url") or ""
+        cap = self._node_slot_caps.get(url)
+        if cap is not None:
+            return cap
+        cap = self._node_slot_default
+        try:
+            client = node.get("client")
+            if client is not None:
+                r = await client.get("/props", timeout=5.0)
+                r.raise_for_status()
+                data = r.json() or {}
+                raw = data.get("total_slots") or data.get("n_parallel")
+                if isinstance(raw, int) and raw > 0:
+                    cap = raw
+                    pretty_log("Node Capacity",
+                               f"{node.get('model')} advertises {cap} slot(s) "
+                               f"— per-node gate sized to match",
+                               level="INFO", icon=Icons.NODE_WORKER)
+        except Exception as e:                                  # noqa: BLE001
+            logger.debug("node capacity probe failed for %s (%s) — using "
+                         "default %d", url, type(e).__name__, cap)
+        self._node_slot_caps[url] = cap
+        return cap
+
+    @asynccontextmanager
+    async def _node_slot(self, node: Dict[str, Any],
+                         wait_timeout: Optional[float] = None):
+        """Hold one of ``node``'s slots for the duration of a request.
+
+        Raises :class:`NodeSaturated` if no permit arrives within
+        ``wait_timeout`` — the caller then knows the node was never asked, so
+        nothing about this failure says anything about the node's health.
+
+        ``wait_timeout=None`` BYPASSES the gate (health probes only). It
+        deliberately does not mean "wait forever": an unbounded wait here would
+        park callers on a wedged node until their own timeouts fired, which is
+        the failure mode this gate replaces, not one to reintroduce.
+        """
+        if wait_timeout is None:
+            yield
+            return
+        url = node.get("url") or ""
+        sem = self._node_slots.get(url)
+        if sem is None:
+            async with self._node_slots_lock:
+                sem = self._node_slots.get(url)          # re-check under lock
+                if sem is None:
+                    cap = await self._node_capacity(node)
+                    sem = asyncio.Semaphore(cap)
+                    self._node_slots[url] = sem
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            raise NodeSaturated(
+                f"no free slot on {node.get('model') or url} within "
+                f"{wait_timeout:.0f}s (cap {self._node_slot_caps.get(url)})")
+        try:
+            yield
+        finally:
+            sem.release()
+
     async def _do_chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "") -> Dict[str, Any]:
         """
         Sends a chat completion request to the upstream LLM with robust retry logic.
         """
+        # How long a caller will queue for a node permit before giving up.
+        # Generous relative to a request, because WAITING is the desired
+        # behaviour — the alternative it replaces is not "go faster", it is
+        # "flood the node, time out anyway, and take it out of rotation for
+        # 60s". Bounded so a wedged node cannot park callers forever.
+        _slot_wait = float(os.getenv("GHOST_NODE_SLOT_WAIT_S", "90") or 90)
+        # ⚠ THE HEALTH PROBE MUST NOT QUEUE BEHIND THE TRAFFIC IT IS WATCHING.
+        # `keepalive_workers()` is what prints "node X stopped answering"; if
+        # its ping waits on the same permits as a research fan-out, a BUSY node
+        # reports as a DEAD one — the identical false alarm this change exists
+        # to remove, reintroduced one layer down. It skips the gate entirely:
+        # one extra in-flight request against a 4-slot node is a rounding
+        # error, and an unstarvable probe is the whole point of a probe.
+        if task_label == "keepalive":
+            _slot_wait = None
         # Request prefix-cache reuse on the upstream. llama.cpp's server
         # honours this as an OpenAI-compatible extension; other backends
         # (vLLM, OpenAI-proper) silently ignore unknown fields. Setting
@@ -982,7 +1128,8 @@ class LLMClient:
                             kwargs = {}
                             if timeout is not None:
                                 kwargs["timeout"] = timeout
-                            resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                            async with self._node_slot(node, wait_timeout=_slot_wait):
+                                resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
                             resp.raise_for_status()
                             self.circuit_breaker.record_success(node["url"])
                             return resp.json()
@@ -1051,7 +1198,8 @@ class LLMClient:
                         kwargs = {}
                         if timeout is not None:
                             kwargs["timeout"] = timeout
-                        resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                        async with self._node_slot(node, wait_timeout=_slot_wait):
+                            resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
                         resp.raise_for_status()
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
@@ -1149,7 +1297,8 @@ class LLMClient:
                         kwargs = {}
                         if timeout is not None:
                             kwargs["timeout"] = timeout
-                        resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                        async with self._node_slot(node, wait_timeout=_slot_wait):
+                            resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
                         resp.raise_for_status()
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
@@ -1200,7 +1349,8 @@ class LLMClient:
                         kwargs = {}
                         if timeout is not None:
                             kwargs["timeout"] = timeout
-                        resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                        async with self._node_slot(node, wait_timeout=_slot_wait):
+                            resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
                         resp.raise_for_status()
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
@@ -1254,7 +1404,8 @@ class LLMClient:
                         kwargs = {}
                         if timeout is not None:
                             kwargs["timeout"] = timeout
-                        resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                        async with self._node_slot(node, wait_timeout=_slot_wait):
+                            resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
                         resp.raise_for_status()
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()

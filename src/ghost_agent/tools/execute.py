@@ -8,9 +8,12 @@ import uuid
 import base64
 import datetime
 import ast
+import hashlib
 import json
+import time
 from pathlib import Path
 from typing import List
+from ..sandbox.jobs import PROMOTED_RESULT_MARKER
 from ..utils.logging import Icons, pretty_log
 from ..utils.sanitizer import sanitize_code
 from .file_system import _get_safe_path
@@ -70,6 +73,11 @@ def _detached_server_signals(text: str) -> bool:
                      or re.search(r"\bsetsid\b", text)))
 
 
+# ⚠ THE INSTALL VERB IS REQUIRED, and `uninstall` is excluded — my first
+# version matched installer+package with no verb, so `pip uninstall
+# openai-whisper` was refused. Blocking the CLEANUP of the very package this
+# guard exists to prevent is the opposite of the intent, and the
+# over-blocking test caught it.
 def _daemonized_server_block(command: str):
     """Refusal message when a shell command would detach a long-lived
     server inside the sandbox, else None.
@@ -128,8 +136,187 @@ def _released_shell_block(project_store, command: str):
 # Execution budget for sandboxed runs (seconds). The sandbox layer wraps
 # every run in `timeout -k 5s <budget>s`, so hitting the budget surfaces
 # as exit 124 (or 137/143 when the -k SIGKILL / a SIGTERM landed).
+# A run that is still ALIVE and still PROGRESSING at the budget is promoted
+# to a background job instead of killed (sandbox/jobs.py); exit 124 now means
+# "the budget expired AND it had gone quiet", i.e. genuinely wedged.
 _EXEC_TIMEOUT_S = 600
 _TIMEOUT_KILL_CODES = (124, 137, 143)
+
+
+async def _run_in_sandbox(sandbox_manager, cmd_str, *, timeout=_EXEC_TIMEOUT_S,
+                          label=None, project_id=None, cleanup_paths=None,
+                          identity=None, **kwargs):
+    """Run a command for the execute TOOL, preferring the promotable path.
+
+    Returns ``(output, exit_code, job_entry_or_None)``. Falls back to the
+    plain 2-tuple ``execute`` for any manager that does not implement jobs.
+
+    The capability is probed through an explicit class-level flag, NOT
+    ``hasattr(mgr, "execute_promotable")``: most sandbox stubs in the suite
+    (and in any caller's tests) are ``MagicMock``s, which auto-create every
+    attribute — a hasattr probe routes them all down the promotable path and
+    then unpacks a Mock as a 3-tuple. ``is True`` is the one check a
+    duck-typed mock cannot accidentally satisfy.
+
+    ``cleanup_paths`` are HOST files the run OWNS — the ephemeral script an
+    `execute(content=…)` call generates. They cannot be deleted while a
+    promoted job is still executing them, so the supervisor takes ownership
+    and unlinks them when the job ends.
+
+    ``identity`` is what the supervisor's re-run guard compares. It defaults
+    to the command, which is right for a `command=` run (the command IS the
+    content) but WRONG for a script run: `python3 -u build.py` is stable
+    across every rewrite of build.py, so a model that reads the promotion
+    banner, fixes the script and re-runs it would be handed the OLD job and
+    blocked from running the fix. The script path folds in a content hash.
+    """
+    runner = getattr(sandbox_manager, "execute_promotable", None)
+    if getattr(sandbox_manager, "supports_job_promotion", False) is not True \
+            or runner is None:
+        output, exit_code = await asyncio.to_thread(
+            sandbox_manager.execute, cmd_str, timeout=timeout, **kwargs)
+        return output, exit_code, None
+    return await asyncio.to_thread(
+        runner, cmd_str, timeout=timeout, label=label,
+        project_id=project_id, cleanup_paths=cleanup_paths,
+        identity=identity, **kwargs)
+
+
+def _promotion_banner(job: dict, ran_s: int) -> str:
+    """The message that turns a timeout into a promotion.
+
+    It has one job beyond informing: FORECLOSING THE RETRY. The retry is what
+    turned 10 minutes of loss into 40 in the incident this replaces, so the
+    "do NOT re-run" line is not politeness — it is the fix. (The supervisor
+    enforces it too: an identical command that is already running as a job
+    returns that job instead of starting a second copy.)
+
+    The closing instruction deliberately avoids "I will report back" phrasing:
+    that reads as a PROMISE OF FUTURE ACTION, which the pending-promise guard
+    rejects. Since 2026-08-12 the reaper DOES wake the model when the job
+    lands (main._resume_after_job), so the work genuinely continues — but the
+    promise still belongs to the system, not to this reply, and the guard is
+    right that a reply cannot keep it."""
+    jid = job.get("id")
+    now = time.time()
+
+    def _num(key):
+        try:
+            return float(job.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # REMAINING lifetime, not the configured one. For a fresh promotion the
+    # two are the same (now == promoted_at); for an already-running job hit
+    # by the re-run guard they are not, and quoting the full TTL would
+    # overstate how long the model can wait.
+    ttl_min = max(1, int((_num("deadline_at") - now) / 60)) \
+        if _num("deadline_at") > now else 1
+    if job.get("duplicate"):
+        # …and its age is the ORIGINAL command's, not the ~0s this call took.
+        age = int(now - _num("started_at")) if _num("started_at") else ran_s
+        head = (f"▎ NOT re-run: this exact command is ALREADY running as "
+                f"background job {jid} (started {age}s ago). A second copy "
+                f"was NOT started — it would compete with the first for the "
+                f"same sandbox CPU.")
+    else:
+        head = (f"▎ Still running at {ran_s}s — promoted to background job "
+                f"{jid}. Do NOT re-run this command — it was NOT killed and "
+                f"is still working.")
+    return (
+        f"{head}\n"
+        f"▎ Poll it with jobs(action='status', job_id='{jid}'); read its full "
+        f"result with jobs(action='collect', job_id='{jid}') once it "
+        f"finishes. Cancel it with jobs(action='cancel', job_id='{jid}').\n"
+        f"▎ It keeps running in the sandbox (up to {ttl_min} more minutes, "
+        f"then it is reaped) and survives this turn; its live output is in "
+        f"'{job.get('log')}' (file_system operation='read').\n"
+        f"▎ FINISH YOUR TURN NOW: state plainly that the work is STILL "
+        f"RUNNING in the background and where its result will appear — do "
+        f"not wait for it here and do not claim it finished. You will be "
+        f"woken with the result when it lands, so there is nothing to poll "
+        f"for and nothing to promise."
+    )
+
+
+def _project_id_from_workdir(container_workdir) -> str:
+    """Owning project id from a scoped container workdir, else ''. Only the
+    canonical 12-hex form is accepted — a garbage workdir must not fabricate
+    ownership."""
+    m = re.search(r"/projects/([0-9a-f]{12})(?:/|$)",
+                  str(container_workdir or ""))
+    return m.group(1) if m else ""
+
+
+def _record_promoted_command(workspace_model, command, duration_s, job):
+    """Workspace ledger entry for a promoted run. Exit code 0 with an
+    explicit note — recording it as a failure would put the same wrong label
+    into the ledger that the strike accounting no longer takes."""
+    if workspace_model is None or not getattr(workspace_model, "enabled", False):
+        return
+    try:
+        workspace_model.record_command_outcome(
+            command=str(command), exit_code=0,
+            duration_seconds=float(duration_s),
+            note=f"still running — promoted to background job {job.get('id')}",
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break a tool
+        pass
+
+
+def _register_promoted_job(job_registry, job, label):
+    """Mirror a promoted sandbox job into the in-process job registry so the
+    existing `jobs` tool lists it alongside delegated sub-agents. The sandbox
+    supervisor stays the source of truth for its state (this row carries no
+    asyncio task); `tools/delegate.py` syncs the two before answering."""
+    if job_registry is None or not isinstance(job, dict):
+        return
+    sid = job.get("id")
+    if not sid:
+        return
+    try:
+        # Dedupe. Two writers can mirror the same sandbox job: this one, and
+        # the `jobs` tool's adoption pass for a job it has not seen. A second
+        # row would be reported as its own "still running" job for ever — and
+        # the re-run guard means one command legitimately returns the SAME
+        # job id twice, which lands here twice by design.
+        for existing in job_registry.list(kind="sandbox"):
+            if (existing.meta or {}).get("sandbox_job_id") == sid:
+                return
+        job_registry.register(
+            "sandbox", str(label or job.get("command") or "")[:200],
+            sandbox_job_id=sid, log=job.get("log"),
+            command=job.get("command"))
+    except Exception:  # noqa: BLE001 — never break the tool over bookkeeping
+        logging.getLogger("GhostAgent").debug(
+            "promoted-job registry mirror failed", exc_info=True)
+
+
+def _promoted_result(job: dict, ran_s: int, output: str) -> str:
+    """Tool result for a promoted command. EXIT CODE 0 on purpose: the turn
+    loop scores a non-zero `execute` exit as a FAILURE and a transient
+    strike, and a legitimately-long task is not a failure — miscounting it
+    poisons the outcome labels the learning loop trains on. The annotation
+    rides AFTER the digits so `EXIT CODE:\\s*(\\d+)` parsers keep working.
+
+    ``PROMOTED_RESULT_MARKER`` rides in the FIRST LINE because success-shaped
+    is exactly what the other readers of an execute result must NOT take this
+    for: the verify gate that marks a task DONE and the TDD gate that
+    installs a skill both key on exit 0, and neither would otherwise know the
+    command has not finished."""
+    if not isinstance(job, dict):
+        job = {}
+    body = (output or "").strip()
+    _state = ("ALREADY RUNNING as background job"
+              if job.get("duplicate") else
+              "STILL RUNNING — promoted to background job")
+    return (
+        f"--- COMMAND RESULT --- {PROMOTED_RESULT_MARKER}\n"
+        f"EXIT CODE: 0 ({_state} "
+        f"{job.get('id')}, NOT finished)\n"
+        f"STDOUT/STDERR:\n{_promotion_banner(job, ran_s)}\n"
+        f"--- output so far ---\n{body or '(nothing printed yet)'}"
+    )
 
 # SANDBOX EGRESS GUARD (agent's own ports). The sandbox container has its
 # own loopback, so 127.0.0.1:8000 in there is NOT the agent's API and
@@ -721,8 +908,10 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # spill_large_output: same small-view + full-log-to-file policy as the
         # script path (the bash branch previously had NO tool-level trim, so a
         # noisy direct command dumped its whole 256 KB into context).
-        output, exit_code = await asyncio.to_thread(
-            sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
+        output, exit_code, promoted_job = await _run_in_sandbox(
+            sandbox_manager, cmd_str, timeout=_EXEC_TIMEOUT_S,
+            label=command[:120],
+            project_id=_project_id_from_workdir(container_workdir),
             spill_large_output=True, **_workdir_kw)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
@@ -850,6 +1039,15 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                         + ". Reference it as /workspace/<path>, or "
                           "move it into the project.]")
         _dt = _time.time() - _t0
+
+        # Budget reached with the command still alive and still working: it
+        # was DETACHED, not killed. Return before every failure-shaped path
+        # below — none of them apply to a run that has not finished.
+        if promoted_job is not None:
+            _record_promoted_command(workspace_model, command, _dt, promoted_job)
+            _register_promoted_job(kwargs.get("job_registry"), promoted_job,
+                                   command)
+            return _promoted_result(promoted_job, int(_dt), output)
 
         # Match-style commands (grep family, pgrep) exit 1 to mean "no
         # matches" — a perfectly successful query with an empty result, not a
@@ -1281,6 +1479,12 @@ if has_error:
     # available in the sandbox image if the model wants to call it
     # explicitly; it's just no longer imposed on every execution.
 
+    # Set when this run is detached as a background job; read by the `finally`
+    # cleanup, which must NOT delete a file the promoted process is still
+    # executing. Initialised here so the cleanup is safe even if the try below
+    # raises before the run.
+    _promoted_job_landed = None
+
     try:
         ext_runner = rel_path.split('.')[-1].lower()
         runtime_map = {"py": "python3 -u", "js": "node", "sh": "bash"}
@@ -1313,9 +1517,42 @@ if has_error:
         # the output) and a fourth divergent budget; it is removed.
         import time as _time
         _t0 = _time.time()
-        output, exit_code = await asyncio.to_thread(
-            sandbox_manager.execute, cmd, spill_large_output=True, **_workdir_kw)
+        # STATEFUL runs opt OUT of promotion: the jupyter runner talks to a
+        # persistent kernel, so detaching it would leave the kernel busy for
+        # every later cell, and the wrapper/runner files this branch deletes
+        # in `finally` are still being read by the detached process.
+        if stateful and ext == "py":
+            output, exit_code = await asyncio.to_thread(
+                sandbox_manager.execute, cmd, spill_large_output=True,
+                **_workdir_kw)
+            promoted_job = None
+        else:
+            output, exit_code, promoted_job = await _run_in_sandbox(
+                sandbox_manager, cmd, timeout=_EXEC_TIMEOUT_S,
+                label=f"{runner} {rel_path}".strip(),
+                project_id=_project_id_from_workdir(container_workdir),
+                # Content-sensitive: a REWRITTEN script must not be mistaken
+                # for the job that is still running the old one.
+                identity=f"{cmd}#{hashlib.sha1(clean_content.encode()).hexdigest()[:16]}",
+                # If this run is promoted the `finally` below must NOT delete
+                # the script the detached process is executing — the job
+                # supervisor deletes it when the job ends instead.
+                cleanup_paths=([str(host_path)] if is_ephemeral else None),
+                spill_large_output=True, **_workdir_kw)
         _dt = _time.time() - _t0
+
+        if promoted_job is not None:
+            # Still running at the budget → detached. Leave the script on
+            # disk (the `finally` cleanup is skipped via this flag) — a
+            # detached `bash` reads its script incrementally, and deleting it
+            # mid-run would break the very job we just promoted.
+            _promoted_job_landed = promoted_job
+            _record_promoted_command(
+                workspace_model, f"{runner} {filename}" if runner else str(filename),
+                _dt, promoted_job)
+            _register_promoted_job(kwargs.get("job_registry"), promoted_job,
+                                   f"{runner} {rel_path}".strip())
+            return _promoted_result(promoted_job, int(_dt), output) + _probe_note
 
         diagnostic_info = ""
         if exit_code != 0:
@@ -1398,11 +1635,22 @@ if has_error:
         # Cleanup paths — log on failure but don't raise. These leaks would
         # accumulate over time without diagnostic visibility.
         _logger = logging.getLogger("GhostAgent")
-        if is_ephemeral:
+        # A PROMOTED script is still executing from this file. Deleting it
+        # would break the job we just detached (bash reads its script
+        # incrementally; python has already loaded it, but the traceback
+        # would name a missing file either way). The path was handed to the
+        # job supervisor as a `cleanup_path`, which unlinks it when the job
+        # reaches a terminal state — including after a restart, since the
+        # path is persisted on the job's registry row.
+        if is_ephemeral and _promoted_job_landed is None:
             try:
                 await asyncio.to_thread(host_path.unlink, missing_ok=True)
             except Exception as ce:
                 _logger.debug(f"execute cleanup (ephemeral): {ce}")
+        elif is_ephemeral:
+            _logger.info(
+                "execute: kept ephemeral %s — still running as job %s",
+                filename, _promoted_job_landed.get("id"))
         if stateful and ext == "py":
             try:
                 await asyncio.to_thread(exec_host_path.unlink, missing_ok=True)

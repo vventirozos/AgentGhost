@@ -166,6 +166,12 @@ class HypothesisTester:
                 # here silently eliminated the real root cause (get_surviving
                 # keeps only `is True`). Leave it untested (None) and defer to
                 # evaluate_results / the LLM rather than pre-judging.
+                # A DETACHED test (sandbox/jobs.py) has not finished, so it
+                # is evidence for nothing — the same "leave it untested"
+                # answer the error case gets, for the same reason.
+                from ..sandbox.jobs import is_promoted_result
+                if is_promoted_result(h.result):
+                    has_error = True
                 h.consistent = None if has_error else True
             except Exception as exc:
                 h.result = f"Test failed: {exc}"

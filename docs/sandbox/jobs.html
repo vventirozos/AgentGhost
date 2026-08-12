@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sandbox.jobs — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Sandbox</h3>
+    <a href="docker.html">docker</a>
+    <a class="current" href="jobs.html">jobs</a>
+    <a href="services.html">services</a>
+    <h3>Related</h3>
+    <a href="../tools/execute.html">execute tool</a>
+    <a href="../core/delegation.html">delegation &amp; jobs tool</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>sandbox / jobs.py</h1>
+  <p class="subtitle">Promoted long-running sandbox commands (2026-08-11):
+  an <code>execute</code> run that is still working after 90 s is DETACHED as
+  a supervised job instead of blocking the turn — and the model is woken with
+  its result when it lands.</p>
+
+  <h2>Why</h2>
+  <p>Hitting the execution budget used to be pure loss, three times over.
+  A live example (2026-08-11) is the canonical shape: a <code>yt-dlp</code>
+  download over Tor was killed at the budget, and the model immediately
+  re-ran the identical command.</p>
+  <ul>
+    <li><strong>The work is destroyed.</strong> The process is killed at
+    the budget and everything it had done is discarded.</li>
+    <li><strong>The retry multiplies it.</strong> Exit 124 arrives with no
+    explanation the model can act on, so it runs the same command again —
+    turning ten minutes of loss into twenty, thirty, forty.</li>
+    <li><strong>The learning signal is poisoned.</strong> A non-zero
+    <code>execute</code> exit is scored as a transient strike, and strike
+    accounting feeds outcome labels and calibration. A legitimately-long
+    task is not a failure; counting it as one corrupts more than the
+    log.</li>
+  </ul>
+  <p>Promotion fixes all three at once, and the <strong>tool decides, not
+  the model</strong>: it happens on OBSERVED duration and OBSERVED
+  progress, so nothing depends on the model predicting how long
+  <code>yt-dlp</code> takes over Tor.</p>
+
+  <h2>What the model sees</h2>
+  <p>Two shapes. A fresh promotion (each <code>▎</code> bullet is emitted as
+  ONE line; they are wrapped here to fit the page):</p>
+  <pre>--- COMMAND RESULT --- [SANDBOX JOB PROMOTED]
+EXIT CODE: 0 (STILL RUNNING — promoted to background job job-1a2b3c4d, NOT finished)
+STDOUT/STDERR:
+▎ Still running at 600s — promoted to background job job-1a2b3c4d. Do NOT re-run
+  this command — it was NOT killed and is still working.
+▎ Poll it with jobs(action='status', job_id='job-1a2b3c4d'); read its full result
+  with jobs(action='collect', job_id='job-1a2b3c4d') once it finishes. Cancel it
+  with jobs(action='cancel', job_id='job-1a2b3c4d').
+▎ It keeps running in the sandbox (up to 44 more minutes, then it is reaped) and
+  survives this turn; its live output is in '.jobs/job-1a2b3c4d.log'
+  (file_system operation='read').
+▎ FINISH YOUR TURN NOW: state plainly that the work is STILL RUNNING in the
+  background and where its result will appear — do not wait for it here, do not
+  claim it finished, and do not promise to report back later (nothing runs after
+  your reply).
+--- output so far ---
+[download]  42% of 700MiB …</pre>
+  <p>And, when the model re-runs a command that is <em>already</em> a job, the
+  supervisor hands back the SAME job rather than starting a second copy:</p>
+  <pre>--- COMMAND RESULT --- [SANDBOX JOB PROMOTED]
+EXIT CODE: 0 (ALREADY RUNNING as background job job-1a2b3c4d, NOT finished)
+STDOUT/STDERR:
+▎ NOT re-run: this exact command is ALREADY running as background job job-1a2b3c4d
+  (started 2100s ago). A second copy was NOT started — it would compete with the
+  first for the same sandbox CPU.
+…</pre>
+  <p>Both quote the REMAINING lifetime (truncated, never rounded up — so a
+  fresh 45-minute promotion reads as "44 more minutes") and the original
+  command's age, not the configured TTL or the duration of the call that hit
+  the guard.</p>
+
+  <p><code>EXIT CODE: 0</code> is deliberate: the turn loop matches
+  <code>EXIT CODE:\s*(\d+)</code> on <code>execute</code> results and treats
+  anything non-zero as a failure + a strike. The annotation rides AFTER the
+  digits so that parser keeps working, and the banner carries the honesty the
+  code cannot — the command has NOT finished.</p>
+
+  <h2>How it works</h2>
+  <p>Mechanics mirror <a href="services.html">services.py</a>, the proven
+  pattern for detached container processes.</p>
+  <ol>
+    <li>The command ships as a SCRIPT through the bind mount
+    (<code>/workspace/.jobs/&lt;id&gt;.cmd.sh</code>) so no shell quoting can
+    corrupt it. The script records its own pid, runs the command, and
+    publishes the exit code to <code>&lt;id&gt;.exit</code> via
+    tmp+rename.</li>
+    <li>It launches under <code>setsid nohup … &amp;</code>, so it re-parents
+    to the container's PID 1 and its recorded <code>$$</code> IS the
+    session/process-group leader — <code>kill -- -&lt;pid&gt;</code> reaps the
+    whole tree.</li>
+    <li>Python polls the HOST side of the bind mount (no docker round-trip
+    per tick): tight at first so a 50 ms <code>ls</code> stays a 50 ms
+    <code>ls</code>, then relaxed. One combined probe — liveness AND the I/O
+    counters — runs inside the container at 2 s and then every 30 s, late on
+    purpose so the overwhelming majority of commands (which finish in under
+    two seconds) never pay for a round-trip they do not need. The liveness
+    half is what makes a runner that was SIGKILLed — and therefore never
+    wrote a sentinel — return immediately instead of blocking for the rest of
+    the budget. A probe that FAILS is "unknown", never "dead": reading a
+    docker hiccup as death once deleted a live job's log and left its process
+    running untracked.</li>
+    <li>The runner script carries a last-resort
+    <code>timeout -k 5s &lt;budget + TTL&gt;s</code> (probed with
+    <code>command -v</code>, so an image without coreutils still runs). The
+    classic path's in-container <code>timeout</code> survived the agent
+    process dying; without an equivalent, a deploy-by-kill mid-run would
+    leave an immortal process with no registry row, no TTL and no
+    reaper.</li>
+    <li>From <strong>90 s</strong> onward (<code>promote_after_s()</code>),
+    re-checked at every probe: still alive AND still progressing &rarr;
+    promote. A command that is demonstrably working stops making the turn
+    wait long before the budget.</li>
+    <li>At the <strong>budget</strong> (600 s), and only then: a command that
+    has never shown progress is killed with exit 124, exactly as
+    <code>timeout</code> would have. The two thresholds answer different
+    questions — see below.</li>
+  </ol>
+  <p>Registry state lives in
+  <code>&lt;host_workspace&gt;/.jobs/registry.json</code> — host side of the
+  bind mount, so a job promoted before an agent restart is still visible and
+  still reapable afterwards.</p>
+
+  <h2>Two thresholds, not one</h2>
+  <p>Promotion happens at <strong>90 s</strong>; the kill still happens at
+  <strong>600 s</strong>. Collapsing them would break one case or the
+  other:</p>
+  <div class="scroll">
+  <table>
+    <tr><th></th><th>Asks</th><th>Why not the other number</th></tr>
+    <tr><td><code>promote_after_s()</code><br>90 s</td>
+      <td>"This is long-running — stop making the turn wait for it."</td>
+      <td>Blocking a turn for ten minutes to reach a decision that was
+      already obvious at ninety seconds is pure latency: the operator waits,
+      and so does the model.</td></tr>
+    <tr><td>the exec budget<br>600 s</td>
+      <td>"This has gone quiet — give up on it."</td>
+      <td>Killing at 90 s would make a silent, purely-computational run die
+      6.7&times; sooner than before promotion existed — a regression dressed
+      up as a speed-up.</td></tr>
+  </table>
+  </div>
+  <p class="warn"><strong>Promoting early is only safe because a landed job
+  RE-ENGAGES the model.</strong> Nothing else resumes a turn once it ends, so
+  without that, an early promotion on a <code>pytest</code> or
+  <code>pip install</code> — commands whose output the model NEEDS to
+  continue — would end the turn and strand the work until the operator spoke
+  again. The reaper therefore wakes the model with the job's result
+  (<code>main._resume_after_job</code>), through the same
+  <code>handle_chat</code> entry point and the same internal
+  <code>job-</code> request class that scheduled tasks use. If auto-resume is
+  ever disabled, raise <code>GHOST_SANDBOX_JOB_PROMOTE_AFTER_S</code> back
+  toward the budget.</p>
+  <p>The wake carries three guards: it <strong>stands down while a user
+  request is in flight</strong> (turns are serialized, so waking would make a
+  live user queue behind autonomous work — the rule scheduled tasks already
+  follow), it fires <strong>once per job</strong>, and it is
+  <strong>rate-capped at 12/hour</strong> — a woken turn can promote another
+  job, which lands and wakes again, and the counter is the backstop on that
+  recursion.</p>
+
+  <h2>The two rails</h2>
+  <h3>1. Progress, not merely liveness</h3>
+  <p>Without this the feature is just a slower timeout. A job earns promotion
+  only if, within the progress window (<code>progress_window_s()</code>,
+  default 120 s, additionally clamped to half the budget), EITHER:</p>
+  <ul>
+    <li>its combined stdout/stderr log GREW — tracked host-side off the bind
+    mount during the poll loop, so it costs no container round-trip. A
+    command that has written <em>nothing at all</em> never qualifies, at any
+    budget; or</li>
+    <li><strong>its own I/O counters moved</strong> —
+    <code>rchar + wchar</code> summed across every process in the job's
+    SESSION, from <code>/proc/&lt;pid&gt;/io</code> (<code>setsid</code> makes
+    the recorded pid the session leader, so its children are included and
+    nothing else is). This is what lets a SILENT downloader promote.</li>
+  </ul>
+  <p class="warn"><strong>Attribution is the subtle part, and the first
+  implementation got it wrong.</strong> It asked "did a file under the workdir
+  change recently" (a <code>find -mmin</code> probe), and a live test then
+  promoted a genuinely wedged <code>sleep 300</code> — because a
+  <em>different</em> job was writing into the same shared
+  <code>/workspace</code>. Workdir mtimes attribute to nobody; per-process
+  counters attribute to the job that earned them.</p>
+  <p>The test is for a CHANGE, not an increase: the sum spans a whole session,
+  so a child exiting removes its counters and the total can fall. Either
+  direction means the tree did something; a total that has not moved at all is
+  the wedge. When <code>/proc</code> cannot be read the signal abstains (no
+  evidence, never false evidence) and log growth alone decides — degrading to
+  the pre-2026-08-11 behaviour rather than promoting blindly.</p>
+  <p><strong>CPU time is deliberately not a signal.</strong> A spin-loop is
+  exactly the wedge that must die at the budget, and it burns CPU by
+  definition. The accepted cost is stated plainly rather than implied away: a
+  long, silent, purely-computational run that neither prints nor touches a
+  file is killed — the same outcome it got before this feature existed. The
+  accepted false POSITIVE is the mirror image: a retry storm, or a process
+  polling a held lock, does I/O — so it promotes, and the lifetime cap is what
+  bounds it.</p>
+
+  <h3>2. A separate lifetime cap</h3>
+  <p>A promoted job is reaped at <code>job_ttl_s()</code> (default 45 min,
+  clock starting at PROMOTION) whether it has finished or not, so the
+  unbounded wait is removed rather than moved into the job layer. Reaping runs
+  from three places, none of which depends on the model asking: the
+  <code>jobs</code> tool reconciles before every answer, a background sweeper
+  in <code>main.py</code> runs every 60 s, and boot reaps before reporting
+  what carried over.</p>
+
+  <h2>Where a landed job surfaces</h2>
+  <p>Nothing re-engages the model after a turn ends, so a job that finishes
+  while nobody is looking has to be <em>answerable</em> rather than pushed:</p>
+  <ul>
+    <li><code>jobs(action='status')</code> / <code>collect</code> — the
+    reconcile runs before every answer, so the exit code and output are
+    current. A FAILED job still returns its output; a bare "exited 1" would
+    leave the model nothing to act on but the long command it was told not to
+    re-run.</li>
+    <li><code>introspect action='activity'</code> — the 60 s sweeper writes
+    each landed job to the activity ledger under the <code>job</code> phase,
+    which is what answers "what happened while I was away". The operator's
+    live log stream gets the same line, but that stream is watched, not
+    queried.</li>
+    <li>The job's own log file stays in <code>.jobs/</code> until the row is
+    trimmed, so <code>file_system</code> can read the FULL output — the
+    landed result inlines only the last 80 lines.</li>
+  </ul>
+  <p>The promotion banner therefore tells the model to state plainly that the
+  work is still running and where its result will appear — NOT to promise to
+  report back, which is a promise nothing in the system can keep and which
+  the pending-promise guard would (correctly) reject.</p>
+
+  <h2>Configuration</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>GHOST_SANDBOX_JOBS</code></td><td><code>1</code></td>
+      <td>Kill switch. <code>0</code> restores the pre-2026-08-11 behaviour
+      exactly: every run goes through <code>timeout -k 5s</code> and a budget
+      overrun is killed.</td></tr>
+    <tr><td><code>GHOST_SANDBOX_JOB_PROMOTE_AFTER_S</code></td><td><code>90</code></td>
+      <td>How long a command must run before it is eligible for promotion.
+      Bounded to [5 s, 1 h]. Distinct from the exec budget, which is when a
+      command that never progressed is killed.</td></tr>
+    <tr><td><code>GHOST_SANDBOX_JOB_TTL_S</code></td><td><code>2700</code></td>
+      <td>Promoted-job lifetime cap. Bounded to [60 s, 6 h]; an unparseable or
+      out-of-range value falls back to the default rather than disabling the
+      rail.</td></tr>
+    <tr><td><code>GHOST_SANDBOX_JOB_PROGRESS_WINDOW_S</code></td><td><code>120</code></td>
+      <td>How recently progress must have been seen to earn promotion. Bounded
+      to [10 s, 1 h], and clamped to half the budget — a window at or above
+      the budget would silently degrade the rail from "recently" to
+      "ever".</td></tr>
+    <tr><td><code>GHOST_SANDBOX_JOB_MAX</code></td><td><code>3</code></td>
+      <td>Concurrent promoted jobs. At the cap a would-be promotion is KILLED
+      instead — an untracked detached process is worse than a timeout.</td></tr>
+  </table>
+  </div>
+
+  <h2>States</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>State</th><th>Meaning</th></tr>
+    <tr><td><code>running</code></td><td>Detached and alive. The only
+      non-terminal state.</td></tr>
+    <tr><td><code>done</code></td><td>Exited on its own;
+      <code>exit_code</code> carries the command's real code.</td></tr>
+    <tr><td><code>expired</code></td><td>Killed at the lifetime cap.</td></tr>
+    <tr><td><code>cancelled</code></td><td>Killed via
+      <code>jobs(action='cancel')</code>.</td></tr>
+    <tr><td><code>lost</code></td><td>The pid is gone with no exit sentinel —
+      container recreated, OOM, or killed from outside.</td></tr>
+  </table>
+  </div>
+
+  <h2>Kill safety</h2>
+  <p>Every signal this module sends is gated, because the number it signals
+  is not trustworthy on its own: the registry lives on the bind mount, so the
+  very commands this module supervises can write it.</p>
+  <ul>
+    <li><strong>An UNSTAMPED row is never signalled.</strong> A row without a
+    container-generation stamp used to get "the benefit of the doubt" —
+    which turned the TTL reaper into an arbitrary in-container session-kill
+    primitive: a planted row naming any live pid, with a deadline in the
+    past, killed that pid's whole session on the next sweep. Verified
+    against a real container (an unrelated <code>setsid</code>'d service tree
+    died). Every row this module writes is stamped, so an unstamped one is
+    forged or ancient — neither earns a signal.</li>
+    <li><strong>A pid floor of 1.</strong> In POSIX <code>kill -- -1</code>
+    means "every process the caller may signal" — NOT "process group 1" — so a
+    pid of 1 TERMs and then KILLs the whole container: every service, every
+    other job, tor. Verified in a live container: the shell issuing it did not
+    survive to print its next line. <code>0</code> is nearly as bad
+    (<code>-0</code> is the caller's own group). Both are refused, loudly.</li>
+    <li><strong>Registry rows are untrusted input.</strong>
+    <code>.jobs/registry.json</code> lives on the bind mount — inside the
+    sandbox, writable by the very commands this module supervises. So the
+    fields a kill is built from are validated on READ: a row without an
+    integer pid above 1, or without a numeric deadline, is dropped with a
+    warning. (A missing deadline used to read as <code>0</code> — "expired in
+    1970" — which is instant expiry AND an instant kill: a fail-dangerous
+    default for a missing field.)</li>
+    <li><strong>Container generation before any signal.</strong> A recreated
+    container invalidates every recorded pid, and fresh containers hand out
+    LOW pids — so a stale row very plausibly points at a supervised service or
+    another job. Expiry and cancel both check the generation stamp FIRST and
+    mark the job <code>lost</code> rather than signalling.
+    <a href="services.html">services.py</a> had to learn the same lesson in
+    2026-07.</li>
+    <li><strong>A kill is verified.</strong> <code>cancel</code> re-probes the
+    pid and returns a boolean; a process that survived TERM+KILL leaves the
+    row RUNNING and says so, because reporting a cancel that did not happen
+    hides a live process.</li>
+    <li><strong>Scope is SESSION or PPID-ANCESTRY</strong>, and the shell is
+    the portable one: dash (the container's <code>/bin/sh</code>) parses
+    <code>--</code> as a pid, so <code>kill -TERM -- -123</code> fails with
+    "Illegal number" and sends <em>nothing</em> — the group-kill half was
+    dead in production until that was measured. A descendant that merely
+    changes process group (GNU <code>timeout</code> does) is reached by the
+    session scan; one that also re-parents is reached by the ancestry walk.
+    <em>Known limit, measured:</em> a descendant that fully DAEMONIZES
+    (<code>setsid … &amp;</code>) re-sessions and re-parents to PID 1, erasing
+    every link — no scan can reach it. The classic <code>timeout</code> path
+    leaks the identical process, so this is a property of the sandbox, not of
+    promotion; <a href="../tools/execute.html">execute</a>'s
+    backgrounded-server guard is what addresses that class, by refusing the
+    command up front.</li>
+    <li><strong>The exit sentinel carries a nonce.</strong> It is written into
+    a directory the supervised command can write, so a bare exit code was
+    forgeable — and creatable BY ACCIDENT: one
+    <code>echo 0 &gt; .jobs/&lt;id&gt;.exit</code>, or any command that wipes
+    <code>.jobs/</code>, made <code>execute</code> report EXIT CODE 0 in
+    0.0 s for a command that kept running, with no row, no TTL and no reaper.
+    The nonce is minted host-side per job and only the runner quotes it
+    back.</li>
+    <li><strong>The jobs directory itself is containment-checked.</strong>
+    Hardening the cleanup paths alone left the wider door open: every file
+    this module writes and deletes derives from
+    <code>&lt;host_workspace&gt;/.jobs</code>, which the sandbox can replace
+    with a symlink. Measured: that redirected host writes and deletes into an
+    arbitrary directory at the agent's uid. It is now refused unless it is a
+    real directory inside the sandbox root.</li>
+    <li><strong>Registry fields are validated on READ</strong>, not trusted at
+    use: a non-finite <code>deadline_at</code> (NaN/Infinity parse as floats
+    and pass a <code>&lt;= 0</code> test) would be an unbounded lifetime; an
+    unknown <code>state</code> — a single trailing space — let a row opt out
+    of reaping entirely.</li>
+  </ul>
+
+  <h2>Failure modes it is built against</h2>
+  <ul>
+    <li><strong>A job that finishes mid-reap.</strong> The reap reads the exit
+    sentinel, then probes liveness. A job exiting between those two steps was
+    marked <code>lost</code> — destroying its exit code and output. The
+    sentinel is now RE-READ (with a short grace) before that conclusion. The
+    grace is skipped on a container-generation mismatch, where no new sentinel
+    can appear.</li>
+    <li><strong>A partially-visible exit sentinel.</strong> Written tmp+rename
+    in the container, but a bind-mount read can still catch an empty file; an
+    unparseable read means "not finished yet", never "exit 0".</li>
+    <li><strong>A recycled pid after a container recreate.</strong> Every entry
+    carries the container generation. A mismatch means the job is gone — the
+    pid number is never trusted, and never signalled.</li>
+    <li><strong>Model-supplied job ids.</strong> Ids reach this module from the
+    <code>jobs</code> tool and are interpolated into file paths, so the
+    <code>job-&lt;8 hex&gt;</code> shape is enforced (not assumed), on the
+    registry read as well as at every entry point.</li>
+    <li><strong>Registry growth.</strong> Terminal rows are bounded (20,
+    oldest dropped with their logs). The registry is a worklist, not an
+    archive — but a landed job is NOT forgotten on the spot: that would delete
+    the log the promotion banner just told the model to read.</li>
+    <li><strong>An orphan created by the orphan-preventer.</strong> Everything
+    between launch and the registry write runs with a live detached process
+    and nothing tracking it, so any failure there (a wedged daemon, a raise
+    from the registry save) kills the process before re-raising. Likewise a
+    probe failure is "unknown", never "dead" — the earlier code returned
+    exit 137, deleted the log out from under a live writer, and neither killed
+    nor tracked the process.</li>
+    <li><strong>A re-run that doubles the load.</strong> The banner tells the
+    model not to re-run a promoted command; the supervisor makes it true. An
+    identical command+workdir that is already RUNNING as a job returns THAT
+    job instead of starting a second copy — the strike counter that used to
+    bound such a loop is, by design, no longer there.</li>
+    <li><strong>Files the caller owns.</strong> An
+    <code>execute(content=…)</code> run generates an ephemeral script the
+    detached process is still executing, so the tool cannot delete it on the
+    way out. The path is handed to the supervisor and persisted on the row, so
+    it is unlinked when the job ends — even across a restart.</li>
+  </ul>
+
+  <h2>Not a service</h2>
+  <p><a href="services.html">manage_services</a> is for a long-lived LISTENER
+  the model starts deliberately, with a port lease and an indefinite lifetime.
+  A job is a one-shot COMMAND the model ran in the foreground that simply took
+  longer than the budget: no port, a hard TTL, and a result to collect.
+  Neither replaces the other.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_sandbox_job_promotion.py</code> (supervisor + the
+  docker.py seam — exercised end-to-end against real processes, not mocks),
+  <code>tests/test_execute_job_promotion.py</code> (the tool contract),
+  <code>tests/test_jobs_tool_sandbox.py</code> (the
+  <a href="../core/delegation.html"><code>jobs</code></a> surface), and
+  <code>tests/test_promoted_result_graders.py</code> (the marker wired into
+  every consequential success-grader — the pins that keep this feature from
+  shipping verification theatre).</p>
+</main>
+</body>
+</html>

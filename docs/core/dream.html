@@ -322,6 +322,49 @@
   resets the streak. Skip ticks also no longer ledger "REM cycle ran" to the activity log (they
   previously overcounted consolidation in the digest).
   Tests: <code>tests/test_log_audit_fixes_2026_07_29.py</code>.</p>
+
+  <h2 id="selfhood-denylist">Self-play may not author the agent's selfhood <span class="tag">2026-08-11</span></h2>
+  <p>
+    The self-play <code>disabled_tools</code> list states its own rule: <em>any tool that writes to
+    real, non-isolated state must be disabled here</em>. <code>self_state</code> was missing — and
+    <code>isolated_context.self_model</code> is the <b>production</b> SelfModel (shallow-copied, and
+    absent from the null-out list), so a synthetic run calling
+    <code>self_state(action='note_principle'|'set_mood')</code> could write the agent's real stated
+    operating principles into <code>values.json</code>/<code>state.json</code>.
+    <code>subagent.py</code> already denied selfhood authoring; self-play — <b>165 of the last 249
+    requests on this box</b> — was the gap.
+  </p>
+
+  <h2 id="cluster-attribution">Self-play credit is filed by the template that earned it <span class="tag">2026-08-11</span></h2>
+  <p>
+    Credit was assigned by keyword-matching the <em>rendered prompt</em> even when a deterministic
+    template had just produced it. Measured over 80 real renders: <b>51% misfiled</b>, with
+    <code>python_general</code> and <code>regex_parse</code> systematically <b>swapped</b> and
+    <code>web_automation</code> filed as <code>concurrency</code> (its prompt says
+    <code>async_playwright</code>). Live consequence: the <code>regex_parse</code> cluster held seven
+    <code>python_general</code> runs and none of its own, at tier 1 earned on word-frequency work.
+  </p>
+  <p>
+    <code>resolve_cluster_key()</code> now runs <b>template key → seed → text classifier</b>. The
+    template outranking the seed is the second half: <code>pick_seed</code> can rotate away from a
+    saturated cluster, clearing <code>_cluster_key</code> without updating the seed dict, so
+    consulting the seed first returns the <em>abandoned</em> target.
+  </p>
+  <p>
+    ⚠ Landing this required a <b>data repair first</b>: correct attribution routed bash renders into
+    a cluster whose stale <code>mastered</code> flag <em>suppresses lesson extraction</em>, which
+    would have silenced ~12% of self-play cycles. <code>bash.mastered</code> was cleared and
+    <code>regex_parse.winning_solutions</code> (wrong-family code being used to score novelty)
+    dropped, under the store's own lock with a backup, and an
+    <code>attribution_version</code> marker stamped so no downstream reader has to guess which
+    taxonomy a number came from.
+  </p>
+  <p>
+    <b>Also:</b> the mined-challenge boilerplate contained the literal <code>SQL</code>, and
+    <code>classify_cluster</code> tests <code>\bsql\b</code> first — so the wrapper, not the task,
+    decided the cluster for <b>23 of 23</b> stored journal runs. Reworded. ⚠ Partial: the wrapper
+    still decides when the task carries no keyword of its own.
+  </p>
 </main>
 </body>
 </html>

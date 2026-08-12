@@ -348,8 +348,10 @@ def test_wiring_world_changed_fires_only_on_success():
     processing (elif of the record-on-failure branch) and is driven by the
     dispatch-time hint."""
     src = _agent_src()
-    idx = src.index("elif _pf_world_mut and not _pf_exec_failed:")
-    assert "note_world_changed()" in src[idx:idx + 1600]
+    # The gate gained a third condition on 2026-08-12 (`not _pf_promoted`),
+    # so it is now a continuation line — match the stable prefix.
+    idx = src.index("elif _pf_world_mut and not _pf_exec_failed")
+    assert "note_world_changed()" in src[idx:idx + 2600]
     # The hint must never treat blanket-is_mutating `execute` as a world
     # mutation — only heuristic-matched commands (probes stay inert).
     assert "looks_mutating_command(" in src
@@ -367,10 +369,14 @@ def test_wiring_failed_execute_never_clears_guard():
     caught exactly that when recording was tried)."""
     src = _agent_src()
     idx = src.index("_pf_exec_failed = False")
-    region = src[idx:idx + 1000]
+    region = src[idx:idx + 2600]
     assert 'fname == "execute"' in region
     assert r"EXIT CODE:\s*(\d+)" in region
-    assert "elif _pf_world_mut and not _pf_exec_failed:" in region
+    # Multi-line since 2026-08-12: the reset is additionally gated on
+    # `_pf_promoted`, so a DETACHED command — which has not changed the world
+    # yet — cannot clear the guard (sandbox/jobs.py).
+    assert "elif _pf_world_mut and not _pf_exec_failed" in region
+    assert "not _pf_promoted" in region
     # record() stays keyed to Error:-prefixed results only.
     assert "if _res_is_error:" in region
 

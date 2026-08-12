@@ -43,6 +43,72 @@
   <h1>tools / execute.py</h1>
   <p class="subtitle">Sandboxed code execution with multiple validation guards and stateful Jupyter support.</p>
 
+  <h2>Budget overrun is a PROMOTION, not a kill <span class="tag">2026-08-11</span></h2>
+  <p>Every sandboxed run has a 600&nbsp;s budget (<code>_EXEC_TIMEOUT_S</code>).
+  Reaching it used to mean the process was killed, exit 124 came back, the turn
+  loop scored a transient strike, and the model re-ran the identical command —
+  the observed shape (a <code>yt-dlp</code> download over Tor) that turned ten
+  minutes of loss into forty.</p>
+  <p>Since 2026-08-12 a run that is still WORKING is detached at
+  <strong>90&nbsp;s</strong>, not at the budget: waiting out ten minutes to
+  reach a decision that was obvious at ninety seconds is pure latency. The
+  600&nbsp;s budget keeps its other job — killing a command that has gone
+  quiet — so a silent, purely-computational run gets exactly the patience it
+  always had. See <a href="../sandbox/jobs.html">sandbox.jobs</a> for why
+  those are two different questions, and why early promotion is only safe
+  because a landed job wakes the model.</p>
+  <p>A run that is still ALIVE and still PROGRESSING at the budget is now
+  DETACHED as a supervised job instead
+  (<a href="../sandbox/jobs.html">sandbox.jobs</a> owns the decision and the
+  process; that page documents the progress discriminator and the lifetime
+  cap). What this tool contributes:</p>
+  <ul>
+    <li><strong>The result is not a failure.</strong> It carries
+    <code>EXIT CODE: 0 (STILL RUNNING — promoted to background job …, NOT
+    finished)</code>. The turn loop matches <code>EXIT CODE:\s*(\d+)</code>, so
+    the annotation rides after the digits and no strike is burned. This matters
+    beyond the log: strike accounting feeds outcome labels and calibration.</li>
+    <li><strong>…and it says so in a way MACHINES can read.</strong>
+    Success-shaped is exactly what a dozen other consumers must not take this
+    for, so the first line carries the literal marker
+    <code>[SANDBOX JOB PROMOTED]</code> — in the FIRST line, so it survives
+    the <code>[:120]</code>/<code>[:200]</code> head slices those readers take
+    — and each grader tests for it. Two of those decisions are
+    consequential and unattended: <a href="../core/delegation.html">the verify
+    gate</a> in <code>project_advancer</code> marks a project task DONE — a
+    600 s+ <code>pytest</code> would have passed it — and the
+    <code>acquired_skills</code> TDD gate INSTALLS a skill. Foresight
+    resolution and the metacog competence record are skipped entirely: an
+    unfinished command has no outcome, and recording either verdict would be
+    a fabrication.</li>
+    <li><strong>The re-run is foreclosed mechanically, not just in
+    prose.</strong> An identical command that is already running as a job
+    returns THAT job rather than starting a second copy — see
+    <a href="../sandbox/jobs.html">sandbox.jobs</a>.</li>
+    <li><strong>The retry is foreclosed in words</strong> — "Do NOT re-run this
+    command", the job id, how to poll (<code>jobs(action='status', job_id=…)</code>),
+    how to read the live log, how to cancel, and an explicit instruction to
+    finish the turn and report rather than wait. The retry is the expensive
+    half of the original failure, so this line is the fix, not politeness.</li>
+    <li><strong>The workspace ledger records it honestly</strong> — exit 0 with
+    the note "still running — promoted to background job &lt;id&gt;", rather than
+    the failure label the strike accounting no longer takes.</li>
+    <li><strong>A promoted ephemeral script is NOT deleted.</strong> The
+    <code>finally</code> cleanup skips the file when the run was promoted — the
+    detached process is still executing it (<code>bash</code> reads its script
+    incrementally).</li>
+    <li><strong>Stateful (Jupyter) runs opt out.</strong> A promoted cell would
+    leave the kernel busy for every later cell, and its runner files are deleted
+    on the way out.</li>
+    <li><strong>Capability is declared, not sniffed.</strong> The promotable path
+    is taken only when the manager sets <code>supports_job_promotion = True</code>;
+    a <code>hasattr</code> probe would capture every MagicMock stub (it answers
+    for any attribute) and unpack a mock as a 3-tuple.</li>
+  </ul>
+  <p><code>GHOST_SANDBOX_JOBS=0</code> restores the old kill-at-the-budget
+  behaviour exactly. Covered by
+  <code>tests/test_execute_job_promotion.py</code>.</p>
+
   <h2>Scope-flap heal — file-not-found with NO project cwd (2026-07-18)</h2>
   <p>The /workspace→project remap heal is gated on the workdir kwarg — i.e. it is
   DISABLED exactly when a call ran without project scoping. Stateful sessions opt out of
@@ -65,7 +131,12 @@
     <li><strong>Timeout kills</strong> — <code>_TIMEOUT_KILL_CODES</code>
     (124/137/143) are now excluded from both heal triggers. A command killed at
     its budget whose accumulated output happens to mention ENOENT (pip/wget noise)
-    is no longer silently re-run for another full budget.</li>
+    is no longer silently re-run for another full budget. Since 2026-08-11 exit
+    124 also means something narrower: the budget expired AND the command had
+    gone quiet — no log growth and no movement in its own I/O counters — or
+    the concurrency cap left no slot to track it in. A still-working command
+    is promoted to a job instead, and returns exit 0 with a promotion
+    banner.</li>
     <li><strong>Ran-then-missing-data-file</strong> — <code>_looks_like_file_not_found</code>
     now returns False when the output contains a Python <code>Traceback</code>: a
     traceback means the interpreter <em>found and ran</em> the script, so a "no such

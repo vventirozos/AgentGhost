@@ -201,10 +201,35 @@ def looks_like_tool_error(result: str) -> bool:
     return _looks_like_tool_error(result)
 
 
+def is_unresolved_tool_result(result) -> bool:
+    """A tool call with NO OUTCOME YET — neither success nor failure.
+
+    Today that means exactly one thing: an ``execute`` command that outran
+    its budget while still working and was DETACHED as a background job
+    (:mod:`sandbox.jobs`). Its result is success-SHAPED on purpose, so that
+    the turn loop does not book a strike for a task that has not failed —
+    which means every consumer of the shared failure sniffer below would
+    otherwise read it as a clean SUCCESS and write that into the corpus.
+
+    Callers must SKIP an unresolved call rather than label it: a third state
+    is the honest one, and a bool cannot carry it.
+    """
+    try:
+        from ..sandbox.jobs import is_promoted_result
+    except Exception:  # noqa: BLE001 — heuristics must never hard-fail
+        return False
+    return is_promoted_result(result)
+
+
 def _looks_like_tool_error(result: str) -> bool:
     """Cheap text detector for "this tool call failed" — the FALLBACK when the
     structured ``ToolCall.error`` flag isn't set (legacy trajectories).
     Conservative: favours false negatives over false positives.
+
+    ⚠ Returns False for an UNRESOLVED call too (see
+    :func:`is_unresolved_tool_result`) — "not an error" is the best a bool
+    can say. Any caller that treats False as SUCCESS must test for
+    unresolved separately; :func:`tool_failure_flags` does.
     """
     if not isinstance(result, str):
         return False
@@ -397,8 +422,17 @@ def tool_failure_flags(tools: Optional[Iterable[Any]]) -> List[bool]:
     for t in tools or ():
         if t is None:
             continue
+        content = (str(t.get("content", "") or "") if isinstance(t, dict)
+                   else str(getattr(t, "result", "") or ""))
+        # SKIP an unresolved call — never emit False for it. Emitting False
+        # meant one detached command LAUNDERED a whole failed turn: three
+        # genuinely failed tools give [T,T,T] and the shape rule fires, but
+        # [T,T,T,F] does not — so a fabricated reply on a turn that also ran
+        # one long command kept its PASS. Skipping leaves [T,T,T].
+        if is_unresolved_tool_result(content):
+            continue
         if isinstance(t, dict):
-            flags.append(_looks_like_tool_error(str(t.get("content", "") or "")))
+            flags.append(_looks_like_tool_error(content))
         else:
             flags.append(_tool_call_failed(t))
     return flags

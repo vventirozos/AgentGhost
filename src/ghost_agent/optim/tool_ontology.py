@@ -685,6 +685,147 @@ def simulate_fs_batch(trajectories: Iterable[Any], *,
             continue
 
 
+FS_BATCH_ARM_KEY = "fs_batch"
+# Below this many ELIGIBLE treatment turns, uptake is not a measurement. The
+# floor is not a significance threshold — it is the point below which "the
+# model never used it" and "the model was never once in a position to use it"
+# are the same observation, and reporting the first would be a fabrication.
+FS_BATCH_MIN_ELIGIBLE = 10
+
+
+@dataclass
+class ArmUptake:
+    """One arm's exposure to the `fs_batch` macro."""
+    arm: str
+    turns: int = 0
+    turns_with_calls: int = 0
+    calls: int = 0
+    fs_calls: int = 0
+    # Turns where the macro's OWN collapse rule would change the sequence.
+    # Derived from `collapse_fs_batch`, never from a hand-written "≥2 reads"
+    # test: a second definition of eligibility that drifts from the shipped
+    # rule would measure a macro nobody deployed.
+    eligible_turns: int = 0
+    removable_steps: int = 0
+    # Calls that actually carry `paths` — the capability being exercised.
+    # Meaningful for the treatment arm only; control cannot emit one because
+    # the parameter is absent from its schema.
+    paths_calls: int = 0
+
+
+def fs_batch_arm_uptake(trajectories: Iterable[Any], *,
+                        max_batch: int = 12) -> Dict[str, Any]:
+    """Did the `fs_batch` treatment arm ever USE the macro, and could it have?
+
+    §4F's stated verification for this arm is mechanical — "re-run the ontology
+    report; those n-grams must collapse. If they do not, the macro did not
+    land, whatever the latency says." That check needs no statistical power,
+    which is why it is worth running at a sample size where the outcome
+    comparison is hopeless.
+
+    ⚠ IT REPORTS THE ELIGIBLE DENOMINATOR FIRST, and declines to read uptake
+    when that denominator is thin. Measured 2026-08-11 on the live corpus: the
+    treatment arm used `paths` ZERO times — and had **1** whole-file read
+    across 23 turns, so the opportunity never arose either. "The model ignores
+    the capability" and "the model was never in a position to use it" produce
+    the identical zero, and only the eligible count separates them. Reporting
+    the first from this data would be the corpus-with-no-opportunity mistake
+    this file already carries a scar for.
+    """
+    arms: Dict[str, ArmUptake] = {}
+    corpus_turns = 0
+    corpus_eligible = 0
+    for traj in trajectories or []:
+        try:
+            calls = list(getattr(traj, "tool_calls", None) or [])
+            collapsed = collapse_fs_batch(calls, max_batch=max_batch)
+            removable = max(0, len(calls) - len(collapsed))
+            # Corpus-wide eligibility RATE — the projection denominator, and
+            # deliberately computed over every trajectory rather than the
+            # enrolled ones, so "how much traffic would this need" does not
+            # inherit the arm's own small-sample noise.
+            corpus_turns += 1
+            if removable:
+                corpus_eligible += 1
+
+            extra = getattr(traj, "extra", None) or {}
+            arm = ((extra.get("experiments") or {}).get(FS_BATCH_ARM_KEY)
+                   if isinstance(extra, dict) else None)
+            if not arm:
+                continue
+            a = arms.setdefault(str(arm), ArmUptake(arm=str(arm)))
+            a.turns += 1
+            if calls:
+                a.turns_with_calls += 1
+            a.calls += len(calls)
+            a.fs_calls += sum(1 for c in calls if _call_name(c) == _FS_TOOL)
+            if removable:
+                a.eligible_turns += 1
+                a.removable_steps += removable
+            a.paths_calls += sum(
+                1 for c in calls
+                if _call_name(c) == _FS_TOOL and _call_field(c, "paths"))
+        except Exception:  # noqa: BLE001 — one bad record must not stop the walk
+            continue
+
+    rate = (corpus_eligible / corpus_turns) if corpus_turns else 0.0
+    treatment = arms.get("treatment")
+    eligible = treatment.eligible_turns if treatment else 0
+    # Turns needed for a readable uptake check, at the corpus eligibility rate
+    # and a 50/50 arm split. None when the rate is 0 — an unknown requirement
+    # is not an infinite one, and printing a number here would invent both.
+    needed = None
+    if rate > 0:
+        needed = int(round(FS_BATCH_MIN_ELIGIBLE / rate * 2))
+    return {
+        "arms": {k: v for k, v in sorted(arms.items())},
+        "corpus_turns": corpus_turns,
+        "corpus_eligible_turns": corpus_eligible,
+        "eligibility_rate": rate,
+        "readable": eligible >= FS_BATCH_MIN_ELIGIBLE,
+        "min_eligible": FS_BATCH_MIN_ELIGIBLE,
+        "enrolled_turns_needed": needed,
+    }
+
+
+def render_fs_batch_arms(report: Dict[str, Any]) -> str:
+    """Render the uptake read. Says what it CANNOT conclude, first."""
+    arms = report.get("arms") or {}
+    out = ["FS_BATCH ARM UPTAKE — did the macro actually land?"]
+    if not arms:
+        out.append("  no trajectory carries an fs_batch arm stamp — the arm "
+                   "is not enrolled, or the corpus predates it")
+        return "\n".join(out)
+    out.append(f"  {'arm':<12}{'turns':>7}{'calls':>7}{'fs':>6}"
+               f"{'ELIGIBLE':>10}{'removable':>11}{'paths used':>12}")
+    for name, a in arms.items():
+        out.append(f"  {name:<12}{a.turns:>7}{a.calls:>7}{a.fs_calls:>6}"
+                   f"{a.eligible_turns:>10}{a.removable_steps:>11}"
+                   f"{a.paths_calls:>12}")
+    rate = report.get("eligibility_rate") or 0.0
+    out.append(f"  corpus eligibility: {report.get('corpus_eligible_turns')}"
+               f"/{report.get('corpus_turns')} turns ({rate:.1%}) — the rate at "
+               f"which ANY turn offers this macro something to collapse")
+    if report.get("readable"):
+        t = arms.get("treatment")
+        if t is not None and t.paths_calls == 0:
+            out.append("  ✗ MACRO DID NOT LAND: eligible turns exist and the "
+                       "treatment arm never emitted a `paths` call. Per §4F "
+                       "that settles it, whatever the latency says.")
+        else:
+            out.append("  ✓ the capability is being exercised — the effect "
+                       "question is now worth its statistics")
+    else:
+        need = report.get("enrolled_turns_needed")
+        out.append(f"  ⚠ NOT READABLE: fewer than {report.get('min_eligible')} "
+                   f"eligible treatment turns. Zero `paths` calls here means "
+                   f"NO OPPORTUNITY, not refusal — the two are the same "
+                   f"observation at this denominator."
+                   + (f" ~{need} enrolled turns would be needed at the corpus "
+                      f"eligibility rate." if need else ""))
+    return "\n".join(out)
+
+
 def mine_sequences(trajectories: Iterable[Any], *,
                    sizes: Sequence[int] = NGRAM_SIZES,
                    min_support: int = DEFAULT_MIN_SUPPORT,

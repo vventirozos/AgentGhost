@@ -191,7 +191,7 @@
     <tbody>
       <tr><td><code>create_skill</code> / <code>manage_skills</code></td><td>Writes a new reusable tool for itself, test-first, and manages the ones it has.</td></tr>
       <tr><td><code>manage_composed_skills</code></td><td>Chains existing skills into a bigger one.</td></tr>
-      <tr><td><code>delegate</code> / <code>delegate_to_swarm</code> / <code>jobs</code></td><td>Farms work out to other LLM machines, if you've configured any.</td></tr>
+      <tr><td><code>delegate</code> / <code>delegate_to_swarm</code> / <code>jobs</code></td><td>Farms work out to other LLM machines, if you've configured any. <code>jobs</code> also tracks a long <code>execute</code> command that outran its 10-minute budget: rather than being killed, a command still doing work is moved to the background and reported there.</td></tr>
       <tr><td><code>dream_mode</code> / <code>self_play</code></td><td>Triggers memory consolidation or practice on demand — normally these run on their own. <a href="self-improvement.html">More →</a></td></tr>
     </tbody>
   </table>

@@ -293,9 +293,24 @@ def test_the_aggregate_gate_is_worst_case_over_request_subsets(tmp_path,
     base = otd._baseline_descriptions()
     slack = reg._TOOL_DESC_AGGREGATE_SLACK
     shrink = "postgres_admin"
-    grow = [n for n in base if n != shrink][:4]
+    # SMALLEST baselines first, so each synthetic artifact keeps headroom
+    # under the per-tool validator's `max(6000, 3 * baseline)` ceiling.
+    # Taking the first four in registry order coupled this fixture to an
+    # unrelated fact — the LENGTH of whichever descriptions happen to be
+    # declared first: growing `knowledge_base` from 537 to 985 chars pushed
+    # its artifact from 5,617 to 6,065, past the flat 6,000 cap, so it was
+    # rejected, never counted, and this test failed with an opaque
+    # `15240 > 20000` while the gate itself was working correctly.
+    grow = sorted((n for n in base if n != shrink),
+                  key=lambda n: len(base[n]))[:4]
     arts = {n: base[n] + " X" * (((slack + 322) // 4) // 2) for n in grow}
     arts[shrink] = base[shrink][:len(base[shrink]) - 322]
+    invalid = [n for n in grow
+               if not reg._validate_tool_description(n, base[n], arts[n])]
+    assert not invalid, (
+        f"fixture: {invalid} would be rejected by the PER-TOOL validator, so "
+        f"they are never counted and this stops exercising the AGGREGATE "
+        f"gate at all")
     for n, t in arts.items():
         (tmp_path / "system" / "optim" / f"tool_description.{n}.json"
          ).write_text(json.dumps({"optimized_instruction": t}))

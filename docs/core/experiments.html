@@ -285,6 +285,49 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
     <code>failure_rate</code> without <code>unknown_rate</code>. If the trigger RATE diverges
     between the arms, read the triggered-only block as confounded.
   </p>
+
+  <h3>2026-08-11 — read the MECHANICAL half first: <code>--fs-batch-arms</code></h3>
+  <p>
+    §4F's stated verification for this arm was never the outcome comparison: <em>&ldquo;re-run the
+    ontology report; those n-grams must collapse. If they do not, the macro did not land, whatever
+    the latency says.&rdquo;</em> That question needs <strong>no statistical power</strong>, so it is
+    readable long before the effect is — which matters, because at this traffic the effect never
+    becomes readable at all.
+  </p>
+  <pre><code>PYTHONPATH=src python scripts/tool_ontology_report.py --fs-batch-arms</code></pre>
+  <p>
+    <strong>The eligible denominator is printed first, and the read declines itself when it is
+    thin.</strong> &ldquo;The model refused the capability&rdquo; and &ldquo;the model was never once
+    offered a chance to use it&rdquo; both render as zero <code>paths</code> calls, and only the
+    eligible count separates them. Eligibility is derived from <code>collapse_fs_batch</code> — the
+    shipped macro's own rule — never from a hand-written &ldquo;≥2 reads&rdquo; test, which would
+    count <code>read_chunked</code> pagination that the macro deliberately does not touch and so
+    measure a macro nobody deployed.
+  </p>
+  <p><b>First live read, 2026-08-11:</b></p>
+  <div class="scroll"><table>
+    <thead><tr><th>arm</th><th>turns</th><th>calls</th><th>file_system</th><th>ELIGIBLE</th><th>removable steps</th><th><code>paths</code> used</th></tr></thead>
+    <tbody>
+      <tr><td>control</td><td>32</td><td>45</td><td>13</td><td>1</td><td>9</td><td>0</td></tr>
+      <tr><td>treatment</td><td>23</td><td>34</td><td>4</td><td><b>0</b></td><td>0</td><td><b>0</b></td></tr>
+    </tbody>
+  </table></div>
+  <p>
+    <strong>Verdict: NOT READABLE — and that is the finding.</strong> The treatment arm emitted no
+    <code>paths</code> call because it had <em>one</em> whole-file read across 23 turns; the macro
+    was never in a position to fire. Corpus-wide only <b>52 of 1,556 turns (3.3%)</b> offer this
+    macro anything to collapse, so a readable uptake check needs roughly <b>598 enrolled turns</b> —
+    about 170 days at the observed rate of ~3.5 real user turns/day, and the outcome comparison needs
+    far more still. <strong>The blocker is not turn count alone, it is that eligible turns are
+    rare</strong>: any traffic bought for this arm has to be file-heavy work, not generic requests,
+    which is ~30× cheaper than raising traffic in general.
+  </p>
+  <p>
+    Tests: <code>tests/test_tool_ontology.py</code>, eight pins, five mutation-checked red. The
+    load-bearing pair is two-sided — the read must <em>decline</em> on an empty denominator and must
+    <em>convict</em> once eligible turns are ample, because a check that can only ever say &ldquo;not
+    readable&rdquo; is furniture.
+  </p>
   <p>
     <strong>Standing cost, so the operator can price it.</strong> Registering
     <code>fs_batch_context</code> excludes the whole treatment arm from newly mined Phase 2b

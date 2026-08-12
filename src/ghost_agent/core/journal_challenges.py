@@ -383,7 +383,16 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
         "You previously struggled with the request below.\n"
         f"A deterministic `{shape['filename']}` fixture has been written in "
         "your working directory — its shape matches what the original "
-        "user task referenced (CSV/JSON/log/SQL/text).\n"
+        # ⚠ THE PARENTHETICAL USED TO READ "(CSV/JSON/log/SQL/text)" AND THAT
+        # ONE WORD MISFILED EVERY MINED CHALLENGE (2026-08-11, §4AT-B).
+        # `classify_cluster` tests `\bsql\b` FIRST, so the boilerplate itself —
+        # not the task — decided the cluster: 23 of 23 stored journal runs
+        # classified as `sql`, including CSV, log, JSON and shell tasks, and
+        # `sql` climbed to expert tier on work that was never SQL. The list is
+        # descriptive prose for the model; it does not need the literal token
+        # that the classifier keys on.
+        "user task referenced (tabular, structured, log-style or plain "
+        "text).\n"
         "Write a `solution.py` that:\n"
         f"  1. Opens `{shape['filename']}` using the appropriate stdlib "
         f"module ({shape['kind']}).\n"

@@ -80,6 +80,52 @@ def _short(text: str, n: int = 180) -> str:
     return " ".join((text or "").split())[:n]
 
 
+def _replace_failure_kind(out: str) -> str:
+    """Why a `file_system` replace did not apply — OBSERVED, not guessed.
+
+    The caller feeds this into the next attempt's prompt behind "YOUR PREVIOUS
+    ATTEMPT FAILED:", so a wrong label costs retries. `file_system` rejects a
+    replace for several distinct reasons and only one of them is a missing
+    anchor; calling them all "anchor not found" sends the model looking for a
+    better SEARCH block when the defect is in its REPLACE block.
+
+    Unknown shapes deliberately return a NEUTRAL phrase rather than the most
+    likely guess — "did not apply" plus the tool's own text is honest, and the
+    raw text is always appended by the caller anyway.
+    """
+    head = (out or "")[:400].lower()
+    if "syntax error" in head or "would introduce a syntax" in head:
+        return "the REPLACEMENT breaks syntax — fix the replacement, not the anchor"
+    # ⚠ MISSING FILE BEFORE MISSING ANCHOR (review round 4). `file_system`
+    # returns `Error: '<f>' not found.` when the TARGET DOES NOT EXIST
+    # (file_system.py:1362) — which the generic "not found" rule below claimed
+    # as an anchor miss, steering the model to hunt for a better SEARCH block
+    # against a path that isn't there. An unfixable hypothesis that burns the
+    # whole retry budget, and path desync is a known live failure mode here.
+    # This is the very defect the function was written to remove, reproduced
+    # inside the fix.
+    if "not found." in head and "block" not in head:
+        return "the FILE does not exist at that path — check the path first"
+    if "multiple instances" in head or "ambiguous" in head:
+        return "anchor is AMBIGUOUS — include more surrounding context"
+    # ⚠ THESE LITERALS ARE COPIED FROM `file_system.py`, NOT IMAGINED. The
+    # first version invented "none of the blocks matched" / "no blocks
+    # matched" / "did not match" — none of which appear anywhere in the tree.
+    # The real multi-block failure is
+    #   "SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '<f>'"
+    # (file_system.py:1671), with per-block detail "Could not find block:"
+    # (:1637). The most common anchor failure was falling through to the
+    # neutral branch while the correct one sat directly above it.
+    if ("blocks matched" in head or "could not find block" in head
+            or "no match" in head or "not found" in head):
+        return "anchor not found"
+    if "marker" in head or "<<<<" in head or "====" in head:
+        return "the block contains SEARCH/REPLACE markers"
+    if "system block" in head or "not applied" in head:
+        return "the write was BLOCKED"
+    return "see the tool output"
+
+
 def _op_ok(out: str) -> bool:
     """A file_system op reports ``SUCCESS: …`` on success; a no-match replace
     returns ``SYSTEM INSTRUCTION: … NOT found``. So success == a SUCCESS head.
@@ -324,6 +370,14 @@ def _maybe_unescape_double_escaped(content: str, path: str) -> Optional[str]:
     if _py_parse_error(candidate) is None:
         return candidate
     return None
+
+
+# Imported lazily from project_advancer so there is ONE definition of the
+# marker — a second copy of the literal is exactly how the producer and the
+# consumer drift apart (the defect class this file already carries scars for).
+def _snap_truncated_mark() -> str:
+    from .project_advancer import SNAPSHOT_TRUNCATED_MARK
+    return SNAPSHOT_TRUNCATED_MARK
 
 
 def _regression_reason(old: Optional[str], new: str) -> Optional[str]:
@@ -955,7 +1009,21 @@ async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list,
             return f"edit on {path} errored: {e}"
         if not _op_ok(out):
             # a no-match replace provably did not mutate — no refresh needed
-            return f"edit on {path} did not apply (anchor not found): {_short(out)}"
+            #
+            # ⚠ NAME THE ACTUAL REASON (2026-08-11, §4AT-F). Every non-SUCCESS
+            # replace was reported as "anchor not found", which is a diagnosis,
+            # not an observation — and often the wrong one. `file_system`
+            # rejects a replace for at least three distinct reasons, and the
+            # feedback string is prefixed with "YOUR PREVIOUS ATTEMPT FAILED:"
+            # into the next spec prompt, so a wrong label steers every retry at
+            # the wrong hypothesis. Live on req 6e9efd6a: a syntax-regression
+            # rollback ("REJECTED: that replace would introduce a syntax error
+            # and was NOT applied … unexpected indent") was relabelled
+            # "anchor not found", and the model spent 20 minutes and 14
+            # attempts hunting for a better ANCHOR while the defect was its
+            # replacement's INDENTATION.
+            return (f"edit on {path} did not apply "
+                    f"({_replace_failure_kind(out)}): {_short(out)}")
         touched.add(path)
         applied += 1
         last_out = out
@@ -1069,6 +1137,20 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
 
     content = fspec.get("content")
     if content is None:
+        # ⚠ A DROPPED EDIT MUST NOT READ AS "NOTHING TO DO" (2026-08-11,
+        # §4AT-F). `edits` are only applied when `path in snap`, and the
+        # prompt snapshot is hard-capped at 12 files. On a larger project an
+        # `edits` entry for an unsnapshotted file fell through to here,
+        # `content` is None, and this returned (None, None) — "skipped, not a
+        # failure": zero tool calls, no reason, nothing in `written`. A
+        # sibling entry that DID apply then made the spec look successful, so
+        # the leaf closed DONE claiming both landed.
+        if isinstance(edits, list) and edits:
+            return (None,
+                    f"{path} was not in the file snapshot (capped at 12 "
+                    f"files), so its {len(edits)} edit(s) were NOT applied — "
+                    f"name it in `files` so it is read first, or split this "
+                    f"task")
         return (None, None)
     if not isinstance(content, str):
         content = str(content)
@@ -1102,6 +1184,26 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         return (None, f"{path} looks truncated (missing </html>) — produce a "
                       "COMPLETE, smaller file with closing tags; add features "
                       "in later tasks via append")
+
+    # ⚠ NEVER JUDGE A REWRITE AGAINST A PREFIX (2026-08-11, §4AT-F).
+    # `_gather_project_files` stores only a prefix once its 400 KB budget is
+    # nearly spent, and that truncation used to be silent — so a 300 KB
+    # index.html snapshotted as 4 KB made a 20 KB full rewrite look like
+    # GROWTH (20000 > 4000×0.85) and the non-regression guard waved through an
+    # overwrite that destroyed 280 KB. For `.py` the prefix usually fails
+    # `ast.parse`, which disables the overwrite guard entirely.
+    # A marked entry means "unknown baseline": re-read the file from disk,
+    # which is what the append path already does for the same reason.
+    if old and _snap_truncated_mark() in old:
+        live, _lerr = await _read_live_file(tool_runner, path)
+        if live is not None:
+            old = live
+        else:
+            # Could not re-read: refuse rather than compare against a prefix.
+            # A refusal costs one retry; a wrong pass costs the file.
+            return (None, f"cannot verify a full overwrite of {path}: its "
+                          f"snapshot is a truncated prefix and the file could "
+                          f"not be re-read — use `edits` instead of `content`")
 
     # Refuse a full-overwrite that would lose prior work on an existing file.
     reg = _regression_reason(old, content)

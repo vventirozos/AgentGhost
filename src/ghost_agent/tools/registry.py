@@ -52,6 +52,13 @@ def _acquired_skill_result_class(result) -> str:
     s = str(result)
     if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
         return "infra"
+    # Still running: the skill's run was detached at the budget, not killed
+    # (sandbox/jobs.py). There is no verdict yet, so it belongs with the
+    # other no-verdict outcomes callers skip telemetry on — crediting a
+    # success would inflate the skill's success rate on an unfinished run.
+    from ..sandbox.jobs import is_promoted_result
+    if is_promoted_result(s):
+        return "infra"
     m = re.search(r"EXIT CODE:\s*(\d+)", s)
     if m:
         code = m.group(1)
@@ -341,9 +348,9 @@ TOOL_DEFINITIONS = [
             }
         }
     },
-    {"type": "function", "function": {"name": "knowledge_base", "description": "Memory manager: imports EXISTING files (ingest_document) — text, PDF, and AUDIO/VIDEO recordings, which are transcribed automatically — ASKS A QUESTION AGAINST ONE INGESTED DOCUMENT (query), records discrete facts (insert_fact), forgets a topic, lists or wipes the store. NEVER use to compose, draft, or save prose the user just asked you to write — answer the user directly instead. Do NOT write Python scripts to read PDFs or ingest files. Do NOT write or install transcription code either — recordings are transcribed for you locally.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["insert_fact", "ingest_document", "query", "expand", "forget", "list_docs", "reset_all"]}, "filename": {"type": "string", "description": "REQUIRED for ingest_document (an EXISTING local filename in the sandbox, e.g. 'plan.txt', or a web HTML URL — NOT raw prose, NOT a title, NOT a PDF URL). Audio/video recordings (.mp3/.wav/.m4a/.mp4/.mov…) are accepted directly: they are transcribed locally and every passage is stamped with its timestamp range, so answers can cite the moment in the recording — use this for talks, podcasts and meetings instead of trying to read the file. REQUIRED for query (which ingested document to ask). REQUIRED for forget (the topic name to forget)."}, "question": {"type": "string", "description": "REQUIRED for action='query': the question to answer from that ONE document. Returns the best-matching passages WITH their section breadcrumbs. This is the RIGHT tool for a large reference manual (e.g. an ingested PostgreSQL PDF) — far better than `recall`, which searches ALL memory at once and caps at a shared budget. Call it repeatedly with different wording to drill down."}, "fact": {"type": "string", "description": "REQUIRED for insert_fact only: a single discrete fact to memorize (e.g. 'The user lives in Athens'). Do NOT use for ingest_document — pass a filename via 'filename' instead."}, "ref": {"type": "string", "description": "REQUIRED for action='expand': an evidence handle from a recall hit's EVIDENCE REFS line (e.g. 'ep:12' for the full episode record, 'session:<id>' for a stored conversation). Expands an abstraction back to its raw source."}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "knowledge_base", "description": "THIS IS YOUR TRANSCRIBER, and your document memory. action='transcribe' (an alias of 'ingest_document') takes an EXISTING audio or video file in your sandbox — .mp4 .mov .mkv .webm .mp3 .wav .m4a .flac .ogg — and transcribes it LOCALLY, indexing every passage with its timestamp range so answers can cite the moment. ONE CALL, no pipeline: knowledge_base(action='transcribe', filename='talk.mp4'). You therefore NEVER write, install, or plan a transcription step — no Whisper, no ffmpeg, no speech-to-text library, no transcribe.py — and never a separate script to save the result: this tool IS both of those steps. The same action imports EXISTING files (ingest_document): text, PDF, and web HTML URLs. Other actions: query (ask a question against ONE ingested document), insert_fact, expand, forget, list_docs, reset_all. NEVER use to compose or save prose the user just asked you to write — answer the user directly instead. Do NOT write Python scripts to read PDFs or ingest files.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["transcribe", "ingest_document", "query", "insert_fact", "expand", "forget", "list_docs", "reset_all"], "description": "'transcribe' and 'ingest_document' are the SAME action: transcribe is the name to reach for when you have an audio/video file, ingest_document when you have a text/PDF/URL."}, "filename": {"type": "string", "description": "REQUIRED for transcribe/ingest_document: an EXISTING local filename in the sandbox — 'talk.mp4', 'notes.pdf', 'plan.txt' — or a web HTML URL. NOT raw prose, NOT a title, NOT a PDF URL, and NOT a YouTube/video URL (download the file first, then pass the FILE). Audio/video (.mp3/.wav/.m4a/.mp4/.mov…) is transcribed for you locally and every passage is stamped with its timestamp range, so answers can cite the moment in the recording — use this for talks, podcasts and meetings instead of writing any transcription code. REQUIRED for query (which ingested document to ask). REQUIRED for forget (the topic name to forget)."}, "question": {"type": "string", "description": "REQUIRED for action='query': the question to answer from that ONE document. Returns the best-matching passages WITH their section breadcrumbs. This is the RIGHT tool for a large reference manual (e.g. an ingested PostgreSQL PDF) — far better than `recall`, which searches ALL memory at once and caps at a shared budget. Call it repeatedly with different wording to drill down."}, "fact": {"type": "string", "description": "REQUIRED for insert_fact only: a single discrete fact to memorize (e.g. 'The user lives in Athens'). Do NOT use for ingest_document — pass a filename via 'filename' instead."}, "ref": {"type": "string", "description": "REQUIRED for action='expand': an evidence handle from a recall hit's EVIDENCE REFS line (e.g. 'ep:12' for the full episode record, 'session:<id>' for a stored conversation). Expands an abstraction back to its raw source."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "recall", "description": "Search the vector database for facts and answers from past conversations and general memory. ALSO the right tool when a question names a project or topic that manage_projects doesn't track ('when does project X ship?') — facts about it often live here even when no tracked project exists. For a question about ONE specific INGESTED DOCUMENT (e.g. a manual or PDF), prefer knowledge_base(action='query', filename=..., question=...) — it searches only that document and returns more, better-scoped passages. Hits may carry EVIDENCE REFS (e.g. 'ep:12') — expand one via knowledge_base(action='expand', ref=...). WARNING: This retrieves semantic chunks; use file_system operation='search' if you need an exact line match.", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "The specific question or search query."}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "execute", "description": "Run Python, Node.js, or Shell code. USE THIS ONLY AS A LAST RESORT for custom math, logic, or formatting. DO NOT use this to simply create/write web files (HTML/CSS) or data files (use file_system write instead!). DO NOT use this to download files, scrape the web, or manage memory. WARNING: Native tools CANNOT be imported in Python. ALWAYS print results. To run an already existing file, you can omit the 'content' parameter. The sandbox has its OWN pid namespace and loopback: you CANNOT kill, restart, or reach a process the USER runs on their machine — if they run it, ask them to restart it.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Optional. A direct bash command to run immediately (e.g., 'ls -la' or 'cat file.csv'). If provided, filename and content are ignored."}, "filename": {"type": "string", "description": "Optional. The name of the file to execute. If omitted but 'content' is provided, an ephemeral script will be generated and run automatically."}, "content": {"type": "string", "description": "The code to execute. Omit this if you just want to run an existing file."}, "args": {"type": "array", "items": {"type": "string"}, "description": "Optional command line arguments to safely pass to the script."}, "stateful": {"type": "boolean", "description": "If true, Python variables/dataframes/models are saved and automatically loaded into memory for your next execution. Acts like a Jupyter Notebook cell."}}, "required": []}}},
+    {"type": "function", "function": {"name": "execute", "description": "Run Python, Node.js, or Shell code. USE THIS ONLY AS A LAST RESORT for custom math, logic, or formatting. DO NOT use this to simply create/write web files (HTML/CSS) or data files (use file_system write instead!). DO NOT use this to download files, scrape the web, or manage memory. WARNING: Native tools CANNOT be imported in Python. ALWAYS print results. To run an already existing file, you can omit the 'content' parameter. The sandbox has its OWN pid namespace and loopback: you CANNOT kill, restart, or reach a process the USER runs on their machine — if they run it, ask them to restart it. A command that runs past the 600s budget while still making progress is NOT killed — it is detached as a background job and the result says so; when that happens, NEVER re-run it, just finish your turn and check `jobs` later.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "Optional. A direct bash command to run immediately (e.g., 'ls -la' or 'cat file.csv'). If provided, filename and content are ignored."}, "filename": {"type": "string", "description": "Optional. The name of the file to execute. If omitted but 'content' is provided, an ephemeral script will be generated and run automatically."}, "content": {"type": "string", "description": "The code to execute. Omit this if you just want to run an existing file."}, "args": {"type": "array", "items": {"type": "string"}, "description": "Optional command line arguments to safely pass to the script."}, "stateful": {"type": "boolean", "description": "If true, Python variables/dataframes/models are saved and automatically loaded into memory for your next execution. Acts like a Jupyter Notebook cell."}}, "required": []}}},
     {
         "type": "function",
         "function": {
@@ -762,6 +769,19 @@ _FS_BATCH_DESC_SUFFIX = (
     "envelope in ONE operation='replace' 'content'. A successful 'replace' "
     "hands back the post-edit view of the changed lines, so you do NOT need "
     "a follow-up read to check it landed."
+    # Restores parity with the control arm: only a `paths` batch read may omit
+    # `path` among the ops that NEED one. Without this the treatment arm is
+    # ALSO told that write/replace/delete need no path — a difference
+    # unrelated to the batch macro, i.e. a confound in the live A/B (§4AT-E).
+    #
+    # ⚠ NAMED EXPLICITLY, because the first wording said "every operation
+    # except a batch read" and that is FALSE: `list_files`, `search` and
+    # `find` run with no path by design (list the workspace root, grep the
+    # whole tree). An emphatic rule stricter than the handler is just a
+    # different arm-difference — it swaps one confound for another.
+    " 'path' is still REQUIRED for read, read_chunked, inspect, write, "
+    "replace, delete, copy, rename and move — the ONLY read that may omit it "
+    "is a 'paths' batch. (list_files / search / find never needed one.)"
 )
 
 
@@ -802,6 +822,20 @@ def _apply_fs_batch_schema(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         params["properties"] = props
         # 'path' stops being mandatory: a pure `paths` read has no single
         # path, and advertising it as required makes that call schema-invalid.
+        #
+        # ⚠ THE RELAXATION IS WIDER THAN THE TREATMENT — 2026-08-11 (§4AT-E).
+        # Dropping `path` from `required` also tells the treatment arm that
+        # `write`, `replace` and `delete` need no path, which has nothing to do
+        # with the batch affordance under test: only `read` fans out, no
+        # mutating op accepts `paths`. That is an unmeasured confound in a LIVE
+        # A/B whose entire purpose is the batch macro.
+        #
+        # JSON Schema cannot express "required unless operation == read"
+        # portably (if/then/else is not reliably honoured by the local
+        # server), and an invented key would be silently ignored — so the
+        # constraint is stated in the DESCRIPTION, which is the channel the
+        # model actually reads. The schema stays permissive; the instruction
+        # restores parity with the control arm for every op except `read`.
         params["required"] = ["operation"]
         out.append({**t, "function": {
             **fn,
@@ -1117,6 +1151,7 @@ def get_available_tools(context):
         # Stateful kernel sessions can't be project-scoped (kernel conn file
         # is pinned to /workspace), so they opt out; everything else runs
         # from /workspace/projects/<id> with its host dir scoped to match.
+        from ..core.jobs import get_job_registry
         host_dir, workdir = _proj_ws(stateful=bool(kwargs.get("stateful")))
         return await tool_execute(
             sandbox_dir=host_dir,
@@ -1126,6 +1161,10 @@ def get_available_tools(context):
             _metacog_bundle=getattr(context, "metacog", None),
             workspace_model=getattr(context, "workspace_model", None),
             project_store=getattr(context, "project_store", None),
+            # A command that outruns its budget is DETACHED as a sandbox job
+            # rather than killed (sandbox/jobs.py); the registry is what makes
+            # it visible to the existing `jobs` tool.
+            job_registry=get_job_registry(context),
             **kwargs,
         )
 

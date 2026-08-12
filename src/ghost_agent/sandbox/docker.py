@@ -43,6 +43,13 @@ class DockerSandbox:
     _tor_attempted = False
     _provision_backoff_until = 0.0
 
+    # Capability flag read by tools/execute.py (see _run_in_sandbox): this
+    # manager implements `execute_promotable`, so a command that outruns its
+    # budget while still working is DETACHED as a job instead of killed. It
+    # is an explicit opt-in rather than a hasattr probe because a MagicMock
+    # stub answers hasattr for anything.
+    supports_job_promotion = True
+
     def __init__(self, host_workspace: Path, tor_proxy: str = None):
         import hashlib
         short_hash = hashlib.md5(str(host_workspace.absolute()).encode()).hexdigest()[:8]
@@ -897,8 +904,58 @@ class DockerSandbox:
             logger.debug(f"run-output spill failed (non-critical): {e}")
             return None
 
+    def execute_promotable(self, cmd: str, timeout: int = 600,
+                           workdir: str = None,
+                           spill_large_output: bool = False,
+                           max_output_chars: int = None,
+                           label: str = None, project_id=None,
+                           cleanup_paths=None, identity: str = None):
+        """``execute`` with one difference: a command that is still ALIVE and
+        still PROGRESSING when the budget expires is DETACHED as a supervised
+        job instead of killed (see :mod:`sandbox.jobs`).
+
+        Returns a 3-tuple ``(output, exit_code, job_entry_or_None)``. A
+        non-None ``job_entry`` means the command is still running — the exit
+        code is 0 (a promotion is not a failure) and the output is whatever
+        it had produced so far.
+
+        Deliberately a SEPARATE method rather than a flag on ``execute``:
+        promotion is only ever right for the ``execute`` TOOL's own runs.
+        Internal callers (rg/find from file_system, the browser runner, the
+        service supervisor's own probes) must keep the classic
+        kill-at-the-budget contract, and a stub sandbox manager in a test
+        simply won't have this attribute — call sites fall back to
+        ``execute``.
+        """
+        return self._execute_impl(
+            cmd, timeout=timeout, workdir=workdir,
+            spill_large_output=spill_large_output,
+            max_output_chars=max_output_chars,
+            promotable=True, job_label=label, job_project_id=project_id,
+            job_cleanup_paths=cleanup_paths, job_identity=identity)
+
     def execute(self, cmd: str, timeout: int = 600, workdir: str = None,
-                spill_large_output: bool = False, max_output_chars: int = None):
+                spill_large_output: bool = False, max_output_chars: int = None,
+                quiet: bool = False):
+        """Run a command in the container under a hard ``timeout -k 5s``
+        budget; returns ``(output, exit_code)``. A budget overrun is killed
+        and surfaces as exit 124/137/143 — see :meth:`execute_promotable` for
+        the tool path that detaches instead."""
+        out, code, _job = self._execute_impl(
+            cmd, timeout=timeout, workdir=workdir,
+            spill_large_output=spill_large_output,
+            max_output_chars=max_output_chars, quiet=quiet)
+        return out, code
+
+    def _execute_impl(self, cmd: str, timeout: int = 600, workdir: str = None,
+                      spill_large_output: bool = False,
+                      max_output_chars: int = None,
+                      promotable: bool = False, job_label: str = None,
+                      job_project_id=None, job_cleanup_paths=None,
+                      job_identity=None, quiet: bool = False):
+        """Shared body of execute / execute_promotable → ``(output,
+        exit_code, job_entry_or_None)``. ``job_entry`` is always None on the
+        classic path."""
         try:
             # ensure_running() either just probed readiness (steady path)
             # or raised (provision path) — re-probing here doubled the
@@ -907,10 +964,33 @@ class DockerSandbox:
             # the normal error path surfaces it.
             self.ensure_running()
 
+            # Promotable runs are supervised by sandbox/jobs.py, which owns
+            # the budget itself (it has to still be holding the process when
+            # the budget expires, which `timeout` never is — it has already
+            # killed it). Resolved BEFORE the command string is built so the
+            # log line matches what actually runs.
+            job_sup = None
+            if promotable:
+                from .jobs import get_job_supervisor, jobs_enabled
+                if jobs_enabled():
+                    job_sup = get_job_supervisor(self)
+
             # Add -k 5s to ensure processes are killed if they ignore SIGTERM
-            cmd_string = f"timeout -k 5s {timeout}s {cmd}"
-            pretty_log("Sandbox Exec", f"Command: {cmd_string}", icon=Icons.TOOL_SHELL)
-            
+            cmd_string = (cmd if job_sup is not None
+                          else f"timeout -k 5s {timeout}s {cmd}")
+            # `quiet` is for the job supervisor's own bookkeeping probes
+            # (liveness, /proc I/O counters, kills). Those run every 30 s per
+            # running job and once a minute per job from the reaper — logging
+            # a 500-char `sh -c 'for f in /proc/…'` blob each time would bury
+            # the stream the operator actually watches, in a subsystem whose
+            # whole point is to be quiet in the background. They still reach
+            # the durable log via logger.debug.
+            if quiet:
+                logger.debug("sandbox probe: %s", cmd_string[:200])
+            else:
+                pretty_log("Sandbox Exec", f"Command: {cmd_string}",
+                           icon=Icons.TOOL_SHELL)
+
             # Cross-platform safe UID/GID fetching (Windows doesn't have getuid)
             user_id = os.getuid() if hasattr(os, 'getuid') else 1000
             group_id = os.getgid() if hasattr(os, 'getgid') else 1000
@@ -929,18 +1009,33 @@ class DockerSandbox:
             if not is_mac:
                 exec_kwargs["user"] = f"{user_id}:{group_id}"
             
-            # The command self-limits via the in-container `timeout -k 5s Ns`
-            # wrapper, so the client deadline only needs to catch a WEDGED
-            # daemon (which never streams the process's EOF back): timeout +
-            # grace. Without it a stuck daemon hangs this worker thread forever.
-            exec_result = self._exec_run(
-                cmd_string,
-                deadline_s=timeout + 60,
-                **exec_kwargs
-            )
+            job_entry = None
+            if job_sup is not None:
+                # Detached-and-polled: the job supervisor launches the command
+                # under setsid, watches it from the HOST side of the bind
+                # mount, and at the budget either promotes it (still alive,
+                # still progressing) or kills it exactly like `timeout` would
+                # have (exit 124). No client deadline is needed — the poll
+                # loop is ours and is bounded by the budget.
+                stdout_bytes, exit_code, job_entry = job_sup.run(
+                    cmd, timeout=timeout, workdir=exec_kwargs["workdir"],
+                    label=job_label, project_id=job_project_id,
+                    exec_kwargs=exec_kwargs,
+                    cleanup_paths=job_cleanup_paths,
+                    identity=job_identity)
+            else:
+                # The command self-limits via the in-container `timeout -k 5s Ns`
+                # wrapper, so the client deadline only needs to catch a WEDGED
+                # daemon (which never streams the process's EOF back): timeout +
+                # grace. Without it a stuck daemon hangs this worker thread forever.
+                exec_result = self._exec_run(
+                    cmd_string,
+                    deadline_s=timeout + 60,
+                    **exec_kwargs
+                )
 
-            stdout_bytes = exec_result.output
-            exit_code = exec_result.exit_code
+                stdout_bytes = exec_result.output
+                exit_code = exec_result.exit_code
 
             # Output handling. A sandbox script that prints multi-MB to stdout
             # would flood the model context with 100k+ tokens of garbage (and
@@ -982,6 +1077,11 @@ class DockerSandbox:
 
             if not output.strip() and exit_code != 0:
                  output = f"[SYSTEM ERROR]: Process failed (Exit {exit_code}) with no output."
+            # A promoted job legitimately has no output yet (a silent
+            # downloader promoted on file growth) — that is not an error, and
+            # the caller's promotion banner supplies the explanation.
+            if job_entry is not None and not output.strip():
+                output = "(no output yet)"
 
             # Readiness TTL bookkeeping. exec_run returning at all means the
             # daemon + container are live, so a normal command (even one that
@@ -994,7 +1094,7 @@ class DockerSandbox:
             else:
                 self.mark_ready()
 
-            return output, exit_code
+            return output, exit_code, job_entry
 
         except Exception as e:
             # The container/daemon may be gone — force a full probe next time.
@@ -1013,7 +1113,8 @@ class DockerSandbox:
                 f"{type(e).__name__}: {e}", icon=Icons.FAIL, level="ERROR")
             return (
                 f"[SANDBOX INFRA ERROR — not your code] "
-                f"{'docker daemon wedged; ' if _wedged else ''}{str(e)}", 1)
+                f"{'docker daemon wedged; ' if _wedged else ''}{str(e)}", 1,
+                None)
 
     def close(self, remove: bool = False):
         """Tear down the sandbox container at agent shutdown.

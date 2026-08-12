@@ -116,9 +116,11 @@
     <code>.html .js .py .md .json …</code> plus <code>Makefile</code>/<code>README</code>-style
     names). Unregistered <em>media/binary</em> files (screenshots, renders) stay
     deletable — they are the scratch the sweep exists to remove; a media
-    deliverable is protected by registering it. The debris classifier outranks
-    the source classifier (<code>temp_*.py</code>, <code>*.log</code>, dotfiles
-    still go). Recovery registers what it keeps, so the record becomes truthful
+    deliverable is protected by registering it. <b>In the DONE sweep the debris
+    classifier outranks the source classifier</b> (<code>temp_*.py</code>,
+    <code>*.log</code>, dotfiles still go) — a finished project's scratch is
+    scratch. <b>The idle tidy is the opposite on one rule only</b>, see below.
+    Recovery registers what it keeps, so the record becomes truthful
     and the next sweep needs no recovery pass. Operator-visible as a ⚠️
     <code>Cleanup … keep-set was PARTIAL</code> warning; <code>summary["recovered"]</code>
     lists the saved files.</li>
@@ -176,5 +178,47 @@
   <p>On a PARTIAL keep-set (some files registered), the DONE sweep deleted an unregistered <strong>data/binary deliverable</strong> — an app database (<code>.db</code>/<code>.sqlite</code>), trained model weights (<code>.pt</code>/<code>.safetensors</code>/<code>.onnx</code>), or a dataset (<code>.parquet</code>/<code>.npy</code>) — because the partial-recovery only rescued source-like files, and the empty-keep-set recovery (which keeps everything non-debris) doesn't run once ANY file is registered. A coding project's seeded <code>data.db</code> / <code>model.pt</code> vanished at the moment of completion when <code>app.py</code> alone was registered. The recovery now also rescues <code>_is_data_deliverable</code> files; media scratch (screenshots, renders) stays deletable. Tests: <code>::TestDataDeliverableRecovery</code>.</p>
 
 </main>
+
+  <h2 id="active-vs-done">Two lifecycles, opposite correct answers <span class="tag">2026-08-11</span></h2>
+  <p>
+    <strong>DONE sweep</strong> — the project is finished, so a scratch-named file is scratch and
+    goes. <strong>Idle tidy</strong> — the project is still being <em>worked on</em>, and deleting
+    <code>debug_utils.py</code> out from under a build that imports it is the harm. §4AT measured
+    the tidy deleting <code>debug_utils.py</code>, <code>temp_loader.py</code>,
+    <code>scratch_notes.py</code>, <code>tmp_fix.py</code> and <code>.gitlab-ci.yml</code> from
+    <b>ACTIVE</b> projects, against this module's own stated contract.
+  </p>
+  <p>
+    <code>_tidy_is_debris()</code> is everything <code>_is_debris()</code> says, with <b>one</b>
+    exception: a scratch NAME PREFIX alone cannot condemn a file that is source. Scratch dirs,
+    scaffolding names, non-kept dotfiles and scratch suffixes all still outrank source-ness — so
+    <code>.browser_runner.py</code> and <code>__pycache__/*.pyc</code> are still collected.
+    ⚠ <b>This took three attempts, each narrowing the scope.</b> Inverting the precedence inside
+    <code>_is_debris</code> broke the DONE sweep; a blanket &ldquo;source-like ⇒ skip&rdquo; in the
+    tidy then kept browser scaffolding. <b>The exemption belongs to one rule</b>, not to the
+    classifier and not to the caller.
+  </p>
+  <h2 id="protection-case">Protection is case-folded, everywhere <span class="tag">2026-08-11</span></h2>
+  <p>
+    A deliverable registered <code>assets/hero.png</code> and written <code>assets/Hero.png</code>
+    was unprotected and deleted — by the sweep <em>and</em> the tidy. On macOS those are ONE file, so
+    nothing else in the stack surfaces the drift. <code>_lower_keys()</code> projects each protection
+    set once per walk, applied at <b>every</b> membership site including the
+    <code>referenced</code>-media check — <b>half-applied is the failure mode</b>.
+    ⚠ A <code>set</code> subclass was tried first and was a landmine: <code>update</code>,
+    <code>|=</code>, <code>discard</code>, <code>clear</code>, <code>copy</code>, <code>union</code>,
+    <code>-</code>, <code>&amp;</code>, <code>^</code> were all unguarded, several silently returning
+    a plain set, and it missed <code>_recover_deliverables</code> entirely.
+  </p>
+  <h2 id="normalizer">One payload, one key <span class="tag">2026-08-11</span></h2>
+  <p>
+    <code>_normalize_rel</code> now collapses repeated separators before stripping each prefix once,
+    so a doubled slash cannot key a file differently from
+    <code>ProjectStore._normalize_rel_path</code>. ⚠ A fixed-point loop was tried first and was
+    <em>worse</em>: it also ate a project's legitimate top-level <code>workspace/</code> directory,
+    deleting the registered file inside it. <b>A repeated real directory name is data, not a prefix
+    to peel.</b> The differential test GENERATES a prefix×tail cross-product (72 payloads) — its
+    first version used 9 hand-picked payloads containing none of the divergent shapes.
+  </p>
 </body>
 </html>

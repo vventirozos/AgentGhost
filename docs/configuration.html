@@ -193,6 +193,7 @@
       <tr><td><code>GHOST_MODEL</code></td><td><code>qwen-3.6-35b-a3</code></td><td>Default for <code>--model</code>.</td></tr>
       <tr><td><code>TOR_PROXY</code></td><td><code>socks5://127.0.0.1:9050</code></td><td>Where Tor's SOCKS proxy is.</td></tr>
       <tr><td><code>GHOST_SANDBOX_MEM</code></td><td><code>4g</code></td><td>Memory ceiling for the sandbox container.</td></tr>
+      <tr><td><code>GHOST_SANDBOX_JOBS</code></td><td><code>1</code></td><td>A sandbox command still making progress after 90&nbsp;s is moved to the background instead of blocking the turn, and the model is woken with its result when it lands. Set to <code>0</code> to go back to killing it at the 600&nbsp;s budget. See <a href="sandbox/jobs.html">sandbox.jobs</a> for the promotion threshold (<code>GHOST_SANDBOX_JOB_PROMOTE_AFTER_S</code>), the lifetime cap (<code>GHOST_SANDBOX_JOB_TTL_S</code>, default 45&nbsp;min), the progress window, and the concurrency cap.</td></tr>
       <tr><td><code>GHOST_EMBED_MODEL</code></td><td><code>BAAI/bge-small-en-v1.5</code></td><td>The embedding model. Changing this invalidates your entire vector store — Ghost refuses to start until you re-embed.</td></tr>
       <tr><td><code>GHOST_MANDATORY_TOR</code></td><td><code>1</code></td><td>Set to <code>0</code> to default mandatory Tor off.</td></tr>
     </tbody>

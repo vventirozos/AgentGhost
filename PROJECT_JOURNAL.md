@@ -72,6 +72,13 @@ included). cwd `/Users/vasilis/Data/AI/Agent`. Verifier is ENABLED; postmortem i
 deliberately OFF. The launcher exec line (out-of-repo `bin/start-ghost-agent.sh`) is the only
 flag truth — this list can drift; check `GET /api/health` `config` for the resolved reality.
 
+**Sandbox JOBS (2026-08-12, §4AX).** No env needed — defaults are live: an `execute` command still
+working at its 600 s budget is DETACHED as a background job instead of killed, reaped 45 min later.
+Kill switch `GHOST_SANDBOX_JOBS=0` restores the old kill-at-the-budget behaviour;
+`GHOST_SANDBOX_JOB_TTL_S` / `_PROGRESS_WINDOW_S` / `_MAX` tune the rails. Operator-visible surfaces:
+`🏃 Job Promoted` / `🛑 Job Expired` on the live stream, `jobs(action='status')`, and
+`introspect action='activity'` (phase `job`). Job state lives in `<sandbox>/.jobs/registry.json`.
+
 **⚠️ Supervisor gotcha.** A plain `kill` of prod is undone within ~9s by launchd (parent pid 1).
 To actually stop prod for an isolated run, the operator must disable the launchd service
 (`sudo launchctl bootout …` / unload the plist). Re-enable it afterward to restore auto-restart.
@@ -379,12 +386,51 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
    latch), idle-orchestration audit (#32: watchdog/cooldowns/rider ordering), F8 episodic
    usage-credit schema design (#33). After #30 the pipeline is swept end-to-end and effort
    shifts to the measurement arms.
-4. **MATURING ON THEIR OWN CLOCKS** (read when ripe, no work): use_planning arm @ n≥30/arm
+4. ~~**MATURING ON THEIR OWN CLOCKS** (read when ripe, no work): use_planning arm @ n≥30/arm
    (~1-2 wk); foresight_note arm @ n≥30/arm; §4K live-ledger backtest ~08-12 (gates the
-   MCTS/BoN consumer decision); tool-desc GEPA gate @ ~250 positives ~08-17.
+   MCTS/BoN consumer decision); tool-desc GEPA gate @ ~250 positives ~08-17.~~
+   ⛔ **FALSE PREMISE — CORRECTED 2026-08-11 (§4AQ). THE CLOCKS ARE STOPPED, NOT SLOW.** Real user
+   traffic is **median 3.5 turns/day, zero on three of the last six days** (measured: 52 genuine
+   requests against 165 self-play in a week). Every one of these reads is gated on real turns —
+   self-play is excluded from the ledgers they consume BY DESIGN — so: §4K backtest = 64 rows,
+   decisive buckets n=2 and n=0; `fs_batch` ~25/arm; `foresight_note` ~17/arm; `use_planning`
+   ~8/arm; nothing written since 08-09. §4AO's 1.34–2.47× attenuation compounds it. **Waiting is
+   not a plan at this traffic** — but ✅ **the operator chose to WAIT anyway (2026-08-11), with the
+   numbers in hand.** So these ARE back on their own clocks, just far slower ones than the dates
+   they carried: nothing is owed until the (now honest) user-turn denominator shows real volume.
+   Tool-desc GEPA @ ~08-17 is supply-gated the same way and inherits the same correction.
+   ⏳ One verification still open: `origin=sim` has not been observed live (no self-play cycle since
+   the 08:42 restart) — confirm on the next idle cycle, since the denominator depends on that half.
+   ✅ **RE-READ 2026-08-12 (operator generated a batch of traffic; live instruments pulled — §4BB below).**
+   4a. **CORRECTION — THE GATE IS RESOLVED OUTCOMES, NOT RAW TURNS.** The arms have now HIT raw
+   n≥30/arm (use_planning 46/30, fs_batch 60/50, foresight_note 46/47, risk_steer 54/76), i.e. the
+   number these entries were waiting on. It changes nothing: `report_from_trajectories` (the code
+   behind `introspect action='experiments'`) conditions failure_rate on RESOLVED outcomes and every
+   arm still reads **"insufficient data (n<30/arm)"** — resolved-n/arm is 5–29, because **60–84% of
+   real user turns carry `outcome='unknown'`** (measured across the whole corpus: 505/612 chat-ish
+   turns, 572/838 task-ish). So the binding denominator is ~2.5–3× smaller than the raw-turn count,
+   and organic chat cannot close it — the §4AO label-noise ceiling, now reaching the A/B arms.
+   Anyone reading these arms must use RESOLVED n, not raw n.
+   4b. **⚠ MY OWN raw-count read was WRONG and the canonical instrument caught it.** Off a hand
+   tally I flagged "use_planning treatment 0 passed / 30 — red flag"; that divided passes by raw n
+   incl. 25 unknowns. The instrument: treatment = 5 resolved, failure_rate 0.200 vs control 0.182,
+   **no signal.** The one real asymmetry it does surface: use_planning treatment unknown_rate 0.833
+   vs control 0.522 — the planner arm produces MORE ungradeable turns (a confound, not a verdict).
 5. **OPERATOR-DECISION SHELF** (no work pending): GHOST_SKILL_PRUNE stays OFF (re-arming
    requires the distill/prune recalibration); router keep/kill resolves with the use_planning
    arm verdict; Studio 1×240k slot revert; nova wired-limit boot daemon.
+6. **THE ACTUAL OPEN BUG-HUNT RESIDUAL SET** (reconciled against the live tree 2026-08-12, §4B/§4C
+   banners): after crossing off everything already fixed under the §4B "ALL FIXED 2026-07-20" and
+   "MOSTLY FIXED 2026-07-22" headers, what genuinely remains is small and none is urgent —
+   (a) the streaming `GHOST_LLM_RECORD` hook + 3 dev improvements (serializer unify, verifier
+   stage-1/2 shared prefix, merge the two `get_fallback_hint` fns); (b) `read_since` EOF re-baseline
+   on a shrunk ledger (latent, no rotation code in-tree); (c) tic-tac-toe `load` parity acceptance
+   and `_invoke_template` broad-except (both LOW/SUSPECTED, self-healing). No traffic gate on any of
+   these; they are simply low-value relative to the converged core.
+   ⚠ **The §4B "ROUTER boot landmine + label inversion" is NOT in this set — it is FIXED under §4O**
+   (`main.py:1715` load has its own try→`clf=None`+retrain; `main.py:1699` `clf.looks_sane()` gate
+   rejects an inverted checkpoint, tagged "§4O C-MAJOR-1"). I listed it here, then code-checked and
+   removed it — the exact re-open-an-already-fixed trap this reconciliation exists to prevent.
 
 ### F8. Episodic usage-credit schema — DESIGN COMPLETE 2026-08-08 (task #33; unblocked by the F2 operator decision)
 
@@ -726,6 +772,1420 @@ over-weights the refute side. **Check a shipping decision against a realistic ba
 
 **Pins:** 15 tests, all revert-tested (3 mutations, all red), including a structural guard against
 re-introducing variant B. Full suite **11,719 passed / 14 skipped**.
+
+### 4AX. THE TIMEOUT IS NOW A PROMOTION — a still-working command is detached, not killed — ✅ SHIPPED 2026-08-12
+
+**The incident (operator-reported, same yt-dlp session as §4AW).** A `yt-dlp`-over-Tor download hit
+the 600 s `execute` budget. The trace: `🔶 + 945s transient fail — Transient strike 1/4 (timed out)`,
+then the model started over. **Four separate costs from one clock:** (1) ~10 min of real work
+destroyed at 599 s; (2) the retry — which is what turns 10 minutes of loss into 40; (3) a transient
+strike on a task that had not failed, and **strike accounting feeds outcome labels and calibration**
+(§4L/§4AO), so miscounting it poisons the learning signal, not just the log; (4) the turn stayed
+blocked on a thing a person would have backgrounded.
+
+**The fix (operator's design, implemented as specified).** When the budget expires and the process is
+still alive AND still making progress, `execute` DETACHES it as a supervised job instead of killing
+it, and says so:
+
+```
+--- COMMAND RESULT --- [SANDBOX JOB PROMOTED]
+EXIT CODE: 0 (STILL RUNNING — promoted to background job job-1a2b3c4d, NOT finished)
+▎ Still running at 600s — promoted to background job job-1a2b3c4d. Do NOT re-run this
+  command — it was NOT killed and is still working.
+▎ Poll it with jobs(action='status', job_id='job-1a2b3c4d'); read its full result with
+  jobs(action='collect', job_id='job-1a2b3c4d') once it finishes. …
+▎ FINISH YOUR TURN NOW: state plainly that the work is STILL RUNNING in the background
+  and where its result will appear — … do not promise to report back later (nothing
+  runs after your reply).
+```
+
+`EXIT CODE: 0` is the load-bearing detail: `agent.py:11067` matches `EXIT CODE:\s*(\d+)` on `execute`
+results and scores anything non-zero as a failure + strike. The annotation rides AFTER the digits so
+that parser keeps working. **The TOOL decides, not the model** — promotion is on observed duration
+and observed progress, so nothing depends on predicting how long yt-dlp takes over Tor.
+
+**Where it lives.** New `sandbox/jobs.py` (`SandboxJobSupervisor`), mechanics mirroring `services.py`:
+command ships as a script through the bind mount, launches `setsid nohup`, records its own `$$`,
+publishes its exit code via tmp+rename; Python polls the HOST side of the mount (no docker
+round-trip per tick, tight-then-relaxed cadence so a 50 ms `ls` stays 50 ms). `docker.execute` and
+the new `execute_promotable` share one `_execute_impl`, so spill/truncation/readiness bookkeeping
+cannot diverge; **only the execute TOOL takes the promotable path** — rg/find, the browser runner and
+the service supervisor's own probes keep the classic kill-at-the-budget contract.
+
+**The two rails the operator named, both real:**
+
+1. **Progress, not liveness** (else it is just a slower timeout). Promotion needs, inside a 120 s
+   window (clamped to ≤ half the budget): log GROWTH, **or the job's OWN I/O counters moving**
+   (`rchar+wchar` summed over its `/proc` session). ⚠ **The first version asked "did a file under the
+   workdir change" — and the LIVE test promoted a genuinely wedged `sleep 300`, because a DIFFERENT
+   job was writing into the same shared `/workspace`.** Workdir mtimes attribute to nobody;
+   per-process counters attribute to the job that earned them. No unit test had caught it — the live
+   run did, on the second command it tried.
+   **CPU time is deliberately NOT a signal:** a spin-loop is exactly the wedge that must die, and it
+   burns CPU by definition. Accepted cost, documented: a long silent pure-compute run is still killed
+   (unchanged from before); the accepted false-positive is a retry storm, bounded by the TTL.
+2. **A separate lifetime cap** — 45 min from PROMOTION (`GHOST_SANDBOX_JOB_TTL_S`), reaped from three
+   places so it never depends on the model asking: the `jobs` tool reconciles before every answer, a
+   60 s sweeper in `main.py`, and boot (a promoted job outlives the agent process — the container
+   does not). Plus a concurrency cap of 3: at the cap a would-be promotion is KILLED, because an
+   untracked detached process is worse than a timeout.
+
+**Where a landed job surfaces.** Nothing re-engages the model after a turn ends, so a finished job is
+made ANSWERABLE rather than pushed: `jobs(action='status'/'collect')` reconciles before every answer;
+the 60 s sweeper writes each landing to the ACTIVITY LEDGER under the existing `job` phase (so
+`introspect action='activity'` — the "what happened while I was away" surface — reports it); and the
+job's log stays in `.jobs/` for `file_system` to read in full. The banner therefore tells the model to
+state that the work is still running and WHERE the result will appear, **not** to promise to report
+back — that phrasing is a promise nothing in the system can keep, and the pending-promise guard
+correctly rejects it.
+
+**Observable via the EXISTING jobs machinery, as asked** — no new tool. Promoted commands register in
+`core/jobs.py` as kind `sandbox`. That breaks one assumption of that registry (its rows are backed by
+asyncio tasks; a container process is not), so `_sync_sandbox_jobs` reconciles before every answer:
+lands exit code + output tail, enforces the TTL, and **ADOPTS jobs promoted before this process
+started**. `cancel` kills the real process group FIRST and only marks the row if that succeeded — a
+row-only cancel is precisely the invisible-orphan bug §4G exists to prevent.
+
+**SEVEN FRESH-EYE REVIEWERS ACROSS THREE ROUNDS + FOUR LIVE RUNS FOUND ~30 DEFECTS, INCLUDING 8
+CRITICALS I HAD WRITTEN MYSELF.** The pattern held, and then held again: **round 2's fixes were where
+round 3's criticals lived.** A green suite covered none of them, and the live container caught two
+things no unit test could.
+
+**⚠ ROUND 3 — THE FIXES WERE THE BUG FARM.** Six of its findings were in code written hours earlier to
+fix round 2:
+- **CRIT — `_load`'s validation did not protect the kill.** It checked `pid > 1` and a numeric
+  deadline but NOT the container stamp, and `_generation_ok` gave an unstamped row "the benefit of the
+  doubt" — so a row planted from inside the sandbox, naming any live pid with a past deadline, made
+  the TTL reaper kill that pid's whole SESSION. Reproduced live: an unrelated `setsid`'d service tree
+  died. services.py launches under setsid too. Fixed: unstamped ⇒ never signalled.
+- **CRIT — the exit sentinel was forgeable, and creatable BY ACCIDENT.** `echo 0 >
+  /workspace/.jobs/<jid>.exit` — or any command that wipes `.jobs/` — made `execute` return
+  `EXIT CODE: 0` in **0.0 s** for a command that kept running: no row, no TTL, no reaper, and a
+  FABRICATED SUCCESS into every grader. Fixed with a host-minted per-job nonce the runner quotes back.
+- **CRIT — `host_dir` was itself unvalidated.** Round 2 hardened `cleanup_paths` (the narrow door)
+  while every other file op derived from `<workspace>/.jobs`, which the sandbox can replace with a
+  symlink → arbitrary host-directory write + delete at the agent's uid, no race needed.
+- **CRIT — the banner's job id did not resolve.** Two `job-<8hex>` namespaces (supervisor vs
+  in-process registry); the banner quotes the SUPERVISOR's. `collect` answered "no job … may have
+  been evicted" and **`cancel` reported a kill that never happened**. Every test had passed the
+  registry id, which is why 20 of them missed it. The feature's entire interface was broken.
+- **MAJOR — `kill -TERM -- -PID` is a SYNTAX ERROR under dash** (the container's `/bin/sh`), so the
+  group-kill half was dead in production — and round 2 had dropped services.py's `|| kill -TERM $pid`
+  fallback. Measured in the real image.
+- **MAJOR — `_trim_terminal` popped `entry['id']` instead of the dict KEY**: it deleted a RUNNING row
+  and its log, left the intended row, so the count never dropped and the next sweep ate another live
+  job — every minute, forever.
+- **MAJOR — an inconclusive probe KILLED the healthy job.** `_probe` zeroes both values on a fault,
+  so `did_io` was False for want of evidence and the wedge branch fired — the false failure the whole
+  module exists to prevent, re-entering through its own diagnostics. Now it promotes (tracked and
+  TTL-bounded) instead.
+- **MAJOR — the marker was matched too loosely.** `is_promoted_result` tested for the bare
+  `[SANDBOX JOB PROMOTED]`, so a genuinely SUCCESSFUL `grep -rn "SANDBOX JOB PROMOTED" src/` — which
+  this repo does constantly, including during this very review — read as an unfinished command to
+  five graders. Now matched on the composite first-line banner: grep → False, `cat` of the source →
+  False, pytest echoing an assertion → False, a real promotion → True.
+- **MAJOR — I wired 13 call sites when there was ONE CHOKE POINT.** `distill/outcome_heuristics.
+  _looks_like_tool_error` is the function the codebase itself calls "THE failure rule", and it feeds
+  the trajectory corpus, skill graduation, GEPA fixtures and the foresight SEED. Worse, its
+  `tool_failure_flags` emitted `False` for a promoted call, so **one detached command LAUNDERED a
+  whole failed turn**: `[T,T,T]` fires the unacknowledged-failure rule, `[T,T,T,F]` does not. Now a
+  third state — unresolved calls are SKIPPED, never labelled.
+
+**Round-3 test findings (the tests were as wrong as the code).** Five pins were VACUOUS — proven green
+after reverting the production line they named — because they asserted on `inspect.getsource` text or
+reimplemented the arithmetic in their own body. And the two shells carrying the feature's core
+mechanism (the `/proc` I/O probe, the session kill) had **ZERO executed coverage**: this host has no
+`/proc` and its `/bin/sh` is bash, so the suite proved the RULES while the MECHANISMS were pinned only
+by spelling — which is precisely how the dash `kill --` bug survived. Both now run against a synthetic
+`/proc` fixture, and the window arithmetic was extracted to `effective_window_s()` so a test can call
+it instead of copying it.
+
+**Earlier rounds:**
+
+- **CRIT — `_kill_pgroup(1)` would have destroyed the whole container.** In POSIX `kill -- -1` means
+  *every process the caller may signal*, NOT "process group 1" — verified in a live container: the
+  shell issuing it did not survive to print its next line. And it was REACHABLE: `.jobs/registry.json`
+  is on the bind mount, writable by the sandboxed commands this module supervises, and `_load`
+  validated only the key shape. A row `{"pid": 1}` with no `deadline_at` (→ `float(None or 0)` = 0 =
+  "expired in 1970") would have TERM+KILLed every service, every job, and tor on the next 60 s sweep.
+  Fixed at both gates: a pid floor of 1 in `_kill_pgroup`, and numeric validation of `pid`/
+  `deadline_at` on registry READ (a missing deadline is now a dropped row, not instant expiry).
+- **CRIT — the expiry branch killed BEFORE checking the container generation.** A recreated container
+  invalidates every pid and hands out LOW ones, so an expired stale row pointed at a live service.
+  This is *exactly* the defect services.py had to fix in 2026-07 ("PID recycling … pointed stop() at
+  innocents") — I had `_generation_ok` in the same file and called it after the kill. Same fix in
+  `cancel`.
+- **CRIT — the verify gate would have marked project tasks DONE on unfinished work.**
+  `project_advancer.classify_verify_result` exists to reject success-shaped output that verified
+  nothing; a promoted result is a fourth such shape (exit 0, no error sentinel, NOT finished). A
+  600 s+ `pytest`/`npm run build` would have passed it — in the IDLE autoadvancer, unattended. The
+  same blindness hit the `acquired_skills` TDD gate (installs a skill), skill telemetry, foresight
+  grading, and the metacog competence record. Fixed with a machine-readable
+  `[SANDBOX JOB PROMOTED]` marker in the result's FIRST line (inside the `[:120]` slices those
+  readers take) + `is_promoted_result()`, wired into each grader. **Prose is not a contract.**
+- **MAJOR — an orphan created by the orphan-preventer.** Any exception between launch and the
+  registry write (wedged daemon, a raise from `_save`) left a live detached process with no row, no
+  TTL, no reaper. And a FAILED probe read as DEATH (`sandbox.execute` reports infra faults as exit 1),
+  returning 137, deleting the log out from under a live writer, and neither killing nor tracking it.
+  Fixed: kill-on-any-failure around the whole supervise phase, and `_pid_state()` returning **None =
+  unknown** so a docker hiccup is never mistaken for a dead process.
+- **MAJOR — a deploy-by-kill mid-run left an immortal process.** The classic path's in-container
+  `timeout` survived the agent dying; the job path replaced it with host-side state that does not.
+  Restored as a last-resort `timeout -k 5s <budget+TTL>s` inside the runner script (probed with
+  `command -v`, so a coreutils-less image still runs).
+- **MAJOR — the re-run loop had lost its only brake.** No strike, and the loop-breaker fingerprint
+  hashes the whole result — which now carries a fresh job id every time, so two identical re-runs never
+  collide. Fixed structurally, not by prose: an identical command+workdir already RUNNING as a job
+  returns THAT job instead of detaching a second copy.
+- **MAJOR — `forget()` at landing destroyed the full log** (the sync runs on EVERY `jobs` call), so
+  the banner's ".jobs/<id>.log" dangled and only an 80-line tail survived; **`collect` returned no
+  output at all for a FAILED job**, i.e. exactly when the model needs it; a fixed `registry.tmp`
+  name (inherited from services.py) can be clobbered by a second process; and `_cancel_sandbox_job`
+  sniffed for an `"Error:"` prefix, so "already done — nothing to cancel" read as a successful kill
+  and overwrote a COMPLETED job's result. All fixed; `cancel` now returns a verified boolean.
+
+**FOUR earlier defects found by my own tests, all fixed, all red-on-revert:**
+
+- **CRIT — `reap()` destroyed the result of any job that finished mid-reap.** It reads the exit
+  sentinel, then probes liveness; a job exiting between those two steps was marked `lost` and its exit
+  code + output thrown away. Reproduced on the first real run. Fix: RE-READ the sentinel (short grace)
+  before concluding `lost`; skipped on a container-generation mismatch, where no sentinel can appear.
+- **MAJOR — every silent process would have been promoted at a short budget.** `last_growth` was
+  seeded with the start time, i.e. "it wrote something at t=0". Any budget shorter than the window
+  then promoted a wedged process. Fix: `None` until the log actually grows. (Prod's 600 s > 120 s
+  window hid it — the test budget of 1 s exposed it, which is the argument for testing the rail
+  rather than the default configuration.)
+- **MAJOR — `hasattr(mgr, "execute_promotable")` captured every MagicMock in the suite** (64 failures):
+  a mock answers hasattr for anything, so mocked sandboxes went down the promotable path and unpacked a
+  Mock as a 3-tuple. Fix: an explicit class flag `supports_job_promotion`, checked with `is True` —
+  the one probe a duck-typed mock cannot fake.
+- **MAJOR — a promoted EPHEMERAL script was deleted out from under itself** by the `finally` cleanup;
+  `bash` reads its script incrementally. Fix: the cleanup is skipped when the run was promoted.
+  Stateful/Jupyter runs opt out of promotion entirely (a promoted cell leaves the kernel busy for
+  every later cell).
+
+**Verification.** 4 new files, **136 pins**: `tests/test_sandbox_job_promotion.py` (supervisor + the
+docker seam — run END-TO-END against real processes, with a 3-line `setsid` shim for macOS so the
+group-kill under test is the real one), `tests/test_execute_job_promotion.py` (the tool contract),
+`tests/test_jobs_tool_sandbox.py`, `tests/test_promoted_result_graders.py` (the marker wired into
+every consequential grader). Plus a LIVE functional run against a throwaway docker container —
+fast path, silent file-writer promoted, wedge killed, cancel, reap-lands-exit-code, TTL expiry —
+which is what caught the attribution defect. ⚠ **The I/O rail needs `/proc`, so its SHELL half
+cannot run on this macOS host**: the decision RULE is pinned with a stubbed probe, the parse is
+pinned against canned container output, and the real read is covered by the live docker run (its
+unit test skips without `/proc`). Kill switch `GHOST_SANDBOX_JOBS=0` restores the old behaviour
+exactly. Docs: new `docs/sandbox/jobs.html` + `docker.html`/`execute.html`/`delegation.html`/
+`configuration.html`/`reference.html`/`tools.html`. **Full suite 12,269 passed / 15 skipped** — the
++1 skip vs the 14-skip steady state is the deliberate `/proc`-gated probe test, the only new skip.
+
+### 4BA. THE BANNER MEASURED THE WRONG THING — "+23.0s" for a turn the operator waited 2 minutes for — ✅ SHIPPED 2026-08-12
+
+**Operator observation, from a live turn:** *"the request was finished in 23.0s, but the agent
+actually replied and gave me terminal control after ~2 mins and ~16k tokens. I guess that's the
+metacog conf."*
+
+**It was not metacog.** `metacog conf` is a single arithmetic emit over already-collected components
+(`agent.py:18574`) — no LLM call, and it already runs after the fact. The real answer was in the
+operator's own log: the last line INSIDE the frame is `💬 +23.0s llm request Turn 2 | Temp 0.60` —
+the FINAL ANSWER being issued. `handle_chat`'s `finally` fires the `END` marker
+(`agent.py:17382`), but on the STREAMING path that function returns a generator
+(`agent.py:19033`) which the client drains afterwards. **So the frame measures time-to-first-token,
+and the entire generation — 2 minutes, ~16k tokens — was logged NOWHERE.** The number was true; the
+label was misleading. Same class as the §4AC/§4AI instrument failures: a reading that is honest about
+a thing nobody thought it was measuring.
+
+**Fix A — add the missing number, don't move the existing one.** Time-to-first-token is genuinely
+useful (it is when output starts appearing) and THREE clients parse that frame (uConsole
+`turnstatus.py`, Slack, web), so relocating the close would have destroyed a real metric to expose
+another. A `Stream Drained` line now reports `TOTAL · first token · chunks · KB · rate` from the
+drain's own `finally`, so a client that disconnects mid-stream — the case where elapsed matters most
+— still produces it. Ordered for the console's ~60-char content truncation: total and first-token
+survive on screen, size and rate fall into the durable mirror.
+
+**Fix B — `**` lines carry a duration.** They showed six blank spaces because `_format_delta`
+measures from a request's BEGIN and background work has none — making post-turn and idle work
+(metacog, hippocampus, dream, the job reaper, the stream drain) **the only part of the agent whose
+cost was invisible in the stream the operator watches.** The reading is time since the PREVIOUS `**`
+line = how long the step that just finished took; "since boot" is useless on a weeks-long daemon. A
+request OPENING resets the anchor, so the first background line after a turn shows blanks instead of
+reporting the turn's own length as a background step — the same category error, avoided.
+
+⚠ **My own test taught me the lesson twice.** `test_the_first_system_line_has_no_delta_to_report`
+passed alone and FAILED in a full run — the anchor is process-global and some background thread in
+the shared test process logs between two statements. Moving the reset inline did not fix it (same
+race, smaller window). The real fix was to split the semantics into a PURE `_delta_from(prev, now)`
+and assert on that, keeping one deliberately-tolerant integration check on the live anchor. **A test
+that depends on global quiet is testing the environment.**
+
+**Verification.** 9 pins in `tests/test_log_timing_visibility.py` (including: each line reports its
+OWN gap and not a monotonically growing time-since-boot; a backwards clock renders `+0.00s`, never a
+negative that would break the fixed six-char column and every line aligned from it; the drain line
+lives in the `finally`). Full suite **12,312 passed / 15 skipped**. Docs: `docs/logging.html`.
+
+### 4AZ. THE TRANSCRIBER NOBODY COULD FIND — §4AW answered from the OTHER side — ✅ SHIPPED 2026-08-12
+
+**The same failure, one level up.** §4AW caught the agent running `pip install openai-whisper`; today
+the operator asked for a YouTube-transcription PROJECT and got a four-task plan whose middle two
+tasks — *"Whisper Transcription — create transcribe.py"* and *"Knowledge Base Integration — create
+ingest.py"* — are **one existing tool call**. The operator's instinct was the right one: *"how can we
+elegantly fix the tool to be easier to pick up?"*
+
+**§4AW already proved the guard lever is exhausted.** The tool was advertised on all 16 tool-carrying
+payloads, sat 3rd of 44, and its description already said *"Do NOT write or install transcription
+code"* — at char 442 of 537, **82% through**. The guard built on that measurement was REVERTED (saw
+only `execute(command=…)`, scanned post-base64, blocked `grep` of the repo's own docs). **A second
+prohibition would have repeated a failed experiment.**
+
+**THE DIAGNOSIS: the tool is named for what it STORES; the model is holding a VERB.** It thinks "I
+need to transcribe", scans the tool list for a transcriber, finds none, and plans a pipeline.
+Presence was never the problem — **findability BY NEED** was. So the fix is discoverability, on the
+three surfaces the model actually reads:
+
+1. **`action='transcribe'` is a first-class alias** of `ingest_document` (plus `transcribe_document`,
+   `transcription`, `ingest`, `ingest_file`) and **leads the enum** — the enum is short and always
+   read, and it is where a model with a verb in mind looks. A fixed map, not a catch-all: an unknown
+   action is still rejected rather than silently ingesting whatever `filename` was passed.
+2. **The description leads with the capability** and carries a worked call. Measured: "transcrib"
+   moved from **20% → 1%**, and the prohibition now hangs off the positive claim ("this tool IS both
+   of those steps") instead of trailing at 82%. It names what NOT to build — Whisper, ffmpeg,
+   speech-to-text, `transcribe.py` — because those are the words that appear in the wrong plan.
+3. **A planning rule** (`PLANNING_SYSTEM_PROMPT` §8), because the observed failure was a **PLAN**, not
+   a tool call. It deliberately does NOT forbid the download: fetching the media is real work and
+   `yt-dlp` genuinely is not in the image, so over-correcting there would have broken task 1 to fix
+   tasks 2-3.
+
+⚠ **One defect in my own change, caught immediately:** the alias block landed in `tool_scratchpad` —
+the `if not action: return "SYSTEM ERROR…"` line is byte-identical in both functions, and a
+first-match replace took the wrong one. Two existing wording pins then caught that my rewrite had
+dropped phrases earlier incidents had put there (`"NEVER use to compose"`, `"imports EXISTING files
+(ingest_document)"`, `"Do NOT write Python scripts…"`); I restored the exact phrases rather than
+weaken the pins.
+
+**Verification.** 16 pins in `tests/test_transcribe_discoverability.py` — every alias reaches the
+ingest handler, an unknown action is still rejected, the other actions are unshadowed, the capability
+is asserted to sit in the first 10% of the description, the worked call is present, and the planning
+rule is asserted to still permit the download. Docs: `docs/tools/memory_tools.html`.
+Full suite **12,300 passed / 15 skipped**.
+
+⚠ **And it surfaced a latent test defect worth keeping.** `test_the_aggregate_gate_is_worst_case_over_
+request_subsets` built its fixture from the FIRST FOUR tools in registry order, coupling it to the
+LENGTH of whichever descriptions happen to be declared first. Growing `knowledge_base` 537 → 985
+pushed that tool's synthetic artifact from 5,617 to 6,065 — past the per-tool validator's flat 6,000
+cap — so it was silently rejected, never counted, and the test failed with an opaque
+`assert 15240 > 20000` **while the aggregate gate under test was working perfectly**. Fixed by
+selecting the four SMALLEST baselines and asserting up front that every artifact is individually
+valid, so a future recurrence says "this stops exercising the aggregate gate at all" instead of
+failing on arithmetic. The class: *a fixture that silently stops testing its subject when an
+unrelated constant moves.*
+⏳ **The measurement that matters is the NEXT plan** — this is a prompt/schema change, so its verdict
+is behavioural: re-issue the same request and count the tasks. Two is right; four is not.
+
+### 4AY. PROMOTION AT 90s + AUTO-RESUME — the number was a symptom, the missing half was the fix — ✅ SHIPPED 2026-08-12
+
+**Operator, after §4AX went live: "isn't 10 minutes a bit too much to wait till it gets to the
+background?"** Correct for the download case, and the analysis matters more than the number.
+
+**Lowering the budget alone would have been a regression.** Promotion only helps when the model does
+NOT need the result to continue. The three most common long commands here — `pip install`, `pytest`,
+a build — are exactly the ones whose output the model needs, and **nothing re-engages the agent after
+a turn ends** (flagged by the §4AX review). So promoting at 90s without auto-resume converts "the
+model waits 5 more minutes, reads the failures, fixes them autonomously" into "the turn ends and the
+work stalls until the operator speaks again."
+
+**So: TWO thresholds, and the missing half built.**
+- `promote_after_s()` = **90s** — "this is long-running, stop making the turn wait." Re-evaluated at
+  every probe past the threshold, so a slow starter is not judged on its first seconds.
+- The exec **budget stays 600s** — "this has gone quiet, give up." Collapsing them would make a
+  silent pure-compute run die **6.7× sooner** than before promotion existed: a regression dressed up
+  as a speed-up. A quiet command still gets every second it always had.
+- **`main._resume_after_job`**: when the reaper observes a landing it WAKES the model with the job's
+  result, via the same `handle_chat` entry point and the same internal `job-` request class scheduled
+  tasks already use (the prefix was already in `INTERNAL_REQUEST_PREFIXES`, so these turns stay out
+  of the operator digest and the smart-memory corpus). Three guards: stands down while a user request
+  is in flight (turns are serialized — waking would make a live user queue behind autonomous work,
+  the rule `should_defer_scheduled_task` already encodes), fires once per job, and is rate-capped at
+  12/hour because a woken turn can promote another job that lands and wakes again.
+
+⚠ **The dependency is stated in the code**: if auto-resume is ever disabled,
+`GHOST_SANDBOX_JOB_PROMOTE_AFTER_S` must go back toward the budget. Early promotion is only safe
+because the loop closes.
+
+**One defect found in my own change by its own test:** the first probe-scheduling arithmetic used
+`max(now + 30, started + promote_after)`, which pushed the first promotion decision out to **32s**
+instead of the intended ~5s in the test (and would have been 32s vs 90s in prod — wrong direction,
+right order of magnitude, invisible without the timing assertion). Fixed to `min` before the
+threshold, ordinary cadence after.
+
+**Verification.** 9 new pins (early promotion beats the budget; a silent command still gets the FULL
+budget — asserted on ELAPSED time, not just the verdict; a late starter still promotes; the wake
+fires once, stands down under load, is rate-capped, survives a raising `handle_chat`, and carries an
+expired job's diagnostics). Full suite **12,278 passed / 15 skipped**.
+
+### 4AW. THE TRANSCRIPTION GUARD — BUILT, REVIEWED, ⛔ REVERTED. The measurement stands; the guard did not — 2026-08-11
+
+**THE MEASUREMENT IS THE KEEPER, and it exonerates the harness.** Asked to build a
+YouTube-transcription project "using your internal tools", the agent ran
+`pip install yt-dlp openai-whisper`. On req `9b7b5e23`: `knowledge_base` was advertised on **all 16**
+tool-carrying payloads, sat **3rd of 44**, and its description contained the literal
+*"Do NOT write or install transcription code"* — at char 442 of 537, **82% through**. The model had
+the tool, near the front, with an explicit prohibition AND the operator's own instruction, and
+installed anyway. **This is the clean counter-example to the day: ~60 audit defects were machinery;
+this one is the model.**
+
+**⛔ THE GUARD I BUILT FROM IT WAS REVERTED ON REVIEW.** Two CRITICALs made it net-negative:
+
+1. **It only saw `execute(command=…)`.** The `filename=`/`content=` script path (line ~1010) never
+   calls it — and that is the idiom the agent uses constantly (tonight's log shows repeated
+   `inline script auto-fixed → /tmp/_ghost_inline_*/inline.py`). Reproduced:
+   `execute(filename="go.py", content="import os; os.system('pip install openai-whisper')")` → not
+   blocked. ⚠ **The sibling guard 340 lines above in the SAME function checks both `command` and
+   `content`** (`execute.py:416-422`). The precedent was in view and I did not follow it.
+2. **It scanned base64.** The inline-`-c` autoconverter rewrites `command` into a
+   `printf <BASE64> | base64 -d` pipeline BEFORE the guard runs. One extra `;` flips the verdict:
+   `bash -c 'pip install openai-whisper; b=2'` blocks;
+   `bash -c 'a=1; pip install openai-whisper; b=2'` **passes**.
+
+**And three more of my own defects, each the class I had just written up:**
+- **My "SEAM" test could not detect a dead guard.** Mutating the wiring to `if False and _tb:` left
+  **all 6 tests green** while `pip install openai-whisper` ran. It was a substring grep — the exact
+  built-but-unwired class its own docstring claimed to defend against. Neutering the guard body left
+  3 of 6 green, both "no false positive" tests being vacuous when nothing fires.
+- **A THIRD dead branch**, and I credited it in both the code comment and this journal. The
+  `(?!uninstall\b|remove\b)` lookahead can never change the outcome — `(?:install|add)` cannot match
+  where `uninstall` begins. Proved over 351,840 generated strings: **0 behavioural differences**.
+  I wrote that claim in the same paragraph where I congratulated myself for finding the previous
+  dead branch.
+- **False positives on ordinary work:** `grep -rn 'pip install openai-whisper' docs/` was blocked —
+  and my own test file had put that literal in the tree, so the agent could no longer grep its own
+  repo for it.
+
+Also: the message told the model to "pass the recording to ingest_document" — a recording it does
+not have yet, since yt-dlp is not in the image and `ingest_document` does not take a YouTube URL;
+it burned a strike (`EXIT CODE: 1` → `turn_has_failure`) where the sibling egress guard deliberately
+returns a plain instruction *"so it teaches without burning a strike"*; no docs; no kill switch.
+
+**WHY REVERT RATHER THAN PATCH.** I had written, before the review: *"a guard that blocks the naive
+form and misses the agent's preferred form may be worse than none, because it reads as protection
+in the journal while the behaviour continues."* The review confirmed exactly that. A correct version
+needs: coverage of `content`/`filename`, placement BEFORE the base64 autoconvert, a behavioural test
+driving `tool_execute` (not a grep), quote-stripping for the FP class, a strike-vs-instruction
+decision, docs, and a kill switch. **That is a piece of work, not a patch — and my error rate across
+this session's tail is the argument for not attempting it now.**
+
+⚠ **THE STANDING LESSON: I pattern-matched onto `_daemonized_server_block`'s call site without
+asking whether it was the only site that mattered.** Third time today — the case fix that missed
+`referenced`, the truncation marker that missed the per-file branch, and now this. Copying a
+sibling's SHAPE without copying its REASONING is the defect generator.
+
+### 4AV. ARM-READABILITY CHECK — three arms priced, one nearly broken by my own measurement error — 2026-08-11
+
+**The question, borrowed from the foresight close (§4AU): not "has this resolved yet" but "CAN it
+resolve, and when".** Applied to every live arm by measuring its TRIGGER rate against the n it needs.
+
+| arm | enrolled c/t | **triggered** c/t | trigger rate | enrolled turns for 30/arm |
+|---|---|---|---|---|
+| **`use_planning`** | 37/12 | **26/7** | **67%** | **~89** |
+| `fs_batch` | 46/37 | 8/4 | 14% | ~415 |
+| `foresight_note` | 34/32 | 3/1 | 6% | ~990 |
+| `risk_steer` | 39/64 | 1/2 | 3% | ~2060 |
+
+**`use_planning` is the one worth waiting for** — ~89 enrolled against ~49 today, i.e. days at the
+current 39 turns/day, not months. §4AO's 1.34–2.47× attenuation still applies on top. `fs_batch`
+stays blocked by its 3.5% ELIGIBILITY rate independently of this (§4AU). `risk_steer` at a **3%**
+trigger rate is effectively unreadable — worth knowing, because a verdict already rests on it.
+
+⚠⚠ **AND I ALMOST BROKE THE INSTRUMENT ON A MISREADING. THIS IS THE FINDING.**
+
+My first pass filtered trigger stamps on TRUTHINESS (`if extra.get("<arm>_fired")`) and read
+**0 triggered control turns across all four arms**. I concluded the trigger was stamped
+treatment-only, that the triggered-only comparison was "uncomputable at any n", and I edited all
+four production stamp sites to pass `True` instead of the arm.
+
+**`tests/test_experiment_wiring.py::test_steer_suppressed_in_control` went red and was RIGHT.** Its
+comment states the actual design: *"Compliance is still recorded: the control arm must be
+distinguishable from 'the trigger never fired', or a null result is unreadable."* **PRESENCE of the
+key means the trigger fired; its VALUE records which arm acted.** Filtering on presence gives the
+table above — the arms were readable all along. All four edits reverted; 355 experiment tests green.
+
+**This is the missing-vs-false confusion, and I fixed the SAME defect from the other side this
+morning** — `liveness._count_user_turns` reporting a number it could not support, where the fix was
+to distinguish "absent" from "zero". Here I read absence-of-truthy as absence-of-record and nearly
+shipped a change that would have destroyed the control/treatment distinction the design encodes.
+
+**What saved it was a test that asserts WHY.** A pin checking only "the flag is False on control"
+would have been equally red but uninformative; the sentence explaining what False MEANS is what
+made the revert obvious in seconds rather than an investigation. **Tests that record intent are the
+ones that survive contact with a confident wrong hypothesis.**
+
+### 4BB. TRAFFIC RE-READ — §4K FORESIGHT IS NO LONGER "FLAT", IT IS UNDERPOWERED-PROMISING; the A/B arms are gated on a slower clock than we were counting — 2026-08-12
+
+**Operator generated a batch of traffic and asked what it moved.** Pulled the two LIVE instruments
+(not a hand reconstruction — the code behind `introspect action='experiments'`, and
+`scripts/foresight_backtest.py`, which is §4K's own verdict machine).
+
+**⚠ §4K FORESIGHT — THE §4AU "FLAT" VERDICT NO LONGER HOLDS AT n=287.** §4AU (08-11) killed the
+MCTS/BoN consumer on **spread 0.099, VERDICT FLAT** (2 usable buckets, 0.063 vs 0.162). The ledger
+has since grown 222 → 327 rows (287 with a probability). Re-run:
+
+```
+p(fail)            n   failure rate
+0.00-0.15        187        0.059
+0.15-0.35         71        0.183
+0.35-0.50         18        0.444   (thin)
+0.50-0.75         11        0.182   (thin)
+0.75-1.01          0          —     (thin, STILL EMPTY)
+spread across usable buckets: 0.124 (threshold 0.1); intervals disjoint: False; ordered by prediction: True
+Brier 0.098 · per-basis acc: exact 0.907 / class 0.819 / tool 0.806
+VERDICT: SPREAD BUT NOT SIGNIFICANT — best/worst intervals overlap; collect more before reading anything in
+```
+
+**So the honest status is neither §4AU's "FLAT" nor "reversed":** the point estimate crossed the 0.10
+threshold (0.099 → 0.124) AND the ordering is now correct (0.059 → 0.183 → 0.444), but the CS
+intervals overlap, so the instrument refuses to call it. **The kill of the MCTS/BoN consumer STANDS**
+— nothing is built — but the recorded state changes from "measured dead" to "spread present, ordered,
+underpowered." Two caveats from §4AU still bind and are the reason it is not more: the **0.75+ bucket
+is STILL empty**, so the predictor has not been shown to flag a single rare high-confidence failure
+(its whole potential use), and the second usable bucket is only n=71. What would move it is not more
+CHAT but more high-p(fail) PREDICTIONS, which only occur on rare failure-precedent tool calls — a
+scarce event, so this clock is slow by nature, not by traffic.
+
+**THE A/B ARMS — every one "insufficient data", and the reason is the real finding.** See queue items
+4a/4b above: raw n≥30/arm is met, but the decisive metric conditions on RESOLVED outcomes and 60–84%
+of real turns are `outcome='unknown'`, so resolved-n/arm is 5–29. The gate was never raw user turns;
+it is GRADED user turns, a ~2.5–3× slower clock, and organic chat cannot close it. My hand read of
+"use_planning treatment 0/30" was a raw-count artifact the canonical instrument corrected to 5
+resolved / no signal (§4BB is why the queue now says "use RESOLVED n").
+
+**No code changed** — this is a measurement re-read. The deliverable is the two queue corrections
+(4a: resolved-outcome gate; this entry: foresight FLAT → underpowered-promising) so the next
+"traffic arrived" read starts from the honest denominator and does not re-run the raw-count mistake.
+
+### 4AU. TRAFFIC ARRIVED (39 real turns) AND TWO CLOCKS FINALLY READ — one confirms today's fix, one KILLS a feature — 2026-08-11
+
+**The supply constraint broke on its own.** Real user turns per day had been 3, 8, 14, 3 — today
+**39**, a 10× jump on the median. §4AQ said the pending verdicts were gated on traffic that did not
+exist; it existed today, so both instruments were re-read.
+
+**✅ THE STREAMING FIX IS CONFIRMED AT POPULATION.** 30 `user_request` trajectories against 39 real
+turns = **77% coverage**, on the first day with enough turns to compute a rate. Compare the pre-fix
+days: **08-07 = 0 trajectories, 08-10 = 0.** The §4AJ mystery (0-70%/day, "erratic", unexplained) is
+answered: the `[DONE]` sentinel was releasing before the durable tail, and clients closing on it
+discarded the record. The residual 23% is the known sparse/selective write policy, not loss.
+
+**⛔ §4K FORESIGHT — THE LIVE LEDGER SAYS *FLAT*, AND IT OUTRANKS THE OFFLINE REPLAY.**
+⚠ **SUPERSEDED 2026-08-12 (§4BB above): at n=287 this reads spread 0.124, ordering correct, "SPREAD
+BUT NOT SIGNIFICANT" — no longer FLAT. The MCTS/BoN kill still stands (intervals overlap, 0.75+ bucket
+still empty), but the state is now "underpowered-promising", not "measured dead". Read §4BB.**
+
+```
+rows: 222 graded predictions (was 64 — insufficient), 197 with a probability
+p(fail)      n     actual        spread across usable buckets: 0.099 (threshold 0.10)
+0.00-0.15  142      0.063        intervals disjoint: False
+0.15-0.35   37      0.162        ordered by prediction: True
+0.35-0.50   11      0.364        per-basis acc: exact 0.905 / class 0.857 / tool 0.818
+0.50-0.75    7      0.286
+0.75-1.01    0        —
+VERDICT: FLAT — §4K stops at Phase 2
+```
+
+**This is the confirmatory instrument the design nominated, and it CONTRADICTS the offline replay**
+(which scored spread 0.310 over 3,558 predictions and said DISCRIMINATES, twice). Per §4K's own
+pre-registered rule the live ledger decides: **the MCTS value-function / BoN consumer does NOT get
+built.** The `foresight_note` arm keeps its own separate kill criterion.
+
+⚠ **AND THE HONEST QUALIFIER: 0.099 vs a 0.100 threshold is a hair, not a rout.** The verdict is
+"did not clear the bar", NOT "proven flat". The decisive high-confidence bucket is **empty (n=0)**
+and the one below it has n=7, so the top of the curve — exactly where a useful predictor would earn
+its keep — is unmeasured. Per-basis accuracy is genuinely good (0.905 exact). The defensible reading
+is that foresight predicts *common* outcomes well and has not been shown to flag *rare failures*,
+which is the only thing a consumer would have used it for. Re-running at n≥30 in the top two buckets
+would settle it; nothing should be built on it before then.
+
+
+**⛔ `fs_batch` RE-READ ON THE SAME HIGH-TRAFFIC DAY — STILL NOT READABLE, AND NOW WE KNOW WHY IT
+NEVER WILL BE.** Enrolled turns grew 55 → 81 (44 control / 37 treatment), but **eligible treatment
+turns went 0 → 2**, against a floor of 10:
+
+| arm | turns | calls | file_system | ELIGIBLE | `paths` used |
+|---|---|---|---|---|---|
+| control | 44 | 75 | 28 | 3 | 0 |
+| treatment | 37 | 112 | 26 | **2** | **0** |
+
+Corpus eligibility held at **3.5%** (56/1584) across a 10× traffic day. **The binding constraint is
+the eligibility RATE, not the turn count** — 37 treatment turns × 3.5% ≈ 1.3 eligible, exactly what
+was observed. A day that moved foresight from 64 to 222 rows moved this arm by two turns. The
+~570-enrolled-turn projection stands, and it is now measured rather than extrapolated: **more
+generic traffic will not resolve `fs_batch`; only file-heavy work would.**
+
+⚠ Note the asymmetry this exposes between the two clocks: the same traffic that CONFIRMED the
+streaming fix (77% coverage, first computable rate) and DECIDED foresight (222 rows) did nothing for
+`fs_batch`. "Wait for traffic" is not one strategy — it is a different bet per instrument, and only
+the ones whose trigger is common benefit.
+
+
+**⛔⛔ AND THE ANSWER IS *NOT* "WAIT FOR MORE DATA" — THE CEILING IS STRUCTURAL. §4K PHASE 2 CLOSES.**
+
+Asked the decisive question instead of scheduling another read: is the empty top bucket
+UNDER-SAMPLED or UNREACHABLE?
+
+```
+max p(fail) EVER observed:  0.667      (197 live predictions, and 3,558 offline)
+p >= 0.75 : 0        p >= 0.50 : 7        p >= 0.35 : 18
+strongest evidence on record: support 4 / fails 3  ->  (3+1)/(4+2) = 0.667
+```
+
+**0.8 IS reachable in principle** — Laplace `(fails+1)/(support+2)` at the support floor of 3 gives
+0.800 for a perfect 3-of-3. **It has never once happened**, because the agent's OWN guards destroy
+the evidence before it accumulates: the no-progress loop-breaker halts an identical failing call at
+~2 repeats, and the pre-flight guard blocks repeatedly-failing targets outright. **Foresight can only
+become confident about a failure the agent is no longer permitted to make.**
+
+This is the §4AN shape exactly, one subsystem over — there, *the router was confident only where it
+added nothing*; here, **foresight cannot become confident at all, by construction.** And where it
+does reach its ceiling it is mis-calibrated in the expensive direction: the 0.50-0.75 bucket
+predicted failure and observed **0.286** (n=7), over-predicting ~2×. A veto/steer consumer would fire
+on a coin-flip and cost a real tool call.
+
+**DECISION: retire the consumer, keep the shadow.** The MCTS value-function / BoN screening plan
+(§4K Phase 2b) is CLOSED — not "deferred pending data", because the data cannot arrive while the
+loop-breaker and pre-flight guard work as designed, and those are worth more than foresight. The
+prediction ledger stays (it is free, self-labelling, and immune to the label-supply famine) as
+telemetry; `foresight_note` keeps its own separate arm verdict. What foresight demonstrably does is
+predict the COMMON case well (exact-basis accuracy 0.905) — which is precisely the case no consumer
+needed.
+
+⚠ **Waiting would have been the comfortable call and it would have been wrong.** "Insufficient data"
+and "the data is unreachable" produce the identical thin-bucket table; only asking what the MAXIMUM
+observed value was, and whether the mechanism could ever exceed it, separates them.
+
+**Why this matters beyond foresight:** an offline replay over the existing corpus said DISCRIMINATES
+and the live ledger says FLAT. The replay's own printed caveats (within-turn calls not independent,
+corpus spans label eras, offline labels approximate the live grade) were correct and load-bearing.
+**A cheap offline proxy that agrees with your hypothesis is not evidence the expensive live
+instrument will.**
+
+### 4AT. #58 PART 2 — the eight never-audited subsystems ✅ CLOSED 2026-08-11 after 8 rounds (questions pre-registered BEFORE reading any of them; ~60 findings; 11 fix clusters shipped, 1 reverted with a plan, rest triaged in-place. ⚠ Adversarial review caught SEVEN defects in my OWN fixes — a red suite shipped unnoticed, a `yield` in the wrong function, a normalizer with a wider blast radius than the bug, a `set` subclass with 8 unguarded operations, invented string literals, tests that could not fail, a one-of-six fix, and 16 unrelated tests poisoned by `asyncio.run`. None would have surfaced from my own testing.)
+
+**Scope chosen by the standing criterion (blast-radius × silence).** Everything with a dedicated
+audit block is excluded: verifier (§4T), self-learning (§4J/§4L), memory substrate (§4M), prompt
+funnel (§4N), dialog layer (§4O), egress (§4P), idle orchestration (§4Q), belief revision (§4R),
+router (§4AJ), liveness probes (§4AI), services/ports (§4G), foresight (§4K). What remains are
+subsystems that have **never** been examined as a unit — several of which run unattended and write.
+
+⚠ **PRE-REGISTERED BEFORE LOOKING**, per §4M/§4N: questions written first so a clean answer is a
+RESULT rather than a thing I failed to notice. Every question is phrased so it can come back NO.
+
+**A. Request lifecycle / API (`api/routes.py`, session store, cancellation, finalize)**
+- A1. Can a turn end WITHOUT finalize — no outcome label, no verifier verdict, no trajectory?
+  (req `6e9efd6a` did exactly this on 08-11 and the cause is still unproven.)
+- A2. Is turn cancellation observable? A cancelled turn that logs nothing is indistinguishable
+  from one that finished.
+- A3. Session persistence: which paths write the assistant turn back, and can a reply reach the
+  user but never the session (or the reverse)?
+- A4. Does the API layer's `foreground_requests` counter always decrement — including on
+  exception, cancellation and the streaming tail?
+
+**B. Self-play supply (`core/challenge_templates.py`, `memory/frontier.py`)**
+- B1. Self-play is **165 of 249 recent requests** — the dominant traffic. Does its generator ever
+  produce the SAME challenge repeatedly, and would anything notice?
+- B2. Frontier/mastery bookkeeping: can a cluster be marked mastered on evidence it did not earn
+  (validator crash, aborted solve, echoed content)?
+- B3. Do challenge templates leak the ANSWER into the prompt (a self-graded task that cannot fail)?
+- B4. What happens when the validator itself is wrong — is there a path where a WRONG validator
+  teaches a lesson?
+
+**C. Project advancer (`core/project_advancer.py`)**
+- C1. It runs unattended and mutates project state. What is the worst single write it can make,
+  and is it reversible?
+- C2. Can it advance a task on evidence that no work happened (the "closed on a plan, not a
+  result" shape)?
+- C3. Does it respect the constraint/lifecycle rules §4-constraint-lifecycle established, or does
+  it have its own copy?
+
+**D. Workspace cleanup (`core/workspace_cleanup.py`)**
+- D1. It DELETES. Under what conditions can it delete something the keep-set should have
+  protected? (The 2026-07 partial-keepset wipe is the precedent.)
+- D2. Is the keep-set derived from one path-normalisation, or does it have a second copy that can
+  disagree with the sweep's?
+- D3. On a partial failure mid-sweep, does it leave a coherent state?
+
+**E. Tool registry (`tools/registry.py`)**
+- E1. The assembled tool schema reaches EVERY prompt. Can a tool be advertised whose handler is
+  missing, or handled but never advertised?
+- E2. Do arm-conditional schema mutations (fs_batch) leak across arms or across requests?
+- E3. Is the advertised schema what the parser actually accepts — any parameter the model can see
+  but the handler drops (the 2026-07-12 `workdir` defect)?
+
+**F. Coding executor (`core/coding_executor.py`)**
+- F1. Which failures are silent — does a rejected edit ever read as an applied one?
+- F2. Are the three "did this fail" classifiers consistent here, or is there a fourth opinion?
+- F3. Retry/repair loops: can one produce an infinite or self-defeating cycle (the req-6e9efd6a
+  SEARCH/REPLACE grind is the live example)?
+
+**G. Selfhood / autobiographical (`selfhood/autobiographical.py`)**
+- G1. **Zero journal mentions — never examined once.** What does it actually write, and does
+  anything read it?
+- G2. Can it record a fabricated or simulation-sourced event as a real memory of the agent's own
+  history? (Self-play is the dominant traffic; its turns must not become autobiography.)
+- G3. Is it bounded, or does it grow without limit?
+
+**H. Postmortem / reflection (`reflection/postmortem.py`)**
+- H1. Postmortem is DELIBERATELY OFF. Is it truly inert, or does part of it still run — the
+  built-but-unwired class in reverse?
+- H2. If re-enabled tomorrow, what would it immediately do wrong? (A gate nobody has opened in
+  months is where the landmines are.)
+- H3. Does anything READ postmortem output today, and would that reader break on absence?
+
+**Method (operator-directed):** investigate → fix → **fresh-eye review rounds with DIFFERENT lenses
+on my own changes** → repeat until a round returns clean. Localized tests only until the last round;
+one full-suite run at the end. Every subsystem gets a verdict recorded here, including the clean
+ones — an audit that only records findings cannot be told from one that was never run.
+
+**STATUS: ⏳ ROUND 1 COMPLETE — all 8 subsystems investigated, ~60 findings. 3 fix clusters
+shipped + pinned; the biggest finding is DIAGNOSED, NOT FIXED (see A, below). Every subsystem has a
+verdict here, clean or not.**
+
+**═══ ROUND 1 VERDICTS (every question answered; ⚠ = I verified the finding myself before acting) ═══**
+
+**A. Request lifecycle — 🔴 3 CRITICAL. THE BIGGEST FINDING OF THE AUDIT, AND IT ANSWERS AN OPEN
+MYSTERY.** A1 = **YES**: `data: [DONE]` is released at `agent.py:18297`, and the ENTIRE durable
+tail runs after it — metacog, episode, hydration judge, **trajectory (18589)**, **project work_log
+(18608)**, **verifier spawn (18794)** — with **8 `try:` blocks and ZERO `finally:`** in that region
+(⚠ I confirmed the structure myself). `[DONE]` is the OpenAI SSE contract's "you may stop reading";
+a client that closes on it abandons the generator, and Python runs `finally` blocks but **not
+post-yield code**. **Live: of 42 requests on 08-11, the 6 that took the streamed-final branch
+produced 0 trajectories, 0 outcome labels, 0 verifier verdicts — 6 of 6. The other 36 recorded
+normally.** This is the mechanism behind req `6e9efd6a`'s missing record (§4AR left the cause
+"unproven" — it is proven now) and **the most plausible explanation on record for the erratic
+0-70%/day trajectory coverage §4AJ measured and could not account for.**
+Also: A2 = **NO** — a hard cancel/disconnect logs NOTHING distinguishable from a clean finish; A3 =
+**YES** — a streamed reply can reach the user and never the session (`routes.py:574` is not in a
+`finally`); A4 = **NO leak** (verified, three inc/dec pairs all in `finally`).
+
+⚠⚠ **NOT FIXED, DELIBERATELY.** I attempted the obvious fix (release `[DONE]` last) and **put the
+`yield` in the wrong function** — `stream_wrapper` is nested inside `_stream_final_generation`, and
+the anchor comment I keyed on belonged to the outer one. It parsed, and an AST scope check caught
+it. Reverted; 70 localized tests green. **A restructure of the live streaming path at the end of a
+long session is exactly the change that should not be rushed** — it wants its own pass with the
+`[DONE]`-holding logic re-read end to end. Highest-priority open item.
+
+**B. Self-play supply — 🔴 CRITICAL, FIXED.** B1 = **YES** (3 of 8 templates emit byte-identical
+prompts; the diversity guard is LLM-path-only). B2 = **YES** — ⚠ I measured it myself: **51% of 80
+real renders are filed under the wrong cluster**, `python_general`/`regex_parse` systematically
+SWAPPED, `web_automation`→`concurrency` (its prompt says `async_playwright`). Live corroboration in
+`self_play_frontier.json`: **the `regex_parse` cluster holds 7 `python_general` runs and none of its
+own**, at tier 1 earned on word-frequency work; `python_general` is a dumping ground for five
+templates. B3 = **YES** (`_concurrency_producer_consumer_exact_once` states the seeded-RNG recipe
+the validator uses; 6 of 7 concurrency shapes pass with zero concurrency primitives). B4 = **YES**
+(a validator that runs cleanly but computes the wrong expected value mints a "struggled-then-won"
+lesson; fired 19× live).
+**FIXED:** `dream.resolve_cluster_key()` — precedence seed → **TEMPLATE KEY** → text classifier.
+The template already knew what it was; re-deriving it by keyword-matching the rendered prompt was
+guessing a fact in hand.
+
+**C. Project advancer — 🟠 MAJOR ×4, logged.** C1 = worst write is an irreversible workspace sweep
+one `update_status` away, and it records nothing in the store. C2 = **YES** (an executor exception
+silently downgrades to a single-shell-command path that marks DONE on any exit-0 output). C3 =
+**YES** — it iterates `metadata["constraints"]` raw instead of the shared `_constraint_list`, so a
+string constraint becomes 17 single-character constraints (reproduced).
+
+**D. Workspace cleanup — 🔴 2 CRITICAL, FIXED.** ⚠ Both reproduced by me before fixing.
+D1 = **YES**: `_is_debris` classified `debug_utils.py`, `temp_loader.py`, `scratch_notes.py`,
+`tmp_fix.py`, `.gitlab-ci.yml` as debris **by NAME**, and the tidy checked debris BEFORE
+source-likeness — deleting them from **ACTIVE** projects, while the module's own contract says
+*"Source/document files are NEVER deleted here regardless of registration."* The contract was false.
+D2 = **YES, two normalizers**: `/workspace//projects/<id>/x.png` reduced to `projects/<id>/x.png`
+here and `x.png` in the store — one file, two keys, so the registration stopped protecting.
+Plus a third, not pre-registered but found on the way: **the keep-set was exact-case**, so a
+deliverable registered `assets/hero.png` and written `assets/Hero.png` was deleted — and on macOS
+those are ONE file, so nothing else surfaces the drift.
+**FIXED:** name never outranks source-ness; `_KeepSet` matches case-insensitively (strictly more
+protective on both filesystem types); `_normalize_rel` strips to a fixed point. **A differential
+test now pins the two normalizers to agree** — the divergence, not either implementation, was the
+defect.
+
+**E. Tool registry — 🟠 MAJOR ×2, logged.** E1 = **YES** (an acquired skill named
+`delegate_to_swarm` is advertised with its own schema while dispatch hits the built-in stub —
+the advertise side computes its shadow set from the already-stripped list). E2 = **NO leak** for
+the dict (copy-on-write verified) but **the arms differ in more than the batch affordance**:
+`registry.py:805` drops `path` from `required` for ALL operations, an unmeasured confound in the
+live `fs_batch` A/B. E3 = **5 instances of the 2026-07-12 `workdir` shape** — `negative_prompt`,
+`timeout_ms`, `timeout_s`, `max_results`, `max_sources` all work end-to-end and none are advertised.
+
+**F. Coding executor — 🔴 2 CRITICAL, logged.** F1 = **YES**: an `edits` entry for a file outside
+the 12-file snapshot is dropped with **zero tool calls and no reason**, while a sibling write
+succeeds — so the leaf closes DONE claiming both landed. F2 = **YES, two more classifiers** that
+disagree *with each other inside this module* (same string = failure on the replace path, success
+on the write path). F3 = **not infinite, but self-defeating**: every non-`SUCCESS` replace is
+labelled **"anchor not found"**, so a syntax-rollback `REJECTED:` sends the model hunting for a
+better anchor when the defect is its replacement's indentation — **this is precisely the 20-minute
+grind in req `6e9efd6a`**.
+
+**G. Selfhood — 🟠 MAJOR ×3, logged.** G1 = it writes on **every turn** (1797 records, 872 KB) and
+the per-turn read path is **hard-disabled** (`_SELFHOOD_PREFIX_ENABLED = False`), so
+`record_reference` has zero production callers and `reference_counts.json` does not exist after five
+weeks. G2 = **not today, but by accident**: there is **no simulation gate on the selfhood write
+path**; self-play is excluded only because `dream.py` nulls the trajectory collector and the capture
+is nested inside it. One line re-arms it — and `_TEMPLATE_PROMPT_MARKERS` already exists to *launder*
+self-play into first-person prose rather than exclude it. Also `self_state` is **missing from the
+self-play tool denylist**, so a synthetic run can write the real `values.json`. G3 = bounded, ✅.
+
+**H. Postmortem — 🟠 MAJOR ×2, logged.** H1 = **NOT truly inert**: the engine is gated, but
+`primary_target_from_args` runs on **every tool call**, and the `postmortem` tool stays advertised in
+every prompt (1460 chars) with no availability gate — while `delegate_to_swarm` IS gated for exactly
+that reason. H2 = two landmines: it materialises the whole trajectory corpus **on the event loop**
+(measured 0.207 s / 22 MB, the identical defect 100 lines above was fixed with `asyncio.to_thread`),
+and it has **no recency bound** — its opening act would be filing defect reports against runs from
+2026-07-17. H3 = nothing reads it; the one reader handles absence correctly ✅.
+
+**═══ WHAT SHIPPED IN ROUND 1 ═══**
+`workspace_cleanup.py` (3 deletion fixes), `dream.py` (`resolve_cluster_key`).
+Pins: `tests/test_workspace_cleanup_deletion_guards.py` (8) +
+`tests/test_selfplay_cluster_attribution.py` (5), localized runs green.
+
+⚠ **A PIN OF MINE WAS WORTHLESS AND ITS MUTATION CAUGHT IT.** The first attribution test grepped the
+source for two names in order — and stayed GREEN when the branch was disabled with `elif False:`,
+because the token still appeared in the dead body. That is why the decision moved into a helper: it
+made a behavioural pin possible. ⚠ And my replacement fixture had the swap BACKWARDS; the test
+failed on correct code and told me so.
+
+**═══ ROUND 2 — FRESH-EYE REVIEW OF MY OWN ROUND-1 CHANGES. BOTH REVIEWERS LANDED HITS. ═══**
+
+Two adversarial reviewers, different lenses (over-correction/new-data-loss; consequences-on-existing-
+data). **Neither returned clean, and one of my two fix clusters was reverted as a result.**
+
+**⚠ THE PROCESS FAILURE FIRST: I SHIPPED THE SUITE RED AND DID NOT KNOW.** I ran my NEW test file
+and a `-k` filter — never `tests/test_workspace_cleanup.py`, the module's own suite.
+`test_partial_keepset_debris_named_sources_still_swept` was failing the whole time. "Localized
+testing" means the tests local to the CODE, not the tests local to my edit.
+
+**D — workspace cleanup: fix RETAINED, but rebuilt after three real objections.**
+1. **Wrong scope.** I inverted debris-vs-source precedence inside `_is_debris`, which also changed
+   the **DONE sweep** — where sweeping `temp_probe.py` from a FINISHED project is deliberate and
+   pinned. The red test was RIGHT. **The distinction I had missed: DONE sweep vs idle tidy on an
+   ACTIVE project. Same word, two lifecycles, opposite correct answers.** The guard now lives in the
+   tidy only; `_is_debris` is untouched.
+2. **My fixed-point normalizer was a NEW data-loss path**, wider than the bug it fixed: stripping
+   repeatedly also eats a project's legitimate top-level `workspace/` directory, so
+   `projects/<id>/workspace/hero.png` keyed as `hero.png` and the registered file was deleted.
+   Replaced with separator-collapsing, which addresses the measured divergence (a doubled slash)
+   and nothing else. **A repeated real directory name is DATA, not a prefix to peel.**
+3. **My `_KeepSet(set)` subclass was a landmine** — `update`, `|=`, `discard`, `clear`, `copy`,
+   `union`, `-`, `&`, `^` all unguarded, several returning a plain set (protection silently lost)
+   or desyncing the mirror. It also missed `_recover_deliverables`, which returns an ordinary set,
+   so the module's own safety net stayed case-sensitive. Replaced with `_lower_keys()`, a projection
+   applied at each site — including the `referenced`-media check the subclass had left exact-case
+   (**half-applied is the failure mode**).
+   ⚠ My differential test was also self-serving: 9 hand-picked payloads containing **zero** of the
+   divergent shapes. It now GENERATES a prefix×tail cross-product (72 payloads, 0 disagreements),
+   and the idempotence assertion was replaced with the property that actually prevents deletion —
+   the two implementations moving in LOCKSTEP.
+
+**B — self-play attribution: ⛔ REVERTED. The direction is right; this landing was not.**
+The reviewer demonstrated that switching to the template key **in isolation** does net harm:
+- **Routes `bash` renders into the one cluster carrying `mastered=True`** (verified: `bash` is the
+  only such cluster, on 6 runs) — and `dream.py:5759` suppresses lesson extraction for a mastered
+  cluster. **~12% of self-play cycles would stop producing lessons**, and `least_practiced_clusters`
+  excludes mastered clusters so they also vanish from the curriculum steer.
+- **`seed["cluster_key"]` still beats the template key on the saturation-rotation path** — `_cluster_key`
+  is set to `None` when rotating away, but the seed dict is never updated, so the abandoned target
+  wins. Live evidence: 9 journal runs filed under `python_general` that reclassify as `sql`.
+- The cluster-scoped dedup ring and `winning_solutions` are keyed per cluster, so re-attribution
+  grants each re-homed template a free "fresh" run and flips novelty verdicts on identical code.
+**Reverted rather than shipped half-right** — a change whose live harm is demonstrated and whose
+benefit needs three more pieces does not go in at the end of a long session.
+
+**READY-TO-IMPLEMENT PLAN (next session, in this order):** (1) feed the POST-rotation `_cluster_key`
+instead of `seed["cluster_key"]`; (2) use the already-computed `challenge_domains` for the
+journal path, or strip `SQL` from the boilerplate at `journal_challenges.py:386` (every mined
+challenge classifies `sql` today — 23/23); (3) stamp `template_key`/`source` into `runs[]` and add
+an `attribution_version` marker so the next change is auditable rather than forensic; (4) **operator
+decision on the corrupted history** — recommended minimum is clearing the stale `bash.mastered` and
+dropping `regex_parse.winning_solutions` (both wrong-family, neither a monotone counter, so neither
+can over-credit). A full reset is the worst option: it empties `winning_solutions`, and
+`jaccard_novelty` returns 1.0 with no prior, so every first-try pass would write a lesson.
+
+**⚠ ROUND 3 (the full suite, run last as instructed) FOUND A THIRD OVER-CORRECTION IN THE SAME
+FIX.** `test_tidy_removes_old_debris` went red: a blanket `if _is_source_like(rel): continue` in the
+tidy kept **`.browser_runner.py`** — browser scaffolding the tidy exists to remove, source-shaped
+only because it ends in `.py`. **The exemption belongs to ONE RULE, not to the classifier and not to
+the caller.** Now `_tidy_is_debris()`: everything `_is_debris` says, except that a scratch NAME
+PREFIX alone cannot condemn a source file; scratch dirs, scaffolding names, non-kept dotfiles and
+scratch suffixes all still outrank source-ness. **Three attempts at one guard, each narrowing the
+scope, each correction forced by a test I had not run.** Final: **12,108 passed / 14 skipped / 0
+failed.**
+
+**═══ ROUND 4 — "PROCEED WITH ALL": six more fixes across five subsystems ═══**
+
+**A — THE STREAMING TAIL, FIXED (the audit's biggest finding).** `[DONE]` now releases as the LAST
+statement of `stream_wrapper`, after episode / hydration judge / trajectory / work_log / verifier
+spawn / lesson outcomes. ⚠ **Scope verified by AST, not by eye** — the first attempt put the `yield`
+in the enclosing `_stream_final_generation`, which parses fine and silently turns the wrong function
+into a generator. This file nests three deep; indentation is not evidence.
+
+⚠⚠ **AND THE MOVE CREATED ITS OWN REGRESSION, WHICH I FOUND BY ASKING WHAT MY CHANGE MADE NEWLY
+POSSIBLE.** Putting the sentinel last means every statement before it can now prevent end-of-stream —
+and **28 of them were inside no `try` at all**. Before the move a tail exception was harmless to the
+client because `[DONE]` had already been sent; after it, the client hangs waiting for a marker that
+never comes. The tail is now wrapped. **The durable record is best-effort; the end-of-stream contract
+is not.** The structural pin then flagged my own `except` handler's `logger.warning` (it can raise
+too) and a `pass` (it cannot) — the first was a real hole and got an inner guard; the second was the
+test being over-strict and the TEST was corrected. Verified no `return`/`raise` exists in the
+generator's own scope, so no path skips the sentinel.
+
+**F — the retry-steering mislabel, FIXED.** Every non-SUCCESS replace was reported as "anchor not
+found" — a diagnosis, not an observation. `_replace_failure_kind()` now names the observed reason,
+and an **unrecognised** shape returns a neutral phrase rather than the most likely guess. ⚠ My first
+version misclassified `"None of the blocks matched"` (a real anchor miss) into the neutral branch and
+carried a trailing-comma typo; both found by running it against the real strings.
+
+**G — `self_state` added to the self-play denylist, FIXED.** `isolated_context.self_model` is the
+PRODUCTION SelfModel, so a synthetic run could author the agent's real operating principles.
+`subagent.py` already denied selfhood authoring; self-play — 165 of the last 249 requests — was the
+gap.
+
+**C — project advancer now uses the SHARED `_constraint_list`, FIXED.** `{"constraints": "no
+external APIs"}` was iterated raw into 17 single-character constraints. The helper exists because
+this shredding destroyed a record once (2026-08-01); this call site kept its own copy and kept the
+bug.
+
+**H — postmortem's two re-enable landmines, FIXED.** Corpus materialisation moved to
+`asyncio.to_thread` (measured 0.207 s / 22 MB on the event loop; the identical pattern 100 lines away
+in `agent.py` was fixed under §4Q and this site never was, because the gate has been shut for
+months). `select_failed_runs` gained `max_age_days=7.0` — its opening act would otherwise have been
+filing defect reports, and under `--postmortem-propose-patch` LLM-generated diffs, against runs from
+2026-07-17/18. ⚠ An **undated** run is KEPT, not dropped: a filter that fails closed on missing data
+hides work rather than bounding it.
+
+**E — the `fs_batch` A/B confound, FIXED.** Dropping `path` from `required` also told the treatment
+arm that write/replace/delete need no path — a difference unrelated to the batch macro under test.
+JSON Schema cannot express "required unless operation == read" portably and an invented key is
+silently ignored (I tried one; it was incoherent and was removed), so the constraint is stated in the
+DESCRIPTION — the channel the model actually reads.
+
+**═══ ROUND 5 — adversarial review of the round-4 batch. FIVE MORE HITS, ALL FIXED. ═══**
+
+1. **⛔ FIXING ONE INSTANCE LEFT FIVE.** `isolated_context` nulls/wraps ten memory surfaces but
+   **never `project_store`** — so `manage_projects` (create/close tasks, mark a project DONE, which
+   retires constraints AND fires the irreversible workspace sweep), `manage_services`, `delegate`,
+   `self_play_loop` and `stop_self_play` were all still callable from a synthetic run.
+   **`core/subagent.py` FORBIDDEN_TOOLS already named every one of them** — self-play had drifted
+   from its sibling. All six now denied, and the pin asserts self-play denies **everything** its
+   sibling forbids, so the two lists cannot drift again.
+2. **The classifier reproduced the very defect it was written to remove.** `Error: '<f>' not found.`
+   is a MISSING FILE (`file_system.py:1362`) and my generic `"not found"` rule claimed it as an
+   anchor miss — steering retries to hunt a better SEARCH block against a path that does not exist.
+   Checked before the anchor rule now.
+3. **I invented the string literals instead of copying them.** `"none of the blocks matched"`,
+   `"no blocks matched"` and `"did not match"` appear **zero** times in the tree. The real message is
+   `SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '<f>'` (`:1671`), so the most
+   common multi-block anchor failure fell through to the neutral branch while the correct branch sat
+   directly above it. Literals are now copied from the source, and the test uses the real string —
+   its first fixture was fabricated too, which is why it validated a classifier against a message
+   production never emits.
+4. **My postmortem pins could not fail.** They asserted `"max_age_days" in signature` and
+   `"if _ts and _ts < _cutoff" in source` — both pass if the body is `: pass`. And every fixture in
+   the existing postmortem suite defaults its timestamp to NOW, so the bound was a no-op across the
+   whole suite. Replaced with behavioural tests that build an old / fresh / undated trajectory and
+   assert selection; all four mutation-red. (The date logic itself was verified sound by the
+   reviewer over the live corpus: 1573 stamps, one format, string order == chronological order,
+   0 mismatches against `datetime` comparison.)
+5. **My new description sentence was FALSE.** `list_files`, `search` and `find` run with no path by
+   design, so "path is required for every operation except a batch read" swapped one arm-difference
+   for another. Now names the nine operations that genuinely require one.
+
+⚠ **A brittle pin of mine also broke for an unrelated reason** — it sliced 1800 source chars after an
+anchor and stopped reaching its target the moment a comment grew. Now reads the denylist via AST.
+
+**Pins:** `test_stream_done_sentinel_ordering.py` (4, AST-based) + `test_audit_4at_round3_fixes.py`
+(11). Full suite **12,123 passed / 14 skipped / 0 failed**. Docs updated for all six subsystems.
+
+**═══ ROUND 6 — final verification. NO NEW CORRECTNESS DEFECTS. ═══**
+Independent check of every claim against the code: suite **12,137 collected, exit 0, zero collection
+errors**; no backup/scratch files anywhere in the tree; every test function in all 35 modified test
+files is collected; no duplicate or orphaned definitions. **`workspace_cleanup.py`,
+`coding_executor.py` and `project_advancer.py` came back entirely clean** — zero unused imports,
+locals, unreachable code or orphaned helpers — despite all three being churned repeatedly today.
+
+Residual MINORs, all **pre-existing dead code, none introduced by this session** and none a
+correctness defect: `registry.py:878` literal `if True:` plus the two zero-reference frozensets
+`_NON_CODING_DROP_TOOLS`/`_NON_VISION_DROP_TOOLS` (already logged as §4AT E-MINOR); `search.py:876`
+unreachable `return`; `agent.py:3404 clear_session` orphan; `registry.py:70
+_acquired_skill_result_ok` kept alive only by a test of itself; an unused
+`STRUCTURAL_FAILURE_REASON` in one lazy-import block. Left in place deliberately — deleting code on
+the last pass of a long unattended session is how the next defect gets introduced.
+⚠ The reviewer also **retracted one of its own earlier findings**: `agent.py:35 atomic_print` is not
+an unused import but a deliberate re-export pinned by a contract test, and deleting it goes red.
+
+**═══ ROUND 7 — the three deferred items, all done (operator: "do all 3") ═══**
+
+**(2) STREAMING FIX — CONFIRMED POINTWISE, NOT YET AT POPULATION.** Live: `c6f71b6c` (15:41) is
+exactly the shape that used to lose everything — `llm request Turn 2` and `request finished` in the
+same second, the streamed-final branch — and it **has a trajectory**. ⚠ But only **1 user turn** has
+occurred since deploy, so there is no rate to read. Recorded as confirmed-on-one-case; the
+population check is gated on the same traffic scarcity as §4AQ. Coverage before the fix, for the
+comparison when traffic arrives: **08-07 29 requests → 0 trajectories, 08-10 27 → 0**.
+
+**(1) SELF-PLAY ATTRIBUTION — RE-LANDED, after the data repair that made it safe.**
+*Data (under the store's own fcntl lock, backup taken):* `bash.mastered → False` (earned on 6 runs
+whose prompts merely contained grep/awk/sed, under the taxonomy where bash renders were filed
+elsewhere); `regex_parse.winning_solutions` dropped (5 entries, all `python_general` word-frequency
+code — novelty was being scored against the wrong family); `attribution_version` stamped so nothing
+downstream has to guess which taxonomy a number came from.
+*Code:* `resolve_cluster_key()` with precedence **TEMPLATE KEY → seed → text classifier**. The
+template outranking the seed is the second half of the defect: `pick_seed` can rotate away from a
+saturated cluster, `_cluster_key` is cleared but the seed dict is not, so consulting the seed first
+returns the ABANDONED target while the template that actually ran sits right there.
+*Journal→sql:* the boilerplate literal `(CSV/JSON/log/SQL/text)` made `\bsql\b` match every mined
+challenge — 23 of 23 filed as `sql`, and `sql` reached expert tier on work that was never SQL. Reworded.
+⚠ **PARTIAL, and stated as such:** the wrapper still decides when the task itself carries no
+keyword (a bash task now correctly wins; a bare log-count task does not). The complete fix is to
+classify the ORIGINAL request rather than the wrapped prompt.
+
+**(3) CODING EXECUTOR — both CRITICALs closed.**
+- **Silently dropped edits.** `edits` apply only when `path in snap`, and the snapshot is capped at
+  12 files — so an entry for an unsnapshotted file fell through to `content is None` and returned
+  "skipped, not a failure": zero tool calls, no reason. A sibling entry that DID apply made the spec
+  look successful, so **the leaf closed DONE claiming work that never happened.** Now returns an
+  explicit reason naming the file.
+- **Rewrite judged against a prefix.** `_gather_project_files` truncates silently, so a 300 KB
+  `index.html` snapshotted at 4 KB made a 20 KB rewrite look like GROWTH and the non-regression
+  guard waved through the loss of 280 KB (for `.py` the prefix fails `ast.parse`, disabling the
+  guard outright). Truncated entries are now MARKED and a marked baseline forces a live re-read —
+  refusing if the re-read fails, because a refusal costs one retry and a wrong pass costs the file.
+  ⚠ **My first pass marked only the budget branch; the per-file branch truncates FIRST and far more
+  often** — the producer-side pin caught it, which is why the pin exists: mutation-testing showed
+  removing the marker reddened nothing.
+
+⚠ **AND I POLLUTED THE SUITE WITH MY OWN TESTS.** Two new tests used `asyncio.run()`, which closes
+the loop and leaves no current one — **16 unrelated auth tests failed in the full run while passing
+in isolation.** Converted to `pytest.mark.asyncio`. A test that passes alone and breaks its
+neighbours is the reason the full suite runs last, and the reason "green in isolation" is not green.
+
+Full suite **12,131 passed / 14 skipped / 0 failed**.
+
+**═══ ROUND 8 — the remaining backlog items (operator: "do the remaining tasks") ═══**
+
+**C — A CRASH NO LONGER DOWNGRADES TO A WEAKER CLOSER.** An exception inside `coding_executor` left
+`cres = None` and fell through to the generic single-shell-command path, which marks a leaf DONE on
+ANY output that is not `ERROR:`-prefixed and not a non-zero exit — verify gate, smoke gate,
+files-written check and constraint gate ALL bypassed. `echo`-shaped output closed a build task.
+**This was the third member of the family fixed today** (dropped edits; truncated-snapshot
+overwrite): a task reaching DONE on evidence that no work happened. A transient exception is a
+reason to STOP, not to accept a lower standard of proof — the leaf now stays open and the next tick
+retries it with the full gate set.
+
+**B — RUNS NOW RECORD THEIR PROVENANCE.** A frontier run stored only the cluster it was FILED under,
+never the template that produced it — so when attribution turned out to be 51% wrong, reconstructing
+what belonged where meant re-rendering the entire template bank at four tiers and matching challenge
+hashes. Forensics, because the record did not say. `runs[]` now carries `template_key`, and an EMPTY
+value is itself information (the challenge had no template — LLM-generated or journal-mined), which
+is the distinction the cluster field structurally cannot carry.
+
+**Deliberately NOT changed:** the verify-only success path (`coding_executor.py:1402`,
+`CodingResult(True, files=[])`). It is gated on a verify actually existing and its summary says
+"verified existing deliverable (nothing to build)" — a real task shape, not the silent-close defect
+class. Churning it at the end of a long session to satisfy a MINOR would be the wrong trade.
+
+Full suite **12,133 passed / 14 skipped / 0 failed**.
+
+**STATUS: ✅ §4AT CLOSED for this session — rounds 2-8. Cleanup + streaming + 5 subsystem fixes in;
+self-play reverted with a plan.
+Subsystems A/C/E/F/G/H findings are LOGGED, NOT FIXED — see the per-subsystem verdicts above; the
+streaming-tail CRITICAL (A) is the highest-priority open item in the project.**
+
+### 4AS. THE WORKER NODE WAS NEVER SICK — research fanned out 9 requests at a 4-slot node and the breaker ejected it — ✅ FIXED 2026-08-11
+
+**Operator's read was right and the shape is sharper than "no limit":** the limit EXISTS, it is just
+scoped to one CALL instead of the NODE.
+
+**Evidence chain, req `0fb69c5f` (deep research, 12:52:59):**
+1. Model issued **3 `deep_research` calls in ONE tool batch** (+29.3s / +30.2s / +31.2s).
+2. `search.py:682` builds `asyncio.Semaphore(3)` **inside** the function. Its own comment states the
+   intent — *"so a research turn doesn't open a dozen Tor circuits + worker LLM calls at once on the
+   RAM-tight box"* — **right intent, wrong scope**.
+3. 3 calls × 3 permits = **9 concurrent worker requests. Nova advertises `total_slots: 4`.**
+   Observed: 20 worker calls in 74s, bursts of 3/second, 14 web summaries.
+4. Excess queues on llama-server; queue + inference exceeds the route timeout → `ReadTimeout`.
+5. `_is_node_fault()` returns True for timeouts (by design — it cannot see the cause).
+6. 3 consecutive → circuit OPEN 60s → `OffMainNodeUnavailable` → the keepalive warning.
+7. **Nova recovered 20s later because it was never down.** Cost was not cosmetic: the model's own
+   next thought was *"the deep research results are mostly timeout errors from the scraper
+   backends"* — degraded research, then three more searches to compensate.
+
+⚠ **One correction to the premise:** those calls DO set `max_tokens: 2048`. The missing limit was
+never a token budget — it was concurrency.
+
+**FIX 1 — per-node gate keyed by URL (`LLMClient._node_slot`).** No tool could fix this from where it
+stood: **Nova serves the WORKER and CRITIC roles simultaneously here**, and query expansion, web
+summaries, fact distillation and the verifier all reach it by different paths. A per-call — or even
+per-role — limit is individually polite and still collectively floods one box. Capacity is read from
+the node's OWN `/props` (`total_slots`), cached; a hand-set copy drifts the moment a node restarts
+with different flags. **Unprobeable → falls back to 3, the old per-call value** — a gate whose
+failure mode is "no gate" is the defect it removes. Every node POST in `_do_chat_completion` is
+wrapped, pinned by a seam test counting POST sites against gated sites.
+
+**FIX 2 — saturation is ours, not the node's.** Moving the wait from llama-server's queue into our
+gate is what makes the distinction PROVABLE rather than heuristic: `NodeSaturated` means the request
+**was never sent**, so `_is_node_fault()` returns False and the breaker never sees it. A genuine
+`ReadTimeout` is still a node fault — the narrowing must not swallow the case the breaker exists for.
+
+⚠ **THE FIX NEARLY REINTRODUCED THE BUG ONE LAYER DOWN.** `keepalive_workers()` is what prints "node
+X stopped answering". Had its ping queued behind the traffic it watches, a BUSY node would report as
+a DEAD one — the identical false alarm. The probe bypasses the gate entirely (`wait_timeout=None` is
+BYPASS, deliberately not "wait forever": an unbounded wait would park callers on a wedged node until
+their own timeouts fired, which is the failure mode being replaced).
+
+**Pins:** 8 in `tests/test_node_concurrency_gate.py`, **5 mutation-checked red** (saturation counted
+as a fault again; gate keyed by role instead of URL so roles stop sharing; unprobeable node becomes
+unbounded; permit leaked on exception; probe no longer exempt). Suite **12,100 passed / 14 skipped**.
+Knobs: `GHOST_NODE_SLOT_WAIT_S` (90s), `GHOST_NODE_SLOTS_DEFAULT` (3).
+Docs: `docs/core/llm.html#node-gate`. ⚠ **Needs a restart.**
+
+**⚠ WATCH AFTER DEPLOY:** the first research turn should log
+`Node Capacity — Nova advertises 4 slot(s)`. If that line is absent the probe failed and the gate is
+running at the conservative default; if `SATURATED` lines appear at all, callers are waiting >90s
+and the fan-out is still too wide for the hardware.
+
+### 4AR. req 6e9efd6a POST-MORTEM — the planner was blowing its token cap 7× in one request, and the warning that said so was pointing at the wrong subsystem — ✅ FIXED 2026-08-11
+
+**The request:** two UI bugs in the calendar app (`sandbox/projects/9009ff89d8bb/index.html`, served
+on :8101). **40.7 minutes, 30 turns, 14 `file_system replace` attempts, 5 rejected by the syntax
+guard, and it never finalized** — no `turn outcome`, no verifier verdict, no trajectory record.
+Both fixes DID land (z-index 1001 on `#session-modal`, `window.openDetail` exposed).
+
+**Operator asked for two fixes. Both were symptoms of something else.**
+
+**1. The duplicate CSS rule.** `#session-modal.modal-overlay { z-index: 1001 }` appeared TWICE,
+byte-identical — a successful edit re-applied during the retry storm, because the agent could not
+tell its own fix had already landed. Deduped (project file, comment added).
+
+**2. "The JSON parser issue" — the parser was never broken.** Pulled the 9 real payloads out of
+`llm_recordings` (`request_id` holds the FULL id; the log prints `[:8]` — matching on equality finds
+nothing) and re-ran the live extractor against them. Two distinct defects, neither a parse bug:
+
+| | n | what it actually was |
+|---|---|---|
+| `finish_reason: length` | **7** | planner **truncated at exactly 4096 completion tokens** |
+| `finish_reason: tool_calls` | 2 | **FALSE POSITIVE** — prose quoting a CSS rule in backticks |
+
+**THE REAL DEFECT: a truncated planner drops the ENTIRE plan.** `extract_json_from_text` returns
+`{}` → `thought`, `tree_update` and `next_action_id` all lost → the log reads `No thought provided.`
+/ `Plan Updated. Focus: ` (blank) with **nothing naming the token cap**, and the loop runs on
+unguided. Seven times in one request. That is a plausible driver of the churn the operator watched.
+
+⚠ **AND THE OBVIOUS SALVAGE WOULD HAVE BEEN WORSE THAN THE BUG.** `_repair_truncated_json` closes
+dangling braces, so a `tree_update` cut mid-object returns **complete-looking with tasks silently
+missing** — and `task_tree.load_from_json` adopts it as the plan of record. Measured on the seven:
+one repaired into a root task with **ZERO children** (the whole plan, gone); another into a
+plausible **8-node** tree that was still incomplete — the shape no eyeball catches. Nothing in the
+repaired dict can tell you which you have.
+
+**Fix: `_complete_object_for_key(raw_text, "tree_update")`** — scan the RAW text, require depth to
+return to zero. **Closed ⇒ trustworthy, cut ⇒ None, no guessing.** `salvage_truncated_plan()`
+returns `(salvaged, whole_tree)`; the planner takes `thought`/`next_action_id` from the first and
+`tree_update` ONLY from the second. On the seven live payloads: **thought recovered 7/7, 2 intact
+trees kept, 5 damaged trees discarded.**
+
+**The diagnostic was lying twice, which is why this took a hunt.** "malformed JSON-like content"
+describes a syntax error and sends the reader at the parser instead of the token budget; and the
+"looked like JSON" gate was `'{' in text`, so any prose containing braces WARNed. All 9 warnings now
+read correctly: **7 TRUNCATED (naming max_tokens/finish_reason), 2 demoted to DEBUG, 0 "malformed".**
+
+⚠ **THE FIRST DISCRIMINATOR I SHIPPED WAS WRONG AND THE EXISTING SUITE CAUGHT IT.** I required a
+QUOTED key — but `{ thought: missing-quotes, next_action_id: !!! }` (the model emitting the plan
+with unquoted keys) is a REAL malformation that must warn, and it is structurally identical to
+`{ z-index: 1001 }`. **Nothing inside the braces separates them; the surrounding context does** —
+both live false positives were inside inline code spans, so the span is masked, not the brace.
+`test_extract_json_logs_warning_on_malformed_braces` went red and was right to. That is the argument
+for keeping pins that assert a warning STILL FIRES.
+
+**✅ THE CAP RAISED 4096 → 8192 (operator, same day) — and measuring it first turned a one-request
+bug into a standing 26% defect.** `GHOST_PLANNER_MAX_TOKENS`, floor 1024, sized off 167 recorded
+planner calls across four days:
+
+| | n | |
+|---|---|---|
+| completed | 123 | p50 1888 · p90 3012 · p95 3543 · p99 3835 · **max 3868** |
+| **TRUNCATED** | **44** | **all at exactly 4096 ⇒ 26.3% of EVERY planning step** |
+
+**One in four planning steps was losing its entire plan, every day, across every request** — req
+6e9efd6a was not special, it was just the one someone read.
+
+⚠ **THE COMPLETED DISTRIBUTION IS CENSORED AND MUST NOT BE READ AS THE REQUIREMENT.** Anything
+wanting >4096 lands in the truncated bucket, not in that tail — max completed 3868 is 94% of the
+cap, the classic tell. So p99 is a FLOOR on the need, never an estimate. Sized instead from what the
+calls produce (reasoning to 18,148 chars ≈ 4.5k tok + content to 5,940 ≈ 1.5k tok ⇒ ~6k worst case,
+8192 = ~35% headroom). **Verification is re-measuring the RATE after deploy, not re-reading the
+comment.**
+
+⚠⚠ **AND THE CAP IS NOT THE WHOLE DISEASE — 34 of the 44 (77%) emitted ZERO characters of JSON.**
+
+| | reasoning_content (median) | content (median) |
+|---|---|---|
+| completed | 5,775 chars | 926 |
+| truncated | **14,659** | **0** |
+
+The budget is going to the `<think>` prelude, so for those 34 a bigger cap buys more thinking — the
+"raising the timeout moves the wall" shape (§4F item 4c, nova `-np`). **The precedented cure already
+exists in-tree:** `tools/vision.py` applies the two-switch no-think (`/no_think` + `enable_thinking:
+False`) to `verify_ui`, and its comment describes THIS failure verbatim — *"without it a thinking
+vision model spends the whole budget on the `<think>` prelude and content comes back empty (the
+exact silent failure that kept the verifier's VISUAL gate inert)"*. **NOT applied to the planner:**
+verify_ui is a perception readout, planning is a reasoning task, and suppressing its deliberation is
+a quality trade to be measured, not assumed. That measurement is the natural next step and is cheap
+(the recording scan above + the truncation rate).
+
+⚠ A test I wrote reloaded `core.agent` to check the env clamp — pulled, because a reload mints a
+second set of classes and breaks `isinstance` for every module holding the first
+([[production-import-shape-guard]] one step further). Replaced with a pure `_planner_cap_from_env`.
+Suite **12,090 passed**; the cap pin is mutation-checked red both ways (default back to 4096, and a
+literal re-inlined into the payload).
+
+**═══ NO-THINK MEASURED (operator asked) — IT WINS ON EVERY AXIS, AND THE CAP RAISE ALONE DOES NOT
+FIX THIS ═══**
+
+**Instrument: `scripts/planner_nothink_bench.py` — a PAIRED replay of 30 REAL recorded planner
+payloads.** A live arm was never an option (3.5 turns/day, §4AQ), but the recordings hold every
+payload the agent actually issued, so the same prompts run under both conditions today. Pairing is
+what makes n=30 readable — the §4V lesson. Stratified 15 originally-truncated / 15 completed:
+the first half is where the fix must WORK, the second where it must do no HARM. Cleared §4U
+preflight on all five gates (smoke proved the arms distinguishable: `reasoning_chars` 0 vs 14,976).
+**Baseline runs at the already-raised 8192 cap**, so this measures the marginal value of no-think
+over the fix just shipped, not over the old broken state.
+
+| paired, n=30 | no_think better | worse | McNemar p |
+|---|---|---|---|
+| truncated | **6** | 0 | **0.031** |
+| parsed (usable plan) | **11** | 1 | **0.006** |
+| has_tree | **12** | 2 | **0.013** |
+
+**Cost, on a call that runs EVERY turn: 3258 → 502 median completion tokens, 58.9s → 9.9s.**
+That is ~49 seconds off every single turn, independent of the correctness win.
+
+⚠ **THE STRATIFIED SAMPLE'S 20% BASELINE TRUNCATION IS NOT A PRODUCTION RATE** — half the sample is
+truncated BY CONSTRUCTION, the §4V trap. Re-weighted to the real 26.3/73.7 mix:
+
+| projected production | truncation | usable plan |
+|---|---|---|
+| old 4096 cap | 26.3% | — |
+| **cap raise alone (shipped)** | **10.5%** | **61.8%** |
+| **cap raise + no_think** | **0.0%** | **98.2%** |
+
+**The cap raise alone leaves ~38% of planning steps without a usable plan.** Truncation is only part
+of it: **6 baseline calls parsed as nothing WITHOUT truncating** (median reasoning 10,365 chars,
+content 743) — the thinking prelude damages the output even when it fits.
+
+**I checked the obvious objection to my own result and it does not hold.** "no_think produces
+shallower plans": on the 16 payloads where both arms returned a tree, no_think ran **5 deeper / 1
+shallower** (median 4 nodes vs 3, sign test p=0.219) with comparable content size. It is not
+trading depth for speed.
+
+⚠ **HONEST LIMITS.** (1) **Two payloads got WORSE** — `314d90d5` lost its plan entirely under
+no_think while baseline returned 8 nodes. (2) **Every metric here is STRUCTURAL** — parse, tree
+presence, node count, and `next_action_id` referential integrity (does the focus name a task that
+EXISTS). None of them says the *strategy* is as good; that needs a judge, and judges on this project
+have a documented record of lying plausibly. The claim is "strictly better on everything
+mechanically checkable, with no sign of shallower plans", not "better plans". (3) Fidelity checked:
+production sends this with `use_swarm=True`, and the recordings confirm all 96 planner calls were
+answered by the main 35B at :8088 — the exact endpoint benched.
+
+**✅ ENABLED BY OPERATOR DECISION 2026-08-11 — DEFAULT ON, `GHOST_PLANNER_NO_THINK=0` restores
+thinking.** Made the CODE DEFAULT rather than a launcher export, mirroring `GHOST_VISUAL_NO_THINK`:
+an env-only switch is live in production and absent everywhere else — tests, ablations, manual
+restarts — which is exactly the prod/dev flag drift this project keeps paying for
+([[launcher-flag-drift]]). The measured-better behaviour is the default; the knob turns it OFF.
+Both switches ride one gate (`/no_think` + `enable_thinking: False`) with a pin, since vision.py
+records that the soft switch alone is unreliable and a soft switch that silently does nothing is the
+worst of the three states. The kill switch is pinned by SUBPROCESS on the real env parse, so a
+renamed variable fails the test rather than silently disabling the knob.
+
+⚠ **WHAT TO WATCH AFTER THE RESTART**, in priority order — the projections above are from a replay,
+and a replay is not production:
+1. **`Planner output TRUNCATED at max_tokens` should approach ZERO.** It was ~26% of planning steps;
+   if it stays materially above 0, the replay did not transfer and the no-think switches are not
+   reaching the live payload. Re-measure with the same recording scan.
+2. **Plan QUALITY is the unmeasured axis** — every number here is structural. Watch for turns whose
+   plan is present and well-formed but strategically thin (shallow decomposition, a focus that is
+   valid but pointless). That is the failure mode a structural metric cannot see, and the one that
+   would justify turning it back off.
+3. **Latency should drop ~49s per turn.** If it does not, the switch is not firing.
+
+**Pins:** 11 in `tests/test_hippocampus_truncation.py` (same file as the 2026-07 consolidation
+truncation this repeats one subsystem over), **5 mutation-checked red**, incl. an over-suppression
+guard and a seam test that the planner feeds `tree_update` from the verified tree — which no unit
+test of the helpers could catch. Suite **12,088 passed / 14 skipped**. Docs: `docs/core/agent.html`.
+
+⚠ **Deploy:** needs a restart to take effect. ⚠ **Still open from this request:** it never finalized
+(ended one second after Turn 30's LLM call began, no traceback, no cancellation line) — cause
+unproven; client-side cancellation is consistent with the evidence but not demonstrated.
+
+### 4AQ. THE MEASUREMENT CLOCKS DO NOT TICK — real user traffic is the binding constraint, and the instrument that should have said so was counting self-play — ✅ FIXED 2026-08-11 (⛔ three pending verdicts RE-DATED)
+
+Went to read the §4K live-ledger backtest (due ~08-12) and the `fs_batch` verdict. **Neither can be
+read, and the reason is the same one, and it invalidates the "maturing on their own clocks" item in
+the execution queue.** The instrument failure came first because it nearly sold me a fabricated one.
+
+**THE BACKTEST SAYS `insufficient data`: 64 graded predictions, 49 with a probability, and the two
+buckets that decide the question hold 2 rows and 0 rows.**
+
+```
+p(fail)      n   actual        p(fail)      n   actual
+0.00-0.15   37   0.135         0.50-0.75    2   0.000  (thin)
+0.15-0.35   10   0.100         0.75-1.01    0      —   (thin)
+0.35-0.50    0      —
+```
+
+**THE LEDGER STOPPED 2026-08-09 22:59 — and so did rrf.observations, the trajectory corpus and the
+session store, all within the same minute (02:04 file mtimes).** Four independent write paths
+stopping together is not a base-rate accident, and §4AI had already waved at this exact trio on
+08-10 and excused it. So I went to the denominator built for precisely this call.
+
+**⚠ THE DENOMINATOR SAID 28 USER TURNS IN 24H. THE TRUE COUNT WAS ZERO.** All 28 were self-play:
+22 `### SYNTHETIC TRAINING EXERCISE`, 4 `SYSTEM JUDGE REJECTION` retries, 2 lesson-extraction turns.
+They arrive on an hourly cadence, they enter through the SAME `handle_chat` as a human request, and
+they logged an identical `request started` line. **The four silent ledgers are silent BY DESIGN —
+§4K's simulation gate, the trajectory writer's user-turn scope — excluding exactly the turns the
+denominator was counting. The denominator and the ledgers were counting opposite populations, and
+the denominator is the number a reader trusts.**
+
+**Two coupled defects, and the first hid the second:**
+
+1. **The count included self-play, so it could reach 0 — the branch that withholds alarms — only on
+   a box where the hourly self-play loop was ALSO dead.** A guard whose triggering condition is
+   unreachable in production is furniture. It was added in §4AI review round 1 to STOP a false
+   MAJOR; by 08-11 it was arguing for one.
+2. **The withholding cleared EVERY row.** The only two probes that alarm are `calibration.fit`
+   (idle clock) and `router.decisions` (every request, self-play included) — neither is explained by
+   an absence of USER turns. Had defect 1 ever let this fire, it would have silenced precisely the
+   alarms a quiet day does not explain. **Fixing 1 is what ARMS 2**, which is why both moved
+   together — the same shape as 2026-08-04's "arming four never-run subsystems".
+
+**THE FIX STAMPS THE POPULATION AT THE SOURCE.** `agent.turn_origin()` returns `user`/`sim` from the
+read-only skill store — the SAME derivation as §4K's gate and finalize's `is_simulation`, deliberately
+not a second notion that can drift from them — and the request-started MIRROR line carries
+`origin=…`. The console frame is untouched: the uConsole `turnstatus` parser and the Slack owner-lock
+both key on it and neither needs this. **A pre-stamp window reports UNCLASSIFIED, not a number** —
+the stamped subset is a lower bound while the label says count, and quoting the total is the original
+bug. An unknown denominator also withholds simulation-gated alarms, since a zero that cannot be
+interpreted does not license a DEAD verdict. Live render now reads
+`⚠ user-turn count unavailable … [unclassified (28 request line(s) predate the origin stamp)]`,
+which is the honest state until the next restart.
+
+**Each probe now declares WHICH absence excuses it** (`DEN_USER_TURNS` / `DEN_REQUESTS` /
+`DEN_NONE`), a separate axis from the cadence vocabulary shown to the reader — the two are not the
+same question and conflating them is what mis-scoped the guard. Default is `DEN_NONE`: a mechanism
+must EARN its excuse, so the decision cannot be skipped by omission.
+
+**Pins:** 6 new (`test_subsystem_liveness.py`, `test_log_beautify.py`), **every one mutation-checked
+red**, including the live defect in miniature (three self-play turns must count 0; reverting the
+origin filter gives `assert 3 == 0`) and a seam test seen to pin the load-bearing `is True` — a
+`MagicMock` context returns a truthy attribute, so a plain truth test would stamp every mocked turn
+`sim`. Suite **12,078 passed / 14 skipped / 0 failed** (final, after the arm-uptake work below).
+⚠ An intermediate run showed 22 failures, ALL Docker-socket `FileNotFoundError`; they were called
+environmental on the reasoning that they fail before any changed code runs and the live agent's own
+sandbox was healthy (self-play solved a challenge at 07:55 with no `DockerException`). The final run
+with the socket back confirms it — same code, 0 failures. **The call was right, but the confirmation
+was luck**: "it fails in a subsystem I did not touch" is an argument, not a control, and the actual
+control (revert and re-run) was skipped because there is no local git here.
+
+**═══ AND NOW THE NUMBER THAT MATTERS — REAL USER TURNS PER DAY ═══**
+
+Classified over the whole app log by prompt fingerprint (self-play solver / judge-rejection retry /
+lesson extraction vs everything else):
+
+| day | 08-04 | 08-05 | 08-06 | 08-07 | 08-08 | 08-09 | 08-10 | 08-11 |
+|---|---|---|---|---|---|---|---|---|
+| self-play | 11 | 27 | 27 | 26 | 19 | 20 | 24 | 11 |
+| **REAL user** | **25** | **13** | **0** | **0** | **5** | **7** | **2** | **0** |
+
+**Median 3.5 real turns/day. Three of the last six days were ZERO.** 165 self-play requests against
+52 genuine ones in a week.
+
+**EVERY PENDING VERDICT IS GATED ON THIS SUPPLY, AND EVERY ONE OF THEIR DATES ASSUMED TRAFFIC THAT
+DOES NOT EXIST:**
+
+| clock | journal date | actual state |
+|---|---|---|
+| §4K live-ledger backtest | ~08-12 | 64 rows in 6 days; decisive buckets n=2 and n=0 |
+| `fs_batch` arm | "resolves well ahead of Phase 2b" | 51 enrolled ⇒ **~25/arm**, none since 08-09 |
+| `foresight_note` arm | n≥30/arm | 34 enrolled ⇒ ~17/arm, and TRIGGERED is a subset |
+| `use_planning` arm | n≥30/arm, "~1-2 wk" | 17 enrolled ⇒ **~8/arm** |
+
+**And §4AO's attenuation compounds it multiplicatively** — every arm needs 1.34–2.47× the traffic
+its naive power calculation assumes. At the observed rate the 0.50–0.75 foresight bucket alone needs
+roughly **three months** to reach n=30. **These are not slow clocks; they are stopped ones.** The
+§4F sequencing decision ("fs_batch resolves well ahead of Phase 2b ~08-17") is invalidated as
+written — not by anything about fs_batch, but because it priced a week of traffic that never came.
+
+**✅ OPERATOR DECISION 2026-08-11: (d) WAIT FOR ORGANIC TRAFFIC — no harness, no generated turns.**
+Taken with the arithmetic in hand (fs_batch ~170 days to a readable *uptake* check, longer for the
+effect), so a future session should read this as a priced choice, NOT an oversight to correct. **Do
+not re-litigate it or build a replay harness without a fresh ask.** What makes waiting safe now is
+that the instrument is honest: the denominator will report real turns instead of self-play, so
+whenever traffic does arrive the ledgers become legible on their own — which was not true this
+morning. Nothing further is owed on this item; re-read §4AQ's table when the denominator shows real
+volume. The rejected options are kept below for the reasoning, not as pending work:
+(a) **Accept the offline evidence and retire the live gate** — §4K already DISCRIMINATES on 3,558
+replayed predictions, reproduced twice, bracketed by the instrument fixes from the conservative side.
+The live ledger becomes a watch that never gates anything. Cheapest, and the honest reading of
+"weaker evidence is all this traffic can buy".
+(b) **Generate traffic** — replay real requests as genuine (non-simulated) turns. Buys real rows,
+but they enter the same corpus the arms and labels read, so it is a measurement decision with
+contamination attached, not a free one.
+(c) **Let self-play feed the gated ledgers** — REJECTED on sight: the gate exists so seeded labels
+and live grades mean the same thing, and self-play is not the population these consumers serve.
+(d) **Drop the arms.** `use_planning` at ~8/arm after a week is not a slow experiment, it is a
+non-experiment.
+
+⚠ **What I nearly filed instead.** "Foresight, RRF, trajectories and sessions all died at 02:04" —
+four subsystems, one timestamp, a clean synchronized-failure story with file mtimes to back it. It
+was wrong, and the only thing between it and the journal was checking what the denominator counted
+rather than what it said. **§4AI's own lesson, one turn later: a trend across subsystems is not
+evidence until you know what the base rate is measured OVER.**
+
+⚠ **Deploy:** the origin stamp is a production write-path change and needs a restart before the
+denominator reports anything but UNCLASSIFIED. Nothing else in this block requires one.
+✅ **DEPLOYED 08:42** — `origin=user` confirmed on live turns; the view correctly still reads
+UNCLASSIFIED until the 24h window clears the pre-stamp lines (~08-12 08:42). ⚠ The `sim` half is
+NOT yet observed live (no self-play cycle since the restart) — confirm on the next idle cycle.
+
+**═══ THE FREE CHECK, RUN FIRST (operator's call): fs_batch's MECHANICAL half — `--fs-batch-arms` ═══**
+
+§4F's stated verification for this arm was never the outcome comparison: *"re-run the ontology
+report; those n-grams must collapse. If they do not, the macro did not land, whatever the latency
+says."* **That needs no statistical power, so it is readable now, and it costs nothing.** Built into
+`scripts/tool_ontology_report.py --fs-batch-arms` (+ `optim/tool_ontology.fs_batch_arm_uptake`).
+
+| arm | turns | calls | file_system | **ELIGIBLE** | removable steps | **`paths` used** |
+|---|---|---|---|---|---|---|
+| control | 32 | 45 | 13 | 1 | 9 | 0 |
+| treatment | 23 | 34 | 4 | **0** | 0 | **0** |
+
+⚠ **THE TREATMENT ARM USED THE MACRO ZERO TIMES — AND THAT IS NOT A FINDING.** It had **one**
+whole-file read across 23 turns, so the capability was never once in a position to fire. *"The model
+refuses the new parameter"* and *"the model was never offered a chance to use it"* produce the
+IDENTICAL zero, and only the eligible denominator separates them. Reporting the first from this data
+would be the empty-denominator fabrication this arc keeps catching. **The tool now prints the
+eligible count FIRST and declines to read uptake below 10 eligible treatment turns** — with a
+two-sided pin, because a check that can only ever say "not readable" is furniture.
+
+**AND IT QUANTIFIES THE REAL BLOCKER, which is not turn count.** Corpus-wide, only **52 of 1,556
+turns (3.3%)** offer this macro anything to collapse. A readable *uptake* check therefore needs
+~**598 enrolled turns** ≈ **170 days** at 3.5 real turns/day; the outcome comparison needs far more.
+**So `fs_batch` cannot resolve on organic traffic — not the effect, not even the uptake.** Its
+eligibility is derived from `collapse_fs_batch`, the shipped macro's own rule, never a hand-written
+"≥2 reads" test (which would count `read_chunked` pagination the macro deliberately does not touch,
+i.e. measure a macro nobody deployed — mutation-tested).
+
+**CONSEQUENCE FOR THE TRAFFIC DECISION: targeted beats more.** If traffic is ever generated for this
+arm it must be **file-heavy work**, not generic requests — at a 3.3% eligibility rate, generic
+traffic is ~30× more expensive per eligible turn. That also retires the framing of §4F's sequencing
+decision ("fs_batch resolves well ahead of Phase 2b"): it was never a question of waiting longer.
+
+**Pins:** 8 in `tests/test_tool_ontology.py`, 5 mutation-checked red (hand-rolled eligibility, floor
+removed, floor forced, invented traffic estimate, projection from the arm sample instead of the
+corpus). Docs: `docs/core/experiments.html`.
 
 ### 4AP. BM25 LESSON-RETRIEVAL FALLBACK MATCHED ANYTHING — ✅ FIXED + DEPLOYED 2026-08-11
 
@@ -5309,6 +6769,32 @@ graph inverted index (the forgetting pass + node-cache landed).
 Severity in parens. Many are latent (no prod caller), multi-process (single-tenant today), or
 model-behavior edges.
 
+> **⚠ LOG-RECONCILIATION 2026-08-12 — READ THIS BEFORE THE BULLETS BELOW.** The two big catalogues
+> here are headed with a FIX verdict and then keep every original finding "for the record" — written
+> in present-tense "Fix: …" prose that SCANS AS OPEN even where the header says it is done. That
+> confused a reader (me, this session — I nearly re-did the stream-abort fix before checking the
+> code). Reconciled against the CURRENT tree; findings verified, not assumed:
+> - **The `[2026-07-20 three-stack review]` catalogue is genuinely ALL FIXED** — its own header, and a
+>   5-item spot-check spanning every severity tier confirms it: the `../..` `cleanup` sandbox escape
+>   (`projects.py:3175` now resolves the id + `workspace_cleanup.py:88` rejects separators/`..`), the
+>   replace→write overwrite (`file_system.py:1344` forwards `filename=`), `_format_error` erasing exit
+>   124 (`execute.py:559` uses `_TIMEOUT_KILL_CODES`), the `rg` positional-pattern flag bug
+>   (`file_system.py:3158` uses `-e {pattern}`), and `tool_rename_file` clobber (`file_system.py:3334`
+>   refuses an existing dest). **Treat every bullet under that header as DONE; do not re-open one
+>   without a fresh code check.**
+> - **The `[2026-07-22 LLM-stack review]` catalogue is MOSTLY FIXED**; its header already names the
+>   true residual set and I re-verified it against code — **STILL OPEN, all low-value:** the streaming
+>   `GHOST_LLM_RECORD` hook (dev feature, record off in prod) + 3 improvements (serializer unify;
+>   verifier stage-1/stage-2 shared prefix — absent in `verifier.py`; fallback-hint merge —
+>   `fallback_chains.get_fallback_chain_hint` and `tool_failure.get_fallback_hint` are still two
+>   functions). The `mid-stream fail-open` and `jobs-collect` items that read as open in the bullets
+>   are FIXED (stream-abort under §4O at `agent.py:18164`; collect read-marking = the `Job.collected`
+>   flag, `core/jobs.py:54`).
+> - **Genuinely-open low residuals** (correctly marked below, non-gated, none urgent): activity
+>   `read_since` EOF re-baseline on a shrunk ledger (latent — no rotation code in-tree); tic-tac-toe
+>   `load` parity/double-winner acceptance (SUSPECTED, self-heals); `_invoke_template` broad
+>   `except TypeError` masking a real tier error (SUSPECTED).
+
 - **[2026-07-22 LLM-stack review — llm.py / router / recording+grammar / delegation / consumers]
   (6 agents). MOSTLY FIXED 2026-07-22 (see §6 "LLM-stack review FIXES" — contention theme, mid-stream
   fail-open, circuit-breaker 4xx, retry classification, router boot landmine, jobs-collect, swarm
@@ -5740,7 +7226,13 @@ model-behavior edges.
   `_reflected_trajectory_ids` unbounded (RESOLVED 2026-07-04 — now persisted+bounded);
   utils/telemetry `stop()` can swallow caller cancellation.
 
-### 4C. Functional bug-hunt deferred findings (live behavior — still open)
+### 4C. Functional bug-hunt deferred findings (live behavior)
+
+> **Reconciled 2026-08-12:** unlike §4B's catalogues, every item here carries its OWN inline
+> RESOLVED/open marker and they are accurate — most are RESOLVED. The only genuinely-open items are
+> non-bugs by nature: Yandex-over-Tor reachability (`low, known` — a Tor per-exit reality) and the
+> huge-reasoning no-file-spec (`reviewed, no fix` — a model-behavior edge). Read each bullet's own
+> tag; there is no hidden open work here.
 
 - **[affordance] `workspace` tool has no `search` action** — **RESOLVED 2026-07-09.** The guess is
   now a real action: `search` (alias `recall`, unadvertised to keep the schema lean per #7) does

@@ -174,6 +174,13 @@ def _step_result_ok(result_str: str) -> bool:
         return True  # empty output is not an error
     if "[SYSTEM ERROR]" in s or "SYSTEM BLOCK" in s or "Critical Tool Error" in s:
         return False
+    # A step DETACHED at its budget (sandbox/jobs.py) reports exit 0 while
+    # STILL RUNNING. Counting it a success inflates the macro's success_rate
+    # — the number the model is shown when choosing a macro — on a step whose
+    # outcome nobody knows yet.
+    from ..sandbox.jobs import is_promoted_result
+    if is_promoted_result(s):
+        return False
     m = re.search(r"EXIT CODE:\s*(\d+)", s)
     if m:
         return m.group(1) == "0"

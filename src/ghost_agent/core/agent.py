@@ -321,6 +321,29 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
     return None
 
 
+def turn_origin(context) -> str:
+    """"user" or "sim" — which POPULATION this turn belongs to.
+
+    Stamped on the request-started log line so the durable record can be split
+    by origin. Self-play, dream and subagent turns enter through the SAME
+    `handle_chat` as a human request and logged an identical line, so until
+    2026-08-11 nothing downstream could tell them apart:
+    `liveness._count_user_turns` counted all of them, and on 08-11 reported 28
+    user turns on a box whose true count was ZERO — while the ledgers it exists
+    to interpret (foresight, rrf, trajectories) were correctly silent because
+    their own simulation gates had excluded those very turns. The denominator
+    and the ledgers were counting opposite populations.
+
+    Derived from the read-only skill store, which is what dream builds its
+    isolated context with — the SAME derivation as the §4K foresight gate and
+    finalize's `is_simulation`. Deliberately not a second definition: a private
+    notion of "is this real traffic" that can drift from the gates' notion is
+    how the two came to disagree in the first place.
+    """
+    return "sim" if getattr(getattr(context, "skill_memory", None),
+                            "is_read_only", False) is True else "user"
+
+
 def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
     """True when ANY tool output this turn looks like a failure.
 
@@ -1593,6 +1616,78 @@ DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
 # loop forever — each continuation is a full upstream round-trip.
 MAX_TRUNCATION_CONTINUATIONS = 3
 
+# Strategic planner output cap. RAISED 4096 → 8192 on 2026-08-11 (operator),
+# sized from 167 recorded planner calls over four days rather than doubled by
+# reflex:
+#
+#   completed (n=123): p50 1888 · p90 3012 · p95 3543 · p99 3835 · max 3868
+#   TRUNCATED (n=44) : ALL at exactly 4096  ⇒  **26.3% of every planning step**
+#
+# ⚠ THE COMPLETED DISTRIBUTION IS CENSORED — anything wanting more than 4096
+# lands in the truncated bucket, not in that tail, so its p99 is a floor on the
+# requirement and NOT an estimate of it. Sized instead from what the calls
+# actually produce: reasoning reaches 18,148 chars (~4.5k tokens) and content
+# 5,940 (~1.5k), so ~6k tokens covers the observed worst case and 8192 leaves
+# ~35% headroom. The honest verification is re-measuring the truncation RATE
+# after deployment, not re-reading this comment.
+#
+# ⚠⚠ AND THE CAP IS NOT THE WHOLE DISEASE. Of the 44 truncations, **34 (77%)
+# emitted ZERO characters of JSON** — the entire budget went into the <think>
+# prelude (reasoning median 14,659 chars on truncated calls vs 5,775 on
+# completed ones). For those, a bigger budget buys more thinking, which is the
+# "raising the timeout moves the wall" shape. The precedented cure is the
+# two-switch no-think that `tools/vision.py` already applies to `verify_ui`
+# for the IDENTICAL failure — deliberately NOT applied here without
+# measurement, because planning is a reasoning task and verify_ui is a
+# perception readout. See docs/core/agent.html#planner-truncation.
+_PLANNER_CAP_DEFAULT = 8192
+_PLANNER_CAP_FLOOR = 1024
+
+
+def _planner_cap_from_env(raw) -> int:
+    """Parse GHOST_PLANNER_MAX_TOKENS with a floor. Pure, so the clamp is
+    testable without reloading this module — a reload would mint a second set
+    of classes and break `isinstance` for everything already holding the
+    first."""
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return _PLANNER_CAP_DEFAULT
+    # A typo must not hand the planner a cap so small that EVERY call
+    # truncates — the exact failure this section exists to end.
+    return max(_PLANNER_CAP_FLOOR, v)
+
+
+_PLANNER_MAX_TOKENS = _planner_cap_from_env(
+    os.getenv("GHOST_PLANNER_MAX_TOKENS", _PLANNER_CAP_DEFAULT))
+
+# Suppress the planner's <think> prelude (the two-switch pair vision.py uses
+# for verify_ui). ✅ DEFAULT ON since 2026-08-11 (operator, after the
+# measurement below); `GHOST_PLANNER_NO_THINK=0` restores thinking.
+#
+# Default rather than a launcher export ON PURPOSE, mirroring
+# GHOST_VISUAL_NO_THINK: an env-only switch is live in production and absent
+# everywhere else — tests, ablations, manual restarts — which is precisely the
+# prod/dev flag drift this project keeps being bitten by. The measured-better
+# behaviour is the default; the knob turns it OFF.
+#
+# MEASURED 2026-08-11, paired replay of 30 REAL recorded planner payloads
+# (scripts/planner_nothink_bench.py), baseline already at the raised 8192 cap:
+#
+#   truncated   6 better / 0 worse   McNemar p=0.031
+#   parsed     11 better / 1 worse   McNemar p=0.006
+#   has_tree   12 better / 2 worse   McNemar p=0.013
+#   cost       3258 → 502 median tokens, 58.9s → 9.9s  (every turn)
+#
+# Re-weighted to the real 26.3/73.7 truncated/completed mix: truncation
+# 10.5% → 0.0%, usable plan 61.8% → 98.2%. Plans are NOT shallower — on the 16
+# payloads where both arms produced a tree, no_think ran 5 deeper / 1
+# shallower (median 4 nodes vs 3). ⚠ Two payloads got WORSE (one lost its plan
+# entirely), and the metrics are STRUCTURAL — whether the strategy is as good
+# is unmeasured. See docs/core/agent.html#planner-truncation.
+_PLANNER_NO_THINK = os.getenv(
+    "GHOST_PLANNER_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+
 
 def _manage_projects_closed_a_task(tool_name: str, result_text: str) -> bool:
     """True iff a ``manage_projects`` call actually closed a task to DONE.
@@ -2464,6 +2559,134 @@ def _is_think_tag_fragment(token: str, accumulated_with_token: str) -> bool:
     return False
 
 
+def _scan_json_braces(t: str) -> int:
+    """Opens minus closes, counting only braces OUTSIDE string literals.
+
+    A brace inside a value (`"desc": "use {this}"`) must not register, or a
+    complete object reads as truncated and vice versa.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in t or "":
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+    return depth
+
+
+def _unclosed_braces(t: str) -> int:
+    """How many `{` were never closed. >0 means the text was CUT OFF."""
+    return max(0, _scan_json_braces(t))
+
+
+_INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
+
+
+def _has_bare_json_braces(t: str) -> bool:
+    """Braces that are NOT inside an inline code span.
+
+    The discriminator between "this reply contains JSON that failed to parse"
+    and "this reply is prose that mentions braces". ⚠ A QUOTED-KEY test was
+    tried first and was WRONG: `{ thought: missing-quotes, next_action_id:
+    !!! }` — a model emitting the plan with unquoted keys — is a genuine
+    malformation worth warning about, and it is structurally identical to
+    `{ z-index: 1001 }`. Nothing inside the braces separates them; the
+    CONTEXT does. Both live false positives were CSS inside backticks
+    (``#session-modal.modal-overlay { z-index: 1001 }``), where the span
+    starts well before the brace — so mask the span, not the brace.
+
+    Fenced ```json blocks are deliberately NOT masked: a fence is an explicit
+    claim that JSON follows, and one that fails to parse is exactly the
+    warning this exists for.
+    """
+    return '{' in _INLINE_CODE_RE.sub('', t or "")
+
+
+def salvage_truncated_plan(plan_content: str) -> tuple:
+    """Recover what survives a planner response cut off at max_tokens.
+
+    Returns ``(salvaged_json, whole_tree_or_None)``. The caller must use the
+    second value for ``tree_update`` and NEVER ``salvaged_json['tree_update']``
+    — see ``_complete_object_for_key`` for why the repaired one lies.
+
+    Lives at module level so the decision is testable on its own; the planner
+    is 6k lines into `handle_chat` and nothing there could be pinned.
+    """
+    salvaged = _repair_truncated_json(plan_content[plan_content.find('{'):])
+    whole_tree = _complete_object_for_key(plan_content, "tree_update")
+    logger.warning(
+        "Planner output TRUNCATED at max_tokens "
+        f"({len(plan_content)} chars, {_unclosed_braces(plan_content)} "
+        f"unclosed): salvaged {sorted(salvaged.keys()) or 'nothing'}; "
+        "tree_update " + ("INTACT (kept)" if whole_tree else
+                          "was CUT — discarded, previous plan tree retained"))
+    return salvaged, whole_tree
+
+
+def _complete_object_for_key(text: str, key: str):
+    """The value of ``key`` ONLY IF it closed in the RAW text — else None.
+
+    The discriminator that makes truncation salvage safe for structured
+    values. ``_repair_truncated_json`` closes dangling braces, so an object
+    cut off mid-way comes back COMPLETE-LOOKING with content silently
+    missing; there is no way to tell that from the repaired dict alone.
+    Measured on req 6e9efd6a's seven truncated planner outputs: one had
+    `tree_update` cut mid-`description`, and the repair yielded a root task
+    with **zero children** — adopting it would have wiped the whole plan.
+    Another truncated AFTER `tree_update` closed, so its 8-node tree was
+    genuinely intact and throwing it away was pure loss.
+
+    So: scan the raw text for the key's opening brace and require the depth
+    to return to zero. Complete ⇒ trustworthy. Cut ⇒ None, no guessing.
+    """
+    import json
+    if not isinstance(text, str):
+        return None
+    m = re.search(r'["\']%s["\']\s*:\s*' % re.escape(key), text)
+    if not m:
+        return None
+    start = text.find('{', m.end())
+    if start == -1 or start > m.end() + 4:      # value is not an object
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    v = json.loads(text[start:i + 1], strict=False)
+                    return v if isinstance(v, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    return None                                  # never closed — it was cut
+
+
 def _repair_truncated_json(t: str) -> dict:
     """Best-effort parse of a JSON object cut off mid-generation.
 
@@ -2609,10 +2832,33 @@ def extract_json_from_text(text: str, repair_truncated: bool = False) -> dict:
                             f"({len(repaired)} top-level keys)")
                 return repaired
         if not result and looked_like_json:
-            # We saw braces but couldn't parse them — that's an extraction
-            # failure worth surfacing, not a "no JSON here" non-event.
+            # We saw braces but couldn't parse them. ⚠ TWO REFINEMENTS,
+            # 2026-08-11, after this line sent a reader hunting a parser bug
+            # that did not exist (req 6e9efd6a: 7 of these in one request).
+            #
+            # (1) BRACES ARE NOT EVIDENCE OF JSON. The gate was `'{' in text`,
+            #     so a prose reply quoting a CSS rule — `#session-modal
+            #     { z-index: 1001 }` — logged a WARNING about malformed JSON
+            #     when the turn's real payload rode `tool_calls` and no JSON
+            #     was ever intended. A quoted key is the cheap discriminator.
+            # (2) TRUNCATED IS NOT MALFORMED. The other 7 were the model cut
+            #     off at max_tokens mid-object; "malformed" describes a syntax
+            #     error and points the reader at the parser instead of at the
+            #     token budget that actually failed. Unbalanced braces name it.
             preview = text[:200].replace("\n", " ")
-            logger.warning(f"extract_json_from_text: malformed JSON-like content failed to parse. Preview: {preview}")
+            if not _has_bare_json_braces(text):
+                logger.debug("extract_json_from_text: braces appear only "
+                             "inside inline code spans — prose, not JSON. "
+                             f"Preview: {preview}")
+            elif _unclosed_braces(text) > 0:
+                logger.warning(
+                    "extract_json_from_text: TRUNCATED JSON — "
+                    f"{_unclosed_braces(text)} unclosed brace(s), {len(text)} "
+                    f"chars. The generation was cut off (check max_tokens / "
+                    f"finish_reason), NOT a parser fault. "
+                    f"Preview: {preview}")
+            else:
+                logger.warning(f"extract_json_from_text: malformed JSON-like content failed to parse. Preview: {preview}")
         return result
     except Exception as e:
         logger.warning(f"extract_json_from_text raised {type(e).__name__}: {e}")
@@ -10118,7 +10364,16 @@ class GhostAgent:
                     # with a narrower rule here would make live rows and
                     # seeded rows disagree about what "failed" means.
                     try:
-                        if _foresight_preds[i] is not None:
+                        from ..sandbox.jobs import (
+                            is_promoted_result as _fs_promoted)
+                        # A DETACHED command has no outcome yet. Grading it
+                        # `ok=True` (its result is success-shaped so the turn
+                        # loop won't strike it) would teach the world model
+                        # that this command shape SUCCEEDS on evidence that
+                        # does not exist. Leaving the prediction unresolved
+                        # is the honest state; the row simply never scores.
+                        if (_foresight_preds[i] is not None
+                                and not _fs_promoted(str_res)):
                             from .foresight import (
                                 resolve_prediction as _fs_resolve)
                             from ..distill.outcome_heuristics import (
@@ -10157,6 +10412,17 @@ class GhostAgent:
                     # clear the guard (2026-07-30 review). Mirrors the
                     # execute strike branch's exit-code parse below.
                     _pf_exec_failed = False
+                    # A command DETACHED at its budget has not changed the
+                    # world YET (sandbox/jobs.py). Computed OUTSIDE the
+                    # execute-only branch below: the `elif` that reads it runs
+                    # for every tool, so binding it conditionally would be a
+                    # NameError on the first non-execute call.
+                    try:
+                        from ..sandbox.jobs import (
+                            is_promoted_result as _sbx_promoted)
+                        _pf_promoted = _sbx_promoted(str_res)
+                    except Exception:  # noqa: BLE001 — hot loop, never raise
+                        _pf_promoted = False
                     if fname == "execute" and not _res_is_error:
                         _pf_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
                         if _pf_exit is not None:
@@ -10172,7 +10438,14 @@ class GhostAgent:
                                 str_res, ptool_op)
                         except Exception:
                             pass
-                    elif _pf_world_mut and not _pf_exec_failed:
+                    elif _pf_world_mut and not _pf_exec_failed \
+                            and not _pf_promoted:
+                        # …but NOT for a command that was detached at its
+                        # budget and is still running (sandbox/jobs.py): it
+                        # has not changed the world YET, so clearing every
+                        # recorded failure on it would disarm the guard on
+                        # the strength of work that has not happened.
+                        #
                         # World-changed reset (2026-07-30, solar-sim
                         # postmortem): a SUCCESSFUL state-mutating call —
                         # file write, service start/stop, a shell command
@@ -10342,7 +10615,15 @@ class GhostAgent:
                     # flag, which mis-attributed competence whenever a
                     # turn dispatched multiple tools in parallel.
                     _mc = getattr(self.context, "metacog", None)
-                    if _mc is not None and getattr(_mc, "enabled", False) and fname:
+                    # A DETACHED command (sandbox/jobs.py) is neither a
+                    # competence success nor a failure — it has not finished.
+                    # Recording it either way corrupts the per-domain profile,
+                    # and its `--- output so far ---` can carry a Traceback
+                    # from a run that is still going, which the failure
+                    # heuristic below would read as a hard failure.
+                    from ..sandbox.jobs import is_promoted_result as _mc_promoted
+                    if _mc is not None and getattr(_mc, "enabled", False) \
+                            and fname and not _mc_promoted(str_res):
                         _lstr = str_res.lstrip()
                         # Any NON-ZERO exit code is a failure, not just
                         # 1/2. The old substring check recorded codes
@@ -10441,7 +10722,23 @@ class GhostAgent:
                             summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=False, task_label="shield")
                             summary_content = summary_data["choices"][0]["message"].get("content", "").strip()
                             if summary_content:
-                                str_res = f"[EDGE CONDENSED]: {summary_content}"
+                                # Preserve the PROMOTION banner across
+                                # condensation. Without this the marker is
+                                # summarised away and every downstream grader
+                                # silently reverts to reading an unfinished
+                                # command as a clean success — a latent bug
+                                # masked only by the live --max-context, since
+                                # the shield threshold scales with it.
+                                _keep = ""
+                                try:
+                                    from ..sandbox.jobs import (
+                                        PROMOTED_RESULT_BANNER as _prb,
+                                        is_promoted_result as _ipr2)
+                                    if _ipr2(str_res):
+                                        _keep = _prb + "\n"
+                                except Exception:  # noqa: BLE001
+                                    _keep = ""
+                                str_res = f"{_keep}[EDGE CONDENSED]: {summary_content}"
                         except Exception as e:
                             logger.debug(f"Context-Shield edge summarisation failed: {type(e).__name__}: {e}")
 
@@ -10627,9 +10924,12 @@ class GhostAgent:
                                 # ENOENTs on the case-sensitive container FS.
                                 getattr(self.context, "_project_work_files",
                                         set()).add(str(ptarget_raw or ptarget))
-                            if (fname in ("execute", "browser",
-                                          "vision_analysis")
-                                    or (fname == "file_system" and is_mutating)):
+                            if ((fname in ("execute", "browser",
+                                           "vision_analysis")
+                                 or (fname == "file_system" and is_mutating))
+                                    and not _pf_promoted):
+                                # …but not a run that is still going: this
+                                # counter is "work performed on the project".
                                 _wt = getattr(self.context,
                                               "_project_work_tools", None)
                                 if isinstance(_wt, dict):
@@ -10650,6 +10950,15 @@ class GhostAgent:
                                         _cargs.get("command")
                                         or _cargs.get("filename") or "").split())[:90]
                                     if _cmd:
+                                        # Say so when it has NOT finished: the
+                                        # work log is read back as "what I did
+                                        # on this project", and a detached
+                                        # command (sandbox/jobs.py) recorded
+                                        # bare would read next turn as work
+                                        # completed.
+                                        if _pf_promoted:
+                                            _cmd = (_cmd[:70]
+                                                    + " [still running]")
                                         _wc.append(_cmd)
                         except Exception:
                             pass
@@ -10821,7 +11130,11 @@ class GhostAgent:
                             else:
                                 last_error_preview = str_res[:60].replace("\n", " ")
                         else:
-                            if is_mutating: seen_tools.clear()
+                            # A DETACHED run has not mutated anything YET, so
+                            # it must not clear the loop-breaker's memory of
+                            # what has already been tried.
+                            if is_mutating and not _pf_promoted:
+                                seen_tools.clear()
                             # Log the actual OUTPUT on success, not just "exit 0"
                             # — the script's stdout is the point of running it.
                             # Durable mirror keeps it (capped so a giant dump
@@ -10831,7 +11144,8 @@ class GhostAgent:
                                 _ok_out = str_res.split(
                                     "STDOUT/STDERR:", 1)[1].strip().replace("\n", " ⏎ ")[:1500]
                             pretty_log(
-                                "Execution Ok",
+                                "Execution Detached" if _pf_promoted
+                                else "Execution Ok",
                                 "exit 0" + (f" · {_ok_out}" if _ok_out else ""),
                                 icon=Icons.OK)
 
@@ -10853,6 +11167,17 @@ class GhostAgent:
                                 "is_read_only",
                                 False,
                             ) is True
+                            # A DETACHED solution.py has NOT run to
+                            # completion (sandbox/jobs.py): its result is exit
+                            # 0 with a banner as "stdout", which would satisfy
+                            # the checks below and short-circuit the attempt
+                            # with "solution.py executed successfully (exit
+                            # 0)" — a fabricated PASS written straight into
+                            # the self-play corpus. Let the turn continue; the
+                            # outer validator re-runs the solution itself.
+                            from ..sandbox.jobs import is_promoted_result
+                            if _is_sim and is_promoted_result(str_res):
+                                _is_sim = False
                             if _is_sim:
                                 # Pull the command text from the
                                 # assistant message that emitted this
@@ -11788,7 +12113,17 @@ class GhostAgent:
             # generation makes the biological watchdog think the
             # system is idle MID-REQUEST and wake the hippocampus.
             self.context.last_activity_time = datetime.datetime.now()
-            perfect_it_prompt = f"Task completed successfully. Final tool output:\n\n{tools_run_this_turn[-1]['content']}\n\n<system_directive>First, succinctly present the tool output/result to the user. Then, based on your Perfection Protocol, analyze the result and proactively suggest one concrete way to optimize, scale, secure, or automate this work further. RESPOND IN PLAIN TEXT ONLY. DO NOT USE TOOLS.</system_directive>"
+            _pp_last = str(tools_run_this_turn[-1]['content'])
+            try:
+                from ..sandbox.jobs import is_promoted_result as _pp_promoted
+                _pp_head = ("A command from this turn is STILL RUNNING in the "
+                            "background (detached at its budget, not killed) — "
+                            "its result is NOT in yet. Final tool output:"
+                            if _pp_promoted(_pp_last)
+                            else "Task completed successfully. Final tool output:")
+            except Exception:  # noqa: BLE001
+                _pp_head = "Task completed successfully. Final tool output:"
+            perfect_it_prompt = f"{_pp_head}\n\n{_pp_last}\n\n<system_directive>First, succinctly present the tool output/result to the user. Then, based on your Perfection Protocol, analyze the result and proactively suggest one concrete way to optimize, scale, secure, or automate this work further. RESPOND IN PLAIN TEXT ONLY. DO NOT USE TOOLS.</system_directive>"
 
             p_req_messages = []
             # Snapshot — deliberately NOT messages.append(): the
@@ -11893,7 +12228,24 @@ class GhostAgent:
                             last_out = last_out.split("DIAGNOSTIC HINT")[0].strip().strip("-").strip()
 
                     preview = (last_out[:2000] + '\n...[Truncated]') if len(last_out) > 2000 else last_out
-                    final_ai_content = f"Process finished successfully.\n\n### Final Output:\n```text\n{preview}\n```"
+                    # …unless the tool output says the command has NOT
+                    # finished. A DETACHED run (sandbox/jobs.py) is
+                    # success-SHAPED so the turn loop books no strike — but
+                    # wrapping it in "Process finished successfully" makes
+                    # the fallback reply state the one thing that is false,
+                    # and hands the same sentence to the verifier as its
+                    # evidence.
+                    try:
+                        from ..sandbox.jobs import is_promoted_result as _ipr
+                        _still_running = _ipr(str(fallback_tool.get("content", "")))
+                    except Exception:  # noqa: BLE001
+                        _still_running = False
+                    _head = ("The command is STILL RUNNING in the background "
+                             "(it outran its execution budget and was detached, "
+                             "not killed); its result is not in yet."
+                             if _still_running
+                             else "Process finished successfully.")
+                    final_ai_content = f"{_head}\n\n### Final Output:\n```text\n{preview}\n```"
 
         if not final_ai_content:
             final_ai_content = "Task executed successfully."
@@ -13255,7 +13607,8 @@ class GhostAgent:
                 if _turn_reg.is_cancelled(req_id):
                     raise TurnCancelled(req_id, _active_turn.reason)
                 char_budget = int(self.context.args.max_context * 3.5)
-                pretty_log("Request Initialized", special_marker="BEGIN")
+                pretty_log("Request Initialized", special_marker="BEGIN",
+                           origin=turn_origin(self.context))
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
 
                 # Pre-allocate the trajectory id for THIS turn. Several
@@ -14751,24 +15104,73 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             {"role": "user", "content": f"### RECENT CONVERSATION:\n{recent_transcript}\n\n{planner_transient.strip()}"}
                         ]
 
+                        if _PLANNER_NO_THINK:
+                            planner_messages[-1]["content"] += "\n\n/no_think"
+
                         planning_payload = {
                             "model": model,
                             "messages": planner_messages,
                             "temperature": 0.0,
                             "top_p": 0.1,
-                            "max_tokens": 4096,
+                            "max_tokens": _PLANNER_MAX_TOKENS,
                             "response_format": {"type": "json_object"}
                         }
+                        if _PLANNER_NO_THINK:
+                            # Hard switch beside the soft one — vision.py
+                            # records that the `/no_think` token alone is not
+                            # reliable on a thinking model.
+                            planning_payload["chat_template_kwargs"] = {
+                                "enable_thinking": False}
 
                         try:
                             p_data = await self.context.llm_client.chat_completion(planning_payload, use_swarm=True)
                             plan_content = p_data["choices"][0]["message"].get("content", "")
                             plan_json = extract_json_from_text(plan_content)
 
+                            # ⚠ TRUNCATION SALVAGE (2026-08-11). The planner
+                            # runs with max_tokens=4096 and a big `tree_update`
+                            # can exceed it: req 6e9efd6a hit `finish_reason:
+                            # length` SEVEN times, each at exactly 4096
+                            # completion tokens. Every one dropped the WHOLE
+                            # plan — thought, tree and focus — because an
+                            # unparseable object returns {}. The log then read
+                            # `No thought provided.` / `Plan Updated. Focus: `
+                            # with no hint that a token cap was the cause, and
+                            # the loop carried on unguided.
+                            #
+                            # ⚠⚠ THE TREE IS TRUSTED ONLY IF IT CLOSED IN THE
+                            # RAW TEXT. `_repair_truncated_json` closes
+                            # dangling braces, so a `tree_update` cut mid-way
+                            # comes back COMPLETE-LOOKING with tasks silently
+                            # missing — and `load_from_json` would adopt it as
+                            # the plan of record. Measured on this request's
+                            # seven truncations: one repaired into a root task
+                            # with ZERO children (the whole plan, gone); one
+                            # truncated after the tree had closed and was
+                            # genuinely intact. `_complete_object_for_key`
+                            # tells those apart on the raw text, so a damaged
+                            # tree is dropped and a whole one is kept.
+                            _plan_truncated = False
+                            _whole_tree = None
+                            if not plan_json and _unclosed_braces(plan_content):
+                                _plan_truncated = True
+                                plan_json, _whole_tree = \
+                                    salvage_truncated_plan(plan_content)
+
                             thought_content = plan_json.get("thought", "No thought provided.")
                             tree_update = plan_json.get("tree_update", {})
                             next_action_id = plan_json.get("next_action_id", "")
                             required_tool = plan_json.get("required_tool", "all")
+
+                            if _plan_truncated:
+                                tree_update = _whole_tree or {}
+                                pretty_log(
+                                    "Planner",
+                                    "output hit the token cap — thought "
+                                    "salvaged; plan tree "
+                                    + ("recovered intact" if _whole_tree else
+                                       "was cut, keeping the previous turn's"),
+                                    icon=Icons.WARN, level="WARNING")
 
                             if tree_update:
                                 task_tree.load_from_json(tree_update)
@@ -17991,573 +18393,620 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         level="WARNING", icon=Icons.WARN,
                     )
 
-            # Release any held [DONE] sentinel now that
-            # (a) all content chunks have been emitted and
-            # (b) the fallback has had its chance to fire.
-            # Without this, the SSE stream would never
-            # terminate cleanly on the scrub path when no
-            # [DONE] is yielded elsewhere.
-            if _held_done_chunk is not None:
-                yield _held_done_chunk
+            # ⚠ THE [DONE] SENTINEL IS NOW RELEASED AT THE VERY END OF THIS
+            # GENERATOR (see the release site at the bottom of stream_wrapper).
+            # It used to be yielded HERE, and everything after it — metacog,
+            # episode, hydration judge, TRAJECTORY, project work_log, the
+            # verifier spawn — ran after the yield with no `finally` anywhere
+            # in the ~300 lines that follow.
+            #
+            # `data: [DONE]` is the OpenAI SSE contract's "you may stop reading
+            # now", so well-behaved clients close on it. A consumer that
+            # abandons an async generator runs its `finally` blocks but NOT its
+            # post-yield code, so the entire durable record of a streamed turn
+            # was discarded while `request finished` logged a clean success.
+            #
+            # Measured 2026-08-11 (§4AT-A): of 42 requests that day, the 6 that
+            # took the streamed-final branch produced **0 trajectories, 0
+            # outcome labels, 0 verifier verdicts — 6 of 6**; the other 36
+            # recorded normally. Also the most plausible account on record for
+            # the erratic 0-70%/day trajectory coverage §4AJ could not explain.
+            pass
+            # ⚠ THE TAIL MUST NOT BE ABLE TO ABORT THE GENERATOR (2026-08-11).
+            # Moving the [DONE] sentinel to the end made every statement below
+            # it capable of preventing end-of-stream — 28 of them were not
+            # inside any try. Before the move a tail exception was harmless to
+            # the client because [DONE] had already been sent; after it, the
+            # client would hang waiting for a marker that never comes. The
+            # durable record is best-effort; the end-of-stream contract is not.
+            try:
 
-            # Metacog: compute this turn's composite confidence
-            # (logprob-OPTIONAL — phase 2.5). The entropy term
-            # is used when the window observed tokens; otherwise
-            # it is neutral (0.5) and competence + verbalised
-            # uncertainty drive the score. Runs on every metacog
-            # turn so calibration always records a sample, even
-            # on speculative-decoding / no-logprobs upstreams.
-            if _entropy_tracker is not None:
-                try:
-                    _reading = _entropy_tracker.reading()
-                    if _reading is not None:
-                        if _reading.n > 0:
-                            self.context.last_entropy_reading = _reading
-                        # Composite confidence (roadmap
-                        # phase 2.4). Fuse entropy with the
-                        # per-domain competence prior for
-                        # the most-recently-dispatched tool.
-                        # The result is logged and stashed
-                        # on the context so observability
-                        # and downstream gating share one
-                        # source of truth. Tool name comes
-                        # from `fname` if set this turn,
-                        # otherwise falls back to a global
-                        # roll-up via domain="other".
-                        _mc_conf = getattr(self.context, "metacog", None)
-                        if (_mc_conf is not None
-                                and getattr(_mc_conf, "confidence", None) is not None
-                                and getattr(_mc_conf, "competence", None) is not None):
-                            try:
-                                from .metacog import _domain_for_tool
-                                _dom = _domain_for_tool(fname or "")
-                                _p = _mc_conf.competence.estimate(_dom, fname or None)
-                                _n = _mc_conf.competence.observations(_dom, fname or None)
-                                # Verbalised-uncertainty pressure
-                                # (core.uncertainty) — fuses the
-                                # "agent said it was unsure" track
-                                # into the composite. The streamed
-                                # path never ran the finalize-side
-                                # hedge auto-scan at all (2026-07-27
-                                # root-cause: with the flag tool
-                                # never called live, pressure was
-                                # structurally 0.0 here) — scan the
-                                # streamed answer before reading.
-                                _upress = 0.0
+                # Metacog: compute this turn's composite confidence
+                # (logprob-OPTIONAL — phase 2.5). The entropy term
+                # is used when the window observed tokens; otherwise
+                # it is neutral (0.5) and competence + verbalised
+                # uncertainty drive the score. Runs on every metacog
+                # turn so calibration always records a sample, even
+                # on speculative-decoding / no-logprobs upstreams.
+                if _entropy_tracker is not None:
+                    try:
+                        _reading = _entropy_tracker.reading()
+                        if _reading is not None:
+                            if _reading.n > 0:
+                                self.context.last_entropy_reading = _reading
+                            # Composite confidence (roadmap
+                            # phase 2.4). Fuse entropy with the
+                            # per-domain competence prior for
+                            # the most-recently-dispatched tool.
+                            # The result is logged and stashed
+                            # on the context so observability
+                            # and downstream gating share one
+                            # source of truth. Tool name comes
+                            # from `fname` if set this turn,
+                            # otherwise falls back to a global
+                            # roll-up via domain="other".
+                            _mc_conf = getattr(self.context, "metacog", None)
+                            if (_mc_conf is not None
+                                    and getattr(_mc_conf, "confidence", None) is not None
+                                    and getattr(_mc_conf, "competence", None) is not None):
                                 try:
-                                    _utk = getattr(self.context, "uncertainty_tracker", None)
-                                    if _utk is not None:
-                                        try:
-                                            from .reply_smoothing import (
-                                                strip_system_notes as _ssn2)
-                                            for _hedge in _utk.scan_text_for_uncertainty(
-                                                _ssn2(full_content or "")
-                                            ):
-                                                _utk.flag_assumption(
-                                                    _hedge, confidence=0.4,
-                                                    basis="auto-detected hedge in response",
-                                                )
-                                        except Exception:  # noqa: BLE001
-                                            pass
-                                        _upress = _utk.pressure()
-                                except Exception:
+                                    from .metacog import _domain_for_tool
+                                    _dom = _domain_for_tool(fname or "")
+                                    _p = _mc_conf.competence.estimate(_dom, fname or None)
+                                    _n = _mc_conf.competence.observations(_dom, fname or None)
+                                    # Verbalised-uncertainty pressure
+                                    # (core.uncertainty) — fuses the
+                                    # "agent said it was unsure" track
+                                    # into the composite. The streamed
+                                    # path never ran the finalize-side
+                                    # hedge auto-scan at all (2026-07-27
+                                    # root-cause: with the flag tool
+                                    # never called live, pressure was
+                                    # structurally 0.0 here) — scan the
+                                    # streamed answer before reading.
                                     _upress = 0.0
-                                # Entropy term is neutral (0.5)
-                                # when the window is empty, so
-                                # competence + uncertainty drive
-                                # the score on logprob-starved
-                                # upstreams instead of suppressing
-                                # the whole reading.
-                                # None when the window observed no tokens —
-                                # scored as neutral, but flagged unobserved
-                                # so it can't poison the entropy-weight fit.
-                                _norm = _reading.norm if _reading.n > 0 else None
-                                # Turn-effort feature (see the finalize path
-                                # for the measurement behind it). None when
-                                # the turn ran no tools — absence of evidence
-                                # about effort, not a measured 0.5.
-                                _eff = None
-                                try:
-                                    from .confidence import (
-                                        effort_component as _eff_fn)
-                                    _enames = [
-                                        t.get("name")
-                                        for t in (stream_tools_snapshot or [])
-                                        if isinstance(t, dict) and t.get("name")]
-                                    if _enames:
-                                        _eff = _eff_fn(_enames)
-                                except Exception:  # noqa: BLE001
+                                    try:
+                                        _utk = getattr(self.context, "uncertainty_tracker", None)
+                                        if _utk is not None:
+                                            try:
+                                                from .reply_smoothing import (
+                                                    strip_system_notes as _ssn2)
+                                                for _hedge in _utk.scan_text_for_uncertainty(
+                                                    _ssn2(full_content or "")
+                                                ):
+                                                    _utk.flag_assumption(
+                                                        _hedge, confidence=0.4,
+                                                        basis="auto-detected hedge in response",
+                                                    )
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                            _upress = _utk.pressure()
+                                    except Exception:
+                                        _upress = 0.0
+                                    # Entropy term is neutral (0.5)
+                                    # when the window is empty, so
+                                    # competence + uncertainty drive
+                                    # the score on logprob-starved
+                                    # upstreams instead of suppressing
+                                    # the whole reading.
+                                    # None when the window observed no tokens —
+                                    # scored as neutral, but flagged unobserved
+                                    # so it can't poison the entropy-weight fit.
+                                    _norm = _reading.norm if _reading.n > 0 else None
+                                    # Turn-effort feature (see the finalize path
+                                    # for the measurement behind it). None when
+                                    # the turn ran no tools — absence of evidence
+                                    # about effort, not a measured 0.5.
                                     _eff = None
-                                _cr = _mc_conf.confidence.score(
-                                    normalised_entropy=_norm,
-                                    competence_p_success=_p,
-                                    n_observations=_n,
-                                    uncertainty_pressure=_upress,
-                                    effort=_eff,
-                                )
-                                self.context.last_confidence = _cr
-                                # Stash for the turn-end calibration
-                                # record (paired with the realized
-                                # outcome). Last reading of the turn
-                                # wins — that's the one we score
-                                # against the turn's outcome.
-                                # Tagged with THIS request's id: the
-                                # SSE drain runs after the semaphore
-                                # is released, so this write can land
-                                # mid-turn-B — the tag lets B's
-                                # finalize reject a reading that
-                                # isn't its own instead of pairing
-                                # A's confidence with B's outcome.
-                                # §4O B-MAJOR-1: a truncated turn must NOT
-                                # teach calibration "I was confident and
-                                # done" — an aborted stream isn't a clean
-                                # (confidence, outcome) sample.
-                                if not stream_aborted:
-                                    self.context._calib_pending = (req_id, _cr)
-                                # Push the reading into the
-                                # bundle so the mid-turn
-                                # arbiter gate (consulted
-                                # at the next tool dispatch)
-                                # has authoritative state to
-                                # decide on. Without this
-                                # push the gate would never
-                                # fire — it reads from the
-                                # bundle, not the context.
-                                try:
-                                    _mc_conf.record_confidence(_cr)
-                                    _mc_conf.count(
-                                        confidence_total=True,
-                                        confidence_below=_cr.below_threshold,
+                                    try:
+                                        from .confidence import (
+                                            effort_component as _eff_fn)
+                                        _enames = [
+                                            t.get("name")
+                                            for t in (stream_tools_snapshot or [])
+                                            if isinstance(t, dict) and t.get("name")]
+                                        if _enames:
+                                            _eff = _eff_fn(_enames)
+                                    except Exception:  # noqa: BLE001
+                                        _eff = None
+                                    _cr = _mc_conf.confidence.score(
+                                        normalised_entropy=_norm,
+                                        competence_p_success=_p,
+                                        n_observations=_n,
+                                        uncertainty_pressure=_upress,
+                                        effort=_eff,
                                     )
-                                except Exception as _crx:
+                                    self.context.last_confidence = _cr
+                                    # Stash for the turn-end calibration
+                                    # record (paired with the realized
+                                    # outcome). Last reading of the turn
+                                    # wins — that's the one we score
+                                    # against the turn's outcome.
+                                    # Tagged with THIS request's id: the
+                                    # SSE drain runs after the semaphore
+                                    # is released, so this write can land
+                                    # mid-turn-B — the tag lets B's
+                                    # finalize reject a reading that
+                                    # isn't its own instead of pairing
+                                    # A's confidence with B's outcome.
+                                    # §4O B-MAJOR-1: a truncated turn must NOT
+                                    # teach calibration "I was confident and
+                                    # done" — an aborted stream isn't a clean
+                                    # (confidence, outcome) sample.
+                                    if not stream_aborted:
+                                        self.context._calib_pending = (req_id, _cr)
+                                    # Push the reading into the
+                                    # bundle so the mid-turn
+                                    # arbiter gate (consulted
+                                    # at the next tool dispatch)
+                                    # has authoritative state to
+                                    # decide on. Without this
+                                    # push the gate would never
+                                    # fire — it reads from the
+                                    # bundle, not the context.
+                                    try:
+                                        _mc_conf.record_confidence(_cr)
+                                        _mc_conf.count(
+                                            confidence_total=True,
+                                            confidence_below=_cr.below_threshold,
+                                        )
+                                    except Exception as _crx:
+                                        logger.debug(
+                                            "metacog record_confidence failed: %s",
+                                            _crx,
+                                        )
+                                    # Log noise control: per-turn
+                                    # confidence readings are
+                                    # high-volume. We only want
+                                    # INFO for the actionable
+                                    # case (below threshold —
+                                    # the arbiter is now armed
+                                    # for the next mutating
+                                    # dispatch). Above-threshold
+                                    # readings drop to DEBUG so
+                                    # monitoring greps stay
+                                    # signal-rich.
+                                    from .metacog_log import (
+                                        emit as _mc_emit,
+                                        Subsystem as _mc_ss,
+                                        LEVEL_INFO, LEVEL_DEBUG,
+                                    )
+                                    _mc_emit(
+                                        _mc_ss.CONF,
+                                        level=(LEVEL_INFO if _cr.below_threshold
+                                               else LEVEL_DEBUG),
+                                        below=_cr.below_threshold,
+                                        C=_cr.composite,
+                                        entropy=_cr.entropy_component,
+                                        competence=_cr.competence_component,
+                                        n=_n,
+                                        domain=_dom,
+                                        tool=fname or None,
+                                        ent_obs=_reading.n,
+                                        threshold=_cr.threshold,
+                                    )
+                                except Exception as _cex:
                                     logger.debug(
-                                        "metacog record_confidence failed: %s",
-                                        _crx,
+                                        "metacog confidence score failed: %s",
+                                        _cex,
                                     )
-                                # Log noise control: per-turn
-                                # confidence readings are
-                                # high-volume. We only want
-                                # INFO for the actionable
-                                # case (below threshold —
-                                # the arbiter is now armed
-                                # for the next mutating
-                                # dispatch). Above-threshold
-                                # readings drop to DEBUG so
-                                # monitoring greps stay
-                                # signal-rich.
-                                from .metacog_log import (
-                                    emit as _mc_emit,
-                                    Subsystem as _mc_ss,
-                                    LEVEL_INFO, LEVEL_DEBUG,
-                                )
-                                _mc_emit(
-                                    _mc_ss.CONF,
-                                    level=(LEVEL_INFO if _cr.below_threshold
-                                           else LEVEL_DEBUG),
-                                    below=_cr.below_threshold,
-                                    C=_cr.composite,
-                                    entropy=_cr.entropy_component,
-                                    competence=_cr.competence_component,
-                                    n=_n,
-                                    domain=_dom,
-                                    tool=fname or None,
-                                    ent_obs=_reading.n,
-                                    threshold=_cr.threshold,
-                                )
-                            except Exception as _cex:
-                                logger.debug(
-                                    "metacog confidence score failed: %s",
-                                    _cex,
-                                )
-                        logger.debug(
-                            "metacog entropy: norm=%.3f (n=%d)",
-                            _reading.norm, _reading.n,
-                        )
-                except Exception as _erx:
-                    logger.debug("entropy stash failed: %s", _erx)
+                            logger.debug(
+                                "metacog entropy: norm=%.3f (n=%d)",
+                                _reading.norm, _reading.n,
+                            )
+                    except Exception as _erx:
+                        logger.debug("entropy stash failed: %s", _erx)
 
-            # Internal (sub-/sched-) requests never feed smart
-            # memory: machine-generated prompts (chess FENs,
-            # job payloads) polluted retrieval AND their
-            # worker-side extract/scoring calls (max_tokens
-            # 3072) kept nova busy enough to time out the next
-            # request's routing calls (2026-07-12).
-            from .autonomous_activity import (
-                is_internal_request as _is_int_req_m1)
-            if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
-                micro_msgs = []
-                for m in [msg for msg in stream_messages_snapshot if msg.get("role") in ["user", "assistant"]][-4:]:
-                    role = m.get("role", "user").upper()
-                    clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")), flags=re.DOTALL)
-                    micro_msgs.append(f"{role}: {clean_content[:500].strip()}")
-                clean_ai = re.sub(r'```.*?```', '', full_content, flags=re.DOTALL)
-                recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
-                if getattr(self.context, 'journal', None):
-
-                    await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model})
-
-            # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
-            think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', full_content, flags=re.DOTALL | re.IGNORECASE)
-            for think_text in think_matches:
-                clean_think = think_text.strip()
-                if clean_think:
-                    ui_think = clean_think.replace('\n', ' | ')
-                    logger.info(f"PLANNER MONOLOGUE: {ui_think}")
-
-                    timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-                    print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*15} AGENT INTERNAL THINKING {'='*15}", flush=True)
-                    for line in clean_think.split('\n'):
-                        if line.strip():
-                            print(f"[INFO ] 💭 {timestamp} - [{req_id}] {line.strip()}", flush=True)
-                    print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*55}", flush=True)
-
-            if was_complex_task or execution_failure_count > 0:
-                if not force_stop or "READY TO FINALIZE" in stream_thought.upper():
-                    # Gated on `--smart-memory > 0.0` to honour
-                    # the contract in CLAUDE.md ("Memory writes
-                    # are gated on --smart-memory / --no-memory").
-                    # Without this, a `--smart-memory 0.0` run
-                    # still queued post_mortem entries → phase 1
-                    # consumer → SkillMemory.learn_lesson, leaking
-                    # auto-extracted lessons into the playbook on
-                    # every complex/failing turn.
-                    # post_mortem shares the SAME gates as the episode write
-                    # below and the non-streaming site (10030): smart_memory
-                    # > 0.0 AND not forget_was_called. Without the forget
-                    # guard, a streamed `forget` turn queued a post_mortem →
-                    # phase-1 consumer → learn_lesson, resurrecting the
-                    # forgotten content as a playbook lesson (tombstone
-                    # resurrection) on the COMMON streaming path — the same
-                    # vector the episode write already closed.
-                    if (getattr(self.context, 'journal', None)
-                            and self.context.args.smart_memory > 0.0
-                            and not forget_was_called):
-                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
-                    if self.context.args.smart_memory > 0.0 and not forget_was_called:
-                        # No verdict is available on the streamed path — the
-                        # verifier runs as a LATE handler after the drain — so
-                        # the structural signals carry the label here. That is
-                        # still strictly better than the 80-char substring
-                        # guess this replaced; a late REFUTED corrects the
-                        # trajectory record, which is the durable one.
-                        await self._record_episode_safe(
-                            last_user_content, stream_tools_snapshot,
-                            full_content,
-                            execution_failure_count=execution_failure_count,
-                            req_id=str(req_id or ''))
-
-            # Post-turn hydration usefulness judge (fire-and-
-            # forget, worker-hosted) — every finalized turn,
-            # matching the non-streaming site.
-            self._judge_hydration_safe(
-                full_content, turn_id=str(req_id or ""))
-
-            # Peek the request-tagged project snapshot for the pid BEFORE
-            # the work_log call consumes it — the late-refute follow-up
-            # filing below also runs in this drain (after semaphore
-            # release) and must file against THIS turn's project, not a
-            # concurrent turn's re-pointed current_project_id.
-            _drain_pid = None
-            try:
-                _dp = getattr(self.context, "_project_work_pending", None)
-                if isinstance(_dp, tuple) and len(_dp) == 2 and _dp[0] == req_id:
-                    _drain_pid = (_dp[1] or {}).get("pid")
-                else:
-                    _drain_pid = getattr(self.context, "current_project_id", None)
-            except Exception:
-                _drain_pid = getattr(self.context, "current_project_id", None)
-
-            # Streamed-turn trajectory + work_log (2026-07-20 H1).
-            # A streamed forced-final turn RETURNS the SSE
-            # generator before `_finalize_and_return` ever runs,
-            # so `_record_turn_trajectory` and the project
-            # work_log — both sole-called from finalize — never
-            # fired for streamed turns: no corpus record (dead
-            # user-correction loop + abort detection) and no
-            # project work_log (the "forgets project work" gap).
-            # Web UI always streams AND one-task-per-turn forces
-            # this ending on task-closing turns, so this is the
-            # COMMON case, not an edge. Record here directly with
-            # the real `full_content` (the earlier finalize-time
-            # backfill was inert — it keyed off a trajectory
-            # finalize never wrote). The verifier runs LATE below
-            # and backfills the outcome by `current_trajectory_id`,
-            # so pass verifier=None here.
-            try:
-                # Record the EFFECTIVE visible content (the fallback text
-                # when the reply was all scrubbed tool-XML), never tag-soup.
-                _traj_content = locals().get(
-                    "_stream_effective_content", full_content) or full_content
-                if (isinstance(_traj_content, str)
-                        and _traj_content.strip()):
-                    self._record_turn_trajectory(
-                        messages=messages,
-                        final_content=_traj_content,
-                        req_id=req_id,
-                        model=model,
-                        trajectory_id=current_trajectory_id,
-                        user_request=last_user_content,
-                        verifier=None,
-                        execution_failed=(
-                            execution_failure_count > 0
-                            and bool(last_was_failure)),
-                    )
-            except Exception as _sbf_exc:
-                logger.debug(
-                    "streamed trajectory record skipped: %s",
-                    _sbf_exc)
-            # Project work_log — same helper finalize uses. No
-            # synchronous verdict on the stream path (verifier is
-            # late), so the outcome is execution-based here.
-            await self._write_project_work_log_safe(
-                last_user_content=last_user_content,
-                final_ai_content=full_content,
-                execution_failure_count=execution_failure_count,
-                verifier_backfill=None,
-                req_id=req_id,
-            )
-
-            # Promised-notification backstop — streamed twin of the
-            # finalize wiring (same 2026-07-20 H1 rationale as the
-            # trajectory/work_log re-runs above: the web UI always
-            # streams, so without this the promise is only kept for
-            # stream:false clients — the reply streams to a possibly
-            # dead tab and the Slack ping never fires).
-            try:
+                # Internal (sub-/sched-) requests never feed smart
+                # memory: machine-generated prompts (chess FENs,
+                # job payloads) polluted retrieval AND their
+                # worker-side extract/scoring calls (max_tokens
+                # 3072) kept nova busy enough to time out the next
+                # request's routing calls (2026-07-12).
                 from .autonomous_activity import (
-                    is_internal_request as _is_internal_req_snb)
-                _sim = getattr(getattr(self.context, "skill_memory", None),
-                               "is_read_only", False) is True
-                # _drain_pid, NOT live current_project_id: this drain runs
-                # post-semaphore, and a concurrent turn can re-point the
-                # global pointer mid-drain — firing (or consuming) another
-                # project's promise (the same hazard the work_log snapshot
-                # above exists for).
-                _np_pid = _drain_pid
-                _np_store = getattr(self.context, "project_store", None)
-                _promise_active = False
-                if _np_pid and _np_store is not None:
-                    from .notify_promise import peek_promise as _np_peek
-                    _promise_active = (_np_peek(_np_store, _np_pid)
-                                       is not None)
-                _sbf = False
-                if (full_content and not _is_internal_req_snb(req_id)
-                        and not _sim and not _promise_active):
-                    _sbf = _notify_promise_backstop(
-                        self.context,
-                        last_user_content=last_user_content,
-                        tools_run=stream_tools_snapshot,
-                        final_content=full_content,
-                        req_id=req_id,
-                        had_failures=execution_failure_count >= 3,
-                    )
-                # Stored-promise fire — streamed twin (see finalize; runs
-                # for internal turns too).
-                if _np_pid and not _sim:
-                    from .autonomous_activity import (
-                        get_activity_log as _np_get_alog,
-                        summarize_turn_content as _np_head)
-                    from .notify_promise import fire_promise_if_settled
-                    _model_notified = _sbf or any(
-                        (str((t or {}).get("name", "")).lower().strip()
-                         == "notify_operator")
-                        and not str((t or {}).get("content", ""))
-                        .lstrip().startswith("Error")
-                        for t in stream_tools_snapshot or [])
-                    fire_promise_if_settled(
-                        _np_store, _np_get_alog(self.context), _np_pid,
-                        model_notified=_model_notified,
-                        req_id=str(req_id or ""),
-                        headline=_np_head(full_content, limit=220),
-                    )
-            except Exception:
-                logger.debug("streamed notify backstop skipped",
-                             exc_info=True)
+                    is_internal_request as _is_int_req_m1)
+                if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
+                    micro_msgs = []
+                    for m in [msg for msg in stream_messages_snapshot if msg.get("role") in ["user", "assistant"]][-4:]:
+                        role = m.get("role", "user").upper()
+                        clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")), flags=re.DOTALL)
+                        micro_msgs.append(f"{role}: {clean_content[:500].strip()}")
+                    clean_ai = re.sub(r'```.*?```', '', full_content, flags=re.DOTALL)
+                    recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
+                    if getattr(self.context, 'journal', None):
 
-            # Calibration sample — same reason as the trajectory/work_log
-            # re-runs above: the streamed path returns before
-            # _finalize_and_return, so this was NEVER recorded on the common
-            # (web-UI) path, biasing the fit to non-streaming turns and
-            # starving it of the real-logprob entropy only the stream path
-            # produces (the finalize fallback hardcodes 0.5). The streamed
-            # reading was stashed as _calib_pending=(req_id, reading);
-            # verifier is late here so pass verifier_backfill=None (a late
-            # REFUTE re-pairs via the correction-negative path).
-            await self._record_calibration_safe(
-                req_id=req_id,
-                tools_run=stream_tools_snapshot,
-                verifier_backfill=None,
-                execution_failure_count=execution_failure_count,
-                budget_exhausted=False,
-                final_ai_content=full_content,
-                user_request=last_user_content or "",
-                truncated=stream_aborted,   # §4O R2 MAJOR-2
-            )
+                        await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model})
 
-            # Streamed-turn tracker reset (2026-07-27): the finalize
-            # surfacing block (footer/verify/reset) never runs on this
-            # path, so hedge assumptions scanned into the tracker for
-            # THIS turn's pressure reading would leak into the next
-            # turn's — reset here, after the calibration record consumed
-            # the state. The durable persisted log is untouched.
-            try:
-                _utk_reset = getattr(self.context, "uncertainty_tracker", None)
-                if _utk_reset is not None:
-                    _utk_reset.reset()
-            except Exception:  # noqa: BLE001
-                pass
+                # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
+                think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', full_content, flags=re.DOTALL | re.IGNORECASE)
+                for think_text in think_matches:
+                    clean_think = think_text.strip()
+                    if clean_think:
+                        ui_think = clean_think.replace('\n', ' | ')
+                        logger.info(f"PLANNER MONOLOGUE: {ui_think}")
 
-            # --- VERIFIER GATE (STREAM), 2026-07-18 ---
-            # The gated verdict was historically invoked only
-            # from _finalize_and_return — the NON-streaming
-            # finalization — so every streamed answer shipped
-            # unverified, with no log line of any kind (found
-            # when the operator asked why a turn had no
-            # verdict and the USR2 task dump showed none).
-            # The text is already out, so an inline verdict
-            # could never amend it: the verdict ALWAYS runs
-            # late here, regardless of GHOST_CRITIC_ASYNC —
-            # spawn the pure computation and hand it to the
-            # late handler (logs every outcome, scrubs
-            # poisoned lessons, backfills the trajectory).
-            # force_correction=True because a streamed reply
-            # never carries an inline Verifier note — a
-            # high-conf REFUTED queues a banner that the next
-            # stream already prepends via
-            # _take_active_correction. Skipped when the turn
-            # carried no verifiable evidence (toolless chat):
-            # spawning there adds only a no-op task and a
-            # noise line per message. The claim strips
-            # <think> blocks — they streamed to the client
-            # but are not part of the answer, and they would
-            # eat the verifier's 2000-char claim budget.
-            # Every branch is LOUD (log-only, INFO): the
-            # first live deploy produced total silence on
-            # streamed project turns and none of the debug
-            # channels are captured at INFO — a gate whose
-            # skip reasons are invisible cannot be
-            # distinguished from a gate that never ran
-            # (same lesson as _on_done's once-silent
-            # exception path).
-            try:
-                _sv_claim = re.sub(
-                    r'<think>.*?(?:</think>|$)', '',
-                    full_content,
-                    flags=re.DOTALL | re.IGNORECASE,
-                ).strip()
-                _sv_tool = _find_substantive_tool_for_verifier(
-                    stream_tools_snapshot)
-                if getattr(self.context.args,
-                           "no_verifier", False):
-                    pass  # ablation off-switch: silent
-                elif getattr(self.context, "verifier",
-                             None) is None:
-                    pretty_log(
-                        "Verifier",
-                        "stream gate: no verifier attached "
-                        "— skipped",
-                        icon=Icons.VERIFIER_LAB)
-                elif not _sv_claim:
-                    pretty_log(
-                        "Verifier",
-                        "stream gate: empty claim after "
-                        "think-strip — skipped",
-                        icon=Icons.VERIFIER_LAB)
-                elif _sv_tool is None:
-                    pretty_log(
-                        "Verifier",
-                        "stream gate: no substantive tool "
-                        f"in {len(stream_tools_snapshot)} "
-                        "record(s) — skipped "
-                        "(bookkeeping-only turn)",
-                        icon=Icons.VERIFIER_LAB)
-                else:
-                    _sv_task = _glog.spawn_task(
-                        self._compute_verifier_verdict(
-                            tools_run_this_turn=stream_tools_snapshot,
-                            messages=stream_verify_messages,
-                            final_ai_content=_sv_claim,
-                            last_user_content=last_user_content,
-                            lc=lc,
-                            # Ledger identity on the STREAMED path too. This
-                            # drain runs after the turn semaphore is
-                            # released, so both values are passed from this
-                            # closure's captures — never read off the
-                            # context, which by now belongs to whichever
-                            # request is running.
-                            req_id=req_id,
-                            trajectory_id=current_trajectory_id,
-                        ))
-                    self._attach_late_verdict_handler(
-                        _sv_task, current_trajectory_id,
-                        stream_conv_fp,
-                        force_correction=True,
-                        project_id=_drain_pid)
-                    pretty_log(
-                        "Verifier",
-                        "stream gate: verdict deferred — "
-                        "verifying asynchronously after "
-                        "the stream",
-                        icon=Icons.VERIFIER_LAB)
-            except Exception as _svx:
-                pretty_log(
-                    "Verifier",
-                    "stream gate spawn failed: "
-                    f"{type(_svx).__name__}: "
-                    f"{str(_svx)[:160]}",
-                    icon=Icons.WARN, level="WARNING")
+                        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+                        print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*15} AGENT INTERNAL THINKING {'='*15}", flush=True)
+                        for line in clean_think.split('\n'):
+                            if line.strip():
+                                print(f"[INFO ] 💭 {timestamp} - [{req_id}] {line.strip()}", flush=True)
+                        print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*55}", flush=True)
 
-            # Retrieval feedback loop: credit lessons that
-            # were surfaced during this turn whenever the
-            # turn finished without an execution failure.
-            # `credit_recent_retrievals` is idempotent per
-            # retrieval (via `last_credited_at`) and only
-            # touches lessons whose `last_retrieved_at`
-            # falls inside the window, so calling it on
-            # turns that didn't surface any lesson is a
-            # no-op. The previous gate
-            # (`was_complex_task or execution_failure_count
-            # > 0`) excluded simple successful tool turns
-            # — exactly the population where lessons are
-            # most likely to be helping — so the feedback
-            # signal was biased toward complex tasks and
-            # the pruner drifted accordingly.
-            sm = getattr(self.context, 'skill_memory', None)
-            if sm is not None and execution_failure_count == 0:
+                if was_complex_task or execution_failure_count > 0:
+                    if not force_stop or "READY TO FINALIZE" in stream_thought.upper():
+                        # Gated on `--smart-memory > 0.0` to honour
+                        # the contract in CLAUDE.md ("Memory writes
+                        # are gated on --smart-memory / --no-memory").
+                        # Without this, a `--smart-memory 0.0` run
+                        # still queued post_mortem entries → phase 1
+                        # consumer → SkillMemory.learn_lesson, leaking
+                        # auto-extracted lessons into the playbook on
+                        # every complex/failing turn.
+                        # post_mortem shares the SAME gates as the episode write
+                        # below and the non-streaming site (10030): smart_memory
+                        # > 0.0 AND not forget_was_called. Without the forget
+                        # guard, a streamed `forget` turn queued a post_mortem →
+                        # phase-1 consumer → learn_lesson, resurrecting the
+                        # forgotten content as a playbook lesson (tombstone
+                        # resurrection) on the COMMON streaming path — the same
+                        # vector the episode write already closed.
+                        if (getattr(self.context, 'journal', None)
+                                and self.context.args.smart_memory > 0.0
+                                and not forget_was_called):
+                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
+                        if self.context.args.smart_memory > 0.0 and not forget_was_called:
+                            # No verdict is available on the streamed path — the
+                            # verifier runs as a LATE handler after the drain — so
+                            # the structural signals carry the label here. That is
+                            # still strictly better than the 80-char substring
+                            # guess this replaced; a late REFUTED corrects the
+                            # trajectory record, which is the durable one.
+                            await self._record_episode_safe(
+                                last_user_content, stream_tools_snapshot,
+                                full_content,
+                                execution_failure_count=execution_failure_count,
+                                req_id=str(req_id or ''))
+
+                # Post-turn hydration usefulness judge (fire-and-
+                # forget, worker-hosted) — every finalized turn,
+                # matching the non-streaming site.
+                self._judge_hydration_safe(
+                    full_content, turn_id=str(req_id or ""))
+
+                # Peek the request-tagged project snapshot for the pid BEFORE
+                # the work_log call consumes it — the late-refute follow-up
+                # filing below also runs in this drain (after semaphore
+                # release) and must file against THIS turn's project, not a
+                # concurrent turn's re-pointed current_project_id.
+                _drain_pid = None
                 try:
-                    if hasattr(sm, 'credit_recent_retrievals'):
-                        # Discriminative form — see the
-                        # finalize-path call for rationale.
-                        await asyncio.to_thread(
-                            sm.credit_recent_retrievals, 300,
-                            query=str(last_user_content or ""),
-                            # BOTH surfaces (§4L R2 NEW-1): the
-                            # delivery dedup removed co-surfaced lessons
-                            # from last_playbook_triggers, starving their
-                            # deterministic credit channel while the
-                            # denominator kept booking.
-                            top_triggers=self._surfaced_lesson_triggers(
-                                sm, turn_id=str(req_id or "")),
+                    _dp = getattr(self.context, "_project_work_pending", None)
+                    if isinstance(_dp, tuple) and len(_dp) == 2 and _dp[0] == req_id:
+                        _drain_pid = (_dp[1] or {}).get("pid")
+                    else:
+                        _drain_pid = getattr(self.context, "current_project_id", None)
+                except Exception:
+                    _drain_pid = getattr(self.context, "current_project_id", None)
+
+                # Streamed-turn trajectory + work_log (2026-07-20 H1).
+                # A streamed forced-final turn RETURNS the SSE
+                # generator before `_finalize_and_return` ever runs,
+                # so `_record_turn_trajectory` and the project
+                # work_log — both sole-called from finalize — never
+                # fired for streamed turns: no corpus record (dead
+                # user-correction loop + abort detection) and no
+                # project work_log (the "forgets project work" gap).
+                # Web UI always streams AND one-task-per-turn forces
+                # this ending on task-closing turns, so this is the
+                # COMMON case, not an edge. Record here directly with
+                # the real `full_content` (the earlier finalize-time
+                # backfill was inert — it keyed off a trajectory
+                # finalize never wrote). The verifier runs LATE below
+                # and backfills the outcome by `current_trajectory_id`,
+                # so pass verifier=None here.
+                try:
+                    # Record the EFFECTIVE visible content (the fallback text
+                    # when the reply was all scrubbed tool-XML), never tag-soup.
+                    _traj_content = locals().get(
+                        "_stream_effective_content", full_content) or full_content
+                    if (isinstance(_traj_content, str)
+                            and _traj_content.strip()):
+                        self._record_turn_trajectory(
+                            messages=messages,
+                            final_content=_traj_content,
+                            req_id=req_id,
+                            model=model,
+                            trajectory_id=current_trajectory_id,
+                            user_request=last_user_content,
+                            verifier=None,
+                            execution_failed=(
+                                execution_failure_count > 0
+                                and bool(last_was_failure)),
                         )
+                except Exception as _sbf_exc:
+                    logger.debug(
+                        "streamed trajectory record skipped: %s",
+                        _sbf_exc)
+                # Project work_log — same helper finalize uses. No
+                # synchronous verdict on the stream path (verifier is
+                # late), so the outcome is execution-based here.
+                await self._write_project_work_log_safe(
+                    last_user_content=last_user_content,
+                    final_ai_content=full_content,
+                    execution_failure_count=execution_failure_count,
+                    verifier_backfill=None,
+                    req_id=req_id,
+                )
+
+                # Promised-notification backstop — streamed twin of the
+                # finalize wiring (same 2026-07-20 H1 rationale as the
+                # trajectory/work_log re-runs above: the web UI always
+                # streams, so without this the promise is only kept for
+                # stream:false clients — the reply streams to a possibly
+                # dead tab and the Slack ping never fires).
+                try:
+                    from .autonomous_activity import (
+                        is_internal_request as _is_internal_req_snb)
+                    _sim = getattr(getattr(self.context, "skill_memory", None),
+                                   "is_read_only", False) is True
+                    # _drain_pid, NOT live current_project_id: this drain runs
+                    # post-semaphore, and a concurrent turn can re-point the
+                    # global pointer mid-drain — firing (or consuming) another
+                    # project's promise (the same hazard the work_log snapshot
+                    # above exists for).
+                    _np_pid = _drain_pid
+                    _np_store = getattr(self.context, "project_store", None)
+                    _promise_active = False
+                    if _np_pid and _np_store is not None:
+                        from .notify_promise import peek_promise as _np_peek
+                        _promise_active = (_np_peek(_np_store, _np_pid)
+                                           is not None)
+                    _sbf = False
+                    if (full_content and not _is_internal_req_snb(req_id)
+                            and not _sim and not _promise_active):
+                        _sbf = _notify_promise_backstop(
+                            self.context,
+                            last_user_content=last_user_content,
+                            tools_run=stream_tools_snapshot,
+                            final_content=full_content,
+                            req_id=req_id,
+                            had_failures=execution_failure_count >= 3,
+                        )
+                    # Stored-promise fire — streamed twin (see finalize; runs
+                    # for internal turns too).
+                    if _np_pid and not _sim:
+                        from .autonomous_activity import (
+                            get_activity_log as _np_get_alog,
+                            summarize_turn_content as _np_head)
+                        from .notify_promise import fire_promise_if_settled
+                        _model_notified = _sbf or any(
+                            (str((t or {}).get("name", "")).lower().strip()
+                             == "notify_operator")
+                            and not str((t or {}).get("content", ""))
+                            .lstrip().startswith("Error")
+                            for t in stream_tools_snapshot or [])
+                        fire_promise_if_settled(
+                            _np_store, _np_get_alog(self.context), _np_pid,
+                            model_notified=_model_notified,
+                            req_id=str(req_id or ""),
+                            headline=_np_head(full_content, limit=220),
+                        )
+                except Exception:
+                    logger.debug("streamed notify backstop skipped",
+                                 exc_info=True)
+
+                # Calibration sample — same reason as the trajectory/work_log
+                # re-runs above: the streamed path returns before
+                # _finalize_and_return, so this was NEVER recorded on the common
+                # (web-UI) path, biasing the fit to non-streaming turns and
+                # starving it of the real-logprob entropy only the stream path
+                # produces (the finalize fallback hardcodes 0.5). The streamed
+                # reading was stashed as _calib_pending=(req_id, reading);
+                # verifier is late here so pass verifier_backfill=None (a late
+                # REFUTE re-pairs via the correction-negative path).
+                await self._record_calibration_safe(
+                    req_id=req_id,
+                    tools_run=stream_tools_snapshot,
+                    verifier_backfill=None,
+                    execution_failure_count=execution_failure_count,
+                    budget_exhausted=False,
+                    final_ai_content=full_content,
+                    user_request=last_user_content or "",
+                    truncated=stream_aborted,   # §4O R2 MAJOR-2
+                )
+
+                # Streamed-turn tracker reset (2026-07-27): the finalize
+                # surfacing block (footer/verify/reset) never runs on this
+                # path, so hedge assumptions scanned into the tracker for
+                # THIS turn's pressure reading would leak into the next
+                # turn's — reset here, after the calibration record consumed
+                # the state. The durable persisted log is untouched.
+                try:
+                    _utk_reset = getattr(self.context, "uncertainty_tracker", None)
+                    if _utk_reset is not None:
+                        _utk_reset.reset()
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # --- VERIFIER GATE (STREAM), 2026-07-18 ---
+                # The gated verdict was historically invoked only
+                # from _finalize_and_return — the NON-streaming
+                # finalization — so every streamed answer shipped
+                # unverified, with no log line of any kind (found
+                # when the operator asked why a turn had no
+                # verdict and the USR2 task dump showed none).
+                # The text is already out, so an inline verdict
+                # could never amend it: the verdict ALWAYS runs
+                # late here, regardless of GHOST_CRITIC_ASYNC —
+                # spawn the pure computation and hand it to the
+                # late handler (logs every outcome, scrubs
+                # poisoned lessons, backfills the trajectory).
+                # force_correction=True because a streamed reply
+                # never carries an inline Verifier note — a
+                # high-conf REFUTED queues a banner that the next
+                # stream already prepends via
+                # _take_active_correction. Skipped when the turn
+                # carried no verifiable evidence (toolless chat):
+                # spawning there adds only a no-op task and a
+                # noise line per message. The claim strips
+                # <think> blocks — they streamed to the client
+                # but are not part of the answer, and they would
+                # eat the verifier's 2000-char claim budget.
+                # Every branch is LOUD (log-only, INFO): the
+                # first live deploy produced total silence on
+                # streamed project turns and none of the debug
+                # channels are captured at INFO — a gate whose
+                # skip reasons are invisible cannot be
+                # distinguished from a gate that never ran
+                # (same lesson as _on_done's once-silent
+                # exception path).
+                try:
+                    _sv_claim = re.sub(
+                        r'<think>.*?(?:</think>|$)', '',
+                        full_content,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    ).strip()
+                    _sv_tool = _find_substantive_tool_for_verifier(
+                        stream_tools_snapshot)
+                    if getattr(self.context.args,
+                               "no_verifier", False):
+                        pass  # ablation off-switch: silent
+                    elif getattr(self.context, "verifier",
+                                 None) is None:
+                        pretty_log(
+                            "Verifier",
+                            "stream gate: no verifier attached "
+                            "— skipped",
+                            icon=Icons.VERIFIER_LAB)
+                    elif not _sv_claim:
+                        pretty_log(
+                            "Verifier",
+                            "stream gate: empty claim after "
+                            "think-strip — skipped",
+                            icon=Icons.VERIFIER_LAB)
+                    elif _sv_tool is None:
+                        pretty_log(
+                            "Verifier",
+                            "stream gate: no substantive tool "
+                            f"in {len(stream_tools_snapshot)} "
+                            "record(s) — skipped "
+                            "(bookkeeping-only turn)",
+                            icon=Icons.VERIFIER_LAB)
+                    else:
+                        _sv_task = _glog.spawn_task(
+                            self._compute_verifier_verdict(
+                                tools_run_this_turn=stream_tools_snapshot,
+                                messages=stream_verify_messages,
+                                final_ai_content=_sv_claim,
+                                last_user_content=last_user_content,
+                                lc=lc,
+                                # Ledger identity on the STREAMED path too. This
+                                # drain runs after the turn semaphore is
+                                # released, so both values are passed from this
+                                # closure's captures — never read off the
+                                # context, which by now belongs to whichever
+                                # request is running.
+                                req_id=req_id,
+                                trajectory_id=current_trajectory_id,
+                            ))
+                        self._attach_late_verdict_handler(
+                            _sv_task, current_trajectory_id,
+                            stream_conv_fp,
+                            force_correction=True,
+                            project_id=_drain_pid)
+                        pretty_log(
+                            "Verifier",
+                            "stream gate: verdict deferred — "
+                            "verifying asynchronously after "
+                            "the stream",
+                            icon=Icons.VERIFIER_LAB)
+                except Exception as _svx:
+                    pretty_log(
+                        "Verifier",
+                        "stream gate spawn failed: "
+                        f"{type(_svx).__name__}: "
+                        f"{str(_svx)[:160]}",
+                        icon=Icons.WARN, level="WARNING")
+
+                # Retrieval feedback loop: credit lessons that
+                # were surfaced during this turn whenever the
+                # turn finished without an execution failure.
+                # `credit_recent_retrievals` is idempotent per
+                # retrieval (via `last_credited_at`) and only
+                # touches lessons whose `last_retrieved_at`
+                # falls inside the window, so calling it on
+                # turns that didn't surface any lesson is a
+                # no-op. The previous gate
+                # (`was_complex_task or execution_failure_count
+                # > 0`) excluded simple successful tool turns
+                # — exactly the population where lessons are
+                # most likely to be helping — so the feedback
+                # signal was biased toward complex tasks and
+                # the pruner drifted accordingly.
+                sm = getattr(self.context, 'skill_memory', None)
+                if sm is not None and execution_failure_count == 0:
+                    try:
+                        if hasattr(sm, 'credit_recent_retrievals'):
+                            # Discriminative form — see the
+                            # finalize-path call for rationale.
+                            await asyncio.to_thread(
+                                sm.credit_recent_retrievals, 300,
+                                query=str(last_user_content or ""),
+                                # BOTH surfaces (§4L R2 NEW-1): the
+                                # delivery dedup removed co-surfaced lessons
+                                # from last_playbook_triggers, starving their
+                                # deterministic credit channel while the
+                                # denominator kept booking.
+                                top_triggers=self._surfaced_lesson_triggers(
+                                    sm, turn_id=str(req_id or "")),
+                            )
+                    except Exception:
+                        pass
+
+                # Outcome-gated lesson feedback (streamed path): the verifier runs
+                # LATE here (trajectory recorded with verifier=None), so only a
+                # structural execution failure is decisive now; a clean turn is
+                # stashed by trajectory_id and drained when the async verdict lands
+                # via _backfill_trajectory_outcome.
+                try:
+                    await self._record_lesson_outcomes(
+                        # BOTH injection surfaces — see the finalize-path call.
+                        surfaced_triggers=self._surfaced_lesson_triggers(
+                            sm, turn_id=str(req_id or "")),
+                        execution_failure_count=execution_failure_count,
+                        verifier_backfill=None,
+                        trajectory_id=current_trajectory_id,
+                    )
                 except Exception:
                     pass
 
-            # Outcome-gated lesson feedback (streamed path): the verifier runs
-            # LATE here (trajectory recorded with verifier=None), so only a
-            # structural execution failure is decisive now; a clean turn is
-            # stashed by trajectory_id and drained when the async verdict lands
-            # via _backfill_trajectory_outcome.
-            try:
-                await self._record_lesson_outcomes(
-                    # BOTH injection surfaces — see the finalize-path call.
-                    surfaced_triggers=self._surfaced_lesson_triggers(
-                        sm, turn_id=str(req_id or "")),
-                    execution_failure_count=execution_failure_count,
-                    verifier_backfill=None,
-                    trajectory_id=current_trajectory_id,
-                )
-            except Exception:
-                pass
+            except Exception as _tail_exc:  # noqa: BLE001
+                # The handler itself must not be able to raise — a throw here
+                # propagates exactly like the one it is catching and takes
+                # end-of-stream with it. (Flagged by the structural pin, which
+                # was right: "guarded" has to mean guarded all the way down.)
+                try:
+                    logger.warning("streamed-turn tail failed (record may be "
+                                   "incomplete): %s: %s",
+                                   type(_tail_exc).__name__, _tail_exc)
+                except Exception:
+                    pass
+            # ── RELEASE THE HELD [DONE] SENTINEL — LAST STATEMENT OF THE
+            # GENERATOR (2026-08-11, §4AT-A) ────────────────────────────────
+            # Everything that must survive the turn has now run: episode,
+            # hydration judge, trajectory, project work_log, verifier spawn,
+            # lesson outcomes. A client closing on the sentinel can no longer
+            # discard any of it. The reader waits for the end-of-stream marker,
+            # not for content — the answer text was fully streamed long before.
+            #
+            # ⚠ MUST STAY INSIDE `stream_wrapper`. The first attempt at this
+            # move put the `yield` below the generator's body, into the
+            # enclosing `_stream_final_generation` — which parses fine and
+            # silently turns the WRONG function into a generator. `yield` is
+            # scoped to the function it appears in, and this file nests three
+            # deep; verify with an AST scope check, not by reading indentation.
+            if _held_done_chunk is not None:
+                yield _held_done_chunk
 
         # Keep THIS turn registered — visible in /api/turns and
         # cancellable — for the WHOLE streamed drain, then
@@ -18574,12 +19023,52 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # reader would then block every later turn.
         _stream_owns_unregister = True
 
+        # TRUE ELAPSED. `handle_chat`'s finally — and with it the
+        # `└─ request finished +Ns` frame — runs when this generator is
+        # RETURNED, i.e. when the final answer starts streaming, not when it
+        # lands. So the frame reported time-to-first-token while the operator
+        # waited for the whole drain: observed 2026-08-12, a turn whose banner
+        # said "+23.0s" gave the terminal back ~2 minutes later, and every
+        # second of that generation was logged NOWHERE. The frame's number is
+        # kept (time-to-first-token is a real, useful metric — it is when
+        # output starts appearing, and three clients parse that frame); this
+        # adds the number it was being mistaken for.
+        _req_t0 = time.monotonic() - (
+            _glog.request_elapsed_s(req_id) or 0.0)
+
         async def _stream_then_unregister(_gen):
+            _drain_t0 = time.monotonic()
+            _chunks = 0
+            _bytes = 0
             try:
                 async for _chunk in _gen:
+                    _chunks += 1
+                    try:
+                        _bytes += len(_chunk)
+                    except TypeError:      # a non-sized chunk type
+                        pass
                     yield _chunk
             finally:
                 _turn_reg.unregister(req_id, _active_turn)
+                try:
+                    _now = time.monotonic()
+                    _drain = _now - _drain_t0
+                    _total = _now - _req_t0
+                    _rate = (f" · {_chunks / _drain:.0f} chunk/s"
+                             if _drain > 0.5 and _chunks else "")
+                    # Ordered for the CONSOLE, which truncates content at
+                    # ~60 chars: total and time-to-first-token are the pair
+                    # that answers "why did the banner say 23s when I waited
+                    # two minutes". Size and rate fall into the durable
+                    # mirror, which keeps the full line.
+                    pretty_log(
+                        "Stream Drained",
+                        f"{req_id[:8]} · TOTAL {_total:.1f}s · first token "
+                        f"{_total - _drain:.1f}s · {_chunks:,} chunks · "
+                        f"{_bytes / 1024:.0f} KB{_rate}",
+                        icon=Icons.REQ_DONE)
+                except Exception:  # noqa: BLE001 — never break a drain
+                    pass
 
         return (_stream_then_unregister(stream_wrapper()),
                 created_time, req_id)
@@ -19180,6 +19669,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     self.context, req_id, "fs_batch_context", _fs_treat)
                 if any(getattr(tc, "name", "") == "file_system"
                        for tc in (tool_calls or [])):
+                    # ⚠ ARM-INDEPENDENT (2026-08-11). The condition guarding
+                    # this — "the turn used file_system at all" — is already
+                    # arm-independent BY DESIGN (the comment above says so).
+                    # Passing `_fs_treat` as the value threw that away: the
+                    # control side stamped False (0/46 vs 4/37), so the
+                    # triggered-only comparison the report tells the operator
+                    # to read FIRST had no control group and was uncomputable
+                    # at any sample size. `fs_batch_context` above stays
+                    # arm-keyed — it correctly records that the PROMPT was
+                    # mutated, which really is treatment-only.
                     _experiments_mod.mark_trigger(
                         self.context, req_id, "fs_batch_fired", _fs_treat)
         except Exception:

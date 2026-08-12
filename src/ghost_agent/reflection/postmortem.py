@@ -537,6 +537,7 @@ def select_failed_runs(
     min_severity: float = 0.4,
     exclude_signatures: Optional[Set[str]] = None,
     include_unknown: bool = False,
+    max_age_days: float = 7.0,
 ) -> List[Tuple[Trajectory, TranscriptSignature]]:
     """Pick the worst FAILED runs worth a post-mortem.
 
@@ -554,6 +555,24 @@ def select_failed_runs(
     exclude = exclude_signatures or set()
     scored: List[Tuple[Trajectory, TranscriptSignature]] = []
     seen_this_run: Set[str] = set()
+    # ⚠ RECENCY BOUND (2026-08-11, §4AT-H). Selection walked the ENTIRE corpus
+    # with no date filter, and severity is time-blind — so the first ticks
+    # after `--postmortem` is re-enabled would file `code_defect` reports (and,
+    # under --postmortem-propose-patch, LLM-generated diffs) against the
+    # oldest, worst runs on record. Verified against the live corpus: its top
+    # picks were dated 2026-07-17/18, code paths that have since been through
+    # the §4L-§4R audits. A post-mortem of a bug that was fixed three weeks ago
+    # is worse than no post-mortem: it spends a main-model call and files a
+    # defect that cannot be reproduced.
+    _cutoff = None
+    if max_age_days and max_age_days > 0:
+        try:
+            import datetime as _dt
+            _cutoff = (_dt.datetime.utcnow()
+                       - _dt.timedelta(days=float(max_age_days))).isoformat()
+        except Exception:                                    # noqa: BLE001
+            _cutoff = None
+    _skipped_old = 0
     for traj in trajectories:
         outcome = getattr(traj, "outcome", "")
         if outcome == Outcome.FAILED.value:
@@ -562,6 +581,14 @@ def select_failed_runs(
             pass
         else:
             continue
+        if _cutoff:
+            _ts = str(getattr(traj, "timestamp", "") or "")
+            # An UNPARSEABLE/absent stamp is kept, not dropped — an unknown
+            # date must not silently shrink the candidate pool (a filter that
+            # fails closed on missing data hides work rather than bounding it).
+            if _ts and _ts < _cutoff:
+                _skipped_old += 1
+                continue
         sig = compute_signature(traj)
         if sig.severity < min_severity:
             continue
@@ -569,6 +596,9 @@ def select_failed_runs(
             continue
         seen_this_run.add(sig.hash)
         scored.append((traj, sig))
+    if _skipped_old:
+        logger.info("post-mortem: %d failed run(s) older than %.0fd skipped "
+                    "(recency bound)", _skipped_old, float(max_age_days))
     scored.sort(key=lambda ts: ts[1].severity, reverse=True)
     return scored[:limit]
 
@@ -630,10 +660,22 @@ class PostMortemEngine:
         """One post-mortem tick. Never raises."""
         report = PostMortemRunReport()
         try:
-            if callable(source) and not hasattr(source, "__iter__"):
-                trajectories = list(source())
-            else:
-                trajectories = list(source)
+            # ⚠ OFF THE EVENT LOOP (2026-08-11, §4AT-H). Materialising the
+            # trajectory corpus here is a blocking read that grows with the
+            # corpus: measured 0.207 s over 1,573 trajectories / 22 MB on the
+            # live box, and rising. The IDENTICAL pattern ~100 lines away in
+            # `agent.py` was moved to a thread under §4Q for exactly this
+            # reason; this site never got the fix because the gate has been
+            # closed for months, so nobody felt it. Re-enabling `--postmortem`
+            # without this stalls every concurrent SSE stream on each tick.
+            import asyncio as _asyncio
+
+            def _materialise():
+                if callable(source) and not hasattr(source, "__iter__"):
+                    return list(source())
+                return list(source)
+
+            trajectories = await _asyncio.to_thread(_materialise)
         except Exception as e:
             logger.warning("post-mortem source iteration failed: %s", e)
             return report

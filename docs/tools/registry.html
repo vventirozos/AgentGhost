@@ -200,6 +200,22 @@
   block. It is bounded (~1.2 KB of the head) and it is the price of measuring a schema change at all.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="fs-batch-parity">The <code>fs_batch</code> arm differs by exactly the treatment <span class="tag">2026-08-11</span></h2>
+  <p>
+    The treatment schema drops <code>path</code> from <code>required</code> so a pure
+    <code>paths</code> batch read is valid — but that also told the treatment arm that
+    <code>write</code>, <code>replace</code> and <code>delete</code> need no path, which has nothing
+    to do with the batch affordance under test. Only <code>read</code> fans out; no mutating op
+    accepts <code>paths</code>. <b>An unmeasured confound in a live A/B whose entire purpose is the
+    batch macro.</b>
+  </p>
+  <p>
+    JSON Schema cannot express &ldquo;required unless <code>operation == read</code>&rdquo; portably
+    (and an invented key is silently ignored — one was tried and removed), so the constraint is
+    stated in the tool DESCRIPTION, which is the channel the model actually reads. The schema stays
+    permissive; the instruction restores parity for every operation except the batch read.
+  </p>
 </main>
 </body>
 </html>

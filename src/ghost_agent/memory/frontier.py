@@ -1043,6 +1043,18 @@ class FrontierTracker:
                     {
                         "timestamp": outcome["timestamp"],
                         "cluster_key": cluster_key,
+                        # ⚠ PROVENANCE (2026-08-11, §4AT-B). A run recorded
+                        # only which cluster it was FILED under, never which
+                        # template produced it — so when attribution turned
+                        # out to be 51% wrong, working out what belonged where
+                        # required re-rendering the whole template bank at
+                        # four tiers and matching challenge hashes. Forensics,
+                        # because the record did not say. Stamping the source
+                        # makes the NEXT attribution change auditable instead:
+                        # empty means the challenge had no template (LLM-
+                        # generated or journal-mined), which is itself the
+                        # distinction the cluster field cannot carry.
+                        "template_key": str(template_key or ""),
                         "challenge": (challenge or "")[:300],
                         "attempts_used": attempts_used,
                         "passed": passed,

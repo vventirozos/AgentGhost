@@ -277,6 +277,50 @@
   any miss the original is written and the (now shape-naming) syntax feedback drives the retry.
   Tests: <code>tests/test_req50855398_fixes.py</code>.</p>
 
+
+  <h2 id="replace-failure-label">A failed replace now names the reason it actually failed <span class="tag">2026-08-11</span></h2>
+  <p>
+    Every non-<code>SUCCESS</code> replace was reported to the model as
+    <em>&ldquo;anchor not found&rdquo;</em> — a diagnosis, not an observation, and often the wrong
+    one. That string is prefixed with <code>YOUR PREVIOUS ATTEMPT FAILED:</code> into the next
+    attempt's prompt, so a wrong label steers every retry at the wrong hypothesis. Live on one
+    request: a syntax-regression rollback (<code>REJECTED: that replace would introduce a syntax
+    error … unexpected indent</code>) was relabelled &ldquo;anchor not found&rdquo;, and the model
+    spent <b>20 minutes and 14 attempts hunting for a better anchor</b> while the defect was its
+    replacement's indentation.
+  </p>
+  <p>
+    <code>_replace_failure_kind()</code> classifies the observed rejection: syntax rollback,
+    ambiguous anchor, genuine anchor miss, marker leak, blocked write. <b>An unrecognised shape
+    returns a neutral phrase rather than the most likely guess</b> — the caller appends the tool's
+    raw text anyway, so saying less beats saying something false. Pinned in
+    <code>tests/test_audit_4at_round3_fixes.py</code>.
+  </p>
+
+  <h2 id="silent-drops">Two ways a task closed DONE claiming work that never happened <span class="tag">2026-08-11</span></h2>
+  <p>
+    <b>Dropped edits.</b> <code>edits</code> apply only when the path is in the prompt snapshot, and
+    that snapshot is hard-capped at 12 files. An <code>edits</code> entry for an unsnapshotted file
+    fell through to the <code>content</code> branch, found <code>None</code>, and returned
+    &ldquo;skipped, not a failure&rdquo; — zero tool calls, no reason, nothing in <code>written</code>.
+    A sibling entry that <em>did</em> apply then made the spec look successful. It now returns an
+    explicit reason naming the file and the cap.
+  </p>
+  <p>
+    <b>Rewrite judged against a prefix.</b> <code>_gather_project_files</code> truncates silently, so
+    a 300&nbsp;KB <code>index.html</code> snapshotted at 4&nbsp;KB made a 20&nbsp;KB full rewrite look
+    like <em>growth</em> (20000 &gt; 4000×0.85) and the non-regression guard waved through the loss of
+    280&nbsp;KB. For <code>.py</code> the truncated prefix usually fails <code>ast.parse</code>, which
+    disables the overwrite guard entirely. Truncated entries now carry
+    <code>SNAPSHOT_TRUNCATED_MARK</code>, and a marked baseline forces a live re-read — <b>refusing if
+    the re-read fails</b>, because a refusal costs one retry and a wrong pass costs the file.
+  </p>
+  <p>
+    ⚠ The marker has <b>one</b> definition, imported rather than copied — producer/consumer drift is
+    the defect class this module already carries scars for. ⚠ The first pass marked only the
+    budget-exhaustion branch; the <em>per-file</em> truncation fires first and far more often, and
+    only a producer-side pin caught it (mutation-testing showed removing the marker reddened nothing).
+  </p>
 </main>
 </body>
 </html>

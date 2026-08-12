@@ -13,6 +13,8 @@ boundary cases (no prior best, failed run, etc).
 
 from typing import Iterable, Optional
 
+from ..sandbox.jobs import is_promoted_result
+
 
 # Tool names whose result content is USER DATA (fixture file contents,
 # retrieved documents, search results). The self-play challenge often
@@ -95,6 +97,12 @@ def count_tool_errors(messages: Iterable[dict]) -> int:
             continue
 
         # Tier 2: unambiguous patterns (stack traces, system alerts).
+        # A command DETACHED at its budget (sandbox/jobs.py) belongs here:
+        # its result is success-shaped, so the reward would treat an
+        # unfinished run as a clean one.
+        if is_promoted_result(content):
+            n += 1
+            continue
         if any(p in content for p in _UNAMBIGUOUS_ERROR_PATTERNS):
             n += 1
             continue

@@ -53,6 +53,11 @@ _BINARY_EXTS = frozenset({
 })
 
 
+# Appended to a snapshot entry that holds only a PREFIX of the real file.
+# Consumers must not treat a marked entry as the file's full prior content.
+SNAPSHOT_TRUNCATED_MARK = "\n…[SNAPSHOT TRUNCATED — prefix only]"
+
+
 def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000,
                           per_file_chars: int = 200_000,
                           max_files: int = 12) -> Dict[str, str]:
@@ -100,12 +105,29 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
                 except OSError:
                     continue
                 if len(content) > per_file_chars:
-                    content = content[:per_file_chars]
+                    # ⚠ MARK THIS ONE TOO. My first pass marked only the
+                    # budget-exhaustion branch below — but THIS is the
+                    # truncation that fires first and far more often (a
+                    # 300 KB file is cut to 200 KB here before the budget is
+                    # anywhere near spent). The producer-side pin caught it:
+                    # the consumer's guard would have stayed dark for the
+                    # common case.
+                    content = content[:per_file_chars] + SNAPSHOT_TRUNCATED_MARK
                 remaining = budget_chars - total
                 if remaining < len(content):
                     # Budget nearly spent — keep a substantial prefix (NEVER
                     # empty) so the guard still knows the file is non-trivial.
-                    content = content[:max(4000, remaining)]
+                    #
+                    # ⚠ AND SAY THAT IT IS A PREFIX (2026-08-11, §4AT-F). The
+                    # truncation was silent, so `coding_executor._apply_file`
+                    # took `snap[path]` as the file's FULL prior content and
+                    # ran the non-regression guard against it: a 300 KB
+                    # index.html stored as 4 KB made a 20 KB full rewrite look
+                    # like GROWTH (20000 > 4000×0.85), so the guard waved
+                    # through an overwrite that destroyed 280 KB. For .py the
+                    # prefix usually fails `ast.parse`, which DISABLES the
+                    # overwrite guard outright.
+                    content = content[:max(4000, remaining)] + SNAPSHOT_TRUNCATED_MARK
                 out[rel] = content
                 total += len(content)
                 if len(out) >= max_files:
@@ -844,9 +866,17 @@ async def advance_once(
         # engine violation was written by THIS path, which never saw the
         # captured "with YOU - Ghost plays directly, not a generated chess
         # AI" constraint at all.
-        _constraints = [str(c) for c in
-                        ((proj.get("metadata") or {}).get("constraints")
-                         or [])]
+        # ⚠ USE THE SHARED NORMALISER (2026-08-11, §4AT-C). Metadata is
+        # model-written JSON, so `{"constraints": "no external APIs"}` is a
+        # legal shape — and iterating it raw yields 17 SINGLE-CHARACTER
+        # "constraints" fed straight to the constraint gate. `_constraint_list`
+        # exists precisely because this shredding already destroyed a
+        # constraint record once (2026-08-01); this call site kept its own copy
+        # and so kept the bug. Three other sites in tools/projects.py use the
+        # helper correctly.
+        from ..memory.projects import _constraint_list
+        _constraints = _constraint_list(
+            (proj.get("metadata") or {}).get("constraints"))
         cres = None
         try:
             cres = await coding_executor(
@@ -862,7 +892,26 @@ async def advance_once(
                 single_file=_single_file,
                 constraints=_constraints)
         except Exception as e:
+            # ⚠ A CRASH MUST NOT DOWNGRADE TO A WEAKER CLOSER (2026-08-11,
+            # §4AT-C). This logged and fell through to the generic
+            # single-shell-command path below, which marks the leaf DONE on
+            # ANY output that is not `ERROR:`-prefixed and not a non-zero
+            # exit — with the verify gate, the smoke gate, the files-written
+            # check and the constraint gate ALL bypassed. `echo`-shaped
+            # output closed a build task.
+            #
+            # Same family as the two coding-executor CRITICALs fixed the same
+            # day (dropped edits, truncated-snapshot overwrite): a task
+            # reaching DONE on evidence that no work happened. A transient
+            # exception is a reason to STOP, not a reason to accept a lower
+            # standard of proof. The leaf stays open and the next tick retries
+            # it with the full gate set.
             logger.warning("coding_executor crashed: %s", e)
+            return AdvanceResult(
+                True, nxt.id, "blocked",
+                f"coding executor crashed on '{nxt.id}' "
+                f"({type(e).__name__}: {e}) — leaf left open rather than "
+                f"closed by the weaker fallback path")
         if cres is not None:
             return _finalize_coding(context, store, plan, project_id, nxt,
                                     cres, _tick_started_at)
@@ -1402,6 +1451,18 @@ def _looks_like_failure(output: str) -> bool:
     # completion" this subsystem exists to prevent). Detect a non-zero EXIT
     # CODE and the [SYSTEM ERROR] sentinel anywhere in the result.
     import re as _re
+    # A command DETACHED at its budget (sandbox/jobs.py) reports exit 0 while
+    # STILL RUNNING. It is not a failure — but it is emphatically not evidence
+    # of success either, and this function's answer is what lets a tick call
+    # `update_status(..., DONE)`. Treated as a failure HERE on purpose: the
+    # caller's only two options are DONE and retry, and retrying an unfinished
+    # command is far cheaper than marking a task complete on work that has not
+    # happened. (The re-run guard makes that retry a no-op that returns the
+    # same job.) The sibling classify_verify_result calls it "inconclusive",
+    # which is the same verdict in the vocabulary that has three answers.
+    from ..sandbox.jobs import is_promoted_result as _promoted
+    if _promoted(s):
+        return True
     _m = _re.search(r"EXIT CODE:\s*(\d+)", s)
     if _m:
         return _m.group(1) != "0"
@@ -1450,6 +1511,16 @@ def classify_verify_result(output) -> str:
         return "inconclusive"
     if s.startswith("SANDBOX EGRESS BLOCKED"):
         return "inconclusive"  # command NOT executed — nothing was verified
+    # A verify command that outran its budget was DETACHED, not killed
+    # (sandbox/jobs.py). Its result is success-SHAPED (`EXIT CODE: 0`, no
+    # error sentinel) so the turn loop does not score a strike — but the
+    # command has NOT finished, so it is the fourth "success-shaped output
+    # that verified nothing" this function exists to reject. Without this a
+    # 600 s+ `pytest`/`npm run build` marks its task DONE, unattended, in the
+    # idle autoadvancer, and the job's eventual exit 1 is never reconciled.
+    from ..sandbox.jobs import is_promoted_result
+    if is_promoted_result(s):
+        return "inconclusive"
     m = re.search(r"EXIT CODE:\s*(\d+)", s)
     if m is None:
         return "inconclusive"  # no exit code at all — not proof of anything

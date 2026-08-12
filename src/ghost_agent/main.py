@@ -28,6 +28,7 @@ import importlib.util
 import sys
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -344,6 +345,189 @@ def _build_resolved_config(args, context) -> dict:
     return cfg
 
 
+# How often the background sweeper asks the sandbox job supervisor to land
+# finished jobs and kill expired ones. The `jobs` tool reconciles on demand
+# too, so this only has to be frequent enough that the LIFETIME CAP is real
+# without the model ever asking — a job must not outlive its deadline just
+# because nobody looked.
+_SANDBOX_JOB_REAP_EVERY_S = 60.0
+
+
+async def _reap_sandbox_jobs(context):
+    """Periodic reaper for promoted sandbox commands (:mod:`sandbox.jobs`).
+
+    Without this the TTL would only be enforced when something happened to
+    call the ``jobs`` tool — i.e. the unbounded wait would have been moved
+    into the job layer rather than removed. Runs until the process exits;
+    every iteration is best-effort and swallows its own failures so a
+    transient docker hiccup can't kill the loop.
+    """
+    from .sandbox.jobs import get_job_supervisor
+    while True:
+        await asyncio.sleep(_SANDBOX_JOB_REAP_EVERY_S)
+        try:
+            sup = get_job_supervisor(getattr(context, "sandbox_manager", None))
+            if sup is None:
+                continue
+            changed = await asyncio.to_thread(sup.reap)
+            for entry in changed:
+                _line = (
+                    f"{entry.get('id')} {entry.get('state')}"
+                    + (f" (exit {entry.get('exit_code')})"
+                       if entry.get("exit_code") is not None else "")
+                    + f" — {str(entry.get('command'))[:70]}")
+                pretty_log(
+                    "Sandbox Job",
+                    _line + ". Read it with jobs(action='collect', job_id=…).",
+                    icon=Icons.JOB_PROMOTE)
+            # …and into the ACTIVITY LEDGER, so it is answerable later. The
+            # operator's live stream is watched, not queried; without this a
+            # job that landed while nobody was looking is visible nowhere
+            # except a `jobs` call the model has no reason to make. Shared
+            # with the `jobs` tool's own reconcile, since either can be the
+            # one that observes a transition.
+            from .tools.delegate import record_landings
+            record_landings(context, changed)
+            # …and WAKE THE MODEL. This is the half that makes promoting at
+            # 90s instead of 600s safe (see sandbox.jobs.promote_after_s):
+            # without it, an early promotion on a `pytest`/`pip install`
+            # would end the turn and strand the work until the operator
+            # spoke again. With it, the model gets its result either way —
+            # just asynchronously — and keeps going on its own.
+            for entry in changed:
+                await _resume_after_job(context, entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a reaper that dies is worse
+            logging.getLogger("GhostAgent").debug(
+                "sandbox job reap cycle failed", exc_info=True)
+
+
+# Jobs already woken, so a landing can never re-trigger. Bounded: reap only
+# reports a transition ONCE (it is the sole writer of terminal states), so
+# this is belt-and-braces against a reaper restart re-reading the registry.
+_RESUMED_JOBS: set = set()
+# A landed job is not allowed to start an unbounded chain of autonomous
+# turns. Each wake is one turn; a woken turn that promotes another job can
+# wake again, so the counter is the backstop on that recursion.
+_MAX_RESUMES_PER_HOUR = 12
+_resume_times: list = []
+
+
+async def _resume_after_job(context, entry) -> bool:
+    """Re-engage the model with a finished job's result.
+
+    Modelled on the scheduled-task path (same ``handle_chat`` entry point,
+    same internal request-id class — ``job-`` is already registered in
+    ``INTERNAL_REQUEST_PREFIXES``, so these turns stay out of the operator
+    digest and the smart-memory corpus).
+
+    Stands down while a USER request is in flight, exactly as a scheduled
+    task does: turns are serialized on one semaphore, so waking here would
+    make a live user queue behind autonomous work. The next landing (or a
+    `jobs` call) picks it up instead. Never raises.
+    """
+    jid = str((entry or {}).get("id") or "")
+    if not jid or jid in _RESUMED_JOBS:
+        return False
+    try:
+        from .tools.tasks import should_defer_scheduled_task
+        if should_defer_scheduled_task(getattr(context, "llm_client", None)):
+            pretty_log(
+                "Job Resume Deferred",
+                f"{jid} landed while a user request is active — leaving it "
+                f"for the next sweep rather than queueing behind the user.",
+                icon=Icons.SKIP)
+            return False
+        now = time.time()
+        _resume_times[:] = [t for t in _resume_times if now - t < 3600]
+        if len(_resume_times) >= _MAX_RESUMES_PER_HOUR:
+            pretty_log(
+                "Job Resume Capped",
+                f"{jid}: {_MAX_RESUMES_PER_HOUR} autonomous resumes already "
+                f"this hour — recording it only. Read it with "
+                f"jobs(action='collect').",
+                level="WARNING", icon=Icons.STOP)
+            _RESUMED_JOBS.add(jid)
+            return False
+
+        _RESUMED_JOBS.add(jid)
+        _resume_times.append(now)
+        code = entry.get("exit_code")
+        state = str(entry.get("state") or "")
+        tail = ""
+        try:
+            sup = getattr(context, "sandbox_manager", None)
+            from .sandbox.jobs import get_job_supervisor
+            _s = get_job_supervisor(sup)
+            if _s is not None:
+                tail = _s.log_tail(jid, lines=60)
+        except Exception:  # noqa: BLE001
+            tail = "(output unavailable)"
+        prompt = (
+            f"SYSTEM: the background job {jid} you started has finished — "
+            f"this is its result arriving, not a new request from the user.\n"
+            f"COMMAND: {str(entry.get('command'))[:300]}\n"
+            f"STATE: {state}"
+            + (f" · EXIT CODE: {code}" if code is not None else "")
+            + f"\nOUTPUT (last lines):\n{tail}\n\n"
+            "Continue the work that was waiting on this. If it succeeded and "
+            "something remains, do it now. If it failed, diagnose from the "
+            "output above rather than re-running the same long command. If "
+            "nothing remains, say briefly what the job produced — the user "
+            "has not seen this output."
+        )
+        pretty_log(
+            "Job Resume",
+            f"{jid} {state}"
+            + (f" (exit {code})" if code is not None else "")
+            + " — waking the model to continue.",
+            icon=Icons.JOB_PROMOTE)
+        from fastapi import BackgroundTasks
+        body = {"model": getattr(context.args, "model", None),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False}
+        await context.agent.handle_chat(body, BackgroundTasks(),
+                                        request_id=f"job-{jid}")
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — a failed wake must not kill the reaper
+        logging.getLogger("GhostAgent").warning(
+            "sandbox job resume failed for %s", jid, exc_info=True)
+        return False
+
+
+async def _announce_ready_when_warm(warmup_task, timeout: float = 120.0):
+    """Emit the READY banner once boot has genuinely finished.
+
+    The main-prefix warmup is spawned in the background (it prefills ~24k
+    tokens and must not hold up the socket), so it was the one boot step that
+    logged AFTER "system ready" — making the banner look like a lie in the
+    operator's stream. Now the banner waits for it.
+
+    Two rails, because a log line must never be able to hide:
+      * the wait is SHIELDED, so a timeout here cannot cancel the warmup;
+      * it is BOUNDED — a wedged upstream would otherwise mean no ready line
+        at all for a server that is, in fact, already serving.
+    """
+    if warmup_task is not None and not warmup_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(warmup_task), timeout)
+        except asyncio.TimeoutError:
+            pretty_log(
+                "Prefix Warmup Slow",
+                f"still running after {int(timeout)}s — announcing ready "
+                f"anyway; the first request may pay part of the prefill.",
+                level="WARNING", icon=Icons.WARN)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — spawn_bg already logs the failure
+            pass
+    pretty_log("System Ready", "Listening for requests",
+               icon=Icons.SYSTEM_READY)
+
+
 @asynccontextmanager
 async def lifespan(app):
     args = app.state.args
@@ -433,8 +617,42 @@ async def lifespan(app):
             except Exception:
                 logging.getLogger("GhostAgent").debug(
                     "boot service reconcile skipped", exc_info=True)
+            # Promoted sandbox JOBS (2026-08-11) outlive the agent process the
+            # same way services do — a command detached at its budget keeps
+            # running in the container across a restart. Reap first (a job
+            # past its lifetime cap must not survive the restart that
+            # orphaned it), then say what carried over.
+            try:
+                from .sandbox.jobs import get_job_supervisor, jobs_enabled
+                _jsup = (get_job_supervisor(context.sandbox_manager)
+                         if jobs_enabled() else None)
+                if _jsup is not None:
+                    await asyncio.to_thread(_jsup.reap)
+                    _job_line = await asyncio.to_thread(_jsup.summary_line)
+                    if _job_line:
+                        pretty_log("Sandbox Jobs", _job_line,
+                                   icon=Icons.JOB_PROMOTE)
+            except Exception:
+                logging.getLogger("GhostAgent").debug(
+                    "boot sandbox-job reconcile skipped", exc_info=True)
         except Exception as e:
             pretty_log("Sandbox Failed", str(e), level="ERROR", icon=Icons.FAIL)
+
+        # The reaper starts REGARDLESS of how the block above went. A docker
+        # failure at boot still leaves `context.sandbox_manager` assigned, so
+        # `execute` promotes normally once docker recovers — and without this
+        # the lifetime cap would then be enforced only when something
+        # happened to call the `jobs` tool, i.e. the unbounded wait would be
+        # back, just relocated. The loop no-ops while no supervisor exists.
+        try:
+            from .sandbox.jobs import jobs_enabled as _jobs_on
+            if _jobs_on():
+                from .utils.logging import spawn_bg as _spawn_bg_jobs
+                _spawn_bg_jobs(_reap_sandbox_jobs(context),
+                               name="sandbox-job-reaper")
+        except Exception:
+            logging.getLogger("GhostAgent").debug(
+                "sandbox-job reaper not started", exc_info=True)
 
     # ProjectStore is intentionally NOT gated by --no-memory. Projects
     # are explicit user-driven structure (titles, tasks, artifacts the
@@ -1742,11 +1960,16 @@ async def lifespan(app):
     # Opt out via GHOST_MAIN_PREFIX_WARMUP=0.
     _warm_main = os.environ.get("GHOST_MAIN_PREFIX_WARMUP", "1").strip().lower() not in ("0", "false", "no")
     _llm_main = getattr(context, "llm_client", None)
+    # Held so the READY banner can wait for it — the warmup is the only boot
+    # step that logs after everything else, and "system ready" printed above
+    # its own two lines read as if boot had finished before it had.
+    _warmup_task = None
     if (_warm_main and _llm_main is not None
             and isinstance(getattr(_llm_main, "upstream_url", None), str)
             and _llm_main.upstream_url):
         from .utils.logging import spawn_bg as _spawn_bg_main
-        _spawn_bg_main(agent.warm_up_main_prefix(), name="main-prefix-warmup")
+        _warmup_task = _spawn_bg_main(agent.warm_up_main_prefix(),
+                                      name="main-prefix-warmup")
 
     # Calibration spine (roadmap phase 2.5). Pairs each turn's composite
     # confidence with the realized outcome, measures Brier/ECE, and (idle
@@ -2009,7 +2232,10 @@ async def lifespan(app):
     except Exception as _expe:
         logger.debug("experiment boot line skipped: %s", _expe)
 
-    pretty_log("System Ready", "Listening for requests", icon=Icons.SYSTEM_READY)
+    # READY IS ANNOUNCED LAST — after the prefix warmup's own two lines, so
+    # the banner means what it says. The server starts serving at the `yield`
+    # below either way: only the LOG LINE waits, never the socket.
+    await _announce_ready_when_warm(_warmup_task)
 
     try:
         yield

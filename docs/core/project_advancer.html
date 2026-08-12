@@ -191,6 +191,31 @@
   <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="constraint-normalise">Constraints go through the shared normaliser <span class="tag">2026-08-11</span></h2>
+  <p>
+    Project metadata is model-written JSON, so <code>{"constraints": "no external APIs"}</code> is a
+    legal shape — and iterating it raw yields <b>17 single-character &ldquo;constraints&rdquo;</b> fed
+    straight to the constraint gate. <code>ProjectStore._constraint_list</code> exists precisely
+    because this shredding destroyed a constraint record once before; the advancer kept its own copy
+    of the logic and so kept the bug. Three sibling call sites in <code>tools/projects.py</code> were
+    already using the helper.
+  </p>
+
+  <h2 id="crash-no-downgrade">A crash does not downgrade to a weaker closer <span class="tag">2026-08-11</span></h2>
+  <p>
+    An exception inside <code>coding_executor</code> left <code>cres = None</code> and fell through
+    to the generic single-shell-command path — which marks the leaf <b>DONE</b> on any output that is
+    not <code>ERROR:</code>-prefixed and not a non-zero exit, with the verify gate, smoke gate,
+    files-written check and constraint gate <em>all bypassed</em>. <code>echo</code>-shaped output
+    closed a build task.
+  </p>
+  <p>
+    This was the third member of one family fixed the same day, alongside silently-dropped
+    <code>edits</code> and the truncated-snapshot overwrite: <b>a task reaching DONE on evidence that
+    no work happened.</b> A transient exception is a reason to <em>stop</em>, not to accept a lower
+    standard of proof — the leaf stays open and the next tick retries it under the full gate set.
+  </p>
 </main>
 </body>
 </html>

@@ -34,9 +34,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ghost_agent.distill.collector import TrajectoryCollector  # noqa: E402
 from ghost_agent.optim.tool_ontology import (  # noqa: E402
-    DEFAULT_MIN_PAIR, DEFAULT_MIN_SUPPORT, analyze_confusion, load_replay_rows,
-    mine_sequences, render_confusion, render_sequences, report_to_dict,
-    simulate_fs_batch,
+    DEFAULT_MIN_PAIR, DEFAULT_MIN_SUPPORT, analyze_confusion,
+    fs_batch_arm_uptake, load_replay_rows, mine_sequences, render_confusion,
+    render_fs_batch_arms, render_sequences, report_to_dict, simulate_fs_batch,
 )
 
 
@@ -69,6 +69,14 @@ def main() -> int:
                          "Diff against the plain run to see which n-grams "
                          "the macro collapses (an UPPER BOUND: it assumes "
                          "full model uptake, which the live arm measures).")
+    ap.add_argument("--fs-batch-arms", action="store_true",
+                    help="split the corpus by the live `fs_batch` arm and ask "
+                         "the MECHANICAL question §4F names: did the macro "
+                         "land? Reports the ELIGIBLE denominator first and "
+                         "declines to read uptake when it is thin — zero "
+                         "`paths` calls on zero opportunities is not a "
+                         "finding. Needs no statistical power, so it is "
+                         "readable long before the outcome comparison is.")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -86,6 +94,13 @@ def main() -> int:
         print(msg, file=sys.stderr)
         return 2
     collector = TrajectoryCollector(root=root, session_id="reader")
+    # Its own walk: the arm read needs `extra` (the arm stamp), which
+    # `simulate_fs_batch` strips, and a single stream cannot be consumed twice.
+    arm_report = None
+    if args.fs_batch_arms:
+        arm_report = fs_batch_arm_uptake(
+            TrajectoryCollector(root=root, session_id="reader")
+            .iter_trajectories())
     _stream = collector.iter_trajectories()
     if args.simulate_fs_batch:
         _stream = simulate_fs_batch(_stream)
@@ -104,8 +119,18 @@ def main() -> int:
             print(f"no usable replay rows in {args.replays}", file=sys.stderr)
 
     if args.json:
-        print(json.dumps(report_to_dict(confusion, macros), indent=2))
+        _d = report_to_dict(confusion, macros)
+        if arm_report is not None:
+            _d["fs_batch_arms"] = {
+                **{k: v for k, v in arm_report.items() if k != "arms"},
+                "arms": {k: vars(v) for k, v in arm_report["arms"].items()},
+            }
+        print(json.dumps(_d, indent=2))
         return 0
+
+    if arm_report is not None:
+        print(render_fs_batch_arms(arm_report))
+        print()
 
     if confusion is not None:
         print(render_confusion(confusion, top=args.top))

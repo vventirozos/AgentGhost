@@ -197,6 +197,166 @@
   session of guesswork (the same lesson the XML parse-error path learned on 2026-07-05). Both
   pinned by <code>tests/test_log_eval_fixes_20260717.py</code>.</p>
 
+  <h2 id="planner-truncation">The planner hits the same token cap — and the obvious salvage is the dangerous one <span class="tag">2026-08-11</span></h2>
+  <p>
+    The strategic planner runs at <code>max_tokens=4096</code> with a <code>tree_update</code> that
+    grows with the task list. On req <code>6e9efd6a</code> it hit <code>finish_reason: length</code>
+    <b>seven times in one request</b>, each at exactly 4096 completion tokens.
+    <code>extract_json_from_text</code> returned <code>{}</code>, so the <em>whole</em> plan was
+    dropped — thought, tree and focus — and the log read <code>No thought provided.</code> /
+    <code>Plan Updated. Focus:&nbsp;</code> with nothing naming the token cap as the cause. The loop
+    carried on unguided; the request ran 40 minutes.
+  </p>
+  <p>
+    <strong>Salvaging naively would have been worse than the bug.</strong>
+    <code>_repair_truncated_json</code> closes dangling braces, so a <code>tree_update</code> cut
+    mid-object comes back <em>complete-looking</em> with tasks silently missing — and
+    <code>task_tree.load_from_json</code> would adopt it as the plan of record. Measured on those
+    seven payloads: one repaired into a root task with <b>zero children</b> (the entire plan, gone),
+    and another into a plausible <b>8-node</b> tree that was still incomplete — the kind no eyeball
+    catches. There is no way to tell from the repaired dict alone.
+  </p>
+  <p>
+    <code>_complete_object_for_key(raw_text, "tree_update")</code> is the discriminator: it scans the
+    <em>raw</em> text and requires the object's depth to return to zero, so <b>closed ⇒ trustworthy,
+    cut ⇒ <code>None</code></b>, with no guessing. <code>salvage_truncated_plan()</code> returns
+    <code>(salvaged, whole_tree)</code>; the planner takes <code>thought</code> /
+    <code>next_action_id</code> from the first and <code>tree_update</code> <em>only</em> from the
+    second, keeping the previous turn's tree when the new one was cut. On the seven live payloads
+    that recovers the thought every time, keeps 2 intact trees, and discards 5 damaged ones.
+  </p>
+  <p>
+    <strong>The diagnostic itself was lying twice, which is why this took a hunt.</strong>
+    <code>extract_json_from_text</code> warned <em>&ldquo;malformed JSON-like content&rdquo;</em> —
+    a phrase that describes a syntax error and points the reader at the parser rather than the token
+    budget. Two fixes: a truncation now reports <b><code>TRUNCATED JSON — N unclosed brace(s)</code></b>
+    and names <code>max_tokens</code>/<code>finish_reason</code> as the place to look; and the
+    &ldquo;this looked like JSON&rdquo; gate is no longer <code>'{' in text</code>, which fired a
+    WARNING on any prose containing braces. Of the 9 warnings in that request, <b>2 were a markdown
+    reply quoting a CSS rule</b> (<code>#session-modal { z-index: 1001 }</code>) whose real payload
+    rode <code>tool_calls</code> and never intended JSON at all. Braces inside an <em>inline code
+    span</em> are now masked before that decision, and brace-scanning ignores braces inside string
+    literals so a value like <code>"use {this}"</code> cannot make a complete object read as
+    truncated.
+  </p>
+  <p>
+    ⚠ <strong>The first discriminator shipped here was wrong, and the existing suite caught it.</strong>
+    It required a <em>quoted key</em>, on the reasoning that real JSON has one and a CSS rule does
+    not. But <code>{ thought: missing-quotes, next_action_id: !!! }</code> — a model emitting the
+    plan with unquoted keys — is a genuine malformation that must warn, and it is structurally
+    identical to <code>{ z-index: 1001 }</code>. <b>Nothing inside the braces separates them; the
+    surrounding context does.</b> A pre-existing pin on that exact shape failed, which is the whole
+    argument for keeping tests that assert a warning still fires.
+  </p>
+  <p>
+    Tests: <code>tests/test_hippocampus_truncation.py</code> — same file as the consolidation
+    truncation this repeats, 8 pins, 5 mutation-checked red, including an over-suppression guard
+    (genuinely malformed JSON must <em>still</em> warn) and a seam test that the planner feeds
+    <code>tree_update</code> from the verified tree, which no unit test of the helpers could catch.
+  </p>
+
+  <h3>The cap, raised on measurement — and why it is only part of the cure <span class="tag">2026-08-11</span></h3>
+  <p>
+    <code>GHOST_PLANNER_MAX_TOKENS</code> (default <b>8192</b>, floor 1024) replaces the hard-coded
+    4096. Sized from 167 recorded planner calls over four days, not doubled by reflex — and the first
+    number that matters is that <b>26.3% of every planning step was truncating</b> (44 of 167, all at
+    exactly the cap). This was never specific to one request.
+  </p>
+  <div class="scroll"><table>
+    <thead><tr><th>completed (n=123)</th><th>p50</th><th>p90</th><th>p95</th><th>p99</th><th>max</th></tr></thead>
+    <tbody><tr><td>completion tokens</td><td>1888</td><td>3012</td><td>3543</td><td>3835</td><td>3868</td></tr></tbody>
+  </table></div>
+  <p>
+    ⚠ <strong>That distribution is censored and must not be read as the requirement.</strong>
+    Anything wanting more than 4096 lands in the truncated bucket rather than in this tail, so p99 is
+    a <em>floor</em> on the need, not an estimate of it. The size instead comes from what the calls
+    actually produce: reasoning reaches 18,148 chars (~4.5k tokens) and content 5,940 (~1.5k), so
+    ~6k covers the observed worst case and 8192 leaves ~35% headroom. <b>The honest verification is
+    re-measuring the truncation rate after deployment</b> — the same recording scan that produced
+    this table.
+  </p>
+  <p>
+    ⚠⚠ <strong>And the cap is not the whole disease.</strong> Of the 44 truncations, <b>34 (77%)
+    emitted zero characters of JSON</b> — the entire budget went into the <code>&lt;think&gt;</code>
+    prelude:
+  </p>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th><code>reasoning_content</code> (median chars)</th><th><code>content</code> (median chars)</th></tr></thead>
+    <tbody>
+      <tr><td>completed</td><td>5,775</td><td>926</td></tr>
+      <tr><td>truncated</td><td><b>14,659</b></td><td><b>0</b></td></tr>
+    </tbody>
+  </table></div>
+  <p>
+    For those calls a bigger budget buys more thinking — the &ldquo;raising the timeout moves the
+    wall&rdquo; shape this project has hit before. The precedented cure is the two-switch no-think
+    (<code>/no_think</code> soft-switch + <code>enable_thinking: False</code>) that
+    <a href="../tools/vision.html"><code>tools/vision.py</code></a> already applies to
+    <code>verify_ui</code> for the <em>identical</em> failure — its comment reads "without it a
+    thinking vision model spends the whole budget on the <code>&lt;think&gt;</code> prelude and
+    content comes back empty". <b>Deliberately not applied to the planner without measurement:</b>
+    <code>verify_ui</code> is a perception readout, planning is a reasoning task, and suppressing its
+    deliberation is a quality trade that has to be measured rather than assumed.
+  </p>
+
+  <h3>…and then it was measured: no-think wins on every axis <span class="tag">2026-08-11</span></h3>
+  <p>
+    <code>scripts/planner_nothink_bench.py</code> replays <b>30 real recorded planner payloads</b>
+    under both conditions. A live A/B was never available (real traffic is ~3.5 turns/day), but the
+    recordings hold every payload the agent actually issued, so the same prompts run under both arms
+    today — and <b>pairing on identical input</b> is what makes n=30 readable. Stratified 15
+    originally-truncated / 15 completed: the first half is where the fix must work, the second where
+    it must do no harm. <b>The baseline arm runs at the already-raised 8192 cap</b>, so this measures
+    what no-think adds <em>on top of</em> the fix above.
+  </p>
+  <div class="scroll"><table>
+    <thead><tr><th>paired, n=30</th><th>no_think better</th><th>worse</th><th>McNemar p</th></tr></thead>
+    <tbody>
+      <tr><td>truncated</td><td><b>6</b></td><td>0</td><td><b>0.031</b></td></tr>
+      <tr><td>parsed (usable plan)</td><td><b>11</b></td><td>1</td><td><b>0.006</b></td></tr>
+      <tr><td>has_tree</td><td><b>12</b></td><td>2</td><td><b>0.013</b></td></tr>
+    </tbody>
+  </table></div>
+  <p>
+    Cost, on a call that runs <em>every turn</em>: <b>3258 → 502 median completion tokens, 58.9s →
+    9.9s</b>. ⚠ The sample's 20% baseline truncation is <em>not</em> a production rate — half of it is
+    truncated by construction. Re-weighted to the real 26.3/73.7 mix: truncation
+    <b>26.3% (old cap) → 10.5% (cap raise) → 0.0% (cap raise + no-think)</b>, usable plan
+    <b>61.8% → 98.2%</b>. <b>The cap raise alone leaves ~38% of planning steps without a usable
+    plan</b>, because 6 baseline calls parsed as nothing <em>without</em> truncating — the prelude
+    damages the output even when it fits.
+  </p>
+  <p>
+    The obvious objection was checked and does not hold: on the 16 payloads where both arms returned
+    a tree, no-think ran <b>5 deeper / 1 shallower</b> (median 4 nodes vs 3). It is not trading depth
+    for speed.
+  </p>
+  <p>
+    ⚠ <strong>Honest limits.</strong> Two payloads got <em>worse</em> (one lost its plan entirely).
+    And every metric here is <b>structural</b> — parse, tree presence, node count, and whether
+    <code>next_action_id</code> names a task that actually exists. None of them says the
+    <em>strategy</em> is as good; that needs a judge, and judges on this project have a documented
+    record of lying plausibly. The claim is "strictly better on everything mechanically checkable,
+    with no sign of shallower plans", not "better plans".
+  </p>
+  <p>
+    <b>✅ Enabled 2026-08-11 — default ON</b>, <code>GHOST_PLANNER_NO_THINK=0</code> restores thinking.
+    Made the code default rather than a launcher export (mirroring
+    <code>GHOST_VISUAL_NO_THINK</code>): an env-only switch is live in production and absent in tests,
+    ablations and manual restarts, which is the prod/dev flag drift this project keeps paying for.
+    Both switches ride one gate, pinned — a soft switch that silently does nothing is the worst of the
+    three states — and the kill switch is itself pinned by subprocess on the real env parse, so a
+    renamed variable fails the test instead of quietly disabling the knob.
+  </p>
+  <p>
+    <strong>Watch after the restart</strong>, because a replay is not production:
+    <code>Planner output TRUNCATED at max_tokens</code> should approach zero (it was ~26% of planning
+    steps — if it does not, the switches are not reaching the live payload); per-turn latency should
+    drop ~49&nbsp;s; and <b>plan quality is the unmeasured axis</b> — a plan that is well-formed but
+    strategically thin is the one failure a structural metric cannot see, and the reason the kill
+    switch exists.
+  </p>
+
   <h2 id="truncated-answer-continuation">Truncated-answer auto-continuation</h2>
   <p>The streaming consume loop records the last non-null <code>finish_reason</code> seen on the upstream stream. When a <em>text</em> turn (no <code>&lt;tool_call&gt;</code> / <code>&lt;function&gt;</code> in flight) ends with <code>finish_reason == "length"</code>, the answer was cut off at the model's token cap — shipping it would hand the user a mid-sentence reply, which the <a href="verifier.html">Verifier</a> correctly REFUTES (truncated output, and any explicit question left unanswered).</p>
   <p>Instead of surfacing the fragment, <code>handle_chat</code> transparently continues the generation: it replays the request with the partial answer as a prior <code>assistant</code> turn plus a "your reply was cut off — continue from exactly where it stopped, don't repeat anything" instruction, and appends the result to <code>full_content</code>. This repeats until the upstream returns a non-<code>length</code> finish or <code>MAX_TRUNCATION_CONTINUATIONS</code> (3) round-trips are spent — the bound prevents a model that mis-reports <code>length</code> on every reply from looping forever. The continuation payload drops <code>tools</code>/<code>tool_choice</code> so it can only produce prose, and strips any <code>&lt;think&gt;</code> prelude the continuation emits before appending. Turns that produced a tool call are unaffected — those go through the parse/retry path, not this user-facing-prose path.</p>
@@ -675,6 +835,39 @@
   <code>tests/test_agent_recent_fallbacks.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="stream-done-ordering">The streamed turn's durable record ran <em>after</em> <code>[DONE]</code> <span class="tag">2026-08-11</span></h2>
+  <p>
+    <code>data: [DONE]</code> is the OpenAI SSE contract's &ldquo;you may stop reading now&rdquo;, so
+    well-behaved clients close on it. A consumer that abandons an async generator runs its
+    <code>finally</code> blocks but <strong>not its post-yield code</strong> — and the sentinel was
+    released at the TOP of the streamed tail, with everything durable after it: metacog, episode,
+    hydration judge, <b>trajectory</b>, <b>project work_log</b>, the <b>verifier spawn</b> and lesson
+    outcomes, across ~300 lines containing 8 <code>try:</code> blocks and zero <code>finally:</code>.
+  </p>
+  <p>
+    <b>Measured on the live log: of 42 requests on 2026-08-11, the 6 that took the streamed-final
+    branch produced 0 trajectories, 0 outcome labels and 0 verifier verdicts — 6 of 6</b>, while the
+    other 36 recorded normally. It is the mechanism behind the request that finished with no record
+    at all, and the most plausible account on file for the erratic 0&ndash;70%/day trajectory coverage
+    that a previous audit measured and could not explain.
+  </p>
+  <p>
+    The sentinel is now the <b>last statement of <code>stream_wrapper</code></b>.
+    ⚠ Verified by an <b>AST scope check, not by reading indentation</b>: the first attempt placed the
+    <code>yield</code> in the enclosing <code>_stream_final_generation</code>, which parses cleanly
+    and silently turns the wrong function into a generator. This file nests three deep.
+  </p>
+  <p>
+    ⚠⚠ <strong>The move created its own regression.</strong> Putting the sentinel last means every
+    statement before it can now prevent end-of-stream — and <b>28 of them sat inside no
+    <code>try</code></b>. Before the move a tail exception was harmless to the client because
+    <code>[DONE]</code> had already been sent; after it, the client hangs waiting for a marker that
+    never comes. The tail is wrapped, and the guard is total: the structural pin flagged even the
+    <code>logger.warning</code> inside the handler, which can raise exactly like the exception it
+    catches. <b>The durable record is best-effort; the end-of-stream contract is not.</b>
+  </p>
+  <p>Tests: <code>tests/test_stream_done_sentinel_ordering.py</code> — 4 AST-based pins (scope, ordering, last-yield, total-guard).</p>
 </main>
 </body>
 </html>
