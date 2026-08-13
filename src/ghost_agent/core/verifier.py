@@ -1147,33 +1147,71 @@ _TEMPLATE_PLACEHOLDERS: Dict[str, Tuple[str, ...]] = {
     "verifier.adjudicate": ("claim", "evidence", "context", "suspects"),
 }
 
+# PINNED RULES a tuned template must carry to be accepted (§4BD 2026-08-12).
+# The GEPA loop optimizes a metric, not the pinned dismissal rules — a
+# candidate that sheds one can still win its gate (the optimizer-sheds-
+# pinned-rules class), and a live artifact SHADOWS the constant, so a rule
+# added to the constant alone is silently dead on the two-stage path
+# (observed same day: the honest-failure rule was edited into
+# _VERIFY_ADJUDICATE_PROMPT and the live judge never saw it). Marker
+# substrings, not full texts, so tuned rewording stays legal as long as
+# the rule survives recognizably.
+_REQUIRED_RULE_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "verifier.adjudicate": (
+        # bookkeeping-state dismissal (2026-07-18 pin, live-validated)
+        "FALSE ALARMS unless the USER REQUEST explicitly asked",
+    ),
+}
+
 # Offline-optimizer hook: {"verifier.enumerate": "<template>", ...}.
 # Never set on a live agent — candidates go through the loader artifact
 # + restart path in production.
 _TEMPLATE_OVERRIDES: Dict[str, str] = {}
 
 
-def _validate_stage_template(name: str, template: str) -> bool:
-    """True iff `template` format-probes cleanly with this stage's
-    placeholders — catches missing/renamed placeholders, stray unescaped
-    braces, and unknown fields in one check."""
+def _template_reject_reason(name: str, template: str) -> str:
+    """"" when `template` is usable for stage `name`, else a SHORT reason.
+
+    Two distinct failure classes, and the log must say which (§4BD): a
+    placeholder/brace break is an authoring bug, a missing rule marker is
+    the optimizer shedding a pinned dismissal rule. Reporting both as
+    "failed placeholder probe" cost a full A/B run — the no-rule arm was
+    silently redirected to the baseline and the comparison measured
+    nothing."""
     fields = _TEMPLATE_PLACEHOLDERS.get(name, ())
     try:
         template.format(**{f: "x" for f in fields})
-        return all(("{%s}" % f) in template for f in fields)
     except Exception:
-        return False
+        return "placeholder probe"
+    if not all(("{%s}" % f) in template for f in fields):
+        return "placeholder probe"
+    missing = [m for m in _REQUIRED_RULE_MARKERS.get(name, ())
+               if m not in template]
+    if missing:
+        return f"pinned rule missing ({missing[0][:40]}…)"
+    return ""
+
+
+def _validate_stage_template(name: str, template: str) -> bool:
+    """True iff `template` format-probes cleanly with this stage's
+    placeholders — catches missing/renamed placeholders, stray unescaped
+    braces, and unknown fields in one check — AND carries every pinned
+    rule marker for the stage (see _REQUIRED_RULE_MARKERS): a tuned
+    template that shed a load-bearing dismissal rule is rejected and the
+    baseline constant serves instead."""
+    return not _template_reject_reason(name, template)
 
 
 def _stage_template(name: str, baseline: str) -> str:
     """Resolve the live template for stage `name` (see block comment)."""
     override = _TEMPLATE_OVERRIDES.get(name)
     if override:
-        if _validate_stage_template(name, override):
+        _why = _template_reject_reason(name, override)
+        if not _why:
             return override
         logger.warning(
-            "Verifier: override template %s failed placeholder probe — "
-            "using baseline", name)
+            "Verifier: override template %s REJECTED (%s) — using baseline",
+            name, _why)
         return baseline
     try:
         from ..optim.loader import tuned_instruction
@@ -1182,16 +1220,17 @@ def _stage_template(name: str, baseline: str) -> str:
         return baseline
     if not tuned:
         return baseline
-    if not _validate_stage_template(name, tuned):
+    _why = _template_reject_reason(name, tuned)
+    if _why:
         logger.warning(
-            "Verifier: tuned template %s failed placeholder probe — "
-            "using baseline", name)
+            "Verifier: tuned template %s REJECTED (%s) — using baseline",
+            name, _why)
         # The activation counter counts what the LOADER handed out; without
         # this it would report a rejected template as "applied", which is
         # exactly the blindness that instrument exists to prevent.
         try:
             from ..optim.loader import note_rejected
-            note_rejected(name, "placeholder probe")
+            note_rejected(name, _why)
         except Exception:  # noqa: BLE001
             pass
         return baseline
@@ -2107,7 +2146,15 @@ class Verifier:
                     _decision, _r, _u = _objection.resolve_refute(
                         issues, claim, evidence, severity)
                     if (_decision == _objection.DISMISS
-                            and _objection.dismiss_enabled()):
+                            and (_objection.dismiss_enabled()
+                                 or (_objection.nonassertive_enabled()
+                                     and _objection.nonassertive_dismissal(_r)))):
+                        # Stand aside for a provable dismissal — including a
+                        # rule-4 one, which is live even in uphold-only mode
+                        # (§4BD). Same reasoning as the escalation site: the
+                        # objection module can settle this by LOOKING, and a
+                        # CONFIRMED-by-proof outranks the guard's blanket
+                        # downgrade to UNCERTAIN.
                         return result
                 except Exception as _se:  # noqa: BLE001
                     logger.warning(
@@ -2234,9 +2281,24 @@ class Verifier:
                     result.objection_upheld = True
                     return result
                 if (_decision == _objection.DISMISS
-                        and not _objection.dismiss_enabled()):
+                        and not _objection.dismiss_enabled()
+                        and not (_objection.nonassertive_enabled()
+                                 and _objection.nonassertive_dismissal(_why))):
                     # Uphold-only mode: fall through to the normal
                     # escalation instead of confirming mechanically.
+                    #
+                    # EXEMPT (§4BD-b 2026-08-12): a dismissal whose reasons
+                    # are ALL rule-4 non-assertive ones. The 2026-08-07
+                    # closure was about FACTUAL dismissals erasing real
+                    # catches; a stated next step or a question carries no
+                    # factual content for a corrupted claim to hide in — but
+                    # that argument is about the SHAPE, and the rule can only
+                    # recognise the shape lexically, so rule 4 itself ships
+                    # DEFAULT-OFF (see `nonassertive_enabled`, which records
+                    # why and what would justify flipping it). This clause is
+                    # therefore inert unless the operator opts in. Unanimity
+                    # is required — one factual dismissal in the mix and the
+                    # whole verdict goes back through the closed gate.
                     _decision = None
                 if _decision == _objection.DISMISS:
                     logger.info(

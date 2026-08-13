@@ -834,6 +834,34 @@
   path-aware parametrization of <code>test_system_parse_error_messaging</code> in
   <code>tests/test_agent_recent_fallbacks.py</code>.</p>
 
+  <h2>The checklist nudge needs a directive, not a keyword (2026-08-13, §4BE)</h2>
+  <p><strong>The leak.</strong> The meta-task ("checklist") nudge armed on a bare substring test of
+  the user's text for <code>{learn, skill, profile, lesson, playbook, memorize}</code>, then injected
+  "CRITICAL: You have not fulfilled the learning/profile instructions <em>in the user's request</em>".
+  Because the test was a keyword match, that sentence was false on every measured turn: "Define a
+  composed <strong>skill</strong>", "show me all custom <strong>skills</strong>" and "what have you
+  <strong>learned</strong> today" all armed it. Measured on the live trajectory corpus,
+  <strong>59 of 59</strong> arming turns carried no learning instruction — a 100% false-positive
+  rate — and the nudge fired 39 times.</p>
+  <p><strong>Why it mattered.</strong> Production request <code>32a8101d</code>: the model reasoned
+  "there's no explicit learning or profile instruction in their message… But the system is requiring
+  it", called <code>learn_skill</code> to comply, and minted a junk lesson that vector-dedup then
+  reinforced to <code>freq=11</code> — a false nudge writing into the very corpus retrieval injects
+  into later prompts. Request <code>207e0702</code> shows the other failure mode: the same nudge
+  drove a repetition loop that the thinking guard had to abort.</p>
+  <p><strong>The fix.</strong> <code>_has_meta_task_directive</code> requires an imperative directive
+  to record something ("remember this", "update your profile", "call learn_skill"), and storage verbs
+  aimed at a data store are excluded — "transcribe it, <em>save it to the knowledge base</em>" is a
+  document write, not a lesson. Arming drops from 59 to 1 turn (4.0% → 0.07%), and each survivor
+  contains a real directive. A round-2 review caught an FP class the first cut <em>added</em>:
+  <code>"(remember that you use TOR.)"</code> inside a project spec is a task constraint, not an
+  instruction to record anything, so the SUBJECT decides: second-person and impersonal subjects (<code>you/your/the/it</code>) are task constraints, first-person ones (<code>I/my/we</code>) are user facts worth recording, and questions are excluded by lookbehind. A first cut had this backwards and dropped "remember that I use zsh"; the final form is an allowlist (first-person subject required), which also costs one genuine directive whose subject is impersonal — a deliberate miss, since a false arm corrupts the corpus and a miss costs one un-nudged turn. The injected message no longer asserts what the user asked: it states
+  the inference, and explicitly instructs the model to say so and finish normally rather than invent
+  a lesson to satisfy the reminder. <strong>A fire-once latch makes that escape hatch real:</strong>
+  the arming condition could previously only be discharged by <em>calling</em> a meta tool, so a
+  model that correctly declined stayed armed and was re-nudged up to 4× with its drafted reply
+  discarded each time — which is how request <code>32a8101d</code> ended up caving on turn 4. Tests: <code>tests/test_label_noise_leaks_4be.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 
   <h2 id="stream-done-ordering">The streamed turn's durable record ran <em>after</em> <code>[DONE]</code> <span class="tag">2026-08-11</span></h2>

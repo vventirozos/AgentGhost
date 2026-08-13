@@ -565,7 +565,11 @@ class TestJournalStash:
 
     def test_stash_caps_at_twenty_newest(self, tmp_path):
         entries = [
-            _pm(f"Failing task number {i:02d} about a csv column mismatch bug")
+            # §4BE: a mineable entry needs an OPERATION and a data shape —
+            # these tests pin stash mechanics (capping / newest-first /
+            # replay marking), so the fixture states a real task.
+            _pm(f"Failing task {i:02d}: parse the csv and count the rows "
+                f"whose column values mismatch")
             for i in range(25)
         ]
         stash_mineable(entries, tmp_path)
@@ -573,8 +577,8 @@ class TestJournalStash:
         records = json.loads(stash_file.read_text())
         assert len(records) == 20
         # Newest survived the trim.
-        assert any("number 24" in json.dumps(r) for r in records)
-        assert not any("number 00" in json.dumps(r) for r in records)
+        assert any("task 24" in json.dumps(r) for r in records)
+        assert not any("task 00" in json.dumps(r) for r in records)
 
     def test_stash_disabled_without_home(self, monkeypatch):
         monkeypatch.delenv("GHOST_HOME", raising=False)
@@ -584,7 +588,10 @@ class TestJournalStash:
     def test_pick_is_newest_first_and_marks_replayed(self, tmp_path):
         stash_mineable([
             _pm("Older stashed failure about a broken sqlite query join"),
-            _pm("Newer stashed failure about csv error rates per product"),
+            # §4BE: state an operation — the gate no longer accepts
+            # "per <noun>" as one (that alternative existed only to keep
+            # this fixture green, which is the wrong direction).
+            _pm("Newer stashed failure: count csv error rates per product"),
         ], tmp_path)
 
         first = pick_stashed_challenge(tmp_path)
@@ -641,7 +648,8 @@ class TestDreamStashFallback:
         # A MagicMock journal (test harness) must not read or mutate the
         # operator's stash file.
         monkeypatch.setenv("GHOST_HOME", str(tmp_path))
-        stash_mineable([_pm("Stashed failure that a mock must not consume")])
+        stash_mineable([_pm("Stashed failure: parse the csv and count the "
+                            "bad rows — a mock must not consume this")])
 
         context = MagicMock()  # journal is a MagicMock
         dreamer = Dreamer(context)

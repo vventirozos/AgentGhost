@@ -1002,8 +1002,9 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         only) maps a branch name to its own step list; a step whose result
         contains its ``branch_condition`` substring jumps to the
         ``branch_target`` sequence. The macro becomes a top-level tool the
-        agent invokes by ``name``. An existing name is NOT overwritten —
-        delete it first.
+        agent invokes by ``name``. An existing name is NOT overwritten — the
+        refusal points at ``run`` (active) or ``approve`` (proposed);
+        replacement stays explicit: delete, then define.
     run    : execute an existing active macro by ``name``, passing its runtime
         inputs in ``params`` (e.g. params={'url': '…'}). This is the
         management-tool path for the same thing a direct ``name(...)`` call
@@ -1156,22 +1157,67 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             name = _validate_composed_name(name)
         except ValueError as ve:
             return f"Error: {ve}"
+        # No silent overwrite: `register()` replaces the object, which also
+        # resets usage/success stats — a name typo could clobber a tuned
+        # macro. Replacement must be explicit: delete, then define. The
+        # message leads with the EXECUTION path (2026-08-12 postmortem: a
+        # run-intent model kept landing on `define`, and the old delete-first
+        # wording steered it into deleting an active macro it only wanted to
+        # invoke); delete is framed as the replace-only recovery, and a
+        # not-yet-active duplicate points at `approve` instead of `run`.
+        #
+        # ORDER MATTERS (2026-08-12 fresh-eye review): this duplicate check
+        # must run BEFORE the known_tools shadow check below. The production
+        # call site derives known_tools from the fully-populated dispatch
+        # table, which register_composed_skill_runners has already seeded
+        # with every ACTIVE macro's own name — so with the shadow check
+        # first, a duplicate define of an active macro was misdiagnosed as
+        # a built-in collision ("choose a different name"), and this branch
+        # was unreachable exactly in the postmortem scenario it exists for.
+        # The registry's own macro is not "shadowing" a tool; it IS the tool.
+        #
+        # The execution guidance leads with action='run' rather than the
+        # direct call: run re-verifies dispatchability itself (its
+        # "registered but not dispatchable" branch), so the FIRST
+        # recommendation stays truthful even in the rare active-but-shadowed
+        # state (a same-named built-in/acquired tool appearing after the
+        # macro was defined — the runner wiring lets the built-in win).
+        # Volatile counters (steps/usage) sit at the message TAIL, outside
+        # RecentFailureGuard's 80-char normalized prefix: for short macro
+        # names a mid-message usage counter made two identical failures
+        # normalize differently, so the repeat guard could never accumulate
+        # a match.
+        if name in reg.skills:
+            existing = reg.skills[name]
+            if existing.status == "active":
+                how_to_use = (
+                    f"To EXECUTE it, use manage_composed_skills("
+                    f"action='run', name='{name}', params={{...}}), or call "
+                    f"the tool '{name}' directly. Do NOT re-define it."
+                )
+                head = (f"Error: composed skill '{name}' already exists and "
+                        f"is ACTIVE.")
+            else:
+                how_to_use = (
+                    f"Activate it with manage_composed_skills("
+                    f"action='approve', name='{name}'), then call it "
+                    f"directly."
+                )
+                head = (f"Error: composed skill '{name}' already exists but "
+                        f"is not active (status={existing.status}).")
+            return (f"{head} {how_to_use} Only if you need to REPLACE its "
+                    f"definition: delete it first (action='delete', "
+                    f"name='{name}'), then define. "
+                    f"({len(existing.steps)} steps, used "
+                    f"{existing.usage_count}x)")
         # Reject a name that shadows a built-in / acquired tool: the runner
         # wiring skips such a macro (the built-in wins), so persisting it and
-        # telling the model "it's now a TOP-LEVEL TOOL" is a lie.
+        # telling the model "it's now a TOP-LEVEL TOOL" is a lie. Reached
+        # only for names that are NOT the registry's own (see order note
+        # above).
         if known_tools and name in known_tools:
             return (f"Error: '{name}' is already a built-in/acquired tool; a "
                     "composed skill can't shadow it. Choose a different name.")
-        # No silent overwrite: `register()` replaces the object, which also
-        # resets usage/success stats — a name typo could clobber a tuned
-        # macro. Replacement must be explicit: delete, then define.
-        if name in reg.skills:
-            existing = reg.skills[name]
-            return (f"Error: composed skill '{name}' already exists "
-                    f"(status={existing.status}, {len(existing.steps)} steps, "
-                    f"used {existing.usage_count}x). To replace it, delete it "
-                    f"first: manage_composed_skills(action='delete', "
-                    f"name='{name}').")
         if not isinstance(steps, list) or not steps:
             return "Error: 'steps' must be a non-empty list of step objects."
         mode = str(mode or "parallel").strip().lower()

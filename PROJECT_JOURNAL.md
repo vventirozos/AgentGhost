@@ -408,7 +408,9 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
    behind `introspect action='experiments'`) conditions failure_rate on RESOLVED outcomes and every
    arm still reads **"insufficient data (n<30/arm)"** — resolved-n/arm is 5–29, because **60–84% of
    real user turns carry `outcome='unknown'`** (measured across the whole corpus: 505/612 chat-ish
-   turns, 572/838 task-ish). So the binding denominator is ~2.5–3× smaller than the raw-turn count,
+   turns, 572/838 task-ish). ⚠ **CORRECTED 2026-08-12 (§4BC): those were RAW-FILE counts that
+   missed the corrections-sidecar overlay — the true rate was 57.3%, and the §4BC run-gate fix
+   drops the steady-state to ~39% (the rest is evidence-free chat, unknown by design).** So the binding denominator is ~2.5–3× smaller than the raw-turn count,
    and organic chat cannot close it — the §4AO label-noise ceiling, now reaching the A/B arms.
    Anyone reading these arms must use RESOLVED n, not raw n.
    4b. **⚠ MY OWN raw-count read was WRONG and the canonical instrument caught it.** Off a hand
@@ -514,6 +516,381 @@ integrity_check: ok`.** Docs: `docs/memory/episodes.html` (schema table + retent
 Deliberately NOT done (scope): crediting `search_by_outcome` / `get_episodes_by_cluster` /
 `get_unconsolidated` — those are dream/consolidation MACHINERY, not prompt surfacing; crediting them
 would inflate counts with internal maintenance passes and corrupt the very signal eviction reads.
+
+### 4BC. RESOLVED-RATE ATTACK — why do 60–84% of real turns end `outcome=unknown`, and which are
+### cheaply gradeable? — MEASURED + FIX SHIPPED 2026-08-12 (restored on branch after the 18:45
+### commit/reset discarded the originals)
+
+**Premise (from §4 preamble 4a + §4AQ + §4AO):** every pending verdict — the four A/B arms, the §4K
+backtest, tool-desc GEPA — is gated on RESOLVED real-turn outcomes. This section attacks the
+denominator, not the volume. Questions were pre-registered before reading the stamping code
+(audit discipline); the full pre-registration was lost with the working tree — the eight
+questions are reproduced implicitly by their ANSWERS below.
+
+**ANSWERS (measured 2026-08-12):**
+
+- **Q8 first, and it mattered: the headline was overstated.** Raw-file scan reproduces the
+  preamble's numbers (1089/1464 unknown = 74.4%). But `update_outcome` writes to a CORRECTIONS
+  SIDECAR (`trajectories/corrections.jsonl`, 285 records: 282 `verifier_late`, 2 operator, 1
+  user-correction) and `iter_trajectories` overlays it at read time — the raw files never change.
+  With the overlay: **unknown = 839/1464 = 57.3%**. The ARMS INSTRUMENT IS CLEAN:
+  `report_from_trajectories` iterates via the collector and sees the overlay.
+- **Q1/Q5:** one writer at finalize (verifier verdict → passed/failed; no verdict → unknown), one
+  corrections path (late verdicts, proven: 282 applied). Late-verdict loss is a non-problem.
+- **Q2 (the decomposition, corrections applied):** 839 unknowns = **483 no-tool chat turns**
+  (verifier skip: no evidence) + **340 bookkeeping-only turns** (name-keyed run-gate skip) + ~16
+  other. On ARM-CARRYING rows: 143 no-tools + 122 bookkeeping + **only 4 substantive** —
+  substantive turns essentially always resolve. The unknown mass is entirely the two BY-DESIGN
+  skip classes.
+- **Q3/Q4/Q7 (what is safely gradeable):** of the 340 bookkeeping unknowns, **271 carry
+  payload-shaped output ≥200 chars** (174 manage_projects listings — "show me all projects" — 41
+  self-play reports, 25 skill inventories, …) — the SAME evidence shape the packer has trusted
+  since 2026-07-25 while the name-only run-gate skipped the judge. The remaining 69 are bare
+  confirmations — honestly ungradeable, stay unknown. No-tool chat turns stay unknown BY DESIGN
+  (no evidence → no verdict → no fabricated labels). No new label writers: the judge remains the
+  only stamp authority.
+- **Q6 (planner confound) = COMPOSITION, not pathology:** use_planning treatment unknowns are 14
+  bookkeeping + 12 no-tools (of 34) vs control 10 + 16 (of 56). With bookkeeping graded, residual
+  unknown rates converge (~0.35 vs ~0.30, both chat-driven).
+
+**FIX (round 1):** run-gate and evidence packer share ONE predicate (`_bookkeeping_informational`,
+`core/agent.py`): error banners + payload-shaped output (≥200 chars) count as verifiable substance
+at BOTH layers, so informational bookkeeping turns RUN the verifier with the listing as evidence.
+Bare confirmations keep skipping (2026-04-19 blast radius); the packer-only `id_linkage` case
+stays out of the run-gate.
+
+**ROUND-2 FRESH-EYE REVIEW found 3 MAJORs in round 1 — all fixed.** ⚠ My round-1 consumer audit
+("`_is_unverified_mutation` is file_system-only — safe") audited the wrong thing: the FUNCTION was
+unchanged but the gate changed WHICH TOOL it receives. (a) on a write→task-table→finalize turn the
+trailing listing shadowed the write, silently disabling the req_C0 untested-write guard; (b) an
+execute-traceback→listing turn lost its `verify_code_output` audit to the weaker claim branch;
+(c) the "zero user-visible cost" claim was async-only. **Fix = a two-view split on the ONE walk:**
+`_find_substantive_tool_for_verifier(..., include_informational_bookkeeping=)` — EVIDENCE view
+(default) decides IF the verifier runs; ACTION view (False = pre-§4BC selection, byte-identical)
+feeds the mutation guard, code-shape routing, overflow recovery, and UI fallback (the latter two:
+action-first, evidence fallback). The verdict computation returns the action-preferred tool.
+Non-async mode is deliberately NOT widened. Round-2 minors fixed: the "~24%" overstatement
+(correct: 271/1464 ≈ 18.5% gain verdicts; 23.2% are bookkeeping-only, the 69 bare confirmations
+stay unknown), stale stream-gate skip-log text. Accepted as-is: the UI fallback's
+execute-flavored banner around a listing.
+
+**ROUND-3 (residual minors, fixed):** (a) the non-async scope guard covers EVERY non-async
+config, not just gate=inf (`_critic_gate_timeout` proves async⇒gate=0, so `not async` is a strict
+superset of `gate==inf` — nothing un-guarded); (b) `_should_await_repair_verdict` excludes ONLY
+§4BC's new listing class — errored-bookkeeping and `stop_reason` shapes awaited before §4BC and
+do again. Verdicts: round-2 review = FIX-FIRST → fixed; round-3 verification = **SHIP** ("no
+remaining input where the change makes any config worse than pre-§4BC").
+
+**Pins:** `tests/test_verifier_rungate_informational.py` (26 tests incl. E8-regression,
+id-linkage exclusion, await exclusion, both round-2 MAJOR shapes red-on-revert) + the
+test_context_governor.py recovery-window widen (4000→6000; the §4BC comment pushed the
+stream-strip line to offset ~4100). Docs: `docs/core/verifier.html` §4BC section + three stale
+passages corrected.
+
+**Expected effect:** payload-shaped bookkeeping turns (18.5% of real traffic) gain an async
+verdict → steady-state unknown rate ~57% → ~39%; arms gain ~15–26 rows/arm equivalent going
+forward. **Watch on next organic bookkeeping turn (after deploy):** a "verdict deferred" line
+instead of "no verifiable evidence (bookkeeping-only tools)", then a LATE verdict backfill.
+⚠ Do NOT fire synthetic API requests to test this — they would contaminate the real-turn
+denominator this whole section exists to grow.
+
+**Proposed follow-up (NOT done, needs operator sign-off):** an OFFLINE retro-grade of the 271
+historical payload-shaped rows — run the two-stage judge over stored (final_response, tool
+results), write `verifier_backfill_4bc` corrections to the sidecar. It is the only way the ARMS'
+resolved-n grows faster than ~3.5 real turns/day; labels would enter the corpus from a batch
+judge pass, so it deserves an explicit yes plus a small human-audited sample first.
+
+
+### 4BD. THE CHEAP JUDGE REFUTES HONEST FAILURE REPORTS — the prompt fix FAILED, the
+### artifact was the cause — ✅ MEASURED + ARTIFACT RETIRED 2026-08-12
+
+**Why this ran.** The 08-12 log audit found 6 of 6 honest "the download failed, here is the exact
+error" replies REFUTED by the cheap judge (conf 0.9–1.0), each rescued only by a 40–55 s main-model
+escalation. Objections were omission-shaped ("omits the exact 429", "omits the ls line") — the
+claim-packing tell. Cost: latency on every such turn, plus the [[escalation-can-corrupt-labels]]
+risk on every overturn. §4BC makes this WORSE once deployed (the judge will grade ~18% more turns).
+
+**Instrument built.** 6 hand-written FP-trap cases of the live shape (Tor-download failure report,
+pipeline partial-success table, execute traceback diagnosis, browser-timeout repro, failed service
+restart, partial fetch with an unquoted 500) — `scripts/verify_bench_cases_honest_failure.jsonl`.
+⚠ Deliberately NOT added to the default pool: that would change `cases_sha256` and invalidate every
+incumbent comparison. Run with `--cases scripts/verify_bench_cases_honest_failure.jsonl --no-mined`.
+
+**BASELINE CONFIRMED THE CLASS IS REAL:** raw cheap judge FPR **0.5** on these cleans (3/6), while
+TPR on injected `fabrication`/`silent_failure` stayed **1.0** — the judge is not blind, it is
+trigger-happy on exactly this shape.
+
+**ATTEMPT 1 — a dismissal rule in both prompts. ⛔ FAILED, and reverted.** Wrote "Reporting a
+failure is not failing" into `_VERIFY_CLAIM_PROMPT` + a matching FALSE-ALARM bullet into
+`_VERIFY_ADJUDICATE_PROMPT`, mirroring the 2026-07-18 bookkeeping-rule precedent. Paired A/B on the
+CONSTANT, K=5 × 6 cases, one process: **no-rule 7/30 (0.23) vs rule 7/30 (0.23), discordant 3 fixed
+/ 3 broke, McNemar p=1.0.** Two objections cited WITH the rule live are shapes the rule explicitly
+names as false alarms ("stated a future plan", "incorrectly diagnoses the root cause") — **the E4B
+judge reads the rule and does not follow it**, exactly [[optimizer-sheds-pinned-rules]]'s
+capacity-bound finding. Shipping it would have been verification theater; **reverted from both
+prompts.**
+
+**⚠ TWO INSTRUMENT DEFECTS IN MY OWN PROBE, both caught mid-run.**
+1. **My new pinned-rule validator silently redirected the control arm.** The no-rule arm failed
+   `_validate_stage_template` (by design — it had shed the pinned rule) and fell back to the
+   BASELINE, so arm A measured the constant, not "no rule". The log said "failed placeholder
+   probe" for BOTH failure classes, which is why it read as noise. Fixed: `_template_reject_reason`
+   now names the class ("pinned rule missing (…)") at the override site, the artifact site, and in
+   `note_rejected`.
+2. **Sequential arms.** Round 1 ran arm A then arm B; a repeat of the SAME config later scored
+   3/30 then 7/30, so arm order/drift was confounded with the arm. Re-run INTERLEAVED (alternating
+   template per trial, order flipped per repeat).
+
+**FINDING (the real one) — the live GEPA `verifier.adjudicate` ARTIFACT was the cause.**
+Interleaved, K=5 × 6 cases, neither template carrying the reverted rule:
+
+| arm | false-refute rate | discordant |
+|---|---|---|
+| code CONSTANT | **7/30 = 0.23** | — |
+| GEPA ARTIFACT | **17/30 = 0.57** | artifact-worse **10**, constant-worse **0** |
+
+**McNemar exact p = 0.0020**, direction unanimous. This is consistent with — and explains — §4AG's
+own table, which nobody read this way at the time: the artifact's `nonrefute_mean` was ALREADY
+worse (0.8379 vs the constant's 0.8530); it bought catches with false alarms and the balanced
+score called it a wash (+0.0065, below the 0.0076 resolution floor), so it was KEPT because "it did
+not lose". It loses badly on the class that was missing from the pool.
+
+**ACTION: artifact RETIRED** → `$GHOST_HOME/system/optim/verifier.adjudicate.json.retired-4bd`
+(the `.noop.retired` precedent from §4AG; verified the loader now falls back to the code constant).
+Production keeps §4AG's measured catch/miss trade (−0.028 refute_mean, unresolvable overall) and
+gains 0.34 on this class. **Reversible: `mv` it back.** BOTH verifier GEPA artifacts are now
+retired — enumerate (no-op, §4AG) and adjudicate (§4BD) — so the two-stage judge runs pure code
+constants, which is also the only form a future rule edit can actually reach.
+
+**KEPT from this round:** (a) the FP-trap case file; (b) `_REQUIRED_RULE_MARKERS` + the reject-reason
+split — a tuned template that SHEDS a pinned dismissal rule is now rejected at load, closing the
+shadowing trap that let a constant-only edit be silently dead (the bookkeeping rule is the pinned
+marker; pinning is what makes a future artifact promotion safe); (c) this write-up.
+
+**⚠ TWO OF MY OWN FP-TRAP CASES WERE MISLABELED — found by taking the judge seriously.**
+`hf-execute-traceback` claimed "download.py expects a positional url argument", which appears
+NOWHERE in the evidence (an inference, not a report); `hf-browser-selector` said "my click …
+timed out" when the evidence shows the click OK and the WAIT timing out. The judge refuted the
+first 13/13 across runs — **unanimous, specific, and RIGHT**. A mislabeled clean inflates FPR and
+would have justified building a mechanism to force a defensible objection to CONFIRM, i.e. a
+fabrication-laundering machine. Both corrected (notes record the correction). **Every FPR number
+above predates the correction; the corrected re-run is below.**
+
+**CORRECTED interleaved re-run (the numbers to quote):** constant **6/30 = 0.20**, artifact
+**18/30 = 0.60**, discordant **13-1**, **McNemar p = 0.0018** — the artifact retirement holds and
+strengthens. And the residual on the constant became legible: **4 of the 6 remaining false-refutes
+are one case, and every objection is a FUTURE-PLAN complaint** ("The statement 'I'll open that
+parser next and re-run the test' is a future plan, not a summary of the test outcome").
+
+### 4BD-b. DETERMINISTIC PRE-ESCALATION DISMISSAL (objection rule 4) — BUILT,
+### HARDENED TWICE, ⛔ SHIPPED **DEFAULT-OFF** 2026-08-12
+
+**The rule.** A stated NEXT STEP ("I'll open the parser next") or a QUESTION back to the user
+("Want me to look at the service log?") asserts nothing about the world, so no evidence can
+contradict it. `objection.py` rule 4 dismisses such an objection with NO main-model call —
+proof-based, in that module's tradition: the fragment must appear VERBATIM in the claim (quoted
+inside the objection, or the objection IS the quote); a paraphrase is never accepted because it
+cannot be checked. Guards: single clause opening with the marker, ≤160 chars, no numeral (ASCII,
+unicode or spelled-out), no INFLECTED result verb (`passes/passed/ran/shows/exists/broke…` — bare
+infinitives after a modal are future actions and stay legal), no clause break (`; : , — newline`),
+no subordinator/relativizer (`that/which/because/since/now that…`), no copula. And every word
+left in the objection once the fragment is removed must be in an explicit framing allowlist.
+
+**⚠ IT WAS ABOUT TO BE INERT.** The whole DISMISS direction has been default-OFF since 2026-08-07
+(3 rescues / 9 DAMAGE). Shipping rule 4 without noticing would have built a feature into a
+disabled path — this project's silent-inoperative-subsystem shape. It therefore needed an
+exemption, which is what forced the damage question.
+
+**⚠ MY DAMAGE MEASUREMENT WAS INVALID, AND THE REVIEW PROVED IT STRUCTURALLY.** I justified
+default-ON with an LLM probe scoring "0 damage over 31 corrupted trials". The reviewer showed the
+numerator COULD NOT have been nonzero: the bench's `fault_fabrication` strings carry digits and
+result verbs (vetoed before rule 4 can act) and `fault_silent_failure` keeps the claim and swaps in
+a tool error, so its objections are absence-shaped and settle at rule 2. **The shape that threatens
+this rule is one no fault injector produces.** An instrument that cannot fail is not evidence —
+same class as §4AC/§4AI. Retracted.
+
+**TWO ADVERSARIAL ROUNDS, both finding shapes I had not modelled:**
+- **v1 → 3 CRITICALs.** The rule dismissed the WHOLE objection on finding ANY non-assertive span,
+  so an objection citing a real contradiction *and* quoting the next step laundered
+  (`CONFIRMED@0.9`, 0 model calls); multi-sentence spans smuggled fabrications; absence synonyms
+  missing from `_ABSENCE_RE` ("not corroborated") turned an UPHOLD into a DISMISS. Plus a MAJOR
+  marker spoof: `nonassertive_dismissal` substring-matched the whole `"{issue} → {why}"` line, so
+  an ISSUE containing the marker phrase let a FACTUAL dismissal through the closed gate —
+  self-reachable, since any turn discussing `objection.py` puts that literal string in the claim.
+- **v2 → 32 more laundering inputs.** `[^.!?]*` is not a clause boundary (`;` `:` newline);
+  the veto list was inflection-specific (`passed` blocked, `passes` free); relative clauses need
+  no punctuation at all ("I'll fix the bug that broke prod"); and the framing allowlist contained
+  the entire vocabulary of the `wrong_topic`/`constraint_violation` fault classes
+  (`requested/asked/summary/outcome/alignment/constraint/task/test`), so 10 of 10 genuine
+  alignment complaints laundered.
+
+**v3 closes all 32 reported inputs** (verified end-to-end through `_escalate_refute` with a
+call-counting client: every one now REFUTED with `main_calls=2`) while still firing on the three
+objection shapes observed live. Cost of the tightening, accepted deliberately: some innocent
+framings now escalate ("not a summary of the test outcome"), because those words are exactly how
+an alignment complaint is phrased.
+
+**⛔ DECISION: DEFAULT-OFF, and the patch cycle STOPPED at v3.** Not a bug count — a structural
+argument I accept: the guard is a LEXICAL proxy for a SEMANTIC property, each round the proxy
+tightened and the escape got one word cleverer, and the failure mode is SILENT (`CONFIRMED@0.9`,
+`objection_dismissed=True` — indistinguishable from a correct rescue in the ledger). A false
+negative costs one main-model call on a turn that was making one anyway; a false positive erases a
+real catch. Two measured rescues do not buy that.
+
+**THE CONVERGENCE EVIDENCE, which is why there is no v4.** Findings per adversarial round:
+**3 → 32 → 34.** The yield is NOT falling. Round 3 closed every input round 2 reported and the
+next round produced just as many, in classes I had again not modelled. The decisive one is
+**presupposition smuggling**: `"Let me restart the crashed service now"` asserts that a service
+crashed, with no copula, no subordinator, no clause break, no inflected verb and no numeral —
+**unreachable by any punctuation- or function-word veto**, which is the only kind of veto this
+design has. Making it safe requires INVERTING the test (require the fragment's content words to
+appear in the user's request) — a different rule, not another guard.
+
+**⚠ DO NOT RUN THE BENCH SWEEP** (this section previously told the next reader to do exactly
+that — corrected here). A sweep IS an opt-in: it arms the rule for a whole arm. And the bench's
+fault injectors provably cannot produce the shapes that break it — that is precisely why the
+0/31 probe was retracted. A sweep would come back clean for the SAME structural reason and that
+clean number would then be used to argue default-ON: **the retracted measurement returning
+through a different door.** Close the presupposition class first, add marker-first fixtures to
+the damage suite, and only then measure.
+
+**Known-unsafe classes are enumerated IN CODE** (`_NONASSERTIVE_KNOWN_HOLES`) and setting the env
+var now logs a WARNING naming them — a flag that silently arms a rule with known laundering paths
+is a trap; a loud one is a choice. Residual, all recorded: unvetoed joiners (ASCII hyphen,
+parens, slash, unicode commas), coordinators (`and/but/then/so`), copula-like verbs
+(`stays/appears/seems/holds`), number words (`both`, ordinals past third), two framing paths, and
+a plan that is ITSELF the defect (an unrequested destructive action). The damage suite's own
+limit, measured by the reviewer: its 12 fixtures are assertion-first while every v3 escape is
+marker-first, so mutation coverage of the current escape class is weak.
+
+**Pins:** `tests/test_objection_nonassertive.py` (the rule + the exemption plumbing + default-OFF)
+and `tests/test_objection_nonassertive_damage.py` (12 adversarial fixtures — every reviewer
+CRITICAL — asserted at per-objection AND whole-verdict level, PLUS mutations of each, so the suite
+pins the mechanism rather than the literal strings that motivated it; 9 of the 12 are red against
+v1). Stated limit: it proves no laundering on shapes we thought of.
+
+**⚠ Still untested (carried):** the truncation-guard stand-aside at `verifier.py` has no test at
+either call site — it is near-dead code once rule 4 is off.
+
+### 4BE. TWO LABEL-NOISE LEAKS THAT WROTE FAKE LABELS INTO THE CORPUS — ✅ FIXED 2026-08-13
+
+Both leaks were found in the 08-12 log audit and both corrupt the LEARNING corpus rather than a
+single turn, which is why they outrank the remaining latency work.
+
+**LEAK 1 — the checklist nudge minted junk lessons.** `has_meta_intent` was a bare substring test
+of the user's text for `{learn, skill, profile, lesson, playbook, memorize}`, and the message it
+injected asserted "you have not fulfilled the learning/profile instructions **in the user's
+request**". Because the test was a keyword match, that sentence was FALSE on every measured turn.
+**Measured on the live trajectory corpus: 59 of 59 arming turns carried no learning instruction
+(100% FP); the nudge fired 39 times, 10 on 08-12 alone.**
+
+The cost is not a wasted turn. Production req `32a8101d`: the model reasoned *"there's no explicit
+learning or profile instruction in their message… But the system is requiring it"*, called
+`learn_skill` to comply, and minted a lesson that vector-dedup reinforced to **freq=11** — a false
+nudge writing into the corpus that retrieval later injects into prompts. Req `207e0702` is the
+other failure mode: the same nudge drove the repetition loop the thinking guard had to abort.
+
+**Fix:** `_has_meta_task_directive` requires an IMPERATIVE directive ("remember this", "update your
+profile", "call learn_skill"), and storage verbs pointed at a data store are excluded — the live
+youtube-project request said "transcribe it, **save it to the knowledge base**" and armed the first
+cut of the new predicate. Arming: **59 → 1 turn (4.0% → 0.07%)** — "Remember this: my preferred debugging tool on macOS is
+dtrace…". ⚠ The final round inverted the subject test to an ALLOWLIST (the "remember that X" form
+needs a FIRST-PERSON subject), which costs one genuine directive: "remember that ram utilization is
+always high because of your LLM" no longer arms — and it is a CLASS, not one instance: English
+routinely puts the fact's topic in subject position, so "remember that Fotini is my wife" and
+"remember that dtrace is my debugging tool" are dropped too. Corpus recall is 1 of the 3 genuine
+record-directives in 1464 turns. That is the deliberate direction — a miss costs one
+un-nudged turn and the model can still record on its own, while a false arm corrupts the corpus —
+but it is a MISS, not a precision gain, and is recorded as such. ⚠ A round-2 review caught an FP class the first cut ADDED and the
+old predicate never had: 5 of the then-8 survivors were the youtube-project request arming on its
+parenthetical *"(remember that you use TOR.)"* — a constraint on how to do the task, not an
+instruction to write to the lesson store. **⚠ And my first exclusion had the subject backwards** (round-2 review): it dropped
+`I/we` — user facts, exactly what the profile store is for, so "remember that I use zsh" stopped
+arming — while still admitting `your/the/it`. The rule is the SUBJECT: second-person and impersonal
+subjects are task constraints ("remember that you use TOR", "remember that the sandbox has no
+network"); first-person subjects are user facts. Questions ("do you remember that…") are excluded by
+lookbehind. That is what took 8 → 2, and it is now pinned in both directions — the reviewer deleted
+the whole exclusion and 166 tests stayed green. The message no longer asserts what the user asked; it states the inference and tells the
+model to say so and finish normally rather than invent a lesson to satisfy it.
+
+**LEAK 2 — self-play graded incoherent exercises, with real egress.** A mined challenge wraps the
+original request in a FIXED harness ("a fixture has been written — write a `solution.py` that
+performs the operation the user asked for, APPLIED TO THAT FILE"), and `_detect_data_shape` fell
+back to a generic `input.txt` for ANY request. So "Run the composed skill youtube_transcribe on
+this URL" became a file exercise. Observed 08-12 17:36: the solver ran the **REAL macro — 8 Tor
+exit rotations, twice, genuine network egress from a "synthetic" exercise** — then satisfied the
+validator by printing the fixture's lines, scored `passed=True`, and the lesson extractor mined
+"genuine lessons" from a run whose task and grader never agreed. Both halves are label noise: the
+fabricated PASS enters frontier scoring, the lesson enters the corpus.
+
+**Fix — two gates, both fail-safe.** (a) `_is_transferable_challenge` refuses requests that act on
+the live world (macro/tool invocation, network fetches, service restarts, browser or live-session
+work) or that name no task verb at all — a declarative statement ("I am located in Athens") asks
+for no operation, so the exercise degenerates to "print the fixture" and its PASS says nothing.
+(b) `_detect_data_shape` now reports `explicit`; the generic `input.txt` fallback — **the actual
+incoherence generator** — is marked inexplicit and the mining path refuses it. `kind`/`filename`
+are unchanged so no other consumer moves.
+
+**Measured on 957 distinct live requests, END-TO-END through `_synthesize_challenge`** (i.e. after
+anonymisation and the pre-existing destructive denylist, which is where an earlier "15 candidates"
+figure came from — it skipped the pipeline and is corrected here): **6 candidates**. The incident
+request is refused end-to-end, and honest data work still mines — verified on the phrasings real
+users write ("how many rows in the csv have status=error?", "give me the top 10 IPs in the access
+log", "turn this csv into json", "search the log file for lines with ERROR"), **20 of 20 accepted against 13 of 13 junk refused**, including
+the phrasings the reviewer supplied ("plot the data from the csv", "i need a breakdown of the csv by
+month", "tail the log", "grep the log for timeouts").
+
+⚠ **"Journal mining is now dead" — checked, and it is not.** The live stash holds 20 records and
+NONE synthesize, which reads like over-blocking until you read them: they are project-continuation
+turns (4 name Chess Coach), contentless ones like *"proceed with all tasks"*, macro invocations
+and tool-driving — and record 19 is the incident itself, *"Run the composed skill youtube_transcribe
+on this short clip: url=…jNQXAC9IRR0"*. Every refusal is individually correct.
+to supply material either way. ⚠ Refusing costs ONE skipped self-play cycle — the template
+bank and LLM-gen still supply material — while accepting writes a fake label AND can touch the
+network, so both gates are deliberately tuned toward refusal.
+
+**Method note.** Leak 2's gate went through four tightenings because I kept extending a DENYLIST
+and it kept leaking (chess prompts, "use your file_system tool", bare "search"). The fix that
+actually converged was inverting to the harness's own precondition — *does a fixture stand in for
+data this request named?* — which is the [[lexical-proxy-for-semantic-property]] lesson applied
+early instead of after three review rounds.
+
+**⚠ ROUND-2 REVIEW FOUND MY FIX MADE ONE THING WORSE, now corrected.** The rewritten nudge text
+invites the model to decline ("say so and finish normally") — but the arming condition can only be
+discharged by CALLING a meta tool, so a correct refusal left it armed and it re-fired up to 4× per
+request with the drafted reply discarded each time. Under the OLD text compliance ended the loop;
+under the new text correct behaviour never did. Live req 32a8101d shows the pressure: the model
+declined twice and caved on turn 4. Fixed with a fire-once latch (`_meta_nudge_fired`), so
+declining now ends the loop exactly as compliance does. Also from that round: the storage-destination
+lookahead fell to one intervening noun ("save this **file** to the knowledge base") and now scans a
+40-char window; the self-play denylist could not match the natural spellings "knowledge base" /
+"file system tool" / "your workspace"; and the chess-COACHING family (62 corpus instances, the
+largest) contains none of {chess, "you are playing"} and needed `coaching|FEN|white|black`.
+
+**⚠ ROUND-3: MY OWN FIXES RE-OPENED THE CLASS TWICE.** Broadening the verb gate to STEMS dropped the
+trailing word boundary, so `read` matched "ready", `count` matched "country", `sum` matched "summer"
+and `list` matched "listen" — 15 of 16 declarative non-tasks became minable. And extending the log
+vocabulary by SUBSTRING made "the log" match "the login"/"the logic" and "logs" match "blogs", so
+*"fix the login page"* mined as a log exercise — with UI-bug post-mortems of exactly that shape
+already sitting in the live stash. Fixed with `stem + (?:e|es|ed|ing|s|is)? + \b` and a word-bounded
+`_LOG_SHAPE_RE`; irregulars (`query/queries`, `analysis`) are spelled out rather than folded into
+the suffix group, because folding in `y` is what re-admits "ready". Both regressions are pinned.
+Also removed `per \w+` / `which \w+` (not operations — they existed to keep one fixture green, so
+the fixture now states an operation instead) and the bare `white|black` chess terms (common data
+values).
+
+**⚠ The verb gate had ZERO coverage and survived being disabled** (a reviewer replaced it with
+`re.compile("")` and all four self-play suites stayed green) while accounting for ~39% of refusals.
+It is now pinned in both directions — and pinning it immediately exposed that `parse\b` does not
+match "parsing", which had silently refused four stash fixtures; the allowlist matches STEMS now.
+
+**Pins:** `tests/test_label_noise_leaks_4be.py` — both directions for both filters (the strings
+they must NOT match beside the ones they must), the verb gate in both directions plus a
+load-bearing check, a non-vacuity check that the nudge fixtures still exercise the OLD bug, and
+end-to-end `_synthesize_challenge` assertions in both directions. Three stash fixtures in
+`tests/test_dream_bugfixes_2026_07_20.py` were updated (four tests went red) to state a real task, since a mineable
+entry now needs an operation and a data shape. Docs:
+`docs/core/agent.html`, `docs/core/journal_challenges.html`.
 
 ### B3 ABLATION — TWO DEFECTS IN THE MEASURING INSTRUMENT (2026-08-08/09, tasks #36/#39/#40)
 

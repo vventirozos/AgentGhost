@@ -37,12 +37,12 @@ class _FakeCtx:
         self.sandbox_dir = base
 
 
-def _define(ctx, name="ping", steps=None):
+def _define(ctx, name="ping", steps=None, known_tools=None):
     return tool_manage_composed_skills(
         context=ctx, action="define", name=name, description="d",
         mode="sequential",
         steps=steps or [{"tool": "web_search", "params": {"query": "$q"}}],
-        known_tools={"web_search"},
+        known_tools=known_tools if known_tools is not None else {"web_search"},
     )
 
 
@@ -191,6 +191,78 @@ class TestAdvertisedSchema:
         await _define(ctx, name="ping")
         fn = self._def_for(ctx, "ping")
         assert "CALL THIS TOOL DIRECTLY" in fn["description"]
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Fix A — duplicate-define message leads with the execution path
+# ─────────────────────────────────────────────────────────────────────────
+class TestDuplicateDefineMessage:
+    """The old "already exists … delete it first" wording steered a RUN-intent
+    model into deleting an active macro it only wanted to invoke (the exact
+    on-ramp to the guard deadlock). The message must now lead with how to USE
+    the existing macro and demote delete to the replace-only path.
+
+    PRODUCTION SHAPE (fresh-eye review, 2026-08-12): the registry call site
+    derives known_tools from the fully-populated dispatch table, which
+    register_composed_skill_runners has already seeded with every ACTIVE
+    macro's own name — so the active-duplicate tests pass the macro's own
+    name in known_tools. With the shadow check ordered before the duplicate
+    check, the duplicate branch was unreachable in exactly that scenario
+    (the refusal misdiagnosed the duplicate as a built-in collision)."""
+
+    async def test_active_duplicate_points_at_run_before_delete(self, tmp_path):
+        ctx = _FakeCtx(tmp_path)
+        await _define(ctx, name="ping")
+        # Production shape: the active macro's runner is registered, so its
+        # own name is in the call-time known_tools set.
+        r = await _define(ctx, name="ping", known_tools={"web_search", "ping"})
+        assert "already exists" in r
+        assert "ACTIVE" in r
+        assert "action='run'" in r
+        assert "Do NOT re-define" in r
+        # The duplicate diagnosis must WIN over the shadow check — the
+        # registry's own macro is not "shadowing" a tool, it IS the tool.
+        assert "Choose a different name" not in r
+        # Delete guidance survives, but only AFTER the execution guidance and
+        # framed as replacement — never as the first way out.
+        assert "REPLACE" in r
+        assert r.index("action='run'") < r.index("action='delete'")
+
+    async def test_proposed_duplicate_points_at_approve_not_run(self, tmp_path):
+        ctx = _FakeCtx(tmp_path)
+        await _define(ctx, name="ping")
+        _registry_from_context(ctx).skills["ping"].status = "proposed"
+        # Proposed macros are never dispatchable, so their name is NOT in the
+        # call-time known_tools — the default fixture IS the production shape.
+        r = await _define(ctx, name="ping")
+        assert "already exists" in r
+        # A non-active macro can't be run — the message must not claim it can.
+        assert "action='approve'" in r
+        assert "action='run'" not in r
+        assert "action='delete'" in r
+
+    async def test_genuine_builtin_collision_still_shadow_refused(self, tmp_path):
+        # A name that is a real built-in (NOT a registry macro) must still be
+        # refused by the shadow check after the reorder.
+        r = await _define(_FakeCtx(tmp_path), name="web_search",
+                          known_tools={"web_search"})
+        assert "Choose a different name" in r
+        assert "already exists and is ACTIVE" not in r
+
+    async def test_volatile_counters_outside_guard_prefix(self, tmp_path):
+        """Steps/usage counters live at the message TAIL: two duplicate-define
+        failures that differ only in usage_count must normalize to the SAME
+        RecentFailureGuard key (first 80 lowercased chars), or for short macro
+        names the repeat guard never accumulates an identical failure."""
+        from ghost_agent.core.triggers import RecentFailureGuard
+        ctx = _FakeCtx(tmp_path)
+        await _define(ctx, name="ping")
+        r1 = await _define(ctx, name="ping", known_tools={"web_search", "ping"})
+        _registry_from_context(ctx).skills["ping"].usage_count = 37
+        r2 = await _define(ctx, name="ping", known_tools={"web_search", "ping"})
+        assert r1 != r2  # the counters really do differ...
+        assert (RecentFailureGuard._norm_err(r1)
+                == RecentFailureGuard._norm_err(r2))  # ...outside the key
 
 
 # ─────────────────────────────────────────────────────────────────────────

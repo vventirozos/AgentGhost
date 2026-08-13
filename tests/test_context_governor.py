@@ -163,7 +163,11 @@ def test_recovery_and_llm_retry_strip_stream_flag():
     import ghost_agent.core.llm as llm_mod
     hc = inspect.getsource(agent_mod.GhostAgent.handle_chat)
     _recov = hc[hc.index("Emergency pruning triggered"):]
-    assert 'payload["stream"] = False' in _recov[:4000]
+    # Bounded window so the strip stays LOCAL to the recovery block; 6000
+    # (was 4000) because the §4BC action-view comment in the recovery
+    # region pushed the line to offset ~4100 (2026-08-12) — the mechanism
+    # itself is unchanged.
+    assert 'payload["stream"] = False' in _recov[:6000]
     lc = inspect.getsource(llm_mod)
     assert "SSE body on a non-streaming call" in lc
 

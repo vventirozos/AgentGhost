@@ -125,6 +125,109 @@ def dismiss_enabled() -> bool:
         in ("1", "true", "yes", "on")
 
 
+# Marker carried by rule 4's `why` string. The whole-verdict caller uses it
+# to tell a NON-ASSERTIVE dismissal apart from the factual ones the
+# 2026-08-07 measurement switched off.
+_NONASSERTIVE_WHY = "objection targets a non-assertive fragment"
+
+
+# Set once the opt-in warning has fired, so a per-call check does not spam
+# the log (this predicate runs on every objection).
+_NONASSERTIVE_OPT_IN_WARNED = False
+
+# KNOWN-UNSAFE INPUT CLASSES, enumerated by adversarial review after v3.
+# Kept in code, not just the journal, because this is what an operator
+# flipping the switch is actually buying.
+_NONASSERTIVE_KNOWN_HOLES = (
+    "presupposition inside a pure intention ('restart the CRASHED service' "
+    "asserts a crash) — unreachable by any lexical veto",
+    "coordinators joining a second predication ('… and the token stays "
+    "unrotated')",
+    "unvetoed clause joiners: ASCII hyphen, parentheses, slash, and the "
+    "unicode comma/enumeration marks",
+    "copula-like verbs (stays/appears/seems/holds/contains) and the "
+    "contracted 's",
+    "a plan that is itself the defect (an unrequested destructive action, "
+    "or a plan offered INSTEAD of the work)",
+)
+
+
+def _warn_nonassertive_opt_in() -> None:
+    """Say plainly what enabling this rule buys. A flag that silently arms a
+    rule with known laundering paths is a trap; a loud one is a choice."""
+    global _NONASSERTIVE_OPT_IN_WARNED
+    _NONASSERTIVE_OPT_IN_WARNED = True
+    logger.warning(
+        "GHOST_VERIFY_OBJECTION_NONASSERTIVE=1: objection rule 4 is ARMED. "
+        "It suppresses a REFUTE with no main-model call, and adversarial "
+        "review found it still launders %d known input classes: %s. Three "
+        "hardening rounds did not converge (yield 3 -> 32 -> 34), so this "
+        "is an EXPERIMENT, not a safety feature.",
+        len(_NONASSERTIVE_KNOWN_HOLES), "; ".join(_NONASSERTIVE_KNOWN_HOLES))
+
+
+def nonassertive_enabled() -> bool:
+    """Rule 4's dismissal. **SHIPS DEFAULT-OFF** —
+    `GHOST_VERIFY_OBJECTION_NONASSERTIVE=1` opts in.
+
+    ⚠ WHY OFF, recorded so nobody re-argues it from the rule's appeal. The
+    rule is a LEXICAL PROXY for a SEMANTIC property ("this fragment asserts
+    nothing"). Two adversarial rounds each found the proxy leaking in a
+    shape the author had not modelled — v1 fell to an objection that cited a
+    real contradiction while also quoting the next step; v2 fell to `;` and
+    `:` as clause joins, to inflection (`passed` vetoed, `passes` not), to
+    relative clauses ("I'll fix the bug that broke prod"), and to framing
+    words that spell an alignment complaint. v3 closes all 32 reported
+    inputs, and the reviewer's judgement — which this default accepts — is
+    that the next escape is one word cleverer, not that none exists.
+
+    The asymmetry decides it: a false NEGATIVE costs one main-model call on
+    a turn that was making one anyway; a false POSITIVE erases a real catch
+    with NO model call and NO visible trace (`CONFIRMED@0.9`,
+    `objection_dismissed=True` — indistinguishable in the ledger from a
+    correct rescue). Two measured rescues do not buy that risk.
+
+    ⚠ THE ORIGINAL JUSTIFICATION WAS RETRACTED. An LLM probe scored "0
+    damage over 31 corrupted trials"; review showed the number was
+    STRUCTURALLY incapable of being nonzero — the bench's `fault_fabrication`
+    strings carry digits and result verbs (vetoed before rule 4 can act) and
+    `fault_silent_failure` keeps the claim, so its objections are
+    absence-shaped and settle at rule 2. The damage surface now lives in
+    `tests/test_objection_nonassertive_damage.py`: 12 adversarial fixtures
+    asserted at the per-objection AND whole-verdict levels, plus mutations
+    (punctuation, tense, subordinator) so the suite pins the MECHANISM
+    rather than the strings that motivated it. Its own limit is stated
+    there: it proves no laundering on shapes we thought of.
+
+    Before flipping this ON, sweep it in `scripts/verify_bench.py` beside
+    `GHOST_VERIFY_OBJECTION_DISMISS` and let a measurement decide.
+    """
+    on = os.getenv("GHOST_VERIFY_OBJECTION_NONASSERTIVE", "0").strip(
+        ).lower() in ("1", "true", "yes", "on")
+    if on and not _NONASSERTIVE_OPT_IN_WARNED:
+        _warn_nonassertive_opt_in()
+    return on
+
+
+def nonassertive_dismissal(reasons: Sequence[str]) -> bool:
+    """True when EVERY reason behind a DISMISS came from rule 4.
+
+    Deliberately unanimous: one factual dismissal mixed in and the whole
+    verdict goes back through the gate the 2026-08-07 measurement closed."""
+    items = [str(r or "") for r in (reasons or [])]
+    # ⚠ Match the WHY, not the whole line. `resolve_refute` formats each
+    # reason as "{issue} → {why}", and a substring test over the whole line
+    # let an ISSUE TEXT containing this marker phrase spoof the exemption —
+    # a factual rule-2 dismissal then reached production with the general
+    # DISMISS gate closed (review M4, reproduced end-to-end; self-reachable
+    # here, since any turn that discusses objection.py puts the literal
+    # string into the claim). The why is appended last, so rsplit isolates
+    # it even when the issue itself contains the separator.
+    return bool(items) and all(
+        r.rsplit(" \u2192 ", 1)[-1].startswith(_NONASSERTIVE_WHY)
+        for r in items)
+
+
 # A number with optional thousands separators / decimals.
 # A COMPARABLE QUANTITY, not merely a digit string. The distinction is
 # load-bearing and was found by measurement: the first version compared
@@ -781,6 +884,217 @@ def _is_noise_allegation(text: str) -> bool:
                 and _NOISE_CONTEXT_RE.search(text))
 
 
+# ── Non-assertive fragments (rule 4, §4BD) ──────────────────────────
+# A stated NEXT STEP or a QUESTION back to the user asserts nothing about
+# the world, so no evidence can contradict it.
+#
+# ⚠ v2 (adversarial review, same day). v1 asked only "does SOME span in the
+# objection look like an intention?" and then dismissed the WHOLE objection.
+# Three reproduced laundering paths killed it: an objection citing a real
+# contradiction that ALSO quoted the next step; a multi-sentence span whose
+# first sentence was a fabrication ("The endpoint is reachable … I'll add
+# the retry next"); and absence complaints whose synonym is missing from
+# `_ABSENCE_RE` ("not corroborated by the evidence") reaching rule 4 and
+# turning an UPHOLD into a DISMISS. v2 therefore requires the objection to
+# reduce ENTIRELY to one non-assertive CLAUSE:
+#   (1) the fragment is a single clause that STARTS with the marker and
+#       contains no internal sentence break;
+#   (2) it is present verbatim in the claim, digit-free, result-verb-free;
+#   (3) everything else in the objection is pure FRAMING — every remaining
+#       word drawn from a small allowlist. Any content word (evidence,
+#       support, contradiction, a number, …) means the objection is saying
+#       something more than "this is a plan", and it escalates.
+
+# (1) whole-fragment shapes. The marker must OPEN the clause, and `[^.!?]*`
+# forbids an internal sentence break — so an assertion cannot precede or
+# follow the intention inside one fragment.
+# Anything that can START A SECOND PREDICATION inside the fragment. v2
+# assumed `[^.!?]*` bounded a clause; it does not — `;` `:` `,` a dash, a
+# newline, or a bare relativizer all carry a full assertion ("I'll retry
+# the fetch; every exit node is blocked", "I'll fix the bug that broke
+# prod"). These three closed FUNCTION-WORD classes are enumerable in a way
+# the open class of content verbs is not.
+_CLAUSE_BREAK_RE = re.compile(r"[;:,\u2014\u2013\n\r\u2026]|\.\.\.")
+_SUBORDINATOR_RE = re.compile(
+    r"\b(?:that|which|who|whom|whose|because|since|although|though|while|"
+    r"whereas|when|whenever|after|before|until|unless|if|as|so\s+that|"
+    r"now\s+that|given\s+that|due\s+to|owing\s+to)\b", re.I)
+# A copula/auxiliary is the spine of a predicative assertion ("the tunnel
+# IS up", "the credentials WERE unchanged"). An intention clause needs none.
+_COPULA_RE = re.compile(
+    r"\b(?:is|are|was|were|be|been|being|am|has|have|had|does|do|did|"
+    r"isn't|aren't|wasn't|weren't|hasn't|haven't|didn't|doesn't)\b", re.I)
+
+_NONASSERTIVE_CLAUSE_RE = re.compile(
+    r"^(?:"
+    r"I(?:'|\u2019)?(?:ll|\s+will|\s+shall|\s+am\s+going\s+to|\s+plan\s+to|"
+    r"\s+intend\s+to|\s+can\s+(?:retry|rerun|re-run|look|check|open|fix))"
+    r"|Let\s+me"
+    r"|Next(?:,)?\s+I(?:'|\u2019)?(?:ll|\s+will)"
+    r"|Want\s+me\s+to|Shall\s+I|Should\s+I|Do\s+you\s+want\s+me\s+to"
+    r"|Would\s+you\s+like\s+me\s+to"
+    r")\b[^.!?]*[.!?]?$", re.I)
+
+# (2) a fragment asserting a RESULT is not a pure intention. Extended after
+# the review: v1 covered past-tense verbs of DOING but not the predicative
+# assertions where fabrications actually live ("the config is valid").
+_RESULT_ASSERTION_RE = re.compile(
+    # ⚠ INFLECTED forms only. After a modal ("I'll re-run the test") the
+    # verb is a BARE INFINITIVE describing a future action and asserts
+    # nothing; the -ed / -s / irregular-past forms are what assert a
+    # result ("review passes", "the check ran"). v3 vetoed both and killed
+    # the rule's own target shape — the distinction is the point.
+    r"\b(?:passes|passed|passing|fails|failed|failing|"
+    r"succeeds|succeeded|works|worked|working|"
+    r"verifies|verified|validates|validated|confirms|confirmed|"
+    r"tests|tested|completes|completed|finishes|finished|"
+    r"fixes|fixed|resolves|resolved|runs|ran|"
+    r"ensures|ensured|deploys|deployed|installs|installed|"
+    r"creates|created|writes|wrote|saves|saved|returns|returned|"
+    r"produces|produced|finds|found|shows|shown|showed|"
+    r"reproduces|reproduced|exists|existed|matches|matched|"
+    r"detects|detected|broke|broken|"
+    r"reachable|valid|invalid|healthy|green|empty|clean|correct|incorrect|"
+    r"already|unchanged|successful|successfully)\b", re.I)
+
+# (3) framing vocabulary. Every word left in the objection once the
+# fragment is removed must appear here, or the objection is asserting
+# something beyond "this is a plan/question" and must escalate.
+# ⚠ DELIBERATELY EXCLUDES evidence / support / corroborated / verifiable /
+# substantiated: those make it a CONTENT complaint, which is rule 2's
+# business (and where `_ABSENCE_RE`'s synonym gaps live — see the C3 path
+# in the review). Excluding them is what keeps a missing synonym escalating
+# instead of silently dismissing.
+_FRAMING_WORDS = frozenset("""
+a an the this that these those it its
+is are was were be being been
+statement sentence claim reply response text fragment part line phrase
+agent assistant model user
+states state stated asserts assert asserted says say said proposes propose
+proposed promises promise promised implies imply implied includes include
+included ends end ending offers offer offered adds add added mentions
+mention mentioned contains contain
+future next plan plans step steps action actions intention intentions
+intent promise question offer suggestion
+not no non never merely only just simply also and or but of to for in on
+with as at from by about
+which what who whom whose when where why how
+""".split())
+
+# ⚠ The allowlist is DELIBERATELY INCOMPLETE, and that is the safe
+# direction: an unlisted word makes the objection escalate (a false
+# NEGATIVE — one extra main-model call), whereas a permissive proxy would
+# dismiss real complaints (a false POSITIVE — a laundered defect). This
+# project's own rule: when the distinction is semantic, use an explicit
+# allowlist and accept the gaps; a clever structural proxy fails silently
+# and broadly. Grow it only from objections observed in the wild.
+
+_WORD_RE = re.compile(r"[A-Za-z]+")
+
+# ASCII `isdigit()` misses non-ASCII numerals and spelled-out numbers, both
+# of which can carry a fabricated quantity into a "plan" (review N5).
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"dozen|hundred|thousand|million|billion|half|twice|first|second|third)\b",
+    re.I)
+
+
+def _has_numeral(text: str) -> bool:
+    """Any digit (ASCII or not), numeric character, or number word."""
+    for ch in text or "":
+        if ch.isdigit() or ch.isnumeric():
+            return True
+    return bool(_NUMBER_WORD_RE.search(text or ""))
+
+# Quoted spans inside an objection: 'like this', "like this", `like this`,
+# and the curly variants a judge emits.
+#
+# ⚠ CONTRACTIONS AND POSSESSIVES, both found by review. A naive
+# `'([^']+)'` splits on the apostrophe inside the quoted text — the very
+# fragments this rule targets are contractions ("'I'll open …'" captured as
+# `ll open …`, which no longer matches the intent pattern). And a
+# POSSESSIVE before the quote ("The reply's statement 'I'll …'") consumed
+# the opening delimiter. So: an apostrophe followed by a LETTER is a
+# contraction, and an opening delimiter may not be preceded by one.
+_QUOTED_SPAN_RE = re.compile(
+    r"(?<![A-Za-z0-9])'((?:[^']|'(?=[A-Za-z])){6,200}?)'"
+    r"|\"([^\"]{6,200})\""
+    r"|`([^`]{6,200})`"
+    r"|(?<![A-Za-z0-9])\u2018((?:[^\u2019]|\u2019(?=[A-Za-z])){6,200}?)\u2019"
+    r"|\u201c([^\u201d]{6,200})\u201d")
+
+# Bounds. A "fragment" longer than this is a paragraph, not a clause.
+_FRAGMENT_MIN_CHARS = 12
+_FRAGMENT_MAX_CHARS = 160
+
+
+def _fragment_is_nonassertive(frag: str, claim_canon: str) -> bool:
+    """One clause, verbatim in the reply, asserting nothing."""
+    f = (frag or "").strip()
+    if not (_FRAGMENT_MIN_CHARS <= len(f) <= _FRAGMENT_MAX_CHARS):
+        return False
+    if _has_numeral(f):
+        return False              # a number could be fabricated
+    if _RESULT_ASSERTION_RE.search(f):
+        return False              # asserts an outcome, not just an intent
+    if (_CLAUSE_BREAK_RE.search(f) or _SUBORDINATOR_RE.search(f)
+            or _COPULA_RE.search(f)):
+        return False              # a second predication can hide there
+    if not _NONASSERTIVE_CLAUSE_RE.match(f):
+        return False              # must OPEN with the marker, one clause
+    return _atom_present(f, False, claim_canon)
+
+
+def _remainder_is_framing(issue: str, frag: str) -> bool:
+    """True when the objection says nothing beyond 'this is a plan'.
+
+    This is the guard that stops a REAL complaint riding along with a
+    quoted next step (review C1): every word left after removing the
+    fragment must be framing vocabulary, and any digit disqualifies.
+    """
+    rest = str(issue or "")
+    i = rest.find(frag)
+    if i >= 0:
+        rest = rest[:i] + " " + rest[i + len(frag):]
+    if _has_numeral(rest):
+        return False
+    # Single letters are the debris of possessives and contractions
+    # ("the reply's statement" -> reply, s) and carry no complaint
+    # semantics, so they are not treated as content words.
+    return all(w.lower() in _FRAMING_WORDS
+               for w in _WORD_RE.findall(rest) if len(w) > 1)
+
+
+def _nonassertive_fragment(issue: str, claim: str) -> Optional[str]:
+    """The claim fragment this objection targets, IF the objection reduces
+    ENTIRELY to that fragment and the fragment asserts nothing.
+
+    Proof discipline (this module dismisses only by looking): the fragment
+    must appear VERBATIM in the claim — quoted inside the objection, or the
+    objection text itself being that quote. A judge's paraphrase is never
+    accepted, because a paraphrase cannot be checked.
+    """
+    text = str(issue or "").strip()
+    claim_s = str(claim or "")
+    if not text or not claim_s:
+        return None
+    c_canon = _canon(claim_s)
+
+    # (a) fragments the objection quotes explicitly — the rest of the
+    # objection must be framing only.
+    for m in _QUOTED_SPAN_RE.finditer(text):
+        frag = next((g for g in m.groups() if g), "")
+        if (_fragment_is_nonassertive(frag, c_canon)
+                and _remainder_is_framing(text, frag)):
+            return frag
+    # (b) the objection IS a bare quote of the reply (the judge's "issues"
+    # list often just echoes the offending sentence). Nothing remains to
+    # check, but the clause shape still must hold.
+    if _fragment_is_nonassertive(text, c_canon):
+        return text
+    return None
+
+
 def resolve_issue(issue: str, claim: str, evidence: str,
                   truncation_severity: float = 0.0) -> Tuple[str, str]:
     """Adjudicate ONE objection mechanically. Returns (decision, why)."""
@@ -962,7 +1276,48 @@ def resolve_issue(issue: str, claim: str, evidence: str,
                     f"{_present[0]!r}")
         return (DISMISS, "alleged machine noise is NOT in the claim")
 
-    # ── (4) TRIED AND REJECTED ON MEASUREMENT, kept as a warning:
+    # ── 4. Non-assertive fragment — the objection targets a part of the
+    # reply that makes no claim about the world, so no evidence can
+    # contradict it (§4BD-b 2026-08-12). Two shapes: a STATED NEXT STEP
+    # ("I'll open the parser next") and a QUESTION back to the user
+    # ("Want me to look at the service log?").
+    #
+    # Motivation: after retiring the GEPA adjudicate artifact, the residual
+    # false-refutes on the honest-failure FP-trap set were dominated by
+    # future-plan complaints, and prompt text does not fix it (the E4B judge
+    # reads the rule and does not follow it, measured p=1.0) — so the fix
+    # had to be mechanical.
+    #
+    # PROOF REQUIRED, in this module's tradition — it dismisses only by
+    # LOOKING: the targeted fragment must be found VERBATIM in the claim
+    # (quoted inside the objection, or the objection IS the quote), and the
+    # objection must reduce ENTIRELY to it (`_remainder_is_framing`).
+    #
+    # ⚠ WHAT THE GUARDS ARE, AND WHAT THEY ARE NOT. `_fragment_is_nonassertive`
+    # rejects numerals, inflected result verbs, clause breaks, subordinators
+    # and copulas — every one of them earned by a laundering input an
+    # adversarial review actually produced (an objection citing a real
+    # contradiction beside a quoted plan; "I'll retry the fetch; every exit
+    # node is blocked"; "I'll fix the bug that broke prod"; `passed` vetoed
+    # while `passes` was not). They are a LEXICAL proxy for a SEMANTIC
+    # property, which is why this rule ships DEFAULT-OFF — see
+    # `nonassertive_enabled` for the decision and what would reverse it.
+    # And it decides ONE objection: `resolve_refute` still needs EVERY
+    # objection dismissed before a refute is dropped.
+    # ⚠ CALLERS MUST GATE. This returns DISMISS regardless of
+    # `nonassertive_enabled()` — the flag is enforced at the two verifier
+    # call sites, not here, so a future third caller would inherit the rule
+    # silently (the silent-inoperative-subsystem shape, in reverse). Any new
+    # consumer of a rule-4 DISMISS must check `nonassertive_enabled()` and
+    # `nonassertive_dismissal()` first.
+    _frag = _nonassertive_fragment(text, claim)
+    if _frag:
+        _shape = "question" if _frag.rstrip().endswith("?") else "stated next step"
+        return (DISMISS,
+                f"{_NONASSERTIVE_WHY} ({_shape}) — it asserts nothing the "
+                f"evidence could contradict")
+
+    # ── (5) TRIED AND REJECTED ON MEASUREMENT, kept as a warning:
     # upholding whenever an objection merely mentions two DIFFERENT
     # numbers — no contrast phrase required — raised protection from 37
     # to 59 catches but hardened false alarms from 2 to 7, because an
@@ -1011,4 +1366,5 @@ def resolve_refute(issues: Sequence[str], claim: str, evidence: str,
 
 
 __all__ = ["DISMISS", "UPHOLD", "UNRESOLVED", "enabled",
-           "dismiss_enabled", "resolve_issue", "resolve_refute"]
+           "dismiss_enabled", "nonassertive_enabled", "nonassertive_dismissal",
+           "resolve_issue", "resolve_refute"]

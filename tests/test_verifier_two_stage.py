@@ -320,6 +320,57 @@ def test_prompts_carry_bookkeeping_dismissal_rule():
         in _VERIFY_ADJUDICATE_PROMPT
 
 
+# ---------- a tuned template may not shed a pinned dismissal rule ----------
+
+
+def test_tuned_template_must_carry_pinned_rules():
+    """The shadowing trap, structurally closed (2026-08-12): a live GEPA
+    artifact OVERRIDES the adjudicate constant, so a dismissal rule edited
+    into the constant alone is SILENTLY DEAD on the two-stage path — found
+    the hard way when a rule was added to the constant and the live judge's
+    behavior could not change because the artifact was serving. The
+    validator now rejects any tuned template that shed a pinned rule, so
+    production falls back to the constant that still carries it.
+
+    Pinned today: the bookkeeping-state dismissal (2026-07-18,
+    live-validated). Adding a marker here makes that rule a hard
+    requirement of every future tuned artifact."""
+    from ghost_agent.core.verifier import (
+        _REQUIRED_RULE_MARKERS,
+        _VERIFY_ADJUDICATE_PROMPT,
+        _template_reject_reason,
+        _validate_stage_template,
+    )
+    # The baseline constant must itself satisfy the markers (else the
+    # fallback would be rejected by its own gate).
+    markers = _REQUIRED_RULE_MARKERS["verifier.adjudicate"]
+    assert markers, "at least one rule must stay pinned"
+    for marker in markers:
+        assert marker in _VERIFY_ADJUDICATE_PROMPT
+    assert _validate_stage_template(
+        "verifier.adjudicate", _VERIFY_ADJUDICATE_PROMPT) is True
+    # A tuned template that shed a pinned rule is rejected even though its
+    # placeholders are intact — and the reason says WHICH class failed, not
+    # the misleading "placeholder probe" (that ambiguity cost a full A/B
+    # run: the no-rule arm was silently redirected to the baseline).
+    shed = _VERIFY_ADJUDICATE_PROMPT.replace(markers[0], "")
+    assert _validate_stage_template("verifier.adjudicate", shed) is False
+    assert "pinned rule missing" in _template_reject_reason(
+        "verifier.adjudicate", shed)
+    assert _template_reject_reason(
+        "verifier.adjudicate", _VERIFY_ADJUDICATE_PROMPT) == ""
+    # A genuinely broken placeholder still reports the placeholder class.
+    assert _template_reject_reason(
+        "verifier.adjudicate", "no placeholders here") == "placeholder probe"
+    # Rewording is legal as long as the marker survives recognizably —
+    # markers are substrings, not full rule texts.
+    reworded = _VERIFY_ADJUDICATE_PROMPT + "\n(extra tuned guidance)"
+    assert _validate_stage_template("verifier.adjudicate", reworded) is True
+    # Stages with no pinned markers keep the old placeholder-only contract.
+    assert _validate_stage_template("verifier.enumerate",
+                                    "{claim} {evidence} {context}") is True
+
+
 # ---------- input truncation ----------
 
 

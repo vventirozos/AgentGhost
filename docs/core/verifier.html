@@ -247,7 +247,7 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
 
   <h2>Widened evidence window for claim-shaped verdicts (2026-07-16)</h2>
   <p>The gate used to judge the ENTIRE final answer against only the <em>last</em> substantive tool output (4000 chars). A multi-source research answer synthesises many tool outputs, so whichever tool happened to run last decided the verdict: on the souvlaki turn (req 738c/73) the last fetch was a <code>403 Forbidden</code> while the answer came from two <em>earlier</em> successful page loads — the verifier truthfully reported "evidence does not support the claim" about the sliver it was shown and REFUTED a correct answer, burning an auto-repair round re-fetching sources the turn already had. The same keyhole produced the "corrected list is unsupported" refute one turn later (prior-turn evidence is invisible to the gate) and near-miss request-alignment refutes on multi-wave search turns.</p>
-  <p><code>_collect_verifier_evidence(tools_run, max_items=3, budget=4000)</code> in <code>agent.py</code> now assembles the last three substantive tool outputs — selection mirrors <code>_find_substantive_tool_for_verifier</code> exactly (synthetic and bookkeeping entries skipped) — rendered chronologically, each prefixed <code>[tool_name]</code>, with newest-heavy budgets (50/30/20; a single-tool turn keeps the full budget, byte-equivalent to the old path) and the total capped <em>including labels</em> so <code>verify_claim</code>'s own <code>[:4000]</code> guard can never truncate the newest item away. Both claim-shaped gate paths use it; the code-shaped path (<code>verify_code_output</code>) deliberately keeps the single-output view — it audits one specific run. <code>_VERIFY_CLAIM_PROMPT</code> declares the multi-tool shape and adds two rubric lines: one failed tool does NOT refute parts of the claim supported by other outputs, and specifics (names, dates, awards, rankings) appearing in NO output are fabrications — still REFUTED, so the widened window does not defang the gate (the "Everest / world champion June 2026" fabrication remains refutable). <code>last_tool</code> semantics are unchanged everywhere else (mutation guard, empty-verdict diagnostics, code-shape classification). Covered by <code>tests/test_verifier_evidence_window.py</code>.</p>
+  <p><code>_collect_verifier_evidence(tools_run, max_items=3, budget=4000)</code> in <code>agent.py</code> now assembles the last three substantive tool outputs — selection mirrors <code>_find_substantive_tool_for_verifier</code> (synthetic entries skipped; bookkeeping entries skipped only when non-informational — since §4BC 2026-08-12 both layers share <code>_bookkeeping_informational</code>, with the packer alone honoring <code>id_linkage</code>) — rendered chronologically, each prefixed <code>[tool_name]</code>, with newest-heavy budgets (50/30/20; a single-tool turn keeps the full budget, byte-equivalent to the old path) and the total capped <em>including labels</em> so <code>verify_claim</code>'s own <code>[:4000]</code> guard can never truncate the newest item away. Both claim-shaped gate paths use it; the code-shaped path (<code>verify_code_output</code>) deliberately keeps the single-output view — it audits one specific run. <code>_VERIFY_CLAIM_PROMPT</code> declares the multi-tool shape and adds two rubric lines: one failed tool does NOT refute parts of the claim supported by other outputs, and specifics (names, dates, awards, rankings) appearing in NO output are fabrications — still REFUTED, so the widened window does not defang the gate (the "Everest / world champion June 2026" fabrication remains refutable). <code>last_tool</code> consumers that ask "what did the turn last DO" — the mutation guard, code-shape classification, overflow recovery, the UI fallback — read the <em>action view</em> (<code>include_informational_bookkeeping=False</code>, the pre-§4BC selection exactly), so a trailing listing can never shadow the write/execute before it (§4BC round 2). Covered by <code>tests/test_verifier_evidence_window.py</code>.</p>
 
   <h3>Slack redistribution + URL squeeze — the starved-evidence refute (2026-07-17)</h3>
   <p>The one-pass newest-heavy split had a dual failure mode to the souvlaki keyhole: a <em>tiny</em> newest output could starve a <em>large</em> older one. On the naftemporiki turn (req 4dab5067) a 106-char weather report — the newest tool — held 65% of the 4000-char budget and left it unused, while the 4KB RSS feed was cut mid-item #4; the verifier (correctly, on what it was shown) REFUTED the answer's items #5–#10 as "not in the evidence" — twice, sync then late — so a fully-supported answer burned a repair round, had its lessons scrubbed, was backfilled <code>failed</code> into the corpus, and queued a bogus next-turn correction. (Initially misread as the worker model failing Greek: the refuted items were simply the ones past the cut.)</p>
@@ -494,8 +494,10 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   <p>Two turn shapes needed their own plumbing (review pass, same day): (a) a turn whose ONLY
   tool was <code>manage_projects</code> used to skip the verifier entirely (bookkeeping run-gate) —
   an output carrying a batch outcome (<code>"stop_reason"</code>, the autoadvance payload
-  signature) now counts as substantive, while plain task_list/create confirmations keep skipping
-  per the 2026-07-25 run-gate/evidence-set split; (b) the code-shaped branch
+  signature) now counts as substantive, while plain task_list/create confirmations kept skipping
+  per the 2026-07-25 run-gate/evidence-set split (NARROWED 2026-08-12, §4BC below: informational
+  payload-shaped output — listings ≥200 chars — now runs the verifier too; only bare short
+  confirmations still skip); (b) the code-shaped branch
   (<code>verify_code_output</code>) judged on the execute output alone — the ledger block now rides
   the tail of that output too, inside its own 4000-char cap. Tests:
   <code>tests/test_project_ledger_integrity_fixes.py</code>.</p>
@@ -526,6 +528,153 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   work — they still surface via the correction banner but are no longer filed as
   "Verifier follow-up" tasks (the incident filed "Truncated response" onto the project's books).
   Tests: <code>tests/test_constraint_lifecycle_and_claim_fairness.py</code>.</p>
+
+  <h2>Informational bookkeeping output runs the verifier (2026-08-12, §4BC)</h2>
+  <p><strong>The measurement:</strong> 57.3% of real user turns ended <code>outcome=unknown</code>
+  (839/1464 with the corrections overlay applied), and every pending A/B-arm verdict is gated on
+  resolved outcomes. Decomposition: 483 unknowns were no-tool chat turns (no evidence — correctly
+  ungraded), 340 were bookkeeping-only turns, and only ~5 involved genuinely lost verdicts (the
+  late-verdict backfill works — 282 sidecar corrections on file). Of the 340, <strong>271 carried
+  payload-shaped output ≥200 chars</strong> (174 <code>manage_projects</code> listings — "show me
+  all projects" — plus self-play reports, skill inventories, knowledge-base listings) that the
+  evidence packer has trusted as evidence since 2026-07-25 while the NAME-only run-gate still
+  skipped the verifier entirely. Those turns could never be verified, and 15–26 unresolved rows
+  per A/B arm trace to exactly this gate.</p>
+  <p><strong>The fix:</strong> the run-gate and the packer now share ONE predicate,
+  <code>_bookkeeping_informational</code> (<code>core/agent.py</code>): error banners and
+  payload-shaped output (≥200 chars) count as verifiable substance at BOTH layers, so an
+  informational bookkeeping turn now RUNS the verifier with the listing as evidence. Bare
+  state-change confirmations ("SUCCESS: Profile updated.") keep skipping — the 2026-04-19 blast
+  radius (a confirmation in the evidence slot guarantees a false REFUTED) — and the packer-only
+  <code>id_linkage</code> case (short confirmations carrying a 12-hex id) deliberately stays OUT
+  of the run-gate: linkage evidence once the judge is running, never a reason to summon it.</p>
+  <p><strong>Two views, one walk (round-2 fresh-eye review, same day):</strong> the widening is
+  an <em>evidence</em>-selection change only. <code>_find_substantive_tool_for_verifier</code>
+  now takes <code>include_informational_bookkeeping</code>: the default <em>evidence view</em>
+  decides IF the verifier runs and lets a listing qualify; the <em>action view</em>
+  (<code>False</code> — the pre-§4BC selection, byte-identical) feeds every consumer that asks
+  "what did the turn last DO": the unverified-mutation guard (a trailing task-table must not
+  shadow the file write before it — the req_C0 class would have been silently re-opened for the
+  common write→mark-DONE→finalize shape), code-shape verdict routing (an execute traceback must
+  keep its <code>verify_code_output</code> audit), overflow recovery, and the UI fallback (both:
+  action view first, evidence view as the bookkeeping-only fallback). The verdict computation
+  returns the action-preferred tool, so downstream guard/diagnostic consumers see pre-§4BC
+  semantics on every mixed turn.</p>
+  <p><strong>Latency guard (async-critic mode — the live config):</strong> widening the gate
+  made the loop-exit #18 repair await (default 25s, <code>GHOST_CRITIC_REPAIR_BUDGET</code>)
+  reachable on listing turns — the most common turn shape.
+  <code>_should_await_repair_verdict</code> excludes LISTING-evidence turns from the
+  BLOCKING await: their verdict rides the deferred/late path (which is what feeds the outcome
+  corpus), so under <code>GHOST_CRITIC_ASYNC=1</code> the label arrives at zero user-visible
+  cost; substantive-tool turns — and the bookkeeping carve-out shapes the pre-§4BC action view
+  already selected (error banners, the autoadvance <code>stop_reason</code> payload) — keep the
+  in-loop repair await unchanged, so a refutable failure narration still repairs before it
+  ships. <strong>Non-async (blocking) configs are deliberately NOT widened at all:</strong>
+  with no critic pool the inline verify would cost ~45s per listing turn, so both the loop-exit
+  inline await and <code>_compute_verifier_verdict_gated</code> (any <code>gate</code> value
+  with async off, including an operator-set finite <code>GHOST_CRITIC_GATE_TIMEOUT</code>) skip
+  bookkeeping-only turns exactly as pre-§4BC — the §4BC label gain applies to async-critic mode
+  only, which is the live launcher config. Expected effect: payload-shaped bookkeeping turns
+  (271/1464 ≈ 18.5% of real traffic; 23.2% of turns are bookkeeping-only but the 69
+  bare-confirmation ones stay unknown) gain an async verdict, cutting the steady-state unknown
+  rate from ~57% toward ~39% (no-tool chat turns remain unknown by design — no evidence, no
+  verdict, no fabricated labels). Tests: <code>tests/test_verifier_rungate_informational.py</code>.</p>
+
+  <h2>Honest failure reports: the prompt fix failed, the GEPA artifact was the cause (2026-08-12, §4BD)</h2>
+  <p><strong>The class:</strong> six of six replies that honestly reported a failure ("the download
+  was blocked, HTTP 429, no transcript") were REFUTED by the cheap judge at confidence 0.9–1.0 and
+  survived only via main-model escalation (40–55 s each). A 6-case FP-trap bench file
+  (<code>scripts/verify_bench_cases_honest_failure.jsonl</code>, deliberately <em>outside</em> the
+  default pool so <code>cases_sha256</code> and every incumbent comparison stay valid) reproduced it:
+  raw cheap-judge FPR <strong>0.5</strong> on these cleans while TPR on injected
+  <code>fabrication</code>/<code>silent_failure</code> stayed <strong>1.0</strong> — trigger-happy,
+  not blind.</p>
+  <p><strong>What did NOT work:</strong> a "reporting a failure is not failing" dismissal rule added
+  to both prompts, mirroring the 2026-07-18 bookkeeping-rule precedent. Paired A/B on the constant
+  (K=5 × 6 cases, one process): <strong>no-rule 7/30 vs rule 7/30, McNemar p=1.0</strong>. Objections
+  cited <em>with</em> the rule live were shapes the rule explicitly dismissed ("stated a future plan",
+  "incorrectly diagnoses the root cause") — the E4B judge reads the rule and does not follow it, the
+  same capacity bound §4Z/§4AH found. The rule was <strong>reverted</strong> rather than shipped.</p>
+  <p><strong>What DID:</strong> retiring the live GEPA <code>verifier.adjudicate</code> artifact.
+  Measured interleaved (alternating template per trial, so arm order and judge drift hit both arms
+  equally — a first, sequential run was confounded and its numbers discarded):</p>
+  <div class="scroll">
+  <table>
+      <tr><th>adjudicate template</th><th>false-refute rate on the class</th><th>discordant pairs</th></tr>
+      <tr><td>code constant</td><td><strong>7/30 = 0.23</strong></td><td>—</td></tr>
+      <tr><td>GEPA artifact</td><td><strong>17/30 = 0.57</strong></td><td>artifact-worse 10, constant-worse 0</td></tr>
+    </table>
+  </div>
+  <p>McNemar exact <strong>p = 0.0020</strong>, direction unanimous. This re-reads §4AG's own table
+  correctly: the artifact's <code>nonrefute_mean</code> was already the worse of the two (0.8379 vs
+  0.8530) — it bought catches with false alarms, the balanced score called it a wash (+0.0065, below
+  the 0.0076 resolution floor), and it was kept because "it did not lose". It loses decisively on the
+  class that was missing from the pool. Retired to
+  <code>$GHOST_HOME/system/optim/verifier.adjudicate.json.retired-4bd</code> (reversible: move it
+  back); both verifier GEPA artifacts are now retired, so the two-stage judge runs pure code
+  constants.</p>
+  <p><strong>Structural fix kept — the shadowing trap.</strong> A live artifact OVERRIDES the code
+  constant, so a rule edited into the constant alone is silently dead. <code>_REQUIRED_RULE_MARKERS</code>
+  now lists dismissal rules a tuned template MUST carry (today: the bookkeeping rule); a template that
+  sheds one is rejected at load and the constant serves instead.
+  <code>_template_reject_reason</code> distinguishes "placeholder probe" from "pinned rule missing" at
+  the override site, the artifact site, and in <code>note_rejected</code> — the older ambiguous message
+  cost a full A/B run by silently redirecting the control arm to the baseline.
+  Tests: <code>tests/test_verifier_two_stage.py</code>.</p>
+  <p><strong>⚠ Two of the FP-trap cases were MISLABELED, and the judge found them.</strong>
+  <code>hf-execute-traceback</code> claimed "download.py expects a positional url argument" — nowhere in
+  the evidence, an inference rather than a report — and <code>hf-browser-selector</code> said "my click
+  timed out" when the evidence shows the click succeeding and the WAIT timing out. The judge refuted the
+  first 13/13 across runs: unanimous, specific, and correct. A mislabeled clean inflates FPR and would
+  have justified building a mechanism to force a defensible objection to CONFIRM — a fabrication-laundering
+  machine. Both were corrected, and the corrected interleaved re-run is the number to quote:
+  <strong>constant 6/30 = 0.20 vs artifact 18/30 = 0.60, discordant 13-1, McNemar p = 0.0018</strong>.</p>
+
+  <h2>Rule 4: non-assertive objections — built, hardened twice, shipped OFF (2026-08-12, §4BD-b)</h2>
+  <p><strong>What it does.</strong> A stated NEXT STEP ("I'll open the parser next") or a QUESTION
+  back to the user ("Want me to look at the service log?") asserts nothing about the world, so no
+  evidence can contradict it — yet after the artifact retirement, 4 of the 6 residual false-refutes
+  on the FP-trap set were exactly future-plan complaints. <code>objection.py</code> rule 4 dismisses
+  such an objection with no main-model call. <strong>Proof-based:</strong> the fragment must appear
+  <em>verbatim</em> in the claim; a paraphrase is never accepted, because a paraphrase cannot be
+  checked. Guards: a single clause opening with the marker, ≤160 chars, no numeral (ASCII, unicode
+  or spelled out), no <em>inflected</em> result verb (bare infinitives after a modal are future
+  actions and stay legal), no clause break, no subordinator or relativizer, no copula — and every
+  word left once the fragment is removed must be in an explicit framing allowlist.</p>
+  <p><strong>⚠ It ships DEFAULT-OFF</strong> (<code>GHOST_VERIFY_OBJECTION_NONASSERTIVE=1</code>
+  opts in), and the reasoning matters more than the rule. The guard is a <em>lexical</em> proxy for
+  a <em>semantic</em> property. Two adversarial rounds each found it leaking in a shape that had not
+  been modelled: v1 dismissed a whole objection on finding any non-assertive span (so an objection
+  citing a real contradiction <em>and</em> quoting the next step laundered), and v2 fell to <code>;</code>
+  and <code>:</code> as clause joins, to inflection (<code>passed</code> vetoed, <code>passes</code>
+  not), to relative clauses ("I'll fix the bug that broke prod"), and to framing words that spell an
+  alignment complaint. v3 closes all 32 reported inputs — but the honest read is that the next escape
+  is one word cleverer, not that none exists.</p>
+  <p><strong>The asymmetry is the argument:</strong> a false negative costs one main-model call on a
+  turn that was making one anyway; a false positive erases a real catch with no model call and
+  <em>no visible trace</em> — <code>CONFIRMED@0.9</code> with <code>objection_dismissed=True</code>
+  is indistinguishable in the ledger from a correct rescue. Two measured rescues do not buy that.</p>
+  <p><strong>⚠ The original justification was retracted.</strong> An LLM probe scored "0 damage over
+  31 corrupted trials"; review showed that numerator was <em>structurally incapable</em> of being
+  nonzero — the bench's <code>fault_fabrication</code> strings carry digits and result verbs (vetoed
+  before rule 4 can act) and <code>fault_silent_failure</code> keeps the claim, so its objections are
+  absence-shaped and settle at rule 2. The damage surface now lives in
+  <code>tests/test_objection_nonassertive_damage.py</code>: 12 adversarial fixtures asserted at the
+  per-objection <em>and</em> whole-verdict levels, plus mutations (punctuation, tense, subordinator)
+  so the suite pins the mechanism rather than the strings that motivated it. Its stated limit: it
+  proves no laundering on shapes we thought of. <strong>Do not run a bench sweep to decide the default:</strong> a sweep is
+  itself an opt-in, and the bench's fault injectors provably cannot produce the shapes that break
+  this rule — which is exactly why the earlier probe was retracted. A sweep would come back clean
+  for the same structural reason and that number would be used to argue default-ON.</p>
+  <p><strong>Why there is no v4.</strong> Findings per adversarial round ran <strong>3 → 32 →
+  34</strong> — not falling. The decisive class is presupposition smuggling: "Let me restart the
+  <em>crashed</em> service now" asserts that a service crashed, with no copula, subordinator,
+  clause break, inflected verb or numeral, so it is unreachable by the only kind of veto this
+  design has. Making it safe means inverting the test — requiring the fragment's content words to
+  appear in the user's request — which is a different rule, not another guard. The known-unsafe
+  classes are enumerated in code (<code>_NONASSERTIVE_KNOWN_HOLES</code>), and setting the env var
+  logs a warning naming them: a flag that silently arms a rule with known laundering paths is a
+  trap, a loud one is a choice.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

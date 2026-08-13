@@ -50,6 +50,36 @@
   <h2>Source filter</h2>
   <p>Only journal entries of type <code>post_mortem</code> or <code>failure</code> are considered. The miner scans for failure markers (<code>error · failed · traceback · assertionerror · timeout · unresolved</code>) and synthesises a tiny deterministic <code>input.txt</code> (typically 4 lines). The validator is intentionally lenient — it accepts any exit-0 output that references the expected file tokens.</p>
 
+  <h2>Transferability + explicit-shape gates (2026-08-13, §4BE)</h2>
+  <p><strong>The leak.</strong> A mined challenge wraps the original request in a FIXED harness: "a
+  <code>&lt;fixture&gt;</code> has been written in your working directory — write a
+  <code>solution.py</code> that opens it and performs the operation the user asked for, <em>applied
+  to that file</em>". <code>_detect_data_shape</code> fell back to a generic <code>input.txt</code>
+  for <em>any</em> request, so "Run the composed skill <code>youtube_transcribe</code> on this URL"
+  became a file exercise. Observed live on 2026-08-12: the solver ran the <strong>real</strong>
+  macro — 8 Tor exit rotations, twice, genuine network egress from a "synthetic" exercise — then
+  satisfied the validator by printing the fixture's lines, scored <code>passed=True</code>, and the
+  lesson extractor mined "genuine lessons" from a run whose task and grader never agreed. Both
+  halves are label noise: a fabricated PASS enters frontier scoring, and a lesson enters the corpus
+  that retrieval later injects.</p>
+  <p><strong>Two gates, both fail-safe.</strong> <code>_is_transferable_challenge</code> refuses a
+  request that acts on the live world (invoking a macro or the agent's own tools, network fetches,
+  service restarts, browser work, live sessions) or that names no task verb at all — a declarative
+  statement like "I am located in Athens" asks for no operation, so the exercise degenerates to
+  "print the fixture" and its PASS says nothing. Separately, <code>_detect_data_shape</code> now
+  reports <code>explicit</code>: the generic <code>input.txt</code> fallback is marked
+  <em>inexplicit</em> and the mining path refuses it, because a fixture that stands in for nothing
+  the request referenced is exactly what made the harness incoherent. <code>kind</code> and
+  <code>filename</code> are unchanged, so every other consumer behaves as before.</p>
+  <p><strong>Refusing costs one skipped self-play cycle</strong> (the template bank and LLM-gen
+  still supply material); accepting writes a fake label into the corpus and can touch the network —
+  so the gates are deliberately tuned toward refusal. Measured against the live trajectory corpus of
+  957 distinct requests, mining goes from "almost anything" to <strong>6 candidates end-to-end</strong> through
+  <code>_synthesize_challenge</code> (an earlier "15" skipped anonymisation and the pre-existing
+  destructive denylist), and the incident request is refused end-to-end. The live stash's 20
+  records all refuse — correctly: they are project-continuation turns (4 name Chess Coach), contentless ones like <em>"proceed with all tasks"</em>, macro invocations and tool-driving — and record 19 is the incident itself. Tests:
+  <code>tests/test_label_noise_leaks_4be.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

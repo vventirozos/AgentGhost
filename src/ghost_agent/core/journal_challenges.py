@@ -117,6 +117,27 @@ def _guess_domains(text: str) -> List[str]:
     return tags or ["python_general"]
 
 
+_LOG_SHAPE_RE = re.compile(
+    # ⚠ Word boundaries closed "the login"/"blogs", but bare `log` is also
+    # a VERB — "log in to the box and fix the login page" mined as a
+    # log-file exercise (round-4 review, third appearance of this class).
+    # The singular noun therefore needs a determiner or a qualifier in
+    # front, and the verb senses "log in/into/out/a ticket" are excluded.
+    r"\.log\b"
+    r"|\b(?:access|error|server|system|application|app|build|run|nginx|"
+    r"apache|the|a|an|this|that|these|those|my|your|our|its|their|his|her)"
+    r"\s+logs?\b"
+    r"|\blog\s*file\b|\blog\s+(?:analysis|data|entries)\b"
+    # A bare plural is the NOUN when a data verb governs it ("parse logs",
+    # "could not match logs") and the VERB when a subject noun precedes it
+    # ("the service logs errors"). Requiring a determiner alone refused the
+    # former, so the governing verb is accepted too.
+    r"|\b(?:pars\w*|analy[sz]\w*|match\w*|check\w*|read\w*|count\w*|"
+    r"search\w*|grep\w*|tail\w*|summari[sz]\w*|scan\w*|inspect\w*|"
+    r"review\w*|process\w*|filter\w*|sort\w*)\s+logs?\b",
+    re.IGNORECASE)
+
+
 def _detect_data_shape(text: str) -> dict:
     """Sniff what kind of input the journal entry referenced.
 
@@ -136,14 +157,42 @@ def _detect_data_shape(text: str) -> dict:
     # Order matters: SQL gets checked before JSON because a phrase like
     # "json field in the postgres column" should still route to SQL.
     if any(k in t for k in (".sql", "sqlite", "postgres", "select ", " join ", " group by ", "database")):
-        return {"kind": "sql", "filename": "input.db"}
+        return {"kind": "sql", "filename": "input.db", "explicit": True}
     if any(k in t for k in (".csv", "csv", "spreadsheet", "comma-separated")):
-        return {"kind": "csv", "filename": "input.csv"}
+        return {"kind": "csv", "filename": "input.csv", "explicit": True}
     if any(k in t for k in (".json", "json", "api response", "rest api")):
-        return {"kind": "json", "filename": "input.json"}
-    if any(k in t for k in (".log", "access log", "nginx", "apache log", "log file", "logs")):
-        return {"kind": "log", "filename": "input.log"}
-    return {"kind": "text", "filename": "input.txt"}
+        return {"kind": "json", "filename": "input.json", "explicit": True}
+    # ⚠ WORD BOUNDARIES. A substring test made "the log" match "the LOGIN",
+    # "the LOGIC", "the LOGOUT" and "logs" match "bLOGS", so UI-bug prose
+    # ("fix the login page") became a log exercise — the incoherence
+    # generator re-opened through the over-block fix (round-2 NEW-2). The
+    # live stash holds UI-bug post-mortems of exactly that shape.
+    if _LOG_SHAPE_RE.search(t):
+        return {"kind": "log", "filename": "input.log", "explicit": True}
+    # ⚠ THE FALLBACK IS THE INCOHERENCE GENERATOR (§4BE, 2026-08-13). It
+    # hands ANY request a generic `input.txt`, and the mined harness then
+    # promises the solver "perform the operation the user asked for, applied
+    # to that file". For "Run the composed skill youtube_transcribe on this
+    # URL" that promise is unmeetable: the observed run really executed the
+    # macro (8 Tor exit rotations, twice — live egress from a "synthetic"
+    # exercise), then satisfied the validator by printing the fixture and
+    # scored passed=True. `explicit` records whether the fixture actually
+    # stands in for data the request referenced; the mining path refuses
+    # when it does not. The `kind`/`filename` keys are unchanged so every
+    # other consumer behaves exactly as before.
+    # ⚠ ARTIFACT-level evidence only. A first cut accepted any of
+    # {file,line,row,record,content,output,…} anywhere in the prose, which
+    # let a live chess prompt and "use your file_system tool" qualify as
+    # "text data". The fixture may only stand in for something the request
+    # actually names as DATA.
+    _texty = any(k in t for k in (
+        ".txt", ".md", ".log", ".csv", ".json", ".xml", ".yaml", ".yml",
+        "the file", "this file", "that file", "a file called", "text file",
+        "the text", "this text", "the data", "this data", "the contents",
+        "the output of", "these lines", "the lines", "each line",
+        "the records", "the rows", "the entries", "the document",
+        "the transcript", "the report", "line by line"))
+    return {"kind": "text", "filename": "input.txt", "explicit": _texty}
 
 
 def _shape_specific_setup(kind: str) -> str:
@@ -311,6 +360,138 @@ _VERBATIM_EXEC_RE = re.compile(
 )
 
 
+# ── Transferability gate (§4BE, 2026-08-13) ─────────────────────────────
+# A mined challenge wraps the original request in a FIXED harness: "a
+# `<fixture>` has been written in your working directory — write a
+# solution.py that opens it and performs the operation the user asked for,
+# APPLIED TO THAT FILE". That framing is only coherent when the original
+# operation is DATA PROCESSING. For a request that acts on the live world
+# ("Run the composed skill youtube_transcribe on this URL"), "apply it to
+# input.txt" is meaningless, and the observed result (2026-08-12 17:36) was
+# the worst of both: the solver ran the REAL macro — 8 Tor exit rotations,
+# twice, genuine egress from a "synthetic" exercise — then satisfied the
+# validator by printing the fixture's lines, scoring passed=True and minting
+# a lesson from an exercise that never cohered.
+#
+# Both halves of that are label noise: a fabricated PASS enters frontier
+# scoring, and the lesson extractor mines "genuine lessons" from a run whose
+# task and grader disagreed. Refusing to mine is strictly better than
+# grading an incoherent exercise.
+#
+# ⚠ FALSE-POSITIVE DIRECTION IS THE SAFE ONE: refusing a minable challenge
+# costs one skipped self-play cycle (the template bank and LLM-gen still
+# supply material); accepting a non-transferable one writes a fake label
+# into the corpus AND can touch the network. Tuned against the live
+# trajectory corpus — see tests/test_label_noise_leaks_4be.py.
+_NON_TRANSFERABLE_RE = re.compile(
+    r"\b("
+    # invoking the agent's own tools / macros by name
+    r"run\s+the\s+(?:composed\s+)?(?:skill|macro)|invoke\s+the\s+(?:macro|skill)"
+    r"|create\s+(?:a\s+)?(?:new\s+)?(?:skill|macro|composed\s+skill|project)"
+    r"|define\s+(?:a\s+)?(?:new\s+)?(?:composed\s+)?skill"
+    r"|manage_composed_skills|youtube_transcribe|self[_\s-]?play"
+    # network / fetch work that cannot be replayed against a local fixture
+    r"|download|upload|scrape|crawl|browse|screenshot"
+    r"|search\s+(?:the\s+)?(?:web|internet|online)"
+    r"|https?://|www\.|\.com\b|\.gr\b|youtube"
+    # live services / infrastructure
+    r"|restart\s+the\s+(?:service|server|agent|daemon)"
+    r"|start\s+the\s+(?:service|server)|deploy\b"
+    r"|systemctl|launchctl|ssh\b|tailscale"
+    # interactive UI work
+    r"|click\s+(?:on\s+)?the|open\s+the\s+browser"
+    # live interaction with the operator or a running game/session
+    # The live chess COACHING prompt is the corpus's largest family (62
+    # instances) and contains none of {chess, "you are playing"} — it opens
+    # "You are Ghost, coaching Vasilis" and talks about FEN/moves.
+    r"|you\s+are\s+playing|live\s+(?:game|chess|session)|chess|coaching"
+    r"|next\s+move|your\s+move|\bfen\b"
+    # driving the agent's OWN tools rather than processing data
+    r"|use\s+your\s+\w+\s+tool|your\s+sandbox|file_system\s+tool"
+    # open-ended web lookups ("search what X will be", "dark web search")
+    r"|dark\s*web|fact[\s-]?check|latest\s+version"
+    # `search` is egress ONLY when it is not aimed at local data
+    r"|search(?!\s+(?:the\s+|this\s+|that\s+)?(?:log|file|csv|json|db|"
+    r"database|table|data|records?|text|output|manual))"
+    # naming any of the agent's own tools (or a tool-call literal) means the
+    # task is about DRIVING THE AGENT, not processing a fixture
+    r"|knowledge[\s_-]?base|introspect|postgres_admin|manage_projects"
+    r"|web[\s_-]?search|file[\s_-]?system|delegate|action\s*=|in\s+the\s+sandbox"
+    r"|in\s+project\b|your\s+(?:workspace|system|tools?)\b"
+    # research/lookup questions are network work however they are phrased
+    r"|deep\s+research|\bresearch\b|what\s+(?:new\s+)?features"
+    r"|pg_stat|show\s+me\s+all\s+(?:databases|tables)"
+    # asking about the agent's own live state — not reproducible offline
+    r"|(?:your|my|all|the)\s+(?:custom\s+|acquired\s+|composed\s+)?"
+    r"(?:memory|lessons?|skills?|macros?|profile|uptime|projects?)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+# The harness promises the solver "performs THE OPERATION the user asked
+# for". A declarative statement ("I am located in Athens", "My hobbies
+# are …") names no operation, so the exercise degenerates to "print the
+# fixture" and its PASS says nothing. Require an actual task verb — an
+# allowlist, because "is this a task?" is semantic and a denylist of
+# non-tasks would leak (the project's own rule).
+_TASK_VERB_RE = re.compile(
+    # ⚠ STEMS, not whole words. The first cut matched `parse\b`, which does
+    # not match "parsing" — the stash fixture "First stashed failure about
+    # json parsing" was refused and four stash tests went red. Inflection is
+    # the norm in real requests ("counting", "sorted", "extracted"), so the
+    # allowlist matches stems and lets the suffix fall where it may.
+    # ⚠ STEM + INFLECTION + BOUNDARY. Dropping \b entirely made this
+    # near-vacuous: `read` matched "ready", `count` matched "country",
+    # `sum` matched "summer", `list` matched "listen" — 15 of 16 declarative
+    # non-tasks became "tasks" (round-2 review NEW-1). The suffix group is
+    # what allows "parsing" while still requiring the word to END there.
+    r"\b(?:pars|count|list|find|search|extract|summari[sz]|sort|filter|"
+    r"comput|calculat|convert|transform|check|read|"
+    r"process|generat|writ|build|fix|debug|test|compar|merg|split|"
+    r"group|aggregat|renam|replac|clean|validat|report|show|print|"
+    r"detect|match|join|render|pick|select|"
+    # quantity / aggregate phrasings that carry the operation without a
+    # classic imperative verb ("how many rows have status=error?",
+    # "what is the average of the value column", "top 10 IPs")
+    r"averag|median|total|duplicat|analys|analyz)"
+    # NEW-4: `per \w+` and `which \w+` are not operations ("as per usual
+    # the csv is attached", "the csv, which is why I asked"). Dropped —
+    # "which entries are duplicated?" is carried by the `duplicat` stem.
+    r"(?:e|es|ed|ing|s|is)?\b"
+    # phrasings that carry the operation without an imperative verb
+    r"|\bhow\s+many\b|\btop\s+\d+\b|\bturn\s+th(?:is|at)\b"
+    # irregular inflections, spelled out so the shared suffix group stays
+    # tight (folding in y/ies would make `read`+`y` match "ready" again)
+    # ⚠ y-STEMS and DOUBLED-CONSONANT gerunds cannot ride the shared
+    # suffix group — `verif`+`y` and `identif`+`y` were DEAD verbs (round-4
+    # review), silently refusing "verify that the csv has no missing values"
+    # and one real corpus entry. Adding `y` to the shared group instead
+    # would re-admit `read`+`y` = "ready", so they are spelled out.
+    r"|\bquer(?:y|ies|ied|ying)\b|\banalys(?:is|es)\b"
+    r"|\bverif(?:y|ies|ied|ying)\b|\bidentif(?:y|ies|ied|ying)\b"
+    r"|\bdebug(?:s|ged|ging)?\b|\bsplit(?:s|ting)?\b"
+    r"|\bmap(?:s|ped|ping)?\b|\bdedup(?:e|es|ed|ing|licat(?:e|es|ed|ing))?\b"
+    r"|\bbreakdown\b|\bplot(?:s|ted|ting)?\b|\bgrep\b|\btail\b",
+    re.IGNORECASE,
+)
+
+
+def _is_transferable_challenge(text: str) -> bool:
+    """True when the original request can honestly be re-posed as
+    'do this to the fixture in your working directory'.
+
+    The mined harness demands a `solution.py` over a local file. A request
+    to run a macro, hit the network, restart a service or drive a browser
+    cannot be applied to a file — grading such a run produces a fabricated
+    PASS and a lesson from an incoherent exercise (§4BE). Nor can a
+    declarative statement that asks for no operation at all."""
+    t = text or ""
+    if _NON_TRANSFERABLE_RE.search(t):
+        return False
+    return bool(_TASK_VERB_RE.search(t))
+
+
 def _is_unsafe_challenge(text: str) -> bool:
     """True when a mined user message must never be replayed by self-play."""
     if not text:
@@ -357,6 +538,17 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
             "journal (%r...) — a replayed user message runs against the LIVE "
             "toolset", user[:80])
         return None
+    # §4BE: the harness can only pose DATA-PROCESSING work. Checked on the
+    # raw user text, before anonymisation, so a stripped URL cannot hide a
+    # network task from the gate.
+    if not _is_transferable_challenge(user):
+        logger.info(
+            "self-play: skipping a NON-TRANSFERABLE journal challenge "
+            "(%r...) — the mined harness asks for a solution.py over a local "
+            "fixture, and this request acts on the live world, so grading it "
+            "would fabricate a PASS and mine a lesson from an incoherent "
+            "exercise", user[:80])
+        return None
 
     # Strip obvious path / email tokens so the agent can't game the
     # challenge by memorising the raw user message.
@@ -376,6 +568,13 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
     # original task. Now a "parse a CSV" journal entry gets a CSV
     # fixture and a CSV-aware validator.
     shape = _detect_data_shape(cleaned)
+    if not shape.get("explicit"):
+        logger.info(
+            "self-play: skipping a journal challenge with NO data signal "
+            "(%r...) — the harness would materialise a generic input.txt and "
+            "then ask the solver to apply an operation that was never about a "
+            "file, which grades an incoherent exercise (§4BE)", cleaned[:80])
+        return None
     setup_script = _shape_specific_setup(shape["kind"])
     validation_script = _shape_specific_validator(shape["kind"], shape["filename"])
 

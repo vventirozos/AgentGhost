@@ -296,6 +296,91 @@ _EDIT_CHURN_VERIFY_TOOLS = frozenset({
     "execute", "browser", "manage_services", "managed_services",
 })
 
+# ── Meta-task ("checklist") nudge intent detection (§4BE, 2026-08-13) ──
+# The nudge tells the model "you have not fulfilled the learning/profile
+# INSTRUCTIONS IN THE USER'S REQUEST". Arming it on a bare keyword made that
+# sentence a LIE on every measured turn: the old test was
+# `any(k in text for k in ["learn","skill","profile","lesson",…])`, so
+# "Define a composed SKILL", "show me all custom SKILLS" and "what have you
+# LEARNED today" all armed it. Measured on the live trajectory corpus:
+# **59 of 59** real turns that armed the nudge contained NO learning
+# instruction — a 100% false-positive rate — and it fired 39 times, 10 of
+# them on 2026-08-12 alone.
+#
+# The damage is not just a wasted turn. Production trace req 32a8101d: the
+# model reasoned "there's no explicit learning or profile instruction in
+# their message… But the system is requiring it", called `learn_skill` to
+# silence the nudge, and minted a junk lesson that vector-dedup then
+# reinforced to freq=11 — i.e. the false nudge writes into the corpus that
+# retrieval later injects. req 207e0702 shows the other failure mode: the
+# same nudge drove a repetition loop the thinking guard had to abort.
+#
+# So the predicate now requires an IMPERATIVE DIRECTIVE to record something,
+# not a mention of the topic. Deliberately narrow — a missed true positive
+# costs one un-nudged turn (the model can still call learn_skill on its own),
+# while a false positive corrupts the lesson corpus.
+_META_TASK_DIRECTIVE_RE = re.compile(
+    r"\b(?:"
+    # Inherently MEMORY-ish verbs: "learn/remember/memorize THIS".
+    # a QUESTION is not a directive ("do you remember that we discussed…")
+    r"(?<!do you )(?<!can you )(?<!did you )"
+    r"(?:learn|remember|memori[sz]e)\s+"
+    # ⚠ THE SUBJECT DECIDES, and the first cut had it backwards (round-2
+    # review NEW-3). "remember that YOU/YOUR/THE/IT …" is a constraint on
+    # how to do the current task ("remember that you use TOR", "remember
+    # that the sandbox has no network") — nothing to record. "remember that
+    # I/my/we/our …" is a USER FACT and is exactly what the profile store
+    # is for; excluding those (as the first cut did) dropped the most
+    # natural genuine phrasings, e.g. "remember that I use zsh".
+    # "that time" is the rhetorical "remember that time when…".
+    # ⚠ ALLOWLIST, not a denylist (round-4 review). A closed list of
+    # EXCLUDED subjects leaked every subject outside it — "remember that
+    # TOR must be used", "remember that this repo uses ripgrep". For the
+    # "remember that X" form the subject must be FIRST-PERSON, which is
+    # what makes it a user fact worth recording; everything else is a task
+    # constraint. ("remember this/it/the following" is unaffected.)
+    r"(?:(?=that\s+(?:i|we|my|our)\b)|(?!that\b))"
+    r"(?:this|that|it|the\s+following|these|from\s+this)"
+    # Storage verbs are ambiguous — "save it to the knowledge base" is a
+    # DOCUMENT write, not a lesson (live false positive: the youtube
+    # project request said "transcribe it, save it to the knowledge base"
+    # and armed the nudge). Require the destination NOT to be a data store.
+    r"|(?:record|note|save|store)\s+"
+    r"(?:this|that|it|the\s+following|these)"
+    # ⚠ Scan a WINDOW, not the next token: "save this FILE to the knowledge
+    # base" / "store this DOCUMENT in the database" / "save it to MY kb" all
+    # defeated a tight lookahead (round-2 review). Up to ~40 chars of noun
+    # phrase may sit between the verb and the destination.
+    r"(?![^.!?\n]{0,40}?\b(?:to|in|into|on|under|at)\s+"
+    r"(?:the|a|an|my|your|our|its)?\s*"
+    r"(?:knowledge[\s_-]?base|kb|file|disk|db|database|table|postgres|"
+    r"sqlite|project|folder|directory|sandbox|workspace|notes?|doc|"
+    r"document|repo|bucket|store)\b)"
+    # "update/add to your profile|memory"
+    r"|(?:update|add\s+to|write\s+to|amend|correct)\s+(?:your\s+|the\s+)?"
+    r"(?:profile|memory|user\s+profile)"
+    # direct tool directives
+    r"|call\s+(?:learn_skill|update_profile)"
+    r"|use\s+(?:learn_skill|update_profile)"
+    # "learn a lesson from …" / "take a lesson"
+    r"|(?:learn|take)\s+a\s+lesson"
+    # "don't forget to remember/record"
+    r"|(?:remember|record)\s+(?:for|next\s+time)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_meta_task_directive(text: str) -> bool:
+    """True when the user actually INSTRUCTED the agent to record something.
+
+    A mention of the words 'skill' / 'lesson' / 'profile' is NOT a directive:
+    "Define a composed skill", "show me all custom skills" and "what have you
+    learned today" are ordinary requests, and the nudge that fired on them
+    told the model a falsehood about its own instructions."""
+    return bool(_META_TASK_DIRECTIVE_RE.search(text or ""))
+
+
 _BOOKKEEPING_TOOL_NAMES = frozenset({
     "manage_projects", "manage_tasks", "manage_skills",
     "scratchpad", "learn_skill", "update_profile",
@@ -305,9 +390,99 @@ _BOOKKEEPING_TOOL_NAMES = frozenset({
 })
 
 
-def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[dict]:
+def _bookkeeping_informational(content: str, *, id_linkage: bool = False) -> bool:
+    """True when a BOOKKEEPING tool's output carries verifiable substance
+    rather than a bare state-change confirmation.
+
+    ONE formula shared by the evidence packer (`_collect_verifier_evidence`)
+    and the run-gate (`_find_substantive_tool_for_verifier`) so the two can
+    never drift (§4BC 2026-08-12; the fit/scorer-one-formula rule). Substance:
+
+    - error banners (``Error`` / ``SYSTEM BLOCK`` / ``REJECTED``) — an
+      errored bookkeeping call is evidence, not bookkeeping (2026-07-25);
+    - payload-shaped output (≥200 chars: listings, task tables, self-play
+      reports) — the 2026-07-25 packer bar, promoted to the run-gate by the
+      §4BC measurement: 271 of 340 bookkeeping-only `unknown` turns carried
+      exactly this evidence shape (174 of them manage_projects listings),
+      and with the name-only run-gate none of them could ever be verified;
+    - ``id_linkage`` (packer ONLY): short confirmations carrying a 12-hex id
+      are linkage evidence once the verifier is already running (2026-07-25:
+      an under-length task_update result made the judge compare a task id
+      against the PROJECT id). Deliberately NOT a run-gate trigger — a bare
+      mutation confirmation is the 2026-04-19 guaranteed-REFUTED shape, so
+      it must not summon the judge on its own.
+    """
+    c = (content or "").strip()
+    if c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+        return True
+    if len(c) >= 200:
+        return True
+    if id_linkage and re.search(r"\b[0-9a-f]{12}\b", c):
+        return True
+    return False
+
+
+def _tool_is_bookkeeping(tool) -> bool:
+    """True when a recorded tool entry names a bookkeeping tool (same
+    normalization as the gate walk)."""
+    if not tool or not isinstance(tool, dict):
+        return False
+    name = str(tool.get("name", "")).lower().strip()
+    return name.replace("-", "_").replace(" ", "_") in _BOOKKEEPING_TOOL_NAMES
+
+
+def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
+    """Loop-exit gate: is the bounded in-loop verdict await worth blocking
+    the reply for? Extracted pure so the §4BC exclusion is unit-testable.
+
+    LISTING-evidence turns say NO (§4BC 2026-08-12): widening the run-gate
+    to informational bookkeeping output made `_lt` non-None on listing
+    turns ("show me all projects"), and the pre-existing await would have
+    taxed exactly those — the most common turn shape — with up to
+    `GHOST_CRITIC_REPAIR_BUDGET` (default 25s) of user-visible latency for
+    a repair that is low-value on a listing summary. Their verdict still
+    lands through the deferred/late path (which is what feeds the outcome
+    corpus); only the BLOCKING await is skipped.
+
+    The exclusion covers ONLY §4BC's new class (round-3 refinement): a
+    bookkeeping tool the pre-§4BC ACTION view already selected — an error
+    banner, or the autoadvance ``stop_reason`` batch payload — awaited
+    before §4BC and still does, so a refutable failure narration can be
+    REPAIRED in-loop rather than shipping and correcting next turn. The
+    mutation-guard re-entry (`unverified`) and substantive-tool awaits are
+    unchanged."""
+    if not (budget > 0 and lt is not None and not unverified):
+        return False
+    if not _tool_is_bookkeeping(lt):
+        return True
+    _c = str(lt.get("content", "")).lstrip()
+    if _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+        return True
+    _name = str(lt.get("name", "")).lower().strip()
+    return (_name.replace("-", "_").replace(" ", "_") == "manage_projects"
+            and '"stop_reason"' in _c)
+
+
+def _find_substantive_tool_for_verifier(
+        tools_run: Optional[list], *,
+        include_informational_bookkeeping: bool = True) -> Optional[dict]:
     """Return the most recent tool whose output carries verifiable
     evidence (execute output, file content, search results, etc.).
+
+    TWO SEMANTICS, one walk (§4BC round-2 fresh-eye review, 2026-08-12):
+
+    - ``include_informational_bookkeeping=True`` (default) — EVIDENCE view:
+      payload-shaped bookkeeping output (≥200 chars) qualifies, so a
+      bookkeeping-only listing turn can run the verifier at all.
+    - ``include_informational_bookkeeping=False`` — ACTION view: the
+      pre-§4BC selection, exactly (bookkeeping skipped unless it ERRORED or
+      carries the autoadvance ``stop_reason`` payload). Consumers that ask
+      "what did this turn last actually DO" — the unverified-mutation guard,
+      code-shape verdict routing, overflow recovery, the UI fallback — MUST
+      use this view: under the evidence view a trailing task-table would
+      shadow the file write / execute that precedes it, silently disabling
+      the req_C0 untested-write guard and demoting code-shaped audits to the
+      weaker claim branch (the round-2 review's two MAJORs).
 
     Walks ``tools_run`` from the end and skips entries whose name is
     in ``_BOOKKEEPING_TOOL_NAMES`` — those produce state-change
@@ -339,14 +514,32 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
         # "managetasks" → "manage_tasks" mapping elsewhere).
         collapsed = name.replace("-", "_").replace(" ", "_")
         if collapsed in _BOOKKEEPING_TOOL_NAMES:
-            # A bookkeeping tool that ERRORED is evidence, not bookkeeping
-            # (2026-07-25 audit: three describe_file errors in a row, reply
-            # claimed success at 0.95, verifier skipped "by design" — the
-            # exact blind spot where self-report goes unchecked). Let the
-            # verifier see the error so a success claim over it gets
-            # refuted.
             _c = str(tool.get("content", "")).lstrip()
-            if _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+            # Informational bookkeeping output IS a reason to run the
+            # verifier (§4BC 2026-08-12). This covers the two prior
+            # carve-outs and one new class, all via the shared predicate:
+            # - error banners (2026-07-25 audit: three describe_file errors
+            #   in a row, reply claimed success at 0.95, verifier skipped
+            #   "by design" — the exact blind spot where self-report goes
+            #   unchecked);
+            # - payload-shaped output ≥200 chars (NEW): listings and
+            #   reports are the same evidence shape the packer has trusted
+            #   since 2026-07-25, but the name-only run-gate meant a
+            #   bookkeeping-ONLY turn ("show me all projects") could never
+            #   be verified at all — measured cost: 271 of the corpus's 340
+            #   bookkeeping-only `unknown` turns, ~57% of all real-turn
+            #   unknowns tracing to this gate, and 15-26 unresolved rows
+            #   per A/B arm.
+            # Bare short confirmations ("SUCCESS: Profile updated.") keep
+            # skipping — the 2026-04-19 blast radius (a confirmation in the
+            # evidence slot guarantees a REFUTED). The packer-only
+            # id-linkage case stays out of the run-gate for the same
+            # reason. The ACTION view (include_informational_bookkeeping=
+            # False) keeps only the error carve-out here.
+            if include_informational_bookkeeping:
+                if _bookkeeping_informational(_c):
+                    return tool
+            elif _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
                 return tool
             # An autoadvance BATCH OUTCOME is a substantive completion/
             # failure claim, not a state-change confirmation (2026-08-01
@@ -354,9 +547,8 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
             # whose output said "project done" over a FAILED ledger — the
             # run gate skipped, so no verdict, no repair, and the false
             # completion reached the user unchecked). stop_reason is the
-            # batch payload's signature key; plain task_list/switch/create
-            # confirmations keep skipping per the run-gate/evidence-set
-            # split (2026-07-25).
+            # batch payload's signature key; short mutation confirmations
+            # without it keep skipping.
             if collapsed == "manage_projects" and '"stop_reason"' in _c:
                 return tool
             continue
@@ -620,23 +812,18 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             # see the data behind the claim. Keep excluding the short
             # state-change confirmations (the 2026-04-19 blast radius:
             # `{"exited": …}` in the evidence slot guarantees a REFUTED),
-            # but pack substantial read output and error text. This
-            # deliberately diverges from _find_substantive_tool_for_verifier
-            # (which still decides IF the verifier runs — bookkeeping-only
-            # turns keep skipping): the split is run-gate vs evidence-set.
+            # but pack substantial read output and error text. Since §4BC
+            # (2026-08-12) the run-gate shares this predicate — informational
+            # bookkeeping output also RUNS the verifier — with ONE remaining
+            # divergence, id_linkage: short confirmations CARRYING a 12-hex
+            # id are linkage evidence once the verifier is already running
+            # (2026-07-25: the verifier refuted a correct close because the
+            # task_update result naming task d8a307dd196f was under the
+            # length bar, so it "compared" the task id against the PROJECT
+            # id and called the mismatch an error), but a bare id
+            # confirmation must not summon the judge on its own.
             _c = str(tool.get("content", "")).strip()
-            _informational = (len(_c) >= 200
-                              or _c.startswith(("Error", "SYSTEM BLOCK",
-                                                "REJECTED"))
-                              # Short confirmations CARRYING AN ID are
-                              # linkage evidence (2026-07-25): the verifier
-                              # refuted a correct close because the
-                              # task_update result naming task d8a307dd196f
-                              # was under the length bar, so it "compared"
-                              # the task id against the PROJECT id and
-                              # called the mismatch an error.
-                              or bool(re.search(r"\b[0-9a-f]{12}\b", _c)))
-            if not _informational:
+            if not _bookkeeping_informational(_c, id_linkage=True):
                 continue
         candidates.append(tool)  # newest-first
         if len(candidates) >= 10:  # bounded deep window for the claim scan
@@ -7214,7 +7401,19 @@ class GhostAgent:
         """
         from .verifier import VerifyVerdict
         verifier = getattr(self.context, "verifier", None)
-        last_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+        # §4BC split: the EVIDENCE view decides IF the verifier runs (a
+        # bookkeeping-only listing turn now qualifies); the ACTION view —
+        # pre-§4BC selection — drives everything keyed on "what did the
+        # turn last DO": code-shape routing below, and every consumer of
+        # the RETURNED last_tool (unverified-mutation guard, diagnostics).
+        # Returning the action-preferred tool is what keeps a trailing
+        # task-table from shadowing the file write before it (round-2
+        # review MAJOR-1/-2).
+        evidence_tool = _find_substantive_tool_for_verifier(
+            tools_run_this_turn)
+        action_tool = _find_substantive_tool_for_verifier(
+            tools_run_this_turn, include_informational_bookkeeping=False)
+        last_tool = action_tool or evidence_tool
         # --no-verifier ablation off-switch (covers BOTH the gated post-loop
         # gate and the direct in-loop auto-repair call): no verdict is computed
         # at all, so nothing is scrubbed/backfilled/repaired.
@@ -7227,7 +7426,7 @@ class GhostAgent:
         # tool / trivial chat skips the LLM call cleanly.
         if (verifier is None
                 or getattr(verifier, "llm_client", None) is None
-                or last_tool is None
+                or evidence_tool is None
                 or not final_ai_content
                 or self._is_strict_trivial_chat(lc)):
             return None, last_tool
@@ -7838,7 +8037,10 @@ class GhostAgent:
         With no critic pool the timeout is ``inf`` and this degrades to a
         plain ``await`` — byte-for-byte the legacy behaviour.
         """
-        last_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+        _ev_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+        _act_tool = _find_substantive_tool_for_verifier(
+            tools_run_this_turn, include_informational_bookkeeping=False)
+        last_tool = _act_tool or _ev_tool
 
         # --no-verifier ablation off-switch: skip the post-response verifier
         # entirely (no verdict computed, no lesson scrubbing, no backfill). The
@@ -7850,6 +8052,20 @@ class GhostAgent:
             return None, last_tool
 
         gate = self._critic_gate_timeout()
+
+        # §4BC scope guard (round-2 review MAJOR-3; widened to ALL
+        # non-async configs in round 3): the informational-bookkeeping
+        # widening is an ASYNC-CRITIC-ONLY feature — its verdict rides the
+        # deferred/late path at no user cost. In any blocking config
+        # (gate=inf inline await, or async OFF with a finite operator-set
+        # GHOST_CRITIC_GATE_TIMEOUT) a bookkeeping-only listing turn would
+        # pay a verdict wait it never paid before, so keep the pre-§4BC
+        # behavior there: no action tool → quiet skip, exactly the old
+        # (None, None) early-return shape (returning None for the tool
+        # keeps the diagnostics on the routine "bookkeeping-only" line,
+        # not the "EMPTY despite verifiable evidence" warning).
+        if _act_tool is None and not self._critic_async_enabled():
+            return None, None
 
         # Fast path / legacy: block for the verdict (no critic pool, or an
         # operator-set infinite budget). No task-spawn overhead.
@@ -12244,9 +12460,15 @@ class GhostAgent:
             # <tool_call> did not parse...") in a "Process
             # finished successfully" banner — silent error to
             # false-success leak.
-            fallback_tool = _find_substantive_tool_for_verifier(
-                tools_run_this_turn
-            )
+            # ACTION view first (§4BC round 2): the fallback should show
+            # what the turn last DID (the execute/file output), not a
+            # trailing status listing; the evidence view only fills in for
+            # bookkeeping-only turns, where the listing beats a generic
+            # banner.
+            fallback_tool = (_find_substantive_tool_for_verifier(
+                tools_run_this_turn,
+                include_informational_bookkeeping=False)
+                or _find_substantive_tool_for_verifier(tools_run_this_turn))
             if fallback_tool is not None:
                 last_out = str(fallback_tool.get('content', ''))
 
@@ -14688,6 +14910,7 @@ class GhostAgent:
                 # steered once" set is loop-local.
                 repeated_action_steered: set = set()
                 preflight_blocks_this_request = 0
+                _meta_nudge_fired = False
                 # Context-pressure steers issued this request (governor,
                 # 2026-07-18): first overflow → externalize-notes steer;
                 # second → synthesize-now steer + whole-file-read lockdown.
@@ -16579,9 +16802,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # retry to plan against fabricated evidence. Also strip
                             # internal-tracking keys (`_synthetic`) before forwarding
                             # upstream so the LLM payload stays clean OpenAI-shape.
-                            real_tool = _find_substantive_tool_for_verifier(
-                                tools_run_this_turn
-                            )
+                            # ACTION view first (§4BC round 2): recovery
+                            # must retry against the output the model was
+                            # actually working from, not a trailing status
+                            # listing; evidence view fills in only when the
+                            # turn was bookkeeping-only.
+                            real_tool = (_find_substantive_tool_for_verifier(
+                                tools_run_this_turn,
+                                include_informational_bookkeeping=False)
+                                or _find_substantive_tool_for_verifier(
+                                    tools_run_this_turn))
                             if real_tool is not None:
                                 # Wrap as a <tool_response> user message — the
                                 # same translation the main request path applies.
@@ -16967,7 +17197,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             continue
 
                         user_request_context = last_user_content.lower()
-                        has_meta_intent = any(kw in user_request_context for kw in ["learn", "skill", "profile", "lesson", "playbook", "memorize"])
+                        # §4BE: an IMPERATIVE directive, not a keyword
+                        # mention. See `_has_meta_task_directive` for the
+                        # measurement that forced this (59/59 false
+                        # positives; the nudge's own text asserts the user
+                        # gave instructions, so a keyword match made it a
+                        # lie and the model wrote a junk lesson to comply).
+                        has_meta_intent = _has_meta_task_directive(
+                            user_request_context)
                         meta_tools_called = any(t in raw_tools_called for t in ["learn_skill", "update_profile", "create_skill", "manage_skills"])
                         # Read-only SURFACE tools discharge the meta-task
                         # nudge: if the user asks "what have you learned
@@ -16994,9 +17231,31 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # inside a throwaway simulation where all memory
                         # writes are blocked anyway.
                         suppress_nudge = getattr(self, "suppress_meta_task_nudges", False)
+                        # ⚠ FIRE ONCE (§4BE round 2). The condition can only
+                        # be discharged by CALLING a meta tool, so a model
+                        # that correctly declines stays armed and is re-nudged
+                        # on every finalisation — up to 4× — with its drafted
+                        # reply discarded each time. Live req 32a8101d: the
+                        # model declined twice ("there's no explicit learning
+                        # or profile instruction in their message") and caved
+                        # on turn 4, minting the junk lesson. The rewritten
+                        # message invites declining, which would have made
+                        # that pressure WORSE without this latch: now correct
+                        # refusal ends the loop exactly as compliance does.
+                        if _meta_nudge_fired:
+                            has_meta_intent = False
                         if not suppress_nudge and has_meta_intent and meta_tools_available and not meta_tools_called and turn < 4:
+                            _meta_nudge_fired = True
                             pretty_log("Checklist Nudge", "Enforcing meta-task compliance", icon=Icons.SHIELD)
-                            messages.append({"role": "user", "content": "CRITICAL: You have not fulfilled the learning/profile instructions in the user's request. You MUST call 'learn_skill' or 'update_profile' now before finishing."})
+                            messages.append({"role": "user", "content": (
+                                "REMINDER: the user's request appears to ask you to RECORD "
+                                "something (a lesson, a skill, or a profile fact) and no "
+                                "recording tool has run this turn. If that reading is right, "
+                                "call 'learn_skill' or 'update_profile' now. If it is NOT — "
+                                "the user only mentioned skills/lessons in passing, or asked "
+                                "you to show or define one — say so in your reply and finish "
+                                "normally; do NOT invent a lesson to satisfy this reminder."
+                            )})
                             continue
 
                         if ui_content:
@@ -17050,9 +17309,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     # The deterministic mutation guard fires
                                     # regardless (LLM-free): an untested write
                                     # always forces the "actually RUN it"
-                                    # re-entry.
-                                    _lt = _find_substantive_tool_for_verifier(
-                                        tools_run_this_turn)
+                                    # re-entry. ACTION-preferred selection
+                                    # (§4BC round 2): a trailing task-table
+                                    # must not shadow the write before it —
+                                    # under the evidence view the guard was
+                                    # silently disabled on write-then-
+                                    # bookkeeping turns, and the repair
+                                    # await was skipped on mixed turns.
+                                    _lt = (_find_substantive_tool_for_verifier(
+                                        tools_run_this_turn,
+                                        include_informational_bookkeeping=False)
+                                        or _find_substantive_tool_for_verifier(
+                                            tools_run_this_turn))
                                     _unverified = _is_unverified_mutation(_lt)
                                     # #18: bounded verdict await at loop-exit.
                                     # The critic runs on the OFF-HOST model, so
@@ -17072,8 +17340,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     # the same turn on the already-contended
                                     # worker.
                                     _rbudget = self._critic_repair_await_budget()
-                                    if (_rbudget > 0 and _lt is not None
-                                            and not _unverified):
+                                    # §4BC: bookkeeping-evidence turns skip the
+                                    # BLOCKING await (pure defer — verdict still
+                                    # lands via the late handler); see
+                                    # _should_await_repair_verdict.
+                                    if _should_await_repair_verdict(
+                                            _rbudget, _lt, _unverified):
                                         try:
                                             _vtask = _glog.spawn_task(
                                                 self._compute_verifier_verdict(
@@ -17115,6 +17387,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 "async verdict await skipped: %s: %s",
                                                 type(_await_exc).__name__, _await_exc,
                                             )
+                                elif _find_substantive_tool_for_verifier(
+                                        tools_run_this_turn,
+                                        include_informational_bookkeeping=False,
+                                ) is None:
+                                    # SYNC mode + no action tool (§4BC scope
+                                    # guard, round-2 MAJOR-3): pre-§4BC this
+                                    # inline await early-returned with no LLM
+                                    # call (last_tool was None); under the
+                                    # widened evidence gate a bookkeeping-only
+                                    # listing turn would now pay a full
+                                    # BLOCKING verify_claim here. Keep sync
+                                    # mode at the old behavior — cache the old
+                                    # (None, None) result shape so the
+                                    # post-loop gate reuses it and stays on
+                                    # the quiet "bookkeeping-only" skip line.
+                                    _verifier_verdict_cache = (None, None)
+                                    _verdict_is_fresh = True
                                 else:
                                     _vr, _lt = await self._compute_verifier_verdict(
                                         tools_run_this_turn=tools_run_this_turn,
@@ -18921,8 +19210,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "Verifier",
                             "stream gate: no substantive tool "
                             f"in {len(stream_tools_snapshot)} "
-                            "record(s) — skipped "
-                            "(bookkeeping-only turn)",
+                            "record(s) — skipped (bare "
+                            "confirmations / no verifiable "
+                            "evidence)",
                             icon=Icons.VERIFIER_LAB)
                     else:
                         _sv_task = _glog.spawn_task(
