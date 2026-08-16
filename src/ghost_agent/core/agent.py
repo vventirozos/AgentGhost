@@ -94,6 +94,160 @@ FACTUAL_SAMPLING_PARAMS = {
 #    trips (the 390s blowups). Ungrounded (scores the model's self-prediction
 #    of un-executed actions). OFF until it has an execution-grounded value fn.
 _MCTS_TURNSTART_ENABLED = False
+
+# R22 MAJOR-1: minimum holdout for a guarded online PRM step. Below this
+# the BCE comparison is not a check, and at ZERO `online_update` commits
+# unconditionally — see `_run_prm_online_update`.
+_PRM_ONLINE_MIN_HOLDOUT = 5
+
+
+def prm_consumer_why_no_reader(ctx) -> str:
+    """Why no code path reads a PRM value right now — naming the conjunct
+    that is ACTUALLY missing.
+
+    R4 MAJOR-4: the phase-2.7 skip log hardcoded "MCTS turn-start hint is
+    module-gated off", so on a box with the constant flipped and no
+    ``--deep-reason`` it told the operator to enable something already
+    enabled — the identical defect R3 graded MAJOR-2 on the boot warning,
+    at the site that fix never grepped for. Derived from the same inputs
+    as `prm_consumer_is_live`, so the two cannot disagree.
+    """
+    _args = getattr(ctx, "args", None)
+    # R12 MAJOR-6: the "construction failed" arm was placed THIRD, behind
+    # two arms that require `_MCTS_TURNSTART_ENABLED` to be False — i.e.
+    # in code unreachable on every production box, while the reachable
+    # arm kept telling an operator who passed --deep-reason that they had
+    # not. Ask the flag first, wherever the constant sits.
+    _deep_raw = getattr(getattr(ctx, "args", None), "deep_reason", None)
+    _asked_deep = _deep_raw is True
+    _reasoner = getattr(ctx, "mcts_reasoner", None) is not None
+    if _asked_deep and not _reasoner:
+        score_why = ("--deep-reason WAS set but no MCTS reasoner exists — "
+                     "its construction failed at boot (see 'Deep Reasoning "
+                     "Failed'), so nothing can call .score()"
+                     + ("" if _MCTS_TURNSTART_ENABLED
+                        else "; the turn-start hint is also module-gated off"))
+    elif not _MCTS_TURNSTART_ENABLED and not _reasoner:
+        # R8 MIN-2: this helper had no "both counts" branch while its
+        # sibling in main.py did, so on the DEFAULT box the two boot
+        # warnings printed different causes in the same boot. The R3
+        # MAJOR-2 completeness fix reached one of the two cause helpers.
+        _dr = getattr(getattr(ctx, "args", None), "deep_reason", None)
+        score_why = ("MCTS turn-start hint is off on both counts "
+                     "(module-gated off, and "
+                     + ("--deep-reason is not set)" if _dr is False else
+                        "--deep-reason is not readable from args)"))
+    elif not _MCTS_TURNSTART_ENABLED:
+        score_why = "MCTS turn-start hint is module-gated off"
+    elif getattr(ctx, "mcts_reasoner", None) is None:
+        # R11 MIN-1: derived from the OBJECT, never the flag — so if
+        # `MCTSReasoner(...)` raises at boot (caught and logged "Deep
+        # Reasoning Failed"), an operator who DID pass --deep-reason was
+        # told they did not. Distinguish the two.
+        _asked = getattr(getattr(ctx, "args", None),
+                         "deep_reason", None) is True
+        score_why = ("MCTS turn-start hint is module-gated ON and "
+                     "--deep-reason WAS set, but no reasoner exists — its "
+                     "construction failed at boot (see 'Deep Reasoning "
+                     "Failed'), so nothing can call .score()"
+                     if _asked else
+                     "MCTS turn-start hint is module-gated ON but "
+                     + ("--deep-reason is not set" if _deep_raw is False
+                        else "--deep-reason is not readable from args")
+                     + ", so no reasoner exists to call .score()")
+    else:
+        score_why = "MCTS turn-start hint is live"
+    # R5 MINOR-1: tri-state, like `prm_online_update_inertness` — an
+    # absent attribute is not a confident "not enabled".
+    _fs = getattr(_args, "frontier_selfplay", None)
+    if _fs is not True:
+        fs_why = ("--frontier-selfplay is not enabled" if _fs is False
+                  else "--frontier-selfplay is not readable from args")
+    elif getattr(ctx, "trajectory_collector", None) is None:
+        fs_why = ("--frontier-selfplay is enabled but trajectory logging "
+                  "is off, so the frontier path that calls .uncertainty() "
+                  "cannot run")
+    else:
+        fs_why = "--frontier-selfplay is enabled"
+    return score_why + " and " + fs_why
+
+
+def prm_consumer_is_live(ctx) -> bool:
+    """Does ANY code path currently read a PRM value?
+
+    The single source of truth for the retrain gate (biological phase 2.7
+    and its twin in `tools/memory.py`). Both used to spell this inline,
+    and both spelled it WRONG the same way — R3 MAJOR-1.
+
+    There are exactly two value-reading consumers:
+
+    * ``.score()`` — the MCTS turn-start hint. Its call site requires
+      ``_MCTS_TURNSTART_ENABLED and ctx.mcts_reasoner is not None``; the
+      reasoner is only constructed under ``--deep-reason``. The constant
+      alone is NECESSARY, NOT SUFFICIENT — reading it alone meant that a
+      box with the constant flipped and no ``--deep-reason`` retrained
+      every cooldown for a model nothing could read, which is precisely
+      the 41-wasted-retrains defect this gate was added to stop. Three
+      instruments reported "nothing reads the PRM" while it trained.
+    * ``.uncertainty()`` — frontier self-play seed selection, gated by
+      ``--frontier-selfplay`` AND a real ``trajectory_collector`` (the
+      frontier read path in ``core/dream.py`` requires one, so
+      ``--no-trajectories`` makes this leg dead). R7 MIN-2: this
+      docstring spelled out ``.score()``'s conjuncts in full and left
+      this leg as flag-only, in the very function that owns both.
+      R7 MIN-3: that call site has a FOURTH conjunct — an
+      ``isinstance(ctx.frontier_tracker, FrontierTracker)`` guard — not
+      read here because ``main.py`` constructs the tracker
+      unconditionally on both branches, so it cannot be False in
+      production. Recorded rather than read: it is the same shape as the
+      collector conjunct that took two rounds to find, and if the
+      tracker ever becomes optional this gate must grow a fourth read.
+      R9 MIN-3: that call site ALSO requires ``isinstance(prm_scorer,
+      PRMScorer)`` and ``prm_scorer.has_model``, and the ``.score()`` leg
+      additionally requires ``_is_hard`` (False on every box with an
+      untrained router), a non-empty user turn, and a non-trivial chat.
+      ``has_model`` is excluded ON PURPOSE — including it would deadlock
+      the retrain (no model ⇒ never train ⇒ never a model); the rest are
+      excluded because they cannot be False in the configurations this
+      gate is asked about. Stated, because an unstated exclusion is
+      indistinguishable from an oversight.
+
+    ``--prm-online-update`` is deliberately absent: it is a PRODUCER that
+    refines an existing model and refuses to bootstrap one, so it can
+    never answer "does anything READ the model?". §4BM registered a
+    widening to count it; §4BN retracted that before implementation.
+    Pinned behaviourally (not by source shape — that was tried twice and
+    failed twice) in ``tests/test_prm_biological_phase.py`` and
+    ``tests/test_self_play_meaningful.py``.
+    """
+    _args = getattr(ctx, "args", None)
+    score_live = bool(
+        _MCTS_TURNSTART_ENABLED
+        and getattr(ctx, "mcts_reasoner", None) is not None
+    )
+    # R5 MAJOR-4: `.uncertainty()`'s only LIVE call site (core/dream.py, the
+    # frontier seed-selection block) also requires a real
+    # TrajectoryCollector — under --no-trajectories the collector is None
+    # and that path cannot run. Reading the flag alone made boot report a
+    # live reader on a box where nothing could read: five rounds
+    # litigated the `.score()` conjunct and nobody audited this leg.
+    # (R6 MIN-1: `core/mcts.py` has a SECOND `.uncertainty()` reader
+    # behind `uncertainty_penalty > 0.0` — dead, since no constructor
+    # call sets it, and downstream of the `.score()` gate anyway. Saying
+    # "ONLY" was a claim never checked, in the comment justifying this
+    # very conjunct.)
+    uncertainty_live = bool(
+        getattr(_args, "frontier_selfplay", False) is True
+        # R6 MIN-3: `dream.py` guards this with
+        # `isinstance(_, TrajectoryCollector)` while this is a None check.
+        # They agree in production — `main.py` assigns either a real
+        # TrajectoryCollector or None, nothing else — so the difference is
+        # reachable only from a test that injects a stub. Tightening it to
+        # isinstance was tried and rejected: it broke five existing phase
+        # tests that legitimately drive the loop with mock collectors, for
+        # no production gain. Documented rather than matched.
+        and getattr(ctx, "trajectory_collector", None) is not None)
+    return bool(score_live or uncertainty_live)
 #  * Selfhood wake-up prefix: first-person narrative/mood prose spliced into the
 #    system prompt every turn. Injects no facts/tools/constraints — cosmetic
 #    voice that only adds tokens/latency. OFF on the request path.
@@ -574,7 +728,17 @@ def turn_origin(context) -> str:
     finalize's `is_simulation`. Deliberately not a second definition: a private
     notion of "is this real traffic" that can drift from the gates' notion is
     how the two came to disagree in the first place.
+
+    §4BF Track 1b: an EXPLICIT label on the context wins — bench-bank runs
+    ride the same read-only isolation as self-play but are a third
+    population ("bench", externally graded), and inheriting "sim" would
+    fold them into the population the flywheel exists to be distinguished
+    from. This is an override set by the bench path, not a second
+    heuristic — the read-only derivation stays the one inference.
     """
+    label = getattr(context, "turn_origin_label", None)
+    if isinstance(label, str) and label:
+        return label
     return "sim" if getattr(getattr(context, "skill_memory", None),
                             "is_read_only", False) is True else "user"
 
@@ -1080,6 +1244,24 @@ _FILE_MUTATION_MARKERS = (
     "wrote", "written", "replaced", "replace applied",
     "auto-promoted", "search/replace", "overwrote", "overwritten",
 )
+
+
+def _verifier_note_block(issues_str: str) -> str:
+    """Build the user-facing REFUTED annotation as ONE strippable block.
+
+    SINGLE-BLOCK INVARIANT (§4BF R2/R3): issues/reasoning are raw LLM
+    strings; a blank line inside the note pushes its tail past
+    ``strip_system_notes``' end-anchored no-``\\n\\n`` regex, and the
+    surviving digits displace the graded answer on text-graded bench
+    turns (label noise in BOTH directions — the R1 CRIT recurring
+    through the writer). The strip's contract is "the note is one
+    block"; this builder — the ONLY author of the marker — enforces it.
+    Module-level so the invariant is behaviorally pinned
+    (tests/test_track2_flip_ii.py); the sole call site is the post-loop
+    verifier consumption gate.
+    """
+    flat = re.sub(r"\s*\n\s*", " ", str(issues_str or "")).strip()
+    return f"\n\n---\n**Verifier note:** {flat}"
 
 
 def _is_unverified_mutation(tool: Optional[dict]) -> bool:
@@ -4293,6 +4475,21 @@ class GhostAgent:
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
+    _BENCH_COOLDOWN = 2700        # 45 min between bench-bank items (§4BF 1b)
+    #: Seconds of quiet an operator-armed bench DRAIN waits for before it
+    #: starts an item (§4BO). Not a cooldown between items — a drain runs
+    #: back-to-back — but a floor that keeps a multi-minute solve from
+    #: starting in the pause between two turns of a live conversation.
+    #: `foreground_requests` already covers a request in flight; this
+    #: covers the operator who is still reading the last reply.
+    _BENCH_DRAIN_IDLE_FLOOR = 60
+    #: Hard ceiling on ONE bench item (§4BO R1 CRITICAL). The solve loop
+    #: has no internal timeout and the biological watchdog is the only
+    #: long-lived background task, so an item parked on the shared
+    #: inference slot silently stops every idle phase until a restart.
+    #: 15 min ≈ 5× the worst honest run measured on this box (3 attempts,
+    #: ~3 min), so it terminates wedges without truncating slow work.
+    _BENCH_ITEM_TIMEOUT = 900
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
     # already prevents same-batch refire, but a journal write that
     # raises mid-loop (or a misbehaving consumer that fails to drain)
@@ -4371,6 +4568,22 @@ class GhostAgent:
             f"(window >= {self._MIN_USABLE_WINDOW_S:.0f}s) for a measurement "
             f"that includes them.")
 
+    def _safe_pretty_log(self, *args, **kwargs) -> None:
+        """`pretty_log` that cannot take the idle loop down with it.
+
+        §4BO R2: the bench phase's guarded region was widened precisely
+        because "a `pretty_log` that hits a full disk" would escape
+        `_biological_tick`, be swallowed as a generic "watchdog tick
+        failed", and leave an armed drain retrying forever. Three of the
+        drain's own log calls then sat OUTSIDE that guard — the same
+        defect class, inside its own fix. Operator narration is never
+        worth a dead idle loop.
+        """
+        try:
+            pretty_log(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pretty_log suppressed in idle phase: %s", exc)
+
     def _bio_roll(self, p: float) -> bool:
         """Probability gate for the idle phases. Returns True deterministically
         under ``--bio-deterministic`` (so the B3 control/treatment arms fire the
@@ -4398,6 +4611,35 @@ class GhostAgent:
         """One pass of the biological hook state machine. Extracted from the
         loop for direct unit testing."""
         ctx = self.context
+
+        # §4BN R33 MINOR-4: this sits ABOVE the memory_system guard on
+        # purpose — a degraded boot is exactly when an operator most needs
+        # to know the process does not match its source, and the previous
+        # placement made the auditor dark in that case (§4BN's own class,
+        # on §4BN's own mechanism).
+        # §4BN R31 CRIT-1 — re-evaluate the source/process divergence HERE,
+        # not only at boot. The boot-only version could not detect either
+        # case it was built for: R28's edit came a day after boot and R30's
+        # nine minutes after, and at boot every file is necessarily older,
+        # so it was silent on a healthy box and on a box about to go stale
+        # alike — R29's own "a verification that cannot distinguish the two
+        # hypotheses" test, failed by the mechanism written to satisfy it.
+        # The tick runs every ~60s for the life of the process, which is
+        # exactly the window the boot check cannot see.
+        try:
+            # R34 MAJOR-1: this used to be `from ..main import …`, which
+            # under `python -m src.ghost_agent.main` loads a SECOND copy
+            # of main and re-executes its whole module body inside the
+            # live process — three spurious boot banners appeared in the
+            # log, and the two copies kept separate baselines. Import the
+            # guard module, which is imported once under either shape.
+            from .staleness import audit_source_newer_than_process as _audit
+            from ..utils.logging import Icons as _I, pretty_log as _plog
+            _audit(lambda m: _plog("Stale Process", m, level="WARNING",
+                                   icon=_I.WARN))
+        except Exception:      # noqa: BLE001 — never break the tick
+            pass
+
         if not getattr(ctx, 'memory_system', None):
             return
 
@@ -4462,6 +4704,29 @@ class GhostAgent:
             self._last_autoadvance_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
+        if not hasattr(self, '_last_bench_at'):
+            self._last_bench_at = datetime.datetime.min
+        # Operator-armed bench drain (§4BO, 2026-08-15). `POST
+        # /api/bench/drain` sets a BUDGET here and the watchdog spends it;
+        # the endpoint never runs an item itself. That keeps the watchdog
+        # the single caller of `banks.pick_next_item`, whose read-modify-
+        # write of the cursor is documented as unsynchronized — a second
+        # process running bench is the race its docstring names.
+        # DELIBERATELY IN-MEMORY: a budget must not survive a restart, or
+        # an operator who armed 200 items and rebooted would find the box
+        # still draining them tomorrow with no record of why.
+        if not hasattr(self, '_bench_drain_remaining'):
+            self._bench_drain_remaining = 0
+        if not hasattr(self, '_bench_drain_banks'):
+            self._bench_drain_banks = None
+        # Last time an item actually finished — the operator-facing
+        # difference between "deferring on the idle floor" and "parked
+        # inside a wedged solve", which `biological_watchdog_alive`
+        # cannot distinguish (it reports the task object, not progress).
+        if not hasattr(self, '_bench_last_item_at'):
+            self._bench_last_item_at = None
+        if not hasattr(self, '_bench_item_started_at'):
+            self._bench_item_started_at = None
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
         # static baseline and is rewritten after each run based on the
         # FrontierTracker's last compression delta.
@@ -5036,9 +5301,14 @@ class GhostAgent:
         # trajectory log skills_auto reads, derives MC-discounted
         # per-step values, fits a logistic regression on hand-crafted
         # features, hot-swaps the freshly-trained model into the
-        # live ``ctx.prm_scorer``. The MCTS reasoner reads scores via
-        # ``ctx.prm_scorer.score`` so the swap is picked up on the
-        # very next plan it scores — no agent restart required.
+        # live ``ctx.prm_scorer``. NOTE (R5 CRIT-1): the MCTS reasoner
+        # does NOT read through ``ctx.prm_scorer`` — it holds its own
+        # ``self.prm_scorer`` reference (core/mcts.py). The swap reaches
+        # it by OBJECT IDENTITY only because the explicit bridge below
+        # (and main.py at boot) assigns ``mcts.prm_scorer = prm_scorer``;
+        # `set_model` then mutates that same object in place. Rebinding
+        # ``ctx.prm_scorer`` to a NEW scorer without re-running the
+        # bridge would leave MCTS on the old weights.
         #
         # Gated on:
         #   (a) ``--prm-train-cooldown`` (or the static default) so a
@@ -5080,25 +5350,46 @@ class GhostAgent:
                 # ``iter_trajectories`` an extra time and inflating
                 # any call-count assertion in unrelated phases.
                 from ..prm.scorer import PRMScorer as _PRMScorer
-                # Don't train a model nothing reads. The PRM has exactly two
-                # consumers and BOTH can be off:
+                # Don't train a model nothing reads. The PRM has TWO
+                # value-reading consumers — plus one PRODUCER that is
+                # deliberately NOT counted here (§4BN corrected §4BM's
+                # "THREE consumers", which had promoted the refiner):
                 #   * `.score()`  → the MCTS turn-start hint, hard-gated by
                 #     `_MCTS_TURNSTART_ENABLED` (no flag can enable it);
                 #   * `.uncertainty()` → frontier self-play seed selection,
                 #     gated by `--frontier-selfplay` (default False since
-                #     2026-07-09, and absent from the live launcher).
+                #     2026-07-09, and absent from the live launcher);
+                # And the PRODUCER that is correctly excluded:
+                #   * `online_update()` (--prm-online-update) REFINES this
+                #     model and explicitly refuses to bootstrap one
+                #     ("Returns False when no model is loaded"). It is not
+                #     a consumer, so it cannot answer "does anything READ
+                #     the model?". §4BM registered widening the gate to
+                #     include it; §4BN RETRACTED that before implementing
+                #     — widening would resume training for a producer with
+                #     no readers, i.e. re-create the 41-wasted-retrains
+                #     defect this skip exists to prevent. main.py warns at
+                #     boot when the flag is set but inert.
                 # With both off this phase burned an idle slot every cooldown
                 # producing a checkpoint no code path ever read — 41 such
                 # retrains in one recent ledger window (2026-07-27) — while
                 # logging "value model refit", which reads like learning
                 # progress. Skip instead, and say why. This is deliberately a
-                # runtime check, not a deletion: flip either consumer on and
-                # training resumes on the next idle pass with no code change.
-                _prm_consumer_live = bool(
-                    _MCTS_TURNSTART_ENABLED
-                    or getattr(getattr(ctx, 'args', None),
-                               'frontier_selfplay', False) is True
-                )
+                # runtime check, not a deletion: set --frontier-selfplay
+                # (with trajectory logging ON — the frontier read path
+                # needs a real collector) and training resumes on the next
+                # idle pass with no code change. R7 MIN-1: the HTML copy
+                # of this sentence was corrected and the SOURCE was not —
+                # the exact inverse of R1 MIN-3, which fixed the source
+                # and missed the copy.
+                # (`_MCTS_TURNSTART_ENABLED` also re-arms it, but only
+                # TOGETHER WITH --deep-reason — the constant alone leaves
+                # `ctx.mcts_reasoner` None and nothing can call `.score()`
+                # (R3 MAJOR-1). Flipping it is a source edit, and also
+                # needs tests/test_cognitive_redesign_doc.py updated. R1
+                # MIN-3: the old "flip either consumer … no code change"
+                # was half false and had been copied into introspect.html.)
+                _prm_consumer_live = prm_consumer_is_live(ctx)
                 if (
                     traj_collector is not None
                     and isinstance(prm_scorer, _PRMScorer)
@@ -5107,10 +5398,12 @@ class GhostAgent:
                     self._last_prm_train_at = datetime.datetime.now()
                     pretty_log(
                         "PRM Retrain",
-                        "skipped — no live consumer (MCTS turn-start hint is "
-                        "module-gated off and --frontier-selfplay is not "
-                        "enabled). Training would produce a checkpoint "
-                        "nothing reads; enable either consumer to resume.",
+                        "skipped — both value-reading consumers are off ("
+                        + prm_consumer_why_no_reader(ctx)
+                        + "). Training would produce a checkpoint neither "
+                        "reads; enable either to resume. "
+                        "(--prm-online-update is a PRODUCER, not a "
+                        "consumer — correctly not counted here; see §4BN.)",
                         icon=Icons.SKIP,
                     )
                 elif (
@@ -5127,6 +5420,16 @@ class GhostAgent:
                         _fp_fn = getattr(traj_collector, 'corpus_fingerprint', None)
                         if callable(_fp_fn):
                             _corpus_fp = await asyncio.to_thread(_fp_fn)
+                        # §4BF 1c: the PRM now also consumes the bench corpus
+                        # (admissibility: prm = bench_feature), so new bench
+                        # data must defeat the skip gate even when the real
+                        # corpus is unchanged.
+                        from .admissibility import (
+                            bench_corpus_fingerprint as _bench_fp_fn)
+                        _bench_fp = await asyncio.to_thread(
+                            _bench_fp_fn, getattr(ctx, "args", None))
+                        if _corpus_fp is not None and _bench_fp is not None:
+                            _corpus_fp = f"{_corpus_fp}|{_bench_fp}"
                     except Exception:
                         _corpus_fp = None
                     if _corpus_fp is not None and _corpus_fp == self._prm_corpus_fp:
@@ -5138,6 +5441,7 @@ class GhostAgent:
                     else:
                         try:
                             from ..prm import PRMTrainer
+                            from .admissibility import iter_bench_trajectories
                             save_path = getattr(ctx, '_prm_checkpoint_path', None)
                             if save_path is None:
                                 base_mem = getattr(ctx, 'memory_dir', None)
@@ -5148,6 +5452,8 @@ class GhostAgent:
                                 trainer.run,
                                 trajectories=traj_collector.iter_trajectories(),
                                 save_path=save_path,
+                                bench_trajectories=iter_bench_trajectories(
+                                    "prm", getattr(ctx, "args", None)),
                             )
                             # Record the fingerprint once the pass ran to
                             # completion (fit OR clean bail) — both are
@@ -5217,6 +5523,14 @@ class GhostAgent:
                         _rt_fp_fn = getattr(traj_collector, 'corpus_fingerprint', None)
                         if callable(_rt_fp_fn):
                             _rt_corpus_fp = await asyncio.to_thread(_rt_fp_fn)
+                        # §4BF 1c: bench corpus feeds the router train side
+                        # too — fold its fingerprint into the skip gate.
+                        from .admissibility import (
+                            bench_corpus_fingerprint as _rt_bench_fp_fn)
+                        _rt_bench_fp = await asyncio.to_thread(
+                            _rt_bench_fp_fn, getattr(ctx, "args", None))
+                        if _rt_corpus_fp is not None and _rt_bench_fp is not None:
+                            _rt_corpus_fp = f"{_rt_corpus_fp}|{_rt_bench_fp}"
                     except Exception:
                         _rt_corpus_fp = None
                     if (_rt_corpus_fp is not None
@@ -5229,6 +5543,7 @@ class GhostAgent:
                     else:
                         try:
                             from ..router import RouterTrainer
+                            from .admissibility import iter_bench_trajectories
                             save_path = getattr(ctx, '_router_checkpoint_path', None)
                             if save_path is None:
                                 base_mem = getattr(ctx, 'memory_dir', None)
@@ -5243,6 +5558,8 @@ class GhostAgent:
                                 trainer.run,
                                 trajectories=traj_collector.iter_trajectories(),
                                 save_path=save_path,
+                                bench_trajectories=iter_bench_trajectories(
+                                    "router", getattr(ctx, "args", None)),
                             )
                             self._router_corpus_fp = _rt_corpus_fp
                             _new_clf = trainer.classifier
@@ -5795,6 +6112,399 @@ class GhostAgent:
                         except Exception as e:
                             logger.warning(f"Adaptive cooldown lookup failed: {e}")
                             self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
+
+        # ── Phase 3b: BENCH BANKS (§4BF Track 1b, 2026-08-13) ────────────
+        # One externally-graded task per tick through the SAME isolated
+        # solve loop self-play uses — the resolved-outcome flywheel. Gated
+        # like phase 3 (deep idle, >3600s) because it burns solver tokens.
+        # Inert until banks exist on disk (scripts/import_bench_banks.py) —
+        # shipping armed-but-unloaded is the deliberate rollout: the
+        # flywheel starts the moment the operator imports data, no restart
+        # needed. Kill switch: --no-bench. Deliberately NOT tied to
+        # --no-self-play: the §4Q lesson is that flag already ablates far
+        # more than its name says — bench must be separable for clean arms.
+        #
+        # COEXISTENCE WITH SELF-PLAY (R1+R2 reviews — both directions were
+        # gotten wrong once). R1: bench claiming a dice-missed tick AND
+        # resetting the idle clock closed the deep-idle window for an hour,
+        # cutting self-play ~5×. The R1 fix gated bench on self-play being
+        # cooldown-blocked — but phase 3's finally advances BOTH clocks
+        # together, so `idle > 3600` implies self-play is re-armed at
+        # every crossing and bench was arithmetically unreachable (R2:
+        # empty ledger on disk proved it). The correct shape: bench may
+        # claim a dice-missed tick, but it must NOT touch
+        # `ctx.last_activity_time` — self-play's re-roll continues on the
+        # very next tick, delayed only by the bench solve itself. The
+        # idle-clock reset stays self-play's job (§4Q); with
+        # --no-self-play the mid-phase starvation that follows is that
+        # flag's already-documented semantics, unchanged by bench.
+        # A DRAIN (§4BO) bypasses the deep-idle window and the 45-min
+        # cooldown — the operator asked for supply NOW — but never
+        # `--no-bench`, which stays an unconditional kill
+        # switch, and never a live turn: `foreground_requests > 0` is the
+        # project's existing "an interactive request is in flight" signal
+        # (core/delegate.py), and the floor below keeps a solve from
+        # starting in the gap between two turns of a conversation.
+        #
+        # ⚠ RE-SAMPLE THE IDLE CLOCK (R1 review, proven with a probe).
+        # `idle_secs` is measured ONCE at the top of the tick, and phases
+        # 2–3 above can burn minutes of real time (dream is an LLM call).
+        # A drain testing the stale value greeted a user turn that had
+        # completed 1 second earlier with `idle_secs = 2000` and started a
+        # multi-minute solve — exactly what the floor exists to prevent.
+        # The measured probe: "real idle at the moment phase 3b ran:
+        # 0.01s (floor is 60s), bench pick called: True". The idle path
+        # has the same staleness but its 45-min cooldown bounds it; a
+        # drain re-evaluates every tick, so it must read the clock NOW.
+        #
+        # ⚠ THIS IS ALSO A REAL COUPLING TO SELF-PLAY (R2 review corrected
+        # an earlier comment here that claimed the drain bypassed it).
+        # Phase 3's finally sets `ctx.last_activity_time = now`, and that
+        # is the clock read below — so on a tick where self-play fired,
+        # true idle is ~0 and the drain correctly stands down for about a
+        # minute. That is the desired behaviour (two heavy solves must not
+        # chain inside one tick), but it IS a coupling, and self-play
+        # keeps re-arming through a long drain because bench deliberately
+        # never resets that clock.
+        _drain_left = int(getattr(self, "_bench_drain_remaining", 0) or 0)
+        _idle_now = (datetime.datetime.now()
+                     - ctx.last_activity_time).total_seconds()
+        _drain_active = (
+            _drain_left > 0
+            and _idle_now > self._bio_scaled(self._BENCH_DRAIN_IDLE_FLOOR)
+            and int(getattr(getattr(ctx, "llm_client", None),
+                            "foreground_requests", 0) or 0) <= 0)
+        _idle_eligible = (idle_secs > self._bio_scaled(3600)
+                          and "self-play" not in _idle_ran)
+        # Which regime produced this row. The two are collected under
+        # genuinely different machine conditions — a drain runs
+        # back-to-back at a 60 s floor, the idle walk runs once per
+        # deep-idle window after a 45 min cooldown — so a reader
+        # comparing pass rates across time needs to know which. This
+        # rides BOTH the results ledger and the trajectory (R2 review:
+        # every admitted learning consumer reads the corpus, not the
+        # ledger, so tagging only the ledger would leave the split in
+        # the one file nothing trains on).
+        _bench_source = "drain" if _drain_active else "idle"
+        if (getattr(ctx.args, "no_bench", False) is not True
+                and (_drain_active or _idle_eligible)):
+            since_last_bench = (datetime.datetime.now()
+                                - self._last_bench_at).total_seconds()
+            if (_drain_active or since_last_bench
+                    >= self._bio_cooldown(self._BENCH_COOLDOWN)):
+                _bench_item = None
+                _pick_raised = False
+                try:
+                    from ..eval import banks as _banks
+                    _bench_item = _banks.pick_next_item(
+                        banks=(self._bench_drain_banks if _drain_active
+                               else None))
+                except Exception as _bpe:  # noqa: BLE001
+                    _pick_raised = True
+                    logger.debug("bench pick skipped: %s", _bpe)
+                if _bench_item is None:
+                    logger.debug("bench phase idle — no banks on disk")
+                    if _drain_active and _pick_raised:
+                        # R1 MINOR-1: a transient OSError reading a bank
+                        # file is NOT "you armed something impossible" —
+                        # discarding 199 queued items over one unreadable
+                        # read would be the wrong cure. Keep the budget,
+                        # say so, and let the next tick retry.
+                        self._safe_pretty_log(
+                            "Bench Drain",
+                            f"pick FAILED this tick (transient) — "
+                            f"{self._bench_drain_remaining} item(s) still "
+                            f"armed, retrying next tick",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                    elif _drain_active:
+                        # An armed drain that cannot pick an item would
+                        # otherwise retry every 60 s forever, spending no
+                        # budget and saying nothing above DEBUG — the
+                        # silent-inoperative-subsystem shape. Cancel it
+                        # LOUDLY and name the two causes, because the
+                        # operator's next question is "did my drain run?"
+                        _cancelled = self._bench_drain_remaining
+                        self._bench_drain_remaining = 0
+                        # Bank names are filesystem-derived (the importer
+                        # writes them, `list_banks` globs them), so they
+                        # get the same control-char strip and length cap
+                        # the phase already applies to dataset ids — an
+                        # operator-stream line must not be forgeable by a
+                        # filename (R3 review).
+                        import re as _re_drain
+                        _safe_req = _re_drain.sub(
+                            r"[\x00-\x1f\x7f]", " ",
+                            str(self._bench_drain_banks or "all"))[:120]
+                        self._safe_pretty_log(
+                            "Bench Drain",
+                            f"CANCELLED with {_cancelled} item(s) unspent — "
+                            f"no bench item could be picked. Either no banks "
+                            f"are imported (scripts/import_bench_banks.py) "
+                            f"or the requested banks "
+                            f"({_safe_req}) do not "
+                            f"exist on disk. Nothing ran.",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                else:
+                    _idle_ran.append("bench")
+                    # ⚠ SPEND THE BUDGET AT CLAIM TIME, NOT IN THE FINALLY
+                    # (R2 review). The finally-based version needed a
+                    # generation stamp to stop a cancel-and-re-arm during
+                    # the solve from eating the NEW budget's slots — and
+                    # that guard then created a worse bug: every arm bumps
+                    # the generation, so an operator or script topping the
+                    # budget up on a cadence shorter than a solve made the
+                    # decrement never apply at all. Measured: 12 items
+                    # solved, budget still 2, bank items burning forever.
+                    # Claiming the slot here removes the race instead of
+                    # guarding it — the item is spent the moment it is
+                    # picked, so no later code path can spend it twice, or
+                    # fail to spend it, no matter what raises or when.
+                    if _drain_active:
+                        self._bench_drain_remaining = max(
+                            0, int(self._bench_drain_remaining) - 1)
+                    # ⚠ THE `try` STARTS HERE, NOT AT THE AWAIT (R1 review,
+                    # proven with a probe). Six statements used to sit
+                    # between this branch and the try — a `pretty_log` that
+                    # hits a full disk, or `from .dream import Dreamer` in
+                    # a process where that module never imported cleanly.
+                    # A raise in any of them escaped `_biological_tick`,
+                    # was swallowed by the watchdog's generic handler as
+                    # "Biological watchdog tick failed" (naming neither
+                    # bench nor the drain), and left the budget UNSPENT
+                    # while `pick_next_item` had already advanced and
+                    # persisted the cursor. Measured: three consecutive
+                    # ticks each burned one bank item, wrote no ledger row,
+                    # and left the budget at 3. Everything the drain must
+                    # account for now lives inside the guarded region, and
+                    # the two log-safe names are bound BEFORE it so the
+                    # `finally` can always name the item.
+                    dreamer = None
+                    _bench_timed_out = False
+                    _safe_iid = str(_bench_item.get("item_id"))[:80]
+                    _safe_bank = str(_bench_item.get("bank"))[:40]
+                    try:
+                        # Operator-stream line (R2): the shared solve loop
+                        # prints "Self-Play …" throughout — without this, a
+                        # bench item is indistinguishable from a self-play
+                        # cycle on the live stream. Item/bank ids are
+                        # SANITIZED (R4 review): they come from a
+                        # downloaded dataset row — control chars in a
+                        # task_id could forge operator-stream lines.
+                        import re as _re_bench
+                        _safe_iid = _re_bench.sub(
+                            r"[\x00-\x1f\x7f]", " ", _safe_iid)
+                        _safe_bank = _re_bench.sub(
+                            r"[\x00-\x1f\x7f]", " ", _safe_bank)
+                        # R3 MAJOR-5: wrapped like every other narration
+                        # line. Raw, a full disk here consumed the cursor
+                        # position and wrote a NO_RESULT row without ever
+                        # running the item — 200 burned items and zero
+                        # bench work over ~3.3 h. Operator narration is
+                        # never worth a real item.
+                        self._safe_pretty_log(
+                            "Bench Bank",
+                            f"running {_safe_iid} "
+                            f"(bank {_safe_bank}) through the "
+                            f"isolated solve loop",
+                            icon=Icons.BRAIN_AIM,
+                        )
+                        # Own import: phase 3's `from .dream import Dreamer`
+                        # is a LOCAL binding that only executes when ITS
+                        # branch runs — relying on it made this phase crash
+                        # with UnboundLocalError on any tick where self-play
+                        # was skipped (caught by the phase unit test).
+                        from .dream import Dreamer as _BenchDreamer
+                        dreamer = _BenchDreamer(ctx)
+                        # Anchor BEFORE the await (phase convention): a slow
+                        # run must not make the next tick double-fire.
+                        self._last_bench_at = datetime.datetime.now()
+                        # R3 MAJOR-4: `_bench_last_item_at` is written in
+                        # the finally, so it moves when an item ENDS. That
+                        # cannot answer the question its own comment
+                        # claims — "deferring on the idle floor" and
+                        # "parked inside a wedged solve" both look like a
+                        # stamp that stopped. A START stamp separates
+                        # them: it advances while the box is working and
+                        # freezes only while nothing is being attempted.
+                        self._bench_item_started_at = datetime.datetime.now()
+                        # ⚠ BOUNDED (R1 CRITICAL). `synthetic_self_play`
+                        # has no internal timeout — `core/dream.py` says so
+                        # in as many words ("wedging the idle orchestrator
+                        # — no caller wraps the solve loop in a timeout").
+                        # The biological watchdog is the process's ONLY
+                        # long-lived background task, so an item that
+                        # parks on the shared inference slot takes every
+                        # idle phase down with it — journal, dream,
+                        # reflection, skills, PRM/router retrain,
+                        # calibration, autoadvance, self-play — until a
+                        # restart, while `/api/health` still reports
+                        # `biological_watchdog_alive: true` because the
+                        # task IS alive, parked inside one await. That is
+                        # the "verification that cannot distinguish"
+                        # shape applied to the only liveness signal.
+                        # At the organic cadence this was a ~0.3% duty
+                        # cycle and the risk was theoretical; a drain runs
+                        # back-to-back at a measured 24–75% (mean 41%),
+                        # which is what makes the bound mandatory rather
+                        # than tidy. Measured
+                        # per-item wall clock on this box is 19–179 s
+                        # (median 31 s, request-start to ledger row), so
+                        # the bound below is ~5× the worst honest run: it
+                        # ends wedges, not slow items.
+                        #
+                        # ⚠ IT IS A FLOOR, NOT A CEILING (R2 review, and
+                        # the comment here claimed otherwise). `wait_for`
+                        # cancels the task and then AWAITS it, including
+                        # its `finally` — which in the solve loop removes
+                        # a Docker container and rmtree's a workspace.
+                        # Measured with a 3 s cleanup and a 0.05 s bound,
+                        # the tick took 3.06 s: 61× past the "ceiling".
+                        # In production the tail is bounded by docker-py's
+                        # ~60 s client timeout, so the real worst case is
+                        # roughly TIMEOUT + 60 s. A cancellation landing
+                        # inside `asyncio.to_thread(ensure_running)` also
+                        # cannot stop that thread, so a container may be
+                        # created after its workspace is gone and leak.
+                        await asyncio.wait_for(
+                            dreamer.synthetic_self_play(
+                                model_name=getattr(ctx.args, "model",
+                                                   "default"),
+                                is_background=True,
+                                injected_challenge={
+                                    "challenge": _bench_item["challenge"],
+                                    "setup_script":
+                                        _bench_item.get("setup_script")
+                                        or _banks._NO_SETUP,
+                                    "validation_script":
+                                        _bench_item["validation_script"],
+                                },
+                                bench_meta={
+                                    "bank": _bench_item.get("bank"),
+                                    "item_id": _bench_item.get("item_id"),
+                                    "cluster": _bench_item.get("cluster"),
+                                    # §4BF flip (ii): "final_response" arms
+                                    # the answer.txt seam + bench-local
+                                    # verifier in the solve loop;
+                                    # absent/unknown = artifact.
+                                    "graded_on": _banks.item_graded_on(
+                                        _bench_item),
+                                    # R2 review: the provenance must ride
+                                    # the TRAJECTORY too, not just the
+                                    # results ledger — every admitted
+                                    # consumer (GEPA trainsets, PRM,
+                                    # router, calibration) reads the
+                                    # corpus, not the ledger.
+                                    "source": _bench_source,
+                                },
+                            ),
+                            timeout=self._BENCH_ITEM_TIMEOUT,
+                        )
+                        _bres = getattr(dreamer, "last_bench_result",
+                                        None) or {}
+                        self._record_autonomous_activity(
+                            "bench",
+                            f"bench {_safe_iid} → "
+                            f"{'PASS' if _bres.get('passed') else 'FAIL'}"
+                            f" ({_bres.get('status') or 'no result'})",
+                        )
+                    except asyncio.TimeoutError:
+                        # Distinguishable in the ledger from every other
+                        # failure: a wedge is an INFRA fact about the box,
+                        # not the agent failing the task, so it must not
+                        # land in the pass-rate denominator as a loss.
+                        _bench_timed_out = True
+                        logger.warning(
+                            "Bench item %s exceeded %ds and was cancelled — "
+                            "the idle loop is free again",
+                            _safe_iid, self._BENCH_ITEM_TIMEOUT)
+                        self._safe_pretty_log(
+                            "Bench Bank",
+                            f"{_safe_iid} exceeded "
+                            f"{self._BENCH_ITEM_TIMEOUT}s and was cancelled "
+                            f"— the idle loop would otherwise have stayed "
+                            f"parked inside it",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                    except Exception as _bexc:  # noqa: BLE001
+                        logger.warning("Bench phase failed: %s: %s",
+                                       type(_bexc).__name__, _bexc)
+                    finally:
+                        # The ledger row rides the FINALLY (R1 review): an
+                        # exception path used to consume the cursor-advanced
+                        # item with no row at all, silently shrinking the
+                        # honest denominator. None/exception = unresolved.
+                        try:
+                            _bres = getattr(dreamer, "last_bench_result",
+                                            None) or {}
+                            _banks.record_result(
+                                _bench_item,
+                                # R2 MAJOR: `banks.stats()` tests `passed`
+                                # BEFORE the unresolved-status prefix, so a
+                                # row of {passed: True, INFRA_ABORT} lands
+                                # in the pass NUMERATOR — and that row is
+                                # constructible: `last_bench_result` is set
+                                # before the sandbox-teardown finally, so a
+                                # run that passed and then wedged during
+                                # cleanup produces exactly it. A wedge is
+                                # not a pass, on any path.
+                                passed=(False if _bench_timed_out
+                                        else bool(_bres.get("passed"))),
+                                status=(
+                                    "INFRA_ABORT (item exceeded "
+                                    f"{self._BENCH_ITEM_TIMEOUT}s)"
+                                    if _bench_timed_out else
+                                    str(_bres.get("status")
+                                        or "NO_RESULT (run did not "
+                                           "conclude)")),
+                                attempts=int(_bres.get("attempts") or 0),
+                                source=_bench_source,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Deliberately NO ctx.last_activity_time reset
+                        # (R2 review): bench must leave the deep-idle
+                        # window open so self-play's dice re-roll fires on
+                        # the very next tick — resetting it here is what
+                        # cut self-play's cadence ~5× in the R1 shape. The
+                        # idle-clock reset stays phase 3's job.
+                        self._last_bench_at = datetime.datetime.now()
+                        self._bench_last_item_at = datetime.datetime.now()
+                        # CLEAR the start stamp (R4 MAJOR-2). Left set, it
+                        # says "an item started at T and this field never
+                        # says it finished" — which reads identically for
+                        # a drain that COMPLETED hours ago and one wedged
+                        # right now. An operator checking health at 03:00
+                        # mid-drain would see a six-hour-old stamp,
+                        # conclude "wedged", and restart — destroying the
+                        # in-memory budget over a misread the field was
+                        # added to prevent. Cleared here, non-null means
+                        # exactly "an item is in flight", and one field
+                        # answers the question instead of a pair.
+                        self._bench_item_started_at = None
+                        # The slot was already spent at claim time; this
+                        # only reports. Wrapped because a log write that
+                        # raises here would escape the tick — the very
+                        # failure the guard above this block exists for.
+                        if _drain_active:
+                            _left = int(self._bench_drain_remaining)
+                            if not _left:
+                                # Same reason the cancel path clears it:
+                                # otherwise health serves a bank filter
+                                # for a drain that is over, indefinitely,
+                                # until the next restart.
+                                self._bench_drain_banks = None
+                            self._safe_pretty_log(
+                                "Bench Drain",
+                                f"{_safe_iid} done — {_left} item(s) left"
+                                if _left else
+                                # NOT "COMPLETE": a cancel mid-solve lands
+                                # here too, and the queue being empty is
+                                # all this line actually knows.
+                                f"{_safe_iid} done — no items left queued",
+                                icon=Icons.BRAIN_AIM,
+                            )
 
         # One durable summary per idle cycle that actually did work (phase-1
         # journal returns early above and logs itself). Reconstructs the loop:
@@ -7375,11 +8085,79 @@ class GhostAgent:
             merged, header="EXPLICIT USER CONSTRAINTS (CURRENT REQUEST)")
         return merged, block, bool(merged)
 
+    def _record_verdict_sidecar(self, trajectory_id: str, verdict: str,
+                                confidence: float) -> None:
+        """Append one verdict record beside the trajectory log.
+
+        Deliberately NOT written into the trajectory's `extra`: the
+        trajectory is persisted before the verdict exists on both live
+        paths, so anything that depends on that ordering records nothing.
+        A sidecar keyed by trajectory_id is ordering-independent.
+
+        Recording only — nothing reads this yet (see
+        tests/test_verdict_fact_recording.py). It exists so the router's
+        difficulty signal can eventually be evaluated for QUALITY: every
+        correctness metric currently on disk derives from the same fields
+        the router's own labels do, which makes the comparison circular.
+        """
+        try:
+            import json as _json
+            # A single monotonic counter, NOT a per-trajectory map. The
+            # map was bounded at 512 entries, so after eviction a second
+            # verdict for the same trajectory started again at 0 and a
+            # `max(seq)` join returned the PRE-repair verdict — silently
+            # inverting the contract for the one metric this file exists
+            # to enable. A global counter makes max(seq) the last write
+            # under every eviction and interleaving.
+            self._verdict_seq_next = getattr(self, "_verdict_seq_next", 0) + 1
+            coll = getattr(self.context, "trajectory_collector", None)
+            root = getattr(coll, "root", None)
+            if root is None:
+                return
+            from ..utils.helpers import get_utc_timestamp
+            day = get_utc_timestamp()[:10]
+            out = Path(root).parent / "verdicts"
+            out.mkdir(parents=True, exist_ok=True)
+            with open(out / f"{day}.jsonl", "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps({
+                    "trajectory_id": trajectory_id,
+                    "verdict": verdict,
+                    "confidence": confidence,
+                    "at": get_utc_timestamp(),
+                    # An auto-repaired turn verifies TWICE: once before the
+                    # repair and once on the repaired answer. Both rows are
+                    # kept (the pre-repair verdict is real signal about the
+                    # first attempt), so the join contract is explicit:
+                    # LAST row per trajectory_id is the shipped answer's
+                    # verdict. A naive join would otherwise mix a REFUTED
+                    # first attempt into the metric this exists to enable.
+                    "seq": self._verdict_seq_next,
+                }) + "\n")
+        except Exception as e:  # noqa: BLE001 — never fail a turn
+            # LOUD, not debug: this is the only durable record of the
+            # verdict, and its whole purpose is to accumulate quietly for
+            # weeks. A silent failure means discovering at analysis time
+            # that there is nothing to analyse — the silent-inoperative
+            # class this feature has already hit once.
+            logger.warning(
+                "verdict sidecar UNWRITABLE (%s: %s) — verifier verdicts "
+                "are NOT being recorded; the router's quality question "
+                "stays unanswerable until this is fixed",
+                type(e).__name__, e)
+
     async def _compute_verifier_verdict(
         self, *, tools_run_this_turn, messages, final_ai_content,
         last_user_content, lc, req_id: str = "", trajectory_id: str = "",
     ):
-        """Pure verifier verdict computation — NO side effects.
+        """Verifier verdict computation — no side effects on the TURN.
+
+        ⚠ One exception, added deliberately: the verdict is RECORDED onto
+        the turn-facts ledger just before returning (see the end of this
+        method). That is a durable write, not a turn effect — nothing here
+        drives a repair, amends a response, or mutates turn state. It is
+        called out because a docstring that said "NO side effects" while
+        the code had one would be the exact defect class this codebase
+        keeps finding.
 
         Extracted from the post-loop verifier gate so the same verdict can
         drive (a) the in-loop AUTO-REPAIR decision at finalisation and
@@ -7757,6 +8535,57 @@ class GhostAgent:
                 f"interaction-cap check error: {type(_ic_exc).__name__}: {_ic_exc}",
                 icon=Icons.WARN, level="WARNING",
             )
+        # ── RECORD THE VERDICT (recording only, no behaviour change) ──
+        # WHY: the router's difficulty signal cannot currently be evaluated
+        # for QUALITY, only for cost. Trajectory labels are derived from
+        # outcome / n_steps / tool_calls, so every correctness comparison
+        # against them is circular, and the corpus carries NO independent
+        # correctness signal — measured: 0 of 1,701 trajectories have a
+        # user correction or a verifier verdict in `extra`. Wall-clock
+        # showed the router's confident-hard slice costs 1.85x
+        # [+13.9s, +34.7s], but "longer" is not "wronger", and nothing on
+        # disk can tell the two apart.
+        #
+        # The verifier already runs on every final answer. Stamping its
+        # verdict here makes the question answerable in a few weeks'
+        # traffic, at zero marginal cost and with no decision depending on
+        # it yet. Deliberately NOT consumed: §4AN's lesson is that a
+        # signal must be shown informative in the region where it acts
+        # BEFORE anything acts on it.
+        #
+        # This method is documented as running exactly once per final
+        # answer (the gate reuses the cached in-loop result), so it is the
+        # one choke point every path shares — recording at the three
+        # consumer sites instead would be the wrapper-split that has
+        # already produced three defects in this feature.
+        try:
+            if v_result is not None:
+                _verdict = getattr(v_result, "verdict", None)
+                _vs = str(getattr(_verdict, "value", _verdict) or "")
+                _vc = round(float(getattr(v_result, "confidence", 0.0) or 0.0), 4)
+                # (a) turn-facts, for the in-loop window where the verdict
+                #     lands before the trajectory is written.
+                if req_id:
+                    from . import turn_facts as _tf
+                    _tf.record(self.context, str(req_id),
+                               verifier_verdict=_vs, verifier_confidence=_vc)
+                # (b) A DURABLE SIDECAR, because (a) alone records NOTHING
+                #     on either live delivery path. Measured: on the
+                #     streamed path `_record_turn_trajectory` runs before
+                #     this coroutine is even started, and with
+                #     GHOST_CRITIC_ASYNC=1 (which the launcher exports) the
+                #     non-streamed gate never waits either — so the fact
+                #     reached the ring after the ledger was written and was
+                #     evicted. 54 of 153 recent trajectories carry a
+                #     `verifier_late` correction, i.e. the verdict lands
+                #     after the write by design. Keying on trajectory_id
+                #     instead makes the record independent of ordering; an
+                #     analysis joins on it.
+                if trajectory_id:
+                    self._record_verdict_sidecar(str(trajectory_id), _vs, _vc)
+        except Exception as _vf_exc:   # recording must never fail a turn
+            logger.debug("verdict recording skipped: %s", _vf_exc)
+
         return v_result, last_tool
 
     @staticmethod
@@ -7954,6 +8783,19 @@ class GhostAgent:
                 return max(0.0, float(raw))
             except ValueError:
                 pass
+        # §4BF flip (ii) R1: bench turns get a patient budget. The tts_bon
+        # trigger (verifier wobble band) only exists when the verdict LANDS
+        # inside this window; at the live 25s a cold judge model or
+        # foreground contention silently starves the trigger and the
+        # pre-registered abort rule would then misread a harness gate as
+        # "wobble band too rare on this population". Bench runs during deep
+        # idle — the wait costs nothing and no user is watching. The env
+        # override above still wins when set (operator intent).
+        try:
+            if turn_origin(self.context) == "bench":
+                return 90.0
+        except Exception:  # noqa: BLE001
+            pass
         return 25.0
 
     async def _adaptive_bon_final(self, *, messages, final_ai_content,
@@ -7964,7 +8806,9 @@ class GhostAgent:
         model, then ONE list-wise comparative judge call on the cheap pool
         picks the reply that ships. Returns (winner_text, meta) — winner
         may be the original; every failure mode resolves to the original.
-        Callers gate on tts.adaptive_bon_enabled() + tts.wobble_band()."""
+        Callers gate on tts.wobble_band() plus EITHER the bench-scoped
+        tts_bon arm (enrolled turns, §4BF flip ii) OR
+        tts.adaptive_bon_enabled() (the env default, everyone else)."""
         from . import tts as _tts
 
         async def _gen(i: int):
@@ -8247,6 +9091,25 @@ class GhostAgent:
                 if getattr(t, "id", None) == trajectory_id:
                     cached = t
                     break
+            # HUMAN LABEL WINS (2026-08-13, /api/feedback). An explicit
+            # human thumb on this turn already resolved the outcome, flushed
+            # the lesson stash with it, and wrote the sidecar; the sidecar is
+            # last-write-wins per id, so letting this late machine verdict
+            # append AFTER the label would silently invert the authority
+            # order the user-correction path established. Yield entirely —
+            # including the calibration re-label, which would otherwise
+            # book a verdict the corpus no longer carries. (Cache-evicted
+            # trajectories can't be recognized here; that race is accepted —
+            # eviction takes many turns, late verdicts land within ~a minute.)
+            if cached is not None and (getattr(cached, "extra", None)
+                                       or {}).get("human_labeled"):
+                pretty_log(
+                    "Verifier",
+                    f"late verdict for trajectory {trajectory_id[:8]} "
+                    f"WITHHELD — a human label already resolved this turn",
+                    icon=Icons.VERIFIER_LAB,
+                )
+                return
             # The direction guards are NO LONGER hand-mirrored here: this
             # site now calls `resolve_turn_outcome` itself (2026-08-04). It
             # used to re-state rule 2 plus the 07-31 structural exception in
@@ -8287,31 +9150,6 @@ class GhostAgent:
             self._flush_stashed_lesson_outcome(
                 trajectory_id,
                 outcome == _Outcome.PASSED.value and _late_pass_ok)
-            # ⚠ CALIBRATION CORRECTION on the late path (§4L Lens-A
-            # MAJOR-1). The sample was written at finalize with only the
-            # INLINE verdict, and with critic nodes live most verdicts
-            # land HERE — the store held 7 hard negatives against 47
-            # late REFUTED corrections, with 6 of 9 joinable late-refuted
-            # turns still sitting in the fit as positives. Re-label
-            # through the same ladder this handler already resolved:
-            # FAILED → 0.0 (checked and wrong), PASSED that survived the
-            # shape rule → 1.0. Features are reused untouched
-            # (no-leakage); source-rank supersession makes it a
-            # re-label, not a counter-weight.
-            try:
-                _ct = getattr(self.context, "calibration_tracker", None)
-                _rid = ""
-                if cached is not None:
-                    _rid = str((getattr(cached, "extra", None) or {}
-                                ).get("req_id") or "")
-                if _ct is not None and _rid:
-                    if outcome == _Outcome.FAILED.value:
-                        _ct.record_late_verdict_correction(_rid, 0.0)
-                    elif (outcome == _Outcome.PASSED.value
-                          and _late_pass_ok):
-                        _ct.record_late_verdict_correction(_rid, 1.0)
-            except Exception:  # noqa: BLE001 — must not break the handler
-                pass
             if outcome == _Outcome.PASSED.value:
                 if cached is None:
                     return
@@ -8329,29 +9167,90 @@ class GhostAgent:
                     return
                 if cached.outcome == _Outcome.PASSED.value:
                     return          # already there — nothing to correct
-                # The stale reason must not survive the upgrade: `passed`
-                # carrying `structural failure` is an incoherent record.
-                cached.failure_reason = ""
+                # The stale reason must not survive the upgrade (`passed`
+                # carrying `structural failure` is an incoherent record) —
+                # but the CACHE clearing rides the write result in the
+                # callback below (R4: clearing it pre-spawn left a
+                # failed-with-empty-reason record when the write was
+                # withheld, which changes how the structural exception
+                # evaluates on a second verdict).
                 reason = ""
-            if cached is not None:
-                cached.outcome = outcome
-                if reason and outcome == _Outcome.FAILED.value \
-                        and not (cached.failure_reason or ""):
-                    cached.failure_reason = reason
             # spawn_bg: strong ref + warning-level failure logging + shutdown
             # drain — a GC'd or silently-failed backfill loses the corpus
             # outcome with no trace (same rule as the user-correction path).
-            _glog.spawn_bg(asyncio.to_thread(
-                collector.update_outcome,
-                trajectory_id, outcome,
-                reason=reason, source="verifier_late",
-            ), name="late-verdict-outcome-backfill")
-            pretty_log(
-                "Verifier",
-                f"late verdict backfilled into the corpus: trajectory "
-                f"{trajectory_id[:8]} → {outcome}",
-                icon=Icons.VERIFIER_LAB,
-            )
+            # yield_to_human: this write is DEFERRED — a human label can
+            # land between the guard check above and this append, and the
+            # sidecar is last-line-wins. The writer-side check (inside the
+            # collector lock) is the race-proof half of the authority order.
+            # The CACHE mutation and the success log ride the write's
+            # RESULT (R2 review): mutating/logging up front left the
+            # in-process cache carrying a verdict the writer withheld, and
+            # printed "backfilled" a moment before the collector printed
+            # "withheld".
+            async def _write_then_apply():
+                ok = await asyncio.to_thread(
+                    collector.update_outcome,
+                    trajectory_id, outcome,
+                    reason=reason, source="verifier_late",
+                    yield_to_human=True,
+                )
+                if ok == "withheld":
+                    # A human label landed in the deferral window. The
+                    # collector said why; revoke the banner this verdict's
+                    # caller queued in that window (R3 review — the route's
+                    # own revoke ran BEFORE the banner was enqueued in this
+                    # ordering), and be honest that the already-run
+                    # consequences stand.
+                    try:
+                        self._drop_pending_corrections_for(trajectory_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.warning(
+                        "late %s for trajectory %s was withheld by a "
+                        "standing authoritative label (human, or the bench "
+                        "oracle on bench turns) AFTER its side effects ran "
+                        "— any lesson retraction/follow-up tasks from this "
+                        "verdict stand",
+                        outcome, str(trajectory_id)[:8])
+                    return
+                if not ok:
+                    # Plain write FAILURE (disk/permission — the collector
+                    # logged it). Distinct from the human-label case (R4):
+                    # revoking the banner here would silently un-tell the
+                    # user about a real refute over an ENOSPC.
+                    return
+                if cached is not None:
+                    cached.outcome = outcome
+                    if outcome == _Outcome.PASSED.value:
+                        cached.failure_reason = ""   # incoherent otherwise
+                    elif reason and not (cached.failure_reason or ""):
+                        cached.failure_reason = reason
+                # ⚠ CALIBRATION CORRECTION on the late path (§4L Lens-A
+                # MAJOR-1) — moved INSIDE the write result (R3 review):
+                # a source-rank supersession must not book a verdict the
+                # corpus write was withheld from carrying; it now also
+                # correctly skips when the shape rule blocked the write.
+                try:
+                    _ct = getattr(self.context, "calibration_tracker", None)
+                    _rid = ""
+                    if cached is not None:
+                        _rid = str((getattr(cached, "extra", None) or {}
+                                    ).get("req_id") or "")
+                    if _ct is not None and _rid:
+                        if outcome == _Outcome.FAILED.value:
+                            _ct.record_late_verdict_correction(_rid, 0.0)
+                        elif outcome == _Outcome.PASSED.value:
+                            _ct.record_late_verdict_correction(_rid, 1.0)
+                except Exception:  # noqa: BLE001 — never break the writer
+                    pass
+                pretty_log(
+                    "Verifier",
+                    f"late verdict backfilled into the corpus: trajectory "
+                    f"{trajectory_id[:8]} → {outcome}",
+                    icon=Icons.VERIFIER_LAB,
+                )
+            _glog.spawn_bg(_write_then_apply(),
+                           name="late-verdict-outcome-backfill")
         except Exception as e:
             logger.debug(
                 "late-verdict outcome backfill skipped: %s: %s",
@@ -8481,17 +9380,47 @@ class GhostAgent:
         except Exception as e:
             logger.debug("record_lesson_outcomes skipped: %s", e)
 
+    # Retained flushed-trigger sets (R2 review): the stash pops once, so the
+    # FIRST resolver (usually the late machine verdict) consumed the set and
+    # a later human label with the OPPOSITE sign vanished — lesson counters
+    # kept the machine's sign for a turn the human overruled, and a changed
+    # mind (👍 then 👎) booked only the first thumb. Bounded ring of
+    # (triggers, booked_sign) lets a later opposite-sign resolver book a
+    # compensating observation. Not a reversal (the counters are additive);
+    # one wrong + one right observation is a wash, which beats a bias.
+    # Sized to the reply-index horizon (R3): reactions arrive minutes-to-
+    # days after the reply, and 64 flushed turns was under an hour of
+    # open-channel traffic.
+    _FLUSHED_TRIG_RETAIN_MAX = 512
+
     def _flush_stashed_lesson_outcome(self, trajectory_id, success):
-        """Drain a stashed surfaced-trigger set when its late verdict lands.
-        No-op when the turn recorded its outcome inline (nothing stashed)."""
+        """Drain a stashed surfaced-trigger set when a verdict/label lands.
+        No-op when nothing is stashed AND no retained set needs re-booking
+        (same sign, or never flushed)."""
         try:
             stash = getattr(self.context, "_surfaced_triggers_by_traj", None)
-            if not stash or trajectory_id not in stash:
+            flushed = getattr(self.context, "_flushed_triggers_by_traj", None)
+            if flushed is None:
+                from collections import OrderedDict
+                flushed = OrderedDict()
+                self.context._flushed_triggers_by_traj = flushed
+            triggers = None
+            if stash and trajectory_id in stash:
+                triggers = stash.pop(trajectory_id)
+            elif trajectory_id in flushed \
+                    and flushed[trajectory_id][1] != bool(success):
+                # Opposite-sign re-book: a human label overriding the
+                # machine's flush, or a changed mind.
+                triggers = flushed[trajectory_id][0]
+            if not triggers:
                 return
-            triggers = stash.pop(trajectory_id)
+            flushed[trajectory_id] = (triggers, bool(success))
+            flushed.move_to_end(trajectory_id)
+            while len(flushed) > self._FLUSHED_TRIG_RETAIN_MAX:
+                flushed.popitem(last=False)
             sm = getattr(self.context, "skill_memory", None)
             rec = getattr(sm, "record_surfaced_outcomes", None) if sm else None
-            if callable(rec) and triggers:
+            if callable(rec):
                 _glog.spawn_bg(
                     asyncio.to_thread(rec, triggers, bool(success)),
                     name="lesson-outcome-late-flush",
@@ -8721,6 +9650,68 @@ class GhostAgent:
             logger.debug("late outcome correction skipped: %s: %s",
                          type(_exc).__name__, _exc)
 
+    def _drop_pending_corrections_for(self, trajectory_id) -> int:
+        """Revoke queued next-turn correction banners for a trajectory a
+        HUMAN label just resolved (R2 review). The verdict-then-label
+        ordering is the common one — the machine had already queued its
+        "correction to my previous answer" banner, and without this the
+        agent apologized, in the reply text, for an answer the user
+        thumbed up. Returns the number dropped. Never raises."""
+        try:
+            lst = getattr(self, "_pending_corrections", None)
+            if not lst or not trajectory_id:
+                return 0
+            kept = [c for c in lst
+                    if not (isinstance(c, dict)
+                            and c.get("traj") == str(trajectory_id))]
+            dropped = len(lst) - len(kept)
+            if dropped:
+                self._pending_corrections = kept
+                pretty_log(
+                    "Human Feedback",
+                    f"revoked {dropped} queued correction banner(s) for "
+                    f"trajectory {str(trajectory_id)[:8]} — a human label "
+                    f"resolved the turn",
+                    icon=Icons.VERIFIER_LAB,
+                )
+            return dropped
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _human_label_locked(self, trajectory_id) -> bool:
+        """True when an explicit human label (/api/feedback) already
+        resolved this trajectory — machine verdicts must yield ENTIRELY
+        (human-authority doctrine). Checks the in-process ``human_labeled``
+        stamp first, then the corrections sidecar (memoized read), so a
+        cache-evicted trajectory still locks. The cache walk snapshots
+        with ``list()`` because it runs from done-callbacks while the
+        turn loop mutates the same OrderedDict. Residual race: a label
+        landing AFTER this check is caught by the writer-side
+        ``yield_to_human`` and the withheld-write callback."""
+        try:
+            cache = getattr(
+                self.context, "_recent_trajectories_for_correction", None)
+            for t in list((cache or {}).values()):
+                if getattr(t, "id", None) == trajectory_id:
+                    if (getattr(t, "extra", None) or {}).get("human_labeled"):
+                        return True
+                    break
+            # Disk probe (R3 review): the 32-entry fingerprint cache is
+            # process-wide and multi-user now — a label whose trajectory
+            # was evicted stamped nothing, and the whole consequence chain
+            # ran against a human-labeled turn. The sidecar is the durable
+            # truth and `_load_corrections` is memoized, so this is one
+            # stat + dict lookup in the common case.
+            collector = getattr(self.context, "trajectory_collector", None)
+            latest = (collector.latest_correction(trajectory_id)
+                      if collector is not None else None)
+            if latest and str(latest.get("source") or "").startswith(
+                    "human_feedback"):
+                return True
+        except Exception:
+            return False
+        return False
+
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
                              last_tool=None, force_correction=False,
                              project_id=None):
@@ -8770,6 +9761,25 @@ class GhostAgent:
         try:
             from .verifier import VerifyVerdict
         except Exception:
+            return
+        # HUMAN LABEL WINS — WHOLE-CHAIN guard (R1 fresh-eye review,
+        # 2026-08-13). The backfill-level guard alone left this caller
+        # running every OTHER consequence of the verdict against a
+        # human-resolved turn: the stream re-render announced the machine
+        # verdict a line after the backfill withheld it, a late REFUTED
+        # scrubbed the lessons of a turn the human approved, filed
+        # follow-up tasks for it, and queued a "correction to my previous
+        # answer" banner onto the next reply. One check gates the whole
+        # block; the backfill guard stays as defense for other callers.
+        if trajectory_id and self._human_label_locked(trajectory_id):
+            pretty_log(
+                "Verifier",
+                f"late {getattr(v_result.verdict, 'value', v_result.verdict)}"
+                f" ({v_result.confidence:.0%}) for trajectory "
+                f"{str(trajectory_id)[:8]} WITHHELD — a human label already "
+                f"resolved this turn",
+                icon=Icons.VERIFIER_LAB,
+            )
             return
         if v_result.confidence >= 0.7:
             if v_result.verdict == VerifyVerdict.CONFIRMED:
@@ -8847,6 +9857,11 @@ class GhostAgent:
                     self._pending_corrections.append({
                         "note": _corr_note,
                         "conv": conv_fp or "",
+                        # Traceable to its turn so a human label can revoke
+                        # it (R2 review: the queued banner apologized on
+                        # the next turn for an answer the user had just
+                        # thumbed up).
+                        "traj": str(trajectory_id or ""),
                         "ts": time.monotonic(),
                     })
                     if len(self._pending_corrections) > _CORRECTION_MAX:
@@ -12590,7 +13605,7 @@ class GhostAgent:
                         verifier_backfill = ("failed", _vr_reason or "")
                 if v_result and v_result.verdict == VerifyVerdict.REFUTED and v_result.confidence >= 0.7:
                     issues_str = "; ".join(v_result.issues[:3]) if v_result.issues else v_result.reasoning
-                    note = f"\n\n---\n**Verifier note:** {issues_str}"
+                    note = _verifier_note_block(issues_str)
                     if note[:60] not in final_ai_content:
                         final_ai_content = f"{final_ai_content}{note}"
                     pretty_log(
@@ -13025,8 +14040,14 @@ class GhostAgent:
             # Internal turns (cron jobs / delegated sub-agents firing
             # handle_chat with a "sched-"/"job-"/"sub-" req_id) must not
             # consume the digest watermark — that would silently eat the
-            # operator's next "while you were away" report.
+            # operator's next "while you were away" report. §4BF 1c (R2
+            # review): the same holds for every NON-USER population —
+            # bench/self-play solver turns run at deep idle, exactly when
+            # autoadvance generates the events, and would prepend the
+            # digest into a reply nobody reads while advancing the
+            # watermark past it. The digest is a USER-surface feature.
             if (_ps is not None and final_ai_content
+                    and turn_origin(self.context) == "user"
                     and not _is_internal_req(fs.req_id)):
                 from pathlib import Path as _Path
                 from .project_digest import (
@@ -13136,7 +14157,16 @@ class GhostAgent:
         # watermarked so each batch shows exactly once; the first run
         # baselines silently. Project-phase records are excluded from the
         # render (the project digest above already covers them). Same
-        # internal-request gate as the project digest.
+        # internal-request AND user-origin gates as the project digest —
+        # §4BF 1c (R4 review CRIT): this block was left with only the
+        # internal gate when the project digest gained the origin gate,
+        # and its old comment falsely claimed parity. Bench solves (6-11
+        # nightly finalizes, exactly when notify events are produced,
+        # `bench-` req_ids that are NOT internal) were consuming the
+        # watermark and prepending the digest into solver replies — on a
+        # boot with no push transport, the chat digest is the ONLY
+        # delivery channel for notify events, INCLUDING the bench
+        # experiment-verdict announcements 1c itself produces.
         try:
             from .autonomous_activity import (
                 get_activity_log as _get_alog,
@@ -13147,6 +14177,7 @@ class GhostAgent:
             )
             _alog = _get_alog(self.context)
             if (_alog is not None and final_ai_content
+                    and turn_origin(self.context) == "user"
                     and not _is_internal_req2(fs.req_id)):
                 from pathlib import Path as _Path
                 _act_wm_path = (_Path(str(self.context.memory_dir)).parent
@@ -13190,7 +14221,13 @@ class GhostAgent:
         # explicit manage_projects(promote_from_context) tool actually
         # creates a project; this is just a one-line footer offer.
         try:
-            if getattr(self.context, "current_project_id", None) is None and final_ai_content:
+            # §4BF 1c (R5 review): USER turns only — a solver turn meeting
+            # the message/write thresholds would append the promotion
+            # footer into its recorded final_response (the same
+            # framing-purity class the user_request override fixed).
+            if (getattr(self.context, "current_project_id", None) is None
+                    and final_ai_content
+                    and turn_origin(self.context) == "user"):
                 _sp = getattr(self.context, "scratchpad", None)
                 _already = False
                 try:
@@ -13335,7 +14372,13 @@ class GhostAgent:
         # caller, so the "which memories did I reach for" signal was
         # always empty. Non-fatal.
         try:
-            _sm = getattr(self.context, "self_model", None)
+            # §4BF 1c: selfhood is a real_only admissibility row — the
+            # same origin gate as the capture site (R5 review: enforce
+            # the POLICY at every write site, not just the one R4 found
+            # bleeding; this one is currently inert only because the
+            # wake-up prefix is hard-gated off).
+            _sm = (getattr(self.context, "self_model", None)
+                   if turn_origin(self.context) == "user" else None)
             if _sm is not None and getattr(_sm, "enabled", False):
                 _wp = wakeup_prefix if isinstance(wakeup_prefix, str) else ""
                 if _wp and final_ai_content:
@@ -13514,8 +14557,17 @@ class GhostAgent:
             #
             # Same rule the experiment framework already states: a turn whose
             # outcome cannot be attributed must not enter the corpus.
-            if getattr(getattr(self.context, "skill_memory", None),
-                       "is_read_only", False) is True:
+            #
+            # §4BF 1c: BENCH solves are the carve-out. They ride the same
+            # read-only isolation as self-play, but their outcome IS
+            # attributable — the bank validator re-labels the sample at the
+            # `bench_validator` rank right after the attempt — and the
+            # operator decision admits them (origin="bench", equal-mass
+            # capped in the fit). Plain self-play stays excluded.
+            _calib_origin = turn_origin(self.context)
+            if (getattr(getattr(self.context, "skill_memory", None),
+                        "is_read_only", False) is True
+                    and _calib_origin != "bench"):
                 return
             _ct = getattr(self.context, "calibration_tracker", None)
             _pending = getattr(self.context, "_calib_pending", None)
@@ -13634,12 +14686,23 @@ class GhostAgent:
                             effort=_effort,
                         )
                         self.context.last_confidence = _pending
-                        try:
-                            _mc.record_confidence(_pending)
-                            _mc.count(confidence_total=True,
-                                      confidence_below=_pending.below_threshold)
-                        except Exception:
-                            pass
+                        # §4BF 1c (R5 review MAJOR): the metacog BUNDLE is
+                        # shared production state — `_last_confidence` is
+                        # the gate `arbitrate_tool_calls` reads on the NEXT
+                        # turn's tool dispatches, so a confident bench solve
+                        # would silently disarm the arbiter across a real
+                        # mutating-tool call (and the counters inflate the
+                        # operator's metacog denominators). The bench
+                        # carve-out above admits bench to CALIBRATION only;
+                        # the bundle stash stays real-turn-pure — the exact
+                        # mirror of the is_read_only-gated competence write.
+                        if _calib_origin == "user":
+                            try:
+                                _mc.record_confidence(_pending)
+                                _mc.count(confidence_total=True,
+                                          confidence_below=_pending.below_threshold)
+                            except Exception:
+                                pass
                         from .metacog_log import (
                             emit as _mc_emit, Subsystem as _mc_ss,
                             LEVEL_INFO, LEVEL_DEBUG,
@@ -13737,7 +14800,15 @@ class GhostAgent:
                     # §4E Tier 3 join key: a later task-reopen carries the
                     # closing turn's req_id and retro-labels this sample.
                     req_id=str(req_id or ""),
+                    origin=("bench" if _calib_origin == "bench" else "user"),
                 )
+                # §4BF 1c join handle: the bench solve loop (dream.py) reads
+                # this after each attempt and re-labels the sample with the
+                # bank validator's verdict. Set ONLY for bench turns — and
+                # AFTER the write — so a stale id can never join a sample
+                # that was skipped (dream clears it before each attempt).
+                if _calib_origin == "bench":
+                    self.context._last_bench_calib_req_id = str(req_id or "")
                 # Stash the components keyed by this response's
                 # fingerprint so a NEXT-turn user-correction can record
                 # a (C, 0.0) negative for this turn — the strongest
@@ -13764,7 +14835,15 @@ class GhostAgent:
                     # populating the stash for almost every turn, which in
                     # turn disabled BOTH the user-correction negative and the
                     # failure-report tier that consume it.
-                    if _calib_outcome >= 0.5:
+                    # §4BF 1c (R1 review): USER turns only. The stash feeds
+                    # the user-correction / failure-report negatives — a
+                    # supervisor bench turns will never have — and it is a
+                    # 32-slot LRU SHARED with dream's copy.copy contexts:
+                    # ~30+ bench attempts per idle night would flush every
+                    # real turn's entry and silently kill the two strongest
+                    # ground-truth tiers (the exact defect class R1 fixed
+                    # for the trajectory stash, one dict over).
+                    if _calib_outcome >= 0.5 and _calib_origin == "user":
                         _cc[self._response_fingerprint(final_ai_content or "")] = {
                             # pre_penalty, matching the inline record above: the
                             # outcome penalty is a function of the label, so
@@ -13792,6 +14871,20 @@ class GhostAgent:
                                 getattr(_pending, "effort_component", 0.5)),
                             "effort_observed": bool(
                                 getattr(_pending, "effort_observed", False)),
+                            # §4BF 1c (R1 review, pre-existing): without the
+                            # req_id the user-correction / failure-report
+                            # rows landed with req_id="" → passthrough in
+                            # `_resolve_superseded` → the proxy-positive
+                            # turn row stayed IN THE FIT next to the
+                            # ground-truth negative — the "counter-weight
+                            # at half strength" defect §4L fixed for the
+                            # verifier tiers, still live for the two
+                            # strongest human tiers. Consumers spread this
+                            # dict into record(**_comp), so the join key
+                            # (and the domain, previously dropped) ride
+                            # along with zero caller changes.
+                            "req_id": str(req_id or ""),
+                            "domain": _dom or "",
                         }
                     while len(_cc) > 32:
                         _cc.popitem(last=False)
@@ -13961,8 +15054,19 @@ class GhostAgent:
                     and getattr(getattr(self.context, "skill_memory", None),
                                 "is_read_only", False) is not True
                 )
-                _experiments_mod.enroll_request(self.context, req_id,
-                                                eligible=_exp_eligible)
+                # §4BF 1c: bench solves are a THIRD population. They fail the
+                # live-eligibility markers above BY DESIGN (read-only skill
+                # memory, selfplay budget) but carry a collector and resolved
+                # outcomes — so they enroll in BENCH-SCOPED specs only.
+                # enroll_request itself refuses live specs for origin=bench
+                # and everything for origin=sim, so a marker drift here can
+                # widen neither population.
+                _exp_origin = turn_origin(self.context)
+                _experiments_mod.enroll_request(
+                    self.context, req_id,
+                    eligible=(True if _exp_origin == "bench"
+                              else _exp_eligible),
+                    origin=_exp_origin)
                 # Risk-governor one-shot latch (core/risk.py). Reset per
                 # request like every other steer flag. `_risk_steer_fired` is
                 # the treatment-compliance bit the trajectory stamp reads; it
@@ -14174,21 +15278,31 @@ class GhostAgent:
                 try:
                     dispatcher = getattr(self.context, 'complexity_dispatcher', None)
                     if dispatcher is not None and last_user_content:
-                        prev_ai_for_router = next(
-                            (m.get("content", "") for m in reversed(messages[:-1])
-                             if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
-                            "",
-                        )
-                        decision = dispatcher.route(
-                            last_user_content,
-                            prior_turn_text=str(prev_ai_for_router or "")[:1000],
-                        )
+                        # prior_turn_text is DELIBERATELY not passed. The
+                        # trainer builds every training row from
+                        # `user_request` alone and never supplies it, so
+                        # `context_turn_coupling` is identically 0.0 across
+                        # the whole corpus while serving fed it a real
+                        # value — a train/serve skew. Harmless only by
+                        # accident (L2 decayed the unlearned weight to
+                        # ~-0.003, and routing is identical with and
+                        # without it, measured), but a feature the model
+                        # never saw varying must not vary at serve time.
+                        # Re-enabling requires the TRAINER to supply the
+                        # prior turn first; the last assistant message in
+                        # `messages[:-1]` is what would feed it. The scan
+                        # that built it was removed with the argument —
+                        # computing a value nothing reads is how a dead
+                        # mechanism survives review.
+                        decision = dispatcher.route(last_user_content)
                         body["_router_decision"] = {
                             "label": decision.label,
                             "confidence": decision.confidence,
                             "allowed_pools": list(decision.allowed_pools),
                             "escalated": decision.escalated,
                             "reason": decision.reason,
+                            "escalation_kind": getattr(
+                                decision, "escalation_kind", ""),
                         }
                         # §4I Phase 1 — make the one PROSPECTIVE difficulty
                         # signal durable. It is computed on every request at
@@ -14205,6 +15319,18 @@ class GhostAgent:
                             router_confidence=round(
                                 float(decision.confidence), 4),
                             router_escalated=bool(decision.escalated),
+                            # §4BQ: WHY it escalated. Without this a failed
+                            # embed is recorded as label=hard,
+                            # confidence=0.0 — indistinguishable in the
+                            # corpus from something the model believed, so
+                            # an embedder outage would read as a run of
+                            # genuine low-confidence predictions in
+                            # scripts/router_confidence_backtest.py. The
+                            # flip is justified by a confidence
+                            # measurement; that instrument must not pool
+                            # "could not embed" with "was not sure".
+                            router_escalation_kind=str(
+                                getattr(decision, "escalation_kind", "") or ""),
                         )
                         # Durable diagnostic: this decision gates MCTS lookahead
                         # + the strategic planner, so it's the "why did/didn't
@@ -14455,6 +15581,10 @@ class GhostAgent:
                                 plan_depth=1,
                                 tools_used_this_turn=(),
                                 tools_failed_this_turn=(),
+                                # §4BF 1c: population indicator, in lockstep
+                                # with prm.labels._build_state_for_step.
+                                origin_bench=(turn_origin(self.context)
+                                              == "bench"),
                             )
                         except Exception:
                             _prm_state = None
@@ -15240,9 +16370,22 @@ class GhostAgent:
                             # the turn's most expensive step on every
                             # delegation inside its timeout budget, a regime
                             # change the operator decision never scoped.
+                            # §4BF 1c (R1 review): BENCH turns carry the same
+                            # selfplay budget but are ENROLLED (bench-scoped
+                            # specs hold a ring slot), so the pre-1c "forced
+                            # treatment is unmeasured" premise no longer
+                            # holds for them: the force would (a) stamp
+                            # use_planning_fired on every bench trajectory —
+                            # context_was_mutated then silently drops the
+                            # entire sanctioned bench fixture/trainset
+                            # stream — and (b) hand a future bench-scoped
+                            # planner spec's CONTROL arm the treatment.
+                            # Bench turns take their assigned arm like any
+                            # enrolled population.
                             _is_self_play = (
                                 getattr(self, "thinking_budget_override",
-                                        None) == "selfplay")
+                                        None) == "selfplay"
+                                and turn_origin(self.context) != "bench")
                             if _is_self_play:
                                 _plan_treat = True
                             _exp_plan.mark_trigger(
@@ -17382,6 +18525,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 )
                                                 _verifier_verdict_cache = (None, _lt)
                                                 _verdict_is_fresh = True
+                                                # §4BF R2 triage bit 2: the
+                                                # verdict EXISTS but missed
+                                                # the await window — for
+                                                # enrolled bench turns this
+                                                # separates "starved by
+                                                # latency" (fix the budget)
+                                                # from "no verdict possible"
+                                                # (toolless final) in the
+                                                # tts_bon abort triage.
+                                                try:
+                                                    if _experiments_mod.arm_for(
+                                                            self.context,
+                                                            "tts_bon", req_id):
+                                                        _experiments_mod.mark_trigger(
+                                                            self.context, req_id,
+                                                            "verify_late_pending",
+                                                            True)
+                                                except Exception:  # noqa: BLE001
+                                                    pass
                                         except Exception as _await_exc:
                                             logger.debug(
                                                 "async verdict await skipped: %s: %s",
@@ -17479,15 +18641,67 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     from . import tts as _tts_mod
                                     _cvr = (_verifier_verdict_cache
                                             or (None, None))[0]
-                                    if (_tts_mod.adaptive_bon_enabled()
-                                            and _tts_mod.wobble_band(_cvr)):
-                                        final_ai_content, _ = (
-                                            await self._adaptive_bon_final(
-                                                messages=messages,
-                                                final_ai_content=final_ai_content,
-                                                last_user_content=last_user_content,
-                                                model=model,
-                                            ))
+                                    _bon_arm = _experiments_mod.arm_for(
+                                        self.context, "tts_bon", req_id)
+                                    if _bon_arm:
+                                        # §4BF R2 (rules review MAJ-8): the
+                                        # starvation-triage observable. The
+                                        # abort rule must distinguish "no
+                                        # verdict existed at the decision
+                                        # point" from "verdicts exist,
+                                        # rarely wobble" — without a durable
+                                        # stamp both read as silence and the
+                                        # rule is unfalsifiable. ⚠ SCOPE
+                                        # (R3): stamped only on finals that
+                                        # REACH this gate — clean first-pass
+                                        # successes (no execution failures,
+                                        # not force-stopped, repair budget
+                                        # unspent). Exits that never reach
+                                        # it carry NO stamps and form the
+                                        # rule's fourth, trigger-INELIGIBLE
+                                        # bucket: the BoN decision point
+                                        # never existed there, so stamping
+                                        # would claim a decision that did
+                                        # not happen.
+                                        # Own guard (R3 MIN): a stamp
+                                        # failure must never eat the
+                                        # wobble/BoN path below.
+                                        try:
+                                            _experiments_mod.mark_trigger(
+                                                self.context, req_id,
+                                                "verify_in_window",
+                                                _cvr is not None)
+                                        except Exception:  # noqa: BLE001
+                                            pass
+                                    if _tts_mod.wobble_band(_cvr):
+                                        # §4BF flip (ii): the bench-scoped
+                                        # tts_bon arm decides for ENROLLED
+                                        # turns (today: text-graded bench
+                                        # attempts — live turns never carry
+                                        # this spec); the env default decides
+                                        # for everyone else. Trigger stamped
+                                        # on BOTH arms (presence = the wobble
+                                        # condition; value = treatment ran),
+                                        # so the report's TRIGGERED block is
+                                        # the wobble-band subset.
+                                        if _bon_arm:
+                                            _run_bon = (
+                                                _bon_arm
+                                                == _experiments_mod.TREATMENT)
+                                            _experiments_mod.mark_trigger(
+                                                self.context, req_id,
+                                                "tts_bon_fired", _run_bon)
+                                        else:
+                                            _run_bon = (
+                                                _tts_mod.adaptive_bon_enabled())
+                                        if _run_bon:
+                                            final_ai_content, _ = (
+                                                await self._adaptive_bon_final(
+                                                    messages=messages,
+                                                    final_ai_content=final_ai_content,
+                                                    last_user_content=last_user_content,
+                                                    model=model,
+                                                ))
                                 except Exception as _bon_exc:
                                     logger.debug(
                                         "adaptive BoN skipped: %s: %s",
@@ -17776,6 +18990,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         entry when the cap is reached."""
         if not getattr(traj, "final_response", "") or not traj.id:
             return
+        # USER turns only (§4BF R1): this cache exists for the next user
+        # message's correction lookup. Bench/sim trajectories can never be
+        # corrected by a user — stashing them only spends the 32-slot LRU
+        # evicting real turns (the belt; the bench isolation also swaps in
+        # its own dict as the suspenders).
+        if str(getattr(traj, "task_kind", "user_request")
+               or "user_request") != "user_request":
+            return
         from collections import OrderedDict
         cache = getattr(self.context, "_recent_trajectories_for_correction", None)
         if cache is None:
@@ -17800,15 +19022,85 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             from ..prm.trainer import samples_to_xy
             new_X, new_y = samples_to_xy([traj])
             if not new_X:
+                # R23 MAJOR-7: this skip was SILENT while its neighbour 40
+                # lines below was made loud in the same edit — and it is
+                # the common case, not the rare one: measured on the live
+                # store, 678 of 1662 trajectories have zero tool calls —
+                # 40.8%, re-measured 2026-08-15; it was 501/1485 = 33.7%
+                # when first taken on 2026-08-14 — so a correction on any
+                # of them yields no
+                # step samples and the flag does nothing and says nothing.
+                pretty_log(
+                    "PRM Online Skipped (no step samples)",
+                    f"user-correction step NOT applied: the promoted turn "
+                    f"(traj={(getattr(traj, 'id', '') or '')[:8]}) produced "
+                    f"no step samples — a turn with no tool calls has "
+                    f"nothing for the value model to learn from",
+                    level="WARNING", icon=Icons.WARN,
+                )
                 return
             holdout_X, holdout_y = [], []
+            _holdout_failed = False
             collector = getattr(self.context, "trajectory_collector", None)
             if collector is not None:
                 try:
-                    recent = list(collector.iter_trajectories())[-50:]
+                    # R21 MAJOR-2 — closes the long-registered MIN-7.
+                    # The promoted trajectory was inside its OWN
+                    # catastrophic-forgetting holdout, and worse than the
+                    # ledger recorded: `iter_trajectories` applies the
+                    # corrections overlay, so the holdout copy carries the
+                    # SAME freshly-written FAILED label as the training
+                    # sample. The guard was therefore biased toward
+                    # accepting the step, not merely weakened.
+                    _tid = getattr(traj, "id", None)
+                    recent = [t for t in collector.iter_trajectories()
+                              if _tid is None or getattr(t, "id", None) != _tid
+                              ][-50:]
                     holdout_X, holdout_y = samples_to_xy(recent)
-                except Exception:
+                except Exception as _e:
+                    # R23 MINOR-5: without this the floor below reports
+                    # "holdout has 0 samples", blaming a thin corpus for
+                    # what is actually a collector failure.
+                    logger.debug("PRM online holdout unavailable: %s: %s",
+                                 type(_e).__name__, _e)
+                    _holdout_failed = True
                     holdout_X, holdout_y = [], []
+            # R22 MAJOR-1 — a live regression introduced by the MIN-7 fix
+            # above, caught one round later. `samples_to_xy` DROPS UNKNOWN
+            # trajectories, and §4BC measured 60-84% of real turns ending
+            # unknown; removing the one resolved trajectory from a [-50:]
+            # window can therefore leave the holdout EMPTY. An empty
+            # holdout makes `online_update` set `base_loss=None` and commit
+            # the step UNCONDITIONALLY — so excluding the promoted
+            # trajectory turned a BIASED catastrophic-forgetting guard into
+            # an ABSENT one, and the operator signal is inverted: the
+            # guarded rejection logs nothing, the unguarded commit prints
+            # "nudged from user-correction".
+            #
+            # The comment 400 lines below promises this step "can only
+            # refine, never destabilise". Honour that: no holdout, no
+            # commit. A one- or two-sample holdout is a guard in name only,
+            # so require a floor.
+            if len(holdout_X) < _PRM_ONLINE_MIN_HOLDOUT:
+                logger.debug(
+                    "PRM online update skipped: holdout has %d samples "
+                    "(floor %d) — committing without a real "
+                    "catastrophic-forgetting check would make this an "
+                    "unguarded gradient step",
+                    len(holdout_X), _PRM_ONLINE_MIN_HOLDOUT,
+                )
+                pretty_log(
+                    "PRM Online Skipped (holdout below floor)",
+                    f"user-correction step NOT applied: holdout has "
+                    f"{len(holdout_X)} samples (floor "
+                    f"{_PRM_ONLINE_MIN_HOLDOUT})"
+                    + (" because reading the trajectory corpus FAILED — "
+                       "this is a collector fault, not a thin corpus"
+                       if _holdout_failed else "")
+                    + "; an unguarded step could destabilise the model",
+                    level="WARNING", icon=Icons.WARN,
+                )
+                return
             updated = scorer.online_update(
                 new_X, new_y, holdout_X=holdout_X, holdout_y=holdout_y,
             )
@@ -18083,7 +19375,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             try:
                 from ..selfhood import SelfModel as _SelfModel
                 self_model = getattr(ctx, 'self_model', None)
-                if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+                # §4BF 1c: selfhood is real_only — same origin gate as the
+                # capture site (policy at every write site; inert here
+                # today because record_outcome is rewrite-only, but the
+                # policy must not depend on that staying true).
+                if (isinstance(self_model, _SelfModel)
+                        and getattr(self_model, 'enabled', False)
+                        and turn_origin(ctx) == "user"):
                     # spawn_bg + to_thread: at the autobio log's byte cap
                     # this is a full-file rewrite — inline it blocks the
                     # event loop mid-turn (this hook runs synchronously
@@ -18199,6 +19497,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # thread (CPU-only) so the user turn never blocks; the update is
         # guarded inside PRMScorer.online_update (clone + holdout BCE
         # check) so it can only refine, never destabilise, the model.
+        #
+        # ⚠ §4BN R26 MAJOR-4 — the EXCLUSION, stated, because an unstated
+        # one is indistinguishable from an oversight (this file's own
+        # doctrine, ~200 lines up).
+        #
+        # This is the ONLY channel wired to the online step, and measured
+        # on the live corrections ledger (308 rows) it is the LEAST
+        # productive of the four sources that promote to FAILED (the
+        # fourth, `operator_overlay`, is a manual out-of-process edit — 1
+        # standing, 1 usable — stated because inferring it is the defect):
+        #
+        #   verifier_late    126 FAILED, 125 would yield step samples — NOT wired
+        #   human_feedback     5 FAILED,   4 would yield step samples — NOT wired
+        #   user_correction    1 FAILED,   0 would yield step samples — WIRED
+        #
+        # The wired path has produced ZERO usable online-update samples in
+        # the whole ledger; the late verifier has produced 125. The
+        # exclusion is deliberate: a late MACHINE verdict is a different
+        # evidence class from a human saying "no, that's wrong", and the
+        # honest-failure rule (a verifier PASS outranks a structural
+        # failure) means a late refute is not automatically a training
+        # negative. Wiring it is a REGISTERED follow-up, not an oversight —
+        # and the imbalance is recorded here so the next reader does not
+        # have to re-measure it.
         try:
             if getattr(getattr(ctx, "args", None), "prm_online_update", False) is True:
                 from ..prm.scorer import PRMScorer as _PRMScorer
@@ -19889,12 +21211,32 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
         traj_kwargs = dict(
             session_id=req_id or "",
-            task_kind="user_request",
+            # §4BF Track 1b: bench-bank runs set `trajectory_task_kind` on
+            # their isolated context (writing to the SEPARATE bench root).
+            # Every reader that filters `task_kind == "user_request"`
+            # excludes them by construction; the live context never sets
+            # the attribute, so real turns keep the default. isinstance
+            # gate, not truthiness: a MagicMock context auto-vivifies the
+            # attribute (the test-harness convention throughout this file).
+            task_kind=(_tk if isinstance(
+                (_tk := getattr(self.context, "trajectory_task_kind", None)),
+                str) and _tk else "user_request"),
             cluster=None,
             tier=None,
             model=str(model or ""),
             system_prompt=system_prompt[:8000],
-            user_request=user_request[:8000],
+            # §4BF 1c (R3 review): bench solves set an override carrying
+            # the CLEAN bank challenge text. Without it every bench row's
+            # user_request was the ~1.2KB "SYNTHETIC TRAINING EXERCISE"
+            # harness framing — and on retry attempts the JUDGE REJECTION
+            # message — so the trainsets (GEPA/PRM/router/fixtures) were
+            # taught inputs real traffic never carries, defeating the
+            # origin-as-a-field doctrine in-band. isinstance gate for the
+            # same MagicMock reason as task_kind above.
+            user_request=(_ur if isinstance(
+                (_ur := getattr(self.context,
+                                "trajectory_user_request_override", None)),
+                str) and _ur else user_request)[:8000],
             tool_calls=tool_calls,
             # §4O C-MAJOR-1: n_steps is a per-TURN difficulty proxy (the
             # router label, the trainset binner, and the postmortem risk
@@ -19934,8 +21276,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # found a live trajectory with req_id nowhere in extra.
         if req_id:
             _extra["req_id"] = str(req_id)
+        # Static per-context extras (§4BF: bench bank/item identifiers).
         try:
-            _sm_h = getattr(self.context, "skill_memory", None)
+            _static = getattr(self.context, "trajectory_extra_static", None)
+            if isinstance(_static, dict) and _static:
+                _extra.update({str(k): v for k, v in _static.items()})
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # §4BF 1c (R5 review MAJOR, belt): USER turns only. The
+            # read-only wrapper no longer passes `last_playbook_triggers`
+            # through (the sim read stamps nothing, so a passthrough read
+            # served the LAST REAL TURN's lesson set — bench trajectories
+            # were stamped with real lessons as their hydration, a
+            # counterfactual-attribution poison). This gate is the belt
+            # for any future wrapper drift.
+            _sm_h = (getattr(self.context, "skill_memory", None)
+                     if turn_origin(self.context) == "user" else None)
             _trigs = list(getattr(_sm_h, "last_playbook_triggers", []) or [])
             # BOTH surfaces (§4L Lens-D MINOR-2) — bus-tier lessons were
             # invisible to the attribution stamp. Turn-key gated (R2
@@ -20120,7 +21477,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 traj.outcome = _resolved
         except Exception as e:
             logger.debug("outcome consolidation skipped: %s: %s", type(e).__name__, e)
-        collector.append(traj)
+        _appended_path = collector.append(traj)
+        # §4BF 1c join handle: the bench solve loop (dream.py) reads this
+        # after each attempt and writes the bank oracle's verdict onto THIS
+        # trajectory via the bench collector's corrections sidecar — the
+        # isolated context has no verifier, so without the write-back every
+        # bench record stayed UNKNOWN and bench-scoped experiment arms
+        # could never resolve a verdict. Set only for bench records, AFTER
+        # a SUCCESSFUL append (R2: append never raises — a None return is
+        # a failed write, and stamping it would produce an orphan
+        # correction row for a record that never landed).
+        try:
+            if (_appended_path is not None
+                    and str(getattr(traj, "task_kind", "") or "") == "bench"):
+                self.context._last_bench_traj_id = str(traj.id or "")
+        except Exception:  # noqa: BLE001
+            pass
         # Stage-1 self-improvement: cache the just-recorded trajectory
         # keyed by its response fingerprint so the NEXT user message's
         # correction-classifier hook can locate it via `messages[-2]`.
@@ -20145,7 +21517,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         try:
             from ..selfhood import SelfModel as _SelfModel
             self_model = getattr(self.context, 'self_model', None)
-            if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+            # §4BF 1c (R4 review CRIT): USER turns only. Selfhood is the
+            # agent's first-person diary — pre-1b this site was unreachable
+            # for solver turns (their collector was None, so the whole
+            # method returned early), but bench turns now carry a real
+            # collector and were appending "unknown user asked me to…"
+            # experiences to the PRODUCTION autobiographical store every
+            # idle night, feeding narrative consolidation. Selfhood is a
+            # real_only row in core/admissibility.py; dream's bench block
+            # also nulls self_model on the isolate (suspenders).
+            if (isinstance(self_model, _SelfModel)
+                    and getattr(self_model, 'enabled', False)
+                    and turn_origin(self.context) == "user"):
                 # Best-effort user handle: pull "root.name" from the
                 # profile memory. Anonymous installations or missing
                 # profile-memory leave it blank; the autobio writer

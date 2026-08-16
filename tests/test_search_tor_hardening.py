@@ -121,9 +121,93 @@ def test_sanitize_query_preserves_or_inside_words():
 
 def test_sanitize_query_falls_back_when_emptied():
     # A query that is ENTIRELY operators would sanitize to "" — we must not
-    # send an empty query, so the original is returned unchanged.
+    # send an empty query. When the operands carry no minable words either
+    # (bare TLDs), the original is returned unchanged.
     pure_ops = "site:.org OR site:.gov"
     assert _sanitize_query(pure_ops) == pure_ops
+
+
+# ──────────────────────────────────────────────────────────────────────
+# A URL-shaped query is the query, spelled wrong (live failure 2026-08-15)
+# ──────────────────────────────────────────────────────────────────────
+
+def test_an_operator_only_query_is_MINED_not_passed_through_raw():
+    """THE live failure. The model asked for
+    `site:reddit.com/r/lgbtgreece/comments/1voyjgf/is_nudism_safe_in_greece`.
+    Stripping the operator emptied the query, so the old fallback handed
+    the scrapers the original — the one shape they cannot honour. Result:
+    zero across four waves and two reformulations (one of them literally
+    "how to site:reddit.com/..."), ~80s burned, and the turn was refuted
+    by the late verifier for not retrieving the content.
+
+    The operand is not noise; it is the query as a URL. Mine it."""
+    got = _sanitize_query(
+        "site:reddit.com/r/lgbtgreece/comments/1voyjgf/is_nudism_safe_in_greece")
+    assert "site:" not in got, f"the unmatchable operator survived: {got!r}"
+    # The slug's words are what the user actually wanted searched…
+    for term in ("reddit", "lgbtgreece", "nudism", "safe", "greece"):
+        assert term in got, f"{term!r} lost from {got!r}"
+    # The post id is KEPT (corrected 2026-08-16). The first rule dropped
+    # any token containing a digit, which also killed `log4shell`, `gpt4`,
+    # `ipv6` and `sha256` — turning `site:en.wikipedia.org/wiki/Log4Shell`
+    # into a confident search for "wikipedia". And the id is harmless
+    # here: the query that actually WON on live Tor in the failing turn
+    # was `reddit lgbtgreece nudism safe greece trans man 1voyjgf`, id
+    # included. Only MOSTLY-digit or long mixed tokens are dropped now.
+
+
+def test_url_furniture_and_OPAQUE_ids_are_dropped():
+    from ghost_agent.tools.search import _keywords_from_operand
+    mined = _keywords_from_operand(
+        "example.com/en/wiki/index.html/watch/page/2/abc123/routing")
+    assert "routing" in mined                      # a real term survives
+    for junk in ("index", "html", "watch", "page", "com", "wiki"):
+        assert junk not in mined.split(), f"{junk} is URL furniture"
+    assert "abc123" not in mined                   # opaque id, mostly digits
+
+
+def test_a_path_of_PURE_furniture_refuses_rather_than_guessing():
+    """Only the domain label surviving means the mined query would search
+    for the wrong thing confidently, so the original is returned and the
+    failure stays loud."""
+    raw = "inurl:example.com/en/index.html/watch/page/2/abc123"
+    assert _sanitize_query(raw) == raw
+
+
+def test_a_MEANINGFUL_term_carrying_a_digit_SURVIVES():
+    """The rule was `any(ch.isdigit()) and not low.isalpha()` — whose
+    second clause is DEAD, since a token with a digit is never isalpha().
+    So it dropped every digit-bearing term: `site:en.wikipedia.org/wiki/
+    Log4Shell` mined to `wikipedia`, and an honest zero (which made the
+    model reformulate) became eight confident results about Wikipedia. A
+    quiet wrong answer is worse than a loud failure."""
+    assert "log4shell" in _sanitize_query(
+        "site:en.wikipedia.org/wiki/Log4Shell")
+    assert "ipv6" in _sanitize_query("inurl:docs.example.org/ipv6/routing")
+
+
+def test_a_query_that_mines_to_NOTHING_DISTINCTIVE_is_refused():
+    """If only the domain label survives, the mined query searches for
+    the wrong thing confidently. Returning the original keeps the failure
+    honest and loud."""
+    got = _sanitize_query("site:en.wikipedia.org/wiki/")
+    assert got == "site:en.wikipedia.org/wiki/"
+
+
+def test_mining_is_capped_so_it_cannot_produce_a_keyword_stuffed_query():
+    """>6 terms has near-zero organic hits anywhere — the module says so
+    in `_reformulate_query`, and a long URL slug is exactly how you would
+    get there by accident."""
+    got = _sanitize_query(
+        "site:example.com/alpha/bravo/charlie/delta/echo/foxtrot/golf/hotel")
+    assert len(got.split()) <= 6, got
+
+
+def test_a_NORMAL_query_with_a_site_operator_is_UNCHANGED():
+    """Mining only happens when stripping would empty the query, so the
+    common `keywords + site:` shape keeps its previous behaviour exactly."""
+    assert _sanitize_query("python asyncio tutorial site:docs.python.org") \
+        == "python asyncio tutorial"
 
 
 def test_sanitize_query_handles_empty():

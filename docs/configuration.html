@@ -151,7 +151,7 @@
     <tbody>
       <tr><td><code>--max-context</code></td><td><code>65536</code></td><td>How much conversation Ghost keeps in front of the model. Must fit what your LLM server was started with — setting it higher than the server's actual window causes failures deep into long conversations.</td></tr>
       <tr><td><code>--native-tools</code></td><td><span class="badge good">on</span></td><td>Sends tool definitions in the standard OpenAI format as well as in the prompt. Turn off with <code>--no-native-tools</code> if your model handles it badly.</td></tr>
-      <tr><td><code>--deep-reason</code></td><td><span class="badge">off</span></td><td>Adds lookahead and parallel hypothesis testing on hard problems. Costs extra model calls.</td></tr>
+      <tr><td><code>--deep-reason</code></td><td><span class="badge">off</span></td><td>Adds lookahead and parallel hypothesis testing on hard problems. Costs extra model calls. &#9888; &sect;4BN: the lookahead half is <strong>module-gated off</strong> (<code>_MCTS_TURNSTART_ENABLED = False</code>) &mdash; only the hypothesis testing is live; boot says so.</td></tr>
       <tr><td><code>--perfect-it</code></td><td><span class="badge">off</span></td><td>Offers optimisation suggestions after a heavy task succeeds.</td></tr>
       <tr><td><code>--verbose</code></td><td><span class="badge">off</span></td><td>Stops truncating log lines. Turn on while you're getting set up.</td></tr>
     </tbody>
@@ -176,7 +176,7 @@
     <dd>Path to a trained request classifier. When set, Ghost routes cheap requests to cheap machines. When unset — the default — every request gets the full pool.</dd>
 
     <dt>--prm-model</dt>
-    <dd>Path to a trained plan-scoring model, used to evaluate partial reasoning paths. Ghost trains this itself during idle time; this flag points at an existing checkpoint.</dd>
+    <dd>Path to a trained plan-scoring model, used to evaluate partial reasoning paths. This flag points at an existing checkpoint. Ghost <em>can</em> train one itself during idle time, but that phase is <strong>consumer-gated</strong> (&sect;4BN): it skips unless something actually reads a PRM value &mdash; <code>.score()</code> (needs both <code>_MCTS_TURNSTART_ENABLED</code> and <code>--deep-reason</code>) or <code>.uncertainty()</code> (<code>--frontier-selfplay</code> <em>and</em> trajectory logging). With neither live, no checkpoint is ever self-trained.</dd>
 
     <dt>--notify-webhook<br>--notify-ntfy</dt>
     <dd>Where to push notifications when something needs you. A LAN or tailnet target is reached directly; a public one only over Tor, and skipped if Tor is down.</dd>
@@ -195,6 +195,8 @@
       <tr><td><code>GHOST_SANDBOX_MEM</code></td><td><code>4g</code></td><td>Memory ceiling for the sandbox container.</td></tr>
       <tr><td><code>GHOST_SANDBOX_JOBS</code></td><td><code>1</code></td><td>A sandbox command still making progress after 90&nbsp;s is moved to the background instead of blocking the turn, and the model is woken with its result when it lands. Set to <code>0</code> to go back to killing it at the 600&nbsp;s budget. See <a href="sandbox/jobs.html">sandbox.jobs</a> for the promotion threshold (<code>GHOST_SANDBOX_JOB_PROMOTE_AFTER_S</code>), the lifetime cap (<code>GHOST_SANDBOX_JOB_TTL_S</code>, default 45&nbsp;min), the progress window, and the concurrency cap.</td></tr>
       <tr><td><code>GHOST_EMBED_MODEL</code></td><td><code>BAAI/bge-small-en-v1.5</code></td><td>The embedding model. Changing this invalidates your entire vector store — Ghost refuses to start until you re-embed.</td></tr>
+      <tr><td><code>GHOST_ROUTER_EMBED</code></td><td><code>1</code></td><td>The complexity router scores each request with 18 lexical features <em>plus</em> a 384-d embedding of the request, reusing the vector store's already-loaded embedder (no extra RAM, no download, no egress). Set to <code>0</code> to train and serve the lexical-only representation instead. Changing it retrains on the next restart, because a checkpoint records which representation &mdash; and which embedder &mdash; produced it, and refuses to load against a different one. If no working embedder is available (e.g. <code>--no-memory</code>), the router falls back to lexical <em>in memory</em> and deliberately leaves the checkpoint on disk untouched.</td></tr>
+      <tr><td><code>GHOST_ROUTER_GATE_LOOKS</code></td><td><code>1</code></td><td>The router's deploy gate is a significance test, and it re-runs whenever the trajectory corpus changes while a passing verdict is <em>sticky</em> — so repeated looks compound into an eventual false deploy (measured: ~14% of growth histories deployed a signal-free model). The control refuses to re-run the same test on evidence that has not materially changed (&ge;85% the same labelled corpus, and fewer than 250 genuinely new rows). Set to <code>0</code> to disable it — which is also the escape hatch if a stale look ledger is blocking a retrain you want. The ledger lives beside the checkpoint as <code>&lt;name&gt;.gate_looks.json</code>; deleting it has the same effect.</td></tr>
       <tr><td><code>GHOST_MANDATORY_TOR</code></td><td><code>1</code></td><td>Set to <code>0</code> to default mandatory Tor off.</td></tr>
     </tbody>
   </table>

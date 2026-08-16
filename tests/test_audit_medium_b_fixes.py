@@ -61,7 +61,9 @@ def test_acquired_skill_result_ok_classifies_exit_code():
 
 def test_browser_extract_text_reports_true_length():
     from ghost_agent.tools import browser
-    src = inspect.getsource(browser)
+    # Runner extracted to browser_runner.py (2026-08-15); these
+    # assertions are about the runner's own source.
+    src = browser._runner_script()
     # Both extract_text sites capture full length BEFORE truncating.
     assert src.count("full_len = len(text)") >= 2
     assert '"length": full_len' in src

@@ -115,6 +115,9 @@ def _sanitize_query(query: str) -> str:
         return query
     q = query
     # Drop site:/inurl:/intitle:/filetype: operators along with their argument
+    _operands = re.findall(
+        r'\b(?:site|inurl|intitle|filetype|ext)\s*:\s*(\S+)', q,
+        flags=re.IGNORECASE)
     q = re.sub(r'\b(?:site|inurl|intitle|filetype|ext)\s*:\s*\S+', ' ', q, flags=re.IGNORECASE)
     # Drop standalone boolean operators. Case-insensitive but boundary-gated,
     # so only the free-standing token `or`/`and`/`OR`/`AND` goes — never an
@@ -126,7 +129,79 @@ def _sanitize_query(query: str) -> str:
     q = q.replace('"', ' ').replace("“", ' ').replace("”", ' ')
     # Collapse whitespace
     q = re.sub(r'\s+', ' ', q).strip()
-    return q or query
+    if q:
+        return q
+    # ⚠ THE OPERATOR WAS THE WHOLE QUERY. Returning `query` unchanged here
+    # (what this did until 2026-08-15) hands the scrapers the one shape
+    # they cannot honour, so the wave is a guaranteed zero. Observed live:
+    # `site:reddit.com/r/lgbtgreece/comments/1voyjgf/is_nudism_safe_...`
+    # went out verbatim, returned nothing across four waves and two
+    # reformulations (one of which was "how to site:reddit.com/..."), and
+    # burned ~80s before the turn failed.
+    #
+    # The operand is not noise — it is the query, spelled as a URL. Mine
+    # it: the path slug carries the actual search terms. Only reached when
+    # stripping empties the query, so the common `foo site:x.com` case is
+    # untouched.
+    mined = _keywords_from_operand(" ".join(_operands))
+    return mined or query
+
+
+#: URL furniture that carries no search signal once the path is split.
+_OPERAND_STOPWORDS = frozenset({
+    "www", "com", "org", "net", "edu", "gov", "io", "co", "uk", "html",
+    "htm", "php", "aspx", "index", "http", "https", "amp", "r", "wiki",
+    "comments", "comment", "post", "posts", "article", "articles", "blog",
+    "page", "pages", "en", "index", "watch", "video", "topic", "thread",
+})
+
+
+def _keywords_from_operand(operand: str) -> str:
+    """Recover search terms from a `site:`/`inurl:` argument.
+
+    `reddit.com/r/lgbtgreece/comments/1voyjgf/is_nudism_safe_in_greece`
+    → `reddit lgbtgreece nudism safe greece`. Keeps the domain label
+    (it biases results toward the right place) and the slug words; drops
+    URL furniture and opaque ids, which are what make the query
+    unmatchable in the first place.
+    """
+    if not operand:
+        return ""
+    text = re.sub(r'^[a-z]+://', ' ', operand, flags=re.IGNORECASE)
+    parts = [p for p in re.split(r'[/._\-+?=&#,:~%\s]+', text) if p]
+    out, seen = [], set()
+    for p in parts:
+        low = p.lower()
+        if low in _OPERAND_STOPWORDS or len(low) < 3:
+            continue
+        # Opaque identifiers: reddit post ids, hashes, revision numbers.
+        #
+        # ⚠ `and not low.isalpha()` was DEAD — a token containing a digit
+        # is never isalpha() — so this dropped ANY token with a digit, not
+        # just opaque ones: log4shell, gpt4, ipv6, sha256, 2024 all went.
+        # `site:en.wikipedia.org/wiki/Log4Shell` mined to `wikipedia`,
+        # turning an honest zero (which made the model reformulate) into
+        # eight confident results about Wikipedia. A quiet wrong answer is
+        # worse than a loud failure.
+        #
+        # An opaque id is mostly-digits or long-and-mixed; a real term
+        # that happens to carry a digit is not.
+        _digits = sum(ch.isdigit() for ch in low)
+        if _digits and (_digits * 2 >= len(low) or len(low) >= 12):
+            continue
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(low)
+    # A URL slug can be long; the engines already do badly past ~6 terms.
+    mined = out[:6]
+    # If everything distinctive was filtered away, the mined query is a
+    # worse failure than none: `site:en.wikipedia.org/wiki/X` -> "wikipedia"
+    # searches for the wrong thing CONFIDENTLY. Only the domain label
+    # surviving means exactly that.
+    if len(mined) <= 1:
+        return ""
+    return " ".join(mined)
 
 
 def _cache_get(key: str) -> Optional[str]:
@@ -665,7 +740,15 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     for wave in range(2):
         valid_results = await _race_search_wave(query, tor_proxy, wave, max_results=15)
         if valid_results:
-            urls = [r.get('href', r.get('url', '')) for r in valid_results[:8]]
+            # `.get(k, default)` returns None when the key EXISTS and is
+            # None — and `_filter_junk` deliberately keeps such a row. The
+            # None then reached process_url, raised, was swallowed by
+            # `gather(return_exceptions=True)`, and filtered out: the
+            # source vanished and the model was told nothing. Same class
+            # this file already fixes at :267, :599 and :916.
+            urls = [(r.get('href') or r.get('url') or '')
+                    for r in valid_results[:8]]
+            urls = [u for u in urls if u]
             break
         if wave == 0:
             await asyncio.sleep(1)
@@ -744,6 +827,26 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
             pretty_log("Parsing Data", url, icon=Icons.TOOL_FILE_R)
             text = await _fetch_with_timeout(url)
 
+            # ⚠ A FAILED FETCH MUST NOT REACH THE DISTILLER. `text` is the
+            # error STRING on failure ("Error: Fetch of <url> timed out
+            # after 22s"), and handing that to a worker prompted with
+            # "Extract ONLY the hard facts... If no relevant info is
+            # found, state that" produces "The provided source text does
+            # not contain any information relevant to the query."
+            #
+            # Measured with 8/8 fetches failing: the report contained the
+            # word "Error" ZERO times and read as POSITIVE NEGATIVE
+            # EVIDENCE — "I checked 8 named sources, none support this".
+            # `fact_check` pipes exactly this into a TRUE/FALSE verifier,
+            # so a Tor blackout became a confident, citation-backed
+            # refutation of a possibly-true claim. The `llm_client=None`
+            # fallback was the only honest path, and registry.py always
+            # wires a client.
+            if isinstance(text, str) and text.startswith("Error:"):
+                pretty_log("Research Source Failed", f"{short_url} — {text[:90]}",
+                           level="WARNING", icon=Icons.WARN)
+                return f"### SOURCE: {url}\n{text}\n"
+
             # 1. Size the per-source extract to the worker's context window
             # (~4 chars/token, reserving room for the prompt + max_tokens) so a
             # small-context worker can't overflow on the distill call — was a
@@ -787,7 +890,23 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     tasks = [_bounded(u) for u in urls]
     page_contents = await asyncio.gather(*tasks, return_exceptions=True)
     valid_contents = [c for c in page_contents if isinstance(c, str)]
-    full_report = "\n\n".join(valid_contents)
+    # A per-source failure is invisible inside a well-formed report, so
+    # count them and say so up front. Without this, 7-of-8-failed and
+    # 8-of-8-failed and "the topic genuinely has nothing" all render
+    # identically — and the model has no way to weigh what follows.
+    _failed = [c for c in valid_contents if "\nError:" in c]
+    _lost = len(urls) - len(valid_contents)
+    _banner = ""
+    if _failed or _lost:
+        _banner = (
+            f"[⚠ SOURCE FAILURES: {len(_failed) + _lost} of {len(urls)} "
+            f"sources could not be fetched (timeout, block, or unreachable). "
+            f"The sections below cover only the "
+            f"{len(valid_contents) - len(_failed)} that loaded. This is a "
+            f"COVERAGE limit, not evidence of absence — do not conclude a "
+            f"claim is unsupported because a failed source did not support "
+            f"it.]\n\n")
+    full_report = _banner + "\n\n".join(valid_contents)
     # Workspace research dedup: record every URL we pulled so a later
     # research turn can ask "did I already see this?" via the workspace
     # tool. Non-fatal — must never break a successful research turn.

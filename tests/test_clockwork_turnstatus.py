@@ -268,6 +268,12 @@ def test_icon_class_matches_the_web_client():
     assert ts.ICON_CLASS == _js_object("ICON_CLASS")
 
 
+def test_non_working_icons_match_the_web_client():
+    # Terminal-bookkeeping glyphs (👍/👎 feedback receipts) excluded from
+    # ticker captions — hand-mirrored constant, so drift-pin it (§4BF R4).
+    assert ts.NON_WORKING_ICONS == _js_set("_NON_WORKING_ICONS")
+
+
 def test_ticker_verbs_match_the_web_client():
     assert ts.TICKER_VERBS == _js_object("TICKER_VERBS")
 

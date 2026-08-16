@@ -22,48 +22,78 @@ import pytest
 
 sys.path.insert(0, "scripts")
 import ablation_trackb3 as B3  # noqa: E402
+import ablation_trackb4 as B4  # noqa: E402
+
+# R17 MAJOR-2: this file imported B3 only, and all four arm assertions ran
+# against it — so when §4BN R16 found B4's treatment arm identical to its
+# uniform arm (it omitted `--frontier-selfplay`, which is off by default,
+# making the ablation compare the treatment with itself), the fix landed
+# in the one file this test does not import. Parametrised over both.
+MODULES = [("trackb3", B3), ("trackb4", B4)]
 
 
-def test_treatment_and_uniform_arms_are_not_identical():
+@pytest.mark.parametrize("name,mod", MODULES)
+def test_frontier_arm_actually_enables_frontier(name, mod):
+    """R17 MAJOR-2: an arm named for a flag must PASS that flag. The
+    default has been OFF since 2026-07-09, so omitting it makes the
+    'frontier' arm identical to the control — and §4BN's
+    `prm_consumer_is_live` False in both, so the PRM leg measures
+    nothing either."""
+    t = mod._treatment_flags(60.0)
+    u = mod._treatment_uniform_flags(60.0)
+    assert "--frontier-selfplay" in t, (
+        f"{name}: the treatment arm does not enable frontier weighting — "
+        "it is off by default, so this arm IS the control")
+    assert "--no-frontier-selfplay" in u or "--frontier-selfplay" not in u, (
+        f"{name}: the uniform arm still enables frontier weighting")
+    assert t != u, f"{name}: arms are identical"
+
+
+@pytest.mark.parametrize("name,mod", MODULES)
+def test_treatment_and_uniform_arms_are_not_identical(name, mod):
     """The two #27b arms must differ. If they don't, the comparison is
     vacuous and any 'tie' it reports is guaranteed by construction."""
-    t = B3._treatment_flags(60.0)
-    u = B3._treatment_uniform_flags(60.0)
+    t = mod._treatment_flags(60.0)
+    u = mod._treatment_uniform_flags(60.0)
     assert t != u, (
         "treatment and treatment_uniform resolve to the SAME flags — the "
         "#27b comparison is comparing an arm with itself")
 
 
-def test_treatment_states_frontier_explicitly():
+@pytest.mark.parametrize("name,mod", MODULES)
+def test_treatment_states_frontier_explicitly(name, mod):
     """The arm must SET the behaviour that defines it, not inherit it.
 
     A flag default is a property of the application; an experiment arm is a
     claim about a configuration. Coupling them means a default flip silently
     redefines the experiment — which is exactly what happened here.
     """
-    flags = B3._treatment_flags(60.0)
+    flags = mod._treatment_flags(60.0)
     assert "--frontier-selfplay" in flags, (
         "the frontier arm does not explicitly enable frontier self-play; it "
         "would inherit main.py's default, which is False")
     assert "--no-frontier-selfplay" not in flags
 
 
-def test_uniform_arm_explicitly_disables_frontier():
-    flags = B3._treatment_uniform_flags(60.0)
+@pytest.mark.parametrize("name,mod", MODULES)
+def test_uniform_arm_explicitly_disables_frontier(name, mod):
+    flags = mod._treatment_uniform_flags(60.0)
     assert "--no-frontier-selfplay" in flags
 
 
-def test_arms_differ_only_in_the_variable_under_test():
+@pytest.mark.parametrize("name,mod", MODULES)
+def test_arms_differ_only_in_the_variable_under_test(name, mod):
     """Beyond being different, they must differ ONLY in the frontier setting —
     otherwise the comparison confounds frontier selection with something else."""
-    t = set(B3._treatment_flags(60.0))
-    u = set(B3._treatment_uniform_flags(60.0))
+    t = set(mod._treatment_flags(60.0))
+    u = set(mod._treatment_uniform_flags(60.0))
     diff = t.symmetric_difference(u)
     assert diff <= {"--frontier-selfplay", "--no-frontier-selfplay"}, (
         f"arms differ in more than the variable under test: {sorted(diff)}")
 
 
-def test_treatment_arm_default_is_not_load_bearing():
+@pytest.mark.parametrize("name,mod", MODULES)
+def test_treatment_arm_default_is_not_load_bearing(name, mod):
     """Guard the general rule: whatever main.py's default becomes, the arm's
     behaviour must be pinned by its own flags."""
     from ghost_agent import main as _main
@@ -71,7 +101,7 @@ def test_treatment_arm_default_is_not_load_bearing():
     src = inspect.getsource(_main.parse_args)
     assert '"--frontier-selfplay"' in src, "flag renamed — update the arms"
     # The arm must not silently follow this default in either direction.
-    flags = B3._treatment_flags(60.0)
+    flags = mod._treatment_flags(60.0)
     assert any(f.endswith("frontier-selfplay") for f in flags)
 
 

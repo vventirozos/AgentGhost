@@ -87,12 +87,21 @@ COMMON = ["--upstream-url", "http://127.0.0.1:8088", "--api-key", "",
 
 
 def _treatment_flags(time_scale: float) -> List[str]:
+    # §4BN R16 M6: this omitted `--frontier-selfplay`, which has been OFF
+    # by default since 2026-07-09 — so the "frontier" arm and the
+    # "uniform" arm were BOTH frontier-off, and the ablation compared the
+    # treatment with itself. `prm_consumer_is_live` is False in both, so
+    # the PRM leg measured nothing either. `ablation_trackb3.py` documents
+    # and fixes this exact defect; trackb4 imports from trackb3 and then
+    # re-declared the function in its pre-fix shape.
     return ["--bio-time-scale", str(time_scale), "--bio-deterministic",
-            "--enable-metacog"]
+            "--enable-metacog", "--frontier-selfplay"]
 
 
 def _treatment_uniform_flags(time_scale: float) -> List[str]:
-    return _treatment_flags(time_scale) + ["--no-frontier-selfplay"]
+    # The control arm: same as treatment but with frontier weighting off.
+    return [f for f in _treatment_flags(time_scale)
+            if f != "--frontier-selfplay"] + ["--no-frontier-selfplay"]
 
 
 def _control_flags() -> List[str]:

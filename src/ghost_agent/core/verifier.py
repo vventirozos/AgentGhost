@@ -857,6 +857,46 @@ _STAGE_NO_THINK = os.getenv(
         "0", "false", "no")
 
 
+def _main_stage_stop_enabled() -> bool:
+    """§4BJ kill switch: restore the legacy stop-at-newline on
+    force_main stage calls. Default OFF — the stop was calibrated on
+    the cheap judge and decapitated the main model's pretty-printed
+    stage answers (74% of MAIN adjudications came back as a lone "{").
+    Read per call so the launcher can flip it without a code change.
+    (§4BK note, corrected by its R1 review: under the §4BK default no
+    force_main stage calls happen, so this flag is INERT — it matters
+    only when GHOST_VERIFY_MAIN_TWO_STAGE=1 re-enables the escalated
+    two-stage attempt. The non-force_main direct-MAIN fallback keeps
+    the stop UNCONDITIONALLY — this flag is never consulted there.)"""
+    return os.getenv("GHOST_VERIFY_MAIN_STAGE_STOP", "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _main_two_stage_enabled() -> bool:
+    """§4BK: should the ESCALATED re-verify attempt the two-stage
+    contract on the MAIN model before falling back to classic?
+
+    Default OFF — classic-on-MAIN is the DESIGNED escalation adjudicator.
+    §4BJ measured the paired comparison in the rescue position: with
+    parsing fixed, two-stage-on-MAIN upheld cheap-judge false refutes
+    that classic overturned (7-vs-0 on clean evidence, p=0.0156; all 13
+    gained FPs were lost rescues), while catching no more genuine faults
+    (TPR 27-vs-26). The forced-suspects contract inherits stage 1's
+    framing — the opposite of what an independent second look needs.
+    Before §4BK the attempt-then-fallback shape also made the pipeline a
+    NONDETERMINISTIC MIX (two-stage judged an escalation only when the
+    35B happened to emit minified JSON, ~26% of the time). The cheap-leg
+    two-stage pipeline is untouched — FPR control belongs there.
+    Kill switch: GHOST_VERIFY_MAIN_TWO_STAGE=1 restores the legacy mix
+    ⚠ ONLY together with GHOST_VERIFY_MAIN_STAGE_STOP=1 (§4BK R2: the
+    switch WITHOUT the stop restores §4BJ's NULLed no-stop
+    two-stage-on-MAIN arm — the worst measured configuration, clean FPR
+    0.190 vs 0.069. Keep the stop export whenever flipping this).
+    Rule: system/eval/classic_main_adjudicator/DECISION_RULE.md."""
+    return os.getenv("GHOST_VERIFY_MAIN_TWO_STAGE", "0").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
 class VerifyVerdict(str, Enum):
     CONFIRMED = "CONFIRMED"
     REFUTED = "REFUTED"
@@ -1071,7 +1111,10 @@ Be terse: each "why" and each issue at most 20 words, reasoning at most one shor
 # `confidence` (the self-reported value saturates near 1.0 — see the
 # bench's mean-conf columns). Verdicts are NEVER changed by the probe;
 # only confidence is blended, and any probe failure leaves the result
-# exactly as it was. Default OFF until verify_bench shows a win
+# exactly as it was. Default OFF — §4BL NULLed the cap on held-out
+# validation and RETIRED the probe mechanism (the fault signal is
+# within-case, unharvestable by a global threshold); the switch stays
+# out of the launcher
 # (GHOST_VERIFY_LOGIT_EXPECT=1 to enable; read per call so the bench can
 # A/B it via env).
 
@@ -1081,17 +1124,45 @@ def _logit_expect_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-def _logit_expect_weight() -> float:
-    """Blend weight for the probe reading (confidence = (1-w)*self +
-    w*aligned). The first bench A/B (2026-07-30) showed w=0.5 drags nearly
-    every verdict below the 0.7 actionable gate (actionable TPR 0.347 —
-    would neuter the verifier); default is the lighter 0.25 pending the
-    re-bench. Clamped to [0, 1]; read per call so benches can sweep it."""
+def _probe_cap_threshold() -> float:
+    """§4BL: a CONFIRMED two-stage verdict whose probe reading falls
+    BELOW this is capped (see _probe_conf_cap). Default 0.966 — frozen
+    on the corrected (cheap pass-through, leakage-excluded) design half
+    of the flip-i data: caps 12/33 = 36% of reachable design-half
+    false-CONFIRMs at 2/23 = 8.7% collateral, precision 0.86 (the §4BL
+    R1 review caught the first freeze optimizing on a population 17%
+    of which the cap cannot reach — overturn-carried readings); the
+    probe's score mass is compressed near 1.0, so the useful boundary
+    sits high.
+    Rule: system/eval/probe_redesign/DECISION_RULE.md. Read per call.
+    ⛔ §4BL OUTCOME: NULLed by the held-out validation half (collateral
+    36%, precision 0.471 — the fault signal is within-case; a global
+    threshold caps hard-styled cases wholesale). The mechanism is
+    RETIRED; this code is inert behind the OFF switch.
+
+    HISTORY: this replaces the w-blend (GHOST_VERIFY_LOGIT_EXPECT_WEIGHT,
+    now vestigial) — the §4BI foreclosure proved no light symmetric
+    blend can move quantized {0.9,0.95,1.0} confidences across the 0.7
+    gate, and §4BJ measured the probe erring toward "acceptable" on
+    genuinely-faulty claims, so the redesigned consumer is CONFIRM-only
+    and discrete."""
     try:
-        w = float(os.getenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "0.25"))
+        t = float(os.getenv("GHOST_VERIFY_PROBE_CAP_T", "0.966"))
     except ValueError:
-        w = 0.25
-    return max(0.0, min(1.0, w))
+        t = 0.966
+    return max(0.0, min(1.0, t))
+
+
+def _probe_conf_cap() -> float:
+    """§4BL: the confidence ceiling for a probe-disbelieved CONFIRM.
+    Default 0.6 — below every ≥0.7 consumption gate (backfill, auditor
+    note, calibration, actionable metrics), same mechanism as the
+    WEB-EXEC skip cap. The verdict itself is never changed."""
+    try:
+        c = float(os.getenv("GHOST_VERIFY_PROBE_CONF_CAP", "0.6"))
+    except ValueError:
+        c = 0.6
+    return max(0.0, min(1.0, c))
 
 
 _VERIFY_SCORE_PROBE_PROMPT = """You are auditing an agent's reply. Rate how likely the CLAIM is an acceptable reply to the USER REQUEST given only the EVIDENCE.
@@ -1512,7 +1583,26 @@ class Verifier:
                     prompt + "\n\n/no_think"
                 payload["chat_template_kwargs"] = {
                     "enable_thinking": False}
-                payload["stop"] = ["\n"]
+                # §4BJ (2026-08-14): the stop-at-newline belt applies to
+                # the CHEAP legs only. It was measured on the cheap judge
+                # (99.5% minified-compliant) but rode along on force_main
+                # stage calls, where the 35B pretty-prints — a lone "{"
+                # at finish=stop on 74% of MAIN adjudications, silently
+                # demoting every escalated re-verify to the classic
+                # prompt (the flip-i "48% fallback" discovery). Without
+                # the stop, the full pretty JSON arrives and _parse_json
+                # handles it — the same cache shows classic-MAIN (never
+                # had a stop) parsing 285/325 on the same model. The
+                # no-think switch stays on both legs (the lone-brace
+                # replies began instantly — it is honored). Kill switch
+                # GHOST_VERIFY_MAIN_STAGE_STOP=1 restores the legacy
+                # truncation. Known residual: the last-resort direct-MAIN
+                # call after a cheap-leg failure (non-force_main) keeps
+                # the stop — the cheap leg fails <0.5%, and stripping it
+                # there would need a second payload copy for a path that
+                # almost never runs.
+                if not force_main or _main_stage_stop_enabled():
+                    payload["stop"] = ["\n"]
 
         # Dedicated critic pool takes precedence when configured
         # (--critic-nodes). It keeps the verdict off the foreground
@@ -1872,20 +1962,41 @@ class Verifier:
             return None
         result.suspects = suspects
 
-        # §4F Phase 3a: sharpen confidence with the score-token probe.
-        # The verdict itself is untouched; UNCERTAIN is excluded (the
-        # acceptability scale doesn't map onto "cannot judge").
+        # §4BL (replaces the §4F Phase 3a w-blend): the score-token
+        # probe as a verdict-gated CONFIRM cap. The verdict is never
+        # changed; UNCERTAIN is excluded (the acceptability scale
+        # doesn't map onto "cannot judge"); REFUTED gets its reading
+        # RECORDED and nothing else — §4BJ measured the probe erring
+        # toward "acceptable" on genuinely-faulty claims, so it must
+        # never weaken or strengthen a refute. A CONFIRMED result the
+        # probe disbelieves (reading < _probe_cap_threshold) loses
+        # actionability: confidence capped at _probe_conf_cap, noted in
+        # the reasoning. Rule + frozen threshold provenance:
+        # system/eval/probe_redesign/DECISION_RULE.md.
         if (_logit_expect_enabled()
                 and result.verdict in (VerifyVerdict.CONFIRMED,
                                        VerifyVerdict.REFUTED)):
             probe = await self._verdict_score_probe(claim, evidence, context)
             if probe is not None:
                 result.probe_score = round(probe, 3)
-                aligned = (probe if result.verdict == VerifyVerdict.CONFIRMED
-                           else 1.0 - probe)
-                w = _logit_expect_weight()
-                result.confidence = round(
-                    (1.0 - w) * float(result.confidence) + w * aligned, 3)
+                # not force_main (§4BL R1 MAJ-2): the cap is registered
+                # for the CHEAP pass only — under the §4BK kill-switch
+                # legacy mix, MAIN two-stage results (incl. overturn
+                # adjudications) must not be capped: an unmeasured mixed
+                # regime, and on the refute-escalation path the probe
+                # would be weakening refute-side outcomes.
+                if (result.verdict == VerifyVerdict.CONFIRMED
+                        and not force_main
+                        and result.probe_score < _probe_cap_threshold()):
+                    _cap = _probe_conf_cap()
+                    if float(result.confidence) > _cap:
+                        result.confidence = _cap
+                        result.reasoning = (
+                            (result.reasoning or "")
+                            + f" [probe-capped at {_cap}: the score-token "
+                              f"probe read {result.probe_score} < "
+                              f"{_probe_cap_threshold()} — this CONFIRM is "
+                              f"not actionable]")
         return result
 
     async def _adjudicate_self_consistent(self, adj_prompt: str, *, n: int,
@@ -2060,7 +2171,9 @@ class Verifier:
 
         async def _reverify_on_main() -> Optional[VerifyResult]:
             strong = None
-            if _two_stage_enabled():
+            # §4BK: classic is the designed MAIN adjudicator — the
+            # two-stage attempt is opt-in (see _main_two_stage_enabled).
+            if _two_stage_enabled() and _main_two_stage_enabled():
                 strong = await self._verify_claim_two_stage(
                     claim_t, evidence_t, context_t, force_main=True)
             if strong is None:
@@ -2215,9 +2328,10 @@ class Verifier:
 
         ``retry`` is the strong-model re-adjudication coroutine factory,
         mirroring ``_escalate_confirm``'s parameter of the same name. None
-        keeps the claim-path default (two-stage on the main model, classic
-        prompt as fallback) so this method's historical behaviour and its
-        ``claim``/``evidence``/``context`` positional signature are
+        keeps the claim-path default — since §4BK the CLASSIC prompt on
+        the main model (the two-stage attempt is opt-in via
+        GHOST_VERIFY_MAIN_TWO_STAGE; see _main_two_stage_enabled) — and
+        the ``claim``/``evidence``/``context`` positional signature is
         unchanged; ``verify_code_output`` injects its own so the CODE prompt
         is re-judged with the CODE prompt (re-asking the claim prompt about
         an execute turn would adjudicate a different question).
@@ -2364,7 +2478,17 @@ class Verifier:
                            "machine noise present in the claim; downgraded "
                            "without escalation. Cheap judge: "
                            + (result.reasoning or "")[:300]),
-                issues=list(result.issues or []))
+                issues=list(result.issues or []),
+                suspects=result.suspects,
+                # §4BF flip (i): reconstructed results DROPPED the
+                # probe reading (run-1 blamed this for its 48% null
+                # rate; the re-run disproved that — the 48% was
+                # classic-fallback share, and these constructions had
+                # dropped only the few truncation-guarded readings —
+                # but the drop was real and is fixed either way). The
+                # reading is REPORTING-ONLY here (this construction's
+                # confidence is its own).
+                probe_score=result.probe_score)
             downgraded.escalation_downgraded = True
             logger.info(
                 "Verifier tier-routing: UNANCHORED refute DOWNGRADED to "
@@ -2407,7 +2531,9 @@ class Verifier:
                                               route=route, trace=trace)
             else:
                 strong = None
-                if _two_stage_enabled():
+                # §4BK: classic is the designed MAIN adjudicator — the
+                # two-stage attempt is opt-in (see _main_two_stage_enabled).
+                if _two_stage_enabled() and _main_two_stage_enabled():
                     strong = await self._verify_claim_two_stage(
                         claim, evidence, context, force_main=True)
                 if strong is None:
@@ -2526,7 +2652,10 @@ class Verifier:
                     verdict=VerifyVerdict.REFUTED,
                     confidence=conf or cheap.confidence,
                     reasoning=reasoning or cheap.reasoning,
-                    issues=list(cheap.issues or []))
+                    issues=list(cheap.issues or []),
+                    suspects=cheap.suspects,
+                    # Reporting-only carry-through (§4BF flip i run-1).
+                    probe_score=cheap.probe_score)
                 logger.info("Verifier escalation: main model CONFIRMED the "
                             "refute under the rebuttal contract — verdict "
                             "stands.")
@@ -2628,7 +2757,10 @@ class Verifier:
                 verdict=VerifyVerdict.CONFIRMED,
                 confidence=conf,
                 reasoning=f"overturn earned ({rebuttal_kind}): {reasoning}",
-                issues=[])
+                issues=[],
+                suspects=cheap.suspects,
+                # Reporting-only carry-through (§4BF flip i run-1).
+                probe_score=cheap.probe_score)
             if not has_quote:
                 # Discipline D: FP-class-only overturns stay below the
                 # consumption gates — CONFIRMED, but never a clean pass.

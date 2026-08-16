@@ -120,7 +120,7 @@ def _b3_report(records, artifacts, meta) -> str:
     has_uniform = any("treatment_uniform" in rep for rep in artifacts)
     if has_uniform:
         L.append("\n## #27b — frontier vs uniform self-play (verified-lesson yield)")
-        for arm_key, label in (("treatment", "frontier (default)"),
+        for arm_key, label in (("treatment", "frontier (--frontier-selfplay; NOT the default — off since 2026-07-09)"),
                                ("treatment_uniform", "uniform (--no-frontier-selfplay)")):
             tot, grad, macro, ran, failed = _lessons(arm_key)
             fail_note = f" [!! {failed} repeat(s) BOOT FAILED, excluded]" if failed else ""
@@ -209,7 +209,7 @@ def _treatment_flags(time_scale: float) -> List[str]:
     # Never rely on a default to define an experiment ARM — state it, so a
     # default flip cannot silently collapse two arms into one.
     #
-    # Side effect worth knowing: with frontier ON, `_prm_consumer_live` becomes
+    # Side effect worth knowing: with frontier ON, `prm_consumer_is_live(ctx)` (core/agent.py; also needs trajectory logging) becomes
     # True, so the PRM retrain phase stops short-circuiting on "no live
     # consumer" and this arm actually exercises it.
     return ["--bio-time-scale", str(time_scale), "--bio-deterministic",

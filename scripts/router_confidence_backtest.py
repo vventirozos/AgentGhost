@@ -89,6 +89,13 @@ def _bucket_of(conf: float):
     return None
 
 
+#: Escalations that are NOT a statement about the request. The router
+#: emits label="hard", confidence=0.0 for all of them, so without the
+#: kind they are indistinguishable from a genuine low-confidence call.
+_NON_BELIEF_ESCALATIONS = frozenset(
+    {"no_model", "no_embedding", "scoring_error"})
+
+
 def collect(trajectories):
     """→ (per_bucket stats, coverage counters). One streaming pass."""
     stats = defaultdict(lambda: {"n": 0, "failed": 0, "unknown": 0,
@@ -106,7 +113,28 @@ def collect(trajectories):
             # a stamped turn that lands nowhere, and reading it as "not
             # stamped" would hide a producer bug as a coverage gap.
             cov["stamped"] += 1
+            # §4BQ: EXCLUDE non-belief escalations. A router that could not
+            # embed, had no model, or crashed while scoring records
+            # label="hard", confidence=0.0 — which is indistinguishable
+            # here from a genuine "the model was unsure" unless the KIND is
+            # consulted. Measured on the live corpus: 14 of 193 stamped
+            # turns (7.3%) carry confidence exactly 0.0, and they are 28%
+            # of the two sub-0.30 buckets this script's verdict turns on.
+            # Bucketing them as beliefs makes an embedder outage read as a
+            # run of low-confidence predictions.
+            _kind = str(extra.get("router_escalation_kind") or "")
+            if _kind in _NON_BELIEF_ESCALATIONS:
+                cov["non_belief"] = cov.get("non_belief", 0) + 1
+                continue
             conf = float(extra["router_confidence"])
+            # LEGACY rows predate the kind stamp. A 0.0 confidence there is
+            # AMBIGUOUS — it is either a non-belief escalation or a
+            # perfectly balanced prediction — and cannot be resolved after
+            # the fact. Counted and reported rather than silently bucketed
+            # as a belief, which is what made an embedder outage look like
+            # a run of low-confidence calls.
+            if not _kind and conf == 0.0:
+                cov["legacy_ambiguous"] = cov.get("legacy_ambiguous", 0) + 1
             key = _bucket_of(conf)
             if key is None:
                 cov["out_of_range"] = cov.get("out_of_range", 0) + 1
@@ -199,6 +227,22 @@ def main() -> int:
         print(f"  corpus: {cov['user_turns']} user turns, "
               f"{cov['stamped']} carry a router stamp, "
               f"{cov['resolved']} of those resolved pass/fail")
+        # NO SILENT DROPS: turns excluded from every bucket are stated, not
+        # quietly absent. Both counters describe stamped turns that landed
+        # nowhere, and reading their absence as "not stamped" would hide a
+        # producer bug as a coverage gap.
+        _dropped = int(cov.get("non_belief", 0)), int(cov.get("out_of_range", 0))
+        if any(_dropped):
+            print(f"  excluded: {_dropped[0]} non-belief escalations "
+                  f"(could-not-embed / no-model / scoring-error — not "
+                  f"statements about the request), "
+                  f"{_dropped[1]} out-of-range confidences")
+        _legacy = int(cov.get("legacy_ambiguous", 0))
+        if _legacy:
+            print(f"  ⚠ {_legacy} pre-§4BQ turns carry confidence 0.00 with no "
+                  f"escalation-kind stamp — could-not-embed and genuinely-"
+                  f"balanced are indistinguishable in those, and they sit in "
+                  f"the lowest bucket")
         if cov["stamped"] == 0:
             print("  ⚠ NO stamped turns — Phase 1 either has not deployed or "
                   "has regressed. Nothing to measure yet.")

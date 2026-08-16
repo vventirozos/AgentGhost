@@ -118,7 +118,9 @@ class TestResolutionAdvisory:
         so --private-pct is not what lands. Measured live: 13/65 = 20% against
         a requested 30%."""
         rc, out, _ = run(_corpus(n_pos=65, n_neg=118, private_pos=13))
-        assert "Private positives: 13/65" in out
+        # §4BF 1c: the advisory now counts REAL private positives only
+        # (the runner's gate evicts bench before its resolution check).
+        assert "Private REAL positives: 13/65" in out
         assert "realised share 20%, requested 30%" in out
         assert "smallest step 0.077" in out
         assert "TOO COARSE" in out

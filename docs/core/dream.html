@@ -101,6 +101,28 @@
 
   <h2>Lesson pipeline</h2>
 
+  <h3><code>lesson_gate_decision</code> (extracted pure, §4BF 1c)</h3>
+  <p>The skill-writing gate is a module-level pure function so its branches
+  are unit-pinned (<code>tests/test_admissibility_1c.py</code>) instead of
+  mirror-copied into a test. Bench-bank runs (§4BF) ride the SAME gate
+  with a neutral pinned frontier shape (<code>is_new_cluster=False</code>,
+  delta 0, not mastered — the self-play-shaped default of
+  <code>is_new_cluster=True</code> would have minted a junk lesson from
+  every failed bench item) and <code>solution_novelty=None</code> (R1
+  review: novelty is scored against frontier winners bench never records,
+  so it read ~1.0 on every first-try pass and would have minted at
+  volume, unverified). The ONLY bench pass-mint path is
+  struggled-then-won, which runs <code>_verify_lesson_helpful</code>
+  (except for <code>fallback_synthesized</code> template lessons — the
+  pre-existing documented skip);
+  failures land in repeat-failure suppression. Admitted bench lessons mint
+  with <code>source="bench"</code> (mirrored on the vector twin) — the
+  audit/retract handle; retrieval and pruning never read source (see
+  <a href="admissibility.html">core/admissibility</a>). The verify re-run
+  itself is stripped of every bench write path (collector, origin labels,
+  oracle joins) — it is a sim, not a bench observation. End-to-end pins:
+  <code>tests/test_bench_solve_loop_1c.py</code>.</p>
+
   <h3><code>_extract_structured_lesson</code></h3>
   <p>Meta-cognitive LLM call that returns <code>{trigger, anti_pattern, correct_pattern, domains, confidence, task/mistake/solution (legacy mirrors)}</code>. The prompt explicitly requires task-class triggers, forbids copying fixture literals, and mandates a non-empty taxonomy domain set.</p>
 
@@ -153,7 +175,64 @@
     <li><code>isolated_context.workspace_model = None</code> (2026-07-09) — the shallow copy kept the <em>real</em> <code>WorkspaceModel</code>, so the temp agent's turns set the process-global event-stamp pointer to <code>""</code> mid-flight (the temp agent has its OWN semaphore, so this raced a concurrent real turn's stamping) and recorded synthetic self-play command/browser outcomes into the real activity log. Every record/prefix site guards on <code>workspace_model is None</code>, so <code>None</code> is the supported "no workspace" state.</li>
     <li><code>selfplay_loop_task / selfplay_loop_stop / selfplay_loop_started_at</code> are stripped — otherwise the inner sub-agent's <code>handle_chat</code> would trip the outer loop's user-message interrupt hook.</li>
     <li><code>verifier, uncertainty_tracker, mcts_reasoner, hypothesis_tester, frontier_tracker</code> set to <code>None</code>.</li>
+    <li><strong>Exception (§4BF Track 2 flip ii):</strong> a bench item with
+    <code>graded_on="final_response"</code> gets a FRESH bench-local
+    <code>Verifier(llm_client=isolated_context.llm_client)</code> rebound
+    right after the null loop — built on the isolate's (background-wrapped)
+    client, never the real context's. That makes the verifier wobble band —
+    the <code>tts_bon</code> trigger — and the REFUTED repair path live on
+    text-graded bench turns, identically for both experiment arms. The null
+    stays in force for self-play and artifact-graded bench runs. Verifier
+    side effects on these turns stay contained by the 1c gates (calibration
+    records as <code>origin="bench"</code>; the read-only-context carve-out
+    covers the lesson-verify rerun).</li>
   </ul>
+
+  <h2>Text-graded bench items — the answer.txt seam (§4BF flip ii)</h2>
+  <p>For <code>graded_on="final_response"</code> items (the
+  <a href="../eval/banks.html">gsm8k_text</a> bank), the SUBJECT of
+  validation is the turn's reply: after <code>handle_chat</code> returns
+  (post adaptive-BoN substitution, so each experiment arm is graded on what
+  it actually produced) and after the pre-validation mock restore, the
+  solve loop writes the final text to <code>&lt;sandbox&gt;/answer.txt</code>
+  — UNCONDITIONALLY for this flavor (an empty reply must grade as a wrong
+  answer, exit 4). A MISSING file is reserved for "the seam itself didn't
+  run": the validator exits 5 and the loop triages it as
+  <code>INFRA_ABORT</code> (never charged to the agent — the §4AO
+  label-noise class, with its own "answer.txt seam missing" ledger wording
+  so the operator's triage isn't misdirected at the generator), aborting
+  the remaining attempts like the other structural-infra paths. The
+  between-attempt purge removes the previous attempt's answer.txt, and
+  <code>_verify_lesson_helpful</code> carries its OWN seam (its
+  pristine-restore deletes answer.txt; without the rewrite a text-graded
+  lesson could never verify — the silent-inoperative class).</p>
+  <p><strong>R1–R3 hardening (2026-08-13, fixes-to-fixes review chain):</strong>
+  both seams write <code>strip_system_notes(final)</code> — the rebound
+  verifier's own "**Verifier note:**" tail otherwise flipped oracle
+  verdicts in BOTH directions (CRIT, found independently twice; the graded
+  subject is the agent's ANSWER, never harness annotations) — and the note
+  writer itself (<code>agent._verifier_note_block</code>, the marker's only
+  author) enforces the single-block invariant, because a blank line inside
+  the note pushed its tail past the strip's end-anchored regex (R2), and
+  raw LLM issues carry blank lines. The seam write is the
+  <code>_write_answer_file</code> fresh-regular-file discipline:
+  unconditional unlink + <code>O_EXCL|O_NOFOLLOW</code> creation +
+  fstat regular-file check — each review round found a new special-file
+  escape (R1: <code>mkdir</code> → IsADirectoryError infra hatch; R2:
+  symlinks — including a relative link that made the HOST-side write
+  overwrite <code>.validator.py</code> with reply text, a false PASS at
+  oracle rank; R3: hardlinks truncating the shared inode, FIFOs blocking
+  the write forever, and solver-spawned daemons racing check-then-write).
+  The solve-loop wrapper is graded_on-aware (the artifact wrapper's "stop
+  as soon as your script exits 0 … do not re-derive" steered text solvers
+  away from restating the number in the reply — exit-4s charged as real
+  failures). The bank oracle's trajectory write yields to human labels and
+  machine verdicts yield to the oracle (<code>collector.update_outcome</code>'s
+  <code>bench_validator</code> guard — the late verifier verdict otherwise
+  overwrote ground truth in the bench sidecar, latest-wins). Bench turns
+  get a 90s critic-repair await budget (deep idle — the wait is free;
+  25s starved the wobble-band trigger under async critic). Pins:
+  <code>tests/test_track2_flip_ii.py</code> (R1/R2/R3 sections).</p>
 
   <h2>Rejection prompt contract (retry attempts)</h2>
   <p>When an attempt fails validation, the retry prompt injected for the next attempt contains the validator's feedback string (the FAIL line with expected-vs-actual output) plus optional float-formatting hints. It does <strong>not</strong> contain the <code>.validator.py</code> source. An earlier revision pasted the full validator script into the retry prompt so the agent could "debug the validator's logic", but this turned every struggled-then-won cycle into an answer-key lookup — the agent copied the validator's constants (multipliers, SQL query shape) instead of reasoning from the expected-vs-actual diff. Skill-gate lessons from those cycles were memorised constants, not transferable knowledge.</p>
@@ -182,7 +261,7 @@
   <p>Async orchestration; the temp agent loop runs synchronously inside the simulation. Triggered by the lifespan-spawned biological watchdog, by the <code>self_play</code> tool (one-shot), or by <code>self_play_loop</code> (continuous). Validator probe / self-test / solver run on the sandbox via <code>asyncio.to_thread</code>.</p>
 
   <h2>Frontier-aware cluster selection</h2>
-  <p>Before the source-selection stage, <code>synthetic_self_play</code> chooses which cluster to target. The default path calls <a href="../memory/frontier.html"><code>FrontierTracker.pick_seed</code></a> (brittle-pool weighted). When <code>--frontier-selfplay</code> is on (default) AND <em>both</em> <code>ctx.prm_scorer</code> is a real <code>PRMScorer</code> with <code>has_model=True</code> AND <code>ctx.trajectory_collector</code> is a real <code>TrajectoryCollector</code> (strict <code>isinstance</code> checks — MagicMock-backed test contexts fail closed), the dream loop instead:</p>
+  <p>Before the source-selection stage, <code>synthetic_self_play</code> chooses which cluster to target. The default path calls <a href="../memory/frontier.html"><code>FrontierTracker.pick_seed</code></a> (brittle-pool weighted). When <code>--frontier-selfplay</code> is on (<strong>NOT</strong> the default &mdash; off since 2026-07-09, and absent from the live launcher) AND <em>both</em> <code>ctx.prm_scorer</code> is a real <code>PRMScorer</code> with <code>has_model=True</code> AND <code>ctx.trajectory_collector</code> is a real <code>TrajectoryCollector</code> (strict <code>isinstance</code> checks — MagicMock-backed test contexts fail closed), the dream loop instead:</p>
   <ol>
     <li>Builds the candidate cluster pool as <code>set(challenge_templates.TEMPLATES.keys()) ∪ tracker.clusters</code>.</li>
     <li>Computes per-cluster signals via <a href="frontier_selection.html"><code>core/frontier_selection.py</code></a>: <code>compute_cluster_uncertainty</code> (PRM boundary-distance) and <code>compute_cluster_rarity</code> (log-decay of <code>Trajectory.cluster</code> counts).</li>

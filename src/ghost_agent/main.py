@@ -169,6 +169,538 @@ def _parse_node_list(spec, pool_name: str) -> list:
     return out
 
 
+# §4BN R34: the staleness guard moved to `core/staleness.py`. Importing
+# `main` from a submodule re-executed this entire module inside the live
+# process (three spurious boot banners in the log, two separate
+# baselines), and a hardcoded `"ghost_agent."` prefix made the guard dead
+# under the production `-m src.ghost_agent.main` shape — the same defect
+# `utils/component_guard.py` records leaving five subsystems inert for
+# weeks. Re-exported here for the boot call site and the tests.
+from .core.staleness import (                      # noqa: E402
+    PRM_STALENESS_WATCHED,
+    audit_source_newer_than_process as _audit_staleness,
+)
+
+PRM_WIRED_ATTRS = ("mcts_reasoner", "prm_scorer", "trajectory_collector")
+
+
+def mark_prm_wired(context, name):
+    """Record that `context.<name>` has been wired.
+
+    R9 CRIT-1: the previous marker (`context.prm_wiring_ready = True`) was
+    an unconditional statement sitting immediately BEFORE the hop — a
+    CLAIM about the wiring, not a signal FROM it. Moving a wiring block
+    below the hop left the claim untouched and every test green, so R8's
+    escape A was still open and a box with trajectory logging ON was
+    still told it was off. A marker adjacent to the reader can never
+    observe the writer; only the writers can.
+    """
+    wired = getattr(context, "_prm_wired", None)
+    if not isinstance(wired, set):
+        wired = set()
+    wired.add(name)
+    context._prm_wired = wired
+    return wired
+
+
+def prm_wiring_incomplete(context):
+    """Which of the values the boot hop reads have NOT been wired yet."""
+    wired = getattr(context, "_prm_wired", None)
+    if not isinstance(wired, set):
+        wired = set()
+    return [n for n in PRM_WIRED_ATTRS if n not in wired]
+
+
+def log_prm_boot_warnings(context):
+    """The single boot hop for every PRM inertness warning.
+
+    R5 MINOR-3 showed the previous shape was a source-shape pin failing in
+    BOTH directions: extracting the two calls into one function that
+    lifespan DOES call broke the pins (honest refactor, false fail), while
+    replacing their arguments with fresh empty namespaces silenced both
+    warnings with 116 tests green (R5 MAJOR-2, real defect, passed). That
+    is the same both-ways tell that justified inverting the gate pins.
+
+    So the refactor the pin used to forbid is now the design: ONE hop,
+    driven end-to-end by a test that asserts both warnings actually fire
+    for an inert config. Returns the two messages so the test can read
+    them.
+    """
+    # R7 MAJOR-1/MAJOR-2 — the INVERSION. Four static pins in a row tried
+    # to prove "the hop is handed the live context/args": a name match, an
+    # argument-name match, a Name/Attribute match. Each fell to the next
+    # spelling (the last one to simply binding a placeholder to a name),
+    # and one false-failed an honest refactor. §4BD-b: stop patching the
+    # proxy, make the property observable at runtime.
+    #
+    # A real GhostContext carries all three attributes by the time this
+    # runs. A placeholder has none of them; a hop relocated above the PRM
+    # wiring block sees `prm_scorer`/`mcts_reasoner` missing entirely
+    # (GhostContext.__init__ defines neither). Either way the warnings
+    # would silently degrade to "nothing to report" — the exact silence
+    # §4BN exists to remove — so say so LOUDLY instead.
+    # R8 CRIT-1: `hasattr` CANNOT detect a too-early hop for
+    # `trajectory_collector` — `GhostContext.__init__` assigns it None, so
+    # the attribute always exists. The R7 self-check was justified by a
+    # property it structurally cannot observe, and the ordering pin was
+    # relaxed on that false premise, re-opening R6 CRIT-1: extract the
+    # collector wiring to a helper called AFTER this hop and a box with
+    # logging ON is again told "trajectory logging is off".
+    #
+    # An explicit marker is the only thing that distinguishes "assigned
+    # None" from "not assigned yet", and it survives the wiring being
+    # moved into a helper or a nested def — both of which defeated the
+    # static pin.
+    _unwired = prm_wiring_incomplete(context)
+    if _unwired:
+        pretty_log(
+            "PRM Boot Warnings",
+            "ran BEFORE the PRM wiring completed — not yet wired: "
+            + ", ".join(_unwired)
+            + ". Every value read here would be a pre-wiring default. NO "
+            "PRM warning is emitted this boot, so their absence means "
+            "nothing. This is a boot-ordering defect, not a config one.",
+            level="ERROR", icon=Icons.WARN,
+        )
+        return {"unread": None, "online_update": None,
+                "inert_flag": None, "wiring_error": _unwired}
+    # R9 MAJOR-1: the self-check inspected `context` and never `args`, so
+    # a placeholder `args` silenced BOTH warnings with 135 tests green —
+    # R5 MAJOR-2 re-opened on the parameter the inversion never covered.
+    # `GhostContext.__init__` sets `self.args = args`, so there is exactly
+    # one object to validate; the parameter is gone and the two warnings
+    # can no longer be handed different namespaces.
+    args = getattr(context, "args", None)
+    _missing = [n for n in PRM_WIRED_ATTRS if not hasattr(context, n)]
+    # R9 MAJOR-1 / Q4: `is None` is not enough — a constructed placeholder
+    # is not None, and it silences both warnings just as completely. The
+    # flags actually read here must be present.
+    # R15 MIN-1: this enumerated 2 of the 3 flags the hop actually reads —
+    # `deep_reason` reaches it through `prm_consumer_why_no_reader`, so a
+    # namespace missing it passed the guard and then printed
+    # "--deep-reason is not set" unchecked.
+    if args is None or not all(hasattr(args, f) for f in
+                               ("frontier_selfplay", "prm_online_update",
+                                "deep_reason")):
+        _missing = _missing + ["args"]
+    if _missing:
+        pretty_log(
+            "PRM Boot Warnings",
+            "cannot evaluate PRM inertness: the context is missing "
+            + ", ".join(_missing)
+            + ". Either this hop runs before that wiring, or it was "
+            "handed a placeholder. NO PRM warning is emitted this boot, "
+            "so their absence means nothing. This is a wiring defect, "
+            "not a config one.",
+            level="ERROR", icon=Icons.WARN,
+        )
+        return {"unread": None, "online_update": None,
+                "inert_flag": None, "wiring_error": _missing}
+    # R8 MAJOR-2: ⚠ FALSE (R13): tests/test_biological_watchdog.py drives `lifespan`, so "the hop actually runs at
+    # boot" rested on an AST name check — and wrapping the call in a
+    # never-taken branch killed every PRM boot warning with 102 tests
+    # green and TOTAL SILENCE (not the ERROR the disclosed escape gives).
+    # Leave a record that this ran, and audit it later in boot.
+    # R10 MIN-4: the record used to be set BEFORE the three calls, so the
+    # auditor certified "produced a result" for a hop that started and
+    # raised. It follows the work now.
+    # R10 MIN-2 flagged that up to three WARNINGs can fire in one boot
+    # for what looks like one condition. Suppressing the general one was
+    # TRIED and REVERTED: it broke two pins that exist because R5 MAJOR-1
+    # established the opposite — stating only one reason leaves the
+    # operator believing a single fix will help when it will not. The
+    # three are about different flags and carry different remedies
+    # (`--prm-model` unread, `--prm-online-update` inert,
+    # `--frontier-selfplay` inert); the shared parenthetical is the
+    # shared CAUSE, which is the point. Kept, deliberately.
+    out = {
+        "unread": _warn_prm_model_unread(context),
+        "online_update": log_prm_online_update_inertness(context, args),
+        "inert_flag": _warn_prm_consumer_flag_inert(context),
+        "wiring_error": None,
+    }
+    try:
+        context.prm_boot_warnings_ran = True
+    except Exception:
+        pass
+    return out
+
+
+def _warn_prm_consumer_flag_inert(context):
+    """R9 MAJOR-3: an operator passes `--frontier-selfplay`, trajectory
+    logging is off, and there is no `--prm-model` and no
+    `--prm-online-update`. Boot was SILENT. Phase 2.7 is silent too —
+    both its branches are guarded on a live collector, so under
+    `--no-trajectories` even the skip log never fires — and the twin logs
+    at debug. The operator never learns, at boot or ever, that the flag
+    they passed cannot run.
+
+    The cause string was already being computed and thrown away.
+    """
+    from .core.agent import prm_consumer_is_live, prm_consumer_why_no_reader
+    args = getattr(context, "args", None)
+    if getattr(args, "frontier_selfplay", False) is not True:
+        return None                      # no consumer flag to be inert
+    # R10 MAJOR-2: `prm_consumer_is_live` deliberately EXCLUDES
+    # `has_model` (including it would deadlock the retrain), but the call
+    # site this warning is about — the frontier picker — REQUIRES it. So
+    # on the default first boot for anyone enabling the flag (logging on,
+    # no checkpoint) the picker fell back to `pick_seed` on every tick and
+    # nothing said so: boot silent, phase 2.7 at debug, the twin at debug,
+    # dream.py logs nothing because the branch simply is not taken. The
+    # guard was justified by a question its predicate cannot answer.
+    # R11 MAJOR-2: this warning is about the FRONTIER leg, but its guard
+    # used `prm_consumer_is_live` — an OR over both legs. So with the
+    # .score() leg live it went silent for a frontier leg that could not
+    # run (R9 MAJOR-3's defect re-opened), and when it did fire it named
+    # only the model, omitting a missing collector. Evaluate the leg the
+    # warning is actually about.
+    _collector = getattr(context, "trajectory_collector", None) is not None
+    _model = getattr(getattr(context, "prm_scorer", None),
+                     "has_model", False)
+    if _collector and _model:
+        return None                      # the frontier leg works
+    _reasons = []
+    if not _collector:
+        _reasons.append("trajectory logging is off, so the frontier path "
+                        "cannot run")
+    if not _model:
+        _reasons.append("no PRM checkpoint is loaded, and the frontier "
+                        "picker requires a fitted model")
+    # R11 MAJOR-1: the tail used to assert "nothing reads a PRM value on
+    # this box" UNCONDITIONALLY — printed from a branch where
+    # `prm_consumer_is_live` is True, so in 10 of 64 configs it
+    # contradicted the sibling warning in the same boot (and the wiring
+    # row in `learning_health`). Worse, with a live collector the retrain
+    # is about to fit the very model it tells the operator to go make.
+    # R12 MAJOR-1: this was `prm_consumer_is_live(context)` — an OR that
+    # INCLUDES the frontier leg, so "is the other leg live?" collapsed to
+    # `score_live or _collector` and the tail was suppressed in 6 configs
+    # where nothing reads a PRM value, including the default first boot
+    # this warning exists for. R11 MAJOR-2's defect, fifteen lines below
+    # R11 MAJOR-2's fix. The other leg is `.score()`, alone.
+    from .core import agent as _ag
+    _other_leg_live = bool(
+        getattr(_ag, "_MCTS_TURNSTART_ENABLED", False)
+        and getattr(context, "mcts_reasoner", None) is not None)
+    _tail = ("Frontier seed selection falls back to the unweighted picker"
+             + ("." if _other_leg_live else
+                "; nothing reads a PRM value on this box.")
+             + (" (The idle retrain is eligible to fit one, so this may "
+                "resolve on its own.)" if (_collector and not _model)
+                else ""))
+    msg = ("--frontier-selfplay is set but its PRM consumer cannot run ("
+           + "; ".join(_reasons) + "). " + _tail)
+    pretty_log("PRM Consumer Inert", msg, level="WARNING", icon=Icons.WARN)
+    return msg
+
+
+def audit_source_newer_than_process():
+    """Boot/tick entry point — injects `pretty_log` into the guard."""
+    return _audit_staleness(
+        lambda m: pretty_log("Stale Process", m, level="WARNING",
+                             icon=Icons.WARN))
+
+
+
+def audit_prm_boot_warnings_ran(context):
+    """Boot self-audit: did the PRM inertness hop actually execute?
+
+    R8 MAJOR-2. Silencing the hop — a dead branch, a deleted call — is
+    invisible to every test that drives `log_prm_boot_warnings` directly,
+    and produces no output at all, so it cannot be noticed in a log
+    either. This runs later in boot and says so.
+    """
+    if getattr(context, "prm_boot_warnings_ran", False):
+        return None
+    # R9 MIN-6: this also fires after a wiring_error early return, where
+    # "removed, disabled, or short-circuited" is the wrong description —
+    # the hop DID run and bailed. Say both.
+    msg = ("the PRM inertness check produced no result this boot, so "
+           "silence about PRM inertness means nothing. Either the boot "
+           "hop was removed/disabled/short-circuited, or it ran and "
+           "bailed on the wiring defect logged above.")
+    pretty_log("PRM Boot Warnings", msg, level="ERROR", icon=Icons.WARN)
+    return msg
+
+
+def _warn_prm_model_unread(context):
+    """R3 MIN-5: a loaded PRM that nothing reads logs SUCCESS and is
+    consulted by no code path — the same silent-inoperative shape §4BN
+    opened for `--prm-online-update`, on its sibling flag. Say so."""
+    # R4 MAJOR-2: this used to re-spell the consumer predicate inline —
+    # a THIRD copy, created by the very round that de-duplicated the twin
+    # (pattern 4: fix the instance, never grep for the class). A copy can
+    # drift to the retracted semantics silently, and R4 demonstrated it:
+    # adding `or prm_online_update` here left 83 tests green while
+    # silencing this warning for the one config §4BN exists to announce.
+    # One predicate, one definition.
+    from .core.agent import prm_consumer_is_live
+    if prm_consumer_is_live(context):
+        return None
+    if not getattr(getattr(context, "prm_scorer", None), "has_model", False):
+        return None          # nothing loaded ⇒ the online-update warning covers it
+    # R5 MINOR-2: name the conjunct that is actually missing, from the
+    # same derivation the gate uses — third site of the R3 MAJOR-2 fix.
+    from .core.agent import prm_consumer_why_no_reader
+    msg = ("a PRM is loaded but NO code path READS a PRM value ("
+           + prm_consumer_why_no_reader(context)
+           + "). The checkpoint is inert until one of those is live.")
+    pretty_log("PRM Unread", msg, level="WARNING", icon=Icons.WARN)
+    return msg
+
+
+def log_prm_online_update_inertness(context, args):
+    """Emit the §4BN inertness WARNING at boot. Returns the message (or
+    None), so this is drivable end-to-end by a test.
+
+    Extracted from `lifespan` because the pin on the delivery hop kept
+    being a source-shape proxy, and kept failing (R1 MAJ-4, R2 MAJ-4,
+    R3 CRIT-1 + MAJOR-4). Between them the proxies stayed GREEN while:
+    the block was commented out; it was moved to an uncalled module-level
+    helper; it was moved to an uncalled NESTED helper (`ast.walk` recurses
+    into nested FunctionDefs, so "inside lifespan" was satisfied); the
+    first argument was replaced by a literal `False`; the reader
+    arguments were replaced by literal `True`s; and the level was
+    downgraded to DEBUG. And they FALSE-failed a rewrite to keyword
+    arguments. Same conclusion as the gate pins: a source-shape test of a
+    behavioural property does not converge — invert. Now one behavioural
+    test drives this function and asserts an operator-visible WARNING, and
+    the only structural check left is that `lifespan` calls it directly.
+    """
+    from .core import agent as _agent_gate
+    # The `.score()` gate is a CONJUNCTION: `_MCTS_TURNSTART_ENABLED and
+    # _mcts is not None` (core/agent.py, MCTS turn-start hint). Pass both
+    # conjuncts — the helper derives the verdict AND the cause, so it can
+    # never name a missing piece it was not given (R2 MAJ-1, R3 MAJOR-2).
+    msg = prm_online_update_inertness(
+        getattr(args, "prm_online_update", False),
+        getattr(getattr(context, "prm_scorer", None), "has_model", False),
+        getattr(args, "frontier_selfplay", None),
+        getattr(_agent_gate, "_MCTS_TURNSTART_ENABLED", False),
+        getattr(context, "mcts_reasoner", None) is not None,
+        getattr(context, "trajectory_collector", None) is not None,
+        getattr(args, "deep_reason", None),
+    )
+    if msg:
+        pretty_log("PRM Online Update", msg, level="WARNING", icon=Icons.WARN)
+    return msg
+
+
+def prm_online_update_inertness(flag_set, has_model, frontier_selfplay,
+                                score_module_gate=False,
+                                score_reasoner_present=False,
+                                trajectory_logging=None,
+                                deep_reason=None):
+    """§4BN: the operator-facing reason `--prm-online-update` will do
+    nothing, or None when it can actually work.
+
+    THREE INDEPENDENT ways the flag no-ops:
+      (a) no model — `online_update` refines a batch model and refuses to
+          bootstrap one ("Returns False when no model is loaded"), and
+          with no live value-reading consumer the idle retrain correctly
+          skips, so no checkpoint is ever written;
+      (b) no reader — the only consumers are `.score()` (MCTS turn-start,
+          module-gated OFF) and `.uncertainty()` (--frontier-selfplay),
+          so refinements would feed nothing;
+      (c) no attempt — with trajectory logging off, the user-correction
+          path returns before the dispatch, so no update is ever tried
+          at all, independently of (a) and (b).
+
+    EVERY reason that applies is reported, not just the first: fixing only
+    (a) leaves the flag just as useless, which is precisely the trap that
+    made this silent.
+
+    ``frontier_selfplay`` may be ``None`` for "the args namespace has no
+    such attribute" (R1 MIN-2): the message CLAIMS a flag state, and the
+    tri-state doctrine from ``learning_health._flag_state`` says a printed
+    claim must not turn "absent" into a confident "not set". Gate
+    semantics are unchanged — only ``is True`` counts as live, matching
+    the two RETRAIN GATES (``core/agent.py`` phase 2.7 and its twin in
+    ``tools/memory.py``). Note the ``.uncertainty()`` consumer itself
+    (``core/dream.py``) uses plain truthiness, so a non-bool truthy value
+    would read live there and not-live here; no caller passes one, and
+    this function only ever reports (R2 MIN-3 — the docstring used to
+    claim it matched "both consumer call sites", which it does not).
+
+    The `.score()` gate arrives as its TWO CONJUNCTS, not as a verdict —
+    ``score_module_gate`` (`_MCTS_TURNSTART_ENABLED`) and
+    ``score_reasoner_present`` (`ctx.mcts_reasoner is not None`, i.e.
+    `--deep-reason`). Three tries to get this right, each failing the
+    same way one level down:
+
+    * v1 HARDCODED ".score() is module-gated off" — printing a state it
+      never checked (§4BM R2's class, re-instantiated inside §4BN's own
+      fix). It lied exactly when the flag started working.
+    * v2 took the module constant — necessary but NOT sufficient — so a
+      box with the constant flipped and no `--deep-reason` went back to
+      booting silent (R2 MAJ-1).
+    * v3 took the conjunction as a single bool, and then named ONE
+      conjunct as the CAUSE: with the constant on and `--deep-reason`
+      off it told the operator ".score() is module-gated off" and sent
+      them to edit a source constant that was already True (R3 MAJOR-2).
+
+    Hence the conjuncts. The verdict is derived here, the cause names
+    whichever conjunct is actually missing, and neither can be asserted
+    without having been supplied.
+
+    Pure and importable ON PURPOSE — the fix is a message, so the message
+    is what a test must be able to assert.
+    """
+    if flag_set is not True:
+        return None
+    score_consumer_live = bool(score_module_gate is True
+                               and score_reasoner_present is True)
+    # R6 MAJOR-1: `.uncertainty()`'s call site also needs a real
+    # TrajectoryCollector. R5 added that conjunct to `prm_consumer_is_live`
+    # and never swept it here, so on a --no-trajectories box the two boot
+    # warnings CONTRADICTED each other in the same boot: one said "no
+    # reader", this one concluded a reader was live and stayed silent.
+    # R7 MAJOR-4: this defaulted to True — "assume logging is on" —
+    # while every sibling defaults conservatively and `frontier_selfplay`
+    # is tri-state precisely so an unsupplied value is never rendered as
+    # a confident state. A second caller following the (then-stale)
+    # published signature would silently omit it and re-create R6
+    # MAJOR-1. Default is now None = "not supplied", which is treated as
+    # NOT live and is SAID so, rather than assumed live.
+    # R13 MAJOR-4: this said "A consumer IS live" for a frontier leg that
+    # cannot read — the picker also needs `has_model` — while the sibling
+    # warning in the same boot said "nothing reads a PRM value on this
+    # box". 12 of 128 configs. The retrain GATE excludes `has_model` on
+    # purpose (including it deadlocks bootstrapping); a boot MESSAGE about
+    # "can this flag work right now" is a different question and must
+    # include it.
+    uncertainty_live = bool(frontier_selfplay is True
+                            and trajectory_logging is True
+                            and has_model is True)
+    # R21 MAJOR-1: the THIRD inertness reason R20 discovered was swept to
+    # the `learning_health` row and NOT to this warning — the §4BN headline
+    # deliverable. The producer's only call path returns early without a
+    # collector, so with `--no-trajectories` the flag is 100% dead; in 2 of
+    # 128 wiring-complete configs ALL THREE warnings were silent for it,
+    # while `main.py` and `prm.md` both claimed "boot now says so".
+    # R22 MINOR-1: `is not False` treated "not supplied" as possible and
+    # returned total silence in 9 of 216 configs. Unsupplied is not a
+    # licence to claim the attempt path works.
+    attempt_possible = trajectory_logging is True
+    _attempt_note = ("" if attempt_possible else
+                     " ⚠ AND trajectory logging is off, so the "
+                     "user-correction path that would schedule an update "
+                     "returns before reaching it — no update is ever "
+                     "ATTEMPTED, independently of the above."
+                     if trajectory_logging is False else
+                     " ⚠ AND trajectory-logging state was not supplied to "
+                     "this check, so whether the update path can even be "
+                     "reached is unknown.")
+    readers_live = uncertainty_live or score_consumer_live
+    if frontier_selfplay is True and trajectory_logging is False:
+        _fs = ("--frontier-selfplay is set but trajectory logging is off, "
+               "so the frontier path that calls .uncertainty() cannot run")
+    elif frontier_selfplay is True and trajectory_logging is True \
+            and has_model is not True:
+        # R14 MAJOR-1: adding `has_model` to `uncertainty_live` made this
+        # branch say "trajectory-logging state was not supplied" on a box
+        # where it WAS supplied, as True — the real reason is that no
+        # model exists yet. Name the conjunct that is actually missing.
+        _fs = ("--frontier-selfplay is set and trajectory logging is on, "
+               "but no PRM is loaded yet, so the frontier picker has "
+               "nothing to read; the idle retrain is eligible to fit one")
+    elif frontier_selfplay is True:
+        _fs = ("--frontier-selfplay is set but trajectory-logging state "
+               "was not supplied to this check, so the frontier path "
+               "cannot be confirmed live")
+    elif frontier_selfplay is False:
+        _fs = "--frontier-selfplay is not set"
+    else:
+        _fs = "--frontier-selfplay is not readable from this args namespace"
+    if score_consumer_live:
+        _score_reason = None
+    elif deep_reason is True and score_reasoner_present is not True:
+        # R12 MAJOR-6 / R16 M5: `prm_consumer_why_no_reader` learned to
+        # ask the FLAG first, and this sibling never did — it receives
+        # `score_reasoner_present` (the object) and used to conclude
+        # "--deep-reason is not set" from it. In the same boot, one
+        # warning said "--deep-reason WAS set" and the other said it was
+        # not: 22 of 192 configs (recomputed R17; none reachable in production — `MCTSReasoner.__init__` cannot raise).
+        _score_reason = ("--deep-reason WAS set but no MCTS reasoner "
+                         "exists — its construction failed at boot"
+                         + ("" if score_module_gate is True
+                            else "; the turn-start hint is also "
+                                 "module-gated off"))
+    elif score_module_gate is not True and score_reasoner_present is not True:
+        _score_reason = (".score() is off on both counts (module-gated off, "
+                         + ("and --deep-reason is not set)"
+                            if deep_reason is False else
+                            "and --deep-reason state was not supplied)"))
+    elif score_module_gate is not True:
+        _score_reason = ".score() is module-gated off"
+    else:
+        # The trap R3 MAJOR-2 caught: the constant IS on here, so telling
+        # the operator to flip it wastes their time. --deep-reason is the
+        # actual missing piece.
+        # R18 MAJOR-5: `frontier_selfplay=None` renders "not readable from
+        # this args namespace" and `trajectory_logging=None` renders "was
+        # not supplied to this check", but `deep_reason=None` rendered a
+        # confident "is not set" — the newest of the three tri-state
+        # parameters was the only one turning "absent" into a state claim.
+        # 106 of 432 configs. This function is documented importable, so a
+        # second caller following the signature hits exactly that.
+        _score_reason = (".score() is module-gated ON but "
+                         + ("--deep-reason is not set"
+                            if deep_reason is False else
+                            "--deep-reason state was not supplied to this "
+                            "check")
+                         + ", so no MCTS reasoner exists to call it")
+    _why_no_reader = (" (" + ", ".join(
+        x for x in (_score_reason, _fs) if x) + ")")
+    if not has_model:
+        msg = ("--prm-online-update is set but NO trained PRM is loaded, so "
+               "updates no-op until one exists: online steps refine a batch "
+               "model and never create one. "
+               + ("A consumer IS live, so the idle retrain is eligible to "
+                  "fit one in a coming idle window (subject to trajectory "
+                  "logging being on and enough samples having accrued); "
+                  "until a model exists this flag does nothing."
+                  if readers_live else
+                  ("Train first (--prm-model); a consumer is configured, "
+                   "so the idle retrain is eligible to fit one."
+                   if (frontier_selfplay is True
+                       and trajectory_logging is True)
+                   # R16 M4: the fix above landed on ONE input and not its
+                   # sibling. With --frontier-selfplay and logging OFF the
+                   # advice still said "enable a value-reading consumer" —
+                   # one IS enabled; the missing knob is trajectory
+                   # logging, which the advice never named.
+                   else "Train first (--prm-model). Note --frontier-selfplay "
+                        "is set but trajectory logging is off, so that "
+                        "consumer cannot run and the idle retrain will not "
+                        "fit one either."
+                   if (frontier_selfplay is True
+                       and trajectory_logging is False)
+                   else "Train first (--prm-model, or enable a "
+                        "value-reading consumer so the idle retrain "
+                        "runs).")))
+        if not readers_live:
+            msg += (" ⚠ Also note NO consumer currently READS the PRM"
+                    + _why_no_reader + ", so refinements would feed nothing.")
+        return msg + _attempt_note
+    if readers_live and has_model and not attempt_possible:
+        # Otherwise-healthy box, but nothing can reach the dispatch.
+        return ("--prm-online-update is set, a model is loaded and a "
+                "consumer is live, but " + _attempt_note.replace(" ⚠ AND ", "").strip())
+    if not readers_live:
+        # R8 MIN-4: when a conjunct was never supplied the headline must
+        # not assert a state definitively — the tri-state doctrine was
+        # honoured only in the parenthetical.
+        _hedge = ("no consumer could be CONFIRMED to read the PRM"
+                  if (frontier_selfplay is True and trajectory_logging is None)
+                  else "NO consumer READS the PRM")
+        return ("--prm-online-update is set and a model is loaded, but "
+                + _hedge + _why_no_reader + " — refinements feed nothing."
+                + _attempt_note)
+    return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Ghost Agent: Autonomous AI Service")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0 — reachable over the network, e.g. a Tailscale host). Use 127.0.0.1 to restrict to loopback. A non-loopback bind refuses to boot without an explicit API key.")
@@ -213,7 +745,7 @@ def parse_args():
     parser.add_argument("--no-redact-logs", action="store_true", default=False, help="Disable redaction of the monitored log stream. By default secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.")
     parser.add_argument("--enable-preflight-guard", action=argparse.BooleanOptionalAction, default=True, help="Pre-flight repeat-failure guard (DEFAULT ON): before dispatching a tool call, block it if the same (tool, primary target) already failed the same way in the recent window, handing the model the prior error instead of re-running a known failure. The live counterpart to the offline post-mortem repeated-error fingerprint; idempotent setters are exempt. Disable with --no-enable-preflight-guard.")
     parser.add_argument("--perfect-it", action="store_true", help="Enable proactive optimization suggestions after successful heavy tasks")
-    parser.add_argument("--deep-reason", action="store_true", help="Enable MCTS action-candidate lookahead and parallel hypothesis testing on hard problems (costs extra worker calls)")
+    parser.add_argument("--deep-reason", action="store_true", help="⚠ Does NOT enable the MCTS turn-start hint on its own — that is additionally gated by `_MCTS_TURNSTART_ENABLED`, a module constant currently False, so `.score()` reads no PRM value on a stock box even with this flag set (§4BN; boot says so). Enable MCTS action-candidate lookahead and parallel hypothesis testing on hard problems (costs extra worker calls)")
     parser.add_argument("--native-tools", action=argparse.BooleanOptionalAction, default=True, help="Attach OpenAI-format tools/tool_choice to LLM payload in addition to the XML tool prompt. On by default for Qwen 3.6 35B-A3 and newer models that support native tool-calls natively; use --no-native-tools to disable.")
     # Stage-1 self-improvement pipeline knobs. All default ON in
     # privacy-safe modes because the whole pipeline is local-only —
@@ -223,6 +755,7 @@ def parse_args():
     parser.add_argument("--no-reflection", action="store_true", help="Disable idle-time self-critique on failed turns even if trajectory logging is on.")
     parser.add_argument("--no-dream", action="store_true", help="Disable the idle-time Deep REM Dream phase (biological-watchdog phase 2: memory consolidation / heuristic harvest). Leaves reflection and self-play intact. The dream-off arm for the Track-B earn-keep idle-loop LOO (scripts/earn_keep.py --track B). Off by default = production dreams normally.")
     parser.add_argument("--no-self-play", action="store_true", help="Disable the idle-time Synthetic Self-Play phase (biological-watchdog phase 3: fresh self-play + counterfactual replay, >60 min idle). ⚠ CONFOUNDED ARM (§4Q, 2026-08-08): this does NOT ablate self-play alone. Self-play's completion is the only idle-time reset of `last_activity_time`, and that reset is what re-opens the (900, 3600] idle window for every other phase. With it off, a long AFK stretch gets ONE window and then idle_secs climbs past 3600 permanently, gating out reflection/postmortem/skills/PRM/router/calibration/tidy/narratives/autoadvance for the rest of the stretch — only the journal phase (no upper bound) survives. Interpret any --no-self-play arm as 'idle machine mostly off', not 'self-play off'. The self-play-off arm for the Track-B earn-keep idle-loop LOO. NOTE: distinct from --frontier-selfplay, which only toggles cluster SELECTION, not whether self-play fires. Off by default = production self-plays normally.")
+    parser.add_argument("--no-bench", action="store_true", help="Disable the idle-time BENCH-BANK phase (biological-watchdog phase 3b, §4BF Track 1b): one externally-graded task (MBPP / GSM8K class, mechanical oracle) per deep-idle tick through the isolated self-play solve loop, outcomes recorded to $GHOST_HOME/system/bench/ (results ledger + a SEPARATE trajectory root with task_kind=bench — never the production corpus). Inert until banks are imported via scripts/import_bench_banks.py. Deliberately independent of --no-self-play so the two can be ablated separately (§4Q). Off by default = bench runs when banks exist.")
     parser.add_argument("--postmortem", action="store_true", default=False, help="Biological-watchdog phase 2.5c: run whole-transcript post-mortems on the worst recent FAILED runs and file durable, classified DEFECT REPORTS (behavioural / configuration / code_defect) to $GHOST_HOME/postmortem/defects.jsonl. Behavioural findings also route into SkillMemory (same channel as reflection). Code-defect findings get an LLM-proposed reproducing test + unified diff attached — stored for review, NEVER auto-applied. Read the queue with the `postmortem` tool. Opt-in, off by default. Requires the trajectory log (no effect under --no-trajectories).")
     parser.add_argument("--postmortem-cooldown", type=int, default=10800, help="Seconds between idle-time post-mortem passes (phase 2.5c). Default 3 hours. Only active under --postmortem.")
     parser.add_argument("--postmortem-min-severity", type=float, default=0.4, help="Minimum structural-severity (0..1) a failed run must score before it earns a post-mortem LLM call. Lower = more runs analysed. Default 0.4.")
@@ -238,11 +771,11 @@ def parse_args():
     # candidate. When the path is unset/missing, ``context.prm_scorer``
     # is a no-op (returns a neutral 0.5 for every candidate) so the
     # existing simulation fallback in MCTS stays in effect.
-    parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path.")
-    parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. Has no effect when --prm-model is unset.")
+    parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path — but ONLY the MCTS turn-start hint and frontier self-play ever read a PRM value; the turn-start hint needs BOTH `_MCTS_TURNSTART_ENABLED` (a module constant, currently False) and --deep-reason, and the frontier leg needs BOTH --frontier-selfplay and trajectory logging. On a box with neither reader live, the checkpoint loads, logs success, and is consulted by nothing; boot warns (§4BN).")
+    parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. NOTE: the retrain phase does NOT depend on --prm-model — it is gated on a live value-reading CONSUMER (.score(), which needs BOTH _MCTS_TURNSTART_ENABLED and --deep-reason, or .uncertainty() via --frontier-selfplay AND trajectory logging). With neither live the phase skips and this cooldown is moot.")
     parser.add_argument("--router-train-cooldown", type=int, default=10800, help="Seconds between idle-time router-classifier retrains. Default 3 hours.")
     parser.add_argument("--calib-refit-cooldown", type=int, default=3600, help="Seconds between idle-time confidence-calibration refits (biological phase 2.7c). Default 60 min. Only active under --enable-metacog.")
-    parser.add_argument("--prm-online-update", action="store_true", default=False, help="Apply a guarded online PRM gradient step when a turn is promoted to FAILED by a user correction (closes the gap until the next idle PRM retrain). The step is applied to a clone and committed only if it doesn't worsen BCE on a holdout of recent trajectories. Requires a trained PRM (--prm-model or an idle-trained checkpoint).")
+    parser.add_argument("--prm-online-update", action="store_true", default=False, help="Apply a guarded online PRM gradient step when a turn is promoted to FAILED by a user correction (closes the gap until the next idle PRM retrain). The step is applied to a clone and committed only if it doesn't worsen BCE on a holdout of recent trajectories. Requires a trained PRM: it REFINES a model and never bootstraps one (returns False with no model loaded). Load one with --prm-model, or earn an idle-trained checkpoint — but note the idle retrain itself skips unless a value-reading consumer (.score()/.uncertainty()) is live, so on a box with neither, this flag is inert in THREE independent ways: (a) no model to refine; (b) nothing that would read a refinement; and (c) with trajectory logging off, the user-correction path that would schedule an update returns before reaching it, so no update is ever ATTEMPTED. Boot names every reason that applies, not just the first. ⚠ A FOURTH limitation, architectural rather than config-dependent so boot cannot detect it: the step is dispatched ONLY from an inline user correction. A negative label arriving through /api/feedback (Slack 👎 / web) promotes the turn to FAILED and never schedules it — measured on the live ledger that channel carries 5 standing FAILED labels (4 usable) against the inline path's 1 (0 usable) — but neither is the dominant source: `verifier_late` carries 126 (125 usable) and is equally unwired, by a deliberate and now-stated exclusion. Wiring it is registered as a follow-up (§4BN R25); the feedback path itself logs a WARNING when a negative label arrives and cannot schedule the step. For (a)/(b)/(c) above, which ARE config-dependent, boot logs a WARNING naming every reason that applies (§4BN).")
     parser.add_argument("--principle-gate", action="store_true", default=False, help="After a final response, run an independent LLM check against the agent's own authored operating principles (selfhood/values) and append a self-note if the response contradicts one. Never blocks — annotates only. Adds one LLM call per final turn; off by default.")
     parser.add_argument("--autoadvance-idle", action="store_true", default=False, help="Biological-watchdog phase 2.95: when idle, autonomously advance ONE ACTIVE project by a single tick (the autoadvancer was previously only reachable via the tool/HTTP). Runs on the existing hard per-project budgets + human gates; coding tasks now generate+run real code instead of a no-op stub. One project / one tick per 30-min cooldown. Off by default.")
     # Frontier-aware self-play. When on, the biological-watchdog phase-3
@@ -259,7 +792,7 @@ def parse_args():
     # experiments (B3: 2v2; B4: equal in all 4 repeats) — no measured
     # advantage, so parsimony wins. The machinery stays for --frontier-selfplay
     # opt-in (re-enable criterion: a run where it out-yields uniform).
-    parser.add_argument("--frontier-selfplay", action=argparse.BooleanOptionalAction, default=False, help="Enable frontier-aware cluster selection in self-play (PRM uncertainty × trajectory rarity). Default OFF since 2026-07-09: tied uniform seeding in two instrumented ablations (#27b).")
+    parser.add_argument("--frontier-selfplay", action=argparse.BooleanOptionalAction, default=False, help="Enable frontier-aware cluster selection in self-play (PRM uncertainty × trajectory rarity). Default OFF since 2026-07-09: tied uniform seeding in two instrumented ablations (#27b). ⚠ Its PRM consumer (`.uncertainty()`) additionally needs trajectory logging ON and a FITTED PRM — with either missing, seed selection silently falls back to the unweighted picker; boot logs a `PRM Consumer Inert` WARNING in that case (§4BN).")
     parser.add_argument("--frontier-uniform-sample-prob", type=float, default=0.2, help="Probability per self-play tick that frontier-aware selection is bypassed in favour of the legacy pick_seed (uniform-sample sanity floor). Without this, a systematically wrong PRM could lock self-play onto a single cluster. Default 0.2.")
     # Selfhood / unified self. The five-piece module (autobiographical
     # log, self-state thread, recognition layer, narrative summariser,
@@ -597,6 +1130,28 @@ async def lifespan(app):
     if importlib.util.find_spec("docker"):
         try:
             context.sandbox_manager = DockerSandbox(context.sandbox_dir, context.tor_proxy)
+            # §4BO: reap sandboxes orphaned by a kill mid-solve, BEFORE
+            # provisioning ours. A `finally` cannot run through SIGKILL,
+            # so those containers survive against a workspace Python has
+            # already deleted and nothing ever looks them up again. Only
+            # containers whose every mount source is gone are removed —
+            # ours mounts $GHOST_HOME/sandbox, which exists, so it can
+            # never match. Never fatal: a sweep failure must not cost a
+            # boot.
+            try:
+                _swept = await asyncio.to_thread(
+                    context.sandbox_manager.sweep_orphaned_containers)
+                if _swept:
+                    pretty_log(
+                        "Sandbox Sweep",
+                        f"removed {len(_swept)} orphaned sandbox "
+                        f"container(s) whose workspace no longer exists: "
+                        f"{', '.join(_swept[:5])}"
+                        + (" …" if len(_swept) > 5 else ""),
+                        icon=Icons.BOOT_AWAKE,
+                    )
+            except Exception as _swe:  # noqa: BLE001
+                logger.debug("sandbox sweep skipped: %s", _swe)
             await asyncio.to_thread(context.sandbox_manager.ensure_running)
             # Boot-time service awareness (2026-07-30, §4G): services are
             # detached container processes that SURVIVE agent restarts —
@@ -1227,6 +1782,15 @@ async def lifespan(app):
             )
         except Exception as e:
             pretty_log("Deep Reasoning Failed", str(e), level="WARNING", icon=Icons.WARN)
+    # R10 CRIT-1: the mark belongs at the END of the block, after every
+    # writer. It used to sit on `context.mcts_reasoner = None` — the
+    # PLACEHOLDER writer — so relocating the `MCTSReasoner(...)`
+    # construction below the hop left `_prm_wired` complete, 307 tests
+    # green, and boot telling a --deep-reason box that --deep-reason is
+    # not set. Same for the `PRMScorer.load(...)` writers below: 8
+    # assignment sites, 5 marks, all 5 on the values the hop does NOT
+    # actually read.
+    mark_prm_wired(context, "mcts_reasoner")
 
     # Process Reward Model. Always attach a scorer to the context — when
     # no checkpoint is loaded, the scorer is a fail-safe pass-through
@@ -1285,6 +1849,7 @@ async def lifespan(app):
                     icon=Icons.WARN,
                 )
 
+
     # When MCTS is enabled AND the PRM has a trained model, plug the
     # scorer in so candidate scoring uses the fast PRM path instead of
     # a worker-LLM simulation per candidate. Mutating the attribute on
@@ -1306,9 +1871,15 @@ async def lifespan(app):
 
     # Persist the resolved checkpoint path so the biological retrain
     # phase knows where to write the next checkpoint. When --prm-model
-    # was unset, the retrain phase still runs but writes under the
+    # was unset, the retrain phase is CONSUMER-GATED and skips unless something reads a PRM value (§4BN); when it does run, it writes under the
     # default GHOST_HOME path.
     context._prm_checkpoint_path = prm_path_resolved
+    # R10 CRIT-1: end of the PRM-scorer block — AFTER both
+    # `PRMScorer.load(...)` writers, which are the ones that set
+    # `has_model`. Marking the `PRMScorer()` placeholder instead let the
+    # whole checkpoint-load block move below the hop with 307 tests
+    # green, killing the "PRM loaded but unread" warning on every box.
+    mark_prm_wired(context, "prm_scorer")
 
     # --- Stage-1 self-improvement wiring ---
     # Trajectory collector: the passive corpus-builder used by
@@ -1339,6 +1910,17 @@ async def lifespan(app):
             "--no-trajectories set: turn-level log disabled (reflection + skills_auto will also skip)",
             icon=Icons.WARN,
         )
+    # End of the trajectory-collector block, after all three branches.
+    mark_prm_wired(context, "trajectory_collector")
+
+    # R6 CRIT-1: the PRM boot warnings MUST run after
+    # `context.trajectory_collector` is assigned above. They previously
+    # sat 36 lines earlier, where the attribute is still the
+    # `GhostContext.__init__` default of None — so the collector conjunct
+    # added in R5 was pinned to False at its ONLY delivery site, and a box
+    # with trajectory logging ON was told "trajectory logging is off".
+    # A false warning of exactly the class this section exists to remove.
+    log_prm_boot_warnings(context)
 
     # Reflector: self-critique biological phase 2.5. Needs both the
     # trajectory collector (source of FAILED trajectories) and the
@@ -1475,8 +2057,16 @@ async def lifespan(app):
                 # post-hoc score (AUC 0.727) instead of corpus order.
                 # Resolved lazily off the context because the calibration
                 # tracker is wired AFTER the Reflector is constructed.
+                # §4BF 1c (R3+R4 reviews): REAL turns only — reflection is
+                # a REAL_ONLY matrix row. The filter runs INSIDE
+                # recent_samples, BEFORE the 500-row tail is taken: the
+                # first cut filtered after the tail, which was a no-op
+                # against dilution (real rows bench pushed out of the
+                # newest-500 stayed out — the exact harm the comment
+                # claimed to prevent).
                 calibration_source=lambda: (
-                    context.calibration_tracker.recent_samples(500)
+                    context.calibration_tracker.recent_samples(
+                        500, exclude_origin="bench")
                     if getattr(context, "calibration_tracker", None) is not None
                     else []
                 ),
@@ -1665,6 +2255,58 @@ async def lifespan(app):
     # load it; otherwise build a disabled dispatcher (acts as an
     # always-escalate wrapper so the request path is unchanged).
     try:
+        # §4BQ flip (vi): register the router's embedder BEFORE any load or
+        # bootstrap-train, since both consult it. We reuse the vector
+        # store's ALREADY-LOADED embedder (`embedding_fn`, the raw passage
+        # encoder — deliberately not `embed_query`, whose BGE instruction
+        # prefix was never part of the measurement), so the flip costs no
+        # second model in RAM on a memory-tight box and no egress.
+        # Registration failure is non-fatal: the trainer then fits the
+        # pre-flip lexical representation and the dispatcher escalates.
+        _emb_status = None
+        try:
+            from .router import probe_router_embedder as _probe_embedder
+            from .router import set_router_embedder as _set_router_embedder
+            _mem_sys = getattr(context, "memory_system", None)
+            _embed_fn = getattr(_mem_sys, "embedding_fn", None)
+            _set_router_embedder(_embed_fn if callable(_embed_fn) else None)
+            # PROBE, don't assume: ask for one vector. A registered but
+            # broken embedder otherwise claims "embeddings wanted", every
+            # fit silently degrades to lexical, and the representation
+            # mismatch retrains on every boot forever without converging.
+            _emb_status = _probe_embedder()
+            if _emb_status.degraded:
+                pretty_log(
+                    "Complexity Router",
+                    "Embeddings enabled but no working embedder (memory "
+                    "disabled or model unavailable) — training and serving "
+                    "the lexical-only representation IN MEMORY; the "
+                    "checkpoint on disk is left untouched",
+                    icon=Icons.BRAIN_PLAN,
+                )
+            elif not _emb_status.enabled:
+                pretty_log(
+                    "Complexity Router",
+                    "GHOST_ROUTER_EMBED is off — lexical-only representation",
+                    icon=Icons.BRAIN_PLAN,
+                )
+            else:
+                pretty_log(
+                    "Complexity Router",
+                    f"Embedding representation active via {_emb_status.model}",
+                    icon=Icons.BRAIN_PLAN,
+                )
+        except Exception as e:  # noqa: BLE001
+            # Loud: this exact handler once swallowed an ImportError and the
+            # §4BQ flip was silently inoperative in production while every
+            # test passed. "skipped" reads benign; name the consequence.
+            pretty_log(
+                "Complexity Router",
+                f"EMBEDDER WIRING FAILED ({type(e).__name__}: {e}) — the "
+                "embedding representation is DISABLED; the router will "
+                "train and serve lexical-only features",
+                level="WARNING", icon=Icons.WARN)
+
         # Where the idle-time router retrain writes/reads the classifier.
         # Mirrors context._prm_checkpoint_path. When --router-model is unset we
         # still train and persist here so the router self-improves from logs.
@@ -1675,6 +2317,10 @@ async def lifespan(app):
         context._router_checkpoint_path = router_ckpt_path
 
         clf = None
+        # A gate-passing model set aside only because its REPRESENTATION is
+        # stale; restored below if the retrain that was supposed to replace
+        # it bails.
+        _stale_clf = None
         if router_ckpt_path.exists():
             # Load in its OWN try/except: a corrupt or schema-incompatible
             # checkpoint must not take down the whole router wiring. The
@@ -1706,11 +2352,39 @@ async def lifespan(app):
                     )
                     clf = None
                 else:
-                    pretty_log(
-                        "Complexity Router",
-                        f"Loaded classifier from {router_ckpt_path}",
-                        icon=Icons.BRAIN_PLAN,
-                    )
+                    # §4BQ: a checkpoint trained on a DIFFERENT representation
+                    # than the one now available is stale, not broken. It
+                    # would still route correctly, so this is not a safety
+                    # check — it exists so the flip actually takes effect (a
+                    # pre-flip lexical model would otherwise be served
+                    # forever) and so disabling the kill switch reverts in
+                    # one restart. Dropping it to None routes into the same
+                    # bootstrap-retrain path a corrupt file uses.
+                    _want_emb = bool(_emb_status and _emb_status.available)
+                    if bool(getattr(clf, "uses_embeddings_", False)) != _want_emb:
+                        pretty_log(
+                            "Complexity Router",
+                            f"Checkpoint at {router_ckpt_path} uses the "
+                            f"{'lexical+embedding' if not _want_emb else 'lexical-only'}"
+                            f" representation but "
+                            f"{'embeddings are available' if _want_emb else 'embeddings are off'}"
+                            " — retraining from trajectories",
+                            icon=Icons.BRAIN_PLAN,
+                        )
+                        # KEEP it as the fallback. Discarding outright left
+                        # the router escalate-all for the whole session
+                        # whenever the retrain then bailed (thin/rotated
+                        # corpus, gate rejection) — throwing away a
+                        # gate-passing model for a non-safety reason.
+                        _stale_clf = clf
+                        clf = None
+                    else:
+                        pretty_log(
+                            "Complexity Router",
+                            f"Loaded classifier from {router_ckpt_path} "
+                            f"({'lexical+embedding' if _want_emb else 'lexical only'})",
+                            icon=Icons.BRAIN_PLAN,
+                        )
             except Exception as load_err:  # noqa: BLE001 — boot must survive any checkpoint state
                 clf = None
                 pretty_log(
@@ -1740,7 +2414,21 @@ async def lifespan(app):
         if clf is None:
             traj_collector = getattr(context, "trajectory_collector", None)
             if traj_collector is not None:
-                boot_clf, boot_report = bootstrap_router(
+                from .core.admissibility import iter_bench_trajectories
+                # §4BQ: the "a degraded run must not overwrite a RICHER
+                # checkpoint" policy lives in RouterTrainer.run, NOT here.
+                # It has to hold for the idle retrain and the self-play
+                # refit too, and the first version of it — written at this
+                # call site only — left both of those still overwriting the
+                # production checkpoint from a `--no-memory` control run.
+                # A rule every trainer must obey belongs in the trainer.
+                #
+                # OFF THE EVENT LOOP: embedding the whole corpus is ~4.8 s of
+                # blocking torch on today's 1,482 turns (and the trajectory
+                # cap allows far more). The other two retrain sites already
+                # use to_thread; this one did not.
+                boot_clf, boot_report = await asyncio.to_thread(
+                    bootstrap_router,
                     traj_collector.iter_trajectories(),
                     save_path=router_ckpt_path,
                     # §4AA: gate on the operating point THIS process will
@@ -1748,6 +2436,9 @@ async def lifespan(app):
                     # not a constant that drifts from it.
                     confidence_threshold=float(
                         args.router_confidence_threshold),
+                    # §4BF 1c: bench rows augment the train side only; the
+                    # held-out gate stays real (RouterTrainer.run).
+                    bench_trajectories=iter_bench_trajectories("router", args),
                 )
                 if boot_clf is not None:
                     clf = boot_clf
@@ -1757,6 +2448,33 @@ async def lifespan(app):
                         f"{boot_report.summary()} · router now routing",
                         icon=Icons.BRAIN_PLAN,
                     )
+                elif _stale_clf is not None:
+                    # The retrain bailed, so the representation-stale model
+                    # we set aside is the best available — and it passed the
+                    # held-out gate. Routing with the older representation
+                    # beats escalate-all for the whole session.
+                    clf = _stale_clf
+                    # ONLY an embedding model without an embedder is
+                    # unusable. The mirror case — a LEXICAL model while
+                    # embeddings are available — routes perfectly well
+                    # (route() consults the embedder only when the model
+                    # asks for one), and an equality test told the
+                    # operator "every turn will escalate" in exactly the
+                    # configuration that is live today.
+                    _restored_usable = not (
+                        bool(getattr(_stale_clf, "uses_embeddings_", False))
+                        and not bool(_emb_status and _emb_status.available))
+                    pretty_log(
+                        "Complexity Router",
+                        f"Retrain bailed ({boot_report.bail_reason or 'no data'}); "
+                        + ("keeping the previous checkpoint's model rather "
+                           "than dropping to escalate-all"
+                           if _restored_usable else
+                           "the previous model needs a representation this "
+                           "process cannot produce, so it is retained but "
+                           "every turn will escalate (fail-safe)"),
+                        level="WARNING", icon=Icons.WARN,
+                    )
                 else:
                     pretty_log(
                         "Complexity Router",
@@ -1764,6 +2482,11 @@ async def lifespan(app):
                         "dispatcher pass-through until an idle retrain produces a model",
                         icon=Icons.BRAIN_PLAN,
                     )
+            # Catch-all for the paths the branch above cannot reach (no
+            # trajectory collector wired): never end up escalate-all while
+            # holding a gate-passing model.
+            if clf is None and _stale_clf is not None:
+                clf = _stale_clf
 
         context.complexity_dispatcher = ComplexityDispatcher(
             classifier=clf,
@@ -2236,6 +2959,13 @@ async def lifespan(app):
     # the banner means what it says. The server starts serving at the `yield`
     # below either way: only the LOG LINE waits, never the socket.
     await _announce_ready_when_warm(_warmup_task)
+
+    # R8 MAJOR-2: last thing before serving — did the PRM inertness hop
+    # actually run? A silenced hop emits nothing, so its absence is
+    # otherwise indistinguishable from a healthy box.
+    audit_prm_boot_warnings_ran(context)
+    # R30 MAJOR-2: and say so if the source moved out from under us.
+    audit_source_newer_than_process()
 
     try:
         yield

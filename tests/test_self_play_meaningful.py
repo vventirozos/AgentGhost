@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import pytest
 from pathlib import Path
+import types
 from unittest.mock import MagicMock
 
 from ghost_agent.core.self_play_scoring import correctness_weighted_score
@@ -460,16 +461,202 @@ class TestPerTemplateSaturation:
 # ---------------------------------------------------------------------------
 
 
+def _twin_ctx_that_would_train(tmp_path, monkeypatch, **argkw):
+    """A ctx for `_maybe_retrain_prm` that passes EVERY guard downstream
+    of the consumer gate, so the gate is the only thing that can stop it.
+
+    R7 CRIT-1: the previous probe asserted `PRMTrainer.__init__` never
+    ran on a bare `MagicMock` ctx — but `memory.py`'s own
+    `isinstance(traj_collector, TrajectoryCollector)` check already
+    guarantees that outcome, whichever way the gate is written. The probe
+    measured a property a DIFFERENT guard supplied, so widening the gate
+    with the producer flag left 77 tests green: the §4BN retraction was
+    unpinned on the twin. (The phase-2.7 pin uses real objects and does
+    catch it — this is the twin-path miss again.)
+
+    Real collector, real scorer: now only the consumer gate stands
+    between this ctx and a fitted model.
+    """
+    from ghost_agent.distill.collector import TrajectoryCollector
+    from ghost_agent.prm.scorer import PRMScorer
+    from ghost_agent.prm import trainer as _tr
+
+    work = []
+    _orig = _tr.PRMTrainer.__init__
+
+    def _spy(self, *a, **k):
+        work.append("trainer")
+        return _orig(self, *a, **k)
+
+    monkeypatch.setattr(_tr.PRMTrainer, "__init__", _spy)
+
+    ctx = types.SimpleNamespace(
+        trajectory_collector=TrajectoryCollector(str(tmp_path)),
+        prm_scorer=PRMScorer(),
+        mcts_reasoner=None,
+        memory_dir=tmp_path,
+        args=types.SimpleNamespace(prm_train_cooldown=None, model="m",
+                                   **argkw),
+    )
+    return ctx, work
+
+
 class TestPRMSchedulerHelper:
+    """R1 MIN-6: both cases below used a bare MagicMock ctx, so
+    `getattr(ctx.args, 'frontier_selfplay', False) is True` was False on
+    the mock and the helper returned at the CONSUMER GATE — neither test
+    ever reached the collector/scorer branch it is named for. Silent test
+    decay of the twin predicate. They now pass the gate first, and a
+    third case pins the gate itself."""
+
+    @staticmethod
+    def _ctx_past_the_consumer_gate():
+        ctx = MagicMock()
+        ctx.args.frontier_selfplay = True   # a real value-reading consumer
+        return ctx
+
     def test_no_op_when_collector_missing(self):
         from ghost_agent.tools.memory import _maybe_retrain_prm
-        ctx = MagicMock()
+        ctx = self._ctx_past_the_consumer_gate()
         ctx.trajectory_collector = None
         # Must not raise.
         _maybe_retrain_prm(ctx)
 
-    def test_no_op_when_scorer_missing(self):
+    def test_no_op_when_scorer_missing(self, tmp_path):
+        """R2 MIN-1: this used an auto-MagicMock collector, so
+        `isinstance(tc, TrajectoryCollector)` was False and the function
+        returned at the COLLECTOR guard — byte-for-byte the same coverage
+        as the test above, never reaching the scorer guard it names.
+        Give it a real collector so the scorer guard is what stops it."""
+        from ghost_agent.distill.collector import TrajectoryCollector
         from ghost_agent.tools.memory import _maybe_retrain_prm
-        ctx = MagicMock()
+        ctx = self._ctx_past_the_consumer_gate()
+        ctx.trajectory_collector = TrajectoryCollector(str(tmp_path))
         ctx.prm_scorer = None
         _maybe_retrain_prm(ctx)
+
+    def test_twin_bridges_a_fresh_model_into_mcts(self, tmp_path,
+                                                  monkeypatch):
+        """R7 MIN-6 (twin divergence): phase 2.7 bridges a freshly-fitted
+        model into `mcts.prm_scorer` on the first-ever fit; this twin did
+        not. On a `.score()`-live box that boots without a checkpoint,
+        `mcts.prm_scorer` stays None and MCTS keeps failing its own
+        `prm_scorer is not None and .has_model` guard after an in-loop
+        refit — this path trained a model nothing reads, the §4BN class,
+        on the twin."""
+        from ghost_agent.tools import memory as _mem
+        from ghost_agent.core import agent as _core_agent
+        from ghost_agent.prm import trainer as _tr
+
+        ctx, _ = _twin_ctx_that_would_train(
+            tmp_path, monkeypatch, frontier_selfplay=True,
+            prm_online_update=False)
+        mcts = types.SimpleNamespace(prm_scorer=None)
+        ctx.mcts_reasoner = mcts
+        monkeypatch.setattr(_core_agent, "_MCTS_TURNSTART_ENABLED", False)
+
+        class _Rep:
+            fit_succeeded = True
+            def summary(self): return "ok"
+
+        def _fake_run(self, *a, **k):
+            self.model = object()
+            return _Rep()
+        monkeypatch.setattr(_tr.PRMTrainer, "run", _fake_run)
+        monkeypatch.setattr(type(ctx.prm_scorer), "set_model",
+                            lambda self, m: None)
+        _mem._maybe_retrain_prm(ctx)
+        assert mcts.prm_scorer is not None, (
+            "the in-loop retrain fitted a model and never bridged it into "
+            "MCTS — after this refit MCTS still fails its own prm_scorer "
+            "guard, i.e. trained a model nothing reads")
+
+    def test_twin_skip_logs_and_names_the_missing_conjunct(self, monkeypatch):
+        """R5 MAJOR-1, twin site: replacing the derived cause with the old
+        hardcoded literal left 116 tests green. Capture the real log.
+
+        Captures `logger.debug` directly rather than via `caplog`: the
+        first version used caplog and PASSED in isolation but FAILED in
+        the full suite with zero records — some earlier test mutates
+        global logging state (handler/propagate/disable), so the capture
+        never fired. An order-dependent pin is not a pin; this one does
+        not depend on logging configuration at all."""
+        from ghost_agent.tools import memory as _mem
+        from ghost_agent.core import agent as _core_agent
+        ctx = MagicMock()
+        ctx.args.frontier_selfplay = False
+        ctx.args.deep_reason = False   # argparse always supplies a bool
+        ctx.mcts_reasoner = None
+        monkeypatch.setattr(_core_agent, "_MCTS_TURNSTART_ENABLED", True)
+        captured = []
+        monkeypatch.setattr(_mem.logger, "debug",
+                            lambda msg, *a, **k: captured.append(str(msg)))
+        _mem._maybe_retrain_prm(ctx)
+        body = "\n".join(captured)
+        assert "PRM retrain skipped" in body, "twin skipped silently"
+        assert "--deep-reason is not set" in body, \
+            f"twin skip log does not name the missing conjunct: {body!r}"
+        assert "module-gated off" not in body, \
+            "twin blames a module gate that is ON in this run"
+        # R18 MAJOR-2 (sixteenth twin-path miss): phase 2.7's skip log has
+        # `assert "PRODUCER" in body` and this twin did not, so deleting
+        # the producer explanation here left 1,767 tests green. That
+        # sentence IS the §4BN retraction, stated where a future reader
+        # of this gate will see it.
+        assert "PRODUCER" in body, (
+            "the twin skip log no longer records WHY --prm-online-update "
+            "is excluded — that sentence is the retraction")
+
+    def test_module_gate_without_a_reasoner_still_short_circuits(
+            self, monkeypatch, tmp_path):
+        """R4 MAJOR-3: the twin gate's use of the shared predicate was
+        unpinned — the only test driving it set the module constant False,
+        so it could not see the conjunct at all. Re-inlining R3's
+        one-conjunct bug here left 83 tests green while this path went
+        back to training a model nothing can read."""
+        from ghost_agent.tools import memory as _mem
+        from ghost_agent.core import agent as _core_agent
+        ctx = MagicMock()
+        ctx.args.frontier_selfplay = False
+        ctx.args.deep_reason = False   # argparse always supplies a bool
+        ctx.mcts_reasoner = None            # no --deep-reason
+        monkeypatch.setattr(_core_agent, "_MCTS_TURNSTART_ENABLED", True)
+        _real_ctx, trained = _twin_ctx_that_would_train(
+            tmp_path, monkeypatch, frontier_selfplay=False,
+            prm_online_update=False)
+        _real_ctx.mcts_reasoner = None       # module gate ON, no reasoner
+        _mem._maybe_retrain_prm(_real_ctx)
+        assert not trained, (
+            "the twin retrain gate walked past a module constant that is "
+            "NECESSARY but not SUFFICIENT — nothing can call .score() "
+            "without a live mcts_reasoner (--deep-reason)")
+
+    def test_consumer_gate_short_circuits_before_any_work(self, monkeypatch,
+                                                          tmp_path):
+        """With no consumer live the helper must return BEFORE touching
+        the collector — that skip is the 41-wasted-retrains fix, and
+        --prm-online-update must not satisfy it (§4BN)."""
+        from ghost_agent.tools import memory as _mem
+        from ghost_agent.core import agent as _core_agent
+        ctx = MagicMock()
+        ctx.args.frontier_selfplay = False
+        ctx.args.deep_reason = False   # argparse always supplies a bool
+        ctx.args.prm_online_update = True      # the PRODUCER — must not count
+        # `_maybe_retrain_prm` does a call-time `from ..core.agent import
+        # _MCTS_TURNSTART_ENABLED`, so the SOURCE module is the patch
+        # target — patching the importer would be a no-op that passes.
+        monkeypatch.setattr(_core_agent, "_MCTS_TURNSTART_ENABLED", False)
+        # R6 MAJOR-5: this used to install a property probe on
+        # `trajectory_collector` and assert it was never READ — but R5
+        # made the collector a legitimate INPUT to the gate, so the probe
+        # stayed quiet only by `and`-short-circuit order. Hoisting the
+        # read into a local (an honest readability refactor) false-failed
+        # it. Assert the real property instead: no training work happened.
+        _real_ctx, trained = _twin_ctx_that_would_train(
+            tmp_path, monkeypatch, frontier_selfplay=False,
+            prm_online_update=True)      # the PRODUCER is ON
+        _mem._maybe_retrain_prm(_real_ctx)
+        assert not trained, (
+            "the retrain helper walked past the consumer gate with no "
+            "consumer live — --prm-online-update is a producer and must "
+            "not re-arm training (§4BN)")

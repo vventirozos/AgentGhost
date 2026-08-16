@@ -30,13 +30,19 @@ BOT = "UBOTBOT12"
 @pytest.fixture(scope="module")
 def bot():
     """Load the bot module once, with the env its import requires."""
-    os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-not-real")
-    os.environ.setdefault("GHOST_API_KEY", "test-key")
+    # ASSIGNED, not setdefault (R1 test review): a dev shell that sourced
+    # the bot's live .env would otherwise hand a REAL token to AsyncApp —
+    # one un-patched auth_test away from a live API call.
+    os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
+    os.environ["GHOST_API_KEY"] = "test-key"
     # Explicitly EMPTY (ASSIGNED, not setdefault): no rotating-file handler
     # at import. A dev shell that sourced the bot's .env would otherwise
     # carry the live path into the env and every module (re)load here would
     # attach a handler on the LIVE bot log to this pytest process.
     os.environ["GHOST_SLACKBOT_LOG"] = ""
+    # Same rationale for the reply index: without this, a test added here
+    # that drives _process_message would write the OPERATOR'S LIVE index.
+    os.environ["GHOST_SLACK_REPLY_INDEX"] = ""
     spec = importlib.util.spec_from_file_location("ghost_slack_bot_under_test",
                                                   _BOT_PATH)
     mod = importlib.util.module_from_spec(spec)
@@ -89,6 +95,11 @@ class TestHandlers:
         return asyncio.run(coro)
 
     def test_mention_from_stranger_is_silently_ignored(self, bot, monkeypatch):
+        # Pins the OWNER-LOCKED mode. Open-channel mode (default ON since
+        # 2026-08-13, operator decision) is pinned in
+        # test_slack_bot_feedback.py — this test asserts the lock still
+        # locks when the flag is off.
+        monkeypatch.setattr(bot, "OPEN_CHANNEL", False)
         proc = AsyncMock()
         monkeypatch.setattr(bot, "_process_message", proc)
         say = AsyncMock()
@@ -157,6 +168,9 @@ class TestHandlers:
 
 class TestThreadContextFilter:
     def test_only_owner_and_bot_messages_forwarded(self, bot, monkeypatch):
+        # OWNER-LOCKED mode pin (flag off) — open-mode context inclusion is
+        # pinned in test_slack_bot_feedback.py.
+        monkeypatch.setattr(bot, "OPEN_CHANNEL", False)
         uploads = AsyncMock()
         monkeypatch.setattr(bot, "upload_file_to_agent", uploads)
         monkeypatch.setattr(

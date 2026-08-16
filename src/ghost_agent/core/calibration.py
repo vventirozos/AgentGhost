@@ -302,9 +302,14 @@ def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 
 # 2026-08-07). Higher rank = stronger evidence, mirroring the outcome
 # ladder: a user correction outranks a late verifier verdict outranks
 # the inline turn grade; §4E's task-reopened retro-negative and the
-# failure-report tier sit between.
+# failure-report tier sit between. §4BF 1c adds `bench_validator`: the
+# bank oracle's mechanical verdict on a bench solve — ground truth for
+# its own population, so it outranks every inferred tier; the human
+# stays on top (bench req_ids never collide with real ones, the order
+# is for principle, not traffic).
 _SOURCE_RANK = {"turn": 0, "verifier_late": 1, "task_reopened": 2,
-                "failure_report": 3, "user_correction": 4}
+                "failure_report": 3, "bench_validator": 4,
+                "user_correction": 5}
 
 
 def resolve_superseded_rows(rows):
@@ -355,6 +360,52 @@ def _resolve_superseded(samples):
     keep = passthrough + [(i, s) for (_r, i, s) in best.values()]
     keep.sort(key=lambda t: t[0])
     return [s for _i, s in keep]
+
+
+def apply_bench_mass_cap_rows(rows):
+    """Dict-level twin of `_apply_bench_mass_cap` for raw-JSONL consumers
+    (learning-health label/feature stats — §4BF 1c R1 review: they gated
+    "entropy learnable" and the separation sigmas on an UNCAPPED,
+    bench-flooded superset while the fit computed the same gates on the
+    capped blend — the "instrument printed LEARNABLE while the fit pinned
+    to 0" lie, one origin richer). Same one-implementation-per-shape rule
+    as `resolve_superseded_rows`: both cap twins keep the newest bench
+    rows up to the real-row count, zero when no real rows."""
+    real_n = sum(1 for r in rows or []
+                 if str((r or {}).get("origin") or "user") != "bench")
+    bench = [r for r in rows or []
+             if str((r or {}).get("origin") or "user") == "bench"]
+    if len(bench) <= real_n:
+        return list(rows or [])
+    keep = {id(r) for r in bench[-real_n:]} if real_n else set()
+    return [r for r in rows or []
+            if str((r or {}).get("origin") or "user") != "bench"
+            or id(r) in keep]
+
+
+def _apply_bench_mass_cap(samples):
+    """§4BF Track 1c: blend populations under an EQUAL-MASS cap.
+
+    Bench solves accumulate labeled rows ~an order of magnitude faster
+    than real turns (~6-11/night vs ~3.5 turns/day, most unknown). The
+    operator decision admits them to the fit — but the instrument being
+    fitted scores REAL turns, so bench may contribute at most as many
+    rows as the real population (the newest bench rows win; recency is
+    file order, the corpus is append-only). With zero real rows bench
+    contributes nothing: a calibration curve fit purely on bench would
+    describe a population the composite never scores in production.
+    Applied in `fit` AND `_load_epoch` so Brier/ECE/reliability describe
+    the exact population the fit consumed (the §4L "population the agent
+    never fits" rule, one origin richer).
+    """
+    real_n = sum(1 for s in samples
+                 if getattr(s, "origin", "user") != "bench")
+    bench = [s for s in samples if getattr(s, "origin", "user") == "bench"]
+    if len(bench) <= real_n:
+        return list(samples)
+    keep = {id(s) for s in bench[-real_n:]} if real_n else set()
+    return [s for s in samples
+            if getattr(s, "origin", "user") != "bench" or id(s) in keep]
 
 
 # The model-text-only hedge scan landed 2026-08-01; before it, the
@@ -637,6 +688,13 @@ class CalibrationSample:
     # current value: silently promoting them is the exact contamination the
     # field exists to prevent.
     epoch: str = ""
+    # Which POPULATION the turn belongs to (§4BF Track 1c): "user" = a real
+    # turn, "bench" = an idle bench-bank solve. Legacy rows predate the
+    # field and were all real turns (sim was write-gated), so the default
+    # is correct on read. Kept separate from `source` — source ranks LABEL
+    # AUTHORITY within one request, origin separates populations across
+    # requests (the fit blends them under an equal-mass cap; see `fit`).
+    origin: str = "user"
 
 
 @dataclass
@@ -778,6 +836,7 @@ class CalibrationTracker:
         source: str = "turn",
         req_id: str = "",
         epoch: str = "",
+        origin: str = "user",
     ) -> bool:
         """Append one (confidence, outcome) pair. Never raises; returns
         True when the sample actually reached disk (callers that report
@@ -811,6 +870,7 @@ class CalibrationTracker:
                 source=str(source or "turn"),
                 req_id=str(req_id or ""),
                 epoch=str(epoch or CURRENT_EPOCH),
+                origin=str(origin or "user"),
             )
             with self._lock:
                 self.dir.mkdir(parents=True, exist_ok=True)
@@ -875,6 +935,8 @@ class CalibrationTracker:
                     # retro-negative below: reused features must not
                     # smuggle an older feature set into the live fit.
                     epoch=base.epoch,
+                    # A re-label never migrates populations.
+                    origin=base.origin,
                 )
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("record_late_verdict_correction failed: %s", exc)
@@ -933,9 +995,65 @@ class CalibrationTracker:
                     # the live fit — with a negative label attached, i.e. the
                     # most damaging row it could possibly contribute.
                     epoch=base.epoch,
+                    origin=base.origin,
                 )
         except Exception as exc:  # pragma: no cover — defensive
             logger.debug("record_task_reopened_negative failed: %s", exc)
+            return False
+
+    def record_bench_validator_verdict(self, req_id: str,
+                                       passed: bool) -> bool:
+        """§4BF Track 1c: re-label a BENCH solve's calibration sample with
+        the bank oracle's mechanical verdict.
+
+        A bench attempt records its ``source="turn"`` sample inside
+        `handle_chat` like any other turn — but that label is the inline
+        PROXY grade, written before the bank validator has run. The
+        validator's exit code is ground truth for this population, so it
+        re-labels at the ``bench_validator`` rank using the same
+        no-leakage contract as every other retro tier: the stored
+        FEATURES are reused untouched, only the label differs, and
+        `_resolve_superseded` makes it a re-label, not a counter-weight.
+        Idempotent per request; joins ``origin="bench"`` turn rows only
+        (a real turn's req_id can never be re-labeled by a bench oracle).
+        Never raises.
+        """
+        try:
+            req_id = str(req_id or "")
+            if not req_id:
+                return False
+            outcome = 1.0 if passed else 0.0
+            with self._lock:
+                samples = self._load_samples()
+                base = None
+                for s in samples:
+                    if s.req_id != req_id:
+                        continue
+                    if s.source == "bench_validator":
+                        return False      # already labeled
+                    if s.source == "turn" and s.origin == "bench":
+                        base = s          # last write wins
+                if base is None:
+                    return False          # no join — skip, never default
+                if abs(base.outcome - outcome) < 1e-9:
+                    return False          # inline grade already agreed
+                return self.record(
+                    composite=base.composite,
+                    entropy_component=base.entropy_component,
+                    competence_component=base.competence_component,
+                    uncertainty_pressure=base.uncertainty_pressure,
+                    outcome=outcome,
+                    domain=base.domain,
+                    entropy_observed=base.entropy_observed,
+                    effort_component=base.effort_component,
+                    effort_observed=base.effort_observed,
+                    source="bench_validator",
+                    req_id=req_id,
+                    epoch=base.epoch,
+                    origin=base.origin,
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("record_bench_validator_verdict failed: %s", exc)
             return False
 
     # ----------------------------------------------------------- reading
@@ -957,8 +1075,11 @@ class CalibrationTracker:
         # average superseded duplicate labels (reported Brier 0.410 vs
         # 0.810 on the fit's resolved population) — the exact
         # "population the agent never fits" failure this docstring
-        # warns about, one filter deeper.
-        return _migrate_leaked_pressure(_resolve_superseded(scoped))
+        # warns about, one filter deeper. Same ORIGIN CAP as the fit too
+        # (§4BF 1c) — the metrics must describe the blended population
+        # the fit consumes, not a bench-flooded superset.
+        return _migrate_leaked_pressure(
+            _apply_bench_mass_cap(_resolve_superseded(scoped)))
 
     def _load_samples(self, limit: Optional[int] = None) -> List[CalibrationSample]:
         if not self.history_path.exists():
@@ -1003,6 +1124,8 @@ class CalibrationTracker:
                         # Untagged legacy rows get their epoch DERIVED, not
                         # defaulted to the current one — see `CURRENT_EPOCH`.
                         epoch=str(d.get("epoch") or epoch_for_ts(d.get("ts"))),
+                        # Legacy rows were all real turns (sim write-gated).
+                        origin=str(d.get("origin") or "user"),
                     )
                 )
             except Exception:
@@ -1013,7 +1136,8 @@ class CalibrationTracker:
     def sample_count(self) -> int:
         return len(self._load_samples())
 
-    def recent_samples(self, limit: int = 500) -> List[CalibrationSample]:
+    def recent_samples(self, limit: int = 500, *,
+                       exclude_origin: str = "") -> List[CalibrationSample]:
         """The most recent ``limit`` samples, ALL epochs.
 
         Public read for consumers that only need the per-turn scores keyed by
@@ -1022,12 +1146,22 @@ class CalibrationTracker:
         against each other within one recent window, and dropping older-epoch
         rows would silently shrink that window — whereas a FIT must never mix
         epochs, which is why `fit` uses `_load_epoch` instead.
+
+        ``exclude_origin`` (§4BF 1c, R4 review): filters BEFORE the window is
+        taken — a caller-side filter after the tail is a no-op against
+        dilution, because the rows bench pushed out of the newest-N stay
+        pushed out. Real-turn consumers (reflection triage) pass "bench" so
+        their window holds ``limit`` REAL rows regardless of idle volume.
         """
         try:
             n = max(1, int(limit))
         except (TypeError, ValueError):
             n = 500
-        return self._load_samples(limit=n)
+        if not exclude_origin:
+            return self._load_samples(limit=n)
+        rows = [s for s in self._load_samples()
+                if getattr(s, "origin", "user") != exclude_origin]
+        return rows[-n:]
 
     # ----------------------------------------------------------- metrics
 
@@ -1095,20 +1229,30 @@ class CalibrationTracker:
         previous fit (or the hardcoded defaults) stays in force.
         """
         floor = min_samples if min_samples is not None else self.min_samples_for_fit
+        # ⚠ Accepted residual (§4BF 1c R3/R4): max_history is a raw LINE
+        # tail, origin-blind — sustained bench volume slowly shrinks the
+        # real mass inside this window (the equal-mass cap protects the
+        # RATIO, not the absolute real count). Latent at today's corpus
+        # (~1.8k rows vs 4k window); revisit if bench cadence grows.
         all_samples = self._load_samples(limit=self.max_history)
         epoch_samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
-        samples = _migrate_leaked_pressure(
-            _resolve_superseded(epoch_samples))
-        # ⚠ Two DIFFERENT exclusions, counted apart (§4L R2 NEW-5): the
-        # old single number folded supersede-drops into a field named
-        # "older-epoch rows excluded" — 1 "older-epoch row" on a corpus
-        # with zero of them.
+        resolved = _resolve_superseded(epoch_samples)
+        samples = _migrate_leaked_pressure(_apply_bench_mass_cap(resolved))
+        # ⚠ THREE different exclusions, counted apart (§4L R2 NEW-5, one
+        # richer for 1c): epoch scope, source-rank supersession, and the
+        # bench mass cap. Folding cap-drops into "superseded" would make
+        # a bench-heavy night read as thousands of duplicate requests.
         n_excluded = len(all_samples) - len(epoch_samples)
-        n_superseded = len(epoch_samples) - len(samples)
+        n_superseded = len(epoch_samples) - len(resolved)
+        n_bench_capped = len(resolved) - len(samples)
         if n_superseded:
             logger.debug(
                 "calibration: %d duplicate-request row(s) resolved by "
                 "source-rank supersession before the fit", n_superseded)
+        if n_bench_capped:
+            logger.debug(
+                "calibration: %d bench row(s) dropped by the equal-mass "
+                "cap before the fit (§4BF 1c)", n_bench_capped)
         if len(samples) < floor:
             logger.debug(
                 "calibration fit bail: %d samples in epoch %s < floor %d "
@@ -1479,17 +1623,26 @@ class CalibrationTracker:
     def stats(self) -> Dict[str, object]:
         """Introspection summary (for ``introspect`` / the calib log)."""
         all_samples = self._load_samples(limit=self.max_history)
-        samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
+        # §4BF 1c (R1 review): the SAME resolution + origin cap as the fit.
+        # The raw-epoch version reported a brier over superseded duplicates
+        # and uncapped bench rows — a population the fit never consumes
+        # (measured in review: 0.2614 over 7 raw rows vs 0.29 over the
+        # fit's 2). The raw count stays visible as `samples_raw_epoch`.
+        raw_epoch = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
+        samples = _migrate_leaked_pressure(
+            _apply_bench_mass_cap(_resolve_superseded(raw_epoch)))
         brier = (
             sum((s.composite - s.outcome) ** 2 for s in samples) / len(samples)
             if samples else None
         )
         params = self.load_params()
         return {
-            # Current epoch — the population the fit and every metric below
-            # describe. `samples_all_epochs` is reported beside it so a drop
-            # after an epoch bump reads as a filter, not as data loss.
+            # Current epoch, resolved + capped — the population the fit and
+            # every metric below describe. `samples_all_epochs` is reported
+            # beside it so a drop after an epoch bump reads as a filter,
+            # not as data loss.
             "samples": len(samples),
+            "samples_raw_epoch": len(raw_epoch),
             "samples_all_epochs": len(all_samples),
             "epoch": CURRENT_EPOCH,
             "brier": round(brier, 4) if brier is not None else None,

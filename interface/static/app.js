@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=9.2';
+import * as matrixGraphFace from './matrix_graph.js?v=9.4';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -113,6 +113,8 @@ const ICON_CLASS = {
     '📣': 'accent',   // NOTIFY_OUT
     '🪞': 'accent',   // SELF_STATE
     '🎓': 'accent',   // SKILL_GRADUATE
+    '👍': 'accent',   // FEEDBACK_POS — human outcome label (/api/feedback)
+    '👎': 'accent',   // FEEDBACK_NEG
 
     // --- tools (external action) ---
     '🌐': 'tool',     // TOOL_SEARCH
@@ -193,9 +195,12 @@ function _iconClass(icon) { return ICON_CLASS[icon] || 'think'; }
 
 // Used elsewhere (setWorkingState gating). "Working" = the agent is
 // actively doing something a user cares to watch; true for everything
-// except idle / SYSTEM_SHUT.
+// except idle / SYSTEM_SHUT — and except the human-feedback receipts
+// (👍/👎), which are terminal bookkeeping: labeling yesterday's reply
+// must not spin the face into a 60s "working" animation on an idle agent.
+const _NON_WORKING_ICONS = new Set(['👍', '👎']);
 const WORKING_ICONS = new Set(Object.keys(ICON_CLASS).filter(i =>
-    ICON_CLASS[i] !== 'idle'
+    ICON_CLASS[i] !== 'idle' && !_NON_WORKING_ICONS.has(i)
 ));
 const IDLE_ICONS = new Set(Object.keys(ICON_CLASS).filter(i =>
     ICON_CLASS[i] === 'idle' || i === '✅' || i === '❌' || i === '🛑'
@@ -220,6 +225,10 @@ let currentTaskId = null;
 let currentChunkIndex = 0;
 let currentAgentMessageDiv = null;
 let currentAccumulatedContent = "";
+// The AGENT's request id for the in-flight turn (from the SSE frames'
+// "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
+// Distinct from currentTaskId, which is the interface proxy's stream handle.
+let currentReqId = null;
 let currentThinkingInterval = null;
 let currentTTSMutedLength = 0;
 
@@ -506,6 +515,20 @@ if ('visualViewport' in window) {
         kbGuardRetries = 0;
         // No focused editable = no keyboard; anything left over is stale.
         if (!isEditing()) kb = 0;
+        // ── ONE MECHANISM AT A TIME ────────────────────────────────
+        // `syncBodyHeight` pins document.body to the visual viewport
+        // whenever _vvKeyboardOpen(), which ALREADY lifts the footer to
+        // sit just above the keyboard. Translating #ui-layer on top of
+        // that applies the same correction twice and drives the composer
+        // clean off the TOP of the screen, overlapping the status bar
+        // (operator screenshot, iOS, after a long reply).
+        //
+        // The transform stays for the window the body pin does not
+        // cover: _vvKeyboardOpen() additionally requires this
+        // orientation's max height to be learned and the drop to exceed
+        // 80px, so a just-focused input or an unlearned baseline still
+        // needs it. Whichever is active, exactly one of them is.
+        if (_vvKeyboardOpen()) kb = 0;
         // A real mobile keyboard never exceeds ~55% of the screen.
         kb = Math.min(kb, Math.round(window.innerHeight * 0.55));
         setKb(kb);
@@ -847,46 +870,44 @@ function decorateCodeBlocks(root) {
     });
 }
 
-// Empty-state hero: greet the user and suggest a few starter prompts
-// instead of leaving the chat log as a silent black rectangle. Clicking
-// a chip drops it into the input so the user can edit before sending.
-const EXAMPLE_PROMPTS = [
-    'What are you capable of?',
-    'Summarise the latest files in my sandbox.',
-    'Write a python script to sort CSV by a column.',
-];
+// Empty-state hero. Operator direction 2026-08-16: the suggestion chips
+// ("What are you capable of?" …) are GONE, and the wordmark is quiet.
+//
+// The reasoning: this sits on top of a live animated constellation that is
+// the most striking thing on the screen. A heavy 700-weight, 10px-tracked,
+// double-glow title plus three buttons competed with it and won — which is
+// why the result read as cluttered. An empty state is a threshold, not a
+// billboard: a hairline wordmark, a rule, and one line of orientation.
 function renderEmptyStateHero() {
     if (!chatLog) return;
     // Don't stack heroes if one's already there.
     if (chatLog.querySelector('.empty-hero')) return;
+
     const hero = document.createElement('div');
     hero.className = 'empty-hero';
+
     const title = document.createElement('div');
     title.className = 'empty-hero-title';
-    title.textContent = 'GHOST AGENT';
+    // Per-letter spans so the reveal can cascade; the trailing letter's
+    // tracking is trimmed in CSS so the word stays optically centred.
+    for (const ch of 'GHOST') {
+        const span = document.createElement('span');
+        span.textContent = ch;
+        title.appendChild(span);
+    }
+
+    const rule = document.createElement('div');
+    rule.className = 'empty-hero-rule';
+
     const sub = document.createElement('div');
     sub.className = 'empty-hero-sub';
     sub.textContent = window.matchMedia('(pointer: coarse)').matches
-        ? 'Ask anything.'
+        ? 'Ask anything'
         : 'Ask anything · ⌘K for commands';
-    const chips = document.createElement('div');
-    chips.className = 'empty-hero-chips';
-    for (const p of EXAMPLE_PROMPTS) {
-        const chip = document.createElement('button');
-        chip.type = 'button';
-        chip.className = 'empty-hero-chip';
-        chip.textContent = p;
-        chip.addEventListener('click', () => {
-            chatInput.value = p;
-            chatInput.focus();
-            // Fire input so auto-expand runs.
-            chatInput.dispatchEvent(new Event('input'));
-        });
-        chips.appendChild(chip);
-    }
+
     hero.appendChild(title);
+    hero.appendChild(rule);
     hero.appendChild(sub);
-    hero.appendChild(chips);
     chatLog.appendChild(hero);
 }
 function dismissEmptyStateHero() {
@@ -984,8 +1005,9 @@ function addMessage(role, text) {
 function decorateMessageActions() {
     if (!chatLog) return;
     chatLog.querySelectorAll('.message.agent, .message.user').forEach(div => {
-        if (div.querySelector(':scope > .msg-actions')) return;
         if (div.classList.contains('thinking') || div.classList.contains('streaming')) return;
+        _ensureFeedbackRow(div);
+        if (div.querySelector(':scope > .msg-actions')) return;
         const row = document.createElement('div');
         row.className = 'msg-actions';
         const time = document.createElement('span');
@@ -1010,6 +1032,213 @@ function decorateMessageActions() {
         row.appendChild(menuBtn);
         div.appendChild(row);
     });
+}
+
+// Inline SVG thumbs (Material outlines rendered as currentColor fills) so
+// the feedback controls take the theme's color system — emoji glyphs can't.
+// Built via DOM APIs to keep the file free of innerHTML='<...>' patterns.
+const _THUMB_PATHS = {
+    up: 'M1 21h4V9H1v12zM23 10c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.58 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z',
+    down: 'M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.59-6.59c.36-.36.58-.86.58-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z'
+};
+
+function _thumbSvg(kind) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('fill', 'currentColor');
+    p.setAttribute('d', _THUMB_PATHS[kind]);
+    svg.appendChild(p);
+    return svg;
+}
+
+// Outcome-label footer for agent bubbles with a known request id: a quiet
+// right-aligned row INSIDE the bubble (hover-revealed on desktop, dim-always
+// on touch, latched visible once a verdict is chosen). Lives in normal flow
+// — the old placement inside the floating .msg-actions overlay crowded the
+// timestamp/menu and could overlap the reply text (operator: "really bad").
+function _ensureFeedbackRow(div) {
+    if (!div.classList.contains('agent') || !div.dataset.reqId) return;
+    if (div.querySelector(':scope > .msg-feedback')) return;
+    const fbRow = document.createElement('div');
+    fbRow.className = 'msg-feedback';
+    if (div.dataset.feedback) fbRow.classList.add('fb-decided');
+    for (const sig of ['positive', 'negative']) {
+        const fb = document.createElement('button');
+        fb.className = `msg-fb-btn msg-fb-${sig}`;
+        fb.type = 'button';
+        fb.title = sig === 'positive'
+            ? 'Good answer (labels this turn passed)'
+            : 'Bad answer (labels this turn failed)';
+        fb.setAttribute('aria-label', fb.title);
+        fb.appendChild(_thumbSvg(sig === 'positive' ? 'up' : 'down'));
+        if (div.dataset.feedback === sig) fb.classList.add('fb-active');
+        fb.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            sendFeedback(div, sig);
+        });
+        fbRow.appendChild(fb);
+    }
+    div.appendChild(fbRow);
+}
+
+// ── Client-only history keys (reqId/feedback — the 👍/👎 label plumbing) ──
+// Stripped from EVERY wire payload; preserved across server-history
+// adoption. One canonical mapper so a new chatHistory sender can't forget
+// the strip (R1 review: the sessions resync compared fat-local vs
+// clean-server JSON and read "drifted" on every focus, wiping the labels).
+function toWireMessage(m) {
+    if (!m || typeof m !== 'object') return m;
+    const { reqId, feedback, ...rest } = m;
+    return rest;
+}
+
+// Carry the client-only label keys forward onto a server-fetched history.
+// Server messages are canonical for role/content but never carry reqId, so
+// adopting them verbatim silently stripped every label (and persisted the
+// loss via saveChatState). Index-aligned and gated on role+content
+// equality, so adopting a genuinely different conversation is a no-op.
+function mergeClientLabelKeys(serverMsgs) {
+    const out = Array.isArray(serverMsgs)
+        ? serverMsgs.map(m => (m && typeof m === 'object' ? { ...m } : m))
+        : [];
+    for (let i = 0; i < out.length && i < chatHistory.length; i++) {
+        const loc = chatHistory[i];
+        if (!loc || !loc.reqId || !out[i] || out[i].role !== loc.role) continue;
+        // Content gate, with ONE relaxation: an aborted reply's local copy
+        // is the server's full reply truncated + "*[Aborted]*" — exact
+        // equality would drop the label from precisely the reply most
+        // likely to be 👎'd (the sessions resync re-adopts ~2s after every
+        // abort, deterministically). Scoped tight (R3 review): only at the
+        // LOCAL TAIL, where the abort stub always lives, and only with a
+        // substantial prefix — a short generic stub ("Sure") prefix-matching
+        // an index-shifted different reply would graft the wrong reqId.
+        let same = out[i].content === loc.content;
+        if (!same && i === chatHistory.length - 1
+                && typeof out[i].content === 'string'
+                && typeof loc.content === 'string') {
+            const abortIdx = loc.content.lastIndexOf('\n\n*[Aborted]*');
+            if (abortIdx >= 32) {
+                same = out[i].content.startsWith(loc.content.slice(0, abortIdx));
+            }
+        }
+        if (same) {
+            out[i].reqId = loc.reqId;
+            if (loc.feedback) out[i].feedback = loc.feedback;
+        }
+    }
+    return out;
+}
+
+// Stamp a bubble with its agent request id. A REUSED bubble (resume path)
+// keeps its dataset across innerHTML rewrites, so a changed id must clear
+// the stale feedback latch + row or the new reply renders a verdict nobody
+// gave — and the same-signal no-op guard would then make that thumb
+// permanently untappable.
+function _stampReqId(div, id) {
+    if (!div) return;
+    // Stale-clear runs even when the NEW id is unknown (R3: a reused
+    // bubble whose new turn captured no id — the "No response" path —
+    // kept the previous turn's reqId, latch, and thumbs, so a tap there
+    // labeled the wrong trajectory).
+    if (div.dataset.reqId && div.dataset.reqId !== (id || '')) {
+        delete div.dataset.reqId;
+        delete div.dataset.feedback;
+        // The retry latch and any armed retry belong to the OLD turn — a
+        // reused bubble must not fire the old label at the new id, nor
+        // start the new turn with its one 404 retry already burned.
+        delete div.dataset.fbRetried;
+        if (div._fbTimer) { clearTimeout(div._fbTimer); div._fbTimer = null; }
+        const old = div.querySelector(':scope > .msg-feedback');
+        if (old) old.remove();
+    }
+    if (id) div.dataset.reqId = id;
+}
+
+// POST a human outcome label for an agent reply (Track-1a, 2026-08-13).
+// The agent resolves request_id → trajectory and writes its corrections
+// sidecar, turning this turn's outcome=unknown into a real label for the
+// learning stack. Fire-and-forget with a visual latch on the tapped thumb.
+async function sendFeedback(div, signal, retryReqId) {
+    const reqId = div.dataset.reqId;
+    // Same-signal repeats are a no-op CLIENT-side too (the server also
+    // dedupes — first live test: three 👍 in 2s appended three sidecar
+    // rows). Switching to the opposite thumb re-labels.
+    if (!reqId || div.dataset.feedback === signal) return;
+    // An ARMED RETRY fires blind 4s later — it must stand down if the
+    // operator labeled in the meantime (either thumb: a 👎 landed after
+    // the pending 👍 would otherwise be silently overwritten server-side)
+    // or if the bubble was re-stamped with a different turn's id.
+    if (retryReqId && (div.dataset.feedback || reqId !== retryReqId)) return;
+    // A fresh tap supersedes any armed retry from a previous tap — and
+    // returns the un-consumed retry budget (R3: a superseding tap during
+    // the flush window burned the latch without a retry ever running, so
+    // the tap that would have succeeded at t+4s turned into an error).
+    if (!retryReqId && div._fbTimer) {
+        clearTimeout(div._fbTimer);
+        div._fbTimer = null;
+        delete div.dataset.fbRetried;
+    }
+    const btns = div.querySelectorAll('.msg-fb-btn');
+    btns.forEach(b => { b.disabled = true; });
+    try {
+        const r = await fetch('/api/feedback', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ request_id: reqId, signal: signal, source: 'web' })
+        });
+        if (!r.ok) {
+            // 404 = the trajectory can flush moments AFTER the stream ends
+            // (the agent records it post-semaphore) — one delayed retry
+            // recovers exactly the tap-the-instant-it-lands case.
+            if (r.status === 404 && !div.dataset.fbRetried) {
+                div.dataset.fbRetried = '1';
+                div._fbTimer = setTimeout(() => {
+                    div._fbTimer = null;
+                    sendFeedback(div, signal, reqId);
+                }, 4000);
+                return;
+            }
+            const err = await r.json().catch(() => ({}));
+            addMessage('system', `Feedback not recorded: ${err.error || err.detail || ('HTTP ' + r.status)}`);
+            return;
+        }
+        delete div.dataset.fbRetried;
+        // Latch on the LIVE bubble: a drift re-render can detach `div`
+        // between the tap (or an armed retry) and this response — latching
+        // the detached node showed no verdict and invited a duplicate tap
+        // (R3 review). The history loop below is the durable half either way.
+        let target = div;
+        if (!target.isConnected) {
+            // CSS.escape: reqIds are server hex today, but X-Request-ID is
+            // client-controlled on other surfaces — an unescaped quote
+            // would throw here AFTER the POST succeeded and misreport a
+            // recorded label as a network error.
+            target = chatLog.querySelector(
+                `.message.agent[data-req-id="${CSS.escape(reqId)}"]`) || div;
+        }
+        target.dataset.feedback = signal;
+        const fbRow = target.querySelector(':scope > .msg-feedback');
+        if (fbRow) fbRow.classList.add('fb-decided');
+        target.querySelectorAll('.msg-fb-btn').forEach(b => {
+            b.classList.toggle('fb-active',
+                b.classList.contains(`msg-fb-${signal}`));
+        });
+        // Persist the latch so a reload re-renders the chosen thumb.
+        for (let i = chatHistory.length - 1; i >= 0; i--) {
+            if (chatHistory[i].reqId === reqId) {
+                chatHistory[i].feedback = signal;
+                break;
+            }
+        }
+        if (typeof saveChatState === 'function') saveChatState();
+    } catch (e) {
+        console.warn('feedback failed:', e);
+        addMessage('system', 'Feedback not recorded: network error — tap again.');
+    } finally {
+        btns.forEach(b => { b.disabled = false; });
+    }
 }
 
 function scrollToBottom() {
@@ -1121,6 +1350,13 @@ function renderHistoryToLog(history) {
                     } else {
                         div.innerHTML = renderMarkdown(cleanContent);
                         if (roleClass === 'agent') decorateCodeBlocks(div);
+                    }
+                    // Restore the feedback handle + chosen thumb so the
+                    // 👍/👎 buttons survive a reload (local history only —
+                    // server-side sessions don't carry reqId).
+                    if (roleClass === 'agent' && msg.reqId) {
+                        div.dataset.reqId = msg.reqId;
+                        if (msg.feedback) div.dataset.feedback = msg.feedback;
                     }
                     chatLog.appendChild(div);
                 }
@@ -1241,16 +1477,32 @@ function ensureAgentBubbleForResume() {
     scrollToBottom();
 }
 
+// True while `sid` is still the conversation this tab is showing. The
+// reconcile poll can outlive a rail switch/new-chat by many seconds —
+// adopting session A's history after the user moved to session B would
+// bind A's transcript to B and replay it into B's durable store on the
+// next turn (R6 review; same corruption class as the sessions resync).
+function _sessionStillCurrent(sid) {
+    const cur = window.__ghostSessionId;
+    // undefined = the sessions module hasn't booted/bound yet → allow.
+    // null = EXPLICITLY unbound (/clear with sessions unreachable,
+    // setCurrent(null)) → adopting anything would resurrect the cleared
+    // conversation (R7 review). Anything else: exact match only.
+    if (cur === undefined) return true;
+    return cur === sid;
+}
+
 async function reconcileFromSession(sid) {
     if (!sid) { clearInflightHandle(); return; }
-    // A LIVE turn owns the log. Bail at entry AND after every await —
-    // adoption calls renderHistoryToLog, which would detach the bubble a
-    // new turn is streaming into and drop its user message.
-    if (isProcessingRequest) return;
+    // A LIVE turn owns the log, and so does a NEWER session identity.
+    // Bail at entry AND after every await — adoption calls
+    // renderHistoryToLog, which would detach the bubble a new turn is
+    // streaming into and drop its user message.
+    if (isProcessingRequest || !_sessionStillCurrent(sid)) return;
     let stillRunning = false;
     try {
         const tr = await fetch('/api/turns');
-        if (isProcessingRequest) return;
+        if (isProcessingRequest || !_sessionStillCurrent(sid)) return;
         if (tr.ok) {
             const td = await tr.json();
             stillRunning = (td.turns || []).some(
@@ -1273,13 +1525,19 @@ async function reconcileFromSession(sid) {
     }
     try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`);
-        if (isProcessingRequest) return;
+        if (isProcessingRequest || !_sessionStillCurrent(sid)) return;
         if (res.ok) {
             const data = await res.json();
+            if (isProcessingRequest || !_sessionStillCurrent(sid)) return;
             const msgs = Array.isArray(data.messages) ? data.messages : [];
             if (msgs.length > chatHistory.length) {
-                // Server is canonical: ADOPT, never append.
-                chatHistory = msgs.map((m) => ({ role: m.role, content: m.content }));
+                // Server is canonical: ADOPT with the FULL message shape
+                // ({...m} — re-shaping to {role, content} dropped
+                // tool_calls/name and guaranteed one spurious drift
+                // re-render on the next resync), carrying the client-only
+                // label keys forward (they exist ONLY here; verbatim
+                // adoption stripped every 👍/👎 and persisted the loss).
+                chatHistory = mergeClientLabelKeys(msgs);
                 renderHistoryToLog(chatHistory);
                 saveChatState();
                 addMessage('system', 'Recovered the reply that finished while you were away.');
@@ -1477,6 +1735,10 @@ function noteTickerLine(raw) {
         return;
     }
     if (cls !== 'tool' && cls !== 'memory' && cls !== 'plan' && cls !== 'accent') return;
+    // Feedback receipts are terminal bookkeeping, not turn activity — an
+    // in-flight turn's status line must not read out a 👍 someone left on
+    // yesterday's reply.
+    if (_NON_WORKING_ICONS.has(icon)) return;
     const iconIdx = parts.findIndex(p => p.includes(icon));
     if (iconIdx < 0) return;
     let ti = iconIdx + 1;
@@ -1546,7 +1808,8 @@ async function sendMessage(isResume = false) {
         currentTaskId = null;
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
-        
+        currentReqId = null;
+
         chatHistory.push({ role: "user", content: text });
         if (typeof saveChatState === 'function') saveChatState();
         if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
@@ -1604,7 +1867,12 @@ async function sendMessage(isResume = false) {
         // chat with a 404. With no `model`, the agent uses its configured
         // model (`requested_model or configured_model`), so the client
         // always tracks whatever the agent is running.
-        const payload = { messages: chatHistory, stream: true };
+        // Strip client-only bookkeeping (reqId/feedback — the 👍/👎 label
+        // plumbing) so the wire payload stays clean OpenAI message shapes.
+        const payload = {
+            messages: chatHistory.map(toWireMessage),
+            stream: true
+        };
         // Durable sessions: when the workspace module holds an active
         // session id, bind the turn to it. The AGENT is the source of
         // truth for session history and merges tolerantly, so replaying
@@ -1622,6 +1890,10 @@ async function sendMessage(isResume = false) {
             });
             setTimeout(scrollToBottom, 50);
         } else {
+            // A genuinely NEW upstream turn (also reachable on a resume
+            // whose task handle was lost) — any captured id belongs to an
+            // abandoned turn and must not stamp this one's reply.
+            currentReqId = null;
             response = await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1666,6 +1938,12 @@ async function sendMessage(isResume = false) {
                 try {
                     const data = JSON.parse(dataStr);
                     let chunkContent = "";
+
+                    // Every frame carries the agent's request id as
+                    // "chatcmpl-<id>" — capture once for feedback labels.
+                    if (!currentReqId && typeof data.id === 'string' && data.id) {
+                        currentReqId = data.id.replace(/^chatcmpl-/, '');
+                    }
 
                     if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
                         chunkContent = data.choices[0].delta.content;
@@ -1742,12 +2020,22 @@ async function sendMessage(isResume = false) {
 
         // Push the final concatenated message to chat history. On the
         // resume path the partial assistant turn was never pushed when it
-        // dropped, so a plain push is correct in both cases.
+        // dropped, so a plain push is correct in both cases. `reqId` is
+        // client-only bookkeeping (stripped from wire payloads) that lets
+        // the 👍/👎 label buttons survive a reload.
         if (currentAccumulatedContent) {
-            chatHistory.push({ role: "assistant", content: currentAccumulatedContent });
+            chatHistory.push({ role: "assistant", content: currentAccumulatedContent,
+                               reqId: currentReqId || undefined });
+            // Stamp only alongside a history entry that carries the id —
+            // a "No response" bubble with live thumbs would take labels
+            // that can never persist (no matching entry to latch onto).
+            _stampReqId(currentAgentMessageDiv, currentReqId);
         } else {
             currentAgentMessageDiv.textContent = "No response";
             chatHistory.push({ role: "assistant", content: "No response" });
+            // Clear any stale stamp from a previous turn on a reused
+            // bubble — an unlabeled "No response" must carry no thumbs.
+            _stampReqId(currentAgentMessageDiv, null);
         }
         if (typeof saveChatState === 'function') saveChatState();
         if (typeof notifyUser === 'function') notifyUser("Response complete.");
@@ -1770,7 +2058,14 @@ async function sendMessage(isResume = false) {
             }
             if (!resuming && currentAccumulatedContent === "" && currentAgentMessageDiv) currentAgentMessageDiv.remove();
             if (currentAccumulatedContent !== "") {
-                chatHistory.push({ role: "assistant", content: currentAccumulatedContent + "\n\n*[Aborted]*" });
+                // Keep the reqId: a reply aborted BECAUSE it was going
+                // wrong is a prime 👎 target, and the trajectory exists.
+                chatHistory.push({ role: "assistant",
+                                   content: currentAccumulatedContent + "\n\n*[Aborted]*",
+                                   reqId: currentReqId || undefined });
+                if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) {
+                    _stampReqId(currentAgentMessageDiv, currentReqId);
+                }
                 addMessage('system', 'Request cancelled by user.');
             } else {
                 addMessage('system', 'Request cancelled by user.');
@@ -2047,7 +2342,11 @@ if (workspaceBtn && workspaceUploadInput) {
                 const response = await fetch('/api/workspace/save', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chat_history: chatHistory })
+                    // Same wire-shape strip as /api/chat: a workspace
+                    // restored weeks later would otherwise present live
+                    // thumbs whose reqIds are past the agent's 8-day
+                    // trajectory scan — guaranteed 404s.
+                    body: JSON.stringify({ chat_history: chatHistory.map(toWireMessage) })
                 });
                 
                 if (!response.ok) throw new Error('Failed to save workspace');
@@ -3559,6 +3858,11 @@ window.GhostCore = {
     sendMessage,
     getChatHistory: () => chatHistory,
     setChatHistory: (h) => { chatHistory = Array.isArray(h) ? h : []; saveChatState(); },
+    // Wire-shape helpers for modules that fetch/compare server histories
+    // (sessions.js): strip client-only label keys for comparison, and
+    // preserve them across adoption. See toWireMessage/mergeClientLabelKeys.
+    toWireMessage,
+    mergeClientLabelKeys,
     // Reset the visible conversation WITHOUT touching the session store —
     // the sessions module decides what happens next (new id, load, …).
     clearConversation: () => {
@@ -3580,6 +3884,6 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=7.0').catch(e =>
+import('./workspace.js?v=7.1').catch(e =>
     console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 

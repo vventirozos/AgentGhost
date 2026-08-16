@@ -431,7 +431,14 @@ def verify_path_sources() -> Dict[str, List[str]]:
         # import-scan below would miss — hence listed explicitly rather
         # than inferred.
         "verifier": [str(root / "core" / "verifier.py"),
-                     str(root / "core" / "objection.py")],
+                     str(root / "core" / "objection.py"),
+                     # §4BF flip (i) R1 M2 — same defect shape as
+                     # objection.py above: the score-token probe's
+                     # payload (logprobs field choice, top_k) comes from
+                     # `entropy.request_logprobs`; an edit there changes
+                     # the probe distribution of a probe-armed system
+                     # while the fingerprint certified NO DRIFT.
+                     str(root / "core" / "entropy.py")],
         "bench": [str(Path(__file__).resolve())],
     }
 
@@ -684,6 +691,12 @@ class TrialResult:
     cheap_verdict: Optional[str] = None
     cheap_confidence: Optional[float] = None
     cheap_issues: Optional[List[str]] = None
+    # §4BF flip (i): the logit-expectation probe's raw score, when the
+    # probe fired. Without this the A/B can only see the BLENDED
+    # confidence — a null result could not distinguish "probe
+    # uninformative" from "probe informative but the blend washed it
+    # out", which is exactly the 2026-07-30 w=0.5 ambiguity again.
+    probe_score: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -709,6 +722,7 @@ class TrialResult:
             "cheap_verdict": self.cheap_verdict,
             "cheap_confidence": self.cheap_confidence,
             "cheap_issues": self.cheap_issues,
+            "probe_score": self.probe_score,
         }
 
 
@@ -1576,6 +1590,23 @@ def score_trials(results: List[TrialResult],
             # Robustness false alarms: degraded-evidence trials refuted.
             # REFUTE-direction sensitive; `arm` above is what qualifies it.
             "degraded_evidence_fp": _overall(("NOT_REFUTED",), "REFUTED"),
+            # §4BF flip (i) V1 liveness, IN the report (R1 C1: without
+            # an aggregate, a silently-dead probe minted a fake NULL —
+            # per-trial probe_score existed only as buried JSON). Fired
+            # = final result carries a probe reading; eligible = final
+            # verdict CONFIRMED/REFUTED (the probe's own gate).
+            "probe": (lambda _f, _e: {
+                "eligible": len(_e),
+                "fired": len(_f),
+                "fire_rate": (round(len(_f) / len(_e), 3)
+                              if _e else None),
+                "mean_score": (round(sum(_f) / len(_f), 3)
+                               if _f else None),
+            })([r.probe_score for r in results
+                if r.probe_score is not None
+                and r.verdict in ("CONFIRMED", "REFUTED")],
+               [r for r in results
+                if r.verdict in ("CONFIRMED", "REFUTED")]),
         },
     }
 
@@ -1795,16 +1826,22 @@ class EscalatingChatClient(HttpChatClient):
         self.route_failures = 0
         self.route_timeouts = 0
         self.route_empty = 0
+        # §4BF flip (i): the score-token probe's calls, counted apart —
+        # a failed probe is an advisory miss (the trial's judge verdict
+        # is untouched), not a judged-by-MAIN blend event.
+        self.probe_calls = 0
+        self.probe_failures = 0
 
     def route_health(self) -> Dict[str, Any]:
         """Cheap-leg call outcomes for the provenance block.
 
         `fell_through_to_main` is the number the reader actually needs: those
         trials were judged by the MAIN model, so they did not measure the
-        cheap judge at all.
+        cheap judge at all. Probe calls are reported apart and never count
+        toward the blend warning (§4BF flip-i R1 M4).
         """
         fell = self.route_failures + self.route_empty
-        return {
+        out = {
             "leg": self.leg,
             "route_calls": self.route_calls,
             "route_failures": self.route_failures,
@@ -1813,6 +1850,10 @@ class EscalatingChatClient(HttpChatClient):
             "fell_through_to_main": fell,
             "clean": fell == 0,
         }
+        if self.probe_calls or self.probe_failures:
+            out["probe_calls"] = self.probe_calls
+            out["probe_failures"] = self.probe_failures
+        return out
 
     async def route(self, task: str, payload: dict, max_tokens: int = 128,
                     temperature: float = 0.0, fallback: Any = None,
@@ -1856,10 +1897,28 @@ class EscalatingChatClient(HttpChatClient):
         return content
 
     async def chat_completion(self, payload: dict, timeout: Any = None,
-                              use_critic: bool = False, **_kw) -> dict:
+                              use_critic: bool = False,
+                              use_worker: bool = False, **_kw) -> dict:
         """The MAIN leg — where `force_main=True` lands, i.e. the
         escalation's adjudicator (and the verifier's last-resort fallback
         when the cheap leg returns nothing parseable, same as prod).
+
+        ``use_worker`` (§4BF flip-i R1 MAJ): the score-token probe sends
+        ``use_worker=True`` when the client has no critic pool — on
+        ``--leg worker`` this used to be swallowed into ``**_kw`` and
+        the probe silently rode the MAIN endpoint while the report
+        claimed a cheap-pool probe. Both cheap-leg flags now route to
+        the cheap endpoint when they match the configured leg.
+
+        PROBE-CALL HEALTH is counted SEPARATELY from route health
+        (§4BF flip-i R1 M4): a probe request is identifiable by its
+        logprobs fields (nothing else on the cheap leg requests them),
+        and a failed probe is an advisory miss — the trial's judge
+        verdict replayed fine. Folding probe failures into
+        ``route_failures`` branded a valid arm "judged by the MAIN
+        model — treat as a blend" while an actually-dead probe showed
+        CLEAN route health: the two failure modes were labeled
+        backwards.
 
         With ``leg="critic"``, a ``use_critic=True`` call (the
         verifier's critic-branch judge call) is served by the CHEAP
@@ -1884,17 +1943,32 @@ class EscalatingChatClient(HttpChatClient):
         bounded by the verifier exactly as they are live: 45s on the
         route leg, 90s here.
         """
-        if use_critic and self.leg == "critic":
+        _is_probe = any(k in payload
+                        for k in ("logprobs", "top_logprobs", "n_probs"))
+        if (use_critic and self.leg == "critic") \
+                or (use_worker and self.leg == "worker"):
             body = dict(payload)
             if self._model:
                 body.setdefault("model", self._model)
-            self.route_calls += 1
+            if _is_probe:
+                self.probe_calls += 1
+            else:
+                self.route_calls += 1
             try:
                 return await self._post_cached(
                     self._client, self.base_url, body,
                     timeout=(timeout if timeout is not None
                              else self._timeout))
             except Exception as exc:
+                if _is_probe:
+                    self.probe_failures += 1
+                    # An advisory probe failing must NOT fall through to
+                    # the MAIN model: the verifier treats an exception
+                    # as "no probe reading" and keeps the unblended
+                    # confidence — answering the probe on the strong
+                    # model would both waste a main-slot call and blend
+                    # a DIFFERENT model's distribution than registered.
+                    raise
                 self.route_failures += 1
                 if "timeout" in type(exc).__name__.lower():
                     self.route_timeouts += 1
@@ -1995,6 +2069,7 @@ async def run_trials(verifier: Verifier, trials: List[BenchTrial],
                         getattr(vr, "escalation_downgraded", False)),
                     truncation_guarded=bool(
                         getattr(vr, "truncation_guarded", False)),
+                    probe_score=getattr(vr, "probe_score", None),
                 )
             except Exception as exc:
                 res = TrialResult(
@@ -2201,10 +2276,19 @@ async def run_bench(cases: List[BenchCase],
                     fault_names: Optional[List[str]] = None,
                     seed: int = 0,
                     concurrency: int = 1,
-                    on_result: Optional[Callable] = None) -> Dict[str, Any]:
+                    on_result: Optional[Callable] = None,
+                    logit_expect: Optional[str] = None) -> Dict[str, Any]:
     """Full bench: build trials once, run them under each arm
     (two-stage on / off, toggled via GHOST_VERIFY_TWO_STAGE, which the
-    verifier reads per call), score, and return the report dict."""
+    verifier reads per call), score, and return the report dict.
+
+    ``logit_expect``: "on"/"off" pins GHOST_VERIFY_LOGIT_EXPECT for the
+    whole run (restored afterwards); None inherits the shell, same as
+    every other discipline flag. The provenance block is built first and
+    verify_flags is RE-STAMPED with the pinned value (R4: an earlier
+    docstring claimed the pin landed before provenance — the re-stamp
+    comment at the pin site is the accurate account).
+    """
     arms = arms or ["two_stage_on", "two_stage_off"]
     unknown = [a for a in arms if a not in ARM_ENV]
     if unknown:
@@ -2243,7 +2327,18 @@ async def run_bench(cases: List[BenchCase],
         "arms": {},
     }
     prev = os.environ.get("GHOST_VERIFY_TWO_STAGE")
+    # Same save/set/restore discipline as TWO_STAGE. Armed here — after
+    # the provenance block above was built — would record the SHELL'S
+    # value, not the run's; so re-stamp verify_flags after pinning.
+    prev_le = os.environ.get("GHOST_VERIFY_LOGIT_EXPECT")
+    if logit_expect not in (None, "on", "off"):
+        raise ValueError(f"logit_expect must be on/off/None: {logit_expect!r}")
     try:
+        if logit_expect is not None:
+            os.environ["GHOST_VERIFY_LOGIT_EXPECT"] = (
+                "1" if logit_expect == "on" else "0")
+            report["provenance"]["verify_flags"]["GHOST_VERIFY_LOGIT_EXPECT"] \
+                = os.environ["GHOST_VERIFY_LOGIT_EXPECT"]
         for arm in arms:
             os.environ["GHOST_VERIFY_TWO_STAGE"] = ARM_ENV[arm]
             results = await run_trials(
@@ -2258,6 +2353,11 @@ async def run_bench(cases: List[BenchCase],
             os.environ.pop("GHOST_VERIFY_TWO_STAGE", None)
         else:
             os.environ["GHOST_VERIFY_TWO_STAGE"] = prev
+        if logit_expect is not None:
+            if prev_le is None:
+                os.environ.pop("GHOST_VERIFY_LOGIT_EXPECT", None)
+            else:
+                os.environ["GHOST_VERIFY_LOGIT_EXPECT"] = prev_le
     # Route health is only meaningful AFTER the trials have run — the block
     # built above was for the arm, whose counters were all zero then.
     _post = escalation_arm(verifier, trials).get("route_health")
@@ -2353,7 +2453,29 @@ def bench_provenance(cases: List[BenchCase],
                       "GHOST_VERIFY_TIER_ROUTING",
                       "GHOST_VERIFY_ESCALATE_REFUTE",
                       "GHOST_VERIFY_ESCALATE_CONFIRM",
-                      "GHOST_VERIFY_TWO_STAGE")
+                      "GHOST_VERIFY_TWO_STAGE",
+                      # §4BF Track 2 flip (i): the logit-expectation probe
+                      # was INVISIBLE to provenance — a probe-on vs
+                      # probe-off pair produced byte-identical fingerprints,
+                      # so verify_bench_status called a probe-flipped live
+                      # system "unchanged" and the comparator demanded no
+                      # --expect-differs declaration.
+                      "GHOST_VERIFY_LOGIT_EXPECT",
+                      # (LOGIT_EXPECT_WEIGHT was retired with the §4BL
+                      # cap — a dead flag recorded as pipeline-selecting
+                      # would read as phantom drift.)
+                      # §4BK R2 — same defect class, found by the review
+                      # while the flags were the very thing under test:
+                      # the escalated-adjudicator gate and the §4BJ stop
+                      # hold SELECT the MAIN-leg pipeline, and neither
+                      # was recorded — the §4BK A/B's own config-equality
+                      # check was trivially blind to them.
+                      "GHOST_VERIFY_MAIN_TWO_STAGE",
+                      "GHOST_VERIFY_MAIN_STAGE_STOP",
+                      # §4BL: the CONFIRM-cap selectors, recorded from
+                      # birth (the invisible-flag class, third strike).
+                      "GHOST_VERIFY_PROBE_CAP_T",
+                      "GHOST_VERIFY_PROBE_CONF_CAP")
         },
         # ⚠ THE GAP THIS CLOSES (2026-08-09): templates and flags were
         # recorded, but the CODE was not. A change to `_escalate_refute`,
@@ -2511,6 +2633,20 @@ def render_report_md(report: Dict[str, Any]) -> str:
                 f"{con.get('rate_actionable')} "
                 f"({con.get('rate')} at any confidence, "
                 f"{con.get('judged')}/{con.get('n')} judged)")
+            lines.append("")
+        _pb = o.get("probe") or {}
+        if _pb.get("fired"):
+            lines.append(
+                f"**score-token probe**: fired on {_pb['fired']}/"
+                f"{_pb['eligible']} eligible trials "
+                f"(rate {_pb['fire_rate']}, mean score "
+                f"{_pb['mean_score']}) — the probe fires only inside "
+                f"the two-stage path, so WHEN probe transport is clean "
+                f"(provenance route_health.probe_failures == 0) a rate "
+                f"far below 1.0 is measuring the pipeline's "
+                f"classic-fallback share, not probe health (measured "
+                f"48% on the standing pool, §4BF flip i run log); with "
+                f"probe failures present, both causes are live.")
             lines.append("")
         if ev:
             lines.append(

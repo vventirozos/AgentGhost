@@ -151,6 +151,18 @@ def main() -> None:
     groups = [
         ("trajectories", sorted((gh / "system" / "trajectories").rglob("*.jsonl")),
          redact_text),
+        # §4BF 1c (R3 review): the bench TRAJECTORY root now EXPORTS text
+        # — its rows feed GEPA/PRM/router/fixture corpora — and bench
+        # system prompts carry real memory hydration. A retroactive rule
+        # addition that skipped this root would silently leave the one
+        # corpus that exports. Deliberately NOT banks/*.jsonl: those are
+        # operator-imported EXTERNAL items (embedded b64 golds — a scrub
+        # rewriting them would corrupt the oracles), not agent text.
+        ("bench_trajectories",
+         sorted((gh / "system" / "bench" / "trajectories").rglob("*.jsonl"))
+         + [p for p in [gh / "system" / "bench" / "results.jsonl"]
+            if p.exists()],
+         redact_text),
         ("llm_recordings", sorted((gh / "system" / "llm_recordings").rglob("*.jsonl")),
          redact_text),
         ("selfhood", [p for p in [

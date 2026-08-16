@@ -251,7 +251,12 @@ def test_double_resolution_is_a_noop(monkeypatch, tmp_path):
     assert len(_ledger(tmp_path).read_text().splitlines()) == 1
 
 
-def test_no_ghost_home_stays_silent_but_still_learns():
+def test_no_ghost_home_stays_silent_but_still_learns(monkeypatch):
+    # This test's premise is a genuinely UNSET GHOST_HOME. The conftest
+    # isolation now SETS a throwaway home (§4BF 1c R5 — deleting it made
+    # fixture-less tests fall back to a real path in the user's $HOME),
+    # so the unset state must be constructed explicitly here.
+    monkeypatch.delenv("GHOST_HOME", raising=False)
     p = fs.predict_for_call(tool="execute", target="ls")
     assert fs.resolve_prediction(p, ok=True) is False   # nothing written…
     cell = fs.get_foresight()._levels["tool"].get("execute|")

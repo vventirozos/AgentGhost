@@ -8,7 +8,7 @@ assert the cooldown-anchor / activity-clock / gating invariants.
 import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -367,13 +367,223 @@ async def test_phase_27_skips_when_no_consumer_is_live(tmp_path: Path):
     args.model = "test-model"
     args.prm_train_cooldown = None
     args.frontier_selfplay = False          # consumer OFF
+    # §4BN / R2 MAJ-2: the PRODUCER is explicitly ON here. `online_update`
+    # REFINES an existing model and refuses to bootstrap one, so it can
+    # never answer "does anything READ the model?" — counting it would
+    # resume training for a model nothing consumes (the 41-retrains
+    # defect). §4BM registered exactly that widening; §4BN retracted it.
+    #
+    # Setting this flag is what makes THIS test the pin on the retraction.
+    # Two earlier attempts pinned it structurally instead — a source
+    # substring, then an AST walk over the gate expression — and R2 showed
+    # the AST version still missed four real widenings (a follow-up
+    # statement, a sidecar local, an `or _helper(ctx)`, and deleting the
+    # branch outright) while FALSE-failing the honest DRY refactor. Both
+    # were lexical proxies for a semantic property; this is the property
+    # itself, and it is spelling-independent by construction.
+    args.prm_online_update = True
     ctx = _make_ctx(
         idle_secs=1200, prm_scorer=scorer, collector=collector, args=args,
         checkpoint_path=tmp_path / "prm.json",
     )
     await _tick(ctx)
-    assert scorer.has_model is False, "trained despite having no consumer"
+    assert scorer.has_model is False, (
+        "trained despite having no consumer — if --prm-online-update was "
+        "just added to the retrain gate, that is the §4BN retraction being "
+        "undone: it is a producer, not a reader")
     assert not (tmp_path / "prm.json").exists()
+
+
+async def test_phase_27_skips_when_module_gate_on_but_no_deep_reason(tmp_path: Path):
+    """R3 MAJOR-1 — the gate read ONE conjunct of a two-conjunct consumer.
+
+    `.score()`'s call site (core/agent.py, MCTS turn-start) requires
+    `_MCTS_TURNSTART_ENABLED and ctx.mcts_reasoner is not None`, and the
+    reasoner only exists under --deep-reason. The retrain gate read the
+    constant alone, so in THIS configuration it trained and wrote a
+    checkpoint while nothing on the box could read a PRM value — the
+    41-wasted-retrains defect, live, with three instruments (boot warning,
+    learning-health row, skip log) simultaneously reporting that nothing
+    reads the model.
+    """
+    from ghost_agent.core import agent as _ag
+    collector = MagicMock()
+    collector.iter_trajectories = MagicMock(
+        side_effect=lambda **kw: iter(_balanced_corpus())
+    )
+    scorer = PRMScorer()
+    args = MagicMock()
+    args.model = "test-model"
+    args.prm_train_cooldown = None
+    args.frontier_selfplay = False
+    args.deep_reason = False   # argparse always supplies a bool
+    ctx = _make_ctx(
+        idle_secs=1200, prm_scorer=scorer, collector=collector, args=args,
+        checkpoint_path=tmp_path / "prm.json",
+    )
+    ctx.mcts_reasoner = None            # no --deep-reason ⇒ nothing calls .score()
+    with patch.object(_ag, "_MCTS_TURNSTART_ENABLED", True):
+        await _tick(ctx)
+        _why_in_scope = _ag.prm_consumer_why_no_reader(ctx)
+    assert scorer.has_model is False, (
+        "trained with the module gate ON but no MCTS reasoner — the "
+        "constant is NECESSARY, not SUFFICIENT; nothing can call .score()")
+    assert not (tmp_path / "prm.json").exists()
+
+    # R4 MAJOR-4: and the SKIP LOG must not blame the conjunct that is
+    # already satisfied. It used to hardcode "module-gated off" here,
+    # sending the operator to flip a constant that is True in this run —
+    # the same defect R3 caught in the boot warning, at the site that fix
+    # never grepped for.
+    why = _why_in_scope
+    assert "--deep-reason is not set" in why
+    assert "module-gated off" not in why, \
+        "tells the operator to enable something that is already enabled"
+
+
+def test_the_LIVE_configs_cause_arm_is_pinned():
+    """R32 CRIT-1 — the arm the live box actually renders had no pin.
+
+    The equality pin below patches `_MCTS_TURNSTART_ENABLED = True`, a
+    config that cannot occur in production (flipping that constant is a
+    source edit). The live launcher passes `--deep-reason`, so
+    `mcts_reasoner` exists and the gate is False — which takes a DIFFERENT
+    arm of `prm_consumer_why_no_reader`, feeding the phase-2.7 skip log
+    (the one §4BN message that reaches an operator every ~3h), the twin
+    log, and both boot WARNINGs. Appending the §4BM framing to that arm was
+    green across 802 tests.
+
+    Pin every arm by equality, with the live one first."""
+    import types
+    from ghost_agent.core import agent as _ag
+
+    def _why(gate, deep, reasoner, frontier=False, collector=True):
+        prev = _ag._MCTS_TURNSTART_ENABLED
+        _ag._MCTS_TURNSTART_ENABLED = gate
+        try:
+            ctx = types.SimpleNamespace(
+                mcts_reasoner=object() if reasoner else None,
+                trajectory_collector=object() if collector else None,
+                args=types.SimpleNamespace(frontier_selfplay=frontier,
+                                           deep_reason=deep))
+            return _ag.prm_consumer_why_no_reader(ctx)
+        finally:
+            _ag._MCTS_TURNSTART_ENABLED = prev
+
+    # THE LIVE CONFIG: --deep-reason on, module gate off, no frontier.
+    assert _why(False, True, True) == (
+        "MCTS turn-start hint is module-gated off"
+        " and --frontier-selfplay is not enabled"), _why(False, True, True)
+    # gate off, no reasoner, flag not set
+    assert _why(False, False, False) == (
+        "MCTS turn-start hint is off on both counts "
+        "(module-gated off, and --deep-reason is not set)"
+        " and --frontier-selfplay is not enabled"), _why(False, False, False)
+    # flag set but construction failed
+    assert _why(False, True, False) == (
+        "--deep-reason WAS set but no MCTS reasoner exists — its "
+        "construction failed at boot (see 'Deep Reasoning Failed'), so "
+        "nothing can call .score(); the turn-start hint is also "
+        "module-gated off"
+        " and --frontier-selfplay is not enabled"), _why(False, True, False)
+    # gate on, reasoner present → .score() live
+    assert _why(True, True, True) == (
+        "MCTS turn-start hint is live"
+        " and --frontier-selfplay is not enabled"), _why(True, True, True)
+
+
+async def test_phase_27_skip_actually_logs_and_says_why(tmp_path: Path,
+                                                        monkeypatch):
+    """R5 MAJOR-1: the skip LOG had no pin at all — the previous test
+    computed `prm_consumer_why_no_reader(ctx)` itself and asserted on
+    that, pinning the helper and never the delivery. R5 hardcoded the old
+    string back into the log (116 green), and then DELETED the entire skip
+    `pretty_log` (116 green). "Skip AND say why" is the whole 2026-07-27
+    fix and the loudness §4BN exists for; capture the real emission."""
+    from ghost_agent.core import agent as _ag
+    emitted = []
+    monkeypatch.setattr(_ag, "pretty_log",
+                        lambda *a, **k: emitted.append((a, k)))
+    collector = MagicMock()
+    collector.iter_trajectories = MagicMock(
+        side_effect=lambda **kw: iter(_balanced_corpus())
+    )
+    scorer = PRMScorer()
+    args = MagicMock()
+    args.model = "test-model"
+    args.prm_train_cooldown = None
+    args.frontier_selfplay = False
+    args.deep_reason = False   # argparse always supplies a bool
+    ctx = _make_ctx(
+        idle_secs=1200, prm_scorer=scorer, collector=collector, args=args,
+        checkpoint_path=tmp_path / "prm.json",
+    )
+    ctx.mcts_reasoner = None
+    with patch.object(_ag, "_MCTS_TURNSTART_ENABLED", True):
+        await _tick(ctx)
+        _why_at_skip = _ag.prm_consumer_why_no_reader(ctx)
+
+    skips = [e for e in emitted if e[0] and e[0][0] == "PRM Retrain"]
+    assert skips, ("phase 2.7 skipped SILENTLY — the operator sees an idle "
+                   "pass that did nothing, with no reason given")
+    body = skips[0][0][1]
+    # R29 CRIT-2: this is the ONE §4BN message that actually reaches an
+    # operator in production — it fires every ~3h on the live box, and for
+    # 28 rounds it was the retracted §4BM framing because the process was
+    # stale. It was pinned by substrings while its rendered siblings got
+    # equality pins. Derive it here: everything except the cause clause is
+    # fixed text, and the cause clause has its own generator.
+    _expected_body = (
+        "skipped — both value-reading consumers are off ("
+        # R30 CRIT-1: this used `_why_at_skip` — the cause helper's OWN
+        # return — so both sides moved together and appending the retracted
+        # §4BM string to that helper was green across 477 tests. That is
+        # verbatim the circularity R29 graded CRIT-1 on the loudness file,
+        # committed one artifact over in the same round. Recompute the
+        # cause here from the same inputs production uses.
+        + ("MCTS turn-start hint is module-gated ON but --deep-reason is "
+           "not set, so no reasoner exists to call .score()"
+           " and --frontier-selfplay is not enabled")
+        + "). Training would produce a checkpoint neither "
+        "reads; enable either to resume. "
+        "(--prm-online-update is a PRODUCER, not a "
+        "consumer — correctly not counted here; see §4BN.)")
+    assert body == _expected_body, (
+        "the production skip message is not what its cause generator "
+        f"derives — text was reworded or appended:\n  got:      {body!r}\n"
+        f"  expected: {_expected_body!r}")
+    assert "--deep-reason is not set" in body, (
+        f"skip log does not name the missing conjunct: {body!r}")
+    assert "module-gated off" not in body, (
+        "skip log blames the module gate, which is ON in this run — it "
+        "sends the operator to enable something already enabled")
+    assert "PRODUCER" in body, \
+        "skip log no longer records why --prm-online-update is excluded"
+
+
+async def test_phase_27_resumes_when_both_score_conjuncts_are_live(tmp_path: Path):
+    """The other direction: with the module gate ON *and* a reasoner
+    present, `.score()` is genuinely reachable and training must resume —
+    otherwise the fix above would be an unconditional off switch."""
+    from ghost_agent.core import agent as _ag
+    collector = MagicMock()
+    collector.iter_trajectories = MagicMock(
+        side_effect=lambda **kw: iter(_balanced_corpus())
+    )
+    scorer = PRMScorer()
+    args = MagicMock()
+    args.model = "test-model"
+    args.prm_train_cooldown = None
+    args.frontier_selfplay = False
+    args.deep_reason = False   # argparse always supplies a bool
+    ctx = _make_ctx(
+        idle_secs=1200, prm_scorer=scorer, collector=collector, args=args,
+        checkpoint_path=tmp_path / "prm.json",
+    )
+    ctx.mcts_reasoner = MagicMock()
+    with patch.object(_ag, "_MCTS_TURNSTART_ENABLED", True):
+        await _tick(ctx)
+    assert scorer.has_model is True, "both conjuncts live but did not train"
 
 
 async def test_phase_27_resumes_when_frontier_consumer_enabled(tmp_path: Path):
@@ -407,6 +617,7 @@ async def test_phase_27_skip_still_advances_the_cooldown(tmp_path: Path):
     args.model = "test-model"
     args.prm_train_cooldown = None
     args.frontier_selfplay = False
+    args.deep_reason = False   # argparse always supplies a bool
     ctx = _make_ctx(
         idle_secs=1200, prm_scorer=PRMScorer(), collector=collector, args=args,
         checkpoint_path=tmp_path / "prm.json",

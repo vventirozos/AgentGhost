@@ -81,9 +81,12 @@ class TestBrowserCoercion:
         # _chromium_args lives inside the runner-script string; assert the
         # source no longer APPENDS the local-IP-exposing flag and keeps the
         # restrictive policy.
-        import inspect
+        # The runner moved out of browser.py into browser_runner.py
+        # (2026-08-15) — it was 1,205 lines held as a STRING, which
+        # made a syntax error in it undetectable. This assertion is
+        # about the RUNNER's source, so read the runner.
         import ghost_agent.tools.browser as b
-        src = inspect.getsource(b)
+        src = b._runner_script()
         assert 'args.append("--disable-features=WebRtcHideLocalIpsWithMdns")' not in src
         assert "disable_non_proxied_udp" in src
 

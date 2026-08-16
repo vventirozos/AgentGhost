@@ -77,7 +77,21 @@ def _traj(req, steps, calls, outcome="passed", heavy=False):
     return Trajectory(user_request=req, n_steps=steps, tool_calls=tcs, outcome=outcome)
 
 
-def _balanced_corpus(n_each):
+def _corpus_floor_each():
+    """Per-class size clearing the trainer's DERIVED floor.
+
+    §4BQ left `_GATE_MIN_HELDOUT` at 60 — two attempts to raise it to
+    150 were retracted, both justified by self-confirming artifacts
+    (see the constant). Sizes are DERIVED so a future recalibration
+    cannot silently turn these into vacuous bails; that had already
+    happened once, to the bench-cap test.
+    """
+    from ghost_agent.router.trainer import _gate_min_trajectories
+    return int(_gate_min_trajectories() * 0.6) + 1
+
+
+def _balanced_corpus(n_each=None):
+    n_each = _corpus_floor_each() if n_each is None else n_each
     easy = [_traj(f"what is {i}?", 1, 1) for i in range(n_each)]
     hard = [_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True) for i in range(n_each)]
     return easy + hard
@@ -196,7 +210,7 @@ class TestBootSelfHeals:
         ckpt.parent.mkdir(parents=True)
         ckpt.write_text(json.dumps({"schema": "ghost.router.logreg.v999"}))
 
-        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(120))
+        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus())
 
         assert kept_path == ckpt  # retrain paths still know where to save
         assert dispatcher is not None  # router alive, not dead
@@ -232,7 +246,7 @@ class TestBootSelfHeals:
     def test_missing_checkpoint_unchanged_behaviour(self, tmp_path):
         """No file at all — the pre-fix happy path must be untouched."""
         ckpt = tmp_path / "router" / "checkpoint.json"
-        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus(120))
+        dispatcher, kept_path, clf = _boot_router(ckpt, _balanced_corpus())
         assert dispatcher is not None
         assert clf is not None
         assert ckpt.exists()  # bootstrap persisted it
@@ -270,12 +284,19 @@ class TestMainSourcePins:
 
     def test_failed_load_flows_into_bootstrap_train(self):
         """After the fallback, `if clf is None:` bootstrap must still run
-        with save_path=router_ckpt_path so the bad file gets overwritten."""
+        and persist to router_ckpt_path so the bad file gets overwritten.
+
+        §4BQ moved the call onto `asyncio.to_thread` (it embeds the whole
+        corpus — ~4.8 s of blocking torch on the event loop otherwise), so
+        the anchor is the bootstrap_router ARGUMENT, not an assignment.
+        The "don't overwrite a richer checkpoint from a degraded run"
+        policy deliberately does NOT live here — it is enforced inside
+        RouterTrainer.run so all three retrain sites inherit it."""
         region = _router_boot_region()
         elif_idx = region.index("elif args.router_model:")
         after = region[elif_idx:]
         # the actual CALL, not the comment that merely mentions the name
-        boot_idx = after.index("= bootstrap_router(")
+        boot_idx = after.index("bootstrap_router,")
         assert "if clf is None:" in after[:boot_idx]
         assert "save_path=router_ckpt_path" in after
 

@@ -37,6 +37,11 @@ export function initSessions(ctx) {
     }
 
     function setCurrent(id) {
+        // Every identity change invalidates in-flight loads/resyncs (R5:
+        // newChat/delete/clear minted a new id WITHOUT bumping the token,
+        // so a resync of the old session could resolve late and paint —
+        // then persist — the old conversation under the new id).
+        loadSeq++;
         currentId = id;
         window.__ghostSessionId = id;
         if (id) Core.safeStorage.set('ghost_session_id', id);
@@ -132,11 +137,39 @@ export function initSessions(ctx) {
         }
     }
 
+    // Monotonic token so overlapping loads (boot's fetch racing a rail
+    // click) can't paint the loser's history under the winner's active
+    // row (R3 review).
+    let loadSeq = 0;
+
     async function load(id) {
+        const seq = ++loadSeq;
         const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const messages = Array.isArray(data.messages) ? data.messages : [];
+        // Superseded by a newer load: return null so the CALLER stands
+        // down too (R4: returning data let switchTo's setCurrent bind the
+        // loser's id under the winner's painted history — the next turn
+        // then replayed conversation B into session A's durable store).
+        if (seq !== loadSeq) return null;
+        let messages = Array.isArray(data.messages) ? data.messages : [];
+        // Preserve client-only 👍/👎 label keys — ONLY when re-loading the
+        // session that is already current (boot/refresh). Merging on a
+        // SWITCH would index-align against the OLD conversation, and any
+        // short templated reply ("Done.") at the same index would graft
+        // the old session's request id onto the new one — a 👍 there
+        // writes an operator-authoritative label onto a trajectory the
+        // operator never read (R2 review CRIT).
+        if (id === currentId && Core.mergeClientLabelKeys) {
+            messages = Core.mergeClientLabelKeys(messages);
+        }
+        // Commit identity ATOMICALLY with the paint (R6): the old
+        // paint-here/bind-in-caller split left a microtask window where a
+        // concurrent resync saw the pre-switch id with an unchanged token
+        // and repainted the old session over the new one — then the
+        // caller bound the new id to it. The merge gate above must keep
+        // reading the OLD currentId, so this runs after it.
+        setCurrent(id);
         Core.setChatHistory(messages);
         Core.renderHistoryToLog(messages);
         if (!messages.length) Core.renderEmptyStateHero();
@@ -151,8 +184,10 @@ export function initSessions(ctx) {
         }
         try {
             Core.stopTTS();
+            // load() commits the identity itself, atomically with the
+            // paint (R6); a superseded load returns null having bound
+            // nothing.
             await load(id);
-            setCurrent(id);
         } catch (e) {
             toast(`Could not open session: ${e.message}`, 'error');
         }
@@ -310,18 +345,37 @@ export function initSessions(ctx) {
     // while this client kept a "*[Aborted]*" stub).
     async function resyncCurrent() {
         if (!enabled || !currentId || Core.isProcessing()) return;
+        // Participate in the load token (R4) and re-check IDENTITY and
+        // PROCESSING after every await (R5): a resync resolving after a
+        // rail click, a New-chat/delete/clear (which mint an id without a
+        // load), or a just-started turn must not repaint — painting
+        // mid-turn detaches the streaming bubble, and painting the old
+        // session under a fresh id persists cross-session contamination.
+        const seq = loadSeq;
+        const id = currentId;
         try {
             const res = await fetch(`/api/sessions/${encodeURIComponent(currentId)}`);
             if (!res.ok) return;   // not persisted yet (or deleted) — nothing to align to
+            if (seq !== loadSeq || id !== currentId) return;
             const data = await res.json();
             const messages = Array.isArray(data.messages) ? data.messages : [];
             const local = Core.getChatHistory();
+            // Compare on the WIRE shape: local entries carry client-only
+            // label keys (reqId/feedback) the server never returns, so a
+            // fat-vs-clean JSON compare read "drifted" on EVERY focus after
+            // any completed turn — wiping the 👍/👎 feature and re-rendering
+            // the log each time the tab came back (R1 review CRIT).
+            const wire = (m) => (m && Core.toWireMessage)
+                ? Core.toWireMessage(m) : (m || null);
             const drifted = messages.length !== local.length
                 || JSON.stringify(messages[messages.length - 1] || null)
-                    !== JSON.stringify(local[local.length - 1] || null);
-            if (drifted && messages.length) {
-                Core.setChatHistory(messages);
-                Core.renderHistoryToLog(messages);
+                    !== JSON.stringify(wire(local[local.length - 1]));
+            if (drifted && messages.length && seq === loadSeq
+                    && id === currentId && !Core.isProcessing()) {
+                const merged = Core.mergeClientLabelKeys
+                    ? Core.mergeClientLabelKeys(messages) : messages;
+                Core.setChatHistory(merged);
+                Core.renderHistoryToLog(merged);
             }
         } catch (e) { /* offline — next visibility change retries */ }
     }
@@ -341,9 +395,9 @@ export function initSessions(ctx) {
             // Sessions state unknown (agent unreachable at boot): unbind
             // entirely so a cleared conversation can never merge into the
             // OLD session if the agent comes back mid-conversation.
-            currentId = null;
-            window.__ghostSessionId = null;
-            Core.safeStorage.remove('ghost_session_id');
+            // Through setCurrent (R6): the direct writes skipped the token
+            // bump AND the rail repaint, leaving a stale .active row.
+            setCurrent(null);
         }
     });
     Core.events.addEventListener('turn-aborted', () => {

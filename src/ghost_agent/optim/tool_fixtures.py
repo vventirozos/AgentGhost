@@ -115,6 +115,10 @@ class ToolChoiceFixture:
     tool_results: List[str] = field(default_factory=list)  # previews
     tier: str = "public"          # public | private (request_id-hash split)
     source: Dict[str, Any] = field(default_factory=dict)   # {file, session_id, ordinal}
+    # §4BF 1c: population of the joined trajectory ("user_request" or
+    # "bench") — the explicit origin feature the admissibility matrix
+    # requires on every bench-admitted example.
+    origin: str = "user_request"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -311,6 +315,30 @@ def _trajectory_index(trajectory_root: Path) -> Dict[str, Any]:
     return index
 
 
+def _bench_trajectory_index() -> Dict[str, Any]:
+    """request_id (== extra["req_id"]) -> BENCH trajectory (§4BF 1c).
+
+    Bench sessions are per-BANK (``session_id="bench-<bank>"``), so the
+    production join key (session_id) is useless there — every bench
+    record instead carries the solve turn's req_id in ``extra``, which
+    is exactly what the recorder stamps on its records. Keyed separately
+    from the production index (real joins keep their pre-1c semantics;
+    a bench join happens only when the production index missed). Empty
+    when no banks exist or the matrix stops admitting this consumer.
+    """
+    from ..core.admissibility import iter_bench_trajectories
+    index: Dict[str, Any] = {}
+    for traj in iter_bench_trajectories("gepa_tool_fixtures"):
+        extra = getattr(traj, "extra", None) or {}
+        rid = str(extra.get("req_id") or "") if isinstance(extra, dict) else ""
+        if not rid:
+            continue
+        prev = index.get(rid)
+        if prev is None or getattr(traj, "timestamp", "") >= getattr(prev, "timestamp", ""):
+            index[rid] = traj
+    return index
+
+
 def mine_fixtures(
     recording_paths: Iterable[Path],
     trajectory_root: Path,
@@ -339,6 +367,11 @@ def mine_fixtures(
     _FILTER_ERRORS["n"] = 0
     cutoff = era_cutoff_utc(era_cutoff_local)
     index = _trajectory_index(trajectory_root)
+    try:
+        bench_index = _bench_trajectory_index()
+    except Exception as e:  # noqa: BLE001 — bench is additive, never fatal
+        logger.debug("tool-fixture miner: bench index skipped (%s)", e)
+        bench_index = {}
 
     stats = {
         "scanned": 0, "bad_ts": 0, "pre_era": 0, "malformed": 0,
@@ -356,6 +389,8 @@ def mine_fixtures(
         # each of those was INCLUDED without ever being checked.
         "experiment_filter_errors": 0,
         "positive": 0, "negative": 0, "paired_results": 0,
+        # §4BF 1c: fixtures whose trajectory join came from the BENCH index.
+        "bench_joined": 0,
     }
     if not exclude_mutated_context:
         stats["experiment_filter_unavailable"] = 1
@@ -412,7 +447,17 @@ def mine_fixtures(
             if request_id in ("", "SYSTEM"):
                 stats["no_request_context"] += 1
                 continue
+            # Production join first (pre-1c semantics untouched); the bench
+            # index answers only what production missed, so a real turn can
+            # never be shadowed by a bench row.
             traj = index.get(request_id)
+            if traj is None:
+                traj = bench_index.get(request_id)
+                if traj is not None:
+                    # Counted apart (R1 review): bench joins folding
+                    # silently into positive/negative made the mix
+                    # invisible to the miner's own accounting.
+                    stats["bench_joined"] = stats.get("bench_joined", 0) + 1
             if traj is None:
                 stats["unjoined"] += 1
                 continue
@@ -458,6 +503,8 @@ def mine_fixtures(
                                   private_pct=private_pct),
                 source={"file": str(path), "session_id": sid,
                         "ordinal": ordinal},
+                origin=(str(getattr(traj, "task_kind", "") or "")
+                        or "user_request"),
             ))
             stats["positive" if label >= 0.5 else "negative"] += 1
             if key is not None:

@@ -189,6 +189,69 @@ async def list_openai_models(request: Request):
         ]
     }
 
+def _bench_drain_int(agent) -> int:
+    """§4BO health field, read defensively.
+
+    R3 m-2 corrected the claim that used to be here: `int(MagicMock())`
+    returns 1, it does not raise — the two real 500s came from
+    `_bench_drain_banks` and `_bench_last_item_iso`. The guard stays
+    because a non-numeric budget is still possible on a partial agent,
+    but it is belt-and-braces, not the fix for the observed failure.
+    """
+    try:
+        return int(getattr(agent, "_bench_drain_remaining", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bench_drain_banks(agent):
+    v = getattr(agent, "_bench_drain_banks", None)
+    if not isinstance(v, (list, tuple)):
+        return None
+    return [str(b)[:64] for b in v if isinstance(b, str)]
+
+
+def _safe_log(*args, **kwargs) -> None:
+    """`pretty_log` that cannot fail a request.
+
+    R3 MAJOR-3: the arm handler's narration ran AFTER the budget was
+    written and was unwrapped, so a log write that raised turned a
+    SUCCESSFUL arm into an HTTP 500. The operator reads that as "nothing
+    happened" and walks away while the box drains 200 items behind it.
+    """
+    try:
+        pretty_log(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bench-drain log suppressed: %s", exc)
+
+
+def _iso_or_none(v):
+    iso = getattr(v, "isoformat", None)
+    if not callable(iso):
+        return None
+    try:
+        out = iso()
+    except Exception:  # noqa: BLE001
+        return None
+    return out if isinstance(out, str) else None
+
+
+def _bench_started_iso(agent):
+    return _iso_or_none(getattr(agent, "_bench_item_started_at", None))
+
+
+def _bench_last_item_iso(agent):
+    v = getattr(agent, "_bench_last_item_at", None)
+    iso = getattr(v, "isoformat", None)
+    if not callable(iso):
+        return None
+    try:
+        out = iso()
+    except Exception:  # noqa: BLE001
+        return None
+    return out if isinstance(out, str) else None
+
+
 @router.get("/api/health", dependencies=[Security(verify_api_key)])
 async def api_health(request: Request):
     """Runtime introspection for the operator + NetMon + the RSS supervisor
@@ -276,6 +339,24 @@ async def api_health(request: Request):
         "foreground_tasks": getattr(llm, "foreground_tasks", None),
         "biological_watchdog_alive": (bio_task is not None and not bio_task.done()),
         "memory_system_loaded": getattr(context, "memory_system", None) is not None,
+        # §4BO: the drain budget is in-memory by design, so without this
+        # the operator's only view of "did my drain run, how much is
+        # left" is watching the live log stream.
+        # Read DEFENSIVELY, per this endpoint's standing contract: a
+        # partial or mocked agent must never 500 the health probe. Both
+        # of these went in un-coerced first and did exactly that —
+        # `int(MagicMock)` and `MagicMock.isoformat()` are not JSON
+        # serializable, and ten health tests turned red.
+        "bench_drain_remaining": _bench_drain_int(agent),
+        "bench_drain_banks": _bench_drain_banks(agent),
+        # `biological_watchdog_alive` reports the task OBJECT, so it
+        # cannot tell "deferring on the idle floor" from "parked inside a
+        # wedged solve". A timestamp that stops advancing can.
+        "bench_last_item_at": _bench_last_item_iso(agent),
+        # The START stamp is what separates "deferring on the idle floor"
+        # (never advances, nothing running) from "parked inside a wedged
+        # solve" (advanced, then froze while an item is still in flight).
+        "bench_item_started_at": _bench_started_iso(agent),
         "scheduler_jobs": sched_jobs,
         "nodes": nodes,
         "node_health": node_health,
@@ -1039,6 +1120,276 @@ async def turn_cancel(request: Request):
     )
     return JSONResponse(result, status_code=200 if result.get("cancelled")
                         else 404)
+
+
+@router.post("/api/feedback", dependencies=[Security(verify_api_key)])
+async def feedback(request: Request):
+    """Explicit human outcome label for a completed turn (Track-1a of the
+    outcome-supply plan, 2026-08-13).
+
+    Body: ``{"request_id": "chatcmpl-<id>"|"<id>", "signal":
+    "positive"|"negative", "note": "...", "source": "slack:U…"|"web"}`` —
+    ``note`` and ``source`` optional. Writes the corrections sidecar
+    (last-write-wins per trajectory), so a thumbs-up/-down from Slack or
+    the web UI resolves a turn's ``outcome=unknown`` the moment the human
+    who read the reply judges it. 404 when the request_id has no recorded
+    trajectory (still being written → the client may retry once).
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    rid = str(body.get("request_id") or "").strip()
+    signal = str(body.get("signal") or "").strip().lower()
+    from ..core.feedback import apply_human_label, VALID_SIGNALS
+    # One body shape on every path ({ok, error, code}) — a client reading
+    # `error` must never get None just because the status was a 400.
+    if not rid:
+        return JSONResponse({"ok": False, "error": "request_id is required",
+                             "code": "bad_request"}, status_code=400)
+    if signal not in VALID_SIGNALS:
+        return JSONResponse(
+            {"ok": False, "code": "bad_request",
+             "error": f"signal must be one of {list(VALID_SIGNALS)}"},
+            status_code=400)
+    # The day-partition scan is file I/O — keep it off the event loop.
+    result = await asyncio.to_thread(
+        apply_human_label, agent, rid, signal,
+        str(body.get("note") or "")[:500],
+        str(body.get("source") or "")[:80],
+    )
+    if result.get("ok"):
+        # Lesson-outcome flush HERE, on the event loop — the helper spawns
+        # loop-bound background work, so calling it from the worker thread
+        # popped the stash and then lost the write (R1 review). Called on
+        # EVERY ok including idempotent repeats (R2): the flush is
+        # sign-aware and no-op-safe, and repeating it heals the case where
+        # the first attempt's post-write path failed after the label
+        # landed. A human label also revokes any queued machine correction
+        # banner for the turn — the verdict-then-label ordering is the
+        # common one, and the banner would otherwise apologize on the next
+        # reply for an answer the human just endorsed.
+        try:
+            flush = getattr(agent, "_flush_stashed_lesson_outcome", None)
+            if callable(flush):
+                flush(result.get("trajectory_id"),
+                      result.get("outcome") == "passed")
+            drop = getattr(agent, "_drop_pending_corrections_for", None)
+            if callable(drop):
+                drop(result.get("trajectory_id"))
+        except Exception:  # noqa: BLE001 — credit must not fail the label
+            pass
+        return JSONResponse(result)
+    # Status from the machine-readable code, not the error prose — rewording
+    # a message must never reroute a client's retry logic.
+    status = {"bad_request": 400, "not_found": 404}.get(
+        str(result.get("code") or ""), 503)
+    return JSONResponse(result, status_code=status)
+
+
+#: Hard ceiling on one drain request. A bench item is a full isolated
+#: solve (minutes of solver tokens), so a typo'd count must not queue
+#: days of work on the operator's only inference slot.
+_BENCH_DRAIN_MAX = 200
+
+
+@router.post("/api/bench/drain", dependencies=[Security(verify_api_key)])
+async def bench_drain(request: Request):
+    """Arm an operator-requested bench drain (§4BO, 2026-08-15).
+
+    Body: ``{"count": N, "banks": ["mbpp", …]}``. ``count: 0`` cancels an
+    armed drain. Returns the resulting budget and an honest wall-clock
+    estimate — 200 items is 5–13 h of the box's only inference slot.
+
+    This endpoint ARMS; it never runs an item. The biological watchdog
+    spends the budget from its own tick, which is what keeps it the single
+    caller of ``banks.pick_next_item`` — that function's cursor is an
+    unsynchronized read-modify-write, and "run bench from a second
+    process" is the race its docstring already names.
+
+    Arming REPLACES any previous budget rather than adding to it. The
+    remainder is readable from ``GET /api/health``
+    (``bench_drain_remaining``), because the budget is in-memory by design
+    and would otherwise be visible only in the live log stream.
+
+    ⚠ Cancelling does NOT abort the item already solving; it stops the
+    ones after it. The running item ends on its own or hits the per-item
+    timeout (``GhostAgent._BENCH_ITEM_TIMEOUT``).
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    # `count` must be PRESENT and an honest integer. A missing key used to
+    # fall through to 0 = cancel, so a typo'd arm request and "stop the
+    # running drain" were the same 200 response (R3 review m2). Bools are
+    # rejected explicitly because `int(True) == 1` would arm one item.
+    if "count" not in body:
+        return JSONResponse(
+            {"ok": False, "code": "bad_request",
+             "error": "count is required (use 0 to cancel an armed drain)"},
+            status_code=400)
+    raw_count = body.get("count")
+    if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float)):
+        return JSONResponse({"ok": False, "code": "bad_request",
+                             "error": "count must be a number"},
+                            status_code=400)
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the `1e999` → float('inf') case, which is not a
+        # subclass of either of the others and used to 500.
+        return JSONResponse({"ok": False, "code": "bad_request",
+                             "error": "count must be a finite integer"},
+                            status_code=400)
+    # CANCEL FIRST, before every other check (R2 review m4). Validation
+    # used to run ahead of this, so `{"count": 0, "banks": "typo"}` 400'd
+    # and the drain kept running — an operator watching the box thrash
+    # must never be refused a stop because of an unrelated field.
+    if count == 0:
+        prior = int(getattr(agent, "_bench_drain_remaining", 0) or 0)
+        agent._bench_drain_remaining = 0
+        agent._bench_drain_banks = None      # else health shows a filter
+                                             # for a drain that is over
+        return JSONResponse({"ok": True, "remaining": 0, "cancelled": prior,
+                             "note": "the item already solving is NOT "
+                                     "aborted; it runs to completion or "
+                                     "hits the per-item timeout"})
+    if count < 0 or count > _BENCH_DRAIN_MAX:
+        return JSONResponse(
+            {"ok": False, "code": "bad_request",
+             "error": f"count must be between 0 and {_BENCH_DRAIN_MAX}"},
+            status_code=400)
+    from ..eval import banks as _banks
+    # A filter that silently means "everything" is the defect class
+    # `pick_next_item` refuses one layer down — the endpoint must not
+    # reintroduce it above that guard. A bare string (what a hand-typed
+    # curl produces), a dict, or a non-string element is a 400, not an
+    # accidental all-banks drain (R3 review M3).
+    raw_banks = body.get("banks")
+    want_banks = None
+    if raw_banks is not None:
+        if not isinstance(raw_banks, list) or not raw_banks:
+            return JSONResponse(
+                {"ok": False, "code": "bad_request",
+                 "error": "banks must be a non-empty list of bank names "
+                          "(omit it to drain every bank)"},
+                status_code=400)
+        if len(raw_banks) > 32:
+            return JSONResponse(
+                {"ok": False, "code": "bad_request",
+                 "error": "banks accepts at most 32 names"},
+                status_code=400)
+        if not all(isinstance(b, str) for b in raw_banks):
+            return JSONResponse(
+                {"ok": False, "code": "bad_request",
+                 "error": "banks entries must be strings"}, status_code=400)
+        want_banks = [b[:64] for b in raw_banks]
+
+
+    # ── Refuse to arm something that cannot run, at ARM time. ──────────
+    # The whole point of the endpoint is supply the operator can schedule;
+    # "armed but permanently inert" is the failure this project keeps
+    # finding, and it is cheap to rule out here instead of leaving a
+    # WARNING in a log nobody is watching.
+    if getattr(getattr(agent, "context", None), "args", None) is not None \
+            and getattr(agent.context.args, "no_bench", False) is True:
+        return JSONResponse(
+            {"ok": False, "code": "disabled",
+             "error": "the agent runs with --no-bench; the drain would "
+                      "never execute. Restart without it to use this."},
+            status_code=409)
+    # The CONSUMER must be alive. The watchdog is the only thing that
+    # spends the budget, so arming while it is dead returns a cheerful 200
+    # for work that can never run — the precise outcome this block exists
+    # to rule out (R3 review m2). /api/health already reports this signal.
+    _bio = getattr(request.app.state, "biological_task", None)
+    if _bio is not None and _bio.done():
+        return JSONResponse(
+            {"ok": False, "code": "no_consumer",
+             "error": "the biological watchdog task is not running, so "
+                      "nothing would spend this budget. Restart the agent."},
+            status_code=409)
+    present = await asyncio.to_thread(_banks.list_banks)
+    if not present:
+        return JSONResponse(
+            {"ok": False, "code": "no_banks",
+             "error": "no bench banks on disk — import them with "
+                      "scripts/import_bench_banks.py first"},
+            status_code=409)
+    if want_banks:
+        missing = [b for b in want_banks if b not in present]
+        if missing:
+            return JSONResponse(
+                {"ok": False, "code": "no_banks",
+                 "error": f"unknown bank(s) {sorted(missing)[:8]}; "
+                          f"on disk: {sorted(present)}"},
+                status_code=409)
+
+    agent._bench_drain_banks = want_banks
+    agent._bench_drain_remaining = count
+    # An honest wall-clock estimate at ARM time. 200 items is 5–13 h of
+    # the box's only inference slot; the operator should see that before
+    # walking away, not discover it from the log stream.
+    _lo = round(count * 92 / 3600.0, 1)     # ~32 s solve + 60 s tick gap
+    _hi = round(count * 240 / 3600.0, 1)    # 3 attempts on a hard item
+    _safe_log(
+        "Bench Drain",
+        f"operator armed {count} item(s), "
+        f"banks={sorted(want_banks) if want_banks else 'all'} — the "
+        f"watchdog will run them back-to-back while the box is quiet "
+        f"(~{_lo}-{_hi}h of the inference slot)",
+        icon=Icons.BRAIN_AIM,
+    )
+    from ..core.agent import GhostAgent as _GA
+    # timeout + the 60 s tick gap + the ~60 s teardown tail `wait_for`
+    # waits out after cancelling (docker remove + rmtree). Omitting the
+    # tail understated a 200-item worst case by ~6%.
+    _worst = round(count * (_GA._BENCH_ITEM_TIMEOUT + 120) / 3600.0, 1)
+    _note = ("arming REPLACES any previous budget; GET /api/health "
+             "reports the remainder. estimated_hours is the MEASURED "
+             f"range; worst case if every item wedges to the per-item "
+             f"timeout is ~{_worst}h.")
+    # R3 MAJOR-2: a live bench-scoped experiment arm accrues from the same
+    # population a drain floods. `tts_bon`'s pre-registered rule reasons
+    # in "bench nights" and gates on "no confound annotation" — a 200-item
+    # drain delivers ~50 nights of accrual in one, under a different
+    # machine regime, and NO analysis path reads the regime tag yet. The
+    # gate depends on a human noticing, so say it to the human who is
+    # about to arm it rather than leaving it to be discovered later.
+    _arms = []
+    try:
+        from ..core.experiments import (load_registry as _lr,
+                                        SCOPE_BENCH as _sb)
+        _arms = list(_lr().names_for_scope(_sb))
+    except Exception as exc:  # noqa: BLE001 — advisory only
+        logger.debug("bench-scoped arm lookup skipped: %s", exc)
+    if _arms:
+        _note += (f" ⚠ live bench-scoped arm(s) {sorted(_arms)} accrue "
+                  f"from this population: {count} drained items enroll "
+                  f"like organic ones and nothing yet stratifies on the "
+                  f"regime. Record the drain window, or pause the arm.")
+    if want_banks:
+        # R2 MAJOR: the cursor is shared, so draining one bank advances
+        # only that bank and the lowest-cursor rotation will not return
+        # to it until the others catch up — measured at ~28 days of
+        # organic cadence after a 200-item single-bank drain. Say it
+        # here, where the operator is choosing.
+        _note += (" ⚠ a bank-scoped drain advances only that bank's "
+                  "cursor, so the organic rotation will not revisit it "
+                  "until the other banks catch up.")
+    return JSONResponse({"ok": True, "remaining": count,
+                         "banks": sorted(want_banks or present),
+                         "estimated_hours": [_lo, _hi],
+                         "worst_case_hours": _worst,
+                         "bench_scoped_arms": sorted(_arms),
+                         "note": _note})
 
 
 @router.get("/api/notifications/pending", dependencies=[Security(verify_api_key)])

@@ -1074,53 +1074,86 @@ pre:hover .render-code-btn {
     margin: auto 0;
     padding: 40px 32px;
     max-width: 600px;
-    animation: slideIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     pointer-events: auto;
+    /* Slower and gentler than the old slideIn: this is the first thing
+       drawn over a live animated background, and a fast entrance made the
+       two motions fight. */
+    animation: heroFade 1.1s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
+
 .empty-hero-title {
     font-family: var(--font-mono);
-    font-size: 2.2rem;
-    font-weight: 700;
-    letter-spacing: 10px;
-    color: var(--accent-color);
-    text-shadow: 0 0 20px rgba(123, 98, 196, 0.35),
-                 0 0 40px rgba(123, 98, 196, 0.15);
-    margin-bottom: 8px;
+    /* 200 weight + wide tracking reads as engraved rather than shouted.
+       The old 2.2rem/700/10px with two stacked glows was the single
+       heaviest element on the screen. */
+    font-size: clamp(1.6rem, 7vw, 2.4rem);
+    font-weight: 200;
+    color: rgba(255, 255, 255, 0.92);
+    margin: 0 0 18px;
+    display: flex;
+    justify-content: center;
 }
+.empty-hero-title span {
+    letter-spacing: 0.42em;
+    opacity: 0;
+    animation: heroLetter 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+/* Trailing letter keeps its tracking in the box but not on the screen —
+   without this the word sits visibly left of centre. */
+.empty-hero-title span:last-child { margin-right: -0.42em; }
+.empty-hero-title span:nth-child(1) { animation-delay: 0.10s; }
+.empty-hero-title span:nth-child(2) { animation-delay: 0.17s; }
+.empty-hero-title span:nth-child(3) { animation-delay: 0.24s; }
+.empty-hero-title span:nth-child(4) { animation-delay: 0.31s; }
+.empty-hero-title span:nth-child(5) { animation-delay: 0.38s; }
+
+/* A hairline that draws itself outward — the only ornament. */
+.empty-hero-rule {
+    width: min(220px, 46vw);
+    height: 1px;
+    margin: 0 auto 16px;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        rgba(123, 98, 196, 0.55) 50%,
+        transparent 100%);
+    transform: scaleX(0);
+    animation: heroRule 1.2s cubic-bezier(0.16, 1, 0.3, 1) 0.42s both;
+}
+
 .empty-hero-sub {
     font-family: var(--font-mono);
-    font-size: 0.8rem;
-    color: rgba(255, 255, 255, 0.45);
-    letter-spacing: 2px;
+    font-size: 0.72rem;
+    font-weight: 300;
+    color: rgba(255, 255, 255, 0.34);
+    letter-spacing: 0.22em;
     text-transform: uppercase;
-    margin-bottom: 32px;
+    margin: 0;
+    animation: heroFade 1s cubic-bezier(0.16, 1, 0.3, 1) 0.62s both;
 }
-.empty-hero-chips {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    align-items: center;
+
+@keyframes heroFade {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
 }
-.empty-hero-chip {
-    background: rgba(14, 9, 24, 0.62);
-    color: rgba(255, 255, 255, 0.75);
-    border: 1px solid rgba(75, 26, 122, 0.4);
-    border-radius: 20px;
-    padding: 10px 20px;
-    font-family: var(--font-main);
-    font-size: 0.85rem;
-    letter-spacing: 0.3px;
-    cursor: pointer;
-    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+@keyframes heroLetter {
+    from { opacity: 0; transform: translateY(14px); filter: blur(6px); }
+    to   { opacity: 1; transform: translateY(0);    filter: blur(0); }
 }
-.empty-hero-chip:hover {
-    background: rgba(75, 26, 122, 0.25);
-    border-color: #4b1a7a;
-    color: #fff;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 20px rgba(75, 26, 122, 0.35);
+@keyframes heroRule {
+    from { transform: scaleX(0); }
+    to   { transform: scaleX(1); }
+}
+
+/* Motion is decoration here; honour the OS preference. */
+@media (prefers-reduced-motion: reduce) {
+    .empty-hero,
+    .empty-hero-title span,
+    .empty-hero-rule,
+    .empty-hero-sub {
+        animation: none;
+        opacity: 1;
+        transform: none;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1280,34 +1313,10 @@ pre:hover .render-code-btn {
     box-shadow: 0 0 0 1px rgba(123, 98, 196, 0.08), inset 0 0 12px rgba(123, 98, 196, 0.04);
 }
 
-/* Empty-state hero: animated gradient wordmark + staggered chip reveal. */
-.empty-hero-title {
-    background: linear-gradient(100deg,
-        var(--accent-color) 0%, #8f7ad1 25%, var(--secondary-color) 50%,
-        #8f7ad1 75%, var(--accent-color) 100%);
-    background-size: 220% auto;
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    color: transparent;
-    text-shadow: none;
-    filter: drop-shadow(0 0 18px rgba(123, 98, 196, 0.30));
-    animation: heroSweep 7s linear infinite;
-}
-@keyframes heroSweep {
-    to { background-position: 220% center; }
-}
-.empty-hero-chip {
-    opacity: 0;
-    animation: chipIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-.empty-hero-chip:nth-child(1) { animation-delay: 0.15s; }
-.empty-hero-chip:nth-child(2) { animation-delay: 0.28s; }
-.empty-hero-chip:nth-child(3) { animation-delay: 0.41s; }
-@keyframes chipIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: translateY(0); }
-}
+/* Empty-state hero: the animated gradient sweep and the staggered chip
+   reveal were removed 2026-08-16 with the chips themselves. The wordmark
+   is deliberately a flat hairline now — a moving gradient on top of a
+   moving background was two animations competing for the same glance. */
 
 /* Decorated code blocks: a thin accent rule along the header bottom and a
    left accent stripe give code a clearer, more designed frame. */
@@ -1335,10 +1344,13 @@ pre:hover .render-code-btn {
         scroll-behavior: auto !important;
     }
     .message { animation: none !important; }
-    .empty-hero-chip { opacity: 1 !important; }
-    .empty-hero-title {
+    .empty-hero-title,
+    .empty-hero-title span,
+    .empty-hero-rule,
+    .empty-hero-sub {
         animation: none !important;
-        background-position: 0 center !important;
+        opacity: 1 !important;
+        transform: none !important;
     }
 }
 
@@ -2101,6 +2113,57 @@ body.zen-mode #rail-scrim {
 .msg-menu-btn:hover { background: var(--surface-highlight); color: #fff; }
 @media (pointer: coarse) {
     .msg-menu-btn { width: 34px; height: 34px; }
+}
+
+/* ── Outcome-label thumbs (agent bubbles with a known request id) ──
+   A quiet right-aligned footer row INSIDE the bubble, in normal flow —
+   not in the floating .msg-actions overlay, which crowded the timestamp/
+   menu and could sit on top of the reply text. Ghost buttons in the
+   muted meta tone; hover lifts them to the shared dark-chip chrome; the
+   chosen thumb latches in the violet accent and keeps the row visible. */
+.msg-feedback {
+    display: flex;
+    justify-content: flex-end;
+    gap: 4px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.message.agent:hover .msg-feedback,
+.msg-feedback:focus-within,
+.msg-feedback.fb-decided { opacity: 1; }
+@media (pointer: coarse) {
+    .msg-feedback { opacity: 0.55; }
+    .msg-feedback.fb-decided { opacity: 1; }
+}
+.msg-fb-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    color: rgba(158, 170, 192, 0.55);   /* the .msg-time meta tone */
+    cursor: pointer;
+}
+.msg-fb-btn svg { width: 13px; height: 13px; display: block; }
+.msg-fb-btn:hover {
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(0, 0, 0, 0.3);
+    border-color: var(--hairline);
+}
+.msg-fb-btn:disabled { cursor: default; pointer-events: none; }
+.msg-fb-btn.fb-active {
+    color: #9f8ae0;
+    border-color: rgba(123, 98, 196, 0.55);
+    background: rgba(123, 98, 196, 0.14);
+}
+@media (pointer: coarse) {
+    .msg-fb-btn { width: 38px; height: 30px; }
+    .msg-fb-btn svg { width: 15px; height: 15px; }
 }
 
 #msg-menu {

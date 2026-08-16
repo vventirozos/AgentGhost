@@ -180,13 +180,13 @@
     <dd>After a node fails repeatedly, Ghost stops sending it work for a while instead of retrying into a dead machine. "Open" means it's been taken out of rotation. Nothing to do with Tor circuits.</dd>
 
     <dt>PRM · Process Reward Model</dt>
-    <dd>A small local model that scores whether a partial plan looks like it's heading somewhere useful — judging the working, not just the answer. Ghost trains it on its own recorded turns.</dd>
+    <dd>A small local model that scores whether a partial plan looks like it's heading somewhere useful &mdash; judging the working, not just the answer. Ghost <em>can</em> train it on its own recorded turns, but that idle retrain is <strong>consumer-gated</strong> (&sect;4BN): it skips unless something actually reads a PRM value, and on a default box nothing does. <em>(R20 MAJOR-3: this caveat was previously spliced into the term name itself &mdash; markdown backticks rendering literally in a beginner glossary, with "any of this" pointing at text from a different page. Rewritten where it belongs, in the definition.)</em></dd>
 
     <dt>Router</dt>
     <dd>A small local classifier that predicts how hard a request is, so easy ones can go to a cheap machine. Off unless you point at a trained one.</dd>
 
     <dt>MCTS · Monte Carlo Tree Search</dt>
-    <dd>Exploring several possible next actions and looking a step ahead before committing, rather than taking the first plausible one. Only on hard problems, and only with <code>--deep-reason</code>.</dd>
+    <dd>Exploring several possible next actions and looking a step ahead before committing, rather than taking the first plausible one. Only on hard problems, and only with <code>--deep-reason</code> &#9888; &sect;4BN: the lookahead half is <strong>module-gated off</strong> (<code>_MCTS_TURNSTART_ENABLED = False</code>) &mdash; only the hypothesis testing is live; boot says so.</dd>
   </dl>
 
   <h2>Network and sandbox</h2>

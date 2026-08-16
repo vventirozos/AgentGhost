@@ -47,12 +47,12 @@ trajectories. Covered by `tests/test_trajectory_failure_heuristic.py`.
 | `ghost_agent._env` | Telemetry hardening (single source of truth) | `main.py` import + `probe:telemetry_disabled` |
 | `ghost_agent.eval` | Trust-aware eval harness (offline invariant gate + protective capability baseline + **execution-grounded behavioral suite**) + network egress guard | CLI `scripts/eval_baseline.py` (`gate` \| `freeze`/`compare --suite {default,capability,behavioral,offline,post_learning} --runner {stub,http}`; `behavioral` forces its own agent-driving+verifying runner) |
 | `ghost_agent.distill` | Trajectory JSONL logs + N-sample self-consistency | `$GHOST_HOME/system/trajectories/` |
-| `ghost_agent.router` | Hand-crafted features → numpy logistic regression → dispatch | `core/agent.py::handle_chat` (body\["_router_decision"\]) |
+| `ghost_agent.router` | 18 hand-crafted features + a 384-d request embedding → numpy logistic regression → dispatch (§4BQ; `GHOST_ROUTER_EMBED=0` reverts to lexical-only) | `core/agent.py::handle_chat` (body\["_router_decision"\]) |
 | `ghost_agent.optim` | DSPy/GEPA prompt optimisation (scope-gated) | Tunes planning / tool-selection / reflection prompts |
 | `ghost_agent.skills_auto` | Passive skill extraction from validator-passing trajectories | Biological phase 2.6 (extract → consolidate → verify → graduate to `auto_skills.json`; PASSED input flows from the late-verdict backfill, 2026-07-05) |
 | `ghost_agent.reflection` | Self-critique biological phase on FAILED trajectories | Biological phase 2.5 → composite sink (JSONL + SkillMemory) |
 | `ghost_agent.reflection.postmortem` | Whole-transcript post-mortem → classified, durable defect reports (behavioural / configuration / code_defect) | Biological phase 2.5c (`--postmortem`) → SkillMemory (behavioural) + `DefectQueue` (`$GHOST_HOME/postmortem/`) → `postmortem` tool |
-| `ghost_agent.prm` | Per-step value model — scores `(state, action)` for MCTS lookahead | Biological phase 2.7 (retrain) → `core.mcts.MCTSReasoner` (fast scoring) |
+| `ghost_agent.prm` | Per-step value model — scores `(state, action)` for MCTS lookahead | Biological phase 2.7 (retrain, **consumer-gated** — skips unless `.score()` or `.uncertainty()` is live; §4BN) → `core.mcts.MCTSReasoner` (fast scoring) |
 | `ghost_agent.selfhood` | First-person autobiographical diary + self-state + recognition / wake-up + narrative consolidation | Biological phase 2.8 (narrative regen) → wake-up prefix on every `handle_chat` |
 
 ## The flow (as wired)
@@ -539,7 +539,7 @@ the first time in its life and **destroyed 13 lessons across two REM cycles**,
 one of them scoring `retrievals=277 succ=77 fail=32` (a 70%-success lesson
 dropped as "low utility"). Its archive-before-delete safety net had been
 written four minutes *after* the live process started, so that process never
-loaded it. **Check module mtime against process start before believing a fix
+loaded it. **Check module CONTENT HASH against what the process loaded (§4BN R32/R33: mtime was tried and false-fires on a byte-identical restore — the agent now warns by itself via `audit_source_newer_than_process`) before believing a fix
 is deployed.**
 
 It is now **off by default** (`GHOST_SKILL_PRUNE=1` to enable), and that is a
@@ -758,6 +758,9 @@ the raw reading lands in `VerifyResult.probe_score` for observability.
 The probe always rides a cheap pool (critic if configured, else
 worker) — never the main slot.
 
+> **§4BL update (2026-08-14):** the w-blend described above was RETIRED — the §4BI foreclosure proved no light symmetric blend can move the judge's quantized confidences across the 0.7 gate. The probe's redesigned consumer (the verdict-gated CONFIRM cap) was then NULLed by held-out validation the same day and the probe mechanism RETIRED — the fault signal is within-case (AUC 0.89) and unharvestable by a global threshold. See docs/core/verifier.html and `system/eval/probe_redesign/DECISION_RULE.md`.
+
+
 **Phase 3b — wobble-band adaptive best-of-N** (`core/tts.py`,
 `GHOST_TTS_ADAPTIVE_BON=1`, `GHOST_TTS_BON_K` extra candidates, clamp
 1-4): fires at the loop-exit verifier gate ONLY when the verdict is in
@@ -792,8 +795,21 @@ KV-pinned stable prefix byte-identical — same-request payload equality
 flags-off vs flags-on, in-request cross-turn pin stability, BoN
 candidates built on a copy of the live message list, and a source guard
 that the prompt-assembly region reads no Phase-3 env switch).
-* `router/` uses hand-crafted features; the (optional) embedding
-  augment is downloaded once and then runs offline.
+### What the router writes to disk
+
+| path | what it is |
+|---|---|
+| `system/router/checkpoint.json` | the trained model. Records `feature_names`, `uses_embeddings` and — critically — `embed_model`, the embedder that produced its training vectors. A checkpoint trained under a different `GHOST_EMBED_MODEL` is **refused at load** and retrained, because width alone cannot tell two 384-d models apart. |
+| `system/router/checkpoint.gate_looks.json` | the multiple-looks ledger: which labelled corpus the gate last examined, and which gate configurations it has already asked of it. Prevents re-running the same significance test on the same evidence. Safe to delete; that grants one fresh look. |
+| `system/verdicts/<day>.jsonl` | one row per verified answer — `{trajectory_id, verdict, confidence, at, seq}`. **Recording only; nothing reads it.** It exists because every correctness metric already on disk is derived from the same fields the router's own labels are, which makes any quality comparison circular. Join on `trajectory_id`, and take **`max(seq)` per trajectory** — `seq` restarts with the process, so a global max returns a pre-restart row. |
+
+* `router/` uses 18 hand-crafted features **plus** a 384-d embedding of
+  the request (§4BQ). The embedder is the vector store's own, already
+  resident, so there is nothing extra to download and no egress. A
+  checkpoint records which embedder trained it and refuses to load
+  against a different one; with no working embedder the router trains and
+  serves the lexical-only representation and escalates rather than
+  scoring a model it cannot feed.
 
 ## Running the eval
 
@@ -1493,16 +1509,23 @@ python -m src.ghost_agent.main \
     --upstream-url "http://127.0.0.1:8080" \
     --prm-model "$GHOST_HOME/system/prm/checkpoint.json"
 
-# Bootstrap: omit the flag entirely. The biological retrain phase
-# (2.7) will produce a first-ever checkpoint after enough
-# trajectories accumulate (defaults: ≥5 trajectories, ≥20 step
-# samples, ≥5% per class) and hot-swap it into the live scorer.
+# Bootstrap: ⚠ THIS RECIPE DOES NOT WORK AS WRITTEN (corrected §4BN).
+# It used to read "omit the flag entirely; phase 2.7 will produce a
+# first-ever checkpoint and hot-swap it in". Since 2026-07-27 phase 2.7
+# is CONSUMER-GATED: it skips entirely unless something READS a PRM
+# value — `.score()` (MCTS turn-start, needs `_MCTS_TURNSTART_ENABLED`
+# AND `--deep-reason`) or `.uncertainty()` (`--frontier-selfplay` and trajectory logging).
+# With neither live, no checkpoint is ever written, no matter how many
+# trajectories accumulate. The sample floors below still apply ON TOP
+# of that gate (≥5 trajectories, ≥20 step samples, ≥5% per class).
+# To actually bootstrap one, enable a consumer:
+python -m src.ghost_agent.main --frontier-selfplay
 
 # Faster retrain cadence for development:
 python -m src.ghost_agent.main --prm-train-cooldown 600
 ```
 
-Coverage: `tests/test_prm_*.py` (195 tests across features, labels,
+Coverage: `tests/test_prm_*.py` (338 tests (a MEASUREMENT — re-run the command named here rather than trusting the number) (13 modules; the enumeration below is partial — regenerate with `pytest --collect-only tests/test_prm_*.py`) across features, labels,
 model, trainer, MCTS integration, biological phase, corner cases, and
 adversarial fuzz/stress). Numerical hardening: NaN/inf inputs are
 neutralised at `_vectorize` (inputs) and `_to_arrays` (labels) so a
@@ -1515,7 +1538,7 @@ remains green at **3248 passing**.
 ## Frontier-aware self-play (closes the PRM → self-play loop)
 
 The PRM produces a per-step confidence signal; the trajectory store
-records per-cluster coverage. Frontier-aware self-play (default on,
+records per-cluster coverage. Frontier-aware self-play (**default OFF** since 2026-07-09 and absent from the live launcher — §4BN R14; R5 corrected this exact claim in `docs/core/dream.html` and missed this file, so the examples below are no-ops unless you pass the flag,
 `--frontier-selfplay`) combines them to choose which cluster the
 biological-watchdog phase-3 self-play pass should target:
 
@@ -1559,13 +1582,19 @@ benefit of frontier targeting on the other 80%.
 CLI:
 
 ```bash
-# Default — frontier weighting on with 20% sanity floor:
-python -m src.ghost_agent.main --upstream-url "http://127.0.0.1:8080"
+# ⚠ §4BN R15: these examples restated "default on" 44 lines below the
+# line R14 had just corrected — the seventh recurrence of this doc-twin,
+# inside the file the previous round fixed. Frontier weighting is OFF by
+# default, so the first command below does NOT enable it and the
+# --no-frontier-selfplay A/B is a no-op against the real default.
 
-# A/B comparison — explicitly revert to legacy brittle-pool pick:
+# Frontier weighting ON (it is OFF by default) with 20% sanity floor:
+python -m src.ghost_agent.main --upstream-url "http://127.0.0.1:8080" \
+    --frontier-selfplay
+
+# A/B comparison — the DEFAULT, legacy brittle-pool pick:
 python -m src.ghost_agent.main \
-    --upstream-url "http://127.0.0.1:8080" \
-    --no-frontier-selfplay
+    --upstream-url "http://127.0.0.1:8080"
 
 # Aggressive — drop sanity floor to 5% if the PRM is well-trained:
 python -m src.ghost_agent.main \
@@ -1621,7 +1650,7 @@ The redesign closes all eight gaps. Modules:
 | `core/adversarial_generator.py` | **new** — per-prompt-fingerprint solver pass-rate tracker; `suggest_bias()` injects guidance into the next challenge-gen prompt. |
 | `memory/frontier.py` | per-template saturation (proposal H); ring buffer of recent winning `solution.py` sources for novelty scoring; `record_run()` now consumes `solution_source`, `template_key`, `novelty`. |
 | `reflection/loop.py` | opt-in `accept_low_novelty_passes` admits self-play passes with `extra.solution_novelty < threshold` into the reflection batch. |
-| `tools/memory.py` | self-play loop calls `_maybe_retrain_prm()` every 20 cycles → PRM model stays fresh without waiting for idle. |
+| `tools/memory.py` | self-play loop calls `_maybe_retrain_prm()` every 20 cycles → PRM model stays fresh without waiting for idle. ⚠ §4BN: this twin short-circuits FIRST on `prm_consumer_is_live` — on a default box nothing reads a PRM value, so it returns before training. |
 | `core/dream.py` | wires all of the above: reads winning `solution.py`, computes novelty, passes it to scorer + tracker + reflector; opens write gate on `novel-shape first-try pass`; appends adversarial bias to generator prompt. |
 
 ### The new score
@@ -1690,11 +1719,22 @@ cluster out.
 ### PRM scheduler inside the loop (proposal E)
 
 `tools/memory._run_self_play_loop` now calls `_maybe_retrain_prm`
-every 20 cycles. Trainer bails out cleanly (with a logged reason)
-when there aren't enough trajectories yet; on success it hot-swaps
-the new `StepValueModel` into the live `PRMScorer`. The frontier-
-weighted picker (`pick_frontier_seed`) can then engage on the next
-cycle instead of falling back to the brittle pool every time.
+every 20 cycles.
+
+> ⚠ **§4BN — recorded R18, fixed R29 (ten rounds open).** That call
+> returns at `prm_consumer_is_live` **before** the trainer is reached, so
+> on a default box none of the paragraph below happens: nothing trains,
+> nothing hot-swaps, and the picker never engages. The trainer's own bail
+> conditions are downstream of a gate that fires first. The sibling
+> description 66 lines above carries this caveat; this copy did not, and
+> a doc positively claiming a retrain that cannot run is §4BN's own
+> defect class on the surface a scouting agent reads first.
+
+When the gate does pass: the trainer bails out cleanly (with a logged
+reason) when there aren't enough trajectories yet; on success it
+hot-swaps the new `StepValueModel` into the live `PRMScorer`, and the
+frontier-weighted picker (`pick_frontier_seed`) can then engage on the
+next cycle instead of falling back to the brittle pool every time.
 
 ### Adversarial generator (proposal G)
 

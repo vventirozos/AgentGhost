@@ -57,7 +57,7 @@ class Trajectory:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     timestamp: str = field(default_factory=lambda: datetime.datetime.utcnow().isoformat() + "Z")
     session_id: str = ""             # groups turns from the same conversation
-    task_kind: str = "user_request"  # user_request | challenge_template | self_play | reflection
+    task_kind: str = "user_request"  # user_request | challenge_template | self_play | reflection | bench (§4BF)
     cluster: Optional[str] = None
     tier: Optional[str] = None
     model: str = ""

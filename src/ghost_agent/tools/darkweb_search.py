@@ -43,6 +43,7 @@ What is NEW here:
 """
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -51,6 +52,13 @@ from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 from ..utils.logging import Icons, pretty_log
+
+# ⚠ This module referenced `logger` without ever defining it — a
+# NameError on every circuit-breaker skip, invisible because
+# `asyncio.gather(..., return_exceptions=True)` discarded it and the
+# engine returning nothing was the intended outcome anyway. The
+# breaker 'worked' by accident, with its only observability dead.
+logger = logging.getLogger("GhostAgent")
 from ..utils.helpers import url_ssrf_reason
 from .search import (
     _sanitize_query,
@@ -231,6 +239,166 @@ _ONION_PAGE_TIMEOUT = 35.0
 # to _ONION_TIMEOUT) plus a short window for a fast second circuit; a slow
 # first attempt simply forfeits most of the retry.
 _ONION_ENGINE_DEADLINE = _ONION_TIMEOUT + 8
+
+
+# ── Per-engine circuit breaker (2026-08-15) ────────────────────────────
+# MEASURED, not guessed. Across one day's live log: torch 5 wins / 0
+# failures, torgle 5/0, ahmia 0/6, ahmia-onion 0/9 — every ahmia failure a
+# full deadline. Probing the endpoints directly over the agent's own Tor:
+#
+#   ahmia.fi/                      200 in 0.7s     ← the SITE is up
+#   ahmia.fi/search/?q=news        302 in 0.7s     ← needs the form token
+#   ahmia.fi/search/?q=…&<token>   504 in 31.4s    ← its SEARCH is broken
+#   <ahmia onion>/                 200 in 1.6s
+#   <ahmia onion>/search/?q=news   504 in 30.7s
+#
+# So the token logic is CORRECT and the engine is simply down at the
+# backend. Deleting it from the table would be the wrong fix — these
+# endpoints rotate constantly and ahmia has been the sanest index when it
+# works. What is wrong is paying its full deadline on EVERY search: two
+# ahmia entries × ~50s of an ~86s budget, spent to learn nothing, on every
+# single dark-web query.
+#
+# So: skip an engine that has failed `_ENGINE_BREAKER_FAILS` times in a
+# row, for `_ENGINE_BREAKER_COOLDOWN`, then let ONE probe through (half
+# open). A win resets it immediately. State is per-process and in-memory
+# by design — a restart re-probes everything, which is the right default
+# for endpoints this volatile.
+_ENGINE_BREAKER_FAILS = 3
+_ENGINE_BREAKER_COOLDOWN = 900.0     # 15 min
+#: {engine_name: (consecutive_failures, opened_at_monotonic)}
+_ENGINE_BREAKER: Dict[str, Tuple[int, float]] = {}
+# ⚠ NO MODULE-LEVEL "skipped this search" LIST. The first version used
+# one, and two searches overlap routinely — `core/agent.py` dispatches a
+# tool batch through `asyncio.gather`, and `tool_darkweb_research` runs
+# its own searches. Measured: search A skipped two engines and reported
+# nothing, while B (which skipped none) was the one that cleared the
+# list; and a search that contacted EVERY engine reported "ran NO
+# engines… do not reword and retry". Fabricating a confident
+# infrastructure diagnosis is worse than the silence it replaced, so the
+# skip list travels with the RESULT instead.
+
+
+def _no_results_error(skipped: List[str], total: int,
+                      all_skipped: bool = False) -> str:
+    """The zero-results message, honest about what was actually asked.
+
+    R4 CRITICAL: only the ALL-skipped case was handled, and the PARTIAL
+    case is the one production lives in — this module's own measurements
+    put both ahmia endpoints at 0 wins, so they sit in cooldown while
+    torch and torgle carry the search. When those two also come back
+    empty, the old text claimed "ZERO results across all onion search
+    engines and circuits" (false: half were never contacted) and
+    prescribed "drop to 2-4 PLAIN keywords" — blaming the query for an
+    infrastructure fact, which is the exact class of lie this change set
+    exists to remove.
+    """
+    # `all_skipped` comes from the fan-out, which compares the engines it
+    # ACTUALLY dispatched against the ones it skipped — entry for entry.
+    # Re-deriving it here from deduped names vs an entry count is what J3
+    # was installed to stop: two engine entries sharing a name made "all
+    # skipped" unreachable and the tool said it "asked 1 of 3" when it had
+    # asked none.
+    if all_skipped or (skipped and total and len(skipped) >= total):
+        return (
+            "ERROR: dark-web search ran NO engines — every configured "
+            f"onion engine ({', '.join(skipped)}) is in a failure "
+            "cooldown after repeated errors, so this search contacted "
+            "nothing and took no time. This is an INFRASTRUCTURE state, "
+            "NOT a statement about your query: do not reword and retry. "
+            "Either Tor is down here or the engines are, and they will "
+            "be re-probed automatically within "
+            f"{_ENGINE_BREAKER_COOLDOWN / 60:.0f} minutes. Fall back to "
+            "web_search, or proceed and say dark-web search was "
+            "unavailable."
+        )
+    if skipped:
+        return (
+            "ERROR: dark-web search returned zero results, but it only "
+            f"asked {total - len(skipped)} of {total} engines — "
+            f"{', '.join(skipped)} are in a failure cooldown after "
+            "repeated errors and were NOT contacted. So this is a WEAK "
+            "negative: it does not mean no onion index has your query. "
+            "Rewording is unlikely to help while the index coverage is "
+            "reduced; prefer web_search, or proceed and say dark-web "
+            "coverage was partial. The skipped engines are re-probed "
+            f"automatically within {_ENGINE_BREAKER_COOLDOWN / 60:.0f} "
+            "minutes."
+        )
+    return _NO_RESULTS_ERROR
+
+
+# `_all_engines_skipped_error` was removed here (R5): once
+# `_no_results_error` took the all/partial/full decision it had
+# zero call sites, and a second copy of the same message is how
+# the two callers drifted apart in the first place.
+
+
+def _narrowed_header(skipped: List[str]) -> str:
+    return (
+        f"\n[⚠ NARROWED: {', '.join(skipped)} skipped — in a failure "
+        f"cooldown, not consulted. Cross-engine corroboration is weaker "
+        f"than usual, so treat the ordering as discovery order.]"
+    )
+
+
+class _BreakerSkipped(list):
+    """An empty result that also says WHICH engine was never contacted.
+
+    A list subclass on purpose: every existing consumer keeps treating it
+    as the empty list it is (`if not res`, `res.extend(...)`, the
+    `isinstance(res, list)` guard in the gather), so nothing downstream
+    needs to change — but the fan-out can distinguish "asked and found
+    nothing" from "never asked", which is the whole point.
+    """
+
+    def __init__(self, engine_name: str):
+        super().__init__()
+        self.engine_name = engine_name
+
+
+def _breaker_should_skip(name: str) -> bool:
+    """True when this engine is in an OPEN breaker window."""
+    if os.environ.get("GHOST_ONION_BREAKER", "1") != "1":
+        return False
+    fails, opened = _ENGINE_BREAKER.get(name, (0, 0.0))
+    if fails < _ENGINE_BREAKER_FAILS:
+        return False
+    if (time.monotonic() - opened) >= _ENGINE_BREAKER_COOLDOWN:
+        # Half-open: let exactly one probe through. Re-arm the clock so a
+        # failing probe does not leak a second one immediately after.
+        _ENGINE_BREAKER[name] = (fails, time.monotonic())
+        return False
+    return True
+
+
+def _breaker_record(name: str, won: bool) -> None:
+    """A win clears the breaker; a failure advances it toward open."""
+    if os.environ.get("GHOST_ONION_BREAKER", "1") != "1":
+        # Read here too. Otherwise a disabled breaker still counts and
+        # still announces "skipping it for 15 min" — while
+        # `_breaker_should_skip` returns False. An instrument that lies.
+        return
+    if won:
+        if name in _ENGINE_BREAKER:
+            _ENGINE_BREAKER.pop(name, None)
+            pretty_log("Darkweb Engine", f"{name}: recovered — breaker cleared",
+                       icon=Icons.TOOL_SEARCH)
+        return
+    fails, opened = _ENGINE_BREAKER.get(name, (0, 0.0))
+    fails += 1
+    # Stamp `opened` on the transition so the cooldown measures from the
+    # moment it opened, not from the first failure of the streak.
+    if fails == _ENGINE_BREAKER_FAILS:
+        opened = time.monotonic()
+        pretty_log(
+            "Darkweb Engine",
+            f"{name}: {fails} consecutive failures — skipping it for "
+            f"{_ENGINE_BREAKER_COOLDOWN / 60:.0f} min (one probe after "
+            f"that). Set GHOST_ONION_BREAKER=0 to disable.",
+            level="WARNING", icon=Icons.WARN,
+        )
+    _ENGINE_BREAKER[name] = (fails, opened)
 
 # Hard body-size ceiling for a single raw fetch. Onion engines are UNTRUSTED
 # and adversarial by this tool's own posture; without a cap a hostile or
@@ -909,12 +1077,23 @@ async def _query_engine(
     # timeout guillotines slow-but-alive engines, which is the failure we
     # already learned not to re-introduce. Scaled by min() so a test that
     # shrinks the deadline still gets a proportionally small total.
+    # Breaker check BEFORE any work — the whole point is to not pay the
+    # deadline for an engine measured to be failing.
+    if _breaker_should_skip(engine["name"]):
+        logger.debug("onion engine %s skipped (breaker open)", engine["name"])
+        return _BreakerSkipped(engine["name"])
     deadline = _ONION_ENGINE_DEADLINE
     if engine.get("form_token_from"):
         deadline += min(_FORM_TOKEN_TIMEOUT, _ONION_ENGINE_DEADLINE)
     try:
-        return await asyncio.wait_for(_attempts(), timeout=deadline)
+        _res = await asyncio.wait_for(_attempts(), timeout=deadline)
+        # "Won" means RESULTS, not "did not raise": an engine that returns
+        # an empty list every time is failing at the only thing it is for,
+        # and 302-to-homepage (ahmia's pre-token shape) is exactly that.
+        _breaker_record(engine["name"], bool(_res))
+        return _res
     except asyncio.TimeoutError:
+        _breaker_record(engine["name"], False)
         # The underlying fetch runs in a worker thread (curl_cffi/httpx has
         # its own timeout), so it isn't force-killed here — but cancelling the
         # await lets the gather proceed without waiting on this engine. The
@@ -962,7 +1141,9 @@ _NO_RESULTS_ERROR = (
 )
 
 
-async def _darkweb_search_raw(query: str, tor_proxy: str, max_results: int = 12) -> List[Dict[str, Any]]:
+async def _darkweb_search_raw(
+    query: str, tor_proxy: str, max_results: int = 12
+) -> Tuple[List[Dict[str, Any]], List[str], bool, int]:
     """Core fan-out: query every engine concurrently, merge + rank results.
 
     Ranking favours onions surfaced by MORE THAN ONE INDEPENDENT INDEX
@@ -971,13 +1152,24 @@ async def _darkweb_search_raw(query: str, tor_proxy: str, max_results: int = 12)
     share an ``index`` (e.g. Ahmia's clearnet + onion mirrors) count once, so
     reaching one index over two transports is NOT mistaken for independent
     agreement. Returns ranked result dicts, each carrying the engine names and
-    indexes that surfaced it."""
+    indexes that surfaced it, PLUS the names of engines the circuit
+    breaker skipped and whether that was ALL of them — returned rather
+    than stashed in a module global, because searches overlap."""
     engines = _load_engines()
     exclude = _engine_onion_hosts(engines)
     per_engine = await asyncio.gather(
         *[_query_engine(e, query, tor_proxy, exclude) for e in engines],
         return_exceptions=True,
     )
+
+    # J3: the denominator is the list THIS call searched, not a second
+    # `_load_engines()` read — that re-reads GHOST_ONION_ENGINES (so a
+    # mid-process change makes "all skipped" arithmetic wrong) and counts
+    # entries while the skip list counts names (two entries sharing a name
+    # made "all skipped" unreachable).
+    skipped = [r.engine_name for r in per_engine
+               if isinstance(r, _BreakerSkipped)]
+    all_skipped = bool(engines) and len(skipped) >= len(engines)
 
     merged: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
@@ -1003,7 +1195,8 @@ async def _darkweb_search_raw(query: str, tor_proxy: str, max_results: int = 12)
         (merged[h] for h in order),
         key=lambda r: -len(r["indexes"]),
     )
-    return ranked[:max_results]
+    return (ranked[:max_results], sorted(set(skipped)), all_skipped,
+            len(engines))
 
 
 def _format_results(results: List[Dict[str, Any]]) -> str:
@@ -1044,15 +1237,24 @@ async def tool_darkweb_search(
     if cached is not None:
         return cached
 
-    ranked = await _darkweb_search_raw(query, tor_proxy, max_results=max_results)
+    ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
+        query, tor_proxy, max_results=max_results)
     if not ranked:
-        return _NO_RESULTS_ERROR
+        return _no_results_error(_skipped, _total, _all_skipped)
 
     reached = sorted({e for r in ranked for e in r.get("engines", [])})
     header = f"[Dark-web search — onion results, engines reached: {', '.join(reached)}]"
-    output = header + "\n\n" + _format_results(ranked)
-    _cache_put(cache_key, output)
-    return output
+    cacheable = header + "\n\n" + _format_results(ranked)
+    # R2 M6: cache WITHOUT the NARROWED banner. It describes a transient
+    # breaker state, and baking it into a 5-minute cache entry kept
+    # telling the operator an engine was "not consulted" long after it had
+    # recovered — a stale claim about infrastructure, which is the class
+    # of lie this whole change set exists to remove.
+    _cache_put(cache_key, cacheable)
+    if _skipped:
+        return header + _narrowed_header(_skipped) + "\n\n" + \
+            _format_results(ranked)
+    return cacheable
 
 
 async def tool_darkweb_research(
@@ -1094,9 +1296,14 @@ async def tool_darkweb_research(
     if cached is not None:
         return cached
 
-    ranked = await _darkweb_search_raw(query, tor_proxy, max_results=max_sources)
+    ranked, _skipped, _all_skipped, _total = await _darkweb_search_raw(
+        query, tor_proxy, max_results=max_sources)
     if not ranked:
-        return _NO_RESULTS_ERROR
+        # J1: this caller kept blaming the query after the sibling was
+        # fixed — and it is the follow-up `darkweb_search`'s own tool
+        # description recommends, so it is the one the model reaches for
+        # after a thin result set.
+        return _no_results_error(_skipped, _total, _all_skipped)
 
     urls = [r["url"] for r in ranked][:max_sources]
 
@@ -1125,6 +1332,19 @@ async def tool_darkweb_research(
             short_url = (url[:35] + "..") if len(url) > 35 else url
             pretty_log("Parsing Onion", url, icon=Icons.TOOL_DARKWEB)
             text = await _fetch_with_timeout(url)
+
+            # ⚠ Same boundary as the clearnet sibling: a failed fetch is an
+            # error STRING, and feeding it to a worker prompted "extract
+            # the hard facts, and if none are found say so" turns "this
+            # onion did not answer" into "this onion contains nothing
+            # relevant" — positive negative evidence, manufactured from a
+            # timeout. It also made the cache gate below inoperative,
+            # since the distiller's output never starts with "Error:".
+            if isinstance(text, str) and text.startswith("Error:"):
+                pretty_log("Onion Source Failed",
+                           f"{short_url} — {text[:90]}",
+                           level="WARNING", icon=Icons.WARN)
+                return f"### SOURCE: {url}\n{text}\n"
 
             safe_text = _clean_for_cpp(text[:url_char_limit])
 
@@ -1188,12 +1408,27 @@ async def tool_darkweb_research(
     # an all-errors run (every onion down/timed out this attempt) would be
     # served back for 300s instead of re-attempting the fetches next time.
     def _source_succeeded(block: str) -> bool:
-        # block is "### SOURCE: <url>\n<preview>\n"; the preview begins with
-        # "Error:" only when the fetch/timeout failed.
+        # block is "### SOURCE: <url>\n<preview>\n". The preview begins
+        # with "Error:" only when the fetch failed — which was TRUE ONLY
+        # WITHOUT an llm_client, i.e. in the configuration that never runs
+        # live: with one wired (registry.py always wires one) the distiller
+        # rewrote the error into "[EDGE EXTRACTED FACTS]: no relevant
+        # information", so this gate returned True for an all-errors run
+        # and cached it for 300s. The early return in `process_url` above
+        # is what makes this test mean what it says.
         parts = block.split("\n", 1)
         preview = parts[1].strip() if len(parts) > 1 else ""
         return bool(preview) and not preview.startswith("Error:")
 
     if any(_source_succeeded(c) for c in valid_contents):
         _cache_put(cache_key, result)
+    # R3 MAJOR: research never emitted the NARROWED banner — and it is the
+    # tool that depends MOST on cross-engine corroboration, since its
+    # ranking picks which onions get deep-read and synthesised into a
+    # report. Skipped engines meant that ranking silently degenerated to
+    # discovery order and the report was built on it. Appended AFTER the
+    # cache write, like the sibling: the banner describes a transient
+    # breaker state and must not be served back for 5 minutes.
+    if _skipped:
+        return result + "\n\n" + _narrowed_header(_skipped).lstrip("\n")
     return result

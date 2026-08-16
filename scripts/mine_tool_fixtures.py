@@ -152,13 +152,36 @@ def main() -> int:
     # started. The private share is hashed per REQUEST and a request emits
     # 1-40 fixtures, so the realised private share is not --private-pct and
     # has to be measured on the positives themselves rather than assumed.
+    #
+    # §4BF 1c (R2 review): REAL positives only — the runner evicts bench
+    # fixtures from the gate tier before ITS resolution check, so counting
+    # bench here said "OK" on mines the runner then refuses (a false
+    # reassurance in exactly the bench-heavy scenario 1c created).
     priv_pos = sum(1 for f in fixtures
-                   if f.tier == "private" and f.label >= 0.5)
+                   if f.tier == "private" and f.label >= 0.5
+                   and getattr(f, "origin", "") != "bench")
+    priv_bench = sum(1 for f in fixtures
+                     if f.tier == "private" and f.label >= 0.5
+                     and getattr(f, "origin", "") == "bench")
+    if priv_bench and not priv_pos:
+        # All-bench private tier: the runner will refuse outright — say so
+        # instead of silently skipping the advisory.
+        print(f"Private positives are ALL bench ({priv_bench}) — the "
+              f"runner's gate is real-only and will refuse; collect real "
+              f"traffic before running the optimizer.")
     if priv_pos and args.min_delta > 0:
         resolution = 1.0 / priv_pos
-        share = priv_pos / n_pos if n_pos else 0.0
+        # Real-over-real (R3 review): dividing real-private by ALL
+        # positives (bench included) stopped measuring the hash split the
+        # number is compared against.
+        n_pos_real = sum(1 for f in fixtures
+                         if f.label >= 0.5
+                         and getattr(f, "origin", "") != "bench")
+        share = priv_pos / n_pos_real if n_pos_real else 0.0
         verdict = "OK" if resolution <= args.min_delta else "TOO COARSE"
-        print(f"Private positives: {priv_pos}/{n_pos} "
+        print(f"Private REAL positives: {priv_pos}/{n_pos_real} real "
+              f"(+{priv_bench} bench private, excluded — the runner's gate "
+              f"is real-only) "
               f"(realised share {share:.0%}, requested {args.private_pct}%); "
               f"smallest step {resolution:.3f} vs --min-delta "
               f"{args.min_delta} — {verdict}")

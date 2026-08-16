@@ -1116,6 +1116,138 @@ class DockerSandbox:
                 f"{'docker daemon wedged; ' if _wedged else ''}{str(e)}", 1,
                 None)
 
+    #: Most containers one boot sweep will remove. A runaway backstop, not
+    #: a policy — if a box ever has more than this many orphans, the
+    #: operator should look rather than have them silently vanish.
+    _SWEEP_CAP = 25
+
+    #: A per-solve sandbox younger than this is assumed to belong to a
+    #: solve that is genuinely in flight (a second agent process, a dev
+    #: run) and is left alone. True orphans persist for hours to days.
+    _SWEEP_MIN_AGE_S = 1800
+
+    def _is_per_solve_workspace(self, source: str) -> bool:
+        """True when ``source`` is a throwaway per-solve workspace.
+
+        THE CRITERION, and the first version of it was WRONG. I first
+        swept "containers whose mount no longer exists on disk", on the
+        theory that the workspace dies with the solve. A dry run against
+        the real box refuted it: a SIGKILL is exactly the case that
+        orphans a container, and it is also exactly the case where Python
+        cannot run `TemporaryDirectory.cleanup()` — so the workspace
+        SURVIVES. The criterion spared every orphan it was written for.
+
+        What actually separates them is the KIND of workspace:
+
+        * per-solve  → `tempfile.TemporaryDirectory()`, i.e. a `tmp*`
+          basename under the system temp root. Nothing may outlive its
+          solve, so one present at boot is by definition a leftover.
+        * the agent's own sandbox → `$GHOST_HOME/sandbox`, a stable path
+          outside the temp root. Never matches.
+        * a DETACHED JOB → `ghostjobs-*`, which is designed to survive
+          agent restarts (§4AX: a still-working command is detached, not
+          killed). Sweeping those would destroy running work, and one was
+          live on the box while this was written.
+        """
+        try:
+            import tempfile
+            root = os.path.realpath(tempfile.gettempdir())
+            real = os.path.realpath(source)
+            if os.path.commonpath([real, root]) != root:
+                return False            # outside the temp root entirely
+            base = os.path.basename(real)
+            # `tmp` prefix = tempfile.TemporaryDirectory; anything else
+            # under the temp root (ghostjobs-*, hand-made dirs) is NOT a
+            # per-solve workspace and must be left alone.
+            return base.startswith("tmp")
+        except Exception:  # noqa: BLE001
+            return False                # cannot tell → not an orphan
+
+    def _container_age_s(self, container) -> float:
+        """Seconds since creation; -1.0 when it cannot be determined
+        (which the caller treats as "too young to touch")."""
+        try:
+            import datetime as _dt
+            raw = str((container.attrs or {}).get("Created") or "")
+            if not raw:
+                return -1.0
+            raw = raw.replace("Z", "+00:00")
+            # docker reports nanoseconds; fromisoformat wants ≤6 digits
+            if "." in raw:
+                head, _, tail = raw.partition(".")
+                frac = "".join(c for c in tail if c.isdigit())[:6]
+                off = tail[len(frac):] if len(tail) > len(frac) else ""
+                off = off.lstrip("0123456789")
+                raw = f"{head}.{frac or '0'}{off or '+00:00'}"
+            created = _dt.datetime.fromisoformat(raw)
+            now = _dt.datetime.now(_dt.timezone.utc)
+            return (now - created).total_seconds()
+        except Exception:  # noqa: BLE001
+            return -1.0
+
+    def sweep_orphaned_containers(self, max_remove: int = None) -> list:
+        """Remove per-solve sandbox containers left behind by a kill
+        mid-solve. Returns the names removed. Never raises — this runs at
+        boot, where an exception is a dead agent.
+
+        WHY (§4BO, 2026-08-15): the per-solve teardown now closes its
+        sandbox properly, but a `finally` cannot run through SIGKILL
+        (`launchctl kickstart -k`, a crash, a reboot). Those containers
+        keep running against a workspace nothing will ever look up again;
+        two were live on the box, aged 3 days and 43 minutes.
+
+        SAFETY. A container is removed only when ALL of:
+          * the name is `ghost-agent-sandbox-*` and not this instance's;
+          * EVERY mount is a per-solve workspace (see
+            `_is_per_solve_workspace` — this is what protects the agent's
+            own sandbox and, critically, detached JOB containers);
+          * it is older than `_SWEEP_MIN_AGE_S`, so a solve genuinely in
+            flight in another process is never touched;
+          * `GHOST_SANDBOX_SWEEP` is not "0".
+        A container with no mounts is left alone — "cannot tell" must not
+        read as "safe to delete". Running-vs-stopped is deliberately not
+        part of the test: a per-solve container outliving its solve is
+        orphaned whether or not a process is still inside it.
+        """
+        removed: list = []
+        if os.environ.get("GHOST_SANDBOX_SWEEP", "1") != "1":
+            logger.debug("sandbox sweep disabled by GHOST_SANDBOX_SWEEP=0")
+            return removed
+        cap = self._SWEEP_CAP if max_remove is None else max_remove
+        try:
+            containers = self.client.containers.list(all=True)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"sandbox sweep listing failed: {e}")
+            return removed
+        for c in containers:
+            if len(removed) >= cap:
+                logger.warning(
+                    "sandbox sweep stopped at the %d-container cap — more "
+                    "orphans remain; inspect `docker ps -a` by hand", cap)
+                break
+            try:
+                name = getattr(c, "name", "") or ""
+                if not name.startswith("ghost-agent-sandbox-"):
+                    continue
+                if name == getattr(self, "container_name", None):
+                    continue
+                sources = [m.get("Source") for m
+                           in ((c.attrs or {}).get("Mounts") or [])
+                           if m.get("Source")]
+                if not sources:
+                    continue          # cannot tell → leave it
+                if not all(self._is_per_solve_workspace(s) for s in sources):
+                    continue          # own sandbox, or a detached job
+                age = self._container_age_s(c)
+                if age < self._SWEEP_MIN_AGE_S:
+                    continue          # may belong to a live solve
+                c.remove(force=True)
+                removed.append(name)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"sandbox sweep skipped {c}: {e}")
+                continue
+        return removed
+
     def close(self, remove: bool = False):
         """Tear down the sandbox container at agent shutdown.
 
@@ -1128,10 +1260,60 @@ class DockerSandbox:
         from signal handlers / shutdown hooks where exceptions are
         disruptive.
         """
-        container = self.container
+        # ⚠ THE CLIENT CLOSE MUST SURVIVE EVERY EARLY EXIT (§4BO). The
+        # lookup below returns early when no container exists — which is
+        # the COMMON per-solve case — and that skipped the finally
+        # entirely, so the first version of this fix still leaked. Own
+        # try/finally, wrapping everything.
+        try:
+            self._close_container(remove)
+        except Exception as e:  # noqa: BLE001
+            # The docstring promises this never raises, and both callers
+            # are teardown paths (a solve's `finally`, the RSS watchdog).
+            # It DID raise: an exception in the container work propagated
+            # straight through the finally below. Making the promise true
+            # rather than deleting it — a teardown that throws is how one
+            # failing container takes an idle loop with it.
+            logger.debug(f"Sandbox close() container step failed: {e}")
+        finally:
+            if remove:
+                self.container = None
+                # `__init__` opens a client per instance via `from_env()`
+                # and dream.py builds a FRESH DockerSandbox per solve, so
+                # an unclosed pool leaks its unix sockets to
+                # /var/run/docker.sock every time. Measured live: 228 unix
+                # FDs after ~20 bench items, then `[Errno 24] Too many
+                # open files` — the remaining items failed to solve AND
+                # failed to append their ledger rows.
+                #
+                # Only on remove=True: remove=False means "stop but keep
+                # it warm for a fast resume" and that instance must stay
+                # usable. After remove=True the instance is dead.
+                try:
+                    closer = getattr(self.client, "close", None)
+                    if callable(closer):
+                        closer()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"Sandbox client close failed: {e}")
+
+    def _close_container(self, remove: bool):
+        """Stop (and optionally remove) the container.
+
+        ⚠ NOT thread-safe, and deliberately does NOT take `self._lock`.
+        On the §4BO per-item timeout path the solve's `execute` may still
+        be running in its own thread when this fires, so close+use can
+        overlap on the `requests.Session` — noisy errors in the doomed
+        exec, but no FD leak (a checked-out urllib3 connection is closed
+        when returned to a cleared pool). Taking the lock would be worse:
+        teardown would block for up to `_EXEC_DAEMON_DEADLINE_S`, which
+        is exactly the wedge the timeout exists to end.
+        """
+        container = getattr(self, "container", None)
         if container is None:
             # Best-effort: maybe a container with our name exists from a
-            # previous run that never bound to `self.container`.
+            # previous run that never bound to `self.container` — the
+            # provisioning-failed-midway case, which is what an FD
+            # exhaustion produces.
             try:
                 container = self.client.containers.get(self.container_name)
             except self.NotFound:
@@ -1156,6 +1338,3 @@ class DockerSandbox:
             pass
         except Exception as e:
             logger.debug(f"Sandbox close() failed: {e}")
-        finally:
-            if remove:
-                self.container = None

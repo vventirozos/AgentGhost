@@ -129,9 +129,11 @@ def _tuned_desc_names():
         names = set()
         try:
             # Only an EXPLICIT GHOST_HOME is trusted: optim.loader's
-            # ~/ghost_llamacpp fallback would make test runs (conftest
-            # deletes GHOST_HOME) and stray shells scan a live operator
-            # home and bake its artifacts into this process-wide set.
+            # ~/ghost_llamacpp fallback would let STRAY SHELLS (env
+            # unset) scan a live operator home and bake its artifacts
+            # into this process-wide set. (Test runs now SET a throwaway
+            # GHOST_HOME — §4BF 1c R5 — so they pass this guard and scan
+            # an empty tmp home; the guard still protects bare shells.)
             if os.getenv("GHOST_HOME"):
                 from ..optim import loader as _optim_loader
                 optim_dir = _optim_loader._optim_dir()

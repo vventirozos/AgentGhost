@@ -48,19 +48,49 @@ def main() -> int:
                     help="confidence-sequence level (default 0.05)")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable summary instead of the report")
+    ap.add_argument("--bench", action="store_true",
+                    help="report the BENCH population instead of live turns "
+                         "(§4BF 1c: reads $GHOST_HOME/system/bench/"
+                         "trajectories, admits task_kind=bench only)")
     args = ap.parse_args()
 
-    root = Path(args.trajectories) if args.trajectories else _default_root()
+    if args.bench and not args.trajectories:
+        # The WRITER's root resolution, not a re-derivation (R5 review:
+        # this script's own fallback disagreed with banks.py's — the
+        # silent-inert split R4 fixed one file over, re-created here).
+        from ghost_agent.eval.banks import trajectories_root
+        root = trajectories_root()
+    else:
+        root = Path(args.trajectories) if args.trajectories else _default_root()
     if not root.exists():
         print(f"no trajectory corpus at {root}", file=sys.stderr)
         return 0
 
+    # Scope filter, DENY form (R6/R7 reviews): exclude every name
+    # DECLARED in the other scope, enabled or not. The R5 cut
+    # ALLOW-listed this scope's enabled names (erased a disabled spec's
+    # history behind a false "stamp regressed" alarm); the R6 cut denied
+    # only ENABLED other-scope names (re-scope-then-disable resurrected
+    # the stale stamps). `enabled: false` must stay cost-free to read.
+    _deny = None
+    try:
+        from ghost_agent.core.experiments import (
+            SCOPE_BENCH, SCOPE_LIVE, load_registry, registry_path)
+        _reg = load_registry(registry_path())
+        _deny = set(_reg.names_in_scope(
+            SCOPE_LIVE if args.bench else SCOPE_BENCH))
+    except Exception:
+        _deny = None
+
     collector = TrajectoryCollector(root=root, session_id="reader")
     summary, triggered, coverage = summarize_streaming(
-        collector.iter_trajectories(day=args.day or None))
+        collector.iter_trajectories(day=args.day or None),
+        admit_task_kinds=(("bench",) if args.bench else ("user_request",)),
+        deny_names=_deny)
 
     if args.json:
-        out = {"coverage": coverage}
+        out = {"coverage": coverage,
+               "population": ("bench" if args.bench else "live")}
         for name, arms in summary.items():
             out[name] = {
                 "arms": {
@@ -79,7 +109,8 @@ def main() -> int:
         return 0
 
     print(render_report(summary, alpha=args.alpha, triggered=triggered,
-                        coverage=coverage))
+                        coverage=coverage,
+                        population=("bench" if args.bench else "live")))
     return 0
 
 

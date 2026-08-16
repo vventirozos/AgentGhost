@@ -255,20 +255,28 @@ class _FakeCollector:
     def append(self, traj):
         self.appended.append(traj)
 
-    def update_outcome(self, tid, outcome, reason="", source=""):
+    def update_outcome(self, tid, outcome, reason="", source="", **kw):
         self.updates.append((tid, outcome, reason, source))
         return True
 
 
 def _backfill(agent, tid, outcome):
     """`_backfill_trajectory_outcome` fires the sidecar write through
-    `spawn_bg`, which needs a running loop — drive it inside one so the
-    background coroutine is actually scheduled instead of warned about."""
+    `spawn_bg`, which needs a running loop — drive it inside one and DRAIN
+    the background tasks before returning: since §4BF R2 the cache
+    mutation + success log ride the deferred write's result on a worker
+    thread, so a single loop tick is no longer enough."""
     import asyncio
+    from ghost_agent.utils import logging as _glog
 
     async def _go():
         agent._backfill_trajectory_outcome(tid, outcome)
-        await asyncio.sleep(0)
+        for _ in range(3):   # drain spawn_bg work (incl. thread joins)
+            pending = [t for t in getattr(_glog, "_BG_TASKS", set())
+                       if not t.done()]
+            if not pending:
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
     asyncio.run(_go())
 
 

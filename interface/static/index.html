@@ -11,7 +11,12 @@
     <meta name="apple-mobile-web-app-title" content="Ghost">
     <!-- The manifest link is injected by server.py (its URL carries the
          access key); the touch icon is safe as static markup. -->
-    <link rel="apple-touch-icon" href="/static/icons/icon-180.png?v=2">
+    <!-- No ?v= cache-buster: Safari has been observed skipping
+         query-string touch icons when snapshotting for Add to Home
+         Screen. Root-path /apple-touch-icon.png aliases the same
+         file for the probe Safari makes when this link is unusable. -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/icons/icon-180.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
     <title>Ghost Interface</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -34,7 +39,7 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=5.1">
+    <link rel="stylesheet" href="/static/style.css?v=5.3">
 </head>
 
 <body>
@@ -285,7 +290,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=9.2"></script>
+    <script type="module" src="/static/app.js?v=9.4"></script>
 </body>
 
 </html>

@@ -1,5 +1,6 @@
 import sys
 import os
+import socket
 import asyncio
 import base64
 import json
@@ -38,20 +39,57 @@ playback_queue = asyncio.Queue()
 #      (port 8000, plain HTTP) that chat uses — so the URLs carry https and
 #      their own port.
 #   2. They require `X-Ghost-Key`, exactly like /api/chat already does.
-# The interface serves a self-signed cert, so verification is off by default;
-# the hop is inside the tailnet (WireGuard-authenticated) and carries the same
-# key the chat calls already send over plain HTTP to :8000.
-GHOST_HOST = os.environ.get("GHOST_HOST", "eva")
+# TLS VERIFICATION IS ON as of 2026-08-15, and the host default is the FQDN.
+# It was off because the interface served a SELF-SIGNED cert (CN=localhost,
+# no subjectAltName) that nothing could verify — so this client accepted ANY
+# certificate on both TLS channels (voice AND the log websocket). Inside the
+# tailnet that is a small hole, but it is a real one: WireGuard authenticates
+# the PEERS, it does not stop a compromised tailnet node from answering on
+# :8080 and collecting the X-Ghost-Key these calls send.
+#
+# The interface now serves a genuine Let's Encrypt cert issued by Tailscale
+# for `eva.taila2b1d.ts.net` (see bin/start-ghost-client.sh). Verification
+# only works against the name in the SAN, hence the FQDN default — the short
+# `eva` would fail hostname matching even though it reaches the same box.
+#
+# ⚠ IF VOICE OR THE TURN-STATUS CAPTION GOES QUIET AFTER A DEPLOY, this is
+# the first thing to check: the FQDN must resolve ON THE DEVICE (Tailscale
+# MagicDNS provides it; `getent hosts eva.taila2b1d.ts.net` confirms it).
+# Both switches are env-overridable, so the escape hatch needs no redeploy —
+# add to ~/bin/launch_ghost.sh before the python3 line:
+#     export GHOST_HOST=eva
+#     export GHOST_VOICE_VERIFY_TLS=0
+# Chat is unaffected either way: it talks plain HTTP to eva:8000.
+GHOST_HOST = os.environ.get("GHOST_HOST", "eva.taila2b1d.ts.net")
 VOICE_BASE_URL = os.environ.get("GHOST_VOICE_BASE", f"https://{GHOST_HOST}:8080")
 TTS_SERVER_URL = f"{VOICE_BASE_URL}/api/tts"
 STT_SERVER_URL = f"{VOICE_BASE_URL}/api/stt"
-VOICE_VERIFY_TLS = os.environ.get("GHOST_VOICE_VERIFY_TLS", "0").lower() in ("1", "true", "yes")
+VOICE_VERIFY_TLS = os.environ.get("GHOST_VOICE_VERIFY_TLS", "1").lower() in ("1", "true", "yes")
+
+# One line at startup, into /tmp/ghost_ui.log — the file deploy.sh tails when
+# a deploy looks wrong. This exists because the voice endpoints spent weeks
+# "unused" while silently failing against a host that no longer existed, and
+# turning verification ON adds exactly one new way to reproduce that: an FQDN
+# that does not resolve on the device. Name the failure at boot instead of
+# leaving a quiet caption and dead voice to be discovered later.
+print(f"[tls] voice+log host={GHOST_HOST} verify="
+      f"{'ON' if VOICE_VERIFY_TLS else 'OFF'}", flush=True)
+if VOICE_VERIFY_TLS:
+    try:
+        socket.getaddrinfo(GHOST_HOST, 8080)
+    except OSError as _dns_err:
+        print(f"[tls] WARNING: {GHOST_HOST} does not resolve here "
+              f"({_dns_err}) — voice and the turn-status caption will be "
+              f"DEAD (chat still works, it uses eva:8000 over plain HTTP). "
+              f"Fall back without a redeploy by adding to "
+              f"~/bin/launch_ghost.sh:  export GHOST_HOST=eva ; "
+              f"export GHOST_VOICE_VERIFY_TLS=0", flush=True)
 
 # ── Live turn status (2026-08-03) ───────────────────────────────────────────
 # The waiting bubble narrates the agent's CURRENT step instead of showing a
 # static "cogitating". The step names come from the interface's log broadcast —
-# same host, port and self-signed cert as the voice endpoints above, so the same
-# TLS switch applies. See turnstatus.py for why the chat stream cannot supply
+# same host, port and (since 2026-08-15) VERIFIED cert as the voice endpoints
+# above, so the same TLS switch applies. See turnstatus.py for why the chat stream cannot supply
 # this itself.
 LOG_WS_URL = os.environ.get("GHOST_LOG_WS")
 

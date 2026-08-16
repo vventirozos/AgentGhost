@@ -82,7 +82,7 @@ A single `(state, action)` tuple where:
   tuple. Mirrors `core.mcts.ActionCandidate` so MCTS can adapt one
   to the other without translation logic in the hot path.
 
-25 hand-crafted features, grouped:
+26 hand-crafted features, grouped:
 
 | Group | Features | Purpose |
 |---|---|---|
@@ -290,6 +290,49 @@ between phase 2.6 (skills_auto) and phase 3 (self-play). Cooldown
 defaults to `_PRM_TRAIN_COOLDOWN = 10800 s` (3 h), overridable via
 `--prm-train-cooldown`.
 
+**Consumer gate (2026-07-27, the part this page omitted).** Before any
+of the below, the phase asks whether *anything reads a PRM value*:
+
+```python
+_prm_consumer_live = prm_consumer_is_live(ctx)     # core/agent.py
+
+def prm_consumer_is_live(ctx) -> bool:
+    score_live = bool(_MCTS_TURNSTART_ENABLED
+                      and getattr(ctx, "mcts_reasoner", None) is not None)
+    uncertainty_live = bool(
+        getattr(getattr(ctx, "args", None),
+                "frontier_selfplay", False) is True
+        # …AND a real collector: the frontier picker's call site
+        # requires one, so --no-trajectories makes this leg dead.
+        and getattr(ctx, "trajectory_collector", None) is not None)
+    return bool(score_live or uncertainty_live)
+```
+
+⚠ This page previously published the predicate as
+`bool(_MCTS_TURNSTART_ENABLED or ctx.args.frontier_selfplay is True)`.
+That was the code, and it was **wrong**: `.score()`'s call site also
+requires a live `ctx.mcts_reasoner` (i.e. `--deep-reason`), so with the
+constant flipped and `--deep-reason` off the phase trained a model
+nothing could read — the very defect the gate exists to prevent. Fixed
+in §4BN R3; the predicate now lives in ONE place and both gates (phase
+2.7 and the twin in `tools/memory.py`) call it. The skip message is
+derived by `prm_consumer_why_no_reader(ctx)` so it names the conjunct
+that is actually missing rather than a hardcoded one.
+
+If not, it **skips and logs why**. It had previously run 41 retrains in
+one ledger window while logging "value model refit" — learning-shaped
+noise for a model nothing consumed. Two things follow, and both bit
+later work:
+
+- The cooldown is **not** gated on `--prm-model` (the CLI help said it
+  was; corrected in §4BN). It is gated on consumers.
+- `--prm-online-update` is a **PRODUCER**, not a third consumer, and is
+  deliberately excluded from this predicate. Widening it to count would
+  reinstate exactly the 41-wasted-retrains defect, with a grinder
+  attached — §4BM registered that widening, §4BN retracted it before
+  any code was written. The twin gate in `tools/memory.py` carries the
+  same predicate and the same exclusion.
+
 ```
 ─── 900s idle ───────────────────────── 3600s idle ───
         ┌─ phase 2 (REM dream)
@@ -311,7 +354,9 @@ window). The activity clock (`ctx.last_activity_time`) is NOT touched
 After a successful fit, the trainer's freshly-trained model is
 hot-swapped into the live `ctx.prm_scorer` via `set_model(...)`. The
 **very next** plan score uses the new weights — no agent restart, no
-disk round-trip. If MCTS was attached but didn't yet have a scorer
+disk round-trip. (On the live box there is no next plan score: `.score()`
+is reachable only from MCTS turn-start, which `_MCTS_TURNSTART_ENABLED`
+holds off. The hot-swap machinery is correct and dormant.) If MCTS was attached but didn't yet have a scorer
 plugged in (first-ever fit case), the phase bridges them too.
 
 ## Tests
@@ -328,7 +373,7 @@ plugged in (first-ever fit case), the phase bridges them too.
 | `tests/test_prm_adversarial.py` | 30 cases — randomised fuzz inputs to feature extraction (10 seeds × 200 inputs each), random balanced-corpus fuzz training (5 seeds), 10K-sample fit under 60 s, 5K-candidate batch scoring, tool args with null bytes / control chars / 50-deep nesting / circular references / injection-shaped strings, 1000-iteration set_model thrash, schema migration rejections (legacy v0, partial feature names), feature-tuple immutability, dtype consistency (FeatureVector ≡ ndarray ≡ list ≡ tuple). |
 | `tests/test_prm_uncertainty.py` | 10 cases — `PRMScorer.uncertainty(state, action)` contract: untrained → 1.0; trained at p=0 / p=1 → 0.0; p=0.5 → 1.0; symmetric quarter-points → 0.5; exception isolation; NaN robustness. Consumed by `core/frontier_selection.py`. |
 
-**Total: 195 tests, all green.** Full agent suite (3248 tests) regression-clean.
+**Total: 338 tests across tests/test_prm_*.py, all green** (a MEASUREMENT, not a constant — re-run the command in this sentence rather than trusting the number; it has been stale in three consecutive rounds) (the per-module list above is partial and drifts; regenerate with `pytest --collect-only tests/test_prm_*.py`). The full agent suite is regression-clean; its count has grown well past the 3248 recorded here.
 
 ## Numerical hardening invariants (proven by test_prm_corner_cases.py)
 
@@ -350,7 +395,7 @@ These properties are now contractually enforced and exercised by tests:
 
 The PRM is **opt-in** at multiple levels:
 
-1. No `--prm-model` flag → no checkpoint loaded → scorer returns 0.5
+1. No `--prm-model` flag → ⚠ **§4BN R14: stale.** Boot falls back to the DEFAULT checkpoint path (`$GHOST_HOME/system/prm/checkpoint.json`) and loads it when present, so "unset" does not imply "no model". Only when neither exists does the scorer return 0.5
    → MCTS falls back to LLM simulation. Default behaviour is
    unchanged from before this module existed.
 2. Flag set but file missing → warning logged, scorer is the no-op
@@ -360,10 +405,17 @@ The PRM is **opt-in** at multiple levels:
 4. All three engaged → PRM scores candidates in microseconds, no LLM
    simulation calls.
 
-The biological retrain phase fires regardless of `--prm-model` — it
-will produce a first-ever checkpoint at the default GHOST_HOME path
-when none was provided, and hot-swap it in. From that point onward
-the agent has a self-trained PRM that's been hot-swapped in mid-flight.
+⚠ **Not on the live box.** The sentence that used to sit here — "the
+biological retrain phase fires regardless of `--prm-model` … from that
+point onward the agent has a self-trained PRM" — has been false since
+2026-07-27, when the phase gained a **consumer gate** (see phase 2.7
+below). With `_MCTS_TURNSTART_ENABLED` False and `--frontier-selfplay`
+unset, the retrain SKIPS, no checkpoint is ever written, and none of
+the four "all engaged" states above is reachable without operator
+action. This stale paragraph is what a scouting pass read in §4BM to
+conclude the retrain predicate was too narrow; the resulting plan was
+retracted in §4BN. Verify against the code (`agent.py` phase 2.7), not
+against this page's history.
 
 ## Online updates (low-latency correction learning)
 
@@ -382,8 +434,15 @@ guarded entry point:
   passes, so a concurrent `score` never sees a torn update;
 * **holdout guard** — the clone is committed only if its BCE on a holdout
   of recent trajectories does **not** worsen (catastrophic-forgetting
-  guard via `bce_loss`); without a holdout the small `lr` + few `steps` +
-  the existing L2 bound the change;
+  guard via `bce_loss`); ⚠ **§4BN R22/R23: the no-holdout path is no longer reachable from the
+  wired call site.** An empty holdout makes `online_update` set
+  `base_loss=None` and commit unconditionally — so
+  `_run_prm_online_update` now SKIPS the step when the holdout is below
+  `_PRM_ONLINE_MIN_HOLDOUT` (5 samples) and logs a `PRM Online Skipped`
+  WARNING. Measured on the live store: median 74 holdout samples, 0%
+  below the floor, so this does not make the flag inert in practice. The
+  scorer's own bounded-step reasoning below still applies to any other
+  caller;
 * **no bootstrap** — returns `False` when no model is loaded.
 
 Wired (opt-in, `--prm-online-update`) at the user-correction promotion
@@ -393,6 +452,77 @@ of recent trajectories the holdout — applied fire-and-forget in a worker
 thread so the turn never blocks. The same `partial_fit` / `clone` /
 `bce_loss` trio is mirrored on `router.model.ComplexityClassifier`.
 Covered by `tests/test_prm_online_update.py`.
+
+**Three ways this flag can be inert:** (a) no model to refine; (b) nothing that would read a refinement; (c) trajectory logging off, so the user-correction path returns before the dispatch and no update is ever ATTEMPTED — independently of (a) and (b). Boot names every reason that applies. A FOURTH limitation is architectural rather than config-dependent, so boot cannot detect it: the step is dispatched only from an inline user correction, never from a `/api/feedback` label (§4BN R25). The
+"no bootstrap" bullet above is a hard floor, and the consumer gate on
+phase 2.7 removes the usual way of getting past it:
+
+| state | what happens |
+|---|---|
+| flag set, no model loaded | every update returns `False` — nothing refines |
+| flag set, model loaded, no `.score()`/`.uncertainty()` consumer live | updates commit, and nothing ever reads the refined weights (they also die at process exit — `online_update` commits via `set_model`, it does not persist to disk) |
+| flag set, model loaded, a consumer live | working as designed |
+
+`main.prm_online_update_inertness(flag_set, has_model, frontier_selfplay,
+score_module_gate, score_reasoner_present, trajectory_logging,
+deep_reason)` is a pure
+function that returns the operator-facing WARNING when the flag cannot
+work, and `None` when it can. Boot calls it through the single
+`log_prm_boot_warnings(context)` hop and logs it under **PRM Online
+Update**.
+
+**Third boot warning: `PRM Consumer Inert` (§4BN R9/R10/R11).** Distinct
+from the two above, which are about `--prm-model` and
+`--prm-online-update`. This one fires when `--frontier-selfplay` is set
+but its consumer cannot run — the frontier picker needs BOTH a real
+`TrajectoryCollector` AND a fitted model (`has_model`), and the latter is
+deliberately excluded from `prm_consumer_is_live` because including it
+would deadlock the retrain. Before it existed, that box was silent
+everywhere: boot said nothing, phase 2.7 logged at debug, the twin logged
+at debug, and `dream.py` logged nothing at all because the branch is
+simply not taken. Its message names whichever conjunct is missing, and
+says so without claiming the whole box is inert when the other leg is
+live.
+
+> ⚠ **This signature has now been stale FOUR times in this file** (4-arg →
+> 5-arg → 6-arg → 7-arg), each time while the prose beside it claimed the function
+> "reads the WHOLE gate". Since it is advertised as importable, a second
+> caller following a stale signature silently omits a conjunct and
+> re-creates the defect. If you change the parameters, change this line in
+> the same edit.
+
+It reads the `.score()` gate at runtime rather than assuming it, and reads
+**both legs** of the consumer question — but NOT every conjunct of either
+call site, and the difference matters. `.score()` is live only when
+`_MCTS_TURNSTART_ENABLED` **and** `context.mcts_reasoner is not None`
+(i.e. `--deep-reason`).
+
+⚠ **The census here is deliberately incomplete, and "reads the WHOLE gate"
+was false when this page said it.** The real call sites carry conjuncts
+this gate does not read: `core/dream.py` additionally requires
+`isinstance(prm_scorer, PRMScorer)`, `has_model`, and an enclosing
+`isinstance(frontier_tracker, FrontierTracker)`; `core/agent.py`'s
+turn-start block additionally requires `_is_hard`, a non-empty user turn,
+and a non-trivial chat.
+
+⚠ **§4BN R15: the exclusion list below describes `prm_consumer_is_live`,
+NOT the function documented above.** Since R13 MAJOR-4, `has_model` is
+parameter #2 of `prm_online_update_inertness` and IS read there — the
+retrain GATE excludes it (a boot message and a training gate ask
+different questions), and this block sat under the signature of the
+function that reads it. `has_model` is excluded from the GATE on
+purpose — including it
+would deadlock the retrain (no model ⇒ never train ⇒ never a model). The
+others are excluded because they cannot be False in the configurations
+this gate is asked about. Recorded rather than quietly omitted: this is
+the page whose staleness is the documented cause of §4BM's bad
+registration, so a completeness claim here is expensive.
+
+The first version hardcoded "module-gated off"
+into the message; the second read only the module constant, which is
+necessary but not sufficient — both would have lied on a box where the
+flag had just started working, or gone silent on one where it hadn't
+(`tests/test_prm_online_update_loudness.py`).
 
 ## Honest tradeoffs
 
@@ -422,8 +552,12 @@ Covered by `tests/test_prm_online_update.py`.
   skew (asserted by `tests/test_prm_mcts_live_wiring.py`). When no
   trained PRM is loaded, the MCTS gate falls back to LLM simulation
   automatically — the fast path engages only once a checkpoint exists.
-  Other opt-in callers (revision step, System 3 pivot, self-play
-  candidate generation) follow the same pattern.
+  ⚠ There are **no other callers** (&sect;4BN R10): `select_best_action` has
+exactly one call site in `src/`, the MCTS turn-start hint. This sentence
+used to list a revision step, a System 3 pivot and self-play candidate
+generation as following "the same pattern" — overstating the `.score()`
+census on the page whose staleness caused §4BM's bad registration, and
+contradicting the retraction's own load-bearing fact.
 
 ## See also
 

@@ -159,6 +159,10 @@ class TestLedgerWriter:
 class TestRefuteEscalationRecords:
     @pytest.mark.asyncio
     async def test_overturn_is_recorded(self, v, home, monkeypatch):
+        # §4BK: these ledger tests exercise the two-stage retry path,
+        # which is opt-in since classic became the designed MAIN
+        # adjudicator — arm the switch (the legacy mix stays supported).
+        monkeypatch.setenv("GHOST_VERIFY_MAIN_TWO_STAGE", "1")
         async def _strong(claim, evidence, context, force_main=False):
             return _res(VerifyVerdict.CONFIRMED, 1.0)
         monkeypatch.setattr(v, "_verify_claim_two_stage", _strong)
@@ -177,6 +181,8 @@ class TestRefuteEscalationRecords:
         """The DENOMINATOR. Only logging overturns makes the rate
         uncomputable — which is how "84% of refutes are overturned" needed a
         hand-run log archaeology probe to establish in the first place."""
+        # §4BK: arms the opt-in two-stage retry path (see the overturn test).
+        monkeypatch.setenv("GHOST_VERIFY_MAIN_TWO_STAGE", "1")
         async def _strong(claim, evidence, context, force_main=False):
             return _res(VerifyVerdict.REFUTED, 0.95)
         monkeypatch.setattr(v, "_verify_claim_two_stage", _strong)
@@ -241,6 +247,8 @@ class TestRefuteEscalationRecords:
         the writer — including path resolution and the enable check — has to
         be self-guarding. Break it at the deepest point and the verdict must
         still come back."""
+        # §4BK: arms the opt-in two-stage retry path (see the overturn test).
+        monkeypatch.setenv("GHOST_VERIFY_MAIN_TWO_STAGE", "1")
         async def _strong(claim, evidence, context, force_main=False):
             return _res(VerifyVerdict.CONFIRMED, 1.0)
         monkeypatch.setattr(v, "_verify_claim_two_stage", _strong)

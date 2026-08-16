@@ -1,3 +1,4 @@
+import itertools
 import pytest
 import os
 import shutil
@@ -24,8 +25,16 @@ def _reset_log_collapse():
     _glog._COLLAPSE_STATE = None
 
 
+_GHOST_HOME_COUNTER = itertools.count()
+
+
+@pytest.fixture(scope="session")
+def _ghost_home_base(tmp_path_factory):
+    return tmp_path_factory.mktemp("isolated_ghost_homes")
+
+
 @pytest.fixture(autouse=True)
-def _isolate_ghost_home(monkeypatch):
+def _isolate_ghost_home(monkeypatch, _ghost_home_base):
     """Tests must never resolve the operator's live GHOST_HOME.
 
     The developer shell exports GHOST_HOME for the live agent, and modules
@@ -33,8 +42,23 @@ def _isolate_ghost_home(monkeypatch):
     a test run with the env inherited silently wrote 112 synthetic
     challenges into the LIVE replay ledger (2026-07-20) and then replayed
     from it in unrelated tests. Tests that need a home set one explicitly
-    (monkeypatch.setenv runs after this delenv)."""
-    monkeypatch.delenv("GHOST_HOME", raising=False)
+    (monkeypatch.setenv runs after this).
+
+    §4BF 1c (R5 review): SETENV to a throwaway tmp home instead of
+    delenv. Deleting the var made every module fall back to its
+    DOCUMENTED DEFAULT — which is a real path in the user's $HOME
+    (~/ghost_llamacpp): a fixture-less test that touches such a module
+    would read or WRITE the user's home (the 08-08 journal_stash under
+    ~/ghost_llamacpp is standing evidence of this pattern from a prior
+    module). A tmp home makes the fallback inert by construction.
+
+    O(1) per test (R6 review): `tmp_path_factory.mktemp` scans the whole
+    basetemp per call — O(n²) over the run, measured at ~44s of the full
+    suite's wall time by 13k tests. One session base + a counter child
+    keeps the isolation at constant cost."""
+    d = _ghost_home_base / str(next(_GHOST_HOME_COUNTER))
+    d.mkdir()
+    monkeypatch.setenv("GHOST_HOME", str(d))
 
 
 @pytest.fixture
@@ -80,6 +104,71 @@ def disable_self_play_templates(monkeypatch):
         "ghost_agent.core.challenge_templates.pick_random_template",
         lambda *args, **kwargs: None,
     )
+
+@pytest.fixture(autouse=True)
+def clear_onion_process_state():
+    """Reset the dark-web engine breaker and the dead-onion memo.
+
+    Both are module-global by design — an engine measured down should
+    STAY skipped across searches within a process, and a dead hidden
+    service should not be re-dialled. That is exactly what makes them
+    leak between tests: two tests in test_darkweb_search.py failed on
+    first run because earlier tests in the same file had driven `torch`
+    to its failure threshold, so the breaker skipped it and their
+    "only torch returns anything" premise silently stopped holding.
+    Same hermeticity argument as `clear_search_cache` below."""
+    def _clear():
+        try:
+            from ghost_agent.tools import darkweb_search as _dw
+            _dw._ENGINE_BREAKER.clear()
+        except Exception:
+            pass
+        try:
+            from ghost_agent.tools import browser as _br
+            _br._DEAD_ONIONS.clear()
+            # R2 M5: _ONION_STRIKES too — the fixture reset 2 of the 4
+            # globals this feature owns, so a leftover strike from one
+            # test could ban a host on the FIRST failure in the next.
+            _br._ONION_STRIKES.clear()
+        except Exception:
+            pass
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_router_embedder():
+    """Reset the §4BQ router embedder registry and the kill-switch env.
+
+    The registry is process-global by design — boot registers the vector
+    store's embedder once and the trainer, the dispatcher and three
+    retrain call sites all read it, which is what stops those sites
+    drifting onto different representations. That same reach is what
+    leaks between tests: a stub embedder left registered makes a later
+    test's lexical-only fit silently train at 402 dims, and the existing
+    router suites then fail their held-out gate. Same hermeticity
+    argument as `clear_onion_process_state` above.
+
+    GHOST_ROUTER_EMBED is dropped for the same reason: it is the flip's
+    kill switch, so an operator plausibly has it exported, and with it set
+    the embedding tests would fail for a reason unrelated to the code
+    under test."""
+    import os as _os
+    _prev = _os.environ.pop("GHOST_ROUTER_EMBED", None)
+
+    def _clear():
+        try:
+            from ghost_agent.router import embedding as _emb
+            _emb.reset_router_embedder()
+        except Exception:
+            pass
+    _clear()
+    yield
+    _clear()
+    if _prev is not None:
+        _os.environ["GHOST_ROUTER_EMBED"] = _prev
+
 
 @pytest.fixture(autouse=True)
 def clear_search_cache():

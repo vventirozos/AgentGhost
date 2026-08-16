@@ -13,13 +13,22 @@ Features are returned as a dict + a deterministic float vector
 (same keys → same ordering). Embeddings are explicitly NOT part of
 this core module — they live in an optional augmentor consumers can
 opt into.
+
+§4BQ flip (vi) takes that opt-in: `extract_features(..., embedding=[...])`
+APPENDS a 384-d block (`emb_000`..`emb_383`) after the lexical features.
+This module stays pure — it never loads a model and never embeds
+anything; the caller supplies the vector (see `router/embedding.py` for
+why, and for the measurement that earned the change). A model is
+self-describing about which representation it wants: its persisted
+`feature_names` is either the 18 lexical names or those plus the 384
+embedding names, and the loader rejects anything else.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 # Patterns used by multiple features. Compiled once at import.
@@ -84,16 +93,52 @@ FEATURE_NAMES: Tuple[str, ...] = (
     "has_numeric_density",
     "has_question_mark",
     "context_turn_coupling",
+    # §4BF Track 1c — APPENDED population indicator: 1.0 when the example
+    # is an idle bench-bank solve. Bench rows may TEACH the model (their
+    # label shift loads on this column instead of polluting the shared
+    # text-feature weights). The serving dispatcher always passes the
+    # default 0.0 — including for bench-bank turns, which DO route through
+    # it (R1 review): they are scored with the real-population intercept,
+    # a deliberate, benign asymmetry (the router's decision on a bench
+    # turn steers only that solve's planner path, never a measurement).
+    # Stale checkpoints are rejected at load by the feature-schema check.
+    "origin_bench",
 )
+
+#: §4BQ flip (vi). Appended AFTER every lexical name, so the lexical
+#: weights keep their indices and any code reading the first
+#: len(FEATURE_NAMES) columns stays correct under both representations.
+EMBED_DIM = 384
+EMBED_FEATURE_NAMES: Tuple[str, ...] = tuple(
+    f"emb_{i:03d}" for i in range(EMBED_DIM)
+)
+
+
+def model_feature_names(use_embeddings: bool) -> Tuple[str, ...]:
+    """The full schema a model trained with/without embeddings carries.
+
+    This is the ONLY definition of the combined order; the classifier's
+    load guard and its saved `feature_names` both derive from it, so the
+    two cannot drift into disagreement.
+    """
+    if use_embeddings:
+        return FEATURE_NAMES + EMBED_FEATURE_NAMES
+    return FEATURE_NAMES
 
 
 @dataclass
 class FeatureVector:
     """Features returned from `extract_features`. `values` is a frozen
-    float tuple in FEATURE_NAMES order — feed straight to the model."""
+    float tuple in FEATURE_NAMES order — feed straight to the model.
+
+    When an `embedding` was supplied, `values` is the lexical block
+    FOLLOWED BY the 384 embedding components (i.e. `model_feature_names`
+    order) and `embedding` holds that block on its own.
+    """
 
     values: Tuple[float, ...]
     by_name: Dict[str, float]
+    embedding: Optional[Tuple[float, ...]] = None
 
     def as_dict(self) -> Dict[str, float]:
         return dict(self.by_name)
@@ -126,13 +171,26 @@ def extract_features(
     text: str,
     *,
     prior_turn_text: str = "",
+    origin_bench: bool = False,
+    embedding: Optional[Sequence[float]] = None,
 ) -> FeatureVector:
     """Extract complexity features from an incoming request.
 
-    `prior_turn_text` is optional: when present, we compute a coupling
-    signal (shared-token overlap) so a short follow-up like "run it
-    again with the new fixture" can inherit the complexity of the
-    previous turn.
+    `prior_turn_text` is optional and **no production path passes it**
+    (§4BQ, 2026-08-16). When present it yields a coupling signal
+    (shared-token overlap) so a short follow-up like "run it again with
+    the new fixture" could inherit the previous turn's complexity — but
+    the TRAINER has never supplied it, so `context_turn_coupling` is
+    identically 0.0 in every fit, and serving it a real value was a
+    train/serve skew (the unlearned weight had simply decayed to
+    ~-0.003 under L2, which is the only reason it was harmless).
+    Re-enabling it means teaching the trainer to supply it FIRST; the
+    column is kept meanwhile because dropping it would invalidate every
+    checkpoint's `feature_names` for one dead weight.
+
+    `origin_bench` marks a bench-bank training example (§4BF 1c) —
+    training passes the trajectory's population, serving keeps the
+    default False (see the FEATURE_NAMES entry).
     """
     t = text or ""
     t_low = t.lower()
@@ -184,11 +242,28 @@ def extract_features(
         "has_numeric_density": num_density,
         "has_question_mark": has_qmark,
         "context_turn_coupling": float(jaccard),
+        "origin_bench": 1.0 if origin_bench else 0.0,
     }
 
     # Build the vector in frozen order so the model's weights line up.
     values = tuple(d[name] for name in FEATURE_NAMES)
-    return FeatureVector(values=values, by_name=d)
+
+    emb: Optional[Tuple[float, ...]] = None
+    if embedding is not None:
+        emb = tuple(float(v) for v in embedding)
+        if len(emb) != EMBED_DIM:
+            # RAISE rather than pad/truncate. Callers validate width in
+            # router/embedding.py, so reaching here is a bug — and a
+            # reshaped vector would be scored against the wrong weights
+            # and route silently wrongly, the one outcome worse than not
+            # routing at all.
+            raise ValueError(
+                f"embedding must be {EMBED_DIM}-d, got {len(emb)}"
+            )
+        d.update(dict(zip(EMBED_FEATURE_NAMES, emb)))
+        values = values + emb
+
+    return FeatureVector(values=values, by_name=d, embedding=emb)
 
 
 def feature_vector_to_list(fv: FeatureVector) -> List[float]:

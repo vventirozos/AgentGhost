@@ -76,8 +76,11 @@ def test_router_sanity_gate_rejects_inverted_model():
 
     # Evidence that FAILS (skips the planner on 87% of hard requests — the
     # §4O catastrophe) must be rejected even with 'healthy' weight signs.
-    m.gate_report_ = {"n": 400, "accuracy": 0.305, "baseline": 0.560,
+    # §4BQ: counts consistent with the stated accuracy — the identity is
+    # accuracy - baseline == (win - lose)/n, so 0.305 - 0.560 = -102/400.
+    m.gate_report_ = {"n": 400, "accuracy": 0.560 + (122 - 224) / 400, "baseline": 0.560,
                       "false_easy_on_hard": 0.868, "classes": 2,
+                      "discordant_win": 122, "discordant_lose": 224,
                       "weights_sha": m.weights_fingerprint()}
     assert not m.looks_sane()
 
@@ -85,8 +88,10 @@ def test_router_sanity_gate_rejects_inverted_model():
     # the old gate would have blocked on.
     for n in m._MONOTONE_HARD_FEATURES:
         m.weights_[m.feature_names_.index(n)] = -0.5
-    m.gate_report_ = {"n": 400, "accuracy": 0.695, "baseline": 0.560,
+    # 0.695 - 0.560 = +54/400, and decisively significant.
+    m.gate_report_ = {"n": 400, "accuracy": 0.560 + (80 - 26) / 400, "baseline": 0.560,
                       "false_easy_on_hard": 0.132, "classes": 2,
+                      "discordant_win": 80, "discordant_lose": 26,
                       "weights_sha": m.weights_fingerprint()}
     assert m.looks_sane(), (
         "a model that beats escalate-all on held-out data must deploy, "

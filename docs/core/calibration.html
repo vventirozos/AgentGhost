@@ -391,6 +391,29 @@
   mixing tiers is irreversible, because you can never audit which tier is noisy nor drop one without discarding
   the whole corpus. Legacy rows default to <code>turn</code>, which is what they were.</p>
 
+  <h3>§4BF 1c — bench population (origin, oracle re-label, equal-mass cap)</h3>
+  <p>Samples additionally carry <code>origin</code> (<code>"user"</code> | <code>"bench"</code>;
+  legacy rows default to <code>user</code> — sim was write-gated, so they were all real turns).
+  Bench-bank solves are the carve-out in the simulation write-gate: they record their per-attempt
+  turn sample with <code>origin="bench"</code>, and the bank oracle's verdict then re-labels each
+  attempt via <code>record_bench_validator_verdict</code> at the <code>bench_validator</code>
+  source rank — mechanical ground truth, above <code>verifier_late</code> and below
+  <code>user_correction</code>, same no-leakage re-label contract as every retro tier, joined
+  only to <code>origin="bench"</code> turn rows (bench req_ids are <code>bench-</code>-prefixed
+  so a collision with a real join key is impossible by construction). PASS verdicts record
+  immediately; FAIL verdicts are DEFERRED until dream's infra triage has ruled — a sandbox
+  banner or a validator crashing in its own frame must never be written as a permanent
+  ground-truth negative (R1 CRIT; the §4AO label-noise class at the strongest rank). The fit,
+  <code>stats()</code>, the operator metrics (Brier/ECE/reliability) AND the learning-health
+  label/feature gates blend populations through <code>_apply_bench_mass_cap</code> (dict twin
+  <code>apply_bench_mass_cap_rows</code>): at most as many bench rows as real rows (newest
+  first), zero when no real rows exist — bench may feed the starved negative class, it may
+  never become the population the instrument describes (see
+  <a href="admissibility.html">core/admissibility</a>). <code>learning_health</code> surfaces
+  the mix as <code>label_origins</code>. The user-correction stash is user-origin-only and
+  carries <code>req_id</code>/<code>domain</code>, so the human negative SUPERSEDES the proxy
+  row instead of counter-weighting it.</p>
+
   <h3>Grading, with measured constants</h3>
   <p><code>grade_turn_outcome()</code> maps a finished turn onto [0, 1]. The numbers are measured rather than
   chosen: across 302 verdict-bearing trajectories the agent passed 251, so an unverified-but-clean turn scores

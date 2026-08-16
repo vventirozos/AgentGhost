@@ -4,7 +4,9 @@ One bounded digit-scale call after a two-stage verdict; the expectation
 over the digit token distribution blends into `confidence`. Contracts:
 verdicts are never changed, UNCERTAIN is excluded, any probe failure
 leaves the result untouched, and the feature is env-gated
-(GHOST_VERIFY_LOGIT_EXPECT, default OFF, read per call).
+(GHOST_VERIFY_LOGIT_EXPECT, default OFF, read per call). Since §4BL the
+consumer is the verdict-gated CONFIRM cap (T frozen on the corrected
+design half; REFUTED readings recorded, never acted on).
 """
 
 import asyncio
@@ -99,47 +101,64 @@ def _run_two_stage(client) -> "VerifyResult":
     return asyncio.run(v._verify_claim_two_stage("claim", "evidence", "ctx"))
 
 
-class TestProbeBlend:
-    def test_confirmed_blends_toward_probe(self, monkeypatch):
+class TestProbeCap:
+    """§4BL: the w-blend is REPLACED by the verdict-gated CONFIRM cap
+    (the §4BI foreclosure proved no light symmetric blend can move
+    quantized confidences across the 0.7 gate; §4BJ measured the probe
+    erring toward "acceptable" on faulty claims → CONFIRM-only)."""
+
+    def test_disbelieved_confirm_is_capped(self, monkeypatch):
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
-        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "0.5")
-        # probe: digit 9 p=.9, digit 0 p=.1 → E=8.1/9=0.9
+        # probe: digit 9 p=.9, digit 0 p=.1 → E=8.1/9=0.9 < T=0.966
         client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
                              _probe("9", 0.9)])
         res = _run_two_stage(client)
         assert res.verdict == VerifyVerdict.CONFIRMED
         assert res.probe_score == pytest.approx(0.9)
-        assert res.confidence == pytest.approx(0.5 * 1.0 + 0.5 * 0.9)
+        assert res.confidence == pytest.approx(0.6)   # capped, not blended
+        assert "probe-capped" in res.reasoning
         assert len(client.calls) == 3
 
-    def test_refuted_uses_inverted_probe(self, monkeypatch):
+    def test_believed_confirm_is_untouched(self, monkeypatch):
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
-        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "0.5")
-        # probe says acceptable≈0.9 but verdict REFUTED → aligned = 0.1
+        monkeypatch.setenv("GHOST_VERIFY_PROBE_CAP_T", "0.85")
+        client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
+                             _probe("9", 0.9)])   # 0.9 ≥ 0.85 → no cap
+        res = _run_two_stage(client)
+        assert res.confidence == pytest.approx(1.0)
+        assert "probe-capped" not in (res.reasoning or "")
+
+    def test_refuted_gets_reading_recorded_and_nothing_else(self, monkeypatch):
+        # §4BJ: the probe errs toward "acceptable" on faulty claims — a
+        # high reading on a REFUTED must neither weaken nor strengthen it.
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
         client = _SeqClient([_stage1(), _stage2("REFUTED", 1.0),
                              _probe("9", 0.9)])
         res = _run_two_stage(client)
         assert res.verdict == VerifyVerdict.REFUTED
-        assert res.confidence == pytest.approx(0.5 * 1.0 + 0.5 * 0.1)
+        assert res.probe_score == pytest.approx(0.9)
+        assert res.confidence == pytest.approx(1.0)   # untouched
 
-    def test_default_weight_is_light(self, monkeypatch):
-        """First bench A/B: w=0.5 dragged actionable TPR to 0.347 — the
-        default must stay light (0.25) until a re-bench justifies more."""
+    def test_cap_never_raises_a_low_confidence(self, monkeypatch):
+        # A CONFIRMED already below the cap must stay where it is — the
+        # cap is a ceiling, not an assignment.
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
-        monkeypatch.delenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", raising=False)
-        client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
-                             _probe("9", 0.9)])
+        client = _SeqClient([_stage1(), _stage2("CONFIRMED", 0.5),
+                             _probe("0", 0.9)])   # probe low → disbelieved
         res = _run_two_stage(client)
-        assert res.confidence == pytest.approx(0.75 * 1.0 + 0.25 * 0.9)
+        assert res.confidence == pytest.approx(0.5)
 
-    def test_weight_clamped_and_junk_safe(self, monkeypatch):
-        from ghost_agent.core.verifier import _logit_expect_weight
-        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "7")
-        assert _logit_expect_weight() == 1.0
-        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "-1")
-        assert _logit_expect_weight() == 0.0
-        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT_WEIGHT", "junk")
-        assert _logit_expect_weight() == 0.25
+    def test_threshold_and_cap_env_junk_safe(self, monkeypatch):
+        from ghost_agent.core.verifier import (_probe_cap_threshold,
+                                               _probe_conf_cap)
+        monkeypatch.setenv("GHOST_VERIFY_PROBE_CAP_T", "junk")
+        assert _probe_cap_threshold() == 0.966
+        monkeypatch.setenv("GHOST_VERIFY_PROBE_CAP_T", "7")
+        assert _probe_cap_threshold() == 1.0
+        monkeypatch.setenv("GHOST_VERIFY_PROBE_CONF_CAP", "junk")
+        assert _probe_conf_cap() == 0.6
+        monkeypatch.setenv("GHOST_VERIFY_PROBE_CONF_CAP", "-3")
+        assert _probe_conf_cap() == 0.0
 
     def test_verdict_never_changed_by_probe(self, monkeypatch):
         monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
@@ -186,3 +205,39 @@ class TestProbeBlend:
         res = _run_two_stage(client)
         assert res.probe_score == pytest.approx(1.0)
         assert res.confidence == pytest.approx(1.0)
+
+
+class TestProbeCapBoundary:
+    def test_reading_exactly_at_threshold_is_not_capped(self, monkeypatch):
+        # §4BL R1 MIN-1: strict < is load-bearing — a real design-half
+        # trial sits exactly on a candidate boundary, and the one-char
+        # mutation `<` → `<=` survived the suite. Pin the boundary with
+        # T set to a reachable expectation value.
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
+        monkeypatch.setenv("GHOST_VERIFY_PROBE_CAP_T", "0.9")
+        client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
+                             _probe("9", 0.9)])   # E = 0.9 == T
+        res = _run_two_stage(client)
+        assert res.probe_score == pytest.approx(0.9)
+        assert res.confidence == pytest.approx(1.0)   # NOT capped
+        assert "probe-capped" not in (res.reasoning or "")
+
+    def test_default_threshold_is_the_frozen_value(self, monkeypatch):
+        from ghost_agent.core.verifier import _probe_cap_threshold
+        monkeypatch.delenv("GHOST_VERIFY_PROBE_CAP_T", raising=False)
+        assert _probe_cap_threshold() == 0.966
+
+    def test_cap_is_cheap_pass_only(self, monkeypatch):
+        # §4BL R1 MAJ-2: under the §4BK kill-switch legacy mix, a MAIN
+        # two-stage CONFIRMED must not be capped (unmeasured regime; on
+        # the refute-escalation path the probe would weaken refutes).
+        import asyncio
+        monkeypatch.setenv("GHOST_VERIFY_LOGIT_EXPECT", "1")
+        client = _SeqClient([_stage1(), _stage2("CONFIRMED", 1.0),
+                             _probe("9", 0.9)])   # 0.9 < 0.966
+        v = Verifier(llm_client=client)
+        res = asyncio.run(v._verify_claim_two_stage(
+            "claim", "evidence", "ctx", force_main=True))
+        assert res.verdict == VerifyVerdict.CONFIRMED
+        assert res.probe_score == pytest.approx(0.9)  # reading recorded
+        assert res.confidence == pytest.approx(1.0)   # NOT capped

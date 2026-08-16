@@ -112,7 +112,7 @@ class PRMScorer:
           * **Holdout guard.** When a holdout set is supplied, the clone
             is committed ONLY if its BCE on the holdout does not worsen
             (catastrophic-forgetting guard). Without a holdout the small
-            ``lr`` + few ``max_steps`` bound the change.
+            ``lr`` + few ``max_steps`` bound the change. ⚠ §4BN R22/R25: the WIRED caller (`_run_prm_online_update`) no longer reaches this path — it SKIPS the step when the holdout is below a floor, because an empty holdout makes this method commit unconditionally. The reasoning here still applies to any other caller.
 
         Returns ``True`` if the model was updated, ``False`` otherwise.
         Never raises — an online-update failure must not break the turn.

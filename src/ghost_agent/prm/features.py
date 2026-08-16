@@ -152,6 +152,16 @@ PRM_FEATURE_NAMES: Tuple[str, ...] = (
     # ── Cross features ───────────────────────────────────────────────
     "tool_already_used_this_turn",
     "tool_failed_this_turn",
+
+    # ── Population indicator (§4BF Track 1c) — APPENDED, keep last-ish ─
+    # 1.0 when the turn is an idle bench-bank solve (task_kind="bench").
+    # A domain-indicator column: bench examples may TEACH the model, but
+    # their population-specific label shift loads here instead of
+    # polluting the shared text/tool weights. Serve sites set it from the
+    # live context (bench solves score with 1.0, real turns 0.0), so it
+    # is NOT serve-inert. Appending grows the vector → stale checkpoints
+    # are detected at load and retrained (see module docstring).
+    "origin_bench",
 )
 
 
@@ -179,6 +189,11 @@ class PlanState:
     # Names of tools that errored this turn — used to flag refire on
     # already-failing tools as risky.
     tools_failed_this_turn: Tuple[str, ...] = ()
+    # §4BF 1c: True when this turn is an idle bench-bank solve. Train
+    # sites derive it from the trajectory's task_kind, serve sites from
+    # the live context — the two must move in lockstep (see the
+    # "origin_bench" entry in PRM_FEATURE_NAMES).
+    origin_bench: bool = False
 
 
 @dataclass
@@ -314,6 +329,7 @@ def _cross_features(state: PlanState, action: ActionFeatures) -> Dict[str, float
     return {
         "tool_already_used_this_turn": 1.0 if used else 0.0,
         "tool_failed_this_turn": 1.0 if failed else 0.0,
+        "origin_bench": 1.0 if getattr(state, "origin_bench", False) else 0.0,
     }
 
 

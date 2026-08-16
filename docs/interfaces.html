@@ -107,8 +107,15 @@
   <pre class="shell">python interface/externals/slack_bot/main.py</pre>
 
   <div class="note warn">
-    <strong>It only answers its owner.</strong> The bot is locked to a single Slack user ID — mentions from anyone else in the workspace are ignored. This is deliberate: the bot can run code on your machine, and a shared Slack channel is not an access-control boundary.
+    <strong>Who it answers.</strong> <em>Direct messages are owner-only, always.</em> In ordinary channels the bot has answered any human in its own workspace since 2026-08-13 (<code>GHOST_SLACK_OPEN_CHANNEL</code>, default on) — that grant was added deliberately to bring real traffic into the outcome ledgers, and it is scoped to channels you put the bot in. Set <code>GHOST_SLACK_OPEN_CHANNEL=0</code> to restore the strict single-user lock. This matters because the bot can run code on your machine, and a shared Slack channel is not an access-control boundary.
   </div>
+
+  <h3>Shadow banning</h3>
+  <p>Set <code>GHOST_SLACK_SHADOW_BAN</code> to a comma-separated list of Slack user IDs. Their messages, mentions <em>and reactions</em> are dropped as if the bot never saw them — no reply, no error, nothing that distinguishes being banned from the bot simply being idle.</p>
+  <pre class="shell">GHOST_SLACK_SHADOW_BAN=U0123ABCD,U0456EFGH</pre>
+  <p>Add it to <code>interface/externals/slack_bot/.env</code> and restart the bot. The list is read once at startup, so a ban costs a restart; attempts are logged at <code>DEBUG</code> only, so they stay out of the live stream.</p>
+  <p><strong>Reactions are covered on purpose.</strong> A 👍/👎 on a bot reply writes a human outcome label that feeds the agent's learning, so a ban that covered only messages would leave a banned user able to poison that signal while appearing ignored.</p>
+  <p>The owner is exempt unconditionally — a mistyped ID in that variable cannot lock you out of your own bot. To find someone's ID: their Slack profile → <strong>⋮</strong> → <em>Copy member ID</em>.</p>
 
   <p>A healthy Slack bot is <em>quiet</em>. Its error log staying empty is the signal that it's fine; check the info log for its heartbeat if you want positive confirmation it's alive.</p>
 

@@ -552,6 +552,26 @@ async def get_manifest(key: str | None = None):
         headers={"Cache-Control": "no-cache, must-revalidate, private"},
     )
 
+#: Root-path icon aliases. Safari probes `/apple-touch-icon.png` (and the
+#: -precomposed variant) at the DOCUMENT ROOT whenever the `<link>` in the
+#: markup is missing or unusable — and it is unusable more often than you
+#: would think: the link carries a `?v=` cache-buster, and the page itself
+#: is key-gated, so an Add-to-Home-Screen pass that never sees the HTML
+#: still has these to fall back on. Unauthenticated on purpose, exactly
+#: like the /static mount they alias: an icon is not a secret, and gating
+#: it is what produces a generated letter tile instead of the ghost.
+_ICON_180 = static_dir / "icons" / "icon-180.png"
+
+
+@app.get("/apple-touch-icon.png", include_in_schema=False)
+@app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)
+async def get_root_touch_icon():
+    return FileResponse(
+        _ICON_180, media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/sw.js")
 async def get_sw():
     # no-cache: a stale service worker is the worst kind of stale — it
@@ -1475,6 +1495,12 @@ async def memory_correct_proxy(request: Request):
 @app.post("/api/memory/delete", dependencies=[Depends(verify_interface_key)])
 async def memory_delete_proxy(request: Request):
     return await _proxy_agent_api(request, "POST", "/api/memory/delete")
+
+@app.post("/api/feedback", dependencies=[Depends(verify_interface_key)])
+async def feedback_proxy(request: Request):
+    """Human outcome label (👍/👎 on an agent reply) → the agent's
+    corrections sidecar. Body: {request_id, signal, note?, source?}."""
+    return await _proxy_agent_api(request, "POST", "/api/feedback")
 
 
 if __name__ == "__main__":

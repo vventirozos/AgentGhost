@@ -27,7 +27,25 @@ Public API:
     ComplexityDispatcher    : production-facing wrapper
 """
 
-from .features import extract_features, FeatureVector, FEATURE_NAMES
+from .features import (
+    extract_features,
+    FeatureVector,
+    FEATURE_NAMES,
+    EMBED_DIM,
+    EMBED_FEATURE_NAMES,
+    model_feature_names,
+)
+from .embedding import (
+    EmbeddingStatus,
+    current_embed_model_name,
+    embed_text,
+    embed_texts,
+    embeddings_enabled,
+    get_router_embedder,
+    probe_router_embedder,
+    reset_router_embedder,
+    set_router_embedder,
+)
 from .labels import derive_label, label_trajectories, LabelSpec
 from .model import ComplexityClassifier, TrainingReport
 from .dispatch import ComplexityDispatcher, RoutingDecision
@@ -42,6 +60,18 @@ __all__ = [
     "extract_features",
     "FeatureVector",
     "FEATURE_NAMES",
+    "EMBED_DIM",
+    "EMBED_FEATURE_NAMES",
+    "model_feature_names",
+    "EmbeddingStatus",
+    "current_embed_model_name",
+    "embed_text",
+    "embed_texts",
+    "embeddings_enabled",
+    "get_router_embedder",
+    "probe_router_embedder",
+    "reset_router_embedder",
+    "set_router_embedder",
     "derive_label",
     "label_trajectories",
     "LabelSpec",

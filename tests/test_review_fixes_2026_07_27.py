@@ -77,12 +77,15 @@ class TestCorrectionStash:
         a later correction would record a SECOND 0.0 for the same turn,
         double-weighting it in the Brier/ECE/weight fit."""
         i = SRC.index("_recent_calib_for_correction")
-        window = SRC[i:i + 3400]
+        window = SRC[i:i + 5600]
         # 0.5, not 1.0: under the graded label a clean turn scores the
         # measured prior (0.83) and never reaches 1.0, so a `>= 1.0`
         # gate stops populating the stash entirely — which disables
-        # every downstream tier that consumes it.
-        assert "if _calib_outcome >= 0.5:" in window
+        # every downstream tier that consumes it. (§4BF 1c added the
+        # user-origin condition on the same line — bench turns have no
+        # correcting human and must not flush the LRU.)
+        assert "_calib_outcome >= 0.5" in window
+        assert '_calib_origin == "user"' in window
 
     def test_stash_records_the_pre_penalty_composite(self):
         """D2: the inline record deliberately stores `pre_penalty_composite`
@@ -91,7 +94,7 @@ class TestCorrectionStash:
         recorded a ~5x-suppressed prediction against outcome=0.0 — the exact
         optimism bug the inline path documents."""
         i = SRC.index("_recent_calib_for_correction")
-        window = SRC[i:i + 3400]
+        window = SRC[i:i + 5600]
         assert 'getattr(_pending, "pre_penalty_composite"' in window
 
     def test_stash_carries_both_observation_flags(self):
@@ -100,7 +103,7 @@ class TestCorrectionStash:
         rarest and most valuable samples — were excluded from the weight
         fits entirely."""
         i = SRC.index("_recent_calib_for_correction")
-        window = SRC[i:i + 3400]
+        window = SRC[i:i + 5600]
         assert '"entropy_observed"' in window
         assert '"effort_observed"' in window
         assert '"effort_component"' in window
@@ -111,9 +114,14 @@ class TestCorrectionStash:
         import inspect
         from ghost_agent.core.calibration import CalibrationTracker
         allowed = set(inspect.signature(CalibrationTracker.record).parameters)
+        # §4BF 1c added req_id + domain to the stash — the join key is
+        # exactly what makes the human negative SUPERSEDE the proxy row,
+        # so a signature drift dropping it must fail HERE, not silently
+        # at record(**_comp).
         for key in ("composite", "entropy_component", "competence_component",
                     "uncertainty_pressure", "entropy_observed",
-                    "effort_component", "effort_observed"):
+                    "effort_component", "effort_observed",
+                    "req_id", "domain"):
             assert key in allowed, f"{key} is not accepted by record()"
 
     def test_record_accepts_the_stash_shape_end_to_end(self):
@@ -125,6 +133,7 @@ class TestCorrectionStash:
             "competence_component": 0.9, "uncertainty_pressure": 0.0,
             "entropy_observed": True, "effort_component": 0.3,
             "effort_observed": True,
+            "req_id": "req-e2e", "domain": "coding",
         }
         with tempfile.TemporaryDirectory() as d:
             t = CalibrationTracker(Path(d), min_samples_for_fit=1)
@@ -133,3 +142,5 @@ class TestCorrectionStash:
             assert s.outcome == 0.0
             assert s.effort_observed is True
             assert s.entropy_observed is True
+            assert s.req_id == "req-e2e"
+            assert s.domain == "coding"

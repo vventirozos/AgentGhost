@@ -18,8 +18,22 @@ def _traj(req, steps, calls, outcome="passed", heavy=False):
     return Trajectory(user_request=req, n_steps=steps, tool_calls=tcs, outcome=outcome)
 
 
-def _balanced_corpus(n_each):
+def _corpus_floor_each():
+    """Per-class size clearing the trainer's DERIVED floor.
+
+    §4BQ left `_GATE_MIN_HELDOUT` at 60 — two attempts to raise it to
+    150 were retracted, both justified by self-confirming artifacts
+    (see the constant). Sizes are DERIVED so a future recalibration
+    cannot silently turn these into vacuous bails; that had already
+    happened once, to the bench-cap test.
+    """
+    from ghost_agent.router.trainer import _gate_min_trajectories
+    return int(_gate_min_trajectories() * 0.6) + 1
+
+
+def _balanced_corpus(n_each=None):
     """n_each easy + n_each hard trajectories (both classes present)."""
+    n_each = _corpus_floor_each() if n_each is None else n_each
     easy = [_traj(f"what is {i}?", 1, 1) for i in range(n_each)]
     hard = [_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True) for i in range(n_each)]
     return easy + hard
@@ -28,8 +42,9 @@ def _balanced_corpus(n_each):
 class TestBootstrapTrains:
     def test_trains_when_enough_multiclass_samples(self, tmp_path):
         from ghost_agent.router import bootstrap_router, ComplexityDispatcher
-        # 30 easy + 30 hard = 60 labeled, well over the default min of 50.
-        trajs = _balanced_corpus(120)
+        # A floor-derived balanced corpus (see _corpus_floor_each), well
+        # over both the default min and the gate's own corpus floor.
+        trajs = _balanced_corpus()
         save = tmp_path / "router" / "checkpoint.json"
         clf, report = bootstrap_router(trajs, save_path=save)
         assert clf is not None
@@ -43,7 +58,7 @@ class TestBootstrapTrains:
 
     def test_respects_custom_min_samples(self, tmp_path):
         from ghost_agent.router import bootstrap_router
-        trajs = _balanced_corpus(120)  # 30 labeled
+        trajs = _balanced_corpus()
         clf, report = bootstrap_router(trajs, min_samples=20)
         assert clf is not None
         assert report.fit_succeeded is True
@@ -117,7 +132,7 @@ class TestBootstrapFromCollector:
         from ghost_agent.distill.collector import TrajectoryCollector
         from ghost_agent.router import bootstrap_router, ComplexityDispatcher
         coll = TrajectoryCollector(root=tmp_path / "traj", session_id="s1")
-        for t in _balanced_corpus(120):
+        for t in _balanced_corpus():
             coll.append(t)
         save = tmp_path / "router" / "checkpoint.json"
         clf, report = bootstrap_router(coll.iter_trajectories(), save_path=save)

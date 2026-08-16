@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.admissibility — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Related</h3>
+    <a href="../eval/banks.html">bench banks (1b)</a>
+    <a href="experiments.html">experiments (arms)</a>
+    <a href="calibration.html">calibration</a>
+    <a href="dream.html">dream (self-play)</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / admissibility.py — who may consume origin=bench (§4BF Track 1c)</h1>
+  <p class="subtitle">The per-consumer policy matrix for bench-bank
+  outcomes — one declarative table, enforced at every read/write seam.
+  Tests: <code>tests/test_admissibility_1c.py</code>.</p>
+
+  <h2>Why</h2>
+  <p>Track 1b (<a href="../eval/banks.html">eval/banks</a>) generates
+  mechanically-graded outcomes in an isolated corner: a separate
+  trajectory root, <code>task_kind="bench"</code>, no learning-store
+  writes. That answered "how do we get graded volume without contaminating
+  anything". This module answers the operator-decided follow-up:
+  <strong>which consumers may read that volume, and in what form</strong>
+  — so admission is a written policy, not an accident of file paths.
+  The §4AQ denominator rule generalizes here: bench volume must never
+  inflate (or grade) a real-turn instrument.</p>
+
+  <h2>The four policies</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>policy</th><th>meaning</th></tr>
+    <tr><td><code>real_only</code></td><td>reads real turns only — the
+    default for any consumer without a row (fail closed).</td></tr>
+    <tr><td><code>bench_feature</code></td><td>admits bench-labeled
+    examples WITH origin attached as an explicit feature/field; every
+    floor, gate and holdout stays real-only. (One accepted deviation:
+    the tool-description runner's SUPPLY gate counts bench positives —
+    ship safety is recovered by its real-only resolution gate, which
+    refuses when the real private tier is too thin.)</td></tr>
+    <tr><td><code>bench_tagged</code></td><td>admits bench-derived WRITES
+    tagged with provenance (<code>source="bench"</code>) so they stay
+    auditable and retractable.</td></tr>
+    <tr><td><code>bench_scoped</code></td><td>bench-only VARIANTS: bench
+    data feeds bench-scoped instances exclusively (experiment arms).</td></tr>
+  </table>
+  </div>
+
+  <h2>The decided matrix (operator, 2026-08-13)</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>consumer</th><th>policy</th><th>where enforced</th></tr>
+    <tr><td>gepa_trainset</td><td>bench_feature</td><td>
+    <code>optim/trainset.py</code> — "bench" joined <code>_GOLD_TASK_KINDS</code>
+    (a bank-oracle pass is a stronger proof than a verifier grade);
+    <code>TrainExample.origin</code>; <code>scripts/run_gepa.py</code> chains
+    the bench corpus. Origin is a FIELD, not an input — the tuned prompt
+    must never condition on a token real traffic can't carry, and holdout
+    identity deliberately excludes it.</td></tr>
+    <tr><td>gepa_tool_fixtures</td><td>bench_feature</td><td>
+    <code>optim/tool_fixtures.py</code> — bench trajectories join by
+    <code>extra.req_id</code> (bench sessions are per-bank, so the
+    production session_id join can't see them); production joins keep
+    pre-1c semantics and always win; <code>ToolChoiceFixture.origin</code>.</td></tr>
+    <tr><td>prm</td><td>bench_feature</td><td><code>prm/features.py</code>
+    appends <code>origin_bench</code> (train from <code>task_kind</code>,
+    serve from the live context — bench solves score 1.0, real turns 0.0);
+    <code>PRMTrainer.run(bench_trajectories=…)</code> augments AFTER the
+    real-only viability floors, equal-mass capped. Idle + in-loop retrains
+    pass <code>iter_bench_trajectories("prm")</code>; the corpus-unchanged
+    skip gate folds the bench fingerprint. The online-update holdout stays
+    real-only (<code>prm_online_holdout</code> row).</td></tr>
+    <tr><td>router</td><td>bench_feature</td><td><code>router/features.py</code>
+    appends <code>origin_bench</code> (serving always passes the default
+    0.0 — the dispatcher routes real traffic only, the column exists so
+    bench label shift loads there instead of on shared text weights);
+    <code>RouterTrainer.run(bench_trajectories=…)</code> adds bench rows to
+    the TRAIN side after the fixed real split — the §4AA held-out gate and
+    every floor are real-only. Boot bootstrap + idle + in-loop wired.</td></tr>
+    <tr><td>calibration</td><td>bench_feature</td><td>
+    <code>CalibrationSample.origin</code>; the write-gate carve-out lets
+    bench turns record (plain self-play stays excluded); each attempt is
+    re-labeled by the bank oracle via
+    <code>record_bench_validator_verdict</code> (source rank: ground truth
+    above <code>verifier_late</code>, below <code>user_correction</code>).
+    PASS verdicts record immediately; FAIL verdicts are DEFERRED past the
+    infra triage chain (R1 CRIT: a Docker banner or validator crash must
+    never become a permanent ground-truth negative). Bench req_ids are
+    <code>bench-</code>-prefixed so they can never collide with a real
+    turn's join key. <code>_apply_bench_mass_cap</code> blends the fit,
+    <code>stats()</code>, Brier/ECE/reliability AND the learning-health
+    gates (dict twin <code>apply_bench_mass_cap_rows</code>) at equal
+    mass — with zero real rows bench contributes nothing. The
+    user-correction stash is user-origin-only and now carries
+    <code>req_id</code>/<code>domain</code> so human negatives SUPERSEDE
+    the proxy row instead of sitting beside it.</td></tr>
+    <tr><td>lessons</td><td>bench_tagged</td><td><code>core/dream.py</code>
+    — bench rides the same extracted <code>lesson_gate_decision</code>
+    with a neutral pinned frontier shape (<code>is_new_cluster=False</code>,
+    so failures suppress instead of minting) and <code>novelty=None</code>
+    (R1: novelty is scored against frontier winners bench never records,
+    so it degenerated to ~1.0 and would have minted an UNVERIFIED lesson
+    on ~every first-try pass). The only bench pass-mint path is
+    struggled-then-won — which runs lesson verification except for
+    template-fallback (<code>fallback_synthesized</code>) lessons, a
+    documented skip — and the mint carries <code>source="bench"</code>
+    (mirrored on the vector twin). Bench items are cluster-attributed from the BANK
+    (<code>bench_meta["cluster"]</code> → <code>challenge_domains</code>),
+    not the frontier seed. Retrieval/prune never read source — the tag is
+    the audit/retract handle (§4BE class).</td></tr>
+    <tr><td>experiments_live</td><td>real_only</td><td>
+    <code>core/experiments.py</code> — enrollment (bench origin can only
+    reach bench-scoped specs) AND read side
+    (<code>summarize_streaming(admit_task_kinds=("user_request",))</code>,
+    the belt: a stamped record of any other population lands in
+    <code>coverage["skipped_kind"]</code>).</td></tr>
+    <tr><td>experiments_bench</td><td>bench_scoped</td><td>
+    <code>ExperimentSpec.scope="bench"</code> (registry JSON; unknown
+    scopes fail closed to SKIPPED). Bench turns enroll via
+    <code>enroll_request(origin="bench")</code> with the bench ITEM as
+    the randomization unit (R1: per-attempt units re-randomized retries
+    — an arm-crossing leak; all attempts of one item now share an arm,
+    and the ≤3 same-arm rows per item are documented dependence). The
+    bank oracle's verdict is written back onto each attempt's bench
+    trajectory (corrections sidecar, <code>source="bench_validator"</code>)
+    — without that write-back every bench record stayed UNKNOWN and no
+    bench arm could ever resolve (R1 CRIT). Verdicts read the bench root
+    with <code>admit_task_kinds=("bench",)</code> and announce as "BENCH
+    experiment … a bench win gates a LIVE watch-window, it is not an
+    auto-apply". <code>introspect action='experiments'</code> renders the
+    bench population as its own labeled section. The lesson-VERIFY re-run
+    is stripped of every bench write path (collector, labels, joins) —
+    it is a sim, not a bench observation.</td></tr>
+    <tr><td>reflection, postmortem, skills_auto, macro_mining, foresight,
+    frontier, rem_fragments, framing_leak, human_feedback,
+    prm_online_holdout</td><td>real_only</td><td>protected by the root
+    split; the rows make the policy explicit so repointing one at the
+    bench root has to argue with a written decision.</td></tr>
+  </table>
+  </div>
+
+  <h2>Access helpers</h2>
+  <ul>
+    <li><code>iter_bench_trajectories(consumer, args=None)</code> — THE way
+    to read the bench corpus: withholds everything for non-admitted
+    consumers (fail closed + debug line), filters to
+    <code>task_kind=="bench"</code> even inside the bench root, degrades to
+    empty on a bench-less box, and (R4) empties under a
+    <code>--no-bench</code> boot when the caller passes the runtime
+    <code>args</code> — the <code>full_no_bench</code> ablation arm must
+    ablate consumption, not just generation. What the flag CANNOT undo:
+    lessons already minted (<code>source=bench</code>) and calibration rows
+    already recorded (<code>origin=bench</code>) — see
+    <code>scripts/ABLATION.md</code> for the arm's honest scope.</li>
+    <li><code>bench_corpus_fingerprint(args=None)</code> — fold into any
+    corpus-unchanged skip gate, or new bench data never triggers a refit;
+    None under <code>--no-bench</code> so a disabled corpus can't force
+    refits either.</li>
+    <li><code>selfhood</code> row (R4 CRIT): the first-person diary was an
+    UNDECIDED consumer — bench turns were writing lived-experience entries
+    to the production autobiographical store. Capture is origin-gated (at
+    all three write sites) and dream's bench isolate nulls
+    <code>self_model</code>. The activity digest got the same user-origin
+    gate as the project digest (its ungated sibling was eating notify
+    events — including bench experiment verdicts — every idle night).</li>
+    <li><strong>The finalize doctrine (R5):</strong> 1b/1c flipped bench
+    turns from "no collector, everything downstream returns early" to
+    "full collector, full finalize" — every side effect whose only
+    protection was that early return had to be re-decided. User-origin
+    gates now cover: the two digests, the selfhood writes, the METACOG
+    confidence stash (a bench solve's reading was arming/disarming the
+    arbiter on the next REAL turn), the hydrated-lessons trajectory stamp
+    (bench rows were stamped with the last real turn's lesson set), and
+    the promotion-nudge footer. Every <code>copy.copy</code>-shared LRU
+    ring the finalize writes through is rebound on the bench isolate —
+    the full six-ring inventory is pinned behaviorally AND as a source
+    twin (<code>tests/test_bench_solve_loop_1c.py</code> /
+    <code>test_admissibility_1c.py</code>).</li>
+    <li><strong>Report populations (R5-R7):</strong> the bench report
+    carries its own title, denominator
+    (<code>coverage["admitted_turns"]</code>) and an items-vs-attempts
+    label; all four live-view surfaces and both announce passes DENY the
+    names DECLARED in the other scope (never an allow-list of this
+    scope's enabled names — that erased a disabled spec's history; never
+    an enabled-only deny — that resurrected stale stamps on
+    re-scope-then-disable); the bench verdict computation itself honors
+    <code>--no-bench</code> via the chokepoint.</li>
+  </ul>
+
+  <h2>Denominator surfaces</h2>
+  <ul>
+    <li><code>learning_health</code>: <code>report["bench"]</code> +
+    a rendered "BENCH FLYWHEEL" scoreboard (the first consumer of
+    <code>banks.stats()</code>), and calibration label health gains
+    <code>label_origins</code>.</li>
+    <li><code>scripts/experiment_report.py --bench</code> — the bench
+    population report from the CLI.</li>
+    <li>Liveness was already origin-clean: <code>_count_user_turns</code>
+    counts <code>origin=user</code> log stamps only.</li>
+  </ul>
+</main>
+</body>
+</html>

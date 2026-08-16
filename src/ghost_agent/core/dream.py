@@ -1,6 +1,7 @@
 # src/ghost_agent/core/dream.py
 
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -41,7 +42,8 @@ _CODE_SIGNAL_PATTERNS = (
 
 def resolve_cluster_key(seed: dict, used_template_cluster: str,
                         challenge: str,
-                        challenge_domains: Optional[list] = None) -> str:
+                        challenge_domains: Optional[list] = None,
+                        trusted_domains: bool = False) -> str:
     """Which frontier cluster this self-play run's credit belongs to.
 
     PRECEDENCE — **template key FIRST**, then the seed, then keyword-classify
@@ -77,6 +79,22 @@ def resolve_cluster_key(seed: dict, used_template_cluster: str,
     # `sql` climbed to expert tier on work that was never SQL. Rewording the
     # boilerplate stopped it DOMINATING; using the pre-computed domain is the
     # complete fix, because it never looks at the wrapper at all.
+    # `trusted_domains` (§4BF 1c, R3 review): the whitelist exists to
+    # reject journal-mined GUESSES — a BENCH item's cluster is
+    # operator-curated at import (like a template's), so it is accepted
+    # unconditionally. The first fix widened the whitelist with
+    # "python_general" instead, which (a) silently promoted the journal
+    # guesser's "no idea" default to authoritative and (b) re-armed the
+    # misfile for any future bank cluster outside the keyword set.
+    if trusted_domains:
+        for d in (challenge_domains or []):
+            d = str(d or "").strip()
+            if d:
+                return d
+        # Trusted caller with NO domain (a future bank shipping
+        # cluster:""): classify the text — never fall to the seed, which
+        # is the abandoned pre-injection curriculum target (R4 review).
+        return classify_cluster(challenge)
     _valid = {k for k, _ in CLUSTER_KEYWORDS} if CLUSTER_KEYWORDS else set()
     for d in (challenge_domains or []):
         d = str(d or "").strip()
@@ -881,6 +899,92 @@ def validate_challenge_quality(setup_script: str, validation_script: str) -> tup
 
     return True, ""
 
+def lesson_gate_decision(*, aborted_by_solver: bool,
+                         validator_infra_crash: bool,
+                         mastered: bool,
+                         journal_source,
+                         passed: bool,
+                         attempt: int,
+                         is_new_cluster: bool,
+                         compression_delta: float,
+                         solution_novelty,
+                         bench: bool = False) -> tuple:
+    """The skill-writing gate, extracted PURE so its branches are unit-
+    testable instead of mirror-pinned (§4BF 1c review prep). Returns
+    ``(should_write_skill, gate_reason)``.
+
+    Only commit a lesson when the run actually produced signal: mastered
+    clusters don't need new lessons; repeated failures on the same
+    cluster suppress to prevent the skill store filling with duplicates.
+    Bench runs (§4BF 1c) ride the SAME gate with a neutral pinned
+    frontier shape (is_new_cluster=False, delta=0, mastered=False) AND
+    solution_novelty=None pinned at the call site, so the ONLY branch
+    that can admit a bench lesson is struggled-then-won; bench failures
+    land in the repeat-failure suppression. ``bench`` switches the
+    solver-abort reason string only (bench items are oracle-verified at
+    import, so an abort there is capitulation, not a broken challenge).
+    """
+    if aborted_by_solver:
+        if bench:
+            # A bench item was oracle-self-tested at import — an abort is
+            # the agent capitulating, not a broken challenge (the ledger
+            # counts it FAILED for the same reason). Still no lesson: the
+            # abort transcript is not lesson material either way.
+            return False, ("solver aborted a BENCH item (counted as a "
+                           "failure in the bank pass rate) → no lesson "
+                           "from abort transcripts")
+        # C5: the solver proved the CHALLENGE was broken (not the
+        # agent). Writing a lesson here would record a fake "agent
+        # mistake" and poison the skill store — the agent would then
+        # avoid the correct behaviour it just exhibited.
+        return False, ("solver aborted (challenge structurally "
+                       "unwinnable) → no agent-side lesson to write")
+    if validator_infra_crash:
+        # Same poisoning risk as the solver-abort case: the agent may
+        # well have SOLVED this challenge (the 04:50 run had solution.py
+        # exit 0) — a "failure" lesson from a generator bug is noise.
+        return False, ("validator infra crash (generator bug, not an "
+                       "agent failure) → no lesson")
+    if mastered:
+        return False, "cluster mastered — skipping skill write"
+    if journal_source and passed:
+        # Journal-mined challenges use a deliberately lenient validator
+        # (any stdout referencing a token from input.txt passes). A
+        # "pass" therefore carries almost no correctness signal — the
+        # compression delta / first-try-win would otherwise trigger a
+        # skill write derived from a trivially-solved run. Failures on
+        # the lenient validator ARE informative (the solver couldn't
+        # even produce any qualifying output) so those fall through to
+        # the failure branches below.
+        return False, ("journal-mined pass → lenient validator, "
+                       "skill write suppressed")
+    if passed and attempt > 0:
+        return True, "struggled-then-won → always write lesson"
+    if passed and attempt == 0 and (is_new_cluster or compression_delta > 0.05):
+        return True, "new cluster or compression improvement"
+    if passed and attempt == 0 and solution_novelty is not None and solution_novelty >= 0.5:
+        # Proposal C (2026-05-17): first-try pass with HIGH structural
+        # novelty against prior winners is itself a learning signal —
+        # the agent found a different shape of solution to a familiar
+        # problem. Worth extracting the principle even when compression
+        # delta is flat.
+        return True, (f"first-try pass with novel shape "
+                      f"(novelty={solution_novelty:.2f}) → write lesson")
+    if not passed and is_new_cluster:
+        return True, "first failure on new cluster → record lesson"
+    if not passed:
+        return False, ("repeat failure on known cluster → suppress to "
+                       "prevent skill bloat")
+    # Boring first-try pass with low novelty — surface it to the
+    # reflector via the trajectory's `extra.solution_novelty`, but DO
+    # NOT write a skill directly from here. The reflector (proposal F)
+    # gets to decide if a meta-lesson is warranted.
+    if solution_novelty is not None:
+        return False, (f"first-try pass with low novelty "
+                       f"({solution_novelty:.2f}) → defer to reflector")
+    return False, "no new signal (passed first try, no compression gain)"
+
+
 def trajectory_seed_available(context, min_count: int = 3) -> bool:
     """Cheap watchdog-tick eligibility probe: are there at least
     ``min_count`` trajectories on disk? Counts non-blank JSONL lines
@@ -1274,6 +1378,64 @@ def mine_recurring_tool_sequences(
 # of preserved middle, false negatives drop the exact breadcrumb the
 # lesson extractor needs.
 import re as _dream_re
+
+
+def _write_answer_file(path, text: str) -> None:
+    """§4BF flip (ii), R3: write the graded reply as a FRESH regular file.
+
+    The seam write is host-side while the sandbox dir is solver-writable,
+    so every special file type a solver can plant is an attack on the
+    oracle: a symlink redirects the write (R2), a HARDLINK truncates the
+    shared inode (.validator.py becomes the reply → false PASS at oracle
+    rank), a FIFO blocks open() forever (wedging the idle orchestrator —
+    no caller wraps the solve loop in a timeout), a socket raises into
+    the blanket infra handler (the INFRA_ABORT escape hatch). And the
+    container persists across handle_chat, so a solver-spawned daemon
+    can swap the path between a check and the write — check-then-write
+    is not enough. Remedy: unconditionally remove whatever is at the
+    path, then O_EXCL|O_NOFOLLOW-create (we only ever write an inode WE
+    created; anything racing us makes open fail loudly instead of being
+    followed), and fstat-verify it is a lone regular file. Raises on
+    sabotage — the caller's infra handler makes that a LOUD INFRA_ABORT
+    with the seam's own message rather than a silent wrong label.
+    """
+    import shutil
+    import stat as _stat
+    from pathlib import Path as _Path
+    p = _Path(path)
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    except FileExistsError as exc:
+        # R4/R5: the unlink/rmtree above failed silently (e.g. a
+        # read-only dir planted by the solver) — surface the SEAM's own
+        # message in the infra LOG LINE. The durable ledger status for
+        # this path still reads as generic validator infra (the
+        # seam_missing_abort wording is reserved for exit-5); accepted —
+        # the log names the interference, the label stays uncharged.
+        raise OSError(
+            "answer.txt could not be freshly created (sandbox "
+            "interference at the seam — a pre-existing entry survived "
+            "removal)") from exc
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise OSError(
+                "answer.txt is not a fresh regular file after O_EXCL "
+                "creation — sandbox interference at the seam")
+        data = text.encode("utf-8")
+        while data:
+            n = os.write(fd, data)
+            data = data[n:]
+    finally:
+        os.close(fd)
 _TRANSCRIPT_TURNING_POINT_RE = _dream_re.compile(
     r"(--- ATTEMPT \d+|Traceback|Error:|ERROR:|AssertionError|SyntaxError|"
     r"NameError|IndentationError|ImportError|ModuleNotFoundError|"
@@ -3289,6 +3451,7 @@ Return ONLY a JSON object with:
         model_name: str,
         original_attempts_used: int,
         original_passed: bool,
+        graded_on: str = "artifact",
     ) -> bool:
         """Re-run the solver ONCE with the lesson prepended to the
         system prompt. Returns True iff the outcome is strictly better:
@@ -3353,7 +3516,8 @@ Return ONLY a JSON object with:
             ],
         }
         try:
-            await temp_agent.handle_chat(body, background_tasks=None)
+            _verify_final, _, _ = await temp_agent.handle_chat(
+                body, background_tasks=None)
             # Run validator fresh.
             sandbox_manager = isolated_context.sandbox_manager
             # Make sure mocks are restored right before validation —
@@ -3363,6 +3527,24 @@ Return ONLY a JSON object with:
                     (_P(sandbox_path) / name).write_bytes(blob)
                 except Exception:
                     pass
+            # §4BF flip (ii): text-graded items are validated on the
+            # REPLY — the pristine-state restore above deleted the main
+            # run's answer.txt, so without this seam the verify
+            # validator exits 5 on every text-graded item and a lesson
+            # for this flavor could never verify (the silent-inoperative
+            # class: verification that structurally always says no).
+            # Stripped of finalize-appended system notes for the same
+            # reason as the solve-loop seam (R1 CRIT: a Verifier note's
+            # trailing digits displace the answer in both directions —
+            # here it would mint a falsely-VERIFIED production lesson).
+            if graded_on == "final_response":
+                from .reply_smoothing import strip_system_notes
+                # Same fresh-regular-file discipline as the solve-loop
+                # seam (R2/R3 — see _write_answer_file's docstring).
+                await asyncio.to_thread(
+                    _write_answer_file,
+                    _P(sandbox_path) / "answer.txt",
+                    strip_system_notes(str(_verify_final or "")))
             output, exit_code = await asyncio.to_thread(
                 sandbox_manager.execute, "python3 .validator.py", 30
             )
@@ -3383,13 +3565,83 @@ Return ONLY a JSON object with:
             return True
         return False
 
-    async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False, injected_challenge: dict = None):
+    async def _record_bench_oracle_verdict(self, isolated_context,
+                                           passed: bool) -> None:
+        """§4BF 1c: write the bank oracle's verdict for the CURRENT attempt
+        back to BOTH durable stores the attempt wrote (R1 review, two
+        independent findings):
+
+        * the calibration sample — re-labeled at the ``bench_validator``
+          rank via the ``_last_bench_calib_req_id`` join;
+        * the bench TRAJECTORY's outcome — via the bench collector's
+          corrections sidecar (``_last_bench_traj_id`` join). Without this
+          every bench record stayed UNKNOWN (the isolated context has no
+          verifier), so bench-scoped experiment arms could never resolve a
+          failure_rate verdict — the flagship 1c capability was inert.
+
+        Both joins are cleared before each attempt, so a skipped write
+        joins nothing. Early-break attempts (SYSTEM ALERT / upstream
+        CRITICAL / solver abort) never reach a validator verdict and
+        DELIBERATELY leave their proxy-graded calibration rows un-oracled
+        — nothing false is written, and inventing a verdict for an
+        unvalidated attempt would be worse. Never raises.
+        """
+        try:
+            _req = str(getattr(isolated_context,
+                               "_last_bench_calib_req_id", "") or "")
+            _ct = getattr(self.context, "calibration_tracker", None)
+            if _req and _ct is not None:
+                await asyncio.to_thread(
+                    _ct.record_bench_validator_verdict, _req, passed)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("bench calibration re-label skipped: %s", e)
+        try:
+            _tid = str(getattr(isolated_context,
+                               "_last_bench_traj_id", "") or "")
+            _col = getattr(isolated_context, "trajectory_collector", None)
+            if _tid and _col is not None:
+                # yield_to_human (R1 follow-through): the oracle outranks
+                # machine verdicts (collector-side bench_validator guard)
+                # but stays below an explicit human label, mirroring the
+                # calibration rank order (user_correction=5 > 4).
+                await asyncio.to_thread(
+                    functools.partial(
+                        _col.update_outcome, _tid,
+                        "passed" if passed else "failed",
+                        "" if passed
+                        else "bank validator rejected the solution",
+                        source="bench_validator",
+                        yield_to_human=True,
+                    ))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("bench trajectory outcome write-back skipped: %s", e)
+
+    async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False, injected_challenge: dict = None,
+                                  bench_meta: dict = None):
+        """``bench_meta`` (§4BF Track 1b, admissions per 1c): marks this run
+        as a BENCH-BANK item — an externally-graded task injected via
+        ``injected_challenge``. Effects: a real TrajectoryCollector is
+        attached, writing to the SEPARATE bench root with
+        ``task_kind="bench"`` and ``origin=bench``; frontier recording and
+        the scratchpad report are SKIPPED (both REAL_ONLY in the 1c
+        matrix, `core/admissibility.py`); lessons ride the normal gate but
+        mint TAGGED ``source="bench"``; each attempt's calibration sample
+        is re-labeled with the bank validator's verdict
+        (``bench_validator`` rank); the outcome is surfaced on
+        ``self.last_bench_result``. Keys: ``bank``, ``item_id``,
+        ``cluster`` (all informational). Requires ``injected_challenge``."""
         import tempfile
         from pathlib import Path
         from ..sandbox.docker import DockerSandbox
         from .agent import GhostAgent
         from .prompts import SYNTHETIC_CHALLENGE_PROMPT
-        
+
+        if bench_meta and not injected_challenge:
+            bench_meta = None   # meta without a challenge is meaningless
+        # Pre-cleared like the other outcome surfaces: None = "no bench
+        # run concluded" so the idle phase never reads a stale result.
+        self.last_bench_result = None
+
         # Curiosity signal — defaults to 0 so early-return paths (bad
         # XML, setup failure, validator syntax error) don't leave a stale
         # delta from a prior run on the Dreamer instance.
@@ -3723,7 +3975,17 @@ Return ONLY a JSON object with:
         # cluster to None and the LLM generated something novel, while
         # cold-start random templates (no seed cluster) were never tracked.
         _used_template_cluster = ""
-        challenge_domains: list = []
+        # §4BF 1c (R1 review): a bench item's cluster comes from the BANK,
+        # not from the frontier seed picked before injection — without
+        # this, resolve_cluster_key fell to seed["cluster_key"] (the
+        # self-play curriculum target), so an MBPP item could be filed and
+        # lesson-tagged as e.g. "sql", and solution novelty was scored
+        # against a foreign cluster's winners. resolve_cluster_key prefers
+        # challenge_domains over the seed.
+        challenge_domains: list = (
+            [str(bench_meta["cluster"])]
+            if (bench_meta and str(bench_meta.get("cluster") or ""))
+            else [])
         journal_source = False
         # Only the LLM-generation path below populates this; deterministic
         # templates and journal-mined challenges are pre-verified shapes and
@@ -4507,7 +4769,13 @@ Return ONLY a JSON object with:
         # false-positive noise (a template whose expected var holds a raw
         # answer while stdout must be SHAPED, e.g. `FOUND=blob3.txt`, fails
         # the echo probe by construction).
-        _pre_verified_shape = bool(journal_source or _tpl is not None)
+        # Injected challenges are pre-verified too (§4BF): counterfactual
+        # replays were gated when first generated, and bench-bank validators
+        # are built from EXTERNAL ground truth (unit tests / gold answers) —
+        # the echo-style self-test cannot instrument them and would emit a
+        # loud false WARNING per run.
+        _pre_verified_shape = bool(
+            journal_source or _tpl is not None or injected_challenge)
 
         class ReadOnlySkillMemory:
             # Marker: any callsite that wants to skip an expensive
@@ -4526,9 +4794,18 @@ Return ONLY a JSON object with:
             # synthetic turns bumped real retrieval counters with no
             # matching helpful-credit, pushing real lessons toward
             # prune_low_utility eligibility.
+            # §4BF 1c (R5 review): `last_playbook_triggers` REMOVED from the
+            # passthrough — the sim read path deliberately stamps nothing
+            # (`stamp_triggers=False` below), so a passthrough read served
+            # the LAST REAL USER TURN's lesson set, and bench finalizes
+            # stamped it into `extra["hydrated_lessons"]` on bench
+            # trajectories (real lessons creditable for MBPP solves) and
+            # into the shared surfaced-triggers stash under bench ids. The
+            # wrapper's own doctrine is deny-by-default; the sim-side
+            # attribution channel is `hydrated_triggers`/`last_sim_triggers`.
             _SAFE_PASSTHROUGH = frozenset({
                 "get_playbook_items", "get_recent_failures", "list_lessons",
-                "find_by_trigger", "file_path", "last_playbook_triggers",
+                "find_by_trigger", "file_path",
                 "_load_playbook", "_get_lock", "_playbook_items_and_branch",
                 "_filter_quarantined",
             })
@@ -4784,6 +5061,98 @@ Return ONLY a JSON object with:
             # PRM, poisoning the learning signal with self-play noise. Null the
             # collector (and the episodic store, defense-in-depth) on the isolate.
             isolated_context.trajectory_collector = None
+            if bench_meta:
+                # BENCH runs are the exception to the null-collector rule —
+                # resolved outcomes are their entire point — but they write
+                # to a SEPARATE root with task_kind="bench"/origin=bench:
+                # admission is PER-CONSUMER via core/admissibility.py (§4BF
+                # 1c — trainsets/calibration take bench with origin as a
+                # feature, lessons tagged, everything else real-only). The
+                # read-only skill memory + selfplay budget markers below
+                # fail LIVE experiment eligibility; handle_chat enrolls
+                # bench turns in BENCH-SCOPED specs via origin="bench".
+                try:
+                    from ..distill.collector import TrajectoryCollector
+                    from ..eval.banks import trajectories_root
+                    # ── PROTECTIVE resets FIRST, arming markers LAST (R5
+                    # review): an exception mid-block must leave a plain
+                    # unarmed sim, never a bench-labeled turn still wired
+                    # to the shared production state below.
+                    #
+                    # OWN caches/rings: copy.copy shares the live
+                    # OrderedDicts, and with a collector attached the
+                    # finalize stashes become live for the first time —
+                    # ~30 bench inserts per idle night would flush the
+                    # small LRUs of REAL turns. The full sibling set (R1,
+                    # R2, R5 reviews — each round found one the previous
+                    # missed; tests/test_bench_solve_loop_1c.py pins the
+                    # whole inventory now):
+                    #   * trajectory correction stash (user-correction
+                    #     promotion),
+                    #   * calibration correction stash (the two strongest
+                    #     ground-truth tiers),
+                    #   * experiments ring (a live streamed turn's pending
+                    #     arm),
+                    #   * turn-facts ring (router_confidence — THE CUPED
+                    #     covariate — and failure_cap_hit),
+                    #   * turn-outcome snapshots (the async-critic
+                    #     "CORRECTED ok → failed" operator line),
+                    #   * surfaced-triggers stash (real lesson triggers
+                    #     keyed under bench trajectory ids).
+                    from collections import OrderedDict as _OD
+                    isolated_context._recent_trajectories_for_correction = \
+                        _OD()
+                    isolated_context._recent_calib_for_correction = _OD()
+                    isolated_context._experiment_arms_recent = _OD()
+                    isolated_context._turn_facts_recent = _OD()
+                    isolated_context._recent_turn_outcome = _OD()
+                    isolated_context._surfaced_triggers_by_traj = _OD()
+                    # …and the PRODUCTION SelfModel (R4 review CRIT): with
+                    # a collector attached, the finalize's selfhood capture
+                    # became reachable for the first time and every bench
+                    # attempt appended a first-person diary Experience to
+                    # the live autobiographical store. Selfhood is a
+                    # real_only admissibility row; the capture site is
+                    # origin-gated too (belt).
+                    isolated_context.self_model = None
+                    # ── Arming markers (collector + labels) LAST.
+                    isolated_context.trajectory_collector = TrajectoryCollector(
+                        root=trajectories_root(),
+                        session_id=f"bench-{bench_meta.get('bank') or 'bank'}",
+                    )
+                    isolated_context.trajectory_task_kind = "bench"
+                    isolated_context.turn_origin_label = "bench"
+                    isolated_context.trajectory_extra_static = {
+                        "bench_bank": str(bench_meta.get("bank") or ""),
+                        "bench_item": str(bench_meta.get("item_id") or ""),
+                        # §4BO: which regime produced this row — "idle"
+                        # (organic, ~14/day) or "drain" (operator-armed,
+                        # back-to-back). The results ledger has the same
+                        # field, but NOTHING TRAINS ON THE LEDGER: the
+                        # bench-scoped experiment report, the GEPA/PRM/
+                        # router trainsets and calibration all read the
+                        # CORPUS through admissibility.iter_bench_
+                        # trajectories. ⚠ NONE OF THEM FILTER ON THIS KEY
+                        # YET (R4 verified: one write, zero reads) — it is
+                        # recorded so the question stays ANSWERABLE, not
+                        # because anything answers it today. Without it a
+                        # {"count": 200} drain delivers roughly fifty
+                        # nights of `tts_bon` accrual in six hours, under
+                        # materially different machine conditions, with no
+                        # field anywhere in the arm's own data source to
+                        # detect or stratify it.
+                        "bench_source": str(bench_meta.get("source")
+                                            or "idle"),
+                    }
+                    # §4BF 1c (R3 review): the recorded user_request must be
+                    # the CLEAN bank challenge, not the harness framing
+                    # block (and not attempt ≥2's judge-rejection message) —
+                    # bench rows feed trainsets, and their inputs must look
+                    # like a task, not like this solve loop's scaffolding.
+                    isolated_context.trajectory_user_request_override = str(
+                        (injected_challenge or {}).get("challenge") or "")
+                except Exception as _bexc:  # noqa: BLE001
+                    logger.warning("bench collector unavailable: %s", _bexc)
             isolated_context.episodic_memory = None
             isolated_context.memory_system = ReadOnlyVectorMemory(self.context.memory_system)
             isolated_context.skill_memory = ReadOnlySkillMemory(self.context.skill_memory)
@@ -4854,6 +5223,29 @@ Return ONLY a JSON object with:
             ):
                 if hasattr(isolated_context, _attr):
                     setattr(isolated_context, _attr, None)
+
+            # §4BF flip (ii): text-graded bench items get a FRESH
+            # bench-local verifier — the C4 null above stays in force for
+            # every other run (self-play and artifact-graded bench turns
+            # keep degrading the verify gates to no-ops). Built on the
+            # ISOLATED context's llm_client (the background-only wrapper
+            # when one was installed above), never the real context's,
+            # so its calls inherit the isolate's routing. This is what
+            # makes the verifier wobble band — the tts_bon trigger — and
+            # the REFUTED repair path live on these turns, identically
+            # for both experiment arms.
+            if (bench_meta
+                    and str(bench_meta.get("graded_on") or "")
+                    == "final_response"):
+                try:
+                    from .verifier import Verifier as _BenchVerifier
+                    isolated_context.verifier = _BenchVerifier(
+                        llm_client=isolated_context.llm_client)
+                except Exception as _bv_exc:  # noqa: BLE001
+                    logger.warning(
+                        "bench text-graded verifier unavailable (%s: %s) — "
+                        "wobble-band trigger will not fire this run",
+                        type(_bv_exc).__name__, _bv_exc)
             
             from ..memory.scratchpad import Scratchpad
             isolated_context.scratchpad = Scratchpad()
@@ -5064,7 +5456,7 @@ Return ONLY a JSON object with:
                             # through the instrumented exec above. No purge:
                             # the probe solution.py written above must
                             # survive for the validator run.
-                            if setup_snapshot:
+                            if setup_snapshot is not None:
                                 await asyncio.to_thread(
                                     _restore_mocks, Path(temp_sandbox), setup_snapshot
                                 )
@@ -5176,11 +5568,13 @@ Return ONLY a JSON object with:
                 # setup snapshot to cancel those side effects before the
                 # solver starts (module-level _preflight_restore: purge
                 # stragglers the pre-flight created, then rewrite the
-                # snapshot).
-                if setup_snapshot:
-                    await asyncio.to_thread(
-                        _preflight_restore, Path(temp_sandbox), setup_snapshot
-                    )
+                # snapshot). Runs even when setup never wrote anything
+                # (snapshot is None → nothing to rewrite, but probe
+                # stragglers still need purging if the gate raised before
+                # its own unlink).
+                await asyncio.to_thread(
+                    _preflight_restore, Path(temp_sandbox), setup_snapshot or {}
+                )
 
                 # --- Reference-solution consistency gate (2026-07-08) ----
                 # The echo self-test above only catches validators that
@@ -5230,10 +5624,10 @@ Return ONLY a JSON object with:
                             await asyncio.to_thread(ref_path.unlink)
                         except Exception:
                             pass
-                        if setup_snapshot:
-                            await asyncio.to_thread(
-                                _preflight_restore, Path(temp_sandbox), setup_snapshot
-                            )
+                        await asyncio.to_thread(
+                            _preflight_restore, Path(temp_sandbox),
+                            setup_snapshot or {}
+                        )
                     if r_code != 0 or rv_code != 0:
                         _why = (
                             f"the reference solution itself crashed (exit {r_code}):\n{(r_out or '')[-300:]}"
@@ -5365,15 +5759,37 @@ Return ONLY a JSON object with:
                 # worker into discrete steps (read → analyse → write → run)
                 # where each response is small enough that a collapse is
                 # cheap and recoverable.
+                # §4BF flip (ii) (R1 review): the artifact wrapper's opening
+                # instruction ("use execute/file_system … stop as soon as
+                # your script exits 0") contradicts a final_response item,
+                # whose deliverable is the REPLY — a solver following it
+                # would finalize "the script confirms the result" and grade
+                # exit-4. Text-graded items get a wrapper that keeps the
+                # response-shape discipline but states the real contract.
+                _graded_on_text = bool(
+                    bench_meta
+                    and str(bench_meta.get("graded_on") or "")
+                    == "final_response")
+                _wrapper_opening = (
+                    "### SYNTHETIC TRAINING EXERCISE\n"
+                    "Solve this challenge efficiently. Your DELIVERABLE is "
+                    "your final REPLY — you may use the `execute` tool to "
+                    "check arithmetic, but no file you write counts as an "
+                    "answer. Your final reply must follow the answer format "
+                    "the challenge specifies (the final numeric answer on "
+                    "its own last line).\n\n"
+                ) if _graded_on_text else (
+                    "### SYNTHETIC TRAINING EXERCISE\n"
+                    "Solve this challenge efficiently. Use the `execute` "
+                    "and `file_system` tools — do not compute results by "
+                    "hand inside <think>. Stop as soon as your script "
+                    "exits 0 with the expected output; do not re-derive "
+                    "the answer to double-check.\n\n"
+                )
                 body = {
                     "model": model_name,
                     "messages": [{"role": "user", "content": (
-                        "### SYNTHETIC TRAINING EXERCISE\n"
-                        "Solve this challenge efficiently. Use the `execute` "
-                        "and `file_system` tools — do not compute results by "
-                        "hand inside <think>. Stop as soon as your script "
-                        "exits 0 with the expected output; do not re-derive "
-                        "the answer to double-check.\n\n"
+                        _wrapper_opening +
                         "### RESPONSE SHAPE RULES (strict)\n"
                         "1. Emit EXACTLY ONE `<tool_call>` per turn. Never "
                         "two. If you want to do two things (read a file AND "
@@ -5418,6 +5834,34 @@ Return ONLY a JSON object with:
                 # the correctness score, and the adversarial-generator
                 # tracker — none of which should see generator noise.
                 validator_infra_crash = False
+                # §4BF flip (ii): the exit-5 "answer.txt seam did not
+                # run" case rides the same infra routing but gets its own
+                # ledger wording — "validator crashed" would misdirect
+                # the operator's triage toward the generator when the
+                # fault is the harness seam.
+                seam_missing_abort = False
+                # ⚠ REGISTERED, NOT CHANGED (§4BO R2 review, 2026-08-15).
+                # A reviewer proposed resetting both flags per attempt: they
+                # are run-scoped and sticky, the status precedence below
+                # tests `passed` FIRST, so a stale flag can only ever turn a
+                # genuine FAILURE into INFRA_ABORT — which
+                # `eval/banks.stats()` excludes from the pass-rate
+                # denominator. That bias is real, strictly one-sided, and
+                # failures are more exposed (three validator executions to a
+                # first-try pass's one). It was invisible while every bench
+                # item passed and gets louder once a drain produces failures
+                # at volume.
+                #
+                # NOT fixed here, deliberately: the comment at the
+                # `_infra_this_attempt` marker below records that per-attempt
+                # keying was already introduced for the oracle verdict, and
+                # reserves "the run's post-loop INFRA_ABORT ledger semantics"
+                # as a separate, pre-existing decision. Whether a run that
+                # touched infra at ANY point counts as an infra run is a
+                # judgement about what the ledger means, not a bug — a flaky
+                # sandbox arguably does taint the whole run. Changing it
+                # silently inside a throughput change would overturn a
+                # recorded decision by side effect.
                 for attempt in range(3):
                     # Before every attempt (including attempt 0, which is
                     # a no-op because the setup just ran), restore the mock
@@ -5425,7 +5869,13 @@ Return ONLY a JSON object with:
                     # the long-standing bug where attempt 1's solution would
                     # mutate the input data and attempt 2 would then fail
                     # validation against a corrupted dataset.
-                    if attempt > 0 and setup_snapshot:
+                    if attempt > 0 and setup_snapshot is not None:
+                        # `is not None`, NOT truthiness (§4BF R2): {} means
+                        # "setup ran and wrote no unprotected files" — every
+                        # bench item, whose setup is a comment stub — and
+                        # must still PURGE attempt N-1's stale solution.py,
+                        # or a no-code retry gets re-graded against it.
+                        # None means "setup never ran".
                         # Between-attempts: purge the previous attempt's
                         # solution.py / output artifacts so attempt N
                         # starts from a clean, post-setup state. The
@@ -5438,7 +5888,34 @@ Return ONLY a JSON object with:
                         )
 
                     pretty_log("Self-Play", f"Commencing Attempt {attempt + 1}/3", icon=Icons.TOOL_CODE)
-                    final_ai_content, _, _ = await temp_agent.handle_chat(body, background_tasks=None)
+                    # §4BF 1c: stale-join guards. The calibration write and
+                    # the trajectory finalize inside handle_chat set these to
+                    # the attempt's ids for bench turns; clearing them FIRST
+                    # means a skipped write leaves "" and the oracle verdict
+                    # below joins nothing instead of a previous attempt's
+                    # rows. Bench req_ids are also PREFIXED so a bench row
+                    # can never collide with a real turn's req_id in any
+                    # req_id-joined store (R1 review: uuid4()[:8] from the
+                    # shared space made "bench never re-labels a real row"
+                    # chance, not construction).
+                    _bench_req_id = None
+                    # Per-ATTEMPT infra marker (R2 review): the deferred
+                    # fail-side oracle verdict must key on whether THIS
+                    # attempt's validation hit infra — the run-scoped
+                    # `validator_infra_crash` is sticky, so one transient
+                    # sandbox banner on attempt 1 silently suppressed the
+                    # genuine fail verdicts of attempts 2-3 (and the run's
+                    # post-loop INFRA_ABORT ledger semantics are a separate,
+                    # pre-existing decision this flag does not change).
+                    _infra_this_attempt = False
+                    if bench_meta:
+                        isolated_context._last_bench_calib_req_id = ""
+                        isolated_context._last_bench_traj_id = ""
+                        import uuid as _uuid
+                        _bench_req_id = f"bench-{_uuid.uuid4().hex[:10]}"
+                    final_ai_content, _, _ = await temp_agent.handle_chat(
+                        body, background_tasks=None,
+                        request_id=_bench_req_id)
 
                     current_attempt_transcript = temp_agent._get_recent_transcript(body["messages"])
                     full_simulation_transcript += f"\n\n--- ATTEMPT {attempt + 1} ---\n{current_attempt_transcript}"
@@ -5483,8 +5960,46 @@ Return ONLY a JSON object with:
                         # Restore mocks one more time *right before* the
                         # validator runs, in case the agent's final step
                         # (post-solution) touched them. Cheap and safe.
-                        if setup_snapshot:
+                        if setup_snapshot is not None:
                             await asyncio.to_thread(_restore_mocks, Path(temp_sandbox), setup_snapshot)
+
+                        # §4BF flip (ii): for final_response-graded bench
+                        # items the SUBJECT of validation is the turn's
+                        # reply, not a sandbox artifact — hand it to the
+                        # validator as answer.txt. Written AFTER the mock
+                        # restore (so nothing here can clobber it),
+                        # UNCONDITIONALLY for this flavor (an empty reply
+                        # must grade as a wrong answer, while a MISSING
+                        # file is reserved for "the seam itself didn't
+                        # run" = the validator's exit-5 infra signal).
+                        # Post-BoN by construction: handle_chat returned
+                        # the substituted final, so both experiment arms
+                        # are graded on what they actually produced.
+                        # ⚠ STRIPPED of finalize-appended system notes
+                        # (R1 review, two independent CRITs): the post-
+                        # loop verifier gate appends "**Verifier note:**"
+                        # to the returned final on REFUTED ≥0.7 — armed
+                        # here by the text-graded verifier rebind — and
+                        # the validator grades the LAST number, so a note
+                        # ending in a digit flunked correct answers and a
+                        # refute quoting the correct value passed wrong
+                        # ones (label noise at the strongest source rank,
+                        # in BOTH directions). The graded subject is the
+                        # agent's ANSWER, never harness annotations.
+                        if (bench_meta
+                                and str(bench_meta.get("graded_on") or "")
+                                == "final_response"):
+                            from .reply_smoothing import strip_system_notes
+                            # Fresh-regular-file discipline lives in
+                            # `_write_answer_file` (R2 closed symlinks;
+                            # R3 closed hardlinks/FIFOs/sockets and the
+                            # daemon-swap race — see its docstring).
+                            await asyncio.to_thread(
+                                _write_answer_file,
+                                Path(temp_sandbox) / "answer.txt",
+                                strip_system_notes(
+                                    str(final_ai_content or "")))
+
 
                         # 30s is plenty: the validator itself launches
                         # solution.py with its own inner `timeout=15`, so
@@ -5494,6 +6009,19 @@ Return ONLY a JSON object with:
                         # minutes of wall-clock before yielding.
                         output, exit_code = await asyncio.to_thread(isolated_context.sandbox_manager.execute, "python3 .validator.py", 30)
                         passed = (exit_code == 0)
+
+                        # §4BF 1c ORACLE VERDICT (R1 review ordering fix):
+                        # PASS verdicts are recorded immediately — exit 0 is
+                        # trustworthy. FAIL verdicts are DEFERRED until the
+                        # infra triage below has ruled: a Docker banner, a
+                        # validator crashing in its own frame, or the broken
+                        # line-split shape must never be written as permanent
+                        # ground-truth negatives at the strongest source rank
+                        # (the §4AO label-noise class). See the fail-side
+                        # call after the triage chain.
+                        if bench_meta and passed:
+                            await self._record_bench_oracle_verdict(
+                                isolated_context, True)
 
                         if passed:
                             pretty_log("Self-Play", "Tests Passed: Challenge Solved", icon=Icons.OK)
@@ -5539,12 +6067,38 @@ Return ONLY a JSON object with:
                             # this banner does not contain.
                             if "[SANDBOX INFRA ERROR" in feedback:
                                 validator_infra_crash = True
+                                _infra_this_attempt = True
                                 pretty_log(
                                     "Self-Play Infra",
                                     "sandbox/docker fault during validation — "
                                     "NOT charging this to the agent",
                                     level="WARNING", icon=Icons.WARN,
                                 )
+                            # §4BF flip (ii): exit 5 is the text-graded
+                            # validator's reserved "answer.txt missing"
+                            # signal — the harness seam above writes the
+                            # file unconditionally for this flavor, so
+                            # absence means the SEAM failed, and charging
+                            # it to the agent would be the §4AO label-
+                            # noise class. Retrying can't help (the same
+                            # seam runs each attempt): abort like the
+                            # other structural-infra paths.
+                            if (bench_meta
+                                    and str(bench_meta.get("graded_on")
+                                            or "") == "final_response"
+                                    and exit_code == 5):
+                                validator_infra_crash = True
+                                seam_missing_abort = True
+                                _infra_this_attempt = True
+                                pretty_log(
+                                    "Self-Play Abort",
+                                    "text-graded bench validator reports "
+                                    "answer.txt missing — the harness seam "
+                                    "did not run (infra, not charged to "
+                                    "the agent)",
+                                    level="ERROR", icon=Icons.STOP,
+                                )
+                                break
                             is_validator_crash = False
                             fatal_markers = (
                                 # Structural crashes — validator can't even start.
@@ -5568,6 +6122,7 @@ Return ONLY a JSON object with:
 
                             if is_validator_crash:
                                 validator_infra_crash = True
+                                _infra_this_attempt = True
                                 pretty_log("Self-Play Abort", f"Validator script crashed or has syntax errors. Aborting (infra — not charged to the agent). Feedback:\n{feedback[:250]}", level="ERROR", icon=Icons.STOP)
                                 break
 
@@ -5580,6 +6135,7 @@ Return ONLY a JSON object with:
                             # failure is charged to the agent or the frontier.
                             if _feedback_shows_joined_actual(feedback):
                                 validator_infra_crash = True
+                                _infra_this_attempt = True
                                 pretty_log(
                                     "Self-Play Abort",
                                     "Validator line-split is broken: 'actual' is one "
@@ -5590,9 +6146,22 @@ Return ONLY a JSON object with:
                                 )
                                 break
 
+                            # §4BF 1c: the DEFERRED fail-side oracle verdict
+                            # — every infra detector above has now ruled (the
+                            # crash/line-split paths `break` before reaching
+                            # here; the sandbox banner falls through with the
+                            # flag set, which the guard below respects).
+                            # Keyed on THIS attempt's flag, not the sticky
+                            # run-scoped one (R2 review: a transient banner
+                            # on attempt 1 must not suppress attempts 2-3's
+                            # genuine fail verdicts).
+                            if bench_meta and not _infra_this_attempt:
+                                await self._record_bench_oracle_verdict(
+                                    isolated_context, False)
+
                             if len(feedback) > 1500:
                                 feedback = feedback[:1500] + "\n...[TRUNCATED FOR LENGTH]"
-                                
+
                             pretty_log("Self-Play Judge Rejection", feedback[:500].replace('\n', ' ') + "...", level="WARNING", icon=Icons.FAIL)
 
                             # Detect float formatting mismatch and add a targeted hint
@@ -5650,6 +6219,15 @@ Return ONLY a JSON object with:
                             body["messages"].append({"role": "user", "content": rejection_msg})
                     except Exception as e:
                         pretty_log("Self-Play Judge", f"Test execution failed: {e}", level="WARNING", icon=Icons.FAIL)
+                        # A RAISED exception around the validator execute is
+                        # harness/infra, not an agent failure (R2 review):
+                        # without this flag the run landed "FAILURE (Aborted
+                        # on attempt N)" and a Docker hiccup was charged to
+                        # the bench pass-rate — the exact mislabel the
+                        # banner-string path (`[SANDBOX INFRA ERROR`) already
+                        # avoids. Frontier recording skips on it too, which
+                        # matches its existing semantics.
+                        validator_infra_crash = True
                         break
 
                 
@@ -5663,6 +6241,11 @@ Return ONLY a JSON object with:
                     status_str = f"SUCCESS (in {attempt + 1} attempts)"
                 elif aborted_by_solver:
                     status_str = f"ABORTED_BY_SOLVER (attempt {attempt + 1}/3)"
+                elif seam_missing_abort:
+                    status_str = (
+                        f"INFRA_ABORT (answer.txt seam missing on attempt "
+                        f"{attempt + 1} — harness fault, agent not charged)"
+                    )
                 elif validator_infra_crash:
                     status_str = (
                         f"INFRA_ABORT (validator crashed on attempt "
@@ -5687,7 +6270,10 @@ Return ONLY a JSON object with:
                 # silenced lesson extraction for ~12% of self-play cycles.
                 cluster_key = resolve_cluster_key(
                     seed, _used_template_cluster, challenge,
-                    challenge_domains=challenge_domains)
+                    challenge_domains=challenge_domains,
+                    # Bank clusters are operator-curated at import — trust
+                    # them past the journal-guess whitelist (R3 review).
+                    trusted_domains=bool(bench_meta))
                 # S1: description_length used to be len(transcript) — which
                 # punished solutions with verbose tool dialogues. MDL /
                 # curiosity wants the *program* description length. Count
@@ -5759,6 +6345,20 @@ Return ONLY a JSON object with:
                         "(validator infra crash; no delta recorded)",
                         icon=Icons.BRAIN_AIM,
                     )
+                elif bench_meta:
+                    # Bench items are EXTERNAL tasks — recording them would
+                    # push foreign difficulty/mastery stats into the frontier
+                    # curriculum the self-play loop steers by (1c matrix:
+                    # frontier is REAL_ONLY). ⚠ The default frontier_result
+                    # above says is_new_cluster=True — a self-play-shaped
+                    # default. On a bench item that would route EVERY failure
+                    # into the "first failure on new cluster" lesson branch
+                    # (~a junk lesson per failed item per night). Bench has no
+                    # frontier concept: pin the neutral shape instead.
+                    frontier_result = {"compression_delta": 0.0,
+                                       "is_new_cluster": False,
+                                       "mastered": False}
+                    logger.debug("bench run — frontier record skipped")
                 elif frontier_tracker is not None:
                     try:
                         recorded = await asyncio.to_thread(
@@ -5777,8 +6377,9 @@ Return ONLY a JSON object with:
                             frontier_result = recorded
                     except Exception as e:
                         logger.warning(f"Frontier record_run failed: {e}")
-                # Expose the delta so the biological watchdog can read it
-                # and adjust the next self-play cooldown.
+                # Expose the delta on the instance (report string reads it;
+                # the watchdog's adaptive cooldown reads the FrontierTracker
+                # directly — R1 review corrected the stale claim here).
                 self.last_compression_delta = float(frontier_result.get("compression_delta", 0.0) or 0.0)
 
                 # Skill-writing gate: only commit a lesson when the run
@@ -5789,77 +6390,33 @@ Return ONLY a JSON object with:
                 is_new_cluster = bool(frontier_result.get("is_new_cluster", False))
                 mastered = bool(frontier_result.get("mastered", False))
 
-                should_write_skill = False
-                gate_reason = ""
-                if aborted_by_solver:
-                    # C5: the solver proved the CHALLENGE was broken
-                    # (not the agent). Writing a lesson here would
-                    # record a fake "agent mistake" and poison the
-                    # skill store — the agent would then avoid the
-                    # correct behaviour it just exhibited.
-                    gate_reason = (
-                        "solver aborted (challenge structurally "
-                        "unwinnable) → no agent-side lesson to write"
-                    )
-                elif validator_infra_crash:
-                    # Same poisoning risk as the solver-abort case: the
-                    # agent may well have SOLVED this challenge (the
-                    # 04:50 run had solution.py exit 0) — a "failure"
-                    # lesson from a generator bug would be pure noise.
-                    gate_reason = (
-                        "validator infra crash (generator bug, not an "
-                        "agent failure) → no lesson"
-                    )
-                elif mastered:
-                    gate_reason = "cluster mastered — skipping skill write"
-                elif journal_source and passed:
-                    # Journal-mined challenges use a deliberately lenient
-                    # validator (any stdout referencing a token from
-                    # input.txt passes). A "pass" therefore carries
-                    # almost no correctness signal — the compression
-                    # delta / first-try-win would otherwise trigger a
-                    # skill write derived from a trivially-solved run.
-                    # Failures on the lenient validator ARE informative
-                    # (the solver couldn't even produce any qualifying
-                    # output) so we let those fall through to the
-                    # failure branches below.
-                    gate_reason = "journal-mined pass → lenient validator, skill write suppressed"
-                elif passed and attempt > 0:
-                    should_write_skill = True
-                    gate_reason = "struggled-then-won → always write lesson"
-                elif passed and attempt == 0 and (is_new_cluster or compression_delta > 0.05):
-                    should_write_skill = True
-                    gate_reason = "new cluster or compression improvement"
-                elif passed and attempt == 0 and solution_novelty is not None and solution_novelty >= 0.5:
-                    # Proposal C (2026-05-17): first-try pass with HIGH
-                    # structural novelty against prior winners is itself
-                    # a learning signal — the agent found a different
-                    # shape of solution to a familiar problem. Worth
-                    # extracting the principle even when compression
-                    # delta is flat.
-                    should_write_skill = True
-                    gate_reason = (
-                        f"first-try pass with novel shape "
-                        f"(novelty={solution_novelty:.2f}) → write lesson"
-                    )
-                elif not passed and is_new_cluster:
-                    should_write_skill = True
-                    gate_reason = "first failure on new cluster → record lesson"
-                elif not passed:
-                    gate_reason = "repeat failure on known cluster → suppress to prevent skill bloat"
-                else:
-                    # Boring first-try pass with low novelty — surface
-                    # it to the reflector via the trajectory's
-                    # `extra.solution_novelty`, but DO NOT write a skill
-                    # directly from here. The reflector (proposal F)
-                    # gets to decide if a meta-lesson is warranted.
-                    if solution_novelty is not None:
-                        gate_reason = (
-                            f"first-try pass with low novelty "
-                            f"({solution_novelty:.2f}) → defer to reflector"
-                        )
-                    else:
-                        gate_reason = "no new signal (passed first try, no compression gain)"
+                # §4BF 1c (operator decision): bench runs now pass through
+                # the SAME gate as self-play — lessons are admitted TAGGED
+                # (the mint below stamps source="bench", the audit/retract
+                # handle). The gate itself is the extracted, unit-pinned
+                # `lesson_gate_decision` (module level, this file).
+                should_write_skill, gate_reason = lesson_gate_decision(
+                    aborted_by_solver=aborted_by_solver,
+                    validator_infra_crash=validator_infra_crash,
+                    mastered=mastered,
+                    journal_source=journal_source,
+                    passed=passed,
+                    attempt=attempt,
+                    is_new_cluster=is_new_cluster,
+                    compression_delta=compression_delta,
+                    # §4BF 1c (R1 review): novelty is a FRONTIER concept —
+                    # scored against the cluster's recorded winners, which
+                    # bench never records (frontier is real-only), so for a
+                    # bench first-try pass it degenerates to ~1.0 and the
+                    # novel-first-try branch becomes an unconditional,
+                    # UNVERIFIED mint at ~6-11 items/night (§4BE junk
+                    # class). Pin it None: struggled-then-won — which always
+                    # runs lesson verification — is the only bench pass-mint
+                    # path, exactly what the doc claims.
+                    solution_novelty=(None if bench_meta
+                                      else solution_novelty),
+                    bench=bool(bench_meta),
+                )
 
                 pretty_log(
                     "Self-Play Frontier",
@@ -6048,6 +6605,24 @@ Return ONLY a JSON object with:
                             _verify_ctx = copy.copy(isolated_context)
                             from ..memory.scratchpad import Scratchpad
                             _verify_ctx.scratchpad = Scratchpad()
+                            # §4BF 1c (R1 review, found by three lenses): the
+                            # copy inherits the BENCH write paths — collector,
+                            # task_kind/origin labels, extra stamps, the
+                            # oracle join handles. A verify turn is a SIM (a
+                            # lesson-injected re-run drawn only from the
+                            # struggled/failed subpopulation): letting it
+                            # write would add a mislabeled bench trajectory
+                            # per verified lesson, an un-oracled origin=bench
+                            # calibration row (which the equal-mass cap then
+                            # PREFERS as newest), and a bench-spec enrollment
+                            # on the wrong unit. Restore the pre-1c isolation.
+                            _verify_ctx.trajectory_collector = None
+                            _verify_ctx.trajectory_task_kind = None
+                            _verify_ctx.turn_origin_label = None
+                            _verify_ctx.trajectory_extra_static = None
+                            _verify_ctx.trajectory_user_request_override = None
+                            _verify_ctx._last_bench_calib_req_id = ""
+                            _verify_ctx._last_bench_traj_id = ""
                             verify_agent = GhostAgent(_verify_ctx)
                             verify_agent.disabled_tools = set(temp_agent.disabled_tools)
                             for t in verify_agent.disabled_tools:
@@ -6074,6 +6649,9 @@ Return ONLY a JSON object with:
                                 model_name=model_name,
                                 original_attempts_used=attempt + 1,
                                 original_passed=passed,
+                                graded_on=(str(bench_meta.get("graded_on")
+                                               or "artifact")
+                                           if bench_meta else "artifact"),
                             )
                             pretty_log(
                                 "Self-Play Verify",
@@ -6105,7 +6683,10 @@ Return ONLY a JSON object with:
                             # BM25 token set (user queries never contain
                             # "Self-Play") and the vector embedding that
                             # drives production retrieval. Provenance is
-                            # tracked separately via `source="self_play"`.
+                            # tracked separately via `source` — "self_play",
+                            # or "bench" for a bench-bank solve (§4BF 1c:
+                            # lessons admit bench TAGGED; the tag is the
+                            # audit/retract handle, retrieval never reads it).
                             await asyncio.to_thread(
                                 self.context.skill_memory.learn_lesson,
                                 learned_lesson.get("task") or trig,
@@ -6119,7 +6700,7 @@ Return ONLY a JSON object with:
                                 confidence=final_conf,
                                 source_challenge_hash=challenge_hash,
                                 verified=verified_flag,
-                                source="self_play",
+                                source=("bench" if bench_meta else "self_play"),
                             )
                             pretty_log(
                                 "Self-Play Lesson Saved",
@@ -6162,6 +6743,15 @@ Return ONLY a JSON object with:
                 # previously this only ran in the else branch above,
                 # so successful learning runs never surfaced the
                 # post-mortem to the main agent's next turn.
+                if bench_meta:
+                    # Bench reports must NOT ride the live scratchpad
+                    # (R1 review): the "Self-Play Report" key is injected
+                    # into EVERY turn's dynamic system state, so an
+                    # overnight GSM8K word problem would sit in the next
+                    # morning's real prompts — and clobber the genuine
+                    # self-play post-mortem the key exists to surface.
+                    # The bench ledger is the report.
+                    report_val = ""
                 if self.context.scratchpad and report_val:
                     try:
                         # namespace=None: background-job output must go to
@@ -6183,6 +6773,16 @@ Return ONLY a JSON object with:
                 # Replays themselves are NOT re-persisted — a replayed
                 # replay would compound the ledger forever.
                 self.last_self_play_status = str(status_str)
+                if bench_meta:
+                    # The idle phase reads this to write the results ledger
+                    # — parse-free (the status string is for humans).
+                    self.last_bench_result = {
+                        "passed": str(status_str).startswith("SUCCESS"),
+                        "status": str(status_str),
+                        "attempts": int(locals().get("attempt", 0) or 0) + 1,
+                        "bank": str(bench_meta.get("bank") or ""),
+                        "item_id": str(bench_meta.get("item_id") or ""),
+                    }
                 # Counterfactual quarantine contract: the playbook triggers
                 # hydrated INSIDE this sim (accumulated by the
                 # ReadOnlySkillMemory wrapper). An empty list means "the
@@ -6210,10 +6810,31 @@ Return ONLY a JSON object with:
                 pretty_log("Self-Play Error", str(e), level="ERROR", icon=Icons.FAIL)
                 return f"Self-Play encountered an error: {e}"
             finally:
-                if isolated_context.sandbox_manager and isolated_context.sandbox_manager.container:
+                # §4BO: route the per-solve teardown through `close()`
+                # rather than removing the container directly. Two live
+                # defects, both found by running a real 20-item drain:
+                #
+                # (1) the docker CLIENT was never closed, and a fresh
+                #     DockerSandbox is built per solve — ~11 leaked unix
+                #     sockets each, `[Errno 24] Too many open files` after
+                #     ~15 items, at which point the remaining items failed
+                #     to solve AND failed to append their ledger rows;
+                # (2) the old guard required `.container` to be truthy, so
+                #     a sandbox that failed midway through provisioning —
+                #     exactly what EMFILE causes — left its container in
+                #     `Created` forever. `close()` looks the container up
+                #     BY NAME when the attribute is unset, which is the
+                #     case that guard skipped.
+                #
+                # Organic cadence (one item per 45-72 min, with restarts)
+                # never accumulated enough to show either; a drain does.
+                if isolated_context.sandbox_manager:
                     try:
-                        await asyncio.to_thread(isolated_context.sandbox_manager.container.remove, force=True)
-                    except: pass
+                        await asyncio.to_thread(
+                            isolated_context.sandbox_manager.close,
+                            remove=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                     
         report_str = ""
         if 'report_val' in locals() and report_val:

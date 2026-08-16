@@ -28,6 +28,7 @@ question without any sweep.
 | Subsystem | Live consumer today? | Verdict |
 |---|---|---|
 | PRM (scoring/training) | **No** — `--prm-model` unset → MCTS/self-play/frontier read a neutral **0.5 placeholder** | INERT. MCTS's value-function branch runs on a placeholder. Wire a trained PRM (needs the discriminating suite as labels) or stop counting it. |
+  > ⚠ §4BN: MCTS turn-start never runs (module-gated off, and it also needs --deep-reason), and the frontier path requires `has_model=True` so it never reads the placeholder — it falls back to `pick_seed`. The neutral-0.5 path is not exercised on a default box.
 | Router / swarm dispatch | **No** — `--router-model` unset = "no-op that always allows full swarm"; no swarm nodes exist | INERT in production. |
 | Reflection → lessons | **Yes** — injected as `### RELEVANT PRIOR LESSONS` (agent.py) | Live loop; magnitude = Track B. |
 | Post-mortem *patch proposals* | **Human-only** — `proposal only — it is never applied` (main.py) | Cost (extra LLM calls generating diffs+repro on failed runs) for output only a human reads via the `postmortem` tool. Cut `--postmortem-propose-patch` if you don't read them. |
@@ -408,8 +409,17 @@ are catalogued as Track-B, costed arms:
 | reflection | `--no-reflection` | `full_no_reflection` | pre-existing |
 | dream (REM, phase 2) | `--no-dream` | `full_no_dream` | gate at `agent.py` phase 2 |
 | self-play (phase 3) | `--no-self-play` | `full_no_selfplay` | ablates fresh self-play **and** counterfactual replay; **≠** `--no-frontier-selfplay` (that only changes cluster *selection*) |
+| bench (phase 3b, §4BF 1b/1c) | `--no-bench` | `full_no_bench` | external graded banks. `--no-bench` stops: new solves, AND in-process bench CONSUMPTION (PRM/router retrains, bench experiment verdict computation in `announce_new_verdicts` and the introspect bench section — all via `admissibility.bench_consumption_enabled`; the fingerprint skip-gate unfolds). It CANNOT stop: bench lessons already minted into the skill store (`source=bench` — prune/retract by provenance before the arm if purity matters), calibration rows already recorded (`origin=bench` — the equal-mass cap still blends them into the fit), or offline GEPA scripts (no runtime args). Register the arm's true scope accordingly. |
 
-Each disables *only* its own loop (isolation tested in `tests/test_biological_watchdog.py`).
+Each disables *only* its own loop (phases 1-3 isolation tested in
+`tests/test_biological_watchdog.py`; bench-phase gating in
+`tests/test_bench_banks.py`). **Arm-interaction caveat:** the
+`full_no_selfplay` arm must ALSO pass `--no-bench` — with self-play off the
+idle clock climbs forever, `_BENCH_COOLDOWN` (2700 s) becomes the binding
+constraint, and bench fills the vacated window with ~10 graded solves/night,
+contaminating an arm that is supposed to measure an *empty* deep-idle phase.
+(In the default config bench costs the window nothing: it claims only
+dice-missed ticks and never touches the idle or self-play clocks.)
 **Still to do before running the LOO:** (1) calibrate the probe battery —
 `ablation_trackb4.py --pilot` (the Track-A ceiling lesson applies: an
 un-calibrated battery measures nothing); (2) confirm the collective

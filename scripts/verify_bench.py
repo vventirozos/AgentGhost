@@ -142,6 +142,16 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--two-stage", choices=("on", "off", "both"),
                     default="both",
                     help="which prompt arm(s) to run (default both)")
+    ap.add_argument("--logit-expect", choices=("on", "off", "inherit"),
+                    default="inherit",
+                    help="pin GHOST_VERIFY_LOGIT_EXPECT for the run "
+                         "(§4BF flip i); 'inherit' leaves the shell "
+                         "value in force like every other discipline "
+                         "flag. Probe calls are cheap-pool; they miss "
+                         "the replay cache on a FIRST probe-armed run "
+                         "(new payload shape) and replay from it on "
+                         "re-runs — a crashed-and-restarted arm replays "
+                         "its own recorded probe responses.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--concurrency", type=int, default=1,
                     help="parallel verify calls; keep 1 for a "
@@ -397,6 +407,13 @@ async def _amain() -> int:
         label=f"verify_bench {args.tier}/{args.two_stage}")
     print(f"{len(cases)} case(s), arms: {', '.join(arms)}, "
           f"judge: {args.base_url}")
+    # Echo the probe pin (R1 review: a mislaunched arm — 'inherit'
+    # where 'on' was intended — was only discoverable post-hoc in
+    # provenance; the banner is where the operator actually looks).
+    print(f"logit-expect probe: {args.logit_expect}"
+          + ("" if args.logit_expect != "inherit" else
+             f" (shell: GHOST_VERIFY_LOGIT_EXPECT="
+             f"{os.environ.get('GHOST_VERIFY_LOGIT_EXPECT', '<unset>')})"))
     print(f"verdict pipeline: {_esc['arm']}"
           + (f" (escalates to {args.main_base_url})"
              if _esc.get("main") else ""))
@@ -417,7 +434,9 @@ async def _amain() -> int:
         report = await run_bench(
             cases, verifier, arms=arms, fault_names=fault_names,
             seed=args.seed, concurrency=args.concurrency,
-            on_result=_progress)
+            on_result=_progress,
+            logit_expect=(None if args.logit_expect == "inherit"
+                          else args.logit_expect))
     finally:
         await client.aclose()
 

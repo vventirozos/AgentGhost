@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eval.banks — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Related</h3>
+    <a href="../core/challenge_templates.html">challenge_templates</a>
+    <a href="../core/dream.html">dream (self-play)</a>
+    <a href="../core/feedback.html">feedback (human labels)</a>
+    <a href="../algorithms/dream_cycle.html">The dream cycle</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>eval / banks.py — bench banks (§4BF Track 1b)</h1>
+  <p class="subtitle">Externally-imported graded tasks (MBPP code-with-tests,
+  GSM8K exact-match math, gsm8k_text reply-graded math) run through the
+  self-play machinery during deep idle — the resolved-outcome flywheel.
+  Tests: <code>tests/test_bench_banks.py</code>,
+  <code>tests/test_track2_flip_ii.py</code>.</p>
+
+  <h2>Why</h2>
+  <p>The learning stack's binding constraint is RESOLVED-outcome supply
+  (§4AQ/§4BC: ~3.5 real turns/day, most <code>unknown</code>). Bench banks
+  turn idle cycles into mechanically-graded outcomes: unit tests and gold
+  answers give free ground truth at whatever volume the idle battery can
+  burn. This also answers B4's failure mode — B4 ceilinged twice because
+  SYNTHESIZING hard tasks is hard; importing hard tasks isn't.</p>
+
+  <h2>The flow</h2>
+  <ol>
+    <li><strong>Import (operator/build-time, never agent runtime — the
+    agent's egress is Tor-only-keyless):</strong>
+    <code>scripts/import_bench_banks.py --mbpp … --gsm8k …</code> normalizes
+    raw dataset rows into the self-play (prompt, setup, validator) triple
+    and writes <code>$GHOST_HOME/system/bench/banks/*.jsonl</code>. Every
+    MBPP item's validator is SELF-TESTED against the dataset's reference
+    solution at import — a broken oracle turns every future FAIL into label
+    noise (2 of 974 rows failed and were dropped on the 2026-08-13
+    import).</li>
+    <li><strong>Idle phase 3b</strong> (<code>_biological_tick</code>,
+    deep idle &gt;3600s, cooldown <code>_BENCH_COOLDOWN=2700s</code>, skips
+    ticks that already ran self-play, kill switch <code>--no-bench</code> —
+    deliberately independent of <code>--no-self-play</code> per §4Q):
+    <code>banks.pick_next_item()</code> (deterministic round-robin,
+    persisted cursor, wraps on exhaustion) →
+    <code>Dreamer.synthetic_self_play(injected_challenge=…,
+    bench_meta=…)</code> — the SAME isolated solve loop as self-play (full
+    tool loop, throwaway Docker sandbox, 3 attempts, read-only memory) →
+    outcome appended to <code>bench/results.jsonl</code> and an
+    <code>autonomous_activity</code> "bench" record. Phase is INERT until
+    banks exist on disk — armed-but-unloaded is the rollout.</li>
+  </ol>
+
+  <h2>Contamination doctrine (1c DECIDED 2026-08-13 — see
+  <a href="../core/admissibility.html">core/admissibility</a>)</h2>
+  <ul>
+    <li>Bench trajectories go to a <strong>separate root</strong>
+    (<code>bench/trajectories/</code>) with <code>task_kind="bench"</code>
+    (context-attr override in <code>_record_turn_trajectory</code>) and
+    <code>origin=bench</code> on the request log line (explicit
+    <code>turn_origin_label</code> override — the read-only heuristic would
+    have folded bench into "sim"). No reader of the production corpus ever
+    sees them <em>by accident</em>; admitted consumers read them through
+    <code>admissibility.iter_bench_trajectories(consumer)</code>, which
+    fails closed for any consumer without a matrix row.</li>
+    <li><strong>Trainsets take bench with origin as a feature</strong>:
+    GEPA trainsets (<code>TrainExample.origin</code>), the tool-fixture
+    miner (<code>ToolChoiceFixture.origin</code>, joined by
+    <code>extra.req_id</code>), the PRM and the router (an appended
+    <code>origin_bench</code> feature column). Validation stays REAL:
+    the router's §4AA held-out gate and every viability floor are
+    computed on the real population alone.</li>
+    <li><strong>Calibration takes bench</strong>: samples carry
+    <code>origin="bench"</code>, the bank oracle re-labels each attempt
+    at the <code>bench_validator</code> source rank, and the fit blends
+    populations under an equal-mass cap.</li>
+    <li><strong>Lessons mint TAGGED</strong> (<code>source="bench"</code>)
+    through the same extracted gate as self-play; the neutral pinned
+    frontier shape + the novelty=None pin mean struggled-then-won (always
+    verified) is the only bench pass-mint path. Frontier recording and
+    the scratchpad report stay real-only.</li>
+    <li>Live experiment arms never enroll bench turns; <strong>bench-scoped
+    specs</strong> (<code>ExperimentSpec.scope="bench"</code>) enroll bench
+    turns exclusively, and a bench verdict announces as a gate for a live
+    watch-window — never an auto-apply.</li>
+  </ul>
+
+  <h2>Oracles</h2>
+  <ul>
+    <li><strong>MBPP</strong>: validator execs the solver's
+    <code>solution.py</code> and runs the dataset's asserts;
+    <code>challenge_test_list</code> rows are HELD-OUT (in the validator,
+    not the prompt; failures report an index, never the body).</li>
+    <li><strong>GSM8K</strong>: the solver's <code>solution.py</code> must
+    print the final number; the validator (house style — it
+    subprocess-runs the solution like the template validators) compares the
+    last number on stdout against the gold with relative tolerance.</li>
+    <li><strong>Anti-cheat</strong>: golds and hidden tests are
+    base64-embedded (a deterrent — the sandbox is shared, same trust model
+    as template validators) and the prompt forbids reading dot-files;
+    failure feedback never prints the gold or hidden-test bodies (retries
+    would otherwise cheat).</li>
+    <li>Injected challenges count as <em>pre-verified</em> for the
+    self-play validator self-test gate (external ground truth; the
+    echo-style instrumentation can't apply and would false-WARN per
+    run).</li>
+  </ul>
+
+  <h2>graded_on — what the oracle grades (§4BF Track 2 flip ii)</h2>
+  <p>Every item optionally carries <code>graded_on</code>:
+  <code>"artifact"</code> (default — the validator inspects files the
+  solver wrote) or <code>"final_response"</code> (the validator reads
+  <code>answer.txt</code>, which <em>dream's solve loop</em> writes with
+  the turn's final reply text — post adaptive-BoN substitution — right
+  before running the validator; the solver never writes it). The field is
+  deliberately <strong>not</strong> in <code>ITEM_FIELDS</code>: adding it
+  to the required set would make <code>load_bank</code>'s
+  all-fields-present check silently drop every pre-§4BF row on disk.
+  Readers use <code>item_graded_on(item)</code>, which defaults
+  absent/unknown values to artifact.</p>
+  <p><strong>gsm8k_text</strong> (<code>normalize_gsm8k_text</code>,
+  imported via <code>scripts/import_bench_banks.py --gsm8k-text
+  &lt;raw&gt;</code>): the same 1,319 GSM8K items, but the challenge asks
+  for the answer <em>in the reply</em> (final numeric answer on the last
+  line) and the validator grades <code>answer.txt</code>. This is the bank
+  flavor whose oracle can measure mechanisms that rewrite final TEXT —
+  built for the bench-scoped <code>tts_bon</code> arm (see
+  <a href="../core/experiments.html">experiments</a>). Validator exit
+  codes are load-bearing: <code>0</code> correct · <code>1</code> wrong
+  number (feedback never leaks the gold) · <code>4</code> no number in
+  the reply (a real solver failure — the format was pinned in the prompt;
+  an EMPTY reply also grades 4) · <code>5</code> <code>answer.txt</code>
+  missing, reserved for "the harness seam did not run" — dream triages 5
+  as INFRA_ABORT, never an agent failure (the §4AO label-noise class).
+  Import self-tests each validator in BOTH directions (gold passes,
+  gold+1 fails) — a check the R1 review then extended to the artifact
+  <code>--gsm8k</code> branch too, which previously had none.
+  <strong>Tolerance cap (R1):</strong> the first import exposed that a
+  purely relative tolerance makes golds ≥1.45M accept ±1 (two such items
+  sat un-dropped in the artifact bank on disk); both gsm8k validators now
+  use <code>min(rel·max(1,|gold|), 0.5)</code> (<code>_TOL_EXPR</code> —
+  one shared string so the flavors can't drift), which keeps
+  float-formatting slack while failing every integer near-miss at any
+  magnitude. Re-imported 2026-08-13: 1,319/1,319 in both banks, all
+  self-tests green. <strong>Grading subject (R1 CRIT, two independent
+  reviewers):</strong> the harness strips finalize-appended system notes
+  (<code>reply_smoothing.strip_system_notes</code>) before writing
+  answer.txt — the verifier's own "**Verifier note:**" tail otherwise
+  displaced the final number in BOTH directions (a note ending in a digit
+  flunked correct answers; a refute quoting the correct value passed
+  wrong ones). Accepted residuals (documented, not defended): the
+  last-number heuristic mis-grades exotic reply tails (unicode minus,
+  LaTeX fractions, e-notation, trailing "in 2 steps") — the challenge's
+  pinned last-line format is the mitigation.</p>
+
+  <h2>A uniform-draw mode that was built and removed (§4BO, 2026-08-15)</h2>
+  <p>Recorded because the reasoning is the reusable part. The premise was:
+  <em>the cursor walk starts at index 0, MBPP/GSM8K are ordered roughly
+  easiest-first, so 18 passes in 18 runs may just be where the walk
+  started.</em> Checked against the actual bank files, that is
+  <strong>false</strong>:</p>
+  <ul>
+    <li>MBPP index 0 is a 2-D dynamic-programming min-cost-path problem;
+    index 967 is <em>"find the minimum of two numbers"</em>. The tail is
+    <em>easier</em> than the head — the order is <code>task_id</code>,
+    which is MBPP's train/test/prompt <strong>split</strong> order.</li>
+    <li>GSM8K: <code>corr(index, question_chars) = +0.04</code>,
+    <code>corr(index, numeric_tokens) = +0.01</code>, quartile means
+    flat. No trend.</li>
+  </ul>
+  <p>So the banks are unordered, the sequential prefix is already a fair
+  sample, and a uniform draw would have the same expected pass rate — a
+  fix aimed at a bias that does not exist. It also carried real costs:
+  with-replacement duplicates (P(≥1 duplicate in a 200-item drain) ≈ 99.6% over the 3,610 on-disk rows)
+  feeding a lesson the isolate reads back on the repeat, and a two-stage
+  bank-then-item draw over a population where <code>gsm8k</code> and
+  <code>gsm8k_text</code> are byte-identical questions under two grading
+  modes.</p>
+  <p>What 18/18 <em>does</em> bound honestly: a 95% one-sided lower bound
+  of <strong>p ≥ 0.847</strong>. What it does not tell you is the variance
+  or where the hard items are — and the answer to that is <em>more
+  items</em>, which is what the drain provides.</p>
+
+  <h2>Operator-armed drain (§4BO)</h2>
+  <p>The idle economy yields ~14 items/day (measured: 18 rows over 29.9 h,
+  median gap 72 min) because an item needs a deep-idle window, a self-play
+  dice miss, and a 45-minute cooldown. A drain lifts all three:</p>
+  <pre>curl -s -X POST http://127.0.0.1:8000/api/bench/drain \
+  -H "X-Ghost-Key: $(cat ~/Data/AI/.ghost_api_key)" \
+  -H 'Content-Type: application/json' \
+  -d '{"count": 30}'                  # optional: "banks": ["mbpp"]</pre>
+  <p>The endpoint <strong>arms a budget; it never runs an item</strong>.
+  The biological watchdog spends it, which keeps the watchdog the single
+  caller of <code>pick_next_item</code> — that function's cursor is an
+  unsynchronized read-modify-write, and "bench from a second process" is
+  the race its docstring names. <code>{"count": 0}</code> cancels the
+  queue (but <em>not</em> the item already solving). The remaining budget
+  is readable from <code>GET /api/health</code>
+  (<code>bench_drain_remaining</code>); it is in-memory by design, so a
+  restart clears it.</p>
+  <p><strong>What a drain still obeys:</strong> <code>--no-bench</code>
+  (absolute, and refused at the door with 409), a live turn
+  (<code>foreground_requests &gt; 0</code>), and a 60-second quiet floor
+  — re-read at the moment the phase runs, not sampled at the top of the
+  tick, because the phases above it can burn minutes and a stale sample
+  let a solve start one second after the operator's reply.</p>
+  <p><strong>Per-item timeout.</strong> The solve loop has no internal
+  timeout and the watchdog is the process's <em>only</em> long-lived
+  background task, so one item parked on the shared inference slot stops
+  every idle phase — journal, dream, reflection, skills, PRM/router
+  retrain, calibration, autoadvance, self-play — until a restart, while
+  <code>/api/health</code> still reports
+  <code>biological_watchdog_alive: true</code> (the task <em>is</em>
+  alive, parked inside one await). At the organic cadence that was a
+  ~0.3% duty cycle; a drain runs at a measured 24–75% (mean 41%). Hence
+  <code>GhostAgent._BENCH_ITEM_TIMEOUT</code> (15 min ≈ 5× the 179 s worst
+  honest run measured here), after which the item is cancelled and
+  recorded <code>INFRA_ABORT</code> — excluded from the pass-rate
+  denominator, because a wedged box is not the agent getting the answer
+  wrong. The bound is a <strong>floor, not a ceiling</strong>:
+  <code>asyncio.wait_for</code> cancels the task and then awaits it,
+  including a <code>finally</code> that removes a Docker container and
+  deletes a workspace, so the real worst case is roughly the timeout plus
+  docker-py's ~60 s client timeout. A cancellation landing inside
+  <code>asyncio.to_thread(ensure_running)</code> cannot stop that thread
+  either, so a container may be created after its workspace is gone and
+  leak — narrow, but per-item under a drain rather than per-incident.</p>
+
+  <h2>⚠ A bank-scoped drain evicts that bank from the organic rotation</h2>
+  <p><code>pick_next_item</code> serves the bank with the <em>lowest
+  cursor</em>, and the drain shares that cursor. So
+  <code>{"count": 200, "banks": ["mbpp"]}</code> advances mbpp to 206
+  while the others sit at 6 — and the organic walk will not return to
+  mbpp until roughly 402 items have run on the other banks, about
+  <strong>28 days</strong> at the measured cadence (the figure scales
+  with the number of banks — 2 banks ≈ 14 days, 4 ≈ 43). Meanwhile
+  <code>stats(source="idle")["mbpp"]</code> — the very series the split
+  exists to keep comparable — is frozen. The endpoint says so in its reply
+  when a filter is given. Drain all banks unless you want that trade.</p>
+  <p><strong>Cost.</strong> 200 items is roughly 5–13 h of the box's only
+  inference slot (llama-server runs <code>-np 1</code>); the arm response
+  returns an <code>estimated_hours</code> range. A bench generation
+  already in flight owns that slot, so an operator turn arriving mid-item
+  waits for it — drain when you are away, not while you are working.</p>
+  <p><strong>Provenance.</strong> Every ledger row carries
+  <code>source</code>: <code>idle</code> (organic) or <code>drain</code>.
+  These are genuinely different machine conditions, so
+  <code>stats(source=…)</code> keeps them separable and the learning-health
+  report breaks them out — pooled, 200 drained rows swamp the ~14/day
+  organic ones and silently redefine what "pass rate" means on that line.
+  Rows written before 2026-08-15 have no field and read as
+  <code>idle</code>. The tag rides the <strong>trajectory</strong> too
+  (<code>bench_meta["source"]</code>), because every admitted learning
+  consumer reads the corpus rather than this ledger.</p>
+
+  <h2>⚠ A drain floods any live bench-scoped experiment arm</h2>
+  <p>Bench-scoped arms (<code>ExperimentSpec.scope="bench"</code>, e.g.
+  <code>tts_bon</code>) accrue from exactly the population a drain
+  multiplies. A 200-item drain delivers roughly <strong>fifty nights</strong>
+  of accrual in one, under a different machine regime — and while every
+  row now carries <code>bench_source</code>, <em>no analysis path filters
+  on it yet</em>. The arm endpoint names any live bench-scoped arms in its
+  reply (<code>bench_scoped_arms</code>) so the decision is made before
+  the drain, not discovered after it. Record the drain window against the
+  arm, or pause the arm first. <strong>Stated plainly: that advisory
+  string is the only mitigation.</strong> If a drain is ever armed while a
+  bench-scoped arm accrues, the earned fix is a
+  <code>bench_source != "drain"</code> filter where the bench verdict pass
+  reads the corpus — one keyword argument — but it is premature before a
+  drain has actually run.</p>
+
+  <h2>Sandbox hygiene under a drain</h2>
+  <p><strong>The FD leak (fixed 2026-08-15, found by running the first
+  real drain).</strong> Each solve builds a fresh <code>DockerSandbox</code>,
+  whose <code>__init__</code> opens a docker client — and nothing closed
+  the connection pool, so every item leaked ~11 unix sockets. A 20-item
+  drain reached <code>[Errno 24] Too many open files</code> at item 16:
+  the remaining items failed to solve <em>and</em> failed to write their
+  ledger rows, and the whole daemon degraded (critic nodes unreachable,
+  journal consolidation skipping, the HTTP API accepting TCP but
+  answering nothing). The per-solve teardown now goes through
+  <code>close(remove=True)</code>, which closes the client and removes a
+  container even when the failure path never bound it. Measured after the
+  fix: six solves, FDs 353&nbsp;→&nbsp;354, unix sockets flat.</p>
+  <p><strong>Boot sweep.</strong> A <code>finally</code> cannot run
+  through SIGKILL, so a daemon killed mid-solve leaves its container
+  behind. Boot now reaps them — but note the criterion, because the
+  obvious one is wrong: a killed process also cannot run
+  <code>TemporaryDirectory.cleanup()</code>, so the workspace
+  <em>survives</em> and "mount no longer exists" spares exactly the
+  containers it targets. The test is the KIND of workspace —
+  <code>tmp*</code> under the system temp root is a per-solve sandbox and
+  is removed; <code>$GHOST_HOME/sandbox</code> (the agent's own) and
+  <code>ghostjobs-*</code> (a <em>detached job</em>, deliberately kept
+  alive across restarts) are never touched. Also guarded by a 30-minute
+  age floor, a 25-container cap, and <code>GHOST_SANDBOX_SWEEP=0</code>.</p>
+  <p>Still worth a periodic <code>docker ps -a</code>: a cancellation
+  landing inside <code>asyncio.to_thread(ensure_running)</code> cannot
+  stop that thread, so a container can still be created after its
+  workspace is gone. The boot sweep will collect it next restart.</p>
+
+  <h2>Watching a drain</h2>
+  <p><code>GET /api/health</code> carries
+  <code>bench_drain_remaining</code>, <code>bench_drain_banks</code>,
+  <code>bench_item_started_at</code> and <code>bench_last_item_at</code>.
+  The start stamp is non-null <em>iff an item is in flight</em> (cleared
+  when one ends), so: non-null and not advancing = <strong>wedged</strong>;
+  null with budget remaining = <strong>deferring</strong> on the quiet
+  floor or a live turn. Reading a stale stamp as a wedge leads to a
+  restart, which discards the in-memory budget.</p>
+
+  <h2>Reading the flywheel</h2>
+  <pre>python3 - &lt;&lt;'EOF'
+from ghost_agent.eval import banks
+print(banks.stats())                    # pooled: what the flywheel ran
+print(banks.stats(source="idle"))       # the organic cadence alone
+print(banks.stats(source="drain"))      # operator-armed drains alone
+print(banks.list_banks())               # items on disk
+EOF</pre>
+  <p>Ledger rows: <code>{ts, bank, item_id, cluster, passed, status,
+  attempts, source}</code>. A run that never concluded records
+  <code>NO_RESULT</code> with <code>passed=false</code> — silent drops
+  would inflate the pass rate. <code>INFRA_ABORT</code>/<code>NO_RESULT</code>
+  are the UNRESOLVED bucket (excluded from the pass-rate denominator);
+  <code>ABORTED_BY_SOLVER</code> counts as a FAILURE (1c: bench items are
+  oracle-self-tested at import, so an abort is the agent capitulating —
+  the lesson gate still writes nothing from abort transcripts, a
+  deliberate asymmetry: no-fault for LEARNING, at-fault for the
+  SCOREBOARD). Accepted residual: the cursor advances at pick time, so a
+  hard process kill mid-solve consumes one item with no ledger row (the
+  in-process <code>finally</code> covers exceptions, not SIGKILL);
+  recovered on wrap.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

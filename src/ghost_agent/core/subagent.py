@@ -103,6 +103,16 @@ def build_subagent_context(context, *, job_id: str, allowed_tools: List[str]):
     iso.trajectory_collector = None
     iso.episodic_memory = None
     iso.journal = None
+    # §4BF 1c (R1 review): a sub-agent spawned from a BENCH context would
+    # inherit turn_origin_label="bench" and enroll (unrecordably — no
+    # collector) in bench-scoped experiments. Clear the label so the
+    # read-only heuristic classifies it "sim" like every other delegate.
+    # Latent today (delegation is disabled inside self-play/bench solves)
+    # but the copy must not depend on that staying true.
+    iso.turn_origin_label = None
+    iso.trajectory_task_kind = None
+    iso.trajectory_extra_static = None
+    iso.trajectory_user_request_override = None
     iso.scheduler = None
     iso.profile_memory = None
     iso.memory_bus = None

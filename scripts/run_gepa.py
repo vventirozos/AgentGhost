@@ -40,6 +40,8 @@ from ghost_agent.distill.collector import TrajectoryCollector  # noqa: E402
 from ghost_agent.optim.signatures import SIGNATURES  # noqa: E402
 from ghost_agent.optim.trainset import (  # noqa: E402
     build_trainset,
+    per_origin_selection,
+    real_only_gate,
     split_public_private,
     split_train_eval,
 )
@@ -97,6 +99,21 @@ async def main() -> int:
         print(f"no trajectories under {traj_root} — run some user turns first", file=sys.stderr)
         return 2
 
+    # §4BF 1c (admissibility: gepa_trainset = bench_feature): bench solves
+    # join the corpus — a PASSED bench final_response was accepted by the
+    # bank's mechanical oracle, and build_trainset stamps origin="bench" on
+    # every example it yields. Missing bench root → empty, silently.
+    bench_trajs = []
+    try:
+        from ghost_agent.core.admissibility import iter_bench_trajectories
+        bench_trajs = list(iter_bench_trajectories("gepa_trainset"))
+        if bench_trajs:
+            print(f"admitting {len(bench_trajs)} bench trajectories "
+                  f"(origin=bench) alongside {len(trajectories)} real ones")
+            trajectories = trajectories + bench_trajs
+    except Exception as e:  # noqa: BLE001 — bench is additive
+        print(f"bench corpus skipped: {e}", file=sys.stderr)
+
     # No cap yet — the signature-target filter below must see the whole
     # corpus first (plan-bearing trajectories are ~1 in 4 of PASSED; capping
     # first would truncate away most of the usable examples).
@@ -150,7 +167,15 @@ async def main() -> int:
               f"by final_response overlap, INCLUDING the private ship gate. "
               f"That is a different objective from {sig.name}; check the "
               f"corpus before trusting a promotion.", file=sys.stderr)
-    examples = examples[:args.max_examples]
+    # §4BF 1c (R1 review): per-origin selection instead of head truncation
+    # — see optim/trainset.py:per_origin_selection for the rules.
+    _real_ex, _bench_ex = per_origin_selection(
+        examples, max_examples=args.max_examples)
+    examples = _real_ex + _bench_ex
+    if _bench_ex or bench_trajs:
+        print(f"corpus after per-origin selection: {len(_real_ex)} real + "
+              f"{len(_bench_ex)} bench examples (equal-mass cap, "
+              f"newest bench first)")
 
     # PUBLIC/PRIVATE first: the private tier is hash-assigned per trajectory
     # and is the ONLY thing the A/B ship-gate judges on. The optimizer —
@@ -158,6 +183,15 @@ async def main() -> int:
     # the public tier. Judging the ship decision on data the optimizer
     # could see is how proxy-gamed prompts get promoted.
     public_set, private_set = split_public_private(examples, private_pct=args.private_pct)
+    # §4BF 1c (R1 review CRIT): the PRIVATE ship-gate is REAL-ONLY — bench
+    # may teach, it may never grade. See optim/trainset.py:real_only_gate.
+    public_set, private_set, _n_moved = real_only_gate(public_set, private_set)
+    if _n_moved:
+        print(f"evicted {_n_moved} bench examples from the PRIVATE gate "
+              f"tier (real-only gate); public tier now "
+              f"{sum(1 for e in public_set if getattr(e, 'origin', '') != 'bench')} real + "
+              f"{sum(1 for e in public_set if getattr(e, 'origin', '') == 'bench')} bench "
+              f"(equal-mass cap enforced)")
     train_set, eval_set = split_train_eval(public_set, eval_fraction=args.eval_fraction)
     print(f"{len(train_set)} train / {len(eval_set)} val (public) / "
           f"{len(private_set)} PRIVATE holdout examples for {sig.name}")
@@ -334,17 +368,33 @@ async def main() -> int:
         # change unchallenged.
         try:
             _art = _json_mod.loads(output_path.read_text(encoding="utf-8"))
-            _art["gate_arm"] = "token-F1 A/B, private holdout"
-            _art["gate"] = {
-                "metric": "token_f1_overlap>=0.3",
-                "n_private": len(private_set),
-                "incumbent_pass_rate": round(cmp.baseline_pass_rate, 4),
-                "candidate_pass_rate": round(cmp.candidate_pass_rate, 4),
-                "delta": round(cmp.delta, 4),
-                "min_delta": args.ab_min_delta,
-                "promoted_utc": __import__("time").strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
-            }
+            # `cmp` exists only on the GATED path (R2 review: the
+            # --no-ab-gate promotion hit a NameError here, was swallowed,
+            # and every ungated promotion shipped with the "promoted
+            # without provenance" warning instead of an honest stamp).
+            try:
+                _cmp = cmp
+            except NameError:
+                _cmp = None
+            if _cmp is not None:
+                _art["gate_arm"] = "token-F1 A/B, private holdout"
+                _art["gate"] = {
+                    "metric": "token_f1_overlap>=0.3",
+                    "n_private": len(private_set),
+                    "incumbent_pass_rate": round(_cmp.baseline_pass_rate, 4),
+                    "candidate_pass_rate": round(_cmp.candidate_pass_rate, 4),
+                    "delta": round(_cmp.delta, 4),
+                    "min_delta": args.ab_min_delta,
+                    "promoted_utc": __import__("time").strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+                }
+            else:
+                _art["gate_arm"] = "UNGATED (--no-ab-gate)"
+                _art["gate"] = {
+                    "metric": "none — adopted unverified",
+                    "promoted_utc": __import__("time").strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+                }
             output_path.write_text(_json_mod.dumps(_art, indent=1),
                                    encoding="utf-8")
         except Exception as _se:  # noqa: BLE001 — stamp must not unship

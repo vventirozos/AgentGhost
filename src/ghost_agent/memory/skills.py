@@ -1485,6 +1485,12 @@ class SkillMemory:
                     # Harness dimension for future where-filtered recall;
                     # read-side plumbing needs nothing today.
                     "dimension": new_lesson.get("dimension", "") or "",
+                    # Provenance mirror (§4BF 1c): the JSON row already
+                    # carries it; mirroring on the twin lets a future
+                    # retract-by-source drive a vector `where` filter too
+                    # (bench lessons are the first source that may need
+                    # bulk retraction).
+                    "source": new_lesson.get("source", "") or "",
                 }
                 memory_system.add(text, meta)
 

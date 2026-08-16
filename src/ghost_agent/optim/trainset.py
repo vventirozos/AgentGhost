@@ -35,6 +35,14 @@ class TrainExample:
     expected_output: Dict[str, str] = field(default_factory=dict)
     source_trajectory_id: str = ""
     weight: float = 1.0  # for class imbalance / source weighting
+    # §4BF 1c: which POPULATION the example came from (the trajectory's
+    # task_kind — "user_request" or "bench"). Carried as an explicit
+    # FIELD, not an input: inputs feed the tuned prompt, and the origin
+    # must stay separable for audits/per-origin eval without teaching the
+    # model to condition its text on a token real traffic never carries.
+    # Deliberately EXCLUDED from `_example_identity` — identity decides
+    # holdout membership, which must never reshuffle over a metadata field.
+    origin: str = "user_request"
 
 
 # Only REAL user turns are gold. A `reflection` trajectory's `final_response`
@@ -51,7 +59,21 @@ class TrainExample:
 # `task_kinds=None` and filters per FIELD instead — see its docstring. So the
 # shipped behaviour is NOT the "505 -> 409 whole-record filter" the §4J
 # write-up describes; that was the first, reverted fix.
-_GOLD_TASK_KINDS: Tuple[str, ...] = ("user_request",)
+#
+# §4BF 1c (admissibility: gepa_trainset = bench_feature): "bench" joins the
+# gold kinds. HONEST SCOPE (R3 review corrected the first version of this
+# comment): the oracle graded the attempt's solution.py exit code, NOT the
+# final_response — a bench row's outcome=passed (via the oracle write-back
+# overlay) proves the SOLVE was correct, while its final_response is the
+# solver's closing reply on that oracle-passed run (typically restating the
+# solution). That is weaker than "oracle-graded output" but stronger than
+# an unverified turn; the input side is clean (bench rows record the bank
+# challenge text via the user_request override), failed attempts are
+# excluded by require_passed + the overlay, and the real-only private gate
+# means no promotion is ever judged on these rows. The reflection exclusion
+# that motivated this tuple is unchanged. Every bench example carries
+# `origin="bench"` (see TrainExample) so it stays separable.
+_GOLD_TASK_KINDS: Tuple[str, ...] = ("user_request", "bench")
 
 
 def filter_by_outcome(
@@ -173,10 +195,76 @@ def build_trainset(
             },
             source_trajectory_id=t.id,
             weight=1.0,
+            origin=(str(getattr(t, "task_kind", "") or "") or "user_request"),
         ))
         if max_examples is not None and len(examples) >= max_examples:
             break
     return examples
+
+
+def per_origin_selection(
+    examples: List[TrainExample],
+    max_examples: Optional[int] = None,
+) -> Tuple[List[TrainExample], List[TrainExample]]:
+    """§4BF 1c corpus selection: returns ``(real, bench)`` after the
+    equal-mass bench cap and the total cap.
+
+    Replaces plain head-truncation (R1 review): ``examples[:max]`` iterated
+    real-root examples first, so on a healthy corpus every bench example
+    was silently dropped right after "admitting N bench trajectories"
+    printed — and on a thin corpus bench flooded unchecked. Rules:
+    bench ≤ len(real) (newest bench first); under a total cap real takes
+    priority but bench keeps a reserve of up to half the cap, so an
+    admission that survives the equal-mass cap cannot be silently zeroed
+    by the total cap.
+    """
+    real = [e for e in examples if getattr(e, "origin", "") != "bench"]
+    bench = [e for e in examples if getattr(e, "origin", "") == "bench"]
+    bench = bench[-len(real):] if real else []
+    if max_examples is not None:
+        cap = max(0, int(max_examples))
+        real_take = min(len(real), max(cap - len(bench), (cap + 1) // 2))
+        real = real[:real_take]
+        rem = max(0, cap - len(real))
+        bench = bench[-rem:] if rem else []
+    return real, bench
+
+
+def real_only_gate(
+    public: List[TrainExample],
+    private: List[TrainExample],
+) -> Tuple[List[TrainExample], List[TrainExample], int]:
+    """§4BF 1c (R1 review CRIT): the PRIVATE ship-gate tier is REAL-ONLY.
+
+    ``holdout_tier`` hashes identity with origin deliberately excluded
+    (holdout stability), so bench examples land in the private tier —
+    the A/B promotion would then be graded partly against bench-style
+    outputs, and bench volume could satisfy the resolution check on a
+    real tier too coarse to resolve the delta. Doctrine: bench may TEACH
+    (public tier), it may never GRADE. Returns
+    ``(public, private, n_moved)`` with bench private examples moved to
+    the public side.
+
+    The move then RE-CAPS the public tier at equal mass (R2 review:
+    moving 100% of bench into a tier holding only ~70% of real quietly
+    inverted the corpus-level equal-mass cap — public went bench-majority
+    right after the run printed "equal-mass cap"). Newest bench rows win,
+    consistent with every other cap in the 1c stack.
+    """
+    bench_priv = [e for e in private if getattr(e, "origin", "") == "bench"]
+    if not bench_priv:
+        return list(public), list(private), 0
+    new_public = list(public) + bench_priv
+    real_pub = [e for e in new_public if getattr(e, "origin", "") != "bench"]
+    bench_pub = [e for e in new_public if getattr(e, "origin", "") == "bench"]
+    if len(bench_pub) > len(real_pub):
+        bench_pub = bench_pub[-len(real_pub):] if real_pub else []
+        new_public = real_pub + bench_pub
+    return (
+        new_public,
+        [e for e in private if getattr(e, "origin", "") != "bench"],
+        len(bench_priv),
+    )
 
 
 def split_train_eval(

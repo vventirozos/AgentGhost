@@ -8,6 +8,17 @@ from pathlib import Path
 import pytest
 
 
+def _corpus_floor_each():
+    """Per-class size clearing the trainer's DERIVED floor. §4BQ left _GATE_MIN_HELDOUT at 60 (a raise to 150 was tried
+    twice and retracted both times — see the constant). Sizes are
+    derived so a future recalibration cannot silently turn these into
+    vacuous bails, which had already happened once."""
+    from ghost_agent.router.trainer import _gate_min_trajectories
+    return int(_gate_min_trajectories() * 0.6) + 1
+
+
+
+
 # ---------------------------------------------------------------- GEPA loader
 
 class TestGepaLoader:
@@ -60,8 +71,8 @@ def _traj(req, steps, calls, outcome="passed", heavy=False):
 class TestRouterTrainer:
     def test_fits_and_persists_and_routes(self, tmp_path):
         from ghost_agent.router import RouterTrainer, ComplexityClassifier, ComplexityDispatcher
-        trajs = [_traj(f"what is {i}", 1, 1) for i in range(130)]
-        trajs += [_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True) for i in range(130)]
+        trajs = [_traj(f"what is {i}", 1, 1) for i in range(_corpus_floor_each())]
+        trajs += [_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True) for i in range(_corpus_floor_each())]
         save = tmp_path / "router" / "checkpoint.json"
         rep = RouterTrainer(min_trajectories=15).run(trajs, save_path=save)
         assert rep.fit_succeeded
@@ -91,9 +102,9 @@ class TestRouterTrainer:
         from ghost_agent.tools.memory import _maybe_retrain_router
 
         coll = TrajectoryCollector(root=tmp_path / "traj", session_id="s1")
-        for i in range(130):
+        for i in range(_corpus_floor_each()):
             coll.append(_traj(f"what is {i}", 1, 1))
-        for i in range(130):
+        for i in range(_corpus_floor_each()):
             coll.append(_traj(f"build deploy {i}", 6, 5, outcome="failed", heavy=True))
 
         class _Ctx:

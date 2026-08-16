@@ -159,3 +159,70 @@ def test_the_face_form_is_never_hardcoded_at_the_call_site():
         "the env override belongs in facestate.startup_form, which weighs it "
         "against the remembered form"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# TLS verification on the two interface channels (2026-08-15)
+# ──────────────────────────────────────────────────────────────────────
+
+def _env_default(var: str) -> str:
+    """The DEFAULT argument of `os.environ.get("<var>", <default>)`.
+
+    Extracted from the call node, not by substring. The first version of
+    this asked whether "'1'" appeared anywhere in the assignment source —
+    and `... .lower() in ('1', 'true', 'yes')` contains '1' on the
+    membership side, so flipping the default to '0' left the guard green.
+    """
+    tree = ast.parse(_CLIENT.read_text())
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and len(node.args) == 2
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == var):
+            return node.args[1].value
+    raise AssertionError(f"os.environ.get({var!r}, ...) not found in client.py")
+
+
+def test_voice_and_log_channels_VERIFY_tls():
+    """They accepted ANY certificate until 2026-08-15, because the
+    interface served a self-signed CN=localhost cert with no SAN that
+    nothing could verify. WireGuard authenticates tailnet PEERS; it does
+    not stop a compromised node answering on :8080 and harvesting the
+    X-Ghost-Key these calls carry. The interface now serves a real
+    Let's Encrypt cert (issued by Tailscale), so verification is possible
+    and therefore mandatory."""
+    default = _env_default("GHOST_VOICE_VERIFY_TLS")
+    assert default == "1", (
+        f"TLS verification is off by default again (default={default!r})")
+
+
+def test_the_host_default_MATCHES_THE_CERT_SAN():
+    """Verification only works against the name in the certificate. The
+    SAN is `DNS:eva.taila2b1d.ts.net` — the short `eva` reaches the same
+    box but fails hostname matching, which was proven live: with
+    verify=True, https://eva:8080 is refused while the FQDN returns 200.
+    A short-name default here would silently disable voice."""
+    assert _env_default("GHOST_HOST") == "eva.taila2b1d.ts.net"
+
+
+def test_the_ONE_switch_still_governs_BOTH_channels():
+    """Voice (httpx) and the log websocket must not drift apart — a
+    half-verified client is the worst of both."""
+    text = _CLIENT.read_text()
+    assert "verify=VOICE_VERIFY_TLS" in text          # the httpx calls
+    assert "verify_tls=VOICE_VERIFY_TLS" in text      # stream_log_lines
+
+
+def test_a_NON_RESOLVING_host_is_announced_at_startup():
+    """The documented failure mode on this device is silence: the voice
+    endpoints spent weeks "unused" while failing against a host that no
+    longer existed. Turning verification on adds exactly one new way to
+    reproduce that — an FQDN the handheld cannot resolve — so it must be
+    named at boot, in the log deploy.sh tails, not discovered later."""
+    text = _CLIENT.read_text()
+    assert "getaddrinfo" in text, "no resolve preflight"
+    assert "[tls]" in text, "the preflight is not greppable in ghost_ui.log"
+    # …and it must name the escape hatch, since the device is often remote.
+    assert "GHOST_VOICE_VERIFY_TLS=0" in text

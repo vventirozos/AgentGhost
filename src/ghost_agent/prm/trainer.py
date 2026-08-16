@@ -97,6 +97,10 @@ class TrainerReport:
     # Non-empty when the fit leaned on features that are inert at serve time
     # (see SERVE_TURN_START_INERT_FEATURES) — a caveat on train accuracy.
     feature_skew_warning: str = ""
+    # §4BF 1c: bench step-samples that augmented the fit (equal-mass
+    # capped; 0 when no banks / bench not passed). Counted separately so
+    # the report never inflates the real-corpus denominator.
+    n_bench_samples: int = 0
 
     def summary(self) -> str:
         if not self.fit_attempted:
@@ -106,8 +110,9 @@ class TrainerReport:
         base = (
             f"trained on {self.n_samples_total} samples "
             f"({self.n_samples_positive}+/{self.n_samples_negative}-) "
-            f"from {self.n_trajectories_seen} trajectories; "
-            f"saved to {self.saved_to or '<unsaved>'}"
+            f"from {self.n_trajectories_seen} trajectories"
+            + (f" +{self.n_bench_samples} bench" if self.n_bench_samples else "")
+            + f"; saved to {self.saved_to or '<unsaved>'}"
         )
         if self.feature_skew_warning:
             base += f"  ⚠ {self.feature_skew_warning}"
@@ -182,10 +187,22 @@ class PRMTrainer:
         self,
         trajectories: Iterable[Trajectory],
         save_path: Optional[Path | str] = None,
+        bench_trajectories: Optional[Iterable[Trajectory]] = None,
     ) -> TrainerReport:
         """Execute the pipeline. Returns a ``TrainerReport`` describing
         what happened — either a successful fit or the reason the
-        trainer bailed."""
+        trainer bailed.
+
+        ``bench_trajectories`` (§4BF Track 1c, admissibility: prm =
+        bench_feature): bench step-samples augment the fit, featurized
+        with ``origin_bench=1.0`` (set by the label builder from
+        ``task_kind``), under an EQUAL-MASS cap — at most as many bench
+        samples as real ones, newest first, and zero when the real corpus
+        alone fails the viability floors. Every floor is computed on the
+        REAL population, so bench volume can never unlock a fit the real
+        data is too thin to earn, and a PRM can never train purely on a
+        population it will not score in production.
+        """
         traj_list = list(trajectories)
         report = TrainerReport(n_trajectories_seen=len(traj_list))
 
@@ -258,6 +275,21 @@ class PRMTrainer:
                     f"negative={neg_frac:.2%} (need ≥{self.min_class_fraction:.0%} of each)"
                 )
                 return report
+
+        # §4BF 1c: bench augmentation joins AFTER the real-only viability
+        # gates above, equal-mass capped (newest bench samples win — the
+        # sample stream follows day-file order, so the tail is newest).
+        # See the run() docstring for the doctrine.
+        if bench_trajectories is not None:
+            try:
+                bench_samples: List[StepSample] = list(
+                    iter_step_samples(list(bench_trajectories), self.spec))
+                if bench_samples:
+                    bench_samples = bench_samples[-len(samples):]
+                    report.n_bench_samples = len(bench_samples)
+                    samples = samples + bench_samples
+            except Exception as exc:  # noqa: BLE001 — additive, never fatal
+                logger.debug("PRM bench augmentation skipped: %s", exc)
 
         # Build training arrays.
         X = [extract_step_features(s.state, s.action) for s in samples]

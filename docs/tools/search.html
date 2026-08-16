@@ -80,7 +80,11 @@
     <li>Standalone boolean <code>OR</code> / <code>AND</code> (boundary-gated and case-insensitive, so an <code>or</code> buried inside a word survives, and dropping a stopword from natural prose is invisible to the scrapers).</li>
     <li>Quotation marks (the words inside are kept).</li>
   </ul>
-  <p>If stripping would empty the query (a pure-operator query with no keywords), the original is returned unchanged rather than sending an empty search. The tool descriptions in <code>registry.py</code> now instruct <strong>plain keywords only</strong> to match.</p>
+  <p>If stripping would empty the query — a query that is <em>nothing but</em> an operator — the operand is <strong>mined for keywords</strong> rather than passed through raw (2026-08-15). This is a live fix: the model asked for
+  <code>site:reddit.com/r/lgbtgreece/comments/1voyjgf/is_nudism_safe_in_greece</code>,
+  stripping emptied it, and the old fallback handed the scrapers back the original — the one shape they cannot honour. That returned zero across four waves and two reformulations (one of them literally <code>how to site:reddit.com/&hellip;</code>), burned ~80&nbsp;s, and the turn was refuted by the late verifier for never retrieving the content.</p>
+  <p>The operand is not noise; it is the query, spelled as a URL. <code>_keywords_from_operand</code> splits it and keeps the meaning-bearing parts — the example above becomes <code>reddit lgbtgreece nudism safe greece</code>, which is almost exactly the query that <em>won</em> (brave, 20 results) earlier in that same turn. It drops URL furniture (<code>www</code>, <code>com</code>, <code>r</code>, <code>comments</code>, <code>index</code>, <code>html</code>&hellip;) and opaque ids (<code>1voyjgf</code>) — the tokens that make a query unmatchable — and caps the result at 6 terms, since the module's own reformulation notes record that longer queries have near-zero organic hits anywhere. If the operand mines to nothing (a bare TLD, e.g. <code>site:.org OR site:.gov</code>) the original is still returned unchanged rather than sending an empty search.</p>
+  <p><strong>Mining only happens on the empty-after-stripping path</strong>, so the ordinary <code>keywords + site:x.com</code> shape keeps its previous behaviour exactly. The tool descriptions in <code>registry.py</code> instruct <strong>plain keywords only</strong> to match.</p>
 
   <h2>Result cache</h2>
   <p>

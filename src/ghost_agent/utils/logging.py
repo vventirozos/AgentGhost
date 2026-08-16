@@ -391,6 +391,9 @@ class Icons:
     CUT          = "🔻"   # context compaction / trim (wide-base; was ✂️)
     CONSTRAINT   = "🔗"   # explicit-user-constraint capture/steer/gate (wide-base; was ⛓️)
     GAME_MOVE    = "🎮"   # participant-mode game turn (/api/game/move) (wide-base; was ♟️)
+    FEEDBACK_POS = "👍"   # human outcome label, positive (/api/feedback → corrections sidecar)
+    FEEDBACK_NEG = "👎"   # human outcome label, negative (same channel; distinct so the
+                          # stream shows the label's direction at a glance)
 
     # --- Custom Modes ---
     MODE_GHOST   = "🫥"

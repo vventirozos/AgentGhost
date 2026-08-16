@@ -119,6 +119,12 @@ _ARM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
 _MAX_ARMS = 8
 _MAX_SPECS = 16
 
+# Experiment populations (§4BF Track 1c). "live" = real user turns;
+# "bench" = idle bench-bank solves. See `ExperimentSpec.scope`.
+SCOPE_LIVE = "live"
+SCOPE_BENCH = "bench"
+_VALID_SCOPES = (SCOPE_LIVE, SCOPE_BENCH)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Specs + registry
@@ -131,6 +137,16 @@ class ExperimentSpec:
     ``traffic`` is the fraction of eligible units ENROLLED (the rest get no
     assignment at all and are excluded from the analysis — they are not a
     third arm). ``weights`` is the relative split among ``arms``.
+
+    ``scope`` (§4BF Track 1c) names the POPULATION this experiment runs
+    on: ``"live"`` = real user turns (the default, and the only scope
+    that existed before 1c); ``"bench"`` = idle bench-bank solves
+    (``task_kind="bench"``). Scopes split at BOTH ends — enrollment
+    (`enroll_request` assigns only scope-matching specs) and analysis
+    (`summarize_streaming` admits only the matching task_kind) — so a
+    bench arm can never perturb or grade live traffic and vice versa.
+    A bench verdict is a GATE for a live watch-window, never an
+    auto-apply (operator decision, 2026-08-13).
     """
 
     name: str
@@ -139,6 +155,7 @@ class ExperimentSpec:
     traffic: float = 1.0
     enabled: bool = True
     description: str = ""
+    scope: str = SCOPE_LIVE
 
     def normalized_weights(self) -> Tuple[float, ...]:
         if self.weights and len(self.weights) == len(self.arms):
@@ -272,6 +289,14 @@ def _spec_from_dict(d: Dict[str, Any]) -> Optional[ExperimentSpec]:
         if not math.isfinite(traffic):
             traffic = 1.0
         traffic = min(1.0, max(0.0, traffic))
+        scope = str(d.get("scope") or SCOPE_LIVE).strip().lower()
+        if scope not in _VALID_SCOPES:
+            # A typo'd scope SKIPS the spec entirely, loudly. (Defaulting
+            # it to live would itself be the population leak — a
+            # bench-intended experiment silently running on real traffic.)
+            logger.warning("experiments: %s has unknown scope %r — skipped",
+                           name, d.get("scope"))
+            return None
         return ExperimentSpec(
             name=name,
             arms=arms,
@@ -279,6 +304,7 @@ def _spec_from_dict(d: Dict[str, Any]) -> Optional[ExperimentSpec]:
             traffic=traffic,
             enabled=bool(d.get("enabled", True)),
             description=str(d.get("description") or "")[:300],
+            scope=scope,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("experiments: spec parse failed (%s: %s)", type(e).__name__, e)
@@ -331,14 +357,34 @@ class ExperimentRegistry:
                 return arm
         return spec.arms[-1] if spec.arms else ""
 
-    def assign_all(self, unit: str) -> Dict[str, str]:
-        """{experiment: arm} for every enabled experiment this unit enrolled in."""
+    def assign_all(self, unit: str, *, scope: str = SCOPE_LIVE) -> Dict[str, str]:
+        """{experiment: arm} for every enabled experiment OF THIS SCOPE the
+        unit enrolled in. Scope defaults to live so every pre-1c caller
+        keeps its behavior; bench enrollment passes scope="bench"."""
         out: Dict[str, str] = {}
-        for name in self.specs:
+        for name, spec in self.specs.items():
+            if getattr(spec, "scope", SCOPE_LIVE) != scope:
+                continue
             arm = self.assign(name, unit)
             if arm:
                 out[name] = arm
         return out
+
+    def names_for_scope(self, scope: str) -> Tuple[str, ...]:
+        """Names of ENABLED specs in ``scope`` — the GATE-side set ("does
+        a bench program exist at all")."""
+        return tuple(sorted(
+            n for n, s in self.specs.items()
+            if s.enabled and getattr(s, "scope", SCOPE_LIVE) == scope))
+
+    def names_in_scope(self, scope: str) -> Tuple[str, ...]:
+        """EVERY name declared in ``scope``, enabled or not — the
+        DENY-side set (R7 review: building the deny from the enabled
+        list meant re-scope-then-DISABLE resurrected the spec's stale
+        other-population stamps on every surface)."""
+        return tuple(sorted(
+            n for n, s in self.specs.items()
+            if getattr(s, "scope", SCOPE_LIVE) == scope))
 
 
 def _kill_switch_on() -> bool:
@@ -368,7 +414,8 @@ def registry_path_for_context(context) -> Optional[Path]:
     Prefers ``context.memory_dir`` ($GHOST_HOME/system/memory) over the env
     var: main.py resolves the home once at boot and the process may outlive
     an env change, and a test context always has a memory_dir while
-    `_isolate_ghost_home` deliberately unsets GHOST_HOME.
+    `_isolate_ghost_home` points GHOST_HOME at a per-test throwaway home
+    (it SETS rather than unsets since §4BF 1c R5 — same isolation intent).
     """
     try:
         md = getattr(context, "memory_dir", None)
@@ -451,7 +498,8 @@ def load_registry(path: Optional[Any] = None,
 _RECENT_ARMS_MAX = 16
 
 
-def enroll_request(context, req_id: str, *, eligible: bool = True) -> Dict[str, str]:
+def enroll_request(context, req_id: str, *, eligible: bool = True,
+                   origin: str = "user") -> Dict[str, str]:
     """Assign every running experiment for this request and stash the result.
 
     Called once per user turn from `handle_chat`, INSIDE the turn semaphore.
@@ -462,9 +510,21 @@ def enroll_request(context, req_id: str, *, eligible: bool = True) -> Dict[str, 
     ``eligible=False`` means this turn must not take part at all — see the
     call site. Never raises: an experiment framework that can break a turn is
     worse than no experiment framework.
+
+    ``origin`` (§4BF Track 1c) selects the POPULATION and therefore which
+    scope of specs may assign: "user" → live-scoped specs (the pre-1c
+    behavior), "bench" → bench-scoped specs ONLY (a bench solve must
+    never flip a live toggle), anything else ("sim") → no enrollment
+    regardless of ``eligible`` (self-play stays out of both populations —
+    its outcome feeds frontier scoring and the lesson keep/kill verdict,
+    so a coin-flip steer there randomizes the LEARNING SIGNAL).
     """
     arms: Dict[str, str] = {}
     try:
+        origin = str(origin or "user")
+        if origin not in ("user", "bench"):
+            _stash_arms(context, req_id, {})
+            return {}
         if not req_id or not eligible or _kill_switch_on():
             _stash_arms(context, req_id, {})
             return {}
@@ -480,7 +540,31 @@ def enroll_request(context, req_id: str, *, eligible: bool = True) -> Dict[str, 
         except Exception:  # noqa: BLE001
             pass
         reg = load_registry(registry_path_for_context(context))
-        arms = reg.assign_all(str(req_id))
+        # §4BF 1c (R1 review): the bench UNIT OF RANDOMIZATION is the bench
+        # ITEM, not the request. A bench item runs up to 3 attempts, each a
+        # fresh handle_chat with its own req_id — per-req_id assignment
+        # re-randomized every attempt, so attempt 2's input (the rejection
+        # message describing attempt 1's solution) was a function of
+        # attempt 1's ARM: an arm-crossing leak inside the experiment's own
+        # population, and a violation of the module's "a retry lands on the
+        # SAME arm" invariant. Keying on (bank, item) gives every attempt
+        # of an item one arm. (The ≤3 same-arm rows per item are dependent
+        # — the bench CS reads them as extra n; acceptable and documented,
+        # the leak was not.) The STASH stays keyed by req_id.
+        unit = str(req_id)
+        if origin == "bench":
+            try:
+                _static = getattr(context, "trajectory_extra_static",
+                                  None) or {}
+                _bank = str(_static.get("bench_bank") or "")
+                _item = str(_static.get("bench_item") or "")
+                if _bank and _item:
+                    unit = f"bench|{_bank}|{_item}"
+            except Exception:  # noqa: BLE001
+                pass
+        arms = reg.assign_all(
+            unit,
+            scope=(SCOPE_BENCH if origin == "bench" else SCOPE_LIVE))
     except Exception as e:  # noqa: BLE001
         logger.debug("experiment enrollment skipped: %s: %s", type(e).__name__, e)
         arms = {}
@@ -660,7 +744,17 @@ def is_treatment(context, name: str, req_id: str = "") -> bool:
 # is the conservative side for a corpus the optimizer replays VERBATIM.
 CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context",
                                           "foresight_note_fired",
-                                          "use_planning_fired")
+                                          "use_planning_fired",
+                                          # §4BF flip (ii): BoN substitutes the
+                                          # FINAL response — it never mutates
+                                          # what the model saw generating this
+                                          # turn, but the substituted text
+                                          # enters the conversation history and
+                                          # the recorded trajectory, so a
+                                          # replay that rehydrates a treatment
+                                          # turn's context replays an artifact
+                                          # only treatment production produced.
+                                          "tts_bon_fired")
 
 # experiment -> the `extra` key stamped when that experiment's TRIGGER fired.
 #
@@ -697,10 +791,17 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context"
 # caveat as foresight_note: a WORKING planner changes downstream router
 # training data, so the trigger rate can drift between arms over time —
 # watch the arm counts.
+# `tts_bon_fired` fires on "the verifier's verdict landed in the wobble
+# band (UNCERTAIN, or REFUTED below the 0.7 action threshold) on a
+# non-repairing final". The verdict is computed BEFORE the arm acts, so
+# the reading is arm-independent within the turn; across attempts of one
+# bench item the usual first-order caveat applies (a working treatment
+# changes whether attempt 2 exists at all — watch the arm counts).
 TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
                                 "fs_batch": "fs_batch_fired",
                                 "foresight_note": "foresight_note_fired",
-                                "use_planning": "use_planning_fired"}
+                                "use_planning": "use_planning_fired",
+                                "tts_bon": "tts_bon_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:
@@ -959,14 +1060,23 @@ class MetricComparison:
 # correction and quietly destroy the comparison (the same trap as conditioning
 # `failure_rate` on the UNKNOWN rate).
 #
-# ⚠ HONEST LIMIT: it is NOT strictly pre-treatment ACROSS a conversation. The
-# router is passed the previous assistant message, and arms are per-request, so
-# turn k's covariate is a function of turn k-1's possibly-TREATED output. The
-# leakage is second-order (one prior message into a coarse difficulty label)
-# but it is real, and it is exactly the trap this comment used to claim was
-# impossible. Anything stronger — a covariate derived from the agent's own
-# recent behaviour — must not be added here without a per-session design.
+# ⚠ HONEST LIMIT (NARROWED, §4BQ 2026-08-16): this used to leak across a
+# conversation, because the router was passed the previous assistant message,
+# making turn k's covariate a function of turn k-1's possibly-TREATED output.
+# That argument no longer applies — `core/agent.py` stopped passing
+# `prior_turn_text` (it was a train/serve skew: the trainer never supplied it,
+# so the feature was identically 0.0 in every fit). The covariate is now a pure
+# function of the user's own request text. Anything stronger — a covariate
+# derived from the agent's own recent behaviour — must still not be added here
+# without a per-session design, and re-enabling prior-turn context in the
+# router would re-open exactly this leak.
 _COVARIATE_KEYS: Tuple[str, ...] = ("router_confidence",)
+
+#: Escalations that are NOT a statement about the request — the router
+#: emits confidence 0.0 for all of them. Kept in lockstep with
+#: `scripts/router_confidence_backtest.py`, which excludes the same set.
+_NON_BELIEF_ESCALATIONS = frozenset(
+    {"no_model", "no_embedding", "scoring_error"})
 
 
 def _covariate_of(traj) -> Optional[float]:
@@ -974,6 +1084,15 @@ def _covariate_of(traj) -> Optional[float]:
     try:
         extra = getattr(traj, "extra", None) or {}
         if not isinstance(extra, dict):
+            return None
+        # §4BQ: a router that could not embed, had no model, or crashed
+        # while scoring records confidence 0.0 — that is a STRUCTURAL
+        # zero, not a belief about this request, so it is not a valid
+        # covariate. Measured on the live corpus: including 4 such zeros
+        # among 104 pairs inflated theta by 69% (+0.114 → +0.193). The
+        # backtest script learned to exclude these; this consumer did not,
+        # which is the third instance of that split on this feature.
+        if str(extra.get("router_escalation_kind") or "") in _NON_BELIEF_ESCALATIONS:
             return None
         for key in _COVARIATE_KEYS:
             if key in extra:
@@ -1329,6 +1448,7 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
                   alpha: float = 0.05,
                   triggered: Optional[Dict[str, Dict[str, ArmStats]]] = None,
                   coverage: Optional[Dict[str, int]] = None,
+                  population: str = SCOPE_LIVE,
                   ) -> str:
     """Human-readable report — the introspect/script surface.
 
@@ -1337,40 +1457,59 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
     it is rendered as a second block per experiment, and it is the one to
     read: the all-traffic block averages the effect over the ~92% of turns the
     trigger never touched.
+
+    ``population`` (§4BF 1c, R5 review): the bench report inherited the
+    live title and divided a bench-stamped numerator by the USER-turn
+    denominator ("128/1 recorded user turns, 12800%") — the title, the
+    coverage noun and the denominator now follow the population.
     """
+    _bench = population == SCOPE_BENCH
+    _noun = "bench solve turns" if _bench else "recorded user turns"
+    _noun_short = "bench solve turn(s)" if _bench else "user turn(s)"
+    _turns_key = "admitted_turns" if _bench else "user_turns"
     if not summary:
-        seen = int((coverage or {}).get("user_turns", 0))
+        seen = int((coverage or {}).get(_turns_key, 0))
         if seen > 0:
             # The number that separates "shipped 10 minutes ago" from "the
             # stamp has been broken for three weeks". Without it the empty
             # report reassures in both cases.
-            return (f"⚠ NO experiment-stamped trajectories, but {seen} user "
-                    "turn(s) are recorded in this corpus. Either the framework "
-                    "shipped after those turns, or the stamp has regressed — "
-                    "check that enrollment runs and that "
+            return (f"⚠ NO experiment-stamped trajectories, but {seen} "
+                    f"{_noun_short} are recorded in this corpus. Either the "
+                    "framework shipped after those turns, or the stamp has "
+                    "regressed — check that enrollment runs and that "
                     "`_record_turn_trajectory` still writes extra["
                     f"'{EXTRA_KEY}']. Internal, simulated and collector-less "
                     "turns are excluded by design.")
-        return ("No experiment-stamped trajectories yet, and no recorded user "
-                "turns to have stamped. Arms are stamped on user turns "
-                "recorded after the framework shipped; internal requests are "
-                "excluded by design.")
+        return (f"No experiment-stamped trajectories yet, and no {_noun} "
+                "to have stamped. Arms are stamped on turns recorded after "
+                "the framework shipped; internal requests are excluded by "
+                "design.")
     lines: List[str] = [
-        "EXPERIMENTS — live randomized arms",
+        ("EXPERIMENTS — BENCH-scoped arms (origin=bench; a bench win gates "
+         "a live watch-window, never an auto-apply; n counts ATTEMPTS — "
+         "≤3 per item share one arm, so n exceeds the flywheel's item "
+         "count by design)" if _bench
+         else "EXPERIMENTS — live randomized arms"),
         f"(asymptotic anytime-valid intervals, alpha={alpha:g} split "
         f"{len(_METRICS)} ways across metrics and 2 ways across arms; "
         f"no verdict below n={_MIN_VERDICT_N}/arm)",
         "",
     ]
-    if coverage and coverage.get("user_turns"):
-        _seen, _st = int(coverage["user_turns"]), int(coverage.get("stamped", 0))
+    if coverage and coverage.get(_turns_key):
+        _seen = int(coverage[_turns_key])
+        _st = int(coverage.get("stamped", 0))
         _pct = (100.0 * _st / _seen) if _seen else 0.0
-        lines.append(f"stamp coverage: {_st}/{_seen} recorded user turns "
+        lines.append(f"stamp coverage: {_st}/{_seen} {_noun} "
                      f"({_pct:.1f}%) carry an arm")
-        if _pct < 50.0:
+        if _pct < 50.0 and not _bench:
             lines.append("  ⚠ under half — expected while the corpus still "
                          "holds pre-ship turns; a sustained drop after that "
                          "means the stamp is regressing")
+        _sk = int(coverage.get("skipped_kind", 0))
+        if _sk:
+            # The read-side belt's own instrument (R5: it was JSON-only).
+            lines.append(f"  {_sk} stamped record(s) of another population "
+                         "excluded by the task_kind belt")
         lines.append("")
     for name in sorted(summary):
         arms = summary[name]
@@ -1420,7 +1559,11 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
     return "\n".join(lines)
 
 
-def summarize_streaming(trajectories: Iterable[Any]) -> Tuple[
+def summarize_streaming(trajectories: Iterable[Any], *,
+                        admit_task_kinds: Tuple[str, ...] = ("user_request",),
+                        admit_names: Optional[Iterable[str]] = None,
+                        deny_names: Optional[Iterable[str]] = None,
+                        ) -> Tuple[
         Dict[str, Dict[str, ArmStats]], Dict[str, Dict[str, ArmStats]],
         Dict[str, int]]:
     """One pass → (all_turns, triggered_only, coverage).
@@ -1431,10 +1574,38 @@ def summarize_streaming(trajectories: Iterable[Any]) -> Tuple[
     need the same walk, and without them a broken stamp is indistinguishable
     from a young experiment (this project's "built and silently never ran"
     failure mode, applied to its own instrument).
+
+    ``admit_task_kinds`` (§4BF Track 1c — the per-origin denominator): only
+    records of these kinds fold into the arm stats. The default admits real
+    user turns only, which is also the read-side belt for the enrollment
+    gate — a stamped record of any OTHER population (reflection, bench, a
+    future kind) is counted in ``coverage["skipped_kind"]`` instead of
+    silently entering a live verdict. The bench report passes ("bench",).
+    Records with no task_kind field predate the field and deserialize as
+    "user_request" (the schema default), so old corpora are unaffected.
+    ``coverage["admitted_turns"]`` counts the admitted population — the
+    denominator its OWN report must divide by (R5 review: the bench report
+    divided bench stamps by user turns → "12800%").
+
+    ``admit_names`` (R5 review): restricts the arm folding to the given
+    experiment names. ``deny_names`` (R6 review) is the form the report
+    and announce surfaces actually use: exclude the OTHER scope's
+    currently-enabled names, keeping everything else — an ALLOW-list of
+    this scope's enabled names erased a disabled spec's accumulated
+    history from its own report and replaced it with a false "the stamp
+    has regressed" alarm (reproduced), and an experiments.json listing
+    only a bench spec silenced every live announcement. Deny excludes
+    exactly the re-scoped spec's stale other-population stamps (the
+    stated intent) while retired/disabled/unknown names — whose stamps
+    were collected under THIS population — keep rendering.
     """
     all_stats: Dict[str, Dict[str, ArmStats]] = {}
     trig_stats: Dict[str, Dict[str, ArmStats]] = {}
-    coverage = {"user_turns": 0, "stamped": 0, "with_covariate": 0}
+    admit = tuple(admit_task_kinds or ("user_request",))
+    _names = set(admit_names) if admit_names is not None else None
+    _deny = set(deny_names) if deny_names is not None else None
+    coverage = {"user_turns": 0, "admitted_turns": 0, "stamped": 0,
+                "with_covariate": 0, "skipped_kind": 0}
 
     def _fold(into: Dict[str, Dict[str, ArmStats]], name: str, arm: str,
               metrics: Dict[str, float], unknown: bool,
@@ -1452,43 +1623,74 @@ def summarize_streaming(trajectories: Iterable[Any]) -> Tuple[
 
     for traj in trajectories or []:
         try:
-            if str(getattr(traj, "task_kind", "") or "") == "user_request":
+            # A record with no/blank kind predates the field — treat as a
+            # real user turn (the schema default), never as a skip.
+            kind = str(getattr(traj, "task_kind", "") or "") or "user_request"
+            if kind == "user_request":
                 coverage["user_turns"] += 1
+            if kind in admit:
+                coverage["admitted_turns"] += 1
             extra = getattr(traj, "extra", None) or {}
             stamped = extra.get(EXTRA_KEY) if isinstance(extra, dict) else None
             if not isinstance(stamped, dict) or not stamped:
                 continue
-            coverage["stamped"] += 1
+            if kind not in admit:
+                coverage["skipped_kind"] += 1
+                continue
             metrics = _metric_values(traj)
             covariate = _covariate_of(traj)
-            if covariate is not None:
-                coverage["with_covariate"] = coverage.get("with_covariate", 0) + 1
             unknown = "failure_rate" not in metrics
+            folded_any = False
             for name, arm in stamped.items():
                 if not isinstance(name, str) or not isinstance(arm, str) or not arm:
                     continue
+                if _names is not None and name not in _names:
+                    continue
+                if _deny is not None and name in _deny:
+                    continue
+                folded_any = True
                 _fold(all_stats, name, arm, metrics, unknown, covariate)
                 if trigger_fired(traj, name):
                     _fold(trig_stats, name, arm, metrics, unknown, covariate)
+            # "stamped" counts rows that FOLDED into at least one arm (R5
+            # review: a malformed {"name": null} stamp counted as covered
+            # while entering no arm — the coverage instrument overstated).
+            if folded_any:
+                coverage["stamped"] += 1
+                if covariate is not None:
+                    coverage["with_covariate"] += 1
         except Exception:  # noqa: BLE001 — one bad record must not stop the walk
             continue
     return all_stats, trig_stats, coverage
 
 
 def report_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
-                             day: Optional[str] = None) -> str:
+                             day: Optional[str] = None,
+                             admit_task_kinds: Tuple[str, ...] = ("user_request",),
+                             admit_names: Optional[Iterable[str]] = None,
+                             deny_names: Optional[Iterable[str]] = None,
+                             population: str = SCOPE_LIVE,
+                             ) -> str:
     """Load the corpus and render. Used by introspect + the CLI script.
 
     Streams: both views and the coverage counters come from ONE walk, so a
-    grown corpus is never materialised in memory.
+    grown corpus is never materialised in memory. ``admit_task_kinds``
+    scopes the population (§4BF 1c): the default reads real turns. The
+    live introspect surface passes ``deny_names`` = the registry's
+    bench-DECLARED names (R6/R7: deny the other scope, never allow-list
+    this one). The bench surfaces build their own summarize+render with
+    the bench population label rather than calling this helper.
     """
     from ..distill.collector import TrajectoryCollector
     collector = TrajectoryCollector(root=Path(str(trajectory_root)),
                                     session_id="reader")
     all_stats, trig_stats, coverage = summarize_streaming(
-        collector.iter_trajectories(day=day))
+        collector.iter_trajectories(day=day),
+        admit_task_kinds=admit_task_kinds,
+        admit_names=admit_names,
+        deny_names=deny_names)
     return render_report(all_stats, alpha=alpha, triggered=trig_stats,
-                         coverage=coverage)
+                         coverage=coverage, population=population)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1506,20 +1708,30 @@ _ANNOUNCED_FILE = "experiments_announced.json"
 _ANNOUNCED_THIS_PROCESS: Dict[str, set] = {}
 
 
-def _announce_key(experiment: str, scope: str, metric: str, verdict: str) -> str:
-    return f"{experiment}|{scope}|{metric}|{verdict}"
+def _announce_key(experiment: str, scope: str, metric: str, verdict: str,
+                  population: str = SCOPE_LIVE) -> str:
+    # Live keys keep the pre-1c shape so already-announced live verdicts
+    # never re-announce after an upgrade; bench keys carry their population.
+    if population == SCOPE_LIVE:
+        return f"{experiment}|{scope}|{metric}|{verdict}"
+    return f"{population}|{experiment}|{scope}|{metric}|{verdict}"
 
 
 def pending_announcements(all_stats: Dict[str, Dict[str, ArmStats]],
                           triggered: Dict[str, Dict[str, ArmStats]],
                           *, already: Optional[Iterable[str]] = None,
-                          alpha: float = 0.05) -> List[Tuple[str, str]]:
+                          alpha: float = 0.05,
+                          population: str = SCOPE_LIVE) -> List[Tuple[str, str]]:
     """(key, human_line) for every verdict that is NEW since ``already``.
 
     Only DECIDED verdicts announce — "no difference detected yet" and
     "insufficient data" are the normal state and must never generate noise.
     Both scopes are checked, but the TRIGGERED one is the informative
     comparison, so it is labelled as such in the line.
+
+    ``population`` labels which corpus produced the stats: a BENCH verdict
+    (§4BF 1c) is announced as a gate for a live watch-window — the operator
+    decision is explicit that it never auto-applies anything.
     """
     seen = set(already or ())
     out: List[Tuple[str, str]] = []
@@ -1537,16 +1749,25 @@ def pending_announcements(all_stats: Dict[str, Dict[str, ArmStats]],
                 # visible in the report; they just do not interrupt.
                 if cmp_.confound:
                     continue
-                key = _announce_key(name, scope, cmp_.metric, v.split(" —")[0])
+                key = _announce_key(name, scope, cmp_.metric,
+                                    v.split(" —")[0], population)
                 if key in seen:
                     continue
                 scope_txt = ("on the turns its trigger fired"
                              if scope == "triggered" else "across all enrolled turns")
-                line = (f"experiment '{name}': {v} on {cmp_.metric} {scope_txt} "
-                        f"(control={cmp_.control_mean:.3f} "
-                        f"treatment={cmp_.treatment_mean:.3f}, "
-                        f"n={cmp_.control_n}/{cmp_.treatment_n}) — "
-                        "read introspect action='experiments' before acting")
+                if population == SCOPE_BENCH:
+                    line = (f"BENCH experiment '{name}': {v} on {cmp_.metric} "
+                            f"{scope_txt} (control={cmp_.control_mean:.3f} "
+                            f"treatment={cmp_.treatment_mean:.3f}, "
+                            f"n={cmp_.control_n}/{cmp_.treatment_n}) — a bench "
+                            "win gates a LIVE watch-window, it is not an "
+                            "auto-apply; read introspect action='experiments'")
+                else:
+                    line = (f"experiment '{name}': {v} on {cmp_.metric} {scope_txt} "
+                            f"(control={cmp_.control_mean:.3f} "
+                            f"treatment={cmp_.treatment_mean:.3f}, "
+                            f"n={cmp_.control_n}/{cmp_.treatment_n}) — "
+                            "read introspect action='experiments' before acting")
                 out.append((key, line))
     return out
 
@@ -1575,12 +1796,56 @@ def announce_new_verdicts(context, *, alpha: float = 0.05) -> List[str]:
         if md is None:
             return []
         system_dir = _P(str(md)).parent
+        reg = load_registry(registry_path_for_context(context))
+        # LIVE pass — scope-filtered like the bench pass (R5 review: the
+        # live pass had NO filter, so a disabled spec, or a spec re-scoped
+        # to bench, kept announcing from its stale real-turn stamps under
+        # the pre-1c live key shape). A missing real root is no longer an
+        # early return (R5: a fresh box that idles and runs bench before
+        # its first user turn would otherwise never announce a bench
+        # verdict while introspect showed it decided).
+        all_stats: Dict[str, Dict[str, ArmStats]] = {}
+        trig_stats: Dict[str, Dict[str, ArmStats]] = {}
         root = system_dir / "trajectories"
-        if not root.exists():
-            return []
-        collector = TrajectoryCollector(root=root, session_id="reader")
-        all_stats, trig_stats, _cov = summarize_streaming(
-            collector.iter_trajectories())
+        if root.exists():
+            # DENY the other scope, never allow-list this one (R6 review:
+            # the allow-list form silenced every live verdict the moment
+            # experiments.json listed only a bench spec, and erased a
+            # disabled spec's history — deny excludes exactly the
+            # re-scoped stale stamps while retired/disabled names keep
+            # their own-population results).
+            bench_scoped = set(reg.names_in_scope(SCOPE_BENCH))
+            collector = TrajectoryCollector(root=root, session_id="reader")
+            all_stats, trig_stats, _cov = summarize_streaming(
+                collector.iter_trajectories(),
+                deny_names=bench_scoped)
+        # §4BF 1c: the BENCH population, read separately. Only names the
+        # registry currently scopes to bench are analyzed — a retired or
+        # re-scoped spec's stale bench stamps must not keep announcing.
+        # Routed through the admissibility chokepoint (R5 review: the
+        # direct collector read bypassed both the matrix row and the
+        # --no-bench consumption gate, so the full_no_bench arm still
+        # computed and announced bench verdicts).
+        bench_all: Dict[str, Dict[str, ArmStats]] = {}
+        bench_trig: Dict[str, Dict[str, ArmStats]] = {}
+        try:
+            bench_names = set(reg.names_for_scope(SCOPE_BENCH))
+            if bench_names:
+                # Same DENY form as the live pass (R6): a disabled bench
+                # spec's own bench-collected rows keep announcing while
+                # any bench program is active; only live-scoped names are
+                # excluded.
+                from .admissibility import iter_bench_trajectories
+                b_all, b_trig, _bcov = summarize_streaming(
+                    iter_bench_trajectories(
+                        "experiments_bench",
+                        getattr(context, "args", None)),
+                    admit_task_kinds=("bench",),
+                    deny_names=set(reg.names_in_scope(SCOPE_LIVE)))
+                bench_all = b_all
+                bench_trig = b_trig
+        except Exception as _be:  # noqa: BLE001 — bench pass is additive
+            logger.debug("bench verdict pass skipped: %s", _be)
         marker = system_dir / _ANNOUNCED_FILE
         try:
             _raw = json.loads(marker.read_text(encoding="utf-8"))
@@ -1601,20 +1866,26 @@ def announce_new_verdicts(context, *, alpha: float = 0.05) -> List[str]:
         already |= _proc_seen
         fresh = pending_announcements(all_stats, trig_stats, already=already,
                                       alpha=alpha)
+        if bench_all or bench_trig:
+            fresh += pending_announcements(bench_all, bench_trig,
+                                           already=already, alpha=alpha,
+                                           population=SCOPE_BENCH)
         if not fresh:
             return []
         log = get_activity_log(context)
+        if log is None:
+            # Nothing can be delivered; do not mark anything announced or
+            # the verdict is lost for good. (R6 review: the marker adds
+            # used to run BEFORE this check, permanently silencing the
+            # process-local set for verdicts that never reached the
+            # ledger — the exact contract the comment above states.)
+            return []
         lines: List[str] = []
         for key, line in fresh:
-            if log is not None:
-                log.record("experiment_verdict", line, severity=SEVERITY_NOTIFY)
+            log.record("experiment_verdict", line, severity=SEVERITY_NOTIFY)
             already.add(key)
             _proc_seen.add(key)
             lines.append(line)
-        if log is None:
-            # Nothing was actually delivered; do not mark it announced or the
-            # verdict is lost for good.
-            return []
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text(json.dumps(sorted(already), indent=2),
@@ -1633,6 +1904,7 @@ def announce_new_verdicts(context, *, alpha: float = 0.05) -> List[str]:
 
 __all__ = [
     "CONTROL", "TREATMENT", "EXTRA_KEY", "ENV_KILL",
+    "SCOPE_LIVE", "SCOPE_BENCH",
     "ExperimentSpec", "ExperimentRegistry", "DEFAULT_SPECS",
     "load_registry", "registry_path", "registry_path_for_context",
     "reset_registry_cache",

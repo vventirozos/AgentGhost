@@ -1850,14 +1850,19 @@ def _maybe_retrain_prm(context) -> None:
     for work that changes nothing — exactly what the 2026-07-27 fix removed
     from the other path.
     """
-    from ..core.agent import _MCTS_TURNSTART_ENABLED
-    _consumer_live = bool(
-        _MCTS_TURNSTART_ENABLED
-        or getattr(getattr(context, "args", None), "frontier_selfplay", False) is True
-    )
+    # R3 MAJOR-1: this predicate was duplicated here and in core/agent.py
+    # phase 2.7, and BOTH read only `_MCTS_TURNSTART_ENABLED` — one
+    # conjunct of a two-conjunct gate. Now one shared function, so the
+    # twin cannot drift again.
+    from ..core.agent import prm_consumer_is_live
+    _consumer_live = prm_consumer_is_live(context)
     if not _consumer_live:
-        logger.debug("PRM retrain skipped — no live consumer reads PRM scores "
-                     "(MCTS turn-start off, --frontier-selfplay off)")
+        from ..core.agent import prm_consumer_why_no_reader
+        logger.debug("PRM retrain skipped — both value-reading consumers are off ("
+                     + prm_consumer_why_no_reader(context) + "). --prm-online-update is "
+                     "deliberately NOT read here: it is a PRODUCER that refines an "
+                     "existing model and refuses to bootstrap one, so counting it "
+                     "would train a model nothing reads (§4BN corrected §4BM)")
         return
     from ..distill.collector import TrajectoryCollector
     from ..prm.scorer import PRMScorer
@@ -1878,12 +1883,25 @@ def _maybe_retrain_prm(context) -> None:
             save_path = Path(mem_dir).parent / "prm" / "checkpoint.json"
 
     trainer = PRMTrainer()
+    from ..core.admissibility import iter_bench_trajectories
     report = trainer.run(
         trajectories=traj_collector.iter_trajectories(),
         save_path=save_path,
+        bench_trajectories=iter_bench_trajectories(
+            "prm", getattr(context, "args", None)),
     )
     if report.fit_succeeded and trainer.model is not None:
         prm_scorer.set_model(trainer.model)
+        # R7 MIN-6 (twin divergence): phase 2.7 bridges a freshly-fitted
+        # model into `mcts.prm_scorer` on the first-ever fit; this twin
+        # did not. On a `.score()`-live box that boots without a
+        # checkpoint, `mcts.prm_scorer` stays None and MCTS keeps failing
+        # its own `prm_scorer is not None and .has_model` guard after an
+        # in-loop refit — i.e. this path trained a model nothing reads,
+        # which is the §4BN class on the twin.
+        _mcts = getattr(context, "mcts_reasoner", None)
+        if _mcts is not None and getattr(_mcts, "prm_scorer", None) is None:
+            _mcts.prm_scorer = prm_scorer
         pretty_log(
             "Self-Play PRM Retrain",
             f"In-loop value-model refit: {report.summary()}",
@@ -1922,10 +1940,17 @@ def _maybe_retrain_router(context) -> None:
         if mem_dir is not None:
             save_path = Path(mem_dir).parent / "router" / "checkpoint.json"
 
-    trainer = RouterTrainer()
+    # §4AA: score the gate at the LIVE dispatcher threshold (R1 review —
+    # this path scored the probe default while the idle/boot paths scored
+    # the shipping operating point).
+    trainer = RouterTrainer(
+        confidence_threshold=getattr(dispatcher, "confidence_threshold", None))
+    from ..core.admissibility import iter_bench_trajectories
     report = trainer.run(
         trajectories=traj_collector.iter_trajectories(),
         save_path=save_path,
+        bench_trajectories=iter_bench_trajectories(
+            "router", getattr(context, "args", None)),
     )
     if report.fit_succeeded and trainer.classifier is not None:
         dispatcher.classifier = trainer.classifier

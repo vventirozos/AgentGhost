@@ -190,7 +190,10 @@ def test_late_confirmed_backfills_passed_outcome(agent, monkeypatch):
     collector = _wire_corpus(agent, traj)
     _run_sync(agent, _verdict(VerifyVerdict.CONFIRMED, conf=0.95))
     collector.update_outcome.assert_called_once_with(
-        "t1", "passed", reason="", source="verifier_late")
+        "t1", "passed", reason="", source="verifier_late",
+        # 2026-08-13 (§4BF R1): machine verdicts yield to a standing
+        # human_feedback record at the writer.
+        yield_to_human=True)
     assert traj.outcome == "passed"   # in-process cache updated too
 
 

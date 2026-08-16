@@ -56,6 +56,99 @@
   <p><strong>Discipline nearly cost the catch rate — caught and fixed by the bench (2026-07-18).</strong> The first disciplined version (terse 1–3 suspects, 63-token adjudication) measured TPR 0.42 vs classic's 0.75 on the live A/B: the terse stage&nbsp;1 named one trivial suspect and missed the injected fabrication entirely, and stage&nbsp;2 only adjudicated named suspects. Three fixes recovered it: stage&nbsp;1 must name EXACTLY 3 suspects with at least one word-by-word-checked specific fact; stage&nbsp;2 fills a per-suspect <code>"checks"</code> array BEFORE the verdict fields (structured deliberation inside the JSON, replacing the free-form thinking the no-think switch removed); and stage&nbsp;2 may flag real problems beyond the suspects list. Re-measured: <strong>TPR 0.75 / FPR 0.0 at ~16&nbsp;s per verdict — classic's catch rate at ~2.5× its speed</strong> (classic: 0.6–0.75 at ~40&nbsp;s). Remaining blind spots are judge-level (Gemma&nbsp;4 E4B), shared by every arm: injected diff-markers never caught (0/6 across all configs), single-digit number swaps (34→35&nbsp;°C) usually missed, and truncated evidence still draws spurious REFUTEs (the packer shape — rubric wording alone does not fix it). Small-n caveat: 2 seed cases; the full 12-case A/B (~90&nbsp;min on nova) is the calibration baseline to run before/after any judge-model change.</p>
   <p><strong>Cost:</strong> one extra VERIFY-route call per claim-shaped verdict (the code and visual paths are unchanged) — and with the stage discipline the two-stage pipeline measured <em>faster</em> end-to-end than one classic verdict, because the classic prompt puts no ceiling on judge verbosity. Each call keeps its own bounded timeout (<code>GHOST_VERIFY_WORKER_TIMEOUT</code>, 45&nbsp;s); with critic/async mode the calls are invisible to the user. Covered by <code>tests/test_verifier_two_stage.py</code>.</p>
 
+  <h2>Score-token probe — confidence sharpening (§4F Phase 3a, §4BF Track 2 flip i)</h2>
+  <p>The two-stage judge's confidence SATURATES (mean 0.92–0.99 on the
+  standing bench), so the ≥0.7 actionable gate barely discriminates.
+  <code>GHOST_VERIFY_LOGIT_EXPECT</code> (default OFF, read per call) adds
+  one bounded probe after adjudication on CONFIRMED/REFUTED verdicts only
+  (UNCERTAIN is excluded — the acceptability scale doesn't map onto
+  "cannot judge"): a 0–9 rating prompt on the cheap pool
+  (<code>max_tokens=4</code>, top-10 logprobs via
+  <code>entropy.request_logprobs</code>), whose digit-mass expectation
+  (<code>_digit_expectation</code>) becomes <code>p(acceptable) ∈ [0,1]</code>.
+  The probe <strong>never changes the verdict</strong>. Its consumer is the
+  §4BL <strong>verdict-gated CONFIRM cap</strong> (cheap pass only — MAIN
+  two-stage results under the §4BK kill switch are never capped): a
+  CONFIRMED result whose
+  reading falls below <code>GHOST_VERIFY_PROBE_CAP_T</code> (default 0.966,
+  frozen on the corrected pass-through, leakage-excluded design half of
+  the flip-i data — the §4BL R1 review caught the first freeze optimizing
+  on overturn-carried phantom readings) has its confidence capped
+  at <code>GHOST_VERIFY_PROBE_CONF_CAP</code> (default 0.6 — below every
+  ≥0.7 consumption gate); REFUTED gets its reading recorded and nothing
+  else (§4BJ measured the probe erring toward "acceptable" on
+  genuinely-faulty claims). This REPLACED the original w-blend
+  (<code>GHOST_VERIFY_LOGIT_EXPECT_WEIGHT</code>, now vestigial): the §4BI
+  foreclosure proved no light symmetric blend can move the judge's
+  quantized {0.9, 0.95, 1.0} confidences across the 0.7 gate (and the
+  2026-07-30 w=0.5 A/B had already collapsed actionable TPR to 0.347).
+  Rule: <code>system/eval/probe_redesign/DECISION_RULE.md</code>.
+  <strong>⛔ OUTCOME (2026-08-14): NULLed by the held-out validation half and
+  RETIRED.</strong> V capped 47% of false-CONFIRMs (real signal) but at 36%
+  collateral and 0.471 precision — the closeout review's variance decomposition
+  showed the fault signal lives WITHIN cases (AUC 0.895) while case identity sets
+  the score's location (62% of variance), so any global threshold caps hard-styled
+  cases wholesale; harvesting the within-case signal needs a clean twin that
+  doesn't exist at inference time. <code>GHOST_VERIFY_LOGIT_EXPECT</code> never
+  shipped and stays out of the launcher; the cap code is in-tree, inert, and
+  pinned. The raw reading rides
+  <code>VerifyResult.probe_score</code> — and is CARRIED (reporting-only,
+  with <code>suspects</code>) through every escalation-path result
+  reconstruction (tier-route downgrade, rebuttal-contract upheld/overturn;
+  the default upheld path returns the strong re-verify's own result, whose
+  own reading is the honest attribution). The flip-i A/B's first run
+  BLAMED these constructions for its 48% null rate; the carry-fixed re-run
+  DISPROVED that — the nulls were classic-fallback trials the probe never
+  fired on, and the constructions had dropped only the ~3 truncation-guarded
+  readings. Never raises; any failure means no blend. Tests:
+  <code>tests/test_verifier_score_probe.py</code>,
+  <code>tests/test_track2_flip_i.py</code> (R4 section). The flip-i run
+  also measured the two-stage pipeline FALLING BACK to the classic prompt
+  on 48% of the standing pool against today's judge (0/203 fallback trials
+  carry suspects) — the §4T numbers blend two pipelines; follow-up owed.</p>
+  <p><strong>Bench instrumentation for the flip decision
+  (<code>tests/test_track2_flip_i.py</code>):</strong> the probe flags ride
+  <code>bench_provenance.verify_flags</code> (previously a probe-on vs
+  probe-off pair produced byte-identical provenance), trial records carry
+  <code>probe_score</code> (distinguishing "probe uninformative" from
+  "informative but washed out by the blend"), and
+  <code>run_bench(logit_expect="on"|"off")</code> /
+  <code>scripts/verify_bench.py --logit-expect</code> pin the flag for a
+  whole run with the same save/set/restore discipline as
+  <code>GHOST_VERIFY_TWO_STAGE</code>, re-stamping provenance with the
+  pinned value. Probe payloads always miss the replay cache (new payload
+  shape), so a Tier-1 replay with the probe on replays judge/main calls and
+  runs probe calls live. Decision rule pre-registered at
+  <code>system/eval/flip_i_logit_probe/DECISION_RULE.md</code>; the flag
+  never shipped — the §4BL cap was NULLed by held-out validation and the probe
+  mechanism retired (see above).</p>
+
+  <h2>Classic-on-MAIN is the designed escalation adjudicator (§4BK, 2026-08-14)</h2>
+  <p>The escalated re-verify (refute-escalation re-adjudication and the
+  confirm-escalation retry) sends the CLASSIC prompt to the main model —
+  the two-stage attempt there is opt-in via
+  <code>GHOST_VERIFY_MAIN_TWO_STAGE</code> (default OFF). History: §4BJ
+  discovered the <code>stop:["\n"]</code> stage discipline (calibrated on
+  the cheap judge) truncated the 35B's pretty-printed stage JSON on 74% of
+  MAIN adjudications — and the pre-registered bench of the "fix" NULLed it:
+  with parsing repaired, two-stage-on-MAIN LOSES the escalation's rescue
+  function (clean FPR 0.069→0.190; all 13 gained FPs were cheap-judge
+  false refutes that classic overturned — forced-suspects anchoring).
+  §4BK then made classic the deliberate adjudicator and benched it: TPR
+  <em>improved</em> +0.024 (9-vs-1 paired, p=0.02 — the mix share had been
+  overturning true refutes too), FPR unchanged with zero flips,
+  false-CONFIRM −0.024. ⚠ <strong>The revert coupling:</strong>
+  <code>GHOST_VERIFY_MAIN_TWO_STAGE=1</code> restores the legacy
+  attempt-then-fallback mix ONLY while the permanent
+  <code>GHOST_VERIFY_MAIN_STAGE_STOP=1</code> launcher export stands — the
+  switch without the stop resurrects §4BJ's NULLed no-stop arm, the worst
+  measured configuration. Cheap-leg two-stage is untouched (99.5% parse;
+  FPR control and the probe live there). Rules:
+  <code>system/eval/fallback_fix/</code> and
+  <code>classic_main_adjudicator/DECISION_RULE.md</code>; tests:
+  <code>tests/test_main_stage_stop_fix.py</code>,
+  <code>tests/test_classic_main_adjudicator.py</code>.</p>
+
   <h2>Judge-model selection — the 45-second envelope (2026-08-05)</h2>
   <p>The cheap judge's false-refute churn (FPR 0.31–0.385 on the bench; ~84% of live refutes overturned on escalation at ~8–18 main-slot calls/day) motivated a judge-model search. Two hard requirements fell out, and they pull against each other:</p>
   <ul>

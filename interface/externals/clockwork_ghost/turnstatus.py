@@ -69,6 +69,8 @@ ICON_CLASS = {
     "📣": "accent",
     "🪞": "accent",
     "🎓": "accent",
+    "👍": "accent",   # FEEDBACK_POS — human outcome label (/api/feedback)
+    "👎": "accent",   # FEEDBACK_NEG
 
     # --- tools (external action) ---
     "🌐": "tool",
@@ -140,6 +142,11 @@ ICON_CLASS = {
     "🫥": "accent",
     "🔥": "accent",
 }
+
+# Terminal-bookkeeping glyphs (human feedback receipts) that must never
+# read as turn activity. Mirrors app.js _NON_WORKING_ICONS — drift-pinned
+# by tests/test_clockwork_turnstatus.py.
+NON_WORKING_ICONS = {"👍", "👎"}
 
 # Titles that narrate plumbing, not progress — never shown.
 TICKER_NOISE = {
@@ -298,6 +305,11 @@ class TurnTicker:
             # the last tool's caption to go stale.
             return self._set(ICON_THINKING, "thinking…")
         if cls not in ("tool", "memory", "plan", "accent"):
+            return False
+        # Feedback receipts (👍/👎) are terminal bookkeeping, not turn
+        # activity — mirrors the web client's exclusion so the uConsole
+        # ticker doesn't read out a label left on an old reply.
+        if icon in NON_WORKING_ICONS:
             return False
 
         icon_idx = next((i for i, p in enumerate(parts) if icon in p), -1)

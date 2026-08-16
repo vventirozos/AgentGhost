@@ -342,7 +342,12 @@ async def tool_introspect(
             # walk (the experiment stamp-coverage block), exactly like the
             # sibling 'experiments' action below.
             import asyncio as _asyncio
-            return await _asyncio.to_thread(render_learning_health, _md)
+            # Pass args so flag-gated consumer rows report their REAL
+            # state (§4BM R1 MIN-2 — the PRM's .uncertainty() row used to
+            # print a hardcoded string that read as a live wiring claim).
+            return await _asyncio.to_thread(
+                render_learning_health, _md,
+                getattr(context, "args", None))
         except Exception as e:
             return f"Learning health unavailable: {type(e).__name__}: {e}"
 
@@ -360,9 +365,59 @@ async def tool_introspect(
             # Off the event loop: the walk touches every day partition, and
             # this tool is called from an async handler that also serves SSE.
             import asyncio as _asyncio
-            return await _asyncio.to_thread(
-                report_from_trajectories,
-                _Path(str(_md)).parent / "trajectories")
+            # DENY the other scope's names (R6 — consistent across all
+            # four live-view surfaces): a spec re-scoped to bench must
+            # not render its stale live stamps here, while disabled or
+            # retired specs keep their own-population history.
+            try:
+                from ..core.experiments import (
+                    SCOPE_BENCH as _SB, load_registry as _lr,
+                    registry_path_for_context as _rpfc)
+                _deny_live = set(_lr(_rpfc(context)).names_in_scope(_SB))
+            except Exception:  # noqa: BLE001
+                _deny_live = None
+            _live = await _asyncio.to_thread(
+                lambda: report_from_trajectories(
+                    _Path(str(_md)).parent / "trajectories",
+                    deny_names=_deny_live))
+            # §4BF 1c: the BENCH population, rendered as its own clearly
+            # labeled section — never folded into the live numbers. Only
+            # when bench-scoped specs exist AND the bench corpus does.
+            # Routed through the admissibility chokepoint with the
+            # registry's bench names + the bench population label (R5
+            # review: the direct-root read bypassed --no-bench, rendered
+            # live-scoped names under the bench banner, and titled itself
+            # "live randomized arms" with a user-turn denominator).
+            try:
+                from ..core.experiments import (
+                    SCOPE_BENCH, load_registry, registry_path_for_context,
+                    render_report, summarize_streaming)
+                from ..core.admissibility import iter_bench_trajectories
+                _reg = load_registry(registry_path_for_context(context))
+                _bnames = set(_reg.names_for_scope(SCOPE_BENCH))
+                if _bnames:
+                    from ..core.experiments import SCOPE_LIVE as _SL
+                    _deny_bench = set(_reg.names_in_scope(_SL))
+
+                    def _bench_report():
+                        b_all, b_trig, b_cov = summarize_streaming(
+                            iter_bench_trajectories(
+                                "experiments_bench",
+                                getattr(context, "args", None)),
+                            admit_task_kinds=("bench",),
+                            deny_names=_deny_bench)
+                        if not b_all and not b_cov.get("admitted_turns"):
+                            return ""
+                        return render_report(
+                            b_all, triggered=b_trig, coverage=b_cov,
+                            population=SCOPE_BENCH)
+                    _bench = await _asyncio.to_thread(_bench_report)
+                    if _bench:
+                        _live += ("\n\n══ BENCH-SCOPED EXPERIMENTS ══\n"
+                                  + _bench)
+            except Exception:  # noqa: BLE001 — bench section is additive
+                pass
+            return _live
         except Exception as e:
             return f"Experiment report unavailable: {type(e).__name__}: {e}"
 

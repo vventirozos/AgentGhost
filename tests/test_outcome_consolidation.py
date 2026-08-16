@@ -80,9 +80,16 @@ class TestResolveTurnOutcome:
 class _FakeCollector:
     def __init__(self):
         self.appended = []
+        self.updates = []
 
     def append(self, traj):
         self.appended.append(traj)
+
+    def update_outcome(self, tid, outcome, reason="", source="", **kw):
+        # Truthy result required since §4BF R2: the cache mutation rides
+        # the deferred write's result.
+        self.updates.append((tid, outcome, reason, source))
+        return True
 
 
 def _agent_with_collector():
@@ -176,15 +183,34 @@ class TestHonestFailureRecording:
         # cause-qualified since 2026-08-10 — assert the contract
         assert is_structural_reason(col.appended[0].failure_reason)
 
+    @staticmethod
+    def _backfill_drained(agent, tid, outcome):
+        # Since §4BF R2 the cache mutation rides the DEFERRED write's
+        # result on a worker thread — drive inside a loop and drain the
+        # spawn_bg tasks before asserting.
+        import asyncio
+        from ghost_agent.utils import logging as _glog
+
+        async def _go():
+            agent._backfill_trajectory_outcome(tid, outcome)
+            for _ in range(3):
+                pending = [t for t in getattr(_glog, "_BG_TASKS", set())
+                           if not t.done()]
+                if not pending:
+                    break
+                await asyncio.gather(*pending, return_exceptions=True)
+        asyncio.run(_go())
+
     def test_late_pass_upgrades_structural_failed(self):
         from ghost_agent.distill.outcome_heuristics import (
             STRUCTURAL_FAILURE_REASON,
         )
         agent, _col = _agent_with_collector()
         traj = types.SimpleNamespace(
-            id="th3", outcome=F, failure_reason=STRUCTURAL_FAILURE_REASON)
+            id="th3", outcome=F, failure_reason=STRUCTURAL_FAILURE_REASON,
+            extra={})
         agent.context._recent_trajectories_for_correction = {"k": traj}
-        agent._backfill_trajectory_outcome("th3", P)
+        self._backfill_drained(agent, "th3", P)
         assert traj.outcome == P
         assert traj.failure_reason == ""  # stale reason cleared
 

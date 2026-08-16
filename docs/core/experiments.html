@@ -74,13 +74,101 @@ $GHOST_HOME/system/experiments.json
     assignment sits on the request hot path and may never raise. Kill everything with
     <code>GHOST_EXPERIMENTS=0</code>; consumers then see <code>""</code> and take the control
     path, which is the same code path as a genuine control assignment (one branch to reason
-    about, by design).
+    about, by design). ⚠ The file replaces <code>DEFAULT_SPECS</code> <em>wholesale</em> —
+    when adding a spec (e.g. the first bench-scoped one), re-list every live default you
+    want to keep enrolling. <code>enabled: false</code> stops NEW enrollment only: the
+    spec's accumulated results keep rendering and announcing (R6 — the report/announce
+    filters are a DENY-list of the <em>other</em> scope's names via
+    <code>deny_names</code>, so retiring or disabling a spec never erases its history;
+    only a spec re-scoped live↔bench has its stale other-population stamps excluded).
   </p>
   <p>
     An experiment name that collides with the trajectory redactor's sensitive-key list
     (<code>auth_token</code>, <code>…_key</code>, …) is <strong>rejected at load</strong>: its arm
     would be stored as <code>&lt;REDACTED&gt;</code> in every trajectory and the whole run would
     be unanalysable after the fact.
+  </p>
+
+  <h2>Populations: scope="live" | "bench" (§4BF Track 1c)</h2>
+  <p>
+    A spec may declare <code>"scope": "bench"</code> to run on the idle
+    <a href="../eval/banks.html">bench-bank</a> population instead of real turns
+    (default <code>"live"</code>; an unknown scope SKIPS the spec — a typo must
+    never run a bench-intended experiment on live traffic). The populations split
+    at BOTH ends: <code>enroll_request(origin=…)</code> assigns only
+    scope-matching specs (bench solves cannot reach live toggles, real turns
+    cannot reach bench ones, plain self-play reaches neither), and
+    <code>summarize_streaming(admit_task_kinds=…)</code> folds only the matching
+    <code>task_kind</code> into arm stats — a stamped record of any other
+    population lands in <code>coverage["skipped_kind"]</code>, never in a
+    verdict. The bench randomization UNIT is the bench item
+    (<code>bench|&lt;bank&gt;|&lt;item&gt;</code>), not the per-attempt req_id —
+    all attempts of one item share an arm, so the retry prompt (a function
+    of the previous attempt's output) can never cross arms; the ≤3
+    same-arm rows per item are dependent and the CS reads them as extra n
+    (documented, accepted). Bench verdicts announce with an explicit caveat:
+    <em>a bench win gates a live watch-window, it is not an auto-apply</em>
+    (operator decision, 2026-08-13 — see
+    <a href="admissibility.html">core/admissibility</a>).
+    <code>introspect action='experiments'</code> renders the bench population as
+    its own labeled section; the CLI equivalent is
+    <code>scripts/experiment_report.py --bench</code>. All four live-view
+    surfaces and both announce passes DENY the names DECLARED in the other
+    scope (<code>names_in_scope</code>, enabled or not — R6/R7: an allow-list
+    of this scope's enabled names erased a disabled spec's history, and an
+    enabled-only deny let re-scope-then-disable resurrect stale stamps; a
+    disabled spec always keeps its own-population history), the bench report
+    divides by its OWN population
+    (<code>coverage["admitted_turns"]</code>) under a bench-labeled title with
+    an items-vs-attempts caveat (all attempts of one item share an arm, so
+    experiment n exceeds the flywheel's item count by design), and bench
+    verdict computation honors <code>--no-bench</code> through the
+    admissibility chokepoint. This is what unblocks the Track-2 flip queue at
+    bench speed (~6-11 graded solves/night vs ~3.5 real turns/day).
+  </p>
+
+  <h2>tts_bon — the first bench-scoped arm (§4BF Track 2 flip ii)</h2>
+  <p>
+    Registered in <code>$GHOST_HOME/system/experiments.json</code> (which
+    replaces <code>DEFAULT_SPECS</code> wholesale — the four live defaults are
+    re-listed there, and the file deliberately carries no <code>salt</code> so
+    live assignments are unchanged). The arm measures <strong>adaptive
+    best-of-N on the verifier's wobble band</strong>
+    (<code>core/tts.py</code>) on text-graded bench attempts
+    (<a href="../eval/banks.html">gsm8k_text</a>): trigger = the in-loop
+    verifier verdict lands UNCERTAIN, or REFUTED below the 0.7 action
+    threshold, on a non-repairing final. The trigger is stamped on BOTH arms
+    as <code>tts_bon_fired</code> (presence = the wobble condition; value =
+    treatment ran); treatment substitutes the BoN winner as the final,
+    control withholds. The consumer sits at the single BoN call site in
+    <code>handle_chat</code>: an <em>enrolled</em> turn's arm decides
+    (env ignored — control with <code>GHOST_TTS_ADAPTIVE_BON=1</code> still
+    withholds), an unenrolled turn falls back to the env default (OFF), so
+    live behavior is untouched. <code>tts_bon_fired</code> is also in
+    <code>CONTEXT_MUTATING_KEYS</code>: BoN never mutates what the model saw
+    generating the turn, but the substituted final enters the conversation
+    history and the recorded trajectory, so replay consumers must be able to
+    exclude treatment turns. Outcomes come from the bank oracle via the 1c
+    write-back; decision rule pre-registered at
+    <code>system/eval/flip_ii_tts_bon/DECISION_RULE.md</code> (ship = open a
+    live watch-window discussion; abort on trigger starvation &lt;5%,
+    TREATMENT WORSE, or &gt;2× wall-clock). R1 amendments to the rule: the
+    starvation share is computed over gsm8k_text attempts only (every bench
+    attempt of every bank enrolls, so the report's all-enrolled trigger
+    line is diluted by construction); starvation must be TRIAGED (no
+    verdict at all / verdict missed the await window / genuinely no wobble)
+    before concluding on the population; and a live watch-window must be a
+    LIVE-scoped spec, never the bare env — the env path stamps no
+    compliance key, so substituted finals would enter the corpus unmarked.
+    Starvation-triage observables (R2/R3): enrolled finals that reach the BoN
+    decision point stamp <code>verify_in_window</code> (was a verdict in the
+    in-loop cache — either arm, wobble or not), and an async await-window miss
+    stamps <code>verify_late_pending</code> — the two keys that make the abort
+    rule's triage falsifiable (neither is a TRIGGER_KEYS or
+    CONTEXT_MUTATING_KEYS member; finals that never reach the gate —
+    repair-exhaustion, force-stop, execution failures — carry no
+    <code>verify_in_window</code> stamp and form the trigger-ineligible
+    bucket). Tests: <code>tests/test_track2_flip_ii.py</code>.
   </p>
 
   <h2>Recording</h2>

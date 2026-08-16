@@ -143,8 +143,12 @@ class TestRunnerAppliesBypass:
 
 
 class TestSourceIntent:
+    # The runner moved out of browser.py into its own module (2026-08-15):
+    # it was 1,205 lines of Python held as a STRING, which made a syntax
+    # error in it undetectable by py_compile, import, or the test suite.
+    # These assertions are about the RUNNER's source, so read the runner.
     SRC = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
-           / "tools" / "browser.py").read_text()
+           / "tools" / "browser_runner.py").read_text()
 
     def test_bypass_wired_at_launch(self):
         assert '_proxy_bypass_for_ports(ALLOWED_LOCAL_PORTS)' in self.SRC

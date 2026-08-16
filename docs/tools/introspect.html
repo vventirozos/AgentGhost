@@ -180,15 +180,27 @@
     distinguish a stuck pipeline from a playbook with nothing tool-shaped in it. The report now
     shows <em>eligible (reusable ∩ mechanizable)</em>, so the operator can see which gate is
     binding. See <a href="../core/dream.html">dream</a>.</li>
-    <li><strong>PRM wiring is reported in full.</strong> The line named only
-    <code>.score()</code> (MCTS turn-start, module-gated off) and omitted
+    <li><strong>PRM wiring: two consumers and one producer named, and since §4BM reported
+    HONESTLY.</strong>
+    The line named only <code>.score()</code> (MCTS turn-start, module-gated off) and omitted
     <code>.uncertainty()</code> → frontier self-play seed selection
-    (<code>--frontier-selfplay</code>, default off and absent from the live launcher). With BOTH
+    (<code>--frontier-selfplay</code>, default off and absent from the live launcher).
+    ⚠ The first repair only added the <em>name</em>: the row printed a hardcoded
+    "frontier self-play (--frontier-selfplay)" string and never read the flag, so an
+    operator checking the wire-or-retire question got a claim the instrument had not
+    verified — found in 2026-08-14 while §4BM was measuring exactly that question about
+    the PRM. All FIVE wiring rows now render a TRI-STATE (the metacog-arbiter row was collected but rendered nowhere until §4BM R5) (ON / OFF / unknown) and
+    report <em>unknown</em> whenever the flag or <code>core.agent</code> was not
+    actually consulted, rather than defaulting to OFF. The row also names <code>--prm-online-update</code> — but on the PRODUCER side: §4BN corrected an earlier framing of it as a "third consumer". It <em>refines</em> the batch model and explicitly refuses to bootstrap one, so it cannot answer "does anything READ the model?" and the retrain-skip predicate correctly ignores it. (Widening that gate was registered as a follow-up and then RETRACTED before implementation: it would have trained a model nothing reads.) When the flag is set but inert — no model, no reader, or trajectory logging off (which stops the update from ever being attempted) &mdash; the agent now SAYS so at boot instead of no-opping silently. With BOTH
     off the idle retrain wrote a checkpoint nothing read — 41 such retrains in one recent ledger
     window — while logging "value model refit", which reads like learning progress. The idle phase
     now SKIPS with an explicit reason when no consumer is live. This is a runtime check, not a
-    deletion: enabling either consumer resumes training on the next idle pass with no code
-    change.</li>
+    deletion: setting <code>--frontier-selfplay</code> (with trajectory logging on) resumes training on the next idle pass with no code
+    change. (<code>_MCTS_TURNSTART_ENABLED</code> re-arms it only together with <code>--deep-reason</code>
+    &mdash; the constant alone leaves no MCTS reasoner to call <code>.score()</code>, &sect;4BN R3.) The other consumer, <code>_MCTS_TURNSTART_ENABLED</code>, is a module constant &mdash; re-arming
+    <em>it</em> is a source edit (and one that also has to update
+    <code>tests/test_cognitive_redesign_doc.py</code>), so "either &hellip; with no code change" was
+    half false and is corrected here. A FOURTH limitation is architectural, so boot cannot detect it: the online step is dispatched only from an inline user correction, never from an <code>/api/feedback</code> label &mdash; the feedback path itself warns (&sect;4BN R25/R26).</li>
     <li><strong>Background-activity counts carry a comparability warning.</strong> Reflection
     appeared to run ~10x less than dream, which looks like a starved loop but is a recording
     artifact — reflection logs only outcome-producing runs and deliberately skips ticks whose

@@ -222,6 +222,10 @@ def _build_state_for_step(
         plan_depth=1,
         tools_used_this_turn=(),
         tools_failed_this_turn=(),
+        # §4BF 1c population indicator — NOT serve-inert: bench solves
+        # score with origin_bench=True at the turn-start site, so train
+        # and serve move together (unlike the pinned block above).
+        origin_bench=(str(getattr(traj, "task_kind", "") or "") == "bench"),
     )
 
 

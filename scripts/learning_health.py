@@ -41,6 +41,10 @@ def main() -> int:
         return 2
 
     if args.json:
+        # NOTE: this script's `args` is its OWN argparse namespace and knows
+        # nothing about the live agent's flags — passing it would report
+        # OFF for a state it never checked (the §4BM R1 MIN-2 defect
+        # itself). None ⇒ the flag-gated rows honestly say 'unknown'.
         print(json.dumps(collect_learning_health(md), indent=2, default=str))
     else:
         print(render_learning_health(md))

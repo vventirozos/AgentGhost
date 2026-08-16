@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.feedback — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Related</h3>
+    <a href="../api/routes.html">api.routes</a>
+    <a href="experiments.html">experiments</a>
+    <a href="calibration.html">calibration</a>
+    <a href="../interfaces/slack_bot.html">Slack bot</a>
+    <a href="../interfaces/web_server.html">Web server</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / feedback.py</h1>
+  <p class="subtitle">Human outcome labels (2026-08-13, Track&nbsp;1a of the
+  outcome-supply plan): a 👍/👎 from the human who read the reply becomes a
+  corrections-sidecar record, resolving a turn's <code>outcome=unknown</code>.
+  Tests: <code>tests/test_human_feedback.py</code>.</p>
+
+  <h2>Why</h2>
+  <p>~57% of real turns end <code>outcome=unknown</code> (§4BC) and every
+  measurement clock in the learning stack — experiment arms, lesson utility,
+  the resolved-rate — is gated on RESOLVED outcomes. The cheapest resolver is
+  the human who just read the reply. This module is the one chokepoint that
+  turns "request_id + thumb" into the same overlay record the
+  user-correction promoter and the late verifier verdict already write, so
+  every corpus reader (<code>iter_trajectories</code>,
+  <code>report_from_trajectories</code>, reflection, PRM/router trainsets)
+  picks the label up with zero new plumbing.</p>
+
+  <h2>Functions</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>normalize_request_id(raw) → str</code></td><td>Wire form <code>chatcmpl-&lt;id&gt;</code> or bare id → bare req_id.</td></tr>
+      <tr><td><code>find_trajectory_for_request(collector, request_id, max_days=8) → Trajectory|None</code></td><td>Day-partition scan, newest day first (restart-proof by construction — no in-memory ring to miss). Matches <code>extra.req_id</code>, with <code>session_id</code> as the legacy fallback; last match of the newest matching day wins.</td></tr>
+      <tr><td><code>apply_human_label(agent, request_id, signal, note="", source="") → dict</code></td><td>The label chokepoint — see the ordered side effects below. Never raises.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Side effects, in order</h2>
+  <ol>
+    <li><strong>Corrections sidecar</strong> via
+    <code>collector.update_outcome</code> (source
+    <code>human_feedback:&lt;source&gt;</code>): positive → <code>passed</code>
+    (never carries a reason — writer and overlay both enforce it), negative →
+    <code>failed</code> with the note (redacted, truncated) as reason, or the
+    self-describing default <code>"human negative feedback"</code>.</li>
+    <li><strong>In-process cache</strong>
+    (<code>_recent_trajectories_for_correction</code>): the cached trajectory
+    is mutated and stamped <code>human_labeled</code> (snapshot walk — the
+    cache is loop-owned; re-stamped even on idempotent repeats so a failed
+    first stamp is repaired by the next click).</li>
+    <li>One <code>pretty_log</code> line (👍/👎 icons) — the operator watches
+    the stream.</li>
+  </ol>
+  <p><strong>Lesson credit happens at the ROUTE, not here</strong> (R1
+  review): <code>_flush_stashed_lesson_outcome</code> spawns loop-bound
+  background work, and this function runs on a <code>to_thread</code> worker
+  — calling it here popped the stash and then lost the write. The
+  /api/feedback route flushes on the event loop after a successful
+  non-repeat label.</p>
+  <p><strong>Idempotent repeats (2026-08-13, from the first live test —
+  three 👍 in 2s appended three rows):</strong> a repeat of the CURRENT
+  label (same outcome, source, and redacted reason) is acknowledged with
+  <code>{"ok": true, "unchanged": true}</code> and writes nothing (debug
+  log only). The dedupe lives INSIDE <code>update_outcome</code>'s lock
+  (<code>skip_identical=True</code> → returns the truthy string
+  <code>"unchanged"</code>) — R2 review: a caller-side compare-then-write
+  was a check-then-act race across concurrent executor threads. Switching
+  signals — or a negative with a different note — still writes;
+  last-write-wins stays the semantics.</p>
+  <p><strong>Verdict-then-label ordering (R2):</strong> when the machine
+  verdict landed FIRST, a human label also (a) re-books the lesson-outcome
+  set with the human sign — <code>_flush_stashed_lesson_outcome</code>
+  retains flushed trigger sets in a bounded ring and books a compensating
+  observation on a sign change (a wash beats a bias; not a reversal, the
+  counters are additive) — and (b) revokes any queued next-turn correction
+  banner for the trajectory (<code>_drop_pending_corrections_for</code>;
+  the banner used to apologize for an answer the user had just thumbed
+  up). Machine lesson retraction and follow-up tasks filed before the
+  label STAND — logged, not reversed. Calibration re-labeling from human
+  labels remains deferred.</p>
+
+  <h2>Authority: human labels outrank machine verdicts — at two layers</h2>
+  <p><strong>In-process:</strong> <code>_human_label_locked</code> (agent.py)
+  gates the ENTIRE late-verdict consequence chain in
+  <code>_record_late_verdict</code> — corpus backfill, the stream
+  re-render, lesson retraction, follow-up filing, and the next-turn
+  correction banner all yield with one WITHHELD line (R1 review: the
+  original backfill-only guard let the rest run, apologizing to the user
+  for an answer they had just thumbed up). <strong>At the writer:</strong>
+  the late-verdict sidecar append passes <code>yield_to_human=True</code>,
+  and <code>update_outcome</code> refuses — inside its lock, against the
+  file — to supersede a <code>human_feedback:*</code> record with a
+  machine one. That closes the race the stamp can't see (the machine write
+  is DEFERRED through a background thread, so it can be checked before the
+  label exists yet land after it) and survives restarts and cache
+  eviction. Among HUMAN sources (feedback, user-correction promotion,
+  operator scripts) last-write-wins stands, mirroring the established
+  user-correction doctrine.</p>
+
+  <h2>Deliberately not wired (follow-ups, not oversights)</h2>
+  <ul>
+    <li><strong>Calibration re-labels</strong> —
+    <code>record_late_verdict_correction</code> is source-ranked for the
+    verifier; human labels need their own source rank in the calibration
+    store, a schema decision, not a bolt-on.</li>
+    <li><strong>Reaction removal</strong> — labels only accrete; a changed
+    mind posts the opposite signal and last-write-wins resolves it.</li>
+  </ul>
+
+  <h2>Producers</h2>
+  <ul>
+    <li><strong>Slack</strong>: 👍/👎 reactions on bot replies
+    (<a href="../interfaces/slack_bot.html">slack_bot</a> — owner or the
+    reply's requester only).</li>
+    <li><strong>Web UI</strong>: thumb buttons on agent bubbles
+    (<a href="../interfaces/web_server.html">web_server</a>).</li>
+    <li>Anything else that can speak <code>POST /api/feedback</code>
+    (<a href="../api/routes.html">api.routes</a>).</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

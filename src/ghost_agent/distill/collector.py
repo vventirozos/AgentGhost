@@ -40,6 +40,13 @@ logger = logging.getLogger("GhostDistill")
 # iterating.
 CORRECTIONS_FILENAME = "corrections.jsonl"
 
+# Source prefix that marks an EXPLICIT human label (/api/feedback). Owned
+# HERE (not core/feedback, which imports it) because the writer-side
+# authority check below is the load-bearing consumer and a circular import
+# would otherwise force a second copy of the literal — the R2 review's
+# "renaming the prefix silently disarms the guard" trap.
+HUMAN_SOURCE_PREFIX = "human_feedback"
+
 # The outcome value that may NEVER carry a ``failure_reason``. Kept as a
 # local constant rather than importing ``schema.Outcome`` into the read
 # loop's hot path; asserted equal to ``Outcome.PASSED.value`` by the tests.
@@ -152,7 +159,9 @@ class TrajectoryCollector:
         reason: str = "",
         *,
         source: str = "",
-    ) -> bool:
+        yield_to_human: bool = False,
+        skip_identical: bool = False,
+    ) -> object:
         """Record an outcome mutation for ``trajectory_id``.
 
         Appends a JSON line to the corrections sidecar; the original
@@ -164,8 +173,32 @@ class TrajectoryCollector:
         ``"user_correction"``, ``"verifier"``) — useful when
         debugging which detector promoted a trajectory.
 
-        Returns True iff the mutation was persisted. Never raises:
-        a failed correction must not break the user turn.
+        ``yield_to_human`` (2026-08-13, R1 review): machine-verdict
+        callers pass True so the write is WITHHELD when the latest
+        sidecar record is an explicit human label
+        (``human_feedback:*``). The in-process ``human_labeled`` stamp
+        alone cannot close this — the late-verdict write is DEFERRED
+        through a background thread, so it can be checked before the
+        label exists yet land after it. The check runs inside the
+        writer lock against the file, which makes it race-proof and
+        restart-proof. Human-authored callers (human feedback itself,
+        user-correction promotion, operator scripts) leave it False —
+        among humans, last-write-wins stands.
+
+        ``skip_identical`` (R2 review): dedupe INSIDE the lock — a
+        caller-side compare-then-write is a check-then-act race when N
+        concurrent labels arrive on executor threads, which is exactly
+        the repeated-👍 shape it exists to stop. When the latest record
+        for the id already carries this exact (outcome, processed
+        reason, source), nothing is written and the string
+        ``"unchanged"`` is returned (truthy, so bool-style callers
+        still read success).
+
+        Returns ``True`` when persisted, ``"unchanged"`` on a
+        skip-identical dedupe, ``"withheld"`` (truthy!) when
+        ``yield_to_human`` refused in favor of a standing human label,
+        and ``False`` on a genuine failure. Never raises: a failed
+        correction must not break the user turn.
         """
         if not self.enabled:
             return False
@@ -196,6 +229,43 @@ class TrajectoryCollector:
             }
             path = self._corrections_path()
             with self._lock:
+                if yield_to_human or skip_identical:
+                    latest = self._load_corrections().get(trajectory_id)
+                    if yield_to_human and latest and str(
+                            latest.get("source") or "").startswith(
+                            HUMAN_SOURCE_PREFIX):
+                        logger.info(
+                            "outcome correction for %s withheld — a human "
+                            "label stands (%s)",
+                            trajectory_id[:8], latest.get("outcome"))
+                        # Distinct sentinel (R4): a caller must be able to
+                        # tell "a human label won" from a plain write
+                        # FAILURE — conflating them made a disk error
+                        # silently revoke a legitimate correction banner.
+                        # Falsy-ness is deliberately NOT preserved: the only
+                        # yield_to_human caller branches on the sentinel.
+                        return "withheld"
+                    # §4BF flip (ii) R1: machine verdicts also yield to
+                    # the BANK ORACLE. The bench-local verifier's late
+                    # verdict (source="verifier_late") lands ~45s after
+                    # dream's validator already wrote ground truth at
+                    # source="bench_validator"; the overlay is
+                    # latest-wins, so without this an LLM's opinion
+                    # overwrote a mechanical oracle's label in the
+                    # origin=bench trainset corpus. Same shape as the
+                    # human guard: oracles outrank machine opinions.
+                    if yield_to_human and latest and str(
+                            latest.get("source") or "") == "bench_validator":
+                        logger.info(
+                            "outcome correction for %s withheld — the bench "
+                            "oracle's label stands (%s)",
+                            trajectory_id[:8], latest.get("outcome"))
+                        return "withheld"
+                    if skip_identical and latest \
+                            and latest.get("outcome") == record["outcome"] \
+                            and latest.get("reason") == record["reason"] \
+                            and latest.get("source") == record["source"]:
+                        return "unchanged"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as f:
                     import json as _json
@@ -207,14 +277,46 @@ class TrajectoryCollector:
             logger.warning("trajectory correction append failed: %s", e)
             return False
 
+    def latest_correction(self, trajectory_id: str) -> Optional[dict]:
+        """Latest sidecar record for ``trajectory_id``, or None.
+
+        Public read for the human-label authority probes
+        (``_human_label_locked``'s disk half) and tests. Returns a COPY —
+        the backing dict is the memoized ``_load_corrections`` snapshot
+        shared with ``iter_trajectories``, and handing out a live
+        reference would let a caller poison the cache."""
+        if not isinstance(trajectory_id, str) or not trajectory_id:
+            return None
+        rec = self._load_corrections().get(trajectory_id)
+        return dict(rec) if rec is not None else None
+
     def _load_corrections(self) -> dict:
         """Read the corrections sidecar into a ``{traj_id: record}``
         dict. Later records for the same id win (append-only +
         last-write-wins). Returns an empty dict when the file is
-        missing or unreadable."""
+        missing or unreadable.
+
+        Memoized on the file's (size, mtime_ns). The win is repeated
+        READS between writes — `find_trajectory_for_request`'s 8-day
+        `iter_trajectories` walk, the `_human_label_locked` disk probe —
+        each of which used to re-parse the whole sidecar; a write
+        invalidates the signature, so the first locked probe after an
+        append still pays one full parse (append-only file, ~1ms at
+        today's size). The stat signature also invalidates on
+        cross-process writes. Callers must treat the result as
+        READ-ONLY (`latest_correction` copies for that reason)."""
         path = self._corrections_path()
         if not path.exists():
+            self._corrections_cache = None
             return {}
+        try:
+            st = path.stat()
+            sig = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            sig = None
+        cached = getattr(self, "_corrections_cache", None)
+        if sig is not None and cached is not None and cached[0] == sig:
+            return cached[1]
         out: dict = {}
         try:
             import json as _json
@@ -233,6 +335,9 @@ class TrajectoryCollector:
                     out[tid] = rec
         except OSError as e:
             logger.warning("cannot read corrections sidecar %s: %s", path, e)
+            return out
+        if sig is not None:
+            self._corrections_cache = (sig, out)
         return out
 
     # -----------------------------------------------------------------

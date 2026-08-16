@@ -36,7 +36,15 @@ import pytest
 from ghost_agent.router.model import ComplexityClassifier
 
 
-def _toy(n=400, seed=3):
+#: Held-out size used by the evidence literals below. Derived from the
+#: gate's own floor so a future recalibration cannot silently turn these
+#: into "rejected for being too small" instead of testing what they name.
+#: §4BQ left _GATE_MIN_HELDOUT at 60; see the constant for why two
+#: attempts to raise it were retracted.
+_N = ComplexityClassifier._GATE_MIN_HELDOUT * 3
+
+
+def _toy(n=_N * 4, seed=3):   # *4 so the 30% held-out share clears _GATE_MIN_HELDOUT
     """A separable corpus: feature 0 predicts 'hard'."""
     rng = np.random.default_rng(seed)
     X, y = [], []
@@ -82,12 +90,21 @@ def test_evaluate_reports_the_escalate_all_baseline(fitted):
     ({}, "no held-out evidence"),
     ({"n": 5, "accuracy": 1.0, "baseline": 0.5, "false_easy_on_hard": 0.0,
       "classes": 2}, "held-out n"),
-    ({"n": 100, "accuracy": 1.0, "baseline": 0.5, "false_easy_on_hard": 0.0,
+    ({"n": _N, "accuracy": 1.0, "baseline": 0.5, "false_easy_on_hard": 0.0,
       "classes": 1}, "one class"),
-    ({"n": 100, "accuracy": 0.50, "baseline": 0.56, "false_easy_on_hard": 0.0,
-      "classes": 2}, "does not beat"),
-    ({"n": 100, "accuracy": 0.90, "baseline": 0.56, "false_easy_on_hard": 0.4,
-      "classes": 2}, "skips the planner"),
+    # §4BQ: no discordant counts => the evidence predates the
+    # significance test and is rejected outright (fail-closed, ONE
+    # standard — a proxy fallback would judge old checkpoints by a
+    # weaker test than the shipped model faces).
+    ({"n": _N, "accuracy": 0.90, "baseline": 0.56,
+      "false_easy_on_hard": 0.0, "classes": 2}, "predates"),
+    # A real but INSIGNIFICANT edge: 30 turns fixed, 25 broken.
+    ({"n": _N, "accuracy": 0.56 + 5 / _N, "baseline": 0.56,
+      "false_easy_on_hard": 0.0, "classes": 2,
+      "discordant_win": 30, "discordant_lose": 25}, "not significant"),
+    ({"n": _N, "accuracy": 0.56 + 50 / _N, "baseline": 0.56,
+      "false_easy_on_hard": 0.4, "classes": 2,
+      "discordant_win": 60, "discordant_lose": 10}, "skips the planner"),
 ])
 def test_every_rejection_reason_is_stated(ev, why):
     ok, reason = ComplexityClassifier.gate_verdict(ev)
@@ -98,7 +115,8 @@ def test_the_gate_is_asymmetric_by_design():
     """Predicting 'easy' for a HARD request skips the planner (harmful);
     predicting 'hard' for an easy one only wastes compute. A model can be
     accurate overall and still be rejected for the dangerous error."""
-    ev = {"n": 200, "accuracy": 0.90, "baseline": 0.56, "classes": 2,
+    ev = {"n": _N, "accuracy": 0.56 + 50 / _N, "baseline": 0.56, "classes": 2,
+          "discordant_win": 60, "discordant_lose": 10,
           "false_easy_on_hard": ComplexityClassifier._GATE_MAX_FALSE_EASY + 0.01}
     assert not ComplexityClassifier.gate_verdict(ev)[0]
     ev["false_easy_on_hard"] = ComplexityClassifier._GATE_MAX_FALSE_EASY - 0.01

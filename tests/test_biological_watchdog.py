@@ -28,6 +28,12 @@ def _make_agent(idle_seconds: int = 0,
     # phase gates (`is not True`) see them as disabled=False.
     ctx.args.no_dream = False
     ctx.args.no_self_play = False
+    # Bench (phase 3b) stays OFF here: these tests exercise phases 1-3, and
+    # an auto-vivified MagicMock would pass the `is not True` gate and let
+    # deep-idle ticks reach the REAL banks.pick_next_item() — advancing a
+    # live cursor + ledger on any box whose default bench home has banks.
+    # Bench-phase behavior is pinned in tests/test_bench_banks.py.
+    ctx.args.no_bench = True
 
     ctx.llm_client = MagicMock()
     ctx.llm_client.foreground_tasks = foreground_tasks

@@ -461,6 +461,28 @@ def main() -> int:
 
     pub = [f for f in positives if f.get("tier") == "public"]
     priv = [f for f in positives if f.get("tier") == "private"]
+    # §4BF 1c (R1 review CRIT): the gate tier is REAL-ONLY. The fixture
+    # tier hash ignores origin, so bench-joined fixtures landed in `priv`
+    # — the incumbent/candidate comparison (the ONLY evidence a promotion
+    # ships on) would be graded partly on bench solves, and bench volume
+    # alone could clear the supply/resolution gates for a run whose real
+    # evidence is too thin. Bench may TEACH (public side, equal-mass
+    # capped against real public fixtures — bench tool-choice profiles are
+    # near-uniform `execute`, and uncapped they would dominate the
+    # optimizer's replay set); it may never GRADE.
+    _bench_priv = [f for f in priv if f.get("origin") == "bench"]
+    if _bench_priv:
+        pub = pub + _bench_priv
+        priv = [f for f in priv if f.get("origin") != "bench"]
+        print(f"moved {len(_bench_priv)} bench fixtures out of the PRIVATE "
+              f"gate tier (real-only gate) into public")
+    _pub_real = [f for f in pub if f.get("origin") != "bench"]
+    _pub_bench = [f for f in pub if f.get("origin") == "bench"]
+    if len(_pub_bench) > len(_pub_real):
+        _pub_bench = _pub_bench[-len(_pub_real):] if _pub_real else []
+        pub = _pub_real + _pub_bench
+        print(f"public tier equal-mass capped: {len(_pub_real)} real + "
+              f"{len(_pub_bench)} bench fixtures")
     if not pub or not priv:
         print("degenerate public/private fixture split", file=sys.stderr)
         return 2

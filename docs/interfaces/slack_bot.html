@@ -27,13 +27,81 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>interface / externals / slack_bot / main.py</h1>
-  <p class="subtitle"><strong>OWNER-LOCKED</strong> async Slack client
-  (<code>slack_bolt</code> Socket Mode), rewritten 2026-07-11. Replies to
-  exactly ONE Slack user, fail-closed; also the delivery leg for the agent's
-  outbound notifications. Tests:
-  <code>tests/test_slack_bot_owner_lock.py</code> (31).</p>
+  <p class="subtitle"><strong>Owner-anchored</strong> async Slack client
+  (<code>slack_bolt</code> Socket Mode), rewritten 2026-07-11; since
+  2026-08-13 it runs in <strong>open-channel mode by default</strong>
+  (operator decision — see below) and turns 👍/👎 reactions into human
+  outcome labels. Also the delivery leg for the agent's outbound
+  notifications. Tests: <code>tests/test_slack_bot_owner_lock.py</code> +
+  <code>tests/test_slack_bot_feedback.py</code>.</p>
 
-  <h2>Owner lock (2026-07-11)</h2>
+  <h2>Open-channel mode + reaction feedback (2026-08-13)</h2>
+  <p>Two operator-requested changes, built to feed the outcome-supply plan
+  (Track&nbsp;1a): real user traffic and explicit human labels.</p>
+  <ul>
+    <li><strong><code>GHOST_SLACK_OPEN_CHANNEL</code> — DEFAULT ON.</strong>
+    Channel mentions from <em>any normal human member of the bot's own
+    workspace</em> are answered, and their thread messages/files are
+    forwarded as context (channel members are users, by operator decision).
+    Bot-authored messages and message subtypes are still rejected on every
+    path, and (R1 review hardening) the grant is doubly scoped: by
+    SURFACE — only <code>C…</code> conversation ids ride it, enforced at the
+    handler AND inside <code>build_thread_context</code>
+    (<code>_is_open_surface</code>; <code>app_mention</code> also fires in
+    IMs/group DMs with no <code>channel_type</code> field, so "@Ghost" in a
+    stranger's DM would otherwise have bypassed the owner lock; 1:1
+    <code>D…</code> mentions defer to the message handler entirely — Slack
+    fires both events and the bot used to answer twice; note the C-prefix
+    heuristic treats a converted-private C-channel as open) — and by
+    WORKSPACE — a Slack-Connect external-org author
+    (<code>team</code>/<code>user_team</code> outside
+    <code>BOT_TEAM_IDS</code> = team ∪ enterprise ids from
+    <code>auth.test</code>) falls back to the owner check; BEST-EFFORT, as
+    many payload shapes omit the team field. If <code>auth.test</code>
+    cannot resolve the workspace at boot (3 retries), open-channel mode is
+    <strong>disabled for the run</strong> rather than running blind.
+    <strong>DMs remain owner-only in both modes.</strong> Thread context
+    treats ONLY this bot's own messages as <code>assistant</code>; a
+    foreign bot's messages (Jira/webhook/workflow apps) are dropped
+    entirely, in both modes — they used to be injected as
+    highest-trust history. Attachments larger than
+    <code>GHOST_SLACK_MAX_UPLOAD_MB</code> (default 50; ≤0 = unlimited)
+    are skipped — they're buffered whole in RAM — and a skipped/failed
+    ingest appends a SYSTEM NOTE so the model says so instead of
+    answering as if it had read the file; file notes are always their own
+    user turn (gluing onto <code>messages[-1]</code> misattributed them).
+    Set <code>GHOST_SLACK_OPEN_CHANNEL=0</code> to restore the strict
+    owner lock. Startup still refuses to run without a resolved owner.</li>
+    <li><strong>Reaction feedback.</strong> Every reply the bot posts is
+    remembered as <code>(channel, ts) → {req_id, requester}</code> in a
+    bounded reply index (<code>GHOST_SLACK_REPLY_INDEX</code>, persisted
+    JSON — written atomically via tmp+<code>os.replace</code> so a
+    kickstart mid-write can't corrupt it — with an 8-day lookup TTL
+    matching the agent's trajectory-scan window). A 👍/👎 (<code>+1</code>/
+    <code>-1</code>, skin-tone variants included) on one of those replies
+    becomes <code>POST /api/feedback</code> → the agent's corrections
+    sidecar (<code>passed</code>/<code>failed</code>). Accepted from the
+    <strong>owner or that reply's requester only</strong>. The payload's
+    <code>note</code> is deliberately EMPTY — a note becomes the turn's
+    <code>failure_reason</code> and feeds the reflection LLM, so "slack
+    reaction :-1: by U…" there produced hallucinated diagnoses; the
+    server default ("human negative feedback") is the honest corpus row.
+    One retry covers 404 (reaction races the trajectory flush) AND 5xx
+    (agent mid-restart); a label that still fails logs at
+    <strong>WARNING</strong> (reaches the launchd <code>.err</code>) and a
+    thumb on an unindexed message logs at INFO — the two silent-death
+    modes an operator must be able to see. Error replies are never
+    registered (a sympathy 👎 on "Agent returned 500" would label a turn
+    the agent never completed). <code>reaction_removed</code> is ignored —
+    a changed mind posts the opposite thumb and the sidecar's
+    last-write-wins resolves it. The correlation handle is the response's
+    <code>id</code> (<code>chatcmpl-&lt;req_id&gt;</code>), not the locally
+    generated <code>X-Request-ID</code>, which the agent may uniquify on
+    collision. <em>Slack app config must grant <code>reactions:read</code>
+    and subscribe to the <code>reaction_added</code> bot event.</em></li>
+  </ul>
+
+  <h2>Owner lock (2026-07-11; the GHOST_SLACK_OPEN_CHANNEL=0 mode)</h2>
   <p>The bot previously answered <em>any</em> workspace member — full agent
   (and tool) access for anyone who could DM it. Now:</p>
   <ul>
@@ -61,8 +129,9 @@
   <div class="scroll"><table>
     <thead><tr><th>Event</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td><code>app_mention</code></td><td>Owner gate → owner-filtered thread context → <code>_process_message()</code>.</td></tr>
-      <tr><td><code>message</code> (DM only)</td><td>Same flow; <code>channel_type == "im"</code> plus the owner gate.</td></tr>
+      <tr><td><code>app_mention</code></td><td><code>is_authorized_message</code> (owner, or any human member in open-channel mode) → filtered thread context → <code>_process_message()</code>.</td></tr>
+      <tr><td><code>message</code> (DM only)</td><td>Same flow; <code>channel_type == "im"</code> plus the owner gate — owner-only in BOTH modes.</td></tr>
+      <tr><td><code>reaction_added</code></td><td>👍/👎 on a registered bot reply → <code>POST /api/feedback</code> (owner or requester only; see above).</td></tr>
     </tbody>
   </table></div>
 
@@ -142,6 +211,9 @@
     <dt>GHOST_AGENT_LOG</dt><dd>agent pretty-log stream for live status (default <code>~/Data/AI/Logs/ghost-agent.log</code>).</dd>
     <dt>GHOST_NOTIFY_SLACK_CHANNEL</dt><dd>notification destination; default = owner DM; <code>off</code> disables.</dd>
     <dt>GHOST_NOTIFY_POLL_SECONDS</dt><dd>poll cadence (default 30).</dd>
+    <dt>GHOST_SLACK_OPEN_CHANNEL</dt><dd><strong>default ON</strong> (2026-08-13, operator decision) — answer channel (<code>C…</code>) mentions from any same-workspace human member; <code>0</code> restores the strict owner lock. DMs/group DMs are owner-only either way.</dd>
+    <dt>GHOST_SLACK_REPLY_INDEX</dt><dd>reply-index JSON for reaction feedback (default <code>~/Data/AI/Logs/ghost-slack-reply-index.json</code>; bounded at 500 entries, atomic writes, 8-day lookup TTL; explicitly empty = in-memory only, used by tests).</dd>
+    <dt>GHOST_SLACK_MAX_UPLOAD_MB</dt><dd>attachment cap (default 50) — thread files are buffered whole in RAM before re-upload.</dd>
   </div>
 
   <h2>Autostart (launchd, 2026-07-11) — LIVE</h2>

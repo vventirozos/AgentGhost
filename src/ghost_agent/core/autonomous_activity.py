@@ -71,6 +71,7 @@ _PHASE_LABELS = {
     "experiment_verdict": "experiment verdict",
     "native_tool_repair": "native tool-call repair",
     "workspace_tidy": "workspace tidy",
+    "bench": "bench bank",
 }
 
 # ── LIVENESS REGISTRY ───────────────────────────────────────────────────────
@@ -129,6 +130,11 @@ PHASE_EXPECTATION = {
     # behind a flag / consumer
     "prm_train": EXPECT_GATED,               # skips unless .score()/.uncertainty() live
     "postmortem": EXPECT_GATED,              # --postmortem
+    # §4BF Track 1b: fires per deep-idle tick once banks are imported;
+    # GATED (not periodic) because it is inert on a box with no banks on
+    # disk and killable via --no-bench — a zero must report the gate, not
+    # alarm.
+    "bench": EXPECT_GATED,
 }
 
 

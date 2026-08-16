@@ -57,37 +57,27 @@ class TestJournalSourcedSkillGate:
     """
 
     def _branch_reached(self, *, journal_source, passed, attempt, is_new_cluster):
-        """Replay exactly the gate cascade from dream.synthetic_self_play
-        (lines ~2136-2170 after the fix). Returns the resulting
-        ``(should_write_skill, gate_reason)`` tuple so we can assert
-        against the branch that fired.
+        """Call the REAL gate (§4BF 1c extracted `lesson_gate_decision`) —
+        the previous version re-implemented the cascade inline, a mirror
+        pin that stayed green no matter what dream.py did. Returns
+        ``(should_write_skill, gate_reason)``.
         """
-        aborted_by_solver = False
-        mastered = False
-        compression_delta = 0.2  # plausible first-try compression gain
-
-        should_write_skill = False
-        gate_reason = ""
-        if aborted_by_solver:
-            gate_reason = "aborted"
-        elif mastered:
-            gate_reason = "mastered"
-        elif journal_source and passed:
-            gate_reason = "journal-mined pass → lenient validator, skill write suppressed"
-        elif passed and attempt > 0:
-            should_write_skill = True
-            gate_reason = "struggled-then-won"
-        elif passed and attempt == 0 and (is_new_cluster or compression_delta > 0.05):
-            should_write_skill = True
-            gate_reason = "new cluster or compression improvement"
-        elif not passed and is_new_cluster:
-            should_write_skill = True
-            gate_reason = "first failure on new cluster"
-        elif not passed:
-            gate_reason = "repeat failure on known cluster"
-        else:
-            gate_reason = "no new signal"
-        return should_write_skill, gate_reason
+        from ghost_agent.core.dream import lesson_gate_decision
+        return lesson_gate_decision(
+            aborted_by_solver=False,
+            validator_infra_crash=False,
+            mastered=False,
+            journal_source=journal_source,
+            passed=passed,
+            attempt=attempt,
+            is_new_cluster=is_new_cluster,
+            # 0.0, not the old 0.2 (R2 nit): a positive delta made the
+            # non-journal first-try assertion insensitive to is_new_cluster
+            # regressions — with 0.0 the branch is driven by the flag the
+            # tests actually pass.
+            compression_delta=0.0,
+            solution_novelty=None,
+        )
 
     def test_journal_source_first_try_pass_is_suppressed(self):
         write, reason = self._branch_reached(
