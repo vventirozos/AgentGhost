@@ -327,7 +327,7 @@ class TestBenchAndSimulationAreExcluded:
             llm_client = object()
 
             async def verify_claim(self, claim, evidence, context="",
-                                   *, high_stakes=False, trace=None):
+                                   *, high_stakes=False, trace=None, **_kw):
                 captured["trace"] = trace
                 return None
 
@@ -354,7 +354,7 @@ class TestBenchAndSimulationAreExcluded:
             llm_client = object()
 
             async def verify_claim(self, claim, evidence, context="",
-                                   *, high_stakes=False, trace=None):
+                                   *, high_stakes=False, trace=None, **_kw):
                 captured["trace"] = trace
                 return None
 
@@ -573,7 +573,7 @@ class TestBothFinalizePaths:
             llm_client = object()
 
             async def verify_claim(self, claim, evidence, context="",
-                                   *, high_stakes=False, trace=None):
+                                   *, high_stakes=False, trace=None, **_kw):
                 captured["trace"] = trace
                 return None
 

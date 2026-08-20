@@ -28,7 +28,13 @@ async def test_llm_client_swarm_success():
     with patch("src.ghost_agent.core.llm.pretty_log") as mock_log:
         resp = await client.chat_completion({"model": "qwen", "prompt": "hello"}, use_swarm=True)
         
-        assert resp == {"choices": [{"message": {"content": "swarm reply"}}]}
+        # `_ghost_leg` records WHICH node served the reply (added
+        # 2026-08-18: a pool→main fallback used to be indistinguishable from
+        # a pool answer, which blinded the §4BR degradation guard). Compare
+        # the reply, and assert the leg deliberately.
+        assert resp["choices"] == [{"message": {"content": "swarm reply"}}]
+        from ghost_agent.core.llm import served_leg
+        assert served_leg(resp)["served_by"] == "swarm"
         mock_swarm_post.assert_called_once()
         mock_main_post.assert_not_called()
         
@@ -59,7 +65,9 @@ async def test_llm_client_swarm_fallback():
     
     with patch("src.ghost_agent.core.llm.pretty_log") as mock_log:
         resp = await client.chat_completion({"model": "qwen", "prompt": "hello"}, use_swarm=True)
-        assert resp == {"choices": [{"message": {"content": "main reply"}}]}
+        assert resp["choices"] == [{"message": {"content": "main reply"}}]
+        from ghost_agent.core.llm import served_leg
+        assert served_leg(resp)["served_by"] == "main"
         
         # It should try both swarm nodes before falling back to main
         assert mock_swarm_post_1.call_count == 1
@@ -112,7 +120,9 @@ async def test_llm_client_swarm_empty_fallback():
     
     with patch("src.ghost_agent.core.llm.pretty_log") as mock_log:
         resp = await client.chat_completion({"model": "qwen", "prompt": "hello"}, use_swarm=True)
-        assert resp == {"choices": [{"message": {"content": "main reply"}}]}
+        assert resp["choices"] == [{"message": {"content": "main reply"}}]
+        from ghost_agent.core.llm import served_leg
+        assert served_leg(resp)["served_by"] == "main"
         
         mock_main_post.assert_called_once()    
         

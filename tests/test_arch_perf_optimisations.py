@@ -587,12 +587,41 @@ async def test_continuity_blocks_ride_in_tail_not_system_slot(monkeypatch):
 # =====================================================================
 
 
-def test_routing_task_constants_exist():
-    assert RoutingTask.VALIDATE_TOOL_ARGS == "VALIDATE_TOOL_ARGS"
-    assert RoutingTask.EXPAND_QUERY == "EXPAND_QUERY"
-    assert RoutingTask.CLASSIFY_INTENT == "CLASSIFY_INTENT"
-    assert RoutingTask.SCORE_RELEVANCE == "SCORE_RELEVANCE"
-    assert RoutingTask.REPAIR_JSON == "REPAIR_JSON"
+def test_every_routing_task_member_has_a_live_caller():
+    """⚠ REPLACED A TAUTOLOGY. This asserted `RoutingTask.X == "X"` for five
+    members — a constant compared with itself, which cannot fail and taught
+    nobody anything. Four of those five had ZERO production callers: the class
+    read as an inventory of what the routing layer does and was an
+    aspirational list (R5 lens B). What is worth pinning is the opposite
+    direction — that a member here corresponds to a real dispatch."""
+    import re
+    from pathlib import Path as _P
+
+    src_root = _P(__file__).resolve().parents[1] / "src" / "ghost_agent"
+    members = [n for n in vars(RoutingTask)
+               if n.isupper() and not n.startswith("_")]
+    assert members, "RoutingTask lost every member"
+
+    # ⚠ AST, not a regex over raw text — `# was RoutingTask.EXPAND_QUERY`
+    # counted as a caller (R7 lens C, A02).
+    import ast as _ast
+    used = set()
+    for f in src_root.rglob("*.py"):
+        if f.name == "llm.py":
+            continue
+        try:
+            tree = _ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for n in _ast.walk(tree):
+            if isinstance(n, _ast.Attribute) and isinstance(n.value, _ast.Name) \
+                    and n.value.id == "RoutingTask":
+                used.add(n.attr)
+    orphans = [m for m in members if m not in used]
+    assert not orphans, (
+        f"RoutingTask members with no caller outside llm.py: {orphans}. "
+        f"Either wire them up or delete them — a label nothing dispatches "
+        f"describes a routing layer that does not exist.")
 
 
 @pytest.mark.asyncio

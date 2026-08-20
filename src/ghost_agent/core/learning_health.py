@@ -1292,7 +1292,14 @@ def _activity_counts(ledger_path: Path, *, window_hours: float = 168.0) -> Dict[
             ts = float(rec.get("ts") or 0)
         except (TypeError, ValueError):
             ts = 0.0
-        if ts and ts < cutoff:
+        if not ts:
+            # Unparseable/zero timestamp: SKIP, don't count. `if ts and
+            # ts < cutoff` kept these rows in EVERY window — a single
+            # garbage-ts row would keep a dead PERIODIC phase looking
+            # alive in the liveness table forever, and that table's whole
+            # job is telling benign zeros from fatal ones.
+            continue
+        if ts < cutoff:
             continue
         kind = str(rec.get("phase") or rec.get("kind") or rec.get("type")
                    or rec.get("category") or "").strip()
@@ -1440,9 +1447,25 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                 f"  mean hit-rate: {_chr} (CLEAN — {_cn} lessons created after "
                 f"{les.get('clean_epoch')}, {les.get('clean_retrievals')} "
                 f"retrievals, denominator counted once)")
+            # Direction COMPUTED, not asserted. This line used to print a
+            # hardcoded "OVERSTATES": true when written (0.620 vs 0.557),
+            # false on live data within a month (0.673 vs 0.681 — the
+            # "overstating" number was LOWER). A report that renders both
+            # numbers and then asserts their ordering from memory is an
+            # instrument stating a stale fact as a measurement. The claim
+            # that matters — not comparable, double-counted denominator —
+            # does not depend on the direction.
+            try:
+                _all_v, _clean_v = float(les["mean_hit_rate"]), float(_chr)
+                _dir = ("currently overstates" if _all_v > _clean_v
+                        else "currently understates" if _all_v < _clean_v
+                        else "coincidentally matches")
+            except (TypeError, ValueError):
+                _dir = "cannot be ordered against"
             lines.append(
                 f"    all-lessons {les['mean_hit_rate']} spans the "
-                f"double-booking era and OVERSTATES — not comparable")
+                f"double-booking era and {_dir} the clean figure — not "
+                "comparable either way (denominator double-counted)")
         else:
             lines.append(
                 f"  mean hit-rate: {les['mean_hit_rate']} ⚠ CONTAMINATED — no "
@@ -1789,13 +1812,17 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
         # less than dream, which looks like a starved loop but is a recording
         # artifact. Reflection only writes a ledger event when it produced
         # OUTCOMES, and it deliberately skips ticks whose trajectory corpus
-        # is unchanged since an all-duplicate pass; dream records every
-        # cycle. A low count here means "little new material", not
-        # "under-scheduled" — check the cooldown constants for scheduling.
+        # is unchanged since an all-duplicate pass. §4CB R1/R2: dream too now
+        # ledgers ONLY cycles that did consolidation work — skip AND error
+        # cycles mint nothing (so the zero-rows liveness alarm can fire on a
+        # permanently failing dream). A low count here means "little new
+        # material", not "under-scheduled" — check the cooldowns instead.
         lines.append(
             "  (per-phase recording policies differ — reflection logs only "
-            "outcome-producing runs and skips unchanged-corpus ticks, dream "
-            "logs every cycle; do NOT read these as a workload budget)")
+            "outcome-producing runs and skips unchanged-corpus ticks; dream "
+            "logs only cycles that did consolidation work, so a zero can "
+            "mean quiet OR erroring — do NOT read these as a workload "
+            "budget)")
 
     cw = r.get("cognitive_wiring")
     if cw:
@@ -2115,10 +2142,53 @@ def _experiment_health_lines(memory_dir) -> List[str]:
                    f"({pct:.1f}% LIFETIME — corpus predates the 2026-08-03 "
                    f"stamp; pre-ship turns can never be stamped, so this "
                    f"understates current coverage)")
+        # C1 sibling (introspect review): enumerate-what-is-stamped hides
+        # an enabled spec with ZERO stamps — the exact shape of the three
+        # days verify_depth ran inert. The registry says what SHOULD be
+        # accumulating; anything enabled-live and absent renders as an
+        # explicit zero instead of silence.
+        #
+        # A helper, used by BOTH branches below — R2 MINOR-4 found the
+        # first version sat after the `not all_stats` early return, so the
+        # nothing-at-all-stamped state (the WORST case for this block)
+        # named no specs. And it must be degradation-aware: a corrupt
+        # registry substitutes the code defaults, whose names would raise
+        # false "enrollment broken" alarms (R2 MAJOR-3).
+        def _zero_rows() -> List[str]:
+            try:
+                from .experiments import (SCOPE_LIVE as _SLV,
+                                          load_registry as _lr2)
+                _reg2 = _lr2(_P(str(memory_dir)).parent / "experiments.json")
+                if getattr(_reg2, "degraded", False):
+                    return ["  ⚠ system/experiments.json unreadable — "
+                            "cannot name which enabled arms are unstamped"]
+                _missing = sorted(set(_reg2.names_for_scope(_SLV))
+                                  - set(all_stats))
+                # Kill-switch reframe (R3 finding 3 — render_report got
+                # this the same round and this sibling did not): with the
+                # master switch off nothing enrolls, so "enrollment
+                # broken" is a correct observation with a wrong diagnosis.
+                # NOTE this reads the RENDERING process's env; when this
+                # renders in the operator shell (scripts/learning_health)
+                # the daemon's env may differ — hence "in this process".
+                from .experiments import ENV_KILL as _EK
+                from .experiments import _kill_switch_on as _ks
+                if _missing and _ks():
+                    return [f"  ⚠ unstamped but expected: {', '.join(_missing)}"
+                            f" — {_EK}=0 is set in this process, so no "
+                            "turn enrolls in anything"]
+                return [f"  {n}: n=0 ⚠ enabled but UNSTAMPED — no "
+                        "eligible traffic yet, or enrollment broken "
+                        "(is it listed in system/experiments.json?)"
+                        for n in _missing]
+            except Exception:  # noqa: BLE001
+                return []
+
         if not all_stats:
             out.append("  ⚠ NO arms stamped — either nothing is enrolled or the "
                        "stamp has regressed (check enrollment + "
                        "_record_turn_trajectory)")
+            out.extend(_zero_rows())
             return out
         for name in sorted(all_stats):
             arms = all_stats[name]
@@ -2127,6 +2197,7 @@ def _experiment_health_lines(memory_dir) -> List[str]:
             fired = sum(s.n for s in trig.values())
             tail = f"; trigger fired on {fired}" if name in TRIGGER_KEYS else ""
             out.append(f"  {name}: {counts}{tail}")
+        out.extend(_zero_rows())
         out.append("  full report: introspect action='experiments'")
         return out
     except Exception:  # noqa: BLE001 — telemetry must never break the report

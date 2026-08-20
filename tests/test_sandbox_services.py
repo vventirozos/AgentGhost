@@ -210,6 +210,35 @@ class TestSupervisorLifecycle:
         assert "export GHOST_SERVICE_HOST=0.0.0.0" in script
         assert script.index("export HOST=0.0.0.0") < script.index("python3 app.py")
 
+    def test_start_binds_loopback_under_host_netns(self, tmp_path):
+        # SECURITY: under docker `--network host` (the Linux DEFAULT) the
+        # container shares the host's netns, so HOST=0.0.0.0 would publish an
+        # UNTRUSTED sandbox service LAN-wide, unauthenticated. In that mode the
+        # supervisor must bind loopback — still reachable by the operator (host)
+        # and the in-sandbox browser via the shared 127.0.0.1, with no LAN
+        # exposure. Regression pin for the previously-inert binds_host_netns().
+        sb = FakeSandbox(tmp_path, happy_handler())
+        sb.binds_host_netns = lambda: True   # simulate --network host (Linux)
+        sup = ServiceSupervisor(sb)
+        sup.start("dash", "python3 app.py", port=8100)
+        script = (tmp_path / ".services" / "dash.cmd.sh").read_text()
+        assert "export HOST=127.0.0.1" in script
+        assert "export GHOST_SERVICE_HOST=127.0.0.1" in script
+        assert "0.0.0.0" not in script       # never binds all interfaces here
+
+    def test_start_binds_all_interfaces_under_bridge_netns(self, tmp_path):
+        # The complement: with an explicit bridge/NAT manager the service binds
+        # 0.0.0.0 (docker's loopback publish only forwards to 0.0.0.0), which is
+        # safe because the container is NAT-isolated. Guards against a fix that
+        # would over-correct and break bridge-mode reachability.
+        sb = FakeSandbox(tmp_path, happy_handler())
+        sb.binds_host_netns = lambda: False  # explicit bridge (macOS default)
+        sup = ServiceSupervisor(sb)
+        sup.start("dash", "python3 app.py", port=8100)
+        script = (tmp_path / ".services" / "dash.cmd.sh").read_text()
+        assert "export HOST=0.0.0.0" in script
+        assert "export GHOST_SERVICE_HOST=0.0.0.0" in script
+
     def test_port_zero_opts_out_of_lease_and_env_export(self, tmp_path):
         # §4G: omission AUTO-ASSIGNS (services expose project output over
         # HTTP by definition); port=0 is the explicit opt-out for the rare
@@ -836,3 +865,99 @@ class TestCaseInsensitiveNames:
     def test_unknown_name_still_errors(self, tmp_path):
         sup = self._running(tmp_path)
         assert "no service named" in sup.restart("dashboard")
+
+
+class TestGenerationStampSurvivesStopResume:
+    """§4BW CRITICAL-1. The generation stamp was `container.id` alone, which
+    a graceful stop→resume preserves while the container's pid counter
+    resets — so a service stamped before an agent restart passed the
+    id==id check and `_pid_alive` on a RECYCLED pid read an innocent process
+    as the service, pointing stop() at it. `State.StartedAt` distinguishes
+    the resume the id cannot. No test covered stop/start before this."""
+
+    class _Container:
+        def __init__(self, cid, started):
+            self.id = cid
+            self.attrs = {"State": {"StartedAt": started}}
+
+        def reload(self):
+            pass
+
+    def _sup(self, tmp_path, cid, started):
+        sb = FakeSandbox(tmp_path, happy_handler())
+        sb.container = self._Container(cid, started)
+        return ServiceSupervisor(sb)
+
+    def test_a_row_from_before_a_resume_reads_DEAD(self, tmp_path):
+        # Service started under generation 1 (StartedAt=T1); its pid is alive
+        # by the happy handler, so ONLY the generation check can catch it.
+        sup = self._sup(tmp_path, "cid-abc", "2026-08-19T08:00:00Z")
+        entry = {"pid": 12345, "container_id": sup._container_generation()}
+        assert sup._entry_alive(entry) is True   # same generation → pid check
+
+        # Agent restarts; the SAME container resumes with a new StartedAt.
+        sup.sandbox.container.attrs["State"]["StartedAt"] = "2026-08-19T10:22:00Z"
+        assert sup._entry_alive(entry) is False, (
+            "a service row stamped before a stop→resume read ALIVE — its "
+            "recycled pid can now belong to an innocent process, and stop() "
+            "would signal it")
+
+    def test_the_id_alone_would_NOT_have_caught_it(self, tmp_path):
+        # Regression witness: prove the stamp actually incorporates StartedAt,
+        # so a future 'simplification' back to bare id is caught here.
+        sup = self._sup(tmp_path, "cid-abc", "2026-08-19T08:00:00Z")
+        gen1 = sup._container_generation()
+        sup.sandbox.container.attrs["State"]["StartedAt"] = "2026-08-19T10:22:00Z"
+        gen2 = sup._container_generation()
+        assert gen1 != gen2, (
+            "the generation is unchanged across a resume — it is still bare "
+            "id, and the recycled-pid kill is back")
+        assert "cid-abc" in gen1 and "08:00:00" in gen1
+
+    def test_a_legacy_id_only_stamp_reads_dead_not_pid_checked(self, tmp_path):
+        # A row written by the pre-fix code (bare id) must be treated as a
+        # generation MISMATCH (dead), never trusted to a pid check — the safe
+        # direction, since such a row only survives a restart that killed it.
+        sup = self._sup(tmp_path, "cid-abc", "2026-08-19T08:00:00Z")
+        legacy = {"pid": 12345, "container_id": "cid-abc"}   # no StartedAt
+        assert sup._entry_alive(legacy) is False
+
+
+class TestRegistrySaveIsConcurrencySafe:
+    """§4BW MAJOR. `_save` wrote to a FIXED `registry.tmp`; a second writer
+    sharing the workspace (an ablation instance, the test suite) could
+    truncate the tmp mid-write and rename garbage into the live registry,
+    so `_load()` returns {} and every service silently loses its row. This
+    is the exact shape jobs.py fixed and named services.py for."""
+
+    def test_each_save_uses_a_distinct_temp_file(self, tmp_path):
+        sup = ServiceSupervisor(FakeSandbox(tmp_path))
+        seen = []
+        import ghost_agent.sandbox.services as svc
+        real_replace = svc.os.replace
+
+        def _spy(src, dst):
+            seen.append(str(src))
+            return real_replace(src, dst)
+
+        import unittest.mock as m
+        with m.patch.object(svc.os, "replace", _spy):
+            sup._save({"a": {"pid": 1}})
+            sup._save({"b": {"pid": 2}})
+        assert len(seen) == 2 and seen[0] != seen[1], (
+            f"two saves reused the same temp file {seen} — a concurrent "
+            f"writer can clobber it and wipe the live registry")
+
+    def test_a_failed_write_leaves_no_stray_temp(self, tmp_path):
+        sup = ServiceSupervisor(FakeSandbox(tmp_path))
+        sup._save({"a": {"pid": 1}})           # seed a good registry
+        import ghost_agent.sandbox.services as svc
+        import unittest.mock as m
+        with m.patch.object(type(svc.Path(tmp_path)), "write_text",
+                            side_effect=OSError("disk full")):
+            with pytest.raises(OSError):
+                sup._save({"b": {"pid": 2}})
+        strays = list(sup.host_dir.glob("*.tmp"))
+        assert not strays, f"a failed save left a temp file behind: {strays}"
+        # the prior good registry is intact
+        assert "a" in sup._load()

@@ -457,11 +457,27 @@ def test_r2_goal_is_first_user_not_first_nonsystem():
             {"role": "tool", "content": "leading tool result", "name": "fs"},
             {"role": "user", "content": big_goal},
             {"role": "assistant", "content": "filler " + "q" * 4500}]
+    # § context R1: with a budget the OTHER candidates can satisfy, the goal
+    # stays intact (the assistant filler is cut first)...
     capped = GhostAgent._cap_oversized_tail([dict(m) for m in msgs],
-                                            max_tokens=1500)
+                                            max_tokens=2600)
     goal = next(m["content"] for m in capped
                 if m["content"].startswith("GOAL spec"))
     assert "dropped by context budget" not in goal    # user goal exempt
+    filler = next(m["content"] for m in capped
+                  if m.get("role") == "assistant")
+    assert "dropped by context budget" in filler      # cut fell elsewhere
+    # ...but when the goal ALONE busts the budget, the R1-era exemption let
+    # the request ship over budget (the HTTP-400 class through the goal
+    # loophole). The LAST RESORT now cuts it too — with the honest
+    # pasted-content note, never the file-re-read one.
+    capped2 = GhostAgent._cap_oversized_tail([dict(m) for m in msgs],
+                                             max_tokens=1200)
+    goal2 = next(m["content"] for m in capped2
+                 if m["content"].startswith("GOAL spec"))
+    assert "dropped by context budget" in goal2
+    assert "pasted content exceeded" in goal2
+    assert "start_line" not in goal2
     # few-message branch: the real user goal (not the leading tool) survives
     import asyncio
     from unittest.mock import MagicMock

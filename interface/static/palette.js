@@ -25,8 +25,16 @@ export function initPalette(ctx) {
             { label: 'Toggle zen mode', hint: 'hide the chrome', run: () => document.body.classList.toggle('zen-mode') },
             { label: 'Agent status', hint: 'health · nodes · turns', run: () => status.togglePanel() },
             { label: 'Notifications', hint: 'agent activity', run: () => notifications.togglePanel() },
-            { label: 'Stop current turn', hint: 'cooperative cancel on the agent', run: () => status.cancelTurn(null, false) },
-            { label: 'Force-stop current turn', hint: 'hard cancel — releases the lock', run: () => status.cancelTurn(null, true) },
+            // ⚠ These two are the SAME defect the composer's Stop had: a
+            // null request id means "cancel whatever holds the semaphore"
+            // (core/turns.py::current), which may be a background dream or
+            // self-play turn — and the Force variant is a guaranteed lock
+            // release on it. The composer was fixed and these were missed,
+            // one control over (R3 lens B). The status panel lists turns
+            // individually with their own per-turn cancel buttons; that is
+            // the honest way to stop a specific turn.
+            { label: 'Stop MY turn', hint: 'cooperative cancel of this tab\'s turn', run: () => Core.cancelOwnTurn(false) },
+            { label: 'Turn queue…', hint: 'list in-flight turns and cancel one', run: () => status.openPanel() },
             { label: 'Toggle density', hint: 'compact / comfortable', run: toggleDensity },
             {
                 label: 'Copy last reply', hint: '', run: async () => {

@@ -32,18 +32,19 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import strip_js_comments
+
 _STATIC = Path(__file__).resolve().parent.parent / "interface" / "static"
 _APP = _STATIC / "app.js"
 _CSS = _STATIC / "style.css"
 _HTML = _STATIC / "index.html"
 
 
-def _strip_comments(js: str) -> str:
-    """Code only — the history of a removed feature lives in comments and
-    SHOULD. Asserting over raw text made this file's own explanation of
-    what was deleted read as the deleted thing still being present."""
-    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
-    return re.sub(r"^\s*//.*$", "", js, flags=re.M)
+# One shared implementation (tests/helpers.strip_js_comments): three
+# near-copies of this fragile regex pair existed, and only one of them
+# carried the pins in TestTheStripperItself. Alias, so those pins guard
+# the code every JS suite actually uses.
+_strip_comments = strip_js_comments
 
 
 @pytest.fixture(scope="module")

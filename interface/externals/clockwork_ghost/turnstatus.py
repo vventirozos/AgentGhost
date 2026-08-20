@@ -138,6 +138,18 @@ ICON_CLASS = {
     "🌙": "plan",
     "🫀": "idle",
 
+    # --- metacognition (§LOG-7 — mirrors app.js) ---
+    "🫧": "plan",     # METACOG (generic uplift)
+    "🌱": "plan",     # METACOG_BOOT
+    "📊": "plan",     # METACOG_SUMMARY
+    "📈": "plan",     # METACOG_CONF
+    "📐": "plan",     # METACOG_CALIB
+    "🥇": "plan",     # METACOG_ARBITER
+    "🚧": "plan",     # METACOG_VALID
+    "💻": "plan",     # METACOG_HOST
+    "🚦": "plan",     # METACOG_REPLAN
+    "🚪": "plan",     # METACOG_GATE
+
     # --- misc ---
     "🫥": "accent",
     "🔥": "accent",

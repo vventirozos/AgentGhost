@@ -1,3 +1,4 @@
+import logging
 import datetime
 import os
 import asyncio
@@ -641,3 +642,33 @@ def semantic_split_text(text: str, chunk_size: int = 600, chunk_overlap: int = 1
                 chunks.append(f"{header_prefix}{sc}" if header_prefix else sc)
 
     return [c for c in chunks if c.strip()]
+
+
+logger = logging.getLogger(__name__)
+
+
+def env_positive(name: str, default: float) -> float:
+    """A positive float from the environment, or the default. Never raises.
+
+    ⚠ Three separate traps, all live before this existed:
+      * `float(os.getenv(X, "90") or 90)` — `"0"` is TRUTHY, so `or 90` never
+        fires. `GHOST_NODE_SLOT_WAIT_S=0` gave every node a 0-second permit
+        wait: no off-main node was ever contacted, every pool call reported
+        SATURATED, and all traffic landed on the single main slot.
+      * a typo'd value (`"90s"`) raised ValueError at the TOP of
+        `_do_chat_completion` — killing every call, including main-only ones
+        with no slot involved.
+      * "<=0 disables" is this codebase's convention elsewhere, so the
+        obvious operator reading produced the worst outcome.
+    (LLM review R3 lens A, MAJOR-2 — the same trap `_main_fallback_timeout_s`
+    fixed one round earlier, at a different site.)"""
+    raw = os.environ.get(name)
+    try:
+        val = float(raw) if raw not in (None, "") else float(default)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a number — using %s", name, raw, default)
+        return float(default)
+    if val <= 0:
+        logger.warning("%s=%r is not positive — using %s", name, raw, default)
+        return float(default)
+    return val

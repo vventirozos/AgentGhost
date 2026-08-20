@@ -38,7 +38,10 @@
       <tr><td>WS /ws</td><td>Persistent websocket — log line broadcast.</td></tr>
       <tr><td>POST /api/chat</td><td>Streaming or non-streaming chat. Returns <code>task_id</code> for streams. The client omits the <code>model</code> field on purpose — the agent 404s (<code>ModelNotFound</code>) on any supplied name that doesn't match its single configured <code>--model</code>, so omitting it makes chat track whatever model the agent runs.</td></tr>
       <tr><td>GET /api/chat/resume/{task_id}</td><td>Resume after disconnect at offset.</td></tr>
-      <tr><td>POST /api/chat/cancel/{task_id}</td><td>Cancel an in-flight task.</td></tr>
+      <tr><td>POST /api/chat/cancel/{task_id}</td><td>Tear down the INTERFACE's buffered
+      relay for a task (and suppress its reply-ready push). This does <em>not</em> stop the
+      agent: the composer's Stop also posts <code>/api/turn/cancel</code>, which is the one
+      that ends the turn and releases the global turn lock.</td></tr>
       <tr><td>POST /api/workspace/save · /load</td><td>Zip download / upload of state.</td></tr>
       <tr><td>POST /api/upload · GET /api/download/{path}</td><td>File I/O against the agent.</td></tr>
       <tr><td>POST /api/stt</td><td>Audio → text <strong>locally</strong>: <code>ffmpeg</code> transcode + Gemma 4 audio node (was: Raspberry Pi voice server, retired 2026-08-02 — the host no longer exists). See <a href="voice_server.html">Voice loop</a>.</td></tr>
@@ -191,7 +194,14 @@
     reattaches the live stream (fresh thinking bubble + <code>/api/chat/resume</code>),
     polls a still-running agent turn (<code>/api/turns</code>), or ADOPTS the session's
     server-side history wholesale — never appends, which would recreate the
-    merge_history doubling case.</li>
+    merge_history doubling case. Suspend/resume is SILENT (2026-08-16, operator
+    request): the old "Safari suspended the UI…" and "Reconnected directly to Ghost
+    Server." system bubbles are gone — the reply stream continuing is the only
+    signal; only genuine errors and user cancels still surface as system messages.
+    Pinned by <code>tests/test_interface_silent_resume.py</code> (the silence, the latched and
+    3-attempt-capped network resume, structured error rendering) and
+    <code>tests/test_webui_console_review.py</code> (the ADOPT-not-append property itself —
+    previously attributed to the silent-resume suite, which never asserted it).</li>
     <li><strong>Web push</strong> (<code>interface/webpush_notify.py</code>; VAPID keys
     <code>~/Data/AI/.ghost_vapid.json</code>, subscriptions
     <code>~/Data/AI/.ghost_push_subs.json</code>, both 0600). Two producers: (a)
@@ -434,12 +444,43 @@
     face's palette family) — the rail reads as strata of the agent's episodic memory. New chat
     mints a client uuid; the agent creates the session on first <code>/api/chat</code> carrying
     <code>session_id</code> (app.js attaches <code>window.__ghostSessionId</code>; the server
-    merges history so the fat client can never double it — including a STALE fat client:
-    since 2026-07-28 <code>merge_history</code> subsequence-aligns a shorter-than-stored replay
-    so a tab that fell behind appends only its genuinely new tail instead of concatenating its
-    whole prefix, and client-introduced assistant messages — aborted-stream stubs — are dropped
-    because assistant turns only originate server-side; pinned by
-    <code>tests/test_sessions_and_cancel.py::TestMergeHistoryStaleReplay</code>). <code>/clear</code> now means "new
+    merges history rather than trusting the replay. <strong>What the merge actually
+    guarantees</strong> (rewritten 2026-08-17 — the previous claim, "the fat client can never
+    double it", was stronger than the code: the old heuristic classified each replay as
+    fat/thin/diverged and got the boundaries wrong, deleting the middle of a stale tab's
+    history in one case): <code>merge_history</code> now runs ONE rule — a longest-common-
+    subsequence alignment of <code>(role, content)</code> against the stored history, then
+    "stored, plus whatever of the replay is not already accounted for". Two invariants hold by
+    construction: nothing stored is ever dropped, and nothing already stored is appended twice.
+    Client-introduced assistant messages are dropped from the persisted tail, because assistant
+    turns only originate server-side; in the cap-evicted PREFIX (prompt only) a complete reply
+    is kept and only an aborted-stream stub — a truncation of a reply the store already holds —
+    is dropped. A <code>tool</code> result whose assistant was dropped goes with it, since an
+    orphaned <code>tool_call_id</code> is persisted and then poisons every later turn. Only the
+    LAST element of the tail is the turn being taken; anything before it that the store already
+    holds is replay and is not written a second time (count-aware, so a genuinely retyped
+    message survives).
+    <strong>Measured</strong> (<code>tests/test_sessions_merge_properties.py</code>, which drives
+    the REAL <code>SessionStore.append_turn</code> with append-only clients — an earlier version
+    fed the server's internal prompt back to the client and so graded its own homework):
+    <strong>no typed message is ever lost, in any configuration</strong> — 1 to 5 tabs, 30–70%
+    aborted streams, failed turns, verbatim retypes, caps as tight as 30, up to 480 turns. At the
+    LIVE cap (400, effectively uncapped for real conversations) the store is exactly right: zero
+    duplicates, zero re-adds, every turn persisted, even at five interleaved tabs. Only an
+    artificially tight cap (30) plus three or more tabs leaves a small bounded residual of
+    DUPLICATED messages.
+    <br>⚠ That residual was driven to zero in one round by a "tail replay-filter" (only the last
+    element of the tail is the new turn, so earlier already-stored elements are replay) and the
+    filter was <strong>reverted</strong> the next round: it deleted user turns. "The store already
+    holds this text" is not "this client is replaying it" — the multiset also counted messages the
+    client never saw, so a turn that FAILED to persist and was being replayed to recover it was
+    cancelled against a stranger's identical message. Measured 35 → 115 lost messages at two
+    clients, while removing zero duplicates at the live cap. The trade the design was chosen for
+    stands: <em>a duplicate is recoverable, a lost turn is not.</em> Resolving it properly needs
+    message ids in the protocol. Pinned by that suite plus
+    <code>tests/test_sessions_and_cancel.py</code> — including
+    <code>test_the_route_persists_the_TAIL_not_a_SLICE</code>, because the defect lives in
+    <code>routes.py</code> and the property suite cannot see it there). <code>/clear</code> now means "new
     session". Search filter, confirmed delete, auto-refresh after each turn (titles are derived
     server-side). Sessions-disabled agents degrade to the legacy localStorage-only mode with an
     honest rail note.</li>
@@ -478,8 +519,11 @@
     <code>mergeClientLabelKeys</code>, which carries the label keys forward index-aligned and
     gated on role+content equality — and the resync's drift comparison strips them first, or
     every tab-focus would read "drifted" and wipe the feature (R1 review CRIT). One delayed
-    404 retry covers tapping the instant a reply lands (the agent records the trajectory
-    post-semaphore); errors surface <code>error || detail</code>. 👍/👎 log glyphs are excluded
+    retry covers 404 (tapping the instant a reply lands — the agent records the trajectory
+    post-semaphore) and, since 2026-08-17, 429 / 5xx: a 503 is the agent RESTARTING, i.e. the
+    window a deploy itself creates, and this client is the source of HALF the live human
+    labels, so a dropped one costs days of the §4BR clock. Errors surface
+    <code>error || detail</code>. 👍/👎 log glyphs are excluded
     from <code>WORKING_ICONS</code> so a label receipt doesn't spin the face on an idle agent.
     Switching your thumb re-labels (the sidecar is last-write-wins).</li>
     <li><strong>Rendering upgrades</strong> (app.js): day separators on live conversations that
@@ -522,6 +566,109 @@
     (equality pinned by <code>test_interface_face_palette</code>) and
     <code>workspace.js?v=N → submodules?v=N</code> — bump together when any module changes.</li>
   </ul>
+
+  <h2>Fresh-eye review 2026-08-17 (§4BU)</h2>
+  <p>The console's <em>failure reporting</em> was systematically wrong: distinct failure modes
+  collapsed into the same two or three messages, so the operator was consistently pointed at the
+  wrong subsystem. None of it was pinned — client-side diagnostics are text no test read. The
+  new suite is <code>tests/test_webui_console_review.py</code>, and for branchy string-building
+  it <strong>executes</strong> the extracted helpers under <code>node</code>
+  (<code>tests/helpers.eval_js</code> / <code>extract_js_function</code>) instead of grepping
+  them — the first draft of the auth fix below satisfied every text assertion while raising a
+  <code>ReferenceError</code> inside the error handler.</p>
+  <ul>
+    <li><strong>Stop cancelled nothing agent-side.</strong> The composer's Stop posted
+    <code>/api/chat/cancel/{task}</code> — an interface-side teardown of the buffered relay — and
+    then printed "Request cancelled by user." The agent ran the whole turn: global turn lock
+    held, tokens spent, reply written to the durable session with no client showing it. Stop now
+    also posts <code>/api/turn/cancel</code> (by <code>request_id</code> when the stream got that
+    far), says "Stopped by user.", and REPORTS when the cancel did not take — 404 (already
+    finished) stays quiet.</li>
+    <li><strong>A dead agent showed no abnormal state.</strong> <code>isDegraded(h)</code> was
+    <code>h &amp;&amp; (…)</code>, so the worst case — the health poll failing, <code>h ===
+    null</code> — returned falsy and the header strip stayed calm; the only cue was the model
+    pill quietly vanishing.</li>
+    <li><strong>401/403 reported as "Agent unreachable".</strong> After a key rotation the agent
+    answers and refuses; the panel and the sessions rail both blamed the process, sending the
+    operator to restart something healthy. Both now split the two, the rail via a
+    <code>_railFailureNote(e)</code> classifier fed by a status carried ON the thrown error
+    (<code>res</code> is local to <code>fetchList</code>).</li>
+    <li><strong>Error bodies were destroyed.</strong> <code>await response.json()</code> on a
+    non-JSON error body throws, and the SyntaxError replaced the status — a front-door 502 read
+    as "Unexpected token &lt;". Only <code>.error</code> was read, while FastAPI's own
+    <code>HTTPException</code> renders <code>{"detail": …}</code>, so a rejected key and an
+    invalid session id both arrived as a bare "HTTP 4xx". One <code>_httpError(response,
+    prefix)</code> helper now handles both shapes, list-valued <code>detail</code>, and carries
+    <code>status</code>.</li>
+    <li><strong>The 500-message cap looked like a network blip.</strong> Its 413 rendered as
+    "Network Error: Too many messages (501 &gt; 500 cap)", so the remedy attempted was a retry,
+    which fails identically forever. It now names itself a lock-out and states the fix (new chat
+    or switch sessions) and that nothing is lost.</li>
+    <li><strong>Session ids the proxy accepted, the store rejected.</strong> The interface's
+    <code>_safe_session_id</code> allowed dots and 128 chars; the store's
+    <code>_ID_RE</code> is <code>^[A-Za-z0-9_-]{1,64}$</code>, and a mismatch makes
+    <code>_path()</code> return None — every write a SILENT no-op, the tab looking fine and
+    nothing persisting. The patterns are now the same set, pinned by SAMPLING both sides (equal-
+    looking patterns are not proof), and the store logs a WARNING instead of failing quietly.
+    A failed session write was also <code>logger.debug</code>: losing the durable copy of a
+    conversation now reaches the operator's live stream.</li>
+    <li><strong>Unpinned guards.</strong> The declared-<code>Content-Length</code> branch of
+    <code>BodySizeLimitMiddleware</code> was interchangeable with its byte counter as far as the
+    tests could tell — deleting it left both 413 assertions green while the middleware started
+    slurping the multi-GB body it exists to refuse; the pin now asserts the body is never READ.
+    Every push test patched the ack grace to 0.0, so the 12&nbsp;s window was pinned nowhere: a
+    0-second default would buzz the phone for a reply the user is already reading. The
+    ADOPT-not-append property of the resume path was attributed to a suite that never asserted
+    it.</li>
+  </ul>
+
+  <h2>Rounds 2 and 3 (2026-08-17)</h2>
+  <p>Three fresh-eye lenses per round, then mutation-testing every fix. R2 found 30 defects,
+  R3 another 30 — and the pattern that matters is that <strong>R3's most serious findings were
+  in R2's fixes</strong>, and R2's in R1's. Each round's repair inherited the defect class it
+  repaired.</p>
+  <ul>
+    <li><strong>A fix that fixed nothing.</strong> <code>f"{e or type(e).__name__}"</code> — an
+    exception OBJECT is always truthy, so the fallback never fired and the empty
+    <code>str(e)</code> still reached the client. It looked right, read right in review, and
+    changed nothing on the one proxy family carrying <code>/api/turn/cancel</code> and
+    <code>/api/feedback</code>.</li>
+    <li><strong>Stop cancelled the wrong turn.</strong> R1 made Stop reach the agent; R2 found
+    it sent a bare body meaning "cancel whatever holds the semaphore", which during a tool phase
+    (when <code>currentReqId</code> is still null) could kill a background dream turn while the
+    user's own turn ran on. It now resolves its own turn via <code>/api/turns</code> — by
+    session, or by matching the turn PREVIEW when sessions are disabled — or cancels nothing and
+    says so. The palette's two Stop commands had the same defect and were missed by the first
+    fix.</li>
+    <li><strong>The client-side merge reordered conversations.</strong> R2's fix for "the resync
+    deletes the user's own message" re-appended unaccounted messages at the TAIL, so an
+    abandoned question landed after the reply to a later one — and, because the store truncates
+    from the front at 400 while the interface caps at 500, every message in that window looked
+    unaccounted and got pasted onto the end. Replaced with a real alignment merge that keeps
+    local-only messages in place.</li>
+    <li><strong>Crash-loop surface.</strong> Eight <code>float()</code>/<code>int()</code> env
+    parses ran at import under a KeepAlive LaunchDaemon: one typo'd or EMPTY value meant
+    permanent silent restart. The R2 push fix had joined that family.</li>
+    <li><strong>Live-but-unbounded.</strong> The active-task cap was enforced only by a 60s
+    sweep (measured 3000 entries in a window), each entry holding a connection from a
+    100-connection pool with a 1800s timeout; in-flight chat workers were never cancelled at
+    shutdown; the push library was called with no HTTP timeout at all, which parks the notify
+    poller for the life of the process.</li>
+    <li><strong>The launcher failed open on the auth SOURCE</strong> — an unreadable key file
+    left the process inheriting the stale, publicly-known key from the LaunchDaemon plist.</li>
+  </ul>
+  <p><strong>Instruments.</strong> The suites now EXECUTE the client's branchy helpers under
+  node (<code>tests/helpers.eval_js</code>, <code>extract_js_function</code>,
+  <code>extract_js_listener</code>) because <code>if (true)</code> / <code>if (false)</code>
+  walks straight through any token assertion — that is how
+  <code>void 0 &amp;&amp; addMessage(…)</code> and
+  <code>authFailed = false &amp;&amp; …</code> survived. <code>tests/test_interface_cachebust.py</code>
+  fails when a static module changes without its <code>?v=</code> moving, and when a leaf is
+  bumped without its ancestors (which ships nothing). Three tests were found fully vacuous and
+  rewritten: one asserted that <code>set.discard</code> does not raise (testing CPython), one
+  compared 200 against a mock returning 200, and one hand-rolled an app that never catches — so
+  the <code>BaseException</code> escape hatch <code>_BodyTooLarge</code> exists for was never
+  exercised.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

@@ -229,11 +229,19 @@ class TrajectoryCollector:
             }
             path = self._corrections_path()
             with self._lock:
+                # Bound unconditionally: the human-supersede warning below
+                # reads it, and a caller passing neither flag would
+                # otherwise hit NameError -> the broad except -> a silent
+                # False, i.e. a DROPPED LABEL reported as a failed write.
+                latest = None
                 if yield_to_human or skip_identical:
                     latest = self._load_corrections().get(trajectory_id)
-                    if yield_to_human and latest and str(
-                            latest.get("source") or "").startswith(
-                            HUMAN_SOURCE_PREFIX):
+                    # EVER-human, not latest-human (review C10): a
+                    # `user_correction` or `operator_overlay` row landing
+                    # between the human label and a late machine verdict
+                    # used to disarm this guard entirely — measured,
+                    # `verifier_late` then overwrote a human-labelled turn.
+                    if yield_to_human and self.has_human_label(trajectory_id):
                         logger.info(
                             "outcome correction for %s withheld — a human "
                             "label stands (%s)",
@@ -266,6 +274,38 @@ class TrajectoryCollector:
                             and latest.get("reason") == record["reason"] \
                             and latest.get("source") == record["source"]:
                         return "unchanged"
+                # C5: among humans last-write-wins STANDS (operator
+                # doctrine), but it must not be SILENT. In open-channel
+                # mode `slack:requester` is any team member, and live rows
+                # show a colleague's 👎 replacing the operator's 👍 3.5h
+                # later with nothing logged — on §4BR, where the operator
+                # is the grader, that silently flips an arm datum.
+                _new_src = str(record.get("source") or "")
+                if _new_src.startswith(HUMAN_SOURCE_PREFIX) and latest is None:
+                    # Neither flag was passed, so `latest` was never read.
+                    # The supersede check needs it; this is the only human
+                    # write path that skips the dedupe read.
+                    latest = self._load_corrections().get(trajectory_id)
+                if _new_src.startswith(HUMAN_SOURCE_PREFIX) and isinstance(
+                        latest, dict):
+                    # isinstance, not truthiness: a cross-process write
+                    # between the dedupe read and here can leave `latest`
+                    # a non-dict, and an unguarded `.get` raised into the
+                    # broad except -> a silent False, i.e. a DROPPED LABEL
+                    # reported as a disk error. Same shape as the NameError
+                    # this warning introduced in round 1, same line.
+                    _old_src = str(latest.get("source") or "")
+                    if (_old_src.startswith(HUMAN_SOURCE_PREFIX)
+                            and _old_src != _new_src
+                            and latest.get("outcome") != record["outcome"]):
+                        logger.warning(
+                            "human label for %s CHANGED by a different "
+                            "source: %s said %s, %s now says %s "
+                            "(last-write-wins stands — if this turn is "
+                            "experiment evidence, check which human you "
+                            "trust)", trajectory_id[:8], _old_src,
+                            latest.get("outcome"), _new_src,
+                            record["outcome"])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with path.open("a", encoding="utf-8") as f:
                     import json as _json
@@ -318,6 +358,11 @@ class TrajectoryCollector:
         if sig is not None and cached is not None and cached[0] == sig:
             return cached[1]
         out: dict = {}
+        # Ids that carry a human record ANYWHERE in their history, not just
+        # as the latest row (see `has_human_label`). Collected in this same
+        # parse because the walk is already happening — the alternative is a
+        # second full read of the sidecar.
+        ever_human: set = set()
         try:
             import json as _json
             with path.open("r", encoding="utf-8") as f:
@@ -333,12 +378,94 @@ class TrajectoryCollector:
                     if not isinstance(tid, str) or not tid:
                         continue
                     out[tid] = rec
+                    if str(rec.get("source") or "").startswith(
+                            HUMAN_SOURCE_PREFIX):
+                        ever_human.add(tid)
         except OSError as e:
             logger.warning("cannot read corrections sidecar %s: %s", path, e)
             return out
         if sig is not None:
             self._corrections_cache = (sig, out)
+            self._ever_human_cache = (sig, ever_human)
         return out
+
+    def _scan_for_human_label(self, tid: str) -> bool:
+        """Direct sidecar scan — the fallback when the memoized set could
+        not be refreshed. Slower, but a stale "no" would let a machine
+        verdict overwrite a human label."""
+        try:
+            path = self._corrections_path()
+            if not path.exists():
+                return False
+            import json as _json
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if rec.get("trajectory_id") == tid and str(
+                            rec.get("source") or "").startswith(
+                            HUMAN_SOURCE_PREFIX):
+                        return True
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def has_human_label(self, trajectory_id: str) -> bool:
+        """Did a human EVER label this turn — not just most recently?
+
+        `_load_corrections` keeps only the latest record per id, so a guard
+        that reads it sees a human label only while nothing else has been
+        written since. A `user_correction` or `operator_overlay` row landing
+        between a human label and a late machine verdict therefore DISARMED
+        the human protection: measured, `verifier_late` then overwrote a
+        human-labelled turn (introspect/feedback review C10). Reachable
+        whenever a follow-up correction beats a slow late verdict, and live
+        p90 verdict latency is ~54s.
+        """
+        tid = str(trajectory_id or "")
+        if not tid:
+            return False
+        try:
+            path = self._corrections_path()
+            if not path.exists():
+                return False
+            st = path.stat()
+            sig = (st.st_size, st.st_mtime_ns)
+            cached = getattr(self, "_ever_human_cache", None)
+            if cached is None or cached[0] != sig:
+                # ⚠ Two failure modes, and they need different answers.
+                # `_load_corrections` refills both caches only when it
+                # actually PARSES; on a `_corrections_cache` memo hit it
+                # returns before the paired assignment. So:
+                #   * re-comparing the CALLER's signature could never be
+                #     satisfied on that path -> a full-file scan on EVERY
+                #     call, permanently (measured: 310 scans over a
+                #     1744-trajectory walk);
+                #   * blindly trusting whatever is there after the reload
+                #     answers from a cache the reload never touched, and a
+                #     stale "no human label" is the direction that LOSES
+                #     DATA (a machine verdict overwrites a human one).
+                # The honest test is whether the reload actually refreshed
+                # the object: if it did, trust it; if it did not, scan.
+                _before = cached
+                self._load_corrections()
+                cached = getattr(self, "_ever_human_cache", None)
+                if cached is not None and cached is not _before:
+                    return bool(tid in cached[1])
+                # Re-verify: an OSError inside the reload leaves the OLD
+                # cache in place, and returning from it would answer from
+                # a stale set (R2 MINOR-9). Unknown must not read as "no
+                # human label" — that is the direction that loses data —
+                # so fall back to a direct scan.
+                return self._scan_for_human_label(tid)
+            return bool(cached and tid in cached[1])
+        except Exception:  # noqa: BLE001 — a guard must not raise
+            return False
 
     # -----------------------------------------------------------------
     # Read path
@@ -430,6 +557,54 @@ class TrajectoryCollector:
                                     # the correction when the original was
                                     # empty.
                                     traj.failure_reason = reason
+                                # PROVENANCE — without this the overlay
+                                # destroyed WHO decided the outcome, and the
+                                # §4BR decision rule's only accepted metric
+                                # ("human feedback label rate") was
+                                # unmeasurable by the instrument it names: a
+                                # human 👎 and a `verifier_late` machine
+                                # verdict were byte-identical to
+                                # `summarize_streaming`, so the experiments
+                                # report could only render the CIRCULAR
+                                # outcome metric the rule explicitly
+                                # disowns. Stamped on `extra` (not a new
+                                # Trajectory field) so nothing on the write
+                                # path or the on-disk schema changes.
+                                _src = str(corr.get("source") or "")
+                                # EVER-human here too (R2 MINOR-7): the
+                                # guard was moved to ever-human and the
+                                # METRIC left reading the latest source, so
+                                # a `user_correction` / `operator_overlay`
+                                # row landing after a human label silently
+                                # removed the turn from the §4BR
+                                # denominator. `human_labeled` records that
+                                # a human graded this turn at some point;
+                                # `outcome_source` still names who set the
+                                # outcome that ships.
+                                if _src and not _src.startswith(
+                                        HUMAN_SOURCE_PREFIX):
+                                    try:
+                                        if self.has_human_label(traj.id):
+                                            traj.extra["human_labeled"] = True
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                if _src:
+                                    try:
+                                        traj.extra["outcome_source"] = _src
+                                        # "timestamp" is what the WRITER
+                                        # emits (376/376 live rows); "at"
+                                        # was never a key, so this stamp
+                                        # was dead on arrival — the C2 fix
+                                        # restored the source half of
+                                        # provenance and dropped the time
+                                        # half the same way (R2 MINOR-8).
+                                        _at = str(corr.get("timestamp")
+                                                  or corr.get("at") or "")
+                                        if _at:
+                                            traj.extra[
+                                                "outcome_source_at"] = _at
+                                    except Exception:  # noqa: BLE001
+                                        pass
                             yield traj
                 except OSError as e:
                     logger.warning("cannot read trajectory file %s: %s", file_path, e)

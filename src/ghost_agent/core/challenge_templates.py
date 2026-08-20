@@ -946,7 +946,7 @@ selector is `#secret`, and print that text (stripped) as the only
 line of output.
 {twist_clause}
 Hints:
-  * Use `await p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage'])`.
+  * Launch Tor-aware (the reflex for ANY raw-Playwright cell, even though this page is local `file://`): `await p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage'] + (['--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost'] if os.environ.get('TOR_PROXY') else []), proxy={{'server': os.environ.get('TOR_PROXY')}} if os.environ.get('TOR_PROXY') else None)`. A public navigation without the proxy leaks the real IP; `file://`/loopback ignore it, so the conditional is always safe.
   * Navigate with `await page.goto('file:///workspace/page.html', wait_until='domcontentloaded')` and then (if needed) `await page.wait_for_selector('#secret')`.
   * Close the browser cleanly: `await browser.close(); await p.stop()`.
 

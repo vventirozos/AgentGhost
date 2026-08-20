@@ -707,7 +707,11 @@ def read_byte_budget(max_context: int) -> int:
     0.5 (≈70% of the window for a single file); two such reads in one turn
     overflowed a 131 K window at 136 K tokens. 0.40 leaves headroom and, paired
     with the cumulative ReadBudget, makes parallel whole-file reads safe."""
-    return max(150000, int(max_context * 3.5 * 0.40))
+    # § context R1 B2: the 150 KB floor is BOUNDED by 0.8x the window —
+    # for small windows the unconditional floor INVERTED the cap (a 100 KB
+    # file returned whole into an 8k-token window). Large windows unchanged.
+    return min(max(150000, int(max_context * 3.5 * 0.40)),
+               max(1, int(max_context * 3.5 * 0.80)))
 
 
 class ReadBudget:
@@ -1111,7 +1115,11 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         # too-large error. Heuristics on the 8 KB head: dense "0x" literals
         # (a C data table) or very long average lines (minified/single-line
         # data). Ranged reads and search remain available for specifics.
-        if file_size > 96 * 1024:
+        # § context R1 B6: under a ZERO budget (context-pressure lockdown)
+        # the sampler must not run — "whole-file reads DISABLED" has to mean
+        # the sample too; the refusal below explains the state honestly.
+        if file_size > 96 * 1024 and not (
+                read_budget is not None and read_budget.remaining <= 0):
             try:
                 _s_head = await asyncio.to_thread(_read_head, path, 8192)
             except OSError as oe:
@@ -1149,8 +1157,23 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         # since the per-file cap already bounds it). This is the guard that
         # stops parallel whole-file reads from overflowing: each passes alone,
         # together they don't fit.
-        if (read_budget is not None and file_size > read_budget.remaining
-                and (read_budget.spent > 0 or read_budget.remaining <= 0)):
+        # § context R1 B2: NO first-read exemption. The old qualifier
+        # `(spent > 0 or remaining <= 0)` let the FIRST read of a batch
+        # ignore the occupancy-shrunk budget entirely (170 KB returned
+        # against a 3 KB remaining budget, 57x) — the shrink only ever bit
+        # the second read. Any read that exceeds the remaining budget is
+        # refused; ranged reads/search stay exempt by design.
+        if read_budget is not None and file_size > read_budget.remaining:
+            if read_budget.spent == 0 and read_budget.remaining > 0:
+                return (
+                    f"Error: Reading '{filename}' ({file_size / 1024:.1f} KB) is "
+                    f"refused — the conversation is near the context ceiling and "
+                    f"only {read_budget.remaining / 1024:.1f} KB of whole-file "
+                    f"read budget remains this turn. Pull only what you need: "
+                    f"operation='search', a ranged read (start_line/end_line — "
+                    f"exempt from this cap), or an 'execute' script that prints "
+                    f"a compact digest."
+                )
             if read_budget.spent == 0:
                 # Zero capacity BEFORE any read: the conversation itself is
                 # already near the context ceiling (occupancy-aware budget,
@@ -3683,7 +3706,27 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     elif operation == "read_chunked":
         page = kwargs.get("page", 1)
         chunk_size = kwargs.get("chunk_size", 32000)
-        return await tool_read_document_chunked(target_path, sandbox_dir, page=page, chunk_size=chunk_size, max_context=max_context)
+        # § context R1 B3: chunked reads were INVISIBLE to the batch budget —
+        # N per-call-capped pages accumulate unbudgeted (the exact
+        # "each call clears its own cap, together they don't fit" shape the
+        # ReadBudget exists for), and the budget's own refusal text routed
+        # the model into this uncharged bypass. Refuse at zero remaining;
+        # charge whatever is returned.
+        if read_budget is not None and read_budget.remaining <= 0:
+            if read_budget.spent == 0:
+                return ("Error: chunked reading is refused — the conversation "
+                        "is already near the context ceiling (no read budget "
+                        "this turn). Use operation='search', a ranged read "
+                        "(start_line/end_line), or an 'execute' digest script.")
+            return (f"Error: the read budget for THIS turn is exhausted "
+                    f"({read_budget.spent / 1024:.1f} KB already read). Use "
+                    f"operation='search', a ranged read, or an 'execute' "
+                    f"digest script.")
+        _ck = await tool_read_document_chunked(target_path, sandbox_dir, page=page, chunk_size=chunk_size, max_context=max_context)
+        if (read_budget is not None and isinstance(_ck, str)
+                and not _ck.startswith("Error")):
+            read_budget.charge(len(_ck))
+        return _ck
     elif operation == "inspect":
         # `lines` used to be dropped here, so the model could never widen the
         # peek; tool_inspect_file coerces bad values back to the default.

@@ -342,3 +342,381 @@ def test_learning_health_warns_when_nothing_is_stamped(tmp_path):
                                     task_kind="user_request"))
     out = "\n".join(_experiment_health_lines(memory_dir))
     assert "⚠ NO arms stamped" in out
+
+
+@pytest.mark.asyncio
+async def test_introspect_shows_an_ENABLED_arm_with_no_traffic(tmp_path, monkeypatch):
+    """Introspect review C1, end-to-end through the tool: an on-disk
+    registry lists an enabled live spec that no trajectory carries — the
+    exact state verify_depth sat in for three days while this report,
+    the instrument that should have shown n=0, structurally could not.
+    """
+    import json
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    ex.reset_registry_cache()
+    agent, collector = _agent_with_collector(tmp_path)
+    await _run(agent)          # corpus now carries risk_steer stamps
+
+    reg = (tmp_path / "experiments.json")
+    reg.write_text(json.dumps({"experiments": [
+        {"name": "risk_steer", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+        {"name": "ghost_arm", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+    ]}))
+    ex.reset_registry_cache()
+
+    from ghost_agent.tools.introspect import tool_introspect
+    out = await tool_introspect(action="experiments", context=agent.context)
+    assert "risk_steer" in out
+    assert "ghost_arm  (n=0)" in out, out[-800:]
+    assert "enabled in the registry but NO enrolled turn" in out
+
+
+@pytest.mark.asyncio
+async def test_introspect_DENIES_bench_scoped_stale_live_stamps(tmp_path, monkeypatch):
+    """The deny-scope filter had no pin — deleting `_deny_live` survived
+    the whole suite. A spec re-scoped to bench must not render its stale
+    live stamps in the live view."""
+    import json
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    ex.reset_registry_cache()
+    agent, collector = _agent_with_collector(tmp_path)
+    await _run(agent)          # stamps risk_steer as a LIVE arm
+
+    reg = (tmp_path / "experiments.json")
+    reg.write_text(json.dumps({"experiments": [
+        {"name": "risk_steer", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "bench"},
+    ]}))
+    ex.reset_registry_cache()
+
+    from ghost_agent.tools.introspect import tool_introspect
+    out = await tool_introspect(action="experiments", context=agent.context)
+    assert "■ risk_steer" not in out, (
+        "a bench-scoped spec's stale live stamps rendered in the live view")
+
+
+# ── Introspect review round 2 (2026-08-17) ─────────────────────────────────
+
+def _write_registry(tmp_path, specs):
+    import json
+    (tmp_path / "experiments.json").write_text(json.dumps(
+        {"experiments": specs}))
+    ex.reset_registry_cache()
+
+
+@pytest.mark.asyncio
+async def test_BENCH_section_shows_an_enabled_unstamped_bench_arm(
+        tmp_path, monkeypatch):
+    """R2 MAJOR-2: the C1 zero-row fix was applied to the live view and
+    NOT to the bench section INSIDE THE SAME FUNCTION, with the bench
+    names already in hand. tts_bon is one drained budget away from
+    verify_depth's exact inert state, invisibly."""
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    ex.reset_registry_cache()
+    agent, _ = _agent_with_collector(tmp_path)
+    await _run(agent)
+    _write_registry(tmp_path, [
+        {"name": "risk_steer", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+        {"name": "bench_stamped", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "bench"},
+        {"name": "bench_ghost", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "bench"},
+    ])
+    # A bench corpus with one stamped turn, via the admissibility reader.
+    from ghost_agent.tools import introspect as I
+
+    def _fake_bench_iter(reason, args):
+        from ghost_agent.distill.collector import Trajectory
+        return iter([Trajectory(user_request="b", final_response="x",
+                                task_kind="bench",
+                                extra={"experiments":
+                                       {"bench_stamped": "control"}})])
+    import ghost_agent.core.admissibility as adm
+    monkeypatch.setattr(adm, "iter_bench_trajectories", _fake_bench_iter)
+
+    from ghost_agent.tools.introspect import tool_introspect
+    out = await tool_introspect(action="experiments", context=agent.context)
+    assert "BENCH-SCOPED EXPERIMENTS" in out
+    assert "bench_stamped" in out
+    assert "bench_ghost  (n=0)" in out, out[-900:]
+
+
+@pytest.mark.asyncio
+async def test_a_CORRUPT_registry_is_ANNOUNCED_not_silently_defaulted(
+        tmp_path, monkeypatch):
+    """R2 MAJOR-3: the round-1 caveat fired on an exception load_registry
+    can never raise, while the REAL failure — file exists, unparseable —
+    silently substituted the code defaults: deny filter off, plus five
+    false "enrollment broken" alarms for specs the operator never listed.
+    """
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    ex.reset_registry_cache()
+    agent, _ = _agent_with_collector(tmp_path)
+    await _run(agent)
+    # ⚠ A DISTINGUISHING spec is load-bearing (R3 finding 2). The first
+    # version of this test asserted `"(n=0)" not in out` against a corpus
+    # where the setup turn had stamped EVERY default spec (traffic=1.0),
+    # so `defaults - summary` was empty whether or not degradation nulled
+    # `_expected` — the assertion passed with the fix reverted. The sixth
+    # cannot-distinguish assertion this project has found; the cure is a
+    # default spec the turn could not have stamped.
+    ghost = ex.ExperimentSpec(
+        name="default_ghost", arms=("control", "treatment"),
+        traffic=1.0, enabled=True, description="R3 probe",
+        scope=ex.SCOPE_LIVE)
+    monkeypatch.setattr(ex, "DEFAULT_SPECS",
+                        tuple(ex.DEFAULT_SPECS) + (ghost,))
+    (tmp_path / "experiments.json").write_text("{not json at all")
+    ex.reset_registry_cache()
+
+    from ghost_agent.tools.introspect import tool_introspect
+    out = await tool_introspect(action="experiments", context=agent.context)
+    assert "UNREADABLE" in out, out[:400]
+    # No false n=0 alarms from the substituted DEFAULT specs — and with
+    # `default_ghost` unstamped by construction, this now goes red if
+    # degradation stops nulling `_expected`.
+    assert "(n=0)" not in out, (
+        "default specs the operator never listed rendered as broken arms")
+
+
+def test_load_registry_carries_its_degradation(tmp_path):
+    import json
+    p = tmp_path / "experiments.json"
+    # Valid file: not degraded.
+    p.write_text(json.dumps({"experiments": []}))
+    ex.reset_registry_cache()
+    assert ex.load_registry(p).degraded is False
+    # Corrupt file: degraded.
+    p.write_text("{broken")
+    ex.reset_registry_cache()
+    assert ex.load_registry(p).degraded is True
+    # Missing file: defaults, NOT degraded (nothing was substituted).
+    ex.reset_registry_cache()
+    assert ex.load_registry(tmp_path / "absent.json").degraded is False
+
+
+def test_the_kill_switch_reframes_the_zero_rows(tmp_path, monkeypatch):
+    """R2 MINOR-5: with GHOST_EXPERIMENTS=0 nothing enrolls, so every
+    enabled spec would alarm 'enrollment broken' forever — a correct
+    observation with a wrong diagnosis attached."""
+    monkeypatch.setenv(ex.ENV_KILL, "0")
+    # Empty corpus AND a stamped corpus: both shapes must reframe.
+    out = ex.render_report({}, expected_names=["ghost_arm"])
+    assert "GHOST_EXPERIMENTS=0 is set" in out
+    assert "ghost_arm" in out
+    assert "enrollment/stamping is broken" not in out
+
+    from ghost_agent.distill.collector import Trajectory
+    stats = ex.summarize_trajectories(
+        [Trajectory(user_request="q", final_response="a",
+                    task_kind="user_request",
+                    extra={ex.EXTRA_KEY: {"risk_steer": "control"}})])
+    out2 = ex.render_report(stats, expected_names=["risk_steer", "ghost_arm"])
+    assert "GHOST_EXPERIMENTS=0 is set" in out2
+    assert "enrollment/stamping is broken" not in out2
+
+
+def test_an_EMPTY_corpus_still_names_the_waiting_arms(monkeypatch):
+    """R2 follow-up: the zero-row block was unreachable from render_report's
+    own empty-corpus early returns — the identical early-return shape the
+    same round fixed in learning_health. Day one of a fresh deploy is
+    exactly when 'which arms should be accumulating' matters most."""
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    out = ex.render_report({}, expected_names=["verify_depth"])
+    assert "verify_depth" in out
+    assert "Enabled and waiting for traffic" in out
+    # And with recorded-but-unstamped turns (the regression shape):
+    out2 = ex.render_report({}, coverage={"user_turns": 7, "stamped": 0},
+                            expected_names=["verify_depth"])
+    assert "verify_depth" in out2
+
+
+def test_the_CLI_report_shows_enabled_unstamped_arms(tmp_path, monkeypatch):
+    """R2 MAJOR-1: the operator CLI (scripts/experiment_report.py) calls
+    itself 'the same report' as introspect and kept enumerating only
+    stamped arms after the introspect fix — this file's own R5 comment
+    records the identical 'fixed one file over, re-created here' pattern.
+    """
+    import subprocess
+    import sys as _sys
+    home = tmp_path / "home"
+    (home / "system").mkdir(parents=True)
+    _write_registry_at = home / "system" / "experiments.json"
+    _write_registry_at.write_text(json.dumps({"experiments": [
+        {"name": "alpha_live", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+        {"name": "ghost_live", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+    ]}))
+    from ghost_agent.distill.collector import Trajectory
+    coll = TrajectoryCollector(root=home / "system" / "trajectories",
+                               session_id="cli")
+    coll.append(Trajectory(user_request="q", final_response="a",
+                           task_kind="user_request",
+                           extra={ex.EXTRA_KEY: {"alpha_live": "control"}}))
+    env = {"GHOST_HOME": str(home), "PATH": "/usr/bin:/bin",
+           "GHOST_API_KEY": "test-key"}
+    out = subprocess.run(
+        [_sys.executable, "scripts/experiment_report.py"],
+        capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert out.returncode == 0, out.stderr[-500:]
+    assert "alpha_live" in out.stdout
+    assert "ghost_live  (n=0)" in out.stdout, out.stdout[-700:]
+
+    # And the machine-readable form: absent key must not read as healthy.
+    outj = subprocess.run(
+        [_sys.executable, "scripts/experiment_report.py", "--json"],
+        capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(Path(__file__).resolve().parents[1]))
+    data = json.loads(outj.stdout)
+    assert data["enabled_unstamped"] == ["ghost_live"]
+    assert data["registry_degraded"] is False
+
+
+def test_the_CLI_json_carries_the_circular_caveat(tmp_path):
+    """R4 C1: `experiment=` was threaded through three of the four
+    `compare_arms` call sites. The missed one is this file's `--json`
+    branch — so a machine consumer read `TREATMENT WORSE` on a metric the
+    human report showed as `NO VERDICT`, on a bench arm already past the
+    n>=30/arm floor. This file's own comments record the same "fixed one
+    file over, re-created here" pattern twice."""
+    import subprocess
+    import sys as _sys
+    home = tmp_path / "home"
+    (home / "system").mkdir(parents=True)
+    (home / "system" / "experiments.json").write_text(json.dumps({
+        "experiments": [
+            {"name": "verify_depth", "arms": ["control", "treatment"],
+             "traffic": 1.0, "enabled": True, "scope": "live"}]}))
+    from ghost_agent.distill.collector import Trajectory
+    coll = TrajectoryCollector(root=home / "system" / "trajectories",
+                               session_id="cli")
+    for i in range(40):
+        for arm, bad in (("control", i < 30), ("treatment", i < 4)):
+            t = Trajectory(user_request="q", final_response="a",
+                           task_kind="user_request",
+                           extra={ex.EXTRA_KEY: {"verify_depth": arm}})
+            t.outcome = "failed" if bad else "passed"
+            coll.append(t)
+    env = {"GHOST_HOME": str(home), "PATH": "/usr/bin:/bin",
+           "GHOST_API_KEY": "test-key"}
+    out = subprocess.run(
+        [_sys.executable, "scripts/experiment_report.py", "--json"],
+        capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert out.returncode == 0, out.stderr[-400:]
+    data = json.loads(out.stdout)
+    # BOTH lists (review R5 F3): the fix threaded `experiment=` through two
+    # calls in this branch and the first version of this pin checked one —
+    # reproducing the very "three of four call sites" shape it exists to
+    # prevent.
+    for key in ("comparisons", "triggered_comparisons"):
+        rows = data["verify_depth"][key]
+        if not rows:
+            continue
+        fr = next((c for c in rows if c["metric"] == "failure_rate"), None)
+        assert fr is not None, f"no failure_rate row in {key}"
+        assert "CIRCULAR" in fr["confound"], (
+            f"--json {key} dropped the per-experiment caveat: {fr}")
+        assert fr["verdict"].startswith("NO VERDICT")
+
+
+def test_learning_health_names_the_arms_when_NOTHING_is_stamped(tmp_path):
+    """R2 MINOR-4: the zero-row block sat after the `not all_stats` early
+    return — so the WORST state for it (nothing stamped at all) named no
+    specs."""
+    from ghost_agent.core.learning_health import _experiment_health_lines
+    from ghost_agent.distill.collector import Trajectory
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    (tmp_path / "experiments.json").write_text(json.dumps({"experiments": [
+        {"name": "ghost_live", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+    ]}))
+    ex.reset_registry_cache()
+    coll = TrajectoryCollector(root=tmp_path / "trajectories",
+                               session_id="lh")
+    for i in range(3):     # user turns exist, no stamps at all
+        coll.append(Trajectory(user_request=f"q{i}", final_response="a",
+                               task_kind="user_request"))
+    out = "\n".join(_experiment_health_lines(memory_dir))
+    assert "NO arms stamped" in out
+    assert "ghost_live: n=0" in out, out
+
+
+@pytest.mark.asyncio
+async def test_BENCH_zero_rows_render_even_on_an_EMPTY_bench_corpus(
+        tmp_path, monkeypatch):
+    """R3 finding 1: the bench closure's `return ""` on an empty corpus
+    skipped render_report entirely, so the R2 zero-row fix was unreachable
+    in its WORST state — bench specs enabled, bench corpus never stamped
+    (fresh home, or bench stamping wholly broken: the verify_depth shape).
+    The section must render 'Enabled and waiting for traffic', not vanish."""
+    monkeypatch.delenv(ex.ENV_KILL, raising=False)
+    ex.reset_registry_cache()
+    agent, _ = _agent_with_collector(tmp_path)
+    await _run(agent)
+    _write_registry(tmp_path, [
+        {"name": "risk_steer", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+        {"name": "bench_ghost", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "bench"},
+    ])
+    import ghost_agent.core.admissibility as adm
+    monkeypatch.setattr(adm, "iter_bench_trajectories",
+                        lambda reason, args: iter([]))
+
+    from ghost_agent.tools.introspect import tool_introspect
+    out = await tool_introspect(action="experiments", context=agent.context)
+    assert "BENCH-SCOPED EXPERIMENTS" in out, (
+        "the section vanished on an empty bench corpus")
+    assert "bench_ghost" in out, out[-600:]
+    assert "waiting for traffic" in out
+
+
+def test_learning_health_zero_rows_respect_the_kill_switch(tmp_path,
+                                                           monkeypatch):
+    """R3 finding 3: render_report got the GHOST_EXPERIMENTS=0 reframe in
+    round 2 and this sibling did not — same round, same defect shape."""
+    from ghost_agent.core.learning_health import _experiment_health_lines
+    from ghost_agent.distill.collector import Trajectory
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir(parents=True)
+    (tmp_path / "experiments.json").write_text(json.dumps({"experiments": [
+        {"name": "ghost_live", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+    ]}))
+    ex.reset_registry_cache()
+    coll = TrajectoryCollector(root=tmp_path / "trajectories",
+                               session_id="lh")
+    coll.append(Trajectory(user_request="q", final_response="a",
+                           task_kind="user_request"))
+    monkeypatch.setenv(ex.ENV_KILL, "0")
+    out = "\n".join(_experiment_health_lines(memory_dir))
+    assert "GHOST_EXPERIMENTS=0 is set" in out, out
+    assert "enrollment broken" not in out
+
+
+def test_the_CLI_json_mode_reports_a_MISSING_corpus_as_a_document(tmp_path):
+    """R3 finding 5: the missing-root early return starved --json of the
+    keys added so that absent != healthy — a pipe consumer got empty
+    stdout and a parse error instead of a document naming the unknown."""
+    import subprocess
+    import sys as _sys
+    home = tmp_path / "empty-home"
+    (home / "system").mkdir(parents=True)      # no trajectories dir
+    env = {"GHOST_HOME": str(home), "PATH": "/usr/bin:/bin",
+           "GHOST_API_KEY": "test-key"}
+    out = subprocess.run(
+        [_sys.executable, "scripts/experiment_report.py", "--json"],
+        capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(Path(__file__).resolve().parents[1]))
+    assert out.returncode == 0
+    data = json.loads(out.stdout)          # must PARSE
+    assert "error" in data
+    assert data["registry_degraded"] is None, (
+        "unknown must be null, not a healthy-looking default")

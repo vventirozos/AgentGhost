@@ -37,6 +37,11 @@ PROXY_ROUTES = [
     ("POST", "/api/notifications/ack"),
     ("POST", "/api/memory/correct"),
     ("POST", "/api/memory/delete"),
+    # ⚠ /api/feedback was MISSING from this table (review R1 M12d). It is the
+    # route that writes human outcome labels — §4BT made those the primary
+    # metric of a live experiment arm — so an unauthenticated or unproxied
+    # regression there is the most consequential of the set.
+    ("POST", "/api/feedback"),
 ]
 
 
@@ -115,11 +120,42 @@ async def test_valid_session_id_passes_through_verbatim():
     fake = _fake_upstream(payload={"id": "x"})
     client = TestClient(server.app)
     with patch.object(server, "_get_http_client", return_value=fake):
-        r = client.get("/api/sessions/web-abc_1.2",
+        r = client.get("/api/sessions/web-abc_1-2",
                        headers={"X-Ghost-Key": server.GHOST_API_KEY})
     assert r.status_code == 200
     args, _ = fake.request.call_args
-    assert args[1].endswith("/api/sessions/web-abc_1.2")
+    assert args[1].endswith("/api/sessions/web-abc_1-2")
+
+
+def test_proxy_id_charset_matches_the_store():
+    """The proxy guard and the STORE's guard must be the same set.
+
+    This test used to assert `web-abc_1.2` was ACCEPTED — an id the store's
+    ``_ID_RE`` rejects, which makes ``_path()`` return None and every write
+    a silent no-op. The lax end of a two-guard pair is where the data goes
+    (review R1 M10), so pin equality by SAMPLING both, not by comparing
+    pattern text (equal-looking patterns are not proof)."""
+    from ghost_agent.core.sessions import _ID_RE
+    samples = ["web-abc_1-2", "0123456789abcdef", "a" * 64, "a" * 65,
+               "web-abc_1.2", ".hidden", "a..b", "a/b", "x?y", "", "-lead",
+               "UPPER_case-9", "a" * 128, "a\n", "a\nb", "a b"]
+    # ⚠ 13 hand-picked samples "pinned equality" while `+`, `:`, `~` and a
+    # TRAILING NEWLINE all disagreed between the two guards (R2 lens C). A
+    # claim of set equality has to be checked over a SET, so sweep every
+    # codepoint that could plausibly appear in an id.
+    samples += [f"a{chr(cp)}b" for cp in range(0x00, 0x300)]
+    samples += [chr(cp) for cp in range(0x20, 0x300)]
+    for sid in samples:
+        store_ok = bool(_ID_RE.match(sid))
+        try:
+            server._safe_session_id(sid)
+            proxy_ok = True
+        except Exception:
+            proxy_ok = False
+        assert proxy_ok == store_ok, (
+            f"{sid!r}: proxy={proxy_ok} store={store_ok} — a proxy-accepted, "
+            "store-rejected id persists NOTHING; the reverse breaks a legal "
+            "session")
 
 
 @pytest.mark.asyncio
@@ -130,11 +166,22 @@ async def test_hostile_session_ids_are_rejected():
     segment. Starlette/TestClient normalize dot segments client-side, so
     the validator is exercised directly (defense for --path-as-is style
     clients), plus percent-encoded dots through the full stack."""
-    for sid in ("..", ".hidden", "a..b", "x?y", "a/b", ""):
+    for sid in ("..", ".hidden", "a..b", "x?y", "a/b", "", "a.b", "a" * 65):
         with pytest.raises(Exception) as exc_info:
             server._safe_session_id(sid)
         assert getattr(exc_info.value, "status_code", None) == 400, f"{sid!r}"
-    assert server._safe_session_id("web-abc_1.2") == "web-abc_1.2"
+    assert server._safe_session_id("web-abc_1-2") == "web-abc_1-2"
+
+    # ⚠ BOTH ROUTES. This test probed only GET through the stack, so
+    # deleting `_safe_session_id` from the DELETE proxy survived mutation
+    # (review R1 M12a) — and DELETE is the destructive one: an escaped path
+    # reaching the agent's catch-all would be a DELETE against whatever it
+    # resolved to.
+    import inspect
+    for _name in ("sessions_get_proxy", "sessions_delete_proxy"):
+        _src = inspect.getsource(getattr(server, _name))
+        assert "_safe_session_id(session_id)" in _src, (
+            f"{_name} pastes the raw path param into the upstream URL")
 
     fake = _fake_upstream()
     client = TestClient(server.app)
@@ -155,3 +202,61 @@ async def test_proxy_upstream_connection_failure_is_502():
                        headers={"X-Ghost-Key": server.GHOST_API_KEY})
     assert r.status_code == 502
     assert "error" in r.json()
+
+
+def test_the_proxy_is_an_ALLOWLIST_not_a_catch_all():
+    """THE design property of this layer, and it was unpinned (review R1
+    M12b): adding an `/api/{path:path}` catch-all survived the whole suite,
+    because the existing structural test only counts decorators and accepts
+    `>= 11` — a catch-all carries the auth dependency too, so it passes.
+
+    The allowlist exists because the agent's API is strictly larger than what
+    a browser should be able to reach. A catch-all silently grants the
+    console every agent endpoint, including ones that mutate memory, run
+    tools, or arm bench drains.
+    """
+    routes = []
+    for r in server.app.routes:
+        path = getattr(r, "path", "")
+        if path.startswith("/api"):
+            routes.append(path)
+    wildcards = [p for p in routes if "{path" in p or p.rstrip("/") == "/api"]
+    assert not wildcards, (
+        f"a catch-all proxy route exists: {wildcards} — the allowlist is the "
+        "boundary between the browser and the agent's full API")
+    # And no path parameter may be pasted into an UPSTREAM path without a
+    # validator. (`/api/chat/resume/{task_id}` is fine: task_id is only ever
+    # a local `active_chat_tasks` dict key, never part of a proxied URL — an
+    # unknown id simply misses the dict. The distinction that matters is
+    # "reaches the upstream URL", not "is a parameter".)
+    import inspect
+    import re as _re
+    for r in server.app.routes:
+        path = getattr(r, "path", "")
+        if not path.startswith("/api") or "{" not in path:
+            continue
+        fn = getattr(r, "endpoint", None)
+        if fn is None:
+            continue
+        src = inspect.getsource(fn)
+        for param in _re.findall(r"\{(\w+)\}", path):
+            # Does this param appear inside an f-string upstream path?
+            pasted = _re.search(
+                r'f"/api/[^"]*\{[^"]*' + param + r'[^"]*\}', src)
+            if pasted:
+                assert "_safe_session_id(" in src or "_safe_" in src, (
+                    f"{path} pastes {param} into the upstream URL with no "
+                    "validator — this is how the allowlist gets escaped by "
+                    "one segment")
+
+
+def test_a_non_allowlisted_agent_endpoint_is_NOT_reachable():
+    """Behavioural mirror of the above: the routes that exist on the agent
+    but deliberately not here must 404 at the proxy rather than reach it."""
+    client = TestClient(server.app)
+    headers = {"X-Ghost-Key": server.GHOST_API_KEY}
+    for path in ("/api/introspect", "/api/skills", "/api/tasks",
+                 "/api/memory/search", "/api/bench/drain", "/api/chat/task/x"):
+        r = client.get(path, headers=headers)
+        assert r.status_code in (404, 405), (
+            f"{path} is reachable through the interface proxy ({r.status_code})")

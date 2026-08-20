@@ -63,7 +63,9 @@ MAX_AUDIO_SECONDS = float(os.environ.get("GHOST_AUDIO_MAX_S", str(6 * 3600)))
 # Must clear the thinking-token budget — with too low a cap the node returns
 # EMPTY content and finish_reason="length". See _transcribe_window.
 WINDOW_MAX_TOKENS = int(os.environ.get("GHOST_AUDIO_MAX_TOKENS", "8192"))
-WINDOW_TIMEOUT_S = float(os.environ.get("GHOST_AUDIO_TIMEOUT_S", "900"))
+from ..utils.helpers import env_positive
+
+WINDOW_TIMEOUT_S = env_positive("GHOST_AUDIO_TIMEOUT_S", 900.0)
 
 # Match pdf_ingest so both document kinds chunk identically downstream.
 CHUNK_SIZE = 1200

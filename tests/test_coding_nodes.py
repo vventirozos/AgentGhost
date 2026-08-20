@@ -126,5 +126,16 @@ async def test_stream_chat_completion_uses_coding_node(mock_coding_nodes):
     assert len(chunks) == 3
     assert 'content": "Streamed "' in chunks[0]
     
-    client.coding_clients[0]["client"].send.assert_called_once()
+    # ⚠ `send` is now called TWICE: once by `_node_slot`'s `/props` capacity
+    # probe (`client.get` -> `client.send`) and once for the completion.
+    # That is the POINT of §4BV R7 — the streaming coding path joined the
+    # per-node concurrency gate the non-streaming branch has always used, and
+    # `assert_called_once()` here was an assertion that it had NOT. Assert the
+    # completion, and assert the probe, separately.
+    _calls = client.coding_clients[0]["client"].send.call_args_list
+    _completions = [c for c in _calls if c.kwargs.get("stream") is True]
+    assert len(_completions) == 1, _calls
+    assert len(_calls) == 2, (
+        f"expected a /props capacity probe alongside the completion, got "
+        f"{_calls}")
     await client.close()

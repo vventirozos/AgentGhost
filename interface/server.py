@@ -24,6 +24,38 @@ import uvicorn
 import os
 import secrets
 
+def _env_num(name: str, default, cast=float):
+    """Env override that cannot crash the process at IMPORT.
+
+    ⚠ These run at module scope under `uvicorn server:app` in a LaunchDaemon
+    with KeepAlive. A typo'd or EMPTY value (`export X="$UNSET"`) made
+    `float()` raise during import → exit → relaunch → same crash, forever:
+    a silent outage with no working endpoint to report it. The codebase
+    already had the guarded idiom in four places (`_max_json_bytes`,
+    `_stream_cap_bytes`, `_total_stream_cap_bytes`, `_push_ack_grace_s`);
+    the timeouts were left on the raw form (R3 lens A)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return cast(default)
+    try:
+        val = cast(raw)
+    except (TypeError, ValueError):
+        logging.getLogger("GhostInterface").warning(
+            "%s=%r is not a number — using %s", name, raw, default)
+        return cast(default)
+    # ⚠ CLAMP. Every consumer is a timeout or a ceiling, and 0 or negative is
+    # worse than a typo: `GHOST_WS_SEND_TIMEOUT=0` makes every broadcast time
+    # out on a HEALTHY client, so the log stream discards and closes every
+    # peer on the first line. `_push_timeout_s` — the function this helper
+    # was modelled on — clamps; the generalisation dropped it and then
+    # guarded nine sites (R4 lens A).
+    if val <= 0:
+        logging.getLogger("GhostInterface").warning(
+            "%s=%r is not positive — using %s", name, raw, default)
+        return cast(default)
+    return val
+
+
 try:
     # Runtime: uvicorn runs with cwd=interface/, plain module on sys.path.
     import webpush_notify
@@ -75,16 +107,15 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 # message COUNT, but a single message carrying a multi-GB string sailed
 # through.
 def _max_json_bytes() -> int:
-    try:
-        return int(os.environ.get("GHOST_INTERFACE_MAX_JSON_BYTES", str(10 * 1024 * 1024)))
-    except (TypeError, ValueError):
-        return 10 * 1024 * 1024
+    return _env_num("GHOST_INTERFACE_MAX_JSON_BYTES", 10 * 1024 * 1024, int)
 
 MAX_JSON_BYTES = _max_json_bytes()
 
 # Hard limit on the number of messages in a chat body. The previous
 # version had no cap upstream of the agent.
 MAX_CHAT_MESSAGES = 500
+
+
 
 # Wall-clock ceiling for a single chat request proxied to the agent
 # backend. A long agent turn (deep browser automation, many sequential
@@ -95,14 +126,14 @@ MAX_CHAT_MESSAGES = 500
 # because no assistant tokens had arrived yet. Raise the default and make
 # it tunable via env. A separate, short connect timeout still fails fast
 # when the backend is actually down rather than merely slow.
-CHAT_TIMEOUT_S = float(os.environ.get("GHOST_CHAT_TIMEOUT", "1800"))  # 30 min
-CHAT_CONNECT_TIMEOUT_S = float(os.environ.get("GHOST_CHAT_CONNECT_TIMEOUT", "10"))
+CHAT_TIMEOUT_S = _env_num("GHOST_CHAT_TIMEOUT", 1800.0)  # 30 min
+CHAT_CONNECT_TIMEOUT_S = _env_num("GHOST_CHAT_CONNECT_TIMEOUT", 10.0)
 
 # Per-send ceiling for websocket log broadcasts. A stalled client (lid-closed
 # laptop, flaky Wi-Fi) doesn't raise on send — it back-pressures, i.e. the
 # await simply never returns — so sends must be bounded or one dead peer
 # freezes the whole broadcast (and, transitively, the tail pipe).
-WS_SEND_TIMEOUT_S = float(os.environ.get("GHOST_WS_SEND_TIMEOUT", "2.0"))
+WS_SEND_TIMEOUT_S = _env_num("GHOST_WS_SEND_TIMEOUT", 2.0)
 
 # Wall-clock bound on reading an upstream ERROR body snippet for the SSE
 # error frame. httpx's read timeout is per-gap, not total, so without this
@@ -152,6 +183,87 @@ def _sse_error_frame(message: str, err_type: str) -> bytes:
 def _upstream_error_frame(msg: str) -> bytes:
     """SSE error frame for an upstream chat failure."""
     return _sse_error_frame(f"upstream chat failed: {str(msg)[:300]}", "UpstreamError")
+
+
+async def _buffer_error_body(resp, *, limit: int = 4096,
+                            total_timeout_s: float = 5.0) -> None:
+    """Buffer a failed STREAMED response's body so `_upstream_failure` can
+    quote it, with a size AND a total wall-clock bound.
+
+    Mirrors `_read_snippet` in the chat worker, which is bounded because
+    httpx's read timeout is per-GAP: without a total bound, reading an error
+    body can block for the whole proxy timeout per chunk (R4 lens A)."""
+    chunks, got = [], 0
+
+    async def _pull():
+        nonlocal got
+        async for chunk in resp.aiter_bytes():
+            chunks.append(chunk)
+            got += len(chunk)
+            if got >= limit:
+                return          # ⚠ RETURN, not break: a `break` leaves the
+                                # generator suspended rather than finished,
+                                # and the size bound then can't be told from
+                                # the `[:limit]` slice below.
+    try:
+        await asyncio.wait_for(_pull(), timeout=total_timeout_s)
+    except Exception:  # noqa: BLE001 — a missing body is not a new failure
+        pass
+    finally:
+        # ⚠ IN THE `finally`, and this is the whole point. The assignment used
+        # to sit inside the `try` AFTER the await, so it was skipped by the
+        # very timeout this function exists to impose — and by a peer reset
+        # mid-body. The complete error body could arrive in the first chunk
+        # and still be thrown away, leaving `_upstream_failure` with nothing
+        # but "upstream returned HTTP N": the causeless message this whole
+        # helper family was written to eliminate (R5 lens A). `_read_snippet`
+        # in the chat worker — which the docstring above says this mirrors —
+        # decodes OUTSIDE its try for exactly this reason.
+        if chunks:
+            resp._content = b"".join(chunks)[:limit]   # what .text decodes
+
+
+def _upstream_failure(label: str, exc: Exception) -> JSONResponse:
+    """One place that turns an upstream exception into a client response.
+
+    Two defects this closes, both found live (R2 lens A):
+
+    * **A 4xx became a 502.** `raise_for_status()` inside a blanket
+      `except Exception` collapsed every upstream status into 502 and threw
+      the upstream BODY away — so "unsupported file type: .exe" reached the
+      operator as `Upload proxy error: Client error '422 Unprocessable
+      Entity' for url '…'`, and a permanent 404 was delivered as a
+      RETRYABLE 502. `_proxy_agent_api` already did this correctly; the
+      file-shaped proxies never got the same treatment.
+    * **An empty diagnosis.** `str(e)` is "" for httpx's whole timeout
+      family, which produced 16 causeless `… proxy error:` lines in the live
+      log — one of them a dropped human feedback label.
+    """
+    detail = str(exc) or type(exc).__name__
+    status = 502
+    resp = getattr(exc, "response", None)
+    if resp is not None and getattr(resp, "status_code", 0) >= 400:
+        status = resp.status_code
+        body = ""
+        try:
+            body = (resp.text or "")[:400]
+        except Exception:  # noqa: BLE001 — an UNREAD streamed body
+            # `raise_for_status()` on a `stream=True` response leaves the body
+            # unread, and `.text` then raises ResponseNotRead — so the two
+            # streamed proxies (workspace save, download) fell back to
+            # "upstream returned HTTP 404", the exact causeless message this
+            # helper was written to remove (R3 lens A). Read it here; callers
+            # that `aclose()` in their except must do so AFTER this.
+            # A sync `resp.read()` here is DEAD CODE — on an async stream it
+            # raises "Attempted to call a sync iterator on an async stream"
+            # and lands right back in this handler, which is the same no-op
+            # class R3 had just removed elsewhere (R4 lens A). The working
+            # half is `_buffer_error_body` in the streamed proxies, so by the
+            # time we get here the body is buffered or genuinely gone.
+            body = ""
+        detail = body or f"upstream returned HTTP {status}"
+    logger.error("%s: %s", label, detail)
+    return _err_json(status, f"{label}: {detail}")
 
 
 def _err_json(status: int, msg: str) -> JSONResponse:
@@ -228,6 +340,43 @@ async def _lifespan(_app: "FastAPI"):
             _task.cancel()
         await asyncio.gather(*_BACKGROUND_TASKS, return_exceptions=True)
         _BACKGROUND_TASKS.clear()
+        # ⚠ IN-FLIGHT CHAT WORKERS FIRST. They live only in
+        # `active_chat_tasks[tid]["background_task"]` and were never
+        # cancelled: `SHARED_HTTP_CLIENT.aclose()` below then ran underneath
+        # them, and their `finally` scheduled a reply-ready push AFTER
+        # `_push_probe_tasks.clear()` — producing the exact "Task was
+        # destroyed but it is pending" this block says it prevents. Ordering
+        # matters: workers, then the probes they spawn, then the client
+        # (R3 lens A).
+        # ⚠ Only genuine, still-pending tasks from THIS loop. A task left
+        # behind by an earlier request (or, in tests, by another module) may
+        # belong to a loop that is already closed, and `cancel()` on it
+        # raises RuntimeError("Event loop is closed") straight out of
+        # shutdown — a teardown fix that breaks teardown (found by the full
+        # suite: the test passed alone and failed after its neighbours ran).
+        _loop = asyncio.get_running_loop()
+        _workers = []
+        for _t in list(active_chat_tasks.values()):
+            _bg = _t.get("background_task")
+            if _bg is None or not isinstance(_bg, asyncio.Task) or _bg.done():
+                continue
+            # ⚠ ACTUALLY CHECK THE LOOP. The previous version claimed to and
+            # did not: it relied on `cancel()` raising for a CLOSED foreign
+            # loop, which leaves the open-foreign-loop case — where cancel()
+            # succeeds and then `asyncio.gather` raises "attached to a
+            # different loop" at attach time, so `return_exceptions=True`
+            # cannot catch it. Two concurrently-live TestClients reproduce it
+            # (R4 lens A). Same teardown-fix-breaks-teardown class, one loop
+            # state along.
+            try:
+                if _bg.get_loop() is not _loop:
+                    continue
+                _bg.cancel()
+            except RuntimeError:
+                continue     # its loop is gone; nothing to await
+            _workers.append(_bg)
+        if _workers:
+            await asyncio.gather(*_workers, return_exceptions=True)
         # Pending reply-push probes (12s grace sleeps) must not outlive
         # the loop — "Task was destroyed but it is pending" otherwise.
         for _task in list(_push_probe_tasks):
@@ -264,7 +413,25 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 # exactly once in this file — in its decorator — where the auth regression
 # test (test_interface_proxies_require_auth) locates it and checks for the
 # verify_interface_key dependency.
-_UPLOAD_PATHS = {"/api/" + _suffix for _suffix in ("upload", "workspace/load", "stt")}
+# Paths whose bodies are FILE uploads (multipart), capped at
+# MAX_UPLOAD_BYTES + framing slack.
+#
+# ⚠ `workspace/save` is NOT one of them and was wrongly added here in R3.
+# Its request body is JSON (`{chat_history: [...]}`) and its handler calls
+# `request.json()` — the zip is the RESPONSE. The upload ceiling therefore
+# handed a `json.loads` a ~101 MB input (measured ~2.3x peak = ~232 MB, then
+# re-serialised to the agent, which has no body cap of its own). It gets its
+# own, larger-than-chat-but-BOUNDED JSON ceiling instead (R4 lens A).
+_UPLOAD_PATHS = {"/api/" + _suffix for _suffix in
+                 ("upload", "workspace/load", "stt")}
+
+# A workspace save carries the whole conversation, so it legitimately needs
+# more than a chat turn — but bounded, and parsed as JSON.
+def _max_workspace_json_bytes() -> int:
+    return _env_num("GHOST_INTERFACE_MAX_WORKSPACE_JSON_BYTES",
+                    64 * 1024 * 1024, int)
+
+_JSON_CAP_OVERRIDES = {"/api/workspace/save": _max_workspace_json_bytes}
 # Multipart framing (boundaries, part headers) rides on top of the file
 # bytes, so upload paths get a little slack above MAX_UPLOAD_BYTES —
 # otherwise a file at exactly the cap is rejected for its envelope.
@@ -297,12 +464,20 @@ class BodySizeLimitMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("method") not in ("POST", "PUT", "PATCH"):
+        # DELETE belongs here: `_proxy_agent_api` explicitly reads DELETE
+        # bodies (`method in ("POST", "DELETE")`), so leaving it out let an
+        # unbounded body be slurped into RAM on the one route the cap exists
+        # to protect (R2 lens A).
+        if scope["type"] != "http" or scope.get("method") not in (
+                "POST", "PUT", "PATCH", "DELETE"):
             await self.app(scope, receive, send)
             return
 
-        if scope.get("path") in _UPLOAD_PATHS:
+        _path = scope.get("path")
+        if _path in _UPLOAD_PATHS:
             cap = MAX_UPLOAD_BYTES + _UPLOAD_CAP_SLACK_BYTES
+        elif _path in _JSON_CAP_OVERRIDES:
+            cap = _JSON_CAP_OVERRIDES[_path]()
         else:
             cap = MAX_JSON_BYTES
 
@@ -617,20 +792,14 @@ ACTIVE_TASK_HARD_CAP = 200     # absolute ceiling regardless of TTL
 # `task["buffer"]` grow without bound and OOMs the interface server.
 # Override via env if needed (e.g. for very large model outputs).
 def _stream_cap_bytes() -> int:
-    try:
-        return int(os.environ.get("GHOST_INTERFACE_STREAM_CAP", "50000000"))
-    except (TypeError, ValueError):
-        return 50_000_000
+    return _env_num("GHOST_INTERFACE_STREAM_CAP", 50_000_000, int)
 
 # Global ceiling across ALL task buffers. The per-task cap alone still
 # allowed ACTIVE_TASK_HARD_CAP × per-task cap (~10 GB) in the worst case.
 # When the global cap is hit, the offending stream is truncated exactly
 # like a per-task overflow (marker and all).
 def _total_stream_cap_bytes() -> int:
-    try:
-        return int(os.environ.get("GHOST_INTERFACE_TOTAL_STREAM_CAP", "200000000"))
-    except (TypeError, ValueError):
-        return 200_000_000
+    return _env_num("GHOST_INTERFACE_TOTAL_STREAM_CAP", 200_000_000, int)
 
 def _total_buffered_bytes() -> int:
     """Bytes currently buffered across ALL chat tasks. The dict is bounded
@@ -650,6 +819,46 @@ def _reclaim_buffered_bytes(needed: int, cap: int) -> None:
             return
         if t.get("done") and t.get("buffer_size", 0) > 0:
             active_chat_tasks.pop(tid, None)
+
+def _enforce_active_task_cap() -> None:
+    """Evict down to ACTIVE_TASK_HARD_CAP. Done tasks go first; a live stream
+    is never silently dropped — popping a still-running entry left its worker
+    raising KeyError and its reader parked on new_data_event forever. If a
+    live task must go, cancel it and wake its reader first.
+
+    ⚠ Called at INSERT as well as from the 60s sweep. Enforcement used to be
+    sweep-only, so the dict could reach any size within a sweep window
+    (measured: 3000 entries). Each entry holds an open `client.stream` on the
+    shared httpx client, whose pool is 100 connections with a 1800s pool
+    timeout — so the 101st chat parks for THIRTY MINUTES and every short
+    proxy call then PoolTimeouts behind it. `_total_buffered_bytes`'s
+    docstring even cites the cap as the reason its per-chunk O(N) sum stays
+    cheap, an invariant nothing upheld (R3 lens A)."""
+    overflow = len(active_chat_tasks) - ACTIVE_TASK_HARD_CAP
+    if overflow <= 0:
+        return
+    for tid, t in list(active_chat_tasks.items()):
+        if overflow <= 0:
+            break
+        if t.get("done"):
+            active_chat_tasks.pop(tid, None)
+            overflow -= 1
+    for tid, t in list(active_chat_tasks.items()):
+        if overflow <= 0:
+            break
+        bg = t.get("background_task")
+        if bg is not None:
+            bg.cancel()
+        t["error"] = t.get("error") or "evicted: active task cap exceeded"
+        t["done"] = True
+        ev = t.get("new_data_event")
+        if ev is not None:
+            ev.set()
+        active_chat_tasks.pop(tid, None)
+        overflow -= 1
+    logger.warning("active chat tasks hit the hard cap (%d) — evicted to %d",
+                   ACTIVE_TASK_HARD_CAP, len(active_chat_tasks))
+
 
 def _sweep_active_chat_tasks(now: float) -> None:
     """One janitor sweep: evict done tasks past their TTL and trim the dict
@@ -672,27 +881,7 @@ def _sweep_active_chat_tasks(now: float) -> None:
     # its worker raising KeyError and its reader parked on
     # new_data_event forever (the client connection hung). If we
     # must evict a live task, cancel it and wake its reader first.
-    overflow = len(active_chat_tasks) - ACTIVE_TASK_HARD_CAP
-    if overflow > 0:
-        for tid, t in list(active_chat_tasks.items()):
-            if overflow <= 0:
-                break
-            if t.get("done"):
-                active_chat_tasks.pop(tid, None)
-                overflow -= 1
-        for tid, t in list(active_chat_tasks.items()):
-            if overflow <= 0:
-                break
-            bg = t.get("background_task")
-            if bg is not None:
-                bg.cancel()
-            t["error"] = t.get("error") or "evicted: active task cap exceeded"
-            t["done"] = True
-            ev = t.get("new_data_event")
-            if ev is not None:
-                ev.set()
-            active_chat_tasks.pop(tid, None)
-            overflow -= 1
+    _enforce_active_task_cap()
 
 async def _active_chat_tasks_janitor():
     """Background sweeper that evicts done tasks past their TTL and trims
@@ -714,10 +903,7 @@ async def _active_chat_tasks_janitor():
 # documented in docs/interfaces/web_server.html.
 
 def _push_ack_grace_s() -> float:
-    try:
-        return float(os.environ.get("GHOST_PUSH_ACK_GRACE", "12"))
-    except (TypeError, ValueError):
-        return 12.0
+    return _env_num("GHOST_PUSH_ACK_GRACE", 12.0)
 
 # Strong refs: an unreferenced create_task() result can be GC'd mid-run
 # (same reason _BACKGROUND_TASKS exists).
@@ -830,6 +1016,7 @@ async def chat_proxy(request: Request):
         if is_streaming:
             task_id = str(uuid.uuid4())
             stream_cap = _stream_cap_bytes()
+            _enforce_active_task_cap()   # BEFORE inserting, not 60s later
             active_chat_tasks[task_id] = {
                 "buffer": [],
                 "buffer_size": 0,
@@ -919,7 +1106,18 @@ async def chat_proxy(request: Request):
                     t["done"] = True
                     raise
                 except Exception as e:
-                    t["error"] = str(e)
+                    # ⚠ `str(e)` is the EMPTY STRING for httpx's whole
+                    # timeout family (ReadTimeout, ConnectTimeout,
+                    # PoolTimeout, WriteTimeout — verified against httpx
+                    # 0.28.1). Every consumer of this field tests it for
+                    # TRUTHINESS: the SSE error frame (below), the resume
+                    # path, the reply-ready push ("Reply ready" instead of
+                    # "Failed"), and the task-state probe. So an agent that
+                    # stalled past GHOST_CHAT_TIMEOUT produced NO error
+                    # frame — and the client, seeing no error, persisted its
+                    # partial text into the durable session as a completed
+                    # reply. Never store an empty diagnosis.
+                    t["error"] = str(e) or f"{type(e).__name__} contacting the agent"
                     t["done"] = True
                 finally:
                     t["finished_at"] = time.time()
@@ -1017,8 +1215,7 @@ async def chat_proxy(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chat proxy error: {e}")
-        return _err_json(502, f"Chat proxy error: {e}")
+        return _upstream_failure("Chat proxy error", e)
 
 @app.get("/api/chat/resume/{task_id}", dependencies=[Depends(verify_interface_key)])
 async def chat_resume_proxy(task_id: str, offset: int = 0):
@@ -1083,9 +1280,13 @@ async def chat_ack_proxy(task_id: str):
 @app.get("/api/push/vapid", dependencies=[Depends(verify_interface_key)])
 async def push_vapid_key():
     """VAPID public key for pushManager.subscribe. `enabled:false` when no
-    keypair is provisioned (push feature off, not an error)."""
+    keypair is provisioned (push feature off, not an error).
+
+    `enabled` reads `can_send()`, not `public_key()`: the latter is a weaker
+    condition than sending needs, so a corrupt PEM reported push as ON while
+    every send returned 0 (R2 lens A)."""
     key = webpush_notify.public_key()
-    return {"enabled": bool(key), "key": key}
+    return {"enabled": bool(webpush_notify.can_send()), "key": key}
 
 @app.post("/api/push/subscribe", dependencies=[Depends(verify_interface_key)])
 async def push_subscribe(request: Request):
@@ -1093,7 +1294,18 @@ async def push_subscribe(request: Request):
     if not isinstance(body, dict):
         return _err_json(400, "Request body must be a JSON object.")
     sub = body.get("subscription")
-    if not isinstance(sub, dict) or not webpush_notify.add_subscription(sub):
+    if not isinstance(sub, dict):
+        return _err_json(400, "Malformed push subscription.")
+    if not webpush_notify.add_subscription(sub):
+        # `add_subscription` returns False for BOTH a malformed payload and
+        # a subscriptions file this process refuses to overwrite. Telling a
+        # perfectly good device that its payload is bad sends the operator
+        # to debug the phone (R3 lens A).
+        if not webpush_notify.store_is_readable():
+            return _err_json(
+                503, "Push subscriptions file is unreadable on the server; "
+                     "refusing to overwrite it. Repair or remove "
+                     "~/Data/AI/.ghost_push_subs.json.")
         return _err_json(400, "Malformed push subscription.")
     return {"ok": True, "count": webpush_notify.subscription_count()}
 
@@ -1125,6 +1337,10 @@ async def chat_task_state(task_id: str):
         "done": bool(task.get("done")),
         "error": task.get("error"),
         "truncated": bool(task.get("truncated")),
+        # A turn the user STOPPED is not a turn to reattach to. Without this
+        # the resume probe saw a live task and replayed the stream the user
+        # had deliberately ended (R2 lens A).
+        "cancelled": bool(task.get("cancelled")),
         "chunks": len(task.get("buffer", [])),
     }
 
@@ -1176,7 +1392,21 @@ async def workspace_save_proxy(request: Request):
                 headers["content-disposition"] = resp.headers["content-disposition"]
         except Exception:
             if resp is not None:
-                await resp.aclose()
+                # Read the error body BEFORE closing: `raise_for_status()` on
+                # a streamed response leaves it unread, and the handler's
+                # `_upstream_failure` then has nothing to report but the
+                # status. BOUNDED — httpx's read timeout is per-GAP, not
+                # total, so an unbounded read of an error body can hang for
+                # the whole proxy timeout per chunk (R4 lens A).
+                try:
+                    await _buffer_error_body(resp)
+                finally:
+                    # SHIELDED: a client disconnect during the (up to 5s)
+                    # buffer window otherwise skips aclose() and strands a
+                    # pooled connection — 100 connections, 1800s pool
+                    # timeout, so the 101st request parks for half an hour
+                    # (R5 lens A).
+                    await asyncio.shield(resp.aclose())
             raise
 
         async def stream_generator():
@@ -1189,8 +1419,7 @@ async def workspace_save_proxy(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Workspace save proxy error: {e}")
-        return _err_json(502, f"Workspace save proxy error: {e}")
+        return _upstream_failure("Workspace save proxy error", e)
 
 
 async def _read_capped_upload(upload: UploadFile) -> bytes:
@@ -1252,8 +1481,7 @@ async def workspace_load_proxy(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Workspace load proxy error: {e}")
-        return _err_json(502, f"Workspace load proxy error: {e}")
+        return _upstream_failure("Workspace load proxy error", e)
 
 @app.post("/api/upload", dependencies=[Depends(verify_interface_key)])
 async def upload_proxy(file: UploadFile = File(...)):
@@ -1272,8 +1500,7 @@ async def upload_proxy(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Upload proxy error: {e}")
-        return _err_json(502, f"Upload proxy error: {e}")
+        return _upstream_failure("Upload proxy error", e)
 
 @app.get("/api/download/{filename:path}", dependencies=[Depends(verify_interface_key)])
 async def download_proxy(filename: str):
@@ -1317,7 +1544,21 @@ async def download_proxy(filename: str):
                 headers["content-disposition"] = "attachment"
         except Exception:
             if resp is not None:
-                await resp.aclose()
+                # Read the error body BEFORE closing: `raise_for_status()` on
+                # a streamed response leaves it unread, and the handler's
+                # `_upstream_failure` then has nothing to report but the
+                # status. BOUNDED — httpx's read timeout is per-GAP, not
+                # total, so an unbounded read of an error body can hang for
+                # the whole proxy timeout per chunk (R4 lens A).
+                try:
+                    await _buffer_error_body(resp)
+                finally:
+                    # SHIELDED: a client disconnect during the (up to 5s)
+                    # buffer window otherwise skips aclose() and strands a
+                    # pooled connection — 100 connections, 1800s pool
+                    # timeout, so the 101st request parks for half an hour
+                    # (R5 lens A).
+                    await asyncio.shield(resp.aclose())
             raise
 
         async def stream_generator():
@@ -1331,8 +1572,7 @@ async def download_proxy(filename: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Download proxy error: {e}")
-        return _err_json(502, f"Download proxy error: {e}")
+        return _upstream_failure("Download proxy error", e)
 
 @app.post("/api/stt", dependencies=[Depends(verify_interface_key)])
 async def stt_proxy(request: Request):
@@ -1364,8 +1604,7 @@ async def stt_proxy(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"STT proxy error: {e}")
-        return _err_json(502, f"STT proxy error: {e}")
+        return _upstream_failure("STT proxy error", e)
 
 @app.post("/api/tts", dependencies=[Depends(verify_interface_key)])
 async def tts_proxy(request: Request):
@@ -1388,8 +1627,7 @@ async def tts_proxy(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"TTS proxy error: {e}")
-        return _err_json(502, f"TTS proxy error: {e}")
+        return _upstream_failure("TTS proxy error", e)
 
 # ── Agent API passthrough proxies (2026-07-28) ─────────────────────────
 # The workspace UI (sessions rail, notifications, status strip, memory
@@ -1421,8 +1659,13 @@ async def _proxy_agent_api(request: Request, method: str, upstream_path: str,
             timeout=_proxy_timeout(timeout_s),
         )
     except Exception as e:
-        logger.error(f"Agent proxy error ({upstream_path}): {e}")
-        return _err_json(502, f"Agent proxy error: {e}")
+        # ⚠ This used to read `{e or type(e).__name__}` — a NO-OP, because an
+        # exception OBJECT is always truthy, so the `or` never fired and the
+        # f-string still rendered an empty `str(e)`. The fix looked right and
+        # changed nothing (R3 lens A). Route through the one helper that gets
+        # this right, for all 12 allowlist routes including /api/turn/cancel
+        # and /api/feedback.
+        return _upstream_failure(f"Agent proxy error ({upstream_path})", e)
     try:
         payload = resp.json()
     except Exception:
@@ -1451,9 +1694,17 @@ def _safe_session_id(session_id: str) -> str:
     segments — so a raw `/api/sessions/..` would reach `/api` upstream
     and land in the agent's /{path:path} catch-all, defeating the
     explicit-allowlist design by one segment. Session ids are uuids (or
-    our web-* mints); a tight charset costs nothing."""
+    our web-* mints); a tight charset costs nothing.
+
+    The charset MIRRORS the store's own id guard
+    (``core/sessions._ID_RE`` = ``^[A-Za-z0-9_-]{1,64}$``) on purpose. It
+    used to be laxer — dots allowed, 128 chars — so ids the proxy waved
+    through were rejected by the store's ``_path()``, which returns None
+    and makes every write a silent no-op: the tab looked fine and NOTHING
+    persisted (review R1 M10). Fail at the door instead. Keep the two
+    patterns in lockstep; the laxer one is always the bug."""
     sid = str(session_id or "")
-    if not sid or ".." in sid or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", sid):
+    if not sid or ".." in sid or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", sid):
         raise HTTPException(status_code=400, detail="Invalid session id")
     return sid
 

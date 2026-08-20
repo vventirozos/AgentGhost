@@ -21,6 +21,11 @@ logger = logging.getLogger("GhostAgent")
 
 router = APIRouter()
 
+# Hard ceiling on messages in ONE /api/chat body. The durable store caps a
+# session at 400; a request carrying more than this is a client bug or an
+# attack, and the merge's DP table is O(stored x incoming).
+MAX_REQUEST_MESSAGES = 2000
+
 
 def _log_internal_error(context_label: str) -> str:
     """Log the current exception under a short correlation id and return the
@@ -494,6 +499,21 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             }},
             status_code=422,
         )
+    # ⚠ The AGENT'S OWN route has no body-size middleware (api/app.py adds
+    # only CORS), so nothing bounded `messages` here — the interface's
+    # 500-message cap protects proxied traffic only, and any key holder (the
+    # Slack bot, bin/ scripts) reaches this route raw. `merge_history_detail`
+    # then allocates a 401 x (m+1) DP table synchronously on the event loop:
+    # measured 3.57s and +332 MB at m=100,000, from a ~3 MB body (R3 lens C).
+    if len(messages) > MAX_REQUEST_MESSAGES:
+        return JSONResponse(
+            {"error": {
+                "message": (f"too many messages ({len(messages)} > "
+                            f"{MAX_REQUEST_MESSAGES} cap)"),
+                "type": "InvalidRequestShape",
+            }},
+            status_code=413,
+        )
     allowed_roles = {"system", "user", "assistant", "tool", "function"}
     for i, m in enumerate(messages):
         if not isinstance(m, dict):
@@ -591,14 +611,20 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     _sess_store = None
     _new_msgs = []
     if _session_id:
-        from ..core.sessions import get_session_store, merge_history
+        from ..core.sessions import get_session_store, merge_history_detail
         _sess_store = get_session_store(agent.context)
         if _sess_store is not None:
             _existing = _sess_store.get(str(_session_id))
             _stored = _existing.messages if _existing is not None else []
-            _merged = merge_history(_stored, messages)
-            # Everything past the stored prefix is what THIS turn adds.
-            _new_msgs = _merged[len(_stored):]
+            # The ALIGNMENT reports what this turn adds — the caller no
+            # longer guesses it from `_merged[len(_stored):]` (§4BU C2).
+            # That slice is only correct when merged is stored PLUS
+            # something, and every fat-replay branch REPLACES stored: past
+            # the 400-message cap it re-appended already-stored messages
+            # every turn, and when the lengths matched it produced an empty
+            # tail, so `_persist_session` early-returned and the user's
+            # message and the reply were SILENTLY NEVER PERSISTED.
+            _merged, _new_msgs = merge_history_detail(_stored, messages)
             body["messages"] = _merged
             messages = _merged
 
@@ -606,7 +632,16 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         """Append this turn (new user messages + the reply) to the session.
         Runs AFTER the turn, so a failed turn never leaves a dangling user
         message with no reply. Never raises into the response path."""
-        if _sess_store is None or not _session_id or not _new_msgs:
+        # An EMPTY tail is not a reason to drop the reply. When a client
+        # re-sends a history whose last message is already stored (a prior
+        # turn that produced no assistant content leaves the store ending in
+        # a bare user message), the tail is empty — and this early return
+        # then threw away the reply the agent had just generated, leaving
+        # that user message unanswered in the durable file forever, so every
+        # later replay repeated the same turn (R2 lens C).
+        if _sess_store is None or not _session_id:
+            return
+        if not _new_msgs and not str(assistant_text or "").strip():
             return
         try:
             _sess_store.append_turn(str(_session_id), _new_msgs,

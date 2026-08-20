@@ -222,7 +222,21 @@ def parse_start_with_phrase(constraints: List[str]) -> Optional[str]:
                   if (mm := rx.match(text))), None)
         if not m:
             continue
-        phrase = m.group(1).strip().strip("'\"“”`").strip()
+        raw = m.group(1).strip()
+        # § finalize/stream R1 A-F5: honor a CLOSED quote even when a
+        # trailing clause follows. 'Start your reply with "BLUF:" and then
+        # summarise the incident' used to yield
+        # `BLUF:" and then summarise the incident` (the end-strip only
+        # touches the string's ends), so enforce_start_with never matched —
+        # the hoist was inert on exactly the phrasing class it was built
+        # for. When the capture opens with a quote and a matching close
+        # exists, the quoted span IS the phrase.
+        _qclose = {'"': '"', "'": "'", "“": "”", "`": "`"}.get(raw[:1])
+        if _qclose:
+            _end = raw.find(_qclose, 1)
+            if _end > 1:
+                raw = raw[1:_end]
+        phrase = raw.strip().strip("'\"“”`").strip()
         if phrase.endswith((".", "!", "?")) and len(phrase) > 4:
             phrase = phrase[:-1].rstrip()
         if len(phrase) >= 3:

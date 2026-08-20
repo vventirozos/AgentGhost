@@ -6,45 +6,42 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from ghost_agent.tools.execute import tool_execute
 
 @pytest.mark.asyncio
-async def test_tool_execute_path_traversal_vulnerability():
-    """Test that the current implementation is vulnerable to path traversal (or fixed if patched)."""
+@pytest.mark.parametrize("payload", [
+    "../../../tmp/evil.py",      # deep relative traversal
+    "../../etc/passwd",
+    "/etc/passwd",               # absolute outside path
+    "../outside.py",
+])
+async def test_tool_execute_blocks_paths_outside_the_sandbox(payload):
+    """§4BW: replaces a VACUOUS predecessor. The old
+    `test_tool_execute_path_traversal_vulnerability` fired a traversal
+    payload and then did `if 'outside'...: pass / elif 'EXIT CODE'...: pass`
+    with no assertion and no else — it passed whether the code was safe,
+    vulnerable, or threw. A security-named test that certified nothing
+    (§4BW test-instrument findings). This one asserts the write is refused
+    and the sandbox manager is never asked to execute anything outside."""
     sandbox_dir = Path("/tmp/sandbox")
     sandbox_manager = MagicMock()
     sandbox_manager.execute = AsyncMock(return_value=("output", 0))
-    
-    # Attack payload: try to write to a file outside sandbox
-    # e.g. ../../../etc/passwd (simulated)
-    filename = "../../../tmp/evil.py" 
-    content = "print('hacked')"
-    
-    # We mock asyncio.to_thread intercepting normally without blowing up unpacking
-    async def fake_to_thread(func, *args, **kwargs):
-        return func(*args, **kwargs)
-        
-    with patch("ghost_agent.tools.execute.asyncio.to_thread", side_effect=fake_to_thread) as mock_to_thread:
-        # Mock exists to avoid stubbornness guard reading the file
-        with patch.object(Path, "exists", return_value=False):
-             # Mock mkdir to avoid actual filesystem ops
-            with patch.object(Path, "mkdir"):
-                 # Mock read_text/write_text to avoid errors
-                with patch.object(Path, "write_text"):
-                    result = await tool_execute(filename, content, sandbox_dir, sandbox_manager)
 
-    # If vulnerable, it tries to write to /tmp/evil.py (resolved from /tmp/sandbox/../../../tmp/evil.py)
-    # The current implementation does: host_path = sandbox_dir / rel_path
-    # rel_path = "../../../tmp/evil.py".lstrip("/") -> "../../../tmp/evil.py"
-    # host_path = /tmp/sandbox / "../../../tmp/evil.py" -> /tmp/evil.py (outside sandbox)
-    
-    # If fixed, it should return an error message about security/path traversal.
-    
-    if "outside sandbox" in result or "Security Error" in result:
-        # This is what we WANT after the fix
-        pass
-    elif "EXIT CODE" in result:
-        # This means it executed, which implies vulnerability (for this test setup)
-        # However, since we patched basic file ops, it might "succeed" in the test eyes 
-        # but the path would be wrong.
-        pass
+    result = await tool_execute(payload, "print('hacked')",
+                                sandbox_dir, sandbox_manager)
+
+    # THE security property, asserted against the code's ACTUAL refusal
+    # messages (verified live, not guessed): a `.py` traversal is stopped by
+    # the containment guard ("Security Error"), a non-`.py` outside path by
+    # the extension guard ("SYSTEM ERROR"); both refuse with EXIT CODE: 1.
+    # Asserting the refusal — not "execute wasn't called with the literal
+    # path" — is what catches a DISABLED containment guard: with it off,
+    # `../outside.py` runs (the mock returns EXIT CODE 0 + output) instead of
+    # refusing. The first version of this test scanned exec args and SURVIVED
+    # that mutation while its older sibling killed it; this does not.
+    assert "EXIT CODE: 1" in result, (
+        f"{payload!r} did not refuse (EXIT CODE 1): {result[:160]!r}")
+    assert ("Security Error" in result or "SYSTEM ERROR" in result), (
+        f"{payload!r} produced no refusal message — a guard was bypassed: "
+        f"{result[:160]!r}")
+
 
 @pytest.mark.asyncio
 async def test_tool_execute_prevents_traversal():

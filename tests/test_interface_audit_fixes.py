@@ -131,8 +131,74 @@ async def test_per_task_buffer_cap_flips_truncated_flag(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# A transport TIMEOUT must still produce an error frame (R2 lens A)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_read_timeout_still_emits_an_SSE_error_frame():
+    """`str(e)` is EMPTY for httpx's timeout family, and every consumer of
+    `task["error"]` tests truthiness — so an agent that stalled past
+    GHOST_CHAT_TIMEOUT emitted NO error frame, the client saw a clean end of
+    stream, and it persisted its partial text into the durable session as a
+    completed reply. The reply-ready push even said "Reply ready".
+
+    Every existing test drives the HTTP-500 branch, which synthesises its own
+    non-empty message — so this whole class was invisible."""
+    import httpx
+    import interface.server as server
+
+    fake_client = MagicMock()
+    fake_client.stream = MagicMock(side_effect=httpx.ReadTimeout(""))
+    req = MagicMock()
+    req.json = AsyncMock(return_value={"stream": True, "messages": [
+        {"role": "user", "content": "hi"}]})
+
+    with patch.object(server, "_get_http_client", return_value=fake_client):
+        resp = await server.chat_proxy(req)
+        received = []
+        async for item in resp.body_iterator:
+            received.append(item)
+
+    tid = resp.headers.get("X-Task-ID")
+    task = server.active_chat_tasks.get(tid) or {}
+    assert task.get("error"), (
+        "a stalled agent recorded an EMPTY error — every downstream check "
+        "tests truthiness, so nothing reports it")
+    assert "ReadTimeout" in task["error"], task["error"]
+    combined = b"".join(received)
+    assert b"event: error" in combined, (
+        f"no error frame reached the browser: {combined[:200]!r}")
+    # And the reply-ready push must say Failed, not "Reply ready".
+    assert task.get("error")[:200]
+    server.active_chat_tasks.pop(tid, None)
+
+
+# ---------------------------------------------------------------------------
 # Non-streaming chat reuses the shared httpx client
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_non_streaming_chat_propagates_the_upstream_STATUS():
+    """The sibling test asserts `status_code == 200` against a mock that
+    returns 200 — and `JSONResponse(payload)` also defaults to 200, so
+    dropping `status_code=response.status_code` survived all 390 tests
+    (R3 lens A). Use a NON-200 upstream, which is the only way the
+    assertion can distinguish anything."""
+    import interface.server as server
+
+    fake_resp = MagicMock()
+    fake_resp.status_code = 429
+    fake_resp.json = MagicMock(return_value={"error": "rate limited"})
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=fake_resp)
+
+    req = MagicMock()
+    req.json = AsyncMock(return_value={"stream": False, "messages": []})
+    with patch.object(server, "_get_http_client", return_value=fake_client):
+        result = await server.chat_proxy(req)
+    assert result.status_code == 429, (
+        "the upstream status is not propagated — every non-200 reads as OK")
+
 
 @pytest.mark.asyncio
 async def test_non_streaming_chat_reuses_shared_http_client():
@@ -170,15 +236,50 @@ async def test_non_streaming_chat_reuses_shared_http_client():
 # websocket disconnect path uses discard, not remove
 # ---------------------------------------------------------------------------
 
-def test_websocket_disconnect_uses_discard_no_keyerror():
-    """Reach into the source (or dummy-call discard) to assert KeyError-safe.
+@pytest.mark.asyncio
+async def test_websocket_disconnect_uses_discard_no_keyerror():
+    """⚠ THIS TEST WAS FULLY VACUOUS. It called `set.discard()` on the live
+    set with a sentinel and asserted that `set.discard` does not raise —
+    testing CPython, not this codebase. It passed with `websocket_endpoint`
+    deleted entirely, and changing the endpoint's `discard` back to `remove`
+    survived all 390 server-touching tests (R3 lens A).
 
-    The simplest, surface-level check: calling .discard() on the live set
-    with a non-member must NEVER raise. (`.remove()` would raise KeyError.)
-    """
+    The real property: a socket already removed from the registry (the
+    broadcaster drops dead peers) must not raise when the endpoint's
+    `finally` runs. Exercise the ENDPOINT."""
     import interface.server as server
 
-    sentinel = object()
-    # If the implementation regressed back to `.remove()`, this exact
-    # pattern would have raised; using `.discard()` is silent.
-    server.connected_websockets.discard(sentinel)
+    class _WS:
+        def __init__(self):
+            self.sent = []
+
+        async def accept(self):
+            pass
+
+        async def receive_text(self):
+            # The broadcaster evicted us while we were parked here.
+            server.connected_websockets.discard(self)
+            raise RuntimeError("peer went away")
+
+        async def send_text(self, t):
+            self.sent.append(t)
+
+        @property
+        def query_params(self):
+            return {"key": server.GHOST_API_KEY}
+
+        async def close(self, *a, **k):
+            pass
+
+    ws = _WS()
+    before = len(server.connected_websockets)
+    # ⚠ The key must be passed: without it the endpoint closes at the auth
+    # gate and never reaches the try/finally at all — which is exactly how
+    # the first version of this replacement ALSO measured nothing.
+    with pytest.raises(RuntimeError) as exc:
+        await server.websocket_endpoint(ws, key=server.GHOST_API_KEY)
+    assert "peer went away" in str(exc.value), (
+        f"teardown raised {exc.value!r} instead of letting the real error "
+        "through — a KeyError here means .remove() is back")
+    assert ws not in server.connected_websockets
+    assert len(server.connected_websockets) == before

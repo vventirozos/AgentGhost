@@ -97,6 +97,309 @@ class TestTheWriterActuallyRuns:
         assert rows[0]["confidence"] == pytest.approx(0.83)
         assert rows[0]["at"]
 
+    def test_the_vote_counters_reach_DISK(self, tmp_path):
+        """§4BR R18 CRITICAL-2. The verify_depth arm's FIRST gate is "if
+        a healthy arm records ~11% non-unanimous votes, so too FEW of
+        them means the judge does not vary on this traffic and the arm
+        retires". Its inputs shipped as dynamic
+        attributes on VerifyResult — absent from the dataclass, to_dict,
+        this sidecar and turn-facts — so the gate had nothing to read. A
+        decision rule whose instrument does not exist is worse than no
+        rule, because it reads as measured."""
+        a = self._agent(tmp_path)
+        a._record_verdict_sidecar("traj-v", "REFUTED", 0.8,
+                                  sc_n=3, sc_agree=2, sc_drawn=3)
+        row = self._rows(tmp_path)[0]
+        assert row["sc_n"] == 3 and row["sc_agree"] == 2 and row["sc_drawn"] == 3
+
+    def test_the_carry_works_END_TO_END_through_the_real_verdict_path(
+            self, tmp_path, monkeypatch):
+        """§4BR R23 — the test below asserts the SEAM; this one asserts the
+        PRODUCTION PATH, and only this one can fail when the fix is removed.
+
+        The seam test re-implements the carry in its own body, so it passes
+        whatever `_compute_verifier_verdict` does. Four mutations proved it:
+        disabling the re-stamp guard, swapping n/agree, reading `[0]`
+        instead of `[2]`, and inverting the guard all left the suite green
+        while fully reinstating the R22 defect. That is the fourth vacuous
+        test in this feature, and the shape is always the same — the test
+        does the work instead of watching the work.
+
+        Here the vote is produced by the real sampler, the file-artifact
+        override really replaces the result, and the assertion reads the
+        sidecar row that lands on disk.
+        """
+        import asyncio
+        from ghost_agent.core import experiments as ex
+        from ghost_agent.core import verifier as V
+        from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+        import ghost_agent.core.agent as AG
+        from ghost_agent.core.agent import GhostAgent
+
+        class _Args:
+            no_verifier = False
+
+        class _SkillMem:
+            is_read_only = False
+
+        a = GhostAgent.__new__(GhostAgent)
+        ctx = self._Ctx()
+        ctx.args, ctx.skill_memory = _Args(), _SkillMem()
+        ctx.trajectory_collector = self._Coll(tmp_path / "trajectories")
+
+        v = V.Verifier(llm_client=object())
+        state = {"n": 0}
+        verdicts = ["CONFIRMED", "REFUTED", "REFUTED"]   # contested -> 3 drawn
+
+        async def _call(prompt, *ar, **kw):
+            state["n"] += 1
+            if kw.get("route_out") is not None:
+                kw["route_out"]["route"] = "critic"
+            if state["n"] == 1:
+                return {"suspects": [{"quote": "q", "check": "support",
+                                      "reason": "r"}]}
+            i = min(state["n"] - 2, len(verdicts) - 1)
+            return {"verdict": verdicts[i], "confidence": 0.8,
+                    "reasoning": "cheap", "issues": []}
+
+        object.__setattr__(v, "_call_llm", _call)
+        ctx.verifier = v
+        a.context = ctx
+
+        ex.enroll_request(ctx, "R", eligible=True, origin="user")
+        ex.mark_trigger(ctx, "R", "verify_depth_fired", True)   # deep turn
+
+        # Force the FILE-ARTIFACT override to win — it builds a replacement
+        # VerifyResult, which is what drops the counters when the carry is
+        # missing.
+        a._verify_file_artifacts = lambda claimed, host_dir: VerifyResult(
+            verdict=VerifyVerdict.REFUTED, confidence=0.9,
+            reasoning="FILE-ARTIFACT", issues=["missing"])
+        monkeypatch.setattr(AG, "_claimed_deliverable_files",
+                            lambda *x, **k: ["report.md"], raising=False)
+        import ghost_agent.tools.file_system as fs
+        monkeypatch.setattr(fs, "project_scoped_sandbox",
+                            lambda c: (str(tmp_path), None), raising=False)
+
+        final = "Done — report.md is written."
+        asyncio.run(a._compute_verifier_verdict(
+            tools_run_this_turn=[{"name": "file_system", "content": "z" * 400,
+                                  "arguments": {}}],
+            messages=[{"role": "user", "content": "make it"},
+                      {"role": "assistant", "content": final}],
+            final_ai_content=final, last_user_content="make it",
+            lc="make it", req_id="R", trajectory_id="T"))
+
+        rows = self._rows(tmp_path)
+        assert rows, "no verdict row was written at all"
+        row = rows[-1]
+        assert row["verdict"] == "REFUTED", "the override must still win"
+        assert row["sc_n"] == 3 and row["sc_agree"] == 2, (
+            f"the vote behind the overridden verdict was lost: {row}")
+        assert row["sc_drawn"] == 3
+
+    def test_an_UNPARSEABLE_vote_survives_an_override_too(self, tmp_path,
+                                                          monkeypatch):
+        """The case that separates `_vote_carry[2]` from `_vote_carry[0]`.
+
+        A contested vote has parsed==3 and drawn==3, so both indices are
+        truthy and the test above cannot tell the guards apart — that
+        mutation survived it. When every adjudication sample is unparseable
+        the record is (n=0, agree=0, drawn=3): guarding on PARSED drops it,
+        guarding on DRAWN keeps it. Dropping it files a turn that paid for
+        three samples as a control turn that never voted, which is the
+        exact confusion `sc_drawn` was added to prevent.
+        """
+        import asyncio
+        from ghost_agent.core import experiments as ex
+        from ghost_agent.core import verifier as V
+        from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+        import ghost_agent.core.agent as AG
+        from ghost_agent.core.agent import GhostAgent
+
+        class _Args:
+            no_verifier = False
+
+        class _SkillMem:
+            is_read_only = False
+
+        a = GhostAgent.__new__(GhostAgent)
+        ctx = self._Ctx()
+        ctx.args, ctx.skill_memory = _Args(), _SkillMem()
+        ctx.trajectory_collector = self._Coll(tmp_path / "trajectories")
+
+        v = V.Verifier(llm_client=object())
+        state = {"n": 0}
+
+        async def _call(prompt, *ar, **kw):
+            state["n"] += 1
+            if kw.get("route_out") is not None:
+                kw["route_out"]["route"] = "critic"
+            if state["n"] == 1:                       # stage 1 succeeds
+                return {"suspects": [{"quote": "q", "check": "support",
+                                      "reason": "r"}]}
+            if state["n"] <= 4:                       # 3 unparseable samples
+                return {}
+            return {"verdict": "CONFIRMED", "confidence": 0.7,   # classic
+                    "reasoning": "fallback", "issues": []}
+
+        object.__setattr__(v, "_call_llm", _call)
+        ctx.verifier = v
+        a.context = ctx
+        ex.enroll_request(ctx, "R", eligible=True, origin="user")
+        ex.mark_trigger(ctx, "R", "verify_depth_fired", True)
+
+        a._verify_file_artifacts = lambda claimed, host_dir: VerifyResult(
+            verdict=VerifyVerdict.REFUTED, confidence=0.9,
+            reasoning="FILE-ARTIFACT", issues=["missing"])
+        monkeypatch.setattr(AG, "_claimed_deliverable_files",
+                            lambda *x, **k: ["report.md"], raising=False)
+        import ghost_agent.tools.file_system as fs
+        monkeypatch.setattr(fs, "project_scoped_sandbox",
+                            lambda c: (str(tmp_path), None), raising=False)
+
+        final = "Done — report.md is written."
+        asyncio.run(a._compute_verifier_verdict(
+            tools_run_this_turn=[{"name": "file_system", "content": "z" * 400,
+                                  "arguments": {}}],
+            messages=[{"role": "user", "content": "make it"},
+                      {"role": "assistant", "content": final}],
+            final_ai_content=final, last_user_content="make it",
+            lc="make it", req_id="R", trajectory_id="T"))
+
+        row = self._rows(tmp_path)[-1]
+        assert row["sc_drawn"] == 3, (
+            f"three samples were paid for and the row lost them: {row}")
+        assert row["sc_n"] == 0, "none of them parsed"
+
+    def test_vote_counters_survive_a_ground_truth_OVERRIDE(self, tmp_path):
+        """§4BR R22 MAJOR-1 — the fourth layer of the same defect.
+
+        `verify_claim` re-stamps the counters after its internal escalation
+        ladder, and its comment claims that makes it "immune to the sixth
+        replacement site". The immunity stops at the function boundary:
+        `_compute_verifier_verdict` substitutes a DIFFERENT VerifyResult
+        three more times after it returns — the visual, WEB-EXEC and
+        file-artifact ground-truth overrides — and the sidecar then reads
+        the counters off the replacement, finds None, and omits the keys.
+        The row becomes byte-identical to a control turn that never voted.
+        Measured on the live log: ~3% of claim verdicts take an override.
+
+        Simulated here at the seam that matters: a result carrying a vote,
+        replaced by a fresh object, then recorded.
+        """
+        from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+        voted = VerifyResult(verdict=VerifyVerdict.CONFIRMED, confidence=0.8,
+                             reasoning="cheap", issues=[])
+        voted.self_consistency_n = 3
+        voted.self_consistency_agree = 2
+        voted.self_consistency_drawn = 3
+        carry = (voted.self_consistency_n, voted.self_consistency_agree,
+                 voted.self_consistency_drawn)
+
+        override = VerifyResult(verdict=VerifyVerdict.REFUTED,
+                                confidence=0.9,
+                                reasoning="FILE-ARTIFACT", issues=["missing"])
+        assert override.self_consistency_n is None      # the defect's source
+        if carry[2] and override.self_consistency_drawn is None:
+            (override.self_consistency_n, override.self_consistency_agree,
+             override.self_consistency_drawn) = carry
+
+        a = self._agent(tmp_path)
+        a._record_verdict_sidecar(
+            "traj-ovr", override.verdict.value, override.confidence,
+            sc_n=override.self_consistency_n,
+            sc_agree=override.self_consistency_agree,
+            sc_drawn=override.self_consistency_drawn)
+        row = self._rows(tmp_path)[0]
+        assert row["verdict"] == "REFUTED", "the override must still win"
+        assert row["sc_n"] == 3 and row["sc_drawn"] == 3, (
+            "the vote that produced the overridden verdict was lost")
+
+    def test_the_override_carry_is_WIRED_in_the_verdict_path(self):
+        """The execution test above proves the seam works; this proves the
+        production path actually contains it. Both halves are needed — the
+        three override sites are what the wire has to cross."""
+        import ast
+        from pathlib import Path
+        import ghost_agent.core.agent as m
+        src = Path(m.__file__).read_text()
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "_compute_verifier_verdict")
+        cap = [n for n in ast.walk(fn) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "_vote_carry"
+                       for t in n.targets)]
+        assert cap, "_vote_carry is not captured at all"
+        assigns = [n.lineno for n in cap]
+        # It must capture FROM v_result, not from constants: replacing the
+        # getattr calls with None preserves every structural property here
+        # while making the carry inert, and that mutation survived the
+        # first version of this test.
+        dumped = ast.dump(cap[0])
+        assert "v_result" in dumped, "the carry does not read v_result"
+        for attr in ("self_consistency_n", "self_consistency_agree",
+                     "self_consistency_drawn"):
+            assert attr in dumped, f"the carry does not capture {attr}"
+        restamp = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                   and any(getattr(t, "attr", "") == "self_consistency_drawn"
+                           for t in ast.walk(n) if isinstance(t, ast.Attribute))]
+        assert restamp, "_vote_carry is captured but never re-applied"
+        assert min(assigns) < max(restamp), "captured after it is applied"
+        # And the overrides must sit BETWEEN the two, or the carry is moot.
+        overrides = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                     for t in n.targets
+                     if isinstance(t, ast.Name) and t.id == "v_result"]
+        crossed = [ln for ln in overrides if min(assigns) < ln < max(restamp)]
+        assert len(crossed) >= 3, (
+            f"the carry spans {len(crossed)} v_result reassignments; the "
+            "visual, WEB-EXEC and file-artifact overrides must all be inside")
+
+    def test_a_single_sample_verdict_carries_NO_vote_keys(self, tmp_path):
+        """Control rows stay byte-shaped as before, so "no vote was taken"
+        stays distinguishable from "a vote of one" in the corpus."""
+        a = self._agent(tmp_path)
+        a._record_verdict_sidecar("traj-c", "CONFIRMED", 0.9)
+        row = self._rows(tmp_path)[0]
+        assert "sc_n" not in row and "sc_agree" not in row
+
+    def test_the_verification_ROUTE_reaches_disk(self, tmp_path):
+        """§4BR R23 finding 2. `verify_route` was written ONLY to turn-facts
+        — three lines above the comment explaining that turn-facts records
+        nothing on either live delivery path. Measured after six days: 154
+        router labels in the corpus and ZERO routes, while two comments
+        claimed the arm's analysis could condition on it.
+
+        It matters because ~10.8% of the arm's population takes the
+        code-output route, which has no two-stage leg and therefore cannot
+        receive the treatment at all. Without the route those turns are
+        indistinguishable from turns the treatment simply failed to help,
+        and they dilute the effect toward zero."""
+        a = self._agent(tmp_path)
+        a._record_verdict_sidecar("traj-r", "CONFIRMED", 0.9,
+                                  route="code_output")
+        assert self._rows(tmp_path)[0]["route"] == "code_output"
+
+    def test_the_route_is_FORWARDED_from_the_verdict_path(self):
+        """The other end of that wire — the half that was missing."""
+        import ast
+        import inspect
+        from pathlib import Path
+        import ghost_agent.core.agent as m
+        from ghost_agent.core.agent import GhostAgent
+        tree = ast.parse(Path(m.__file__).read_text())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "_compute_verifier_verdict")
+        call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                    and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "route" in kw, "the route is not forwarded to the sidecar"
+        assert "_verify_route" in ast.dump(kw["route"])
+        params = inspect.signature(GhostAgent._record_verdict_sidecar).parameters
+        assert "route" in params
+
     def test_a_repaired_turn_keeps_BOTH_rows_with_seq_ordering(self, tmp_path):
         """An auto-repaired turn verifies twice. Both rows are real
         signal, so the join contract is last-wins — asserted here rather
@@ -154,10 +457,51 @@ class TestTheStampIsWiredAtTheChokePoint:
         import ghost_agent.core.agent as m
         return Path(m.__file__).read_text()
 
+    @staticmethod
+    def _sidecar_call():
+        """The sidecar call node inside `_compute_verifier_verdict`.
+
+        By AST rather than by substring: the call grew keyword arguments
+        (§4BR vote counters) and wrapped onto several lines, which broke a
+        pin that was only ever testing the formatting.
+        """
+        import ast
+        from pathlib import Path
+        import ghost_agent.core.agent as m
+        tree = ast.parse(Path(m.__file__).read_text())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "_compute_verifier_verdict")
+        return next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                    and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
+
     def test_the_verdict_is_recorded(self):
         src = self._src()
         assert "verifier_verdict=_vs, verifier_confidence=_vc" in src
-        assert "self._record_verdict_sidecar(str(trajectory_id)" in src
+        call = self._sidecar_call()
+        assert len(call.args) >= 3, "trajectory_id, verdict and confidence"
+
+    def test_the_vote_counters_are_FORWARDED_from_the_verdict(self):
+        """The other end of the wire. `TestTheWriterActuallyRuns` proves the
+        sidecar PERSISTS the counters when handed them; this proves the
+        verdict path HANDS them over. Renaming the kwarg here raises a
+        TypeError swallowed by the broad `except` — a warning in the log and
+        silently no counters on disk — and that mutation survived a suite
+        that tested only the writer."""
+        import ast
+        import inspect
+        from ghost_agent.core.agent import GhostAgent
+        call = self._sidecar_call()
+        kw = {k.arg: k.value for k in call.keywords}
+        for name, attr in (("sc_n", "self_consistency_n"),
+                           ("sc_agree", "self_consistency_agree"),
+                           ("sc_drawn", "self_consistency_drawn")):
+            assert name in kw, f"{name} is not forwarded to the sidecar"
+            src = ast.dump(kw[name])
+            assert attr in src, f"{name} must come from v_result.{attr}: {src}"
+        # …and the writer must actually accept them under those names.
+        params = inspect.signature(GhostAgent._record_verdict_sidecar).parameters
+        assert {"sc_n", "sc_agree", "sc_drawn"} <= set(params)
 
     def test_it_is_recorded_ONCE_at_the_shared_choke_point(self):
         """`_compute_verifier_verdict` is documented as running exactly
@@ -182,12 +526,32 @@ class TestTheStampIsWiredAtTheChokePoint:
         assert owners == ["_compute_verifier_verdict"], owners
 
     def test_recording_can_never_fail_a_turn(self):
-        """A durable write on the answer path must be strictly optional."""
-        src = self._src()
-        i = src.index("self._record_verdict_sidecar(str(trajectory_id)")
-        window = src[i - 900:i + 900]
-        assert "except Exception as _vf_exc" in window
-        assert "never fail a turn" in window
+        """A durable write on the answer path must be strictly optional.
+
+        By AST containment rather than a character window: the window
+        version measured DISTANCE from the call and broke when the call
+        grew keyword arguments, which has nothing to do with the property
+        it guards.
+        """
+        import ast
+        from pathlib import Path
+        import ghost_agent.core.agent as m
+        tree = ast.parse(Path(m.__file__).read_text())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "_compute_verifier_verdict")
+        call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                    and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
+        guarding = [t for t in ast.walk(fn) if isinstance(t, ast.Try)
+                    and any(c is call for c in ast.walk(t))
+                    and any(isinstance(h.type, ast.Name)
+                            and h.type.id == "Exception" for h in t.handlers)]
+        assert guarding, "the durable write is not inside a try/except Exception"
+        # ...and the recording must never fail a turn: no bare re-raise.
+        for t in guarding:
+            for h in t.handlers:
+                assert not any(isinstance(n, ast.Raise) for n in ast.walk(h)), (
+                    "the handler re-raises; recording would fail the turn")
 
     def test_the_docstring_admits_the_write(self):
         """It previously said "NO side effects". A docstring that

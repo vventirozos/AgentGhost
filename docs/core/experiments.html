@@ -171,6 +171,129 @@ $GHOST_HOME/system/experiments.json
     bucket). Tests: <code>tests/test_track2_flip_ii.py</code>.
   </p>
 
+  <h2>verify_depth — the router's first live consumer (§4BR, 2026-08-16)</h2>
+  <p>
+    The §4BQ complexity router has been accurate-but-unconsumed since its
+    embedding flip. This arm consumes it: on a turn the router calls
+    <strong>confidently hard</strong> (<code>label="hard"</code> and NOT
+    escalated — an untrained or unsure router escalates <em>with</em>
+    label=hard, so counting those would fire on nearly everything), the
+    treatment runs the verifier's cheap-leg adjudication with
+    self-consistency n=3 instead of one sample. Control keeps n=1,
+    byte-identical to today. See
+    <a href="verifier.html">verifier</a> for the vote itself.
+  </p>
+  <p>
+    <strong>The premise is untested and that is the point.</strong> "Harder
+    turns are likelier to get a wrong verdict" has never been shown here —
+    §4AN's standing lesson is that this router was accurate overall and
+    worthless exactly where it acted. So it ships as a randomised arm rather
+    than a default, and the deploy is the measurement. Pre-registered at
+    <code>system/eval/verify_depth/DECISION_RULE.md</code>, which opens with
+    a <em>mechanism</em> gate — if the judge does not vary on this traffic
+    the arm retires regardless of outcomes, because the outcome metric
+    (human feedback, the only signal independent of the verdict) is sparse
+    enough that it may never reach its floor.
+  </p>
+  <p>
+    ⚠ <strong>That gate had to be rescaled, and the error was a live hazard.</strong>
+    The predicted ~17% disagreement was measured over three <em>full</em>
+    repeat runs, while the recorded statistic comes from an
+    <em>early-stopped</em> vote that stops at two samples whenever the first
+    two agree. The two differ by exactly 2/3 (full: 1 − p³ − (1−p)³;
+    early-stopped: 2p(1−p)), so a mechanism behaving exactly as measured
+    records <strong>11.1%</strong>, not 17%. The first version of the gate
+    compared the recorded number against the full-draw prediction and would
+    have retired a perfectly healthy arm with probability <strong>0.164</strong>
+    at n=40 — it was likelier to kill the feature than the feature was to be
+    inert. The live rule is calibrated on what is actually recorded; treat
+    <code>system/eval/verify_depth/DECISION_RULE.md</code> as the only
+    authority for the thresholds, and do not restate them here. The convenient metric, <code>resolve_turn_outcome</code>'s
+    SUCCESS/FAILED label, is <em>circular</em>: the verdict is an input to it,
+    so a treatment that changes verdicts moves it mechanically.
+  </p>
+  <p>
+    <strong>Where the decision is taken matters more than what it decides.</strong>
+    Both the trigger and the arm are resolved in <code>handle_chat</code>, in
+    the router block, and the verdict path only reads the result. Taking it at
+    the point of use looked right — <code>_compute_verifier_verdict</code> is
+    the one place every verdict is produced — but on the streamed path the
+    trajectory is written before that coroutine is spawned, so the enrolment
+    and the trigger would land after the drain: measured 2/169 rows, against
+    145/169 for facts stamped in <code>handle_chat</code>. The block must also
+    sit <em>after</em> <code>enroll_request</code>, because
+    <code>mark_trigger</code> refuses to create a ring slot and returns
+    silently when none exists.
+  </p>
+  <p>
+    <code>verify_depth_fired</code> is a <code>TRIGGER_KEYS</code> member,
+    stamped <em>only</em> on turns that actually triggered (<code>trigger_fired</code>
+    reads presence, not value, so an unconditional stamp would make
+    "triggered only" mean all traffic); its value carries whether the
+    treatment ran. A deep turn additionally stamps
+    <code>verify_depth_context</code>, a <code>CONTEXT_MUTATING_KEYS</code>
+    member — a changed verdict can append the correction note to the final
+    text and add a repair round, both of which enter the conversation history
+    and the recorded trajectory, so the GEPA fixture corpus must exclude
+    them. Kill switch <code>GHOST_VERIFY_DEPTH_ROUTING=0</code>; note
+    <code>GHOST_VERIFY_TWO_STAGE=0</code> also removes the voted leg, and both
+    switches are folded into the single <code>verifier.depth_for_turn</code>
+    predicate so a turn can never be <em>recorded</em> as treatment while
+    <em>behaving</em> as control. Rollback of enrolment = delete the entry
+    from <code>system/experiments.json</code> (hot-reloads on mtime). Tests:
+    <code>tests/test_verify_depth_routing.py</code>.
+  </p>
+  <p>
+    ⚠ <strong>The registry lesson, learned twice.</strong> This arm shipped
+    100% inert: it was added to <code>DEFAULT_SPECS</code> only, and the
+    on-disk <code>system/experiments.json</code> replaces those wholesale, so
+    <code>arm_for</code> returned <code>""</code> and every turn took the
+    control path while the tests stayed green. The file's own comment already
+    recorded this lesson from Track 1c. <code>tests/test_verify_depth_routing.py</code>
+    now carries a general drift check that fails for <em>any</em> enabled
+    default missing from the live file.
+  </p>
+
+  <h2>Circularity is per-(experiment, metric) — <code>NO VERDICT</code> (2026-08-17)</h2>
+  <p>
+    <code>failure_rate</code> derives from <code>resolve_turn_outcome</code>, whose inputs
+    include the verifier verdict. For an arm whose <em>treatment changes that verdict</em> the
+    metric moves mechanically in whichever direction the treatment pushes it, with no bearing
+    on answer quality — so a difference there is the instrument moving.
+    <code>verify_depth</code>'s pre-registered rule says exactly this and disowns the metric;
+    <code>tts_bon</code> substitutes the final text chosen by the verifier's own score and is
+    in the same position. Both are listed in <code>_CIRCULAR_FOR</code>, and
+    <code>compare_arms(..., experiment=…)</code> attaches a CIRCULAR caveat that makes
+    <code>MetricComparison.verdict</code> render <strong><code>NO VERDICT</code></strong> and
+    suppresses the operator announcement.
+  </p>
+  <p>
+    It is deliberately <em>per-experiment</em>: <code>failure_rate</code> stays a legitimate
+    metric for <code>risk_steer</code>, <code>fs_batch</code> and <code>use_planning</code>,
+    which change the ANSWER rather than the instrument. Every caller threads the name —
+    including <code>scripts/experiment_report.py</code>'s <code>--json</code>, which for one
+    round did not and therefore reported <code>TREATMENT WORSE</code> on a bench arm the human
+    report already showed as <code>NO VERDICT</code>.
+  </p>
+  <p>
+    ⚠ Suppression creates an obligation: <code>_CIRCULAR_REMEDY</code> must name a REACHABLE
+    replacement per experiment. "Read the human-graded metric" is reachable on the live
+    population only — human feedback arrives against a user <code>request_id</code>, so
+    <code>human_failure_rate</code> is structurally n=0 on bench turns.
+  </p>
+  <p>
+    ⚠ <strong>A retraction worth keeping.</strong> <code>tts_bon</code> was listed as circular
+    for one round on the reasoning that bench outcomes are verifier-derived. They are not:
+    dream's §4BF-1c write-back stamps the bench trajectory outcome from the <strong>bank
+    oracle</strong> (<code>source="bench_validator"</code>, measured 79/79 rows), and the
+    oracle-yield leg in <code>update_outcome</code> stops a late verifier verdict from
+    superseding it — so <code>failure_rate</code> there IS the ground truth. The suppression
+    removed that arm's only decidable metric and made its pre-registered SHIP condition ("no
+    confound annotation on the winning metric") unsatisfiable. The general lesson:
+    <em>suppressing a metric is not the conservative default</em> — it can leave an arm
+    undecidable, which is a silent-inoperative defect wearing a caution label.
+  </p>
+
   <h2>Recording</h2>
   <p>
     The arm is stamped on the turn's trajectory as
@@ -198,8 +321,11 @@ PYTHONPATH=src python scripts/experiment_report.py [--day YYYY-MM-DD] [--alpha 0
   </pre>
   <p>
     Metrics: <code>failure_rate</code> (UNKNOWN turns excluded — an unverifiable turn is not
-    evidence either way), <code>n_steps</code>, <code>duration_s</code>. All are
-    lower-is-better.
+    evidence either way), <code>human_failure_rate</code> (the same rate restricted to turns a
+    HUMAN graded — see the guards table), <code>n_steps</code>, <code>duration_s</code> — all
+    lower-is-better and all four consuming the Bonferroni budget — plus
+    <code>human_label_rate</code>, which is higher-is-more-data, DESCRIPTIVE, exempt from the
+    alpha split, and never renders a direction verdict.
   </p>
 
   <h2>Why confidence SEQUENCES, not a t-test — and what they do not promise</h2>
@@ -230,7 +356,8 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
   <ul>
     <li><strong>Regularised variance</strong> (<code>_regularised_sigma</code>). The plain sample SD is 0 on constant input, which collapsed the interval to a POINT — six Bernoulli observations that happen to be constant per arm then "prove" a difference. At p=0.5 that shape occurs 12.2% of the time at 2 turns/arm.</li>
     <li><strong>No verdict below n=30/arm.</strong> The numbers and the interval are still shown; only the conclusion waits.</li>
-    <li><strong>α split across metrics</strong> (Bonferroni ÷3) as well as arms (÷2). Without it, "stop when ANY of three intervals crosses" runs at ~15% against a nominal 5%.</li>
+    <li><strong>α split across metrics</strong> (Bonferroni ÷ the number of TESTED metrics — 4 today; descriptive rates like <code>human_label_rate</code> are excluded, since a denominator must not widen every real interval to pay for a diagnostic) as well as arms (÷2). Without it, "stop when ANY interval crosses" runs at ~15% against a nominal 5%.</li>
+    <li><strong><code>human_failure_rate</code> / <code>human_label_rate</code></strong> (2026-08-17): the failure rate over turns a HUMAN graded, and its denominator. §4BR's decision rule accepts only human feedback as a correctness signal and disowns the plain outcome label as CIRCULAR — but the corrections overlay dropped the sidecar's <code>source</code>, so a human 👎 and a <code>verifier_late</code> machine verdict were byte-identical to the analysis and the pre-registered metric was uncomputable. The overlay now stamps <code>extra["outcome_source"]</code> (plus <code>human_labeled</code>, so a later machine correction cannot silently drop the turn from the denominator). <code>human_failure_rate</code> inherits the differential-attrition caveat a fortiori (it conditions on resolved AND labelled); <code>human_label_rate</code> carries a DESCRIPTIVE caveat and never announces a verdict — with lower-is-better false, "more thumbs in treatment" would otherwise have announced as a quality win, and it is the first human metric to clear the n≥30/arm floor on live data.</li>
   </ul>
   <p>
     The p=0.1 row is the honest weak spot, and a low failure rate is exactly this agent's
@@ -303,6 +430,8 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
       <tr><td>enrollment skew</td><td>Fires on an <strong>exact binomial tail</strong> (p &lt; 0.001), not a fixed ±20% tolerance: hash assignment is fair in EXPECTATION and the realised split is Binomial, so the old rule falsely accused the stamp 11.9% of the time at its own minimum n. Computed in log space — the direct form overflowed float64 past n=1023 and silently disabled the alarm on any large corpus.</td></tr>
       <tr><td>unknown_rate</td><td>Printed above failure_rate on every block, because failure_rate CONDITIONS on it.</td></tr>
       <tr><td>arm reads <code>&lt;REDACTED&gt;</code></td><td>The experiment name collides with the redactor. Those rows are unrecoverable; rename it.</td></tr>
+      <tr><td><code>■ name (n=0)</code></td><td>Enabled in the registry, but NO enrolled turn carries it (2026-08-17 introspect review). The report used to enumerate only arms that already <em>had</em> stamps, so an enabled-but-inert spec — <code>verify_depth</code>'s exact three-day state — was invisible in the very instrument that should have shown it. <code>render_report(expected_names=…)</code> receives the registry's enabled names for the population; every caller (introspect live + bench sections, the learning block, <code>scripts/experiment_report.py</code>) passes them, and the empty-corpus early returns name the waiting arms too. With <code>GHOST_EXPERIMENTS=0</code> the row reframes as "expected — nothing enrolls" instead of a false alarm (in the learning block too, R3), with one caveat: the switch is read from the <em>rendering</em> process's env — introspect renders inside the daemon (authoritative), while the CLI renders in the operator's shell, whose env may differ from the daemon that actually enrolls. The bench section renders its zero rows even on an EMPTY bench corpus (R3: the early return used to skip the whole section in exactly the worst state).</td></tr>
+      <tr><td>registry UNREADABLE</td><td>A corrupt <code>system/experiments.json</code> makes <code>load_registry</code> substitute the code defaults — by design it never raises, which had made every downstream "warn on failure" guard fire on an impossible event while the real failure silently disabled the deny-scope filter and produced false n=0 alarms for default specs. The registry now carries <code>degraded=True</code> when the file exists but failed to parse (missing file ≠ degraded); report surfaces render the warning and skip conclusions drawn from the substituted defaults.</td></tr>
     </tbody>
   </table></div>
 
@@ -310,7 +439,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
   <ul>
     <li><strong>Carryover / SUTVA violation.</strong> Cross-session memory means a lesson learned on a treatment turn can help a later control turn. That contaminates the control arm and biases the measured effect <em>toward zero</em> — a positive reading is conservative, a null one is genuinely ambiguous.</li>
     <li><strong>The outcome label is a proxy</strong> (verifier + structural signal): process health, not correctness. Same caveat <code>grade_turn_outcome</code> carries.</li>
-    <li><strong>Differential attrition is the sharpest trap.</strong> <code>failure_rate</code> conditions on the turn resolving to PASSED/FAILED — a POST-treatment variable. A treatment that makes turns end unverifiable (the risk steer literally says "STOP. Report what is known") changes WHICH turns are scored; simulated with <em>zero</em> true effect that manufactured a 14-point "improvement". The report tests the UNKNOWN rate itself and flags <code>failure_rate</code> CONFOUNDED when the arms differ on it.</li>
+    <li><strong>Differential attrition is the sharpest trap.</strong> <code>failure_rate</code> and <code>human_failure_rate</code> (<code>_ATTRITION_SENSITIVE</code> — the human-graded one also conditions on being LABELLED, so it inherits the bias a fortiori) condition on the turn resolving to PASSED/FAILED — a POST-treatment variable. A treatment that makes turns end unverifiable (the risk steer literally says "STOP. Report what is known") changes WHICH turns are scored; simulated with <em>zero</em> true effect that manufactured a 14-point "improvement". The report tests the UNKNOWN rate itself and flags <strong>both</strong> attrition-sensitive metrics CONFOUNDED when the arms differ on it — unless circularity takes precedence, since a metric the treatment moves mechanically cannot be rescued by an attrition caveat.</li>
     <li><strong><code>n_steps</code> and <code>duration_s</code> are mechanism, not outcome</strong>, for any treatment that ends turns earlier. "TREATMENT BETTER" on those two is tautological, so they carry that annotation permanently.</li>
     <li><strong>Traffic is not iid.</strong> Requests arrive in correlated bursts; randomization balances that in expectation, but the variance estimate is optimistic when one session contributes many turns.</li>
     <li><strong>The measured population is narrower than "all traffic".</strong> Trivial greetings take <code>_handle_trivial_chat</code>, which bypasses the turn loop and the finalize chain — those turns write no trajectory, so they are assigned an arm that is never recorded. Correct (nothing under test can affect a one-shot "thanks"), but arm counts will always run below the raw request count.</li>

@@ -57,15 +57,64 @@
   </table></div>
 
   <h2>Routing tasks</h2>
-  <p>The <code>RoutingTask</code> enum at line 71 advertises the labels worker pools can fulfil:</p>
+  <p>
+    <code>RoutingTask</code> is a plain class of string constants — <em>not</em> an enum, and
+    <em>not</em> a closed set. <code>route()</code> accepts any string, so these are a convenience
+    for the call sites that share a label, not a contract. Members with a live caller:
+  </p>
   <ul>
-    <li><code>VALIDATE_TOOL_ARGS</code> — quick JSON-schema sanity check.</li>
-    <li><code>EXPAND_QUERY</code> — sub-query decomposition for memory hydration.</li>
-    <li><code>CLASSIFY_INTENT</code> — factual vs procedural vs contextual.</li>
-    <li><code>SCORE_RELEVANCE</code> — re-rank candidate documents.</li>
-    <li><code>REPAIR_JSON</code> — coerce a malformed payload back to valid JSON.</li>
-    <li><code>VERIFY</code> — used by <a href="verifier.html">Verifier</a>.</li>
+    <li><code>EXPAND_QUERY</code> — sub-query decomposition for memory hydration
+        (<a href="bus.html">bus</a>, <a href="agent.html">agent</a>); the highest-traffic routed call.</li>
+    <li><code>CLASSIFY_FAILURE</code> — failure-dimension tagging.</li>
+    <li><code>DISTILL_PATTERN</code> — lesson synthesis from a failure cluster.</li>
   </ul>
+  <p class="note">
+    <strong>Corrected 2026-08-18 (§4BV R5).</strong> This list previously named six members, of
+    which five were wrong: <code>VALIDATE_TOOL_ARGS</code>, <code>CLASSIFY_INTENT</code>,
+    <code>SCORE_RELEVANCE</code> and <code>REPAIR_JSON</code> had <em>zero</em> production callers
+    (now deleted), and <code>VERIFY</code> was never a member at all — the
+    <a href="verifier.html">Verifier</a> passes the bare string <code>"VERIFY"</code>, and in the
+    shipping topology it does not use <code>route()</code> at all: with <code>--critic-nodes</code>
+    set, verdicts go down the critic leg. Both live members were missing from the list.
+  </p>
+
+  <h2 id="pool-budget">The pool budget is a deadline, not a per-node duration <span class="tag">2026-08-18</span></h2>
+  <p>
+    A caller's queue budget covers <strong>the whole pool attempt and the request</strong>, as one
+    wall-clock deadline. Before §4BV R5 it was spent in full by <em>every</em> node in the retry
+    loop, and then again by the POST, so the two budgets added:
+  </p>
+  <div class="scroll"><table><thead><tr><th>pool size</th><th>stated budget</th><th>measured, before</th><th>after</th></tr></thead>
+    <tbody>
+      <tr><td>1 node (the shipping topology)</td><td>12&nbsp;s</td><td><b>23.91&nbsp;s</b></td><td>9.01&nbsp;s</td></tr>
+      <tr><td>2 nodes</td><td>12&nbsp;s</td><td>24&nbsp;s</td><td>≤&nbsp;12&nbsp;s</td></tr>
+      <tr><td>3 nodes</td><td>12&nbsp;s</td><td>36&nbsp;s</td><td>≤&nbsp;12&nbsp;s</td></tr>
+    </tbody>
+  </table></div>
+  <p>
+    <code>route()</code> states a 12&nbsp;s fail-fast because it is awaited on the user's critical
+    path and its fallback is free (a string concat), so every second past the budget is dead air.
+    Two properties are load-bearing and easy to get wrong:
+  </p>
+  <ul>
+    <li><strong>The remainder is shared across untried nodes.</strong> A flat per-attempt deadline
+        removes the blow-up but lets node&nbsp;0 consume the entire budget while node&nbsp;2 — free
+        right now — is never asked.</li>
+    <li><strong>The floor is on the total, and the HTTP reserve comes out of it.</strong>
+        <code>_MIN_HTTP_FLOOR</code> is held back so a caller cannot spend everything queueing and
+        then POST with nothing left; flooring at <code>_MIN_SLOT_WAIT</code> alone would leave only
+        2&nbsp;s of real queue time and quietly disable the gate.</li>
+  </ul>
+  <p>
+    Callers that state a budget do so <em>by name</em> via <code>slot_wait=</code>:
+    <code>route()</code>, the web-summary distillation in
+    <a href="../tools/search.html">search</a> / darkweb_search (whose 55&nbsp;s outer per-URL
+    deadline would otherwise be exceeded — a saturated node then loses the URL instead of degrading
+    to raw page text), <code>build_gates</code>, and the
+    <a href="verifier.html">Verifier</a>'s critic leg. Everything else inherits
+    <code>GHOST_NODE_SLOT_WAIT_S</code> (90&nbsp;s), which remains a <em>ceiling</em>, never a value.
+    <code>keepalive</code> bypasses the gate entirely, so a busy node can never read as a dead one.
+  </p>
 
   <h2 id="node-gate">Per-node concurrency gate — one budget per node URL <span class="tag">2026-08-11</span></h2>
   <p>
@@ -243,9 +292,92 @@
     <tbody>
       <tr><td><code>_STREAM_FIRST_BYTE_TIMEOUT</code></td><td><code>GHOST_STREAM_FIRST_BYTE_TIMEOUT</code></td><td>180s</td><td>Time to the FIRST byte (prompt prefill / time-to-first-token).</td></tr>
       <tr><td><code>_STREAM_IDLE_TIMEOUT</code></td><td><code>GHOST_STREAM_IDLE_TIMEOUT</code></td><td>60s</td><td>Gap between subsequent bytes (catches a real mid-stream hang).</td></tr>
+      <tr><td><code>_STREAM_ERROR_BODY_TIMEOUT</code></td><td><code>GHOST_STREAM_ERROR_BODY_TIMEOUT</code></td><td>15s</td><td>Reading the BODY of a &gt;=400 response, purely to improve the error message.</td></tr>
     </tbody>
   </table></div>
   <p>Any received line — including SSE keepalive/blank lines — ends the first-byte wait and resets the gap timer. A timeout yields an error SSE event + <code>[DONE]</code>; the agent then sees a turn with thinking but no actionable output and forces a retry. The earlier flat <b>30s</b> tripped that false "stall → forced retry" whenever a turn's prefill exceeded 30s, wastefully re-prefilling the whole (growing) context. The httpx client timeout (1200s) bounds the overall request above these. Tune the env vars for very slow or very fast nodes. Covered by <code>tests/test_stream_idle_timeout.py</code>.</p>
+
+  <h2>The streaming coding pool joins the node discipline (2026-08-18, §4BV R7)</h2>
+  <p>Until R7 <code>_do_stream_chat_completion</code> picked a coding node <em>once</em>, above
+  its retry loop, with no concurrency gate, no circuit-breaker bookkeeping and no main-model
+  fallback — while its non-streaming sibling <code>_do_chat_completion</code> has had all three
+  since 2026-08-11. Measured on a 2-node pool (node0 dead, node1 healthy), 3 calls:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Path</th><th>Nodes contacted</th><th>Permits</th><th>Breaker (dead node)</th><th>Main fallback</th></tr></thead>
+    <tbody>
+      <tr><td>non-streaming (reference)</td><td><code>DEAD, GOOD</code> &times;3</td><td>6</td><td><code>failures=3 open</code></td><td>yes</td></tr>
+      <tr><td>streaming, before</td><td><code>DEAD, DEAD, GOOD, DEAD, DEAD</code></td><td><b>0</b></td><td><b><code>failures=0 closed</code></b></td><td><b>never</b> (2 of 3 calls raised)</td></tr>
+      <tr><td>streaming, after</td><td><code>DEAD, GOOD</code> &times;3</td><td>6</td><td><code>failures=3 open</code></td><td>yes</td></tr>
+    </tbody>
+  </table></div>
+  <p>The breaker never learning is what made <code>get_coding_node</code>'s
+  <code>is_available()</code> filtering <em>provably dead code</em> on this path — verbatim the
+  defect this file already records as fixed at <code>generate_image</code>. The node is now
+  selected per attempt (so a retry moves to the next box instead of re-hitting the dead one),
+  the permit is held for the whole generation, <code>NodeSaturated</code> advances without ever
+  touching the breaker, a 4xx is not charged to the node, and an exhausted pool falls back to
+  main with the <em>caller's</em> model restored in the payload.</p>
+  <p>Fan-out, 6 concurrent coding streams at a node advertising <code>total_slots=2</code>:
+  peak simultaneous requests on the wire went from <b>6</b> to <b>2</b>, with all 6 streams
+  still completing.</p>
+  <p><b>Budget.</b> The streaming path adopts <code>_do_chat_completion</code>'s
+  <code>_queue_deadline</code> (one wall-clock budget for the whole pool loop, divided by the
+  attempts still to come <em>including the current one</em>, floored at <code>_MIN_ACQUIRE</code>,
+  handed to the gate as a <em>callable</em> so the <code>/props</code> probe is inside it). It
+  deliberately does <b>not</b> adopt <code>_total_deadline</code>/<code>_http_budget</code>:
+  a stream has no meaningful total budget — nothing can pass one, and a long answer is not a
+  fault — so its bound stays the per-chunk watchdog above.</p>
+  <p><b>Live impact: none.</b> <code>--coding-nodes</code> is empty on this deployment, so the
+  loop reduces to the same two main-model attempts as before. That equivalence is pinned by
+  <code>test_an_empty_coding_pool_is_still_exactly_two_main_attempts</code>.</p>
+
+  <h2>Stall attribution: our own queue is not the upstream's fault (§4BV R7)</h2>
+  <p>Measured: 3 concurrent streams plus 1 non-streaming POST against the 1-slot main node put
+  2 of the 3 streams over the first-byte budget waiting in <em>llama-server's</em> queue behind
+  our own traffic — and all of them printed <code>Upstream Stream Stall</code>. That is the same
+  diagnosis corruption <code>NodeSaturated</code> exists to remove one layer down.</p>
+  <p>A self-queued verdict is now issued <b>only on proof</b>: a <code>/props</code> probe must
+  have <em>succeeded</em> (only successful probes land in <code>_node_slot_caps</code>, so the
+  capacity is never a default or a guess) <b>and</b> our own in-flight count must exceed it.
+  Otherwise the line states the concurrency as a fact and leaves the diagnosis open — an unknown
+  capacity is not evidence of innocence either, and a probed capacity we are <em>within</em> is
+  reported as such rather than as "unknown".</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Situation</th><th>Log line</th></tr></thead>
+    <tbody>
+      <tr><td>cap known, exceeded</td><td><code>Stream Stall (Self-Queued): … 4 of OUR OWN requests were in flight against a 1-slot node …</code></td></tr>
+      <tr><td>cap known, within it</td><td><code>Upstream Stream Stall: … (3 concurrent requests …; a 4-slot node, within capacity)</code></td></tr>
+      <tr><td>cap unknown</td><td><code>Upstream Stream Stall: … (3 concurrent requests …; capacity unknown)</code></td></tr>
+      <tr><td>sole caller</td><td><code>Upstream Stream Stall: … (sole in-flight request)</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>The counter is keyed on the <b>configured</b> URL (<code>node["url"]</code> /
+  <code>self.upstream_url</code>), never <code>str(client.base_url)</code>: httpx normalises the
+  latter (<code>http://h:8088/v1</code> → <code>…/v1/</code>, <code>http://h:80</code> →
+  <code>http://h</code>), and <code>_node_slot_caps</code> is keyed on the configured string, so
+  a normalised key would silently never match and the whole verdict would be dead code. On the
+  shipping topology <code>--visual-nodes</code> is byte-identical to the upstream URL, so main's
+  capacity (1) is populated for free by the first vision call. A held <code>_main_node_lock</code>
+  counts as one more in-flight request; pool POSTs are not counted at all, which can only
+  <em>lose</em> an accusation, never manufacture one.</p>
+
+  <h2>Three "a chunk may be bytes" fixes in one function (§4BV R7)</h2>
+  <p>The chunk loop already documented that a chunk "is <code>str</code> on the real
+  <code>aiter_lines</code> path but <code>bytes</code> on others". Two of its three consumers
+  honoured that; the other two did not:</p>
+  <ul>
+    <li><code>_note_usage_from_sse</code> — decoded first. Correct.</li>
+    <li>The emit — interpolated the object into an f-string, shipping its Python <b>repr</b>
+        (<code>b'data: {…}'</code>), a frame no SSE parser accepts. Invisible to the existing
+        test, whose assertion is a substring a repr still contains.</li>
+    <li><code>_stream_rec_accumulate</code> — its type guard sat <em>outside</em> its own
+        <code>try</code>, so <code>bytes.startswith("data:")</code> raised <code>TypeError</code>,
+        which the stream loop's <code>except Exception</code> turns into a re-raise with no
+        <code>[DONE]</code>. With <code>GHOST_LLM_RECORD=1</code> a bytes chunk killed the turn
+        outright, despite a docstring promising "tolerant by contract".</li>
+  </ul>
+  <p>All latent in production (httpx yields <code>str</code>), all fixed. Covered by
+  <code>tests/test_stream_coding_gate_4bv_r7.py</code> (27 tests, 26/26 mutations killed).</p>
 
   <h2>Foreground-request yield (2026-06-11)</h2>
   <p>Background LLM callers (<code>is_background=True</code>) used to wait only on <code>foreground_tasks</code> — LLM calls <em>in flight</em> — capped at 30s. But a user turn spends much of its wall-clock <em>between</em> LLM calls (tools, file I/O, browser); in those gaps the counter reads 0, a background turn grabs the single llama slot, and the user's next turn queues behind a full background generation. Post-req-70 this starved the prompt for ~12 minutes while consolidation/self-play churned.</p>

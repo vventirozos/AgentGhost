@@ -72,7 +72,10 @@ Honest caveats (read before believing a verdict)
   steer literally says "STOP. Report what is known") changes WHICH turns are
   scored, and that alone manufactured a 14-point apparent improvement with
   zero true effect in simulation. `compare_arms` therefore tests the UNKNOWN
-  rate itself and flags `failure_rate` CONFOUNDED when the arms differ on it.
+  rate itself and flags `failure_rate` AND `human_failure_rate`
+  (`_ATTRITION_SENSITIVE` — the human-graded metric conditions on resolved
+  AND labelled, so it inherits the bias a fortiori) CONFOUNDED when the arms
+  differ on it.
   Never read a failure_rate win without reading the unknown_rate line above it.
 * **The measured population is narrower than "all traffic".** Trivial
   greetings take `_handle_trivial_chat`, which bypasses the turn loop AND the
@@ -224,6 +227,38 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
             "0.306, monotone, 2026-08-05)."
         ),
     ),
+    ExperimentSpec(
+        name="verify_depth",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "§4BQ's first CONSUMER: on a turn the complexity router calls "
+            "confidently HARD (label=hard, not escalated), the treatment "
+            "runs the two-stage adjudication with self-consistency n=3 "
+            "(majority vote) instead of a single sample; control keeps "
+            "n=1. Targets the MISS side — the judge's own confidence "
+            "carries no signal about false-CONFIRM (AUC 0.5087), while "
+            "cross-sample disagreement does, and majority-of-3 was "
+            "measured to fix `artifact_leak` (36% of the miss mass) with "
+            "`clean` never varying so the FPR gate survives. Samples run "
+            "SEQUENTIALLY on the CRITIC node, reusing llama.cpp's per-slot "
+            "prompt cache, and the vote early-stops once it is decided: "
+            "measured 10.8s (n=1) vs ~13.0s when the first two samples "
+            "agree, 17.8s when they do not — on an IDLE critic with a "
+            "synthetic prompt; live user-facing claim verifies (n=60) run "
+            "p50 27.6s / p90 54.9s end to end, which is what the 60s vote "
+            "budget is sized against. "
+            "The vote stops as soon as a sample comes back on the MAIN "
+            "route, so a cheap-pool outage costs one main-model call, not "
+            "n. Routing by difficulty is what makes it affordable: "
+            "n=3 on the ~58% of turns the router calls confidently hard "
+            "rather than on all of them. "
+            "⚠ The premise 'harder turns are likelier wrong' is UNTESTED "
+            "— that is why this ships as an ARM and not as a default. "
+            "Kill: GHOST_VERIFY_DEPTH_ROUTING=0."
+        ),
+    ),
 )
 
 
@@ -314,7 +349,8 @@ def _spec_from_dict(d: Dict[str, Any]) -> Optional[ExperimentSpec]:
 class ExperimentRegistry:
     """The set of running experiments + the assignment function."""
 
-    def __init__(self, specs: Sequence[ExperimentSpec] = (), *, salt: str = ""):
+    def __init__(self, specs: Sequence[ExperimentSpec] = (), *, salt: str = "",
+                 degraded: bool = False):
         seen: Dict[str, ExperimentSpec] = {}
         for s in specs:
             if s.name in seen:
@@ -322,6 +358,17 @@ class ExperimentRegistry:
             seen[s.name] = s
         self.specs: Dict[str, ExperimentSpec] = seen
         self.salt = str(salt or "")
+        # True when the on-disk file EXISTS but could not be parsed, so
+        # these specs are the substituted code defaults — not what the
+        # operator's registry says. Load-bearing for the report surfaces
+        # (introspect review R2 MAJOR-3): `load_registry` deliberately
+        # never raises, which made every "warn on registry failure" guard
+        # downstream fire on an exception that cannot happen — while the
+        # real failure silently disabled the deny-scope filter AND raised
+        # five false "enrollment broken" alarms for default specs the
+        # operator never listed. A swallowed error must still be VISIBLE
+        # to the surfaces that render conclusions from it.
+        self.degraded = bool(degraded)
 
     # -- assignment ---------------------------------------------------
 
@@ -478,7 +525,11 @@ def load_registry(path: Optional[Any] = None,
     except Exception as e:  # noqa: BLE001
         logger.warning("experiments: %s unreadable (%s: %s) — using defaults",
                        p, type(e).__name__, e)
-        reg = ExperimentRegistry(DEFAULT_SPECS)
+        # degraded=True: the file EXISTS and is wrong, which is a different
+        # state from "no file" — assignment falls back safely either way,
+        # but a report rendering deny-filters and n=0 alarms from the
+        # substituted defaults must be able to say so (R2 MAJOR-3).
+        reg = ExperimentRegistry(DEFAULT_SPECS, degraded=True)
     _REGISTRY_CACHE[key] = (mtime, reg)
     return reg
 
@@ -742,9 +793,17 @@ def is_treatment(context, name: str, req_id: str = "") -> bool:
 # only half of production ever sees. It over-claims in one direction only
 # (a treatment turn that never built a tool block is excluded anyway), which
 # is the conservative side for a corpus the optimizer replays VERBATIM.
+#
+# `verify_depth_context` is stamped on a turn whose treatment actually ran
+# deep. Depth changes the VERDICT, and a changed verdict can append the
+# verifier note to the final text and can add an in-loop repair round —
+# both of which enter the conversation history and the recorded trajectory.
+# Like `fs_batch_context` it over-claims in the conservative direction: a
+# deep turn whose verdict came out identical is excluded anyway.
 CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context",
                                           "foresight_note_fired",
                                           "use_planning_fired",
+                                          "verify_depth_context",
                                           # §4BF flip (ii): BoN substitutes the
                                           # FINAL response — it never mutates
                                           # what the model saw generating this
@@ -797,11 +856,18 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context"
 # the reading is arm-independent within the turn; across attempts of one
 # bench item the usual first-order caveat applies (a working treatment
 # changes whether attempt 2 exists at all — watch the arm counts).
+# `verify_depth_fired` fires on "the complexity router called this turn
+# confidently HARD (label=hard, not escalated)". The router runs in
+# handle_chat, BEFORE the verdict and before the arm is consulted, so the
+# reading is arm-independent within the turn — with the standing
+# first-order caveat that a working treatment changes the trajectories the
+# router is later trained on (watch the arm counts).
 TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
                                 "fs_batch": "fs_batch_fired",
                                 "foresight_note": "foresight_note_fired",
                                 "use_planning": "use_planning_fired",
-                                "tts_bon": "tts_bon_fired"}
+                                "tts_bon": "tts_bon_fired",
+                                "verify_depth": "verify_depth_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:
@@ -841,11 +907,133 @@ def context_was_mutated(traj) -> bool:
 #                  unverifiable turn is not evidence either way.
 #   n_steps      — assistant turns in the loop (the depth that predicts failure)
 #   duration_s   — wall clock
+#   human_failure_rate — failure_rate restricted to turns a HUMAN labelled
+#                  (`extra["outcome_source"].startswith("human_feedback")`,
+#                  stamped by the corrections overlay). THE §4BR METRIC.
+#                  Its decision rule accepts only human feedback as a
+#                  correctness signal and explicitly disowns the plain
+#                  outcome label as CIRCULAR — the verdict is an input to
+#                  it. Before this existed the overlay dropped `source`, so
+#                  a human 👎 and a `verifier_late` machine verdict were
+#                  indistinguishable and the pre-registered metric was
+#                  unmeasurable by the instrument that names it. Absent on
+#                  machine-labelled and unlabelled turns, so it never
+#                  zero-fills: `human_label_rate` carries the denominator.
+#   human_label_rate — 1.0 on a human-labelled turn, 0.0 otherwise. Answers
+#                  "is the channel producing data on this arm at all", which
+#                  at ~0.77 qualifying turns/day is the question that decides
+#                  whether the arm can EVER conclude.
 _METRICS: Tuple[Tuple[str, bool], ...] = (
     ("failure_rate", True),
+    ("human_failure_rate", True),
+    ("human_label_rate", False),
     ("n_steps", True),
     ("duration_s", True),
 )
+
+# Prefix written by core/feedback.py into the corrections sidecar's
+# `source`. Imported rather than re-spelled would be circular (feedback
+# imports experiments' siblings), so it is asserted equal in
+# tests/test_human_feedback.py.
+_HUMAN_SOURCE_PREFIX = "human_feedback"
+
+# Metrics that are DESCRIPTIVE, not hypotheses — they answer "is there data
+# here at all", so they must not consume the Bonferroni budget of the
+# metrics that ARE tested. `human_label_rate` is the denominator for
+# `human_failure_rate`: reporting it is how the operator sees whether the
+# §4BR arm can ever conclude, and charging alpha for a denominator would
+# widen every real interval to pay for a diagnostic.
+#
+# NOTE the honest cost of the rest: adding `human_failure_rate` DOES widen
+# every other interval (alpha/3 → alpha/4 per metric). That is the correct
+# price of testing one more hypothesis, and it buys the only metric §4BR's
+# decision rule accepts.
+_DESCRIPTIVE_METRICS: frozenset = frozenset({"human_label_rate"})
+
+# Metrics whose denominator is CONDITIONED on the outcome being resolved,
+# so differential attrition between arms biases them. `human_failure_rate`
+# conditions twice over (resolved AND labelled) and therefore inherits the
+# annotation a fortiori — it was originally added beside `failure_rate`'s
+# annotation without receiving it.
+_ATTRITION_SENSITIVE: frozenset = frozenset({
+    "failure_rate", "human_failure_rate"})
+
+# CIRCULARITY IS PER-(EXPERIMENT, METRIC), not per-metric (review R3 M3).
+# `failure_rate` derives from `resolve_turn_outcome`, whose inputs include
+# the verifier verdict — so for an experiment whose TREATMENT changes that
+# verdict, the metric moves mechanically in whichever direction the
+# treatment pushes it, with no bearing on correctness. `verify_depth`'s
+# pre-registered decision rule says exactly this and disowns the metric;
+# `tts_bon` substitutes the final text on the verifier's wobble band, so it
+# is in the same position.
+#
+# The previous pass suppressed the DENOMINATOR (`human_label_rate`) on the
+# argument that "the operator's first verdict would come from a quantity
+# the rule says is not a hypothesis" — and left the metric the rule
+# explicitly names as circular announcing freely, which reaches a verdict
+# FIRST because the honest metric's floor may take months. Small hole
+# closed with the big one open, using the big one's argument.
+#
+# `failure_rate` stays legitimate for arms that do not touch the verdict
+# (risk_steer, fs_batch, use_planning) — hence a per-experiment table
+# rather than a blanket exclusion.
+# ⚠ `tts_bon` WAS listed here for one round and that was WRONG — a
+# retraction worth keeping, because the reasoning was plausible and the
+# consequence severe. Its treatment does pick the final by the verifier's
+# score, so `failure_rate` LOOKS circular; but on the BENCH population the
+# trajectory outcome is not verifier-derived at all. dream's 1c write-back
+# stamps it from the BANK ORACLE (`source="bench_validator"`) — measured
+# 79/79 tts_bon-stamped bench rows, zero exceptions — and
+# `update_outcome`'s `yield_to_human` leg refuses to let a late verifier
+# verdict supersede that oracle label. The write-back's own comment says it
+# exists so "bench-scoped experiment arms could NEVER resolve a
+# failure_rate verdict" stopped being true.
+#
+# So the suppression removed the arm's ONLY decidable metric — the very
+# ground truth its pre-registered rule names — and made that rule's SHIP
+# condition ("no confound annotation on the winning metric") structurally
+# unsatisfiable. Suppressing a metric is not the safe direction by default:
+# it can render an arm undecidable, which is its own silent-inoperative
+# defect.
+_CIRCULAR_FOR: Dict[str, Tuple[str, ...]] = {
+    "verify_depth": ("failure_rate",),
+}
+
+
+# Where a circular metric's REPLACEMENT actually lives, per experiment. The
+# generic advice ("read the human-graded metric") is reachable only on the
+# LIVE population: human feedback arrives against a user `request_id`, and
+# bench turns are `task_kind="bench"`, so `human_failure_rate` is
+# structurally n=0 there (measured: 0/0 at n=46/33 for tts_bon). Pointing a
+# bench reader at it would suppress the only metric with any n and offer an
+# unreachable remedy — a caveat that leaves nothing decidable is its own
+# defect (review R4 M1).
+_CIRCULAR_REMEDY: Dict[str, str] = {
+    "verify_depth": ("Read `human_failure_rate` instead — human feedback is "
+                     "independent of the verdict (see the arm's "
+                     "DECISION_RULE)."),
+}
+
+
+def circular_note(experiment: str, metric: str) -> str:
+    """Caveat when ``metric`` is mechanically moved by ``experiment``'s
+    treatment (empty when it is not)."""
+    exp = str(experiment or "")
+    if metric in (_CIRCULAR_FOR.get(exp, ()) or ()):
+        return (
+            f"CIRCULAR for {exp}: this metric derives from the turn "
+            "outcome, which takes the verifier verdict as an input — and "
+            "this treatment CHANGES that verdict. A difference here is the "
+            "instrument moving, not evidence of better answers. "
+            + _CIRCULAR_REMEDY.get(
+                exp, "Read a metric independent of the verdict."))
+    return ""
+
+
+def _tested_metric_count() -> int:
+    """Metrics that consume alpha (see `_DESCRIPTIVE_METRICS`)."""
+    return max(1, sum(1 for m, _ in _METRICS
+                      if m not in _DESCRIPTIVE_METRICS))
 
 # Metrics whose movement can BE the treatment's mechanism rather than a
 # result of it. `risk_steer` tells a struggling turn to stop and report, so
@@ -1038,6 +1226,17 @@ class MetricComparison:
 
     @property
     def verdict(self) -> str:
+        # A metric that CANNOT decide must say so at every stage, not only
+        # once its interval happens to exclude zero (review R4 observation).
+        # The three early returns below fire first, so a circular or
+        # descriptive metric read as a plain "no difference detected yet" —
+        # and `_render_block` renders only the verdict, never the confound,
+        # so the caveat was invisible for exactly as long as the numbers
+        # were inconclusive. That is the whole window in which a reader
+        # forms an expectation.
+        if self.metric in _DESCRIPTIVE_METRICS or self.confound.startswith(
+                "CIRCULAR"):
+            return f"NO VERDICT — ⚠ {self.confound}"
         if self.diff is None or self.diff_lo is None or self.diff_hi is None:
             return "insufficient data"
         if min(self.control_n, self.treatment_n) < _MIN_VERDICT_N:
@@ -1161,6 +1360,26 @@ def _metric_values(traj) -> Dict[str, float]:
     outcome = str(getattr(traj, "outcome", "") or "").lower()
     if outcome in ("passed", "failed"):
         out["failure_rate"] = 1.0 if outcome == "failed" else 0.0
+    # §4BR: the human-graded slice. `outcome_source` is stamped by the
+    # corrections overlay (distill/collector.iter_trajectories).
+    try:
+        _extra = getattr(traj, "extra", None) or {}
+        _src = str(_extra.get("outcome_source") or "") if isinstance(
+            _extra, dict) else ""
+    except Exception:  # noqa: BLE001
+        _src = ""
+    # `human_labeled` covers the case where a human graded the turn but a
+    # later non-human correction set the shipping outcome — without it the
+    # turn silently left the §4BR denominator (R2 MINOR-7).
+    try:
+        _ever = bool(_extra.get("human_labeled")) if isinstance(
+            _extra, dict) else False
+    except Exception:  # noqa: BLE001
+        _ever = False
+    _is_human = _src.startswith(_HUMAN_SOURCE_PREFIX) or _ever
+    out["human_label_rate"] = 1.0 if _is_human else 0.0
+    if _is_human and outcome in ("passed", "failed"):
+        out["human_failure_rate"] = 1.0 if outcome == "failed" else 0.0
     try:
         steps = int(getattr(traj, "n_steps", 0) or 0)
         if steps > 0:
@@ -1240,7 +1459,8 @@ def _unknown_rates(stats_by_arm: Dict[str, ArmStats], control: str,
 
 def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
                  control: str = CONTROL, treatment: str = TREATMENT,
-                 alpha: float = 0.05) -> List[MetricComparison]:
+                 alpha: float = 0.05,
+                 experiment: str = "") -> List[MetricComparison]:
     """Per-metric anytime-valid comparison of two arms.
 
     The difference interval is the CONSERVATIVE union of the two per-arm
@@ -1254,25 +1474,38 @@ def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
     two boxes). Wider than a purpose-built two-sample CS by roughly 40%, but
     the argument cannot go subtly wrong.
 
-    **α is split three ways, not one.** Per arm (÷2) AND across the reported
-    metrics (÷3, Bonferroni). Without the metric split, "stop when any
+    **α is split two ways, not one.** Per arm (÷2) AND across the TESTED
+    metrics (÷`_tested_metric_count()`, Bonferroni — 4 today: failure_rate,
+    human_failure_rate, n_steps, duration_s; descriptive rates are excluded,
+    see `_DESCRIPTIVE_METRICS`). Without the metric split, "stop when any
     interval excludes zero" — which is what the report invites — runs at
-    ~15% error against a nominal 5%, because three intervals get three
+    ~15% error against a nominal 5%, because several intervals get several
     chances to cross.
 
-    **Differential attrition.** `failure_rate` conditions on the turn
-    resolving to PASSED/FAILED, which is a POST-treatment variable. A
+    **Differential attrition.** `failure_rate` AND `human_failure_rate`
+    (`_ATTRITION_SENSITIVE`) condition on the turn resolving to
+    PASSED/FAILED, which is a POST-treatment variable — the human-graded one
+    conditions on being LABELLED as well, so it inherits the bias a
+    fortiori. A
     treatment that changes how often turns end unverifiable (the risk steer
     literally instructs "STOP. Report what is known") shifts which turns enter
     the denominator, and that alone can manufacture a large apparent
     improvement — measured at 14 points with zero true effect. So the
-    UNKNOWN rate is itself compared, and `failure_rate` is flagged
-    CONFOUNDED when the arms differ on it.
+    UNKNOWN rate is itself compared, and BOTH metrics are flagged
+    CONFOUNDED when the arms differ on it — except where circularity takes
+    precedence (`_CIRCULAR_FOR`), since a metric this experiment's treatment
+    moves mechanically cannot be rescued by an attrition caveat.
+
+    ``experiment`` is what makes the per-experiment caveats possible;
+    omitting it silently downgrades a `NO VERDICT — ⚠ CIRCULAR` into a
+    plain `TREATMENT BETTER/WORSE`. Every caller must pass it — the CLI's
+    `--json` branch did not for one round, and reported a direction on a
+    metric the human report suppressed.
     """
     c = stats_by_arm.get(control)
     t = stats_by_arm.get(treatment)
     # Bonferroni across metrics, then the union bound across arms.
-    per_metric_alpha = alpha / max(1, len(_METRICS))
+    per_metric_alpha = alpha / _tested_metric_count()
     arm_alpha = per_metric_alpha / 2.0
 
     # Attrition check first — its result annotates failure_rate below.
@@ -1341,7 +1574,7 @@ def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
                         # `variance_reduction` advertised the shortfall as a
                         # win. Measured with ZERO true effect: 12/300 false
                         # "TREATMENT BETTER/WORSE" verdicts (4.0% on one
-                        # metric, against a 5% budget for all three), rising
+                        # metric, against a 5% budget for all TESTED metrics), rising
                         # with rho^2 — i.e. dormant until the covariate
                         # becomes worth having. Re-centring takes it to 0/300.
                         #
@@ -1363,8 +1596,33 @@ def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
             lo = (t_mean - t_rad) - (c_mean + c_rad)
             hi = (t_mean + t_rad) - (c_mean - c_rad)
         confound = ""
-        if metric == "failure_rate" and attrition_confound:
+        # CIRCULARITY FIRST: it is the strongest caveat and the one an
+        # operator must not miss (R3 M3).
+        _circ = circular_note(experiment, metric)
+        if _circ:
+            confound = _circ
+        elif metric in _ATTRITION_SENSITIVE and attrition_confound:
+            # `human_failure_rate` inherits this A FORTIORI (review R2
+            # MAJOR-4): its denominator is a strict SUBSET of
+            # failure_rate's — outcome resolved AND a human chose to
+            # label — so differential attrition applies at least as
+            # strongly, plus a second selection step nobody controls.
+            # It was added beside the annotation without inheriting it.
             confound = attrition_confound
+        elif metric in _DESCRIPTIVE_METRICS:
+            # A DESCRIPTIVE rate is not a hypothesis: "more thumbs in the
+            # treatment arm" is not a quality result, and with
+            # lower_is_better=False it would announce as one. This metric
+            # is also the first §4BR-adjacent one to clear the n>=30/arm
+            # floor on live data, so without this the operator's FIRST
+            # verdict on the arm would come from the quantity the decision
+            # rule explicitly says is not a hypothesis (R2 MAJOR-5).
+            confound = (
+                "DESCRIPTIVE, not a hypothesis: this is the DENOMINATOR "
+                "for the human-graded metric (how many turns anyone "
+                "labelled), so an arm difference reflects who happened to "
+                "react, not answer quality. Excluded from the alpha split "
+                "and never a verdict to act on.")
         elif metric in _MECHANISM_METRICS:
             confound = _MECHANISM_METRICS[metric]
         out.append(MetricComparison(
@@ -1414,7 +1672,7 @@ def _binomial_two_sided_p(k: int, n: int) -> float:
 
 
 def _render_block(arms: Dict[str, ArmStats], *, alpha: float,
-                  label: str) -> List[str]:
+                  label: str, experiment: str = "") -> List[str]:
     """One comparison block (per-metric lines + the attrition line)."""
     lines: List[str] = [f"    [{label}]"]
     # Attrition is reported as its own line, not only as an annotation:
@@ -1425,7 +1683,7 @@ def _render_block(arms: Dict[str, ArmStats], *, alpha: float,
             f"    {'unknown_rate':<14} control={c_s.unknown / c_s.n:.3f} "
             f"treatment={t_s.unknown / t_s.n:.3f}  (failure_rate conditions "
             "on this — a gap here confounds it)")
-    for cmp_ in compare_arms(arms, alpha=alpha):
+    for cmp_ in compare_arms(arms, alpha=alpha, experiment=experiment):
         if cmp_.control_mean is None and cmp_.treatment_mean is None:
             continue
         cm = "—" if cmp_.control_mean is None else f"{cmp_.control_mean:.3f}"
@@ -1449,6 +1707,7 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
                   triggered: Optional[Dict[str, Dict[str, ArmStats]]] = None,
                   coverage: Optional[Dict[str, int]] = None,
                   population: str = SCOPE_LIVE,
+                  expected_names: Optional[Iterable[str]] = None,
                   ) -> str:
     """Human-readable report — the introspect/script surface.
 
@@ -1468,6 +1727,21 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
     _noun_short = "bench solve turn(s)" if _bench else "user turn(s)"
     _turns_key = "admitted_turns" if _bench else "user_turns"
     if not summary:
+        # The empty-corpus early returns must still NAME what should be
+        # accumulating — R2 found the zero-row block unreachable from here
+        # (the identical early-return shape it had just fixed in
+        # learning_health, in the same function the rows were added to).
+        _exp_tail = ""
+        _exp_missing = sorted(set(expected_names or ()))
+        if _exp_missing:
+            if _kill_switch_on():
+                _exp_tail = (f"\nEnabled but unstamped: "
+                             f"{', '.join(_exp_missing)} — expected: "
+                             f"{ENV_KILL}=0 is set, so no turn enrolls "
+                             "in anything.")
+            else:
+                _exp_tail = (f"\nEnabled and waiting for traffic: "
+                             f"{', '.join(_exp_missing)}.")
         seen = int((coverage or {}).get(_turns_key, 0))
         if seen > 0:
             # The number that separates "shipped 10 minutes ago" from "the
@@ -1479,11 +1753,11 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
                     "regressed — check that enrollment runs and that "
                     "`_record_turn_trajectory` still writes extra["
                     f"'{EXTRA_KEY}']. Internal, simulated and collector-less "
-                    "turns are excluded by design.")
+                    "turns are excluded by design." + _exp_tail)
         return (f"No experiment-stamped trajectories yet, and no {_noun} "
                 "to have stamped. Arms are stamped on turns recorded after "
                 "the framework shipped; internal requests are excluded by "
-                "design.")
+                "design." + _exp_tail)
     lines: List[str] = [
         ("EXPERIMENTS — BENCH-scoped arms (origin=bench; a bench win gates "
          "a live watch-window, never an auto-apply; n counts ATTEMPTS — "
@@ -1491,7 +1765,8 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
          "count by design)" if _bench
          else "EXPERIMENTS — live randomized arms"),
         f"(asymptotic anytime-valid intervals, alpha={alpha:g} split "
-        f"{len(_METRICS)} ways across metrics and 2 ways across arms; "
+        f"{_tested_metric_count()} ways across TESTED metrics (descriptive "
+        f"rates excluded) and 2 ways across arms; "
         f"no verdict below n={_MIN_VERDICT_N}/arm)",
         "",
     ]
@@ -1534,7 +1809,9 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
             lines.append("    ⚠ an arm reads '<REDACTED>' — the experiment name "
                          "collides with the trajectory redactor's sensitive-key "
                          "list. Rename it; these rows are unrecoverable.")
-        lines.extend(_render_block(arms, alpha=alpha, label="all enrolled turns"))
+        lines.extend(_render_block(arms, alpha=alpha,
+                                   label="all enrolled turns",
+                                   experiment=name))
         trig = (triggered or {}).get(name) or {}
         if trig:
             trig_total = sum(s.n for s in trig.values())
@@ -1543,12 +1820,49 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
                          f"({share:.1f}%) — READ THIS BLOCK: the one above "
                          "averages the effect over turns the trigger never "
                          "touched")
-            lines.extend(_render_block(trig, alpha=alpha,
+            lines.extend(_render_block(trig, alpha=alpha, experiment=name,
                                        label="triggered turns only"))
         elif name in TRIGGER_KEYS:
             lines.append("    ── trigger has not fired on any recorded turn yet; "
                          "the block above cannot show an effect that has not "
                          "happened")
+        lines.append("")
+    # ── ENABLED-BUT-UNSTAMPED ARMS (§4BR follow-up, introspect review C1).
+    # The loop above enumerates only experiments that already HAVE stamps,
+    # so a running spec with zero enrolled traffic simply produced no row —
+    # no zero, no warning — while the coverage line above read reassuringly.
+    # That silence is not hypothetical: verify_depth ran 100% inert for
+    # three days (registered in DEFAULT_SPECS while the on-disk registry
+    # replaced them wholesale), and THIS report was the instrument that
+    # should have shown `verify_depth: n=0` — and structurally could not.
+    # An instrument that omits the broken case renders the healthy ones
+    # more convincingly. `expected_names` = the registry's enabled specs
+    # for this population; anything absent from the summary renders as an
+    # explicit zero.
+    _missing = sorted(set(expected_names or ()) - set(summary))
+    if _missing and _kill_switch_on():
+        # R2 MINOR-5: with the master kill switch on, NOTHING enrolls, so
+        # every enabled spec would alarm "enrollment broken" forever — a
+        # correct observation with a wrong diagnosis attached.
+        # "in this process": the switch is read from the RENDERER's env.
+        # Introspect renders inside the daemon (authoritative); the CLI
+        # renders in the operator's shell, whose env may differ from the
+        # daemon that actually enrolls (R3 finding 4).
+        lines.append(f"⚠ {len(_missing)} enabled spec(s) with no stamps "
+                     f"({', '.join(_missing)}) — expected: "
+                     f"{ENV_KILL}=0 is set in this process, so no turn "
+                     "enrolls in anything. (If this is the CLI, the "
+                     "daemon's env is the one that decides enrollment.)")
+        lines.append("")
+        _missing = []
+    for name in _missing:
+        lines.append(f"■ {name}  (n=0)")
+        lines.append("    ⚠ enabled in the registry but NO enrolled turn "
+                     "carries it — either no eligible traffic has arrived "
+                     "yet, or enrollment/stamping is broken. If traffic has "
+                     "been flowing, check that the spec is listed in "
+                     "system/experiments.json (it replaces the code "
+                     "defaults WHOLESALE) before suspecting the randomizer.")
         lines.append("")
     lines.append(
         "Caveats: cross-session memory leaks between arms (biases toward null); "
@@ -1670,6 +1984,7 @@ def report_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
                              admit_names: Optional[Iterable[str]] = None,
                              deny_names: Optional[Iterable[str]] = None,
                              population: str = SCOPE_LIVE,
+                             expected_names: Optional[Iterable[str]] = None,
                              ) -> str:
     """Load the corpus and render. Used by introspect + the CLI script.
 
@@ -1690,7 +2005,8 @@ def report_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
         admit_names=admit_names,
         deny_names=deny_names)
     return render_report(all_stats, alpha=alpha, triggered=trig_stats,
-                         coverage=coverage, population=population)
+                         coverage=coverage, population=population,
+                         expected_names=expected_names)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1737,7 +2053,8 @@ def pending_announcements(all_stats: Dict[str, Dict[str, ArmStats]],
     out: List[Tuple[str, str]] = []
     for scope, summary in (("triggered", triggered or {}), ("all", all_stats or {})):
         for name in sorted(summary):
-            for cmp_ in compare_arms(summary[name], alpha=alpha):
+            for cmp_ in compare_arms(summary[name], alpha=alpha,
+                                     experiment=name):
                 v = cmp_.verdict
                 if not v.startswith("TREATMENT "):
                     continue

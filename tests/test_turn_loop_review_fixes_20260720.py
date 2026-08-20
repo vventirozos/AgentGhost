@@ -98,12 +98,25 @@ def test_is_mutating_covers_unzip_git_clone_and_image_gen():
         assert needle in seg, f"is_mutating missing {needle}"
 
 
-def test_batch_collapse_unsafe_excludes_stateful_tools():
-    unsafe = agent_mod._BATCH_COLLAPSE_UNSAFE
-    for name in ("browser", "manage_projects", "notify_operator", "delegate"):
-        assert name in unsafe
+def test_batch_collapse_allowlist_is_reads_only():
+    # R2 (2026-08-19): collapse is gated by a read-safe ALLOWLIST, not a
+    # denylist — so stateful / side-effecting tools (including runtime-
+    # registered macros/skills, which a denylist could never name) are
+    # collapse-unsafe by DEFAULT. Assert the allowlist is reads-only and that
+    # every known side-effecting tool is absent from it. (Behavioral collapse
+    # coverage lives in test_dispatch_pipeline_extraction + test_turnloop_r2.)
+    readsafe = agent_mod._COLLAPSE_READSAFE
+    for stateful in ("browser", "manage_projects", "notify_operator",
+                     "delegate", "delegate_to_swarm", "manage_services",
+                     "manage_skills", "create_skill", "postgres_admin",
+                     "jobs", "manage_composed_skills", "execute",
+                     "update_profile", "learn_skill"):
+        assert stateful not in readsafe, f"{stateful} must not be collapse-safe"
+    for read in ("recall", "web_search", "deep_research", "introspect"):
+        assert read in readsafe
+    # the consumer inverts membership (unknown/dynamic → unsafe)
     src = inspect.getsource(agent_mod.GhostAgent._dispatch_and_process_tool_batch)
-    assert "_collapse_unsafe = is_mutating or fname in _BATCH_COLLAPSE_UNSAFE" in src
+    assert "fname not in _COLLAPSE_READSAFE" in src
 
 
 def test_failure_attribution_uses_failing_tool_name():

@@ -116,8 +116,28 @@ export function initSessions(ctx) {
 
     async function fetchList() {
         const res = await fetch('/api/sessions');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+            // Carry the status ON the error. Callers need to tell "the key
+            // was rejected" from "nothing is listening" (review R1 M9), and
+            // `res` is not in their scope — reading it there is a
+            // ReferenceError raised inside the handler, which would take out
+            // the rail and boot()'s retry with it.
+            const err = new Error(`HTTP ${res.status}`);
+            err.status = res.status;
+            throw err;
+        }
         return res.json();
+    }
+
+    // 401/403 = the agent is answering and refusing this key (the normal
+    // state after a rotation); anything else = it isn't answering. Reporting
+    // both as "unreachable" sent the operator to restart a healthy process.
+    function _railFailureNote(e) {
+        const st = e && e.status;
+        return (st === 401 || st === 403)
+            ? 'Not authorised — the agent rejected this key (probably '
+              + 'rotated). Reload with the current ?key=.'
+            : 'Agent unreachable — session list unavailable.';
     }
 
     async function refresh() {
@@ -133,7 +153,7 @@ export function initSessions(ctx) {
             sessions = data.sessions || [];
             render();
         } catch (e) {
-            note('Agent unreachable — session list unavailable.');
+            note(_railFailureNote(e));
         }
     }
 
@@ -152,6 +172,18 @@ export function initSessions(ctx) {
         // loser's id under the winner's painted history — the next turn
         // then replayed conversation B into session A's durable store).
         if (seq !== loadSeq) return null;
+        // A turn started during the two awaits above does NOT bump loadSeq,
+        // and this function paints unconditionally: the streaming bubble was
+        // detached, the user's message dropped, and `setCurrent(id)` rebound
+        // the identity so the reply landed in the OTHER session's durable
+        // store. Its three siblings (switchTo, boot, resyncCurrent) all
+        // re-check processing; this one never did (R2 lens B).
+        if (Core.isProcessing()) {
+            // Standing down is right, but standing down SILENTLY is not: the
+            // rail row the operator clicked would simply never open.
+            toast('A turn started — finish it, then reopen this session', 'error');
+            return null;
+        }
         let messages = Array.isArray(data.messages) ? data.messages : [];
         // Preserve client-only 👍/👎 label keys — ONLY when re-loading the
         // session that is already current (boot/refresh). Merging on a
@@ -160,8 +192,18 @@ export function initSessions(ctx) {
         // the old session's request id onto the new one — a 👍 there
         // writes an operator-authoritative label onto a trajectory the
         // operator never read (R2 review CRIT).
-        if (id === currentId && Core.mergeClientLabelKeys) {
-            messages = Core.mergeClientLabelKeys(messages);
+        if (id === currentId) {
+            // RE-loading the session already on screen (boot, refresh) — not
+            // a switch. The local copy is the same conversation, so it may
+            // hold a turn the agent never persisted, and replacing wholesale
+            // deletes the user's own message. That is the F2 defect exactly;
+            // the fix landed in `resyncCurrent` and this sibling path kept
+            // the old behaviour, so the loss simply moved from "2s later" to
+            // "on the next reload" (R3 lens B).
+            messages = _reconcileWithLocal(messages, Core.getChatHistory());
+            if (Core.mergeClientLabelKeys) {
+                messages = Core.mergeClientLabelKeys(messages);
+            }
         }
         // Commit identity ATOMICALLY with the paint (R6): the old
         // paint-here/bind-in-caller split left a microtask window where a
@@ -218,6 +260,19 @@ export function initSessions(ctx) {
             if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`);
             sessions = sessions.filter(x => x.id !== s.id);
             if (s.id === currentId) {
+                // RE-CHECK after the await. The entry gate above ran before
+                // window.confirm() and the DELETE round trip — a turn started
+                // in between, and clearing here detaches its streaming bubble
+                // and orphans the reply into an emptied history, which the
+                // agent then persists under a session it just deleted (R2
+                // lens B). The row is gone either way; the conversation on
+                // screen stays until the turn ends.
+                if (Core.isProcessing()) {
+                    render();
+                    toast('Session deleted — the running turn keeps this view',
+                          'error');
+                    return;
+                }
                 Core.clearConversation();
                 setCurrent(mintId());
             } else {
@@ -272,6 +327,18 @@ export function initSessions(ctx) {
         // The active conversation was among the deleted (or never
         // persisted) — start clean either way, same as deleting the
         // current session individually.
+        //
+        // ⚠ Only the button was disabled during the loop; the COMPOSER
+        // stayed live through N sequential DELETEs, so a turn started
+        // mid-loop had its bubble detached here and its reply written into
+        // an empty history — recreating the session that was just deleted
+        // (R2 lens B). Same re-check as deleteSession.
+        if (Core.isProcessing()) {
+            render();
+            toast('Sessions deleted — the running turn keeps this view',
+                  'error');
+            return;
+        }
         Core.clearConversation();
         setCurrent(mintId());
         toast(failed
@@ -311,7 +378,7 @@ export function initSessions(ctx) {
             enabled = !!data.enabled;
         } catch (e) {
             enabled = null;   // unknown — retry on next refresh
-            note('Agent unreachable — session list unavailable.');
+            note(_railFailureNote(e));
             setTimeout(boot, 30_000);
             return;
         }
@@ -343,6 +410,111 @@ export function initSessions(ctx) {
     // the session. Re-sync whenever the tab becomes visible, and shortly
     // after an aborted turn (the server may have persisted the full reply
     // while this client kept a "*[Aborted]*" stub).
+    // Adopt the server copy WITHOUT deleting messages the server has not
+    // got yet.
+    //
+    // This path used to replace local history unconditionally whenever it
+    // "drifted" — including when the server had FEWER messages. The sibling
+    // path in app.js requires `msgs.length > chatHistory.length` and is
+    // pinned with exactly that reasoning ("silent local truncation"), but
+    // this one had no such gate, so any turn the agent failed to persist —
+    // an error frame, a Stop that killed the relay before the write, a
+    // workspace load — had the user's own typed message DELETED from their
+    // screen ~2s later by the resync that exists to help them (R2 lens B).
+    //
+    // Stable message key. Mirrors the server's `_msg_key`: the ROLE plus a
+    // stringified content, so a multimodal payload compares by value rather
+    // than by object identity. Key ORDER matters to JSON.stringify, so
+    // objects are serialised with sorted keys — two identical multimodal
+    // parts built in different key order are the same message (R3 lens B).
+    function _msgKey(m) {
+        const c = m && m.content;
+        let text;
+        if (c === null || c === undefined) text = '';
+        else if (typeof c === 'string') text = c;
+        else text = JSON.stringify(c, (_k, v) =>
+            (v && typeof v === 'object' && !Array.isArray(v))
+                ? Object.keys(v).sort().reduce((o, kk) => (o[kk] = v[kk], o), {})
+                : v);
+        return (m && m.role) + '\u0000' + text;
+    }
+
+    // Adopt the server copy WITHOUT deleting or REORDERING anything.
+    //
+    // ⚠ This is the second version. The first took every local user message
+    // the server did not account for and `concat`ed them onto the end — an
+    // order-blind multiset. Its own comment claimed it "mirrors the server's
+    // own merge", and it did not: the server LCS-aligns and appends only the
+    // unmatched TAIL, order-preserving. Two consequences, both reproduced
+    // (R3 lens B): an abandoned question landed AFTER the reply to a later
+    // question, and — because the store truncates from the FRONT at 400
+    // while the interface caps at 500 — every message in that window looked
+    // "unaccounted" and got pasted onto the tail, where the next turn
+    // replayed it and the server appended it for good. The fix inherited the
+    // defect class it was written to remove, one layer along.
+    //
+    // Now: align local against the server with the same LCS the server uses,
+    // and re-append only what follows the last aligned position. USER
+    // messages only — a local assistant entry the server lacks is an
+    // aborted-stream stub, and dropping it is the one thing the original
+    // unconditional adopt got right.
+    // Alignment PAIRS, the same LCS traceback the server runs.
+    function _lcsPairs(serverMsgs, localMsgs) {
+        const n = serverMsgs.length, m = localMsgs.length;
+        if (!n || !m) return [];
+        const sk = serverMsgs.map(_msgKey), lk = localMsgs.map(_msgKey);
+        const table = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+        for (let i = n - 1; i >= 0; i--) {
+            for (let j = m - 1; j >= 0; j--) {
+                table[i][j] = sk[i] === lk[j]
+                    ? table[i + 1][j + 1] + 1
+                    : Math.max(table[i + 1][j], table[i][j + 1]);
+            }
+        }
+        const pairs = [];
+        let i = 0, j = 0;
+        while (i < n && j < m) {
+            if (sk[i] === lk[j]) { pairs.push([i, j]); i++; j++; }
+            else if (table[i + 1][j] >= table[i][j + 1]) i++;
+            else j++;
+        }
+        return pairs;
+    }
+
+    function _reconcileWithLocal(serverMsgs, localMsgs) {
+        const raw = localMsgs || [];
+        if (!raw.length) return serverMsgs;
+        const local = raw.map(
+            (m) => (m && Core.toWireMessage) ? Core.toWireMessage(m) : m);
+        const pairs = _lcsPairs(serverMsgs, local);
+        const out = [];
+        let i = 0, j = 0;
+        const firstAligned = pairs.length ? pairs[0][1] : local.length;
+        const takeLocal = (k) => {
+            const m = raw[k];
+            if (!m) return;
+            // BEFORE the first aligned position sits the client's copy of
+            // history the store's 400-message cap EVICTED. Keep it whole —
+            // it is the operator's own record, and the server puts anything
+            // ahead of the alignment into `lead` (prompt only), so it can
+            // never be re-persisted from there. AFTER the first alignment,
+            // a local-only entry is a turn the agent never stored: keep the
+            // USER message (that is the F2 fix) and drop assistant entries,
+            // which are aborted-stream stubs.
+            if (k < firstAligned || m.role === 'user') out.push(m);
+        };
+        for (const [pi, pj] of pairs) {
+            while (i < pi) out.push(serverMsgs[i++]);   // server-only
+            while (j < pj) takeLocal(j++);              // local-only, in place
+            out.push(serverMsgs[pi]);
+            i = pi + 1;
+            j = pj + 1;
+        }
+        while (i < serverMsgs.length) out.push(serverMsgs[i++]);
+        while (j < local.length) takeLocal(j++);
+        return out;
+    }
+
     async function resyncCurrent() {
         if (!enabled || !currentId || Core.isProcessing()) return;
         // Participate in the load token (R4) and re-check IDENTITY and
@@ -367,13 +539,22 @@ export function initSessions(ctx) {
             // the log each time the tab came back (R1 review CRIT).
             const wire = (m) => (m && Core.toWireMessage)
                 ? Core.toWireMessage(m) : (m || null);
-            const drifted = messages.length !== local.length
-                || JSON.stringify(messages[messages.length - 1] || null)
+            // ⚠ Compare against the RECONCILED array, not the raw server
+            // copy. Once one local turn is legitimately unaccounted (the F2
+            // case), local is permanently `server + k` — so a length compare
+            // against the server copy read "drifted" on EVERY focus, and the
+            // resync rebuilt the whole log (innerHTML='', scroll to bottom)
+            // each time, destroying scroll position and selection forever
+            // (R3 lens B). Reconciling is cheap and idempotent; rendering is
+            // not.
+            const adopted = _reconcileWithLocal(messages, local);
+            const drifted = adopted.length !== local.length
+                || JSON.stringify(adopted[adopted.length - 1] || null)
                     !== JSON.stringify(wire(local[local.length - 1]));
             if (drifted && messages.length && seq === loadSeq
                     && id === currentId && !Core.isProcessing()) {
                 const merged = Core.mergeClientLabelKeys
-                    ? Core.mergeClientLabelKeys(messages) : messages;
+                    ? Core.mergeClientLabelKeys(adopted) : adopted;
                 Core.setChatHistory(merged);
                 Core.renderHistoryToLog(merged);
             }
@@ -401,7 +582,24 @@ export function initSessions(ctx) {
         }
     });
     Core.events.addEventListener('turn-aborted', () => {
-        setTimeout(resyncCurrent, 2000);
+        // ⚠ RETRY, don't fire once. `resyncCurrent` bails immediately when a
+        // turn is in flight (`Core.isProcessing()`), so an operator who hits
+        // Stop and retypes within 2s skipped realignment entirely — the tab
+        // stayed diverged until it happened to be hidden and shown again.
+        // That was the client-side half of the doubling defect: the server's
+        // alignment is now robust enough that this is belt rather than brace,
+        // but a mitigation that silently no-ops on the fastest path is worth
+        // fixing on its own terms.
+        let _tries = 0;
+        const _attempt = () => {
+            if (!enabled || !currentId) return;
+            if (Core.isProcessing()) {
+                if (_tries++ < 10) setTimeout(_attempt, 2000);
+                return;                     // ...wait out the new turn
+            }
+            resyncCurrent();
+        };
+        setTimeout(_attempt, 2000);
     });
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') resyncCurrent();

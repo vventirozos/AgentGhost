@@ -13,6 +13,8 @@ a specific stub passes it in rather than rebuilding the whole context.
 """
 from __future__ import annotations
 
+import re
+
 from unittest.mock import AsyncMock, MagicMock
 
 
@@ -86,3 +88,111 @@ class FakeBgTasks:
 
     def add_task(self, fn, *args, **kwargs):
         self.tasks.append((fn, args, kwargs))
+
+
+def strip_js_comments(js: str) -> str:
+    """Comment-free view of a JS source, for the text-assertion suites over
+    ``interface/static/*`` (there is no JS runtime here).
+
+    ⚠ ORDER MATTERS, and the natural order is WRONG. Stripping ``/* */``
+    first lets a line comment containing ``/api/*`` open a phantom block
+    comment that closes at the next real ``*/`` — measured 5,655 characters
+    and 206 lines of app.js deleted, including ``installAuthFetch`` and
+    ``X-Ghost-Key``. Positive assertions then fail loudly, but NEGATIVE ones
+    ("this removed feature is gone") pass VACUOUSLY for anything inside the
+    phantom span. Line comments first.
+
+    Trailing comments must go too: stripping only line-initial comments left
+    ``foo();  // r.status === 429`` satisfying assertions about the code.
+    Two wrong versions preceded this one — ``(?<!:)`` truncated
+    ``` `${wsProtocol}//${host}/ws` ``` mid-template-literal, and adding
+    ``[;)}]`` made it worse because ``}`` is exactly the character before
+    that ``//``. The invariant a real trailing comment always has and a
+    protocol-relative URL never has is WHITESPACE (or line start) directly
+    before the slashes.
+
+    Three copies of this function existed; ``TestTheStripperItself`` in
+    tests/test_webui_feedback_client.py pins THIS one."""
+    js = re.sub(r"(?:(?<=\s)|^)//.*$", "", js, flags=re.M)
+    return re.sub(r"/\*.*?\*/", "", js, flags=re.S)
+
+
+def eval_js(source: str, expr: str, timeout: float = 20.0):
+    """Run ``source`` under node and return ``JSON.parse``-able ``expr``.
+
+    Text assertions over ``interface/static/*`` cannot see SCOPE, and that
+    blind spot has teeth: a review fix that read ``res.status`` from a catch
+    block in a *different* function than the one declaring ``res`` satisfied
+    every text pin while raising a ReferenceError inside the error handler —
+    i.e. the diagnostic path crashed and took the caller's retry with it.
+    For small pure helpers, extract and EXECUTE instead.
+
+    Raises RuntimeError with node's stderr on failure, so a ReferenceError
+    is a test failure rather than a silent empty result. Skips (loudly) when
+    node is absent."""
+    import json
+    import shutil
+    import subprocess
+
+    import pytest as _pytest
+
+    node = shutil.which("node")
+    if not node:
+        # A skip here silently deletes EVERY behavioural JS pin at once —
+        # `test_webui_console_review.py` reports "11 passed, 15 skipped" and
+        # reads green while 100% of its execution coverage is gone (R2 lens
+        # B/C). `test_node_is_available` below turns that into ONE loud
+        # failure, which is why a skip is tolerable here.
+        _pytest.skip("node not on PATH — JS EXECUTION pins are inert here")
+    script = f"{source}\nprocess.stdout.write(JSON.stringify({expr}));\n"
+    proc = subprocess.run([node, "--input-type=module", "-e", script],
+                          capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"node failed: {proc.stderr.strip()[:2000]}")
+    return json.loads(proc.stdout or "null")
+
+
+def extract_js_function(source: str, name: str) -> str:
+    """Source text of ``function <name>(…) { … }``, brace-matched.
+
+    Deliberately naive about braces inside strings/regexes/comments — it is
+    for extracting small helpers to run under :func:`eval_js`, and a
+    mis-extraction fails loudly at parse time rather than passing weakly."""
+    needle = f"function {name}("
+    i = source.index(needle)
+    # Include an `async` prefix: extracting only from `function` produced a
+    # body full of `await` in a non-async function, i.e. a SyntaxError that
+    # looks like a broken harness rather than a broken assertion.
+    if source[max(0, i - 6):i] == "async ":
+        i -= 6
+    j = source.index("{", i)
+    depth = 0
+    for k in range(j, len(source)):
+        if source[k] == "{":
+            depth += 1
+        elif source[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[i:k + 1]
+    raise AssertionError(f"unbalanced braces extracting {name}")
+
+
+def extract_js_listener(source: str, event: str) -> str:
+    """Body of ``window.addEventListener('<event>', (e) => { … })`` wrapped as
+    ``function handler(e) { … }``, brace-matched.
+
+    Inline listeners cannot be reached by :func:`extract_js_function`, and
+    token assertions over them are defeated by the cheapest possible mutation
+    (`if (false)` keeps every token). Extract and RUN them instead."""
+    needle = f"window.addEventListener('{event}'"
+    i = source.index(needle)
+    j = source.index("{", source.index("=>", i))
+    depth = 0
+    for k in range(j, len(source)):
+        if source[k] == "{":
+            depth += 1
+        elif source[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return "function handler(e) " + source[j:k + 1]
+    raise AssertionError(f"unbalanced braces extracting the {event} listener")

@@ -67,6 +67,12 @@ from .search import (
     _cache_get,
     _cache_put,
     _norm_cache_key,
+    # ⚠ IMPORTED, NOT RE-DECLARED. This module had its own 45.0 copy under
+    # the same name — two constants one edit apart, so tuning the web
+    # summary leash in search.py silently left the darkweb path on the old
+    # value (R4 lens A). Onion fetches are the SLOWER of the two; if they
+    # ever need a different budget it must be a differently-NAMED constant.
+    _WEB_SUMMARY_TIMEOUT_S,
 )
 
 # --------------------------------------------------------------------------
@@ -1328,6 +1334,15 @@ async def tool_darkweb_research(
             return f"Error: {e}"
 
     async def process_url(url: str) -> str:
+        # ⚠ The distill budget is what is LEFT, not a constant. This module
+        # imported search.py's 45s — but search runs under a 55s outer
+        # deadline and this one under `_ONION_PAGE_TIMEOUT + 10` = 45s, of
+        # which the Tor fetch alone may consume 40s. So the summary was
+        # handed the entire outer deadline with the fetch already spent, and
+        # a 5s fetch was enough to LOSE THE URL (R6 lens A measured exactly
+        # that). An onion fetch is the slow half here; size the distill
+        # against the clock, not against the clearnet sibling's number.
+        _url_deadline = time.monotonic() + (_ONION_PAGE_TIMEOUT + 10)
         async with sem:
             short_url = (url[:35] + "..") if len(url) > 35 else url
             pretty_log("Parsing Onion", url, icon=Icons.TOOL_DARKWEB)
@@ -1364,11 +1379,52 @@ async def tool_darkweb_research(
                     "temperature": 0.0,
                     "max_tokens": 2048,
                 }
+                # Whatever the fetch left us, minus a small floor so we
+                # never start a distillation that cannot finish.
+                _summary_budget = max(
+                    5.0, _url_deadline - time.monotonic() - 2.0)
                 try:
-                    summary_data = await llm_client.chat_completion(payload, use_worker=True, task_label="web summary")
-                    pretty_log("Worker Compute", f"Distilling facts from {short_url}", icon=Icons.TOOL_DEEP)
+                    summary_data = await llm_client.chat_completion(
+                        payload, use_worker=True,
+                        # ⚠ The fallback is FREE — the `except`
+                        # two lines below keeps the raw page text.
+                        # Without this, a worker outage sent EVERY
+                        # url's distillation to the main 35B,
+                        # foreground, serialised behind the main
+                        # lock, each racing a 55s per-url deadline —
+                        # one research call becoming N unbounded 35B
+                        # generations (LLM review R3 lens B, B2).
+                        off_main_only=True,
+                        # ⚠ BOUND THE TOTAL, NOT JUST THE POST. This whole
+                        # coroutine runs under an outer per-url deadline; if
+                        # the pool budget can exceed it, a saturated node
+                        # makes the outer `wait_for` cancel fetch AND distill
+                        # and the URL is LOST — strictly worse than the
+                        # raw-text degradation sitting in the except block
+                        # below. R2 capped this implicitly via
+                        # `min(_slot_wait, timeout)`; R4 removed that cap
+                        # without replacing it, which took the budget to the
+                        # 90s operator ceiling, 1.6x the outer deadline
+                        # (R5 lens A). Now stated explicitly, as R4's own
+                        # doctrine requires.
+                        timeout=_summary_budget,
+                        slot_wait=_summary_budget,
+                        total_budget=_summary_budget,
+                        task_label="web summary")
+                    pretty_log("Worker Compute", f"Distilled facts from {short_url}", icon=Icons.TOOL_DEEP)
                     preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
-                except Exception:
+                except Exception as _sum_exc:
+                    from ..core.llm import _err_text
+                    # ⚠ SAY SO. This was a bare `except Exception:` with no
+                    # log at all, so every degradation here was invisible:
+                    # the source silently reverts to raw truncated page text,
+                    # which then feeds `fact_check` as if it were distilled
+                    # evidence (R4 lens B).
+                    pretty_log(
+                        "Summary Degraded",
+                        f"{short_url}: {_err_text(_sum_exc)} — falling back "
+                        f"to raw page text",
+                        level="WARNING", icon=Icons.WARN)
                     # Clean the raw-text fallback: unscrubbed surrogates/control
                     # chars from an onion page can crash the downstream C++ JSON
                     # parser (what _clean_for_cpp prevents). safe_text is already

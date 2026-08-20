@@ -200,8 +200,14 @@ def test_the_public_signature_is_unchanged():
     changed signature would silently make that direction structurally dead."""
     import inspect
     params = list(inspect.signature(Verifier.verify_claim).parameters)
-    assert params == ["self", "claim", "evidence", "context",
-                      "high_stakes", "trace"]
+    # The POSITIONAL contract and the load-bearing keyword are what the
+    # bench introspects; keyword-only ADDITIONS are legitimate evolution
+    # (§4BQ added `deep`). Asserting an exact list froze the signature
+    # against additions it has no stake in, while a REMOVAL or reorder —
+    # what would actually make the escalation structurally dead — is
+    # still caught.
+    assert params[:4] == ["self", "claim", "evidence", "context"]
+    assert "high_stakes" in params and "trace" in params
     from ghost_agent.eval.verify_bench import verify_claim_accepts_high_stakes
     assert verify_claim_accepts_high_stakes(Verifier(llm_client=None)) is True
 

@@ -420,6 +420,11 @@ class SelfModel:
             "enabled": True,
             "root": str(self.root),
             "experience_count": self.autobio.count() if self.autobio else 0,
+            # Boot markers, SEPARATED (introspect review M2): they were 22%
+            # of "experiences on file" and 84% of the top cluster — restart
+            # noise rendered as what the agent thinks about.
+            "session_boots": (self.autobio.boot_count()
+                              if self.autobio else 0),
             "open_questions": len(self.state.open_questions()) if self.state else 0,
             "unfinished_threads": len(self.state.unfinished_threads()) if self.state else 0,
             "last_mood": _mood.label if _mood else "",

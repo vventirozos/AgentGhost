@@ -738,7 +738,18 @@ async def tool_browser(
     # loopback/LAN target stays direct (Tor can't route it; resolve returns
     # unchanged), preserving the supervised-sandbox-service capability.
     from ..utils.egress_guard import resolve_egress_proxy as _resolve_egress_proxy
-    tor_proxy = _resolve_egress_proxy(tor_proxy, url)
+    # ⚠ DECIDE ON THE URL ACTUALLY DIALED FIRST, not the top-level `url`
+    # (§5 lens A). For `interact` the runner dials `actions[0]`'s goto target
+    # before the top-level url, so a loopback top-level url with a PUBLIC
+    # first goto yielded proxy=None and would have launched Chromium cleartext
+    # against the public host. Currently unreachable (the sole caller always
+    # threads a truthy tor_proxy and --mandatory-tor aborts on a dead one),
+    # but it becomes a live deanonymization leak the moment any in-process
+    # caller runs with tor_proxy=None. `_runner_first_url` is the same
+    # host/runner "which URL is dialed first" resolver the SSRF pre-flight
+    # already uses below — reuse it here so both guards agree.
+    _proxy_decision_url = _runner_first_url(operation, url, actions, sandbox_dir)
+    tor_proxy = _resolve_egress_proxy(tor_proxy, _proxy_decision_url or url)
 
     # SSRF guard: refuse http(s) navigation to internal/metadata hosts.
     # (file:// fixtures and about:/data: are allowed; loopback ports of

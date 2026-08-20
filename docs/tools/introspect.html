@@ -243,6 +243,46 @@
   <code>uncertainty_pressure</code>'s constant 0.0 was root-caused as an ordering bug in the turn
   loop, not a dead concept — see <a href="../core/uncertainty.html">uncertainty</a>.</p>
 
+  <h2>2026-08-17 — fresh-eye review: the instrument audited as an instrument</h2>
+  <p>A two-round review treated every rendered number as a testable claim, on the §4BM/§4BR
+  premise that in this codebase it is the <em>instruments</em> that fail, not the runtime. The
+  headline findings, all fixed and mutation-pinned (26 mutations, 0 survivors):</p>
+  <ul>
+    <li><strong>An enabled experiment with ZERO stamped turns was invisible</strong> in every
+    report surface — the renders enumerated only arms that already had stamps, so
+    <code>verify_depth</code>'s three 100%-inert days (§4BR) could not have shown in the very
+    report meant to catch that state. All four surfaces now render an explicit
+    <code>■ name (n=0)</code> row with a warning naming the real failure mode: the live
+    introspect view, the bench section, the <code>learning</code> block, and the operator CLI
+    (<code>scripts/experiment_report.py</code>, whose <code>--json</code> gained
+    <code>enabled_unstamped</code> + <code>registry_degraded</code>). The zero rows also render
+    from the empty-corpus early returns — the round-2 reviewer found the round-1 fix
+    unreachable from exactly the branch where it matters most. With
+    <code>GHOST_EXPERIMENTS=0</code> the rows reframe ("expected: nothing enrolls") instead of
+    alarming "enrollment broken".</li>
+    <li><strong>A corrupt <code>system/experiments.json</code> silently substituted the code
+    defaults</strong> — deny-scope filter off, five false "enrollment broken" alarms for specs
+    the operator never listed, and the round-1 caveat guarded an exception
+    <code>load_registry</code> deliberately never raises. The registry now carries a
+    <code>degraded</code> flag; every report surface renders an UNREADABLE warning and refuses
+    to draw conclusions from the substituted defaults.</li>
+    <li><strong>"Experiences on file: 2001" was 22% session-boot markers</strong>, and 84% of
+    the top "topic cluster" was restart noise rendered as introspection.
+    <code>count()</code>/<code>cluster_counts()</code> exclude <code>outcome=="boot"</code>;
+    stats render "Session boots (excluded from the counts above): N". <code>recent</code>
+    still shows boots (labeled) — they are real chronology.</li>
+    <li><strong>The learning report asserted a stale direction</strong> ("all-lessons …
+    OVERSTATES") that live data had reversed; the direction is now computed from the two
+    numbers it prints.</li>
+    <li>Never-raises hardening (non-string <code>action</code> raised AttributeError;
+    OverflowError on JSON bignums), offset-carrying timestamps converted rather than
+    reinterpreted, and garbage-timestamp ledger rows no longer count in every liveness
+    window.</li>
+  </ul>
+  <p>Review lesson recorded: two of the round-1 fix tests were themselves vacuous (one ran
+  against a context whose early return skipped the code under test; one mutation was
+  semantically equivalent) — both caught by mutation-testing the tests, not by reading them.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

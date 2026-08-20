@@ -138,12 +138,27 @@ class TestTaskStateAndAck:
         try:
             r = client.get("/api/chat/task/t-live/state", headers=AUTH)
             assert r.json() == {"exists": True, "done": False, "error": None,
-                                "truncated": False, "chunks": 2}
+                                "truncated": False, "cancelled": False,
+                                "chunks": 2}
             r = client.post("/api/chat/ack/t-live", headers=AUTH)
             assert r.json() == {"ok": True}
             assert server.active_chat_tasks["t-live"]["client_acked"] is True
         finally:
             server.active_chat_tasks.pop("t-live", None)
+
+    def test_a_cancelled_task_says_so(self, client):
+        """The probe omitted `cancelled`, so the silent-resume path saw a
+        live task and replayed a stream the user deliberately stopped
+        (R2 lens A)."""
+        server.active_chat_tasks["t-stopped"] = {
+            "buffer": [b"a"], "buffer_size": 1, "done": True, "error": None,
+            "truncated": False, "cancelled": True,
+        }
+        try:
+            r = client.get("/api/chat/task/t-stopped/state", headers=AUTH)
+            assert r.json()["cancelled"] is True
+        finally:
+            server.active_chat_tasks.pop("t-stopped", None)
 
     def test_ack_unknown_task_404(self, client):
         r = client.post("/api/chat/ack/nope", headers=AUTH)
@@ -247,6 +262,148 @@ class TestBroadcast:
         assert webpush_notify.broadcast("t", "b") == 0
 
 
+class TestPushHealthTellsTheTruth:
+    """R2 lens A: the health signal sat on a WEAKER condition than sending."""
+
+    def test_a_corrupt_PEM_reports_push_as_OFF(self, push_files, monkeypatch,
+                                               tmp_path):
+        import json as _json
+        vapid = tmp_path / "vapid.json"
+        vapid.write_text(_json.dumps({
+            "public_key_b64url": "BOGUSPUBLICKEY",
+            "private_key_pem": "-----BEGIN PRIVATE KEY-----\nnot-a-key\n"
+                               "-----END PRIVATE KEY-----\n"}))
+        monkeypatch.setattr(webpush_notify, "_VAPID_FILE", vapid)
+        monkeypatch.setattr(webpush_notify, "_vapid_cache", None)
+        monkeypatch.setattr(webpush_notify, "_vapid_signer", None)
+        # The weaker predicate still says yes — that is the trap.
+        assert webpush_notify.public_key() == "BOGUSPUBLICKEY"
+        assert webpush_notify.can_send() is False, (
+            "push reports itself usable with a PEM that cannot sign")
+        assert webpush_notify.broadcast("t", "b") == 0
+
+    def test_the_endpoint_reports_can_send_not_public_key(self, client,
+                                                          monkeypatch):
+        monkeypatch.setattr(webpush_notify, "public_key", lambda: "PUB")
+        monkeypatch.setattr(webpush_notify, "can_send", lambda: False)
+        r = client.get("/api/push/vapid", headers=AUTH)
+        assert r.status_code == 200
+        assert r.json()["enabled"] is False, (
+            "the UI is told push works because a key file parses")
+
+
+class TestSubscriptionsAreNotDestroyedByABadRead:
+    """R2 lens A: `_load_subs` failed open to {}, and the next write
+    persisted that emptiness over every registered device."""
+
+    def _write_subs(self, monkeypatch, tmp_path, text):
+        p = tmp_path / "push_subs.json"
+        p.write_text(text)
+        monkeypatch.setattr(webpush_notify, "_SUBS_FILE", p)
+        return p
+
+    def test_a_truncated_file_is_not_overwritten_by_a_new_subscribe(
+            self, monkeypatch, tmp_path):
+        p = self._write_subs(monkeypatch, tmp_path,
+                             '{"https://push.example/a": {"endpoint": "a"')
+        ok = webpush_notify.add_subscription({
+            "endpoint": "https://push.example/new",
+            "keys": {"p256dh": "x", "auth": "y"}})
+        assert ok is False, "a new device was stored over an unreadable file"
+        assert p.read_text().startswith('{"https://push.example/a"'), (
+            "the unrepaired file was clobbered — every other device lost")
+
+    def test_a_json_LIST_is_refused_too(self, monkeypatch, tmp_path):
+        p = self._write_subs(monkeypatch, tmp_path, '[{"endpoint": "a"}]')
+        assert webpush_notify.add_subscription({
+            "endpoint": "https://push.example/new",
+            "keys": {"p256dh": "x", "auth": "y"}}) is False
+        assert p.read_text() == '[{"endpoint": "a"}]'
+
+    def test_an_ABSENT_file_is_still_the_empty_case(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(webpush_notify, "_SUBS_FILE",
+                            tmp_path / "does-not-exist.json")
+        assert webpush_notify.subscription_count() == 0
+        assert webpush_notify.add_subscription({
+            "endpoint": "https://push.example/new",
+            "keys": {"p256dh": "x", "auth": "y"}}) is True
+
+    def test_read_only_callers_never_raise(self, monkeypatch, tmp_path):
+        self._write_subs(monkeypatch, tmp_path, "not json at all")
+        assert webpush_notify.subscription_count() == 0
+        assert webpush_notify.broadcast("t", "b") == 0
+
+
+class TestEveryPushCarriesATimeout:
+    def test_webpush_is_called_with_an_explicit_timeout(self, push_files,
+                                                        monkeypatch):
+        """pywebpush's own default is `timeout=None`, and it passes that
+        INTO `WebPusher.send`, so `kwargs.pop("timeout", 10000)` yields None
+        and `requests.post` blocks forever. One unresponsive endpoint then
+        parks the notify poller for the life of the process (R2 lens A)."""
+        seen = {}
+
+        def _fake_webpush(**kw):
+            seen.update(kw)
+            return type("R", (), {"status_code": 201})()
+
+        import sys, types
+        fake = types.ModuleType("pywebpush")
+        fake.webpush = _fake_webpush
+        fake.WebPushException = type("WebPushException", (Exception,), {})
+        monkeypatch.setitem(sys.modules, "pywebpush", fake)
+        monkeypatch.setattr(webpush_notify, "_vapid_key_object",
+                            lambda: object())
+        monkeypatch.setattr(webpush_notify, "_load_subs_or_empty", lambda: {
+            "https://push.example/a": {"endpoint": "https://push.example/a",
+                                       "keys": {"p256dh": "x", "auth": "y"}}})
+        assert webpush_notify.broadcast("t", "b") == 1
+        assert "timeout" in seen, "the push has no timeout — it can hang forever"
+        assert 0 < seen["timeout"] <= 60, seen["timeout"]
+
+
+class TestPushFailuresAreLegible:
+    """R3 lens A: the R2 fixes stopped the data loss and left the REPORTS
+    wrong."""
+
+    def test_a_corrupt_store_is_a_503_not_a_client_error(self, client,
+                                                         monkeypatch, tmp_path):
+        p = tmp_path / "push_subs.json"
+        p.write_text('{"https://push.example/a": {"endpoint": "a"')
+        monkeypatch.setattr(webpush_notify, "_SUBS_FILE", p)
+        r = client.post("/api/push/subscribe", headers=AUTH, json={
+            "subscription": {"endpoint": "https://push.example/new",
+                             "keys": {"p256dh": "x", "auth": "y"}}})
+        assert r.status_code == 503, (
+            f"a server-side corrupt store is reported to the device as ITS "
+            f"fault: {r.status_code} {r.text[:120]}")
+        assert "unreadable" in r.text.lower()
+
+    def test_a_healthy_store_still_400s_a_malformed_payload(self, client,
+                                                            monkeypatch, tmp_path):
+        p = tmp_path / "push_subs.json"
+        p.write_text("{}")
+        monkeypatch.setattr(webpush_notify, "_SUBS_FILE", p)
+        r = client.post("/api/push/subscribe", headers=AUTH,
+                        json={"subscription": {"endpoint": "not-https"}})
+        assert r.status_code == 400
+
+    def test_a_dead_push_subsystem_says_so_at_every_exit(self, monkeypatch,
+                                                          tmp_path, caplog):
+        """The "reached 0 of N" alarm could not fire for the two likeliest
+        causes — no VAPID config, and an unusable PEM — because both return
+        earlier (R3 lens A)."""
+        import logging
+        monkeypatch.setattr(webpush_notify, "_load_subs_or_empty", lambda: {
+            "https://push.example/a": {"endpoint": "https://push.example/a"}})
+        monkeypatch.setattr(webpush_notify, "vapid_config", lambda: None)
+        with caplog.at_level(logging.WARNING):
+            assert webpush_notify.broadcast("t", "b") == 0
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "push is off" in blob, (
+            f"push is entirely dead and nothing said so: {blob!r}")
+
+
 class TestReplyReadyPush:
     def _run(self, coro):
         return asyncio.run(coro)
@@ -289,6 +446,49 @@ class TestReplyReadyPush:
             self._run(server._push_if_unacked("t-can", "x"))
         finally:
             server.active_chat_tasks.pop("t-can", None)
+        pushed.assert_not_awaited()
+
+    def test_ack_grace_is_a_real_wait_read_AFTER_the_sleep(self, monkeypatch):
+        """Every other test in this class patches the grace to 0.0, so the
+        grace was pinned NOWHERE: a 0-second default (or checking the ack
+        flag before sleeping) would push to the phone the instant the turn
+        finished, while the page that was about to ack was still parsing the
+        stream — a buzz for a reply the user is already reading (review R1
+        M12e).
+
+        Two things are asserted: the default is long enough for a live page
+        to ack, and the flag is read AFTER the wait, not before."""
+        assert server._push_ack_grace_s() >= 5.0, (
+            "the ack grace is too short for a live page to ack in")
+        monkeypatch.setenv("GHOST_PUSH_ACK_GRACE", "3.5")
+        assert server._push_ack_grace_s() == 3.5, "the env override is dead"
+        monkeypatch.setenv("GHOST_PUSH_ACK_GRACE", "not-a-number")
+        assert server._push_ack_grace_s() >= 5.0, (
+            "a malformed override collapses the grace instead of falling back")
+        monkeypatch.delenv("GHOST_PUSH_ACK_GRACE", raising=False)
+
+        server.active_chat_tasks["t-late-ack"] = {"done": True}
+        pushed = AsyncMock(return_value=1)
+        monkeypatch.setattr(server.webpush_notify, "broadcast_async", pushed)
+        monkeypatch.setattr(server.webpush_notify, "subscription_count", lambda: 1)
+        monkeypatch.setattr(server, "_push_ack_grace_s", lambda: 0.15)
+
+        async def _acks_during_the_grace():
+            probe = asyncio.ensure_future(
+                server._push_if_unacked("t-late-ack", "x"))
+            await asyncio.sleep(0.05)      # inside the grace window
+            # ⚠ REPLACE the registry entry, do not mutate the dict in place.
+            # Mutating it let a probe that looked the task up BEFORE sleeping
+            # still observe the ack, so hoisting the lookup above the sleep —
+            # the actual defect — survived the mutation.
+            server.active_chat_tasks["t-late-ack"] = {"done": True,
+                                                      "client_acked": True}
+            await probe
+
+        try:
+            self._run(_acks_during_the_grace())
+        finally:
+            server.active_chat_tasks.pop("t-late-ack", None)
         pushed.assert_not_awaited()
 
     def test_cancel_endpoint_sets_the_flag(self, client):

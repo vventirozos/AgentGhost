@@ -162,17 +162,28 @@
     threaded through the op payload as <code>allowed_local_ports</code>) —
     literal hosts only, so no DNS/rebind surface; every other loopback /
     internal target stays blocked.</li>
-    <li><strong>From the host (operator)</strong>: in <code>host</code>
-    network mode (Linux default) the service binds host ports directly. In
-    <code>bridge</code> mode (macOS default) docker.py publishes the
+    <li><strong>From the host (operator)</strong>: the bind address the
+    manager exports depends on the network mode, and it is a security
+    boundary. In <code>bridge</code> mode (macOS default) the container is
+    NAT-isolated, so docker.py publishes the
     <code>GHOST_SANDBOX_SERVICE_PORTS</code> range (default
     <code>8100-8104</code>, loopback-bound; empty disables) when the
     container is (re)created — an existing container picks this up on its
-    next re-provision. The service must bind <code>0.0.0.0</code> inside the
-    container for the bridge-publish to forward — the manager exports
-    <code>HOST=0.0.0.0</code> (and <code>GHOST_SERVICE_HOST</code>) alongside
-    <code>PORT</code> for exactly this. An app bound to the container's own
-    loopback is reachable by the in-sandbox browser but NOT from the host.</li>
+    next re-provision — and the service binds <code>0.0.0.0</code> inside the
+    container so the bridge-publish can forward. <code>0.0.0.0</code> there is
+    safe: only the explicitly-published host-loopback mapping escapes. In
+    <code>host</code> network mode (Linux default) the container SHARES the
+    host's network stack, so a service binding <code>0.0.0.0</code> would be
+    reachable LAN-wide and unauthenticated — hosting untrusted, LLM-generated
+    code. To prevent that the manager binds <strong>loopback</strong>
+    (<code>HOST=127.0.0.1</code>) in host-netns mode: the operator still
+    reaches it at <code>127.0.0.1:&lt;port&gt;</code> on the host (shared
+    netns) and so does the in-sandbox browser, with no LAN exposure. The
+    manager exports <code>HOST</code> / <code>GHOST_SERVICE_HOST</code> (and
+    <code>PORT</code>) accordingly; remote exposure is always an explicit
+    operator step (<code>tailscale serve</code>), never an unauthenticated
+    default. An app bound to the container's own loopback is reachable by the
+    in-sandbox browser but, in bridge mode, NOT from the host.</li>
     <li><strong>From another device (tailnet)</strong>: a published port lands
     on host <code>127.0.0.1</code> only (by design — it's an agent sandbox).
     Put it on your tailnet with <code>tailscale serve</code> — see

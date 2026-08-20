@@ -777,6 +777,11 @@ class TestTheBudgetAlwaysTerminates:
             "an unpickable drain stayed armed — it will spin forever"
         assert any(k.get("level") == "WARNING"
                    for a, k in emitted if a and a[0] == "Bench Drain")
+        # §4CB R2 B-MIN-2: the cancel must clear the bank filter too — the
+        # drained-to-zero path clears it so /api/health stops serving a
+        # filter for a drain that is over; this path zeroed the budget but
+        # left banks set until the next restart.
+        assert agent._bench_drain_banks is None
 
     @pytest.mark.asyncio
     async def test_a_TRANSIENT_pick_failure_keeps_the_budget(self):

@@ -71,14 +71,25 @@ def _detect_paragraph_loop(reasoning_buf: str) -> bool:
     lines = reasoning_buf.splitlines()
     if len(lines) < 2:
         return False
+    # § finalize/stream R1 B-4: count STANDALONE line repeats, not substring
+    # occurrences. `buf.count(line)` also counted the line EMBEDDED in
+    # otherwise-diverse prose — a debugging monologue quoting the same
+    # ≥48-char error/traceback line six times (routine) fired the guard with
+    # only two verbatim standalone repeats. A loop repeats the line AS a
+    # line; a quote embeds it mid-sentence. One pass over the already-split
+    # lines, same cost class as before.
+    _stripped = [l.strip() for l in lines[:-1]]
+    _counts: dict = {}
+    for _s in _stripped:
+        if len(_s) >= PARAGRAPH_LOOP_MIN_LINE:
+            _counts[_s] = _counts.get(_s, 0) + 1
     # The last element may be a mid-line streaming fragment — check only
     # COMPLETED lines (everything before it), newest first.
     checked = 0
-    for line in reversed(lines[:-1]):
-        line = line.strip()
+    for line in reversed(_stripped):
         if len(line) < PARAGRAPH_LOOP_MIN_LINE:
             continue
-        if reasoning_buf.count(line) >= PARAGRAPH_LOOP_THRESHOLD:
+        if _counts.get(line, 0) >= PARAGRAPH_LOOP_THRESHOLD:
             return True
         checked += 1
         if checked >= PARAGRAPH_LOOP_SCAN_LINES:
@@ -101,20 +112,16 @@ _STREAM_STOP_MARKERS = ("</think", "<tool_call")
 def _detect_thinking_loop(buf: str) -> bool:
     """True if the tail of `buf` repeats itself enough to be a loop.
 
-    Checks two n-gram sizes (the tight 200-char window for fast repeats,
-    plus a 400-char window as a backstop for slightly-paraphrased runs
-    where each paragraph is just long enough to dodge the 200-char probe)."""
+    Single tight-window n-gram check. The old 400-char "wide backstop" was
+    PROVABLY DEAD (§ finalize/stream R1 C-G2): every occurrence of the
+    400-char tail contains an occurrence of the 200-char tail, so
+    count(wide) >= threshold implies count(tight) >= threshold — the tight
+    check above it had always already returned True. Removed so mutation
+    sweeps stop reading the inert branch as an unpinned guard."""
     if len(buf) < THINKING_LOOP_WINDOW * THINKING_LOOP_THRESHOLD:
         return False
     tail = buf[-THINKING_LOOP_WINDOW:]
-    if buf.count(tail) >= THINKING_LOOP_THRESHOLD:
-        return True
-    wide_window = THINKING_LOOP_WINDOW * 2
-    if len(buf) >= wide_window * THINKING_LOOP_THRESHOLD:
-        wide_tail = buf[-wide_window:]
-        if buf.count(wide_tail) >= THINKING_LOOP_THRESHOLD:
-            return True
-    return False
+    return buf.count(tail) >= THINKING_LOOP_THRESHOLD
 
 
 def _tail_has_stop_marker(buf: str, new_token: str) -> bool:

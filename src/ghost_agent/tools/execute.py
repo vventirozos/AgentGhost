@@ -516,6 +516,39 @@ def _rerun_unsafe(command: str) -> bool:
     return False
 
 
+# §4BX/#5 — raw-Playwright anonymity backstop. The `browser` tool enforces the
+# Tor proxy on every launch; `execute(stateful=True)` running raw Playwright
+# does NOT — the model must thread `proxy=os.environ['TOR_PROXY']` itself
+# (prompts.py teaches it; TOR_PROXY is injected into the cell env). A launch
+# that omits it and then navigates to a PUBLIC host dials cleartext from the
+# real IP — the exact leak the browser tool exists to prevent. We cannot
+# block (a `file://`/loopback launch legitimately needs no proxy, and Tor
+# can't route file://), so this is a loud NON-BLOCKING notice on the result,
+# visible to the model, the verifier and the operator's stream.
+_PW_LAUNCH_RE = re.compile(
+    r"(async_playwright|(chromium|firefox|webkit)\s*\.\s*launch)", re.I)
+
+
+def _proxyless_browser_launch(code: str) -> bool:
+    """True if `code` launches Playwright WITHOUT referencing a proxy."""
+    if not code or not _PW_LAUNCH_RE.search(code):
+        return False
+    low = code.lower()
+    return ("proxy" not in low) and ("tor_proxy" not in low)
+
+
+_PROXYLESS_BROWSER_NOTE = (
+    "\n\n⚠ ANONYMITY: this cell launched Playwright with NO proxy while a "
+    "Tor proxy was available (TOR_PROXY is set in the cell env). A `file://` "
+    "or loopback navigation is fine, but any PUBLIC navigation just dialled "
+    "cleartext from the real IP — the Tor-only rule. Add "
+    "`proxy={'server': os.environ['TOR_PROXY']}` (+ the "
+    "`--host-resolver-rules` DNS arg) to the launch, or use the native "
+    "`browser` tool which enforces it."
+)
+
+
+
 async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, container_workdir: str = None, **kwargs):
     # When a project is active, run from /workspace/projects/<id> so files
     # written via file_system (also scoped) read back. Passed ONLY when set,
@@ -1148,6 +1181,16 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
 
     is_new_code = True
     _probe_note = ""
+    # Non-blocking anonymity backstop for raw-Playwright in stateful execute.
+    _proxyless_browser_note = ""
+    if (stateful and content and getattr(sandbox_manager, "tor_proxy", None)
+            and _proxyless_browser_launch(content)):
+        _proxyless_browser_note = _PROXYLESS_BROWSER_NOTE
+        pretty_log(
+            "Anonymity",
+            "raw Playwright launched with no proxy while Tor is available "
+            "— flagged on the result (public navigation would leak)",
+            level="WARNING", icon=Icons.WARN)
     if not content:
         if not host_path.exists():
             return _format_error(f"SYSTEM ERROR: File '{filename}' does not exist. You must provide 'content' to create it.")
@@ -1310,7 +1353,25 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     hint="Retry without stateful=True, or re-run the command so the sandbox restarts.",
                 )
             try:
-                _container.exec_run(f"python3 -m ipykernel_launcher -f {conn_file}", **exec_kwargs)
+                # ⚠ OFF THE EVENT LOOP, WITH A DEADLINE (§4BW MAJOR). This
+                # was a synchronous `_container.exec_run(...)` inside an async
+                # function — a wedged daemon here froze the WHOLE agent event
+                # loop (every tool, every turn), the exact class the
+                # 2026-07-22 `_exec_run` wrapper removed elsewhere; the fix
+                # never reached this call. Route through that wrapper (hard
+                # client-side deadline) when the manager exposes it, and run
+                # it on a thread so a hang cannot block the loop.
+                _boot = getattr(sandbox_manager, "_exec_run", None)
+                if callable(_boot):
+                    await asyncio.to_thread(
+                        _boot,
+                        f"python3 -m ipykernel_launcher -f {conn_file}",
+                        deadline_s=60, **exec_kwargs)
+                else:
+                    await asyncio.to_thread(
+                        _container.exec_run,
+                        f"python3 -m ipykernel_launcher -f {conn_file}",
+                        **exec_kwargs)
             except Exception as _boot_err:
                 return _format_error(
                     f"Error: Failed to boot the stateful Jupyter kernel: {_boot_err}",
@@ -1625,10 +1686,10 @@ if has_error:
 
         if exit_code != 0:
              return _format_error(output, hint=diagnostic_info,
-                                  exit_code=exit_code) + _probe_note
+                                  exit_code=exit_code) + _probe_note + _proxyless_browser_note
 
         return (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\n"
-                f"STDOUT/STDERR:\n{output}{_probe_note}")
+                f"STDOUT/STDERR:\n{output}{_probe_note}{_proxyless_browser_note}")
     except Exception as e:
         return _format_error(f"Error: {e}")
     finally:

@@ -879,6 +879,23 @@ def _intent_filter(tools: list, query: str | None, *, drop_unconfigured: set | N
     return [t for t in tools if t.get("function", {}).get("name") not in drop]
 
 
+# Built-in tools whose LLM-facing schemas are appended INSIDE
+# get_active_tool_definitions below (vision availability / image-node config)
+# rather than living in TOOL_DEFINITIONS. Their schemas are still static
+# module literals with known parameters — they are BUILT-INS, not runtime
+# macros. Consumers that need "the set of built-in tool names" (the usable-
+# native gate's `_STATIC_TOOL_NAMES` in core/agent.py) must union these with
+# TOOL_DEFINITIONS' names: classifying them as runtime-registered let a
+# degenerate empty-args native `vision_analysis {}` shadow a fully-specified
+# XML call (§ turn-loop R5). Guarded against drift by
+# test_turnloop_r5_fixes.py, which DERIVES this set from the live
+# get_active_tool_definitions output and asserts equality — add a new
+# conditionally-advertised built-in there and here together.
+CONDITIONALLY_ADVERTISED_BUILTIN_NAMES = frozenset({
+    "vision_analysis", "image_generation",
+})
+
+
 def get_active_tool_definitions(context, query: str = None):
     active_tools = list(TOOL_DEFINITIONS)
 

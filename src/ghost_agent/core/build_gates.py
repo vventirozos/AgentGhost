@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from ..utils.helpers import env_positive
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -60,6 +62,12 @@ def files_from_specs(file_specs: list) -> Dict[str, str]:
         if body:
             out[path] = str(body)
     return out
+
+
+# The gate is awaited inline by a build/act step, so it needs a patience of
+# its own: without one, a wedged worker costs 90s of slot wait plus the
+# client's 1200s default before the (bounded) main fallback even starts.
+_GATE_TIMEOUT_S = env_positive("GHOST_GATE_TIMEOUT", 60.0)
 
 
 def _parse_verdict(content: str) -> Optional[dict]:
@@ -143,12 +151,68 @@ async def constraint_gate(context, constraints: List[str],
     # With no worker pool configured, `use_worker=True` falls back to the main
     # node (see LLMClient.chat_completion) and the confirm pass is skipped —
     # so behaviour is byte-identical to before.
-    screened_off_main = bool(getattr(llm, "worker_clients", None))
+    # ⚠ WHICH MODEL ANSWERED, not which pool was configured. This used to be
+    # `bool(llm.worker_clients)` — computed BEFORE the call, from
+    # configuration. When the worker was down (or our own slot gate was
+    # saturated) the client silently answered the SCREEN from the main model,
+    # and this flag still said "screened off main", so the veto was then
+    # "independently confirmed" by THE SAME MODEL, at temperature 0.0, on the
+    # same prompt. Measured: worker alive → 1 main call; worker dead → 2 main
+    # calls, same verdict, reported as screen-then-confirm. The safety
+    # property this function is built around — a small model's veto is not
+    # trusted alone — was destroyed exactly when the infrastructure was
+    # degraded (LLM review R2 lens C, with an executable proof).
+    from .llm import served_leg, OffMainNodeUnavailable
+
+    screened_off_main = False
 
     async def _ask(use_worker: bool) -> str:
+        nonlocal screened_off_main
+        try:
+            return await _ask_once(use_worker)
+        except OffMainNodeUnavailable:
+            # The pool is down and we refused the main model for QUEUEING
+            # reasons — not because the check is optional. Re-run it on main
+            # as an ordinary main-targeted call so it waits its turn.
+            data = await llm.chat_completion(
+                dict(payload), use_worker=False, is_background=is_background,
+                timeout=_GATE_TIMEOUT_S, task_label="constraint gate (main)")
+            if use_worker:
+                screened_off_main = False
+            return (data.get("choices", [{}])[0].get("message", {})
+                    .get("content") or "")
+
+    async def _ask_once(use_worker: bool) -> str:
+        nonlocal screened_off_main
         data = await llm.chat_completion(
             dict(payload), use_worker=use_worker, is_background=is_background,
+            # ⚠ A BACKGROUND caller must not dogpile the main slot (§4O
+            # A-MAJOR-2): idle autoadvance reaches here with
+            # is_background=True, and because the worker box is not the main
+            # URL the call skipped both the foreground wait and the background
+            # semaphore, then fell back to main anyway.
+            #
+            # ⚠⚠ BUT `off_main_only` ALONE SILENTLY DISABLES THE GATE. It
+            # makes the client RAISE when the pool is down, and this function
+            # fails open on any exception — so with Nova unreachable a
+            # background build lost its constraint check entirely and shipped
+            # a VIOLATING artifact, logging one debug line. Measured: nova
+            # down + is_background=True -> gate_passed=True, main_calls=0
+            # (found within the same round that introduced it — R3 lens A,
+            # MAJOR-1). A safety gate must not be skippable by an
+            # infrastructure outage. So: prefer the worker, and on
+            # unavailability fall back to main DELIBERATELY and WITHOUT the
+            # pool flag, which makes `targets_main_node` true so the call is
+            # properly queued and foreground-yielded rather than jumping the
+            # line.
+            off_main_only=is_background,
+            # The gate is on the build's critical path; state the total
+            # budget rather than inheriting the 90s operator ceiling.
+            timeout=_GATE_TIMEOUT_S, slot_wait=_GATE_TIMEOUT_S,
+            total_budget=_GATE_TIMEOUT_S,
             task_label="constraint gate")
+        if use_worker:
+            screened_off_main = served_leg(data).get("served_by") == "worker"
         return (data.get("choices", [{}])[0].get("message", {})
                 .get("content") or "")
 
@@ -169,7 +233,9 @@ async def constraint_gate(context, constraints: List[str],
     if screened_off_main:
         # A small screening model wants to BLOCK work. Confirm on the main
         # model first — an unconfirmed veto is how a weak judge deadlocks a
-        # project.
+        # project. (If the screen ALREADY ran on main, there is nothing to
+        # confirm it with: block on that evidence directly rather than asking
+        # the same model the same question twice.)
         try:
             confirm = _parse_verdict(await _ask(use_worker=False))
         except Exception as e:  # noqa: BLE001

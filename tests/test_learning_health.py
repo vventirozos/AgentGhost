@@ -419,7 +419,31 @@ def test_the_CLEAN_number_is_the_headline(tmp_path):
                         _lesson("2026-08-05T00:00:00", 10, 2)])
     out = render_learning_health(md)
     assert "mean hit-rate: 0.25 (CLEAN" in out
-    assert "OVERSTATES" in out and "not comparable" in out
+    assert "not comparable" in out
+
+
+def test_the_direction_of_the_distortion_is_COMPUTED_not_asserted(tmp_path):
+    """Introspect review M1. This line used to hardcode "OVERSTATES" —
+    true when written (0.620 vs 0.557), FALSE on live data within a month
+    (0.673 vs 0.681: the "overstating" number was lower). A report that
+    prints both values and then asserts their ordering from memory is an
+    instrument stating a stale fact as a measurement.
+
+    Both directions constructed; each must render its own truth.
+    """
+    # Contaminated era dragged UP -> all-lessons overstates.
+    md = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 90),
+                        _lesson("2026-08-05T00:00:00", 10, 2)])
+    out = render_learning_health(md)
+    assert "currently overstates the clean figure" in out
+    assert "OVERSTATES" not in out          # the old hardcoded shout is gone
+
+    # Contaminated era dragged DOWN -> all-lessons understates. The live
+    # store is in THIS state today; the old text called it overstated.
+    md2 = _pb(tmp_path, [_lesson("2026-07-01T00:00:00", 100, 5),
+                         _lesson("2026-08-05T00:00:00", 10, 9)])
+    out2 = render_learning_health(md2)
+    assert "currently understates the clean figure" in out2
 
 
 def test_NO_clean_lesson_says_so_rather_than_quoting_the_dirty_one(tmp_path):
@@ -607,3 +631,56 @@ def test_frontier_selfplay_flag_is_a_real_bool_in_the_parser():
         ns = parse_args()
     assert isinstance(getattr(ns, "frontier_selfplay"), bool)
     assert isinstance(getattr(ns, "prm_online_update"), bool)
+
+
+# ── Introspect fresh-eye review (2026-08-17) ───────────────────────────────
+
+def test_activity_counts_SKIPS_unparseable_timestamps(tmp_path):
+    """m4: `if ts and ts < cutoff` kept a garbage-ts row in EVERY window —
+    one such row would keep a dead PERIODIC phase looking alive in the
+    liveness table forever, and that table's job is telling benign zeros
+    from fatal ones."""
+    import json as _json
+    from ghost_agent.core.learning_health import _activity_counts
+    ledger = tmp_path / "autonomous_activity.jsonl"
+    rows = [
+        {"ts": "garbage", "phase": "dream"},
+        {"ts": None, "phase": "dream"},
+        {"phase": "dream"},                       # absent ts
+        {"ts": 0, "phase": "dream"},
+    ]
+    ledger.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+    counts = _activity_counts(ledger, window_hours=24.0)
+    assert counts.get("dream", 0) == 0, (
+        f"rows with no usable timestamp counted as recent activity: {counts}")
+
+
+def test_learning_report_shows_an_enabled_arm_with_zero_stamps(tmp_path):
+    """C1 sibling: the LIVE EXPERIMENTS block enumerated only stamped
+    arms, so an enabled spec with zero traffic — verify_depth's three
+    inert days — rendered as silence in this surface too."""
+    import json as _json
+    md = _pb(tmp_path, [])
+    # A trajectory corpus carrying one stamped arm — written through the
+    # REAL collector (hand-rolled files miss the session-*.jsonl naming
+    # and the Trajectory schema, and silently produce an empty walk).
+    from ghost_agent.distill.collector import TrajectoryCollector, Trajectory
+    coll = TrajectoryCollector(root=tmp_path / "trajectories",
+                               session_id="lh-test")
+    coll.append(Trajectory(user_request="do the thing",
+                           final_response="done",
+                           task_kind="user_request",
+                           extra={"experiments": {"risk_steer": "control"}}))
+    # A registry that also enables a spec nothing has stamped.
+    (tmp_path / "experiments.json").write_text(_json.dumps({"experiments": [
+        {"name": "risk_steer", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+        {"name": "ghost_arm", "arms": ["control", "treatment"],
+         "traffic": 1.0, "enabled": True, "scope": "live"},
+    ]}))
+    from ghost_agent.core import experiments as _ex
+    _ex.reset_registry_cache()
+    out = render_learning_health(md)
+    assert "risk_steer" in out
+    assert "ghost_arm: n=0" in out, out[-600:]
+    assert "UNSTAMPED" in out

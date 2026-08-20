@@ -864,6 +864,32 @@
 
   <footer><a href="../index.html">← Back to index</a></footer>
 
+  <h2 id="stream-raise-durable-tail">A raise mid-final-stream no longer skips the durable tail <span class="tag">2026-08-19</span></h2>
+  <p>
+    The final-generation drain in <code>stream_wrapper</code> iterated
+    <code>stream_chat_completion</code> with <strong>no enclosing handler</strong> (AST-proven,
+    §4BV&nbsp;R7). Any raise — the streaming path still re-raises on HTTP&nbsp;4xx/5xx and on its
+    generic error path — skipped the <em>entire</em> durable tail: episode, hydration judge,
+    trajectory, project work_log, verifier spawn, lesson outcomes. The client saw the route's
+    error event; the turn vanished from every persistent record.
+  </p>
+  <p>
+    Fixed by <strong>conversion, not swallowing</strong>: <code>_stream_or_abort_frames</code>
+    wraps the iterator and turns a raise into the two frames the loop body already handles — an
+    <code>{"error": …}</code> frame (parsed into <code>stream_aborted</code>, which appends the
+    truncation marker to the durable content) and a <code>data: [DONE]</code> (captured and
+    released <em>after</em> the tail, per the <a href="#stream-done-ordering">held-sentinel
+    ordering above</a>). <code>CancelledError</code>/<code>GeneratorExit</code> still propagate —
+    a cancelled turn must still cancel.
+  </p>
+  <p>
+    ⚠ <strong>Exactly one call site is wrapped, deliberately.</strong> <code>handle_chat</code>'s
+    internal drain sits inside a <code>try</code> whose handlers <em>depend</em> on the raise —
+    one runs the emergency context prune on a 400 mentioning "context". Wrapping it would
+    silently delete that recovery. <code>tests/test_stream_durable_tail.py</code> pins both
+    directions and the frame shapes.
+  </p>
+
   <h2 id="stream-done-ordering">The streamed turn's durable record ran <em>after</em> <code>[DONE]</code> <span class="tag">2026-08-11</span></h2>
   <p>
     <code>data: [DONE]</code> is the OpenAI SSE contract's &ldquo;you may stop reading now&rdquo;, so

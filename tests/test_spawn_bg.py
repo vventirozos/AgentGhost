@@ -119,3 +119,51 @@ def test_no_bare_create_task_in_hot_modules():
         "bare asyncio.create_task outside the allow-list — use spawn_bg:\n"
         + "\n".join(offenders)
     )
+
+
+def test_a_None_task_never_poisons_the_registry(monkeypatch):
+    """A pre-existing cross-file failure, root-caused by the 2026-08-17
+    feedback-channel review.
+
+    `spawn_bg` did `_BG_TASKS.add(spawn_task(coro))`. A `spawn_task` patched
+    to `asyncio.run` (which returns the coroutine's VALUE, not a Task —
+    `tests/test_critic_async.py` does exactly this) handed back None; the
+    add succeeded, the following `add_done_callback` raised, and because the
+    discard lives in the done-callback the None stayed in the set FOREVER.
+    Every later file that iterates it calling `.done()` or `.cancel()` then
+    crashed — 6 failures in `test_unacknowledged_failure_gate` when run
+    after `test_critic_async`, invisible in full-suite order only because
+    two alphabetically-earlier files happen to `clear()` the set.
+    """
+    import asyncio
+    from ghost_agent.utils import logging as glog
+
+    async def _work():
+        return "done"
+
+    monkeypatch.setattr(glog, "spawn_task", lambda coro: asyncio.run(coro))
+    glog._BG_TASKS.clear()
+    # `asyncio.run` returns the coroutine's VALUE — None, a str, anything —
+    # so the guard must duck-type, not test one sentinel.
+    assert glog.spawn_bg(_work()) is None
+    assert not glog._BG_TASKS, f"registry poisoned: {glog._BG_TASKS!r}"
+
+    async def _returns_none():
+        return None
+
+    assert glog.spawn_bg(_returns_none()) is None
+    assert not glog._BG_TASKS
+
+    # And the mirror: a REAL task still registers and stays usable by the
+    # downstream readers that call `.done()` / `.cancel()` over the set.
+    monkeypatch.undo()
+
+    async def _drive():
+        t = glog.spawn_bg(_work())
+        assert t is not None and hasattr(t, "done")
+        assert t in glog._BG_TASKS
+        for entry in glog._BG_TASKS:
+            assert hasattr(entry, "done") and hasattr(entry, "cancel")
+        await t
+
+    asyncio.run(_drive())

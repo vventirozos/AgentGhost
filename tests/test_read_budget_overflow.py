@@ -44,8 +44,11 @@ def test_read_byte_budget_lowered_factor_and_floor():
     big = read_byte_budget(131072)
     assert big == int(131072 * 3.5 * 0.40)
     assert big < int(131072 * 3.5 * 0.5)          # strictly tighter than before
-    # Floor protects small-context configs.
-    assert read_byte_budget(1000) == 150000
+    # § context R1 B2a: the floor is BOUNDED by 0.8x the window — for tiny
+    # windows the unconditional 150 KB floor INVERTED the cap (a 100 KB file
+    # returned whole into an 8k window). Where the floor FITS, it holds.
+    assert read_byte_budget(60000) == 150000          # floor fits -> holds
+    assert read_byte_budget(1000) == int(1000 * 3.5 * 0.8)   # bounded
 
 
 def test_readbudget_accounting():

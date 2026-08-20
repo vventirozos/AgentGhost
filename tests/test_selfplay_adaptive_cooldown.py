@@ -15,14 +15,14 @@ from ghost_agent.core.agent import GhostAgent, GhostContext
 from ghost_agent.memory.frontier import FrontierTracker
 
 
-@pytest.fixture(autouse=True)
-def _isolate_ghost_home(monkeypatch):
-    """_biological_tick's counterfactual batch resolves its replay
-    ledger from $GHOST_HOME. On a dev box with GHOST_HOME exported and
-    a populated ledger, ticks here replayed REAL pending challenges
-    through the mocked dreamer (extra synthetic_self_play awaits) and
-    appended results to the operator's ledger. Keep the tests hermetic."""
-    monkeypatch.delenv("GHOST_HOME", raising=False)
+# ⚠ This file used to define its own autouse `_isolate_ghost_home` that
+# DELETED the var — which SHADOWED conftest's same-named fixture and
+# re-armed the very failure conftest documents: with GHOST_HOME unset,
+# modules fall back to a real path in the user's $HOME (~/ghost_llamacpp),
+# so "hermetic" was strictly worse than the tmp home it displaced. The
+# conftest fixture already covers this file's stated need (a throwaway
+# home per test); the local override is deleted rather than renamed
+# (found by the 2026-08-17 feedback-channel review).
 
 
 def _make_agent_with_tracker(tmp_path, idle_seconds=4000):

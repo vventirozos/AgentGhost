@@ -225,8 +225,25 @@ class ActivityLog:
                 line = json.dumps(rec.to_dict(), ensure_ascii=False)
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                # §4CB R1 B-M6: heal a crash-truncated tail. If the process
+                # died mid-write, the file ends without "\n"; appending
+                # directly would MERGE this record into the partial line,
+                # making both unparseable — read_since skips the merged line
+                # and advances, so the first post-restart record silently
+                # never reached the digest/poller consumers. A leading
+                # newline isolates the damage to the half-written record.
+                _prefix = ""
+                try:
+                    _sz = os.path.getsize(self.path)
+                    if _sz > 0:
+                        with open(self.path, "rb") as _rf:
+                            _rf.seek(_sz - 1)
+                            if _rf.read(1) != b"\n":
+                                _prefix = "\n"
+                except OSError:
+                    pass
                 with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
+                    f.write(_prefix + line + "\n")
         except Exception as e:  # noqa: BLE001 — fail-safe contract
             logger.debug("activity record failed: %s", e)
             return False

@@ -492,6 +492,39 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                 logger.debug("failure_distill route failed for %s: %s",
                              state_key, e)
                 continue
+            # ⚠ "NEVER ANSWERED" IS NOT "NO PATTERN". `route()` returns its
+            # `fallback` for a no-pool, an OffMainNodeUnavailable AND any
+            # exception — it never raises — so the `except` above is dead for
+            # node failures. A transient worker outage therefore produced
+            # `reply=None`, fell into the branch below, and wrote a PERMANENT
+            # `no_pattern` fingerprint: the cluster is skipped forever until
+            # its evidence changes, and since `eligible` is sorted by evidence
+            # count, the clusters burned are the highest-evidence ones. One
+            # outage poisons up to 2*cap clusters per pass (LLM review R3
+            # lens B, item 6, reproduced end to end). The sibling
+            # `failure_dimension` survives the same shape only because it
+            # persists nothing.
+            #
+            # R4 lens A argued this cannot tell "never answered" from
+            # "answered with nothing", and proposed a sentinel fallback. That
+            # was BUILT AND REVERTED after measuring it: `route()` ends with
+            # `return content if content else fallback`, so it collapses an
+            # empty completion onto the fallback BEFORE this code sees it —
+            # a sentinel is handed back for both cases and distinguishes
+            # nothing. (Mutation M9: swapping the sentinel back to `None`
+            # left all 24 tests green, which is what an inert fix looks like.)
+            # The distinction would have to be made inside `route()`, and it
+            # is not worth that: an EMPTY completion is a degenerate
+            # generation, not a considered verdict, and retrying it is right.
+            # A genuine "these cases share no pattern" verdict arrives as
+            # `{"pattern": ""}` — a non-empty completion — and is recorded
+            # correctly by the branch below.
+            if reply is None:
+                logger.debug(
+                    "failure_distill: no reply for %s (node unavailable?) — "
+                    "leaving the cluster un-fingerprinted so it is retried",
+                    state_key)
+                continue
             data = _parse_pattern_json(str(reply or ""))
             correct = str((data or {}).get("correct_pattern") or "").strip()
             if not data or not correct:

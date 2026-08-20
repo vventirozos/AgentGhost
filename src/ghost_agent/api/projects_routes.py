@@ -29,7 +29,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Securi
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .routes import verify_api_key, get_agent
+from .routes import verify_api_key, get_agent, _mark_foreground
 from ..core.planning import ProjectPlan, TaskStatus
 from ..core.project_advancer import (
     advance_once,
@@ -232,17 +232,27 @@ async def advance_project(pid: str, request: Request):
         return await handler(**args)
 
     from ..core.coding_executor import build_coding_task
-    # Pin the event stamp to the project being advanced (as the idle tick
-    # and tool path both do) — otherwise workspace events stamp whatever
-    # project the chat side currently has active.
-    with pinned_event_project(pid):
-        result = await advance_once(
-            ctx, pid,
-            tool_runner=_run,
-            llm_classifier=default_llm_classifier(ctx),
-            code_generator=default_code_generator(ctx),
-            coding_executor=build_coding_task,
-        )
+    # §4CB R1 A-F1: mark the WHOLE advance as a foreground request (same
+    # bracket as game_routes). This route runs an LLM classifier plus a
+    # 4096-token code generation on the main slot; unmarked, the biological
+    # tick treated the process as idle and ran journal consolidation
+    # MID-advance, and the RSS watchdog's opt-in execv restart could kill
+    # the process mid-advance. try/finally so a raise never leaks the count.
+    _mark_foreground(get_agent(request), +1)
+    try:
+        # Pin the event stamp to the project being advanced (as the idle tick
+        # and tool path both do) — otherwise workspace events stamp whatever
+        # project the chat side currently has active.
+        with pinned_event_project(pid):
+            result = await advance_once(
+                ctx, pid,
+                tool_runner=_run,
+                llm_classifier=default_llm_classifier(ctx),
+                code_generator=default_code_generator(ctx),
+                coding_executor=build_coding_task,
+            )
+    finally:
+        _mark_foreground(get_agent(request), -1)
     return {
         "ok": result.ok,
         "task_id": result.task_id,

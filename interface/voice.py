@@ -57,15 +57,40 @@ logger = logging.getLogger(__name__)
 AUDIO_NODE_URL = os.environ.get("GHOST_AUDIO_NODE_URL", "http://100.83.184.117:8088")
 AUDIO_NODE_MODEL = os.environ.get("GHOST_AUDIO_NODE_MODEL", "gemma")
 
+def _env_num(name: str, default, cast=float):
+    """Env override that cannot crash the process at IMPORT. See the twin in
+    interface/server.py: a typo'd or EMPTY value made `float()` raise during
+    module import, and under a KeepAlive LaunchDaemon that is a permanent,
+    silent crash-loop (R3 lens A)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return cast(default)
+    try:
+        val = cast(raw)
+    except (TypeError, ValueError):
+        logging.getLogger("GhostInterface").warning(
+            "%s=%r is not a number — using %s", name, raw, default)
+        return cast(default)
+    # Same positivity clamp as the twin in interface/server.py — it landed
+    # there first and this copy was left behind (R5 lens A). Every consumer
+    # here is a timeout or a ceiling: `GHOST_TTS_TIMEOUT_S=0` makes every
+    # /api/tts fail with "'say' timed out after 0s".
+    if val <= 0:
+        logging.getLogger("GhostInterface").warning(
+            "%s=%r is not positive — using %s", name, raw, default)
+        return cast(default)
+    return val
+
+
 # Per-slot context on nova is `--ctx-size 131072 / -np 4` = 32,768 tokens, and
 # audio costs a measured 25.0 tok/s, so ~21 min is the hard ceiling. 15 min
 # leaves room for the prompt and the transcript itself. Push-to-talk clips are
 # seconds long; this bound exists so a stray large upload fails fast and
 # legibly instead of wedging a slot.
-STT_MAX_SECONDS = float(os.environ.get("GHOST_STT_MAX_SECONDS", "900"))
+STT_MAX_SECONDS = _env_num("GHOST_STT_MAX_SECONDS", 900.0)
 # Must clear the thinking-token budget — see trap 1 in the module docstring.
-STT_MAX_TOKENS = int(os.environ.get("GHOST_STT_MAX_TOKENS", "2048"))
-STT_TIMEOUT_S = float(os.environ.get("GHOST_STT_TIMEOUT_S", "180"))
+STT_MAX_TOKENS = _env_num("GHOST_STT_MAX_TOKENS", 2048, int)
+STT_TIMEOUT_S = _env_num("GHOST_STT_TIMEOUT_S", 180.0)
 
 # Female voice (operator preference, 2026-08-03; was "Samantha", itself a
 # 2026-08-02 replacement for "Daniel", en_GB male). Ava (Premium) is a
@@ -93,8 +118,8 @@ TTS_RATE = os.environ.get("GHOST_TTS_RATE", "")  # words/min; "" = voice default
 # app.js already splits replies into chunks and queues them, so a single
 # request is a sentence or two. The cap stops a pathological chunk from
 # turning into a multi-minute synthesis job.
-TTS_MAX_CHARS = int(os.environ.get("GHOST_TTS_MAX_CHARS", "2000"))
-TTS_TIMEOUT_S = float(os.environ.get("GHOST_TTS_TIMEOUT_S", "60"))
+TTS_MAX_CHARS = _env_num("GHOST_TTS_MAX_CHARS", 2000, int)
+TTS_TIMEOUT_S = _env_num("GHOST_TTS_TIMEOUT_S", 60.0)
 
 # Verbatim transcription, NOT intent extraction. The transcript goes straight
 # to the 35B agent, which is the thing that should be interpreting intent —
@@ -317,12 +342,20 @@ async def synthesize(text: str) -> bytes:
         try:
             await _run_binary([*base[:1], "-v", TTS_VOICE, *base[1:]],
                               timeout=TTS_TIMEOUT_S)
-        except VoiceError:
+        except VoiceError as e:
             # An unknown/uninstalled voice name made `say` exit non-zero, which
             # killed ALL speech — a one-character typo in GHOST_TTS_VOICE, or a
             # voice absent from a given macOS build, took the whole feature
             # down. Fall back to the system default voice: degraded output
             # beats silence, and the warning names the real cause.
+            #
+            # ⚠ ONLY for the non-zero-exit case. A bare `except VoiceError`
+            # also caught the 504 TIMEOUT and the 503 missing-binary, blamed
+            # both on the voice name, and RETRIED — taking the request to
+            # 2 x TTS_TIMEOUT_S (120s) for a `say` that was already hanging
+            # (R3 lens A).
+            if getattr(e, "status", None) != 502:
+                raise
             logger.warning("TTS voice %r unavailable — falling back to the "
                            "system default. Check `say -v '?'`.", TTS_VOICE)
             await _run_binary(base, timeout=TTS_TIMEOUT_S)

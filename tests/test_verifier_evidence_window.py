@@ -243,7 +243,7 @@ def _agent_with_stub_verifier(captured):
         llm_client = object()  # non-None: gate must not skip
 
         async def verify_claim(self, claim, evidence, context="",
-                               *, high_stakes=False, trace=None):
+                               *, high_stakes=False, trace=None, **_kw):
             captured["claim"] = claim
             captured["evidence"] = evidence
             captured["high_stakes"] = high_stakes

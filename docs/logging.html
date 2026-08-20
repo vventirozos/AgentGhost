@@ -231,6 +231,56 @@
   that width.</p>
   <p>Tests: <code>tests/test_log_timing_visibility.py</code>.</p>
 
+  <h2>The 2026-08-20 stream audit (§LOG)</h2>
+  <p>A two-lens audit (716 <code>pretty_log</code> sites inventoried; 16 days
+  of live mirror measured) confirmed the mechanics — zero alignment breaks in
+  6,967 real lines, frames balanced 748/748, repeat-collapse caught every
+  burst — and found seven semantic gaps, all fixed:</p>
+  <ul>
+    <li><strong>Origin on the frames (LOG-4).</strong> 45 of one week's 87
+    turns were self-play wearing a user turn's clothes — <code>origin</code>
+    was mirror-only. Both frame lines now end with a dim
+    <code>· user / · sim / · bench</code> marker, placed <em>after</em> the
+    rule so the three frame parsers (uConsole, Slack, web) are untouched.
+    END reads the origin stashed at BEGIN.</li>
+    <li><strong>The final reply is logged (LOG-3).</strong> A
+    <code>Final Reply</code> 🤖 line lands beside <code>Turn Outcome</code>:
+    60-char head on the console, full text in the mirror — the mirror's
+    "reconstruct a turn" contract was false for the answer itself.</li>
+    <li><strong>Mirror deltas are the console's (LOG-2).</strong>
+    <code>_mirror</code> used to re-call <code>_format_delta</code>; the
+    second STATEFUL read advanced the SYSTEM anchor, so every SYSTEM
+    step-duration in the durable record was ~+0.00s. The delta is now
+    computed once and passed through.</li>
+    <li><strong>Dispatch-level tool line (LOG-5).</strong> One
+    <code>Tool Call</code> 🎬 line per executed call (name + compact args) —
+    before, a tool was visible only if it self-logged; a successful
+    <code>yt_download</code> appeared nowhere. Unknown-tool rejections warn
+    instead of silently striking, and the three strike lines
+    (<code>Execution Fail</code>/<code>Transient Fail</code>/<code>Tool
+    Warning</code>) are WARNING so their error previews get the 240-char
+    budget instead of dying at 60.</li>
+    <li><strong>Idle liveness (LOG-6a).</strong> The once-per-cycle
+    <code>Idle Cycle</code> 📡 summary now reaches the console (it was
+    <code>logger.info</code> → file-only), so a quiet night and a wedged
+    event loop no longer look identical.</li>
+    <li><strong>Stale-process backoff (LOG-6b).</strong> The staleness
+    warning gained a per-file 1h cooldown on top of per-digest dedup — on a
+    dev box every save minted a new digest and re-warned (95 near-identical
+    warnings in 16 days, the #1 WARNING).</li>
+    <li><strong>Icon registry hygiene (LOG-7).</strong> The metacog icons
+    are registered in <code>Icons</code> (three glyph collisions resolved:
+    arbiter 🧮→🥇, replan 🔀→🚦, default 🧠→🫧) and added to both client
+    ICON_CLASS maps; bridged stdlib warnings title as
+    <code>agent·module</code> instead of the anonymous <code>agent</code>;
+    <code>Schedule/Watch Error</code> got ❌ instead of the unclassified 🔹;
+    benign <code>Auto Memory Skip</code> moved off 🛑 to ⏩; deferral lines
+    use ⏳ (waiting, not skipping); the pre-frame-era bare
+    <code>print()</code> thinking dump — which bypassed the stdout lock,
+    the mirror <em>and redaction</em> — is deleted (LOG-1).</li>
+  </ul>
+  <p>Tests: <code>tests/test_logging_stream_fixes.py</code>.</p>
+
 </main>
 </body>
 </html>

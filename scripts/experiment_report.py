@@ -64,6 +64,18 @@ def main() -> int:
         root = Path(args.trajectories) if args.trajectories else _default_root()
     if not root.exists():
         print(f"no trajectory corpus at {root}", file=sys.stderr)
+        if args.json:
+            # R3 finding 5: a bare early return starved --json of the very
+            # keys added so that "absent ≠ healthy" — a pipe consumer got
+            # empty stdout and a JSON parse error instead of a document
+            # saying what is unknown.
+            print(json.dumps({"error": f"no trajectory corpus at {root}",
+                              "coverage": {},
+                              "population": ("bench" if args.bench
+                                             else "live"),
+                              "registry_degraded": None,
+                              "enabled_unstamped": None},
+                             indent=2, sort_keys=True))
         return 0
 
     # Scope filter, DENY form (R6/R7 reviews): exclude every name
@@ -73,14 +85,34 @@ def main() -> int:
     # only ENABLED other-scope names (re-scope-then-disable resurrected
     # the stale stamps). `enabled: false` must stay cost-free to read.
     _deny = None
+    _expected = None
+    _degraded = False
     try:
         from ghost_agent.core.experiments import (
             SCOPE_BENCH, SCOPE_LIVE, load_registry, registry_path)
         _reg = load_registry(registry_path())
         _deny = set(_reg.names_in_scope(
             SCOPE_LIVE if args.bench else SCOPE_BENCH))
+        _degraded = bool(getattr(_reg, "degraded", False))
+        # Introspect review R2 MAJOR-1 — this file's OWN R5 comment above
+        # records the "fixed one file over, re-created here" pattern, and
+        # it happened again: the enabled-but-unstamped zero-row fix (C1,
+        # the shape that hid verify_depth's three inert days) landed in
+        # the introspect surface while this "same report" CLI kept
+        # enumerating only stamped arms. Skipped when the registry is
+        # degraded: the substituted defaults would raise false
+        # "enrollment broken" alarms for specs the operator never listed.
+        if not _degraded:
+            _expected = set(_reg.names_for_scope(
+                SCOPE_BENCH if args.bench else SCOPE_LIVE))
     except Exception:
         _deny = None
+        _expected = None
+    if _degraded:
+        print("WARNING: system/experiments.json exists but is unreadable — "
+              "scope filter reflects the CODE DEFAULTS, and "
+              "enabled-but-unstamped arms cannot be detected",
+              file=sys.stderr)
 
     collector = TrajectoryCollector(root=root, session_id="reader")
     summary, triggered, coverage = summarize_streaming(
@@ -90,7 +122,12 @@ def main() -> int:
 
     if args.json:
         out = {"coverage": coverage,
-               "population": ("bench" if args.bench else "live")}
+               "population": ("bench" if args.bench else "live"),
+               "registry_degraded": _degraded,
+               # Enabled specs with no stamped turn — the machine-readable
+               # form of the n=0 rows (absent key ≠ healthy).
+               "enabled_unstamped": sorted((_expected or set())
+                                           - set(summary))}
         for name, arms in summary.items():
             out[name] = {
                 "arms": {
@@ -98,19 +135,32 @@ def main() -> int:
                           "means": {m: s.mean(m) for m in (s.values or {})}}
                     for arm, s in arms.items()
                 },
+                # experiment=name on BOTH (review R4 C1). The human path
+                # below threads it and this machine path did not, so
+                # `--json` dropped every per-experiment caveat — including
+                # the CIRCULAR annotation on `failure_rate`, which for
+                # tts_bon is the ONLY metric with any n on the bench
+                # population and is already past the verdict floor. A bench
+                # consumer would have read TREATMENT WORSE where the human
+                # report reads NO VERDICT. This file's own comments record
+                # the same "fixed one file over, re-created here" pattern
+                # twice already.
                 "comparisons": [asdict(c) | {"verdict": c.verdict}
-                                for c in compare_arms(arms, alpha=args.alpha)],
+                                for c in compare_arms(arms, alpha=args.alpha,
+                                                      experiment=name)],
                 "triggered_comparisons": [
                     asdict(c) | {"verdict": c.verdict}
                     for c in compare_arms(triggered.get(name, {}),
-                                          alpha=args.alpha)],
+                                          alpha=args.alpha,
+                                          experiment=name)],
             }
         print(json.dumps(out, indent=2, sort_keys=True))
         return 0
 
     print(render_report(summary, alpha=args.alpha, triggered=triggered,
                         coverage=coverage,
-                        population=("bench" if args.bench else "live")))
+                        population=("bench" if args.bench else "live"),
+                        expected_names=_expected))
     return 0
 
 

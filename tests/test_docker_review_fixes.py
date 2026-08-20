@@ -90,6 +90,54 @@ class TestResumeStopped:
         with patch.object(DockerSandbox, "_is_container_ready", return_value=False):
             assert sb._try_resume_stopped() is False  # → caller recreates
 
+    def test_resume_REFRESHES_started_at_so_the_generation_stamp_changes(self):
+        """§4BW R2 CRITICAL. The R1 generation-stamp fix reads
+        `container.attrs['State']['StartedAt']`, but docker-py's `start()`
+        does NOT refresh `.attrs` and `_try_resume_stopped` reloaded only
+        BEFORE start — so the stamp was identical across a resume and the
+        recycled-pid kill stayed armed. The R1 unit test MISSED this because
+        its stub `reload()` was a no-op and it hand-wrote the new StartedAt,
+        i.e. it simulated the refresh real docker never does.
+
+        This uses a FAITHFUL container: `reload()` pulls the daemon's current
+        StartedAt into attrs; `start()` advances the daemon clock but leaves
+        attrs untouched (exactly docker-py). After a resume, attrs must hold
+        the NEW StartedAt — which only happens if the fix reloads after start.
+        Mutation witness: delete the post-start `c.reload()` and attrs keeps
+        the stale value, failing here."""
+        class _FaithfulContainer:
+            def __init__(self):
+                self._daemon_started = "2026-08-19T08:00:00Z"
+                self._status = "exited"
+                self.attrs = {"State": {"StartedAt": ""}}  # never refreshed yet
+                self.id = "cid-abc"
+
+            @property
+            def status(self):
+                return self._status
+
+            def reload(self):
+                # docker-py: reload pulls the daemon's CURRENT truth.
+                self.attrs = {"State": {"StartedAt": self._daemon_started,
+                                        "Status": self._status}}
+
+            def start(self):
+                # A real (re)start advances the daemon's StartedAt and
+                # transitions to running — but does NOT touch `.attrs`.
+                self._daemon_started = "2026-08-19T10:22:00Z"
+                self._status = "running"
+
+        sb = _bare_sandbox()
+        sb.container = _FaithfulContainer()
+        with patch.object(DockerSandbox, "_is_container_ready",
+                          return_value=True):
+            assert sb._try_resume_stopped() is True
+        got = sb.container.attrs["State"]["StartedAt"]
+        assert got == "2026-08-19T10:22:00Z", (
+            f"after a resume, attrs.StartedAt is {got!r} — stale. The "
+            f"generation stamp will be identical across the resume and a "
+            f"recycled pid still reads ALIVE (the wrong-process kill).")
+
 
 class TestSpillCounterSeed:
     def test_seeds_past_existing_logs(self, tmp_path):

@@ -1980,8 +1980,22 @@ class EscalatingChatClient(HttpChatClient):
                 main_body = dict(payload)
                 if self.main_model:
                     main_body.setdefault("model", self.main_model)
-                return await self._post_cached(
+                _main_res = await self._post_cached(
                     self._main_client, self.main_base_url, main_body)
+                # ⚠ STAMP THE LEG, exactly as production's LLMClient now does.
+                # This shim emulates the critic→main fallback; since
+                # 2026-08-18 the runtime marks such a result `served_by:
+                # "main"`, and the verifier reports `route="main"`, which
+                # trips §4BR's degradation guard and BREAKS the
+                # self-consistency vote at that sample. Without the stamp the
+                # bench reported `route="critic"`, drew all n samples, and so
+                # measured a decision rule the runtime no longer runs —
+                # precisely on the degraded path the bench already counts as
+                # `route_failures` (R2 lens A: the fix broke the instrument
+                # that measures it).
+                from ..core.llm import _stamp_leg
+                return _stamp_leg(_main_res, "main",
+                                  fell_back_from="critic", requested="critic")
         body = dict(payload)
         if self.main_model:
             body.setdefault("model", self.main_model)

@@ -624,6 +624,42 @@ async def test_tool_browser_interact_rewrites_screenshot_subaction_paths(tmp_pat
     assert "actions[0]" in traversal_result
 
 
+async def test_atomic_screenshot_out_path_traversal_is_blocked(tmp_path):
+    """§5 lens C (M18): the ATOMIC screenshot op's out_path confinement was
+    unpinned — removing `_get_safe_path(sandbox_dir, target)` at the call
+    site SURVIVED the whole browser suite, and a `../../../tmp/...` out_path
+    genuinely escaped host-side (the `host_out.parent.mkdir(parents=True)`
+    created a directory OUTSIDE the sandbox). Only the interact sub-action
+    had a traversal test. This pins the atomic op the same way."""
+    import os
+    from ghost_agent.tools.browser import tool_browser
+
+    runner_payload = {"url": "http://x", "path": "/workspace/s.png",
+                      "title": "t", "used_last_url": False}
+    stub = _make_sandbox_stub(f"[BROWSER_OK] {json.dumps(runner_payload)}\n")
+
+    escape = "../../../../../../tmp/ghost_r2_escape_probe/pwn.png"
+    outside = Path("/tmp/ghost_r2_escape_probe")
+    if outside.exists():
+        import shutil
+        shutil.rmtree(outside, ignore_errors=True)
+
+    result = await tool_browser(
+        operation="screenshot", url="http://x", out_path=escape,
+        sandbox_dir=tmp_path, sandbox_manager=stub,
+    )
+    assert "ERROR" in result, (
+        f"a traversal out_path was not refused: {result[:160]!r}")
+    # The host-side escape: the mkdir must NOT have created a dir outside the
+    # sandbox root. This is what actually escaped under the mutation.
+    assert not outside.exists(), (
+        f"the traversal out_path created {outside} OUTSIDE the sandbox "
+        f"host-side — path confinement is bypassed")
+    # And the runner must never have been asked to write the escaping path.
+    if stub.last_command:
+        assert "/tmp/ghost_r2_escape_probe" not in stub.last_command
+
+
 def test_browser_tool_definition_includes_interact():
     from ghost_agent.tools.registry import TOOL_DEFINITIONS
     browser_def = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "browser")

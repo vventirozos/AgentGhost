@@ -155,10 +155,15 @@ def test_backstop_wired_into_finalize_and_stream():
     src = (_SRC / "core" / "agent.py").read_text()
     idx = src.find("def _finalize_and_return")
     assert idx > 0
-    assert "_notify_promise_backstop(" in src[idx:idx + 60000]
+    # window = the whole method (to the next method def), not a magic char
+    # count — a 60000-char window silently broke when § finalize/stream R1
+    # grew the method above it (the backstop call slid past the window).
+    end = src.find("\n    async def ", idx + 1)
+    assert end > idx
+    assert "_notify_promise_backstop(" in src[idx:end]
     # honest failure signal: strike count, never force_stop (dream/self-play
     # successes set force_stop and would read as "stopped after failures")
-    w = src[idx:idx + 60000]
+    w = src[idx:end]
     wiring = w[w.find("_notify_promise_backstop("):]
     assert "had_failures=execution_failure_count >= 3" in wiring[:600]
     # backstop stays simulation-gated (and, since the notify-promise

@@ -1827,7 +1827,19 @@ class Dreamer:
         self.memory = agent_context.memory_system
 
     async def dream(self, model_name: str = "qwen-3.6-35b-a3"):
+        # §4CB R1 B-M1: OUTCOME SURFACE. The idle tick used to classify this
+        # method's outcome by substring-probing the returned human message —
+        # which couldn't see "Dream error:" / "Memory system not available."
+        # and so ledgered failures as "REM cycle ran" (blinding the
+        # EXPECT_PERIODIC liveness alarm) while resetting the skip-streak
+        # backoff (max-cadence refire of a permanently failing dream). Every
+        # terminal site below stamps this dict; None = "did not conclude"
+        # (raise). Mirrors last_bench_result / last_self_play_status.
+        # phase: "ran" | "skipped" | "error"; side_output: True when a skip
+        # still produced episodic/distillation/digest side work.
+        self.last_dream_outcome = None
         if not self.memory or not self.memory.collection:
+            self.last_dream_outcome = {"phase": "error", "side_output": False}
             return "Memory system not available."
 
         # Entry is announced AFTER the freshness gate below (2026-07-29):
@@ -1927,6 +1939,7 @@ class Dreamer:
             )
         except Exception as e:
             msg = f"Dream error: {e}"
+            self.last_dream_outcome = {"phase": "error", "side_output": False}
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
 
@@ -1967,6 +1980,14 @@ class Dreamer:
                     msg += f" Distilled {distilled_lessons} failure-pattern lesson(s)."
                 if project_digests:
                     msg += f" Wrote {project_digests} project digest(s)."
+                # side_output from the actual counts — the old tick-side
+                # substring probe ("digest") matched THIS bare message's
+                # "trajectory/self-play digests", permanently disarming the
+                # skip-streak backoff on the entropy-skip path (B-MINOR-5).
+                self.last_dream_outcome = {
+                    "phase": "skipped",
+                    "side_output": bool(episode_lessons or distilled_lessons
+                                        or project_digests)}
                 pretty_log("Dream Mode", msg, icon=Icons.DREAM)
                 return msg
 
@@ -2023,6 +2044,10 @@ class Dreamer:
                 msg += f" Distilled {distilled_lessons} failure-pattern lesson(s)."
             if project_digests:
                 msg += f" Wrote {project_digests} project digest(s)."
+            self.last_dream_outcome = {
+                "phase": "skipped",
+                "side_output": bool(episode_lessons or distilled_lessons
+                                    or project_digests)}
             pretty_log("Dream Mode", msg, icon=Icons.SKIP)
             return msg
 
@@ -2456,11 +2481,13 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 msg = ("Dream Complete — produced nothing this cycle: no "
                        "consolidation met the compression bar and extracted "
                        f"{h_count} heuristics.{metrics_note}")
+            self.last_dream_outcome = {"phase": "ran", "side_output": True}
             pretty_log("Dream Mode", msg, icon=Icons.OK)
             return msg
 
         except Exception as e:
             msg = f"Dream error: {e}"
+            self.last_dream_outcome = {"phase": "error", "side_output": False}
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
 
@@ -3652,6 +3679,15 @@ Return ONLY a JSON object with:
         # stale prior sim's trigger list. Stamped with the real list at
         # sim conclusion, next to last_self_play_status.
         self.last_selfplay_hydrated_triggers = None
+        # §4CB R2 A-MAJ-1: last_self_play_status itself was the ONE surface
+        # missing from this pre-clear block. The tick's counterfactual arm
+        # stamps "" on this SAME Dreamer instance (counterfactual.py) before
+        # each replay; when the replay raises and the slot falls through to
+        # a fresh self-play, a non-concluding run kept the leftover "" and
+        # the ledger gate ("is the surface set?") minted the exact false
+        # "session ran" row §4CB R1 B-M2 shipped to eliminate. None = "no
+        # sim concluded"; the ONLY stamp site is sim conclusion below.
+        self.last_self_play_status = None
 
         system_message = SYNTHETIC_CHALLENGE_PROMPT
 

@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from ghost_agent.core.llm import LLMClient
+from ghost_agent.core.llm import LLMClient, RoutingTask
 from ghost_agent.utils.logging import request_id_context
 
 
@@ -135,22 +135,68 @@ def test_sse_usage_is_parsed_from_bytes_too():
     assert (got["tokens_in"], got["tokens_out"]) == (9, 2)
 
 
-def test_every_completion_path_counts_usage():
-    """A missed funnel under-reports the turn's cost silently, and in the
-    direction that flatters it. `route()` was missed on the first pass — it
-    serves verify / decompose / classification on the worker pool.
-    """
+def test_a_routed_call_is_counted_EXACTLY_ONCE():
+    """⚠ THIS TEST USED TO FORCE A DEFECT.
+
+    It was an AST assertion that `route`, `chat_completion` and
+    `_do_stream_chat_completion` each CONTAIN a `_note_usage` call — a
+    structural proxy for the semantic property "each response is counted
+    once". `route()` delegates to `chat_completion()`, so the honest
+    implementation has no `_note_usage` of its own and FAILED the check;
+    adding a second one satisfied it and made every worker-routed call
+    (query expansion, decompose, classify, VERIFY) report exactly 2x its
+    tokens into `Trajectory.tokens_in/out` and into the OpenAI `usage` block
+    returned to API clients — and write every §4BG fixture twice.
+
+    Count the mechanism instead: one HTTP response, one tally.
+    (§4BN: pin identity, not a property.)"""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    c = _client()
+    c.worker_clients = [{"url": "http://w", "model": "wm",
+                         "client": MagicMock(), "name": "W"}]
+    payload_seen = []
+
+    async def _fake_do(payload, *a, **kw):
+        payload_seen.append(payload)
+        return {"choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10}}
+
+    c._do_chat_completion = _fake_do
+    recorded = []
+    c._maybe_record_call = lambda *a, **kw: recorded.append(kw.get("kind", "chat"))
+
+    _with_req("req-once", lambda: asyncio.run(
+        c.route("CLASSIFY_INTENT", {"model": "m", "messages": []},
+                fallback="FB")))
+    got = c.usage_for("req-once")
+    assert (got["tokens_in"], got["tokens_out"]) == (100, 10), (
+        f"one routed call counted as {got} — the tally is doubled")
+    assert got["calls"] == 1, f"one HTTP response, {got['calls']} calls counted"
+    assert len(recorded) == 1, (
+        f"one routed call wrote {len(recorded)} recordings — duplicate "
+        f"fixtures in the mining corpus")
+
+
+def test_every_completion_path_still_reaches_the_counter():
+    """The property the AST check was reaching for, stated honestly: every
+    path that completes a call must END UP counted — directly or through a
+    delegate. `route` delegates; the other two count themselves."""
     import ast
     import inspect
     import textwrap
 
-    for name in ("route", "chat_completion", "_do_stream_chat_completion"):
+    for name in ("chat_completion", "_do_stream_chat_completion"):
         fn = getattr(LLMClient, name)
         tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
         calls = {c.func.attr for c in ast.walk(tree)
                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
         assert calls & {"_note_usage", "_note_usage_from_sse"}, (
             f"LLMClient.{name} completes a call without counting its tokens")
+    route_src = inspect.getsource(LLMClient.route)
+    assert "chat_completion(" in route_src, (
+        "route() no longer delegates, so it must count for itself")
 
 
 def test_api_usage_block_survives_a_mock_llm_client():

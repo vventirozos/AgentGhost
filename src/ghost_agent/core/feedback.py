@@ -167,17 +167,36 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     "code": "bad_request"}
         sig = str(signal or "").strip().lower()
         if sig not in VALID_SIGNALS:
+            logger.warning(
+                "human feedback REJECTED for req %s — signal %r is not one "
+                "of %s; this label is LOST", rid[:12], signal,
+                list(VALID_SIGNALS))
             return {"ok": False, "code": "bad_request",
                     "error": f"signal must be one of {list(VALID_SIGNALS)}"}
 
         ctx = getattr(agent, "context", None)
         collector = getattr(ctx, "trajectory_collector", None)
         if collector is None:
+            logger.warning(
+                "human feedback DROPPED for req %s — no trajectory "
+                "collector is wired, so the label cannot be recorded at "
+                "all", rid[:12])
             return {"ok": False, "error": "trajectory collector is not wired",
                     "code": "unavailable"}
 
         traj = find_trajectory_for_request(collector, rid)
         if traj is None:
+            # ⚠ THE LOSS PATH THAT MATTERS, and it logged NOTHING: the
+            # client raced the trajectory write, or the id never matched.
+            # Slack retries once; the web UI retried only on 404 (5xx —
+            # e.g. the agent restarting, the window a deploy itself
+            # creates — fell through to a transient chat bubble and
+            # nothing durable). With ~0.77 qualifying turns/day feeding
+            # §4BR's 7-week clock, a silently lost label costs days.
+            logger.warning(
+                "human feedback NOT RECORDED for req %s — no trajectory "
+                "matched (client may have raced the write). If this "
+                "repeats, labels are being lost silently.", rid[:12])
             return {"ok": False, "code": "not_found",
                     "error": f"no trajectory found for request_id {rid!r}"}
 

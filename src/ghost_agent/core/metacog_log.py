@@ -52,24 +52,27 @@ class Subsystem:
     SUMMARY = "summary"    # shutdown / periodic rollup
 
 
-# Per-subsystem icons. Picked to be visually distinct from each other
-# AND from the icons already in ``utils.logging.Icons`` (BRAIN_THINK
-# 💭, BRAIN_PLAN 📋, BRAIN_CTX 🧩, BRAIN_AIM 🎯, SHIELD 🛡️,
-# BELIEF_SCALES ⚖️, EVENT_BUS 📡, HEARTBEAT 🫀, etc.) — the previous
-# version emitted every metacog line with 💭 which was
-# indistinguishable from the agent's own thinking trace.
+# Per-subsystem icons — REGISTERED in ``utils.logging.Icons`` since §LOG-7
+# (2026-08-20). The previous literal map was a registry bypass with three
+# glyph COLLISIONS against registry meanings (🧮 arbiter vs VECTOR_EMBED,
+# 🔀 replan vs EVENT_BUS, 🧠 default vs BRAIN_SUM), and its unregistered
+# glyphs were unknown to the interface ICON_CLASS maps, so every metacog
+# line degraded to the generic "think" class on the uConsole/web tickers.
+# One source of truth: the registry; this map only picks per subsystem.
+from ..utils.logging import Icons as _Icons
+
 _SUBSYSTEM_ICONS = {
-    Subsystem.BOOT:    "🌱",   # sprout — startup / lifecycle
-    Subsystem.SUMMARY: "📊",   # bar chart — rollup
-    Subsystem.CONF:    "📈",   # trend chart — confidence reading (wide-base; was 🌡️)
-    Subsystem.CALIB:   "📐",   # ruler — calibration measurement / Brier refit
-    Subsystem.ARBITER: "🧮",   # abacus — decision / weighing candidates
-    Subsystem.VALID:   "🚧",   # construction barrier — pre-exec block
-    Subsystem.HOST:    "💻",   # laptop — host resource signal (wide-base; was 🖥️)
-    Subsystem.REPLAN:  "🔀",   # shuffle — alternate route
-    Subsystem.GATE:    "🚪",   # door — gate pass / skip (debug)
+    Subsystem.BOOT:    _Icons.METACOG_BOOT,      # 🌱 sprout — lifecycle
+    Subsystem.SUMMARY: _Icons.METACOG_SUMMARY,   # 📊 bar chart — rollup
+    Subsystem.CONF:    _Icons.METACOG_CONF,      # 📈 trend — confidence
+    Subsystem.CALIB:   _Icons.METACOG_CALIB,     # 📐 ruler — Brier refit
+    Subsystem.ARBITER: _Icons.METACOG_ARBITER,   # 🥇 winner — arbiter pick
+    Subsystem.VALID:   _Icons.METACOG_VALID,     # 🚧 barrier — pre-exec block
+    Subsystem.HOST:    _Icons.METACOG_HOST,      # 💻 laptop — host signal
+    Subsystem.REPLAN:  _Icons.METACOG_REPLAN,    # 🚦 signals — replan bridge
+    Subsystem.GATE:    _Icons.METACOG_GATE,      # 🚪 door — gate skip (debug)
 }
-_DEFAULT_ICON = "🧠"           # generic metacog (used if subsystem is unknown)
+_DEFAULT_ICON = _Icons.METACOG   # 🫧 generic metacog (unknown subsystem)
 
 
 # Levels that map directly to pretty_log's `level` kwarg.

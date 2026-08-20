@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 import re
 import secrets
 import shlex
@@ -284,9 +285,26 @@ class ServiceSupervisor:
 
     def _save(self, reg: Dict[str, dict]) -> None:
         self.host_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._registry_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(reg, indent=2))
-        os.replace(tmp, self._registry_path)
+        # ⚠ UNIQUE temp name (§4BW MAJOR). jobs.py fixed this exact shape and
+        # its comment names services.py as the unsafe twin — and it was never
+        # applied here. A fixed `registry.tmp` is not safe against a second
+        # process sharing the workspace (an ablation instance, the test
+        # suite): writer B can truncate the tmp that writer A is mid-write on,
+        # then rename it into place, so A's trailing bytes land in the LIVE
+        # registry. It then parses as garbage, `_load()` returns {}, and every
+        # running service silently loses its row — ports, tokens and project
+        # coupling gone, `valid_service_token` 403s every sandbox app.
+        tmp = self._registry_path.with_suffix(
+            f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            tmp.write_text(json.dumps(reg, indent=2))
+            os.replace(tmp, self._registry_path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
     def list_entries(self) -> list:
         """Public read-only snapshot of the registered services
@@ -414,9 +432,34 @@ class ServiceSupervisor:
         same-numbered pid in the new container is an UNRELATED process
         (review 2026-07-22: PID recycling across a container recreate made
         dead services read RUNNING and pointed stop() at innocents)."""
+        # ⚠ id ALONE IS NOT A GENERATION. `close(remove=False)` +
+        # `_try_resume_stopped` (docker.py) stop and restart the SAME
+        # container — id unchanged — while resetting its pid counter. So a
+        # service stamped before an agent restart passed the id==id check,
+        # and `_pid_alive` on a RECYCLED pid read an innocent process as the
+        # service (§4BW CRITICAL-1: dungeon-crawler pid 132 / jiu-jitsu pid
+        # 1825 live on this box, dead but stamped current). `State.StartedAt`
+        # changes on every (re)start, so it distinguishes the resume the id
+        # cannot. A legacy id-only stamp then mismatches this id:StartedAt
+        # form and `_entry_alive` reads it dead — the safe direction (never
+        # signals a recycled pid), which is correct because a legacy-stamped
+        # row only survives a restart that already killed its process.
         try:
-            cid = getattr(getattr(self.sandbox, "container", None), "id", None)
-            return str(cid) if cid else None
+            container = getattr(self.sandbox, "container", None)
+            cid = getattr(container, "id", None)
+            if not cid:
+                return None
+            started = ""
+            try:
+                attrs = getattr(container, "attrs", None) or {}
+                started = (attrs.get("State", {}) or {}).get("StartedAt", "")
+                if not started and hasattr(container, "reload"):
+                    container.reload()
+                    attrs = getattr(container, "attrs", None) or {}
+                    started = (attrs.get("State", {}) or {}).get("StartedAt", "")
+            except Exception:  # noqa: BLE001 — attrs/reload may be stubbed
+                started = ""
+            return f"{cid}:{started}" if started else str(cid)
         except Exception:  # noqa: BLE001 — a mock may refuse attributes
             return None
 
@@ -803,22 +846,43 @@ class ServiceSupervisor:
                     logger.info("manage_services: dropped redundant 'cd %s' "
                                 "(workdir=%s already covers it)", _tgt, wd)
                     _cmd_str = _m.group(2).strip()
-            # HOST=0.0.0.0: bind the container's forwarding interface, not
-            # loopback (2026-07-12). In bridge mode docker publishes host
-            # 127.0.0.1:<port> -> container <port>, and a loopback-bound app
-            # never receives the forwarded packets — so it's reachable from
-            # the in-sandbox browser but NOT from the host or a remote device.
-            # 0.0.0.0 is safe: the container is network-isolated. Frameworks
-            # that read HOST (uvicorn/gunicorn --host, `flask run`, many Node
-            # servers) pick it up; the report + docs tell hand-rolled apps to
-            # honour it. This is the code half of "host something remotely-
-            # reachable"; `tailscale serve` on the host is the other half.
+            # HOST bind address depends on the sandbox network mode — this is
+            # a SECURITY boundary, not just a reachability one.
+            #
+            # * BRIDGE mode (macOS default): the container has its own netns
+            #   behind docker NAT. docker publishes host 127.0.0.1:<port> ->
+            #   container <port>, and a loopback-bound app never receives the
+            #   forwarded packets — so it must bind 0.0.0.0. That is safe here
+            #   because 0.0.0.0 inside a NAT-isolated container is NOT a LAN
+            #   address; only the explicitly-published loopback mapping escapes.
+            #
+            # * HOST-netns mode (`--network host`, the Linux DEFAULT): the
+            #   container SHARES the host's network stack. 0.0.0.0 there binds
+            #   EVERY host interface, so the service — hosting UNTRUSTED,
+            #   LLM-generated code with no auth of its own — becomes reachable
+            #   LAN-wide. Bind loopback instead: the operator still reaches it
+            #   at 127.0.0.1:<port> on the host (shared netns) and so does the
+            #   in-sandbox browser, with zero LAN exposure. (binds_host_netns()
+            #   was written for exactly this decision and had never been
+            #   consulted — the mitigation was inert until now.)
+            #
+            # Frameworks that read HOST (uvicorn/gunicorn --host, `flask run`,
+            # many Node servers) pick it up; the report + docs tell hand-rolled
+            # apps to honour it. In bridge mode this is the code half of "host
+            # something remotely-reachable" (`tailscale serve` on the host is
+            # the other half); in host mode remote exposure is likewise an
+            # explicit operator action, never an unauthenticated default.
             _env_prefix = ""
             if port is not None:
+                try:
+                    _host_netns = bool(self.sandbox.binds_host_netns())
+                except Exception:  # noqa: BLE001 — stub/older manager → bridge
+                    _host_netns = False
+                _bind_host = "127.0.0.1" if _host_netns else "0.0.0.0"
                 _env_prefix = (f"export PORT={int(port)}\n"
                                f"export GHOST_SERVICE_PORT={int(port)}\n"
-                               f"export HOST=0.0.0.0\n"
-                               f"export GHOST_SERVICE_HOST=0.0.0.0\n")
+                               f"export HOST={_bind_host}\n"
+                               f"export GHOST_SERVICE_HOST={_bind_host}\n")
             _pidfile_in = f"{CONTAINER_SERVICES_DIR}/{stem}.pid"
             # `exec` the command so the (setsid) shell BECOMES it — same pid,
             # still the session/group leader — so the pid we record IS the real

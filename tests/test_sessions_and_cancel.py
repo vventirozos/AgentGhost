@@ -129,7 +129,17 @@ class TestMergeHistoryStaleReplay:
                _m("user", "completely"), _m("user", "different"),
                _m("user", "thread"), _m("user", "entirely")]
         merged = merge_history(stored, inc)
-        assert len(merged) == len(stored) + len(inc)
+        # ⚠ ASSERTION CHANGED 2026-08-17 (§4BU). This used to require a FULL
+        # concatenation (18), which duplicates the two messages the payload
+        # shares with stored. The rewrite appends only what is genuinely new,
+        # so the result is 16: every new message survives and nothing is
+        # duplicated. The intent — an unrelated payload is appended, not
+        # treated as a replay that replaces history — is asserted below.
+        assert len(merged) == len(stored) + 4
+        for _txt in ("completely", "different", "thread", "entirely"):
+            assert any(x.get("content") == _txt for x in merged), _txt
+        _keys = [(x.get("role"), x.get("content")) for x in merged]
+        assert len(_keys) == len(set(_keys)), "nothing may be duplicated"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -146,6 +156,80 @@ class TestSessionStore:
         assert store.delete(sess.id) is True
         assert store.get(sess.id) is None
         assert store.delete(sess.id) is False
+
+    def test_the_id_guard_is_anchored_at_the_END(self, tmp_path):
+        """`^…$` also matches before a TRAILING NEWLINE in Python, while the
+        interface's `re.fullmatch` does not — so `web-x\n` persisted a file
+        the UI could neither open nor delete (R2 lens C). The two guards are
+        supposed to be the same set."""
+        from ghost_agent.core.sessions import _ID_RE
+        assert not _ID_RE.match("web-x\n"), (
+            "a trailing newline still passes the store's id guard")
+        store = SessionStore(tmp_path)
+        assert store.append_turn("web-x\n", [_m("user", "hi")], "yo") is False
+        assert list(tmp_path.glob("*")) == []
+
+    def test_an_unpersistable_id_is_LOUD(self, tmp_path, caplog):
+        """An id the charset guard rejects makes ``_path()`` return None, so
+        every write is a no-op and the whole conversation is dropped on the
+        floor. That was silent, and the interface's own proxy guard was laxer
+        than this one — so a client minting `web-a.1` looked like it was
+        persisting and never was (review R1 M10).
+
+        The operator watches the live log stream; data loss has to appear
+        there, which means WARNING, not debug."""
+        import logging
+        store = SessionStore(tmp_path)
+        with caplog.at_level(logging.WARNING,
+                             logger="GhostAgent"):
+            ok = store.append_turn("web-a.1", [_m("user", "hi")], "yo")
+        assert ok is False, "an id the store cannot path was accepted"
+        assert store.get("web-a.1") is None
+        recs = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert recs, "the session vanished with no WARNING on the stream"
+        blob = " ".join(r.getMessage() for r in recs)
+        assert "web-a.1" in blob, f"the WARNING does not name the id: {blob}"
+        assert "persist" in blob.lower() or "durable" in blob.lower(), blob
+
+    def test_the_write_path_has_its_own_id_backstop(self, tmp_path, caplog):
+        """``_write`` carries a SECOND id guard behind ``append_turn``'s.
+
+        Called directly, because nothing in the public API can reach it: both
+        callers validate first. It is defence in depth against a future
+        caller that doesn't — and an unpinned defensive guard is exactly the
+        kind that gets deleted as dead code, or silently stops warning
+        (mutation M10b survived the whole suite before this test existed).
+        A path-traversal id must produce no file ANYWHERE, not just a False."""
+        import logging
+        store = SessionStore(tmp_path)
+        sess = Session(id="../escaped")
+        with caplog.at_level(logging.WARNING, logger="GhostAgent"):
+            assert store._write(sess) is False
+        assert not (tmp_path.parent / "escaped.json").exists(), (
+            "the write escaped the session root")
+        assert list(tmp_path.glob("*.json")) == []
+        blob = " ".join(r.getMessage() for r in caplog.records
+                        if r.levelno >= logging.WARNING)
+        assert "escaped" in blob, f"the backstop refused silently: {blob}"
+
+    def test_a_failed_write_is_LOUD(self, tmp_path, caplog):
+        """A write that raises (disk full, permissions, a read-only volume)
+        was ``logger.debug`` — the operator's stream showed nothing while
+        every turn silently failed to persist."""
+        import logging
+        from unittest.mock import patch
+        store = SessionStore(tmp_path)
+        sess = store.create()
+        assert sess is not None
+        with caplog.at_level(logging.WARNING,
+                             logger="GhostAgent"):
+            with patch("builtins.open", side_effect=OSError("No space left")):
+                ok = store.append_turn(sess.id, [_m("user", "hi")], "yo")
+        assert ok is False
+        recs = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert recs, "a losing write is still debug-level"
+        blob = " ".join(r.getMessage() for r in recs)
+        assert "No space left" in blob, f"the cause was discarded: {blob}"
 
     def test_append_turn_roundtrip(self, tmp_path):
         store = SessionStore(tmp_path)
@@ -552,6 +636,69 @@ class TestSessionsAPI:
             msgs = [m["content"] for m in
                     c.get("/api/sessions/s3").json()["messages"]]
             assert msgs == ["one", "the reply", "two", "the reply"]
+
+    def test_the_route_persists_the_TAIL_not_a_SLICE(self, tmp_path):
+        """§4BU C2 pinned WHERE IT ACTUALLY LIVES.
+
+        The property suite imports `merge_history_detail` and cannot see
+        `routes.py`, and the one fat-client route test above happens to have
+        an empty `lead`, where the slice is coincidentally correct. So
+        injecting the original defect into the route —
+        `_new_msgs = _merged[len(_stored):]` — left all 141 session tests
+        green (R3 lens C).
+
+        The discriminating case needs a non-empty `lead`: a client that
+        still holds messages the store's cap evicted. Then the slice
+        re-appends the last len(lead) STORED messages every single turn —
+        the quadratic doubling, back."""
+        app, agent = _make_app(tmp_path)
+        store = agent.context.session_store
+        # Store is missing q1/A1 (as if the cap had evicted them); the
+        # client still replays them.
+        store.append_turn("s-lead", [_m("user", "q2")], "A2")
+        with TestClient(app) as c:
+            c.post("/api/chat", json={
+                "model": "test-model", "stream": False, "session_id": "s-lead",
+                "messages": [
+                    {"role": "user", "content": "q1"},
+                    {"role": "assistant", "content": "A1"},
+                    {"role": "user", "content": "q2"},
+                    {"role": "assistant", "content": "A2"},
+                    {"role": "user", "content": "q3"},
+                ],
+            })
+        msgs = [(m["role"], m["content"])
+                for m in store.get("s-lead").messages]
+        assert msgs == [("user", "q2"), ("assistant", "A2"),
+                        ("user", "q3"), ("assistant", "the reply")], (
+            f"the route re-persisted already-stored messages: {msgs}")
+
+    def test_a_reply_survives_an_EMPTY_tail(self, tmp_path):
+        """`_persist_session` used to early-return whenever the tail was
+        empty, discarding the reply the agent had just generated. Reachable
+        whenever a client re-sends a history whose last message is already
+        stored — the store then keeps a bare user message forever and every
+        replay repeats the turn.
+
+        Unpinned before this: no suite exercised "empty tail + real
+        assistant text", and the property harness structurally cannot
+        (it asserts the tail is never empty) — R3 lens C."""
+        app, agent = _make_app(tmp_path)
+        store = agent.context.session_store
+        store.append_turn("s-empty", [_m("user", "hello")], "")
+        before = [(m["role"], m["content"])
+                  for m in store.get("s-empty").messages]
+        assert before == [("user", "hello")], before
+        with TestClient(app) as c:
+            c.post("/api/chat", json={
+                "model": "test-model", "stream": False,
+                "session_id": "s-empty",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+        after = [(m["role"], m["content"])
+                 for m in store.get("s-empty").messages]
+        assert after == [("user", "hello"), ("assistant", "the reply")], (
+            f"the reply was discarded because the tail was empty: {after}")
 
     def test_no_session_id_is_unchanged_behaviour(self, tmp_path):
         app, _ = _make_app(tmp_path)

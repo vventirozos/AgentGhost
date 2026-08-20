@@ -360,6 +360,19 @@ REPLY_INDEX_PATH = os.environ.get(
     "/Users/vasilis/Data/AI/Logs/ghost-slack-reply-index.json")
 _REPLY_INDEX: "OrderedDict[str, dict]" = OrderedDict()
 _REPLY_INDEX_MAX = 500
+# Has this process actually LOADED the on-disk index? `_save_reply_index`
+# writes the whole in-memory dict, so saving before a load REPLACES the
+# file's contents with whatever this process happens to hold.
+#
+# That is not hypothetical: importing this module under pytest (which never
+# runs `main()`, the only caller of `_load_reply_index`) and registering one
+# reply truncated the operator's live index to a single test fixture,
+# destroying the reply→request mapping for every older bot reply — i.e.
+# silently killing 👍/👎 on all of them. Env isolation is the first line of
+# defence and was added in the same pass; this is the belt, because the
+# defect class here is "a guard that stops guarding when someone writes the
+# next test file".
+_REPLY_INDEX_LOADED_PATH: str | None = None
 
 # Reaction name → feedback signal. Slack sends skin-tone variants as
 # "+1::skin-tone-3" — classify on the base name.
@@ -384,6 +397,8 @@ def _reply_key(channel: str | None, ts: str | None) -> str:
 
 
 def _load_reply_index() -> None:
+    global _REPLY_INDEX_LOADED_PATH
+    _REPLY_INDEX_LOADED_PATH = REPLY_INDEX_PATH
     if not REPLY_INDEX_PATH:
         return
     try:
@@ -402,7 +417,26 @@ def _load_reply_index() -> None:
 
 
 def _save_reply_index() -> None:
+    global _REPLY_INDEX_LOADED_PATH
     if not REPLY_INDEX_PATH:
+        return
+    # THE INVARIANT: never replace contents this process has not read.
+    # Writing a path that does not exist yet truncates nothing, so that is
+    # allowed (a first-run bot, and legitimate tests that repoint the path
+    # at a fresh tmp file). Writing an EXISTING file we never loaded is the
+    # destructive case — it replaces real entries with a partial in-memory
+    # view, which is how the operator's live index was reduced to one test
+    # fixture. Comparing the loaded PATH (not a bool) also catches a
+    # mid-process repoint.
+    if _REPLY_INDEX_LOADED_PATH != REPLY_INDEX_PATH and \
+            os.path.exists(REPLY_INDEX_PATH):
+        # Loud: a silent skip would hide a real bot mis-start.
+        logger.warning(
+            "reply index save REFUSED — %s already exists and was never "
+            "loaded in this process, so writing would REPLACE its "
+            "contents. (Under pytest this means a live path leaked into a "
+            "test; set GHOST_SLACK_REPLY_INDEX='' — the conftest autouse "
+            "fixture does this.)", REPLY_INDEX_PATH)
         return
     try:
         # Atomic replace, not truncate-in-place: the documented deploy is
@@ -410,10 +444,28 @@ def _save_reply_index() -> None:
         # respawns on crash — a torn write would corrupt the file and
         # _load_reply_index would silently start EMPTY, defeating the
         # restart-survival this persistence exists for (R1 review).
+        # Re-check at WRITE time (R2 MINOR-12): the guard above ran against
+        # the path's state a moment ago. If we loaded a MISSING path and
+        # another process created it since, replacing it now would clobber
+        # entries this process never saw. Cheap, and it closes the one state
+        # of six that violated the stated invariant.
+        if _REPLY_INDEX_LOADED_PATH != REPLY_INDEX_PATH and \
+                os.path.exists(REPLY_INDEX_PATH):
+            logger.warning(
+                "reply index save REFUSED at write time — %s appeared after "
+                "the load check; another process owns it",
+                REPLY_INDEX_PATH)
+            return
         tmp = f"{REPLY_INDEX_PATH}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(dict(_REPLY_INDEX), f)
         os.replace(tmp, REPLY_INDEX_PATH)
+        # This process now OWNS the file's contents (R3 m6): without
+        # recording that, the first save CREATED the file and every later
+        # save refused it — "loaded a missing path, then locked myself
+        # out". Production never hit it (main() loads first), but the
+        # docstring promises fresh-tmp-path writes keep working.
+        _REPLY_INDEX_LOADED_PATH = REPLY_INDEX_PATH
     except Exception as e:  # noqa: BLE001 — persistence is best-effort
         logger.warning("reply index save failed: %s", e)
 

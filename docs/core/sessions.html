@@ -52,28 +52,35 @@
   <p>Pass <code>session_id</code> in the <code>/api/chat</code> body and the
   SERVER becomes the source of truth for history. It tolerates both client
   styles, which is what makes adoption incremental:</p>
-  <ul>
-    <li>a <strong>thin</strong> client sends only the new message →
-    <code>stored + incoming</code>;</li>
-    <li>a <strong>fat</strong> client (today's web UI) replays the whole
-    conversation → the incoming list already carries the stored history as its
-    prefix, so it is used <em>as-is</em> rather than appended. This is the
-    check that stops a fat client from <strong>doubling the conversation on
-    every turn</strong>.</li>
-  </ul>
-  <p>Everything past the stored prefix is what this turn adds, and that slice
-  (plus the assistant's reply) is what gets appended — <em>after</em> the turn
-  completes, so a failed turn never leaves a dangling user message with no
-  reply. <strong>Omit <code>session_id</code> and behaviour is exactly as
-  before</strong> (fully client-carried), so every existing client keeps
-  working untouched.</p>
+  <p>⚠ <strong>Rewritten 2026-08-17/18 (§4BU). The thin/fat classifier this
+  section used to describe is GONE</strong>, along with the "used as-is rather
+  than appended" rule and the "everything past the stored prefix" slice — that
+  slice was itself the doubling defect (it re-appended already-stored messages
+  whenever the merge inserted anywhere but the end).</p>
+  <p>There is now <strong>one rule and no thresholds</strong>: longest-common-
+  subsequence alignment of <code>(role, content)</code> against the stored
+  history, then <em>stored, plus whatever of incoming is not already accounted
+  for</em>. Two invariants hold by construction — nothing stored is ever
+  dropped, and nothing already stored is appended twice. Client-side assistant
+  messages are dropped from the persisted tail (assistant turns originate
+  server-side); in the cap-evicted PREFIX, which reaches the prompt only, a
+  complete reply is kept and only a stub the client itself marked
+  <code>*[Aborted]*</code> is dropped. A <code>tool</code> result whose calling
+  assistant was dropped goes with it, because an orphaned
+  <code>tool_call_id</code> is persisted and then poisons every later turn.</p>
+  <p><code>merge_history_detail()</code> returns <code>(merged, new_tail)</code>;
+  the route persists the TAIL, never a slice of the merged list. The reply is
+  persisted even when the tail is empty (a client re-sending an already-stored
+  history used to have its reply discarded forever). <strong>Omit
+  <code>session_id</code> and behaviour is exactly as before</strong> (fully
+  client-carried), so every existing client keeps working untouched.</p>
 
   <h3>Bounds &amp; safety</h3>
   <ul>
     <li>Session ids are opaque tokens (<code>[A-Za-z0-9_-]{1,64}</code>) — a
     <strong>path-traversal guard</strong>, since the id names a file.</li>
     <li>200 sessions (least-recently-updated evicted); 400 messages per session
-    (leading system messages + the newest tail kept, mirroring the agent's own
+    (the most RECENT system messages (§4BU: keeping the oldest evicted the CURRENT prompt) + the newest tail kept, mirroring the agent's own
     500-message cap).</li>
     <li>Malformed messages are dropped rather than persisted (a corrupt session
     would otherwise poison every future turn that loads it); tool-call plumbing
@@ -173,7 +180,17 @@
   <ul>
     <li><strong><code>merge_history</code> compounded the whole conversation every turn (HIGH, closed).</strong> The fat-client detection required the stored history to be an <em>exact</em> prefix of the client's replay; on any divergence it fell through to <code>stored + incoming</code>, so the entire replay was appended again — and <code>append_turn</code> stored it. Measured: 5 &rarr; 11 &rarr; 19 &rarr; 29 messages over four turns (quadratic), until the 400-message cap filled with duplicates and the LLM context was dominated by repeated history.</li>
     <li>Two realisable triggers, both permanent once hit: (a) an <strong>aborted stream</strong> — the server persists the full reply before streaming, so a client that disconnects mid-reply keeps a truncated copy and every subsequent turn diverges; (b) the <strong>message cap</strong> — once a session exceeds <code>MAX_MESSAGES_PER_SESSION</code> the stored copy loses its oldest messages, so the client's replay can never prefix-match again.</li>
-    <li>Detection now tolerates divergence: when the incoming replay aligns with the stored messages everywhere except (at most) the final one — at any offset, which covers the cap-eviction case — the replay is treated as authoritative and <em>replaces</em> the stored copy instead of being concatenated onto it. Thin clients (which send only new messages) are unaffected. Regression tests: <code>tests/test_bughunt_fixes_2026_07_27.py::TestSessionMerge</code>.</li>
+    <li>⚠ <strong>The fix described here — "tolerate divergence in at most the
+    final message; treat the replay as authoritative and REPLACE the stored
+    copy" — was itself removed in §4BU.</strong> A one-message tolerance means
+    the SECOND aborted stream in a session breaks detection permanently, and
+    "replace the stored copy" is a licence to delete durable history: a stale
+    tab missing middle messages had them deleted. Both were reproduced. The
+    current design (above) never replaces and never drops; it appends only the
+    unmatched tail. Regression tests:
+    <code>tests/test_sessions_merge_properties.py</code> (property-based, driving
+    the real <code>SessionStore.append_turn</code> with append-only clients) and
+    <code>tests/test_sessions_and_cancel.py</code>.</li>
   </ul>
 </main>
 </body>

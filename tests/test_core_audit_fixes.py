@@ -201,20 +201,58 @@ def _llm_source() -> str:
     return src_path.read_text()
 
 
-def test_vision_retry_loop_has_exhaustion_break():
-    src = _llm_source()
-    # Look for the specific guard pattern we added.
-    assert "exhausted" in src.lower() or "if node in tried_nodes:\n                            break" in src, (
-        "vision retry loop missing exhaustion guard"
-    )
+def test_a_pool_never_re_posts_to_a_node_it_already_tried():
+    """⚠ REPLACES TWO VACUOUS SOURCE-TEXT TESTS.
 
+    They asserted `"exhausted" in src.lower()` — a word that appears ONLY in
+    comments — and `src.count("if node in tried_nodes:\\n") >= 2`, which
+    counts 10 occurrences of which only 5 are guards (the rest are re-select
+    branches). Mutation-proven: turning all five guards into `pass`, i.e.
+    making them completely inoperative, left BOTH tests green (R2 lens B,
+    item 4).
 
-def test_coding_retry_loop_has_exhaustion_break():
-    src = _llm_source()
-    # The coding loop indents two levels deeper than the worker pool's
-    # equivalent; we check for at least two `if node in tried_nodes: break`
-    # occurrences (vision + coding).
-    occurrences = src.count("if node in tried_nodes:\n")
-    assert occurrences >= 2, (
-        f"expected ≥2 exhaustion guards (vision + coding); found {occurrences}"
-    )
+    The guard is load-bearing: without it an already-tried node is re-POSTed,
+    burning a second full timeout and recording a second breaker failure from
+    one logical call. Measure the POSTs."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from ghost_agent.core.llm import LLMClient
+
+    calls = {"a": 0, "b": 0}
+
+    def _node(tag, url):
+        cli = MagicMock()
+
+        async def _fail(*a, **kw):
+            calls[tag] += 1
+            raise RuntimeError(f"{tag} down")
+
+        cli.post = AsyncMock(side_effect=_fail)
+        return {"url": url, "model": f"m-{tag}", "client": cli, "name": tag}
+
+    c = LLMClient("http://upstream.invalid:8080")
+    c.worker_clients = [_node("a", "http://a"), _node("b", "http://b")]
+    c._worker_index = 0
+    # Trip both breakers so the selector's is_available() filter is exercised
+    # too — this is the state in which the guard matters.
+    for url in ("http://a", "http://b"):
+        for _ in range(5):
+            c.circuit_breaker.record_failure(url)
+
+    try:
+        asyncio.run(c._do_chat_completion(
+            {"model": "m", "messages": []}, use_worker=True,
+            off_main_only=True, timeout=5.0))
+    except Exception:
+        pass
+
+    # ⚠ PER-NODE, not the total. `total <= len(pool)` is satisfied by
+    # hammering ONE node twice — which is exactly the defect — because with
+    # both breakers open the selector returns pool[0] every time. The first
+    # version of this replacement passed with all five guards neutered.
+    assert max(calls.values()) <= 1, (
+        f"a node was POSTed to {max(calls.values())} times for ONE logical "
+        f"call ({calls}) — the exhaustion guard is inoperative, so an "
+        f"already-tried node burns a second full timeout and records a "
+        f"second breaker failure")
+    assert sum(calls.values()) <= len(c.worker_clients), calls

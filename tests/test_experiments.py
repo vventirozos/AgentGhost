@@ -494,7 +494,11 @@ def test_metric_alpha_split_is_actually_applied():
         ex.summarize_trajectories(trajs)["risk_steer"]) if c.metric == "n_steps")
     vals = [4.0] * 200
     unsplit = ex.asymp_cs_radius(vals, alpha=0.05 / 2)      # arms only
-    split = ex.asymp_cs_radius(vals, alpha=0.05 / 3 / 2)    # arms AND metrics
+    # Derived from the CONSTANT, not hardcoded: the literal "3" broke the
+    # moment a metric was added (§4BS follow-up), which made a correct
+    # Bonferroni change look like a regression.
+    split = ex.asymp_cs_radius(
+        vals, alpha=0.05 / ex._tested_metric_count() / 2)
     assert split > unsplit
     # The reported half-width is the sum of the two per-arm radii, and it must
     # be built from the SPLIT alpha.
@@ -926,3 +930,36 @@ def test_bounded_data_scale_has_no_discontinuity():
     inside = ex.asymp_cs_radius([0.3] * 40)
     edge = ex.asymp_cs_radius([-0.001] + [0.3] * 39)
     assert edge >= inside * 0.99
+
+
+# ── Introspect fresh-eye review C1 (2026-08-17): enabled-but-unstamped ─────
+
+def test_an_enabled_arm_with_ZERO_stamps_gets_an_explicit_row():
+    """THE report structurally could not show the §4BR inert-arm bug: it
+    enumerates only experiments that already HAVE stamps, so verify_depth's
+    three 100%-inert days rendered as... nothing. No row, no zero, while
+    the coverage line read reassuringly. An instrument that omits the
+    broken case renders the healthy ones more convincingly."""
+    trajs = [_traj("control") for _ in range(3)]
+    out = ex.render_report(ex.summarize_trajectories(trajs),
+                           expected_names=["risk_steer", "brand_new_arm"])
+    assert "risk_steer" in out
+    assert "brand_new_arm  (n=0)" in out
+    assert "enabled in the registry but NO enrolled turn" in out
+    # The hint names the actual failure mode from §4BR.
+    assert "system/experiments.json" in out
+
+
+def test_a_stamped_arm_does_NOT_get_the_zero_row():
+    trajs = [_traj("control"), _traj("treatment")]
+    out = ex.render_report(ex.summarize_trajectories(trajs),
+                           expected_names=["risk_steer"])
+    assert "(n=0)" not in out
+
+
+def test_expected_names_is_optional_and_absent_means_no_rows():
+    """CLI/script callers that pass nothing keep the old shape."""
+    trajs = [_traj("control")]
+    out = ex.render_report(ex.summarize_trajectories(trajs))
+    assert "(n=0)" not in out
+    assert "enabled in the registry" not in out

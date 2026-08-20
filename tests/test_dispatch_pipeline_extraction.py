@@ -160,10 +160,12 @@ async def test_duplicate_readonly_calls_execute_once_but_all_answered():
         calls["n"] += 1
         return f"probe-result-{calls['n']}"
 
-    agent.available_tools = {"probe_tool": probe}
+    # R2: collapse is gated by a read-safe ALLOWLIST, so the tool must be a
+    # real read (`recall`) — a synthetic name is unknown → collapse-unsafe.
+    agent.available_tools = {"recall": probe}
     tc = [
         {"id": f"t{i}", "type": "function",
-         "function": {"name": "probe_tool", "arguments": '{"q": "same"}'}}
+         "function": {"name": "recall", "arguments": '{"q": "same"}'}}
         for i in range(3)
     ]
     ts = _make_ts(tool_calls=tc, strikes=StrikeLedger(),

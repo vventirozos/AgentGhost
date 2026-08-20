@@ -490,7 +490,7 @@ async def _probe_pre_interaction(page):
     Returns ``{pre_interaction: bool, controls: [text,…]}`` (or {} on any
     failure — never raises into the op)."""
     js = """() => {
-      const KW = /click to (play|start)|press (to )?start|start game|tap to (play|start)|enter game|^play$|^start$|^begin$|loading/i;
+      const KW = /click to (play|start)|press (to )?start|start game|tap to (play|start)|enter game|^play$|^start$|^begin$|\bloading\b/i;
       const vis = (el) => { try { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width>4 && r.height>4 && s.visibility!=='hidden' && s.display!=='none' && parseFloat(s.opacity||'1')>0.1; } catch(e){ return false; } };
       const out = [];
       const sel = 'button,a,[role=button],h1,h2,[id*=start i],[id*=play i],[class*=start i],[class*=play i],[class*=overlay i],[class*=modal i]';

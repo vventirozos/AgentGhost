@@ -29,14 +29,30 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
 MAX_SESSIONS = 200          # oldest-updated evicted past this
 MAX_MESSAGES_PER_SESSION = 400
 MAX_TITLE_CHARS = 80
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# ⚠ `\Z`, not `$`: Python's `$` also matches immediately BEFORE a trailing
+# newline, so `"web-x\n"` passed this guard while the interface's
+# `re.fullmatch` rejected it — the store wrote `web-x\n.json`, which the UI
+# could neither open nor delete (R2 lens C).
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
+
+
+def _warn_unpersistable(session_id) -> None:
+    """An id the charset guard rejects means the session is NOT durable —
+    every turn in it is dropped on the floor. That was silent on BOTH early
+    returns, so a client minting a slightly-wrong id (the interface's proxy
+    guard used to allow dots and 128 chars, this one does not) looked like it
+    was persisting and never was (review R1 M10). The operator watches the
+    live stream: data loss belongs there."""
+    logger.warning(
+        "session NOT persisted: id %r fails the id charset (%s) — this "
+        "conversation is not durable", session_id, _ID_RE.pattern)
 _ROLES = ("system", "user", "assistant", "tool", "function")
 
 # Search stopwords for the hydration tier (mirrors core.bus._STOPWORDS —
@@ -116,107 +132,302 @@ def derive_title(messages) -> str:
     return "New conversation"
 
 
-def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
-    """Build the message list for a turn from the STORED history and what
-    the client sent, tolerating both client styles:
+def _coerce_messages(seq) -> List[dict]:
+    """Keep only dict-shaped messages. The module contract is "never raises
+    into a request", and `merge_history_detail` broke it: a str/None entry
+    (or a str passed where a list belongs) died on `.get` with an
+    AttributeError. The only live caller validates shape first, so this was
+    a latent fail-open rather than an outage — the kind that surfaces the
+    day a second caller appears (R2 lens C)."""
+    if isinstance(seq, dict) or isinstance(seq, str):
+        return []
+    try:
+        return [m for m in (seq or []) if isinstance(m, dict)]
+    except TypeError:
+        return []
 
-    * a *thin* client sends only the new message(s) → ``stored + incoming``;
-    * a *fat* client (the current web UI) replays the whole conversation →
-      ``incoming`` already contains the stored history as its prefix, so it
-      is used as-is instead of being duplicated.
 
-    Detection compares (role, content) pairs over the stored prefix — this
-    is what stops a fat client from doubling the conversation on every turn.
+def _msg_key(m) -> tuple:
+    return (m.get("role"), str(m.get("content") or ""))
 
-    The prefix compare must tolerate DIVERGENCE, not just exact equality. A
-    fat client whose stored copy differs by a single message — an aborted
-    stream leaves the server holding the full reply while the client kept a
-    partial one, and a session at ``MAX_MESSAGES_PER_SESSION`` has its oldest
-    messages dropped server-side — used to fall through to ``stored +
-    incoming``, re-appending the ENTIRE conversation every turn (5 → 11 → 19
-    → 29 messages, quadratic, until the cap filled with duplicates). When
-    incoming is recognisably the same conversation replayed, it is
-    authoritative and simply replaces the stored copy.
 
-    A fat client can also be STALE — *behind* the stored copy rather than
-    ahead of it. With one session id shared across browser tabs, tab B
-    replays its shorter history + a new user message while tab A already
-    advanced the session. ``len(incoming) < len(stored)`` used to skip fat
-    detection entirely and concatenate, duplicating tab B's whole prefix
-    (2026-07-28 review finding). When incoming aligns with stored's prefix,
-    the STORED copy is authoritative (it is a superset) and only the
-    genuinely new tail is appended. Assistant messages in that tail are
-    dropped: assistant turns only ever originate server-side, so a client
-    can never legitimately introduce one the store hasn't seen (an aborted
-    stream's partial stub is the usual imposter).
+def _lcs_match(stored: List[dict], incoming: List[dict]) -> List[tuple]:
+    """Longest common subsequence of (role, content) keys, as index pairs.
+
+    THE alignment primitive, and the reason this module was rewritten
+    (§4BU C1). The previous design asked "do stored and incoming differ by
+    at most ONE message?" — a fixed tolerance. Every aborted turn leaves the
+    client holding a partial reply where the server holds the full one, i.e.
+    one substitution, PERMANENTLY. Two aborts in a session therefore
+    exceeded the tolerance, fat detection failed, and the whole conversation
+    was concatenated — reproduced end to end: stored 6 → merged 13 with 4
+    duplicated messages, and the corruption never healed.
+
+    An LCS makes the decision count-INDEPENDENT: what matters is how much of
+    the conversation two views share, not how many edits separate them.
+    O(n·m) on lists bounded by MAX_MESSAGES_PER_SESSION, and both sides are
+    small (≤400), so this is microseconds.
     """
-    stored = stored or []
-    incoming = incoming or []
+    n, m = len(stored), len(incoming)
+    if not n or not m:
+        return []
+    # Row-wise DP; keep only two rows (the traceback is rebuilt from choices).
+    # For the sizes involved a full table is fine and much simpler to read.
+    # Hoist the keys: `_msg_key` stringifies `content`, and for LIST content
+    # (multimodal parts) that re-serialises the whole payload on every cell —
+    # measured 4.5s for a 160x160 merge, 59ms with the keys precomputed.
+    skeys = [_msg_key(x) for x in stored]
+    ikeys = [_msg_key(x) for x in incoming]
+    table = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        ki = skeys[i]
+        row, nxt = table[i], table[i + 1]
+        for j in range(m - 1, -1, -1):
+            row[j] = (nxt[j + 1] + 1 if ki == ikeys[j]
+                      else max(nxt[j], row[j + 1]))
+    pairs: List[tuple] = []
+    i = j = 0
+    while i < n and j < m:
+        if skeys[i] == ikeys[j]:
+            pairs.append((i, j))
+            i += 1
+            j += 1
+        elif table[i + 1][j] >= table[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    return pairs
+
+
+def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
+    """Build the message list for a turn. See `merge_history_detail`."""
+    return merge_history_detail(stored, incoming)[0]
+
+
+def merge_history_detail(stored: List[dict],
+                         incoming: List[dict]) -> Tuple[List[dict], List[dict]]:
+    """``(merged, new_tail)`` — the prompt for this turn, and the messages
+    this turn genuinely ADDS to the durable store.
+
+    ONE RULE: **stored, plus whatever of incoming is not already accounted
+    for.** No client style is inferred, nothing is replaced, and there is no
+    tolerance threshold anywhere.
+
+    That is the point. The previous design classified the client — thin /
+    fat / diverged / stale — and acted differently for each, with the
+    classifier tuned by counts and ratios. Every threshold was a place to be
+    wrong, and it was: a tolerance of ONE diverged message meant the SECOND
+    aborted stream in a session made fat detection fail, and the whole
+    conversation was concatenated every turn from then on (reproduced:
+    stored 6 -> merged 13, 4 messages duplicated, permanent). Working
+    through the classifier's cases produced three more bugs (a stale tab
+    missing MIDDLE messages had them deleted; a two-message conversation
+    with one abort stopped aligning; a stale tab whose only reply diverged
+    duplicated its whole prefix). The lesson is the shape, not the
+    individual bugs: an ambiguous intent inferred from content does not
+    become reliable by adding thresholds.
+
+    Appending only the unmatched tail needs no classifier and gives the two
+    invariants that matter, by construction:
+
+      * **nothing is dropped** — stored is always a prefix of the result, so
+        no divergence shape can delete durable history;
+      * **nothing is duplicated** — only messages after the last aligned
+        position are appended, so a replay of the whole conversation adds
+        exactly its new tail. Growth is linear in turns.
+
+    Assistant and duplicate-system messages are stripped from the tail:
+    assistant turns originate server-side (an aborted stream's partial stub
+    is the usual imposter, and the real reply is appended by `append_turn`),
+    and a thin client re-sends its system prompt every turn, which used to
+    grow an unbounded run of duplicates.
+
+    Two accepted consequences, both the safe side of an ambiguity the
+    protocol cannot resolve (there are no message ids or sequence numbers):
+
+    1. A diverged client's copy never replaces the server's, so the store
+       keeps the FULL reply of an aborted turn rather than the partial one
+       the user saw. That is information kept, not lost.
+    2. When the user retypes a message verbatim ("ok", "continue") it is
+       appended even though identical text is already stored — because the
+       alternative is dropping a genuinely new message, which loses the turn
+       entirely. Under multi-tab interleaving this can leave one duplicated
+       short message in history; harmless, and strictly better than the turn
+       vanishing.
+    """
+    stored = _coerce_messages(stored)
+    incoming = _coerce_messages(incoming)
     if not stored:
-        return list(incoming)
+        return list(incoming), list(incoming)
+    if not incoming:
+        return stored, []
 
-    def _key(m):
-        return (m.get("role"), str(m.get("content") or ""))
+    pairs = _lcs_match(stored, incoming)
 
-    if len(incoming) >= len(stored):
-        if all(_key(a) == _key(b)
-               for a, b in zip(stored, incoming[:len(stored)])):
-            return list(incoming)   # fat client — already carries the history
-        # Same conversation, slightly diverged: look for an alignment of the
-        # stored messages inside incoming that matches everywhere except (at
-        # most) the final stored message. `delta > 0` covers the cap-eviction
-        # case, where stored lost its oldest messages but incoming still has
-        # them.
-        for _delta in range(0, len(incoming) - len(stored) + 1):
-            _matched = sum(
-                1 for _i, _s in enumerate(stored)
-                if _key(_s) == _key(incoming[_i + _delta]))
-            if _matched >= 1 and _matched >= len(stored) - 1:
-                return list(incoming)   # fat replay wins — do NOT concatenate
+    # THE LAST MESSAGE OF A REPLAY IS NEVER "ALREADY STORED" when it is a
+    # user message AND stored continues past the match. The operator retypes
+    # short replies, and a greedy alignment matched the newly typed one
+    # against an identical older message and consumed it: the model answered
+    # the PREVIOUS turn and nothing was persisted. Requiring that stored
+    # continue past the match keeps a plain fat replay (whose trailing
+    # message really is the stored one) aligned.
+    if (pairs and pairs[-1][1] == len(incoming) - 1
+            and incoming[-1].get("role") == "user"
+            and pairs[-1][0] < len(stored) - 1):
+        # ⚠ Keep the ALIGNMENT for the lead/extras split even though this
+        # pair is no longer treated as "already stored". Dropping it from
+        # `pairs` outright made `first_j` fall back to len(incoming), which
+        # collapsed the whole client prefix — including cap-EVICTED messages
+        # — into `extras`, i.e. straight into the durable file, undoing the
+        # eviction the lead mechanism exists to respect (R2 lens C).
+        aligned = pairs
+        pairs = pairs[:-1]
     else:
-        # Stale fat replay: greedy SUBSEQUENCE alignment of incoming inside
-        # stored (order-preserving). A leading-prefix compare is not enough:
-        # a tab that stays stale across turns has GAPS relative to stored
-        # (whole exchanges another tab added), plus possibly an aborted-
-        # stream stub that matches nothing. Stored wins for everything it
-        # already holds; only incoming's unmatched TAIL — the newly typed
-        # message(s) after the last recognised position — is appended.
-        _s = 0
-        _last_match_i = -1
-        _matched = 0
-        for _i, _msg in enumerate(incoming):
-            _k = _key(_msg)
-            _j = _s
-            while _j < len(stored) and _key(stored[_j]) != _k:
-                _j += 1
-            if _j < len(stored):
-                _s = _j + 1
-                _last_match_i = _i
-                _matched += 1
-        # Guards: the match must be substantial (>= 2 stops a thin client's
-        # lone message coincidentally equal to an old one from being
-        # swallowed) and must account for nearly ALL of incoming (a large
-        # unmatched remainder means this is a different conversation, not a
-        # stale replay of this one).
-        if _matched >= 2 and _matched >= len(incoming) - 3:
-            _tail = incoming[_last_match_i + 1:]
-            _stored_sys = {str(m.get("content") or "") for m in stored
-                           if m.get("role") == "system"}
-            _extras = [m for m in _tail
-                       if m.get("role") != "assistant"
-                       and not (m.get("role") == "system"
-                                and str(m.get("content") or "") in _stored_sys)]
-            return list(stored) + _extras
-    # A thin client re-sends its system prompt every turn; appending it each
-    # time grew an unbounded run of duplicate system messages (and eventually
-    # bypassed append_turn's history cap). Keep only system messages we don't
-    # already hold verbatim.
+        aligned = pairs
+
+    first_j = aligned[0][1] if aligned else len(incoming)
+    if pairs:
+        last_j = pairs[-1][1]
+    elif aligned:
+        # M5 consumed the ONLY pair. `extras` must start AT the message it
+        # un-matched (so the retyped turn is genuinely new) and no earlier —
+        # falling back to -1 swept the client's cap-evicted prefix into the
+        # durable file (R2 lens C).
+        last_j = aligned[-1][1] - 1
+    else:
+        last_j = -1
     stored_systems = {str(m.get("content") or "") for m in stored
                       if m.get("role") == "system"}
-    incoming = [m for m in incoming
-                if not (m.get("role") == "system"
-                        and str(m.get("content") or "") in stored_systems)]
-    return list(stored) + list(incoming)
+
+    # THE PROMPT MAY BE MORE GENEROUS THAN THE STORE. When the client still
+    # holds messages the store's cap EVICTED, they sit before the first
+    # aligned position — restoring them gives this turn the context the
+    # client actually has, while `new_tail` deliberately excludes them so
+    # the cap's decision is not undone in the durable file. This is the one
+    # place the two return values differ in kind rather than in length.
+    def _is_abort_stub(m) -> bool:
+        """A client-side assistant message the client itself marked as an
+        aborted stream. The web client writes `content + "\n\n*[Aborted]*"`
+        (app.js), so the MARKER is the identity — not a heuristic.
+
+        ⚠ This was a prefix test, and it had three false positives (R4 lens C):
+        (1) `if not text: return True` classified every EMPTY-content assistant
+        as a stub, which is the shape of a normal tool-calling turn — so a
+        legitimate tool round in `lead`, and (via `_drop_orphan_tools`) the
+        search results an earlier answer was based on, both vanished from the
+        prompt; (2) a complete short reply that happens to PREFIX a longer
+        stored one ("Done." vs "Done. I also updated the docs.") was deleted,
+        producing the consecutive-user-messages shape `_admissible` exists to
+        avoid; (3) any reply merely MENTIONING the marker was compared on its
+        head only. Identity, not a property — the marker at the END, or an
+        empty message that carries no tool calls (nothing to say and nothing
+        to do)."""
+        text = str(m.get("content") or "")
+        if text.rstrip().endswith("*[Aborted]*"):
+            return True
+        return not text and not m.get("tool_calls")
+
+    def _admissible(m, *, in_lead: bool) -> bool:
+        """One predicate, two regions, and the difference is deliberate.
+
+        ``extras`` becomes ``new_tail`` — it is PERSISTED — and assistant
+        turns originate server-side, so every client assistant there is
+        dropped (`append_turn` writes the real reply).
+
+        ``lead`` is prompt-only: the client's copy of history the cap
+        EVICTED. Dropping every assistant there was an over-correction from
+        the R2 fix — it deleted complete replies to evicted turns, emitting
+        consecutive user messages and removing most of the context `lead`
+        exists to restore (R3 lens C). Drop only the abort stub, which is
+        what the R2 case was actually about: a truncated reply sitting
+        immediately before the full one."""
+        role = m.get("role")
+        if role == "assistant":
+            return in_lead and not _is_abort_stub(m)
+        return not (role == "system"
+                    and str(m.get("content") or "") in stored_systems)
+
+    def _drop_orphan_tools(msgs):
+        """A ``tool`` message whose ``tool_call_id`` has no surviving
+        assistant is a protocol error: most OpenAI-shaped servers reject a
+        tool result with no preceding tool_call, and `_clean_messages`
+        preserves `tool_call_id` into the DURABLE file — so one orphan
+        poisons every future turn of that session (R3 lens C). Filtering
+        assistants without filtering their tool results created them."""
+        live, any_calls = set(), False
+        for m in msgs:
+            if m.get("role") != "assistant":
+                continue
+            calls = m.get("tool_calls")
+            # ⚠ `for call in (m.get("tool_calls") or [])` iterated whatever the
+            # client sent: `tool_calls: 7` raised TypeError out of the merge,
+            # which `routes.py` calls OUTSIDE its try — so a plain-text 500
+            # bypassed the OpenAI-shaped error envelope, breaking this
+            # module's "never raises into a request" contract. And the route's
+            # own validator PERMITS the shape (it allows `content: null` when
+            # `tool_calls` is truthy and never checks its type) — R4 lens C.
+            if not isinstance(calls, (list, tuple)):
+                continue
+            any_calls = True
+            for call in calls:
+                if isinstance(call, dict) and call.get("id"):
+                    live.add(str(call["id"]))
+        out = []
+        for m in msgs:
+            if m.get("role") == "tool":
+                cid = m.get("tool_call_id")
+                if cid is None:
+                    # An unidentified result is admissible only if SOME
+                    # surviving assistant made calls — otherwise it is the
+                    # same orphan by another spelling.
+                    if not any_calls:
+                        continue
+                elif str(cid) not in live:
+                    # ⚠ Unless no surviving assistant declared ids at all, in
+                    # which case dropping the result creates the MIRROR error:
+                    # tool_calls in the prompt with no matching result
+                    # (R4 lens C F4).
+                    if live or not any_calls:
+                        continue
+            out.append(m)
+        return out
+
+    lead = []
+    if aligned and first_j > 0:
+        lead = _drop_orphan_tools(
+            [m for m in incoming[:first_j] if _admissible(m, in_lead=True)])
+
+    extras = _drop_orphan_tools(
+        [m for m in incoming[last_j + 1:] if _admissible(m, in_lead=False)])
+
+    # ⚠ A TAIL REPLAY-FILTER WAS TRIED HERE AND REVERTED (R4). The idea: only
+    # the last element of `extras` is the turn being taken, so anything before
+    # it that the store already holds is replay and need not be written twice.
+    # It removed the multi-tab re-adds it targeted (117 -> 0 at 3 tabs with a
+    # cap of 30) and it LOST USER TURNS in the live configuration:
+    #
+    #   stored   = [u "ok", a A1, u "q2", a A2]     (tab A did the "ok" turn)
+    #   incoming = [u "q2", a A2, u "ok", u "q3"]   (tab B's "ok" turn ERRORED;
+    #                                                it is replaying to recover)
+    #   -> tail = [u "q3"]      tab B's "ok" is gone from the store forever
+    #
+    # The flaw is that "the store already holds this text" is not the same as
+    # "this client is replaying it": `remaining` also counted messages the
+    # client never saw — another tab's turns, and the pre-eviction era. A turn
+    # that FAILED to persist is not the last element of the tail, so the safety
+    # argument ("the new turn is the element this never examines") only covered
+    # the current turn, not the one being recovered.
+    #
+    # Measured end to end with a client model that includes failed turns:
+    # 2 clients 35 -> 115 user messages lost, 3 clients 60 -> 126. And at the
+    # LIVE cap (400, i.e. effectively uncapped for real conversations) it
+    # removed ZERO re-adds while adding 66 losses at 3 tabs. It was tuned on
+    # the pathological regime and only cost in the real one.
+    #
+    # So the accepted position stands, and it is the one the design was chosen
+    # for: a duplicate is recoverable, a lost turn is not. Resolving this
+    # properly needs message ids in the protocol, which is a client change.
+    return lead + stored + extras, list(extras)
 
 
 class SessionStore:
@@ -292,6 +503,7 @@ class SessionStore:
                 self.root.mkdir(parents=True, exist_ok=True)
                 path = self._path(sess.id)
                 if path is None:
+                    _warn_unpersistable(sess.id)
                     return False
                 tmp = path.with_suffix(".tmp")
                 # §4M (Lens A MINOR): fsync before the rename so power
@@ -303,7 +515,11 @@ class SessionStore:
                 os.replace(tmp, path)
             return True
         except Exception as e:  # noqa: BLE001
-            logger.debug("session write failed: %s", e)
+            # Losing the durable copy of a conversation is not a debug-level
+            # event: at debug the operator's live stream showed nothing while
+            # every turn silently failed to persist (review R1 M10).
+            logger.warning("session write FAILED for %s (%s): %s",
+                           sess.id, type(e).__name__, e)
             return False
 
     def delete(self, session_id: str) -> bool:
@@ -430,6 +646,10 @@ class SessionStore:
         if sess is None:
             path = self._path(session_id)
             if path is None:
+                # ⚠ This return, not _write's, is the one a client-picked id
+                # actually hits — the whole conversation is dropped here and
+                # it was silent.
+                _warn_unpersistable(session_id)
                 return False
             sess = Session(id=str(session_id))
         new_msgs = _clean_messages(user_messages)
@@ -463,9 +683,19 @@ class SessionStore:
         if len(sess.messages) > MAX_MESSAGES_PER_SESSION:
             systems = [m for m in sess.messages if m.get("role") == "system"]
             rest = [m for m in sess.messages if m.get("role") != "system"]
+            # ⚠ Reserve room for the CONVERSATION. Keeping every system
+            # message first means a session accumulating distinct system
+            # prompts drives `keep` to 0 and deletes the entire dialogue,
+            # leaving a file of nothing but system messages (reproduced at
+            # 420 turns — R3 lens C). Systems are context; the conversation
+            # is the point. Cap the systems at a quarter of the budget.
+            sys_budget = max(1, MAX_MESSAGES_PER_SESSION // 4)
+            # The MOST RECENT ones: past the budget, keeping the oldest means
+            # the prompt evicted is the CURRENT one, which is backwards
+            # (R4 lens C F7).
+            systems = systems[-sys_budget:]
             keep = max(0, MAX_MESSAGES_PER_SESSION - len(systems))
-            sess.messages = (systems[:MAX_MESSAGES_PER_SESSION]
-                             + (rest[-keep:] if keep else []))
+            sess.messages = systems + (rest[-keep:] if keep else [])
         if not sess.title:
             sess.title = derive_title(sess.messages)
         sess.updated_at = _now()
@@ -498,5 +728,5 @@ def get_session_store(context) -> Optional[SessionStore]:
 __all__ = [
     "MAX_SESSIONS", "MAX_MESSAGES_PER_SESSION",
     "Session", "SessionStore",
-    "derive_title", "merge_history", "get_session_store",
+    "derive_title", "merge_history", "merge_history_detail", "get_session_store",
 ]

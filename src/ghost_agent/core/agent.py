@@ -280,14 +280,28 @@ _HYPOTHESIS_GROUNDING_ENABLED = os.environ.get("GHOST_HYPOTHESIS_GROUNDING", "1"
 _METACOG_ARBITER_ENABLED = False
 
 # Tools that are stateful or side-effecting but are NOT in the sandbox-
-# mutation `is_mutating` list — batch dedup must never collapse two
-# byte-identical calls of these to one execution (2026-07-20): `browser`
-# op=interact is a stateful click, and manage_projects/notify_operator/
-# delegate have real side effects. Dropping a real call causes state drift;
-# executing a redundant read is merely wasteful, so err toward not collapsing.
-_BATCH_COLLAPSE_UNSAFE = frozenset({
-    "browser", "manage_projects", "notify_operator", "delegate",
-    "delegate_to_swarm", "manage_services", "manage_skills", "create_skill",
+# Batch dedup may collapse two byte-identical calls in one batch to a SINGLE
+# execution ONLY for pure-read tools: re-running a read is merely wasteful, but
+# dropping a side-effecting call causes state drift, so the mechanism biases
+# hard toward NOT collapsing. This is therefore an ALLOWLIST of read-safe tools
+# — anything NOT listed is collapse-unsafe by default.
+#
+# 2026-08-19 review (§ turn-loop R2, lens B): the previous DENYLIST
+# (`_BATCH_COLLAPSE_UNSAFE`) could never enumerate side-effecting tools that are
+# registered at RUNTIME under their own names — composed macros
+# (`register_composed_skill_runners` → `tools[name]`) and acquired skills
+# (`make_skill_runner` → `tool_execute`, arbitrary code). Those user-defined
+# names bypassed the denylist, so two byte-identical `deploy(...)` /
+# `rotate_secrets(...)` calls in one batch collapsed to one execution — a
+# silently dropped side effect. Inverting to an allowlist makes every unlisted
+# tool (static OR dynamic) safe-by-default. Per-action refinement for mixed
+# read/write tools (file_system read vs write, knowledge_base query vs ingest)
+# is handled by the `is_mutating` gate, which is OR'd in first, so a listed
+# tool still does not collapse when the specific call mutates.
+_COLLAPSE_READSAFE = frozenset({
+    "recall", "web_search", "deep_research", "fact_check",
+    "darkweb_search", "darkweb_research", "introspect", "list_lessons",
+    "file_system", "knowledge_base",
 })
 
 # manage_services actions that only OBSERVE the supervisor (plus the tool's
@@ -388,6 +402,46 @@ _CODING_TASK_PROFILES = {
 
 _CREATIVE_KEYWORDS = {"design", "architect", "brainstorm", "creative", "alternative", "refactor", "naming", "generate", "invent"}
 _PRECISE_KEYWORDS = {"sql", "query", "select", "insert", "update", "delete", "migrate", "schema", "exact", "precise", "security", "auth", "encrypt", "regex"}
+
+
+async def _stream_or_abort_frames(it):
+    """Drain an SSE stream; convert a RAISE into the abort frames it should
+    have been.
+
+    ⚠ WHY (§4BV R7 lens B, fixed 2026-08-19). The FINAL-generation drain in
+    `stream_wrapper` iterates `stream_chat_completion` with NO enclosing
+    handler — AST-verified, not read off the indentation. Any raise there
+    (`_do_stream_chat_completion` still re-raises on HTTP 4xx/5xx and on the
+    generic path) skipped the ENTIRE durable tail: episode, hydration judge,
+    trajectory, project work_log, verifier spawn, lesson outcomes. The client
+    got routes.py's error event, but the turn vanished from every persistent
+    record — the worst possible outcome for a turn that already streamed
+    most of an answer.
+
+    The fix is a conversion, not a swallow: the loop body ALREADY parses an
+    upstream `{"error": …}` frame (sets `stream_aborted`, appends the
+    truncation marker to the durable content, logs "Stream Aborted"), and it
+    captures `data: [DONE]` to release AFTER the tail (§4AT-A). So a raise
+    becomes exactly those two frames and every existing mechanism does its
+    job. Cancellation is deliberately untouched — `CancelledError` and
+    `GeneratorExit` are `BaseException`, and a cancelled turn must still
+    cancel.
+
+    ⚠ ONLY the final-generation site iterates through this. `handle_chat`'s
+    internal drain is wrapped in a try whose handlers DEPEND on the raise —
+    one of them runs the emergency context prune on a 400 mentioning
+    "context". Wrapping that site would silently delete that recovery;
+    `tests/test_stream_durable_tail.py` pins both directions.
+    """
+    try:
+        async for _chunk in it:
+            yield _chunk
+    except Exception as _sx:                          # noqa: BLE001
+        _msg = f"stream raised {type(_sx).__name__}: {str(_sx)[:200]}"
+        logger.warning("final-generation stream converted a raise into an "
+                       "abort frame: %s", _msg)
+        yield f"data: {json.dumps({'error': _msg})}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
 
 
 def _classify_coding_task(query: str) -> str:
@@ -2439,6 +2493,246 @@ def _tool_call_truncated(content: str) -> bool:
     if fn_opens > fn_closes:
         return True
     return False
+
+
+# A REAL `<function ...>` opener in any accepted dialect: `name=`, bare `=`, or
+# the `_name=` variant, with `name` optionally padded — the exact shapes the
+# sloppy-attribute heals normalize. Deliberately NOT a bare `<function`
+# substring: prose that merely MENTIONS the token ("the <function> keyword"),
+# and a raw-JSON tool call whose arguments contain the literal string
+# `<function`, must NOT be mistaken for an XML tool call. Routing either into
+# the XML healer dropped native calls, dropped raw-JSON calls, and truncated
+# prose replies (§ turn-loop R2). Used by BOTH the bare-`<function>` wrapper
+# heal and the `has_tool_tag` routing gate so the two agree on "real tag."
+_FN_TAG_RE = re.compile(r'<function(?:_name)?\s*(?:name\s*=|=)', re.IGNORECASE)
+
+
+# --- prompt-bleed truncation (§ finalize/stream R1 A-F3) --------------------
+# STRONG markers are prompt-section text that never appears in legitimate
+# user-facing content — any one of them proves a system-prompt bleed and the
+# reply is truncated at the earliest marker. WEAK markers are legitimate in
+# real answers (`# Tools` is a routine README heading; a coding answer may
+# quote an OpenAI tool-schema `{"type": "function"` example) — before this
+# split, a single weak marker silently truncated the reply (a README draft
+# lost its Tools+License sections; a schema example cut a coding answer to
+# its first line, both delivered with Turn Outcome `ok`). A weak marker only
+# truncates when corroborated: a strong marker present anywhere, or BOTH weak
+# markers co-occurring (a real bleed dumps the tool list, so they do).
+_BLEED_STRONG = ("<tools>", "You may call one or more functions",
+                 "CRITICAL INSTRUCTION:", "SPECIALIST SUBSYSTEM ACTIVATED",
+                 "ENGINEERING STANDARDS", "DYNAMIC SYSTEM STATE",
+                 "[SYSTEM STATE UPDATE]",
+                 # § R2 A-F3b: the native-path prompt renders the tool list as
+                 # this pointer sentence (agent.py, native header) — a
+                 # paraphrased bleed can carry it with no other marker.
+                 "(Tool schemas are advertised via the native")
+_BLEED_WEAK = ("# Tools", '{"type": "function"')
+
+
+# --- stream-scrub hold-back classifier (§ finalize/stream R1 B-1, R2 C1/M4) --
+_SCRUB_TAG_NAMES = ("tool_call", "tool_response", "tool", "function")
+
+
+# (§ R4 D1) The close-end check must be NAME-AWARE: `_MODULE_SCRUB_RE`'s
+# close arm is a BACKREFERENCE (`</\1`), so an unclosed <tool_call> whose
+# eaten tail ends with an inner </function> — the CANONICAL native tool-call
+# shape — is still being eaten by the \Z arm. A name-blind "any close tag"
+# check read that as closed, unfroze the view, and plain appends leaked the
+# block's internals to the client. Built per-match from group(1) in
+# `_scrub_tail_is_open`.
+
+
+# THE stream scrub pattern — single module-level source of truth used by the
+# final-stream generator AND `_scrub_tail_is_open` (two inline copies would
+# drift: the wrapper-split lesson). `(?<!\x60)`: a backtick-quoted mention of
+# tool XML is legitimate prose (§ R1 B-1).
+# The \Z arm carries a NAMED GROUP so consumers can ask WHICH ARM matched
+# (§ R5: `_scrub_tail_is_open` used to test a text PROPERTY — "group(0) ends
+# with its own close tag" — and a malformed opener with no '>' before its
+# close tag swallowed that tag into `[^>]*>`-land: the match had really ended
+# via \Z (still eating) while the suffix read "closed", unfreezing the view
+# and leaking eaten internals to the client. Arm identity is exact;
+# pin-identity-not-property, in code.)
+_MODULE_SCRUB_RE = re.compile(
+    r'(?<!`)<(tool_call|tool|function|tool_response)\b[^>]*>.*?'
+    r'(?:</\1\b[^>]*>|(?P<eof>\Z))',
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+
+def _scrub_tail_is_open(buf: str) -> bool:
+    """True when the LAST scrub match in `buf` is an unclosed block whose
+    \\Z arm is consuming the tail — new '>'-less text is provably eaten and
+    the scrubbed view is frozen (the incremental-scrub invariant).
+
+    § R4 D1 + R5: closed means the CLOSE-TAG ARM matched — asked directly
+    via the pattern's named `eof` group (arm identity), never inferred from a
+    text suffix. The R4 suffix check ("group(0) ends with its own close
+    tag") was a property proxy: a malformed opener with no '>' swallowed its
+    own close tag into `[^>]*>`, the match really ended via \Z (eating), and
+    the proxy read "closed" — unfreezing the view and leaking eaten
+    internals."""
+    last = None
+    for m in _MODULE_SCRUB_RE.finditer(buf):
+        last = m
+    if last is None or last.end() != len(buf):
+        return False
+    return last.group('eof') is not None
+
+
+def _frag_is_forming_tag(frag: str) -> bool:
+    """True when `frag` (the lowercased text after an unresolved '<') could
+    still become a scrub-target tag.
+
+    § R3 A-D2: R2's 64-char release valve existed for prose like
+    "<tool_threshold else …" — but releasing a GENUINE attribute-heavy
+    opener at 64 chars leaked it and, once it completed and scrubbed,
+    permanently swallowed the post-block text (the C1 swallow reborn through
+    C1's own valve). The real discriminator is the tag-NAME BOUNDARY:
+    "tool" followed by "_threshold" is a longer word (prose, release
+    immediately — faster than the old 64-wait); "function name=…" is the
+    exact name plus a boundary (a forming tag: hold however long its
+    attributes run — never released, so never swallowed)."""
+    if frag == "":
+        return True
+    if frag.startswith("/") and len(frag) <= 16:
+        return True
+    for name in _SCRUB_TAG_NAMES:
+        if name.startswith(frag):        # partial name, still typing
+            return True
+        if frag.startswith(name):
+            nxt = frag[len(name):len(name) + 1]
+            if nxt == "" or not (nxt.isalnum() or nxt == "_"):
+                return True              # exact name + boundary → forming tag
+    return False
+
+
+def _emit_safe_end(view: str, emitted: int) -> int:
+    """Index up to which `view` is safe to emit to the client.
+
+    Scans the un-emitted window for the FIRST '<' that (a) has no '>' after
+    it, (b) is not backtick-quoted, and (c) opens a fragment that could still
+    become a scrub-target tag (`_frag_is_forming_tag`). Holding from the LAST
+    '<' (the R1 shape) was a proxy: a newer '<' released an earlier
+    still-forming tag, and once that tag completed and scrubbed, the shrunken
+    view sat below the emitted counter and legitimate post-block prose was
+    silently swallowed (R2 C1)."""
+    p = view.find('<', emitted)
+    while p != -1:
+        if '>' not in view[p:] and not (p > 0 and view[p - 1] == '`'):
+            if _frag_is_forming_tag(view[p + 1:].lower()):
+                return p
+        p = view.find('<', p + 1)
+    return len(view)
+
+
+def _inline_think_open(buf: str) -> bool:
+    """True while an inline ``<think>`` block is OPEN in `buf` — the gate for
+    the cognitive watchdog and the content-channel n-gram probe.
+
+    ASYMMETRIC by failure direction (§ R2 M1/M2, redesigned § R3 A-D1):
+
+    * OPENER: a backtick-preceded ``<think`` is a code-span MENTION and is
+      skipped — counting it opened the gate on a plain answer and the
+      watchdog severed it (R2 M1). Only backticks skip: quote characters are
+      ordinary prose and an apostrophe-preceded REAL opener must count.
+    * CLOSER: EVERY ``</think`` occurrence counts, quoted or not. A real
+      block routinely ends with a quoted string (``…"notes.md"</think>``) —
+      R2's quote-skip treated that REAL closer as a mention, the gate stuck
+      open, and the false sever the fix existed to kill came back. A
+      mentioned closer at worst closes the gate early: probes off is the
+      SAFE direction (under-protection), a false sever is not.
+
+    Closer matches by PREFIX (``</think``) so ``</thinking>`` disarms — the
+    opener already matches ``<thinking`` by prefix (R2 M2)."""
+    i = buf.rfind('<think')
+    while i > 0 and buf[i - 1] == '`':
+        i = buf.rfind('<think', 0, i)
+    return i > buf.rfind('</think')
+
+
+def _find_unquoted(text: str, marker: str) -> int:
+    """First occurrence of `marker` not immediately preceded by a quote or
+    backtick — a quoted marker is the reply DISCUSSING the prompt, not the
+    prompt bleeding (§ R2 A-F3a: a meta-answer quoting "CRITICAL
+    INSTRUCTION:" was truncated to 19 chars)."""
+    i = text.find(marker)
+    while i > 0 and text[i - 1] in "`'\"":
+        i = text.find(marker, i + 1)
+    return i
+
+
+def _truncate_prompt_bleed(text: str) -> str:
+    if not text:
+        return text
+    strong_idxs = [i for m in _BLEED_STRONG
+                   if (i := _find_unquoted(text, m)) != -1]
+    weak_idxs = [i for m in _BLEED_WEAK
+                 if (i := _find_unquoted(text, m)) != -1]
+    if strong_idxs:
+        return text[:min(strong_idxs + weak_idxs)]
+    # § R2 M-3: two weak markers corroborate only when NEAR each other — a
+    # real bleed dumps the schema JSON right after the `# Tools` heading. On
+    # the multi-turn ASSEMBLED reply, a legitimate README `# Tools` section
+    # plus a legitimate schema example hundreds of chars later co-occurred
+    # and truncated the reply wholesale.
+    if len(weak_idxs) >= 2 and (max(weak_idxs) - min(weak_idxs)) <= 600:
+        return text[:min(weak_idxs)]
+    return text
+
+
+# A line ending in a task-status suffix. Stripped only in RUNS of >=3
+# consecutive matching lines — that shape is a regurgitated task TREE, while
+# one or two isolated lines ("- Ship the report (PENDING)") are legitimate
+# content in a task-status answer, the exact format the agent's own task
+# tooling teaches (§ finalize/stream R1 A-F3: the old unconditional line
+# scrub deleted them, unlogged, on every non-streamed turn).
+_TASK_STATUS_LINE_RE = re.compile(
+    r'^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*$')
+
+
+# § R3 B-D3: fence markers, BOTH dialects (``` and ~~~), line-anchored — the
+# R2 fence walk counted bare "```" substrings, so tilde fences were invisible
+# (a correction landed inside a ~~~markdown block) and inline ``` mentions
+# miscounted.
+_FENCE_MARK_RE = re.compile(r'(?m)^\s*(?:`{3,}|~{3,})')
+
+
+# § R3 B-D2: the bracket arm requires task-ish interiors — a bare `^\s*\[`
+# counted a markdown-link lead ("[README](docs/…) refreshed (DONE)") as
+# task-shaped.
+_TASK_SHAPE_RE = re.compile(
+    r'task_\d+|^\s*(?:🔄|🟢|⏳|✅|❌|🛑|➖)'
+    r'|^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b')
+
+
+def _scrub_task_status_runs(text: str) -> str:
+    if not text or "(" not in text:
+        return text
+    lines = text.split("\n")
+    flags = [bool(_TASK_STATUS_LINE_RE.match(l)) for l in lines]
+    out: list = []
+    i, n = 0, len(lines)
+    while i < n:
+        if flags[i]:
+            j = i
+            while j < n and flags[j]:
+                j += 1
+            # § R2 M-4 + R3 B-D2: a run is stripped only when it is long
+            # (>=3) AND MAJORITY task-shaped. `any()` let one task_NN id
+            # mentioned in PROSE ("Fix the task_7 regression") poison a
+            # legitimate workstream answer wholesale; a real regurgitated
+            # tree carries its markers on (essentially) every line.
+            _shaped = sum(1 for l in lines[i:j] if _TASK_SHAPE_RE.search(l))
+            if j - i < 3 or _shaped * 2 < (j - i):
+                out.extend(lines[i:j])
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
 # Streaming sanity guards live in core/stream_guards.py (the guard-module seam,
 # IMPROVEMENTS.md #5) — new stream guards land THERE, not inline here. Re-export
 # the names so existing references + tests in this module keep working.
@@ -2526,6 +2820,52 @@ from ..tools.tasks import tool_list_tasks
 from ..memory.skills import SkillMemory
 
 logger = logging.getLogger("GhostAgent")
+
+
+def _compute_pure_trigger_tools():
+    """Names of tools that take NO parameters — a call with empty args is a
+    COMPLETE call for these (dream_mode/self_play/stop_self_play), not a
+    degenerate one. Derived from TOOL_DEFINITIONS so it stays in sync as the
+    tool list changes (guard the thing, not a hardcoded list). Used by the
+    usable-native gate: an empty-args native call is only allowed to win over a
+    competing XML call when the tool is a pure trigger — otherwise empty args
+    means the native call is degenerate and the XML call should be honored
+    (§ turn-loop R3). NOTE: `execute` has params but no REQUIRED ones, so it is
+    correctly EXCLUDED — an empty `execute {}` is degenerate, not a trigger."""
+    trig = set()
+    for _d in (TOOL_DEFINITIONS or []):
+        _fn = _d.get("function") or {}
+        _name = _fn.get("name")
+        _props = ((_fn.get("parameters") or {}).get("properties")) or {}
+        if _name and not _props:
+            trig.add(_name)
+    return frozenset(trig)
+
+
+_PURE_TRIGGER_TOOLS = _compute_pure_trigger_tools()
+
+# Names of the BUILT-IN tools — TOOL_DEFINITIONS plus the built-ins whose
+# schemas are appended inside get_active_tool_definitions (vision_analysis,
+# image_generation; § turn-loop R5: deriving from TOOL_DEFINITIONS alone
+# misclassified those two as runtime tools, so a degenerate empty-args native
+# `vision_analysis {}` shadowed a fully-specified XML call — a regression the
+# R4 comment's "schema unknowable at import" claim did not actually cover).
+# A dispatchable tool NOT in this set is runtime-registered (a composed macro
+# via register_composed_skill_runners, or an acquired skill) — its schema
+# really is unknowable at import, so the trigger set above can never contain
+# it even when it genuinely takes no parameters (a zero-`$var` macro
+# advertises `properties: {}`). The usable-native gate treats an empty-args
+# call to such a tool as USABLE (§ turn-loop R4): dispatching it errors
+# recoverably at worst if it did need args, whereas the alternative —
+# executing content-XML of unknown provenance (possibly a mutating ECHO)
+# while dropping the model's real native call — is the unrecoverable
+# direction.
+from ..tools.registry import CONDITIONALLY_ADVERTISED_BUILTIN_NAMES  # noqa: E402
+
+_STATIC_TOOL_NAMES = frozenset(
+    _n for _d in (TOOL_DEFINITIONS or [])
+    for _n in [(_d.get("function") or {}).get("name")] if _n
+) | CONDITIONALLY_ADVERTISED_BUILTIN_NAMES
 
 
 # ============================================================================
@@ -3725,6 +4065,13 @@ class StreamState:
     _turn_reg: Any
 
 
+# The System-2 planner runs inline on the user's turn. Without a budget it
+# inherits httpx's 1200s default on the single main slot (LLM review R3).
+from ..utils.helpers import env_positive
+
+_PLANNER_TIMEOUT_S = env_positive("GHOST_PLANNER_TIMEOUT", 180.0)
+
+
 class GhostAgent:
     def _rebuild_available_tools(self):
         """Rebuild the dispatch dict from the registry after a lookup miss
@@ -4012,29 +4359,226 @@ class GhostAgent:
         # with a tool result (B-MINOR-2), and exempting THAT while
         # center-cutting the user's actual spec was the wrong target.
         _goal = next((m for m in msgs if m.get("role") == "user"), None)
+        # § context R1 A-F5a: the NEWEST user message carries the constraints
+        # governing the CURRENT work — protected like the goal, yielding only
+        # as a LAST RESORT (when nothing else can shrink), and then with a
+        # marker that does not promise file re-reads for pasted content.
+        _newest_user = next((m for m in reversed(msgs)
+                             if m.get("role") == "user"), None)
 
+        _FILE_NOTE = ("re-read the specific region with start_line/end_line "
+                      "if needed")
+        _PASTE_NOTE = ("the pasted content exceeded the context window; ask "
+                       "the user for the missing part if needed")
+
+        def _cut_str(c, keep, note):
+            half = max(1, keep // 2)
+            return (c[:half]
+                    + f"\n[... {len(c) - keep:,} chars dropped by context "
+                      f"budget enforcement — {note} ...]\n"
+                    + c[-half:])
+
+        def _cut_message(m, note):
+            """Shrink one message; True when something was cut."""
+            c = m.get("content", "")
+            if isinstance(c, str) and len(c) > 4000:
+                if '<tool_call' in c:
+                    # § context R1 A-F2 + R2 C1/M5: NEVER splice the marker
+                    # inside <tool_call> XML. PER-BLOCK forward scan — the R1
+                    # first-open..last-close span (a) destroyed legit prose
+                    # BETWEEN blocks (M5) and (b) went NEGATIVE when a close
+                    # preceded an unclosed open (echoed/truncated logs): the
+                    # overlapping rebuild GREW the message ~1.33x/iteration to
+                    # 2.2e9 chars on the request path (C1). Forward scanning
+                    # from each open makes a negative span impossible.
+                    pos = 0
+                    while True:
+                        lo = c.find('<tool_call', pos)
+                        if lo == -1:
+                            break
+                        hi = c.find('</tool_call>', lo)
+                        if hi == -1:
+                            if len(c) - lo > 2000:
+                                m["content"] = (
+                                    c[:lo] + f"\n[unclosed tool_call "
+                                    f"({len(c) - lo:,} chars) dropped by "
+                                    "context budget enforcement]\n")
+                                return True
+                            break
+                        hi += len('</tool_call>')
+                        if hi - lo > 4000:
+                            m["content"] = (
+                                c[:lo] + f"\n[tool_call block ({hi - lo:,} "
+                                "chars) dropped by context budget "
+                                "enforcement]\n" + c[hi:])
+                            return True
+                        pos = hi
+                    # no oversized block: center-cut the largest TAG-FREE
+                    # segment (prose before/between/after blocks).
+                    segs = []
+                    pos = 0
+                    while True:
+                        lo = c.find('<tool_call', pos)
+                        if lo == -1:
+                            segs.append((pos, len(c)))
+                            break
+                        segs.append((pos, lo))
+                        hi = c.find('</tool_call>', lo)
+                        if hi == -1:
+                            break
+                        pos = hi + len('</tool_call>')
+                    segs = [(a, b) for a, b in segs if b - a > 4000]
+                    if not segs:
+                        return False
+                    a, b = max(segs, key=lambda ab: ab[1] - ab[0])
+                    seg = c[a:b]
+                    m["content"] = (c[:a]
+                                    + _cut_str(seg, max(1500, len(seg) // 3),
+                                               note)
+                                    + c[b:])
+                    return True
+                m["content"] = _cut_str(c, max(1500, len(c) // 3), note)
+                return True
+            if isinstance(c, list):
+                # § context R4 parity: the token COUNTER str()-coerces ANY
+                # "text" value, so a non-str part (a list of strings arrives
+                # fine via JSON) costs its full serialized size while being
+                # invisible to a str-only cutter — uncuttable-but-counted,
+                # the F1 class one level down. Replace an oversized non-str
+                # text value with an honest stub first.
+                for p in c:
+                    if (isinstance(p, dict) and "text" in p
+                            and not isinstance(p.get("text"), str)
+                            and len(str(p.get("text"))) > 4000):
+                        _sz = len(str(p.get("text")))
+                        p["text"] = (f"[non-text part ({_sz:,} chars) "
+                                     "dropped by context budget enforcement]")
+                        return True
+                best = None
+                for p in c:
+                    if (isinstance(p, dict) and isinstance(p.get("text"), str)
+                            and len(p["text"]) > 4000
+                            and (best is None
+                                 or len(p["text"]) > len(best["text"]))):
+                        best = p
+                if best is not None:
+                    best["text"] = _cut_str(best["text"],
+                                            max(1500, len(best["text"]) // 3),
+                                            note)
+                    return True
+                # § context R2 M2/1e: no single oversized part, but the SUM
+                # busts the budget (100 x 3.9KB parts) — keep head parts to
+                # ~4000 chars, replace the remainder with a marker part.
+                _txt_total = sum(len(p["text"]) for p in c
+                                 if isinstance(p, dict)
+                                 and isinstance(p.get("text"), str))
+                if _txt_total > 8000:
+                    kept, acc, dropped = [], 0, 0
+                    for p in c:
+                        t = (p.get("text") if isinstance(p, dict) else None)
+                        if not isinstance(t, str):
+                            t = None
+                        if t is None or acc < 4000:
+                            kept.append(p)
+                            acc += len(t or "")
+                        else:
+                            dropped += len(t)
+                    if dropped:
+                        kept.append({"type": "text",
+                                     "text": f"[... {dropped:,} chars across "
+                                             "trailing parts dropped by "
+                                             "context budget enforcement ...]"})
+                        m["content"] = kept
+                        return True
+            for tc in sorted(
+                    (m.get("tool_calls") or []),
+                    key=lambda t: -len((((t or {}).get("function") or {})
+                                        .get("arguments")) or "")):
+                fn = (tc or {}).get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str) and len(args) > 4000:
+                    # keep the arguments VALID JSON for history replay — a
+                    # center-cut would corrupt them; replace with an honest
+                    # valid-JSON stub instead.
+                    fn["arguments"] = json.dumps({
+                        "_dropped_by_context_budget":
+                            f"{len(args):,} chars of arguments dropped",
+                        "head": args[:600],
+                    })
+                    return True
+            return False
+
+        def _max_cuttable(m):
+            # § context R2 M2: measure what ONE _cut_message call can
+            # actually shrink — the R1 SUM proxy picked a 100x3.9KB-part
+            # message every iteration, _cut_message refused it, control fell
+            # to the LAST RESORT and center-cut the goal while a perfectly
+            # cuttable 100KB string sat untouched (11x over target shipped).
+            c = m.get("content", "")
+            best = len(c) if (isinstance(c, str) and len(c) > 4000) else 0
+            if isinstance(c, list):
+                # § context R3 MINOR: non-str "text" parts (int/None from a
+                # malformed client) raised TypeError here and bricked EVERY
+                # over-budget turn — same never-raises law as _msg_token_cost.
+                parts = [len(p["text"]) for p in c
+                         if isinstance(p, dict)
+                         and isinstance(p.get("text"), str)]
+                for p in c:
+                    if (isinstance(p, dict) and "text" in p
+                            and not isinstance(p.get("text"), str)
+                            and len(str(p.get("text"))) > 4000):
+                        best = max(best, len(str(p.get("text"))))
+                if parts:
+                    if max(parts) > 4000:
+                        best = max(best, max(parts))
+                    elif sum(parts) > 8000:
+                        best = max(best, sum(parts))
+            for tc in (m.get("tool_calls") or []):
+                args = ((tc or {}).get("function") or {}).get("arguments")
+                if isinstance(args, str) and len(args) > 4000:
+                    best = max(best, len(args))
+            return best
+
+        _refused: set = set()
         guard = 0
         while sum(_tok(m) for m in msgs) > target and guard < 64:
             guard += 1
             cand = None
             for m in msgs:
-                if m.get("role") == "system" or m is _goal:
+                if (m.get("role") == "system" or m is _goal
+                        or m is _newest_user or id(m) in _refused):
                     continue
-                c = m.get("content", "")
-                if isinstance(c, str) and len(c) > 4000 and (
-                        cand is None or len(c) > len(cand.get("content") or "")):
+                sz = _max_cuttable(m)
+                if sz > 0 and (cand is None or sz > _max_cuttable(cand)):
                     cand = m
-            if cand is None:
-                break
-            c = cand["content"]
-            keep = max(1500, len(c) // 3)
-            half = keep // 2
-            cand["content"] = (
-                c[:half]
-                + f"\n[... {len(c) - keep:,} chars dropped by context budget enforcement — "
-                  "re-read the specific region with start_line/end_line if needed ...]\n"
-                + c[-half:]
-            )
+            if cand is not None:
+                _before = _tok(cand)
+                # § context R2 C1 (belt+braces): every accepted cut must
+                # STRICTLY SHRINK the candidate — a cut that grows or holds
+                # blacklists it, so no rebuild bug can ever wedge the loop.
+                if _cut_message(cand, _FILE_NOTE) and _tok(cand) < _before:
+                    continue
+                _refused.add(id(cand))
+                continue
+            # last resort (A-F5a): only the protected messages remain big.
+            if (_newest_user is not None and _newest_user is not _goal
+                    and _max_cuttable(_newest_user) > 0
+                    and id(_newest_user) not in _refused):
+                _before = _tok(_newest_user)
+                if (_cut_message(_newest_user, _PASTE_NOTE)
+                        and _tok(_newest_user) < _before):
+                    continue
+                _refused.add(id(_newest_user))
+                continue
+            if (_goal is not None and _max_cuttable(_goal) > 0
+                    and id(_goal) not in _refused):
+                _before = _tok(_goal)
+                if (_cut_message(_goal, _PASTE_NOTE)
+                        and _tok(_goal) < _before):
+                    continue
+                _refused.add(id(_goal))
+                continue
+            break
         return msgs
 
     async def _prune_context(self, messages: List[Dict[str, Any]], max_tokens: int = 12000, model: str = "test-model") -> List[Dict[str, Any]]:
@@ -4104,7 +4648,19 @@ class GhostAgent:
                 system_msgs + scrubbed_truncated, max_tokens)
 
         # Keep recent context (last 3 turns = 6 messages + goal)
-        original_goal = non_system_msgs[0]
+        # § context R1 A-F4: the goal is the first USER message — the THIRD
+        # of three "goal" sites (§4N R2 fixed the other two); this one still
+        # used non_system_msgs[0], so a tool-seeded history kept the tool
+        # result as "the goal" and shipped the real user instruction to the
+        # summarizer. A pre-goal seed now goes to the middle pool instead.
+        _goal_idx = next((i for i, m in enumerate(non_system_msgs)
+                          if m.get("role") == "user"), 0)
+        original_goal = non_system_msgs[_goal_idx]
+        # § context R2 M4: when the goal sits INSIDE the recent window it
+        # already rides in recent_context verbatim — prepending it too
+        # DUPLICATED it (both copies tail-cap-exempt: a huge pasted goal
+        # doubled its token cost). Prepend only when it is outside.
+        _goal_in_recent = False
         # §4N B-MINOR-1: don't let the recent window START on an orphaned
         # tool result (its <tool_call> got summarized into the middle) —
         # pull the caller in with it. `recent_start` also bounds the anchor
@@ -4115,6 +4671,8 @@ class GhostAgent:
                 non_system_msgs[recent_start].get("role") == "tool":
             recent_start -= 1
         recent_context = non_system_msgs[recent_start:] # last ~3 turns intact
+        _goal_in_recent = _goal_idx >= recent_start
+        _goal_head = [] if _goal_in_recent else [original_goal]
 
         # SEMANTIC CONTEXT ANCHORING: extract key findings from middle
         # turns before they get summarized away. These anchors survive
@@ -4122,49 +4680,57 @@ class GhostAgent:
         # Anchors are: (1) tool results with error messages or key data,
         # (2) assistant messages with explicit findings/conclusions,
         # (3) the most recent successful tool result (legacy behavior).
-        anchor_messages = []
-        anchored_originals = set()  # Track which original messages were anchored by id()
         _anchor_keywords = {
             "error:", "traceback", "found:", "result:", "conclusion:",
             "root cause", "the issue is", "the problem is", "discovered",
             "key finding", "important:", "note:", "exit code:",
         }
-        for m in non_system_msgs[1:recent_start]:
+        # § context R1 A-F4: the middle pool excludes the GOAL by position
+        # (wherever it sits), not "index 0" — a pre-goal tool seed belongs in
+        # the summary, the user instruction does not.
+        _middle_pool = [m for i, m in enumerate(non_system_msgs[:recent_start])
+                        if i != _goal_idx]
+        _anchor_pairs = []  # (original message, compact anchor message)
+        for m in _middle_pool:
             content = str(m.get("content", "")).lower()[:500]
             is_tool = m.get("role") == "tool"
             is_assistant_finding = m.get("role") == "assistant" and any(kw in content for kw in _anchor_keywords)
             is_tool_error = is_tool and any(kw in content for kw in {"error:", "traceback", "exit code: 1", "failed"})
-            is_tool_data = is_tool and len(str(m.get("content", ""))) > 100
 
             if is_assistant_finding or is_tool_error:
                 # Compact the anchor to save tokens
                 anchor_text = str(m.get("content", ""))[:800]
-                anchor_messages.append({
+                _anchor_pairs.append((m, {
                     "role": m["role"],
                     "content": f"[ANCHORED] {anchor_text}",
                     **({"name": m["name"]} if "name" in m else {})
-                })
-                anchored_originals.add(id(m))
+                }))
+
+        # § context R1 A-F3: the cap keeps the most RECENT anchors, and the
+        # overflow originals fall back to the middle pool for SUMMARIZATION.
+        # The old `[:4]` kept the chronologically FIRST four and dropped the
+        # rest from BOTH the anchors and the condense set — the newest
+        # findings vanished with no summary and no marker.
+        _kept_pairs = _anchor_pairs[-4:]
+        anchor_messages = [a for _, a in _kept_pairs]
+        anchored_originals = {id(m) for m, _ in _kept_pairs}
 
         # Legacy: always keep the most recent tool result from middle
         recent_tool_anchor = None
-        for m in reversed(non_system_msgs[1:recent_start]):
+        for m in reversed(_middle_pool):
             if m.get("role") == "tool" and id(m) not in anchored_originals:
                 recent_tool_anchor = m
                 break
 
-        # Cap anchors to prevent them from dominating the context
-        anchor_messages = anchor_messages[:4]
-
         middle_messages = [
-            m for m in non_system_msgs[1:recent_start]
+            m for m in _middle_pool
             if m is not recent_tool_anchor and id(m) not in anchored_originals
         ]
 
         if not middle_messages:
             all_anchors = anchor_messages + ([recent_tool_anchor] if recent_tool_anchor else [])
             return self._cap_oversized_tail(
-                system_msgs + [original_goal] + all_anchors + recent_context,
+                system_msgs + _goal_head + all_anchors + recent_context,
                 max_tokens)
 
         # Condense the middle messages using a fast LLM worker
@@ -4230,7 +4796,7 @@ class GhostAgent:
         # result we hoisted out of the middle.
         all_anchors = anchor_messages + ([recent_tool_anchor] if recent_tool_anchor else [])
         return self._cap_oversized_tail(
-            system_msgs + [original_goal, {"role": "assistant", "content": summary}]
+            system_msgs + _goal_head + [{"role": "assistant", "content": summary}]
             + all_anchors + recent_context,
             max_tokens)
 
@@ -4378,7 +4944,12 @@ class GhostAgent:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.error(f"Biological watchdog tick failed: {e}")
+                    # §4CB R2 B-MIN-5: name the TYPE and keep the traceback —
+                    # for a preamble/self-play re-raise this line is the only
+                    # trace, and an empty str(e) (bare OSError) logged nothing
+                    # actionable.
+                    logger.error("Biological watchdog tick failed: %s: %s",
+                                 type(e).__name__, e, exc_info=True)
         except asyncio.CancelledError:
             logger.debug("Biological watchdog daemon cancelled")
             raise
@@ -4416,7 +4987,9 @@ class GhostAgent:
         _lc = getattr(self.context, "llm_client", None)
         if (getattr(_lc, "foreground_tasks", 0) > 0
                 or getattr(_lc, "foreground_requests", 0) > 0):
-            self._rss_over_since = getattr(self, "_rss_over_since", None) or "pending"
+            # §4CB R2 B-MIN-6: the old `_rss_over_since = "pending"` write
+            # here was dead instrumentation — written on this branch, read
+            # nowhere. The WARNING line below is the actual signal.
             logger.warning(
                 "RSS %.0f MB over limit %.0f MB but foreground work is active; "
                 "deferring controlled restart until idle.", rss, limit_mb,
@@ -4635,8 +5208,8 @@ class GhostAgent:
             # guard module, which is imported once under either shape.
             from .staleness import audit_source_newer_than_process as _audit
             from ..utils.logging import Icons as _I, pretty_log as _plog
-            _audit(lambda m: _plog("Stale Process", m, level="WARNING",
-                                   icon=_I.WARN))
+            _audit(lambda m, level="WARNING": _plog(
+                "Stale Process", m, level=level, icon=_I.WARN))
         except Exception:      # noqa: BLE001 — never break the tick
             pass
 
@@ -4847,27 +5420,57 @@ class GhostAgent:
                 if _dream_eligible:
                     if self._bio_roll(0.5):
                         _idle_ran.append("dream")
-                        from .dream import Dreamer
-                        pretty_log("Biological Hook",
-                                   "Agent is idle. Entering spontaneous REM cycle...",
-                                   icon=Icons.BRAIN_THINK)
-                        dreamer = Dreamer(ctx)
                         # Anchor the cooldown BEFORE the await so an exception
                         # mid-dream doesn't leave `_last_dream_at` at its prior
                         # value, which would cause the watchdog to re-fire the
                         # failing dream on every tick until the idle window
                         # naturally expires. Mirrors the fix already in place
                         # for synthetic self-play below.
+                        # §4CB R1 A-F2: the anchor moved ABOVE the preamble and
+                        # the preamble moved INSIDE the try — pretty_log has
+                        # raised in production (OSError 28), and from between
+                        # the eligibility claim and the try it escaped the
+                        # whole tick with `_last_dream_at` unadvanced: the
+                        # failing phase refired every tick and every later
+                        # phase starved while the watchdog reported alive.
                         self._last_dream_at = datetime.datetime.now()
                         try:
+                            pretty_log("Biological Hook",
+                                       "Agent is idle. Entering spontaneous REM cycle...",
+                                       icon=Icons.BRAIN_THINK)
+                            # §4CB R2 A-MIN-9: import inside the try — a
+                            # first-import failure outside it escaped with
+                            # the anchor unadvanced (per-tick refire).
+                            from .dream import Dreamer
+                            dreamer = Dreamer(ctx)
                             _dream_msg = str(await dreamer.dream(
                                 model_name=getattr(ctx.args, 'model', 'default')) or "")
-                            _dream_skipped = (
-                                "Skipping REM" in _dream_msg
-                                or "Not enough entropy" in _dream_msg)
-                            _side_output = any(
-                                k in _dream_msg for k in
-                                ("Episodic pass", "Distilled", "digest"))
+                            # §4CB R1 B-M1: classify by the OUTCOME SURFACE the
+                            # Dreamer stamps at every terminal site. The old
+                            # substring probes couldn't see "Dream error:" /
+                            # "Memory system not available." — failures were
+                            # ledgered as "REM cycle ran" (blinding the
+                            # EXPECT_PERIODIC zero-rows alarm) and reset the
+                            # backoff streak (max-cadence refire of a
+                            # permanently failing dream). Strings remain only
+                            # as a fallback for mocked Dreamers, extended with
+                            # the error shapes and with the bare-"digest" probe
+                            # narrowed to "project digest" (the entropy-skip
+                            # message itself contains "digests", which kept the
+                            # backoff permanently disarmed on that path).
+                            _outcome = getattr(dreamer, "last_dream_outcome", None)
+                            if isinstance(_outcome, dict):
+                                _dream_skipped = _outcome.get("phase") != "ran"
+                                _side_output = bool(_outcome.get("side_output"))
+                            else:
+                                _dream_skipped = (
+                                    "Skipping REM" in _dream_msg
+                                    or "Not enough entropy" in _dream_msg
+                                    or "Dream error" in _dream_msg
+                                    or "Memory system not available" in _dream_msg)
+                                _side_output = any(
+                                    k in _dream_msg for k in
+                                    ("Episodic pass", "Distilled", "project digest"))
                             if _dream_skipped and not _side_output:
                                 self._dream_skip_streak = getattr(
                                     self, "_dream_skip_streak", 0) + 1
@@ -4889,9 +5492,23 @@ class GhostAgent:
                             # skills, PRM, router, calibration, tidy,
                             # narratives, stale-questions, autoadvance,
                             # self-play) for that tick. Self-play re-raises on
-                            # purpose because it is LAST; dream is not.
+                            # purpose (the watchdog handler catches it; §4CB
+                            # R3: phase 3b now follows phase 3, so that
+                            # re-raise also costs bench one tick — it
+                            # self-heals on the next); dream is not last.
                             logger.warning("Dream phase failed: %s: %s",
                                            type(_dream_exc).__name__, _dream_exc)
+                            # §4CB R2 A-MAJ-2: the RAISE flavor of a failing
+                            # dream must feed the backoff streak too — the
+                            # surface stamps only RETURN sites, so a raise
+                            # skipped the whole classification block and a
+                            # permanently RAISING dream (pretty_log under
+                            # OSError 28 inside dream() is a real site)
+                            # refired at base cadence forever with the streak
+                            # frozen. Do NOT reference `dreamer` here — it is
+                            # unbound when Dreamer(ctx) itself raised.
+                            self._dream_skip_streak = getattr(
+                                self, "_dream_skip_streak", 0) + 1
                         finally:
                             # Do NOT reset ctx.last_activity_time here —
                             # see the comment in phase 1. Resetting it
@@ -4946,17 +5563,24 @@ class GhostAgent:
                         )
                         reflector = None  # falls through the phase gate below
                 if reflector is not None and traj_collector is not None:
-                    pretty_log(
-                        "Biological Hook",
-                        "Agent is idle. Entering reflection cycle on recent failures...",
-                        icon=Icons.BRAIN_THINK,
-                    )
                     # Anchor BEFORE the await so a crash mid-reflection
                     # still advances the cooldown — same defensive
                     # pattern the dream phase uses above.
+                    # §4CB R2 B-MAJ-1: anchor hoisted ABOVE the preamble and
+                    # the preamble moved INSIDE the try — the same A-F2
+                    # starvation identity R1 closed in phases 2/3 but left
+                    # open here: a raising pretty_log (production-observed
+                    # OSError 28) escaped the tick with the anchor still at
+                    # datetime.min, refiring every 60s tick and starving
+                    # phases 2.5c→3b while the watchdog reported alive.
                     _idle_ran.append("reflection")
                     self._last_reflection_at = datetime.datetime.now()
                     try:
+                        pretty_log(
+                            "Biological Hook",
+                            "Agent is idle. Entering reflection cycle on recent failures...",
+                            icon=Icons.BRAIN_THINK,
+                        )
                         # Loaded from disk once so restarts don't re-reflect
                         # the oldest failures (the loop progresses through the
                         # backlog instead of redoing work every boot).
@@ -5070,13 +5694,17 @@ class GhostAgent:
                 since_last_pm = (datetime.datetime.now() - self._last_postmortem_at).total_seconds()
                 if since_last_pm >= self._bio_cooldown(pm_cooldown):
                     _idle_ran.append("postmortem")
-                    pretty_log(
-                        "Biological Hook",
-                        "Agent is idle. Running post-mortem on worst recent failures...",
-                        icon=Icons.BRAIN_THINK,
-                    )
+                    # §4CB R2 B-MAJ-2: same class as B-MAJ-1 (reflection) —
+                    # anchor above the preamble, preamble inside the try, so
+                    # a raising announce can neither escape the tick nor
+                    # leave the cooldown unadvanced.
                     self._last_postmortem_at = datetime.datetime.now()
                     try:
+                        pretty_log(
+                            "Biological Hook",
+                            "Agent is idle. Running post-mortem on worst recent failures...",
+                            icon=Icons.BRAIN_THINK,
+                        )
                         pm_report = await engine.run(
                             source=lambda: traj_collector.iter_trajectories(),
                         )
@@ -5396,7 +6024,15 @@ class GhostAgent:
                     and not _prm_consumer_live
                 ):
                     self._last_prm_train_at = datetime.datetime.now()
-                    pretty_log(
+                    # §4CB R2 A-MIN-6: NO `_idle_ran.append` on this branch —
+                    # it is a deliberate months-long no-op (consumers off by
+                    # config), and reporting "prm" in "idle cycle: ran …"
+                    # here contradicts the §4Q contract that the summary
+                    # names phases that DO/ATTEMPT work. The working branch
+                    # below appends. R2 B-MIN-1: _safe_pretty_log — this
+                    # skip-line sits outside the phase try, so a raising
+                    # log (OSError 28) escaped the whole tick.
+                    self._safe_pretty_log(
                         "PRM Retrain",
                         "skipped — both value-reading consumers are off ("
                         + prm_consumer_why_no_reader(ctx)
@@ -5411,6 +6047,14 @@ class GhostAgent:
                     and isinstance(prm_scorer, _PRMScorer)
                 ):
                     self._last_prm_train_at = datetime.datetime.now()
+                    # §4CB R1 A-F4: six mid phases never appended to
+                    # `_idle_ran`, so the tick's "no phase ran" diagnostic
+                    # lied for exactly the phases it was built to watch
+                    # (#40's zero-reflection investigation class). Append
+                    # where the phase attempts real work (the fingerprint
+                    # check below IS work; the consumers-off branch above
+                    # is not — §4CB R2 A-MIN-6).
+                    _idle_ran.append("prm")
                     # Skip-if-unchanged gate: stat-level corpus fingerprint.
                     # Same-fingerprint ⇒ identical training data ⇒ the refit
                     # is a guaranteed no-op — don't burn the pass or log a
@@ -5433,7 +6077,10 @@ class GhostAgent:
                     except Exception:
                         _corpus_fp = None
                     if _corpus_fp is not None and _corpus_fp == self._prm_corpus_fp:
-                        pretty_log(
+                        # §4CB R2 B-MIN-1: outside the phase try — a raising
+                        # log here escaped the tick (after-anchor, so no
+                        # refire storm, but every later phase lost the tick).
+                        self._safe_pretty_log(
                             "PRM Retrain",
                             "skipped — trajectory corpus unchanged since last refit",
                             icon=Icons.SKIP,
@@ -5516,6 +6163,7 @@ class GhostAgent:
                 if (isinstance(traj_collector, _TrajColCls)
                         and isinstance(dispatcher, _ComplexityDispatcher)):
                     self._last_router_train_at = datetime.datetime.now()
+                    _idle_ran.append("router")   # §4CB R1 A-F4
                     # Skip-if-unchanged gate — same rationale as the PRM
                     # phase above: identical corpus ⇒ identical classifier.
                     _rt_corpus_fp = None
@@ -5535,7 +6183,8 @@ class GhostAgent:
                         _rt_corpus_fp = None
                     if (_rt_corpus_fp is not None
                             and _rt_corpus_fp == self._router_corpus_fp):
-                        pretty_log(
+                        # §4CB R2 B-MIN-1: same as the PRM skip-line above.
+                        self._safe_pretty_log(
                             "Router Retrain",
                             "skipped — trajectory corpus unchanged since last refit",
                             icon=Icons.SKIP,
@@ -5706,6 +6355,7 @@ class GhostAgent:
                 _tidy_store = getattr(ctx, 'project_store', None)
                 if _tidy_store is not None:
                     self._last_workspace_tidy_at = datetime.datetime.now()
+                    _idle_ran.append("tidy")   # §4CB R1 A-F4
                     try:
                         from .workspace_cleanup import tidy_project_workspace
                         _tidy_deleted = 0
@@ -5909,6 +6559,7 @@ class GhostAgent:
                 self_model = getattr(ctx, 'self_model', None)
                 if self_model is not None and getattr(self_model, 'enabled', False):
                     self._last_narrative_at = datetime.datetime.now()
+                    _idle_ran.append("selfhood-narrative")   # §4CB R1 A-F4
                     # Meta-cognitive narrative (proposal item #4): fold the
                     # learning phases' output into the diary. Recent
                     # mistakes from SkillMemory are the convergence point —
@@ -5952,6 +6603,7 @@ class GhostAgent:
                 _sm = getattr(ctx, 'self_model', None)
                 if _sm is not None and getattr(_sm, 'enabled', False):
                     self._last_stale_questions_at = datetime.datetime.now()
+                    _idle_ran.append("stale-questions")   # §4CB R1 A-F4
                     try:
                         stale = _sm.stale_open_questions(max_age_days=3.0)
                         if stale:
@@ -5994,6 +6646,7 @@ class GhostAgent:
                     ws = getattr(ctx, 'workspace_model', None)
                     if isinstance(ws, _WorkspaceModel) and getattr(ws, 'enabled', False):
                         self._last_workspace_narrative_at = datetime.datetime.now()
+                        _idle_ran.append("workspace-narrative")   # §4CB R1 A-F4
                         text = await ws.consolidate_narrative()
                         if text:
                             preview = text.replace("\n", " ")[:120]
@@ -6028,11 +6681,6 @@ class GhostAgent:
                     "idle self-play: eligible, skipped this tick (20%% dice miss)")
             else:
                 _idle_ran.append("self-play")
-                from .dream import Dreamer
-                pretty_log("Biological Hook",
-                           "Agent is deeply idle. Initiating Synthetic Self-Play...",
-                           icon=Icons.TOOL_CODE)
-                dreamer = Dreamer(ctx)
                 # C3: anchor `_last_selfplay_at` in a try/finally so a
                 # synthetic_self_play exception doesn't leave the
                 # cooldown un-reset. Previously, an exception skipped
@@ -6041,8 +6689,20 @@ class GhostAgent:
                 # window elapsed on its own. Advance the anchor BEFORE
                 # the await so even a ctrl-C / timeout mid-flight gets
                 # caught by the cooldown next tick.
+                # §4CB R1 A-F2: anchor hoisted ABOVE the preamble and the
+                # preamble moved INSIDE the try (same starvation identity
+                # as phase 2 — a raising pretty_log between the eligibility
+                # claim and the try escaped with the cooldown unadvanced;
+                # here the finally now also guarantees the LOAD-BEARING
+                # idle-clock reset runs even on a preamble raise).
                 self._last_selfplay_at = datetime.datetime.now()
                 try:
+                    pretty_log("Biological Hook",
+                               "Agent is deeply idle. Initiating Synthetic Self-Play...",
+                               icon=Icons.TOOL_CODE)
+                    # §4CB R2 A-MIN-9: import inside the try (same as phase 2).
+                    from .dream import Dreamer
+                    dreamer = Dreamer(ctx)
                     # Counterfactual phase 1 (2026-07-17): ~1 idle slot in 4
                     # replays PAST challenges against the current lessons
                     # instead of generating fresh ones — the measurement leg
@@ -6072,10 +6732,27 @@ class GhostAgent:
                             model_name=getattr(ctx.args, 'model', 'default'),
                             is_background=True
                         )
-                        self._record_autonomous_activity(
-                            "self_play",
-                            "synthetic self-play session ran (new lessons land "
-                            "in the skills playbook)")
+                        # §4CB R1 B-M2: `last_self_play_status` is stamped
+                        # ONLY at sim conclusion (dream.py), so unset ⟺ the
+                        # session never concluded — generation/setup/validator
+                        # failures return narrative strings without raising.
+                        # Recording those as "session ran" blinded the
+                        # EXPECT_PERIODIC zero-rows liveness alarm exactly for
+                        # the permanently-broken case it exists to catch.
+                        # §4CB R2 A-MAJ-1: TRUTHINESS, not `is not None` —
+                        # the counterfactual arm stamps "" on this same
+                        # Dreamer before each replay, and "" walked through
+                        # the identity gate (synthetic_self_play now also
+                        # pre-clears to None; this is the consumer-side belt).
+                        if getattr(dreamer, "last_self_play_status", None):
+                            self._record_autonomous_activity(
+                                "self_play",
+                                "synthetic self-play session ran (new lessons land "
+                                "in the skills playbook)")
+                        else:
+                            logger.info(
+                                "self-play session did not conclude — "
+                                "no ledger row minted")
                 except Exception as _spe:
                     # NAME self-play in the log (the tick handler's catch-all
                     # otherwise attributes the crash to "the tick"), then
@@ -6226,6 +6903,14 @@ class GhostAgent:
                         # operator's next question is "did my drain run?"
                         _cancelled = self._bench_drain_remaining
                         self._bench_drain_remaining = 0
+                        # §4CB R2 B-MIN-2: clear the bank filter too — the
+                        # drained-to-zero path below clears it for exactly
+                        # this reason ("health serves a bank filter for a
+                        # drain that is over, indefinitely"); this cancel
+                        # path zeroed the budget but left banks set. Read
+                        # the name for the message BEFORE clearing.
+                        _cancelled_banks = self._bench_drain_banks
+                        self._bench_drain_banks = None
                         # Bank names are filesystem-derived (the importer
                         # writes them, `list_banks` globs them), so they
                         # get the same control-char strip and length cap
@@ -6235,7 +6920,7 @@ class GhostAgent:
                         import re as _re_drain
                         _safe_req = _re_drain.sub(
                             r"[\x00-\x1f\x7f]", " ",
-                            str(self._bench_drain_banks or "all"))[:120]
+                            str(_cancelled_banks or "all"))[:120]
                         self._safe_pretty_log(
                             "Bench Drain",
                             f"CANCELLED with {_cancelled} item(s) unspent — "
@@ -6512,6 +7197,16 @@ class GhostAgent:
         if _idle_ran:
             logger.info("idle cycle: ran %s (idle %.0fm since last activity)",
                         ", ".join(_idle_ran), idle_secs / 60.0)
+            # §LOG-6a (2026-08-20): the summary above is logger.info →
+            # FILE-ONLY, so the watched console had NO liveness signal
+            # during deep idle — a wedged event loop and a healthy quiet
+            # night were indistinguishable for 30-45 min stretches. One
+            # console line per idle cycle that actually did work.
+            self._safe_pretty_log(
+                "Idle Cycle",
+                f"ran {', '.join(_idle_ran)} "
+                f"(idle {idle_secs / 60.0:.0f}m)",
+                icon=Icons.ACTIVITY)
         else:
             # WHY THIS EXISTS (#40, 2026-08-09): across 9 ablation arm-runs the
             # reflection phase fired ZERO times, and there was no way to tell
@@ -6814,7 +7509,7 @@ class GhostAgent:
                 # every `forget`. Bail before the fact is embedded. (The
                 # graph triplets above were already filtered.)
                 if is_removal_or_negation_text(fact):
-                    pretty_log("Auto Memory Skip", f"Discarded removal/negation tombstone: {fact}", icon=Icons.STOP)
+                    pretty_log("Auto Memory Skip", f"Discarded removal/negation tombstone: {fact}", icon=Icons.SKIP)
                     return
                 # Project-state backstop (2026-07-25): the prompt now scores
                 # tracked-project state at 0.2, but a small model inflates —
@@ -6941,7 +7636,7 @@ class GhostAgent:
                     # --smart-memory is lowered, which is the case the old code
                     # silently mishandled.
                     if not (is_personal or is_technical):
-                        pretty_log("Auto Memory Skip", f"Discarded generic knowledge: {fact}", icon=Icons.STOP)
+                        pretty_log("Auto Memory Skip", f"Discarded generic knowledge: {fact}", icon=Icons.SKIP)
                         return
                     # `identity` still requires genuine high confidence. This
                     # one IS a semantic judgement about what deserves to be a
@@ -8086,7 +8781,11 @@ class GhostAgent:
         return merged, block, bool(merged)
 
     def _record_verdict_sidecar(self, trajectory_id: str, verdict: str,
-                                confidence: float) -> None:
+                                confidence: float, *,
+                                sc_n: Optional[int] = None,
+                                sc_agree: Optional[int] = None,
+                                sc_drawn: Optional[int] = None,
+                                route: str = "") -> None:
         """Append one verdict record beside the trajectory log.
 
         Deliberately NOT written into the trajectory's `extra`: the
@@ -8132,6 +8831,14 @@ class GhostAgent:
                     # verdict. A naive join would otherwise mix a REFUTED
                     # first attempt into the metric this exists to enable.
                     "seq": self._verdict_seq_next,
+                    # §4BR vote attribution. Omitted entirely on the
+                    # single-sample path so a control row stays byte-shaped
+                    # as before and "no vote" is distinguishable from
+                    # "a vote of one".
+                    **({} if sc_n is None else {
+                        "sc_n": sc_n, "sc_agree": sc_agree,
+                        "sc_drawn": sc_drawn}),
+                    **({} if not route else {"route": route}),
                 }) + "\n")
         except Exception as e:  # noqa: BLE001 — never fail a turn
             # LOUD, not debug: this is the only durable record of the
@@ -8267,6 +8974,63 @@ class GhostAgent:
         # this method and share its cached result) — so the escalation can
         # never be live on one delivery path and dark on another.
         _high_stakes = _turn_had_tool_failure(tools_run_this_turn)
+
+        # ── §4BQ: the router's FIRST live consumer ────────────────────
+        # `_high_stakes` above is RETROSPECTIVE (a tool failed). This is
+        # the PROSPECTIVE counterpart: the complexity router judged the
+        # request confidently hard before any work happened, so the cheap
+        # leg's adjudication runs majority-of-3 instead of one sample.
+        #
+        # DECIDED IN handle_chat, NOT HERE — and the first version of this
+        # comment argued the opposite, that "this is the ONE place every
+        # verdict is produced" so the decision belonged beside
+        # `_high_stakes`. That reasoning is sound about the VERDICT and
+        # wrong about the STAMP: on the streamed path the trajectory is
+        # written before this coroutine is spawned, so an arm enrolled and
+        # a trigger stamped here land after the drain and never reach the
+        # corpus (measured 2/169 rows, against 145/169 for facts stamped in
+        # handle_chat). The decision now happens where the router runs and
+        # the ring slot is live; this method reads one boolean.
+        #
+        # ⚠ RANDOMISED, not defaulted. The premise "harder turns are
+        # likelier wrong" is UNTESTED — §4AN's whole lesson is that this
+        # router was accurate overall and worthless where it acted. Both
+        # arms stamp the trigger, so the triggered-only comparison is
+        # possible and the deploy IS the measurement.
+        # §4BR: READ the decision handle_chat already took (trigger, arm and
+        # kill switch all resolved there, while the ring slot is still live).
+        # Recomputing it here would be a second definition of one rule — the
+        # wrapper-split shape this project keeps re-growing — and would run
+        # too late on the streamed path to be recorded at all.
+        _deep = False
+        # Which verification route this turn took. Only `claim` has a
+        # two-stage leg, so it is the only route the treatment can reach.
+        _verify_route = "claim"
+        try:
+            # Read the EXPERIMENTS ring, not turn-facts. Both carry the same
+            # boolean (`mark_trigger`'s value IS `_vd_deep`), but the rings
+            # have different eviction exposure: turn-facts is a 16-slot ring
+            # every request writes to — including sub-agent and dream turns,
+            # which run the same router block — while the experiments ring
+            # only ever holds ENROLLED requests. (Both rings refresh LRU
+            # position on write; MEMBERSHIP is the difference, not the
+            # eviction policy.) A 16-wide sub-agent fan-out therefore evicts the
+            # parent's turn-facts entry while leaving the experiments one
+            # intact, which would read as `_deep=False` on a turn whose
+            # trajectory still stamps `verify_depth_fired=True` — a control
+            # run filed as treatment, the exact inversion `depth_for_turn`'s
+            # docstring promises cannot happen.
+            _flags = _experiments_mod.trigger_flags(
+                self.context, str(req_id or "")) or {}
+            _deep = bool(_flags.get("verify_depth_fired"))
+        except Exception as _vd_exc:   # never fail a verdict over routing
+            # WARNING: the swallow is correct (a routing fault must never
+            # fail a verdict) but its consequence is a SILENT control run on
+            # a turn recorded as enrolled. Three other degradation paths in
+            # this feature were promoted for exactly this reason; the live
+            # agent runs at INFO, so DEBUG here is no record at all.
+            logger.warning("verify-depth routing skipped, this turn verifies "
+                           "at control depth: %s", _vd_exc)
         # Ledger identity for the verifier's escalation records. Built here,
         # next to _high_stakes, for the same reason: this is the ONE place
         # every verdict is produced, so an escalation can never be joinable
@@ -8300,6 +9064,17 @@ class GhostAgent:
                     _code_output = ((tool_output[:_lroom] + "\n" + ledger_block)
                                     if _lroom > 0 else ledger_block)
                 with verify_purpose("turn gate"):
+                    # NO `deep=` here on purpose: this route has no
+                    # two-stage leg (one _call_llm, by design — see
+                    # verify_code_output's docstring), so there is no
+                    # adjudication to sample 3 times. Accepting the
+                    # parameter and ignoring it would be the
+                    # documented-but-unwired shape this codebase keeps
+                    # deleting. The route IS stamped below so the arm's
+                    # analysis can condition on it — a confident-hard turn
+                    # that took this route gets no treatment, and diluting
+                    # the arm with those silently would understate the
+                    # effect.
                     v_result = await verifier.verify_code_output(
                         code=code_text,
                         output=_code_output,
@@ -8308,6 +9083,7 @@ class GhostAgent:
                         high_stakes=_high_stakes,
                         trace=_trace,
                     )
+                    _verify_route = "code_output"
             else:
                 with verify_purpose("turn gate"):
                     v_result = await verifier.verify_claim(
@@ -8315,6 +9091,7 @@ class GhostAgent:
                         evidence=claim_evidence,
                         context=request_view[:1000],
                         high_stakes=_high_stakes,
+                        deep=_deep,
                         trace=_trace,
                     )
         else:
@@ -8324,8 +9101,28 @@ class GhostAgent:
                     evidence=claim_evidence,
                     context=request_view[:1000],
                     high_stakes=_high_stakes,
+                    deep=_deep,
                     trace=_trace,
-            )
+                )
+        # §4BR: carry the vote counters ACROSS the ground-truth overrides.
+        #
+        # `verify_claim` already re-stamps them onto its own return value
+        # after its internal escalation ladder, and the comment there says
+        # "stamping here is immune to the sixth [replacement site]". That
+        # immunity stops at the function boundary — THREE more overrides
+        # below build or substitute a different VerifyResult (visual,
+        # WEB-EXEC, file-artifact), after which the sidecar reads the
+        # counters off the replacement, finds None, and omits the keys
+        # entirely. The row is then byte-identical to a control turn that
+        # never voted. Measured on the live log: ~3% of claim verdicts take
+        # one of these overrides.
+        #
+        # Same fix, one level up: snapshot before, re-stamp after.
+        _vote_carry = (
+            (getattr(v_result, "self_consistency_n", None),
+             getattr(v_result, "self_consistency_agree", None),
+             getattr(v_result, "self_consistency_drawn", None))
+            if v_result is not None else None)
         # Visual ground-truth override (unchanged from the inline gate).
         try:
             if _is_visual_intent(last_user_content):
@@ -8535,6 +9332,17 @@ class GhostAgent:
                 f"interaction-cap check error: {type(_ic_exc).__name__}: {_ic_exc}",
                 icon=Icons.WARN, level="WARNING",
             )
+        # Re-stamp the vote across whichever override won above. Guarded on
+        # DRAWN (index 2): a vote whose samples all failed to parse still
+        # drew them, and must not read as a control turn.
+        if (v_result is not None and _vote_carry is not None
+                and _vote_carry[2]
+                and getattr(v_result, "self_consistency_drawn", None) is None):
+            try:
+                (v_result.self_consistency_n, v_result.self_consistency_agree,
+                 v_result.self_consistency_drawn) = _vote_carry
+            except Exception:  # noqa: BLE001 — attribution never fails a turn
+                pass
         # ── RECORD THE VERDICT (recording only, no behaviour change) ──
         # WHY: the router's difficulty signal cannot currently be evaluated
         # for QUALITY, only for cost. Trajectory labels are derived from
@@ -8568,7 +9376,8 @@ class GhostAgent:
                 if req_id:
                     from . import turn_facts as _tf
                     _tf.record(self.context, str(req_id),
-                               verifier_verdict=_vs, verifier_confidence=_vc)
+                               verifier_verdict=_vs, verifier_confidence=_vc,
+                               verify_route=str(_verify_route))
                 # (b) A DURABLE SIDECAR, because (a) alone records NOTHING
                 #     on either live delivery path. Measured: on the
                 #     streamed path `_record_turn_trajectory` runs before
@@ -8582,7 +9391,38 @@ class GhostAgent:
                 #     instead makes the record independent of ordering; an
                 #     analysis joins on it.
                 if trajectory_id:
-                    self._record_verdict_sidecar(str(trajectory_id), _vs, _vc)
+                    self._record_verdict_sidecar(
+                        str(trajectory_id), _vs, _vc,
+                        # §4BR: the vote counters ride the SIDECAR, for the
+                        # same reason the verdict does. They are the
+                        # instrument for the arm's mechanism gate ("if
+                        # a healthy arm records ~11% non-unanimous
+                        # votes, so too FEW of them means the judge does
+                        # not vary here and the arm retires"), and a gate
+                        # whose input lands after the
+                        # ledger write has nothing to read — which is
+                        # exactly what shipped: they were dynamic
+                        # attributes on VerifyResult, absent from the
+                        # dataclass, to_dict, the sidecar and turn-facts,
+                        # with no reader in the tree outside two tests.
+                        sc_n=getattr(v_result, "self_consistency_n", None),
+                        sc_agree=getattr(v_result, "self_consistency_agree",
+                                         None),
+                        sc_drawn=getattr(v_result, "self_consistency_drawn",
+                                         None),
+                        # §4BR R23: the route rides the sidecar too. It was
+                        # written ONLY to turn-facts — three lines above the
+                        # comment explaining that turn-facts records nothing
+                        # on either live delivery path — so after six days
+                        # of traffic the corpus held 154 router labels and
+                        # ZERO routes. Two separate comments claimed the
+                        # arm's analysis "can condition on it"; it could
+                        # not. ~10.8% of the arm's population takes the
+                        # code-output route, which has no two-stage leg and
+                        # therefore no treatment, and without this they are
+                        # indistinguishable from turns the treatment simply
+                        # failed to help.
+                        route=str(_verify_route))
         except Exception as _vf_exc:   # recording must never fail a turn
             logger.debug("verdict recording skipped: %s", _vf_exc)
 
@@ -8670,15 +9510,27 @@ class GhostAgent:
         later turns. Native tool defs still travel in the payload ``tools``
         field, so tool-calling does not depend on the text block's position.
         """
+        def _prefix_content(existing, prefix_text):
+            """Prepend injection text to message content that may be a STRING
+            or a structured LIST (native vision parts). f-stringing a list
+            baked its Python repr into prompt text — the image part was
+            destroyed and a real image's base64 became text the governor then
+            had to eat (§ context R1 B4). List shape: the injection becomes a
+            leading text part; image parts ride untouched."""
+            if isinstance(existing, list):
+                return [{"type": "text", "text": prefix_text}] + list(existing)
+            return f"{prefix_text}\n{existing}"
+
         if not pin:
             transient_injection = f"{stable_injection}\n\n{dynamic_state.strip()}"
             if req_messages and req_messages[-1]["role"] == "user":
                 original_msg = req_messages[-1]["content"]
-                req_messages[-1]["content"] = (
+                req_messages[-1]["content"] = _prefix_content(
+                    original_msg,
                     f"<system_state_update>\n{transient_injection}\n(CRITICAL: This is "
                     "internal system state. Do NOT acknowledge or comment on this block in "
                     "your thoughts. Focus entirely on the user instruction.)\n"
-                    f"</system_state_update>\n\n[USER INSTRUCTION]\n{original_msg}"
+                    "</system_state_update>\n\n[USER INSTRUCTION]"
                 )
             else:
                 req_messages.append({
@@ -8706,8 +9558,9 @@ class GhostAgent:
             req_messages.insert(ins, {"role": "user", "content": stable_block})
             first_user_idx = ins
         else:
-            req_messages[first_user_idx]["content"] = (
-                f"{stable_block}\n\n[USER INSTRUCTION]\n{req_messages[first_user_idx]['content']}"
+            req_messages[first_user_idx]["content"] = _prefix_content(
+                req_messages[first_user_idx]["content"],
+                f"{stable_block}\n\n[USER INSTRUCTION]",
             )
         last_idx = len(req_messages) - 1
         if last_idx == first_user_idx:
@@ -8719,8 +9572,9 @@ class GhostAgent:
             # byte-identical from turn 1 onward.
             req_messages.append({"role": "user", "content": volatile_block})
         elif req_messages[last_idx]["role"] == "user":
-            req_messages[last_idx]["content"] = (
-                f"{volatile_block}\n\n{req_messages[last_idx]['content']}"
+            req_messages[last_idx]["content"] = _prefix_content(
+                req_messages[last_idx]["content"],
+                f"{volatile_block}\n",
             )
         else:
             req_messages.append({"role": "user", "content": volatile_block})
@@ -9702,11 +10556,40 @@ class GhostAgent:
             # ran against a human-labeled turn. The sidecar is the durable
             # truth and `_load_corrections` is memoized, so this is one
             # stat + dict lookup in the common case.
+            # EVER-human, not latest-human (review R2 MAJOR-1). The writer
+            # guard in `update_outcome` was moved to `has_human_label` and
+            # THIS site — which gates the whole late-verdict consequence
+            # chain: lesson scrubbing, follow-up task filing, the
+            # "correction to my previous answer" banner, the stream
+            # re-render — was left reading only the LATEST sidecar record.
+            # So an intermediate `user_correction` row protected the
+            # outcome and NOT the consequences: measured, the lessons of a
+            # human-approved turn were scrubbed and follow-ups filed, both
+            # irrecoverable. The fix's own test docstring claimed both
+            # sites were covered; only one was.
+            # TRUTHINESS, deliberately — and this line was `is True` for
+            # one round, which INVERTED the guard's own failure direction
+            # (review R4 M2).
+            #
+            # The guard must FAIL CLOSED: when in doubt, treat the turn as
+            # human-labelled and withhold the machine verdict, because the
+            # consequences it gates — lesson retraction, follow-up filing,
+            # the correction banner — are irrecoverable, while withholding
+            # merely defers. `is True` fails OPEN for any truthy non-bool:
+            # the chain runs against a human-approved turn.
+            #
+            # What actually went wrong was a TEST DOUBLE: two suites wire a
+            # bare `MagicMock()`, whose `has_human_label` returns a truthy
+            # Mock, and the old `str(...).startswith(...)` form coerced it
+            # to False by accident. That is fixed where it belongs — the
+            # mock now states `return_value = False`. Production's
+            # `has_human_label` returns a real bool on every path, so `is
+            # True` bought nothing and cost the failure direction. The
+            # sibling guards (collector.update_outcome, the overlay) use
+            # truthiness too; one doctrine, three sites.
             collector = getattr(self.context, "trajectory_collector", None)
-            latest = (collector.latest_correction(trajectory_id)
-                      if collector is not None else None)
-            if latest and str(latest.get("source") or "").startswith(
-                    "human_feedback"):
+            if collector is not None and collector.has_human_label(
+                    trajectory_id):
                 return True
         except Exception:
             return False
@@ -10015,9 +10898,26 @@ class GhostAgent:
             parse_target, flags=re.IGNORECASE,
         )
 
-        # Heal bare <function> tags missing the <tool_call> wrapper
-        if '<function' in parse_target and '<tool_call' not in parse_target:
-            parse_target = parse_target.replace('<function', '<tool_call>\n<function')
+        # Does the (think-stripped) reply LOOK like a raw-JSON tool call?
+        # Computed BEFORE any tag heal so a `{`-leading raw-JSON reply is left
+        # entirely alone: the bare-`<function>` heal below must NOT inject a
+        # `<tool_call>` into a JSON argument value that literally contains
+        # `<function name=`/`<function=` (§ turn-loop R3 — that corrupted the
+        # dispatched `command`/`content`, e.g. `grep '<function name=' x.py`).
+        # Leading `{` is invariant under the heals (they only touch tag text).
+        _looks_raw_json = parse_target.strip().startswith('{')
+
+        # Heal bare <function ...> tags missing the <tool_call> wrapper — but
+        # only a REAL function tag (name=/= dialect), never a prose mention of
+        # "<function>" or a raw-JSON arg containing the literal `<function`
+        # (§ turn-loop R2/R3). Wrapping a mere mention injected a phantom
+        # <tool_call> that then (a) tripped has_tool_tag, routing prose / raw
+        # JSON into the XML healer, (b) parsed as a truncated/garbage call
+        # → system_parse_error + a truncated user reply, or (c) corrupted a
+        # raw-JSON argument value in place. Skipped entirely for raw JSON.
+        if ('<tool_call' not in parse_target and not _looks_raw_json
+                and _FN_TAG_RE.search(parse_target)):
+            parse_target = _FN_TAG_RE.sub(r'<tool_call>\n\g<0>', parse_target)
 
         # Heal sloppy attribute syntax from newer Qwen variants
         # (3.6+). They drop the `name` attribute and/or pad `=`
@@ -10055,7 +10955,86 @@ class GhostAgent:
         )
         # -----------------------------
 
-        has_tool_tag = re.search(r'<(?:tool_call|function)\b', parse_target, re.IGNORECASE) is not None
+        # A REAL tool-call marker only: a `<tool_call>` wrapper or a real
+        # `<function ...>` opener (name=/= dialect) — NOT a bare `<function`/
+        # `<tool_call` substring in prose or raw-JSON args (§ turn-loop R2).
+        # A raw-JSON tool call (content starts with `{`, computed above before
+        # the heals) is NEVER an XML call — route it to the raw-JSON fallback
+        # below even when its argument values literally contain `<tool_call>`/
+        # `<function` (e.g. a grep/write of tool XML — highly plausible in this
+        # codebase); otherwise the substring matched here and the real call was
+        # dropped as system_parse_error.
+        has_tool_tag = (not _looks_raw_json) and (
+            re.search(r'<tool_call\b', parse_target, re.IGNORECASE) is not None
+            or _FN_TAG_RE.search(parse_target) is not None
+        )
+
+        # Native `tool_calls` take precedence over a content preamble that
+        # merely MENTIONS tool XML (2026-08-19 review). Under --native-tools
+        # (default ON) the structured `tool_calls` array is the authoritative
+        # channel; the assistant's prose can still contain the substring
+        # `<function`/`<tool_call>` (schema echo, reasoning, "I'll use the
+        # <function> convention"). `has_tool_tag` matches that substring, so
+        # WITHOUT this guard such a reply was routed into the XML healer — and
+        # the real native calls, read ONLY in the `else` branch below, were
+        # DROPPED (→ system_parse_error / reason='truncated') or replaced by a
+        # wrong tool with empty args. Prefer native whenever it is present; the
+        # XML path stays the fallback for when the server did NOT populate
+        # `tool_calls`. The leaked tokens are scrubbed on the native path too
+        # (see the guarded scrub just before the return).
+        # Prefer native ONLY when it carries a USABLE call, else a degenerate
+        # native entry (empty args, or a name the agent doesn't expose) would
+        # shadow a richer, fully-parseable XML call in the content (§ turn-loop
+        # R2, lens A regression). Usable = an available tool name AND either
+        # non-empty args, or — for a legitimately no-arg call — no competing
+        # real XML call in the content (has_tool_tag, tightened above, is now a
+        # faithful "content has a real call" signal).
+        _avail_names = getattr(self, "available_tools", None) or {}
+
+        def _native_call_usable(tc):
+            fn = (tc or {}).get("function") or {}
+            name = fn.get("name")
+            if name not in _avail_names:
+                return False
+            # Resolve the native arguments to a dict. A truncated/garbage
+            # native args STRING, or args that are a list/scalar, are
+            # degenerate — they must NOT be treated as "has args" and allowed
+            # to shadow a fully-parseable XML call (§ turn-loop R3, F1b/F1c).
+            raw = fn.get("arguments")
+            if isinstance(raw, dict):
+                args = raw
+            elif raw is None:
+                args = {}
+            elif isinstance(raw, str):
+                s = raw.strip()
+                if s in ("", "{}", "null", "[]"):
+                    args = {}
+                else:
+                    try:
+                        parsed = json.loads(s)
+                    except Exception:
+                        return False  # unparseable native args → degenerate
+                    args = parsed if isinstance(parsed, dict) else None
+            else:
+                args = None
+            if args is None:
+                return False  # non-dict args → degenerate
+            if args:
+                return True   # real args → usable
+            # Empty args: usable for a pure-trigger tool (a complete call with
+            # no parameters), OR for a RUNTIME-registered tool (not in the
+            # static definitions — a composed macro / acquired skill whose
+            # schema is unknowable here; § turn-loop R4). For a STATIC tool
+            # that takes parameters, empty args is degenerate and must yield
+            # to a competing XML call — keying off `not has_tool_tag` instead
+            # would re-open the exact proxy the gate exists to close
+            # (§ turn-loop R3, F1a: an echoed tool tag in prose made a no-arg
+            # native call look unusable).
+            return (name in _PURE_TRIGGER_TOOLS
+                    or name not in _STATIC_TOOL_NAMES)
+
+        _native_tcs_present = bool(msg) and any(
+            _native_call_usable(tc) for tc in (msg.get("tool_calls") or []))
 
         # Per-turn diagnosis of the parse reason. Populated when
         # the parser fails so the recovery-message branch can
@@ -10064,7 +11043,7 @@ class GhostAgent:
         # was invalid" — which sends the model guessing.
         parse_failure_reason = ""
 
-        if has_tool_tag:
+        if has_tool_tag and not _native_tcs_present:
             pretty_log("Agent Parser", "Extracting XML tool call...", icon=Icons.TOOL_CODE)
 
             # --- UPSTREAM TRUNCATION DETECTOR ---
@@ -10690,6 +11669,20 @@ class GhostAgent:
                 except Exception:
                     pass
 
+        # Native-precedence leak scrub (2026-08-19 review). When native
+        # `tool_calls` won the routing over content that ALSO carried
+        # `<function`/`<tool_call>` tokens, the XML-path scrub above never ran,
+        # so those tokens would leak into the user-facing reply. Strip them
+        # here. Guarded on `has_tool_tag` so it is a no-op for pure-text turns;
+        # idempotent on the XML path (already scrubbed → nothing left to match).
+        if has_tool_tag:
+            ui_content = re.sub(
+                r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+                '',
+                ui_content,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+
         return tool_calls, ui_content, parse_failure_reason
 
     async def _dispatch_and_process_tool_batch(self, ts: "TurnState") -> bool:
@@ -11050,9 +12043,17 @@ class GhostAgent:
                 # verification read could then hit the no-progress breaker) and
                 # byte-identical clone/unzip/image_generation calls were
                 # dedup-collapse eligible.
+                # `knowledge_base` action is matched on the HEALED, lowercased
+                # value: `tool_knowledge_base` aliases transcribe/transcribe_
+                # document/transcription/ingest/ingest_file → ingest_document (a
+                # WRITE) AFTER this check runs (memory.py). Keying on the raw
+                # arg let an aliased ingest (transcribe is the ADVERTISED verb)
+                # be classified read-safe → byte-identical duplicates collapsed,
+                # dropping a real ingest (§ turn-loop R3, F2a). `file_system`
+                # `copy` mutates (creates a file) and was likewise missing (F2b).
                 is_mutating = fname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
-                              (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone"]) or \
-                              (fname == "knowledge_base" and t_args.get("action") in ["ingest_document", "forget", "reset_all", "insert_fact"]) or \
+                              (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
+                              (fname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
                               (fname == "manage_composed_skills" and t_args.get("action") in ["define", "approve", "delete"])
 
                 # --- IDEMPOTENCY GUARD (production loop fix) ---
@@ -11378,14 +12379,18 @@ class GhostAgent:
                         # Batch dedup collapses byte-identical calls in one
                         # batch to a single execution. `is_mutating` alone is
                         # NOT a sufficient safety gate (2026-07-20): stateful
-                        # tools like `browser` (op=interact click), and
-                        # side-effecting ones like `manage_projects`,
-                        # `notify_operator`, `delegate` aren't in that list, so
-                        # two identical clicks collapsed to one and the model
-                        # believed both happened (state drift). Dropping a real
-                        # call is far worse than a redundant read, so exclude
-                        # anything stateful/side-effecting from collapse too.
-                        _collapse_unsafe = is_mutating or fname in _BATCH_COLLAPSE_UNSAFE
+                        # tools like `browser` (op=interact click) and
+                        # side-effecting ones like `manage_projects` believe
+                        # both happened when one is dropped (state drift).
+                        # Collapse is now gated by an ALLOWLIST of read-safe
+                        # tools (`_COLLAPSE_READSAFE`) rather than a denylist
+                        # (§ turn-loop R2): a denylist could not name the
+                        # runtime-registered macro/skill runners, which run
+                        # arbitrary side-effecting code. Anything not read-safe
+                        # (or any mutating call, via the `is_mutating` OR) is
+                        # collapse-unsafe. Dropping a real call is far worse
+                        # than a redundant read, so unknown/dynamic → unsafe.
+                        _collapse_unsafe = is_mutating or fname not in _COLLAPSE_READSAFE
                         _dup_src_idx = None if _collapse_unsafe else batch_seen_reads.get(a_hash)
                         if _dup_src_idx is not None:
                             # Duplicate read-only call in the SAME batch —
@@ -11397,6 +12402,32 @@ class GhostAgent:
                             tool_tasks.append(None)
                             tool_durations.append(None)
                         else:
+                            # §LOG-5 (2026-08-20): ONE dispatch-level line
+                            # per executed tool call. Before this, a tool
+                            # was visible only if it self-logged — a
+                            # successful yt_download/notify/delegate run
+                            # appeared NOWHERE on the operator stream.
+                            # Compact arg summary; redaction happens inside
+                            # pretty_log; dup-collapsed reads (above) never
+                            # execute, so they get no line.
+                            try:
+                                _disp_bits = []
+                                for _dk in ("operation", "action", "op",
+                                            "path", "url", "query",
+                                            "command", "prompt"):
+                                    _dv = t_args.get(_dk)
+                                    if isinstance(_dv, str) and _dv:
+                                        _disp_bits.append(
+                                            f"{_dk}={_dv[:60]}")
+                                    if len(_disp_bits) >= 2:
+                                        break
+                                pretty_log(
+                                    "Tool Call",
+                                    fname + (f" · {' · '.join(_disp_bits)}"
+                                             if _disp_bits else ""),
+                                    icon=Icons.REQ_START)
+                            except Exception:
+                                pass
                             _coro = self.available_tools[fname](**t_args)
                             tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
                             tool_durations.append(None)
@@ -11450,6 +12481,13 @@ class GhostAgent:
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
+                    # §LOG-5c: this rejection incremented the strike counter
+                    # with NO operator line — a model hallucinating tool
+                    # names was invisible until the strike cap fired.
+                    pretty_log("Tool Warning",
+                               f"unknown tool '{fname}' rejected "
+                               f"(strike {execution_failure_count}/6)",
+                               icon=Icons.WARN, level="WARNING")
 
             # If every tool_call this iteration was rejected
             # synthetically, the model's preamble text was a
@@ -12511,7 +13549,7 @@ class GhostAgent:
                         last_error_res = str_res
                         failed_fname = fname
                         last_error_preview = str_res.replace("Error:", "").strip()
-                        pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN)
+                        pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")  # §LOG-5b
 
                     elif fname in ["manage_tasks", "learn_skill", "update_profile"] and "SUCCESS" in str_res.upper():
                         if is_mutating: seen_tools.clear()
@@ -12654,11 +13692,15 @@ class GhostAgent:
 
                     if failure_class == FailureClass.RETRYABLE:
                         transient_failure_count += 1
-                        pretty_log("Transient Fail", f"Transient strike {transient_failure_count}/4 ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN)
+                        # §LOG-5b: WARNING — these strike lines are the
+                        # turn's primary "what broke" record, and at INFO
+                        # they only got the 60-char budget, which cut the
+                        # error preview mid-clause (WARN+ gets 240).
+                        pretty_log("Transient Fail", f"Transient strike {transient_failure_count}/4 ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")
                         diagnostic_msg = format_failure_context(last_error_preview, failure_class)
                     else:
                         execution_failure_count += 1
-                        pretty_log("Execution Fail", f"Strike {execution_failure_count}/6 ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL)
+                        pretty_log("Execution Fail", f"Strike {execution_failure_count}/6 ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL, level="WARNING")  # §LOG-5b
                         diagnostic_msg = format_failure_context(last_error_preview, failure_class)
                         # Detect the SAME structural failure recurring.
                         # At ≥3 repeats: freeze the success-decay (so the
@@ -12762,7 +13804,7 @@ class GhostAgent:
                         # Distinct title (was "Loop Breaker", shared by 3
                         # different events): this is the dispatch-pipeline
                         # failure cap forcing a final answer.
-                        pretty_log("Failure Cap", "Forcing final response", icon=Icons.STOP)
+                        pretty_log("Failure Cap", "Forcing final response", icon=Icons.STOP, level="WARNING")
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed. Provide a final response explaining the situation."})
                         force_final_response = True
                         # Tell the LATE episode write that this turn ended at
@@ -13183,15 +14225,11 @@ class GhostAgent:
         _verdict_is_fresh = fs._verdict_is_fresh
         _verifier_verdict_cache = fs._verifier_verdict_cache
         # --- FINAL OUTPUT SCRUBBER ---
-        # Apply scrubbers FIRST so we don't accidentally scrub our own manual fallback injections
-        bleed_markers = [
-            "# Tools", "<tools>", "CRITICAL INSTRUCTION:", "You may call one or more functions",
-            '{"type": "function"', "SPECIALIST SUBSYSTEM ACTIVATED", "ENGINEERING STANDARDS",
-            "DYNAMIC SYSTEM STATE", "[SYSTEM STATE UPDATE]"
-        ]
-        for bleed_marker in bleed_markers:
-            if bleed_marker in final_ai_content:
-                final_ai_content = final_ai_content.split(bleed_marker)[0]
+        # Apply scrubbers FIRST so we don't accidentally scrub our own manual
+        # fallback injections. Bleed truncation via the shared strong/weak
+        # helper (§ R1 A-F3) — a lone `# Tools` heading or a quoted tool-
+        # schema example no longer destroys the reply.
+        final_ai_content = _truncate_prompt_bleed(final_ai_content)
 
         # Last-resort scrub on final_ai_content. Must match the
         # widened mid-flow ui_content scrub (agent.py:~3149) shape
@@ -13224,7 +14262,7 @@ class GhostAgent:
         final_ai_content = re.sub(r'<tool_response.*?>.*?(?:</tool_response.*?>|\Z)', '', final_ai_content, flags=re.DOTALL | re.IGNORECASE)
         final_ai_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', final_ai_content, flags=re.DOTALL)
         final_ai_content = re.sub(r'(?m)^\s*(?:🔄|🟢|⏳|✅|❌|🛑|➖)\s*\[.*?\].*?\n?', '', final_ai_content)
-        final_ai_content = re.sub(r'(?m)^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*\n?', '', final_ai_content)
+        final_ai_content = _scrub_task_status_runs(final_ai_content)  # § R1 A-F3
         final_ai_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', final_ai_content)
         final_ai_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', final_ai_content)
         # Strip leaked Qwen Generative-Reward-Model JSON. These keys
@@ -13312,9 +14350,12 @@ class GhostAgent:
         # steers can't fix assembly order; this deterministic hoist can.
         # Runs after smoothing and BEFORE the verifier gate, so the verdict
         # judges the text the user actually receives.
+        _sw_active_phrase = None
         try:
             from ..utils.constraints import (
-                enforce_start_with, extract_constraints as _exc_fn)
+                enforce_start_with, parse_start_with_phrase as _psw_fn,
+                reply_satisfies_start_with as _rssw_fn,
+                extract_constraints as _exc_fn)
             _sw_constraints = (list(_exc_fn(last_user_content or ""))
                                + self._active_project_constraints())
             _enforced, _sw_dropped = enforce_start_with(
@@ -13328,8 +14369,56 @@ class GhostAgent:
                     icon=Icons.CONSTRAINT,
                 )
                 final_ai_content = _enforced
+            # § finalize/stream R1 A-F2: remember an ACTIVE, satisfied
+            # start-with phrase so the later finalize prepends (clarifying
+            # question, digests, deferred correction) insert BELOW the
+            # mandated opening instead of re-burying it — the method was
+            # enforcing and violating the same constraint in one pass.
+            _p = _psw_fn(_sw_constraints)
+            if _p and _rssw_fn(final_ai_content, _p):
+                _sw_active_phrase = _p
         except Exception as _sw_exc:
             logger.debug("start-with enforcement skipped: %s", _sw_exc)
+
+        def _head_insert(block: str, reply: str) -> str:
+            """Insert finalize-added material at the head of the reply —
+            unless an active start-with constraint leads it (§ R1 A-F2), in
+            which case the block goes AFTER the phrase-led first segment so
+            the mandated opening stays first."""
+            if not block:
+                return reply
+            if not _sw_active_phrase:
+                return block + reply
+            # § R3 B-D3: a reply that ENDS inside an open fence (odd total
+            # marker count) cannot take an insert or an append without
+            # corrupting the fence — the constraint yields to content
+            # integrity: plain prepend, as before R1.
+            if len(_FENCE_MARK_RE.findall(reply)) % 2 == 1:
+                return block + reply
+            _cut = reply.find("\n\n")
+            # § R2 M-1 (+ R3 B-D3): never land inside an OPEN code fence —
+            # counted line-anchored and in BOTH dialects (``` and ~~~); the
+            # R2 walk counted bare ``` substrings, so a ~~~markdown fence
+            # took the digest INSIDE it. With an odd count before the cut,
+            # advance past the closing fence's paragraph break.
+            while _cut != -1 and len(
+                    _FENCE_MARK_RE.findall(reply[:_cut])) % 2 == 1:
+                _fm = _FENCE_MARK_RE.search(reply, _cut)
+                if _fm is None:
+                    _cut = -1
+                    break
+                _cut = reply.find("\n\n", _fm.end())
+            if _cut != -1:
+                _cut += 2
+                return reply[:_cut] + block + reply[_cut:]
+            _cut = reply.find("\n")
+            if _cut != -1 and not _FENCE_MARK_RE.search(reply):
+                _cut += 1
+                return reply[:_cut] + "\n" + block + reply[_cut:]
+            _tail = block
+            if _tail.endswith("\n\n---\n\n"):
+                _tail = _tail[:-len("\n\n---\n\n")]
+            return reply.rstrip() + "\n\n---\n\n" + _tail
 
         # --- THE "PERFECT IT" PROTOCOL INJECTION ---
         # Only trigger proactive optimization for heavy engineering/research tasks
@@ -13509,11 +14598,60 @@ class GhostAgent:
                         _still_running = _ipr(str(fallback_tool.get("content", "")))
                     except Exception:  # noqa: BLE001
                         _still_running = False
-                    _head = ("The command is STILL RUNNING in the background "
-                             "(it outran its execution budget and was detached, "
-                             "not killed); its result is not in yet."
-                             if _still_running
-                             else "Process finished successfully.")
+                    # § finalize/stream R1 A-F1: the header must also check
+                    # the ERROR shape. The ACTION view deliberately returns
+                    # errored tools, and this banner only checked
+                    # still-running — so an `Error:`-prefixed tool result was
+                    # delivered under "Process finished successfully." while
+                    # the same turn's Turn Outcome line said `failed` (the
+                    # comment above claims the false-success leak was fixed —
+                    # it was, but only for `_synthetic` entries). Classified
+                    # on the SAME shapes the dispatch loop uses, plus the
+                    # execute EXIT-CODE banner.
+                    # § R2 M-2: colon'd prefixes only — the bare "ERROR"
+                    # prefix branded a successful log read starting
+                    # "ERROR count: 0" (or "ERRORS = {") as FAILED. The EXIT
+                    # CODE banner is consulted only for execute-family output
+                    # (elsewhere it is data — a saved CI log), and where
+                    # present it DECIDES: an explicit "EXIT CODE: 0" outranks
+                    # an error-looking first line of raw output.
+                    _raw_out = str(fallback_tool.get("content", ""))
+                    _fb_name = str(fallback_tool.get("name", ""))
+                    # § R3 B-D1: keying the banner check on the NAME was a
+                    # proxy — acquired skills dispatch under their own names
+                    # with tool_execute's banner verbatim, and delegate
+                    # returns "[sandbox job N finished — EXIT CODE: 1]"; a
+                    # failing skill shipped as "Process finished
+                    # successfully." Consult the banner for execute-SHAPED
+                    # content: a line-anchored EXIT CODE with execution
+                    # framing, or the sandbox-job form. The as-data case
+                    # ("ci-log.txt saved earlier says EXIT CODE: 3") stays
+                    # excluded — unanchored, no framing.
+                    _exec_shaped = (
+                        _fb_name == "execute"
+                        or (re.search(r"(?m)^EXIT CODE:\s*\d+", _raw_out)
+                            is not None
+                            and ("STDOUT/STDERR:" in _raw_out
+                                 or "--- EXECUTION RESULT ---" in _raw_out))
+                        or re.search(r"\[sandbox job [^\]]*EXIT CODE:\s*\d+",
+                                     _raw_out) is not None)
+                    _m_exit = (re.search(r"EXIT CODE:\s*(\d+)", _raw_out)
+                               if _exec_shaped else None)
+                    if _m_exit is not None:
+                        _looks_failed = _m_exit.group(1) != "0"
+                    else:
+                        _looks_failed = _raw_out.lstrip().startswith(
+                            ("Error:", "ERROR:", "SYSTEM ERROR",
+                             "Critical Tool Error"))
+                    if _still_running:
+                        _head = ("The command is STILL RUNNING in the background "
+                                 "(it outran its execution budget and was detached, "
+                                 "not killed); its result is not in yet.")
+                    elif _looks_failed:
+                        _head = ("The last command FAILED — the output below "
+                                 "is its error result, not a success.")
+                    else:
+                        _head = "Process finished successfully."
                     final_ai_content = f"{_head}\n\n### Final Output:\n```text\n{preview}\n```"
 
         if not final_ai_content:
@@ -13558,8 +14696,36 @@ class GhostAgent:
             # was split). Recompute only when the loop exited without
             # a fresh in-loop verdict (error / abort / terminal path,
             # or repair budget spent on a non-5851 exit).
+            # § finalize/stream R1 A-F4: the in-loop verdict was computed on
+            # PRE-finalize text. When finalize's own scrubbers / smoothing /
+            # start-with hoist changed the reply, that cached verdict is for
+            # text the user never receives — stamping it into calibration /
+            # work_log / selfhood is label pollution. The cache's 3rd element
+            # fingerprints the judged text; on mismatch (real verdicts only —
+            # a pending late-handler None keeps its existing ownership),
+            # recompute against the delivered text.
+            _cached_verdict = None
             if _verdict_is_fresh and _verifier_verdict_cache is not None:
-                v_result, last_tool = _verifier_verdict_cache
+                _cv = _verifier_verdict_cache
+                _judged_fp = _cv[2] if len(_cv) > 2 else None
+                # § R2 C-1 (gate flip): a REAL verdict is reused ONLY with a
+                # matching judged-text fingerprint. R1 treated a missing
+                # fingerprint as trusted, so the SYNC stamp's 2-tuple silently
+                # bypassed the guard in default config — missing now means
+                # "unknown → recompute". A None verdict (bookkeeping skip /
+                # late-handler ownership) keeps the reuse path as designed.
+                if _cv[0] is None or _judged_fp == hash(final_ai_content):
+                    _cached_verdict = (_cv[0], _cv[1])
+                else:
+                    pretty_log(
+                        "Verifier",
+                        "in-loop verdict is for pre-finalize text (reply "
+                        "changed during finalization, or the stamp carried "
+                        "no fingerprint) — recomputing on the delivered text",
+                        icon=Icons.VERIFIER_LAB,
+                    )
+            if _cached_verdict is not None:
+                v_result, last_tool = _cached_verdict
             else:
                 # Non-blocking gate: with a dedicated --critic-nodes
                 # pool the (slower) verdict runs in the background and
@@ -13936,9 +15102,15 @@ class GhostAgent:
                 try:
                     _info_tools = {"web_search", "deep_research", "recall",
                                    "fact_check", "browser", "file_system", "knowledge_base"}
+                    # § finalize/stream R1 A-F6: same error shapes as the
+                    # dispatch classifier — "Critical Tool Error" was missing,
+                    # so a failed search counted as successful info-gathering
+                    # and falsely resolved an unknown.
                     _ran_info = any(
                         isinstance(t, dict) and t.get("name") in _info_tools
-                        and not str(t.get("content", "")).lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR"))
+                        and not str(t.get("content", "")).lstrip().startswith(
+                            ("Error", "ERROR", "SYSTEM ERROR",
+                             "Critical Tool Error"))
                         for t in (tools_run_this_turn or [])
                     )
                     if _ran_info:
@@ -13960,12 +15132,11 @@ class GhostAgent:
                     question = None
                 if (question and final_ai_content
                         and question[:40] not in final_ai_content):
-                    final_ai_content = (
+                    final_ai_content = _head_insert(
                         f"**{question}**\n\n"
                         f"(Answering with my current understanding below "
                         f"— correct me if that clarification changes "
-                        f"things.)\n\n---\n\n{final_ai_content}"
-                    )
+                        f"things.)\n\n---\n\n", final_ai_content)
                 risk = tracker.get_risk_summary()
                 if risk and final_ai_content and risk[:60] not in final_ai_content:
                     final_ai_content = f"{final_ai_content}\n\n---\n{risk}"
@@ -14066,7 +15237,8 @@ class GhostAgent:
                     if _dg.has_content:
                         _digest = render_digest(_dg)
                         if _digest and _digest[:40] not in final_ai_content:
-                            final_ai_content = f"{_digest}\n\n---\n\n{final_ai_content}"
+                            final_ai_content = _head_insert(
+                                f"{_digest}\n\n---\n\n", final_ai_content)
                             pretty_log(
                                 "Autoadvance Digest",
                                 f"{_dg.advanced} advanced, "
@@ -14202,8 +15374,8 @@ class GhostAgent:
                                        current_req_id=str(fs.req_id or ""),
                                        severities=(_SEV_NOTIFY,))
                     if _adg and _adg[:40] not in final_ai_content:
-                        final_ai_content = (
-                            f"{_adg}\n\n---\n\n{final_ai_content}")
+                        final_ai_content = _head_insert(
+                            f"{_adg}\n\n---\n\n", final_ai_content)
                         pretty_log(
                             "Activity Digest",
                             f"{len(_recs)} background record(s) surfaced",
@@ -14259,7 +15431,8 @@ class GhostAgent:
                     _WRITE_VERBS = ("wrote", "applied", "replace", "renamed",
                                     "moved", "deleted", "downloaded",
                                     "unzipped", "cloned", "created",
-                                    "auto-promoted", "inserted", "appended")
+                                    "auto-promoted", "inserted", "appended",
+                                    "copied")  # § R1 A-F6: copy IS a write
                     def _is_fs_write(_t):
                         if not (isinstance(_t, dict) and _t.get("name") == "file_system"):
                             return False
@@ -14429,7 +15602,9 @@ class GhostAgent:
 
         # Deterministically prepend any deferred async-verdict
         # correction staged at turn start (GHOST_CRITIC_ASYNC).
-        final_ai_content = self._take_active_correction() + (final_ai_content or "")
+        # § R1 A-F2: respects an active start-with head via _head_insert.
+        final_ai_content = _head_insert(self._take_active_correction(),
+                                        final_ai_content or "")
 
         # Consolidated TURN OUTCOME — one grep-able summary per turn so a reader
         # (or the operator's eye) gets success/fail + confidence + the tools
@@ -14487,6 +15662,15 @@ class GhostAgent:
                       else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
                 level=("WARNING" if (_state == "failed"
                                      or _state.startswith("partial")) else "INFO"))
+            # §LOG-3 (2026-08-20): the turn's single most important artifact
+            # never reached the log — the operator watched minutes of
+            # reasoning and never saw what was SAID, and the durable
+            # mirror's "reconstruct a turn" contract was false for the
+            # answer itself. Console shows the head (60-char budget);
+            # the mirror gets the full text (redacted like everything).
+            if final_ai_content:
+                pretty_log("Final Reply", final_ai_content,
+                           icon=Icons.LLM_REPLY)
             # Snapshot what we just printed so a LATE verdict can correct
             # the stream (async-critic mode prints this BEFORE any verdict
             # exists). Bounded ring — this is a logging aid, never a store.
@@ -14516,6 +15700,17 @@ class GhostAgent:
                         _ring.popitem(last=False)
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # § context R1 B1: request-END disarm of the per-batch read budget —
+        # the registry resolves `context._read_budget` AT CALL TIME, so a
+        # leftover (possibly zero/spent) budget from this request would
+        # otherwise govern every out-of-band tool call (project advancer,
+        # research, composed skills, API routes) until the next interactive
+        # batch. The request-START clear covers crashed paths on the next
+        # request; this covers the overnight window in between.
+        try:
+            self.context._read_budget = None
         except Exception:
             pass
         return final_ai_content, created_time, req_id
@@ -15143,6 +16338,18 @@ class GhostAgent:
                 # Context-pressure lockdown: set after the SECOND overflow in
                 # one request (read budget drops to zero for its remainder).
                 self.context._ctx_pressure_lockdown = False
+                # § context R1 B1: the BUDGET OBJECT needs the same disarm as
+                # the flag. It is armed per tool batch (dispatch pipeline) but
+                # was never cleared at request end — and the registry resolves
+                # it AT CALL TIME, so a leftover ReadBudget(0) from a request
+                # that ended under lockdown governed every OUT-OF-BAND tool
+                # call (project-advancer idle ticks, project research,
+                # composed skills, the projects API) until the next
+                # interactive batch: one lockdown on the day's last turn
+                # poisoned a whole night of autonomous work with a
+                # "conversation near the context ceiling" refusal in contexts
+                # with no conversation. The arm-without-disarm class, again.
+                self.context._read_budget = None
                 # Snapshot the project that was active when THIS user message
                 # arrived — the delete-eligibility gate in tools.projects
                 # only honours a bare "delete it" against this project. A
@@ -15332,6 +16539,75 @@ class GhostAgent:
                             router_escalation_kind=str(
                                 getattr(decision, "escalation_kind", "") or ""),
                         )
+                        # §4BR — the router's FIRST consumer, decided HERE
+                        # and not where it is used.
+                        #
+                        # The natural home looked like _compute_verifier_verdict
+                        # (one place, every delivery path). It is the wrong
+                        # one: on the STREAMED path the trajectory is written
+                        # before the verdict task is even spawned, so both the
+                        # trigger flag and the arm ENROLMENT would land after
+                        # the drain and never reach the corpus. Measured on
+                        # the live corpus, that is not a corner case — 145/169
+                        # rows since 2026-08-10 carry `router_label` (stamped
+                        # here) and 2/169 carry `verifier_verdict` (stamped
+                        # there). An arm nobody can read is not an experiment.
+                        #
+                        # So the decision is taken where the INPUT already is:
+                        # the router has just run, the ring slot is live, and
+                        # both paths pass through here. The verdict then READS
+                        # this rather than recomputing it — one definition.
+                        try:
+                            from .verifier import (depth_for_turn as _depth_rule,
+                                                   router_called_hard)
+                            _rhard = router_called_hard(
+                                str(decision.label or ""),
+                                bool(decision.escalated))
+                            _vd_deep = _depth_rule(
+                                router_label=str(decision.label or ""),
+                                router_escalated=bool(decision.escalated),
+                                arm=_experiments_mod.arm_for(
+                                    self.context, "verify_depth",
+                                    str(req_id or "")),
+                            )
+                            # GUARDED, not unconditional. `trigger_fired`
+                            # tests for the key's PRESENCE, not its value
+                            # (experiments.py), so stamping False on every
+                            # routed turn would make "triggered only" mean
+                            # "all traffic" — the report block the operator
+                            # is told to read FIRST would become identical
+                            # to the all-enrolled one, diluting the effect
+                            # over the ~42% of turns the treatment cannot
+                            # reach. That is the §4AN dilution this design
+                            # exists to avoid, reintroduced by the stamp.
+                            # Every other site guards the same way
+                            # (risk_steer inside should_steer, tts_bon
+                            # inside wobble_band); the value follows the
+                            # module contract — "the treatment actually
+                            # ran" — so it is _vd_deep, not the trigger.
+                            if _rhard:
+                                _experiments_mod.mark_trigger(
+                                    self.context, req_id,
+                                    "verify_depth_fired", _vd_deep)
+                                _turn_facts.record(
+                                    self.context, req_id,
+                                    verify_depth_deep=bool(_vd_deep),
+                                    # §4F contract: the treatment can append
+                                    # a verifier note to the FINAL text and
+                                    # can add a repair round, both of which
+                                    # enter conversation history and the
+                                    # recorded trajectory. Stamped so the
+                                    # GEPA fixture corpus can exclude these
+                                    # turns (optim/tool_fixtures.py).
+                                    **({"verify_depth_context": True}
+                                       if _vd_deep else {}))
+                        except Exception as _vd_exc:   # never fail a turn
+                            # See the mirror of this handler in
+                            # _compute_verifier_verdict: silent-control is
+                            # the safe direction but must still be visible.
+                            logger.warning(
+                                "verify-depth routing skipped, this turn is "
+                                "neither triggered nor enrolled: %s", _vd_exc)
                         # Durable diagnostic: this decision gates MCTS lookahead
                         # + the strategic planner, so it's the "why did/didn't
                         # deep-reasoning fire" record. INFO (durable-only; a
@@ -16076,7 +17352,7 @@ class GhostAgent:
                     # combined cap is 8 total failures of any kind.
                     total_failures = execution_failure_count + transient_failure_count
                     if execution_failure_count >= 6 or total_failures >= 8:
-                        pretty_log("Strike Cap", f"structural={execution_failure_count}, transient={transient_failure_count} — aborting turn loop.", icon=Icons.STOP)
+                        pretty_log("Strike Cap", f"structural={execution_failure_count}, transient={transient_failure_count} — aborting turn loop.", icon=Icons.STOP, level="WARNING")
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed."})
                         if not final_ai_content:
                             final_ai_content = "I hit a hard limit after repeated failures and could not complete this task. Please rephrase or break it into smaller steps."
@@ -16521,7 +17797,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 "enable_thinking": False}
 
                         try:
-                            p_data = await self.context.llm_client.chat_completion(planning_payload, use_swarm=True)
+                            # ⚠ Ask for the swarm pool only if one EXISTS.
+                            # Production passes no --swarm-nodes, so this
+                            # unconditional flag meant the planner's call —
+                            # the highest-leverage reasoning of the turn — ran
+                            # on the MAIN model, foreground, with NO timeout:
+                            # neither timeout-clamp arm fires when the pool is
+                            # absent AND the caller passed none, so it rode
+                            # httpx's 1200s default on the single slot. Its
+                            # only routing test sits in a class skipped
+                            # "System 2 Planner disabled" — a stale reason,
+                            # since --use-planning is in the launcher (LLM
+                            # review R3 lens B, item 5). `_run_system_3_pivot`
+                            # already uses this idiom.
+                            _plan_use_swarm = bool(getattr(
+                                self.context.llm_client, 'swarm_clients', None))
+                            p_data = await self.context.llm_client.chat_completion(
+                                planning_payload, use_swarm=_plan_use_swarm,
+                                timeout=_PLANNER_TIMEOUT_S,
+                                task_label="planner")
                             plan_content = p_data["choices"][0]["message"].get("content", "")
                             plan_json = extract_json_from_text(plan_content)
 
@@ -17668,7 +18962,35 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         # the separate per-token boundary check is gone.
                                         if len(guard_buf) >= next_loop_probe:
                                             next_loop_probe = len(guard_buf) + THINKING_LOOP_PROBE_EVERY
-                                            if _detect_thinking_loop(guard_buf):
+                                            # § finalize/stream R1 B-3: the
+                                            # full_content fallback exists for
+                                            # INLINE-think models (reasoning
+                                            # arrives as a <think> block in
+                                            # content), yet it probed ALL
+                                            # content — tool-call BODIES and
+                                            # plain no-think answers repeat
+                                            # units legitimately (30 identical
+                                            # JSON fixture rows in a file
+                                            # write, a zero-matrix dump the
+                                            # user asked for) and were aborted
+                                            # as a "thinking loop", content
+                                            # discarded + a fake failure
+                                            # strike. Probe the content
+                                            # channel only INSIDE an open
+                                            # inline <think> block — the case
+                                            # the fallback was built for. The
+                                            # tool-call-collapse probe owns
+                                            # tool degeneracies, and the
+                                            # extended hard cap + upstream
+                                            # max_tokens still bound plain-
+                                            # content runaway.
+                                            _probe_ok = True
+                                            if not reasoning_content:
+                                                # R2 M2/M3: shared mention-
+                                                # aware / closer-prefix gate.
+                                                _probe_ok = _inline_think_open(
+                                                    full_content)
+                                            if _probe_ok and _detect_thinking_loop(guard_buf):
                                                 thinking_loop_detected = True
                                                 pretty_log("Thinking Loop", f"Detected n-gram repetition at {len(guard_buf)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
                                                 break
@@ -17916,7 +19238,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 break
                             messages.append({"role": "user", "content": "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."})
                             if execution_failure_count >= 6:
-                                pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP)
+                                pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP, level="WARNING")
                                 force_final_response = True
                             continue
                     except (httpx.ConnectError, httpx.ConnectTimeout):
@@ -18025,9 +19347,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # --- HALLUCINATION & LEAK SCRUBBERS ---
                     if ui_content:
                         # 1. Hard Truncation for System Prompt Bleed
-                        for bleed_marker in ["# Tools", "<tools>", "CRITICAL INSTRUCTION:", "You may call one or more functions", '{"type": "function"']:
-                            if bleed_marker in ui_content:
-                                ui_content = ui_content.split(bleed_marker)[0]
+                        # Shared strong/weak bleed helper (§ R1 A-F3) — same
+                        # rules as the finalize twin so the two sites cannot
+                        # drift (the wrapper-split lesson).
+                        ui_content = _truncate_prompt_bleed(ui_content)
 
                         # 2. Regex scrubbers for XML and Execution Artifacts
                         ui_content = re.sub(r'<tool_response>.*?(?:</tool_response>|$)', '', ui_content, flags=re.DOTALL | re.IGNORECASE)
@@ -18042,7 +19365,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # brackets (a `task_NN` id or one of the status
                         # keywords) so markdown links survive.
                         ui_content = re.sub(r'(?m)^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b[^\]]*\].*?\n?', '', ui_content)
-                        ui_content = re.sub(r'(?m)^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*\n?', '', ui_content)
+                        ui_content = _scrub_task_status_runs(ui_content)  # § R1 A-F3
                         ui_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', ui_content)
                         ui_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', ui_content)
 
@@ -18507,7 +19830,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 # Cache so the post-loop gate
                                                 # reuses it (no double compute
                                                 # on the common landed path).
-                                                _verifier_verdict_cache = (_vr, _lt)
+                                                # 3rd element (§ R1 A-F4): a
+                                                # fingerprint of the TEXT this
+                                                # verdict judged, so finalize
+                                                # can detect its own scrub/
+                                                # smooth/hoist moved the reply
+                                                # and recompute instead of
+                                                # stamping a verdict for text
+                                                # the user never receives.
+                                                _verifier_verdict_cache = (
+                                                    _vr, _lt,
+                                                    hash(final_ai_content))
                                                 _verdict_is_fresh = True
                                                 _refuted = (
                                                     _vr is not None
@@ -18523,7 +19856,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                         "current_project_id",
                                                         None),
                                                 )
-                                                _verifier_verdict_cache = (None, _lt)
+                                                _verifier_verdict_cache = (
+                                                    None, _lt,
+                                                    hash(final_ai_content))
                                                 _verdict_is_fresh = True
                                                 # §4BF R2 triage bit 2: the
                                                 # verdict EXISTS but missed
@@ -18576,7 +19911,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         req_id=req_id,
                                         trajectory_id=current_trajectory_id,
                                     )
-                                    _verifier_verdict_cache = (_vr, _lt)
+                                    # § R2 C-1: the SYNC branch (the code
+                                    # default) stamped a 2-tuple, silently
+                                    # bypassing the A-F4 fingerprint gate —
+                                    # stamp the judged-text fingerprint here
+                                    # too.
+                                    _verifier_verdict_cache = (
+                                        _vr, _lt, hash(final_ai_content))
                                     _verdict_is_fresh = True
                                     _refuted = (
                                         _vr is not None
@@ -18909,6 +20250,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # every non-streamed exit path still unregisters here.
             if not _stream_owns_unregister:
                 _turn_reg.unregister(req_id, _active_turn)
+                # § context R3 MAJOR-1: the UNIVERSAL read-budget disarm.
+                # handle_chat has multiple returns and the point disarms
+                # (finalize return, stream-drain finally) missed the
+                # `except TurnCancelled` return — the Stop-button path, which
+                # correlates with exactly the long/lockdown turns whose
+                # leftover is ReadBudget(0). Every NON-streamed exit crosses
+                # this finally; streamed exits disarm in the drain's finally
+                # (the budget must stay armed during the drain, so it is
+                # excluded here via the same ownership flag).
+                try:
+                    self.context._read_budget = None
+                except Exception:
+                    pass
             if 'messages' in locals(): del messages
             if 'tools_run_this_turn' in locals(): del tools_run_this_turn
             if 'sandbox_state' in locals(): del sandbox_state
@@ -19675,6 +21029,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # plausible-but-cut answer could backfill PASS). Track it so
             # the partial is marked truncated and kept out of calibration.
             stream_aborted = False
+            _cancel_cut = False   # § finalize/stream R1 B-5: user cancel cut
             loop_detected = False
 
             # NEW: Flush intermediate text to the UI as the first stream chunk
@@ -19736,12 +21091,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # `_scrubbed_emitted_len=1 > len(stream_prefix)=0`.
             # `\Z` closes that loophole without affecting any
             # closed-tag match.
-            _stream_scrub_pattern = re.compile(
-                r'<(tool_call|tool|function|tool_response)\b[^>]*>.*?'
-                r'(?:</\1\b[^>]*>|\Z)',
-                flags=re.DOTALL | re.IGNORECASE,
-            )
+            # `(?<!\x60)` (backtick) — a BACKTICK-QUOTED mention of tool XML
+            # (`<tool_call>` in a final answer EXPLAINING tool syntax) is
+            # legitimate prose, and without the guard the `\Z` fallback
+            # suppressed everything after the mention (§ finalize/stream R1
+            # B-1; mirrors _tail_has_stop_marker's quoted-mention guard).
+            # Single source of truth (§ R3): the module-level pattern is also
+            # what `_scrub_tail_is_open` uses — an inline twin would drift.
+            _stream_scrub_pattern = _MODULE_SCRUB_RE
             _scrubbed_emitted_len = len(full_content) if _stream_scrub_active else 0
+            # § R3 A-D3 incremental-scrub state (see the emission block).
+            _scrub_view_cache = full_content if _stream_scrub_active else ""
+            _scrub_tail_open = False
             # Once ANY '<' appears we must run the full scrub
             # regex (a tag might be forming). Until then — the
             # common case for a plain-text final answer — the
@@ -19775,7 +21136,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 except Exception as _etx:
                     logger.debug("entropy tracker init failed: %s", _etx)
 
-            async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
+            async for chunk in _stream_or_abort_frames(
+                    self.context.llm_client.stream_chat_completion(
+                        payload, use_coding=has_coding_intent)):
                 if loop_detected: break
                 # Cooperative cancel boundary (2026-07-15): the
                 # turn stays registered for the whole drain now,
@@ -19783,6 +21146,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # stop emitting on the next chunk. Finalization
                 # after the loop still runs on the partial text.
                 if _turn_reg.is_cancelled(req_id):
+                    _cancel_cut = True   # § finalize/stream R1 B-5
                     break
                 self.context.last_activity_time = datetime.datetime.now() # Heartbeat
 
@@ -19862,16 +21226,68 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # with the whole block removed. Net
                     # effect: the client sees clean text
                     # and never sees the XML flicker past.
+                    _flip_now = False
                     if not _scrub_seen_lt and "<" in full_content[_scrubbed_emitted_len:]:
                         _scrub_seen_lt = True
+                        _flip_now = True
+                        # Entering tag-watch: the cache is the raw buffer,
+                        # WHICH ALREADY CONTAINS THIS DELTA — the flip
+                        # iteration must not also take the append branch
+                        # (§ R4 D2: it double-appended its own delta, so
+                        # ordinary " < " math prose duplicated bytes on the
+                        # client, invisible to every durable instrument).
+                        _scrub_view_cache = full_content
+                        _scrub_tail_open = False
                     if _scrub_seen_lt:
-                        _scrubbed_view = _stream_scrub_pattern.sub('', full_content)
+                        # § R3 A-D3: re-running the full scrub regex per
+                        # chunk is quadratic-with-backtracking on
+                        # unclosed-opener spam (90KB of "<tool " drip cost
+                        # ~620s of CPU in this loop). INVARIANT: the scrubbed
+                        # view can only change shape when a '>' ARRIVES —
+                        # every pattern match needs a closing '>', appended
+                        # '>'-less text can never complete a new match, and
+                        # a \Z-arm match (unclosed block) just extends what
+                        # it eats (view frozen). So: recompute on '>' deltas
+                        # only; freeze while an unclosed block is eating;
+                        # plain-append otherwise. Byte-equivalence against
+                        # the naive per-chunk sub is fuzz-pinned.
+                        if '>' in _new_text:
+                            # also correct on a flip-with-'>' delta: a match
+                            # may have just completed, so the provisional
+                            # flip cache is overwritten by the real re-sub.
+                            _scrubbed_view = _stream_scrub_pattern.sub('', full_content)
+                            _scrub_view_cache = _scrubbed_view
+                            _scrub_tail_open = _scrub_tail_is_open(full_content)
+                        elif _flip_now:
+                            # § R4 D2: the flip cache already contains this
+                            # delta — no append.
+                            _scrubbed_view = _scrub_view_cache
+                        elif _scrub_tail_open:
+                            _scrubbed_view = _scrub_view_cache
+                        else:
+                            _scrub_view_cache += _new_text
+                            _scrubbed_view = _scrub_view_cache
                     else:
                         # No '<' anywhere yet → the sub is a
                         # no-op; the scrubbed view equals the
                         # raw buffer. Skip the O(n) regex.
                         _scrubbed_view = full_content
-                    _to_emit = _scrubbed_view[_scrubbed_emitted_len:]
+                    # § finalize/stream R1 B-1 + R2 C1: HOLD BACK a
+                    # potentially partial scrub-target tag. R1 held from the
+                    # LAST '<' — a proxy: a newer '<' moved rfind and
+                    # RELEASED an earlier still-forming tag, resurrecting the
+                    # leak + swallow it fixed ("<function or " released by a
+                    # following "<t"). Hold from the FIRST unresolved
+                    # tag-prefixed '<' in the un-emitted window instead
+                    # (`_emit_safe_end`), and reuse the same classifier at
+                    # the end-flush so a dangling opener never leaks raw on
+                    # abnormal stream end (R2 M4). Fragments that grow past
+                    # 64 chars without a '>' are prose ("if x <tool_threshold
+                    # else …") and are released — a real opener never gets
+                    # that long.
+                    _safe_view = _scrubbed_view[
+                        :_emit_safe_end(_scrubbed_view, _scrubbed_emitted_len)]
+                    _to_emit = _safe_view[_scrubbed_emitted_len:]
                     if _to_emit:
                         _synthetic = {
                             "id": f"chatcmpl-{req_id}",
@@ -19885,7 +21301,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             }],
                         }
                         yield f"data: {json.dumps(_synthetic)}\n\n".encode('utf-8')
-                        _scrubbed_emitted_len = len(_scrubbed_view)
+                        _scrubbed_emitted_len = len(_safe_view)
                     # Skip the raw chunk — we already
                     # emitted the scrubbed equivalent.
                 elif _stream_scrub_active and not _is_content_chunk:
@@ -19916,7 +21332,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # severing the stream.
                 if _is_content_chunk and ("\n" in _new_text or "?" in _new_text):
                     tail = full_content[-400:]
-                    if len(tail) == 400:
+                    # § finalize/stream R1 B-2 (+ R2 M1/M2): the watchdog
+                    # exists for infinite <think> loops — gate on an open
+                    # think block via the shared mention-aware, closer-prefix
+                    # helper (a quoted `<think` mention used to re-arm it
+                    # forever, and `</thinking>` never disarmed it).
+                    _in_open_think = _inline_think_open(full_content)
+                    if len(tail) == 400 and _in_open_think:
                         last_60 = tail[-60:]
                         if last_60.strip() and tail.count(last_60) >= 5:
                             pretty_log("Cognitive Watchdog", "Infinite <think> loop detected. Severing stream.", level="WARNING", icon=Icons.STOP)
@@ -19931,19 +21353,74 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 break_text = f"\n</think>\n<tool_call>\n<function=replan>\n<parameter=reason>\n{_bt_reason}\n</parameter>\n</function>\n</tool_call>"
                             else:
                                 break_text = f"\n</think>\n<tool_call>\n<function name=\"replan\">\n<parameter name=\"reason\">{_bt_reason}</parameter>\n</function>\n</tool_call>"
+                            # § finalize/stream R1 B-2: on the scrub path the
+                            # client must NEVER receive the raw synthetic tool
+                            # XML (it bypassed the active scrub and the user's
+                            # visible reply became `</think><tool_call>…SYSTEM
+                            # OVERRIDE…`). Emit a clean notice instead; the
+                            # XML still lands in durable full_content, which
+                            # is what the replay/trajectory machinery reads.
+                            if _stream_scrub_active:
+                                _client_text = ("\n\n[⚠ stream interrupted — "
+                                                "internal reasoning loop "
+                                                "detected, recovering]")
+                            else:
+                                _client_text = break_text
                             break_chunk = {
                                 "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
-                                "model": stream_model, "choices": [{"index": 0, "delta": {"content": break_text}, "finish_reason": None}]
+                                "model": stream_model, "choices": [{"index": 0, "delta": {"content": _client_text}, "finish_reason": None}]
                             }
                             yield f"data: {json.dumps(break_chunk)}\n\n".encode('utf-8')
                             full_content += break_text
+
+            # § finalize/stream R1 B-1: END-FLUSH. The hold-back above may
+            # still be withholding a tail fragment that never resolved (a
+            # legitimate non-tag `<…` with no closing `>`). Emit the final
+            # scrubbed remainder so held text is not lost. Skipped when the
+            # stream was severed (loop_detected) so watchdog remnants
+            # (`</think>` around the durable break_text) never reach the
+            # client. Runs BEFORE the truncation-marker appends below so
+            # those stay durable-only.
+            if _stream_scrub_active and not loop_detected:
+                try:
+                    _final_view = _stream_scrub_pattern.sub('', full_content)
+                    # § R2 M4: the flush reuses the hold-back classifier so a
+                    # dangling scrub-target opener at abnormal stream end is
+                    # SUPPRESSED (durable content keeps it), never emitted raw.
+                    _tail_rem = _final_view[
+                        _scrubbed_emitted_len:
+                        _emit_safe_end(_final_view, _scrubbed_emitted_len)]
+                    if _tail_rem:
+                        _synthetic = {
+                            "id": f"chatcmpl-{req_id}",
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": stream_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": _tail_rem},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(_synthetic)}\n\n".encode('utf-8')
+                        _scrubbed_emitted_len = len(_final_view)
+                except Exception:
+                    pass  # flush is best-effort; never break end-of-stream
 
             # §4O B-MAJOR-1: an upstream abort cut the final answer short.
             # Mark the DURABLE content truncated so the episode/trajectory/
             # work_log record it as incomplete (not a clean final answer)
             # and a reader/verifier can see the cut — the client already
             # saw the abort frame; this is about the persisted record.
-            if stream_aborted and full_content:
+            # § finalize/stream R1 B-5: a USER CANCEL mid-final-stream is the
+            # same cut — before this, the partial persisted as a clean record
+            # (truncated=False into calibration, the amputated claim judged by
+            # the late verifier: label noise). Same flag, truthful wording.
+            if _cancel_cut and full_content:
+                stream_aborted = True   # → calibration truncated=True
+                full_content += ("\n\n[⚠ RESPONSE TRUNCATED — cancelled by "
+                                 "the user mid-answer]")
+            elif stream_aborted and full_content:
                 full_content += ("\n\n[⚠ RESPONSE TRUNCATED — upstream "
                                  "aborted the stream mid-answer]")
 
@@ -20266,14 +21743,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     clean_think = think_text.strip()
                     if clean_think:
                         ui_think = clean_think.replace('\n', ' | ')
+                        # Feeds the web UI's monologue box (app.js parses
+                        # "PLANNER MONOLOGUE:" off the log stream) — keep.
                         logger.info(f"PLANNER MONOLOGUE: {ui_think}")
-
-                        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-                        print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*15} AGENT INTERNAL THINKING {'='*15}", flush=True)
-                        for line in clean_think.split('\n'):
-                            if line.strip():
-                                print(f"[INFO ] 💭 {timestamp} - [{req_id}] {line.strip()}", flush=True)
-                        print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*55}", flush=True)
+                        # §LOG-1 (2026-08-20): the raw `print()` banner dump
+                        # that lived here was a pre-frame-era leftover: it
+                        # bypassed atomic_print's stdout lock (could splice
+                        # mid-line into concurrent turns), the durable
+                        # mirror (console showed content the "complete"
+                        # record lacked), and _redact_log — and the operator
+                        # console already receives this thinking live via
+                        # the streaming 💭 path. Deleted; nothing else
+                        # consumed that format.
 
                 if was_complex_task or execution_failure_count > 0:
                     if not force_stop or "READY TO FINALIZE" in stream_thought.upper():
@@ -20694,6 +22175,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     yield _chunk
             finally:
                 _turn_reg.unregister(req_id, _active_turn)
+                # § context R2 M3: request-END disarm for STREAMED turns —
+                # the finalize-return disarm never runs on this path (the
+                # web UI always streams), so a leftover/zero read budget
+                # still poisoned every out-of-band caller overnight.
+                try:
+                    self.context._read_budget = None
+                except Exception:
+                    pass
                 try:
                     _now = time.monotonic()
                     _drain = _now - _drain_t0

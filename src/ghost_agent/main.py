@@ -396,10 +396,12 @@ def _warn_prm_consumer_flag_inert(context):
 
 
 def audit_source_newer_than_process():
-    """Boot/tick entry point — injects `pretty_log` into the guard."""
+    """Boot/tick entry point — injects `pretty_log` into the guard.
+    §LOG-6b: the guard picks the level — WARNING for the first divergence
+    of a file per cooldown, INFO for repeat divergences within it."""
     return _audit_staleness(
-        lambda m: pretty_log("Stale Process", m, level="WARNING",
-                             icon=Icons.WARN))
+        lambda m, level="WARNING": pretty_log("Stale Process", m,
+                                              level=level, icon=Icons.WARN))
 
 
 
@@ -947,6 +949,24 @@ _MAX_RESUMES_PER_HOUR = 12
 _resume_times: list = []
 
 
+async def _handle_chat_foreground(context, body, request_id: str):
+    """§4CB R1 A-F3 / R2 A-MAJ-4: every autonomous full-turn dispatch
+    (scheduled task, job resume) is a FOREGROUND request for its duration —
+    unmarked, the biological tick ran consolidation mid-turn and the RSS
+    watchdog's opt-in execv restart could kill the process mid-turn. One
+    shared bracket so the invariant has one executed pin instead of an
+    unpinnable copy per call site; try/finally so a raise never leaks the
+    counter."""
+    from fastapi import BackgroundTasks
+    from .api.routes import _mark_foreground
+    _mark_foreground(context.agent, +1)
+    try:
+        return await context.agent.handle_chat(
+            body, BackgroundTasks(), request_id=request_id)
+    finally:
+        _mark_foreground(context.agent, -1)
+
+
 async def _resume_after_job(context, entry) -> bool:
     """Re-engage the model with a finished job's result.
 
@@ -968,9 +988,10 @@ async def _resume_after_job(context, entry) -> bool:
         if should_defer_scheduled_task(getattr(context, "llm_client", None)):
             pretty_log(
                 "Job Resume Deferred",
-                f"{jid} landed while a user request is active — leaving it "
+                f"{jid} landed while a user or autonomous turn is in flight "
+                f"— leaving it "
                 f"for the next sweep rather than queueing behind the user.",
-                icon=Icons.SKIP)
+                icon=Icons.REQ_WAIT)
             return False
         now = time.time()
         _resume_times[:] = [t for t in _resume_times if now - t < 3600]
@@ -1016,12 +1037,11 @@ async def _resume_after_job(context, entry) -> bool:
             + (f" (exit {code})" if code is not None else "")
             + " — waking the model to continue.",
             icon=Icons.JOB_PROMOTE)
-        from fastapi import BackgroundTasks
         body = {"model": getattr(context.args, "model", None),
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False}
-        await context.agent.handle_chat(body, BackgroundTasks(),
-                                        request_id=f"job-{jid}")
+        # §4CB R1 A-F3 → R2 A-MAJ-4: the shared foreground bracket.
+        await _handle_chat_foreground(context, body, f"job-{jid}")
         return True
     except asyncio.CancelledError:
         raise
@@ -1099,7 +1119,23 @@ async def lifespan(app):
             icon=Icons.SHIELD,
         )
 
-    context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None), getattr(args, 'critic_nodes_parsed', None), node_api_key=args.api_key)
+    # ⚠ KEYWORD ARGS, not positional (§4BW/#6). The pools were passed
+    # positionally into a 9-arg signature; a swap (e.g. visual<->critic) would
+    # route every vision call to the critic node and every verdict to the
+    # vision node, and it was INVISIBLE — swapping the slots passed all 43
+    # tests, and there is no boot log of pool->slot composition. Keyword args
+    # make that mis-wire impossible to introduce.
+    context.llm_client = LLMClient(
+        args.upstream_url,
+        tor_proxy=context.tor_proxy,
+        swarm_nodes=args.swarm_nodes_parsed,
+        worker_nodes=args.worker_nodes_parsed,
+        visual_nodes=getattr(args, 'visual_nodes_parsed', None),
+        coding_nodes=getattr(args, 'coding_nodes_parsed', None),
+        image_gen_nodes=getattr(args, 'image_gen_nodes_parsed', None),
+        critic_nodes=getattr(args, 'critic_nodes_parsed', None),
+        node_api_key=args.api_key,
+    )
 
     # Pre-warm off-main nodes in the BACKGROUND so the first user-critical-path
     # worker call (query expansion) doesn't eat a cold-start timeout (nova is a
@@ -1464,8 +1500,12 @@ async def lifespan(app):
                         getattr(context, "llm_client", None)):
                     pretty_log(
                         "Scheduled Task Deferred",
-                        f"{job_id} — a user request is active; will retry next tick.",
-                        icon=Icons.SKIP,
+                        # §4CB R3 MINOR-5: since scheduled/job-resume turns
+                        # also mark foreground, this defer can trigger on a
+                        # SIBLING autonomous turn — don't claim "user".
+                        f"{job_id} — a user or autonomous turn is in flight; "
+                        f"will retry next tick.",
+                        icon=Icons.REQ_WAIT,
                     )
                     # "Next tick" is only true for interval jobs. For a CRON
                     # job the next occurrence may be a day away — the fire
@@ -1491,14 +1531,12 @@ async def lifespan(app):
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                 }
-                # Isolated background_tasks object — FastAPI's real one is
-                # request-scoped and not accessible here. The agent's
-                # handle_chat only uses it for optional post-turn async
-                # work, so an empty shim is safe.
-                from fastapi import BackgroundTasks
-                bg = BackgroundTasks()
-                _content, _, _ = await context.agent.handle_chat(
-                    body, bg, request_id=f"sched-{job_id}")
+                # §4CB R1 A-F3 → R2 A-MAJ-4: dispatch through the shared
+                # foreground bracket (it supplies the empty BackgroundTasks
+                # shim — handle_chat only uses it for optional post-turn
+                # async work, so a request-scoped one isn't needed).
+                _content, _, _ = await _handle_chat_foreground(
+                    context, body, f"sched-{job_id}")
                 # The turn's CONCLUSION now reaches the operator via the
                 # activity ledger (next-turn digest + outbound push) —
                 # previously the final content was DISCARDED and only
@@ -1609,7 +1647,7 @@ async def lifespan(app):
                     pretty_log("Watch Reaction Deferred",
                                f"{job_id} ({task_name}): user active — edge kept, "
                                "will re-fire next tick",
-                               icon=Icons.SKIP)
+                               icon=Icons.REQ_WAIT)
             elif not condition_met and last_fired:
                 _tools_tasks.set_watch_state(job_id, False)  # cleared → re-armable
                 pretty_log("Watch Reset",

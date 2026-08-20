@@ -38,8 +38,19 @@ class _RouteStub:
         self.calls = []
 
     async def route(self, task, payload, **kw):
+        """⚠ HONOURS `fallback`, because the real `route()` does. This stub
+        returned a hardcoded `None` when out of responses, so no test using
+        it could observe the difference between "nothing answered" and "the
+        model answered with nothing" — the distinction the production code
+        now turns on. A stub that ignores the argument under test makes
+        every test built on it vacuous for that argument (R4 lens A)."""
         self.calls.append((task, payload, kw))
-        return self.responses.pop(0) if self.responses else None
+        if not self.responses:
+            return kw.get("fallback")
+        reply = self.responses.pop(0)
+        # The real route() collapses an empty completion onto the fallback:
+        # `return content if content else fallback`.
+        return reply if reply else kw.get("fallback")
 
 
 _SQL_FAILURES = [
@@ -420,3 +431,83 @@ class TestCycleReport:
         assert _STATE_META_KEY in state
         # the watermark still works with the meta key present
         assert await distill_failure_clusters(ctx) == 0
+
+
+def _burned_clusters(tmp_path):
+    """Clusters fingerprinted as a permanent "no pattern" verdict.
+
+    ⚠ Reads the path the code actually writes (`$GHOST_HOME/system/...`).
+    An earlier version of this helper looked in `$GHOST_HOME/` directly, so
+    the file was never found, the dict was always empty, and the assertion
+    below was green no matter what the pass did."""
+    from ghost_agent.core.failure_distill import _state_path
+    path = _state_path()
+    assert path is not None, "GHOST_HOME is unset — the test isolates nothing"
+    assert str(tmp_path) in str(path), (
+        f"the pass would write outside the tmp dir: {path}")
+    if not path.exists():
+        return []
+    state = json.loads(path.read_text())
+    return [k for k, v in state.items()
+            if isinstance(v, dict) and v.get("no_pattern")]
+
+
+def test_a_node_outage_does_not_freeze_a_cluster_forever(tmp_path, monkeypatch):
+    """⚠ A TRANSIENT OUTAGE IS NOT A VERDICT.
+
+    `route()` returns its `fallback` for a no-pool, an OffMainNodeUnavailable
+    AND any exception — it never raises — so the `except` around the call is
+    dead for node failures. `reply=None` therefore fell into the
+    "no pattern" branch and wrote a PERMANENT fingerprint: the cluster is
+    skipped every later cycle until its evidence changes, and since clusters
+    are processed highest-evidence-first, the ones burned are the most
+    valuable (LLM review R3 lens B, item 6, reproduced end to end).
+
+    The sibling `failure_dimension` survives the same shape only because it
+    persists nothing."""
+    import asyncio
+    from ghost_agent.core import failure_distill as fd
+
+    # No responses at all -> route() returns its fallback, exactly as it does
+    # for a no-pool, an OffMainNodeUnavailable, or any exception.
+    ctx, sm, store, stub = _ctx(tmp_path, [])
+
+    # ⚠ BEHAVIOURAL. The first version of this test was two source-text
+    # assertions, the second of which — `window.index(x) < len(window)` — is
+    # TRUE for every x the first assertion already proved present. It could
+    # not fail. Drive the pass instead and read the state file.
+    _seed(sm, _SQL_FAILURES, dimension="tool_misuse")
+    n = asyncio.run(fd.distill_failure_clusters(ctx, min_cluster=2))
+
+    assert n == 0, "an outage should write no lessons"
+    assert stub.calls, "the pass never reached the routed call"
+    burned = _burned_clusters(tmp_path)
+    assert not burned, (
+        f"a transient node outage was recorded as a permanent 'no pattern' "
+        f"verdict for {burned} — the cluster is skipped every later cycle "
+        f"until its evidence changes, and clusters are processed "
+        f"highest-evidence-first, so the ones burned are the most valuable")
+
+
+def test_an_empty_answer_IS_recorded_so_the_cluster_stops_re_paying(
+        tmp_path, monkeypatch):
+    """The complement, and the reason the outage fix needed a sentinel.
+
+    R3 fixed "an outage burns the cluster" by treating a falsy reply as
+    retry-forever. But `route()` collapses BOTH "nothing answered" and "the
+    model answered with an empty string" onto the same fallback value, so
+    that fix also made a genuine no-pattern verdict retry every cycle —
+    trading a permanent loss for a permanent cost (R4 lens A). Only a
+    sentinel the model cannot produce tells them apart."""
+    import asyncio
+    from ghost_agent.core import failure_distill as fd
+
+    # The model answered. Its answer was an explicit "no pattern here".
+    ctx, sm, store, stub = _ctx(tmp_path, [json.dumps({"pattern": ""})])
+    _seed(sm, _SQL_FAILURES, dimension="tool_misuse")
+    n = asyncio.run(fd.distill_failure_clusters(ctx, min_cluster=2))
+
+    assert n == 0
+    assert _burned_clusters(tmp_path), (
+        "a model verdict of 'these cases share no pattern' was not recorded, "
+        "so this cluster re-pays the synthesis call every cycle forever")

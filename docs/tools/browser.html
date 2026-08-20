@@ -171,6 +171,20 @@ browser(operation="close")                             # wipes profile + sidecar
     The full <code>load</code> event waits for <em>every</em> subresource — images, fonts, analytics beacons, long-poll sockets. Over a slow Tor exit those frequently never settle within the timeout, so a page that had already delivered the content the agent wanted would raise a Playwright <code>TimeoutError</code> and the runner would exit 1 (the classic <code>navigate: runner exit 1</code>). So <code>_build_op_payload</code> now applies a proxy-aware default: <strong>when a proxy is set and the caller hasn't pinned <code>wait_until</code>, it defaults to <code>domcontentloaded</code></strong> (the HTML-parsed milestone) instead of <code>load</code>. An explicit <code>wait_until</code> always wins, and without a proxy (e.g. a local <code>file://</code> fixture) the runner keeps its own <code>load</code> default. For SPAs that paint after DOMContentLoaded, pass an explicit <code>wait_until="networkidle"</code> or use <code>interact</code> with a <code>wait_for_selector</code>. Covered by <code>tests/test_browser_tor_diagnostics.py</code>.
   </p>
 
+  <h2>The proxy decision uses the URL actually dialed first <span class="tag">2026-08-19</span></h2>
+  <p>
+    <code>resolve_egress_proxy</code> is fed the URL the runner will <em>actually dial first</em>,
+    not the top-level <code>url</code>. For <code>interact</code> the runner navigates to
+    <code>actions[0]</code>'s <code>goto</code> target before the top-level URL, so a loopback
+    top-level URL with a public first goto previously yielded <code>proxy=None</code> and would have
+    launched Chromium cleartext against the public host. The decision now runs through the same
+    <code>_runner_first_url</code> resolver the SSRF pre-flight uses, so both guards agree on which
+    URL is judged. Latent before the fix (the sole caller always threads a live Tor proxy and
+    <code>--mandatory-tor</code> aborts boot on a dead one), but a live deanonymization leak for any
+    in-process caller running with <code>tor_proxy=None</code>. Pinned by an executed test in
+    <code>test_browser_service_proxy_bypass.py</code>.
+  </p>
+
   <h2>Runner protocol</h2>
   <p>A tiny script <code>.browser_runner.py</code> is written into <code>/workspace</code> on every call and invoked as <code>python3 .browser_runner.py &lt;op_json&gt;</code>. It emits exactly one sentinel line:</p>
   <pre><code>[BROWSER_OK] {...json payload...}

@@ -54,9 +54,19 @@ def _exp_age(ts_iso) -> str:
     try:
         from datetime import datetime, timezone
         dt = datetime.fromisoformat(str(ts_iso or "").rstrip("Z"))
-        epoch = dt.replace(tzinfo=timezone.utc).timestamp()
+        if dt.tzinfo is None:
+            # Naive stamps in this codebase are UTC-by-convention ("Z"
+            # stripped above) — attach, don't convert.
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            # An offset-CARRYING stamp must be CONVERTED. `.replace` here
+            # reinterprets the wall-clock digits as UTC: a 5h-old "+03:00"
+            # stamp would render as 2h. Latent (every current producer
+            # writes naive-UTC+Z) but this is exactly the class of quiet
+            # wrongness a self-report must not carry.
+            dt = dt.astimezone(timezone.utc)
         from ..core.autonomous_activity import _age_str
-        return _age_str(epoch)
+        return _age_str(dt.timestamp())
     except Exception:  # noqa: BLE001
         return ""
 
@@ -89,6 +99,9 @@ def _render_stats(stats: dict) -> str:
         return "Selfhood is disabled."
     lines: List[str] = []
     lines.append(f"Experiences on file: {stats.get('experience_count', 0)}")
+    _boots = stats.get("session_boots") or 0
+    if _boots:
+        lines.append(f"Session boots (excluded from the counts above): {_boots}")
     lines.append(f"Open questions: {stats.get('open_questions', 0)}")
     lines.append(f"Unfinished threads: {stats.get('unfinished_threads', 0)}")
     mood = stats.get("last_mood") or ""
@@ -241,14 +254,20 @@ def _render_activity(context, *, hours=None, limit=None) -> str:
     if log is None:
         return ("Background-activity ledger is not attached in this "
                 "session — nothing to report.")
+    # OverflowError included (introspect review m3): JSON `Infinity`
+    # parses as float('inf'), and int(inf) raises OverflowError — which
+    # fell through to the branch guard and rendered "Activity report
+    # failed: OverflowError" instead of clamping like every other weird
+    # input. (min() handles inf for the float path; the int() call is
+    # where it detonated.)
     try:
         h = float(hours) if hours else _DEFAULT_ACTIVITY_HOURS
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         h = _DEFAULT_ACTIVITY_HOURS
     h = max(0.25, min(h, _MAX_ACTIVITY_HOURS))
     try:
         n = int(limit) if limit else _DEFAULT_ACTIVITY_LIMIT
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         n = _DEFAULT_ACTIVITY_LIMIT
     n = max(1, min(n, _MAX_ACTIVITY_LIMIT))
     records, truncated, failed = _read_activity_tail(log)
@@ -296,7 +315,13 @@ async def tool_introspect(
 
     Never raises — introspection is secondary to the user turn.
     """
-    raw_action = (action or "summary").strip().lower()
+    # str() FIRST: this line runs before any try, and a non-string action
+    # (the model emitting 123, ["summary"], true — tool-arg type corruption
+    # is a documented incident class here) raised AttributeError straight
+    # out of the tool. Every OTHER malformed input degrades gracefully;
+    # this one surfaced as the raw invocation-error shape that the
+    # never-raises contract exists to prevent.
+    raw_action = str(action or "summary").strip().lower()
     if raw_action not in _VALID_ACTIONS:
         return (
             "SYSTEM ERROR: 'action' must be one of "
@@ -305,10 +330,14 @@ async def tool_introspect(
 
     # One log line per introspection, whatever the action — the operator
     # monitors the live stream ('activity' logs itself, with the clamped
-    # window it actually used).
+    # window it actually used). Guarded: a logging failure is not a reason
+    # to break introspection (same contract as everything below).
     if raw_action != "activity":
-        pretty_log("Introspect", f"{raw_action} requested",
-                   icon=Icons.BRAIN_SUM)
+        try:
+            pretty_log("Introspect", f"{raw_action} requested",
+                       icon=Icons.BRAIN_SUM)
+        except Exception:  # noqa: BLE001
+            pass
 
     # 'activity' reads the autonomous-activity ledger, not the SelfModel —
     # it must keep working when selfhood is disabled, so it branches before
@@ -369,17 +398,58 @@ async def tool_introspect(
             # four live-view surfaces): a spec re-scoped to bench must
             # not render its stale live stamps here, while disabled or
             # retired specs keep their own-population history.
+            _registry_note = ""
             try:
                 from ..core.experiments import (
-                    SCOPE_BENCH as _SB, load_registry as _lr,
+                    SCOPE_BENCH as _SB, SCOPE_LIVE as _SLV,
+                    load_registry as _lr,
                     registry_path_for_context as _rpfc)
-                _deny_live = set(_lr(_rpfc(context)).names_in_scope(_SB))
-            except Exception:  # noqa: BLE001
+                _reg0 = _lr(_rpfc(context))
+                _deny_live = set(_reg0.names_in_scope(_SB))
+                # C1: the report enumerates only experiments that already
+                # HAVE stamps, so an enabled spec with zero traffic
+                # rendered NOTHING — no row, no zero — which is exactly
+                # how verify_depth's three inert days stayed invisible in
+                # the one instrument that should have shown n=0. The
+                # registry's enabled live specs are what the report must
+                # account for.
+                _expected = set(
+                    n for n in _reg0.names_for_scope(_SLV))
+                # R2 MAJOR-3: the caveat below originally fired on an
+                # EXCEPTION from load_registry — which deliberately never
+                # raises. The real failure (file exists, unparseable) was
+                # a silent substitution of the code defaults: deny filter
+                # quietly off, plus five false "enrollment broken" n=0
+                # alarms for default specs the operator never listed. A
+                # guard keyed to an impossible event is not a guard; the
+                # registry now CARRIES its degradation and the report
+                # renders conclusions only over what it can trust.
+                if getattr(_reg0, "degraded", False):
+                    _expected = None      # defaults ≠ the operator's specs
+                    _registry_note = (
+                        "⚠ system/experiments.json exists but is "
+                        "UNREADABLE — the code defaults were substituted. "
+                        "The bench-scope filter reflects the DEFAULTS, "
+                        "not your registry; enabled-but-unstamped arms "
+                        "cannot be detected this render; and any "
+                        "BENCH-scoped section is missing below (the "
+                        "defaults declare no bench specs — R3 finding 6: "
+                        "vanishing is not neutral). Fix the file; the "
+                        "daemon log has the parse error.\n\n")
+            except Exception as _reg_exc:  # noqa: BLE001
                 _deny_live = None
-            _live = await _asyncio.to_thread(
+                _expected = None
+                # Defense in depth only — load_registry does not raise.
+                _registry_note = (
+                    "⚠ registry unreadable "
+                    f"({type(_reg_exc).__name__}) — bench-scope filter is "
+                    "OFF and enabled-but-unstamped arms cannot be "
+                    "detected in this render\n\n")
+            _live = _registry_note + await _asyncio.to_thread(
                 lambda: report_from_trajectories(
                     _Path(str(_md)).parent / "trajectories",
-                    deny_names=_deny_live))
+                    deny_names=_deny_live,
+                    expected_names=_expected))
             # §4BF 1c: the BENCH population, rendered as its own clearly
             # labeled section — never folded into the live numbers. Only
             # when bench-scoped specs exist AND the bench corpus does.
@@ -406,17 +476,43 @@ async def tool_introspect(
                                 getattr(context, "args", None)),
                             admit_task_kinds=("bench",),
                             deny_names=_deny_bench)
-                        if not b_all and not b_cov.get("admitted_turns"):
-                            return ""
+                        # R3 finding 1: this used to `return ""` when the
+                        # bench corpus was empty — which skipped
+                        # render_report entirely, so the R2 zero-row fix
+                        # was unreachable in its WORST state: bench specs
+                        # enabled, bench corpus never stamped (fresh home,
+                        # or bench stamping wholly broken — the verify_depth
+                        # shape). Bench names exist here by construction
+                        # (`if _bnames:` gates this closure), so an empty
+                        # corpus must render the "Enabled and waiting for
+                        # traffic" branch, not vanish.
+                        # R2 MAJOR-2: the C1 zero-row fix was applied to
+                        # the live view and NOT here — inside the same
+                        # function, with `_bnames` already in hand. A
+                        # bench spec with zero stamps (tts_bon, one
+                        # drained budget from verify_depth's exact inert
+                        # state) was invisible while bench coverage read
+                        # reassuringly. Skipped only when the registry is
+                        # degraded — the defaults' bench names are not
+                        # the operator's.
                         return render_report(
                             b_all, triggered=b_trig, coverage=b_cov,
-                            population=SCOPE_BENCH)
+                            population=SCOPE_BENCH,
+                            expected_names=(
+                                None if getattr(_reg, "degraded", False)
+                                else _bnames))
                     _bench = await _asyncio.to_thread(_bench_report)
                     if _bench:
                         _live += ("\n\n══ BENCH-SCOPED EXPERIMENTS ══\n"
                                   + _bench)
-            except Exception:  # noqa: BLE001 — bench section is additive
-                pass
+            except Exception as _bench_exc:  # noqa: BLE001 — bench is additive
+                # m1: the section is additive, but VANISHING is not neutral
+                # — a reader who saw bench numbers yesterday reads their
+                # absence as "no bench activity", not "the render broke".
+                _live += ("\n\n⚠ bench-scoped section unavailable this "
+                          f"render ({type(_bench_exc).__name__}) — absence "
+                          "of bench numbers above is NOT evidence of no "
+                          "bench activity")
             return _live
         except Exception as e:
             return f"Experiment report unavailable: {type(e).__name__}: {e}"

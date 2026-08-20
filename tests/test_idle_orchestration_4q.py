@@ -245,11 +245,18 @@ def test_idle_summary_reports_reflection():
 
 
 def test_idle_summary_covers_the_phases_that_do_real_work():
-    """Guard against the summary drifting back to a partial view."""
+    """Guard against the summary drifting back to a partial view.
+    §4CB R1 A-F4 / R2: six more phases gained appends (prm, router, tidy,
+    selfhood-narrative, stale-questions, workspace-narrative) — removing
+    five of them passed every pre-R2 test (lens-A mutant M3), so the full
+    label set is pinned here alongside the pre-existing postmortem/bench."""
     import inspect
     src = inspect.getsource(GhostAgent._biological_tick)
     for label in ("dream", "reflection", "skills-auto", "self-play",
-                  "store-hygiene", "calibration", "autoadvance"):
+                  "store-hygiene", "calibration", "autoadvance",
+                  "postmortem", "bench", "prm", "router", "tidy",
+                  "selfhood-narrative", "stale-questions",
+                  "workspace-narrative"):
         assert f'_idle_ran.append("{label}")' in src, f"{label} is silent"
 
 

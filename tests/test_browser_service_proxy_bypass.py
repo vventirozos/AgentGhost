@@ -171,3 +171,45 @@ class TestSourceIntent:
         assert block("http://127.0.0.1:8100/") is False   # allowed service
         assert block("http://127.0.0.1:9051/") is True    # Tor control — blocked
         assert block("http://127.0.0.1:8000/") is True    # agent API — blocked
+
+
+@pytest.mark.asyncio
+async def test_interact_proxy_decision_uses_the_first_dialed_url_not_toplevel():
+    """§5 lens A: the Tor-proxy decision must be made against the URL the
+    runner ACTUALLY dials first. For `interact`, that is actions[0]'s goto
+    target — so a loopback top-level url with a PUBLIC first goto must still
+    force the proxy onto the public host, not read the loopback url and skip
+    it (a cleartext deanonymization dial)."""
+    import json
+    from unittest.mock import patch
+    from ghost_agent.tools import browser as _b
+
+    seen = {}
+
+    def _spy_resolve(proxy, url):
+        seen["url"] = url
+        return proxy  # passthrough; we only care WHICH url it judged
+
+    payload = {"final_url": "http://pub.example", "final_title": "t",
+               "actions": [], "used_last_url": False}
+    stub = _make_sandbox_stub(f"[BROWSER_OK] {json.dumps(payload)}\n") \
+        if "_make_sandbox_stub" in globals() else None
+    if stub is None:
+        import types
+        async def _exec(cmd, **kw):
+            return (f"[BROWSER_OK] {json.dumps(payload)}\n", 0)
+        stub = types.SimpleNamespace(execute=_exec, last_command=None)
+
+    with patch("ghost_agent.utils.egress_guard.resolve_egress_proxy",
+               side_effect=_spy_resolve):
+        await _b.tool_browser(
+            operation="interact",
+            url="http://127.0.0.1:8100",                 # loopback top-level
+            actions=[{"action": "goto", "url": "http://pub.example/x"}],
+            sandbox_dir=Path("/tmp"), sandbox_manager=stub,
+        )
+
+    assert seen.get("url") == "http://pub.example/x", (
+        f"the proxy decision judged {seen.get('url')!r} (the loopback "
+        f"top-level url) instead of the public first-goto — an interact that "
+        f"navigates to a public host would launch cleartext")

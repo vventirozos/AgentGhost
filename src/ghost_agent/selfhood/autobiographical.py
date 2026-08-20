@@ -687,10 +687,28 @@ class AutobiographicalMemory:
         except Exception:  # noqa: BLE001 — stats must never raise
             return counts
         for exp in experiences:
+            # Session-boot markers are bookkeeping, not experiences. On the
+            # live store they were 445 of 2001 entries (22%), and 84% of
+            # the top cluster — the agent's #1 reported "topic" about
+            # itself was restart noise rendered as introspection. They
+            # stay in the store (real chronology, `recent` may show them);
+            # they just don't count as things the agent DID.
+            if (exp.outcome or "").strip().lower() == "boot":
+                continue
             c = (exp.cluster or "").strip()
             if c:
                 counts[c] = counts.get(c, 0) + 1
         return counts
+
+    def boot_count(self) -> int:
+        """Session-boot markers on file — reported SEPARATELY from
+        experiences (see `cluster_counts` for why they are excluded)."""
+        try:
+            experiences, _, _ = self._search_index()
+        except Exception:  # noqa: BLE001
+            return 0
+        return sum(1 for e in experiences
+                   if (e.outcome or "").strip().lower() == "boot")
 
     # ------------------------------------------------------------------
     # Reference-count tracker (#13)
@@ -766,7 +784,8 @@ class AutobiographicalMemory:
             experiences, _, _ = self._search_index()
         except Exception:  # noqa: BLE001
             return 0
-        return len(experiences)
+        return sum(1 for e in experiences
+                   if (e.outcome or "").strip().lower() != "boot")
 
 
 _STOPWORDS = frozenset({

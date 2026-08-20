@@ -14,7 +14,21 @@ _STATIC = _ROOT / "interface" / "static"
 
 
 def _read(name):
-    return (_STATIC / name).read_text(encoding="utf-8")
+    """CODE ONLY.
+
+    ⚠ This suite asserted over RAW text, so all 85 of its assertions were
+    satisfiable by the COMMENTS beside the code. Demonstrated (R2 lens B):
+    repointing `status.js`'s `fetch('/api/turn/cancel')` at `/api/DEAD` —
+    every per-turn cancel button dead — still passed, because the string
+    also appears in that file's header comment. Same for `/api/health`,
+    `/api/turns` and `/api/notifications/ack`. Worse, one test sliced from
+    the first `pointerleave` occurrence, which is INSIDE a comment, so
+    `ev.pointerType === 'mouse' || true` restored the 2026-08-01
+    "mobile delete-all impossible" bug and stayed green.
+    """
+    from tests.helpers import strip_js_comments
+    text = (_STATIC / name).read_text(encoding="utf-8")
+    return strip_js_comments(text) if name.endswith(".js") else text
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +74,14 @@ def test_chat_payload_binds_session_id():
     # The payload gains session_id only when the workspace holds one —
     # sessions-disabled agents keep the legacy fully-client-carried mode.
     assert "window.__ghostSessionId" in js
-    assert re.search(r"payload\.session_id\s*=\s*window\.__ghostSessionId", js)
+    # The binding falls back to the STORED id: sessions.js publishes the
+    # global only after the workspace import chain plus three agent round
+    # trips, and the composer is live throughout — a turn sent in that
+    # window carried no session_id and was never persisted (R3 lens B).
+    assert re.search(r"payload\.session_id\s*=\s*_sid", js)
+    i = js.index("const _sid = window.__ghostSessionId")
+    assert "safeStorage.get('ghost_session_id')" in js[i:i + 200], (
+        "an unbound early turn is still sent with no session id")
 
 
 def test_ghostcore_bridge_published_before_workspace_import():

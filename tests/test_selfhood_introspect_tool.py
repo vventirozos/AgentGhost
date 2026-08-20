@@ -141,6 +141,13 @@ async def test_recall_action_surfaces_relevant_past(tmp_path: Path):
     out = await tool_introspect(
         action="recall", query="trapdoor", self_model=sm,
     )
+    # ⚠ SUCCESS SHAPE, not just the query word. The first version asserted
+    # `"trapdoor" in out` — which the FAILURE message ("Nothing in my past
+    # matches 'trapdoor'.") also satisfies, so a recall that returned []
+    # on every query passed this test. A verification that cannot
+    # distinguish success from a dead mechanism (§4BN), in the test whose
+    # name promises the past is surfaced.
+    assert "What I remember about" in out, out
     assert "trapdoor" in out.lower()
     # Unrelated turns should NOT bubble up — postgres has nothing to do
     # with trapdoor functions, and the IDF scorer should rank it out.
@@ -475,3 +482,121 @@ def test_count_and_clusters_track_appends(tmp_path: Path):
         fh.write("{not json}\n")
     assert sm.autobio.count() == 2
     assert sum(sm.autobio.cluster_counts().values()) <= 2
+
+
+# ── Introspect fresh-eye review (2026-08-17) — the unpinned contracts ──────
+# 7 of 9 mutations survived the whole relevant test set: every numeric cap
+# in the tool DESCRIPTION (a contract the model plans against), the recall
+# success shape, the deny-scope filter and the bench banner were all
+# asserted nowhere. An instrument whose caps and filters can be deleted
+# with the suite green is the §4BM class again.
+
+async def test_the_recall_cap_is_25_as_the_description_promises(tmp_path: Path):
+    from ghost_agent.tools.introspect import _clamp_limit, _MAX_LIMIT
+    assert _MAX_LIMIT == 25
+    assert _clamp_limit(9999, 5) == 25
+    assert _clamp_limit(25, 5) == 25
+    assert _clamp_limit(3, 5) == 3
+
+
+def test_a_negative_or_zero_limit_falls_back_to_the_default():
+    from ghost_agent.tools.introspect import _clamp_limit
+    assert _clamp_limit(-3, 5) == 5
+    assert _clamp_limit(0, 5) == 5
+    assert _clamp_limit(None, 5) == 5
+    assert _clamp_limit("abc", 5) == 5
+
+
+def test_the_activity_caps_match_the_description():
+    """'activity': limit cap 100, window cap 336h (14 days)."""
+    from ghost_agent.tools import introspect as I
+    assert I._MAX_ACTIVITY_LIMIT == 100
+    assert I._MAX_ACTIVITY_HOURS == 24.0 * 14
+
+
+async def test_activity_hours_and_limit_are_CLAMPED_not_errored(tmp_path: Path):
+    """Weird-but-parseable inputs must clamp, not error.
+
+    ⚠ The first version of this test was VACUOUS: its context had no
+    activity ledger attached, so `_render_activity` returned "nothing to
+    report" BEFORE the parse it exists to exercise — it passed identically
+    with and without the OverflowError fix. The ledger must exist for the
+    clamp code to run at all.
+
+    Probe values chosen to actually detonate the old code:
+      * limit=float('inf') -> int(inf) raises OverflowError;
+      * hours=10**400 -> float(<bignum int>) raises OverflowError (a JSON
+        integer literal of 400 digits parses as int; float('inf') does NOT
+        raise in float(), so it cannot probe the hours except).
+    """
+    from ghost_agent.core.autonomous_activity import ActivityLog
+    log = ActivityLog(tmp_path / "autonomous_activity.jsonl")
+    assert log.record("dream", "cycled once")
+    ctx = SimpleNamespace(memory_dir=tmp_path / "memory", activity_log=log)
+
+    out = await tool_introspect(action="activity", limit=float("inf"),
+                                context=ctx)
+    assert "Activity report failed" not in out, out
+
+    out2 = await tool_introspect(action="activity", hours=10**400,
+                                 context=ctx)
+    assert "Activity report failed" not in out2, out2
+
+    out3 = await tool_introspect(action="activity", hours=99999, limit=-5,
+                                 context=ctx)
+    assert "Activity report failed" not in out3, out3
+
+
+async def test_a_NON_STRING_action_degrades_instead_of_raising():
+    """Tool-arg type corruption is a documented incident class; every other
+    malformed input degraded gracefully while a non-string action raised
+    AttributeError straight out of the tool — the raw invocation-error
+    shape the never-raises contract exists to prevent."""
+    for bad in (123, ["summary"], {"a": 1}, 0.5, True):
+        out = await tool_introspect(action=bad)
+        assert isinstance(out, str), bad
+        assert "SYSTEM ERROR" in out or "Introspection is unavailable" in out, (
+            bad, out[:100])
+
+
+def test_boot_markers_are_NOT_experiences(tmp_path: Path):
+    """On the live store, 445 of 2001 'experiences' (22%) were session-boot
+    markers, and 84% of the top 'topic cluster' was restart noise rendered
+    as what the agent thinks about. Boots stay in the store (chronology)
+    but count separately."""
+    sm = SelfModel(root=tmp_path)
+    sm.capture_turn(trajectory_id="t-1", user_request="fix the parser",
+                    tool_names=[], outcome="passed", final_response="done")
+    sm.autobio.mark_session_boot(prior_session_at="")
+    # A second same-minute boot is DEDUPED by mark_session_boot (crash-loop
+    # protection) — so write one and expect one; the dedup is its own
+    # feature, not this test's subject.
+    sm.autobio.mark_session_boot(prior_session_at="")
+    assert sm.autobio.count() == 1, "boots must not count as experiences"
+    assert sm.autobio.boot_count() == 1
+    assert sm.autobio.cluster_counts().get("meta", 0) == 0, (
+        "boot markers must not dominate the cluster mix")
+    stats = sm.stats()
+    assert stats["experience_count"] == 1
+    assert stats["session_boots"] == 1
+
+
+async def test_stats_render_shows_boots_separately(tmp_path: Path):
+    sm = SelfModel(root=tmp_path)
+    sm.capture_turn(trajectory_id="t-1", user_request="fix the parser",
+                    tool_names=[], outcome="passed", final_response="done")
+    sm.autobio.mark_session_boot(prior_session_at="")
+    out = await tool_introspect(action="stats", self_model=sm)
+    assert "Experiences on file: 1" in out
+    assert "Session boots" in out
+
+
+def test_exp_age_converts_offset_stamps_instead_of_reinterpreting():
+    """A '+03:00' stamp 5h old must not render as 2h. Latent (producers
+    write naive-UTC+Z) but a self-report must not carry quiet wrongness."""
+    from datetime import datetime, timedelta, timezone
+    from ghost_agent.tools.introspect import _exp_age
+    tz = timezone(timedelta(hours=3))
+    five_h_ago = (datetime.now(tz) - timedelta(hours=5)).isoformat()
+    age = _exp_age(five_h_ago)
+    assert age.startswith("5"), f"5h-old +03:00 stamp rendered as {age!r}"

@@ -208,16 +208,87 @@ async def _probe(c, n):
 
 
 def test_the_dispatch_path_actually_USES_the_gate():
-    """⚠ THE SEAM. Every helper above can be perfect while `_do_chat_completion`
-    still posts un-gated — which is precisely the state this file describes.
-    Pins that every node POST is wrapped, and that the probe is exempted."""
+    """⚠ THE SEAM, DRIVEN — not counted in the source text.
+
+    Every helper above can be perfect while `_do_chat_completion` still posts
+    un-gated. The first version of this test counted a literal
+    (`src.count("self._node_slot(node, wait_timeout=_slot_wait)")`). R5 lens B
+    moved all five POSTs OUTSIDE their `async with` blocks — removing the
+    per-node gate from the dispatch path entirely — left the literal in place,
+    and 105 tests passed. It also broke on a pure rename when the wait
+    expression later changed, so it was simultaneously blind to the defect and
+    hostile to refactoring.
+
+    This drives all five pools and asserts each POST happened while a permit
+    was actually held."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock, MagicMock
+
+    pools = [("vision_clients", "_vision_index", dict(use_vision=True)),
+             ("worker_clients", "_worker_index", dict(use_worker=True)),
+             ("critic_clients", "_critic_index", dict(use_critic=True)),
+             ("coding_clients", "_coding_index", dict(use_coding=True)),
+             ("swarm_clients", "_swarm_index", dict(use_swarm=True))]
+    ungated = []
+    for attr, idx, kw in pools:
+        c = LLMClient("http://main.invalid:8088")
+        held = {"now": False, "seen_while_held": False, "posts": 0}
+
+        async def _post(path, **_kw):
+            held["posts"] += 1
+            if held["now"]:
+                held["seen_while_held"] = True
+            r = MagicMock()
+            r.json = lambda: {"choices": [{"message": {"content": "ok"}}]}
+            r.raise_for_status = lambda: None
+            r.status_code, r.text = 200, "{}"
+            return r
+
+        cl = MagicMock()
+        cl.post = AsyncMock(side_effect=_post)
+        props = MagicMock()
+        props.json = lambda: {"total_slots": 1}
+        props.raise_for_status = lambda: None
+        cl.get = AsyncMock(return_value=props)
+        setattr(c, attr, [{"url": "http://N", "model": "m",
+                           "client": cl, "name": "N"}])
+        setattr(c, idx, 0)
+
+        real_slot = c._node_slot
+
+        def _spy(node, wait_timeout=None, _real=real_slot):
+            @asynccontextmanager
+            async def _wrap():
+                async with _real(node, wait_timeout=wait_timeout):
+                    held["now"] = True
+                    try:
+                        yield
+                    finally:
+                        held["now"] = False
+            return _wrap()
+
+        c._node_slot = _spy
+        c.http_client = MagicMock()
+        c.http_client.post = AsyncMock(side_effect=_post)
+        asyncio.run(c._do_chat_completion(
+            {"model": "m", "messages": []}, timeout=5, **kw))
+        if not (held["posts"] and held["seen_while_held"]):
+            ungated.append(f"{attr} ({held['posts']} POSTs, "
+                           f"held={held['seen_while_held']})")
+
+    assert not ungated, (
+        "node POSTs that did NOT happen while a permit was held: "
+        + ", ".join(ungated)
+        + " — an un-gated path is a hole in a budget that only works if it "
+          "is total")
+
+
+def test_the_health_probe_is_exempt_from_the_gate():
+    """Kept structural: the exemption is a decision, and the observable
+    (a probe that does not queue) is what the sibling behavioural tests in
+    test_llm_contention_fixes.py already drive."""
     import inspect
     src = inspect.getsource(LLMClient._do_chat_completion)
-    posts = src.count('node["client"].post("/v1/chat/completions"')
-    gated = src.count("self._node_slot(node, wait_timeout=_slot_wait)")
-    assert posts >= 5, f"expected the node POST sites, found {posts}"
-    assert gated == posts, (
-        f"{posts} node POSTs but only {gated} behind the gate — an un-gated "
-        "path is a hole in a budget that only works if it is total")
     assert 'task_label == "keepalive"' in src and "_slot_wait = None" in src, (
         "the health probe must be exempt, or a busy node reads as a dead one")

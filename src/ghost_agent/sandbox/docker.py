@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -19,6 +20,106 @@ CONTAINER_WORKDIR = "/workspace"
 # for a genuinely stuck daemon. The per-command exec passes its own tighter
 # deadline (the in-container `timeout Ns` budget + grace).
 _EXEC_DAEMON_DEADLINE_S = float(os.environ.get("GHOST_EXEC_DAEMON_DEADLINE", "1200") or 1200)
+
+
+# Grace added on top of a provision install's own in-container ``timeout N``
+# budget when choosing its CLIENT-side wedge deadline. The client deadline MUST
+# exceed the in-container cap: otherwise a healthy-but-slow install trips the
+# client deadline first and is mis-diagnosed as a wedged daemon (which aborts
+# provisioning, arms the backoff, and lets the abandoned worker keep installing
+# so the retry double-installs). 300s covers docker-py stream drain plus the
+# SIGTERM->SIGKILL grace ``timeout`` itself uses. Env-tunable; never below 0.
+_PROVISION_EXEC_GRACE_S = max(
+    0.0, float(os.environ.get("GHOST_PROVISION_EXEC_GRACE", "300") or 300))
+
+_TIMEOUT_PREFIX_RE = re.compile(r"^\s*timeout\s+(?:-k\s*\S+\s+)?(\d+)")
+
+
+def _provision_deadline_s(cmd) -> float:
+    """CLIENT-side wedge deadline for a provision exec: its in-container
+    ``timeout N`` budget + grace, so a legitimately-slow install can never
+    trip the client deadline before its own in-container cap. A command with
+    no ``timeout`` prefix (the fast sudoers/marker/probe execs) falls back to
+    the module wedge default. The returned deadline is GUARANTEED to strictly
+    exceed the parsed cap — the inversion this fixes cannot silently return."""
+    m = _TIMEOUT_PREFIX_RE.match(str(cmd or ""))
+    if not m:
+        return _EXEC_DAEMON_DEADLINE_S
+    cap = float(m.group(1))
+    deadline = cap + _PROVISION_EXEC_GRACE_S
+    # Invariant: never hand back a deadline that does not clear the cap.
+    if deadline <= cap:
+        deadline = cap + 1.0
+    return deadline
+
+
+# Ceiling on how much of a CLASSIC (non-jobs) exec's output the agent holds in
+# RAM at once, mirroring sandbox/jobs.py's _LOG_READ_CAP. docker-py's own exec
+# buffer is UNBOUNDED (it b"".join()s the whole stream), so this is strictly
+# safer than the path it replaces; head+tail keeps both ends of a pathological
+# output readable. Env-tunable (MB); floored at 1 KB. Read at import (docker.py
+# convention — see _EXEC_DAEMON_DEADLINE_S) so no per-exec os.environ read lands
+# on the hot path.
+_CLASSIC_EXEC_RAM_CAP = max(
+    1024, int(float(os.environ.get("GHOST_SANDBOX_EXEC_RAM_CAP_MB", "32") or 32)
+              * 1024 * 1024))
+
+# Kill switch for the classic-path output streamer. Default ON;
+# GHOST_SANDBOX_EXEC_STREAM=0 reverts to buffering the whole exec output in
+# agent RAM (the pre-fix behaviour), so a live regression can be disarmed with a
+# restart and no redeploy. Module-load constant, same reason as the cap above.
+_EXEC_STREAM_ENABLED = str(
+    os.environ.get("GHOST_SANDBOX_EXEC_STREAM", "1")).strip().lower() \
+    not in ("0", "false", "no", "off")
+
+
+def _drain_stream_bounded(stream, cap, demux=False):
+    """Iterate a docker exec byte stream into AT MOST ~cap bytes, kept as
+    head + tail, returning ``(bytes, total_bytes_seen)``.
+
+    Byte-IDENTICAL to buffering the whole stream when total <= cap (the normal
+    path): the very frames docker-py's ``consume_socket_output`` would
+    ``b"".join`` are concatenated here. Above cap, RAM is bounded to ~cap and
+    the middle is elided with a marker — only the pathological-output regime
+    differs, which is the entire point.
+    """
+    half = max(1, cap // 2)
+    head = bytearray()
+    tail = bytearray()
+    total = 0
+    overflow = False
+    for chunk in stream:
+        if not chunk:
+            continue
+        if demux:
+            # (stdout, stderr) frames — combine, matching demux=False output.
+            if isinstance(chunk, (tuple, list)):
+                so, se = chunk
+                chunk = (so or b"") + (se or b"")
+            if not chunk:
+                continue
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", "replace")
+        total += len(chunk)
+        if not overflow:
+            head += chunk
+            if len(head) > cap:
+                overflow = True
+                spill = bytes(head[half:])
+                del head[half:]
+                tail += spill
+        else:
+            tail += chunk
+        if overflow and len(tail) > 2 * half:
+            del tail[:len(tail) - half]
+    if not overflow:
+        return bytes(head), total
+    if len(tail) > half:
+        del tail[:len(tail) - half]
+    omitted = total - len(head) - len(tail)
+    marker = (f"\n[... {omitted} bytes elided — output exceeded the "
+              f"{cap}-byte agent RAM cap; head+tail kept ...]\n").encode()
+    return bytes(head) + marker + bytes(tail), total
 
 
 class SandboxDaemonTimeout(Exception):
@@ -239,6 +340,72 @@ class DockerSandbox:
             raise result["err"]
         return result["ok"]
 
+    def _provision_exec(self, cmd, **kwargs):
+        """A provision-time exec whose CLIENT-side wedge deadline is derived
+        from the command's own in-container ``timeout N`` budget + grace (see
+        :func:`_provision_deadline_s`). Provision execs hold ``self._lock``, so
+        they still need a client deadline against a genuinely wedged daemon —
+        but it must sit ABOVE the install's own cap, never below it. Bare
+        ``_exec_run`` (deadline_s=None) used the 1200s wedge default, which is
+        LESS than the 1800s pip/torch/playwright caps: the inversion this
+        method exists to remove."""
+        return self._exec_run(
+            cmd, deadline_s=_provision_deadline_s(cmd), **kwargs)
+
+    def _exec_run_streamed(self, cmd, *, cid, ram_cap, deadline_s=None,
+                           **exec_kwargs):
+        """Stream a container exec through a bounded head+tail sink instead of
+        buffering the whole output in agent RAM, returning ``(output_bytes,
+        exit_code)``.
+
+        Reproduces ``Container.exec_run`` EXACTLY — same ``exec_create`` args,
+        same ``exec_start`` stream, same ``exec_inspect`` for the exit code
+        (docker-py source) — so the output is byte-identical to the buffered
+        call for output <= ram_cap; only the memory profile differs for a
+        pathological producer. Runs under the SAME client wedge deadline as
+        ``_exec_run`` (a daemon thread joined with a timeout), so a wedged
+        daemon can't hang the caller."""
+        deadline = _EXEC_DAEMON_DEADLINE_S if deadline_s is None else deadline_s
+        demux = bool(exec_kwargs.get("demux", False))
+        api = self.client.api
+        create_kw = {"stdout": True, "stderr": True}
+        if exec_kwargs.get("workdir") is not None:
+            create_kw["workdir"] = exec_kwargs["workdir"]
+        if exec_kwargs.get("user"):
+            create_kw["user"] = exec_kwargs["user"]
+        if exec_kwargs.get("environment"):
+            create_kw["environment"] = exec_kwargs["environment"]
+        result = {}
+
+        def _run():
+            stream = None
+            try:
+                exec_id = api.exec_create(cid, cmd, **create_kw)["Id"]
+                stream = api.exec_start(exec_id, stream=True, demux=demux)
+                out, _total = _drain_stream_bounded(stream, ram_cap, demux=demux)
+                code = api.exec_inspect(exec_id).get("ExitCode")
+                result["ok"] = (out, code)
+            except BaseException as e:  # noqa: BLE001 — re-raised on caller thread
+                result["err"] = e
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        t = threading.Thread(target=_run, name="sandbox-exec-stream", daemon=True)
+        t.start()
+        t.join(timeout=deadline)
+        if t.is_alive():
+            raise SandboxDaemonTimeout(
+                f"container exec exceeded its {deadline:.0f}s client deadline — "
+                f"the docker daemon may be wedged (streamed command abandoned)")
+        if "err" in result:
+            raise result["err"]
+        return result["ok"]
+
     def _probe_container_ready(self):
         # Verify the volume mount is still valid (not a deleted host inode)
         # AND the container responds to exec — in ONE exec_run. Previously
@@ -289,6 +456,18 @@ class DockerSandbox:
                 c.unpause()
             else:
                 c.start()
+            # ⚠ RELOAD AFTER START (§4BW R2 CRITICAL). docker-py's `start()`
+            # does NOT refresh `.attrs`, and the reload above ran BEFORE it —
+            # so without this, `attrs["State"]["StartedAt"]` keeps its
+            # pre-stop value for the whole resumed lifetime. That silently
+            # broke the R1 generation-stamp fix: a stop→resume keeps the
+            # container id AND (via the stale attrs) the same StartedAt, so
+            # the stamp is identical across the resume and a recycled pid
+            # still reads ALIVE — the exact wrong-process kill the stamp
+            # exists to prevent. One reload here, at the single event where
+            # attrs go stale, keeps the discriminator honest without a
+            # per-liveness-check reload.
+            c.reload()
         except Exception as e:  # noqa: BLE001 — fall through to recreate
             logger.debug("sandbox resume failed (%s); will recreate", e)
             return False
@@ -671,7 +850,7 @@ class DockerSandbox:
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
             apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish'"
-            code, out = self._exec_run(apt_cmd, environment=env_vars)
+            code, out = self._provision_exec(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"System package installation failed: {err_msg}")
@@ -679,7 +858,7 @@ class DockerSandbox:
             self._exec_run("sh -c 'echo \"ALL ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'")
 
             if self.tor_proxy:
-                code, out = self._exec_run("timeout 600 pip install --no-cache-dir pysocks requests")
+                code, out = self._provision_exec("timeout 600 pip install --no-cache-dir pysocks requests")
                 if code != 0:
                     err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                     raise Exception(f"PySocks bootstrap failed: {err_msg}")
@@ -693,7 +872,7 @@ class DockerSandbox:
                 "psycopg2-binary asyncpg sqlalchemy tabulate sqlglot playwright html2text lxml "
                 "flask python-chess"
             )
-            code, out = self._exec_run(install_cmd, environment=env_vars)
+            code, out = self._provision_exec(install_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"Python package installation failed: {err_msg}")
@@ -707,7 +886,7 @@ class DockerSandbox:
             # get a working sandbox (the agent falls back to a runtime install),
             # so a torch flake must not poison provisioning of everything else.
             pretty_log("Sandbox PyTorch", "Installing CPU PyTorch (~1m)…", icon=Icons.SANDBOX_BOX)
-            torch_code, torch_out = self._exec_run(
+            torch_code, torch_out = self._provision_exec(
                 "timeout 1800 pip install --no-cache-dir torch "
                 "--index-url https://download.pytorch.org/whl/cpu",
                 environment=env_vars,
@@ -740,7 +919,7 @@ class DockerSandbox:
             # manually deleted the supercharged marker without wiping
             # the cache), `playwright install` short-circuits in ~1 s.
             pretty_log("Sandbox Chromium", "Installing headless Chromium (~2m)…", icon=Icons.TOOL_DOWN)
-            pw_code, pw_out = self._exec_run(
+            pw_code, pw_out = self._provision_exec(
                 "timeout 1800 python3 -m playwright install chromium --with-deps",
                 environment=env_vars,
             )
@@ -1027,15 +1206,42 @@ class DockerSandbox:
                 # The command self-limits via the in-container `timeout -k 5s Ns`
                 # wrapper, so the client deadline only needs to catch a WEDGED
                 # daemon (which never streams the process's EOF back): timeout +
-                # grace. Without it a stuck daemon hangs this worker thread forever.
-                exec_result = self._exec_run(
-                    cmd_string,
-                    deadline_s=timeout + 60,
-                    **exec_kwargs
-                )
-
-                stdout_bytes = exec_result.output
-                exit_code = exec_result.exit_code
+                # grace. Without it a stuck daemon hangs this worker thread
+                # forever.
+                #
+                # Output is STREAMED through a bounded head+tail sink so a
+                # runaway producer (`yes`, `cat bigfile`) can't buffer 100s of
+                # MB in agent RAM (the jobs path already caps at 32 MB; this
+                # brings rg/find, the browser runner, execute.py heal retries
+                # and GHOST_SANDBOX_JOBS=0 to parity). Normal-sized output is
+                # byte-identical to the buffered call. Streaming is used ONLY
+                # for a REAL container (a string `.id`): a MagicMock/None
+                # container (tests) or the kill switch takes the buffered
+                # `_exec_run` path, and any non-wedge streaming fault also falls
+                # back to it, so a docker-py API shift can't take out execute().
+                _cid = getattr(self.container, "id", None)
+                _streamed = False
+                if _EXEC_STREAM_ENABLED and isinstance(_cid, str) and _cid:
+                    try:
+                        stdout_bytes, exit_code = self._exec_run_streamed(
+                            cmd_string, cid=_cid, ram_cap=_CLASSIC_EXEC_RAM_CAP,
+                            deadline_s=timeout + 60, **exec_kwargs)
+                        _streamed = True
+                    except SandboxDaemonTimeout:
+                        raise
+                    except Exception as _stream_err:  # noqa: BLE001
+                        logger.warning(
+                            "streamed classic exec failed (%s: %s) — falling "
+                            "back to buffered exec_run",
+                            type(_stream_err).__name__, _stream_err)
+                if not _streamed:
+                    exec_result = self._exec_run(
+                        cmd_string,
+                        deadline_s=timeout + 60,
+                        **exec_kwargs
+                    )
+                    stdout_bytes = exec_result.output
+                    exit_code = exec_result.exit_code
 
             # Output handling. A sandbox script that prints multi-MB to stdout
             # would flood the model context with 100k+ tokens of garbage (and
@@ -1126,6 +1332,18 @@ class DockerSandbox:
     #: run) and is left alone. True orphans persist for hours to days.
     _SWEEP_MIN_AGE_S = 1800
 
+    #: A ``ghostjobs-*`` detached-job container younger than this is spared
+    #: unconditionally — a job's whole life is at most the exec budget plus
+    #: job_ttl_s (bounded to 6h), so this is many multiples past any job
+    #: ceiling. Only a container older than this is even a reap CANDIDATE, and
+    #: it still has to pass the no-running-job and idle-process checks.
+    _GHOSTJOB_REAP_MIN_AGE_S = float(
+        os.environ.get("GHOST_SANDBOX_GHOSTJOB_MAX_AGE_H", "48") or 48) * 3600.0
+
+    #: Client-side deadline for the ghostjob liveness probe. A wedged candidate
+    #: must not hang the boot sweep; a timeout reads as LIVE (spare).
+    _GHOSTJOB_LIVENESS_DEADLINE_S = 15.0
+
     def _is_per_solve_workspace(self, source: str) -> bool:
         """True when ``source`` is a throwaway per-solve workspace.
 
@@ -1185,6 +1403,120 @@ class DockerSandbox:
         except Exception:  # noqa: BLE001
             return -1.0
 
+    def _workspace_has_running_job(self, ws_root) -> bool:
+        """True when ``<ws_root>/.jobs/registry.json`` has a job row still in
+        the ``running`` state — a LIVE detached job that must never be swept.
+        A missing registry means no running job; any OTHER read/parse failure
+        is treated as "cannot tell → assume live" and spares the container."""
+        import json
+        try:
+            reg = os.path.join(ws_root, ".jobs", "registry.json")
+            with open(reg, "r") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return False           # no registry → no running job
+        except Exception:  # noqa: BLE001
+            return True            # unreadable → assume live, spare
+        if not isinstance(data, dict):
+            return True
+        for row in data.values():
+            if isinstance(row, dict) and str(row.get("state")) == "running":
+                return True
+        return False
+
+    def _container_has_live_process(self, container) -> bool:
+        """True (=> SPARE) unless the container can be POSITIVELY read as idle:
+        an exec listing ONLY PID 1 + a sleep, or an exec that raises because
+        the container is gone/stopped (nothing alive to protect). Anything
+        unparseable is treated as LIVE. The exec is bounded by a short client
+        deadline so a wedged candidate cannot hang the boot sweep — a timeout
+        reads as LIVE."""
+        box = {}
+
+        def _probe():
+            try:
+                box["res"] = container.exec_run("ps -eo pid,comm --no-headers")
+            except BaseException as e:  # noqa: BLE001 — inspected below
+                box["err"] = e
+
+        t = threading.Thread(target=_probe, name="ghostjob-liveness",
+                             daemon=True)
+        t.start()
+        t.join(timeout=self._GHOSTJOB_LIVENESS_DEADLINE_S)
+        if t.is_alive():
+            return True            # probe wedged → cannot confirm idle → spare
+        if "err" in box:
+            err = box["err"]
+            msg = str(err).lower()
+            gone = (type(err).__name__ in ("NotFound", "APIError",
+                                           "NullResource")
+                    or "not running" in msg
+                    or "no such container" in msg
+                    or "is not running" in msg)
+            return not gone        # gone/stopped → not live; else uncertain
+        res = box.get("res")
+        raw = getattr(res, "output", None)
+        if raw is None and isinstance(res, tuple) and len(res) == 2:
+            raw = res[1]
+        if isinstance(raw, (bytes, bytearray)):
+            text = raw.decode("utf-8", "replace")
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            return True            # unparseable → cannot confirm idle → spare
+        if not text.strip():
+            return True            # empty read → cannot confirm → spare
+        idle = {"sleep", "docker-init", "ps", "sh", "bash", "cat", "tini"}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            comm = (parts[1] if len(parts) > 1 else parts[0]).strip()
+            comm = comm.split()[0] if comm else ""
+            base = os.path.basename(comm)
+            if base and base not in idle:
+                return True        # a real process → LIVE → spare
+        return False               # only PID1 + sleep/ps → idle → reapable
+
+    def _is_reapable_dead_ghostjob(self, container, sources, age_s) -> bool:
+        """A ``ghostjobs-*`` detached-job container is reapable ONLY when it is
+        UNAMBIGUOUSLY a dead leftover — the default is always to spare.
+
+        ALL of: kill switch on; EVERY mount a ``ghostjobs-*`` dir under the
+        system temp root; older than ``_GHOSTJOB_REAP_MIN_AGE_S``; NO
+        ``running`` row in its ``.jobs`` registry; and an idle process table
+        (or a gone container). A LIVE detached job — a running registry row OR
+        a real in-container process — is ALWAYS spared, as is the agent's own
+        sandbox (a non-ghostjobs mount) and any container we cannot read."""
+        if os.environ.get("GHOST_SANDBOX_REAP_GHOSTJOBS", "1") == "0":
+            return False
+        import tempfile
+        try:
+            root = os.path.realpath(tempfile.gettempdir())
+        except Exception:  # noqa: BLE001
+            return False
+        ghost_ws = []
+        for s in sources:
+            try:
+                real = os.path.realpath(s)
+                if os.path.commonpath([real, root]) != root:
+                    return False       # a mount outside the temp root
+            except Exception:  # noqa: BLE001
+                return False
+            if not os.path.basename(real).startswith("ghostjobs-"):
+                return False           # a non-ghostjobs mount → not our case
+            ghost_ws.append(real)
+        if not ghost_ws:
+            return False
+        if age_s < self._GHOSTJOB_REAP_MIN_AGE_S:
+            return False               # too young — a job may be in flight
+        if any(self._workspace_has_running_job(w) for w in ghost_ws):
+            return False               # a LIVE detached job — never touch
+        if self._container_has_live_process(container):
+            return False               # something real is running inside
+        return True
+
     def sweep_orphaned_containers(self, max_remove: int = None) -> list:
         """Remove per-solve sandbox containers left behind by a kill
         mid-solve. Returns the names removed. Never raises — this runs at
@@ -1236,11 +1568,14 @@ class DockerSandbox:
                            if m.get("Source")]
                 if not sources:
                     continue          # cannot tell → leave it
-                if not all(self._is_per_solve_workspace(s) for s in sources):
-                    continue          # own sandbox, or a detached job
                 age = self._container_age_s(c)
-                if age < self._SWEEP_MIN_AGE_S:
-                    continue          # may belong to a live solve
+                if all(self._is_per_solve_workspace(s) for s in sources):
+                    if age < self._SWEEP_MIN_AGE_S:
+                        continue      # may belong to a live solve
+                elif not self._is_reapable_dead_ghostjob(c, sources, age):
+                    # own sandbox, a LIVE detached job, or anything we cannot
+                    # read as unambiguously dead — spare it.
+                    continue
                 c.remove(force=True)
                 removed.append(name)
             except Exception as e:  # noqa: BLE001

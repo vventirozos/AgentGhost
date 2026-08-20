@@ -463,7 +463,20 @@ class TestSessionMerge:
                               ("user", "next"))
         merged = self._m(stored, incoming)
         assert len(merged) == 3, "diverged replay must not concatenate"
-        assert merged == incoming
+        # ⚠ ASSERTION CHANGED 2026-08-17 (§4BU), deliberately. This used to
+        # assert `merged == incoming` — the client's partial reply replacing
+        # the server's full one. The rewrite makes STORED authoritative and
+        # appends only the client's new tail, because "incoming replaces
+        # stored" is what allowed durable history to be DELETED when a stale
+        # tab was missing middle messages. Keeping the server's full reply
+        # is information kept, not lost; the property this test exists for —
+        # no compounding — is asserted above and by the invariant suite in
+        # tests/test_sessions_merge_properties.py.
+        assert merged[0] == incoming[0]
+        assert merged[-1] == incoming[-1], "the new user message must survive"
+        assert merged[1]["content"] == "FULL ANSWER", (
+            "the server's complete reply is authoritative, not the client's "
+            "aborted stub")
 
     def test_repeated_turns_do_not_grow_quadratically(self):
         stored = self._msgs(("user", "hi"), ("assistant", "FULL ANSWER"))

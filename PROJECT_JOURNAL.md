@@ -355,6 +355,42 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 
 ## 4. WHAT REMAINS TO DO
 
+### ▶ FRESH-EYE REVIEW QUEUE (opened 2026-08-17, operator-requested)
+Ranked by the lens that made §4BR and §4BS pay off: **instruments and seams that changed
+recently, whose failure mode is SILENT**. Two just converged (§4BR verify_depth, §4BS
+introspect); these are the remaining candidates in priority order. Discipline for each:
+fresh-eye rounds until one returns clean, localized tests during iteration, FULL suite only
+as the last step, mutation-pin every fix red-on-revert, docs + journal + restart on close.
+
+1. **✅ CONVERGED 2026-08-17 (§4BT) — human-feedback channel** (`/api/feedback`, Slack 👍/👎 via
+   `handle_reaction`, web UI, → `corrections.jsonl` overlay + outcome labels). WHY FIRST: it
+   is now the PRIMARY metric of the live `verify_depth` arm and the only correctness signal
+   §4BR's decision rule accepts. Shipped 08-13 (Track 1a) with open items (Slack scopes), and
+   never had a converged review. Failure mode is the worst kind — silently lost or
+   double-counted labels — at ~0.77 qualifying turns/day, where each lost label costs days of
+   a 7-week clock. A bug here means discovering in October that Gate 0 was starved by code,
+   not by traffic.
+2. **✅ CONVERGED 2026-08-17 (§4BU) — web workspace console / session bridge**. 3 rounds x 3
+   lenses, ~75 defects, every fix mutation-pinned. See §4BU.
+3. **OPEN — LLM client / routing** (`core/llm.py`). Last converged 2026-07-22; heavy churn
+   since (node slot budgets keyed by URL, breakers, prefix warmup, streaming finalize, the
+   native-tools XML fix). Every subsystem rides it, and `/health` is already known to LIE
+   under Metal OOM.
+4. **OPEN — sandbox / execute stack**. Last converged 2026-07-22; port leases (§4G), remote
+   hosting and `bin/serve-remote.sh` all shipped after it, unreviewed.
+5. **OPEN — `tools/browser.py` runner**. The ~1200-line EMBEDDED SCRIPT STRING: the standing
+   memory is that grep/py_compile are not evidence there (import and call it). Only ever had
+   incident-driven fixes, never a converged pass.
+6. **OPEN — launcher / daemon layer** (`bin/start-ghost-agent.sh`, plists, log rotation).
+   Small and never reviewed, but it is the FLAG TRUTH, and the EX_CONFIG + log-ownership +
+   Local-Network traps all live there. Half a day, not a campaign.
+
+**Deliberately NOT queued** (converged within ~10 days, or continuously re-audited as a side
+effect of feature rounds): verifier stack (§4T/§4BJ-§4BL), memory substrate (§4M),
+admissibility/bench (§4BH), dialog layer (§4O), idle orchestration (§4Q), belief revision
+(§4R), agent.py turn loop.
+
+
 ### ▶ CURRENT EXECUTION QUEUE (2026-08-08, mirrors the session task list — newest state wins)
 1. **CLOSED 2026-08-08 ~17:20 (NEGATIVE, operator-killed at the tail)** — §4F miss-side judge-GEPA
    run 4: ~15h, ~2486 trials, 75 proposals, incumbent 0.7836 UNBEATEN, new_best_count=0, best public
@@ -1337,6 +1373,354 @@ loadable checkpoint `online_update()` returns False immediately, so that flag al
 a guaranteed no-op. Widening the predicate is a BEHAVIOUR change and belongs in its own
 registration.* Flip
 queue item (iii) is REMOVED; the queue below reflects that.
+
+### 4BT. THE FEEDBACK CHANNEL — a test that destroyed live data, a metric
+### that did not exist, and FIVE rounds in which every fix inherited the
+### defect it fixed — ✅ SHIPPED 2026-08-17
+
+Operator opened a fresh-eye review QUEUE (§4 above) and picked #1: the human-feedback
+channel — `/api/feedback`, Slack 👍/👎, the web UI, the corrections overlay. It went first
+because §4BR made it **the primary metric of a live arm**: `verify_depth`'s decision rule
+accepts human feedback as the ONLY correctness signal and disowns the outcome label as
+circular. At ~0.77 qualifying turns/day a silently lost label costs days of a 7-week clock,
+so the severity model was set accordingly: a lost or mis-attributed label is a CRITICAL.
+
+**TWO CRITICALS IN ROUND 1.**
+
+**C1 — a test I had written the previous day was destroying live data.**
+`tests/test_slack_bot_shadow_ban.py` (§4BS work) did not set `GHOST_SLACK_REPLY_INDEX`, so
+the bot's `REPLY_INDEX_PATH` defaulted to the operator's LIVE
+`~/Data/AI/Logs/ghost-slack-reply-index.json`. The module loads that file only inside
+`main()`, so under pytest the in-memory index starts EMPTY and the first `register_reply`
+wrote the whole dict back — TRUNCATING the live file to the test's fixtures. It had already
+happened: `C1234567:8.8 → requester=UNORMAL99` was the OLDEST entry in the operator's index.
+Scope, stated precisely: no recorded label was lost (all 50 intact in `corrections.jsonl` —
+25 web, 9 slack:owner, 16 slack:requester); what was lost was the ABILITY to label any bot
+reply older than that run, unreconstructible because the bot logs no channel:ts. The same
+file also set `GHOST_SLACK_LOG_FILE`, a name nothing reads, attaching a RotatingFileHandler
+to the live operator audit log. Two other suites isolated these correctly — which is exactly
+why a per-file convention was the wrong mechanism.
+
+**C2 — the §4BR primary metric did not exist as an instrument.** The corrections overlay set
+`traj.outcome` and dropped the sidecar's `source`, so a human 👎 and a `verifier_late` machine
+verdict were byte-identical to `summarize_streaming`. The report therefore rendered exactly
+the CIRCULAR metric the rule forbids — and it LOOKED right, because the few labelled rows
+happened to be human-sourced. A pre-registered metric written against an instrument that
+cannot compute it; second time in two days (cf. §4BR's Gate 0).
+
+---
+
+#### The five rounds — each fix inherited the defect it fixed
+
+| round | what the PREVIOUS round's fix broke |
+|---|---|
+| R2 | the C10 fix (ever-human vs latest-human) was applied to the writer guard and NOT to `_human_label_locked`, which gates the whole late-verdict CONSEQUENCE chain — lesson retraction, follow-up filing, the correction banner. The fix's own test docstring claimed both sites. Also: my conftest isolation was function-scoped, so module-scoped fixtures (how both Slack suites load the bot) and import-time constants (`webpush_notify._SUBS_FILE` → the live push-subs file) still bound live paths. |
+| R3 | the `has_human_label` change broke two tests my `-k` filter never selected (a `MagicMock` returns a truthy Mock → the guard withheld every late verdict). And the `human_label_rate` suppression was justified by "the operator's first verdict must not come from a non-hypothesis" while `failure_rate` — which the rule explicitly disowns — announced freely and reaches a verdict FIRST. Small hole closed with the big one open, using the big one's argument. |
+| R4 | the per-(experiment, metric) circularity fix was threaded through **3 of 4** `compare_arms` call sites; the missed one was the CLI's `--json`, in the file whose own comments record that pattern twice. R4 also argued me OUT of a fix: `is True` inverted the guard's documented fail-CLOSED direction (an ambiguous answer must withhold, since the consequences are irrecoverable). |
+| R5 | **the `tts_bon` circularity entry rested on a FALSE PREMISE.** Bench trajectory outcomes are NOT verifier-derived: dream's §4BF-1c write-back stamps them from the BANK ORACLE (`source="bench_validator"` — verified 79/79 rows), and `update_outcome`'s oracle-yield leg refuses a late verifier verdict. So the suppression removed the arm's ONLY decidable metric and made its pre-registered SHIP condition structurally unsatisfiable — and the false claim had been written into a pre-registered decision rule AND the docs. Retracted in all three places. |
+
+**The generalisable lesson from R5, recorded because it inverts an instinct:**
+**suppressing a metric is not the conservative default.** A caveat that leaves an arm with
+nothing decidable is a silent-inoperative subsystem wearing a caution label. A suppression
+must name a REACHABLE replacement, and "reachable" has to be verified against that arm's
+POPULATION — "read the human-graded metric" is unreachable on bench, where feedback arrives
+against a user `request_id` and turns are `task_kind="bench"`.
+
+---
+
+#### What shipped
+
+- **Provenance reaches the analysis.** The overlay stamps `extra["outcome_source"]` (+
+  `outcome_source_at`, and `human_labeled` so a LATER machine correction cannot silently drop
+  the turn from the denominator). New metrics `human_failure_rate` (the §4BR primary) and
+  `human_label_rate` (its denominator — DESCRIPTIVE, exempt from the Bonferroni split, never
+  renders a direction, never announces). Live: `human_failure_rate n=2/4` on the triggered
+  block, matching the decision rule exactly.
+- **Circularity is per-(experiment, metric)** (`_CIRCULAR_FOR` + `_CIRCULAR_REMEDY`):
+  `failure_rate` renders `NO VERDICT — ⚠ CIRCULAR for verify_depth` and cannot announce, while
+  staying legitimate for `risk_steer`/`fs_batch`/`use_planning`, which change the ANSWER not
+  the instrument. The caveat surfaces at EVERY stage, including while the interval is
+  inconclusive — otherwise it was invisible for exactly as long as the numbers were.
+- **Human authority is EVER-human, at both sites.** A `user_correction` row landing between a
+  human label and a late verdict used to disarm the protection; a machine verdict then
+  overwrote a human-labelled turn (measured). Both the writer and the consequence-chain guard
+  now scan history, and both fail CLOSED.
+- **One human overturning another is no longer silent** (one live instance: a colleague's 👎
+  replaced the operator's 👍 3.5h later). Last-write-wins stands by operator doctrine; it now
+  logs at WARNING.
+- **Every loss path is visible.** `not_found` / `bad_request` / `unavailable` logged NOTHING;
+  the live agent runs at INFO, so a DEBUG diagnostic is no diagnostic. The web client — HALF
+  the live labels — retried only on 404, so a 503 during a restart (the window a deploy
+  itself creates) lost the label with one transient chat bubble.
+- **Live-path isolation is structural**, at conftest MODULE level (collection time), covering
+  module-scoped loads and import-time binding, plus a writer-side refusal to overwrite a reply
+  index this process never read.
+- **A real pre-existing bug fixed on the way:** `spawn_bg` did
+  `_BG_TASKS.add(spawn_task(coro))`, and a `spawn_task` patched to `asyncio.run` returns the
+  coroutine's VALUE — a non-Task entered the registry, `add_done_callback` raised, the discard
+  never ran, and three later test files crashed iterating the set, surviving only because two
+  alphabetically-earlier files happened to `clear()` it. Now duck-typed, with a conftest
+  reset. The order dependency went from 6 failures to 98 passed.
+- **Counting rule pre-registered** (one label per trajectory, latest wins): 50 sidecar rows
+  across 41 distinct trajectories, so the two available counts differ by 25% on the arm.
+
+#### Verification
+
+**47 mutations, 0 survivors.** Full suite **13,554 passed**. Docs: `experiments.html`
+(circularity section + guard rows + metric list), `routes.html`, `web_server.html`,
+`introspect.html`. Decision rules amended: `verify_depth` (metric + counting rule),
+`flip_ii_tts_bon` (the retraction).
+
+⚠ **My own instruments failed repeatedly and are worth listing**, since the pattern is the
+finding: a `-k` filter that missed the callers of a function I changed (2 broken tests);
+FOUR non-discriminating tests of my own in one round; a comment-stripper written to fix
+comment-satisfied assertions that stripped only line-START comments, then two more wrong
+versions (one truncating a template literal); the same stripper's `/* */` pass running FIRST,
+deleting 5,655 chars of app.js and making a SIBLING suite's negative assertions vacuous; a
+mutation harness that CORRUPTED a test file by mutating a path its restore did not cover; and
+a lexical pin that matched the word `bench_validator` in its own explanatory comment. Every
+one was caught by mutation-testing the tests rather than by reading them.
+
+⚠ **Still open:** `_MECHANISM_METRICS` is blanket per-METRIC where `_CIRCULAR_FOR` is
+per-(experiment, metric), so `n_steps`/`duration_s` can never announce for ANY arm — and the
+stated reason ("a treatment that ends turns earlier") is false for `foresight_note` and
+`use_planning`, and permanently suppresses `fs_batch`'s own registered target (turn DEPTH).
+Pre-existing, conservative direction, not fixed here. Also open: the bank-oracle join that
+would let `tts_bon` conclude, recorded in that arm's rule.
+
+### 4BS. INTROSPECT AUDITED AS AN INSTRUMENT — the report that could not
+### show the failure it existed to catch, in every surface that renders it —
+### ✅ SHIPPED 2026-08-17
+
+Operator: "fresh eye review introspect, look for deficiencies and bugs." Three rounds,
+severity model inverted on purpose: introspect is ALL instrument, so a convincingly-rendered
+wrong number is a CRITICAL here, not a nit (§4BM's lesson applied as a review brief).
+
+**THE CRITICAL (R1).** The experiments report enumerated only arms that already HAVE stamps.
+An enabled spec with zero traffic produced no row, no zero, nothing — while the coverage line
+read reassuringly. That is byte-for-byte the state §4BR's `verify_depth` sat in for three
+inert days: the one report that should have shown `n=0` structurally could not. And the same
+silence lived in EVERY surface: the introspect live view, the bench section, the learning
+block, and the operator CLI.
+
+**The fix took all three rounds to actually cover the surfaces** — the §4BR "fix inherits the
+blind spot" pattern, again, twice:
+- R1 fixed the live introspect view. R2 found the CLI (whose own R5 comment documents the
+  "fixed one file over, re-created here" pattern) and the bench section INSIDE THE FIXED
+  FUNCTION still silent — plus the R1 caveat guarded an exception `load_registry` can never
+  raise, while the REAL failure (file exists, unparseable) silently substituted the code
+  defaults: deny filter off + five false "enrollment broken" alarms.
+- R2's cure: the registry now CARRIES its degradation (`degraded=True` only when the file
+  exists but failed to parse); every surface renders UNREADABLE and refuses conclusions from
+  substituted defaults. R3 then found R2's bench fix unreachable in its WORST state (empty
+  bench corpus → `return ""` before render_report), the learning block's zero rows missing the
+  kill-switch reframe R2 gave render_report, and one R2 test whose key assertion could not
+  distinguish the fix from the defect (traffic=1.0 stamps every default, so `defaults −
+  summary` was empty either way — the SIXTH cannot-distinguish assertion found this month;
+  cured with a monkeypatched default spec the turn cannot stamp).
+
+**What else the audit corrected (all live-data lies):**
+- "Experiences on file: 2001" — 445 (22%) were session-boot markers, and 84% of the top
+  "topic cluster" was restart noise rendered as what the agent thinks about. Boots now count
+  separately everywhere (count/cluster_counts/stats render + the narrative's cluster mix).
+- The lessons hit-rate line hardcoded "OVERSTATES" about a number that live data shows
+  UNDERSTATING (0.673 vs clean 0.681) — the direction was measured once in July and baked
+  into prose. Now computed from the two numbers it prints.
+- Never-raises hardening: non-string `action` raised AttributeError out of the tool;
+  OverflowError on JSON bignums; offset-carrying timestamps were REINTERPRETED as UTC rather
+  than converted; garbage-ts ledger rows counted in every liveness window forever.
+- The description's caps (recall 25, activity 100/336h), the deny-scope filter and the bench
+  banner were all real in code and deletable with the suite green — 7 of 9 R1 mutations
+  survived. All pinned now.
+- `GHOST_EXPERIMENTS=0` reframes the zero rows ("expected: nothing enrolls — read from THIS
+  process's env; the daemon's env decides enrollment") instead of alarming "enrollment
+  broken" forever. CLI `--json` gained `registry_degraded` + `enabled_unstamped`, and its
+  missing-corpus early return now emits a parseable document instead of empty stdout.
+
+**Review-of-the-review ledger (kept because the pattern is the finding):** my own R1 fixes
+shipped one vacuous test (no ledger attached → early return before the code under test — the
+project's fifth) and one equivalent mutant misread as a survivor; R2's fixes shipped the sixth
+vacuous assertion; R3's probe corpus was the cure. Mutation harness: **30 mutations, 0
+survivors** across introspect.py, experiments.py, learning_health.py, autobiographical.py,
+model.py and the CLI script.
+
+**Verified sound along the way (R1-R3, by execution):** no event-loop blocking (learning
+2.55s + experiments 266ms correctly off-thread; on-loop selfhood reads ≤24ms at live volume);
+"Nothing here writes" holds across every callee; recall genuinely IDF-weighted; the
+anytime-valid claim honestly implemented; degraded-flag cache lifecycle correct across
+corrupt→fixed→deleted; live renders clean (verify_depth n=20 with trigger 6/20, tts_bon n=75
+under the bench banner, no spurious zero rows). R3 also surfaced a true OBSERVATION, not a
+defect: tts_bon has 0 fired stamps across 75 attempts with verdicts present at the decision
+point on 23 — the "verdicts exist, rarely wobble" arm of its pre-registered abort triage,
+accruing exactly the evidence the rule asked for.
+
+**Files:** `tools/introspect.py`, `core/experiments.py` (`degraded`, `expected_names`,
+kill-switch reframe, empty-corpus naming), `core/learning_health.py` (`_zero_rows`, computed
+direction, ts-skip), `selfhood/autobiographical.py` (`boot_count`), `selfhood/model.py`,
+`scripts/experiment_report.py`. **Tests:** `test_selfhood_introspect_tool.py`,
+`test_experiment_wiring.py`, `test_experiments.py`, `test_learning_health.py`. **Docs:**
+`docs/tools/introspect.html`, `docs/core/experiments.html`. Full suite 13,488 passed.
+
+### 4BR. THE ROUTER'S FIRST CONSUMER — and SEVEN review rounds in which
+### every round found a defect the previous round's FIX had introduced —
+### ✅ SHIPPED 2026-08-16
+
+§4BQ left the complexity router accurate and **unconsumed**: its only historical
+consumer, the MCTS depth gate, is off pending an execution-grounded value function
+(a paired ablation measured 78% vs 80% at ~1.8× latency). This closes that loop.
+
+**THE CONSUMER.** On a turn the router calls *confidently hard* (`label="hard"` and
+NOT escalated — an untrained or unsure router escalates *with* label=hard, so counting
+those fires on nearly everything), the verifier's two-stage CHEAP-leg adjudication runs
+self-consistency n=3 instead of one sample. Control keeps n=1, byte-identical to today.
+
+**Why this lever and not verification routing.** Two-stage is already universal, so
+routing *it* would mean REMOVING verification from easy turns — the risky direction, and
+a capability regression on the 7.9% false-easy. Self-consistency was off for a reason
+that difficulty routing repairs: it costs 3× on *every* turn, and routing makes it ~29%
+of turns (58% trigger × 50% arm). It targets the MISS side, which matters because the
+judge's own confidence carries no signal about false-CONFIRM (AUC 0.5087 — chance), so
+"act when unsure" is unavailable; cross-sample disagreement is the signal the judge does
+express. Majority-of-3 was measured (2026-08-10) to fix `artifact_leak` — 36% of the miss
+mass — with `clean` never varying, so the FPR gate survives.
+
+**Shipped as a randomised arm, not a default**, because the premise "harder turns are
+likelier wrong" is UNTESTED. §4AN is the standing warning. Pre-registered at
+`system/eval/verify_depth/DECISION_RULE.md`. Kill: `GHOST_VERIFY_DEPTH_ROUTING=0`.
+
+---
+
+#### The seven rounds — each fix carried the defect class it fixed
+
+| round | what the PREVIOUS round's fix broke |
+|---|---|
+| R17 | the arm was **100% inert** — added to `DEFAULT_SPECS` only, which the on-disk registry replaces wholesale. `arm_for` returned `""` on every turn; the test asserted against the object production does not read. The live file's own comment records this lesson from Track 1c. |
+| R18 | R17's confidence fix (max-of-k → "lower median") was a **MIN-of-2** in the modal case — the early stop makes k=2 usual — so it suppressed corrections exactly as reliably as max-of-k manufactured them. Same defect, sign flipped. Also: the trigger stamped on ALL traffic, because `trigger_fired` reads presence, not value. |
+| R19 | R18's "counters reach disk" fix stopped one layer short: the escalation ladder builds **replacement objects** at five sites, none carrying the new fields — and every REFUTED verdict enters that ladder, i.e. exactly the turns the mechanism affects. `probe_score` had this identical bug in §4BF. |
+| R20 | R19's new abort signal logged at **DEBUG while production runs at INFO** (the launcher passes no `--debug`; the 20MB live log has zero GhostAgent DEBUG lines) — the same defect R18 had fixed one line above. It also fired on votes that were never truncated. |
+| R21 | no runtime critical. R20's fix was pinned by a **VACUOUS test** (0.0001s budget against a 3-microsecond vote → the deadline never expired, so it passed with and without the fix); another pin flaked 4.3% under load; and **Gate 0 compared an early-stopped statistic to a full-draw prediction** — exactly 2/3 — giving the arm's own first gate a **16.4%** chance of retiring a healthy feature. |
+| R22 | the retired Gate 0 threshold survived in **four restatements** after the canonical file was fixed, including the operator-facing docs page. And THREE more replacement sites (visual / WEB-EXEC / file-artifact overrides in `_compute_verifier_verdict`) dropped the counters one layer above every prior fix (~3% of verdicts). |
+| R23 | **SHIP** — no behavioural defect. Found the FOURTH vacuous test (the R22 pin re-implemented the carry in its own body, so four mutations survived it), and `verify_route` was a dead instrument: written only to turn-facts, three lines above the comment explaining turn-facts records nothing on either delivery path. 154 router labels on disk, ZERO routes. |
+
+---
+
+#### Three measurements I got wrong, and what they cost
+
+**1. Latency, twice.** I claimed the samples ran under `asyncio.gather` so added
+wall-clock was "≈ one sample". Timed on the live critic with the real 2,285-token prompt:
+
+    1 sample 10.8s · 3 SEQUENTIAL 17.8s (10.3/2.7/4.7) · 3 CONCURRENT 24.9s
+
+`gather` is **1.4× slower** — llama.cpp keeps a per-slot prompt cache, so a repeat of the
+same prompt skips the prefill while concurrent samples land on different slots and each
+re-prefills 2.3k tokens. The parallelism was being bought with cache misses. Then I sized
+the vote budget against *that* synthetic figure; live user-facing claim verifies (INFO,
+non-bench, n=60) run **p50 27.6s / p90 54.9s, 65% already over 25s in CONTROL**. The
+budget moved 20s → 60s, and DECISION_RULE's latency abort became arm-vs-arm, because an
+absolute 25s line fires unconditionally on the arm that changes nothing.
+
+**2. The trigger rate.** "~41% of turns" had no provenance anywhere. The corpus says
+58.1% (122/210).
+
+**3. Gate 0's timeline, by 3.7×.** "n=40 is ~2 weeks at 3.5 turns/day" used the RAW rate
+and ignored the three discounts stated in the same document. Qualifying turns are
+3.5 × 0.581 × 0.50 × 0.756 = **0.77/day** → n=40 is **52 days (7.4 weeks)**.
+
+---
+
+#### The design decisions worth keeping
+
+- **Sequential + early stop.** The vote is drawn until DECIDED, not until the budget is
+  spent. At n=3 the common case costs 2 samples. The bound is strict (`>`, not `>=`)
+  because a runner-up drawing level makes a TIE, and ties resolve to sample 1 — a loose
+  bound changes verdicts at n=5. (Exhaustively verified equivalent to a full draw over
+  all 4³ and 4⁵ sequences including drops and ties: 0 mismatches.)
+- **The winner is the first agreeing sample in DRAW ORDER** — never a rank on confidence,
+  in either direction. Any rank rule is a change to the 0.7 action gate (correction note,
+  in-loop repair, passed/failed label) wearing a vote's clothing. Draw order has no rank:
+  when the vote is unanimous the result is *literally* control's own sample.
+- **Decide where the input is.** Trigger and arm resolve in `handle_chat`, where the
+  router runs. The natural home looked like `_compute_verifier_verdict` ("the one place
+  every verdict is produced") — but on the streamed path the trajectory is written before
+  that coroutine is spawned. Measured: 2/169 rows survived there against 145/169 for facts
+  stamped in `handle_chat`.
+- **Read the ENROLLED-ONLY ring.** `_deep` comes from the experiments ring, not the
+  16-slot turn-facts ring that sub-agent and dream turns also write to. A 16-wide fan-out
+  evicts one and not the other, filing a control run as treatment.
+- **Both kill switches inside one predicate.** `GHOST_VERIFY_DEPTH_ROUTING=0` and
+  `GHOST_VERIFY_TWO_STAGE=0` both make the treatment a no-op, so both live in
+  `verifier.depth_for_turn` — a turn can never be RECORDED as treatment while BEHAVING
+  as control.
+- **Four silent treatment→control paths, all now at WARNING**: stage-1 no suspects,
+  all-samples-unparseable, main-route degradation, budget truncation.
+
+#### Pre-registration honesty (`system/eval/verify_depth/DECISION_RULE.md`)
+
+Live turns have **no correctness oracle**, and the convenient metric —
+`resolve_turn_outcome`'s SUCCESS/FAILED — is **circular**: the verdict is an input to it,
+so a treatment that changes verdicts moves it mechanically. The honest metric is human
+feedback, which at ~0.77 qualifying turns/day may take months or never reach its floor.
+Gate 0 therefore reads the MECHANISM first: too few non-unanimous votes means the judge
+does not vary here and the arm retires without waiting on outcomes.
+
+#### Verification
+
+**50 mutations, all killed, 0 survivors** (`scratchpad/mutate_4br.sh`). Full suite
+**13,462 passed**. Two of the "survivors" during the work were harness faults, not code
+faults — one mutation was semantically equivalent (`{} or X` ≡ `X`) and could never fail;
+a mutation harness lies in both directions, and an equivalent mutant reads exactly like an
+inert guard. Timing tests were converted off `asyncio.sleep` to a controlled `monotonic`
+clock (4.3% flake → 0/20 under 6-way CPU load).
+
+⚠ **Unrelated pre-existing flake — DIAGNOSED AND FIXED, and my first diagnosis was wrong.**
+One full-suite run failed
+`test_bughunt_unit6_tools_web.py::TestDeepResearchFetch::test_fetch_honours_proxy_and_suppresses_newnym`.
+I recorded it as "order-dependent"; it was not. There is no random-ordering plugin, and it
+reproduced STANDALONE at 1-in-30.
+
+Root cause: the test was making **real internet searches**. Its isolation patched
+`asyncio.to_thread`, but the search path had been refactored to
+`loop.run_in_executor(_RACE_POOL, ...)` — a dedicated pool, deliberately not the shared
+to_thread executor — so the patch went dead SILENTLY. Instrumenting the flow printed live
+engine wins and real URLs (`yahoo won wave 0 in 1.6s (10 results)`, wikipedia/rd.com/…).
+Three consequences from one root cause: (1) ~3% flake, when every live engine returned empty
+inside the wave deadline `urls` was empty, deep_research returned "search phase failed", the
+fetch never ran, and the assertion died on KeyError; (2) it asserted proxy derivation for
+whatever URL the internet returned, not the fixed one it declares; (3) 2-4s of real network
+I/O inside a unit suite. Egress was Tor-routed (Tor is on 9050 and the proxy reaches DDGS),
+so no keyless-egress violation — but a unit suite should not touch the network.
+
+Fixed by patching `_race_search_wave`, the seam every OTHER deep_research test already uses
+(`test_egress_failclosed_4p`, `test_research_failure_honesty`) and whose sibling docstring
+says deep_research "fans out to `_race_search_wave` DIRECTLY (bypassing to_thread)". 40/40
+runs pass, no network.
+
+A first sweep flagged seven more files as live-network risks and was **WRONG** — the third
+time in this session that an ad-hoc checker of mine lied. `from ddgs import DDGS` happens
+INSIDE `_race_search_wave` at call time, so their `patch("ddgs.DDGS")` does intercept.
+Exactly one test was affected. Same class as everything else in §4BR: **a guard that
+silently stopped guarding when the thing underneath it moved**, failing open with no noise.
+
+#### The stopping rule
+
+Not "a round came back clean" — R17–R22 never did. R23 was told the decision it fed:
+rank findings by whether they change what the agent DOES versus what the record SAYS, and
+the operator ships unless something is behavioural. It returned SHIP with four
+record-only findings, all fixed. Cf. §4BN (34 rounds) and §4BP (5): the loop is
+self-fuelling, and the honest exit is a cost/benefit judgement about what the remaining
+findings can actually cost.
+
+**Files:** `core/verifier.py` (`depth_for_turn`, `router_called_hard`, `_vote_budget_s`,
+`_adjudicate_self_consistent`, `_call_llm` route_out, 6 new `VerifyResult` fields),
+`core/agent.py` (the §4BR block in `handle_chat`, `_compute_verifier_verdict`,
+`_record_verdict_sidecar`), `core/experiments.py` (spec, `TRIGGER_KEYS`,
+`CONTEXT_MUTATING_KEYS`), `Data/system/experiments.json`,
+`Data/system/eval/verify_depth/DECISION_RULE.md`, `docs/core/verifier.html`,
+`docs/core/experiments.html`. **Tests:** `test_verify_depth_routing.py`,
+`test_verify_self_consistency.py`, `test_verdict_fact_recording.py`.
+
+⚠ **NOT YET MEASURED.** The arm has stamped zero live turns — the deploy is the
+measurement, and Gate 0 needs ~7 weeks of traffic. Nothing here is a result.
 
 ### 4BQ. FLIP (vi) — THE ROUTER'S PROBLEM WAS ITS EYES, AND EMBEDDINGS FIX
 ### IT — measured before building, 2026-08-16
@@ -19374,3 +19758,2469 @@ seam (#5, partial). Per-item detail in the Log table (preserved in git history).
   the competence-detector EXIT-CODE substring gap (codes 3-9/127/130 scored SUCCESS). The `**d`
   dataclass-from-dict schema-drift silent-drop/wipe pattern recurred across selfhood/distill/eval and
   was hardened everywhere. Residuals → §4B. Regression tests: `tests/test_bughunt_unit*.py`.
+
+## §4BU — Web workspace console / session bridge (fresh-eye review, 2026-08-17)
+
+Queue item 2. Three rounds, three lenses each (interface server + push, client JS, adversarial
+verifier over the round's own changes). ~75 defects. Full suite green; every fix proven
+red-on-revert.
+
+### The finding that outranks the defects
+
+**Each round's most serious findings were in the PREVIOUS round's fixes.** Not similar bugs —
+the same defect class, carried into the repair:
+
+* R1 made Stop actually reach the agent. R2 found it sent a bare `{}` body, which
+  `core/turns.py::cancel(None)` reads as "the turn holding the semaphore" — and `currentReqId`
+  is null for the whole pre-first-token window, i.e. exactly when Stop is pressed. So Stop
+  during a tool phase could cancel a background dream turn while the user's own queued turn ran
+  to completion, and the tab said "Stopped by user." The dishonesty R1 removed, one layer down.
+  R3 then found the palette's two Stop commands still doing the original thing.
+* R2 stopped the resync deleting the user's own message, by re-appending unaccounted local
+  messages. R3 found it re-appended them at the TAIL: an abandoned question landed after the
+  reply to a later question, and because the store truncates from the FRONT at 400 while the
+  interface caps at 500, every message in that window looked unaccounted and was pasted onto
+  the end — where the next turn replayed it and the server persisted it.
+* R2 unified the merge's two filters into one predicate. R3 found that over-corrected: `lead`
+  now dropped COMPLETE replies to cap-evicted turns, and — because it dropped the assistant
+  carrying `tool_calls` but not the `tool` result referencing it — wrote an orphaned
+  `tool_call_id` into the durable file, poisoning every later turn of that session.
+* R2 fixed the empty-diagnosis bug (`str(e)` is `""` for httpx's timeout family). R3 found the
+  fix for the last proxy family was `f"{e or type(e).__name__}"` — **a no-op**, because an
+  exception object is always truthy. It looked right and changed nothing.
+
+### And the defects moved into the instruments, again
+
+* **My property harness could not see the defect it was written for.** `_simulate` advanced the
+  store with `merged + [reply]`; the route persists `append_turn(tail, reply)`. So `new_tail`'s
+  CONTENTS were never tested — only its truthiness. Reintroducing the §4BU C2 defect verbatim
+  left it green. It also carried `assert … == stored or True`, a tautology running across 5
+  tests x 7 scenarios x 40 seeds.
+* **Then the corrected harness still graded its own homework**: it fed `merged` — the server's
+  INTERNAL prompt, a value no client can observe — back as the client's history, letting the
+  merge absorb its own divergences. Rebuilt on the real `SessionStore.append_turn` with
+  append-only clients, the measured residual went UP (15 re-added, 3 duplicated messages at 3
+  tabs / cap 30), which is what made it fixable: only the LAST element of the tail is the turn
+  being taken, so anything before it the store already holds is replay. Now zero across 1–5
+  tabs, 30–70% aborts, caps down to 30, up to 480 turns.
+* **The C2 defect was pinned in the function that never had it.** Injecting it into
+  `merge_history_detail` dies in 3s; injecting it at its real site in `routes.py` survived all
+  141 session tests, because the property suite imports the function and cannot see the route.
+* **Text assertions cannot see scope, and `if (true)` walks through any token pin.** My first
+  auth fix read `res.status` from a catch block in a different function than the one declaring
+  it — a ReferenceError *inside the error handler*, which would have killed the sessions rail
+  and `boot()`'s 30s retry — and it satisfied every text assertion available. `tests/helpers.py`
+  now carries `eval_js` / `extract_js_function` / `extract_js_listener`; the branchy client
+  helpers are executed under node against fake fetches.
+* **Three tests were fully vacuous**: one asserted that `set.discard` does not raise (testing
+  CPython, not the endpoint — `.remove()` in the endpoint survived 390 tests), one compared 200
+  against a mock returning 200, and one hand-rolled an inner app that catches nothing, so the
+  FastAPI parsing layer `_BodyTooLarge(BaseException)` exists to bypass was never in the
+  picture. A wall-clock timing pin had 34x of headroom and passed with and without its fix —
+  replaced by counting `_msg_key` calls (161 hoisted vs 13,121 unhoisted).
+* **A mutation of mine landed on the wrong line** (a 12-space pattern matched inside a 16-space
+  line) and, by accident, exposed a genuinely unpinned site. Verify WHERE a mutation lands, not
+  just that it landed.
+
+### Live defects worth naming
+
+* `merge_history` could **delete** a stale tab's history (the classifier's boundaries were
+  wrong); rewritten as one LCS rule with two invariants by construction.
+* Session ids the proxy accepted, the store rejected → `_path()` returns None → **every write a
+  silent no-op**. The charsets are now one set, swept over 0x00–0x300, and both silent early
+  returns WARN. A failed session write was `logger.debug`.
+* `_ID_RE` used `$`, which matches before a trailing newline: `web-x\n` persisted a file the UI
+  could neither open nor delete.
+* The store's 400-message cap kept every system message first, so a session accumulating
+  distinct system prompts drove `keep` to 0 and **deleted the entire conversation**.
+* The agent's own `/api/chat` had no message cap (the interface's 500 protects proxied traffic
+  only): 3.57s of synchronous CPU and +332 MB from a ~3 MB body.
+* A stalled agent produced **no error frame at all** (`str(e)` empty for timeouts, every
+  consumer testing truthiness), so the client persisted its partial text as a completed reply
+  and the push said "Reply ready".
+* `pywebpush` was called with no timeout — its own default `None` propagates into
+  `requests.post` — so one unresponsive endpoint parks `_notify_push_poller` for the life of
+  the process.
+* `_load_subs()` failed open to `{}` and the next write persisted that over every device.
+* `/api/push/vapid` reported `enabled` from a weaker condition than sending needs.
+* Eight `float()`/`int()` env parses at import = permanent crash-loop under a KeepAlive
+  LaunchDaemon on one typo'd or empty value.
+* The active-task cap was enforced only by a 60s sweep (3000 entries measured), each entry
+  holding one of 100 pooled connections with a 1800s timeout.
+* In-flight chat workers were never cancelled at shutdown, and the push-probe cleanup ran
+  BEFORE the thing that spawns push probes.
+* `.thinking` is styled in no CSS file: the finally-block teardown was inoperative and every
+  zero-content turn end left dots animating forever, decorated with a timestamp.
+* `beforeunload` did teardown no `pageshow` restored (bfcache): after Back, every image pointed
+  at a revoked blob and every future image went unprocessed.
+* `stopTTS` did not cancel the in-flight `/api/tts` fetch — the agent spoke over the user's
+  recording.
+* One shared `ghost_inflight_turn` key: any tab destroyed any tab's recovery handle.
+* `~/Data/AI/bin/start-ghost-client.sh` failed OPEN on the auth source — an unreadable key file
+  left the process on the stale, publicly-known plist key. Now exits.
+
+### Instruments added
+
+`tests/test_webui_console_review.py` (node-executed client pins), `tests/test_interface_cachebust.py`
+(a content-hash manifest: editing a module without bumping its `?v=`, or bumping a leaf without
+its ancestors, fails), `tests/test_js_execution_available.py` (node absent = ONE loud failure,
+not 15 green skips), `tests/helpers.py` gains the JS execution helpers and one shared comment
+stripper (there were four near-copies, only one of them pinned).
+
+### §4BU round 4 (2026-08-18) — the round that reverted a fix
+
+R4's three lenses found ~35 more items, and the important one is that **a
+fix I shipped in R3 was destroying user turns.**
+
+**The tail replay-filter, reverted.** R3 measured a multi-tab residual (15
+re-added messages at 3 tabs, cap 30) and closed it with: only the LAST element
+of `new_tail` is the turn being taken, so earlier elements the store already
+holds are replay. The safety argument was "this cannot lose the new turn,
+because the new turn is the element it never examines" — and that is true only
+of the CURRENT turn. A turn that FAILED to persist is not the last element; it
+is exactly what a client replays to recover. Reproduced end to end:
+
+    stored   = [u "ok", a A1, u "q2", a A2]     tab A did the "ok" turn
+    incoming = [u "q2", a A2, u "ok", u "q3"]   tab B's "ok" turn ERRORED
+    -> tail = [u "q3"]        tab B's "ok" is gone from the store forever
+
+The deeper error: "the store already holds this text" is not "this client is
+replaying it". The multiset also counted messages the client never saw —
+another tab's turns and the pre-eviction era. Measured 35 → 115 lost messages
+at 2 clients, 60 → 126 at 3 — and at the LIVE cap (400) it removed ZERO
+duplicates while adding 66 losses. **It was tuned on the pathological regime
+and only cost in the real one.** Reverted, with the measurement and the reason
+in the code.
+
+**Why no test caught it** — the metric couldn't see loss. `lost` only inspected
+`merged[-3:]`, i.e. the message typed THIS turn and never a replayed one;
+`REPEATS` ("ok"/"continue"/"yes") were exempt from the duplicate counters; and
+`persisted` only tested the tail for truthiness. A mutation dropping every
+"continue" from the tail survived all 282 tests. The harness now counts every
+text typed against every text any tail carried (`never_persisted`), and that
+metric kills both that mutation and the filter itself.
+
+**The docs claim moved three times, and each move taught something.** "Bounded
+residual" (on a harness that graded its own homework) → "zero across nine
+scenarios" (true, but achieved BY the filter) → what is now written: no typed
+message is ever lost anywhere; the live cap is exactly clean at five tabs; only
+an artificial cap of 30 with 3+ tabs leaves a bounded duplicate residual. A
+number that keeps improving under review is worth distrusting.
+
+**Other R4 findings, all fixed:**
+
+* `resp.read()` in `_upstream_failure` was DEAD on an async stream ("Attempted
+  to call a sync iterator on an async stream") — R3's fix for a no-op WAS a
+  no-op. The working half is a now-BOUNDED `_buffer_error_body` (4 KB, 5 s
+  total) in the two streamed proxies; the chat worker's `_read_snippet` has been
+  bounded for exactly that reason for a year.
+* `_env_num` generalised `_push_timeout_s` and dropped its `> 0` clamp, then
+  guarded nine sites: `GHOST_WS_SEND_TIMEOUT=0` makes every broadcast time out
+  on a HEALTHY client, so the log stream closes every peer on the first line.
+* Adding `/api/workspace/save` to `_UPLOAD_PATHS` (R3) widened a JSON body from
+  10 MB to ~101 MB on a route that calls `request.json()` — ~232 MB peak here,
+  re-serialised to an agent with no body cap of its own. It has its own bounded
+  64 MB JSON ceiling now.
+* The lifespan's "only tasks from THIS loop" comment never checked the loop; a
+  pending task from a foreign OPEN loop cancels fine and then `gather` raises
+  at attach time, where `return_exceptions=True` cannot help.
+* `_is_abort_stub` treated every EMPTY-content assistant as a stub — the shape
+  of a normal tool-calling turn — so a legitimate tool round and the results an
+  answer was based on vanished from the prompt. And a complete "Done." was
+  deleted whenever the store held "Done. I also updated the docs." Identity
+  (the marker at the END) replaced the prefix heuristic.
+* `for call in (m.get("tool_calls") or [])` iterated whatever the client sent:
+  `tool_calls: 7` raised out of the merge, which `routes.py` calls OUTSIDE its
+  try — a plain-text 500 bypassing the OpenAI-shaped envelope, on a shape the
+  route's own validator permits.
+* The `/ws` log-stream key gate had ZERO tests: deleting it passed 235
+  interface tests and 697 audit tests. It is the one gate whose removal is an
+  exfiltration channel.
+* `readInflightHandle` had zero references anywhere: relaxing its staleness
+  test lets a tab STEAL a live tab's in-flight turn, and nothing noticed.
+
+**The instrument lesson of this round: a pin on a pure function says nothing
+about whether the caller uses its result.** `const adopted = (0 ?
+_reconcileWithLocal(…) : messages)` restored the data loss with all four
+executed reconciliation tests passing. Both adoption callers (`resyncCurrent`
+and `load`) are now executed end to end under node with stubbed fetch/Core.
+Across 86 client mutations one sentence held: every node-executed test that
+asserts a COMPUTED VALUE is real; every test that greps a token — even inside a
+byte window — fell to `if (false)`, a dead reference, or a value-bypass.
+
+⚠ **Harness note for future rounds:** exclude `tests/test_interface_cachebust.py`
+from mutation runs over `interface/static/*`. It is a content-hash guard, so it
+kills 86/86 mutations for a non-behavioural reason and reports "the suite is
+sound". Two independent reviewers hit that trap in the same round.
+
+**R4 postscript — the round's tests broke the round's suite.** Three of the
+four instruments I wrote for R4 were themselves defective, and one of them
+cost 37 minutes of wall clock before I noticed the full suite had stopped
+finishing:
+
+* `test_the_log_stream_websocket_REQUIRES_the_key` HUNG the suite. An accepted
+  socket parks `websocket_endpoint` in `await receive_text()` and
+  TestClient's context-manager exit waits on it; a REJECTED one (closed before
+  `accept`) hangs inside `websocket_connect` itself. It passed alone in 2s and
+  hung forever as test 38 of 40 — the shape R3 already recorded (a harness
+  regression presents as a wedged run, not a red test, because nothing here
+  has pytest-timeout). Both halves now drive the endpoint with a fake peer.
+* The env-guard pin went substring → SUBPROCESS → AST. The subprocess version
+  was the one that deadlocked: forking from a pytest process carrying ~110
+  threads hangs before exec, and `subprocess.run`'s timeout covers
+  `communicate()`, not the fork.
+* `test_interface_proxies_require_auth` (pre-existing) scanned server.py for
+  the first textual occurrence of a route string and looked ±200 chars for
+  `verify_interface_key`. Adding a `_JSON_CAP_OVERRIDES` entry above the
+  decorator captured the search. Its worse failure mode was silent: an earlier
+  mention could match a DIFFERENT route's decorator and pass while a route sat
+  unauthenticated. It now walks `app.routes`, requires the dependency in the
+  real dependant graph, and proves 401 end to end.
+
+⚠ **And a mutation battery left the repo mutated.** The harness restores after
+each mutant, but the BATCH hit a 10-minute tool timeout mid-run, so the
+last-applied mutation — `if False:` in place of the `/ws` key check — stayed on
+disk. Blast radius checked before anything else: the client daemon runs without
+`--reload` and its process predated the mutation, and a live handshake with a
+bad key returned 403, so the running service never loaded it. Restored, and the
+file diffs clean against the pre-battery backup. **Every mutation harness from
+here carries an `EXIT/INT/TERM` trap, not just a post-run copy.**
+
+Final state: full suite 13,773 passed / 17 skipped / 0 failed in 10m17s; agent,
+interface and Slack bot restarted and verified (health 200 on both ports, push
+`enabled:true`, v10.0 assets serving, `/ws` refusing a bad key with 403).
+
+### §4BU round 5 (2026-08-18)
+
+Not clean either, and the headline is the fifth consecutive instance of the
+same pattern: **the top finding was inside R4's own new function.**
+
+`_buffer_error_body` (added in R4 to stop the causeless "upstream returned
+HTTP N") assigned `resp._content` INSIDE its `try`, after the await — so the
+very timeout it exists to impose discarded the body it had already collected,
+as did a peer reset mid-body. The complete error message could arrive in the
+first chunk and still be thrown away. `_read_snippet` in the chat worker,
+which the docstring claims to mirror, decodes OUTSIDE its try for exactly this
+reason. Measured through the real handler: clean stream ✅, peer reset ❌,
+stall-after-body ❌ — both now ✅ with the assignment in a `finally`.
+
+**Why the test didn't see it:** it asserted ELAPSED TIME, which is true with
+and without the bug. Same shape as the size-bound test, which asserted
+`len(_content) <= 1024` — guaranteed by the `[:limit]` slice whether or not
+the READ stops, so removing the size break survived. It now counts what the
+generator actually yielded.
+
+Other R5 fixes:
+
+* A cancellation window R4 widened from zero to 5s (the buffer await) skipped
+  `aclose()` and stranded a pooled connection — 100 connections, 1800s pool
+  timeout. `aclose()` is now shielded, pinned by cancelling mid-buffer.
+* The AST env-guard check guarded a SPELLING: it missed `os.getenv` — 91 uses
+  in `src/`, this codebase's dominant idiom — plus walrus, `or 10`, `.strip()`
+  and `Decimal`, and false-positived on module-level try/except. Widened; and
+  because an AST check cannot see a helper that STOPS CATCHING, both
+  `_env_num` twins are now exercised behaviourally.
+* `voice._env_num` was a divergent twin — R4's positivity clamp landed on the
+  server copy only, so `GHOST_TTS_TIMEOUT_S=0` failed every TTS call.
+* The four helpers `_env_num`'s own comment cites as "the guarded idiom"
+  guarded typos but not zero: `GHOST_INTERFACE_STREAM_CAP=0` truncates every
+  reply to zero bytes. All four now route through `_env_num`.
+* The TTS retry restriction (R4 fix #6) had ZERO tests — deleting it, which
+  restores a 120s hang blamed on the voice name, survived all 316.
+
+Full suite after R5-A: 13,782 passed / 17 skipped / 0 failed.
+
+**Five rounds, and the honest summary of the arc:** rounds 1-3 found defects in
+the runtime; rounds 4-5 found them almost entirely in the fixes and in the
+instruments. The rate never hit zero, but the SEVERITY fell — R5's worst is a
+degraded error message and a rare connection leak, where R1's was a merge that
+deleted history and R3's was a filter that deleted user turns. That is the
+signal to stop: not "no findings", but "no finding that costs the operator
+data or a wrong diagnosis".
+
+**R5 lens B — four more, all in R4's work, one of them live.**
+
+* **The adopted-orphan REATTACH path never released the handle.**
+  `clearInflightHandle`'s own docstring says adopting an orphan and then
+  clearing the bare form "leaves the orphan on disk to be re-adopted on every
+  visibility change — a loop, not a cleanup". The ADOPT branch did exactly
+  that: the resume path never calls `saveInflightHandle()`, so all four
+  terminal cleanups dropped OUR empty slot while the dead tab's key survived.
+  Every visibility return replayed the buffer — reply re-rendered, TTS
+  re-spoken, a duplicate assistant into `chatHistory`, an `/api/chat/ack`
+  re-POST — for up to the proxy's 10-minute TTL (the client GC window and
+  `ACTIVE_TASK_TTL_SECONDS` are the same 600s). The orphan is now RE-HOMED
+  under the adopting tab. The durable store was never at risk (`_admissible`
+  drops every client assistant from `extras`).
+* **The R4 revert was not pinned.** Re-applying the exact tail replay-filter —
+  the one that deletes user turns — passed all 167 session tests, INCLUDING
+  `never_persisted`, the metric added to catch it. The reasoning lived in a
+  code comment and nowhere else. `TestTheTailReplayFilterStaysREVERTED` is now
+  the four-line regression test for a DELETION, verified red the moment the
+  filter returns.
+* **`never_persisted` measured the TAIL, not the STORE.** `_simulate` advances
+  the store through the real `append_turn`, so anything dropping a message
+  INSIDE the store was invisible: a mutation making `_clean_messages` discard
+  user turns deleted 31 of 60 typed messages from the durable file and the
+  metric read zero, 167 green. It now reads the file back, with cap eviction
+  accounted separately. (Fixing it, I placed the read AFTER the temp-dir
+  cleanup and every message counted as lost — caught on the next run.)
+* **R4's whole client-side change was unpinned**: reverting all four
+  handle-threading call sites passed 241 tests, because the pins assert the
+  substring `clearInflightHandle`, which cannot see an argument.
+
+Scope note recorded in the harness: `never_persisted` excludes the `REPEATS`
+texts, because a verbatim retype is genuinely indistinguishable from a replay
+without message ids — the ambiguity this design accepts. Measured: the
+residual appears only with repeats AND a cap tight enough to evict inside the
+alignment window; zero without either. That exclusion is exactly why the
+reverted filter needed its own explicit test — its victim was a repeat.
+
+Docs corrected: `docs/core/sessions.html` still described the thin/fat
+classifier that was DELETED, and presented the one-message divergence
+tolerance — the cause of the quadratic doubling — as the current fix;
+`docs/api/routes.html` had no mention of the 413 request cap;
+`docs/interfaces/web_server.html` still named the single `ghost_inflight_turn`
+key.
+
+**Incidental, not chased:** five orphaned `sh` processes from pytest temp dirs,
+6 days old, left by the sandbox/service-lease tests
+(`test_cancel_kills_the_process`, `test_reap_kills_a_job_past_its…`). A
+test-harness child leak; harmless at five, worth a look when the sandbox stack
+comes up the queue (item 4).
+
+### §4BU CLOSED — 2026-08-18
+
+Queue item 2 converged after **5 rounds x 2-3 independent lenses**, ~120
+defects. Final: full suite **13,790 passed / 17 skipped / 0 failed**; agent,
+interface and Slack bot restarted and verified live (health 200 with a key and
+401 without, push `enabled:true`, v10.1 assets serving, `/ws` refusing both a
+bad key and no key with 403).
+
+**When to stop, given the find-rate never reached zero.** The SEVERITY curve
+did: R1 a merge that deleted conversation history; R2 a resync that deleted the
+user's own message; R3 a filter that deleted user turns; R4 a crash-loop
+surface and a no-op fix; R5 a degraded error message and a replay loop. Rounds
+1-3 found defects in the runtime, rounds 4-5 almost entirely in the FIXES and
+the INSTRUMENTS. Stopping condition met: no remaining finding costs the
+operator data or points them at the wrong subsystem.
+
+**The one-line summary of five rounds:** *every round's worst finding was in
+the previous round's fix, and once the runtime was guarded the defects moved
+into the things that check it.* Concretely, the recurring shapes were —
+a fix that fixes nothing (`{e or type(e).__name__}` on a truthy exception
+object; `resp.read()` on an async stream); a fix that inherits the defect
+class it removes (`lead` vs `extras`, tail-append vs in-place, the composer
+Stop vs the palette Stop); a metric that cannot see its own failure mode
+(`never_persisted` reading the tail, wall-clock where a call count belonged,
+upper bounds that a harmful change drives to zero); and a pin that asserts a
+SPELLING rather than a behaviour (substring greps, `if (false)` walk-throughs,
+route auth scanned from source text).
+
+**Left open, deliberately:**
+* `tests/test_webui_feedback_client.py` is 4/12 behavioural on the path that
+  produces half the live human labels. R4 named the three conversions worth
+  doing (retry arming/bound/stand-down, the exact wire body, the detached-node
+  re-target). Worth a focused hour, not another round.
+* Four manual `str.index(...) + N` window slices in the JS suites can drift
+  into vacuity as the files grow (`test_delete_one_rechecks_after_the_awaits`
+  is already reading past its function).
+* Five orphaned `sh` processes, 6 days old, from the sandbox/service-lease
+  tests — a harness child leak to fold into queue item 4.
+* `MAX_MESSAGES_PER_SESSION` at 400 vs the interface's 500-message cap: the
+  window between them is where multi-tab duplicates live at all.
+
+Next: queue item 3, LLM client / routing (`core/llm.py`).
+
+
+## §4BV — LLM client / node routing (fresh-eye review, 2026-08-18)
+
+Queue item 3. Round 1: three lenses (routing/capacity/breakers · the request
+path · the caller seam). All three converged on one cluster, which is the
+finding of the round.
+
+### The pool→main downgrade was INVISIBLE and UNBOUNDED
+
+When a pool node fails — or our OWN saturation gate (`NodeSaturated`) trips —
+`_do_chat_completion` catches it, silently re-runs on the main 35B with
+`timeout = None` (httpx's **1200s** default) on the FOREGROUND path, and
+returns a dict identical in shape to a pool-served one. Three consequences:
+
+1. **The caller's budget vanished.** The verifier's 120s critic call could
+   become a twenty-minute main-slot occupation. Seven foreground callers
+   (`search.py` web summary, `darkweb_search`, Context Shield, compaction,
+   `dream`, `build_gates`, the verifier's critic path) had no `off_main_only`,
+   so a saturated Nova converted a 3-way research fan-out into three
+   serialized unbounded 35B summarizations. Fixed: the fallback gets a
+   main-sized bound (`_MAIN_FALLBACK_TIMEOUT_S`, 300s, env-overridable) —
+   still not the caller's node-sized budget, which would kill a 35B, and no
+   longer infinity.
+2. **§4BR's degradation guard was blind.** `verifier.py` stamped
+   `route="critic"` on verdicts the MAIN model produced, so the guard that
+   aborts a self-consistency vote when `route in ("main","failed")` could
+   never fire — and all n samples piled onto the single foreground slot,
+   which is precisely the condition it exists to stop. Fixed: results carry
+   `_ghost_leg` (`served_by` / `fell_back_from`), read via `served_leg()`,
+   and the verifier reports the leg that actually served it.
+3. **Recordings attributed main-model output to the critic node**, polluting
+   the §4BG fixture corpus with wrong model provenance.
+
+### `route()` double-counted every worker-routed call
+
+Query expansion, decompose, classify and VERIFY all reach the node through
+`route()`, which delegates to `chat_completion()` — and then counted and
+recorded the SAME response again. `Trajectory.tokens_in/out` and the OpenAI
+`usage` block returned to every API client were **exactly 2x** for a large and
+variable slice of each turn, and every §4BG fixture was written twice.
+
+⚠ **The test had forced the defect in.** `test_every_completion_path_counts_usage`
+was an AST assertion that `route` / `chat_completion` /
+`_do_stream_chat_completion` each CONTAIN a `_note_usage` call — a structural
+proxy for "each response is counted once", which a redundant call satisfies.
+The honest implementation (delegate, don't count) FAILED it. Replaced with an
+identity check: one HTTP response → one tally, one recording. (§4BN again:
+pin identity, not a property.)
+
+### Three pools claimed a fallback that never happens
+
+`off_main_only` callers never touch the 35B, but the critic, coding and swarm
+branches logged "All X nodes failed, falling back to main upstream"
+unconditionally — keepalive alone emitted it every 45s, ~2,880 false WARNINGs
+a day, against the module's own "transitions, not ticks" contract. The worker
+branch had been fixed; the other three kept the line.
+
+### `str(e)` is empty for httpx's whole timeout family — at 10 of 11 sites
+
+The same defect fixed twice in the interface this week. Here it produced
+`Upstream Failed: Failed after 2 attempts: ` on the main model's terminal
+error, a blank `Embedding Fatal`, blank SSE error frames, and — worst — handed
+THE MODEL `ERROR generating image: … after 3 attempts: ` with no cause to
+reason about. The module already knew the answer in two places
+(`str(e) or repr(e)`, `_node_error_detail`); one `_err_text()` now covers all.
+
+### A wrong claim of mine, corrected by the suite
+
+I described the `_ghost_leg` stamp as "non-invasive by construction: a private
+key ignored by every existing consumer". Three tests compare the whole
+response dict and caught it. It is safe from LEAKING to API clients only
+because `api/routes.py` constructs the OpenAI payload field by field rather
+than forwarding — so that property is now pinned too.
+
+### Open after R1 (measured, not fixed)
+
+* **The circuit breaker is 100% inoperative in production.** Every selector
+  ends `return pool[0]` when no node passes `is_available()`, and every pool
+  ships with exactly ONE node — so the breaker can never prevent a request.
+  Its tests all build TWO-node pools, so they pass while the shipping
+  topology is untested. Fixing it needs care: with one node, "refuse" means
+  falling back to main, which is the dogpile above.
+* **`route()`'s 12s fail-fast is defeated by a 90s slot wait**
+  (`GHOST_NODE_SLOT_WAIT_S`, not exported by the launcher). The permit wait
+  precedes the HTTP budget, so turn-start query expansion can add up to 90s of
+  dead air for a value whose fallback is a free string concat.
+* **`_main_node_lock` covers 2 of 3 main entry points** (`_do_stream_chat_completion`
+  takes neither it nor a slot), and because `--visual-nodes` IS the main
+  upstream URL, a 1-slot llama-server can hold main + vision + stream
+  concurrently — queueing invisibly inside the server.
+* **Both exhaustion-guard tests pass on a comment** (`"exhausted" in src.lower()`
+  and a `src.count(...)` text count); mutating all five retry guards to `pass`
+  leaves them green.
+* `generate_image` sits outside the slot gate and records a 400 as node
+  illness; `foreground_tasks` is inflated by off-main calls (suppressing idle
+  phases); `warm_up_workers` hardcodes `range(3)`; the keepalive `down` set is
+  keyed by URL, so worker+critic sharing one box logs a state transition every
+  tick forever.
+* Seam: the planner declares `use_swarm=True` against an empty pool (its only
+  test is skipped with a stale reason); `coding_executor` never passes
+  `use_coding` at all; `constraint_gate`'s screen-then-confirm degrades to
+  asking the SAME model twice when the worker is down; `failure_distill`
+  writes a permanent `no_pattern` verdict when `route()` returns its fallback
+  after a transient node outage.
+
+Full suite 13,797 passed / 17 skipped / 0 failed; agent restarted and healthy.
+
+### §4BV rounds 2–3 (2026-08-18)
+
+R2 closed most of R1's open list. R3 then found that **the worst defect in
+each round was inside the previous round's fix** — the §4BM pattern, for a
+fifth and sixth consecutive time.
+
+* **`_env_positive`** — `float(os.getenv("GHOST_NODE_SLOT_WAIT_S", "90") or 90)`
+  had three traps at once: `"0"` is TRUTHY so `or 90` never fires (a `0` gave
+  every node a 0-second permit wait — no off-main node was ever contacted and
+  all traffic landed on the single main slot, i.e. a gate whose failure mode is
+  "no gate"); a typo'd `"90s"` raised **ValueError at the top of
+  `_do_chat_completion`**, killing every call including main-only ones; and
+  "<=0 disables" is this repo's convention elsewhere, so the obvious operator
+  reading produced the worst outcome.
+* **`require_healthy`** made the circuit breaker able to prevent a request for
+  the first time — but only for callers whose fallback is FREE (`route()`).
+  Refusing globally would turn a sick node into a main-model dogpile.
+* **`off_main_only` silently disabled the constraint gate.** My own R2 change
+  (`off_main_only=is_background`) made the client RAISE when the pool was
+  down, and `constraint_gate` fails open on any exception — so a background
+  build with Nova unreachable **shipped a violating artifact**, logging one
+  debug line. Measured: `gate_passed=True, main_calls=0`. Caught by a sibling
+  lens twenty minutes after I wrote it. Fixed with a deliberate main fallback.
+* **`failure_distill` burned its best clusters.** `route()` never raises — it
+  returns its fallback for a no-pool, an `OffMainNodeUnavailable` and any
+  exception — so the `except` around it is dead for node failures. A transient
+  outage wrote a **permanent** `no_pattern` fingerprint, and since clusters are
+  processed highest-evidence-first, the ones burned were the most valuable.
+
+### §4BV round 4 (2026-08-18) — the round where the fixes were the subject
+
+Two lenses. Lens A: "the streak holds — round 3's worst defect is inside a
+round 3 fix." Lens B settled the three items R3 had left open, and **overturned
+one of them**.
+
+**Three R3 fixes were inert or false, and all three were mine.**
+
+1. **The replay `route()` fix never fired.** I guarded with `try/except` plus
+   `response is None` — but `_next` raises only on *exhaustion*, and the corpus
+   has **3,728 `kind="route"` records and ZERO with a null response**. A modern
+   `kind="chat_completion"` record took neither escape: consumed, mismatch
+   logged, raw dict returned to a caller expecting a string. Now branches on the
+   record KIND, by **peeking** rather than consuming — guessing wrong there
+   desyncs every later call in the replay.
+2. **The synthesised `_ghost_leg` asserted something FALSE for 41,211 of 74,323
+   live records.** I filled a missing `served_by` from `meta.use_worker` — the
+   *request* flag, i.e. exactly the confusion `_ghost_leg` was introduced to
+   prevent. Every one of those records requested a pool and fell back to main.
+   A confident wrong answer is worse than none here: `served_leg`'s consumers
+   can detect `""` and cannot detect a plausible lie.
+3. **The headline safety test was vacuous.** `TestTheGateCannotBeSkippedByAnOutage`
+   used a `FakeLLM` whose `chat_completion` swallows `off_main_only` into
+   `**kw` — so it could never raise `OffMainNodeUnavailable` and never entered
+   the path it was named for. Deleting the entire R3 fix left 140 tests passing.
+   Rebuilt on the real `LLMClient`.
+
+**The guard did not reach the places that needed it.** `_env_positive` was
+written in R3 and lived in `llm.py`, invisible to its siblings — so
+`_PLANNER_TIMEOUT_S` (written the same round) and `_GATE_TIMEOUT_S` reproduced
+**both** traps it exists to close. It now lives in `utils.helpers`, and
+`tests/test_env_timeout_constants.py` enumerates every tunable timeout and
+drives each through five bad values. Its structural backstop immediately found
+**three more** nobody had named, including two in `llm.py` itself: a typo in
+`GHOST_STREAM_IDLE_TIMEOUT` would have stopped the agent booting.
+
+**Lens B overturned R2's `min(_slot_wait, timeout)`.** The rationale — "a
+caller that said 'worthless after N seconds' has told us how long it will
+queue" — describes a total budget the code has never implemented. Measured:
+the two budgets **add** (timeout=2s + a permit freed at 1.9s → 3.91s), and the
+wait is re-spent **per node** (3.01s against a 1.0s stated budget on a 3-node
+pool, growing linearly as nodes are added). It also silently re-deadlined seven
+other callers to serve one. `slot_wait` is now an explicit parameter that
+`route()` asks for by name; nobody else is quietly re-timed. Deleting the
+original line had survived 158 tests, so this was never pinned in either
+direction.
+
+**Lens B confirmed the unconfigured-pool raise, and undercounted it at 4 —
+it was 12.** Neither raise message matches `_TRANSIENT_MESSAGE_MARKERS`, and
+only two sites in the tree catch `OffMainNodeUnavailable` by name. Smart-memory
+consolidation and post-mortems **lost their journal item permanently** (popped,
+then unrequeueable); a user-triggered dream replied `"Dream error: no worker
+nodes are configured…"`; lesson graduation reported `"0 lessons graduated"` — a
+success-shaped string for a dead subsystem. The correct handling was already
+written twenty lines below (the "requested but unconfigured" arm, which bounds
+the main call); my raise merely shadowed it. Zero live impact — production sets
+`--worker-nodes` — which is exactly why it went unnoticed.
+
+**Two rationales repeated across the codebase were simply false.**
+"`keepalive` IS the recovery detector, so a pool that refuses can never observe
+healing" appeared **verbatim at five sites plus a test docstring**;
+`is_available` promotes open→half_open after the cooldown and returns True to
+every caller, `require_healthy` included, so refusal delays recovery by at most
+one cooldown. And "half_open — allow one probe" is wrong: 50 consecutive calls
+were all admitted, with the state still half_open. Both corrected, both now
+pinned — the half_open one deliberately pinned **as-is**, with a note that a
+bare single-flight bool would wedge a node forever on a cancelled probe.
+
+**Fixed from lens B's new findings:** `get_embeddings` held the same mutex as
+every main chat call with **no timeout** (httpx's 1200s) and **no foreground
+accounting** — one wedged call blocked every completion for twenty minutes
+while `_wait_for_foreground_clear` read an idle agent; a failed capacity probe
+was cached **permanently**, pinning a `-np 1` node at the default 3 for the
+process lifetime (3× over-subscription by the gate whose only job is to prevent
+it); warmup fired a hardcoded 3 requests and, because worker and critic are the
+same box, warmed Nova **six times** at boot while keepalive pinged it twice
+every 45s; verify queued on that one box **twice per verdict** (135s of pure
+permit waiting) — now bounded to ~75s; `close()` leaked all six pools if the
+first `aclose()` raised; and both web-summary paths swallowed their degradation
+in a bare `except` with **no log at all**, so a research call could run entirely
+on raw HTML and read identically in the stream.
+
+**One R4 fix of mine was built, measured, and reverted.** Lens A's MINOR-10
+said `failure_distill` cannot distinguish "never answered" from "answered with
+nothing", and a sentinel fallback was the obvious fix. Mutation M9 — swapping
+the sentinel back to `None` — left all 24 tests green. `route()` ends
+`return content if content else fallback`, so it collapses an empty completion
+onto the fallback *before* this code sees it; the sentinel distinguished
+nothing. Reverted, with the measurement recorded at the call site. An empty
+completion is a degenerate generation, not a verdict, and retrying it is right;
+a genuine "no pattern" verdict arrives as `{"pattern": ""}` and was always
+handled correctly.
+
+**And one of my R4 tests was vacuous twice before it worked.** The behavioural
+pin for `require_healthy` on in-loop re-selects passed on the buggy build in
+two successive versions: with both breakers open the first select returns None
+and the retry loop is never entered; with only one open the bare re-select
+filters to the healthy list and never reaches the last resort. The defect needs
+*every* node unavailable AND `pool[0]` not yet tried — i.e. a pool degrading
+**during** a call. Only the third version failed on M4.
+
+**Self-review caught a fix of mine that could not take effect.** The
+capacity-probe TTL — cache successes forever, failures briefly — is inert on
+its own: `_node_slots` is written in exactly one place and never resized, so
+the semaphore built from the provisional default outlives the corrected number
+and `_node_capacity` is never consulted again. Found by reading the neighbour
+of my own edit rather than by a lens. Both halves now ship together and are
+independently pinned (M13 reverts the resize, M14 reverts the TTL; each kills
+a different test). The resize replaces the semaphore, so in-flight holders
+release against the old object and the node can briefly carry old+new — worth
+it against gating a 1-slot node at 3 forever.
+
+**Open, deliberately:** the per-node amplification of the permit wait (a real
+total deadline across the pool loop, with a floor so a caller cannot burn its
+budget queueing and then POST with 1s left); `_do_stream_chat_completion` still
+holds no concurrency gate, never touches the breaker, and has no main fallback
+for a dead coding node; `_disable_thinking` is worker-branch-only;
+`RoutingTask` is 4/7 dead while its highest-traffic caller passes a bare
+string.
+
+**R4 verified live.** Full suite **13,856 passed / 17 skipped / 0 failed**;
+agent restarted 14:07 onto the R4 code, all six pools reporting. The boot log
+shows both warmup fixes working against the real node:
+
+```
+before:  node capacity  Nova advertises 4 slot(s)
+         node warmup    worker node Nova pre-warmed (3/3 slots)
+         node warmup    critic node Nova pre-warmed (3/3 slots)   <- same box, twice
+after:   node capacity  Nova advertises 4 slot(s)
+         node warmup    worker node Nova pre-warmed (4/4 slots)   <- sized to -np, once
+```
+
+An intermediate full-suite run came back **56 failed** from a test *I* added:
+it used `importlib.reload` on `core.agent` and `core.verifier` to read
+constants under a patched environment. Reload rebinds those modules' classes
+for the rest of the session, so objects built later fail `isinstance` against
+classes captured earlier — 56 tests in four unrelated files, every one of
+which passes in isolation. A localized run cannot see this. The wiring is now
+checked by parsing the source with `ast` (a `Call` to `env_positive` with the
+right var and default — AST, not substring, because a comment satisfies a text
+search), and the guard's behaviour is tested by calling it directly.
+
+### §4BV round 5 (2026-08-18) — three lenses; the streak held a sixth time
+
+R5 ran an adversarial lens on R4's fixes, a lens on the four items R4 left
+deliberately open, and a lens on the INSTRUMENTS (87 mutants, 66 killed / 21
+survived). The prior was confirmed again: **the worst finding was a live
+regression R4 introduced, and its justifying comment was measurably false.**
+
+**MAJOR — R4's `slot_wait` change lost a URL on the user's critical path.**
+Removing R2's `min(_slot_wait, timeout)` did not just stop re-deadlining
+callers; it RAISED six of them to the 90s operator ceiling. `search.py` runs
+fetch+distill under a 55s outer `wait_for`, so a saturated Nova stopped
+degrading to raw page text and started cancelling the whole coroutine:
+
+```
+R2 min(90,t)  -> RAW PAGE TEXT       (degraded, URL survives)
+R4 (shipped)  -> URL LOST ENTIRELY   (outer per-url deadline cancels)
+```
+
+And the R4 test asserted the regression as correct (`_wait_seen(timeout=12)
+== 90.0`), so it would have resisted the fix.
+
+**The underlying fault both earlier rounds missed:** the permit budget was
+spent in full by EVERY node AND again by the POST. `route()` states a 12s
+fail-fast on the user's critical path and measured **23.91s on the one-node
+shipping topology** — this was never the multi-node-only problem R4 took it
+for. At 1/2/3 nodes: 12 / 24 / 36s. `_node_capacity`'s 5s `/props` probe runs
+inside `_node_slot` but BEFORE the permit wait, so it was spent entirely
+outside the budget (2.83x), and `generate_image` re-spent its full budget
+across `range(3)` — ~273s of pure queueing for one image.
+
+Fixed by making the budget a wall-clock DEADLINE covering queueing and the
+request, with two amendments neither obvious nor optional:
+* the remainder is **shared across untried nodes** — a flat per-attempt
+  deadline lets node 0 eat everything while node 2, free right now, is never
+  asked (measured: flat failed at 9.0s where sharing succeeded at 6.01s);
+* the floor is on the **total** and the HTTP reserve comes out of it —
+  flooring at `_MIN_SLOT_WAIT` alone leaves 2.0s of real queueing and quietly
+  guts the anti-disable guarantee.
+`route()` now measures 9.01s against its 12s contract. The three foreground
+callers (`search`, `darkweb_search`, `build_gates`) state their budget by
+name, which restores the cap R4 deleted — as an explicit choice this time.
+
+**Two more faults were introduced by R4's own `_node_slot` rework.** The
+capacity probe ran inside `_node_slots_lock` — ONE lock for every node — and
+R4's 300s re-probe TTL turned a once-per-process 5s stall into a recurring
+one: a healthy Nova dispatch measured stalling 5.0s behind the image-gen
+Jetson, which is not a llama-server and never answers `/props`. Now per-URL
+locks, probe outside them (0.01s). And R4 REPLACED the semaphore on a
+capacity correction, documenting the window as "the duration of those
+requests" — false in the direction that matters: queued waiters stay parked
+on the old object and keep being admitted through it, so the window is
+`queue_depth / old_cap x request_duration`. Now resized in place by
+permanently absorbing the surplus permits.
+
+**R4 also edited past a defect on the exact line it changed.** `_slots`
+defaults to 3 for an unprobeable node and `failure_threshold` is 3, so boot
+warmup opened the breaker on the node it was warming — 60s of degraded query
+expansion on every co-restart, at precisely the moment warmup exists to
+prevent it. Now probes with one and fans out only on success (1 failure, not
+3), and no longer freezes a capacity guess taken at the worst possible moment.
+
+**A fix whose comment was false in the other direction.** R4 removed the
+unconfigured-pool raise saying "the correct handling already exists twenty
+lines below". That arm was gated on `timeout is not None`, so three of the
+twelve subsystems it was protecting ran on main with httpx's **1200s**
+default — trading "smart-memory loses its journal item" for "smart-memory
+occupies the single main inference slot for twenty minutes."
+
+**Item 3 was REFUTED, which is the useful kind of finding.** Applying
+`_disable_thinking` at the seam looked obviously right and is an active live
+regression: `bin/start-ghost-agent.sh:293` exports `GHOST_CRITIC_NO_THINK=0`
+deliberately (no-think produced false REFUTEs), `_disable_thinking`'s
+`setdefault` only defers to an explicit `True` while every kill switch here
+expresses "on" by OMITTING the key, and `--visual-nodes` is the main box — so
+the seam fix would suppress thinking on the 35B and render four operator
+switches inert. What it found instead: the branch production actually runs
+was **untested** (replacing it with `raise AssertionError` passed 188 tests),
+because `_CRITIC_NO_THINK` was read at import and no test could set it; and
+its test pinned the arm that is switched OFF live. Ship the pin, not the fix.
+
+**The instruments.** The `llm.py` core is genuinely well-pinned — every guard
+named as load-bearing died to a behavioural test. The rot was in the tests:
+* `test_node_concurrency_gate.py`'s seam pin counted a literal. Moving all
+  five POSTs OUTSIDE their `async with` blocks — removing the per-node gate
+  from the dispatch path entirely — left **105 tests passing**. Now driven.
+* `test_..._floored_not_honoured` asserted `== _MIN_SLOT_WAIT`, recomputed
+  from the thing under test: setting the constant to `0.0` left it asserting
+  `0.0 == 0.0` while the documented failure mode went live. Now a literal
+  band — and the first band I chose (1.0) was still too loose to catch the
+  floor being applied without the reserve, which a mutation showed.
+* `test_llm_client_records_both_branches_and_route` certified a feature that
+  had been deliberately DELETED: its `'kind="route"' in src` matched the
+  COMMENT recording the deletion, and its `count("_maybe_record_call(") >= 3`
+  counted the `def` line. Neither assertion could fail for its stated reason.
+* `test_warmup_passes_off_main_only` was satisfied by the explanatory comment
+  above the call; flipping the real kwarg to `False` left it green. Deleted —
+  the behavioural sibling already proves it.
+* Six R4 fixes were unpinned, including `close()` and the verifier's
+  `slot_wait` — the only production consumer of the mechanism R4 built.
+
+**Also in R5:** `RoutingTask` lost four members with zero production callers
+(the class read as an inventory of what the routing layer does and was an
+aspirational list), and its docstring lost two false claims — "call sites are
+type-checked" (`route()` takes any string; `verifier.py` passes a bare
+`"VERIFY"`) and "centralised so a routing-model swap lands in one place",
+contradicted by the caller that matters. Its test asserted
+`RoutingTask.X == "X"` for five members — a constant compared with itself —
+and is now a liveness check that fails when a member has no caller.
+`docs/core/llm.html` had five of six routing bullets wrong, including a
+member that never existed, and both live members missing; it now also
+documents the pool-deadline semantics.
+
+**One flake fixed as an instrument, not re-rolled.**
+`test_hydrate_context_actually_concurrent` asserted `elapsed < 0.16` on a
+~0.10s operation — 1.6x of headroom, green in isolation and red under the
+full 13.8k-test suite. A wall-clock band is the wrong instrument for a
+concurrency property in both directions: too tight and it flakes on a loaded
+box, too loose and it passes on a sequential implementation. It now counts
+PEAK OVERLAP, which is exact — a sequential implementation can never exceed 1.
+Serialising `_fetch_all_tiers` takes it from 3 to 1 and fails the test.
+(Worth recording: my first attempt to prove that mutated
+`gather(*fetch_coros)` instead, which is an EQUIVALENT mutant for a
+single-query hydrate — identical elapsed, 0.105s both ways. The old
+wall-clock assertion would not have caught it either. Always check that the
+mutation you used to validate a pin is the one the test actually exercises.)
+
+**Deliberately deferred to R6, with reasons:** the streaming coding path
+(no breaker, no `_node_slot`, no main fallback, and a retry that re-hits the
+same dead node — all four proved, all latent because `--coding-nodes` is
+empty; lens B has a verified ~20-line patch). It is confined to a dead
+branch, but it lives inside the generator every user turn flows through, and
+landing it at the tail of a long session with only a suite run as the check
+is precisely how R4's defects got in. The main-node half of that path stays
+open by decision, not oversight: `stream_chat_completion` already wraps the
+generator in `foreground_tasks`, so accounting is correct, and a gate would
+relocate a queue llama-server already serves while holding a permit across
+`yield`s on a cap-1 resource. The residual cost worth writing down instead of
+fixing: with 4-deep self-inflicted queueing, a third stream's prefill can
+exceed `_STREAM_FIRST_BYTE_TIMEOUT` and be reported as "Upstream Stream
+Stall" — our own over-subscription misattributed to the upstream. That argues
+for a counter in the stall log, not a lock.
+
+### §4BV round 6 (2026-08-18) — R5's headline mechanism was a live regression
+
+Three lenses: adversarial on R5, the deferred streaming path, and the
+INSTRUMENTS (45 + 87 mutants). The prior held a seventh time, and this round
+found the worst defect of the whole review — **shipped by R5, live, and
+degrading verification while the agent ran**.
+
+**CRITICAL — R5 collapsed two different budgets into one, and cut every
+caller's generation time to the queue ceiling.** `_http_cap` clipped the HTTP
+timeout to `GHOST_NODE_SLOT_WAIT_S`, whose own docstring says it is "how long
+a caller will queue". Measured on the shipped tree:
+
+```
+verifier critic   asked 120s -> POST got  29.99s
+dream self-play   asked 180s -> POST got  89.99s
+```
+
+Against the live verdict distribution (n=39 from ghost-agent.log: median
+24.4s, p90 56.7s, max 70.3s) that failed **28.2% of all verdicts** — and
+because a ReadTimeout IS a node fault, each failure was also charged to Nova,
+so a slow-but-healthy judge would trip its own breaker. A 36.6s CONFIRMED
+verdict is visible in the log; under R5 it would have died. `slot_wait` and
+the request budget are now separate, with an opt-in `total_budget` for the
+four callers that genuinely have an outer deadline.
+
+**CRITICAL — and R5's fix for the URL-loss never worked.** `_http_cap` was
+computed on the line ABOVE the `async with`, i.e. at t=0 before any queueing,
+so it never clipped anything: the identity mutant `return t` survived 112
+tests. `route()` still measured **19.95s against its stated 12s**, and
+`search.py` still lost URLs (55.00s, outer deadline cancelled). The budget is
+now taken while the permit is held: route() measures 12.00s and the POST
+budgets are visibly clipped (4.05 / 7.05 / 11.55).
+
+**MAJOR — the last node of every pool was never asked.** `_untried` was
+computed AFTER `tried_nodes.append(node)`, so it counted the attempts
+remaining *after* this one and the final share drained to exactly 0.0 — and
+`asyncio.wait_for(sem.acquire(), 0.0)` rejects even a completely FREE
+semaphore. Budgets were `[9.0, 0.0]` at 2 nodes, `[4.5, 4.5, 0.0]` at 3.
+Both lenses found it independently; it is the precise defect the sharing
+exists to prevent, moved from node 2 to node N.
+
+**MAJOR — three more.** `darkweb_search` imported search.py's 45s budget but
+runs under a 45s outer deadline of its own, of which the Tor fetch may take
+40 — a 5s fetch was enough to lose the URL; it now sizes the distill against
+the clock. Probing outside the lock (R5's correct fix) let a stale FAILING
+probe land after a fresh SUCCEEDING one and win permanently, pinning the gate
+at 3 for a `total_slots=1` node — which live is `--visual-nodes`, the main
+35B's single slot; the authority is now re-read inside the lock. And the
+warmup fan-out was STILL exactly `failure_threshold`: R5 narrowed it to
+`_slots - 1`, but Nova advertises 4, so `4 - 1 = 3` restored the collision.
+Warmup failures no longer reach the breaker at all — a boot ping against a
+booting node is not evidence, and that also covers the shape R5 missed (node
+answers the first ping, then fails the batch under Metal OOM).
+
+**A bug I introduced DURING this round, caught by a hanging test.** Making
+the permit wait a callable (so it resolves after the capacity probe) meant
+passing a `functools.partial` — which is truthy, so it defeated
+`_node_slot`'s `if wait_timeout is None` bypass, checked BEFORE resolution.
+Keepalive therefore waited forever on a saturated node: the health probe,
+wedged, permanently. Fixed with a literal `None` for keepalive plus a
+defensive bypass when a callable resolves to None.
+
+**The instruments were worse than the runtime.** 21 of 45 mutants survived
+round 5's own tests. The headline: `TestThePermitBudgetIsATotalDeadline`
+replaced `_node_slot` with a spy that yielded unconditionally for the
+designated "free" node, ignoring the `wait_timeout` it was handed — so it
+asserted a property the HARNESS supplied. Five mutations against the very
+mechanism it existed to protect survived it, and the defect it hid (the
+0.0s last node) was live. The docstring's numbers came from the same
+instrument. That is `harness-grades-own-homework`, one file over from where
+this review last found it. The class now holds real permits on a real
+semaphore.
+
+Also survived and now pinned: `slot_wait=None` at search/darkweb (byte-for-
+byte the regression those call sites exist to prevent); `off_main_only=False`
+in build_gates, whose guard was satisfied by the same string in a COMMENT;
+growing capacity while releasing no permits; a gate test that could not tell
+"held a permit" from "bypassed the gate"; `hasattr(c, "_node_slot_locks")`
+as the entire per-URL-lock assertion; and `generate_image`'s deadline pinned
+by `in src` while both real forms of the defect keep the token.
+
+Two tests were called out as strictly worse than nothing:
+`test_route_deliberately_does_not_record_a_second_time` passes on a genuine
+double-record and FAILS on a comment saying it doesn't happen.
+
+**From the streaming lens, applied:** `ConnectTimeout`/`PoolTimeout` were
+missing from the streaming retry tuple — the only one of three sites to omit
+them. They fell to the generic handler, which re-raises without emitting
+`data: [DONE]`: one attempt instead of two and a truncated SSE stream, on the
+path every user turn flows through. Now retried, sentinel emitted, pinned
+across four transport faults.
+
+**Deferred to R7 with a validated patch in hand:** the streaming coding
+branch (no breaker, no gate, no main fallback, retry re-hits the same dead
+node — all four measured, all latent because `--coding-nodes` is empty). The
+lens produced a +348/−82 patch, 12 mutations with 11 killed and 1 correctly
+identified as equivalent, 303 localized tests green. It is NOT landing in the
+same commit as a critical routing redesign that has not yet baked — the item
+is dead code live, and the patch touches the generator every user turn flows
+through. It also verified, against the real four-wrapper consumer chain, that
+a permit held across `yield`s releases in 12 event-loop ticks (~0.2 ms) with
+no GC wait — and that `AsyncExitStack` is NOT what saves the abandonment
+path, which is a claim I would otherwise have made.
+
+**Declined with measurement:** gating the main node in the streaming path.
+`stream_chat_completion` already wraps the generator in `foreground_tasks`
+(accounting is correct), and peak simultaneous *generating* is 1 — the server
+serialises. The residual worth fixing instead is attribution: 2 of 3 streams
+printed "Upstream Stream Stall" for a queue we created ourselves.
+
+### §4BV round 7 (2026-08-18) — the shape finally changed
+
+Three lenses: adversarial on R6's two-budget mechanism, the deferred
+streaming patch, and the instruments. **For the first time, the round's own
+repairs did not carry the defect class they were fixing.**
+
+**The verdict on the mechanism.** R7 found NO arithmetic error in
+`_permit_wait` / `_gate_wait` / `_http_budget` / `_node_slot`. Eight targeted
+mutations all died; the `+1` divisor is correct in all five branches
+(AST-verified against each `tried_nodes.append`); every named edge case —
+negative remainders, a total below the reserve, keepalive with a total set,
+`timeout=None` with a total — behaves. And the test lens: all 12 of R6's
+known survivors are genuinely dead, every mutation aimed at what R6 ADDED
+died, and the spy-that-replaced-the-mechanism problem is gone.
+
+**The prior held only in a weaker form: the worst defect was no longer
+INSIDE the fix, it was BESIDE it.**
+
+* **`search.py` was still losing URLs, live.** R6 gave `darkweb_search.py`
+  the clock-derived budget and left the ORIGINAL on a flat 45.0 under a
+  `PER_URL_TIMEOUT` of 55.0 that also covers the semaphore wait and up to two
+  22s fetch attempts. 45 is not the remainder of 55; it is merely smaller.
+  Reproduced three ways including one with the worker node COMPLETELY FREE —
+  a normal slow fetch plus a normal distill loses the URL at 55.00s. A second
+  accounting error compounds it: the outer timer starts BEFORE
+  `async with sem`, so at concurrency 3 the 4th and later URLs spend part of
+  their budget queued (2 of 8 sources lost). Now clock-derived with a floor
+  that degrades to raw text rather than losing the source.
+* **`generate_image` never received either half of R6's `_node_slot` fix** —
+  still a float argument expression (so the `/props` probe, which the Jetson
+  never answers, falls outside the budget: stated 4.00s, elapsed 5.01s) and
+  still `max(0.0, …)`, handing attempts 2 and 3 a hard 0.0. That is R5's
+  defect (c) — a 0.0 wait refuses a node whose permits are ALL FREE — still
+  live one function away from the `_MIN_ACQUIRE` constant created to fix it.
+* **`_MIN_HTTP_FLOOR` was a node-fault factory.** Clamping the POST budget UP
+  to the floor meant a permit acquired with 0.5s left still POSTed, with 3s.
+  That ReadTimeout IS a node fault, so OUR OWN queueing was charged to the
+  node's breaker; `deep_research` fans out three at a time, which is enough
+  to open it for 60s — the req-0fb69c5f outcome through a new door. It now
+  declines the permit (`NodeSaturated`, explicitly not a node fault).
+* **A stated total was abandoned at the fallback**: both main arms used the
+  raw `timeout` and raised it to 300s, so a stated 60s could reach 357s on
+  the build's critical path. Now honoured down to a 35B-sized floor.
+* **`route()` was re-timing its callers.** Its 12s is a TOTAL because it sits
+  on the user's critical path — but R6 forced that total on every caller, so
+  a VERIFY that queued 20s ran on 25s of its stated 45s, while `verifier.py`'s
+  own comments still describe the two budgets as adding. The queue bound is
+  now route's own; a caller overriding `timeout` keeps an unclipped request.
+
+**On the instruments.** 20 mutants survived, mostly second-order: pairs of
+redundant guards where each half masks the other's removal — which is exactly
+how R5 shipped its regressions. Each half is now pinned separately. Three
+tests were removed or rebuilt, one of them measured **anti-correlated with
+the truth**: `test_route_deliberately_does_not_record_a_second_time` passed
+on a genuine double-record and FAILED on a comment saying it doesn't happen.
+
+One test could not be written honestly. `_MIN_ACQUIRE` now binds ZERO times —
+the `+1` divisor keeps every share positive, and the one remaining path to a
+zero share returns `_BUDGET_BLOWN` before the wait is computed. Rather than
+construct a state no caller can produce (which is how harnesses start
+guaranteeing their own results), it is pinned structurally with the reason in
+the docstring. Three of my own first attempts at the other pins were too weak
+— the probe-timing bound, a mock that ignored its own `timeout` kwarg, and the
+`_MIN_ACQUIRE` premise — and each surfaced only by re-running the mutation
+against the new test.
+
+### The streaming coding branch, landed
+
+Deferred twice, and the deferral was vindicated: **R6's draft patch contained
+three defects R6 itself had just fixed a few hundred lines away** — no
+`_MIN_ACQUIRE` floor, no `+1` in the divisor, and the wait passed as an
+argument expression so the probe falls outside the budget. Landing it as
+written would have shipped the same three defects a third time.
+
+The landed version gives the streaming coding pool the non-streaming
+discipline exactly: `DEAD, GOOD ×3` instead of 5 contacts to a dead node,
+6 permit acquisitions instead of 0, `failures=3 open` instead of
+`failures=0 closed`, a real main fallback with the caller's `model` restored,
+and peak concurrency 6 → 2 at a `total_slots=2` node. 26/26 mutations killed.
+
+**Two claims from R6 were corrected, both of which I had repeated:**
+* "`AsyncExitStack` is load-bearing for node-failure → next-node" — REFUTED.
+  Without it the permit is not leaked (rebinding drops the CM and the
+  finalizer releases it). What it actually buys is SYNCHRONY: the permit
+  reads 1 at the next attempt with it and 0 without, so you race your own
+  GC-scheduled release against the next acquire.
+* The real argument for holding a permit across `yield`s is not "bounded
+  acquisition" but that the ONE abandonment mode where it leaks (a retained
+  Task reference) is a mode where the existing `resp.aclose()` **already
+  leaks identically** — the permit rides a finalization dependency the
+  function has always had, and adds no new leak class.
+
+**Two further defects found there, one live:** with `GHOST_LLM_RECORD=1` a
+bytes chunk KILLS THE TURN — `_stream_rec_accumulate`'s type guard sits
+outside its own `try`, so `bytes.startswith("data:")` propagates into the
+stream loop and re-raises with no `[DONE]`. R6 fixed the *repr* form of that
+same inconsistency one line away and missed this. And a test written for the
+first `aread()` bound caught a SECOND unbounded `aread()` four lines down —
+the fix had inherited the blind spot.
+
+**Landed on measured main-path equivalence, not on assertion.** With an empty
+coding pool (the live topology) five scenarios were compared before/after on
+attempts, escaped exception type and exact SSE bytes: identical in every one,
+the only difference in the whole output being a log timestamp.
+
+**Declined, with the reasoning recorded.** A `raise` after a terminal frame
+skips the durable tail (trajectory, work_log, verifier spawn, lesson
+outcomes) — AST-proven that `agent.py:20046` has no enclosing handler. It is
+NOT fixable in `llm.py`: the other call site's handler runs the emergency
+context prune on a 400 + "context", and turning raise into return deletes
+that recovery. It belongs in `agent.py`, separately. Also declined: gating
+the main node (recorded decision; R7 makes the DIAGNOSIS honest instead),
+and `_stamp_leg` for streams (now newly relevant since a coding stream can
+finally fall back, but it needs a side channel — the generator yields bytes).
+
+**Open recommendation not acted on:** there is no `pytest-timeout` in the
+venv, so budget mutations degrade into indefinite CI hangs rather than
+failures — one mutation hung a run forever, another stretched one file from
+85s to 671s. Installing it is worth more than another assertion.
+
+### Carried-forward items 1+2 landed (2026-08-19)
+
+**The durable-tail skip (`agent.py`, from §4BV R7 lens B).** The
+final-generation drain in `stream_wrapper` iterated the stream with no
+enclosing handler, so a raise (HTTP 4xx/5xx and the generic path still
+re-raise) skipped episode, hydration judge, trajectory, work_log, verifier
+spawn and lesson outcomes — the turn vanished from every persistent record.
+Fixed by CONVERSION, not swallowing: `_stream_or_abort_frames` turns a raise
+into the two frames the loop already handles — the `{"error": …}` frame
+(sets `stream_aborted`, appends the truncation marker to the durable
+content) and a `data: [DONE]` (captured, released after the tail per §4AT-A).
+Cancellation still propagates. Exactly ONE call site is wrapped:
+`handle_chat`'s internal drain keeps its bare raise because its handlers run
+the emergency context prune on 400+"context". Three mutants killed
+(unwrapped site / silent swallow / BaseException eats cancellation);
+`tests/test_stream_durable_tail.py` pins both directions plus the frame
+shapes. Docs: `docs/core/agent.html#stream-raise-durable-tail`.
+
+**`pytest-timeout` installed (2.4.0), `timeout = 300` in pytest.ini.**
+Without it, budget/deadline mutations degraded into indefinite CI hangs
+(one R7 mutation wedged a run forever). 300s is ~10x the slowest legitimate
+test; a deliberate-hang demo now fails in 5s. The rationale is recorded in
+pytest.ini itself.
+
+## §4BW — Sandbox / execute review (queue #4, 2026-08-19) — REVIEW COMPLETE, FIXES PENDING
+
+⚠ PROCESS NOTE. A PARALLEL #4 review session (agents named "#4 lens A/B",
+NOT the three "Sandbox lens A/B/C" this session launched) ran concurrently
+and EDITED the live tree: `src/ghost_agent/sandbox/services.py`,
+`tests/test_sandbox_services.py`, `docs/sandbox/services.html` (writes at
+09:45 and 09:50). That change — wiring `binds_host_netns()`, previously a
+silent-inoperative-subsystem with zero consumers, so services bind loopback
+under Linux host-net instead of exposing untrusted LLM services LAN-wide — is
+sound and independently validated by this session's own security lens
+("holds and is pinned"), and mutation-verified here (revert fails the new
+test). Behaviourally a no-op on this macOS box (bridge mode → still 0.0.0.0).
+Kept. No other files were touched. Fixes below were NOT applied — held
+pending an operator decision on the two-writer collision, because editing
+into an actively-churning tree is the exact hazard this review discipline
+exists to prevent.
+
+### Findings (5 reports, strongly converging)
+
+**CRITICAL-1 — wrong-process-group kill (live-proven).** Service/job liveness
+is stamped with `container.id`, but a graceful stop→resume
+(`close(remove=False)` → `_try_resume_stopped`, added AFTER the stamp) keeps
+the id while resetting the container's PID counter. A stale registry row then
+carries the CURRENT stamp with a dead PID, and `stop()` / a TTL-expiry can
+fire `kill -KILL -- -<pid>` at an innocent process group. Live on this box:
+rows `dungeon-crawler` (pid 132) and `jiu-jitsu-calendar` (pid 1825) predate
+the last restart, are dead, and are stamped current — pid 132 is inside the
+recycled range; only recycling luck keeps them reading DEAD. Exact
+PID-recycling class the stamp was built for (2026-07-22), resurrected via the
+resume door. Unpinned. Fix: stamp `(id, State.StartedAt)`; legacy id-only
+stamps → mismatch-safe (dead verdict, not a pid check).
+
+**CRITICAL-2 — immortal host-process leak on interrupt.** `jobs.py:1033`
+catches `except Exception`, but KeyboardInterrupt/SystemExit are
+BaseException and slip past the kill-on-unwind, and the interrupt lands in a
+poll-loop that sleeps most of its life. ROOT CAUSE of the 11 orphaned
+busy-loop processes cleared at the start of this task (leaked by
+`test_sandbox_job_promotion.py`'s real-host fixture on interrupted runs; the
+box mints more whenever a run of that file is interrupted). macOS ships no
+`timeout` binary, so the runner's last-resort ceiling is absent host-side →
+leaks are immortal. Mutation M1 (delete the whole unwind-kill block) SURVIVED
+the 77-test file — completely unpinned. Fix: `except BaseException` +
+registry-independent module-teardown that killpg's every launched leader.
+
+**MAJOR — services registry `_save` fixed-tmp-name.** `services.py:287`
+writes to a fixed `.tmp`; jobs.py fixed this exact shape and its comment names
+services.py as the unsafe twin. Concurrent writer (2nd agent instance /
+the test suite) → unparseable `registry.json` → `_load()` returns `{}` →
+all service rows (ports, tokens, project coupling) silently wiped → 403s
+every running sandbox app. Unpinned. Fix: jobs' unique-tmp scheme
+(`.{pid}.{hex}.tmp`) + unlink-on-error.
+
+**MAJOR — provision deadline inversion.** Client wedge-deadline default
+1200s < in-container install caps 1800s (pip/torch/playwright), and provision
+execs pass no per-exec deadline_s. A healthy-but-slow install is mis-diagnosed
+as a daemon wedge, aborted, 300s backoff armed — while the abandoned thread
+finishes the install anyway, so the retry runs a SECOND concurrent install.
+Unpinned. Fix: `deadline_s = install_cap + 120`, or raise the default; pin
+`_EXEC_DAEMON_DEADLINE_S > max(install caps)`.
+
+**MAJOR — unbounded job-log disk growth.** No cap anywhere; a fast writer is
+"progressing" so it promotes and writes to the host-side bind mount for the
+whole TTL. Measured 2.4 GB/s in-container; budget+TTL ≈ 300+ GB → fills the
+host disk under the 35B. Fix: cap in `_supervise`/`reap` (GHOST_SANDBOX_JOB_
+MAX_LOG_MB), keep head+tail.
+
+**MAJOR — classic-path exec output buffered whole in agent RAM.** Non-jobs
+`_execute_impl` accumulates the entire docker-py exec stream BEFORE the
+256KB/10MB truncation; measured 300 MB output → +685 MB agent maxrss. A
+`yes`-shaped run OOMs the agent on the 16/36 GB box. Jobs path is safe
+(32 MB cap). Fix: stream into a bounded head+tail / spill.
+
+**MAJOR — jupyter kernel boot blocks the event loop.**
+`execute.py:1313` calls `container.exec_run(... detach=True)` synchronously
+inside `async def tool_execute`, not via to_thread / `_exec_run`. A wedged
+daemon freezes the WHOLE agent event loop — the exact class the 2026-07-22
+fix removed elsewhere; the fix didn't reach this call. Fix: route through
+`await asyncio.to_thread(_exec_run, deadline_s=60, ...)`.
+
+**MAJOR — the 7-day ghostjobs container leak (triple-confirmed).** Nothing in
+the tree creates `ghostjobs-*` anymore, yet `_is_per_solve_workspace` exempts
+them from the sweep unconditionally (proven spared at 365 days), and the TTL
+reaper is in-process (dies with the process that SIGKILL-orphaned it).
+`ghost-agent-sandbox-66782302` is idle, empty workspace, unreferenced.
+OPERATOR: `docker rm -f ghost-agent-sandbox-66782302` is safe. Fix: sweep may
+remove a ghostjobs mount older than a hard bound with no running row and only
+PID1+sleep inside.
+
+**MAJOR (operator DECISION, not a bug) — sandbox execute egresses cleartext.**
+Arbitrary `execute` shell/python reaches the public internet from the real IP
+(bridge NAT / host net), outside the Tor-only rule. The browser/search/
+download/weather tools ARE Tor-routed via `resolve_egress_proxy`; the gap is
+arbitrary run. Documented/accepted (`GHOST_SANDBOX_NETWORK=none` opt-out;
+pip/apt provisioning depends on it). OPERATOR DECISION 2026-08-19:
+**accepted tradeoff — left as-is, no lockdown.** The tools that carry the
+anonymity guarantee (browser/search/download/weather) remain Tor-routed;
+arbitrary execute is knowingly exempt.
+
+### Test-instrument defects (lens C, mutation-based; 265 in-scope baseline)
+
+- `test_execute_security.py::test_tool_execute_path_traversal_vulnerability`
+  is FULLY VACUOUS — a security-named test with `if...: pass / elif...: pass`,
+  no assertion, no else; green on safe OR vulnerable code. Delete/replace.
+- Egress socket guard asserts only 2 of its 4 patched verbs — `connect_ex`
+  (E2) and `sendmsg` (E4) interception is real but UNTESTED (both survived).
+- The ENTIRE container-lifecycle safety layer (orphan-reaper criterion D1,
+  min-age gate D2, exec-daemon deadline D3) has ZERO in-scope coverage — it
+  rides on one out-of-scope file (`test_bench_drain_4bo.py`); rename/delete it
+  and the "sandbox" suite stays green while the safety net is gone.
+- Spill-cap (D4) untested; `init=true` zombie defense pinned by a TEXT
+  assertion only (token pin, survived a pop-the-kwarg mutation).
+
+### SOUND (mutation-backed) — the anonymity-carrying boundary holds
+`resolve_egress_proxy` backstop (fail-closed, `--mandatory-tor` default-on),
+`is_allowed_host` classifier, 6to4/Teredo block, path confinement (`.resolve()`
+before the containment check catches workspace symlinks pointing out), secrets
+unreachable (workspace mount only, no env passthrough, no docker socket, no
+--privileged), the orphan reaper's own sparing logic, job promotion (50+
+pins), port leases, lock ordering (acyclic), exec deadline on the main path.
+`coding_executor.py` clean.
+
+### §4BW FIXES APPLIED (2026-08-19, sole-writer pass after the parallel session went quiet)
+
+All mutation-verified (revert fails the pin). Localized 241 passed; full
+suite pending.
+
+- **CRITICAL-1 — generation stamp.** `_container_generation` in BOTH
+  services.py and jobs.py now stamps `f"{id}:{StartedAt}"` (was bare id).
+  A stop→resume changes StartedAt, so a stale row mismatches and reads dead;
+  a legacy id-only stamp mismatches the new form → dead (the safe direction).
+  Pins: `TestGenerationStampSurvivesStopResume` (3 tests) — the stop/resume
+  case that had no coverage at all.
+- **CRITICAL-2 — interrupted-run leak.** `jobs.py` run()'s launch guard is
+  now `except BaseException` (was `except Exception`), so a KeyboardInterrupt/
+  pytest-timeout/killed-batch in the poll-loop sleep still kills the detached
+  process instead of leaking it immortal. Pin:
+  `test_an_interrupt_during_supervise_still_kills_the_launched_process`.
+- **MAJOR — registry `_save` wipe.** services.py `_save` now uses jobs' unique
+  temp name (`.{pid}.{hex}.tmp`) + unlink-on-error, so a concurrent writer
+  can't clobber it and wipe all service rows. Pins:
+  `TestRegistrySaveIsConcurrencySafe` (2).
+- **MAJOR — jupyter boot froze the event loop.** `execute.py`'s stateful
+  kernel boot now dispatches through `asyncio.to_thread(manager._exec_run,
+  deadline_s=60, ...)` (was a synchronous `_container.exec_run` in an async
+  fn). Pin: `test_the_jupyter_kernel_boot_never_blocks_the_event_loop` (AST).
+- **TEST DEFECT — vacuous security test.** `test_execute_security.py`'s
+  assertion-free `test_tool_execute_path_traversal_vulnerability` replaced by
+  a parametrized `test_tool_execute_blocks_paths_outside_the_sandbox` that
+  asserts the code's ACTUAL refusal messages ("Security Error" / "SYSTEM
+  ERROR", EXIT CODE 1) — mutation-verified against a disabled containment
+  guard. (My first two rewrites were WEAKER than the sibling; caught by
+  mutation, as usual.)
+- **TEST DEFECT — egress socket verbs.** Added `connect_ex` + `sendmsg` block
+  tests (2 of the 4 patched verbs were unasserted) + a loopback complement;
+  mutation-verified.
+
+**NOT YET FIXED (scoped for a follow-up batch — all real, none firing now):**
+provision deadline inversion (1200s<1800s → slow installs mis-killed and run
+twice); unbounded job-log disk growth (→ host-disk fill under adversarial
+output); classic-path exec output buffered whole in agent RAM (→ OOM);
+the 7-day ghostjobs container leak (needs a sweep age-bound; the live
+container is safe to `docker rm -f ghost-agent-sandbox-66782302`); pulling
+the lifecycle-safety pins (orphan reaper / min-age / exec deadline) into an
+in-scope test file so they don't ride on one out-of-scope file; the MINORs.
+These touch hot paths (exec-output streaming, job-log capping) and deserve a
+dedicated careful pass rather than a rushed one at the tail of this session.
+
+### §4BW ROUND 2 (2026-08-19) — the R1 CRITICAL fix was itself defective
+
+The pattern held a ninth time this session: the worst finding of R2 was inside
+R1's own fix, and — worse — MY R1 TEST ENCODED THE BLIND SPOT.
+
+**CRITICAL-1's R1 fix did not close the bug.** The stamp read
+`container.attrs["State"]["StartedAt"]`, but docker-py's `start()` does NOT
+refresh `.attrs`, and `_try_resume_stopped` reloaded only BEFORE `start()`.
+So across the one event the stamp exists to detect — a graceful stop→resume —
+attrs kept the pre-stop StartedAt, the generation string was identical, and
+the recycled-pid kill stayed armed. Proven live against a throwaway container
+(StartedAt changed on the daemon, stale in cached attrs).
+
+**And the R1 unit test was the fantasy that hid it:** its stub `reload()` was
+a no-op `pass` and it HAND-WROTE the new StartedAt to "simulate" a resume —
+i.e. it performed the refresh real docker-py never does on `start()`. The
+harness encoded the fix's blind spot; the test was green precisely because the
+stub lied. (harness-grades-own-homework, one more time.)
+
+**Fix:** `_try_resume_stopped` now calls `c.reload()` AFTER `c.start()`/
+`unpause()` — one reload at the single event where attrs go stale, not a
+per-liveness-check reload (which would be N deadline-less daemon round-trips).
+Pinned by `test_resume_REFRESHES_started_at_so_the_generation_stamp_changes`
+with a FAITHFUL container stub (reload pulls daemon truth; start advances the
+daemon clock but leaves attrs untouched, exactly docker-py). The mutant —
+delete the post-start reload — leaves attrs stale and fails it.
+
+**The other five R1 fixes: all SOUND** under mutation (adversarial lens
+re-verified each): `except BaseException`, the `_save` unique tmp, the jupyter
+`to_thread`+deadline, the vacuous-test replacement, and the connect_ex/sendmsg
+egress tests. The out-of-band `binds_host_netns` wiring is COMPLETE (single
+bind site, restart reuses start, no second hardcoded 0.0.0.0). MINOR left:
+`remote_access_hint()` text still says "HOST=0.0.0.0" unconditionally (now
+wrong for host-netns; operator-facing string only).
+
+### §4BW R2 — three deferred MAJORs landed; C staged
+
+Designed on a copy by a review lens, then each independently re-verified and
+mutation-checked before applying to the live tree.
+
+- **A — provision deadline inversion (docker.py):** `_provision_deadline_s`
+  gives every install exec a client deadline of its in-container `timeout N`
+  cap + grace (600/900/1800 → 900/1200/2100), so a slow-but-healthy install
+  no longer trips the 1200s wedge default and gets run twice. Pinned;
+  mutation (deadline ignores the cap) killed.
+- **B — unbounded job-log growth (jobs.py):** `job_max_log_bytes()`
+  (GHOST_SANDBOX_JOB_MAX_LOG_MB, default 1GB) expires a runaway via the
+  existing `_kill_pgroup`+STATE_EXPIRED path, in both the `_supervise` poll
+  and `reap()`; the live log is kept, never truncated. Pinned.
+- **D — ghostjobs sweep age bound (docker.py):** `_is_reapable_dead_ghostjob`
+  removes a `ghostjobs-*` container only when kill-switch on AND every mount
+  is a ghostjobs temp dir AND age > 48h AND no running registry row AND idle
+  process table. The existing "never remove the agent's own sandbox / a live
+  detached job" pins stay green. Precise mutation (disable the age gate)
+  killed by `test_a_YOUNG_ghostjob_is_spared`.
+
+**⚠ The lens's own A test carried the `importlib.reload(d)` contamination
+trap** — reloading the production docker module rebinds `SandboxDaemonTimeout`
+for the rest of the session, which broke `test_raises_on_daemon_wedge` run
+after it (stale-class `pytest.raises`). Rewritten to `monkeypatch.setattr`
+the module constant. This is the same trap I hit myself in §4BV R4; the C
+test (staged) carries it too and must be fixed before C lands.
+
+**C — classic-exec output buffered whole in RAM: STAGED, NOT LANDED.** The
+patch streams the exec into a bounded head+tail sink (kill-switched, engages
+only for real containers). It is the highest-value fix (prevents agent OOM on
+adversarial multi-GB output) AND the highest-risk (hot path used by every
+classic execute; byte-equivalence proven against docker-py SOURCE but not the
+live daemon). Blocked on: (a) a real-container smoke test of byte-equivalence,
+(b) fixing the reload trap in its test, (c) an operator call on default-on.
+**C LANDED 2026-08-19** after a real-container byte-equivalence smoke test
+on the live daemon: `_exec_run_streamed` is byte-identical to docker-py's
+buffered `exec_run` for every deterministic case — text, raw binary (NULs,
+0xFF, non-UTF8), multi-MB, exit codes — and the head+tail sink bounds RAM
+regardless of output size (50MB streamed at a 32MB cap peaked <4x cap;
+buffering would hold the lot). Streaming default ON with
+`GHOST_SANDBOX_EXEC_STREAM=0` as the kill switch. The test's `importlib.reload`
+trap was removed (monkeypatch the constant). Cap mutation (sink never bounds)
+killed by 2 pins; no cross-test contamination (C-then-docker_review green).
+The one earlier "byte mismatch" was `/dev/urandom` non-determinism in the
+harness, not C.
+
+## §4BX — browser (#5) + launcher/daemon (#6) review (2026-08-19)
+
+Five lenses (3 browser, 2 launcher). The recurring signature held: almost
+every MAJOR was CORRECT CODE WITH NO PROOF — the code does the right thing,
+nothing would catch it regressing.
+
+### Fixed + pinned (all mutation-verified)
+- **#6 node-pool wiring (MAJOR).** `main.py`'s `LLMClient(...)` passed the six
+  node pools POSITIONALLY into a 9-arg signature; a visual<->critic swap would
+  route every vision call to the critic node and every verdict to the vision
+  node, and it was INVISIBLE — swapping the slots passed all 43 tests (bare
+  mock, no `call_args` check; no boot log of pool→slot). Now keyword args +
+  `test_main_node_pool_wiring.py` drives the real `lifespan` with a distinct
+  sentinel per role. Swap mutant killed.
+- **#5 page-JS never executed (MAJOR, embedded-script-string-trap).** The
+  `_probe_pre_interaction` guard JS in `browser_runner.py` had only
+  string-containment "coverage"; corrupt the KW regex or invert the
+  visibility helper and every browser test stayed green (lens C M23/M24).
+  Now `test_browser_probe_js_execution.py` EXTRACTS the arrow fn and RUNS it
+  under node against DOM fixtures. Both mutants killed.
+- **#5 atomic-screenshot path confinement (lens C M18).** Removing
+  `_get_safe_path` at the atomic screenshot call site SURVIVED the whole
+  browser suite, and a `../../../tmp/...` out_path escaped host-side (the
+  `mkdir(parents=True)` created a dir OUTSIDE the sandbox). Only the interact
+  sub-action had a traversal test. Pinned now for the atomic op too.
+- **#5 interact proxy decision (lens A, latent deanonymization).**
+  `resolve_egress_proxy` judged the top-level `url`, not the URL actually
+  dialed first — an `interact` with a loopback top-level and a PUBLIC first
+  goto yielded proxy=None → cleartext dial. Unreachable today (sole caller
+  threads a live proxy; --mandatory-tor aborts on a dead one) but a live leak
+  for any in-process `tor_proxy=None` caller. Now routes through
+  `_runner_first_url` (the resolver the SSRF pre-flight already uses).
+  Pinned; docs updated.
+- **#5 `loading` keyword anchored** — was unanchored, tripping on
+  "Downloading"/"Reloading"; now `\bloading\b`, node-test pinned.
+
+### Verified SOUND (with mutation evidence — as valuable as the defects)
+- **Every browser launch routes through Tor**, both enforcing layers
+  (runner launch-site proxy + host `resolve_egress_proxy` backstop)
+  mutation-pinned; DNS forced through SOCKS, WebRTC host candidates off,
+  loopback SSRF-port-gated. Atomic-op state reset enforced by fresh
+  subprocess+context per op. (browser A + C)
+- **#6 boot boundary clean:** the live exec line's 15 flags parse strictly
+  against current main.py (a bogus flag exits 2); all 4 plists avoid the
+  EX_CONFIG(78) log-ownership trap; no LAN-vs-tailnet reachability issue;
+  llama double-interrupt mitigated; --mandatory-tor installs the guard before
+  any egress. (launcher A + B)
+
+### RECOMMENDED to the operator — NOT changed (boot-security / config domain)
+- **launcher fail-OPEN on a missing key file (MAJOR).**
+  `start-ghost-agent.sh` exports `GHOST_API_KEY=""` on an unreadable key file;
+  empty-string ≠ None, so it slips past the "refuse on non-loopback with no
+  key" guard and the FULL agent boots unauthenticated on 0.0.0.0, KeepAlive
+  holding it there. This is the operator's DELIBERATE, documented choice
+  ("treat that line as a page") to dodge a respawn loop. Recommended
+  strictly-better fix that keeps that intent: on missing key bind
+  `--host 127.0.0.1` (loopback, still up, no loop, loud, not network-exposed).
+- No `ThrottleInterval` on the agent/llama plists (respawn-loop risk if Tor is
+  down at boot); a stale/dead `ghost-secret-123` literal in the client plist
+  (no live leak — overridden + fail-closed); `[ACTIVE]` tag drift in the
+  launcher comment header vs the real exec line.
+
+### Not fixed (bounded, lower value) — recorded for later
+host-side `file://` path check is single-layer (runner interceptor backstops);
+a PIL screenshot render runs sync on the loop (thumbnailed, negligible); a
+loopback WebSocket isn't route-intercepted (loopback-only); the `evaluate`
+cap is post-materialization (can OOM the runner subprocess, never the agent).
+And the RAW-Playwright escape hatch in `execute(stateful=True)` is NOT governed
+by the browser tool's proxy enforcement — a `challenge_templates.py` example
+even omits the proxy (flagged for the prompts/execute owner).
+
+### §4BX follow-ups (2026-08-19) — the raw-Playwright footgun + the launcher fail-open
+
+**#1 — raw Playwright in `execute(stateful=True)` now has an anonymity
+backstop.** The `browser` tool enforces the Tor proxy on every launch; the
+raw-Playwright escape hatch did not — the model had to thread
+`proxy=os.environ['TOR_PROXY']` itself (prompts.py teaches it; TOR_PROXY is
+injected into the cell env), and a proxyless launch that navigates to a public
+host dials cleartext from the real IP. Two fixes:
+- `challenge_templates.py` — the raw-Playwright HINT now models the Tor-aware
+  CONDITIONAL launch (`proxy=... if os.environ.get('TOR_PROXY') else None` +
+  the `--host-resolver-rules` DNS arg), so self-play stops reinforcing a
+  proxyless pattern. Harmless for the template's own `file://` task; right
+  reflex for any egressing one.
+- `execute.py` — a NON-BLOCKING runtime notice (`_proxyless_browser_launch`)
+  when a stateful cell launches Playwright without a proxy while TOR_PROXY is
+  set. Not a block — a `file://`/loopback launch legitimately needs none and
+  Tor can't route file:// — but a loud line on the result visible to the
+  model, the verifier and the operator's stream. Pinned by
+  `test_execute_playwright_anonymity.py` (detector unit cases + driven stateful
+  path); 3 mutants killed (note un-wired / detector always-False /
+  detector-flags-everything).
+
+**#2 — launcher fail-open closed (operator-approved).**
+`start-ghost-agent.sh`: a missing/unreadable key file exported an EMPTY key,
+which (empty != None) slipped past main.py's "refuse a non-loopback bind with
+no key" guard and booted the FULL agent unauthenticated on 0.0.0.0,
+LAN/tailnet-reachable, KeepAlive holding it. Now the missing-key branch sets
+`GHOST_BIND_HOST=127.0.0.1` and the exec passes `--host "$GHOST_BIND_HOST"`
+(default 0.0.0.0 unchanged for the normal keyed case). Verified:
+`enforce_api_key_policy("", "127.0.0.1")` boots cleanly (loopback → auth
+disabled is allowed, no refusal, no respawn loop, still a loud page), while
+`("", "0.0.0.0")` warns — the exposure removed. Same operator intent (stay up,
+paged) minus the network exposure. Applies next boot; the live agent is
+unaffected (key file present). The three plist/header MINORs (ThrottleInterval,
+dead ghost-secret-123 literal, [ACTIVE] header drift) remain operator-domain
+recommendations, untouched.
+
+## §4BY — Turn loop review, Round 1 (tool-parse + dispatch slice, 2026-08-19)
+
+First round of the multi-turn fresh-eye review of the turn loop
+(`core/agent.py`, ~22k LOC). Slice: `_parse_assistant_tool_calls` (the
+XML/native tool-call parser) + `_dispatch_and_process_tool_batch` (the guard /
+dedup / result pipeline). Three lenses on copies of the tree (parser / dispatch
+/ test-mutation-sweep); every finding reproduced against the live method before
+any edit; every fix mutation-verified. Real tree byte-identical throughout.
+
+### CRITICAL — native `tool_calls` dropped when the content preamble merely MENTIONS tool XML (lens B, reproduced)
+`has_tool_tag = re.search(r'<(?:tool_call|function)\b', parse_target)` is
+computed from the assistant's CONTENT. When True it routed into the XML healer;
+the native `tool_calls` array is read ONLY in the `else` branch. So a native
+reply (`--native-tools` is default ON) whose prose contained the substring
+`<function`/`<tool_call>` — schema echo, reasoning, "I'll use the `<function>`
+convention" — was routed to the XML path and the REAL native calls were dropped
+(→ `system_parse_error`, reason='truncated') or replaced by a wrong tool with
+empty args. Live probe: `msg={content:"…<function>…", tool_calls:[recall]}` →
+returned `['system_parse_error']`, `recall` gone.
+**Fix:** `_native_tcs_present = bool(msg and msg.get("tool_calls"))`; gate
+becomes `if has_tool_tag and not _native_tcs_present:`. Native wins whenever
+present; the XML healer stays the fallback for when the server did not populate
+`tool_calls`. Because that routes a content-with-tags reply into the native
+branch (whose `ui_content` was never scrubbed), a second edit runs the tool-XML
+scrub on that path too (`if has_tool_tag:` before the return — idempotent no-op
+on the XML path) so the leaked tokens never reach the user-facing reply.
+Pinned + 2 mutants killed (gate reverted → native dropped; scrub neutered →
+`<tool_call>` leaks into ui).
+
+### MAJOR M2 — batch-dedup collapse denylist missed side-effecting tools (lens A, reproduced)
+`_collapse_unsafe = is_mutating or fname in _BATCH_COLLAPSE_UNSAFE`.
+`postgres_admin` (SQL INSERT/UPDATE/DELETE), `jobs` (start/stop/cancel), and
+`manage_composed_skills` (a `run` can execute an arbitrary side-effecting
+macro) were in NEITHER set — so two byte-identical INSERTs (or job actions) in
+one batch collapsed to a SINGLE execution: a silently dropped write, no error,
+no recovery signal. Violates the mechanism's own stated bias ("executing a
+redundant read is merely wasteful, so err toward not collapsing"). **Fix:**
+added the three to `_BATCH_COLLAPSE_UNSAFE` (collapse-safety only; NOT to
+`is_mutating`, whose world-changed-reset/seen-tools semantics deliberately
+exclude a read-only `run`). Pinned behaviorally through the real dispatch
+(2 identical postgres_admin / jobs calls → 2 executions); mutant killed.
+NOTE (class risk): a FUTURE side-effecting tool added to the registry would
+reintroduce the gap. The class-fix is to invert to a read-safe allowlist; not
+done this pass (blast radius on the read-collapse optimization + its pinned
+tests) — recorded for the operator.
+
+### MAJOR M1 — the live pre-flight repeat-failure guard was pinned only by source-string checks (lens A + lens C, reproduced)
+The guard itself is live and correct at runtime (`would_repeat` blocks the 3rd
+identical failure, `record` on error, `note_world_changed` clears globally on a
+successful mutation; `_preflight_guard_enabled` default True). But lens C's
+mutation sweep showed MD7 (block), MD9 (record), MD8 (world-changed reset) all
+SURVIVED neutering with a fully green in-scope suite — `test_preflight_guard.py`
+asserts the call TEXT via `inspect.getsource`, never drives a dispatch through
+it. This is exactly the "token pins vs executed pins" class, on a
+security-relevant loop-protection guard. **Not a code change — a test gap.**
+Added driven-dispatch pins: same failing call 3× → 3rd blocked pre-dispatch
+(coroutine not run, `preflight_blocks_this_request≥1`, block message present);
+`would_repeat` armed after two failures (record fired); a successful write
+clears the guard so a previously-armed read is allowed again. 3 mutants killed.
+
+### Also hardened (lens C SURVIVED mutants, existing behavior pinned)
+Flood cap (`_MAX_TOOL_CALL_BLOCKS=5`) — behavioral pin, cap-widening mutant
+killed. Native-repair CALL SITE (the helper was unit-tested, its invocation in
+the parser was not) — verbatim live-corruption fed through the full method,
+repair-skip mutant killed.
+
+### Verified SOUND (mutation-backed, as valuable as the defects)
+Batch-dedup collapse + its safety carve-out, idempotency block, preamble
+rollback, participant guard, no-progress world-changed reset, last_was_failure,
+system-3 pivot, native-vs-XML pure path — all die on driven tests.
+
+### Deferred + documented (real but narrow / risky-to-bundle)
+Truncation false-positive: the bare-`<function>` heal injects an unclosed
+`<tool_call>`, so `_tool_call_truncated` false-flags "truncated" on a COMPLETE
+bare-function call — but the call still parses (no `system_parse_error` → no
+history scrub); harm is misdiagnosis + a wrong recovery hint when a good call
+coexists with a malformed block. Raw-JSON drop+leak: needs `{`-JSON content AND
+a stray `<function>` AND no native calls (very narrow). m4 idempotency set never
+invalidated (forget-then-reinsert-identical within one request). m6 `_res_is_error`
+divergence (site A stricter than site B; at most a safe `.lstrip()`). m3 guard
+key uses path not content for file_system — matches the block message's
+documented intent, not a bug. m5 no per-tool timeout in parallel dispatch
+(design change). Fixing the two parser MINORs means touching the heal — held
+for a dedicated pass, not bundled with the CRITICAL routing edit.
+
+### Verification
+New `tests/test_turnloop_r1_fixes.py`: 12 pins, all driven, 9 mutants killed
+across them. Localized parser+dispatch+guard suites: 315 passed. Full suite:
+14029 passed, 17 skipped, 0 failed (11m41s).
+
+### §4BY Round 2 (2026-08-19) — the round where the fixes were the subject
+
+Three fresh lenses attacked R1's own fixes. Both R1 fixes carried the SAME
+defect class — "guarded a proxy, not the thing" — and two independent lenses
+converged on it. All reproduced against the live method before any edit; all
+fixes mutation-verified (8 mutants killed); real tree byte-identical throughout
+(three lenses worked on isolated `src` copies after a concurrent-write
+correction; a pristine anchor was stashed as insurance).
+
+**Root cause behind THREE findings.** `has_tool_tag` was a bare-substring match
+(`<function`/`<tool_call>` anywhere in the content). That single lexical proxy
+mis-fired on: (a) a prose reply MENTIONING `<function>` [the R1 CRITICAL], (b) a
+raw-JSON tool call whose ARGS contain the literal `<function`/`<tool_call>` —
+e.g. `execute` grepping tool XML, or a `file_system` write of tool XML, both
+highly plausible in THIS repo — dropping the real call as `system_parse_error`
+[lens C-1, escalated MAJOR], and (c) a prose reply explaining tool syntax to the
+user, turned into a strike + a truncated reply [lens C-3/A2]. **Fix (the
+inversion, not another patch):** `has_tool_tag` now requires a REAL tag — a
+`<tool_call>` wrapper or a `<function ...>` opener in the name=/= dialect
+(`_FN_TAG_RE`, shared with the bare-`<function>` wrapper heal so the two agree);
+and a `{`-leading raw-JSON reply is never routed to the XML path even when its
+arg values contain those literals. Bare `<tool_call>` stays a wrapper marker
+(kept deliberately, so a severed/truncated real call still gets the truncation
+hint) — a documented residual for the rare prose "<tool_call>" mention.
+
+**MAJOR (lens A) — degenerate native shadows rich XML.** R1's gate
+`bool(msg.get("tool_calls"))` meant "native array non-empty," a proxy for
+"native has a usable call." Proven: native `execute {}` (empty args) or a name
+the agent doesn't expose, alongside a rich `<function name=...><parameter>` call
+in content, dispatched the degenerate native and DROPPED the real call (an empty
+`execute` can silently no-op a mutation). **Fix:** prefer native only when it
+carries a USABLE call — an available name AND (non-empty args, or, for a
+legitimately no-arg call, no competing real XML call in content).
+
+**CRITICAL (lens B) — dynamic side-effecting tools bypass the M2 denylist.**
+R1 added `postgres_admin`/`jobs`/`manage_composed_skills` to a denylist — but
+composed macros (`register_composed_skill_runners` → `tools[name]`) and acquired
+skills (`make_skill_runner` → `tool_execute`, arbitrary code) register under
+RUNTIME names a static denylist can never enumerate, so two byte-identical
+`deploy(...)` calls in one batch still collapsed to one execution — a silently
+dropped side effect. **Fix (invert the structure):** replaced the denylist with
+a read-safe ALLOWLIST (`_COLLAPSE_READSAFE`); anything not listed (static OR
+dynamic) is collapse-unsafe by default — the direction the mechanism already
+biased toward. Blast radius was exactly one pinned test (a synthetic
+`probe_tool`), updated to a real read; the source-string denylist pin was
+rewritten to an allowlist property test.
+
+**MAJOR (lens C-2) — three live guards were deletable-green.** The mid-loop
+strike-cap `break`, arg unescaping, and the truncation-error dedupe survived
+neutering with a green in-scope suite. No code change — added driven pins
+(8 parse-errors → cap breaks at 6; `&amp;`/`&lt;` args reach the tool unescaped;
+N truncated fragments → exactly one synthetic error).
+
+**Verified / corrected.** Lens C-4 claimed `--enable-preflight-guard` ships
+OFF: FALSE — argparse default is True and nothing passes `--no-...`; the guard
+is live. Its narrower point held (the MagicMock harness couldn't detect the
+DEFAULT flipping), fixed by building the dispatch agent with a real
+`argparse.Namespace` and pinning both flag directions. Lens A confirmed R1's two
+native-precedence pins non-vacuous; the two now-corrected "leak" assertions were
+R1 over-scrubbing prose and were updated (prose is preserved).
+
+**Deferred (bounded).** The `\Z` scrub can over-eat a preamble when a REAL
+tool call is present (pre-existing; the root fix shrank its blast radius to
+real-call turns only). Bare-`<tool_call>` prose mention (rare).
+
+### Verification
+New `tests/test_turnloop_r2_fixes.py` (18 pins) + updated R1/dispatch/2026-07-20
+tests; 8 R2 mutants killed. Broad localized set (incl. self_play_redesign +
+browser_tool): 438 passed. Full suite: 14044 passed, 17 skipped, 0 failed (12m46s).
+
+### §4BY Round 3 (2026-08-19) — the fixes were the subject again; the class held a third time
+
+Three fresh lenses attacked R2's fixes. For the THIRD consecutive round the real
+defects were inside the round's own fixes, all the same class ("guarded a
+proxy, not the thing"). All reproduced against the live method; all fixes
+mutation-verified (8 mutants killed); real tree byte-identical throughout
+(lenses on isolated copies; R2 pristine anchor stashed).
+
+**Clean bill on the riskiest R2 fix.** Lens A's primary hypothesis — that the
+tightened `_FN_TAG_RE` MISSES a real dialect and drops a real call — was
+DISPROVEN by driving 20 dialects: `_FN_TAG_RE` is a strict SUPERSET of what the
+downstream extractor parses, and every sloppy-heal trigger is a subset of it, so
+no real call is dropped. The two shapes it doesn't match (attrs-before-name,
+name-as-text) never parsed under the old code either and aren't dialects the
+model's own renderer emits. The root inversion is sound.
+
+**MAJOR (lens C-1) — the raw-JSON fix was only half-applied.** R2's
+`_looks_raw_json` gated the `has_tool_tag` ROUTING but not the earlier
+bare-`<function>` HEAL, which runs first. So a raw-JSON call whose arg value
+contains a real `<function name=`/`<function=` token had `<tool_call>\n` injected
+INTO that value — the dispatched `command`/`content` was corrupted and then run
+(`grep '<function name=' x.py`, a `file_system` write of tool XML). **Fix:**
+compute `_looks_raw_json` BEFORE the heal and skip the heal for raw JSON. R2's
+own pin for this was VACUOUS (it used `<function` with no `name=`, matching
+nothing) — corrected to a real `<function name=` literal + an uncorrupted-value
+assertion.
+
+**MAJOR (lens B, F1a) — the usable-native gate re-opened its parent regression
+for no-arg tools.** `_native_call_usable` returned `_has_args or not
+has_tool_tag` — and for a legitimately no-arg native call (dream_mode/self_play/
+stop_self_play, `properties:{}`) `_has_args` is False, so usability collapsed to
+`not has_tool_tag`, the exact proxy the gate exists to replace. A no-arg native
+call + prose that ECHOES a tool tag → the echoed example was executed instead
+(and if it named a mutating tool, that mutation ran). **Fix:** empty args are
+usable only for a PURE-TRIGGER tool — `_PURE_TRIGGER_TOOLS`, derived from
+TOOL_DEFINITIONS (tools with no `properties`) so it self-syncs; `execute` (has
+params, none required) is correctly excluded, so an empty `execute {}` still
+yields to a rich XML call (Q1 preserved).
+
+**MAJOR (lens B, F1b/F1c) — degenerate native args classified "usable."** A
+truncated/garbage native args STRING, or args that parse to a list/scalar,
+passed the old `raw.strip() not in ("","{}",...)` check and shadowed a
+fully-parseable XML call. **Fix:** resolve args to a real dict (parse the
+string; reject unparseable / non-dict); only a non-empty dict (or a pure
+trigger) is usable.
+
+**MAJOR (lens B, F2a) — aliased knowledge_base mutations collapsed.**
+`is_mutating` read the RAW action against `[ingest_document,forget,reset_all,
+insert_fact]`, but the tool heals transcribe/transcribe_document/transcription/
+ingest/ingest_file → ingest_document (a WRITE) AFTER that check. `transcribe` is
+the ADVERTISED primary verb, so two identical transcribes collapsed → a real
+ingest dropped. **Fix:** classify on the healed, lowercased action (aliases
+added, with a comment tying it to memory.py's map). **MINOR (F2b):** `file_system`
+`copy` mutates (creates a file) but was absent from `is_mutating` → added.
+
+**Also (lens C-3).** Three R2-introduced branches were pinned on only one arm
+(the `_has_args` dict/None branches, the multi-tag bare-function heal) —
+driven pins added for each. Deferred items re-confirmed bounded: the `\Z`
+preamble over-eat never touches `tool_calls`; the bare-`<tool_call>` prose
+mention corrupts a prose reply + burns a strike but drops no tool call (MINOR,
+the `<tool_call\b` wrapper marker is kept deliberately for truncation hints).
+
+### Verification
+New `tests/test_turnloop_r3_fixes.py` (14 pins) + the corrected R2 pin; 8 R3
+mutants killed. Broad localized set (incl. transcribe/loop-breaker/self-play/
+browser): 466 passed. Full suite: 14058 passed, 17 skipped, 0 failed (12m30s).
+
+### §4BY Round 4 (2026-08-19) — convergence: one MAJOR at the predicted seam, everything else held
+
+Three lenses attacked R3's fixes. The round's shape finally changed: two of
+three lenses came back essentially CLEAN, and the one MAJOR sat exactly at the
+seam R3's own comment claimed to have closed — found INDEPENDENTLY by two
+lenses (A's adversarial probe and C's import audit converged on it).
+
+**MAJOR (lens A + lens C) — `_PURE_TRIGGER_TOOLS` guarded static import-time
+membership, not the live registry.** The set derives from TOOL_DEFINITIONS, but
+`available_tools` is a superset: composed macros and acquired skills register
+at RUNTIME, and a zero-`$var` macro / no-input skill genuinely advertises
+`properties: {}`. Such a tool can never be a "trigger," so its empty-args
+native call lost to an echoed tag in prose — the echoed tool ran and the real
+macro was dropped (control with `dream_mode` proved the static derivation was
+the sole differentiator). **Fix:** `_STATIC_TOOL_NAMES` (from TOOL_DEFINITIONS);
+empty args are usable for a known trigger OR for any NON-static (runtime) tool —
+schema unknowable there, and dispatching it errors recoverably at worst, whereas
+executing content-XML of unknown provenance (a possibly-mutating echo) is the
+unrecoverable direction. Q1 and all R3 empty-dict/None/truncated pins preserved
+(`execute` et al. are static non-triggers).
+
+**Lens C cleared the import-time staleness risk with evidence:** TOOL_DEFINITIONS
+is a module-level literal + two unconditional pre-import appends; every dynamic
+addition operates on copies; the recomputed trigger set is identical at runtime.
+The residual WAS the dynamic-tools blindness above — same finding, second lens.
+
+**MINOR (lens B) — `knowledge_base(action="update_profile")`:** an unadvertised
+pass-through to the profile writer, absent from `is_mutating` → duplicates
+collapsed. Doubly mitigated (the setter is idempotent; the verb isn't in the
+schema enum) but added for classifier completeness + pinned. Lens B's full
+audit found the classifier otherwise COMPLETE: every file_system write op
+covered (no op-alias heals exist; unimplemented ops error harmlessly), the kb
+heal map fully covered, introspect/read tools pure.
+
+**Lens C: all 15 R3-era pins non-vacuous** (16 mutations, diagonal kill map;
+heal-gate and routing-gate independently pinned). Four unpinned R3-diff sites
+got driven pins: kb action case/whitespace normalization ("TRANSCRIBE" / 
+" ingest \n" collapsed under the raw-action mutant), the `"null"`/`"[]"`
+fast-path, the scalar-args else-branch, and `_looks_raw_json`'s `.strip()`
+(a padded raw-JSON call was healed into corruption under the mutant).
+
+**Harness honesty note:** one mutation batch row printed KILLED after its edit
+had actually been REFUSED (anchor matched twice — the count-guard worked; the
+pytest failure that produced the verdict was unattributable). Re-run singly
+with a precise unique anchor: cleanly killed (both case pins `assert 1 == 2`).
+The lesson stands: a batch harness verdict is only as good as each row's
+verified application (mutation-batch-needs-a-trap, again).
+
+**Deferred (bounded, documented):** all-null-values native dict passes
+non-emptiness (same-name shadow, rare); mixed degenerate+usable native batch
+dispatches both (degenerate errors recoverably); bytes / deeply-nested args
+judged degenerate (LOW); bare-`<tool_call>` prose mention (MINOR, wrapper
+marker kept for truncation hints); `\Z` preamble over-eat (cosmetic).
+
+### Verification
+New `tests/test_turnloop_r4_fixes.py` (10 pins); 7 R4 mutants killed (one
+re-run singly after the batch refusal). Broad localized: 522 passed. Full
+suite: 14068 passed, 17 skipped, 0 failed (11m25s).
+
+### §4BY Round 5 (2026-08-19) — the fifth proxy, and the derivation guard that ends the pattern
+
+A single focused lens attacked only the R4 diff. Verdict: NOT converged — one
+reproduced MAJOR, the fifth instance of "guarded a proxy, not the thing," and
+this time the proxy was in R4's own justification: `name not in
+_STATIC_TOOL_NAMES` meant "not in TOOL_DEFINITIONS," not "runtime-registered."
+
+**MAJOR (R4-introduced regression, reproduced).** Two BUILT-INS —
+`vision_analysis` (unconditionally dispatchable, the high-traffic verify_ui
+channel) and `image_generation` (registered when the image node is configured,
+as on this deployment) — have their LLM-facing schemas appended inside
+`get_active_tool_definitions`, not in TOOL_DEFINITIONS. R4 therefore classified
+them "dynamic ⇒ empty-args usable," so a degenerate native
+`vision_analysis {}` SHADOWED a fully-specified XML call (same-tool and
+cross-tool variants both reproduced; dispatch then errors "action/target
+MANDATORY" — wasted turn). The R4 comment's "schema unknowable at import"
+claim was factually false for these two: their schemas are static module
+literals with required params.
+
+**Fix.** `CONDITIONALLY_ADVERTISED_BUILTIN_NAMES` in tools/registry.py (next
+to the appends it describes); agent.py's `_STATIC_TOOL_NAMES` unions it in.
+Deliberately NOT a hand-list-left-to-drift: the new derivation test computes
+ground truth from the LIVE `get_active_tool_definitions` output (every
+conditional gate enabled via truthy-mock, macro/skill sources disabled) and
+asserts `active − static == constant` — a future conditionally-advertised
+built-in that isn't added to the constant fails the test. The mock's
+truthy-MagicMock construction enables future context/llm_client-keyed gates by
+default, so the guard is robust to gates that don't exist yet.
+
+**R5's clean findings:** no shadowing inversion is possible (acquired skills
+and composed runners both skip names already in the tools dict, and `define`
+rejects built-in names — classification stays safe-conservative);
+`fs_batch` is a schema arm, not a tool name; the kb `is_mutating` list is
+complete against memory.py's full dispatch; the three R4 pins guarding the
+gate are live (each dies under its precise revert).
+
+**Harness honesty, again:** the first MUT-1 attempt died on a script syntax
+error and printed SURVIVED with no mutation applied — void verdict, re-run
+singly: cleanly killed (all 4 R5 pins fail, including the drift-guard itself
+reporting the missing name). Second occurrence this review of a batch verdict
+that had to be voided; the count-guard + single re-run discipline held both
+times.
+
+### Verification
+New `tests/test_turnloop_r5_fixes.py` (4 pins: membership, live-derivation
+drift guard, same-tool + cross-tool behavioral); 2 R5 mutants killed (one after
+a voided first attempt). Localized incl. registry suites: 152 passed. Full
+suite: 14072 passed, 17 skipped, 0 failed (12m30s).
+
+### §4BY CONVERGED (2026-08-19) — six rounds, the closing verdict
+
+R6 (single lens, R5 diff only) returned CLEAN on all five attack lanes: no
+drift-guard escape exists in current code (every conditional append gates on
+attr-truthiness, which the derivation mock auto-enables; removals can never
+enter `active − static`; the only residual is a FUTURE value/env/file-gated
+append — inherent to any enable-all-gates derivation, documented in the
+registry comment). Imports verified clean in both orders in fresh
+interpreters. Semantics differentially verified: plain-prose and
+no-image-node cases are byte-identical pre/post-R5 (the availability check
+precedes the static check). All 4 R5 pins non-vacuous, and the
+derivation+membership pins CHAIN — constant↔registry and constant↔agent are
+guarded on separate legs, so no single revert leaves the suite green.
+
+**The six-round arc:** R1 CRITICAL (native calls dropped on a prose mention) +
+MAJOR (collapse denylist gap) → R2 CRITICAL (dynamic tools bypass the
+denylist) + MAJOR (degenerate native shadows rich XML) + the root inversion
+(`has_tool_tag` real-tag) → R3 MAJORs (raw-JSON heal corruption; no-arg
+trigger proxy; aliased kb mutations) → R4 one MAJOR (static trigger set blind
+to runtime tools) → R5 one MAJOR (conditionally-advertised built-ins blind
+spot) → R6 CLEAN. Five consecutive instances of "the fix guarded a proxy, not
+the thing," each caught by the next round's fresh eyes; the pattern ended only
+when the guard became a DERIVATION (computed from the live source of truth)
+rather than another list. Every fix mutation-verified; five full-suite greens
+(14029 → 14044 → 14058 → 14068 → 14072, 0 failures throughout); the agent
+restarted onto each round's fixes. 55 new behavioral pins across
+test_turnloop_r1..r5_fixes.py; 32 mutants killed; two batch-harness verdicts
+voided and re-run singly (count-guard + single-re-run discipline held).
+
+**Slice status: tool-parse + dispatch CONVERGED.** Remaining turn-loop slices
+for subsequent rounds: finalization + streamed turn (`_finalize_and_return`,
+`handle_chat` stream path), context management / pruning, verdict-gating
+(overlaps §4L/§4M, lower priority), idle/biological orchestration (§4Q).
+
+## §4BZ — Turn loop review, slice 2: finalization + streamed turn — Round 1 (2026-08-19)
+
+Three lenses (finalize / streaming / instrument sweep) on isolated copies.
+NINE reproduced MAJORs across A+B, every one verified by driving the live
+method; lens C found 18 of 20 finalize/stream guards in agent.py deletable-
+green and delivered per-mutant-verified driven pins for all of them (adopted
+as tests/test_finalize_stream_pins.py, 17 probes). One consolidated fix pass;
+13 fixes mutation-verified (one VOID re-run singly; one deliberate no-op
+control correctly SURVIVED).
+
+### Fixed (streaming, lens B)
+**B-1 scrub desync (MAJOR):** a tag split across deltas leaked its prefix to
+the client, then the never-decreasing emitted-length counter silently
+swallowed an equal number of legitimate post-block chars — leak + drop +
+streamed-vs-durable divergence in one turn. Fix: HOLD BACK a potentially
+partial scrub-target tag at the tail (prefix/closer detection, backtick-aware)
++ an end-flush for never-resolved fragments (skipped after a sever). Plus a
+backtick lookbehind on the scrub pattern so an answer EXPLAINING `<tool_call>`
+keeps its text (mirrors _tail_has_stop_marker's mention guard).
+**B-2 watchdog (MAJOR):** the "infinite <think> loop" watchdog never checked
+it was INSIDE a think block (severed a legitimately periodic zero-matrix
+answer), and on the scrub path yielded its synthetic break XML RAW to the
+client (`</think><tool_call>…SYSTEM OVERRIDE…` as the visible reply). Fix:
+gated on an open <think>; scrub-path clients get a clean interrupt notice
+while the XML still lands in durable content for the replan machinery.
+**B-3 n-gram probe scope (MAJOR):** the full_content fallback exists for
+INLINE-think models but probed ALL content — a file write of 30 identical
+fixture rows aborted as a "thinking loop" (content discarded + fake strike).
+Fix: content-channel probes only inside an open inline <think>; hard caps and
+the tool-collapse probe still bound the rest. Trade documented: a no-think
+plain-content loop now falls to the extended cap instead of the n-gram probe.
+**B-4 paragraph guard (MAJOR/MINOR):** counted SUBSTRING occurrences, so
+debugging prose QUOTING one error line ≥6 times severed the stream with only
+two standalone repeats. Fix: standalone-line counting (one pass, same cost).
+**B-5 cancel cut (MINOR):** user cancel mid-final-stream persisted the
+amputated answer as a clean record. Fix: truncated=True into calibration + a
+truthful "cancelled by the user mid-answer" durable marker.
+
+### Fixed (finalization, lens A)
+**A-F1 false success (MAJOR; CRITICAL under --no-verifier):** the empty-reply
+fallback stamped "Process finished successfully." over an `Error:`-prefixed
+tool result (the old fix covered only `_synthetic` entries). Fix: the header
+also classifies the error shape (dispatch tuple + EXIT CODE banner) → honest
+"The last command FAILED" head.
+**A-F2 enforce-then-violate (MAJOR):** the start-with hoist ran pre-verifier,
+then the clarifying-question gate, both digests, and the deferred-correction
+prepend re-buried the mandated opening. Fix: `_head_insert` — finalize-added
+material inserts BELOW an active, satisfied start-with head at all four sites.
+**A-F3 scrubbers destroying replies (MAJOR):** three reproduced destructions
+(task-status lines, `# Tools` README truncation, tool-schema example
+truncation). Fix: shared `_truncate_prompt_bleed` with STRONG markers
+(truncate alone) vs WEAK (`# Tools`, `{"type": "function"` — truncate only
+corroborated), and `_scrub_task_status_runs` (strip only runs of ≥3 status
+lines — a regurgitated TREE — never isolated legit lines). Applied at BOTH
+twins (finalize + per-turn) via one helper — the wrapper-split lesson.
+**A-F4 verdict label pollution (MAJOR):** the fresh-cache path stamped an
+in-loop verdict computed on PRE-finalize text after scrub/smooth/hoist changed
+the reply — `verifier:passed` flowed to calibration/work_log for text the user
+never received. Fix: the cache now fingerprints the judged text; on mismatch
+(real verdicts only — a pending late-handler None keeps its ownership) the
+verdict is recomputed on the delivered text.
+**A-F5 inert hoist parser (MAJOR):** `parse_start_with_phrase` mis-parsed
+'…with "BLUF:" and then summarise…' (closing quote not honored before a
+trailing clause) — the req-56221fad hoist was inert on its target phrasing.
+Fix: a closed quote span IS the phrase.
+**A-F6 divergent error vocabulary (MINOR):** `_ran_info` missed "Critical
+Tool Error" (a failed search falsely resolved an unknown) → dispatch tuple
+adopted; `_is_fs_write` gained "copied". (`_model_notified`'s "Error" sniff
+verified sound for notify_operator's actual failure strings — not changed.)
+
+### Instrument findings (lens C)
+18/20 agent.py finalize/stream guards were deletable-green (only the pure
+stream_guards detectors + the durable-tail raise-conversion were behaviorally
+pinned) — all 18 now locked by the adopted driven pins. G2: the 400-char
+"wide backstop" in _detect_thinking_loop was PROVABLY DEAD (every wide-tail
+occurrence contains a tight-tail occurrence) — deleted, so sweeps stop reading
+an inert branch as an unpinned guard. CRITICAL instrument hazard, recorded:
+11 test files do `sys.path.insert(0, …/../src)` at import — once collected,
+the REAL src shadows any PYTHONPATH override for the whole pytest session;
+lens C's own first sweep reported 25/25 FALSE survivals until it mirrored the
+repo layout beside its mutated copy. Slice-1 verdicts unaffected (those
+harnesses mutated the real file directly; none of the 11 files were in scope).
+
+### Deferred (documented)
+Degenerate slip: short-line incrementing enumeration evades both detectors to
+the 200K cap (INFO). `_tail_has_stop_marker` misses a quote-preceded real
+transition (LOW, log-only). Bare-`<tool_call>` prose in the PARSER (slice-1
+residual). The 11 sys.path.insert test files (instrument hazard, not a
+production defect). Vacuous source-string pins listed by lens C (~30 tests
+across 15 files) — candidates for behavioral rewrites in later rounds.
+
+### Verification
+New tests/test_finalize_stream_r1_fixes.py (26 pins) + adopted
+tests/test_finalize_stream_pins.py (17); 13 fix-mutants KILLED + 1 no-op
+control correctly survived + 1 VOID re-run singly (clean kill). Broad
+localized across both slices: 1105 passed. First full run: 14113 passed +
+exactly 2 failures, BOTH stale token pins the fixes superseded (a 60000-char
+source window the grown method overflowed — now sliced to the next def; two
+literal lines renamed by B-1 — updated, behavior pinned behaviorally) — the
+full suite catching files the localized selection missed, as designed. Full
+suite after: 14139 passed, 17 skipped, 0 failed — the single post-R2 run also covers these R1 fixes (see R2 addendum).
+
+### §4BZ Round 2 (2026-08-19) — the class held a sixth time, on both halves
+
+Two lenses attacked R1's thirteen fixes. Three of five streaming fixes and
+four of six finalize fixes carried the defect class they fixed; every finding
+reproduced by driving the real generator/method; all R1 pins confirmed
+non-vacuous by both lenses' revert sweeps (except A-F6 — see M-5).
+
+**CRITICAL C1 (stream): the hold-back guarded the LAST `<` — a proxy.** A
+newer `<` moved `rfind` and RELEASED an earlier still-forming tag
+("<function or " freed by a following "<t") — leak + swallow + client/durable
+divergence, the exact invariant R1 B-1 claimed to close. **Fix:** hold from
+the FIRST unresolved tag-prefixed `<` in the un-emitted window
+(`_emit_safe_end`), with a 64-char prose-release cap; the END-FLUSH reuses the
+same classifier so a dangling opener never leaks raw on abnormal stream end
+(R2 M4 — the flush was un-doing the fix at stream end).
+
+**CRITICAL C-1 (finalize): the A-F4 fingerprint guard didn't run where it
+mattered.** Only the async-await stamps carried the 3-tuple; the SYNC branch
+(the code default) still stamped a 2-tuple, and the R1 gate treated a missing
+fingerprint as TRUSTED — bypassed in default config, and the dominant live
+path (late-verdict handler) has no fingerprint logic at all. **Fix:** the
+sync stamp carries the fingerprint, and the gate is FLIPPED — a real verdict
+reuses only on a matching fingerprint; missing now means recompute. The
+late-handler exemption is a pre-existing design gap (attach-time cannot know
+the delivered text) — documented for R3, not rushed.
+
+**MAJORs fixed:** the watchdog/probe think-gates were re-armed by a QUOTED
+`<think` mention and never disarmed by `</thinking>` (opener matched by
+prefix, closer demanded the exact tag) — replaced with one shared
+mention-aware, closer-prefix helper `_inline_think_open` (M1/M2/M3, the exact
+false-abort B-2/B-3 buried, resurrected). `_head_insert` landed digests
+INSIDE a code fence (the sibling `enforce_start_with` had the fence guard;
+the closure didn't — fence-walk added, M-1). The A-F1 prefix sniff branded
+"ERROR count: 0" log reads FAILED and let an Error-prefix outrank an explicit
+EXIT CODE: 0 — colon'd prefixes only; the exit banner is consulted only for
+execute output and DECIDES there (M-2). Two-weak bleed corroboration was
+unsound on the ASSEMBLED reply (legit README `# Tools` + a legit schema
+example hundreds of chars apart truncated 283→34) — corroboration now
+requires proximity ≤600 chars (M-3). The ≥3-run status scrub deleted a
+legitimate 4-item workstream answer — a stripped run must also be TASK-SHAPED
+(task_NN / emoji / bracket lead) (M-4). A-F6 was silently revertible (M-5) —
+driven pins added for both halves. MINORs fixed alongside: strong bleed
+markers are now mention-aware (a meta-answer QUOTING "CRITICAL INSTRUCTION:"
+was truncated to 19 chars), and the native-path pointer sentence joined
+_BLEED_STRONG (a paraphrased bleed carried no other marker).
+
+**Deferred (documented):** the late-verdict handler's pre-finalize-text
+corrections (design gap, R3); A-F5 first-close-quote parse on apostrophes
+(no deletion possible — MIN_KEEP protects); clarify-question reverse-stack
+ordering; fingerprint hashes the unstripped text (worst case a spurious
+recompute — the safe direction); code-fence `<` UX stall (recovered at
+end-flush, never lost).
+
+### Verification (R2)
+New tests/test_finalize_stream_r2_fixes.py (24 pins); 14 R2 mutants KILLED,
+tree restored byte-identical. Broad localized across both slices: 1220
+passed. Full suite: 14139 passed, 17 skipped, 0 failed (12m39s).
+
+### §4BZ Round 3 (2026-08-19) — the seventh instance, and the asymmetry lesson
+
+Two lenses attacked R2's fixes. Verdict: NOT clean — five reproduced defects
+inside R2's own fixes plus one adjacent R1-rooted performance hole. The
+overcorrection question came back CLEAN with evidence: the flipped verdict
+cache is alive (6/6 realistic clean turns reuse; recompute fires only on
+genuine mutation; no always-recompute path exists).
+
+**A-D1 (MAJOR) — the mention-skip swallowed REAL closers.** R2's quote-skip
+treated `…"notes.md"</think>` — a think block ENDING with a quoted string,
+an utterly routine shape — as a mention: gate stuck open, false sever back,
+fake replan in durable. **Fix: asymmetric by failure direction.** The
+mention-skip applies to the OPENER only, and only for backticks (code-span
+mentions); EVERY closer counts — a mentioned closer at worst closes early
+(probes off, the safe direction), a skipped real closer causes a sever.
+
+**A-D2 (MAJOR) — R2's 64-char release valve recreated the swallow it
+prevented.** An attribute-heavy opener released at 64 chars leaked raw and,
+once completed and scrubbed, permanently swallowed the post-block text.
+**Fix: the tag-NAME BOUNDARY is the real discriminator** — "tool" followed by
+"_threshold" is a longer word (prose: release IMMEDIATELY, faster than the
+old valve); "function name=…" is the exact name + boundary (a forming tag:
+hold however long its attributes run — never released, never swallowed).
+
+**A-D3 (adjacent, R1-rooted) — the per-chunk scrub re-sub was quadratic-with-
+backtracking on unclosed-opener spam** (90KB of "<tool " drip ≈ 620s CPU,
+and the think-gates deliberately hold both loop guards off for that shape).
+**Fix: incremental view on a proved invariant** — the scrubbed view can only
+change shape when a '>' ARRIVES (every match needs one; '>'-less appends
+can't complete a match; a \Z-arm match just extends its eating, view frozen).
+Recompute on '>' deltas only; freeze while a block is eating
+(`_scrub_tail_is_open`, close-TAG-anchored); plain-append otherwise. The
+stream pattern is now a single module-level source of truth shared with the
+detector (the wrapper-split lesson). Freeze/resume byte-exactness and a
+300-chunk spam wall-clock bound are pinned.
+
+**B-D1 (MAJOR) — R2's execute-only banner gate was a NAME proxy.** Acquired
+skills dispatch under their own names with tool_execute's banner verbatim,
+and delegate returns "[sandbox job N — EXIT CODE: 1]" — a failing skill
+shipped as "Process finished successfully." **Fix: execute-SHAPED content**
+(line-anchored EXIT CODE + execution framing, or the sandbox-job form)
+consults the banner; the as-data case stays excluded.
+
+**B-D2 (MAJOR) — `any()` over the run:** one task_7 mentioned in PROSE
+deleted a legitimate workstream answer wholesale, and a markdown-link lead
+counted as "task-shaped". **Fix:** majority-shaped requirement + the bracket
+arm now demands task-ish interiors.
+
+**B-D3 (MINOR) — the fence walk counted bare ``` substrings:** tilde fences
+were invisible (a correction landed inside ~~~markdown) and an unclosed
+fence at EOS took the append INSIDE it. **Fix:** line-anchored dual-dialect
+fence counting; a reply ending inside an open fence takes a plain PREPEND —
+the constraint yields to content integrity.
+
+**Accepted/documented:** the sync-stamp pin gap (revert direction is
+cost-only — the flipped gate recomputes); the late-verdict handler's
+pre-finalize-text corrections (pre-existing design gap); "user asked for
+task ids" majority-shaped answers (deliberate trade); reading a saved full
+execution log classifies by its content (rare, documented).
+
+### Verification (R3)
+New tests/test_finalize_stream_r3_fixes.py (19 pins); 9 R3 mutants KILLED;
+both R3 lenses independently confirmed every R1/R2 pin non-vacuous under
+precise reverts. Broad localized: 1241 passed. Full suite: 14158 passed, 17 skipped, 0 failed (12m55s).
+
+### §4BZ Round 4 (2026-08-19) — the fuzzer round: two divergences + the phantom pin
+
+A single convergence lens attacked R3's diff with a DIFFERENTIAL FUZZER as
+the primary weapon (real generator vs naive always-recompute, 5,500 streams /
+54,941 chunks): 1,817 divergent streams, every one explained by exactly two
+signatures — no third class.
+
+**D1 (MAJOR-CRITICAL) — the close-end check was name-blind while the scrub
+pattern's close arm is a BACKREFERENCE.** An unclosed `<tool_call>` whose
+'>'-delta ends with an inner `</function>` — the CANONICAL native tool-call
+shape — read as "closed": the frozen-view invariant broke on the exact input
+class the scrub exists for, plain appends leaked the block's INTERNALS to the
+client, and the desynced counter then swallowed the visible tail. **Fix:**
+closed means closed BY ITS OWN TAG — the check is built per-match from
+group(1).
+
+**D2 (MAJOR) — the `_scrub_seen_lt` flip iteration double-appended its own
+delta** (the flip cache already contains it): ordinary " < " math prose and
+"<toolbox"-style words duplicated bytes on the client, once per stream,
+invisible to every durable instrument. **Fix:** a `_flip_now` branch — the
+flip iteration takes the cache as-is; a flip-with-'>' delta still recomputes.
+
+**V1 (MAJOR, instrument) — the A-D3 pins were vacuous against the precise
+revert**: restoring naive per-chunk re-sub passed all 19 R3 pins, and the
+R3 in-code comment cited a fuzz pin that DID NOT EXIST (the
+phantom-verification class, in this review's own hand). **Fixed honestly:**
+tests/test_finalize_stream_r4_fixes.py now carries (a) both divergence
+repros, (b) a sub-call-count discriminator (40 '>'-less deltas → ≤4 subs;
+the naive revert runs ~42 and FAILS), and (c) the REAL bounded differential
+fuzzer (60 seeded re-split streams, fallback-aware reference). The
+full-mechanism revert is now KILLED.
+
+**Residuals confirmed MINOR by the lens:** held-forever "<tool," prose
+suppressed at end-flush when no '>' ever follows (durable keeps it — the
+documented R2→R3 trade); a think block quoting `` `</think` `` closes the
+gate early (safe direction, bounded by max_tokens); a verbatim saved exec
+log read classifies as exec-shaped (fallback-head wording only); 4-space-
+indented fence-marker lines miscounted (CommonMark code, placement
+cosmetics).
+
+### Verification (R4)
+7 new pins incl. the fuzzer; 3 R4 mutants KILLED (name-blind close, flip
+double-append, full-mechanism revert). Localized: 253 passed. Full suite:
+14165 passed, 17 skipped, 0 failed (12m34s).
+
+### §4BZ Round 5 (2026-08-19) — pin-identity-not-property, expressed in code
+
+The final convergence lens extended the differential fuzz to ~134k chunks
+with fresh seeds and an enriched alphabet and found ONE divergence class (20
+streams), all with a single root: **the R4 close-end check tested a text
+PROPERTY — "group(0) ends with its own close tag" — instead of WHICH ARM
+matched.** A malformed opener with no '>' of its own swallows its close tag
+into `[^>]*>`-land; the match really ends via the \Z arm (still eating), the
+property proxy reads "closed", the view unfreezes, and eaten block internals
+leak raw to the client — the exact leak class the R4 fix shipped to kill,
+reachable through the fix's own check. R4's fuzzer could not generate the
+shape (every opener in its alphabet carried its own '>'; re-splits preserve
+order). Round NINE of "the worst defect is inside the previous round's fix,"
+and the memory lesson [[pin-identity-not-property]] verbatim.
+
+**Fix (the lens validated the direction at 18,000 streams / ~310k chunks,
+zero divergences):** the \Z alternative in `_MODULE_SCRUB_RE` is now a NAMED
+GROUP (`(?P<eof>\Z)`) and `_scrub_tail_is_open` returns
+`last.group('eof') is not None` — arm identity asked directly from the
+match, no inference from text. Pinned: the killer unit shape, the E2E
+no-leak repro (revert reproduces `pre SECRET_A SECRET_B` verbatim), and the
+in-suite fuzzer's alphabet gained the killer class so the net can generate
+it. **MINOR also fixed:** the sub-count pin gained a LOWER bound — an
+import-time alias dodging the monkeypatch left the counter at 0 and passed
+the whole R4 suite with a full naive revert live (fail-open pin).
+
+**Clean under attack:** IGNORECASE backreference/`re.escape` casing both
+directions; all `_flip_now` interactions (flip-then-end, double-'<' flip,
+prefix-emitted flip, cancel/abort interleavings) byte-exact; both R4 pins
+genuine under revert with the fuzzer as an independent second net.
+
+### Verification (R5)
+3 new pins + fuzzer alphabet + lower bound; the property-proxy revert
+mutation KILLED (2 pins fail with the verbatim leak). Localized: 187 passed.
+Full suite: 14168 passed, 17 skipped, 0 failed (12m53s).
+
+### §4BZ CONVERGED (2026-08-19) — six rounds, the closing verdict
+
+R6 (single lens, R5 diff only) returned CONVERGED with the strongest evidence
+of the review: the named `eof` group proven semantics-neutral across 150,000
+adversarial strings (identical spans/groups/sub output); arm identity
+verified structurally (the engine cannot set `eof` when the close arm
+matched — final alternation, close arm tried first, \Z zero-width at EOS
+only) AND empirically (50k random buffers scored against an appended-sentinel
+"is it actually eating" oracle, 0 mismatches); two more differential fuzz
+runs, 310,007 chunks, 0 divergences; 5 mutants all killed, including the
+alias-dodge + naive-revert combination that proves the sub-count pin a true
+two-sided discriminator. Sole finding: MINOR — the in-suite fuzzer's fixed
+seed never composes the killer adjacency, so that net is redundant (the class
+is carried by the unit + E2E pins, both loud). The lens also reported its own
+two hand-label errors as its errors — the instrument critiquing itself.
+
+**The six-round arc:** R1 nine reproduced MAJORs across finalize+streaming +
+18 deletable-green guards (13 fixes) → R2 two CRITICALs inside R1's fixes
+(hold-back last-'<' proxy; fingerprint gate bypassed by the sync 2-tuple) +
+5 MAJORs (14 fixes) → R3 five MAJORs inside R2's (quote-skip swallowed real
+closers; the 64-char valve; name-proxy banner gate; any()-poisoned runs;
+tilde-blind fences) + the quadratic scrub → incremental invariant (7 fixes)
+→ R4 the fuzzer round: two divergence classes + the PHANTOM fuzz-pin claim
+(3 fixes, honest nets) → R5 pin-identity-not-property in code (arm-identity
+fix, validated pre-ship at 310k chunks) → R6 CONVERGED. Nine consecutive
+"worst defect inside the previous fix" instances across §4BY+§4BZ ended only
+when checks became IDENTITIES (derivations, arm groups, two-sided
+discriminators) instead of properties. Four full-suite greens across the
+slice (14139 → 14158 → 14165 → 14168, 0 failures throughout), agent
+redeployed each round. ~90 new behavioral pins across the slice's five pin
+files; 40+ mutants killed; three voided harness rows honestly re-run.
+
+**Slice status: finalization + streamed turn CONVERGED.** With §4BY
+(tool-parse + dispatch) also converged, the turn loop's two highest-risk
+slices are done. Remaining slices for future rounds: context management /
+pruning, verdict-gating (overlaps §4L/§4M), idle/biological orchestration
+(§4Q re-check).
+
+## §4CA — Turn loop review, slice 3: context management / pruning — Round 1 (2026-08-19)
+
+Three lenses (pruning / governor+injection / instrument sweep) on isolated
+copies. ONE CRITICAL + NINE MAJORs, all reproduced on the live methods and
+heavily cross-corroborated (lens C's surviving mutants were exactly lens
+A/B's findings). One consolidated pass; 13 fixes mutation-verified (one pin
+sharpened after its mutant survived a fixture that couldn't discriminate).
+
+### Fixed (pruning, lens A)
+**F1 (CRITICAL) — the tail-cap's counter and cutter disagreed on scope.**
+The counter (deliberately, §4N B-MAJOR-1) counts list-content text parts and
+native tool_calls args; the cutter touched only plain strings — a 60 KB
+list-part or native-args message rode through a "successful" prune at 7.5x
+budget (the HTTP-400 → destructive-recovery class re-opened via a TYPE
+proxy; the existing pin used only str content). Fix: `_cuttable_size` +
+`_cut_message` cover all three shapes — list text parts center-cut (image
+parts untouched), native args replaced with an HONEST VALID-JSON stub
+(a center-cut would corrupt them for history replay).
+**F2 (MAJOR) — the tail cap spliced its drop-marker INSIDE `<tool_call>`
+XML** (the exact §4N C-MAJOR-4 defect, fixed in context_manager but alive in
+its twin). Fix: whole-block REMOVAL (syntactically safe), unclosed-block
+removal, prose-side-only cuts — never a mid-tag splice.
+**F3 (MAJOR) — the anchor cap `[:4]` kept the chronologically FIRST four
+keyword matches and vaporized the rest** — not anchored, not summarized, no
+marker; the NEWEST findings vanished. Fix: keep the most recent 4; the
+overflow originals return to the middle pool for summarization. (The
+`is_tool_data` anchor class remains built-but-unwired — inventoried.)
+**F4 (MAJOR) — the third "goal" site** still used `non_system_msgs[0]`; a
+tool-seeded history shipped the real user instruction to the summarizer.
+Fix: goal = first USER message by position; a pre-goal seed joins the
+middle pool.
+**F5 (MAJOR, both twins) — "protect the FIRST user message" was a
+name-proxy** for "the instruction that governs the current work": the tail
+cap center-cut the CURRENT request's constraints, and context_manager L3
+compressed the current request every turn at ratio ≥0.87. Fix: the newest
+user message is protected at both sites; at the tail cap it yields only as
+a LAST RESORT (when it alone busts the budget — shipping over budget would
+400 the request and lose it anyway), with an honest pasted-content marker,
+never the file-re-read one. The §4N goal pin that tolerated over-budget
+shipping through the goal loophole was updated to the new law.
+
+### Fixed (governor + injection, lens B)
+**B1 (MAJOR/CRITICAL) — ReadBudget arm-without-disarm.** The lockdown FLAG
+had a disarm; the BUDGET OBJECT didn't — armed per batch, resolved AT CALL
+TIME by every out-of-band surface (project advancer, research, composed
+skills, API routes): one lockdown on the day's last turn poisoned a whole
+night of autonomous work with "conversation near the context ceiling"
+refusals in contexts with no conversation (the preflight-guard-lifecycle
+class, verbatim). Fix: disarm at request START (crash-path safety) and at
+the finalize return (the overnight window); the S4 pin upgraded to spy the
+armed limit mid-run AND pin the disarm.
+**B2 (MAJOR) — the first-read exemption defeated the occupancy shrink**
+(170 KB returned against a 3 KB remaining budget, 57x) and the 150 KB floor
+INVERTED the cap for small windows (100 KB file whole into an 8k window).
+Fix: no exemption — any read exceeding the remaining budget refuses (with a
+truthful three-way message); the floor is bounded by 0.8x the window.
+**B3 (MAJOR) — read_chunked was invisible to the budget and the budget's
+own refusal text ROUTED the model into the uncharged bypass.** Fix: chunked
+reads refuse at zero remaining and charge what they return.
+**B4 (MAJOR, config-gated) — `_compose_injection` f-strung LIST content**:
+a native-vision message became its Python repr — image part destroyed,
+base64 baked into prompt text. Fix: a list-aware prefix helper at all three
+injection sites (the stable block becomes a leading text part; image parts
+ride untouched).
+**B6 (MINOR) — the generated-file sampler ran before the budget check**,
+returning samples under lockdown. Fix: gated on remaining budget.
+
+### Instrument (lens C)
+48% of the slice's guards were deletable-green or token-pinned-only — the
+prune/compose/CM core was well pinned while the ENTIRE governor wiring
+(steer, lockdown set, lockdown clear, cap, zero-cap, fail-closed) was
+theater: two "kills" were getsource token pins. Lens C's 10 driven pins
+adopted (tests/test_context_governor_pins.py) — including real handle_chat
+drives with an SSE stream mock. Vacuous-pin inventory recorded (the
+`test_agent_wires_context_manager_before_prune` ordering pin does not even
+assert the rebinding). Canary-mutant discipline confirmed the mirror saw
+mutations (the sys.path.insert hazard again).
+
+### Deferred (documented)
+F6 MINORs: few-branch silent single-message drop (no marker), the
+`_emergency_prune` goal/orphan handling (off hot path), the
+`_summarize_tool_output` line-count math, `_history_budget` falsy fallback.
+Lens B notes: the 24k injection reserve is an unmeasured constant (no assert
+vs the composed size); a verbatim saved exec log still reads exec-shaped.
+
+### Verification
+New tests/test_context_r1_fixes.py (15 pins) + adopted
+tests/test_context_governor_pins.py (10); 13 fix-mutants KILLED (one after
+sharpening a non-discriminating fixture); two outdated pins updated to the
+new law (bounded floor; last-resort goal cut with the honest note). Broad
+localized: 361 passed. Full suite: 14193 passed, 17 skipped, 0 failed (12m32s).
+
+### §4CA Round 2 (2026-08-19) — the tenth instance, and the worst wedge of the review
+
+One lens attacked the R1 fixes. Verdict: 1 CRITICAL + 4 MAJORs, all inside
+R1's own fixes; every R1 pin confirmed live under precise reverts (12/12).
+
+**C1 (CRITICAL) — the R1 XML-safety branch had an unbounded-growth wedge.**
+With a `</tool_call>` BEFORE an unclosed `<tool_call` (echoed/truncated
+logs), `rfind(close) < find(open)` made the span negative and the rebuild
+duplicated the overlap — the message GREW ~1.33x per iteration: 6.5 KB →
+2,240,362,365 chars in 20 seconds at 100% CPU, INLINE on the request path.
+**Fix:** per-block FORWARD scan (a negative span is structurally
+impossible), plus a belt: every accepted cut must STRICTLY SHRINK the
+candidate or it is blacklisted — no rebuild bug can ever wedge the loop
+again (the belt proved load-bearing under mutation).
+
+**M2 (MAJOR) — the R1 selector was a SUM proxy for cuttability**: a
+100x3.9KB-part message out-scored everything, `_cut_message` refused it
+every iteration, control fell to the LAST RESORT and center-cut the goal
+and the newest user message while a perfectly cuttable 100 KB string sat
+untouched — 11x over target shipped, the exact 400-class the fix claimed to
+close. **Fix:** `_max_cuttable` measures what ONE cut can shrink; refused
+candidates are blacklisted and the next-largest tried BEFORE the last
+resort; a sum-of-small-parts fallback (keep ~4 KB of head parts + a marker
+part) makes the many-small-parts shape cuttable at all.
+
+**M3 (MAJOR) — the B1 request-end disarm rode only `_finalize_and_return`;
+STREAMED turns skip finalize** (the web UI always streams), so the
+overnight-poisoning defect survived on the common path — and the S4 pin
+drove a non-streamed request, so it could not see it. **Fix:** the disarm
+also lives in `_stream_then_unregister`'s finally; pinned by a REAL
+streamed handle_chat drive, drained to completion.
+
+**M4 (MAJOR) — A-F4's goal prepend DUPLICATED the goal** when it sits
+inside the recent window (tool-seeded short histories): both copies
+tail-cap-exempt, a huge pasted goal doubling its token cost. **Fix:**
+prepend only when the goal is outside the recent window.
+
+**M5 (MAJOR) — the R1 block removal spanned first-open..last-close**,
+silently deleting legit prose BETWEEN blocks ("IMPORTANT FINDING: the root
+cause is X"). **Fix:** the same per-block forward scan removes one
+oversized block at a time; prose segments survive and only tag-free
+segments are ever center-cut.
+
+**Clean under attack:** the valid-JSON args stub renders through both
+dialects and all five `arguments` consumers are `.get()`-tolerant; CM
+newest-user identity semantics; the three-way refusal (negative remaining
+clamps); chunked charges exactly what it returns (PDFs included, retries
+charge the new content — correct); the disarm broke no legitimate
+cross-call budget consumer (the registry getattr is the sole out-of-band
+reader); `_prefix_content` causes no history aliasing.
+
+### Verification (R2)
+New tests/test_context_r2_fixes.py (7 pins, incl. the wedge-shape timeout
+pin and the streamed-disarm E2E); 7 R2 mutants KILLED (timeout-guarded so
+the wedge revert cannot hang the harness). Broad localized: 120 passed.
+Full suite: 14200 passed, 17 skipped, 0 failed (12m30s).
+
+### §4CA Round 3 (2026-08-20) — the eleventh instance: the third return path
+
+The convergence lens attacked R2's diff. Verdict: NOT converged — one MAJOR
+runtime defect and a two-pin vacuity cluster.
+
+**MAJOR-1 — the disarm missed the THIRD return.** handle_chat has three
+request-end paths; R1+R2 covered finalize and the stream drain — the
+`except TurnCancelled` return (the STOP BUTTON, which correlates with
+exactly the long/lockdown turns whose leftover is ReadBudget(0)) left the
+budget armed, reproduced live with a cooperative cancel. **Fix: the
+UNIVERSAL disarm lives in handle_chat's outer finally** (non-streamed
+ownership; streamed exits keep the drain disarm since the budget must stay
+armed during the drain). Pinned by a mid-request-armed cancel drive.
+
+**MAJOR-2 — two R2 pins were vacuous, one of them TWICE.** The streamed-
+disarm pin planted its budget before the call — the request-START disarm
+(an R1 line) cleared it before the drain ever ran; and the governor harness
+never even reaches the streamed-final generator (its return is plain text),
+so the first rewrite was still fake. The honest pin drives the REAL
+`_stream_final_generation` (whose return wraps `_stream_then_unregister`)
+and arms the budget AFTER the generator exists. The goal-duplicate pin's
+5-message fixture routed down the <=5 branch that never touches
+`_goal_head` — now >=6 messages. Both now die on their reverts, and a
+comment-only control mutation correctly SURVIVES (the harness is honest in
+both directions). The unpinned segment scan (V3) got a pin; the strict-
+shrink belt is documented as intentionally unpinnable defense (it fires
+only on future bugs — the equivalent-mutant class); the selector-alignment
+revert (V4) is redundant-but-harmless now that the CUTTER handles the
+many-parts shape — documented, not forced.
+
+**MINOR fixed:** non-str `"text"` parts (malformed client) raised TypeError
+inside the cap with no enclosing try — one bad part bricked every
+over-budget turn; the same never-raises guards `_msg_token_cost` keeps.
+**MINORs documented:** the mention-triggered args stub for zero token gain;
+backticked-mention block removal (substring trigger predates R2).
+
+**Cleared with proof:** `hi > lo` invariant provable + 20k tag-soup fuzz
+(terminates, never grows, marker never inside an intact block); the
+unclosed tail is excluded from prose segments (no mid-tag splice); image
+parts are NEVER dropped by the sum-fallback; the goal-head flag reads the
+FINAL walked-back recent_start.
+
+### Verification (R3)
+3 new pins + 2 repaired + 1 rewritten-twice; 5 real mutants KILLED + 1
+comment-only control correctly survived. Localized: 143 passed. Full
+suite: 14203 passed, 17 skipped, 0 failed (12m41s).
+
+### §4CA Round 4 + CONVERGED (2026-08-20) — the residue moved into the pins; closed there
+
+The final convergence lens attacked R3's diff. Verdict: the RUNTIME code of
+the R3 diff carries nothing above MINOR — the twelfth-round pattern held only
+in ATTENUATED form, inside the round's INSTRUMENTATION: three executed
+mutants proved the R3 pins could not defend half the R3 fix surface
+(reverting the `_txt_total` guard alone, or the kept/dropped tolerance
+alone, survived the whole pin file 10/10 — the fixture's 9000-char part
+meant the best-pick site always cut first and the sum branch was never
+reached; and moving the "universal" disarm into the cancel handler alone
+passed everything — the crash-exit value was unpinned). One pin's first
+assertion was OR-vacuous, and one assert (`out is not None`) asserted a
+tautology. ALL CLOSED: a sum-shape malformed fixture, a crash-exit disarm
+drive, the call-count + non-OR asserts, and honest assertions — five
+closure mutants killed.
+
+**Parity closure (the F1 lesson one level down):** the token COUNTER
+str()-coerces ANY "text" value, so a JSON-reachable list-valued part cost
+25,025 tokens while being invisible to the str-only cutter —
+uncuttable-but-counted, last-resort mauling, 17k-over ships (pre-existing
+reachable shape, R3-attributable only for bytes). The cutter and selector
+now handle oversized non-str text values with an honest stub; both halves
+mutation-killed.
+
+**Cleared with proof:** the ownership gate has no reachable armed-forever
+path (the asyncgen finalizer empirically fires an abandoned started
+generator's finally; no suspension point between flag-set and generator
+start; every non-HTTP caller passes stream:False); the unregister call
+cannot raise past the disarm; exact isinstance agreement across all four
+cutter/selector sites; no harness-grades-own-homework instance in the pin
+code.
+
+**The four-round arc (§4CA):** R1 one CRITICAL + nine MAJORs (counter/cutter
+type proxy, ReadBudget arm-without-disarm, first-read exemption, chunked
+bypass, injection list-repr, goal/newest-user proxies, anchor vaporization)
+→ R2 the worst wedge of the review (2.24e9 chars in 20s) + selector proxy +
+the streamed-disarm gap + goal duplication + inter-block prose loss → R3
+the THIRD return path (Stop-button cancel) + two pins vacuous (one twice) +
+a crash-class guard → R4 runtime clean; residue in the pins, closed. The
+disarm needed FOUR placements to become true (start, finalize, drain,
+outer finally) — lifecycle guards are complete only when every exit path is
+enumerated, and their pins only honest when each placement dies alone.
+
+**Slice status: context management / pruning CONVERGED.** Remaining
+turn-loop slices: verdict-gating (overlaps §4L/§4M recent audits),
+idle/biological orchestration (§4Q re-check). Follow-up noted outside this
+slice: aligning `_msg_token_cost`'s bytes-repr inflation.
+
+### Verification (R4)
+3 pin repairs + 2 new pins (crash-exit, parity) + honest assertions; 5
+closure mutants KILLED. Localized: 139 passed. Full suite: 14206 passed, 17 skipped, 0 failed (12m29s).
+
+## §4CB — Idle/biological orchestration fresh-eye review (the §4Q re-check) — Round 1 (2026-08-20)
+
+Slice 4 of the turn-loop review series (§4BY parse/dispatch, §4BZ finalize/stream, §4CA context — all CONVERGED). Three adversarial lenses on isolated copies (bio1a/bio1b/bio1c) against anchors agent.py `2761584172ce…`, autonomous_activity.py `0f21ac90…`, dream.py `61570860…`. All §4Q fixes held (151 tests green; `_bio_cooldown` at 17 sites, `_bio_scaled(60)` tick period, self-play `last_activity_time` reset intact). Lens C's sweep: 13/19 mutants killed by existing tests (32% deletable-green — better than the 48–90% of sibling slices).
+
+### R1 findings (6 MAJOR verified + minors)
+
+- **A-F1 MAJOR — `/api/projects/{pid}/advance` never marked `foreground_requests`** (projects_routes.py). A live authed route running LLM classifier + 4096-token code gen; unmarked, the biological tick ran journal consolidation MID-advance (driven repro), the RSS watchdog's opt-in execv restart could kill mid-advance, and background work held off only 30s. §4Q-R2's "the ONE live endpoint missing it" claim was false. FIX: the game_routes `_mark_foreground` try/finally bracket around the whole advance.
+- **A-F2 MAJOR — phase-2/3 preambles sat OUTSIDE the phase try, before the cooldown anchors.** `pretty_log` has raised in production (OSError 28); from between the eligibility claim and the try it escaped `_biological_tick` with the cooldown unadvanced — the failing phase refired every 60s tick and every later phase starved, while `biological_watchdog_alive` stayed true (the health-lies class). FIX: anchors hoisted above the preambles; preamble + Dreamer construction moved INSIDE the trys. Phase 3's finally (the LOAD-BEARING clock reset) now also runs on a preamble raise.
+- **B-M1 MAJOR — dream failure ledgered as success + backoff reset.** The tick classified dream() by substring (`"Skipping REM" / "Not enough entropy"`); the three failure shapes (`"Dream error: …"` ×2, `"Memory system not available."`) matched neither → a permanently failing dream minted "REM cycle ran" rows (blinding the EXPECT_PERIODIC zero-rows alarm — learning_health.py `n24==0`) and reset `_dream_skip_streak` (max-cadence refire). FIX: **outcome surface** `Dreamer.last_dream_outcome = {"phase": ran|skipped|error, "side_output": bool}`, pre-cleared at entry (None = did not conclude), stamped at all 6 terminal sites; the tick classifies by the surface, strings remain only as a mocked-Dreamer fallback (extended with the error shapes). Mirrors `last_bench_result`/`last_self_play_status`. The lexical-proxy inversion (§4BD-b rule 4), not a third string patch.
+- **B-M2 MAJOR — self-play failure ledgered as "session ran".** All internal failures return narrative strings without raising; the tick recorded success on any non-raise. FIX: gate the ledger row on `getattr(dreamer, 'last_self_play_status', None) is not None` — stamped ONLY at sim conclusion on a per-tick-fresh Dreamer, so None ⟺ never concluded. A CONCLUDED FAILURE still counts as a session (outcome-gated learning needs the failure arm). Zero rows on persistent breakage → the liveness alarm can finally fire.
+- **B-M3 MAJOR — the load-bearing phase-3 idle-clock reset was pinned by NOTHING.** Deletion survived 226+ tests (every existing pin asserts phases must NOT reset the clock; none that phase 3 MUST). "Pin the deletion" applied: executed pin drives a deep-idle self-play and asserts the clock advanced.
+- **B-M4/C-M17 MAJOR — `is_read_only = True` sentinel identity unpinned.** All 15+ consumer gates correctly use `is True`; `is_read_only = 1` flips every simulation guard at once (calibration/selfhood/metacog/escalation/experiments, §4J regression) and survived 217+ tests. Pinned by identity assert through the live isolate.
+- **B-MINOR-5 — entropy-skip backoff dead**: the bare entropy message contains "digests", so the `"digest"` side-output probe always matched → streak never advanced on that path (the 2026-07-29 churn fix was silently inert there). Fixed at the source (side_output computed from the actual counts) + fallback probe narrowed to `"project digest"`.
+- **B-MINOR-6 — crash-truncated ledger tail** merged with the next append into one unparseable line; read_since skipped it → first post-restart record invisible to digest/poller consumers. FIX: `ActivityLog.record` heals a newline-less tail with a leading "\n".
+- **A-F3 MINOR — scheduled-task and job-resume `handle_chat` turns ran unmarked** (main.py) → same mid-turn consolidation/execv exposure. FIX: `_mark_foreground` try/finally brackets at both sites. The job-resume bracket is pinned via `_resume_after_job`; the scheduled site is nested in `lifespan` (not unit-drivable) — same 4-line bracket, eyeball-verified, honest gap noted.
+- **A-F4 MINOR — 6 of 15 phases never appended to `_idle_ran`** (PRM, router, tidy, selfhood-narrative, stale-questions, workspace-narrative) → the tick-end summary and the #40 "no phase ran" diagnostic lied for exactly the phases it was built to watch. FIX: appends at each cooldown-commit point (dream convention). Pinned via the roll-less tidy phase + caplog.
+- **A-F5 half-REFUTED**: `_aa_code_gen` "main-targeted" — it passes `is_background=True` with exact parity to `default_code_generator` (project_advancer.py:614), and the parity is deliberate (comment). No change. Stale mid-tick `idle_secs` remains documented-not-fixed.
+
+### Lens C survivors → driven pins (all adopted into tests/test_bio_r1_fixes.py)
+M10 skip-streak backoff (token pin walked through by the mutant — live demo of the disease), M11 `_bio_roll` deterministic override (was killed only by an out-of-selector file), M13 write-side severity coercion (shadowed by read-side re-coercion), M15 600-char summary cap (shadowed by the 16KB line cap — probe BETWEEN the caps), M17 sentinel identity, M19 isolate `trajectory_collector is None`.
+
+### Verification
+- **tests/test_bio_r1_fixes.py: 24 pins**, all driving real code (tick-level via the watchdog harness, real-Dreamer surface stamps via the trajectory-seeds fixture, route-level via the projects-API TestClient, `_resume_after_job` driven directly).
+- **Mutation batch: 20/20 KILLED + comment-only control SURVIVED**, per-mutant restore + baseline-shasum verified, final tree pristine. Includes both preamble reverts, the surface-ignored/fallback-blind/probe-revert trio, both bracket halves (+1/−1), the tail-heal revert, and all six lens-C survivors.
+- Localized neighbors: 946 passed / 1 skipped / 0 failed (all token-pin files intact).
+- Full suite: 14230 passed, 17 skipped, 0 failed (12m28s).
+
+### Deferred / documented (candidates for R2 lenses to re-check)
+- B-M7 ledger rotation (577KB/5wk, readers bounded, in-source acknowledged).
+- B-M8 `record_scheduled_result` classifies by exception-shape only (verifier verdict unconsulted; content rides the summary).
+- B-M9 shared ReadBudget window when a user turn and an idle advance overlap (~3.5 turns/day, opt-in flag).
+- Lens A documented-not-fixed: phase-2.9 unconditional finally, `/api/generate` counters, dead band (3600,7200], organic self-play/dream unbounded await, stale mid-tick `idle_secs`.
+- Test hygiene (lens C): `test_selfplay_bug_fixes.py:95` reseeds process-global RNG without restore; `challenge_templates._LAST_TEMPLATE_KEY` order-coupling; `test_bio_time_scale.py::_agent()` re-implements `__init__` flag parsing; selector blind spot — `test_bio_time_scale.py` escaped the name+symbol in-scope union.
+- Dream surface stamps at the freshness-skip and final-except sites degrade gracefully to the (now error-aware) string fallback if deleted — belt unpinned, suspenders pinned.
+
+### §4CB Round 2 (2026-08-20) — the thirteenth instance: the codebase plants the value that defeats the fix
+
+Two lenses on fresh copies (bio2a fix-attack, bio2b convergence sweep) against the R1 anchors. Lens B's verdict: NOT CLEAN. Lens A's verdict: "the R1 pattern held" — thirteenth consecutive round where the worst defect sits inside the previous round's fix.
+
+**A-MAJ-1 (the headline) — R1's B-M2 identity gate was defeated by a value the codebase itself plants.** The R1 comment claimed "this Dreamer is freshly constructed per tick, so None ⟺ never concluded" — false on the tick's own counterfactual arm: `run_counterfactual_batch` stamps `last_self_play_status = ""` on the SAME Dreamer before each replay; a raising replay `continue`s with `replayed=0`, the slot falls through to fresh self-play on the poisoned instance, a non-concluding run keeps `""`, and `"" is not None` minted exactly the false "session ran" row B-M2 shipped to eliminate. Driven end-to-end by lens A with the real counterfactual code. FIX (both sides): `synthetic_self_play` now pre-clears `last_self_play_status = None` next to the other outcome surfaces (the block's own comment already said "mirrors the caller's pre-clear" — the mirror was missing), and the consumer gate is TRUTHINESS (`""` falsy) instead of `is not None`. Both mutation-killed separately.
+
+**A-MAJ-2 — the surface has a third outcome: RAISE.** All six stamps sit on return sites; an escaping raise leaves the surface None and skips the classification block wholesale — a permanently RAISING dream (unguarded `pretty_log` inside dream() under OSError 28 — the exact production failure A-F2 cites) refired at base cadence forever with the streak frozen. FIX: the phase-2 except increments `_dream_skip_streak` (deliberately without referencing `dreamer` — unbound when `Dreamer(ctx)` itself raised).
+
+**B-MAJ-1/2 — the A-F2 class had TWO unfixed instances.** R1 fixed preamble-outside-try in phases 2 and 3; reflection (2.5, production-wired) and post-mortem (2.5c, opt-in) had the identical shape — driven: a raising announce escaped the tick with the anchor at datetime.min → every-tick refire + full idle-layer starvation while the watchdog reported alive. FIX: same recipe (anchor hoisted, preamble inside try), one pin covering both. Also A-MIN-9: the `from .dream import Dreamer` imports moved inside the trys (first-import failure = same identity), phase 3b already self-imports.
+
+**Pin gaps lens A proved by driving lookalikes through all 24 R1 pins:**
+- A-MAJ-3: `isinstance(side_output, bool)` was vacuous — hardcoding `True` (which re-disarms the backoff on the surface path, i.e. B-MINOR-5 reborn) passed everything. Fixed: `is False` asserted + a driven True-case (patched `_consolidate_episodes`). Both directions mutation-killed (R2M6/R2M7).
+- A-MAJ-4: the scheduled-task bracket was the one wholly unpinned R1 fix (full revert passed 126 tests). Fixed structurally: extracted `_handle_chat_foreground(context, body, request_id)` in main.py, used by BOTH the scheduled site and `_resume_after_job`; the helper is executed-pinned directly (mark-during/unmark-after/unmark-on-raise). Honest residual: the scheduled CALL SITE is nested in `lifespan` and remains unpinnable without driving the app lifecycle — reverting that one line to a bare `handle_chat` call is invisible to tests; documented here as the slice's known unpinned line (eyeball-verified; the helper makes the right call the path of least resistance).
+- A-MAJ-5: 5 of 6 new `_idle_ran` appends unpinned — the §4Q label-list pin now names all 15 phase labels (kills the M3 lookalike).
+
+**Convention conflict resolved (A-MIN-6):** R1's PRM append sat on the consumers-off branch — a deliberate months-long no-op — contradicting §4Q's "report only when it WORKS" pin. The append moved to the working branch only (fingerprint check = work); mutation R2M12 confirms the 4Q pin now guards it.
+
+**MINORs fixed:** three after-anchor skip-line `pretty_log`s (PRM consumers-off, PRM corpus-unchanged, router corpus-unchanged) → `_safe_pretty_log` (a raise there escaped the tick); bench loud-cancel now clears `_bench_drain_banks` (was: /api/health served a stale bank filter until restart — pinned in test_bench_drain_4bo); watchdog tick handler logs exception TYPE + traceback (bare `str(e)` of an OSError logged nothing); dead `_rss_over_since = "pending"` write removed; learning_health caveat corrected ("dream logs only cycles that did consolidation work — a zero can mean quiet OR erroring"); `last_dream_outcome` entry pre-clear pinned (stale-verdict-on-raise, R2M11).
+
+**Verified sound by lens A (attacks that failed):** tail-heal vs all three watermark attacks; no bracket double-marking or self-deadlock (parking applies only to `is_background` calls); `max(0,·)` clamp; phase-3 re-raise lands in the watchdog handler and the loop survives; §4Q/watchdog pins still mean what they claim. **Lens B verified:** EXPECT_PERIODIC alarm reachable end-to-end with the new no-rows-on-failure semantics; all six bracket sites try/finally balanced (no new starvation direction); documented-not-fixed items none worse than documented; dream stamps' unpinned sites degrade to the error-aware fallback as designed.
+
+**Deferred (documented, not fixed):** foreground leak residual (a future leaked +1 starves the idle layer with only DEBUG-level absence — the anti-leak ceiling exists only on the BG-call side); heal_missing_twins tick-wiring pinned only by token (lens B M-MIN-4); false "DEAD dream" possible on a fully-quiet ≥24h box (freshness-skip arithmetic vs the liveness registry — pre-existing); lens C's R1 test-hygiene list.
+
+### Verification (R2)
+8 new pins (32 total in test_bio_r1_fixes.py) + §4Q label-list extension + bench-cancel assert; **12/12 R2 mutants KILLED + comment-only control SURVIVED** (per-mutant restore, tree pristine). Localized: 1046 passed / 1 skipped / 0 failed. Full suite: 14238 passed, 17 skipped, 0 failed (12m37s).
+
+### §4CB Round 3 + CONVERGED (2026-08-20) — the streak breaks at the code level; the residue was all verification
+
+Two lenses on fresh copies (bio3a attacking the R2 fixes with 15 mutants, bio3b running the whole-slice class sweep + 7 spot-mutants of its own choosing).
+
+**Lens A: no live defect in the R2 fixes** — every driven attack on the seven R2 changes failed (falsy-but-concluded statuses impossible: all six `status_str` sites are non-empty f-strings; the CF-concludes trace is gated behind `_ran_cf`; bench self-imports its own Dreamer; no raise-path double-count; helper return-shape faithful on every non-streaming path; no self-deferral). The fourteenth instance, to the extent it exists, is a VERIFICATION gap the R2 fix created: tightening the gate to truthiness made "concluded ⟹ truthy" newly load-bearing, and only a token pin (`assert "…= str(status_str)" in src`) guarded it — a tail-clear mutant (every real session reads None → ledger silent, counterfactual classify() gets "UNKNOWN" forever) **walked through 356 tests**. Plus three smaller pin gaps: the streak pin couldn't tell increment from set-to-1 (backoff capped at 2× instead of 4×); the consumers-off no-append and the three `_safe_pretty_log` conversions were revertible unseen.
+
+**Lens B verdict: SLICE VERDICT: CLEAN.** Independent class sweep across all 16 phases + both watchdogs + activity consumers: preamble-outside-try ZERO remaining, string-proxy outcome classification ZERO, success-rows-on-failure ZERO, anchor-not-advanced-on-raise ZERO, `_idle_ran` complete. 1,303 slice tests green on the pristine copy. Its 7 self-chosen spot-mutants: 3 killed; 4 survivors all MINOR-grade or exactly the documented residuals (raw-log revert = lens A's finding, now pinned; phase-1 early-return comment-only contract; defensive CancelledError re-raise; the lifespan `ok=True` call-site residual — experimentally confirmed to be the same one-line unpinnable site as A-MAJ-4's).
+
+**R3 closure pass:** 4 executed pins — concluded-run truthy-status identity (via the real synthetic_self_play harness), raise-streak 2→3 increment, consumers-off branch absent from the idle-cycle summary (caplog), consumers-off skip-line raise containment (selective raiser). Plus two wording fixes (the defer lines claimed "a user request is active" for sibling-autonomous collisions — now "a user or autonomous turn is in flight") and the stale "self-play is LAST" comment (phase 3b follows it now). **4/4 closure mutants KILLED + control SURVIVED** (conclusion-stamp clear, streak hardcode, append re-add, raw-log revert), tree pristine.
+
+**The §4CB arc (3 rounds):** R1 six MAJORs (advance-route foreground, preambles outside trys ×2, dream/self-play failure→success ledgering via string proxies, unpinned clock reset, unpinned sentinel) + 20 mutants killed. R2: the counterfactual `""` defeating R1's own identity gate (13th consecutive fix-carries-the-defect instance), the raise-path streak freeze, the SAME preamble class in reflection/postmortem, three pin gaps + 12 mutants killed. R3: code holds; the last gaps were pins, closed with 4 more kills. **36 mutants killed + 3 controls survived across the slice; 36 pins in tests/test_bio_r1_fixes.py + extended §4Q label pin + bench-cancel pin.**
+
+**What ended the streak here vs. the six-round slices:** the fixes were consumer-side identity checks on producer-stamped surfaces (outcome dicts, conclusion-only stamps) rather than new text/property probes — the R2/R3 defects were in the CONTRACT's unpinned half, not in new proxy logic. Same conclusion as §4BY/§4BZ/§4CA: rounds end when checks become identities and both halves of each identity are executed-pinned.
+
+**Deferred (final list, documented):** the lifespan scheduled call-site one-liner (unpinnable without driving the app lifecycle; helper makes the right call the default); ledger rotation; record_scheduled_result exception-shape classification (SM7); shared ReadBudget window; foreground-leak DEBUG-only absence; heal_missing_twins token-only tick wiring; quiet-box false "DEAD dream" corner; organic dream/self-play unbounded awaits; phase-2.9 unconditional finally; /api/generate unmarked (bypasses handle_chat); dead (3600,∞) band; lens C's R1 test-hygiene list (RNG reseed, `_LAST_TEMPLATE_KEY` coupling, `test_bio_time_scale` selector blind spot).
+
+### Verification (R3)
+4 new pins (36 total) + 2 wording fixes + 1 comment fix; 4/4 mutants killed + control survived. Localized: 1069 passed / 1 skipped / 0 failed. Full suite: 14242 passed, 17 skipped, 0 failed (11m35s). Agent redeployed + health-checked after the run.
+
+## §LOG — Operator-stream logging audit + fix pass (2026-08-20)
+
+Operator asked: do we log everything, do the icons make sense, does the monitoring human get the best possible output? Two analysis lenses (716 pretty_log sites AST-inventoried across 48 files; 16 days / 67k lines of live mirror measured; every icon render-tested). Verdict: mechanics excellent (0 alignment breaks in 6,967 real lines, frames 748/748 balanced, collapse caught every burst, ERROR genuinely reserved), semantic layer had seven gaps. All fixed same day.
+
+### The seven fixes (each mutation-killed)
+- **LOG-1** agent.py: pre-frame-era bare `print()` `<think>` dump DELETED — it bypassed the stdout lock (mid-line splicing), the durable mirror, and `_redact_log`; the modern streaming 💭 path already carries the content, and the web UI's `PLANNER MONOLOGUE:` logger.info feed stays.
+- **LOG-2** utils/logging.py: `_mirror` now receives the delta the console computed instead of re-calling `_format_delta` — the second STATEFUL read advanced the SYSTEM anchor, so every SYSTEM step-duration in the "complete" durable record was ~+0.00s (max mirror SYSTEM delta in 7 live days: +0.08s vs +2700s on console). All five call sites pass it through.
+- **LOG-3** agent.py finalize: `Final Reply` 🤖 logged beside Turn Outcome — the turn's single most important artifact previously appeared NOWHERE (console head 60 chars, full text in mirror). Resurrects the dead LLM_REPLY icon. Known gap: the streamed-final path bypasses finalize; its client text lands via the trajectory, not this line.
+- **LOG-4** frames: `· user / · sim / · bench` origin marker on BOTH console frame lines (45 of one week's 87 turns were self-play pixel-identical to user turns; origin was mirror-only). End-of-rule placement — the real uConsole parser is loaded and fed the new frames in the pins; Slack/web substring matches unaffected. END stashes origin from BEGIN in `_REQ_STATE`; the mirror END line now carries `origin=` too.
+- **LOG-5** dispatch: one `Tool Call` 🎬 line per executed tool (name + compact args; dup-collapsed reads get none) — before, a tool was visible only if it self-logged (`yt_download` logged NOTHING); unknown-tool rejections now emit a WARNING instead of a silent strike; the three strike lines (Execution/Transient Fail, Tool Warning) promoted to WARNING so their previews get the 240-char failure budget (they died at 60, exactly on the why).
+- **LOG-6a** tick: `Idle Cycle` 📡 console line per work-producing idle cycle (the summary was logger.info → file-only; 30-45 min console silences made a wedged loop and a quiet night indistinguishable). logger.info kept for existing consumers/pins.
+- **LOG-6b** staleness: per-FILE 1h warn-LEVEL cooldown on top of per-digest dedup. First design (suppress repeats) was caught by the standing R33/R34 pins in test_prm_online_update_loudness.py — the full suite failed it: suppression re-created the rejected path-keyed dedup (R34: the edit/restore/edit cycle must still speak) and my cooldown stamp ran before the emit (R33: a raising sink must not silence). Reconciled design: every distinct divergence still logs and returns, but repeats within the hour log at INFO — only the first divergence per file per cooldown is a WARNING (95 near-identical WARNINGs in 16 days was the #1 warning, training the operator to ignore the color). The injected sink now takes a `level` kwarg (signature-detected, so the R34 pin's bare list.append sink still works); both production lambdas pass it through.
+- **LOG-7** icons/titles: metacog's 10 literal glyphs registered as `Icons.METACOG_*` with the three collisions resolved (arbiter 🧮→🥇, replan 🔀→🚦, default 🧠→🫧) and both client ICON_CLASS maps extended (app.js coverage enforced by the existing drift test; uConsole coverage pinned new); bridged stdlib warnings title `agent·module` instead of anonymous `agent` (230 live warnings, incl. spawn_bg task deaths); `Schedule/Watch Error` ❌ instead of default 🔹; `Auto Memory Skip` 🛑→⏩; `Failure Cap`/`Strike Cap`/`Think-Loop Halt` promoted to WARNING; the three deferral lines ⏳ (waiting-will-retry, not skipped) — resurrects REQ_WAIT; docs/logging.html gained the §LOG section.
+
+### Verification
+tests/test_logging_stream_fixes.py: 20 pins (mirror-delta behavioral + read-once mechanism, both frame origins + REAL turnstatus parser fed the new frames + no-origin unchanged, mirror END origin, bare-print deletion pin, Final Reply via REAL handle_chat (bench harness), dispatch line + unknown-tool + strike-level via the dispatch-extraction harness, Idle Cycle via the tick harness, staleness cooldown 4 pins (level sequence, re-arm, raising-sink-stays-loud, same-digest dedup), bridge title, metacog identity pins incl. collision-with-others check). **Mutation batches: 12/12 + 4/4 (staleness redesign, two-sided level mutants) KILLED + comment-only control SURVIVED**, per-mutant restore, tree pristine. One stale token anchor updated (test_ghostlog_viewer mirror-before-collapse pin — law unchanged, call text gained `delta=`). Localized: 447+523 passed. Full suite: 14262 passed, 17 skipped, 0 failed (12m33s). One interface cache-bust bump (app.js 10.1→10.2 + coupled matrix_graph, recorded) after the guard caught the app.js edit.
+
+### Found-not-fixed (documented)
+- Pre-existing test-order contamination: `test_critic_async.py` before `test_auth_rejection_logging.py` → 16 "no current event loop" failures (never occurs in alphabetical suite order; neither file touched by this pass).
+- Lens findings deferred: `prefill cache`/`llm request` per-turn plumbing demotion (clients already blacklist as ticker noise); ▼/▲ section markers spend 2 lines per 1 (single section type, 463×); `Verifier` 46-site mega-title; 🔍/🔎 and 🌐/🌎 confusable pairs + ten book/paper glyphs; 303 `except: logger.debug` handlers dark in production (+ 304 `except: pass`); self-play mining internals ≈22% of WARNINGs (candidates for INFO+FAIL); boot `Resolved Config` truncated at 60 on the live view (full copy in mirror + last_config.json + /api/health — deliberate); m3 delta-format edge cases (+100000s column break, negative render — 0 live occurrences); launcher header drift (--verbose/--max-context/--postmortem claims vs exec line); stream-path Final Reply gap (above).

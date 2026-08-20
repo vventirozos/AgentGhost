@@ -141,14 +141,22 @@ async def test_hydrate_context_fans_out_in_parallel(bus, mocks):
 @pytest.mark.asyncio
 async def test_hydrate_context_actually_concurrent(bus, mocks):
     """hydrate_context must use asyncio.gather, not sequential awaits."""
-    timings = {"started": 0, "finished": 0}
-
-    real_to_thread = asyncio.to_thread
+    # ⚠ COUNTS OVERLAP, does not time it. This asserted `elapsed < 0.16` on
+    # an operation that takes ~0.10s — 1.6x of headroom, which held in
+    # isolation and flaked under the full 13.8k-test suite (R5). Wall-clock
+    # bands are the wrong instrument for a concurrency property twice over:
+    # too tight and they flake on a loaded box, too loose and they pass on a
+    # sequential implementation. Peak overlap IS the property, and it is
+    # exact — a sequential implementation can never exceed 1.
+    timings = {"started": 0, "finished": 0, "live": 0, "peak": 0}
 
     async def slow_to_thread(func, *args, **kwargs):
         timings["started"] += 1
+        timings["live"] += 1
+        timings["peak"] = max(timings["peak"], timings["live"])
         await asyncio.sleep(0.05)
         result = func(*args, **kwargs)
+        timings["live"] -= 1
         timings["finished"] += 1
         return result
 
@@ -158,12 +166,17 @@ async def test_hydrate_context_actually_concurrent(bus, mocks):
         await bus.hydrate_context("anything")
         elapsed = time.monotonic() - t0
 
-    # Three concurrent 50ms fetches ≈50ms, plus ONE post-fusion credit pass
-    # (also via to_thread, sequential after formatting) ≈50ms → ~100ms total.
-    # A sequential implementation would be >=200ms.
-    assert elapsed < 0.16, f"hydrate_context appears sequential ({elapsed:.3f}s)"
+    # Three fetches must be in flight AT THE SAME TIME; the fourth is the
+    # post-fusion credit pass, which is sequential after formatting by design.
+    assert timings["peak"] >= 3, (
+        f"hydrate_context awaited its fetches sequentially — peak overlap "
+        f"was {timings['peak']}, expected 3 concurrent")
     assert timings["started"] == 4
     assert timings["finished"] == 4
+    # Backstop only, deliberately loose: catches a pathological regression
+    # (e.g. an accidental per-fetch retry loop) without re-introducing a
+    # timing race on a loaded machine.
+    assert elapsed < 1.0, f"hydrate_context took {elapsed:.3f}s"
 
 
 @pytest.mark.asyncio

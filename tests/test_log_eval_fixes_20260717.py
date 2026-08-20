@@ -90,7 +90,7 @@ def _agent_confirming_at(conf):
         llm_client = object()
 
         async def verify_claim(self, claim, evidence, context="",
-                               *, high_stakes=False, trace=None):
+                               *, high_stakes=False, trace=None, **_kw):
             return VerifyResult(verdict=VerifyVerdict.CONFIRMED,
                                 confidence=conf, reasoning="looks right")
 

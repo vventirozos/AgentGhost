@@ -168,7 +168,10 @@ def test_the_mirror_is_still_complete():
     """⚠ Mirror-collapse was considered and REJECTED: several instruments
     count mirror lines. The archive must keep recording every occurrence."""
     src = (REPO / "src" / "ghost_agent" / "utils" / "logging.py").read_text()
-    i_mirror = src.index("_mirror(req_id, title_str, full, level)")
+    # §LOG-2 (2026-08-20): the call gained `delta=delta` (pass the console's
+    # delta through instead of a second stateful _format_delta read). The
+    # LAW this pin guards — mirror BEFORE collapse — is unchanged.
+    i_mirror = src.index("_mirror(req_id, title_str, full, level, delta=delta)")
     i_collapse = src.index("if _collapse_enabled():")
     assert i_mirror < i_collapse, (
         "collapse now runs before the mirror — the archive is no longer "

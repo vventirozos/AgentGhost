@@ -239,6 +239,22 @@ def job_ttl_s() -> float:
     return _env_float("GHOST_SANDBOX_JOB_TTL_S", 45 * 60.0, 60.0, 6 * 3600.0)
 
 
+def job_max_log_bytes() -> int:
+    """Hard ceiling on a SINGLE job's log file, in bytes.
+
+    A promoted job writes its log for its whole TTL with no size cap; a fast
+    writer (`yes`, a wget/curl loop) is "progressing", so it promotes and then
+    fills the host disk (measured 100s of GB across budget + the 45-min TTL).
+    Crossing this ceiling EXPIRES the job through the SAME _kill_pgroup +
+    STATE_EXPIRED path the TTL uses. The live log is NEVER truncated in place —
+    the writer holds the file offset, and deleting/rewinding an open file it is
+    still writing to corrupts it; reads already head+tail via _LOG_READ_CAP.
+
+    Default 1024 MB; a value of 0 disables the cap. Bounded to [0, 64 GB]."""
+    mb = _env_float("GHOST_SANDBOX_JOB_MAX_LOG_MB", 1024.0, 0.0, 65536.0)
+    return int(mb * 1024 * 1024) if mb > 0 else 0
+
+
 def progress_window_s() -> float:
     """How recently the command must have shown progress to earn promotion.
     Default 120 s; bounded to [10 s, 1 h]."""
@@ -442,9 +458,29 @@ class SandboxJobSupervisor:
         every entry: a container recreate invalidates every pid, and a
         same-numbered pid in the NEW container is an unrelated process — so a
         generation mismatch means the job is gone, never "kill that pid"."""
+        # ⚠ id + StartedAt, not id alone — see the twin in services.py.
+        # A graceful stop→resume keeps the id but resets the pid counter, so
+        # a bare-id stamp let the TTL reaper aim `_kill_pgroup` (a
+        # SESSION-wide kill) at a recycled pid within its 45-min window
+        # (§4BW CRITICAL-1). StartedAt changes on every restart; a legacy
+        # id-only stamp mismatches this form and `_generation_ok` reads it
+        # dead — the safe direction for a kill primitive.
         try:
-            cid = getattr(getattr(self.sandbox, "container", None), "id", None)
-            return str(cid) if cid else None
+            container = getattr(self.sandbox, "container", None)
+            cid = getattr(container, "id", None)
+            if not cid:
+                return None
+            started = ""
+            try:
+                attrs = getattr(container, "attrs", None) or {}
+                started = (attrs.get("State", {}) or {}).get("StartedAt", "")
+                if not started and hasattr(container, "reload"):
+                    container.reload()
+                    attrs = getattr(container, "attrs", None) or {}
+                    started = (attrs.get("State", {}) or {}).get("StartedAt", "")
+            except Exception:  # noqa: BLE001 — attrs/reload may be stubbed
+                started = ""
+            return f"{cid}:{started}" if started else str(cid)
         except Exception:  # noqa: BLE001 — a mock may refuse attributes
             return None
 
@@ -1030,7 +1066,18 @@ class SandboxJobSupervisor:
                                    project_id=project_id,
                                    cleanup_paths=cleanup_paths,
                                    identity=identity)
-        except Exception:
+        except BaseException:
+            # ⚠ BaseException, NOT Exception (§4BW CRITICAL-2). This guard's
+            # whole job is "kill the detached process on any exit from the
+            # launch→registration window" — but the window is dominated by
+            # `_supervise`'s poll-loop SLEEP, so an interrupt (KeyboardInterrupt
+            # / SystemExit from a Ctrl-C, a pytest timeout, a killed batch)
+            # lands here far more often than an ordinary Exception. Those are
+            # BaseException and used to sail straight through, leaking an
+            # immortal detached process with no row and no reaper — the source
+            # of the week-old busy-loop orphans on this box. The re-raise
+            # below preserves the interrupt.
+            #
             # EVERYTHING from here to the registry write runs with a live
             # detached process and no row tracking it. A docker fault (wedged
             # daemon, container restart, a raise from the registry save) would
@@ -1068,6 +1115,7 @@ class SandboxJobSupervisor:
         # the window — but the list is tiny (one per 30 s) and keeping it
         # whole makes the comparison obvious.
         io_samples = []
+        maxlog = job_max_log_bytes()
         promote_after = min(float(promote_after_s()), budget)
         # A probe lands exactly at the promotion threshold, so the decision
         # is taken at ~90 s rather than at the next 30 s tick after it.
@@ -1085,6 +1133,18 @@ class SandboxJobSupervisor:
             now = time.monotonic()
             if size > last_size:
                 last_size, last_growth = size, now
+            if maxlog and size > maxlog:
+                # Runaway writer within the budget window (before it even
+                # promotes): kill now rather than let a fast producer fill the
+                # host disk for the rest of the budget. Same cap as the reaper.
+                pid = pid or self._read_pid(jid) or launcher_pid
+                pretty_log(
+                    "Job Log Cap",
+                    f"{jid} exceeded the {maxlog // (1024 * 1024)}MB job-log "
+                    f"cap mid-run — killed: {str(cmd)[:70]}",
+                    level="WARNING", icon=Icons.STOP)
+                return self._kill_and_return(jid, pid, 124,
+                                             cleanup_paths=cleanup_paths)
             if now - started >= budget:
                 break
             if now >= next_probe:
@@ -1342,6 +1402,31 @@ class SandboxJobSupervisor:
                     self._cleanup_files(jid, entry=entry)
                     changed.append(entry)
                     dirty = True
+                    continue
+                maxlog = job_max_log_bytes()
+                if maxlog and self._log_size(jid) > maxlog:
+                    # Runaway writer: a fast producer promotes (it is
+                    # "progressing") and would otherwise write for its whole
+                    # TTL, filling the host disk (measured 100s of GB). Expire
+                    # it exactly like the TTL does — probe BEFORE signalling (a
+                    # generation match is not proof this pid is still the job's
+                    # process). The live log is kept, NOT truncated in place:
+                    # the writer holds its offset, and _read_log already
+                    # head+tails it for the model.
+                    if self._pid_state(entry.get("pid")) is not False:
+                        self._kill_pgroup(entry.get("pid"))
+                    entry["state"] = STATE_EXPIRED
+                    entry["finished_at"] = time.time()
+                    entry["expired_reason"] = "log_size_cap"
+                    self._cleanup_files(jid, entry=entry)
+                    changed.append(entry)
+                    dirty = True
+                    pretty_log(
+                        "Job Log Cap",
+                        f"{jid} exceeded the {maxlog // (1024 * 1024)}MB "
+                        f"job-log cap and was killed: "
+                        f"{str(entry.get('command'))[:70]}",
+                        level="WARNING", icon=Icons.STOP)
                     continue
                 if time.time() >= float(entry.get("deadline_at") or 0):
                     # Probe BEFORE signalling. A generation match only says

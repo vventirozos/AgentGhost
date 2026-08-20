@@ -1407,3 +1407,37 @@ def test_promoted_run_with_no_output_is_not_reported_as_an_error(
     assert job is not None
     assert "SYSTEM ERROR" not in out
     assert out == "(no output yet)"
+
+
+def test_an_interrupt_during_supervise_still_kills_the_launched_process(
+        sup, monkeypatch):
+    """§4BW CRITICAL-2. `run()`'s launch→registration guard was
+    `except Exception`, but the window it protects is dominated by
+    `_supervise`'s poll-loop sleep — so an interrupt (KeyboardInterrupt from
+    a Ctrl-C, a pytest timeout, a killed mutation batch) lands there far more
+    often than an ordinary Exception, and BaseException slipped straight past
+    the kill: an immortal detached process with no row and no reaper. That is
+    the source of the week-old busy-loop orphans on this box.
+
+    Mutation witness: with `except Exception` the KeyboardInterrupt
+    propagates and `_kill_pgroup` is NEVER called — this test fails."""
+    killed = []
+    monkeypatch.setattr(sup, "_launch", lambda jid, kw: 4242)
+    monkeypatch.setattr(sup, "_read_pid", lambda jid: 4242)
+    monkeypatch.setattr(sup, "_kill_pgroup",
+                        lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(sup, "_cleanup_files",
+                        lambda *a, **k: None)
+
+    def _interrupt(*a, **k):
+        raise KeyboardInterrupt("Ctrl-C during the quiet poll phase")
+
+    monkeypatch.setattr(sup, "_supervise", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        sup.run("while :; do sleep 1; done", timeout=5.0,
+                workdir="/workspace")
+
+    assert killed == [4242], (
+        "an interrupted run left its detached process group alive — this is "
+        "how the immortal orphans are minted")

@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=9.4';
+import * as matrixGraphFace from './matrix_graph.js?v=10.2';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -182,6 +182,19 @@ const ICON_CLASS = {
     '🌙': 'plan',     // DREAM
     '🫀': 'idle',     // HEARTBEAT — biological watchdog, routine
 
+    // --- metacognition (§LOG-7 — registered in Icons; were literal
+    // glyphs in metacog_log.py that fell through to the 'think' floor) ---
+    '🫧': 'plan',     // METACOG (generic uplift)
+    '🌱': 'plan',     // METACOG_BOOT
+    '📊': 'plan',     // METACOG_SUMMARY
+    '📈': 'plan',     // METACOG_CONF
+    '📐': 'plan',     // METACOG_CALIB
+    '🥇': 'plan',     // METACOG_ARBITER
+    '🚧': 'plan',     // METACOG_VALID
+    '💻': 'plan',     // METACOG_HOST
+    '🚦': 'plan',     // METACOG_REPLAN
+    '🚪': 'plan',     // METACOG_GATE
+
     // --- misc ---
     '🫥': 'accent',   // MODE_GHOST
     '🔥': 'accent',
@@ -229,23 +242,33 @@ let currentAccumulatedContent = "";
 // "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
 // Distinct from currentTaskId, which is the interface proxy's stream handle.
 let currentReqId = null;
+// The text of the turn this tab most recently sent — the only identifier
+// available when durable sessions are off. See `_resolveOwnTurnId`.
+let _lastSentUserText = '';
 let currentThinkingInterval = null;
 let currentTTSMutedLength = 0;
 
 const SEND_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
 const CANCEL_SVG = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="9" x2="15" y2="15"></line><line x1="15" y1="9" x2="9" y2="15"></line></svg>`;
 
-function toggleSendButtonUI(isProcessing) {
+function toggleSendButtonUI(isProcessing, stoppable = true) {
     // Every request path (chat, voice, resume) ends through here with
     // false — one idempotent hook covers all ticker teardown.
     if (!isProcessing) stopTurnTicker();
     if (sendBtn) {
         if (isProcessing) {
-            sendBtn.innerHTML = CANCEL_SVG;
-            sendBtn.classList.add('send-btn-cancel');
+            // ⚠ `stoppable` distinguishes a turn Stop can abort from an
+            // upload/workspace operation that merely holds the turn flag.
+            // Making those visible (F14) gave them a live-looking Stop
+            // button wired to nothing, because the handler needs
+            // `currentChatController` (R3 lens B). Show BUSY, not STOP.
+            sendBtn.innerHTML = stoppable ? CANCEL_SVG : SEND_SVG;
+            sendBtn.classList.toggle('send-btn-cancel', !!stoppable);
+            sendBtn.disabled = !stoppable;
         } else {
             sendBtn.innerHTML = SEND_SVG;
             sendBtn.classList.remove('send-btn-cancel');
+            sendBtn.disabled = false;
         }
     }
 }
@@ -457,6 +480,15 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pageshow', (e) => {
     if (e.persisted && (!ws || ws.readyState !== WebSocket.OPEN)) {
         connectWebSocket();
+    }
+    // Re-arm the artifact observer on a bfcache restore. It is only
+    // observed once at module init, so any teardown left it dead for the
+    // life of the restored page (see the pagehide handler).
+    if (e.persisted) {
+        try {
+            const el = document.getElementById('chat-log');
+            if (el) chatObserver.observe(el, { childList: true, subtree: true });
+        } catch (err) { /* ignore */ }
     }
 });
 
@@ -1192,7 +1224,15 @@ async function sendFeedback(div, signal, retryReqId) {
             // 404 = the trajectory can flush moments AFTER the stream ends
             // (the agent records it post-semaphore) — one delayed retry
             // recovers exactly the tap-the-instant-it-lands case.
-            if (r.status === 404 && !div.dataset.fbRetried) {
+            //
+            // 429/5xx too (review C3): a 503 is the agent RESTARTING, i.e.
+            // the exact window a deploy creates, and this path produced
+            // one transient chat bubble and nothing durable — while this
+            // client is the source of HALF the live labels. Slack already
+            // retries these; the web UI silently did not.
+            const _retryable = (r.status === 404 || r.status === 429
+                                || r.status >= 500);
+            if (_retryable && !div.dataset.fbRetried) {
                 div.dataset.fbRetried = '1';
                 div._fbTimer = setTimeout(() => {
                     div._fbTimer = null;
@@ -1373,7 +1413,14 @@ function loadChatState() {
     const saved = safeStorage.get('ghost_chat_history');
     if (saved) {
         try {
-            chatHistory = JSON.parse(saved);
+            // Shape-validate: JSON.parse happily yields a string, a number
+            // or an object, and `chatHistory.push` then throws BEFORE
+            // sendMessage's try block — the composer dies with a
+            // console-only error and no visible cause (R2 lens B). The
+            // bridge setter has always guarded this; the two direct
+            // assignments did not.
+            const _parsed = JSON.parse(saved);
+            chatHistory = Array.isArray(_parsed) ? _parsed : [];
             renderHistoryToLog(chatHistory);
         } catch (e) {
             console.error("Failed to load chat history", e);
@@ -1399,6 +1446,9 @@ function loadChatState() {
 const INFLIGHT_KEY = 'ghost_inflight_turn';
 let reconcilePollTimer = null;
 let resumeLatch = false;        // synchronous re-entry guard (see below)
+// Bounded attempts for the NETWORK-error resume path (the fourth resume
+// trigger, which used to bypass the latch and could retry forever silently).
+let _netResumeTries = 0;
 let inflightHeartbeat = null;   // owner-tab liveness while streaming
 
 // Tab identity: sessionStorage survives same-tab reloads but NOT an iOS
@@ -1417,9 +1467,32 @@ const TAB_ID = (() => {
     } catch (e) { return `tab-${Math.random().toString(36).slice(2)}`; }
 })();
 
+// ⚠ ONE KEY PER TAB. A single shared `ghost_inflight_turn` meant every
+// tab wrote over every other tab's handle and `clearInflightHandle()`
+// deleted it outright — on turn completion, abort, /clear, the resume
+// mismatch drop, the reconcile give-up. Tab 1's heartbeat then correctly
+// stood down, so nothing noticed; if tab 1 was killed mid-turn its reply
+// was unrecoverable, which is the exact recovery this subsystem exists for
+// (R3 lens B). Namespacing is the fix — a tabId GUARD would only move the
+// loss into saveInflightHandle, where tab 2's own turn becomes the casualty.
+function _inflightKey(tabId) {
+    return `${INFLIGHT_KEY}:${tabId || TAB_ID}`;
+}
+
+function _inflightKeys() {
+    const out = [];
+    try {
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(INFLIGHT_KEY + ':')) out.push(k);
+        }
+    } catch (e) { /* private mode — no enumeration */ }
+    return out;
+}
+
 function saveInflightHandle() {
     if (!currentTaskId) return;
-    safeStorage.set(INFLIGHT_KEY, JSON.stringify({
+    safeStorage.set(_inflightKey(), JSON.stringify({
         taskId: currentTaskId,
         sessionId: window.__ghostSessionId || safeStorage.get('ghost_session_id') || null,
         tabId: TAB_ID,
@@ -1431,29 +1504,55 @@ function saveInflightHandle() {
     if (inflightHeartbeat) clearInterval(inflightHeartbeat);
     inflightHeartbeat = setInterval(() => {
         try {
-            const raw = safeStorage.get(INFLIGHT_KEY);
+            const raw = safeStorage.get(_inflightKey());
             if (!raw) return;
             const h = JSON.parse(raw);
-            if (h.tabId !== TAB_ID) return;  // another tab took over
+            if (h.tabId !== TAB_ID) return;  // paranoia: not ours to beat
             h.beat = Date.now();
-            safeStorage.set(INFLIGHT_KEY, JSON.stringify(h));
+            safeStorage.set(_inflightKey(), JSON.stringify(h));
         } catch (e) { /* storage gone — nothing to keep alive */ }
     }, 5000);
 }
 
-function clearInflightHandle() {
-    safeStorage.remove(INFLIGHT_KEY);
+// `handle` names WHOSE key to drop. Adopting an orphan and then calling the
+// bare form would clear our own (empty) slot and leave the orphan on disk to
+// be re-adopted on every visibility change — a loop, not a cleanup.
+function clearInflightHandle(handle) {
+    safeStorage.remove(_inflightKey(handle && handle.tabId));
+    safeStorage.remove(INFLIGHT_KEY);            // legacy single-key handle
     if (reconcilePollTimer) { clearTimeout(reconcilePollTimer); reconcilePollTimer = null; }
     if (inflightHeartbeat) { clearInterval(inflightHeartbeat); inflightHeartbeat = null; }
 }
 
 function readInflightHandle() {
-    try {
-        const raw = safeStorage.get(INFLIGHT_KEY);
-        if (!raw) return null;
-        const h = JSON.parse(raw);
-        return (h && typeof h.taskId === 'string' && h.taskId) ? h : null;
-    } catch (e) { return null; }
+    const parse = (raw) => {
+        try {
+            const h = JSON.parse(raw);
+            return (h && typeof h.taskId === 'string' && h.taskId) ? h : null;
+        } catch (e) { return null; }
+    };
+    // Ours first — a tab always owns its own turn.
+    const mine = safeStorage.get(_inflightKey());
+    const ours = mine ? parse(mine) : null;
+    if (ours) return ours;
+    // Otherwise adopt an ORPHAN: another tab's handle whose heartbeat has
+    // gone stale (that tab was killed). A live tab's handle is left alone.
+    const STALE_MS = 15000;
+    const GC_MS = 10 * 60 * 1000;   // the proxy's replay buffer TTL
+    let best = null;
+    for (const k of _inflightKeys()) {
+        const h = parse(safeStorage.get(k) || '');
+        if (!h) { safeStorage.remove(k); continue; }
+        const age = Date.now() - (h.beat || h.ts || 0);
+        if (age > GC_MS) { safeStorage.remove(k); continue; }
+        if (age > STALE_MS && (!best || (h.ts || 0) > (best.ts || 0))) best = h;
+    }
+    // Legacy single-key handle written before this tab upgraded.
+    if (!best) {
+        const legacy = safeStorage.get(INFLIGHT_KEY);
+        if (legacy) best = parse(legacy);
+    }
+    return best;
 }
 
 // Recreate the thinking bubble + ticker for a resume that outlived the
@@ -1492,8 +1591,34 @@ function _sessionStillCurrent(sid) {
     return cur === sid;
 }
 
-async function reconcileFromSession(sid) {
-    if (!sid) { clearInflightHandle(); return; }
+// One announcement per recovery, and a poll chain that cannot silently die.
+let _reconcileAnnounced = false;
+let _reconcileTries = 0;
+const _RECONCILE_MAX_TRIES = 120;   // ~10 minutes at 5s
+
+function _scheduleReconcilePoll(sid, handle) {
+    if (reconcilePollTimer) return;
+    if (_reconcileTries++ >= _RECONCILE_MAX_TRIES) {
+        addMessage('system', 'Gave up waiting for this turn. If it finished, '
+            + 'switching sessions and back will show the reply.');
+        stopTurnTicker();
+        clearInflightHandle(handle);
+        _reconcileAnnounced = false;
+        _reconcileTries = 0;
+        return;
+    }
+    reconcilePollTimer = setTimeout(() => {
+        reconcilePollTimer = null;
+        reconcileFromSession(sid, handle);
+    }, 5000);
+}
+
+async function reconcileFromSession(sid, handle) {
+    // `handle` is the inflight record this recovery is FOR — which may belong
+    // to another (dead) tab we adopted. Terminal cleanups must name it: a
+    // bare clear drops our own empty slot and leaves the orphan on disk, to
+    // be re-adopted on every visibility change (R4 lens B).
+    if (!sid) { clearInflightHandle(handle); return; }
     // A LIVE turn owns the log, and so does a NEWER session identity.
     // Bail at entry AND after every await — adoption calls
     // renderHistoryToLog, which would detach the bubble a new turn is
@@ -1508,21 +1633,31 @@ async function reconcileFromSession(sid) {
             stillRunning = (td.turns || []).some(
                 (t) => t.session_id === sid && (t.running || t.queued));
         }
-    } catch (e) { /* agent unreachable — retry on next visibility */ return; }
+    } catch (e) {
+        // A hiccup on /api/turns used to return here with NO poll
+        // rescheduled, so the recovery chain died permanently — a thinking
+        // bubble and a running clock, forever, on a visible tab (R2 lens B).
+        _scheduleReconcilePoll(sid, handle);
+        return;
+    }
     if (stillRunning) {
         // The proxy's replay buffer is gone (restart) but the agent is
         // still computing. The reply will land in the session store when
         // it finishes — keep a placeholder and poll.
         ensureAgentBubbleForResume();
-        if (!reconcilePollTimer) {
+        // Announce ONCE per recovery, not once per poll. The old guard
+        // (`if (!reconcilePollTimer)`) conflated "first time" with "no poll
+        // pending", and the timeout body nulls the timer BEFORE recursing —
+        // so a 3-minute turn printed ~36 identical "Ghost is still working"
+        // bubbles (measured under node: 6 in 30s).
+        if (!_reconcileAnnounced) {
+            _reconcileAnnounced = true;
             addMessage('system', 'Ghost is still working on your request…');
-            reconcilePollTimer = setTimeout(() => {
-                reconcilePollTimer = null;
-                reconcileFromSession(sid);
-            }, 5000);
         }
+        _scheduleReconcilePoll(sid, handle);
         return;
     }
+    _reconcileAnnounced = false;
     try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`);
         if (isProcessingRequest || !_sessionStillCurrent(sid)) return;
@@ -1541,11 +1676,21 @@ async function reconcileFromSession(sid) {
                 renderHistoryToLog(chatHistory);
                 saveChatState();
                 addMessage('system', 'Recovered the reply that finished while you were away.');
+                _reconcileAnnounced = false;
+                _reconcileTries = 0;
             } else {
                 addMessage('system', 'The previous request could not be recovered.');
+                // Reset the budget on EVERY terminal exit, not only the
+                // successful one: a later recovery in the same page
+                // otherwise started with whatever was left and gave up
+                // early — or immediately (R3 lens B).
+                _reconcileAnnounced = false;
+                _reconcileTries = 0;
             }
         } else if (res.status === 404) {
             addMessage('system', 'The previous request could not be recovered.');
+            _reconcileAnnounced = false;
+            _reconcileTries = 0;
         } else {
             return; // sessions store hiccup — retry on next visibility
         }
@@ -1556,7 +1701,7 @@ async function reconcileFromSession(sid) {
         currentAgentMessageDiv.remove();
         currentAgentMessageDiv = null;
     }
-    clearInflightHandle();
+    clearInflightHandle(handle);
 }
 
 async function resumeOrReconcileInflightTurn() {
@@ -1583,7 +1728,7 @@ async function resumeOrReconcileInflightTurn() {
         const currentSid = window.__ghostSessionId
             || safeStorage.get('ghost_session_id') || null;
         if (h.sessionId && currentSid && h.sessionId !== currentSid) {
-            clearInflightHandle();
+            clearInflightHandle(h);
             return;
         }
         let state = null;
@@ -1592,19 +1737,40 @@ async function resumeOrReconcileInflightTurn() {
             if (r.ok) state = await r.json();
         } catch (e) { /* proxy down — nothing to do until it returns */ return; }
         if (isProcessingRequest) return;
+        if (state && state.cancelled) {
+            // The user stopped this turn; reattaching would replay the
+            // stream they ended (R2 lens A).
+            clearInflightHandle(h);
+            return;
+        }
         if (state && state.exists) {
             // Replay buffer alive: reattach the stream exactly like the
             // same-page Safari resume, with a fresh bubble. sendMessage
             // sets isProcessingRequest synchronously before its first
             // await, so the latch can release right after this call.
+            //
+            // ⚠ RE-HOME THE HANDLE FIRST. `clearInflightHandle`'s own
+            // docstring says adopting an orphan and then clearing the bare
+            // form "would leave the orphan on disk to be re-adopted on every
+            // visibility change — a loop, not a cleanup" — and this branch,
+            // the ADOPT branch, did exactly that: the resume path never
+            // calls saveInflightHandle(), so all four terminal cleanups
+            // dropped OUR empty slot while the dead tab's key survived. Every
+            // visibility return re-adopted it and replayed the whole buffer:
+            // reply re-rendered, TTS re-spoken, a duplicate assistant pushed
+            // into chatHistory, for up to the proxy's 10-minute TTL (R5 lens
+            // B, reproduced). Dropping the orphan and re-saving under THIS
+            // tab makes the heartbeat and all four terminal paths work.
+            clearInflightHandle(h);
             currentTaskId = h.taskId;
             currentChunkIndex = 0;
             currentAccumulatedContent = "";
+            saveInflightHandle();
             ensureAgentBubbleForResume();
             sendMessage(true);
             return;
         }
-        await reconcileFromSession(h.sessionId);
+        await reconcileFromSession(h.sessionId, h);
     } finally {
         resumeLatch = false;
     }
@@ -1752,6 +1918,123 @@ function noteTickerLine(raw) {
     setTurnStatusDesc(desc, icon);
 }
 
+// Turn a failed Response into an Error that still says something.
+//
+// Two ways the previous one-liner destroyed the diagnosis (review R1 M14/M15):
+//   * `await response.json()` on a NON-JSON error body throws, and the
+//     SyntaxError replaced the status entirely — a front-door 502 with an
+//     HTML body read as "Unexpected token <", which names no subsystem.
+//   * only `.error` was read, but FastAPI's own HTTPException renders
+//     `{"detail": …}` — so a 401 from the key check and a 400 "Invalid
+//     session id" both arrived as a bare "HTTP 4xx".
+// `detail` can also be an array (validation errors), which stringifies to
+// "[object Object]"; carry the status so callers can classify regardless.
+async function _httpError(response, prefix) {
+    let body = null;
+    try { body = await response.json(); } catch (e) { body = null; }
+    let msg = '';
+    if (body && typeof body === 'object') {
+        const d = body.error || body.detail;
+        msg = typeof d === 'string' ? d : (d ? JSON.stringify(d) : '');
+    }
+    if (!msg) msg = `HTTP ${response.status}`;
+    const err = new Error(prefix ? `${prefix}: ${msg}` : msg);
+    err.status = response.status;
+    return err;
+}
+
+// Stop means stop. `/api/chat/cancel/<task>` is a PROXY-side teardown (it
+// kills the buffered relay task); the agent's own turn only stops via
+// `/api/turn/cancel`. Without this, "Stopped by user." was a lie: the turn
+// ran to completion, held the global turn lock, and its reply landed in the
+// durable session with no client showing it (review R1 M8).
+// ⚠ RESOLVE THE TARGET FIRST. A bare `{}` body means "cancel the turn
+// holding the semaphore" (core/turns.py::current) — NOT "cancel mine". And
+// `currentReqId` is null until the first SSE frame carrying an id, which for
+// a tool-heavy turn is the whole 30-60s thinking phase, i.e. exactly when
+// Stop gets pressed. So the R1 version of this fix could kill a background
+// dream/self-play turn while the user's own queued turn ran on to completion
+// and the tab reported "Stopped by user." — the same dishonesty one layer
+// deeper (R2 lens B). `/api/turns` carries `session_id` per turn, so the
+// client can identify its own turn; if it cannot, it must NOT guess.
+async function _resolveOwnTurnId(sentText) {
+    const sid = window.__ghostSessionId
+        || safeStorage.get('ghost_session_id') || null;
+    let data;
+    try {
+        // BOUNDED. Stop exists for the case where the agent is wedged, and
+        // /api/turns queues behind the same lock — an unbounded fetch here
+        // meant the "could not identify your turn" warning never printed at
+        // all, and every Stop leaked a pending request (R3 lens B).
+        const res = await fetch('/api/turns', {
+            signal: AbortSignal.timeout(4000),
+        });
+        if (!res.ok) return null;
+        data = await res.json();
+    } catch (e) {
+        return null;
+    }
+    const turns = (data && data.turns) || [];
+    const pick = (list) => list.length
+        ? ((list.find(t => t.running) || list[0]).request_id || null) : null;
+    if (sid) {
+        const mine = turns.filter(t => t && t.session_id === sid);
+        if (mine.length) return pick(mine);
+    }
+    // SESSIONS DISABLED (or not yet bound): there is no session id to match
+    // on — `routes.py` reports `enabled:false` whenever the store is off, and
+    // sessions.js then never publishes an id at all. Identify by the turn
+    // PREVIEW instead, which the registry derives from the user message
+    // (turns.py trims it to 120 chars). Without this the composer's Stop
+    // could cancel nothing at all in a supported deployment mode — a
+    // regression the tests missed because they all stub a session id.
+    const probe = String(sentText || '').split(/\s+/).join(' ').slice(0, 40);
+    if (probe) {
+        const byText = turns.filter(
+            t => t && typeof t.preview === 'string' && t.preview.startsWith(probe));
+        if (byText.length === 1) return byText[0].request_id || null;
+    }
+    return null;
+}
+
+async function _cancelAgentTurn(reqId, sentText, hard) {
+    const target = reqId || await _resolveOwnTurnId(sentText);
+    if (!target) {
+        // No bare-body fallback: cancelling "whatever is running" can hit an
+        // unrelated background turn.
+        addMessage('system', '⚠ Stopped listening, but this tab could not '
+            + 'identify its turn on the agent, so nothing was cancelled — it '
+            + 'may still be running. The turn panel (status strip) lists '
+            + 'in-flight turns and can cancel by id.');
+        return false;
+    }
+    const body = hard ? { request_id: target, hard: true }
+                      : { request_id: target };
+    return fetch('/api/turn/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    }).then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.cancelled) return true;
+        // 404 = nothing to cancel, which is the benign case (the turn had
+        // already finished). Anything else means the agent IS still working:
+        // actionable, so say it.
+        if (res.status !== 404) {
+            addMessage('system', '⚠ Stop reached this tab but NOT the agent — '
+                + 'the turn is still running (' + (data.detail || data.error
+                || ('HTTP ' + res.status)) + '). Its reply will appear in this '
+                + 'session when it finishes; the turn panel can hard-cancel.');
+        }
+        return false;
+    }).catch((e) => {
+        addMessage('system', '⚠ Stop reached this tab but the cancel call '
+            + 'failed (' + (e && e.message || e) + ') — the agent may still '
+            + 'be running this turn.');
+        return false;
+    });
+}
+
 async function sendMessage(isResume = false) {
     const resuming = isResume === true;
     const text = chatInput.value.trim();
@@ -1811,6 +2094,10 @@ async function sendMessage(isResume = false) {
         currentReqId = null;
 
         chatHistory.push({ role: "user", content: text });
+        // Remembered for Stop: with sessions disabled there is no session id
+        // to match a turn on, and the turn registry's `preview` is derived
+        // from exactly this text (R3 lens B).
+        _lastSentUserText = text;
         if (typeof saveChatState === 'function') saveChatState();
         if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
         
@@ -1840,9 +2127,9 @@ async function sendMessage(isResume = false) {
         currentThinkingInterval = null;
     } else {
         // Cross-reload resumes have no surviving bubble; same-page resumes
-        // keep theirs (this is a no-op then).
+        // keep theirs (this is a no-op then). Reconnects are silent — the
+        // stream resuming is the only signal the user needs.
         ensureAgentBubbleForResume();
-        addMessage('system', 'Reconnected directly to Ghost Server.');
         setTimeout(scrollToBottom, 100);
     }
 
@@ -1877,7 +2164,17 @@ async function sendMessage(isResume = false) {
         // session id, bind the turn to it. The AGENT is the source of
         // truth for session history and merges tolerantly, so replaying
         // the full local history here can never double it.
-        if (window.__ghostSessionId) payload.session_id = window.__ghostSessionId;
+        // ⚠ Fall back to the STORED id. `window.__ghostSessionId` is only
+        // published by sessions.js, which runs after the dynamic
+        // import('./workspace.js') chain plus three agent round trips — and
+        // the composer is live throughout. A turn sent in that window
+        // carried no session_id, was never persisted, and the next resync
+        // (which protects user messages but not assistant ones) then deleted
+        // the reply the user was reading. `saveInflightHandle` has had this
+        // exact fallback all along (R3 lens B).
+        const _sid = window.__ghostSessionId
+            || safeStorage.get('ghost_session_id') || null;
+        if (_sid) payload.session_id = _sid;
         currentChatController = new AbortController();
 
         let response;
@@ -1909,13 +2206,19 @@ async function sendMessage(isResume = false) {
         }
 
         if (!response.ok) {
-            const errData = await response.json();
-            throw new Error(errData.error || `HTTP ${response.status}`);
+            throw await _httpError(response);
         }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let streamBuffer = "";
+        // Set when an error frame renders; suppresses the phantom
+        // "No response" assistant reply that would otherwise be pushed into
+        // chatHistory and persisted (see the finalize branch below).
+        let streamHadError = false;
+        // Reset per turn: the network-resume attempts below are bounded so a
+        // down proxy cannot spin a silent retry loop forever.
+        _netResumeTries = 0;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -1951,7 +2254,23 @@ async function sendMessage(isResume = false) {
                         // Fallback for non-streaming formats that might be wrapped
                         chunkContent = data.message.content;
                     } else if (data.error) {
-                        addMessage('system', `Error: ${data.error}`);
+                        // The agent and the proxy both send STRUCTURED errors
+                        // ({message, type, error_id}); a bare template turned
+                        // every one of them into "Error: [object Object]".
+                        // That is the string the operator saw for the agent
+                        // being down (UpstreamError), a evicted task
+                        // (TaskEvicted), a blown buffer (BufferCapExceeded)
+                        // and an agent InternalError alike — destroying the
+                        // error_id that correlates to the log. Objects only
+                        // ever reached this branch, so the bug was total.
+                        const _e = data.error;
+                        let _msg = (_e && typeof _e === 'object')
+                            ? (_e.message || _e.detail || _e.error || JSON.stringify(_e))
+                            : String(_e);
+                        const _type = (_e && typeof _e === 'object' && _e.type) ? ` [${_e.type}]` : '';
+                        const _eid = (_e && typeof _e === 'object' && _e.error_id) ? ` (error_id ${_e.error_id})` : '';
+                        addMessage('system', `Error${_type}: ${_msg}${_eid}`);
+                        streamHadError = true;
                         activeFace.triggerSpike();
                         continue;
                     }
@@ -2030,6 +2349,14 @@ async function sendMessage(isResume = false) {
             // a "No response" bubble with live thumbs would take labels
             // that can never persist (no matching entry to latch onto).
             _stampReqId(currentAgentMessageDiv, currentReqId);
+        } else if (streamHadError) {
+            // An error frame already rendered a system message saying what
+            // went wrong. Pushing a phantom assistant reply on top of it put
+            // "No response" into chatHistory — and from there into the
+            // DURABLE session store, where it is indistinguishable from a
+            // real (bad) reply and becomes context for later turns. The
+            // error is the outcome; there is no assistant turn to record.
+            currentAgentMessageDiv.remove();
         } else {
             currentAgentMessageDiv.textContent = "No response";
             chatHistory.push({ role: "assistant", content: "No response" });
@@ -2056,6 +2383,14 @@ async function sendMessage(isResume = false) {
             if (currentTaskId) {
                 fetch(`/api/chat/cancel/${currentTaskId}`, { method: 'POST' }).catch(()=>{});
             }
+            // /api/chat/cancel only tears down the PROXY's buffered stream:
+            // the agent kept running the whole turn, holding the global turn
+            // lock and burning tokens, while this client said "Request
+            // cancelled by user." (review R1 M8). Cancel the real turn too —
+            // by request_id when the stream got that far, else the
+            // currently-running turn, which is ours because the lock is
+            // global. Report failure, because then it is NOT cancelled.
+            _cancelAgentTurn(currentReqId, _lastSentUserText);
             if (!resuming && currentAccumulatedContent === "" && currentAgentMessageDiv) currentAgentMessageDiv.remove();
             if (currentAccumulatedContent !== "") {
                 // Keep the reqId: a reply aborted BECAUSE it was going
@@ -2066,9 +2401,9 @@ async function sendMessage(isResume = false) {
                 if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) {
                     _stampReqId(currentAgentMessageDiv, currentReqId);
                 }
-                addMessage('system', 'Request cancelled by user.');
+                addMessage('system', 'Stopped by user.');
             } else {
-                addMessage('system', 'Request cancelled by user.');
+                addMessage('system', 'Stopped by user.');
             }
             currentTaskId = null;
             clearInflightHandle();
@@ -2084,19 +2419,66 @@ async function sendMessage(isResume = false) {
             
             const errMsg = e.message.toLowerCase();
             if (errMsg.includes('load failed') || errMsg.includes('networkerror') || errMsg.includes('fetch')) {
-                addMessage('system', 'Safari suspended the UI. Detached Ghost continues calculation...');
+                // Safari killed the fetch by suspending the tab. Resume
+                // silently — no system bubble; the reply continuing is the
+                // only signal.
+                // ⚠ GUARDED RESUME. These two callbacks are the FOURTH
+                // resume trigger and they bypassed `resumeLatch` entirely.
+                // On an iOS unlock the latched path (boot /
+                // visibilitychange / pageshow) replays an already-complete
+                // buffer in milliseconds and NULLS currentTaskId — so this
+                // 1s callback then found no task, fell through the
+                // `resuming && currentTaskId` test, and took the POST
+                // branch: a whole NEW turn whose last message is an
+                // assistant reply. There is also no attempt cap, so a down
+                // proxy produced an endless silent 1s retry loop behind a
+                // permanent thinking bubble.
+                const _resumeAttempt = () => {
+                    if (!currentTaskId) return;          // already resumed
+                    if (isProcessingRequest) return;     // the latch's job
+                    if (_netResumeTries >= 3) {
+                        addMessage('system',
+                            '⚠ Lost the connection to this turn and could ' +
+                            'not reattach after 3 tries. The turn may still ' +
+                            'be running — reload to pick it up.');
+                        _netResumeTries = 0;
+                        // ⚠ RELEASE THE HANDLE. The 5s inflight heartbeat
+                        // kept writing `beat`, so `Date.now() - h.beat <
+                        // 15000` stayed true forever and no other tab (or
+                        // reopened PWA) could ever adopt this orphaned turn
+                        // — the exact recovery this subsystem exists for
+                        // (R2 lens B).
+                        clearInflightHandle();
+                        return;
+                    }
+                    _netResumeTries += 1;
+                    sendMessage(true);
+                };
                 if (document.visibilityState === 'visible') {
-                    setTimeout(() => sendMessage(true), 1000);
+                    setTimeout(_resumeAttempt, 1000);
                 } else {
                     document.addEventListener('visibilitychange', function resumeOnVisible() {
                         if (document.visibilityState === 'visible') {
                             document.removeEventListener('visibilitychange', resumeOnVisible);
-                            setTimeout(() => sendMessage(true), 1000);
+                            setTimeout(_resumeAttempt, 1000);
                         }
                     });
                 }
             } else {
-                addMessage('system', `Network Error: ${e.message}`);
+                // Not every failure here is a NETWORK failure. The 500-message
+                // interface cap surfaces as `Too many messages (501 > 500
+                // cap)` — a lock-out that needs /clear or a session switch,
+                // not a retry — and labelling it "Network Error" pointed the
+                // operator at the wrong problem (review R1 M11).
+                const _m = String(e && e.message || e);
+                if (/Too many messages/i.test(_m)) {
+                    addMessage('system',
+                        `This conversation is too long for one request (${_m}). `
+                        + 'Start a new chat, or switch sessions and back — the '
+                        + 'server keeps the durable copy, so nothing is lost.');
+                } else {
+                    addMessage('system', `Network Error: ${_m}`);
+                }
                 activeFace.triggerSpike();
                 // The turn is abandoned client-side. If the agent finishes
                 // anyway, the sessions resync (visibilitychange) adopts it.
@@ -2110,8 +2492,31 @@ async function sendMessage(isResume = false) {
         _cancelScheduledStreamRender();
         // Drop the streaming cursor glyph and any stale "thinking" class
         // so the message renders as a completed reply.
+        //
+        // ⚠ THE CLASS IS NOT THE ANIMATION. `.thinking` is styled in no CSS
+        // file at all; the bouncing dots belong to `.typing-indicator span`,
+        // a CHILD element that only ever disappears when the bubble's
+        // content is replaced. So on every zero-content end — a 500, a 401
+        // after key rotation, the 413 message cap, an abort during a resume,
+        // the resume give-up — this teardown removed a class that styles
+        // nothing and left dots animating forever, with a timestamp and a ⋯
+        // menu decorating the corpse (R2 lens B).
         if (currentAgentMessageDiv) {
             currentAgentMessageDiv.classList.remove('streaming', 'thinking');
+            const _ind = currentAgentMessageDiv.querySelector('.typing-indicator');
+            if (_ind) {
+                if (currentAccumulatedContent) {
+                    _ind.remove();          // real content arrived; the
+                                            // renderer normally does this
+                } else {
+                    // Nothing ever streamed: this bubble has no content to
+                    // become. `decorateMessageActions()` below would give it
+                    // a timestamp and a ⋯ menu, making an animating stub read
+                    // as a finished empty reply.
+                    currentAgentMessageDiv.remove();
+                    currentAgentMessageDiv = null;
+                }
+            }
         }
 
         if (isTTSActive && ttsBuffer.trim().length > 0) {
@@ -2337,7 +2742,12 @@ if (workspaceBtn && workspaceUploadInput) {
         } else {
             isProcessingRequest = true;
             activeFace.setWorkingState(true);
-            
+            // The composer must SHOW the busy state: without this the
+            // button still reads SEND, and a click hits neither branch of
+            // the handler while Enter tests !isProcessingRequest — the user
+            // is silently ignored (R2 lens B).
+            toggleSendButtonUI(true, false);   // no AbortController here
+
             try {
                 const response = await fetch('/api/workspace/save', {
                     method: 'POST',
@@ -2349,7 +2759,7 @@ if (workspaceBtn && workspaceUploadInput) {
                     body: JSON.stringify({ chat_history: chatHistory.map(toWireMessage) })
                 });
                 
-                if (!response.ok) throw new Error('Failed to save workspace');
+                if (!response.ok) throw await _httpError(response, 'Save failed');
                 
                 const blob = await response.blob();
                 const url = window.URL.createObjectURL(blob);
@@ -2375,6 +2785,7 @@ if (workspaceBtn && workspaceUploadInput) {
             } finally {
                 isProcessingRequest = false;
                 activeFace.setWorkingState(false);
+                toggleSendButtonUI(false);
             }
         }
     });
@@ -2386,6 +2797,11 @@ if (workspaceBtn && workspaceUploadInput) {
         
         isProcessingRequest = true;
         activeFace.setWorkingState(true);
+        // The composer must SHOW the busy state: without this the
+        // button still reads SEND, and a click hits neither branch of
+        // the handler while Enter tests !isProcessingRequest — the user
+        // is silently ignored (R2 lens B).
+        toggleSendButtonUI(true, false);   // no AbortController here
         addMessage('system', `Loading workspace from ${file.name}...`);
         
         const formData = new FormData();
@@ -2397,13 +2813,28 @@ if (workspaceBtn && workspaceUploadInput) {
                 body: formData
             });
             
-            if (!response.ok) throw new Error(`Load failed with status ${response.status}`);
+            if (!response.ok) throw await _httpError(response, 'Load failed');
             
             const result = await response.json();
             if (result.error) throw new Error(result.error);
             
-            chatHistory = result.chat_history || [];
+            // Shape-validate like the bridge setter does: a non-array here
+            // makes the next `chatHistory.push` throw BEFORE sendMessage's
+            // try block, killing the composer with a console-only error.
+            chatHistory = Array.isArray(result.chat_history)
+                ? result.chat_history : [];
             renderHistoryToLog(chatHistory);
+            // PERSIST, and take a FRESH session identity. Without the save,
+            // a reload silently restored the old localStorage history over
+            // the loaded workspace; without the rebind, the next turn
+            // appended the workspace's messages into whatever durable
+            // session was current — contaminating a conversation the
+            // operator never opened (R2 lens B).
+            saveChatState();
+            try {
+                window.GhostCore?.events?.dispatchEvent(
+                    new CustomEvent('conversation-cleared'));
+            } catch (err) { /* workspace modules not loaded */ }
 
             addMessage('system', 'Workspace loaded successfully.');
             updateWorkspaceBtnState();
@@ -2414,6 +2845,7 @@ if (workspaceBtn && workspaceUploadInput) {
         } finally {
             isProcessingRequest = false;
             activeFace.setWorkingState(false);
+            toggleSendButtonUI(false);
             scrollToBottom();
         }
     });
@@ -2439,6 +2871,7 @@ if (uploadBtn && fileUploadInput) {
 
         isProcessingRequest = true;
         activeFace.setWorkingState(true);
+        toggleSendButtonUI(true, false);   // no AbortController here
 
         addMessage('system', `Uploading ${file.name} to sandbox...`);
 
@@ -2452,7 +2885,9 @@ if (uploadBtn && fileUploadInput) {
             });
 
             if (!response.ok) {
-                throw new Error(`Upload failed with status ${response.status}`);
+                // The server explains WHY (type not allowed, too large, no
+                // filename); pasting only the status threw that away.
+                throw await _httpError(response, 'Upload failed');
             }
 
             const result = await response.json();
@@ -2475,6 +2910,7 @@ if (uploadBtn && fileUploadInput) {
         } finally {
             isProcessingRequest = false;
             activeFace.setWorkingState(false);
+            toggleSendButtonUI(false);
             scrollToBottom();
         }
     });
@@ -2493,8 +2929,11 @@ if (downloadBtn) {
             // can't carry the header, so it would just 401 — and skipping
             // the res.ok check would "download" the error JSON as the file.
             fetch(url)
-                .then(res => {
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                .then(async (res) => {
+                    // `await` needs an async callback — and the server's
+                    // reason ("no such file: report.pdf") is what the
+                    // operator needs, not a bare status (R3 lens B).
+                    if (!res.ok) throw await _httpError(res, 'Download failed');
                     return res.blob();
                 })
                 .then(blob => {
@@ -3479,13 +3918,26 @@ function _showBrokenImagePlaceholder(img) {
 // `connected_websockets` immediately instead of waiting for the TCP RST.
 // Disconnecting the MutationObserver is harmless during unload but helps
 // in tests / reused windows.
-window.addEventListener('beforeunload', () => {
-    try { chatObserver.disconnect(); } catch (e) { /* ignore */ }
-    try { if (ws) ws.close(); } catch (e) { /* ignore */ }
+// ⚠ `pagehide`, guarded on `!persisted` — NOT `beforeunload`.
+//
+// `beforeunload` does not block bfcache in Safari or Chrome, and this
+// handler performs teardown that NOTHING restores: `chatObserver.observe()`
+// runs exactly once, at module init, and neither pageshow handler
+// re-observes. So opening a PDF and hitting Back left a page where every
+// existing <img> pointed at a REVOKED blob (and could not be reprocessed,
+// because `_processChatLogArtifacts` bails on the surviving
+// `placeholder-added` class) and every FUTURE image or PDF link went
+// unprocessed — a plain /api/download/ load that 401s with no broken-image
+// badge (R2 lens B). The code's own `e.persisted` handling proves bfcache
+// is expected here.
+window.addEventListener('pagehide', (e) => {
+    if (e.persisted) return;   // going into bfcache — the page comes BACK
+    try { chatObserver.disconnect(); } catch (err) { /* ignore */ }
+    try { if (ws) ws.close(); } catch (err) { /* ignore */ }
     // Revoke every cached blob URL so the browser releases the memory
     // promptly instead of waiting for GC on a navigated-away document.
     for (const url of _authedBlobCache.values()) {
-        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+        try { URL.revokeObjectURL(url); } catch (err) { /* ignore */ }
     }
     _authedBlobCache.clear();
 });
@@ -3519,6 +3971,16 @@ if (ttsToggleBtn) {
 }
 
 function stopTTS() {
+    // ⚠ BUMP THE GENERATION FIRST. `processTTSFetch` shifts its text before
+    // awaiting /api/tts, then pushes the blob and calls playNextAudio() —
+    // against state this function just cleared. So an interrupted clip
+    // played ANYWAY: the mic path's "full duplex interruption" is exactly
+    // this, the agent talking over the user's recording (R3 lens B).
+    _ttsGeneration += 1;
+    // Revoke what we drop, or every interruption leaks a blob URL.
+    for (const url of ttsAudioQueue) {
+        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+    }
     ttsTextQueue = [];
     ttsAudioQueue = [];
     ttsBuffer = "";
@@ -3535,6 +3997,10 @@ function stopTTS() {
     if (typeof _stopTTSAudioPump === 'function') _stopTTSAudioPump();
 }
 
+// Bumped by stopTTS. Every await inside the TTS pipeline re-checks it, so
+// an interrupted clip cannot resurrect itself after the queue was cleared.
+let _ttsGeneration = 0;
+
 function queueTTS(text) {
     ttsTextQueue.push(text);
     processTTSFetch();
@@ -3543,22 +4009,35 @@ function queueTTS(text) {
 async function processTTSFetch() {
     if (isFetchingTTS || ttsTextQueue.length === 0) return;
     isFetchingTTS = true;
-    
+
     let text = ttsTextQueue.shift();
-    
+    const gen = _ttsGeneration;
+
     try {
         let res = await fetch('/api/tts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: text })
         });
+        if (gen !== _ttsGeneration) {
+            // stopTTS ran while this was in flight. Anything we do now
+            // speaks over whatever replaced it.
+            isFetchingTTS = false;
+            return;
+        }
         if (res.ok) {
             let blob = await res.blob();
+            if (gen !== _ttsGeneration) { isFetchingTTS = false; return; }
             let audioUrl = URL.createObjectURL(blob);
             ttsAudioQueue.push(audioUrl);
             if (!isPlayingTTS) playNextAudio();
         } else {
-            console.error("TTS Fetch Error:", res.status);
+            // Same as STT: /api/tts carries the reason (voice unavailable,
+            // text too long, `say` timed out) and the user saw NOTHING at
+            // all — console-only (R3 lens A).
+            const _e = await _httpError(res, '🔊 Voice error');
+            console.error("TTS Fetch Error:", _e.message);
+            addMessage('system', _e.message);
         }
     } catch (e) {
         console.error("TTS Fetch Error:", e);
@@ -3566,7 +4045,7 @@ async function processTTSFetch() {
     
     isFetchingTTS = false;
     // Recursively fetch the next chunk while audio is playing
-    if (ttsTextQueue.length > 0) {
+    if (gen === _ttsGeneration && ttsTextQueue.length > 0) {
         processTTSFetch();
     }
 }
@@ -3781,7 +4260,16 @@ if (micBtn) {
                             addMessage('system', '🎙️ STT transcribed nothing.');
                         }
                     } else {
-                        addMessage('system', '🎙️ STT Error: HTTP ' + res.status);
+                        // voice.py raises real diagnoses ("'ffmpeg' not
+                        // found on PATH… set GHOST_FFMPEG_BIN", "Audio is
+                        // 22.3 min; the limit is 15 min", "thinking tokens
+                        // consumed the entire budget — raise
+                        // GHOST_STT_MAX_TOKENS") and stt_proxy returns each
+                        // verbatim. Printing only the status made "the mic
+                        // does nothing" indistinguishable from "the audio
+                        // node is down" (R3 lens A).
+                        const _e = await _httpError(res, '🎙️ STT Error');
+                        addMessage('system', _e.message);
                     }
                 } catch (err) {
                     addMessage('system', '🎙️ STT Upload Failed: ' + err.message);
@@ -3856,6 +4344,13 @@ window.GhostCore = {
     activeFace,
     stopTTS,
     sendMessage,
+    // Cancel THIS TAB's turn (resolving its request id first). Exposed so
+    // the palette can stop a turn without the blind "whatever holds the
+    // semaphore" cancel it used to issue (R3 lens B).
+    cancelOwnTurn: (hard) => {
+        if (currentChatController) { try { currentChatController.abort(); } catch (e) {} }
+        return _cancelAgentTurn(currentReqId, _lastSentUserText, hard);
+    },
     getChatHistory: () => chatHistory,
     setChatHistory: (h) => { chatHistory = Array.isArray(h) ? h : []; saveChatState(); },
     // Wire-shape helpers for modules that fetch/compare server histories
@@ -3884,6 +4379,21 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=7.1').catch(e =>
-    console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
+import('./workspace.js?v=7.6').catch(e => {
+    // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
+    // with it `window.__ghostSessionId` — so when it fails to load, every
+    // turn silently reverts to CLIENT-CARRIED history: no durable session,
+    // no rail, no bell, no status strip, and nothing on screen saying so.
+    // A stale `?v=` in a cached index.html is enough to cause it, and the
+    // operator's only clue was an empty sidebar. Durable sessions are the
+    // thing this console exists for; losing them cannot be a console.warn.
+    console.warn('[Ghost] workspace modules failed to load:', e);
+    try {
+        addMessage('system',
+            '⚠ Console modules failed to load — this tab has NO durable ' +
+            'session (history is client-carried only), no sessions rail and ' +
+            'no notifications. Hard-reload to retry; if it persists the ' +
+            'static assets are stale or unreachable.');
+    } catch (_) { /* addMessage unavailable — the warn above is all we have */ }
+});
 

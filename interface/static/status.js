@@ -27,6 +27,7 @@ export function initStatus(ctx) {
 
     let health = null;
     let healthOk = null;
+    let healthFailNote = '';
     let turnsTimer = null;
 
     function pillText(h) {
@@ -37,20 +38,52 @@ export function initStatus(ctx) {
         return String(model).split('/').pop().slice(0, 26);
     }
 
+    // 401/403 is an AUTH failure, not an unreachable agent: after a key
+    // rotation the injected key is stale and every call fails, while the
+    // panel blamed the agent process ("Agent unreachable on :8000") — wrong
+    // diagnosis, wrong fix attempted (review R1 M9).
+    //
+    // A PURE function on purpose: as a boolean computed inline in the catch,
+    // a `false && …` mutation survived every text assertion the suite could
+    // write. tests/test_webui_console_review.py EXECUTES this under node.
+    function _healthFailureNote(e) {
+        const msg = String((e && e.message) || e || '');
+        if (/\b(401|403)\b/.test(msg)) {
+            return 'NOT AUTHORISED (' + (/\b401\b/.test(msg) ? '401' : '403')
+                + '). The agent is answering but rejecting this key — it was '
+                + 'probably rotated. Reload with the current ?key=, or '
+                + 're-open the PWA from a fresh link.';
+        }
+        return 'Agent unreachable on :8000. The interface is up; the agent '
+            + 'process is not answering.';
+    }
+
     function isDegraded(h) {
-        return h && (h.memory_system_loaded === false
+        // `h === null` means the health poll FAILED — the most abnormal state
+        // there is — and `null && …` is falsy, so the header strip showed no
+        // abnormality at all with the agent down: the only cue was the model
+        // pill quietly vanishing (review R1 M9).
+        // `!h`, not `h === null`: an ABSENT health object is the same
+        // finding as a null one, and `undefined` reached the property reads
+        // and threw a TypeError inside the render (found by executing this
+        // function rather than grepping it — R2 lens C).
+        if (!h) return true;
+        return !!(h.memory_system_loaded === false
             || h.biological_watchdog_alive === false);
     }
 
     async function pollHealth() {
         try {
-            const res = await fetch('/api/health');
+            const res = await fetch('/api/health',
+                { signal: AbortSignal.timeout(8000) });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             health = await res.json();
             healthOk = true;
+            healthFailNote = '';
         } catch (e) {
             health = null;
             healthOk = false;
+            healthFailNote = _healthFailureNote(e);
         }
         window.__ghostHealth = health;
         if (modelPill) {
@@ -97,7 +130,7 @@ export function initStatus(ctx) {
 
         if (healthOk === false) {
             bodyEl.appendChild(el('div', 'status-unreachable',
-                'Agent unreachable on :8000. The interface is up; the agent process is not answering.'));
+                healthFailNote || _healthFailureNote(null)));
             return;
         }
         if (!health) {
@@ -141,7 +174,13 @@ export function initStatus(ctx) {
         const tsec = el('div', 'status-section');
         tsec.appendChild(el('div', 'status-section-title', 'TURNS'));
         try {
-            const res = await fetch('/api/turns');
+            // ⚠ BOUNDED. `_rendering` releases in a finally, but an
+            // unbounded fetch never reaches it: one hung /api/turns
+            // froze the panel for the LIFE of the page, including
+            // after close/reopen — and /api/turns is what you open
+            // when the agent is wedged (R3 lens B).
+            const res = await fetch('/api/turns',
+                { signal: AbortSignal.timeout(8000) });
             const data = res.ok ? await res.json() : null;
             const turns = (data && data.turns) || [];
             if (!turns.length) {
@@ -189,6 +228,7 @@ export function initStatus(ctx) {
         try {
             const res = await fetch('/api/turn/cancel', {
                 method: 'POST',
+                signal: AbortSignal.timeout(8000),
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(requestId
                     ? { request_id: requestId, hard }
@@ -229,7 +269,7 @@ export function initStatus(ctx) {
     document.getElementById('status-close')?.addEventListener('click', closePanel);
     document.addEventListener('click', (e) => {
         if (panel && !panel.classList.contains('hidden')
-            && !panel.contains(e.target) && !indicator.contains(e.target)) {
+            && !panel.contains(e.target) && !indicator?.contains(e.target)) {
             closePanel();
         }
     });

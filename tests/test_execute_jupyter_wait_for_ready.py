@@ -136,3 +136,53 @@ def test_runner_separates_ready_failure_exit_from_execution_exit():
         "the runner would continue into the polling loop against a "
         "half-initialised kernel"
     )
+
+
+def test_the_jupyter_kernel_boot_never_blocks_the_event_loop():
+    """§4BW MAJOR (structural). The stateful-kernel boot was a synchronous
+    `_container.exec_run(...)` inside `async def tool_execute` — a wedged
+    daemon there froze the WHOLE agent event loop. Every `exec_run` call in
+    `tool_execute` must now be dispatched through `asyncio.to_thread` (which
+    additionally lets it carry the `_exec_run` deadline). AST, not grep: a
+    bare synchronous call in an async function is a structural fact."""
+    import ast
+    import inspect
+    from ghost_agent.tools import execute as ex
+
+    tree = ast.parse(inspect.getsource(ex.tool_execute).lstrip())
+
+    def _is_to_thread(node):
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_thread")
+
+    # Collect every call whose func attr is exec_run, and every call that is
+    # the first positional arg of asyncio.to_thread (dispatched off-loop).
+    to_thread_targets = set()
+    for n in ast.walk(tree):
+        if _is_to_thread(n) and n.args:
+            to_thread_targets.add(id(n.args[0]))
+
+    bad = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
+                and n.func.attr == "exec_run":
+            # a bare `x.exec_run(...)` call node is itself the thing invoked;
+            # off-loop dispatch passes the METHOD (x.exec_run) as to_thread's
+            # arg, so a synchronous call node is one that is actually Called.
+            bad.append(ast.dump(n.func))
+
+    assert not bad, (
+        f"tool_execute makes a synchronous exec_run call {bad} — a wedged "
+        f"daemon will freeze the event loop; dispatch it via "
+        f"asyncio.to_thread(manager._exec_run, ...) instead")
+    # And confirm the boot IS dispatched off-loop (the method is handed to
+    # to_thread somewhere).
+    handed_off = any(
+        isinstance(a, ast.Attribute) and a.attr in ("_exec_run", "exec_run")
+        for tid in to_thread_targets
+        for n in ast.walk(tree) if id(n) == tid
+        for a in [n])
+    assert handed_off, (
+        "the kernel boot is not handed to asyncio.to_thread — the off-loop "
+        "dispatch was removed")

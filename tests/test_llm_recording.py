@@ -99,12 +99,98 @@ class TestReplay:
 
 
 class TestWiring:
-    def test_llm_client_records_both_branches_and_route(self):
-        src = (Path(__file__).resolve().parents[1]
-               / "src" / "ghost_agent" / "core" / "llm.py").read_text()
-        assert src.count("_maybe_record_call(") >= 3  # fg + bg + route
-        assert 'kind="route"' in src
+    def test_llm_client_records_the_foreground_and_background_branches(self):
+        """⚠ RENAMED AND REWRITTEN. This was
+        `..._records_both_branches_and_route`, and neither of its assertions
+        could fail for its stated reason (R5 lens C):
 
+          * `'kind="route"' in src` — the ONLY occurrence in llm.py is inside
+            a COMMENT documenting that the route recording was DELETED by the
+            §4BG double-count fix. The test certified a feature that had been
+            deliberately removed.
+          * `src.count("_maybe_record_call(") >= 3` counted the `def` line.
+
+        Route recording is intentionally gone: the delegated `chat_completion`
+        write is the only one now, which is what `test_llm_token_usage.py`
+        drives. What remains worth pinning is that BOTH dispatch branches
+        record."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from ghost_agent.core.llm import LLMClient
+
+        for is_background in (False, True):
+            c = LLMClient("http://main.invalid:8088")
+            seen = []
+            c._maybe_record_call = lambda *a, **kw: seen.append(kw)
+
+            async def _main(*a, **kw):
+                r = MagicMock()
+                r.json = lambda: {"choices": [{"message": {"content": "ok"}}],
+                                  "usage": {"prompt_tokens": 1,
+                                            "completion_tokens": 1}}
+                r.raise_for_status = lambda: None
+                r.status_code, r.text = 200, "{}"
+                return r
+
+            c.http_client = MagicMock()
+            c.http_client.post = AsyncMock(side_effect=_main)
+            asyncio.run(c.chat_completion({"model": "m", "messages": []},
+                                          is_background=is_background,
+                                          timeout=5))
+            assert seen, (
+                f"is_background={is_background} produced no recording — that "
+                f"branch is invisible to the §4BG corpus")
+
+    def test_route_does_not_double_record_a_routed_call(self):
+        """⚠ DRIVEN. The previous version asserted
+        `"_maybe_record_call" not in getsource(route)` and was measured
+        ANTI-CORRELATED with the truth: routing through
+        `llm_recording.maybe_record` (no literal) passed it, while a COMMENT
+        mentioning the helper failed it (R7 lens C, M20/M21). A test that
+        passes on the defect and fails on documentation is worse than no
+        test."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from ghost_agent.core import llm_recording as _rec
+        from ghost_agent.core.llm import LLMClient
+
+        kinds = []
+        real = _rec.maybe_record
+
+        def _spy(kind, *a, **kw):
+            kinds.append(kind)
+            return None
+
+        c = LLMClient("http://main.invalid:8088")
+        r = MagicMock()
+        r.json = lambda: {"choices": [{"message": {"content": "expanded"}}],
+                          "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        r.raise_for_status = lambda: None
+        r.status_code, r.text = 200, "{}"
+        cl = MagicMock()
+        cl.post = AsyncMock(return_value=r)
+        props = MagicMock()
+        props.json = lambda: {"total_slots": 4}
+        props.raise_for_status = lambda: None
+        cl.get = AsyncMock(return_value=props)
+        c.worker_clients = [{"url": "http://W", "model": "m",
+                             "client": cl, "name": "W"}]
+        c._worker_index = 0
+        c.http_client = MagicMock()
+        c.http_client.post = AsyncMock(return_value=r)
+
+        _rec.maybe_record = _spy
+        try:
+            asyncio.run(c.route("EXPAND_QUERY",
+                                {"model": "m", "messages": []}, "fb"))
+        finally:
+            _rec.maybe_record = real
+
+        assert len(kinds) <= 1, (
+            f"one routed call produced {len(kinds)} recordings ({kinds}) — "
+            f"every routed call lands in the §4BG corpus twice, and the "
+            f"duplicate carries the routing payload rather than the served "
+            f"one")
 
 class TestCrossRestartReplay:
     """Fix 2026-07-22: the per-process ordinal restarts at 1 while the day
@@ -297,3 +383,89 @@ class TestImageElision:
         # original untouched
         assert payload["messages"][0]["content"][0]["source"]["data"] \
             == "C" * 2048
+
+
+class TestReplayServesTheShapesTheCorpusActuallyContains:
+    """R4 lens A. Both R3 replay fixes were written against record shapes the
+    corpus does not contain, and were therefore inert on every real record.
+    These tests use the two shapes that DO exist, counted in the live store:
+    3,728 `kind="route"` records (none with a null response) and 74,323
+    `kind="chat_completion"` records, 41,211 of which requested a pool and
+    were served by main."""
+
+    _PAYLOAD = {"messages": []}
+
+    def _mk(self, **over):
+        from ghost_agent.core.llm_recording import payload_fingerprint
+        rec = {"ordinal": 1, "kind": "chat_completion",
+               "fingerprint": payload_fingerprint(self._PAYLOAD),
+               "payload": dict(self._PAYLOAD), "meta": {},
+               "response": {"choices": [{"message": {"content": "hello"}}]}}
+        rec.update(over)
+        return rec
+
+    def test_route_over_a_modern_chat_record_returns_content_not_a_dict(self):
+        """⚠ THE INERT FIX. R3 guarded with try/except + `response is None`,
+        but `_next` raises only on exhaustion and no record has a null
+        response — so a `kind="chat_completion"` record took neither escape
+        and the raw dict reached a caller expecting a string."""
+        from ghost_agent.core.llm_recording import ReplayLLMClient
+        import asyncio
+
+        r = ReplayLLMClient([self._mk()])
+        out = asyncio.run(r.route("EXPAND_QUERY", {"messages": []}, "FB"))
+        assert out == "hello", f"route() returned {out!r}"
+        assert not r.mismatches, (
+            f"a correctly-served call was logged as a mismatch: {r.mismatches}")
+
+    def test_a_route_record_is_still_served_directly(self):
+        from ghost_agent.core.llm_recording import ReplayLLMClient
+        import asyncio
+
+        r = ReplayLLMClient([self._mk(kind="route", response="routed")])
+        assert asyncio.run(
+            r.route("EXPAND_QUERY", {"messages": []}, "FB")) == "routed"
+
+    def test_the_peek_does_not_desync_the_cursor(self):
+        """The reason this is a peek and not a consume-and-retry: guessing
+        wrong here shifts every subsequent call in the replay by one."""
+        from ghost_agent.core.llm_recording import ReplayLLMClient
+        import asyncio
+
+        second = self._mk(ordinal=2)
+        second["response"] = {"choices": [{"message": {"content": "second"}}]}
+        r = ReplayLLMClient([self._mk(), second])
+        asyncio.run(r.route("EXPAND_QUERY", {"messages": []}, "FB"))
+        nxt = asyncio.run(r.chat_completion({"messages": []}))
+        assert nxt["choices"][0]["message"]["content"] == "second", (
+            "the replay cursor skipped or repeated a record")
+
+    def test_a_legacy_record_reports_an_unknown_leg_not_a_guessed_one(self):
+        """⚠ THE CONFIDENT LIE. R3 filled a missing `served_by` from
+        `meta.use_worker` — the REQUEST flag. For the 41,211 records that
+        asked for a pool and fell back to main, that asserts "worker" for a
+        call the 35B answered, which is precisely the confusion `_ghost_leg`
+        exists to prevent. `served_leg`'s consumers can detect "" and cannot
+        detect a plausible lie."""
+        from ghost_agent.core.llm_recording import ReplayLLMClient
+        from ghost_agent.core.llm import served_leg
+        import asyncio
+
+        r = ReplayLLMClient([self._mk(meta={"use_worker": True})])
+        leg = served_leg(asyncio.run(r.chat_completion({"messages": []})))
+        assert leg["served_by"] == "", (
+            f"replay claims the {leg['served_by']!r} leg served a record that "
+            f"only records what was REQUESTED")
+        assert leg["requested"] == "worker", (
+            "the request flag IS knowable and should still be reported")
+
+    def test_a_recorded_leg_is_replayed_verbatim(self):
+        from ghost_agent.core.llm_recording import ReplayLLMClient
+        from ghost_agent.core.llm import served_leg
+        import asyncio
+
+        r = ReplayLLMClient([self._mk(meta={"use_worker": True,
+                                            "served_by": "main",
+                                            "requested_pool": "worker"})])
+        leg = served_leg(asyncio.run(r.chat_completion({"messages": []})))
+        assert (leg["served_by"], leg["requested"]) == ("main", "worker")

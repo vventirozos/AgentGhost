@@ -475,3 +475,53 @@ def test_stt_and_tts_still_require_auth():
         idx = src.find(f'"{route}"')
         assert idx != -1, f"{route} vanished from server.py"
         assert "verify_interface_key" in src[max(0, idx - 200): idx + 200]
+
+
+# ---------------------------------------------------------------------------
+# R5 lens A: the retry RESTRICTION had no test — deleting it survived all 316.
+# ---------------------------------------------------------------------------
+
+def test_tts_retries_the_default_voice_only_on_a_NONZERO_EXIT():
+    """A bare `except VoiceError` also caught the 504 TIMEOUT and the 503
+    missing-binary, blamed both on the voice name, and RETRIED — taking a
+    request to 2 x TTS_TIMEOUT_S (120s) for a `say` that was already hanging.
+    R4 narrowed it to the 502 (non-zero exit) case and nothing pinned that."""
+    import asyncio
+    from unittest.mock import patch
+    from interface import voice
+
+    calls = []
+
+    def _make_runner(exc):
+        async def _run(cmd, timeout=None):
+            calls.append(list(cmd))
+            if len(calls) == 1:
+                raise exc
+            # the fallback attempt "succeeds"
+            out = [c for c in cmd if str(c).endswith(".aiff") or "-o" in str(c)]
+            return None
+        return _run
+
+    # 502 (non-zero exit, e.g. an unknown voice) -> falls back, TWO attempts.
+    calls.clear()
+    with patch.object(voice, "_run_binary",
+                      _make_runner(voice.VoiceError("'say' failed: x", 502))):
+        try:
+            asyncio.run(voice.synthesize("hello"))
+        except Exception:
+            pass
+    assert len(calls) == 2, (
+        f"a non-zero exit must fall back to the default voice: {len(calls)}")
+
+    # 504 (timeout) -> re-raised, ONE attempt.
+    for status, label in ((504, "timeout"), (503, "missing binary")):
+        calls.clear()
+        with patch.object(voice, "_run_binary",
+                          _make_runner(voice.VoiceError(f"'say' {label}", status))):
+            try:
+                asyncio.run(voice.synthesize("hello"))
+            except voice.VoiceError as e:
+                assert getattr(e, "status", None) == status
+        assert len(calls) == 1, (
+            f"a {status} ({label}) was retried — doubling the wall clock and "
+            f"blaming the voice name: {len(calls)} attempts")

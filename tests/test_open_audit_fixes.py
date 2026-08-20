@@ -90,15 +90,24 @@ def test_sandbox_execute_small_output_unchanged():
 
 
 def test_interface_proxies_require_auth():
-    """Every state-mutating proxy endpoint must carry the new
-    verify_interface_key dependency."""
-    src = Path("interface/server.py").read_text()
-    # The helper itself must exist.
-    assert "verify_interface_key" in src
-    assert "X-Ghost-Key" in src
-    # Every state-mutating endpoint must reference the dependency.
-    # We scan the route decorators — they're all on `@app.post(...)` /
-    # `@app.get(...)` lines with a `Depends(verify_interface_key)` in them.
+    """Every state-mutating proxy endpoint must actually REQUIRE the key.
+
+    ⚠ This used to scan `interface/server.py` for the first textual
+    occurrence of each route string and look ±200 chars for
+    `verify_interface_key`. Any earlier mention of the path anywhere in the
+    file — a comment, a dict key, a set literal — captured the search and the
+    test failed (or, worse, matched a *different* route's decorator and
+    passed). It broke the moment `/api/workspace/save` gained a
+    `_JSON_CAP_OVERRIDES` entry above its decorator.
+
+    Ask the APP instead: build the real dependency graph and require the
+    check to be in it, then confirm the route 401s without a key. Route
+    tables cannot be captured by a comment."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import interface.server as server
+    from starlette.testclient import TestClient
+
     protected_routes = [
         "/api/chat",
         "/api/workspace/save",
@@ -108,15 +117,31 @@ def test_interface_proxies_require_auth():
         "/api/stt",
         "/api/tts",
     ]
+    by_path = {}
+    for r in server.app.routes:
+        if getattr(r, "path", None):
+            by_path.setdefault(r.path, []).append(r)
+
     for route in protected_routes:
-        # Find the decorator line for this route.
-        marker = f'"{route}"'
-        idx = src.find(marker)
-        assert idx != -1, f"route {route} missing from interface/server.py"
-        decorator_line = src[max(0, idx - 200):idx + len(marker) + 200]
-        assert "verify_interface_key" in decorator_line, (
-            f"route {route} does not declare verify_interface_key dependency"
-        )
+        routes = by_path.get(route)
+        assert routes, f"route {route} is not registered on the app"
+        for r in routes:
+            names = [getattr(d.call, "__name__", "")
+                     for d in r.dependant.dependencies]
+            assert "verify_interface_key" in names, (
+                f"route {route} does not require verify_interface_key "
+                f"(dependencies: {names})")
+
+    # And prove it end to end on the ones that take a plain body — a
+    # dependency present in the graph but not enforced would still pass the
+    # check above.
+    client = TestClient(server.app)
+    for route in ("/api/chat", "/api/workspace/save", "/api/upload",
+                  "/api/workspace/load"):
+        r = client.post(route, json={})
+        assert r.status_code == 401, (
+            f"{route} answered {r.status_code} with NO key")
+    assert client.get("/api/download/anything.txt").status_code == 401
 
 
 def test_interface_has_upload_size_cap():

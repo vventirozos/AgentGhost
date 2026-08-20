@@ -1,3 +1,4 @@
+import atexit
 import itertools
 import pytest
 import os
@@ -6,9 +7,66 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
+# ⚠ COLLECTION-TIME live-path isolation. Must run at MODULE level, before
+# any test module is imported — an autouse FIXTURE is too late for the two
+# ways this project actually reaches live files:
+#
+#   1. module-level `import` / module-scoped fixtures. Both Slack suites
+#      load the bot from a module-scoped fixture, and a function-scoped
+#      autouse fixture has not run yet at that point — measured: the
+#      module-scope observer saw the LIVE
+#      ~/Data/AI/Logs/ghost-slack-reply-index.json while the function-scope
+#      one saw "".
+#   2. import-time CONSTANT binding, which no env fixture can ever fix
+#      (interface/webpush_notify binds _SUBS_FILE at import to the live
+#      ~/Data/AI/.ghost_push_subs.json).
+#
+# History: a test suite truncated the operator's live Slack reply index
+# this way on 2026-08-17, destroying label attribution for every older bot
+# reply. The per-suite convention that two other files followed correctly
+# is the wrong mechanism — it holds until someone writes the next file.
+# Setting these here makes the safe default structural for the whole
+# session; a test needing a real path still overrides it explicitly.
+# The Slack bot treats an EMPTY value as "disabled" and checks for it
+# before every read/write. webpush_notify does NOT — it builds a Path from
+# the value, and Path("") is ".", so an empty string would make it write
+# into the CWD. Those two get a throwaway directory instead of "".
+_LIVE_ISOLATION_DIR = tempfile.mkdtemp(prefix="ghost-test-live-isolation-")
+# Cleaned on exit — without this every pytest invocation leaked a directory
+# (134 of them were already in /var/folders when a review counted).
+atexit.register(shutil.rmtree, _LIVE_ISOLATION_DIR, ignore_errors=True)
+for _live_var, _live_default in (
+        ("GHOST_SLACK_REPLY_INDEX", ""),
+        ("GHOST_SLACKBOT_LOG", ""),
+        ("GHOST_PUSH_SUBS_FILE",
+         os.path.join(_LIVE_ISOLATION_DIR, "push_subs.json")),
+        ("GHOST_VAPID_FILE",
+         os.path.join(_LIVE_ISOLATION_DIR, "vapid.json")),
+):
+    os.environ[_live_var] = _live_default
+
 # Canonical builders (IMPROVEMENTS.md #26). Importable directly
 # (`from tests.helpers import make_context`) or via the fixtures below.
-from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401
+from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401  # isort:skip
+
+
+@pytest.fixture(autouse=True)
+def _reset_bg_task_registry():
+    """`utils.logging._BG_TASKS` is a module-global set that leaks across
+    files. A test that patches `spawn_task` with something returning None
+    (e.g. `asyncio.run`) used to poison it permanently — the add_done_callback
+    raised, so the discard never ran — and every later file that iterates the
+    set calling `.done()` / `.cancel()` crashed on the None.
+
+    Three files read that set today and were rescued only by two INCIDENTAL
+    `clear()` calls in alphabetically-earlier files: rename one of those, or
+    add a test shuffler, and three suites break at once. `spawn_bg` now
+    refuses a None task; this makes the isolation structural regardless.
+    """
+    from ghost_agent.utils import logging as _glog
+    _glog._BG_TASKS.clear()
+    yield
+    _glog._BG_TASKS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +117,36 @@ def _isolate_ghost_home(monkeypatch, _ghost_home_base):
     d = _ghost_home_base / str(next(_GHOST_HOME_COUNTER))
     d.mkdir()
     monkeypatch.setenv("GHOST_HOME", str(d))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_live_side_files(monkeypatch):
+    """The same lesson as `_isolate_ghost_home`, for paths that do NOT live
+    under GHOST_HOME — so isolating the home was never enough.
+
+    2026-08-17: `tests/test_slack_bot_shadow_ban.py` imported the Slack bot
+    without setting `GHOST_SLACK_REPLY_INDEX`, so `REPLY_INDEX_PATH`
+    resolved to the operator's live
+    `~/Data/AI/Logs/ghost-slack-reply-index.json`. The bot loads that file
+    only inside `main()`, so under pytest the in-memory index starts EMPTY
+    and the first `register_reply` TRUNCATED the live file to the test's
+    fixtures — destroying the reply→request mapping for every bot reply
+    older than that run, and with it the ability to label those turns.
+    Unreconstructible: the bot logs no channel:ts. The same file also set
+    `GHOST_SLACK_LOG_FILE`, a name nothing reads, so a RotatingFileHandler
+    attached to the live operator audit log.
+
+    Two other suites DID isolate these correctly, which is exactly why a
+    per-file convention is the wrong mechanism: it holds until someone
+    writes the next file. This makes the safe default structural — a test
+    that needs a real path still sets one explicitly (monkeypatch.setenv
+    runs after autouse fixtures).
+
+    Empty string is the documented "disabled" value for both: the bot
+    checks `if not REPLY_INDEX_PATH` before every read and write.
+    """
+    for var in ("GHOST_SLACK_REPLY_INDEX", "GHOST_SLACKBOT_LOG"):
+        monkeypatch.setenv(var, "")
 
 
 @pytest.fixture

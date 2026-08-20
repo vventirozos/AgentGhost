@@ -296,7 +296,7 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
 
         return f"SUCCESS: Task '{task_name}' scheduled (ID: {job_id})."
     except Exception as e:
-        pretty_log("Schedule Error", str(e), level="ERROR")
+        pretty_log("Schedule Error", str(e), level="ERROR", icon=Icons.FAIL)
         return f"ERROR: {e}"
 
 async def tool_watch_condition(task_name: str, check_command: str,
@@ -344,7 +344,7 @@ async def tool_watch_condition(task_name: str, check_command: str,
         return (f"SUCCESS: Watch '{task_name}' active (ID: {job_id}) — polling every {secs}s. "
                 f"It fires the reaction the moment `{str(check_command)[:60]}` first exits 0.")
     except Exception as e:
-        pretty_log("Watch Error", str(e), level="ERROR")
+        pretty_log("Watch Error", str(e), level="ERROR", icon=Icons.FAIL)
         return f"ERROR: {e}"
 
 

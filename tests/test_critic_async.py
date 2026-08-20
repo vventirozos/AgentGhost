@@ -169,6 +169,12 @@ def _wire_corpus(agent, traj):
     """Attach a mock collector + the correction cache holding `traj`."""
     from collections import OrderedDict
     collector = MagicMock()
+    # EXPLICIT: a bare MagicMock answers `has_human_label` with a truthy
+    # Mock, which the human-authority guard (`_human_label_locked`) reads as
+    # "a human already labelled this" and withholds the whole late verdict —
+    # silently blinding the very corpus write these tests pin. State the
+    # intent instead of inheriting whatever Mock returns.
+    collector.has_human_label.return_value = False
     agent.context.trajectory_collector = collector
     agent.context._recent_trajectories_for_correction = OrderedDict(
         [("fp", traj)] if traj is not None else [])

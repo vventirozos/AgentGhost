@@ -206,8 +206,11 @@ class TestStreamingScrubOnFinalGeneration:
         the scrub, nothing ships to the client."""
         src = AGENT_SRC.read_text()
         assert "_scrubbed_view = _stream_scrub_pattern.sub('', full_content)" in src
-        assert "_to_emit = _scrubbed_view[_scrubbed_emitted_len:]" in src
-        assert "_scrubbed_emitted_len = len(_scrubbed_view)" in src
+        # § finalize/stream R1 B-1: emission now goes through the
+        # partial-tag hold-back view; behavior is pinned in
+        # test_finalize_stream_r1_fixes.py::TestScrubDesyncFixed.
+        assert "_to_emit = _safe_view[_scrubbed_emitted_len:]" in src
+        assert "_scrubbed_emitted_len = len(_safe_view)" in src
 
     def test_source_bypasses_raw_yield_on_scrub_path(self):
         """When the scrub path is active for a content chunk, the code

@@ -670,3 +670,83 @@ class TestReplyIndexPersistence:
         # Older than the agent's 8-day trajectory scan → guaranteed 404
         # server-side; the lookup misses honestly instead (R1 review).
         assert bot.lookup_reply("C1", "1.0") is None
+
+
+# ── Feedback-channel review, 2026-08-17: the surviving mutations ────────────
+
+class TestTheLabelDroppedSignalIsPinned:
+    """C6: the one durable "a label was dropped" record. Demoting it to
+    DEBUG survived the whole suite — and the bot's own comment says this
+    line exists because "the feature can be 100% dead and every surface
+    says healthy". The bot's file handler is level INFO, so DEBUG writes
+    nowhere."""
+
+    def test_an_unindexed_thumb_logs_at_INFO_not_DEBUG(self, bot, monkeypatch,
+                                                       caplog):
+        import asyncio
+        import logging
+        monkeypatch.setattr(bot, "OWNER_ID", OWNER)
+        monkeypatch.setattr(bot, "_last_unindexed_log_ts", 0.0)
+        bot._REPLY_INDEX.clear()
+        with caplog.at_level(logging.DEBUG):
+            asyncio.run(bot.handle_reaction({
+                "user": OWNER, "reaction": "+1",
+                "item": {"type": "message", "channel": "C1", "ts": "1.0"},
+            }))
+        hits = [r for r in caplog.records if "unindexed" in r.getMessage()]
+        assert hits, "a dropped label produced no record at all"
+        assert any(r.levelno >= logging.INFO for r in hits), (
+            f"logged only at {[r.levelname for r in hits]} — the bot's file "
+            "handler is INFO, so this writes nowhere")
+
+    def test_the_hourly_rate_limit_still_holds(self, bot, monkeypatch, caplog):
+        """The mirror: colleagues thumb each other constantly in an open
+        channel, so the INFO line must not become a flood."""
+        import asyncio
+        import logging
+        monkeypatch.setattr(bot, "OWNER_ID", OWNER)
+        monkeypatch.setattr(bot, "_last_unindexed_log_ts", 0.0)
+        bot._REPLY_INDEX.clear()
+        with caplog.at_level(logging.DEBUG):
+            for i in range(3):
+                asyncio.run(bot.handle_reaction({
+                    "user": OWNER, "reaction": "+1",
+                    "item": {"type": "message", "channel": "C1",
+                             "ts": f"{i}.0"},
+                }))
+        info = [r for r in caplog.records
+                if "unindexed" in r.getMessage() and r.levelno >= logging.INFO]
+        assert len(info) == 1, f"{len(info)} INFO lines for 3 misses"
+
+
+class TestTheReplyIndexBoundsAreReal:
+    """C11: TTL 8d → 1s and MAX 500 → 1 both survived. The suite pinned that
+    an EXPIRED entry is dropped but never that a FRESH one survives, because
+    every test looks up within milliseconds of registering."""
+
+    def test_a_fresh_entry_survives_the_TTL_window(self, bot, monkeypatch):
+        import time
+        monkeypatch.setattr(bot, "REPLY_INDEX_PATH", "")
+        bot._REPLY_INDEX.clear()
+        bot.register_reply("C1", "1.0", "reqA", REQUESTER)
+        # ⚠ ABSOLUTE age, not `TTL - 3600`: deriving the age from the
+        # constant under test made the assertion vacuous — with TTL=1.0 the
+        # subtraction produced a FUTURE timestamp and the lookup passed.
+        # That mutation survived the first version of this test.
+        SEVEN_DAYS = 7 * 86400.0
+        bot._REPLY_INDEX["C1:1.0"]["t"] = time.time() - SEVEN_DAYS
+        assert bot._REPLY_INDEX_TTL_S > SEVEN_DAYS, (
+            "the reply TTL must outlast a week — a Friday reply thumbed the "
+            "following Friday still has to attribute")
+        assert bot.lookup_reply("C1", "1.0") is not None, (
+            "a 7-day-old reply must still be labelable")
+
+    def test_the_capacity_holds_more_than_a_handful(self, bot, monkeypatch):
+        monkeypatch.setattr(bot, "REPLY_INDEX_PATH", "")
+        bot._REPLY_INDEX.clear()
+        for i in range(60):
+            bot.register_reply("C1", f"{i}.0", f"req{i}", REQUESTER)
+        assert bot._REPLY_INDEX_MAX >= 100, (
+            "at ~3.5 turns/day over an 8-day TTL the cap must not bind")
+        assert bot.lookup_reply("C1", "0.0") is not None, (
+            "the oldest of 60 entries was evicted — capacity is too small")

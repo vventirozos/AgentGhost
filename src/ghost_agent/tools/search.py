@@ -378,6 +378,10 @@ def _fetch_error_is_retryable(err: str) -> bool:
     return True
 
 
+# A per-url distillation is one of many inside a research call and its
+# fallback is free, so it gets a short leash.
+_WEB_SUMMARY_TIMEOUT_S = 45.0
+
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             max_results: int = 20) -> List[Dict]:
     """Race ALL engines in parallel, each on its OWN Tor circuit; the first
@@ -821,6 +825,22 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
         return last
 
     async def process_url(url):
+        # ⚠ THE DISTILL BUDGET IS WHAT THE CLOCK LEAVES, NOT A CONSTANT.
+        # R6 gave `darkweb_search.py` this treatment and left THIS, the
+        # original, on a flat `_WEB_SUMMARY_TIMEOUT_S`. 45 is not the
+        # remainder of `PER_URL_TIMEOUT`; it is merely smaller than it. The
+        # outer `wait_for` below covers the semaphore wait, up to two 22s
+        # fetch attempts AND the distill, so a normal slow fetch plus a
+        # normal distill blows it and the URL is LOST — measured at 55.00s
+        # with the worker node COMPLETELY FREE (R7 lens A). Losing the URL
+        # is strictly worse than the raw-text degradation sitting in the
+        # `except` block below, and `fact_check` consumes the result either
+        # way.
+        #
+        # The deadline starts HERE, before `async with sem`: at concurrency
+        # 3 the 4th and later URLs spend part of their per-URL budget queued
+        # on that semaphore, and that time is already gone when we get here.
+        _url_deadline = time.monotonic() + PER_URL_TIMEOUT
         async with sem:
             # Shorten URL for log
             short_url = (url[:35] + "..") if len(url) > 35 else url
@@ -866,11 +886,65 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
                     "temperature": 0.0,
                     "max_tokens": 2048
                 }
+                # What the fetch left us, less a small margin for the
+                # response to come back. Below the floor there is no point
+                # starting a distillation we cannot finish — take the
+                # raw-text path instead of losing the URL.
+                _summary_budget = min(
+                    _WEB_SUMMARY_TIMEOUT_S,
+                    _url_deadline - time.monotonic() - 2.0)
+                if _summary_budget < 5.0:
+                    raise TimeoutError(
+                        f"only {_summary_budget:.1f}s left of the per-URL "
+                        f"budget — taking the raw-text path rather than "
+                        f"starting a distillation that cannot finish")
                 try:
-                    summary_data = await llm_client.chat_completion(payload, use_worker=True, task_label="web summary")
-                    pretty_log("Worker Compute", f"Distilling facts from {short_url}", icon=Icons.TOOL_DEEP)
+                    summary_data = await llm_client.chat_completion(
+                        payload, use_worker=True,
+                        # ⚠ The fallback is FREE — the `except`
+                        # two lines below keeps the raw page text.
+                        # Without this, a worker outage sent EVERY
+                        # url's distillation to the main 35B,
+                        # foreground, serialised behind the main
+                        # lock, each racing a 55s per-url deadline —
+                        # one research call becoming N unbounded 35B
+                        # generations (LLM review R3 lens B, B2).
+                        off_main_only=True,
+                        # ⚠ BOUND THE TOTAL, NOT JUST THE POST. This whole
+                        # coroutine runs under an outer per-url deadline; if
+                        # the pool budget can exceed it, a saturated node
+                        # makes the outer `wait_for` cancel fetch AND distill
+                        # and the URL is LOST — strictly worse than the
+                        # raw-text degradation sitting in the except block
+                        # below. R2 capped this implicitly via
+                        # `min(_slot_wait, timeout)`; R4 removed that cap
+                        # without replacing it, which took the budget to the
+                        # 90s operator ceiling, 1.6x the outer deadline
+                        # (R5 lens A). Now stated explicitly, as R4's own
+                        # doctrine requires.
+                        timeout=_summary_budget,
+                        slot_wait=_summary_budget,
+                        # ⚠ THE TOTAL IS WHAT MATTERS HERE. `slot_wait` alone
+                        # bounds only the queueing, and queue + POST then
+                        # exceeded the outer `wait_for` anyway — measured URL
+                        # LOSS at 55.00s on the shipped R5 code (R6 lens A).
+                        total_budget=_summary_budget,
+                        task_label="web summary")
+                    pretty_log("Worker Compute", f"Distilled facts from {short_url}", icon=Icons.TOOL_DEEP)
                     preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
-                except Exception:
+                except Exception as _sum_exc:
+                    from ..core.llm import _err_text
+                    # ⚠ SAY SO. This was a bare `except Exception:` with no
+                    # log at all, so every degradation here was invisible:
+                    # the source silently reverts to raw truncated page text,
+                    # which then feeds `fact_check` as if it were distilled
+                    # evidence. A whole research call could run on raw HTML
+                    # and read identically in the stream (R4 lens B).
+                    pretty_log(
+                        "Summary Degraded",
+                        f"{short_url}: {_err_text(_sum_exc)} — falling back "
+                        f"to raw page text",
+                        level="WARNING", icon=Icons.WARN)
                     # Clean the raw-text fallback too: unscrubbed surrogates /
                     # control chars in a fetched page can crash the downstream
                     # C++ JSON/grammar parser (the exact thing _clean_for_cpp

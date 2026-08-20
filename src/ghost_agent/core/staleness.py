@@ -38,8 +38,10 @@ line that matters.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 import sys
+import time
 from typing import Dict, List, Optional
 
 # Every module whose text §4BN's claims depend on. If the running process
@@ -64,6 +66,10 @@ _DIGESTS_AT_LOAD: Dict[str, str] = {}
 # rounds, so edit → warn → restore → edit again was exactly the R28/R30
 # condition, silently.
 _REPORTED: set = set()
+# §LOG-6b: per-file warn cooldown (seconds) + last-warned clock. See the
+# audit function — per-digest dedup alone re-warned on every dev-box save.
+_FILE_WARN_COOLDOWN = 3600.0
+_FILE_LAST_WARNED: Dict[str, float] = {}
 
 
 def _package_root() -> str:
@@ -120,15 +126,46 @@ def audit_source_newer_than_process(log) -> Optional[str]:
     fresh = [rel for rel in stale if (rel, current[rel]) not in _REPORTED]
     if not fresh:
         return None
+    # §LOG-6b (2026-08-20): per-FILE warn-level cooldown ON TOP OF the
+    # per-digest dedup — reconciled with two standing laws this module
+    # already pins: (R34) every DISTINCT divergence must still be
+    # announced (path-keyed suppression was tried and rejected — the
+    # edit/restore/edit cycle hid real staleness), and (R33) nothing may
+    # be marked before a SUCCESSFUL emit. So repeats within the window
+    # still log and still return — but at INFO: during active development
+    # every save mints a new digest, and 95 near-identical WARNINGs in 16
+    # days (the #1 warning) trained the operator to ignore the color.
+    # Only the FIRST divergence of a file per cooldown is a WARNING.
+    _now = time.monotonic()
+    _loud = [rel for rel in fresh
+             if _now - _FILE_LAST_WARNED.get(rel, -1e9)
+             >= _FILE_WARN_COOLDOWN]
+    _level = "WARNING" if _loud else "INFO"
     msg = ("the running process no longer matches its source: "
            + ", ".join(fresh)
            + " changed on disk after this process loaded them. CPython does "
              "not reload, so what you are reading is not what is running — "
              "restart before trusting any log line from these modules.")
-    log(msg)
+    # Pass the level only to sinks that accept it (the production lambdas
+    # do; the R34 pin's bare `list.append` sink does not) — decided by
+    # signature, never by a try/except that could double-emit.
+    try:
+        _params = inspect.signature(log).parameters.values()
+        _takes_level = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD or p.name == "level"
+            for p in _params)
+    except (TypeError, ValueError):
+        _takes_level = False
+    if _takes_level:
+        log(msg, level=_level)
+    else:
+        log(msg)
     # Marked AFTER emitting: the watchdog tick swallows exceptions, so
     # marking first meant one raising logger silenced the divergence for
-    # the life of the process.
+    # the life of the process. (§LOG-6b: the warn-cooldown stamp obeys the
+    # same law — a raising sink must leave the next audit LOUD.)
     for rel in fresh:
         _REPORTED.add((rel, current[rel]))
+    for rel in _loud:
+        _FILE_LAST_WARNED[rel] = _now
     return msg

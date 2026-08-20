@@ -195,10 +195,28 @@ class TestDeepResearchFetch:
         monkeypatch.setattr(search_mod, "helper_fetch_url_content", fake_fetch)
         monkeypatch.setattr("importlib.util.find_spec", lambda name: True)
 
-        async def fake_to_thread(fn, *a, **k):
+        # ⚠ PATCH THE RACE, NOT `asyncio.to_thread`. This test used to stub
+        # `asyncio.to_thread`, and that patch went DEAD when the search
+        # path moved to `loop.run_in_executor(_RACE_POOL, ...)` — a
+        # dedicated pool, deliberately not the shared to_thread executor
+        # (see `_race_search_wave`). Nothing failed loudly; the test simply
+        # stopped isolating anything and began running REAL ddgs queries
+        # against live search engines on every run. Observed consequences:
+        #   * ~3% flake (1 in 30 standalone runs) — when every live engine
+        #     came back empty inside the wave deadline, `urls` was empty,
+        #     deep_research returned "search phase failed", the fetch never
+        #     happened, and the assertion below died on KeyError;
+        #   * it asserted proxy derivation for whatever URL the internet
+        #     happened to return, not the fixed one it declares;
+        #   * ~2-4s of real network I/O inside a unit suite.
+        # `_race_search_wave` is the seam every other deep_research test in
+        # this repo patches (test_egress_failclosed_4p,
+        # test_research_failure_honesty), and its own docstring notes that
+        # deep_research fans out to it directly.
+        async def fake_wave(query, tor_proxy, wave, max_results=15):
             return [{"href": "http://example.com/1"}]
 
-        monkeypatch.setattr("asyncio.to_thread", fake_to_thread)
+        monkeypatch.setattr(search_mod, "_race_search_wave", fake_wave)
 
         llm = MagicMock()
         llm.chat_completion = AsyncMock(return_value={"choices": [{"message": {"content": "facts"}}]})

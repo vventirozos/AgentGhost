@@ -168,6 +168,54 @@ def test_sendto_blocked_for_public():
         uninstall()
 
 
+def test_connect_ex_blocked_for_public():
+    """§4BW: the guard patches connect / connect_ex / sendto / sendmsg, but
+    the suite asserted only connect and sendto — `connect_ex` interception
+    was real (verified) but UNTESTED, so removing it would go unnoticed.
+    The guard raises BEFORE any packet, so no real network is used."""
+    uninstall = install("socks5://127.0.0.1:9050")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(MandatoryTorError):
+                s.connect_ex(("8.8.8.8", 53))
+        finally:
+            s.close()
+    finally:
+        uninstall()
+
+
+def test_connect_ex_allows_loopback():
+    """The complement, so a guard that blocks EVERYTHING isn't mistaken for
+    a working one — loopback (Tor's own SOCKS port lives here) must pass."""
+    uninstall = install("socks5://127.0.0.1:9050")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            # No listener → real connect_ex returns a nonzero errno, but it
+            # must NOT be a MandatoryTorError (the guard let it through).
+            rv = s.connect_ex(("127.0.0.1", 1))
+            assert isinstance(rv, int)
+        finally:
+            s.close()
+    finally:
+        uninstall()
+
+
+def test_sendmsg_blocked_for_public():
+    """The fourth patched verb, also previously unasserted."""
+    uninstall = install("socks5://127.0.0.1:9050")
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            with pytest.raises(MandatoryTorError):
+                s.sendmsg([b"x"], [], 0, ("8.8.8.8", 53))
+        finally:
+            s.close()
+    finally:
+        uninstall()
+
+
 # ──────────────────────────────────────────────────────────────────────
 # liveness probe
 # ──────────────────────────────────────────────────────────────────────

@@ -79,8 +79,17 @@ class TestMainFallbackTimeout:
             {"model": "m", "messages": []}, use_worker=True, timeout=6.0))
         assert _content(res) == "FROM_MAIN"      # fallback still happens…
         assert cap["called"] is True
-        # …but WITHOUT the 6s worker budget, which would kill the 35B.
-        assert cap["timeout"] == "<unset>"
+        # …but WITHOUT the 6s worker budget, which would kill the 35B —
+        # AND NOT UNBOUNDED EITHER. This used to assert `"<unset>"`, i.e.
+        # httpx's 1200-SECOND default, on the FOREGROUND path: a busy worker
+        # (our own NodeSaturated reaches here too) converted into a
+        # twenty-minute main-slot occupation, and the caller's own careful
+        # budget vanished. The main model gets a budget sized for the main
+        # model (LLM review 2026-08-18, three independent lenses).
+        from ghost_agent.core.llm import _MAIN_FALLBACK_TIMEOUT_S
+        assert cap["timeout"] == _MAIN_FALLBACK_TIMEOUT_S
+        assert cap["timeout"] > 6.0, "the worker budget leaked to the 35B"
+        assert cap["timeout"] < 1200.0, "the main fallback is unbounded again"
 
     def test_worker_success_never_touches_main(self):
         cap = {}
@@ -176,5 +185,8 @@ class TestOffMainOnly:
             return cap_a, cap_b
 
         cap_a, cap_b = asyncio.run(both())
-        assert cap_a["timeout"] == "<unset>"   # node fallback: dropped
+        from ghost_agent.core.llm import _MAIN_FALLBACK_TIMEOUT_S
+        # node fallback: the caller's node budget is dropped, replaced by a
+        # BOUNDED main budget (not httpx's 1200s default — see above).
+        assert cap_a["timeout"] == _MAIN_FALLBACK_TIMEOUT_S
         assert cap_b["timeout"] == 90.0        # direct main call: preserved

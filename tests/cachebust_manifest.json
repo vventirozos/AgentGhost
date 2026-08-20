@@ -1,0 +1,30 @@
+{
+  "app.js": {
+    "sha": "061fea6940b7f454",
+    "version": "10.2"
+  },
+  "matrix_graph.js": {
+    "sha": "3718a2f10ec95dab",
+    "version": "10.2"
+  },
+  "notifications.js": {
+    "sha": "d285f64c8a82f93d",
+    "version": "6.9"
+  },
+  "palette.js": {
+    "sha": "4007a59981289f35",
+    "version": "6.8"
+  },
+  "sessions.js": {
+    "sha": "8827a4ac569ed7c5",
+    "version": "7.6"
+  },
+  "status.js": {
+    "sha": "571c797bf852aee3",
+    "version": "7.0"
+  },
+  "workspace.js": {
+    "sha": "a21e77e754862425",
+    "version": "7.6"
+  }
+}

@@ -73,7 +73,10 @@ def test_handle_chat_delegates_to_finalize():
 
 def test_method_carries_the_finalization_landmarks():
     src = inspect.getsource(GhostAgent._finalize_and_return)
-    for marker in ("FINAL OUTPUT SCRUBBER", "bleed_markers",
+    # § finalize/stream R1 A-F3: the inline bleed loop became the shared
+    # _truncate_prompt_bleed helper (strong/weak markers) used by BOTH the
+    # finalize and per-turn twins.
+    for marker in ("FINAL OUTPUT SCRUBBER", "_truncate_prompt_bleed",
                    "_deferred_perfect_it", "verifier_backfill",
                    "return final_ai_content, created_time, req_id"):
         assert marker in src, f"finalization landmark missing: {marker}"

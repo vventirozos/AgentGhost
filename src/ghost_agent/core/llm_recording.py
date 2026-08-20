@@ -351,9 +351,74 @@ class ReplayLLMClient:
 
     async def chat_completion(self, payload: Dict[str, Any],
                               **_kw) -> Dict[str, Any]:
-        return self._next("chat_completion", payload).get("response") or {}
+        rec = self._next("chat_completion", payload)
+        resp = rec.get("response") or {}
+        # ⚠ REPLAY THE SERVED LEG TOO. Two consumers now branch on
+        # `served_leg(result)` — the verifier's §4BR degradation guard and
+        # `constraint_gate`'s screen-then-confirm — and a replayed dict
+        # carrying no `_ghost_leg` reports `{"", "", ""}`. That silently
+        # drives BOTH the wrong way under replay: the gate's
+        # `screened_off_main` reads False (the independent confirm pass is
+        # skipped and a screen veto blocks directly) and the verifier reads
+        # "critic" for a main-served verdict. The recording carries the leg
+        # when the producer stamped it; prefer that, and fall back to the
+        # recorded meta so older fixtures still drive the consumers sanely
+        # (LLM review R3 lens B, B6). `eval/verify_bench.py` already does
+        # this correctly.
+        if isinstance(resp, dict) and "_ghost_leg" not in resp:
+            meta = rec.get("meta") or {}
+            served = str(meta.get("served_by") or "")
+            requested = str(meta.get("requested_pool") or "")
+            if not requested:
+                # These flags are the REQUEST, and only the request.
+                requested = ("worker" if meta.get("use_worker") else
+                             "critic" if meta.get("use_critic") else
+                             "vision" if meta.get("use_vision") else "main")
+            resp = dict(resp)
+            resp["_ghost_leg"] = {
+                # ⚠ NEVER DERIVED FROM THE REQUEST FLAGS. R3 filled a missing
+                # `served_by` with `"worker" if meta.use_worker ...`, which
+                # confuses "what was asked for" with "what answered" — the
+                # exact distinction `_ghost_leg` was introduced to carry.
+                # R4 lens A checked it against the corpus: it asserts a leg
+                # that is WRONG for 41,211 of 74,323 live records, every one
+                # of them a call that requested a pool and fell back to main.
+                # A confident wrong answer is worse here than no answer,
+                # because `served_leg`'s consumers can detect "" and cannot
+                # detect a plausible lie. Legacy records simply do not know.
+                "served_by": served,
+                "fell_back_from": "",
+                "requested": requested,
+                "synthesized": not served,
+            }
+        return resp
 
     async def route(self, task: str, payload: Dict[str, Any],
                     fallback: Any = None, **_kw) -> Any:
-        resp = self._next("route", payload).get("response")
+        # `route()` recordings were retired when the double-count was removed
+        # (the delegated `chat_completion` write is the only one now), so a
+        # replay must look there or every routed call reports a mismatch and
+        # returns a dict where the caller expects a string.
+        # ⚠ PEEK, DO NOT CONSUME. R3 wrapped `_next` in a try/except and
+        # tested `response is None` — but `_next` raises only on EXHAUSTION,
+        # and a modern recording writes `kind="chat_completion"` with a dict
+        # response. So neither escape fired: the record was consumed, a
+        # mismatch was logged, and the raw dict was handed back to a caller
+        # expecting a string. R4 lens A checked the corpus — 3,728 records
+        # with `kind="route"`, ZERO with a null response — so the fix was
+        # inert on every record it was written for. Branch on the KIND, and
+        # do it without moving the cursor, or a wrong guess here desyncs
+        # every subsequent call in the replay.
+        nxt = (self.records[self._cursor]
+               if self._cursor < len(self.records) else None)
+        if nxt is not None and nxt.get("kind") == "route":
+            rec = self._next("route", payload)
+        else:
+            rec = None
+        if rec is None or rec.get("response") is None:
+            resp = await self.chat_completion(payload)
+            content = ((resp.get("choices") or [{}])[0]
+                       .get("message", {}).get("content", ""))
+            return content if content else fallback
+        resp = rec.get("response")
         return resp if resp is not None else fallback

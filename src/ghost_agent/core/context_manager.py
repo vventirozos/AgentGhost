@@ -151,10 +151,19 @@ class ContextManager:
         # the goal message here — identify it by object identity so a later
         # message that happens to equal it is unaffected.
         goal_msg = next((m for m in conv_msgs if m.get("role") == "user"), None)
+        # § context R1 A-F5b: the NEWEST user message carries the constraints
+        # governing the CURRENT work — "protect the first user message" was a
+        # name-proxy for "the instruction that governs the work". With the
+        # live tail shape [..., user_current, assistant, tool] and
+        # keep_full=2, L3 center-cut the current request itself (a hard
+        # constraint at char 900 destroyed, reachable every turn via
+        # compress_if_needed). Same identity rule as the goal.
+        newest_user_msg = next((m for m in reversed(conv_msgs)
+                                if m.get("role") == "user"), None)
         compressed_old = []
         for msg in old_msgs:
-            if msg is goal_msg:
-                compressed_old.append(msg)      # goal is sacrosanct
+            if msg is goal_msg or msg is newest_user_msg:
+                compressed_old.append(msg)      # goal + current request are sacrosanct
                 continue
             compressed = self._compress_message(msg, level)
             if compressed is not None:

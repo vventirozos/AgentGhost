@@ -135,7 +135,7 @@ export function initNotifications(ctx) {
     });
     document.addEventListener('click', (e) => {
         if (panel && !panel.classList.contains('hidden')
-            && !panel.contains(e.target) && !btn.contains(e.target)) {
+            && !panel.contains(e.target) && !btn?.contains(e.target)) {
             closePanel();
         }
     });

@@ -106,6 +106,22 @@ def spawn_bg(coro, *, name: str = "bg"):
     silent death would be a real loss. Returns the Task.
     """
     task = spawn_task(coro)
+    if not hasattr(task, "add_done_callback"):
+        # NOT `is None` — duck-typed on the one method the registry needs.
+        # A `spawn_task` that ran the coroutine INLINE, or a test double
+        # patched to `asyncio.run`, returns the coroutine's VALUE, which is
+        # whatever the coroutine returned: None, a str, anything. Adding a
+        # non-Task to the registry poisons it: the
+        # `add_done_callback` below raises, so the discard in `_done` never
+        # runs and the None stays FOREVER — and every later reader that
+        # calls `t.done()` / `t.cancel()` over the set crashes.
+        #
+        # That is a real, pre-existing cross-file failure: three test files
+        # read this set and are currently rescued only by two incidental
+        # `clear()` calls in alphabetically-earlier files (found by the
+        # 2026-08-17 feedback-channel review). The work is already done when
+        # we get None, so there is nothing to register.
+        return None
     _BG_TASKS.add(task)
 
     def _done(t: "asyncio.Task"):
@@ -399,6 +415,23 @@ class Icons:
     MODE_GHOST   = "🫥"
     POSTGRES     = "🐘"
 
+    # --- Metacognition (§LOG-7, 2026-08-20) ---
+    # Registered here (were literals in core/metacog_log.py, a registry
+    # bypass): three of the old glyphs COLLIDED with registry meanings —
+    # 🧮 arbiter vs VECTOR_EMBED, 🔀 replan vs EVENT_BUS, 🧠 default vs
+    # BRAIN_SUM — and the unregistered seven were invisible to the client
+    # ICON_CLASS maps (every metacog line degraded to the "think" floor).
+    METACOG          = "🫧"   # generic metacog uplift (was 🧠)
+    METACOG_BOOT     = "🌱"   # lifecycle: enable / disable / shutdown
+    METACOG_SUMMARY  = "📊"   # shutdown / periodic rollup
+    METACOG_CONF     = "📈"   # composite confidence reading
+    METACOG_CALIB    = "📐"   # calibration spine: Brier / ECE / refit
+    METACOG_ARBITER  = "🥇"   # dual-solver arbiter decision (was 🧮)
+    METACOG_VALID    = "🚧"   # pre-execution validator verdict
+    METACOG_HOST     = "💻"   # host telemetry signal
+    METACOG_REPLAN   = "🚦"   # replan bridge attempt (was 🔀)
+    METACOG_GATE     = "🚪"   # gate skip reasons (debug only)
+
     # --- Boot-phase icons ---
     # Each startup component gets a distinct glyph so the first page of
     # the log is scannable and each subsystem's state jumps out. These
@@ -454,7 +487,15 @@ class _PrettyLogHandler(logging.Handler):
             # "GhostSelfhood" → "Selfhood", "GhostAgent" → "Agent".
             subsystem = name[5:] if name.startswith("Ghost") else name
             icon = Icons.FAIL if record.levelno >= logging.ERROR else Icons.WARN
-            pretty_log(subsystem or "log", record.getMessage(),
+            # §LOG-7 (2026-08-20): include the emitting MODULE — 230 live
+            # warnings rendered under the bare title "agent" (21% of all
+            # WARNINGs, incl. spawn_bg background-task deaths), giving the
+            # operator level+text but no greppable event family.
+            _mod = getattr(record, "module", "") or ""
+            _title = (f"{subsystem or 'log'}·{_mod}"
+                      if _mod and _mod.lower() != (subsystem or "").lower()
+                      else (subsystem or "log"))
+            pretty_log(_title, record.getMessage(),
                        icon=icon, level=record.levelname)
         except Exception:
             self.handleError(record)
@@ -707,7 +748,8 @@ def _redact_log(s: str) -> str:
         return s
 
 
-def _mirror(req_id: str, title: str, content: str, level: str = "INFO") -> None:
+def _mirror(req_id: str, title: str, content: str, level: str = "INFO",
+            delta: Optional[str] = None) -> None:
     """Write pretty_log's FULL (untruncated) content to the durable file sink.
 
     This is what makes ``$GHOST_HOME/system/ghost-agent.log`` a COMPLETE,
@@ -716,12 +758,20 @@ def _mirror(req_id: str, title: str, content: str, level: str = "INFO") -> None:
     (the GhostStream logger carries no stdout handler; see setup_logging), so a
     mirror line never double-prints on the operator's monitored stream. Never
     raises — logging must not break the app.
+
+    ``delta`` MUST be the delta the console line already computed. §LOG-2
+    (2026-08-20): this function used to call ``_format_delta`` a second
+    time — for SYSTEM lines that second STATEFUL read advanced the anchor,
+    so the durable record's SYSTEM deltas were all ~+0.00s (the real idle
+    step-durations existed only on the transient console). Recomputing
+    here is only a fallback for direct callers.
     """
     lg = _MIRROR_LOGGER
     if lg is None:
         return
     try:
-        delta = _format_delta(req_id).strip()
+        delta = (delta if delta is not None
+                 else _format_delta(req_id)).strip()
         prefix = f"{req_id[:8]} {delta}".strip()
         sep = " — " if content else ""
         lg.log(_LEVELNO.get(level.upper(), logging.INFO),
@@ -738,17 +788,26 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     # ---- Lifecycle frames ------------------------------------------------
     if special_marker == "BEGIN":
         with _REQ_STATE_LOCK:
-            _REQ_STATE[req_id] = {"started": time.monotonic()}
+            _REQ_STATE[req_id] = {"started": time.monotonic(),
+                                  "origin": origin}
         reset_system_delta_anchor()
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         # Measure the plain (ANSI-free) prefix, then fill the rest of the
         # line so the frame spans the full console width.
+        # §LOG-4 (2026-08-20): the origin marker now ALSO lands on the
+        # console frame — 45 of one week's 87 turns were self-play wearing
+        # a user turn's clothes, indistinguishable on the watched stream.
+        # END-OF-LINE placement only: the uConsole/Slack/web clients parse
+        # the head fields and the "request started" substring, so the
+        # suffix must never move them.
+        _osfx = f" · {origin}" if origin else ""
         visible = len(f"┌─ {tag} {req_id[:8]}  request started  {ts} ")
-        rule = _fill_rule(visible)
+        rule = _fill_rule(visible + len(_osfx))
         line = (
             f"{rcol}┌─ {BOLD}{tag}{RESET}{rcol} {req_id[:8]}{RESET}  "
             f"{DIM}request started  {ts}{RESET} "
             f"{rcol}{rule}{RESET}"
+            + (f" {DIM}·{RESET} {BOLD}{origin}{RESET}" if origin else "")
         )
         # ORIGIN STAMP (2026-08-11). Self-play/dream turns enter through the
         # SAME handle_chat as a human request, so the durable log could not
@@ -762,22 +821,30 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         # the probe reports that as UNCLASSIFIED rather than guessing.
         suffix = f" origin={origin}" if origin else ""
         _mirror(req_id, "request started", f"{req_id[:8]} at {ts}{suffix}",
-                "INFO")
+                "INFO", delta="+0.00s")
         atomic_print(line)
         return
 
     if special_marker == "END":
         delta = _format_delta(req_id).strip()
-        # delta already carries its leading "+" (e.g. "+22.3s") — don't double it.
-        _mirror(req_id, "request finished", delta, "INFO")
         with _REQ_STATE_LOCK:
-            _REQ_STATE.pop(req_id, None)
+            _state = _REQ_STATE.pop(req_id, None) or {}
+        # §LOG-4: close the frame with the same origin marker BEGIN opened
+        # with (stashed at BEGIN — END call sites don't know it).
+        _end_origin = _state.get("origin")
+        _osfx = f" · {_end_origin}" if _end_origin else ""
+        # delta already carries its leading "+" (e.g. "+22.3s") — don't double it.
+        _mirror(req_id, "request finished",
+                delta + (f" origin={_end_origin}" if _end_origin else ""),
+                "INFO", delta=delta)
         visible = len(f"└─ {tag}  request finished  {delta} ")
-        rule = _fill_rule(visible)
+        rule = _fill_rule(visible + len(_osfx))
         line = (
             f"{rcol}└─ {BOLD}{tag}{RESET}  "
             f"{DIM}request finished  {delta}{RESET} "
             f"{rcol}{rule}{RESET}"
+            + (f" {DIM}·{RESET} {BOLD}{_end_origin}{RESET}"
+               if _end_origin else "")
         )
         atomic_print(line)
         return
@@ -790,7 +857,8 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▼ {title_str}{RESET}"
         )
-        _mirror(req_id, f"section start: {title_str}", "", "INFO")
+        _mirror(req_id, f"section start: {title_str}", "", "INFO",
+                delta=delta)
         atomic_print(line)
         return
 
@@ -802,7 +870,8 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▲ {title_str}{RESET}"
         )
-        _mirror(req_id, f"section end: {title_str}", "", "INFO")
+        _mirror(req_id, f"section end: {title_str}", "", "INFO",
+                delta=delta)
         atomic_print(line)
         return
 
@@ -828,7 +897,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     # view; the mirror always has the whole thing. ``no_truncate`` exempts the
     # stream line from the budget (💭 thinking blocks); the mirror is unaffected.
     full = _redact_log(raw.replace("\n", " ").replace("\r", ""))
-    _mirror(req_id, title_str, full, level)
+    _mirror(req_id, title_str, full, level, delta=delta)
 
     # ── Console repeat-collapse (2026-08-05). Consecutive IDENTICAL lines
     # (same request, icon, title, content, level) print once; when a

@@ -36,10 +36,22 @@ logger = logging.getLogger("GhostAgent")
 # box); this cap ensures an unreachable or stalled node falls through to
 # the worker/direct fallback instead of blocking the turn. Override with
 # GHOST_CRITIC_CALL_TIMEOUT (seconds).
-try:
-    _CRITIC_CALL_TIMEOUT = float(os.getenv("GHOST_CRITIC_CALL_TIMEOUT", "120") or 120)
-except ValueError:
-    _CRITIC_CALL_TIMEOUT = 120.0
+from ..utils.helpers import env_positive
+
+_CRITIC_CALL_TIMEOUT = env_positive("GHOST_CRITIC_CALL_TIMEOUT", 120.0)
+
+# ⚠ THE TWO VERIFY LEGS QUEUE ON THE SAME PHYSICAL BOX. `--worker-nodes` and
+# `--critic-nodes` are byte-identical in the shipping topology, so they share
+# one `_node_slots` semaphore: a saturated Nova is queued for TWICE per
+# verdict, once per leg, before the verdict falls back to the main 35B.
+# Measured at 135s of pure permit waiting (R4 lens B, NEW-3) — on a path
+# whose whole purpose is to answer before the user gives up.
+#
+# This bounds the critic leg explicitly instead of letting it inherit the 90s
+# operator ceiling. The deeper fix is to not queue on a node this call has
+# already been refused by, which needs saturation to be visible to the
+# caller; until then, 30 + route()'s 45 keeps the pair under 75s.
+_VERIFY_SLOT_WAIT_S = env_positive("GHOST_VERIFY_SLOT_WAIT", 30.0)
 
 # The verdict is a tiny JSON object — it does NOT need a reasoning model's
 # <think> prelude, and that prelude is the dominant latency on an off-host
@@ -49,7 +61,21 @@ except ValueError:
 # `enable_thinking=False` hard-switch, with a small token cap since there
 # is no prelude to budget for. Override with GHOST_CRITIC_NO_THINK=0 to
 # restore a thinking verdict, GHOST_CRITIC_MAX_TOKENS to tune the cap.
-_CRITIC_NO_THINK = os.getenv("GHOST_CRITIC_NO_THINK", "1").strip().lower() not in ("0", "false", "no", "off")
+def _critic_no_think() -> bool:
+    """⚠ READ PER CALL, not at import.
+
+    As a module constant this was frozen before any test could set the
+    variable, so `monkeypatch.setenv` could not reach it and the LIVE
+    configuration was untestable. And the live configuration is the OTHER
+    branch: `bin/start-ghost-agent.sh` exports `GHOST_CRITIC_NO_THINK=0`
+    deliberately, because no-think produced false REFUTEs on this judge.
+    So the branch production actually runs had no coverage at all —
+    replacing it with `raise AssertionError` passed 188 tests across ten
+    verifier files (R5 lens B) — while its test pinned the branch that is
+    switched OFF live.
+    """
+    return os.getenv("GHOST_CRITIC_NO_THINK", "1").strip().lower() not in (
+        "0", "false", "no", "off")
 try:
     _CRITIC_MAX_TOKENS = int(os.getenv("GHOST_CRITIC_MAX_TOKENS", "512") or 512)
 except ValueError:
@@ -67,11 +93,7 @@ except ValueError:
 # late-verdict handler already tolerate a verdict that lands late, and a
 # genuinely sick node still fails bounded. Override with
 # GHOST_VERIFY_WORKER_TIMEOUT (seconds).
-try:
-    _VERIFY_WORKER_TIMEOUT_S = float(
-        os.getenv("GHOST_VERIFY_WORKER_TIMEOUT", "45") or 45)
-except ValueError:
-    _VERIFY_WORKER_TIMEOUT_S = 45.0
+_VERIFY_WORKER_TIMEOUT_S = env_positive("GHOST_VERIFY_WORKER_TIMEOUT", 45.0)
 
 # Hard wall-clock for the LAST-RESORT direct verdict call on the MAIN
 # model (the final fallback in `_call_llm`, reached when the critic pool
@@ -138,7 +160,7 @@ def _two_stage_enabled() -> bool:
         "0", "false", "no")
 
 
-def _self_consistency_n() -> int:
+def _self_consistency_n(deep: bool = False) -> int:
     """How many times to sample the ADJUDICATION and take the majority.
 
     1 (the default) = OFF, byte-identical to the single-sample path.
@@ -176,11 +198,129 @@ def _self_consistency_n() -> int:
         n = int(os.getenv("GHOST_VERIFY_SELF_CONSISTENCY", "1").strip() or "1")
     except ValueError:
         return 1
+    # §4BQ consumer: a turn the complexity router called confidently HARD
+    # gets majority-of-3 even when the global default is 1. The global
+    # knob still wins if it is set HIGHER — routing raises the floor for
+    # hard turns, it never lowers anyone's setting.
+    if deep and _depth_routing_enabled():
+        n = max(n, 3)
     # Even n has no majority; cap at 5 so a typo cannot multiply every
     # verification by 50 against a 120s critic ceiling.
     if n < 1:
         return 1
     return min(5, n if n % 2 == 1 else n - 1) or 1
+
+
+def _depth_routing_enabled() -> bool:
+    """§4BQ: may the router's difficulty verdict raise verification depth?
+
+    Read per call (not at import), same idiom as `_two_stage_enabled`, so
+    the routing can be killed without a restart.
+    """
+    return os.getenv("GHOST_VERIFY_DEPTH_ROUTING", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
+_VOTE_BUDGET_DEFAULT_S = 60.0
+
+
+def _vote_budget_s() -> float:
+    """Elapsed-time point past which the vote STOPS STARTING new samples.
+
+    ⚠ NOT a ceiling on the vote's duration, and the first version of this
+    docstring said it was. The check runs after each `await`, so a sample
+    already in flight runs to its own timeout: the true bound is this budget
+    PLUS one per-call bound (critic 120s + worker 45s in the worst case).
+    It cuts the multiplication, not the tail.
+
+    What it exists for: the per-call timeouts bound ONE adjudication, and
+    nothing bounded a loop of them. The realistic bad case is not a clean
+    fall-through to the main model — the route guard catches that — but a
+    PARTIAL outage, critic timing out while the worker still answers, which
+    keeps route="worker" and evades that guard entirely: three samples at
+    3x(120+45)s = 495s for a single verdict.
+
+    ON THE DEFAULT — and on how the first one was chosen wrongly. It was
+    20s, picked to sit under `_critic_repair_await_budget` (25s) and above a
+    17.8s "contested vote" figure measured on an IDLE critic node with a
+    synthetic 2,285-token prompt.
+
+    Live, from the operator's own `Verify` lines 2026-08-11..16, restricted
+    to request-scoped user turns (INFO level, excluding bench-drain — n=60;
+    a first pass quoted n=109 and silently included 28 background/deferred
+    verdicts and 21 bench rows):
+
+        whole claim-verify:   p50 27.6s   p90 54.9s   max 79.0s   65% >25s
+        without an escalation mark (n=41): p50 25.4s  p90 54.3s
+
+    So the repair window the 20s budget was protecting is already missed on
+    most CONTROL verdicts, and a 20s budget would instead have truncated
+    ordinary votes to one or two samples — silently converting treatment
+    into control while still recording it as a vote. Note these are
+    whole-verify figures (stage 1 + adjudication + any escalation); the vote
+    is a fraction of them and the log cannot be decomposed further, so 60s
+    is a bound with margin rather than a tuned value.
+
+    60s is chosen to sit ABOVE the live distribution of a whole verify (so
+    it does not truncate real disagreement) and far BELOW the 495s pathology
+    it exists to cut. It is a bound, not a tuning: the logs give whole-verify
+    latency and cannot be decomposed into stage-1 vs adjudication, so a
+    tighter number would be fabricated precision.
+
+    GHOST_VERIFY_VOTE_BUDGET overrides; 0 (or negative) disables the ceiling.
+    """
+    raw = os.getenv("GHOST_VERIFY_VOTE_BUDGET")
+    if raw is not None and raw.strip() != "":
+        try:
+            v = float(raw)
+            return v if v > 0 else float("inf")
+        except ValueError:
+            pass
+    return _VOTE_BUDGET_DEFAULT_S
+
+
+def router_called_hard(router_label: str, router_escalated: bool) -> bool:
+    """The §4BR TRIGGER: the router called this turn confidently HARD.
+
+    Deliberately arm-independent and kill-switch-independent — it answers
+    "was this turn ELIGIBLE", which is what makes a triggered-only
+    comparison possible. Both arms stamp it (§4AN: the router was accurate
+    overall and worthless where it acted; an all-enrolled average would
+    dilute the effect over turns the trigger never touched).
+    """
+    return str(router_label or "") == "hard" and not router_escalated
+
+
+def depth_for_turn(*, router_label: str, router_escalated: bool,
+                   arm: str) -> bool:
+    """§4BR: should THIS turn get depth-routed verification?
+
+    The whole rule, in one executable place. It lived inline inside
+    `handle_chat`'s router block, where the only way to check it was to read
+    it — and a review duly cut the wire with every test still green. A
+    predicate that can be CALLED is the difference between a pinned rule and
+    a described one.
+
+    All four conditions matter:
+      * `label == "hard"` — the router's difficulty verdict;
+      * `not escalated` — an untrained or unsure router escalates WITH
+        label="hard", so counting those would fire on everything (§4BQ);
+      * `arm == "treatment"` — the premise "harder turns are likelier wrong"
+        is UNTESTED, so this is a randomised arm, not a default;
+      * BOTH switches that can make the treatment a no-op — folded in HERE
+        rather than checked only where they are used, so the recorded
+        `verify_depth_deep` can never say "treatment ran" about a turn that
+        behaved as control. `GHOST_VERIFY_DEPTH_ROUTING=0` disables the
+        routing; `GHOST_VERIFY_TWO_STAGE=0` removes the voted leg entirely
+        (`verify_claim` takes the classic single-prompt path, one LLM call,
+        control's exact shape) — the second was missed on the first pass,
+        which is the same "treatment filed as a withheld one" defect for a
+        different switch.
+    """
+    return (_depth_routing_enabled()
+            and _two_stage_enabled()
+            and router_called_hard(router_label, router_escalated)
+            and str(arm or "") == "treatment")
 
 
 def _escalate_refute_enabled() -> bool:
@@ -966,6 +1106,24 @@ class VerifyResult:
     # (p(acceptable) ∈ [0,1]), None when the probe is off/unavailable.
     # Diagnostic — the blended value lands in `confidence`.
     probe_score: Optional[float] = None
+    # §4BR: how many adjudication samples were DRAWN, and how many carried
+    # the winning verdict. None on the single-sample path.
+    #
+    # DECLARED, not set as a dynamic attribute — which is what they were,
+    # and it made them unreachable: absent from the dataclass, from
+    # `to_dict`, from the verdict sidecar and from turn-facts, so the ONLY
+    # readers in the tree were two test files. The verify_depth decision
+    # rule opens with a mechanism gate (too FEW non-unanimous votes means
+    # the judge does not vary on this traffic, so the arm retires) that had
+    # nothing to read: the instrument for the gate was itself the
+    # documented-but-unwired shape.
+    self_consistency_n: Optional[int] = None
+    self_consistency_agree: Optional[int] = None
+    # Samples ATTEMPTED, which is not `self_consistency_n` (samples that
+    # parsed). The gap is the parser's failure rate, and keeping them
+    # separate is what stops "the vote stopped early" and "the judge
+    # returned garbage" from reading identically in the corpus.
+    self_consistency_drawn: Optional[int] = None
 
     def passed(self) -> bool:
         return self.verdict == VerifyVerdict.CONFIRMED
@@ -999,6 +1157,10 @@ class VerifyResult:
             d["objection_upheld"] = True
         if self.probe_score is not None:
             d["probe_score"] = self.probe_score
+        if self.self_consistency_n is not None:
+            d["self_consistency_n"] = self.self_consistency_n
+            d["self_consistency_agree"] = self.self_consistency_agree
+            d["self_consistency_drawn"] = self.self_consistency_drawn
         return d
 
 
@@ -1538,7 +1700,8 @@ class Verifier:
     async def _call_llm(self, prompt: str, temperature: float = 0.1,
                         max_tokens: int = 2048,
                         json_only: bool = False,
-                        force_main: bool = False) -> dict:
+                        force_main: bool = False,
+                        route_out: Optional[dict] = None) -> dict:
         """Make a verification LLM call, preferring worker nodes for cost.
 
         Default token budget is sized for thinking models (Qwen/DeepSeek-R1
@@ -1550,6 +1713,12 @@ class Verifier:
         the worker-route timeout.
         """
         if not self.llm_client:
+            # Stamped like every other exit. An UNSTAMPED return leaves the
+            # caller's route dict empty, which the vote sampler reads as
+            # "route unknown, keep sampling" — n futile round trips instead
+            # of one. Every return from this method must say where it went.
+            if route_out is not None:
+                route_out["route"] = "failed"
             return {}
 
         payload = {
@@ -1632,7 +1801,7 @@ class Verifier:
             # <think> essay. Kept separate from `payload` so the worker /
             # direct fallbacks below still get the original (thinking)
             # request for whatever model backs them.
-            if _CRITIC_NO_THINK:
+            if _critic_no_think():
                 critic_payload = {
                     "messages": [
                         {"role": "user", "content": prompt + "\n\n/no_think"}
@@ -1647,8 +1816,34 @@ class Verifier:
             else:
                 critic_payload = payload
             try:
+                # ⚠ `is_background` HERE TOO. `_bounded_fallback_kwargs` was
+                # written for exactly this defect — its own test file says so:
+                # the verify "always inflated foreground_tasks, even when
+                # invoked from a BACKGROUND flow … making other background
+                # work misread a live user". But it was applied only to the
+                # last-resort MAIN call, and THIS is the leg that fires in
+                # production (--critic-nodes is set, GHOST_CRITIC_ASYNC=1).
+                # The ordering was perfectly inverted: the most off-main leg
+                # was foreground, the middle leg background, and only the main
+                # leg background-aware. Every async post-response verdict
+                # blanked the biological tick, the self-play loop and the RSS
+                # gate for up to 120s (LLM review R3 lens B, NEW-1). Keep the
+                # critic's own timeout; take only the background flag.
+                _crit_kw = dict(_bounded_fallback_kwargs(self.llm_client))
+                _crit_kw.pop("timeout", None)
                 result = await self.llm_client.chat_completion(
-                    critic_payload, use_critic=True, timeout=_CRITIC_CALL_TIMEOUT,
+                    critic_payload, use_critic=True,
+                    # ⚠ NO `total_budget` HERE, DELIBERATELY. `slot_wait`
+                    # bounds only how long we QUEUE for Nova's permit; the
+                    # verdict itself keeps its full `_CRITIC_CALL_TIMEOUT`.
+                    # R5 conflated the two and silently cut this call from
+                    # 120s to 30s — against the live distribution (n=39:
+                    # median 24.4s, p90 56.7s) that failed 28.2% of verdicts
+                    # AND charged each one to Nova as a node fault, because
+                    # a ReadTimeout is a node fault. A slow verdict is not a
+                    # sick node.
+                    timeout=_CRITIC_CALL_TIMEOUT,
+                    slot_wait=_VERIFY_SLOT_WAIT_S, **_crit_kw,
                 )
                 text = (
                     result.get("choices", [{}])[0]
@@ -1657,6 +1852,23 @@ class Verifier:
                 )
                 parsed = self._parse_json(text)
                 if parsed:
+                    if route_out is not None:
+                        # ⚠ REPORT THE LEG THAT ACTUALLY SERVED IT. When every
+                        # critic node fails (or our own saturation gate trips),
+                        # the client silently re-runs on the MAIN model and
+                        # returns an identically-shaped dict — so this used to
+                        # stamp "critic" on a verdict the 35B produced, and
+                        # §4BR's degradation guard (which aborts the
+                        # self-consistency vote when route is "main"/"failed")
+                        # could never fire. Every sample then piled onto the
+                        # single foreground slot, which is the exact condition
+                        # that guard exists to stop (LLM review 2026-08-18).
+                        from .llm import served_leg
+                        _leg = served_leg(result)
+                        route_out["route"] = (
+                            "main" if _leg.get("served_by") == "main" else "critic")
+                        if _leg.get("fell_back_from"):
+                            route_out["fell_back_from"] = _leg["fell_back_from"]
                     return parsed
             except Exception as exc:
                 logger.debug("Verifier critic-pool call failed: %s", exc)
@@ -1687,6 +1899,8 @@ class Verifier:
                 )
                 parsed = self._parse_json(text)
                 if parsed:
+                    if route_out is not None:
+                        route_out["route"] = "worker"
                     return parsed
                 # Empty/unparseable worker response → fall through to
                 # direct call rather than giving up.
@@ -1711,9 +1925,15 @@ class Verifier:
                 .get("message", {})
                 .get("content", "")
             )
+            if route_out is not None:
+                # "main" whether or not force_main asked for it: the SAMPLER
+                # needs to know this landed on the single foreground slot.
+                route_out["route"] = "main"
             return self._parse_json(text)
         except Exception as exc:
             logger.warning("Verifier LLM call failed: %s", exc)
+            if route_out is not None:
+                route_out["route"] = "failed"
             return {}
 
     @staticmethod
@@ -1920,7 +2140,9 @@ class Verifier:
 
     async def _verify_claim_two_stage(self, claim: str, evidence: str,
                                       context: str,
-                                      force_main: bool = False
+                                      force_main: bool = False,
+                                      deep: bool = False,
+                                      vote_out: Optional[dict] = None
                                       ) -> Optional[VerifyResult]:
         """Forced identification (stage 1) → adjudication (stage 2).
 
@@ -1939,15 +2161,30 @@ class Verifier:
         if not suspects:
             # Parse failure OR an empty enumeration despite the forced-pick
             # instruction — either way there is nothing to adjudicate.
-            logger.debug("Verifier two-stage: no usable suspects, "
-                         "falling back to single-stage")
+            #
+            # LEVEL DEPENDS ON WHAT WAS PROMISED. On an ordinary turn this is
+            # routine plumbing at DEBUG (the cheap leg fails <0.5%). On a
+            # `deep` turn it is a treatment that silently became a control:
+            # stage 1 never produced suspects, so no vote was ever taken,
+            # and the arm records a turn that did nothing. That is the third
+            # such degradation path in this feature and the other two were
+            # promoted for exactly this reason — the live agent runs at INFO
+            # (the launcher passes no --debug), so DEBUG is invisible.
+            if deep:
+                logger.warning(
+                    "self-consistency: stage 1 produced no suspects on a "
+                    "DEPTH-ROUTED turn — no vote was taken and the "
+                    "treatment degrades to the classic single-prompt path")
+            else:
+                logger.debug("Verifier two-stage: no usable suspects, "
+                             "falling back to single-stage")
             return None
 
         adj_prompt = _stage_template(
             "verifier.adjudicate", _VERIFY_ADJUDICATE_PROMPT).format(
             claim=claim, evidence=evidence, context=context,
             suspects=self._format_suspects_block(suspects))
-        _n = _self_consistency_n()
+        _n = _self_consistency_n(deep=deep)
         if _n <= 1:
             stage2 = await self._call_llm(
                 adj_prompt, temperature=0.1, force_main=force_main,
@@ -1955,10 +2192,24 @@ class Verifier:
             result = self._build_verify_result(stage2)
         else:
             result = await self._adjudicate_self_consistent(
-                adj_prompt, n=_n, force_main=force_main)
+                adj_prompt, n=_n, force_main=force_main, vote_out=vote_out)
         if result is None:
-            logger.debug("Verifier two-stage: adjudication unparseable, "
-                         "falling back to single-stage")
+            # The SIBLING of the stage-1 branch above, and it was left at
+            # DEBUG when that one was promoted — while costing strictly
+            # more: stage 1 succeeded, every adjudication sample was drawn
+            # and PAID FOR, and none of them parsed. The turn ships control
+            # behaviour via the classic prompt having spent n samples.
+            # (`sc_drawn` records it, so it is recoverable offline; the
+            # WARNING is what makes it visible while it is happening.)
+            if deep:
+                logger.warning(
+                    "self-consistency: every adjudication sample was "
+                    "unparseable on a DEPTH-ROUTED turn — %d sample(s) "
+                    "spent, no vote taken, falling back to the classic "
+                    "single-prompt path", _n)
+            else:
+                logger.debug("Verifier two-stage: adjudication unparseable, "
+                             "falling back to single-stage")
             return None
         result.suspects = suspects
 
@@ -2000,13 +2251,14 @@ class Verifier:
         return result
 
     async def _adjudicate_self_consistent(self, adj_prompt: str, *, n: int,
-                                          force_main: bool
+                                          force_main: bool,
+                                          vote_out: Optional[dict] = None
                                           ) -> Optional["VerifyResult"]:
         """Sample the adjudication ``n`` times; the MAJORITY verdict wins.
 
-        Returns the sampled result that carries the winning verdict (highest
-        confidence among them), so `reasoning`/`issues` stay a real, coherent
-        judgement rather than a synthetic merge of several.
+        Returns the sampled result carrying the winning verdict, so
+        `reasoning`/`issues` stay a real, coherent judgement rather than a
+        synthetic merge of several.
 
         Unparseable samples are DROPPED, not counted — a reply the parser
         could not read is not a vote for anything, and letting it count would
@@ -2016,44 +2268,186 @@ class Verifier:
         parse, so a flaky judge degrades to today's behaviour instead of to
         None: this must never make a verification FAIL that would otherwise
         have succeeded.
+
+        SEQUENTIAL, NOT CONCURRENT — and that is a measurement, not a
+        preference. This ran under `asyncio.gather` with a comment asserting
+        that "n sequential adjudications would multiply latency by n". Timed
+        against the live critic node on the real 2,285-token adjudication
+        prompt (§4BR R17):
+
+            1 sample  ........ 10.8s
+            3 sequential ..... 17.8s   (10.3 / 2.7 / 4.7)
+            3 concurrent ..... 24.9s
+
+        Sequential is 1.4x FASTER because llama.cpp keeps a per-slot prompt
+        cache: repeats of the same prompt on the same slot skip the prefill
+        (2.7s vs 10.3s), while concurrent samples are dealt to DIFFERENT
+        slots and each pays the full 2.3k-token prefill. The concurrency
+        that looked free was buying parallelism with cache misses.
+
+        EARLY STOP. The vote is drawn until it is DECIDED, not until the
+        budget is spent: once the leader's margin over the runner-up exceeds
+        the samples left, no remaining draw can change the winner. At n=3
+        that means the common case (first two agree) costs 2 samples, ~13.0s
+        — about +2s over a single sample rather than +14s.
+
+        THE WINNER IS THE FIRST AGREEING SAMPLE IN DRAW ORDER — deliberately
+        NOT an order statistic on confidence, in either direction.
+
+        Two wrong versions came before this one, and the second was written
+        as the fix for the first. Originally this took the MOST confident
+        agreeing sample: max-of-k, which lifts verdicts over the 0.7 action
+        threshold a single sample would have left below it. Replacing it
+        with the "lower median" looked conservative but was worse in the
+        modal case — the early stop means k=2 most of the time, and the
+        lower median of 2 is the MINIMUM, stochastically smaller than a
+        single sample (Beta(8,2): P(conf >= 0.7) falls 0.804 -> 0.646).
+        That silently SUPPRESSES corrections instead of inflating them, and
+        0.7 is not a cosmetic line: it gates the correction note appended to
+        the reply, the in-loop repair, and the passed/failed outcome label
+        the whole learning stack trains on.
+
+        Any rule that picks by rank is a change to the action gate wearing a
+        vote's clothing. Draw order has no such bias: sample 1 is drawn
+        exactly as control's single sample is, so when the vote is unanimous
+        — the common case — this returns byte-identically what control would
+        have returned. Depth then changes the VERDICT when samples disagree,
+        and changes nothing at all when they agree, which is precisely the
+        claim the arm is supposed to be testing.
         """
-        import asyncio as _asyncio
         from collections import Counter
 
-        async def _one():
+        async def _one(route_out: dict):
             try:
                 raw = await self._call_llm(
                     adj_prompt, temperature=0.1, force_main=force_main,
-                    max_tokens=_STAGE_MAX_TOKENS, json_only=True)
+                    max_tokens=_STAGE_MAX_TOKENS, json_only=True,
+                    route_out=route_out)
                 return self._build_verify_result(raw)
             except Exception:  # noqa: BLE001 — one bad sample must not kill the vote
                 return None
 
-        # Concurrent: n sequential adjudications would multiply latency by n
-        # against the 120s critic ceiling.
-        got = await _asyncio.gather(*[_one() for _ in range(n)],
-                                    return_exceptions=True)
-        results = [r for r in got
-                   if r is not None and not isinstance(r, BaseException)]
+        import time as _time
+        results: List[VerifyResult] = []
+        drawn = 0
+        _deadline = _time.monotonic() + _vote_budget_s()
+        for i in range(n):
+            route: dict = {}
+            r = await _one(route)
+            drawn += 1
+            if r is not None:
+                results.append(r)
+            # DEGRADED ROUTE: the cheap pools fell through and this sample
+            # ran on the MAIN model. Live, --critic-nodes and --worker-nodes
+            # are the same box, so one node outage sends every sample there;
+            # they serialize on the single foreground inference slot at up
+            # to 90s each. Sampling k times is only affordable because it
+            # is off-host — when it isn't, stop at one (§4BR R17 MAJOR-6).
+            if route.get("route") in ("main", "failed") and not force_main:
+                # WARNING, not debug, and NOT conditioned on there being
+                # samples left. This is abort condition #3 of the arm's
+                # decision rule ("any treatment turn observed running
+                # adjudication samples on the MAIN model"), and a record
+                # that is skipped whenever the degradation lands on the
+                # LAST sample cannot support an abort — the operator's
+                # live stream is WARNING+, so this is where it must land.
+                logger.warning(
+                    "self-consistency: adjudication degraded to the %s "
+                    "route at sample %d/%d — the cheap pools are not "
+                    "serving; the vote stops here rather than sending "
+                    "%d more call(s) to the main inference slot",
+                    route.get("route"), i + 1, n, n - i - 1)
+                break
+            # WALL-CLOCK CEILING. The route guard catches a full fall-through
+            # to the main model, but NOT the likeliest partial outage: live,
+            # --critic-nodes and --worker-nodes are the same box, so a critic
+            # that times out (120s) while the worker still answers (45s) is
+            # route="worker" — no stop, and the vote silently multiplies the
+            # per-call bound by n (worst case 3x165s = 495s for one verdict
+            # against a 25s in-loop repair window). A per-call timeout is not
+            # a bound on a LOOP of calls (§4BR R18 MAJOR-4).
+            # DECIDED-FIRST, THEN THE BUDGET. The order matters for the
+            # RECORD, not the behaviour: a vote that finished early because
+            # the majority was settled has not been truncated, and checking
+            # the deadline first reported those as "budget exhausted" — an
+            # abort signal firing on healthy votes. Same for the final
+            # iteration, where there is nothing left to draw.
+            if len(results) >= 2:
+                counts = Counter(x.verdict for x in results).most_common()
+                lead = counts[0][1] - (counts[1][1] if len(counts) > 1 else 0)
+                if lead > (n - i - 1):
+                    break               # decided; further draws cannot flip it
+            if i + 1 < n and _time.monotonic() >= _deadline:
+                # WARNING, like the degradation line above and for the same
+                # reason: DECISION_RULE.md treats routine budget exhaustion
+                # as an abort signal ("the sizing is wrong"), and the live
+                # agent runs at INFO — the launcher passes no --debug, and
+                # the 20MB live log contains ZERO GhostAgent DEBUG lines. A
+                # signal the operator cannot see is not a signal. This is
+                # the second time an instrument for this feature shipped
+                # below the visible threshold.
+                logger.warning(
+                    "self-consistency: vote TRUNCATED at %d/%d samples — "
+                    "%gs budget exhausted; the treatment silently "
+                    "degrades toward control while still recording a vote",
+                    i + 1, n, _vote_budget_s())
+                break
+
+        def _publish(n_parsed: int, n_agree: int) -> None:
+            """Record the vote OUT OF BAND as well as on the result.
+
+            The result object is not a reliable carrier: it can be replaced
+            downstream (the escalation ladder — §4BR R19) and it can fail to
+            exist at all (below, when no sample parses, after which
+            `verify_claim` falls back to the classic single prompt and ships
+            a result this function never touched). Both cases file a turn
+            that paid for three samples as a control turn that never voted,
+            and the second is exactly the "judge returned garbage" case
+            `self_consistency_drawn` was added to distinguish.
+            """
+            if vote_out is not None:
+                vote_out.update(n=n_parsed, agree=n_agree, drawn=drawn)
+
         if not results:
+            _publish(0, 0)
             return None
         if len(results) < 2:
+            # ATTRIBUTION ON THE DEGRADED PATH TOO. This early return used to
+            # set neither counter, so the one case the mechanism gate and the
+            # latency abort exist to detect — a vote that could not be taken —
+            # was the single case with no record that it happened.
+            results[0].self_consistency_n = len(results)
+            results[0].self_consistency_agree = len(results)
+            results[0].self_consistency_drawn = drawn
+            _publish(len(results), len(results))
             return results[0]
 
         counts = Counter(r.verdict for r in results)
         top = counts.most_common()
         # A tie (possible once samples are dropped) keeps the FIRST sample's
-        # verdict — today's behaviour — rather than letting ordering decide.
+        # verdict — control's own sample, and therefore today's behaviour —
+        # rather than letting ordering decide.
+        #
+        # `results[0].verdict` is NOT interchangeable with `top[0][0]` even
+        # though Counter breaks ties by insertion order, because insertion
+        # order is FIRST-OCCURRENCE order, not sample order. At n<=3 they
+        # coincide; at n=5 they part company — samples U,C,C,R,R tie C and R
+        # at 2 each with U first, so `top[0][0]` is CONFIRMED while sample 1
+        # said UNCERTAIN. n=5 is a supported setting
+        # (GHOST_VERIFY_SELF_CONSISTENCY=5), and this is the second n=5 blind
+        # spot found in this function.
         if len(top) > 1 and top[0][1] == top[1][1]:
             winner = results[0].verdict
         else:
             winner = top[0][0]
         agreeing = [r for r in results if r.verdict == winner]
-        best = max(agreeing, key=lambda r: float(getattr(r, "confidence", 0.0)))
+        best = agreeing[0]          # draw order — never a rank on confidence
         # Recorded so the bench can attribute a delta to THIS mechanism and
         # not to the judge having a different day.
         best.self_consistency_n = len(results)
         best.self_consistency_agree = len(agreeing)
+        best.self_consistency_drawn = drawn
+        _publish(len(results), len(agreeing))
         return best
 
     def _log_verify_outcome(self, result: Optional["VerifyResult"],
@@ -2104,9 +2498,15 @@ class Verifier:
     async def verify_claim(self, claim: str, evidence: str,
                                  context: str = "",
                                  *, high_stakes: bool = False,
+                                 deep: bool = False,
                                  trace: Optional[Dict[str, Any]] = None
                                  ) -> Optional[VerifyResult]:
         """Check whether *claim* is supported by *evidence*.
+
+        ``deep`` (§4BQ/§4BR) raises the cheap leg's adjudication to
+        majority-of-3. Decided by `depth_for_turn` in `handle_chat` — where
+        the router runs, before either delivery path writes its trajectory —
+        and merely forwarded by `agent._compute_verifier_verdict`.
 
         Default path (GHOST_VERIFY_TWO_STAGE, on unless =0) is two LLM
         calls: forced identification of the reply's weakest fragments,
@@ -2145,9 +2545,17 @@ class Verifier:
         evidence_t = evidence[:4000]
         context_t = context[:1000]
         result = None
+        _vote_rec: dict = {}
         if _two_stage_enabled():
+            # `deep` reaches the CHEAP leg ONLY. The two force_main call
+            # sites below are main-model escalations; multiplying those
+            # would put 3x on the 35B for the turns that are already the
+            # most expensive, which is the cost profile this consumer
+            # exists to avoid. §4BK also puts FPR/miss control on the
+            # cheap leg by design.
             result = await self._verify_claim_two_stage(
-                claim_t, evidence_t, context_t)
+                claim_t, evidence_t, context_t, deep=deep,
+                vote_out=_vote_rec)
         if result is None:
             prompt = _VERIFY_CLAIM_PROMPT.format(
                 claim=claim_t,
@@ -2163,6 +2571,35 @@ class Verifier:
         _cheap = ((result.verdict.value, result.confidence,
                    list(result.issues or []))
                   if result is not None else None)
+        # §4BR: the vote counters ride the SAME snapshot, for the reason the
+        # comment above gives — and they were added without it, so the
+        # escalation ladder destroyed them on precisely the turns they exist
+        # to describe.
+        #
+        # Every REFUTED verdict enters `_escalate_refute` (17% of decided
+        # verdicts live), and 47 of 59 rows in the escalation ledger end at
+        # an outcome that returns a NEWLY BUILT result. The 2026-08-10
+        # measurement this whole arm rests on found both contested trials
+        # were `artifact_leak` with a REFUTED majority — i.e. both of the
+        # cases where the mechanism did something would have had their
+        # counters deleted before reaching disk. And the sidecar OMITS the
+        # keys when they are None, so such a turn is indistinguishable from
+        # a control turn that never voted: Gate 0 would read a sample biased
+        # toward unanimity and retire the arm for being inert.
+        #
+        # `probe_score` had this identical bug and was fixed the same way in
+        # §4BF. Five replacement sites exist today; stamping here is immune
+        # to the sixth.
+        # Read from the OUT-OF-BAND record, not off `result`. Reading the
+        # object covered the five downstream replacement sites but stayed
+        # blind UPSTREAM: when every adjudication sample fails to parse,
+        # `_verify_claim_two_stage` returns None, `verify_claim` falls back
+        # to the classic single prompt, and the result that ships was never
+        # touched by the vote — so a turn that paid for three samples filed
+        # as a control turn that never voted. `_vote_rec` is written by the
+        # sampler itself on every exit, including that one.
+        _vote = ((_vote_rec.get("n"), _vote_rec.get("agree"),
+                  _vote_rec.get("drawn")) if _vote_rec else None)
         result = self._guard_truncated_absence(result, claim_t, evidence_t,
                                                trace=trace)
         result = await self._escalate_refute(
@@ -2191,6 +2628,13 @@ class Verifier:
         if final is not None and _cheap is not None:
             final.cheap_verdict, final.cheap_confidence, \
                 final.cheap_issues = _cheap
+        if final is not None and _vote is not None and _vote[2]:
+            # Guard on DRAWN, not on parsed-n: a vote where nothing parsed
+            # still drew samples and must be recorded as a vote, otherwise
+            # the all-unparseable case is again indistinguishable from a
+            # control turn.
+            final.self_consistency_n, final.self_consistency_agree, \
+                final.self_consistency_drawn = _vote
         return final
 
     def _guard_truncated_absence(self, result: Optional[VerifyResult],
