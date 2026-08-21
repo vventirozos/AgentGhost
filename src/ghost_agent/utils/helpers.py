@@ -96,18 +96,48 @@ def request_new_tor_identity(control_port=9051, password=""):
                 
             return True, "Identity renewed successfully"
     except Exception as e:
-        # Fallback: try restarting the tor service directly
+        # Fallback: bounce the tor SERVICE, since the control port is unusable.
+        #
+        # ⚠ macOS deliberately does NOT use `brew services restart tor` any
+        # more (2026-08-21). Tor here is supervised by a system LaunchDaemon
+        # labelled `com.local.tor`, NOT by Homebrew — that label was chosen
+        # precisely because Homebrew reinstalls a RIVAL job under its own
+        # label. Shelling out to brew therefore did three bad things at once:
+        #
+        #   1. it created ~/Library/LaunchAgents/homebrew.mxcl.tor.plist, a
+        #      second tor job that cannot bind :9050 and sits in `error`
+        #      state fighting the real daemon (observed live);
+        #   2. it did NOT restart the tor that is actually running, so no
+        #      identity was renewed;
+        #   3. it returned True anyway — a lying success. Callers cannot tell
+        #      a real rotation from a no-op, which is worse than failing.
+        #
+        # Restarting a SYSTEM daemon needs root, and the agent runs as an
+        # unprivileged user, so this will usually fail — and it should then
+        # say so rather than fabricate a renewal. That is fine: the live
+        # rotation path is per-circuit SOCKS isolation
+        # (`socks_url_with_identity`), which needs neither the control port
+        # nor a daemon bounce and has none of the blast radius. See the 503
+        # handling in `fetch_via_tor` below.
+        label = os.environ.get("GHOST_TOR_SERVICE_LABEL", "com.local.tor")
         try:
             if platform.system() == "Darwin":
-                # macOS Homebrew
-                subprocess.run(["brew", "services", "restart", "tor"], check=True, capture_output=True)
-                return True, "Identity renewed successfully via brew services restart"
+                subprocess.run(
+                    ["launchctl", "kickstart", "-k", f"system/{label}"],
+                    check=True, capture_output=True, timeout=30,
+                )
+                return True, f"Identity renewed via launchctl kickstart system/{label}"
             else:
-                # Linux systemd (might require sudo NOPASSWD or run as root, but worth trying)
-                subprocess.run(["sudo", "-n", "systemctl", "restart", "tor"], check=True, capture_output=True)
+                # Linux systemd (needs sudo NOPASSWD or root; worth trying).
+                subprocess.run(["sudo", "-n", "systemctl", "restart", "tor"],
+                               check=True, capture_output=True, timeout=30)
                 return True, "Identity renewed successfully via systemctl restart"
         except Exception as fallback_e:
-            return False, f"Tor control port error: {e}. Fallback restart also failed: {fallback_e}"
+            return False, (
+                f"Tor control port error: {e}. Service restart also failed: "
+                f"{fallback_e}. (Rotation still works: per-circuit SOCKS "
+                f"isolation does not need either.)"
+            )
 
 
 def socks_url_with_identity(tor_proxy: Optional[str], identity: str) -> Optional[str]:
@@ -307,11 +337,13 @@ async def helper_fetch_url_content(
                         # Rotate via a fresh SOCKS-isolated CIRCUIT on the next
                         # attempt (handled at the top of the loop), NOT via
                         # request_new_tor_identity: on this box the control
-                        # port (9051) is closed, so that path fell back to
-                        # `brew services restart tor` — bouncing the WHOLE Tor
-                        # daemon (up to 2x per fetch) and re-circuiting every
-                        # concurrent sibling fetch. Per-circuit isolation gets
-                        # a fresh exit with none of that blast radius.
+                        # port (9051) is closed, so that path falls back to
+                        # bouncing the WHOLE Tor daemon (up to 2x per fetch),
+                        # re-circuiting every concurrent sibling fetch — and
+                        # since 2026-08-21 it cannot even do that unprivileged
+                        # (restarting the com.local.tor system daemon needs
+                        # root) and correctly returns False. Per-circuit
+                        # isolation gets a fresh exit with none of that.
                         await asyncio.sleep(2)
                         continue
                     return f"Error: Access Denied (503) via Tor. The site {url} likely blocks Tor exit nodes. Try a different source."

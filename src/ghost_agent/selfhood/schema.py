@@ -92,6 +92,13 @@ class Mood:
     label: str = ""                # short tag (e.g. "curious", "stuck", "satisfied")
     evidence: str = ""             # one sentence why
     set_at: str = field(default_factory=_utcnow_iso)
+    # Provenance (mood rework 2026-08-20): "self" = authored via the
+    # self_state tool; "derived" = computed by the functional-state
+    # updater from verdict streaks / pressure / open questions. Records
+    # predating the field load as "self" (from_dict filters unknown
+    # keys, dataclass default fills missing ones) — historically
+    # accurate, since the tool was the only writer.
+    source: str = "self"
 
 
 @dataclass

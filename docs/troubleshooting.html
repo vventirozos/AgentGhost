@@ -61,6 +61,36 @@
   <p>Mandatory Tor is on by default and Ghost probes it at boot. Check the daemon is running and listening:</p>
   <pre class="shell">curl --socks5-hostname 127.0.0.1:9050 -s https://check.torproject.org | grep -o "Congratulations"</pre>
   <p>If Tor is fine but Ghost still refuses, check <code>TOR_PROXY</code> points at the right port.</p>
+  <p>The boot probe is only a TCP connect to the SOCKS port — it does not wait for a bootstrapped circuit. So "the port answers" is the whole gate, and Tor being <em>slow to bootstrap</em> is never the cause of this abort. Tor being absent is.</p>
+
+  <h3>Nothing came back after a reboot</h3>
+  <p>Almost always dependency ordering rather than Ghost itself. Ghost boots fail-closed on Tor, so if Tor is not up yet Ghost aborts — and under <code>KeepAlive</code> that abort becomes a respawn loop that re-pays the full model-loading startup on every iteration. The giveaway is a service that reports as running while never holding a port:</p>
+  <pre class="shell">sudo launchctl print system/com.local.ghost-agent | grep -E "state|last exit"
+#   state = spawn scheduled      <-- looping, not stopped
+#   last exit code = 3</pre>
+  <p>Two things make this survivable, and both are worth checking if you are setting up a new host:</p>
+  <ul>
+    <li><strong>Run every dependency as a system daemon, not a login agent.</strong> A <code>LaunchAgent</code> starts at <em>login</em>. If Ghost is a system daemon and Tor is a login agent, a headless reboot leaves Ghost looping until somebody physically logs in.</li>
+    <li><strong>Wait for dependencies in the launcher, don't race them.</strong> launchd starts jobs concurrently, so "Tor also autostarts" is not by itself enough. <code>start-ghost-agent.sh</code> waits for port 9050 (bounded — after the timeout it proceeds and lets the fail-closed abort speak, rather than hanging silently forever).</li>
+  </ul>
+
+  <h3>A second Tor keeps appearing, or Tor rotation reports success but nothing changes</h3>
+  <p>If Tor is supervised by your own service definition rather than by Homebrew's, be careful with anything that "restarts Tor" by calling <code>brew services restart tor</code>. Homebrew owns its own label, so that call installs and starts a <em>second</em> Tor job — which cannot bind port 9050 because the real one already has it, and sits in <code>error</code> state forever. The Tor that is actually serving is never restarted.</p>
+  <p>Ghost's <code>request_new_tor_identity()</code> hit exactly this. It now restarts the supervising launchd job instead, and returns a truthful failure when it cannot (restarting a system daemon needs root, and Ghost runs unprivileged) rather than reporting a renewal that did not happen. Nothing is lost: exit-node rotation runs on per-circuit SOCKS isolation, which needs neither Tor's control port nor a daemon restart.</p>
+  <p>Check for a stray rival job with:</p>
+  <pre class="shell">ls ~/Library/LaunchAgents/ /Library/LaunchDaemons/ | grep -i tor
+lsof -nP -iTCP:9050 -sTCP:LISTEN</pre>
+
+  <h3>PostgreSQL won't start after an unclean shutdown</h3>
+  <p>If the log repeats <code>FATAL: lock file "postmaster.pid" already exists</code> naming a PID that is alive, check what that PID actually <em>is</em>:</p>
+  <pre class="shell">ps -p &lt;pid&gt; -o comm=</pre>
+  <p>Across a reboot the kernel reuses PID numbers, so the PID in a leftover lock file frequently belongs to some unrelated process. PostgreSQL can see the PID is alive but not that it belongs to something else, so it refuses forever — this does not heal on its own, and under <code>KeepAlive</code> it retries every few seconds indefinitely. Remove the lock file only once you have confirmed the PID is not a postmaster; if it <em>is</em> one, you have a real second instance and deleting the lock would be actively harmful.</p>
+
+  <h3>Docker/OrbStack: the app is running but the sandbox still fails</h3>
+  <p>On macOS the OrbStack app and the OrbStack <em>engine</em> are separate. The app can be up and idle in the background while the VM has not been spawned, and the app only starts it on demand — so seeing OrbStack in Activity Monitor tells you nothing about whether Docker works. Ask the engine directly:</p>
+  <pre class="shell">orb status          # "Running" is the answer that matters
+docker info --format '{{.ServerVersion}}'</pre>
+  <p>This is also the one dependency that cannot be made to start before login, because it is a GUI VM manager. On a headless reboot the sandbox tools stay unavailable until somebody logs in; everything else is a system daemon and comes back on its own.</p>
 
   <h3>First-ever boot hangs or fails loading the embedder</h3>
   <p>This one catches everybody. On a fresh install the embedding model hasn't been downloaded yet, and the Tor egress guard blocks that download because it's a direct connection to a public host. Boot once with <code>--no-mandatory-tor</code> to let it cache, then run normally from then on.</p>

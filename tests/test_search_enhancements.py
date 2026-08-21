@@ -210,12 +210,24 @@ def test_request_new_tor_identity_fallback_mac(mock_subprocess_run, mock_platfor
     # Assert socket connection was attempted
     mock_socket_instance.connect.assert_called_once_with(("127.0.0.1", 9051))
     
-    # Assert fallback brew command was called
-    mock_subprocess_run.assert_called_once_with(["brew", "services", "restart", "tor"], check=True, capture_output=True)
-    
+    # Assert the fallback bounces the SUPERVISING LAUNCHD JOB, not brew.
+    #
+    # Changed 2026-08-21: this used to assert `brew services restart tor`.
+    # On this host tor is supervised by the system LaunchDaemon
+    # `com.local.tor` — a label chosen precisely because Homebrew reinstalls
+    # a RIVAL job under its own. The brew call therefore created a second tor
+    # job that could not bind :9050 and sat in `error` state (observed live),
+    # did NOT restart the running tor, and returned True regardless. The
+    # label is overridable via GHOST_TOR_SERVICE_LABEL.
+    mock_subprocess_run.assert_called_once_with(
+        ["launchctl", "kickstart", "-k", "system/com.local.tor"],
+        check=True, capture_output=True, timeout=30,
+    )
+
     # Assert success response
     assert success is True
-    assert "via brew services restart" in msg
+    assert "launchctl kickstart" in msg
+    assert "brew" not in msg
 
 @patch("src.ghost_agent.utils.helpers.socket.socket")
 @patch("src.ghost_agent.utils.helpers.platform.system")
@@ -237,7 +249,10 @@ def test_request_new_tor_identity_fallback_linux(mock_subprocess_run, mock_platf
     mock_socket_instance.connect.assert_called_once_with(("127.0.0.1", 9051))
     
     # Assert fallback systemctl command was called
-    mock_subprocess_run.assert_called_once_with(["sudo", "-n", "systemctl", "restart", "tor"], check=True, capture_output=True)
+    mock_subprocess_run.assert_called_once_with(
+        ["sudo", "-n", "systemctl", "restart", "tor"],
+        check=True, capture_output=True, timeout=30,
+    )
     
     # Assert success response
     assert success is True
@@ -258,17 +273,54 @@ def test_request_new_tor_identity_fallback_failure(mock_subprocess_run, mock_pla
     
     # Setup subprocess to fail
     import subprocess
-    mock_subprocess_run.side_effect = subprocess.CalledProcessError(1, ["brew", "services", "restart", "tor"])
-    
+    # 2026-08-21: the fallback bounces the supervising LaunchDaemon
+    # (com.local.tor) instead of `brew services restart tor` — see
+    # test_request_new_tor_identity_fallback_mac for why.
+    mock_subprocess_run.side_effect = subprocess.CalledProcessError(
+        1, ["launchctl", "kickstart", "-k", "system/com.local.tor"])
+
     # Run the function
     success, msg = request_new_tor_identity()
     
     # Assert socket connection was attempted
     mock_socket_instance.connect.assert_called_once_with(("127.0.0.1", 9051))
     
-    # Assert fallback brew command was called
-    mock_subprocess_run.assert_called_once_with(["brew", "services", "restart", "tor"], check=True, capture_output=True)
-    
+    # Assert the fallback targeted the launchd job, not Homebrew
+    mock_subprocess_run.assert_called_once_with(
+        ["launchctl", "kickstart", "-k", "system/com.local.tor"],
+        check=True, capture_output=True, timeout=30,
+    )
+
     # Assert failure response
     assert success is False
-    assert "Fallback restart also failed" in msg
+    assert "Service restart also failed" in msg
+
+
+@patch("src.ghost_agent.utils.helpers.socket.socket")
+@patch("src.ghost_agent.utils.helpers.platform.system")
+@patch("src.ghost_agent.utils.helpers.subprocess.run")
+def test_request_new_tor_identity_reports_failure_honestly(
+    mock_subprocess_run, mock_platform_system, mock_socket
+):
+    """A failed service restart must return False, never a fabricated success.
+
+    The pre-2026-08-21 macOS path returned True whenever the `brew` call did
+    not raise — including on this host, where it restarted a DIFFERENT (and
+    non-functional) tor job than the one actually serving :9050. Callers had
+    no way to distinguish a real rotation from a no-op, which is strictly
+    worse than a reported failure: the live rotation path (per-circuit SOCKS
+    isolation) does not need this function at all.
+    """
+    mock_socket_instance = MagicMock()
+    mock_socket_instance.__enter__.return_value = mock_socket_instance
+    mock_socket_instance.connect.side_effect = ConnectionRefusedError("refused")
+    mock_socket.return_value = mock_socket_instance
+    mock_platform_system.return_value = "Darwin"
+    # Restarting a SYSTEM daemon needs root; the agent runs unprivileged.
+    mock_subprocess_run.side_effect = PermissionError("Operation not permitted")
+
+    success, msg = request_new_tor_identity()
+
+    assert success is False, "must not claim an identity renewal that did not happen"
+    assert "Operation not permitted" in msg
+    assert "brew" not in msg

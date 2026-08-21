@@ -106,7 +106,17 @@ def _render_stats(stats: dict) -> str:
     lines.append(f"Unfinished threads: {stats.get('unfinished_threads', 0)}")
     mood = stats.get("last_mood") or ""
     if mood:
-        lines.append(f"Last noted mood: {mood}")
+        # Age + provenance so an old label reads as history, not as a
+        # current state (the 23-day "curious" problem).
+        from ..selfhood.mood import (
+            age_seconds, describe_mood_provenance, mood_is_stale,
+        )
+        set_at = stats.get("last_mood_set_at") or ""
+        prov = describe_mood_provenance(
+            stats.get("last_mood_source") or "self", age_seconds(set_at),
+        )
+        stale = " — STALE" if mood_is_stale(set_at) else ""
+        lines.append(f"Last noted mood: {mood} ({prov}{stale})")
     last = stats.get("last_session_at") or ""
     if last:
         lines.append(f"Last active: {last}")

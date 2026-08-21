@@ -17,6 +17,13 @@ from .autobiographical import (
     summarise_turn_first_person,
 )
 from .model import SelfModel
+from .mood import (
+    DERIVED_MOOD_VOCAB,
+    MOOD_STALE_AFTER_HOURS,
+    SELF_MOOD_GRACE_HOURS,
+    MoodSignals,
+    derive_mood,
+)
 from .narrative import NarrativeSummariser
 from .recognition import (
     PREFIX_CLOSE,
@@ -36,9 +43,13 @@ from .state import SelfStateThread
 
 __all__ = [
     "AutobiographicalMemory",
+    "DERIVED_MOOD_VOCAB",
     "Experience",
+    "MOOD_STALE_AFTER_HOURS",
     "Mood",
+    "MoodSignals",
     "NarrativeSummariser",
+    "SELF_MOOD_GRACE_HOURS",
     "OpenQuestion",
     "PREFIX_CLOSE",
     "PREFIX_OPEN",
@@ -48,6 +59,7 @@ __all__ = [
     "SelfStateThread",
     "UnfinishedThread",
     "build_wakeup_prefix",
+    "derive_mood",
     "strip_wakeup_prefix",
     "summarise_turn_first_person",
 ]

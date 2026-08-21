@@ -513,6 +513,59 @@ class AutobiographicalMemory:
                 continue
         return items
 
+    def recent_verdicts(
+        self,
+        limit: int = 5,
+        *,
+        scan_limit: int = 200,
+        max_age_days: Optional[float] = None,
+        now=None,
+    ) -> List[str]:
+        """Outcomes ("passed"/"failed") of the newest VERDICT-BEARING
+        experiences, oldest → newest. Scans back through the newest
+        ``scan_limit`` raw lines — NOT ``limit`` raw lines — because the
+        raw tail is dominated by boot markers and unknown-verdict turns
+        (live mix ≈ 19% verdict-bearing, and a crash-restart burst can
+        stack 8+ boot markers in a row): a raw-tail read of N records
+        yields ~0 verdicts and starves every streak-derived mood
+        (review R2). ``max_age_days`` drops verdicts whose record
+        timestamp is older (or unparseable) — without it, weeks-old
+        verdicts reached this deep can mint a "fresh" streak mood
+        (review R3). Bounded: the deque holds at most ``scan_limit``
+        lines and the file itself is compaction-capped. Never raises."""
+        if limit <= 0 or not self.path.exists():
+            return []
+        from collections import deque
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                tail_lines = deque(f, maxlen=max(int(scan_limit), limit))
+        except OSError as e:
+            logger.warning(
+                "cannot read autobiographical log %s: %s", self.path, e)
+            return []
+        cutoff_secs = (None if max_age_days is None
+                       else max(0.0, float(max_age_days)) * 86400.0)
+        # Function-level import: mood.py is a leaf module (stdlib only),
+        # so no cycle — but keep it lazy to match the file's style.
+        from .mood import age_seconds as _age
+        verdicts: List[str] = []
+        for line in tail_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("outcome") not in ("passed", "failed"):
+                continue
+            if cutoff_secs is not None:
+                age = _age(str(d.get("timestamp") or ""), now=now)
+                if age is None or age > cutoff_secs:
+                    continue
+            verdicts.append(d["outcome"])
+        return verdicts[-limit:]
+
     def get_by_ids(self, ids: Iterable[str]) -> List[Experience]:
         """Fetch experiences by id, in log order; unknown ids are silently
         skipped. Served from the cached search index so repeated calls

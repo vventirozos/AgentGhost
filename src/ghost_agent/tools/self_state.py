@@ -48,8 +48,19 @@ def _render_state(state, self_model=None) -> str:
         for p in principles:
             lines.append(f"  [{p.id[:8]}] {p.text}")
     if mood and mood.label:
+        # Unlike the wake-up prefix (which DROPS a stale mood so it
+        # can't prime the model), this introspection view shows it with
+        # an explicit stale flag — the tool's job is the truth on file.
+        from ..selfhood.mood import (
+            age_seconds, describe_mood_provenance, mood_is_stale,
+        )
+        prov = describe_mood_provenance(
+            getattr(mood, "source", "self"), age_seconds(mood.set_at),
+        )
+        stale = " — STALE, no longer surfaced in my wake-up prefix" \
+            if mood_is_stale(mood.set_at) else ""
         ev = f" — {mood.evidence}" if mood.evidence else ""
-        lines.append(f"Mood: {mood.label}{ev}")
+        lines.append(f"Mood: {mood.label} ({prov}{stale}){ev}")
     if open_qs:
         lines.append("Open questions:")
         for q in open_qs:
@@ -176,7 +187,11 @@ async def tool_self_state(
             mood = (mood or "").strip()
             if not mood:
                 return "SYSTEM ERROR: 'mood' is required for set_mood."
-            m = state.set_mood(mood, (evidence or "").strip())
+            # Explicit provenance: tool writes are the agent's own
+            # self-assessment, distinct from the derived updater's
+            # source="derived" (which yields to a fresh self mood for
+            # SELF_MOOD_GRACE_HOURS).
+            m = state.set_mood(mood, (evidence or "").strip(), source="self")
             pretty_log("Self-State", f"mood set: {mood}", icon=Icons.BRAIN_SUM)
             if m is None:
                 return "Nothing recorded — the mood label was empty."

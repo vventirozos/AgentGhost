@@ -25,6 +25,15 @@ from .autobiographical import (
     redact_pii,
     summarise_turn_first_person,
 )
+from .mood import (
+    SELF_MOOD_GRACE_HOURS,
+    STREAK_MAX_AGE_DAYS,
+    STREAK_WINDOW,
+    MoodSignals,
+    age_seconds,
+    derive_mood,
+    mood_is_stale,
+)
 from .narrative import NarrativeSummariser
 from .recognition import build_wakeup_prefix
 from .schema import Experience
@@ -379,6 +388,282 @@ class SelfModel:
             logger.debug("record_outcome skipped: %s", e)
             return False
 
+    def update_derived_mood(
+        self,
+        *,
+        pressure_lockdown: bool = False,
+        idle_seconds: float = 0.0,
+        operator_turn: bool = False,
+        now=None,
+    ) -> Optional["object"]:
+        """Recompute the functional mood from live signals and persist
+        it when unambiguous (mood rework 2026-08-20).
+
+        Called from two sites, both origin-gated to REAL traffic
+        (``turn_origin == "user"`` — checked inline at the post-turn
+        site and at the phase gate for 2.8c):
+          - the post-turn capture path (after ``capture_turn``, inside
+            ``_record_turn_trajectory`` — so it requires a wired
+            trajectory collector, and on STREAMED turns the verifier
+            verdict lands late, meaning the streak can lag one turn),
+            with this turn's context-pressure lockdown flag;
+          - biological-watchdog phase 2.8c, with the idle clock — the
+            only path that can derive "idle", and what keeps the
+            staleness TTL honest across quiet stretches.
+
+        Contract:
+          - ambiguous signals → no write at all (the prior mood stands
+            and its staleness clock keeps running — never fabricate a
+            neutral);
+          - a self-authored mood younger than ``SELF_MOOD_GRACE_HOURS``
+            is respected, not clobbered (otherwise the ``set_mood``
+            tool action would survive at most one turn);
+          - a derived ACUTE mood ("idle"/"overloaded") is only replaced
+            or retired by a caller entitled to falsify it (acute-hold +
+            retirement rules; ``operator_turn`` distinguishes real
+            operator turns from scheduled/job-resume turns via
+            ``is_internal_request`` at the hook);
+          - re-deriving the same label refreshes ``set_at`` without a
+            history append (``SelfStateThread.set_mood`` dedup);
+          - transitions are pretty-logged (🪞) so the operator sees
+            mood changes in the live stream.
+
+        Returns the persisted Mood on write, None otherwise. Never
+        raises — mood is a gauge, secondary to everything."""
+        if not self.enabled or self.state is None:
+            return None
+        try:
+            # Normalize ONCE (review R5): derive, retirement, and the
+            # acute-hold must all read the same coerced value — a
+            # caller passing None would otherwise get post-turn
+            # semantics in one check and tick semantics in another.
+            idle_seconds = float(idle_seconds or 0.0)
+            pressure_lockdown = bool(pressure_lockdown)
+            operator_turn = bool(operator_turn)
+            # Signal gathering needs no lock — the streak and questions
+            # are inputs, not the record being read-modified.
+            outcomes: list = []
+            if self.autobio is not None:
+                # Verdict-bearing back-scan, NOT a raw-tail read: the
+                # raw tail is boot markers + unknown-verdict turns
+                # almost everywhere (live mix ≈ 19% verdicts, newest
+                # verdict observed 78 records back) — a recent(16) read
+                # starved the streak to zero and made stuck/satisfied
+                # unreachable (review R2). Age-bounded so a streak of
+                # weeks-old verdicts can't keep minting a "fresh" mood
+                # via the heartbeat set_at refresh (review R3).
+                outcomes = self.autobio.recent_verdicts(
+                    limit=STREAK_WINDOW,
+                    max_age_days=STREAK_MAX_AGE_DAYS,
+                    now=now,
+                )
+
+            open_qs = self.state.open_questions()
+            newest_age_h = None
+            ages = [
+                a for a in (
+                    age_seconds(q.opened_at, now=now) for q in open_qs
+                ) if a is not None
+            ]
+            if ages:
+                newest_age_h = min(ages) / 3600.0
+
+            verdict = derive_mood(MoodSignals(
+                outcomes=outcomes,
+                pressure_lockdown=pressure_lockdown,
+                open_question_count=len(open_qs),
+                newest_question_age_hours=newest_age_h,
+                idle_seconds=idle_seconds,
+            ))
+            if verdict is None:
+                # Acute-state retirement (review R2): "idle" and
+                # "overloaded" are one-observation states. When the
+                # very signal that minted them is now absent — a user
+                # turn just completed (so not idle), a turn ended
+                # cleanly (so not locked down) — the reading is
+                # FALSIFIED, not merely unrefreshed; letting it stand
+                # for the 48h TTL re-creates the stale-label defect at
+                # smaller scale. Streak states (stuck/satisfied) and
+                # curious are standing assessments and age out
+                # normally. Retiring is not fabricating a neutral —
+                # it's clearing a gauge whose basis is gone.
+                self._maybe_retire_acute_mood(
+                    pressure_lockdown=pressure_lockdown,
+                    idle_seconds=idle_seconds,
+                    operator_turn=operator_turn,
+                )
+                return None
+            label, evidence = verdict
+
+            # Prior-read → grace check → transition detection → write,
+            # all under the state's RLock (re-entrant: set_mood takes it
+            # again). Today every mood writer runs on the event-loop
+            # thread, but that invariant is one asyncio.to_thread
+            # refactor away from false (the neighboring selfhood calls
+            # already run off-thread) — an unlocked read-modify-write
+            # here would let a concurrent tool set_mood land between
+            # read and write, clobbering the grace window and
+            # mislabelling the logged transition (review R1).
+            with self.state.lock:
+                prior = self.state.mood()
+                if (prior is not None
+                        and getattr(prior, "source", "self") == "self"
+                        and not mood_is_stale(prior.set_at, now=now)):
+                    age = age_seconds(prior.set_at, now=now)
+                    if (age is not None
+                            and age < SELF_MOOD_GRACE_HOURS * 3600.0):
+                        return None
+                # Acute-hold (review R4/R5): a FRESH derived ACUTE mood
+                # may only be REPLACED by a caller entitled to falsify
+                # it — otherwise the lockdown-blind idle tick overwrote
+                # "overloaded" with a streak label 40 minutes after the
+                # mint, with zero new events. Rules:
+                #   - a STALE acute prior no longer deserves the hold
+                #     (it is already dropped/flagged everywhere; letting
+                #     it veto a live decisive derivation left the gauge
+                #     dark indefinitely — R5);
+                #   - "overloaded": only a completed turn may act on it,
+                #     and only an OPERATOR turn may mint the replacement
+                #     label; an internal clean turn instead RETIRES it
+                #     (it falsifies "the last turn ended under lockdown"
+                #     but must not launder an operator-facing standing
+                #     label into place — R5: idle→overloaded→satisfied
+                #     via two internal turns displaced "idle" with the
+                #     operator away all night);
+                #   - "idle": an operator turn may replace it, and a
+                #     fresher acute "overloaded" from any completed turn
+                #     outranks it.
+                # Same-label re-derivation (heartbeat) always allowed.
+                retired_over_label = ""
+                if (prior is not None
+                        and getattr(prior, "source", "self") == "derived"
+                        and prior.label in ("idle", "overloaded")
+                        and label != prior.label
+                        and not mood_is_stale(prior.set_at, now=now)):
+                    if prior.label == "overloaded":
+                        if idle_seconds != 0.0:
+                            return None
+                        if not operator_turn:
+                            retired_over_label = prior.label
+                            self.state.clear_mood()
+                    elif (prior.label == "idle"
+                            and not (idle_seconds == 0.0
+                                     and (operator_turn
+                                          or label == "overloaded"))):
+                        return None
+                if retired_over_label:
+                    mood = None
+                    transition = False
+                else:
+                    transition = not (
+                        prior is not None and prior.label == label
+                        and getattr(prior, "source", "self") == "derived"
+                    )
+                    mood = self.state.set_mood(
+                        label, evidence, source="derived")
+            if retired_over_label:
+                # Internal clean turn falsified "overloaded": retired,
+                # nothing minted (see the acute-hold comment above).
+                try:
+                    from ..utils.logging import Icons, pretty_log
+                    pretty_log(
+                        "Selfhood",
+                        f"mood {retired_over_label} retired — its basis "
+                        "no longer holds",
+                        icon=Icons.SELF_STATE,
+                    )
+                except Exception:
+                    pass
+                return None
+            if mood is not None and transition:
+                # Guarded separately: the write above already happened,
+                # and a logging hiccup must not turn "wrote" into the
+                # caller seeing None.
+                try:
+                    from ..utils.logging import Icons, pretty_log
+                    if prior is not None and prior.label == label:
+                        # Provenance flip (self→derived on the same
+                        # label): "mood curious → curious" reads as a
+                        # bug in the live stream — say what happened.
+                        msg = (f"mood {label} re-derived from live "
+                               f"signals (was self-noted): {evidence}")
+                    else:
+                        prior_label = (prior.label if prior is not None
+                                       else "(none)")
+                        msg = f"mood {prior_label} → {label}: {evidence}"
+                    pretty_log("Selfhood", msg, icon=Icons.SELF_STATE)
+                except Exception:
+                    pass
+            return mood
+        except Exception as e:
+            logger.debug("update_derived_mood skipped: %s: %s",
+                         type(e).__name__, e)
+            return None
+
+    def _maybe_retire_acute_mood(
+        self, *, pressure_lockdown: bool, idle_seconds: float,
+        operator_turn: bool = False,
+    ) -> bool:
+        """Clear a derived acute mood whose basis is falsified (see the
+        call site in ``update_derived_mood``). Only ever touches
+        ``source="derived"`` moods — a self-authored label is the
+        agent's own statement and ages out via grace + TTL instead.
+
+        Retirement happens ONLY on the post-turn path (idle_seconds ==
+        0.0, i.e. a turn just completed). "overloaded" is turn-scoped:
+        ANY cleanly-completed turn falsifies "the last turn ended under
+        lockdown". "idle" is operator-scoped and additionally requires
+        ``operator_turn`` — scheduled tasks and job resumes run this
+        same hook at 3am while the operator is genuinely away, and
+        letting them retire "idle" re-created the retire→re-derive
+        flap (review R4; the hook derives operator_turn from
+        ``is_internal_request(req_id)``). The idle tick can NEVER
+        retire: its clock is saw-toothed by phase 3's
+        last_activity_time reset in the self-play finally, so a small
+        idle reading there does not prove the operator returned
+        (probe-proven flap, review R3).
+        Returns True when a mood was cleared. Never raises."""
+        try:
+            if self.state is None:
+                return False
+            if idle_seconds != 0.0:
+                return False
+            with self.state.lock:
+                prior = self.state.mood()
+                if (prior is None
+                        or getattr(prior, "source", "self") != "derived"):
+                    return False
+                # The lockdown guard is unreachable from the current
+                # call site (derive_mood returns "overloaded" whenever
+                # the flag is set, so the verdict-None branch implies
+                # it's off) but is part of this helper's OWN contract —
+                # a caller passing lockdown=True must not retire the
+                # reading it just confirmed. Pinned by a direct test.
+                falsified = (
+                    (prior.label == "idle" and operator_turn)
+                    or (prior.label == "overloaded"
+                        and not pressure_lockdown)
+                )
+                if not falsified:
+                    return False
+                cleared = self.state.clear_mood()
+            if cleared:
+                try:
+                    from ..utils.logging import Icons, pretty_log
+                    pretty_log(
+                        "Selfhood",
+                        f"mood {prior.label} retired — its basis no "
+                        "longer holds",
+                        icon=Icons.SELF_STATE,
+                    )
+                except Exception:
+                    pass
+            return cleared
+        except Exception as e:
+            logger.debug("acute-mood retirement skipped: %s: %s",
+                         type(e).__name__, e)
+            return False
+
     # -----------------------------------------------------------------
     # Idle-path APIs (called by biological watchdog phase 2.8)
     # -----------------------------------------------------------------
@@ -428,6 +713,12 @@ class SelfModel:
             "open_questions": len(self.state.open_questions()) if self.state else 0,
             "unfinished_threads": len(self.state.unfinished_threads()) if self.state else 0,
             "last_mood": _mood.label if _mood else "",
+            # Provenance + freshness (mood rework 2026-08-20) so the
+            # introspection surfaces can render honest age/stale flags
+            # instead of presenting an old label as current.
+            "last_mood_source": (getattr(_mood, "source", "self")
+                                 if _mood else ""),
+            "last_mood_set_at": (_mood.set_at if _mood else ""),
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),

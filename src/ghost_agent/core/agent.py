@@ -4063,6 +4063,14 @@ class StreamState:
     _active_turn: Any
     _proj_task_closed_this_req: Any
     _turn_reg: Any
+    # Snapshot of `context._ctx_pressure_lockdown` taken UNDER the request
+    # semaphore (mood rework 2026-08-20, review R1). The SSE drain runs
+    # post-semaphore, where the live flag belongs to whichever request
+    # holds the semaphore NOW — reading it there mis-attributes the next
+    # turn's pressure to this one (same hazard class as _drain_pid /
+    # _project_work_pending). Defaulted so pre-existing constructors
+    # (tests) stay valid; the build site always passes it explicitly.
+    pressure_lockdown: Any = False
 
 
 # The System-2 planner runs inline on the user's turn. Without a budget it
@@ -5043,6 +5051,7 @@ class GhostAgent:
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
     _STALE_QUESTIONS_COOLDOWN = 7200  # 2 h between stale open-question surfacings (phase 2.8b)
+    _DERIVED_MOOD_COOLDOWN = 1800  # 30 min between idle derived-mood refreshes (phase 2.8c)
     _ROUTER_TRAIN_COOLDOWN = 10800   # 3 h between router-classifier retrains (phase 2.7b)
     _CALIB_REFIT_COOLDOWN = 3600  # 60 min between calibration refits (phase 2.7c)
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
@@ -5257,6 +5266,8 @@ class GhostAgent:
             self._last_workspace_narrative_at = datetime.datetime.min
         if not hasattr(self, '_last_stale_questions_at'):
             self._last_stale_questions_at = datetime.datetime.min
+        if not hasattr(self, '_last_derived_mood_at'):
+            self._last_derived_mood_at = datetime.datetime.min
         if not hasattr(self, '_last_router_train_at'):
             self._last_router_train_at = datetime.datetime.min
         # Corpus fingerprints from the last COMPLETED PRM / router refit.
@@ -6621,6 +6632,80 @@ class GhostAgent:
                         logger.debug(f"stale-question surfacing failed: {e}")
                     finally:
                         self._last_stale_questions_at = datetime.datetime.now()
+
+        # Phase 2.8c: Derived-mood refresh (15-60 min idle; mood rework
+        # 2026-08-20). Recomputes the functional mood from the same
+        # signal set as the post-turn site, plus the idle clock — the
+        # ONLY path that can derive "idle" (the post-turn site passes
+        # idle_seconds=0), and what keeps the wake-up prefix's staleness
+        # TTL honest across quiet stretches: a mood that still derives
+        # gets its set_at refreshed in place; one that no longer derives
+        # ages out of the prefix at MOOD_STALE_AFTER_HOURS. Ambiguous
+        # signals write nothing (never fabricate a neutral), and this
+        # path never RETIRES either — retirement is post-turn-only,
+        # because this clock is saw-toothed by phase 3's
+        # last_activity_time reset (review R3). Same idle window +
+        # advance-anchor-before-await cooldown discipline as phases
+        # 2.8/2.8b; does NOT touch ctx.last_activity_time.
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
+            since_last_mood = (datetime.datetime.now()
+                               - self._last_derived_mood_at).total_seconds()
+            if since_last_mood >= self._bio_cooldown(self._DERIVED_MOOD_COOLDOWN):
+                _sm_mood = getattr(ctx, 'self_model', None)
+                # turn_origin gate (review R1): the live watchdog context
+                # always derives "user", but a harness driving
+                # _biological_tick with a sim-flavored context (read-only
+                # skill store / explicit label) must not author
+                # production mood — same real_only rule as the post-turn
+                # site (§4AT-G / §4BF 1c).
+                # Collector gate (review R4): retirement lives on the
+                # post-turn hook inside _record_turn_trajectory, which
+                # is unreachable under --no-trajectories — minting
+                # "idle" here with the retiring half dead would let a
+                # falsified label stand its full 48h TTL. No collector
+                # → no derived mood at all (symmetric death; self moods
+                # + TTL still work).
+                if (_sm_mood is not None
+                        and getattr(_sm_mood, 'enabled', False)
+                        and getattr(ctx, 'trajectory_collector', None)
+                        is not None
+                        and turn_origin(ctx) == "user"):
+                    self._last_derived_mood_at = datetime.datetime.now()
+                    _idle_ran.append("derived-mood")   # §4CB R1 A-F4
+                    try:
+                        # ⚠ RE-SAMPLE THE IDLE CLOCK (review R3 — the
+                        # same fix phase 3b carries): `idle_secs` was
+                        # measured at tick-top, and phases 2.5–2.8 run
+                        # real LLM calls before this line. A user turn
+                        # completing during those awaits would otherwise
+                        # be greeted here by a stale >30min reading and
+                        # a false "idle" mood minted MID-conversation.
+                        _idle_now_mood = (
+                            datetime.datetime.now()
+                            - ctx.last_activity_time
+                        ).total_seconds()
+                        # Normalize to production scale: the phase
+                        # WINDOW is _bio_scaled but IDLE_AFTER_SECONDS
+                        # inside derive_mood is a production constant —
+                        # under --bio-time-scale the raw clock would
+                        # never reach it and "idle" becomes underivable
+                        # in accelerated harness runs (the §4CB "scaled
+                        # gates, not work" class). Ratio is 1.0 in
+                        # production.
+                        _mood_scale = 900.0 / max(
+                            float(self._bio_scaled(900)), 1e-9)
+                        # Clamp floor 0.001, NOT 0.0: exactly 0.0 is the
+                        # post-turn sentinel inside update_derived_mood
+                        # (retirement/acute-hold entitlement) — a
+                        # backwards wall-clock step must not let this
+                        # lockdown-blind tick masquerade as a completed
+                        # turn (review R5).
+                        _sm_mood.update_derived_mood(
+                            idle_seconds=(max(0.001, _idle_now_mood)
+                                          * _mood_scale),
+                        )
+                    except Exception as e:
+                        logger.debug(f"derived-mood idle refresh failed: {e}")
 
         # Phase 2.9: Workspace Narrative Consolidation (15-60 min idle).
         # Mirrors phase 2.8 but for the world-model. Re-renders the
@@ -18668,6 +18753,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _active_turn=_active_turn,
                             _proj_task_closed_this_req=_proj_task_closed_this_req,
                             _turn_reg=_turn_reg,
+                            # Under the semaphore: this is THIS turn's flag.
+                            pressure_lockdown=bool(getattr(
+                                self.context, "_ctx_pressure_lockdown", False)),
                         )
                         # WRITE-BACK (not a captured read): the streaming path
                         # defers the turn-unregister to _stream_then_unregister's
@@ -21018,6 +21106,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         _active_turn = ss._active_turn
         _proj_task_closed_this_req = ss._proj_task_closed_this_req
         _turn_reg = ss._turn_reg
+        pressure_lockdown = ss.pressure_lockdown
 
         async def stream_wrapper():
             full_content = ""
@@ -21846,6 +21935,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             execution_failed=(
                                 execution_failure_count > 0
                                 and bool(last_was_failure)),
+                            # Semaphore-time snapshot from StreamState —
+                            # the live flag here belongs to whichever
+                            # request runs NOW, not this turn.
+                            pressure_lockdown=pressure_lockdown,
                         )
                 except Exception as _sbf_exc:
                     logger.debug(
@@ -22643,8 +22736,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         user_request: str = "",
         verifier: Optional[str] = None,
         execution_failed: bool = False,
+        pressure_lockdown: Optional[bool] = None,
     ) -> None:
         """Build and persist a Trajectory for the turn that just finished.
+
+        ``pressure_lockdown`` feeds the derived-mood hook at the bottom.
+        None means "caller runs INSIDE this request's semaphore — read the
+        live context flag" (true for the finalize chain). Any caller that
+        runs post-semaphore (the SSE drain) MUST pass its semaphore-time
+        snapshot instead: the live flag there describes whichever request
+        holds the semaphore now, not this turn.
 
         No-op when `ctx.trajectory_collector` isn't wired. Walks the
         final `messages` list to reconstruct the tool-call sequence
@@ -23046,6 +23147,55 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as e:
             logger.debug(
                 "selfhood capture skipped: %s: %s",
+                type(e).__name__, e,
+            )
+
+        # Derived-mood update (mood rework 2026-08-20): recompute the
+        # functional mood from the verdict streak plus this turn's
+        # context-pressure lockdown flag. On the non-streamed path the
+        # capture above already carries the verifier-resolved verdict;
+        # on the streamed path verifier=None here, so the just-captured
+        # experience is outcome="unknown" until the late verifier
+        # backfills it — streak-derived moods can lag one turn there
+        # (unknowns are filtered, never miscounted).
+        # Separate try + same real_only origin gate as the capture:
+        # sim/bench turns must never author production mood (§4AT-G /
+        # §4BF 1c), and a fresh self-authored mood is respected inside
+        # update_derived_mood (grace window), so this cannot clobber a
+        # set_mood the model made this very turn. Ambiguous signals
+        # write nothing. Runs on both streamed and non-streamed turns —
+        # this method is the shared trajectory-append path (and like the
+        # capture, only when a trajectory_collector is wired: the
+        # early-return at the top of this method gates both).
+        try:
+            from ..selfhood import SelfModel as _SelfModelDM
+            _sm_dm = getattr(self.context, 'self_model', None)
+            if (isinstance(_sm_dm, _SelfModelDM)
+                    and getattr(_sm_dm, 'enabled', False)
+                    and turn_origin(self.context) == "user"):
+                # See the docstring: None = in-semaphore caller, read
+                # live; the SSE drain passes its semaphore-time snapshot.
+                _plock = (pressure_lockdown
+                          if pressure_lockdown is not None
+                          else bool(getattr(
+                              self.context, "_ctx_pressure_lockdown",
+                              False)))
+                # operator_turn (review R4): scheduled tasks and job
+                # resumes run this same hook with origin "user" (live
+                # context, writable store) — but a 3am "sched-"/"job-"
+                # turn is NOT proof the operator is active, and letting
+                # it retire "idle" re-created the retire→re-derive
+                # flap. Same req_id-prefix discriminator the activity
+                # digest uses.
+                from .autonomous_activity import (
+                    is_internal_request as _is_internal_dm)
+                _sm_dm.update_derived_mood(
+                    pressure_lockdown=bool(_plock),
+                    operator_turn=not _is_internal_dm(req_id),
+                )
+        except Exception as e:
+            logger.debug(
+                "derived-mood update skipped: %s: %s",
                 type(e).__name__, e,
             )
 

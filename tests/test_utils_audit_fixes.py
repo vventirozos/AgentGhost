@@ -270,8 +270,10 @@ async def test_fetch_url_503_rotates_circuit_not_daemon(monkeypatch):
     monkeypatch.setenv("TOR_PROXY", "socks5://127.0.0.1:9050")
 
     # The daemon-restarting request_new_tor_identity must NEVER be called now
-    # (control port 9051 is closed on the box, so it fell back to
-    # `brew services restart tor`). 503 rotation is per-circuit instead.
+    # (control port 9051 is closed on the box, so it falls back to bouncing
+    # the whole tor daemon — and since 2026-08-21 that means the com.local.tor
+    # LaunchDaemon, which an unprivileged agent cannot restart at all).
+    # 503 rotation is per-circuit instead.
     monkeypatch.setattr(helpers, "request_new_tor_identity",
                         MagicMock(return_value=(True, "ok")))
     monkeypatch.setattr(helpers.asyncio, "sleep", AsyncMock(return_value=None))

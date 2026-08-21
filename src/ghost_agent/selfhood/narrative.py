@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
 from .autobiographical import AutobiographicalMemory
+from .mood import mood_is_stale
 from .schema import Experience, _utcnow_iso
 from .state import SelfStateThread
 
@@ -229,11 +230,21 @@ class NarrativeSummariser:
             for q in state.open_questions()[-3:]:
                 if q.text:
                     parts.append(q.text)
+            # Staleness-aware (mood rework 2026-08-20, review R1): a
+            # mood past the prefix TTL must not keep steering diary
+            # recall either — blending a weeks-old label into the IDF
+            # query was the last surviving stale-mood leak.
+            # Label ONLY, never evidence (review R7): evidence strings
+            # legitimately vary with the clock (streak counts drain at
+            # the 7-day bound), and a varying recall query shifts the
+            # retrieved experiences → the prompt sha1 → spurious
+            # regenerations. Today that was masked only by the
+            # tokenizer dropping the 1-digit varying tokens — an
+            # implicit template-policing dependence; the label carries
+            # the steering signal on its own.
             mood = state.mood()
-            if mood and mood.label:
+            if mood and mood.label and not mood_is_stale(mood.set_at):
                 parts.append(mood.label)
-                if mood.evidence:
-                    parts.append(mood.evidence)
         except Exception:
             return ""
         return " ".join(parts).strip()
@@ -241,13 +252,32 @@ class NarrativeSummariser:
     def _format_state_block(self, state: Optional[SelfStateThread]) -> str:
         if state is None:
             return "(no persisted state)"
-        block = state.format_as_prefix() or "(no open questions or unfinished threads)"
+        # include_mood_age=False: this block feeds NARRATIVE_PROMPT,
+        # whose sha1 is the regenerate skip-guard — a wall-clock-varying
+        # "2h ago" would defeat the guard and bake relative time into
+        # the persisted diary (review R2). Staleness drop still applies.
+        block = (state.format_as_prefix(include_mood_age=False)
+                 or "(no open questions or unfinished threads)")
         # Mood arc: surface how my functional state has SHIFTED recently so the
         # narrative can describe an arc ("stuck → satisfied") rather than only
         # the latest slot. Wires the previously-unread mood_history reader.
+        # Age-bounded (review R5): "lately" must mean lately — with one
+        # transition per weeks at live rates, an unfiltered history
+        # rendered a 23-day-old label into the diary prompt as recent,
+        # the stale-label defect reborn on the arc surface. Same 48h
+        # TTL as every other read surface.
         try:
-            hist = state.mood_history(limit=8)
-            labels = [getattr(m, "label", "") for m in (hist or []) if getattr(m, "label", "")]
+            hist = state.mood_history(limit=8) or []
+            # Freshness by TRANSITION time, keeping one predecessor
+            # (review R6): a state entered 3 days ago and held until a
+            # transition 1h ago IS part of the "lately" arc — filtering
+            # each entry by its own set_at dropped the from-state and
+            # left the arc dark at live rates (one transition per
+            # weeks). No fresh transition at all → no arc line.
+            fresh_idx = [i for i, m in enumerate(hist)
+                         if not mood_is_stale(getattr(m, "set_at", ""))]
+            hist = hist[max(0, fresh_idx[0] - 1):] if fresh_idx else []
+            labels = [getattr(m, "label", "") for m in hist if getattr(m, "label", "")]
             arc = [l for i, l in enumerate(labels) if i == 0 or l != labels[i - 1]]  # collapse repeats
             if len(arc) >= 2:
                 block = f"{block}\nMood arc lately: {' → '.join(arc)}."

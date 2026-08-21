@@ -56,6 +56,94 @@ wired). Repo is versioned on another server (local git intentionally absent).
 
 ## 2. Operational reference (live agent)
 
+### 2.0 Boot / service topology (2026-08-21)
+
+After the 2026-08-21 reboot the agent stayed down ~20 min in a launchd respawn loop. Root cause
+was **dependency ordering, not the agent**: Tor had no autostart at all, so `--mandatory-tor`
+(fail-closed) aborted boot on every respawn, each iteration re-paying the full heavy-import +
+tokenizer load before dying. Everything below is the post-fix state.
+
+| service | port | launchd label | scope |
+|---|---|---|---|
+| Tor SOCKS | 9050 | `com.local.tor` | **boot** (system daemon) |
+| PostgreSQL 18 | 5432 | `com.local.postgres` | **boot** |
+| llama-server | 8088 | `com.local.llama-server` | **boot** |
+| ghost-agent | 8000 | `com.local.ghost-agent` | **boot** |
+| web client (**HTTPS**) | 8080 | `com.local.ghost-client` | **boot** |
+| Slack bot | — | `com.local.ghost-slackbot` | **boot** |
+| OrbStack engine | — | `com.local.orbstack-engine` (LaunchAgent) | **login only** |
+| Tailscale | — | system extension + login-item helper | **boot** (extension) |
+
+All six core services are **system LaunchDaemons in `/Library/LaunchDaemons`**, deliberately not
+`brew services` / LaunchAgents: a LaunchAgent starts at *login*, and a login-scoped Tor leaves the
+(system-daemon) agent respawn-looping from boot until a human logs in.
+
+**Triage after any reboot** — one command:
+```bash
+for l in homebrew.mxcl.tor com.local.postgres com.local.llama-server \
+         com.local.ghost-agent com.local.ghost-client com.local.ghost-slackbot; do
+  printf "%-28s " "$l"; sudo launchctl print system/$l 2>/dev/null | grep -m1 "state ="
+done
+```
+`state = spawn scheduled` + a non-zero `last exit code` means a **respawn loop**, not a stopped
+service — `launchctl list` showing a live pid does not mean the port is held (see the 2026-07-27
+deploy gotcha; always verify a LISTENER with `lsof -nP -iTCP:<port> -sTCP:LISTEN`).
+
+**Two reboot traps, both now guarded (`tests/test_service_autostart.py`, 29 executed pins):**
+
+1. **Tor race.** launchd starts tor and the agent *concurrently*, so tor autostarting is not by
+   itself sufficient. `bin/start-ghost-agent.sh` now waits for :9050 before `exec` — **bounded**
+   (180 s, `GHOST_TOR_WAIT_MAX`), then falls through so the fail-closed abort stays loud rather
+   than the daemon hanging silently forever. The boot probe
+   (`utils/egress_guard.tor_liveness_ok`) is a plain TCP connect, so the port answering — not a
+   bootstrapped circuit — is the correct gate. Config: `/opt/homebrew/etc/tor/torrc`
+   (`SocksPort 127.0.0.1:9050 IsolateSOCKSAuth`, explicit `DataDirectory` because a launchd
+   daemon has no `$HOME`).
+
+   ⚠ **The tor daemon is labelled `com.local.tor`, NOT `homebrew.mxcl.tor`.** It was installed
+   under the Homebrew label first, and within the hour `brew services` re-created its OWN copy at
+   `~/Library/LaunchAgents/homebrew.mxcl.tor.plist`, which sat in `error` state fighting the
+   system daemon for :9050. Homebrew owns that label. Consequence: **`brew services list` reports
+   tor as `none`, and that is CORRECT** — do not "fix" it with `brew services start tor`, which
+   starts a second tor that cannot bind the port. Pinned by
+   `test_no_rival_homebrew_tor_job_exists`.
+
+   ⚠ **The AGENT was itself recreating that rival job.**
+   `utils/helpers.request_new_tor_identity()` (called from ~20 sites in
+   `tools/system.py` + `tools/file_system.py`) falls back to a service restart when the control
+   port 9051 is closed — which it is here — and that fallback was `brew services restart tor`.
+   Live effect: it created `~/Library/LaunchAgents/homebrew.mxcl.tor.plist` fighting the real
+   daemon for :9050, did **not** restart the tor actually serving, and **returned `True`
+   regardless** — a fabricated success callers could not distinguish from a real rotation. Fixed
+   2026-08-21: the macOS fallback is now `launchctl kickstart -k system/com.local.tor`
+   (label overridable via `GHOST_TOR_SERVICE_LABEL`), and it returns an honest `False` when it
+   cannot restart — which is the normal outcome, since bouncing a system daemon needs root and
+   the agent is unprivileged. That is fine: the live rotation path is per-circuit SOCKS isolation
+   (`socks_url_with_identity`), which needs neither the control port nor a daemon bounce.
+
+2. **Postgres stale lock via PID reuse.** The leftover `postmaster.pid` named PID 784; after the
+   reboot 784 was `AirPlayUIAgent`. Postgres sees a live PID, refuses, and under `KeepAlive`
+   retries forever — it **cannot** self-heal this, because it can see the PID is alive but not
+   that it belongs to something else. `bin/start-postgres.sh` clears the lock only when it can
+   prove no postmaster owns it (PID gone, or PID alive but `ps -o comm=` is not postgres), and
+   leaves a genuine postmaster strictly alone.
+
+**OrbStack is the one thing a headless reboot will not restore** — it is a GUI VM manager and
+cannot run pre-login. Note also that the app and the engine are separate: on 2026-08-21 the app
+launched 9 s after boot while the VM did not spawn until 16:05:59, six minutes later (the app
+starts it on demand). So "OrbStack is running" says nothing about whether Docker works — ask
+`orb status` (want `Running`). `com.local.orbstack-engine` (LaunchAgent, one-shot) now runs
+`orb start` at login to close that window, and the sandbox container carries
+`--restart unless-stopped` so it returns with the engine.
+
+**Tailscale needed no change** and is not one of the above failures: its networking is a root
+*system extension* (`io.tailscale.ipn.macsys.network-extension`, `[activated enabled]`) which is
+boot-scoped, and its `serve` config persists — all six proxies (3000, 8088, 8100-8103) were
+already restored on their own after the reboot. The GUI app rides an enabled login-item helper.
+The agent depends on it for the worker/critic node (Nova) and image-gen node (Ghost), for the web
+client's TLS cert, and for the sandbox `serve` proxies.
+
+
 **Process / flags.** `python -m src.ghost_agent.main --port 8000` under a **root launchd job**
 `/Library/LaunchDaemons/com.local.ghost-agent.plist` (**KeepAlive=true**). Live flags (2026-07-13):
 `--verbose --deep-reason --smart-memory 0.9 --max-context 240000 --mandatory-tor
@@ -372,23 +460,51 @@ as the last step, mutation-pin every fix red-on-revert, docs + journal + restart
    not by traffic.
 2. **✅ CONVERGED 2026-08-17 (§4BU) — web workspace console / session bridge**. 3 rounds x 3
    lenses, ~75 defects, every fix mutation-pinned. See §4BU.
-3. **OPEN — LLM client / routing** (`core/llm.py`). Last converged 2026-07-22; heavy churn
-   since (node slot budgets keyed by URL, breakers, prefix warmup, streaming finalize, the
-   native-tools XML fix). Every subsystem rides it, and `/health` is already known to LIE
-   under Metal OOM.
-4. **OPEN — sandbox / execute stack**. Last converged 2026-07-22; port leases (§4G), remote
-   hosting and `bin/serve-remote.sh` all shipped after it, unreviewed.
-5. **OPEN — `tools/browser.py` runner**. The ~1200-line EMBEDDED SCRIPT STRING: the standing
-   memory is that grep/py_compile are not evidence there (import and call it). Only ever had
-   incident-driven fixes, never a converged pass.
-6. **OPEN — launcher / daemon layer** (`bin/start-ghost-agent.sh`, plists, log rotation).
-   Small and never reviewed, but it is the FLAG TRUTH, and the EX_CONFIG + log-ownership +
-   Local-Network traps all live there. Half a day, not a campaign.
+3. **✅ CONVERGED 2026-08-18 (§4BV) — LLM client / routing** (`core/llm.py`). 7 rounds.
+4. **✅ REVIEWED 2026-08-19 (§4BW) — sandbox / execute stack.** Fixes landed through R2;
+   **item C (classic-exec whole-output RAM buffering → bounded head+tail sink) is STAGED,
+   NOT LANDED** — blocked on a real-container byte-equivalence smoke test, the reload-trap
+   test fix, and an operator call on default-on. Still the open tail of this queue.
+5. **✅ CONVERGED 2026-08-19 (§4BX) — `tools/browser.py` runner** (+ recorded bounded
+   not-fixed items; raw-Playwright proxy backstop shipped in follow-ups).
+6. **✅ CONVERGED 2026-08-19 (§4BX) — launcher / daemon layer.**
+
+**Queue refresh (2026-08-20, post-§4CC gap analysis — same ranking lens: instruments and
+seams that changed recently, whose failure mode is SILENT):**
+7. **OPEN — verifier→autobio outcome-backfill stoppage (INVESTIGATION, hours not a
+   campaign).** Found during §4CC: newest passed/failed record in the live
+   autobiographical log is 2026-08-16, 78 records back — the late-verifier backfill
+   appears to have landed nothing in ~4 days. Starves the §4CC mood streak AND any
+   consumer of autobio outcome labels. Distinguish real breakage from traffic drought
+   FIRST (the §4BT lesson: "discovering in October that the gate was starved by code,
+   not by traffic").
+8. **OPEN — measurement-instrument stack** (`core/experiments.py` ~2.2k, `core/calibration.py`
+   ~1.8k + their report surfaces). Never converged as a unit; four standing lessons say
+   instruments lie plausibly (instruments-fail-not-runtime, judge-instrument-failures,
+   §4BR wrong-statistic gate, restated-is-not-checked), and every keep/kill decision —
+   verify_depth arm, §4BT labels, future A/Bs — rides them. Maximally silent failure mode:
+   a wrong verdict looks exactly like a verdict.
+9. **OPEN — autonomous-dispatch seams in `main.py`** (~3.2k: lifespan wiring, scheduled
+   tasks, job resume, foreground marking, INTERNAL_REQUEST_PREFIXES contract). §4CC's R4
+   MAJOR (sched-/job- turns masquerading as operator activity) came from exactly this seam
+   and was caught only by a reviewer enumerating req_id producers. Never had a dedicated
+   pass; wiring files are where silent-inoperative subsystems live.
+10. **OPEN — project-store stack** (`tools/projects.py` ~4.2k — largest tool file,
+   `memory/projects.py` ~2k, `core/project_advancer.py` ~1.6k, workspace sweep). Last
+   converged look was the three-stack review 2026-07-20; §4G port leases, autoadvance and
+   work_log write-back all shipped after. Failure mode includes the IRREVERSIBLE
+   workspace sweep on DONE and silently-retired constraints.
+11. **OPEN (lower) — `core/dream.py` as a UNIT** (~6.9k; 2/3 of live traffic). Heavily
+   incident-audited (§4AT containment, §4BF bench, curriculum) but never one converged
+   whole-unit pass; its isolation lists have twice been found drifted from subagent.py's.
+12. **OPEN (lower) — `tools/file_system.py`** (~3.8k). Incident-fixed
+   (partial-keepset wipe) but never converged-reviewed.
 
 **Deliberately NOT queued** (converged within ~10 days, or continuously re-audited as a side
 effect of feature rounds): verifier stack (§4T/§4BJ-§4BL), memory substrate (§4M),
-admissibility/bench (§4BH), dialog layer (§4O), idle orchestration (§4Q), belief revision
-(§4R), agent.py turn loop.
+admissibility/bench (§4BH), dialog layer (§4O), idle orchestration (§4Q/§4CB), belief
+revision (§4R), agent.py turn loop (§4BY/§4BZ/§4CA), logging stream (§LOG), feedback
+channel (§4BT), introspect/learning_health (§4BS), egress (§4P), selfhood/mood (§4CC).
 
 
 ### ▶ CURRENT EXECUTION QUEUE (2026-08-08, mirrors the session task list — newest state wins)
@@ -22224,3 +22340,71 @@ tests/test_logging_stream_fixes.py: 20 pins (mirror-delta behavioral + read-once
 ### Found-not-fixed (documented)
 - Pre-existing test-order contamination: `test_critic_async.py` before `test_auth_rejection_logging.py` → 16 "no current event loop" failures (never occurs in alphabetical suite order; neither file touched by this pass).
 - Lens findings deferred: `prefill cache`/`llm request` per-turn plumbing demotion (clients already blacklist as ticker noise); ▼/▲ section markers spend 2 lines per 1 (single section type, 463×); `Verifier` 46-site mega-title; 🔍/🔎 and 🌐/🌎 confusable pairs + ten book/paper glyphs; 303 `except: logger.debug` handlers dark in production (+ 304 `except: pass`); self-play mining internals ≈22% of WARNINGs (candidates for INFO+FAIL); boot `Resolved Config` truncated at 60 on the live view (full copy in mirror + last_config.json + /api/health — deliberate); m3 delta-format edge cases (+100000s column break, negative render — 0 live occurrences); launcher header drift (--verbose/--max-context/--postmortem claims vs exec line); stream-path Final Reply gap (above).
+
+## §4CC — Selfhood mood rework: derived gauge + staleness TTL (2026-08-20)
+
+**Trigger.** Operator asked why "hows your mood" always answers "curious". Root cause: mood
+was write-only self-authorship — `self_state(set_mood)` fired ONCE in 23 days (2026-07-28),
+and every surface presented that stale label as current forever. Classic built-but-unwired
+loop: a write path nothing drives, a read path with no honesty about age.
+
+**What shipped (operator-directed: derived updater + staleness prefix).**
+- `selfhood/mood.py` (new): pure rule table — lockdown→overloaded; verdict streak (newest ≤5
+  verdict-bearing records ≤`STREAK_MAX_AGE_DAYS`=7d via `autobio.recent_verdicts` bounded
+  back-scan): ≥3 fails incl. latest→stuck, all-pass ≥3→satisfied, decisive-size-but-mixed
+  suppresses curious; fresh question ≤24h→curious; ≥30min idle→idle; ambiguous→None (never
+  fabricate). Clock-free evidence strings citing real counts. Age/staleness helpers.
+- Provenance `source=self|derived`; 6h grace for self moods; heartbeat refresh (same
+  label+source: set_at/evidence refresh, NO history append — history = transitions);
+  input caps 64/300+ellipsis; public `SelfStateThread.lock`; `clear_mood`.
+- Acute-state lifecycle: retirement post-turn-only ("overloaded" by any clean completed
+  turn; "idle" only by an OPERATOR turn — `operator_turn = not is_internal_request(req_id)`);
+  acute-hold on the write path (fresh acute replaced only by an entitled caller; internal
+  clean turns RETIRE overloaded, never mint over it; stale acutes don't hold).
+- 48h TTL on EVERY read surface: prefix drops, `self_state list`/`introspect` flag STALE
+  with provenance+age, `_derive_recall_query` label-only + stale-excluded, "Mood arc lately"
+  = fresh-transition suffix + one from-state. Narrative mood rendering = label+provenance
+  ONLY (no age, no evidence) so the regenerate skip-guard sha1 is stable by construction.
+- Wiring: post-turn hook at the tail of `_record_turn_trajectory` (both streamed and
+  non-streamed; origin-gated `turn_origin=="user"`; pressure flag rides a StreamState
+  snapshot taken UNDER the semaphore — the drain's live read belongs to the next request);
+  biological phase 2.8c (15-60min window, 30min cooldown, re-samples the idle clock like 3b,
+  bio-scale-normalized, collector-gated, clamp floor 0.001 ≠ the 0.0 post-turn sentinel).
+- `self_state` registry description updated (grace/TTL semantics); docs
+  `docs/algorithms/selfhood.html` §"Derived mood + staleness" (+ .md banner).
+
+**Review: 7 fresh-eye rounds (13 reviewer passes), the fix-inherits-the-blind-spot streak
+held through R6.** R1: streamed pressure-flag cross-request read (MAJOR) + phase origin gate
++ grace/introspect pins. R2: acute states sticky after basis falsified + streak starved on
+live data (raw tail = boots/unknowns; newest verdict 78 records back) + build-site snapshot
+unpinned. R3: idle-retirement flap via the saw-toothed clock + 2.8c stale tick-top idle +
+eternal streak via heartbeat refresh. R4: sched-/job- turns masquerading as operator
+activity + lockdown-blind tick overwriting overloaded + unpinned re-sample/age-bound +
+--no-trajectories asymmetry. R5: idle-evidence span churning the narrative sha1 +
+age-unbounded arc + two-step entitlement laundering. R6: evidence-COUNT churn via the 7-day
+drain + unpinned clamp; acceptance walker ran 7 production-shape walks incl. a live-replica
+deploy-day walk — all PASS. R7: no behavioral defects; closed the last mutation survivors
+(arc off-by-two, provenance drop) + recall label-only. Every named mutation survivor closed
+with an EXECUTED pin (incl. a full-handle_chat streamed-turn pin via the dual-channel
+disclaimer recipe).
+
+**Tests:** `tests/test_selfhood_derived_mood.py` — 102 tests; key guards mutation-verified
+(staleness gate, origin gate, history dedup, grace width, build-site kwarg deletion, clamp
+floor, arc window, age bound, retire-not-replace). Localized 396+ green throughout. FULL
+suite as the final step: **14,363 passed / 17 skipped / 0 failed** (12m32s; one docs-markup
+scroll-wrapper fix after).
+
+**Deploy-day behavior on the live store (probe-verified on a replica):** the 23-day "curious"
+loads as source="self", drops from the prefix, shows "self-noted 23d ago — STALE" on both
+tools, is excluded from recall and arc; the first operator turn derives honestly from the
+real streak.
+
+**Found-not-fixed / follow-ups:**
+- ⚠ **Verdict backfill appears DEAD since 2026-08-16** (queue item #7): newest passed/failed
+  autobio record is 78 back. Investigate code-vs-traffic before trusting any streak-fed
+  surface.
+- `_SELFHOOD_PREFIX_ENABLED` remains False (pre-existing): the wake-up prefix is off on the
+  request path; mood answers ride introspect/self_state (now age-honest) + narrative.
+- Bounded gaps documented in selfhood.html (out-of-band surfaces don't count as operator
+  activity; one-turn retirement lag; last-decisive evidence counts; held-idle 48h age-out;
+  stale-acute fall-through) — all fail toward honest absence.

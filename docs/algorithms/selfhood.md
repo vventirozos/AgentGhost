@@ -1,5 +1,15 @@
 # Selfhood
 
+> **2026-08-20 mood rework:** mood is now DERIVED from live signals
+> (verdict streaks, context pressure, open-question freshness, idle
+> clock; `selfhood/mood.py`) with provenance (`source="self"|"derived"`),
+> a 6 h grace window for self-authored moods, a 48 h staleness TTL on
+> every read surface, transitions-only history, and acute-state
+> retirement. Sections of this page that predate the rework (e.g.
+> "every `set_mood` appends to the history") describe the old
+> behaviour — see `docs/algorithms/selfhood.html`, section
+> "Derived mood + staleness", for the current mechanism.
+
 A five-component module that stitches the agent's episodic instances
 into one continuous first-person self. Each new process boot reads
 back what prior instances wrote — autobiographical experiences, open
