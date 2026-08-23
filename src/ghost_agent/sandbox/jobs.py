@@ -1365,6 +1365,92 @@ class SandboxJobSupervisor:
 
     # -- lifecycle -----------------------------------------------------------
 
+    def take_unreported(self) -> List[dict]:
+        """Terminal transitions nobody has REPORTED yet — drained once.
+
+        ⚠ WHY (queue #9, 2026-08-21). ``reap()`` is the sole writer of
+        terminal states and returns each transition EXACTLY ONCE, to
+        whoever happened to call it. It has four callers, and three of them
+        drop that return value: ``_sync_sandbox_jobs`` recorded it but never
+        woke the model, and the two inside ``register``/``promote`` discard
+        it entirely — so a job landing during an ``execute`` call was
+        reported to nobody at all. Measured on the live box: 7 jobs, 6
+        landed and NONE collected, 6 ledger records written by the tool
+        path, and **zero** wake turns in the corpus for the loop whose whole
+        purpose is to stop a promoted job stranding until the operator
+        speaks again ("the half that makes promoting at 90s instead of 600s
+        safe").
+
+        The state change was always durable; only the NOTIFICATION was
+        ephemeral. This makes the notification durable too: a landing is
+        stamped ``reported_at=None`` when it happens, and this drains it
+        once — so it survives whoever raced to observe it, and survives a
+        restart in between.
+
+        Rows that landed BEFORE this shipped carry no ``reported_at`` key at
+        all and are treated as already reported: the key must be PRESENT and
+        null. Without that, the first drain after deploy would wake the
+        model once per historical landing (6 of them on the live box).
+        """
+        return self._drain("reported_at", stamp=True)
+
+    def pending_wakes(self) -> List[dict]:
+        """Terminal transitions that still owe the model a WAKE.
+
+        ⚠ SEPARATE FROM `reported_at`, and the separation is the point (R2 of
+        this pass). Recording and waking fail differently: recording always
+        succeeds, but a wake DEFERS whenever a turn is already in flight —
+        and stamping on read meant a deferred wake was consumed and lost for
+        ever. That is the very defect this pass exists to fix, re-created
+        inside the fix. So this SELECTS without stamping; the caller stamps
+        via `mark_woken` only once the wake is actually delivered (or
+        explicitly declined), and a deferral simply comes back next tick.
+        """
+        return self._drain("woken_at", stamp=False)
+
+    def mark_woken(self, job_id) -> bool:
+        """Stamp one row as woken. Called after the wake landed."""
+        jid = str(job_id or "")
+        if not jid:
+            return False
+        with self._lock:
+            reg = self._load()
+            entry = reg.get(jid)
+            if not isinstance(entry, dict) or "woken_at" not in entry:
+                return False
+            if entry["woken_at"]:
+                return False
+            entry["woken_at"] = time.time()
+            self._save(reg)
+        return True
+
+    def _drain(self, field: str, *, stamp: bool) -> List[dict]:
+        """Rows whose ``field`` is PRESENT and null — optionally stamping.
+
+        "Present and null" (not merely falsy-or-absent) is what makes this
+        safe to deploy: rows that landed before these markers existed carry
+        neither key and are treated as already handled. Absence meaning
+        "pending" would have woken the model once per historical landing on
+        the first tick after deploy — six of them on the live box, against a
+        cap of twelve an hour.
+        """
+        out: List[dict] = []
+        with self._lock:
+            reg = self._load()
+            dirty = False
+            for _jid, entry in reg.items():
+                if entry.get("state") == STATE_RUNNING:
+                    continue
+                if field not in entry or entry[field]:
+                    continue
+                if stamp:
+                    entry[field] = time.time()
+                    dirty = True
+                out.append(dict(entry))
+            if dirty:
+                self._save(reg)
+        return out
+
     def reap(self) -> List[dict]:
         """Land finished jobs and kill expired ones. Returns the entries whose
         state CHANGED, so a caller can report only the news.
@@ -1383,6 +1469,8 @@ class SandboxJobSupervisor:
                     entry["state"] = STATE_DONE
                     entry["exit_code"] = int(code)
                     entry["finished_at"] = time.time()
+                    entry["reported_at"] = None
+                    entry["woken_at"] = None
                     self._cleanup_files(jid, entry=entry)
                     changed.append(entry)
                     dirty = True
@@ -1399,6 +1487,8 @@ class SandboxJobSupervisor:
                 if not gen_ok:
                     entry["state"] = STATE_LOST
                     entry["finished_at"] = time.time()
+                    entry["reported_at"] = None
+                    entry["woken_at"] = None
                     self._cleanup_files(jid, entry=entry)
                     changed.append(entry)
                     dirty = True
@@ -1419,6 +1509,8 @@ class SandboxJobSupervisor:
                     entry["finished_at"] = time.time()
                     entry["expired_reason"] = "log_size_cap"
                     self._cleanup_files(jid, entry=entry)
+                    entry["reported_at"] = None
+                    entry["woken_at"] = None
                     changed.append(entry)
                     dirty = True
                     pretty_log(
@@ -1441,6 +1533,8 @@ class SandboxJobSupervisor:
                     entry["state"] = STATE_EXPIRED
                     entry["finished_at"] = time.time()
                     self._cleanup_files(jid, entry=entry)
+                    entry["reported_at"] = None
+                    entry["woken_at"] = None
                     changed.append(entry)
                     dirty = True
                     pretty_log(
@@ -1469,6 +1563,8 @@ class SandboxJobSupervisor:
                     entry["state"] = STATE_LOST
                 entry["finished_at"] = time.time()
                 self._cleanup_files(jid, entry=entry)
+                entry["reported_at"] = None
+                entry["woken_at"] = None
                 changed.append(entry)
                 dirty = True
             if self._trim_terminal(reg):

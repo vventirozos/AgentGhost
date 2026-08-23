@@ -580,6 +580,63 @@ def _cv_brier(pairs, *, k: int = 5, seed: int = 7) -> Optional[float]:
     return total / n
 
 
+def _cv_delta_ci(pairs, *, k: int = 5, seed: int = 7, boots: int = 2000,
+                 alpha: float = 0.05):
+    """Paired bootstrap CI for (cross-validated model loss − base-rate loss).
+
+    ⚠ WHY (queue #8, 2026-08-21). `learning_health` called the model a WINNER
+    whenever `brier_cv` sat below `brier_base_rate` by more than 1e-6 — a
+    tolerance that makes any numerical wobble a victory. Measured on the live
+    store the same day: brier_cv 0.03889 against a base rate of 0.03998, a
+    delta of −0.00108 whose 95% paired-bootstrap CI is
+    **[−0.00246, +0.00017]**. It straddles zero, so the honest verdict is
+    "indistinguishable" and the rendered one was "beats the base-rate
+    predictor". The same defect as the experiment report's "no difference
+    detected yet": a verdict stated without the power to support it — on the
+    instrument every keep/kill decision in this project reads.
+
+    PAIRED (resamples per-row loss DIFFERENCES rather than the two Briers
+    independently): both predictors are scored on the very same rows, and the
+    correlation between them is most of the variance — resampling them apart
+    would inflate the interval and hide a real win as readily as the point
+    estimate manufactured a fake one.
+
+    Deterministic (fixed seeds, no shuffle-on-read) so two fits on identical
+    data produce the identical interval: an audit number that moves on its
+    own is not one. Returns ``(delta, lo, hi)``, or None when there are too
+    few rows to cross-validate.
+    """
+    rows = [(float(c), float(o)) for c, o in pairs]
+    n = len(rows)
+    if n < 2 * k:
+        return None
+    base = sum(o for _, o in rows) / n
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)
+    delta_rows = [0.0] * n
+    for f in range(k):
+        test = set(idx[f::k])
+        train = [rows[i] for i in range(n) if i not in test]
+        if len(train) < 2:
+            return None
+        a, b = _fit_platt(train)
+        for i in test:
+            c, o = rows[i]
+            delta_rows[i] = (apply_platt(c, a, b) - o) ** 2 - (base - o) ** 2
+    delta = sum(delta_rows) / n
+    rng = random.Random(seed + 1)
+    means = []
+    for _ in range(boots):
+        acc = 0.0
+        for _ in range(n):
+            acc += delta_rows[rng.randrange(n)]
+        means.append(acc / n)
+    means.sort()
+    lo = means[int((alpha / 2.0) * len(means))]
+    hi = means[min(len(means) - 1, int((1.0 - alpha / 2.0) * len(means)))]
+    return delta, lo, hi
+
+
 def _feature_contribution(attr: str, composites, *, rebuild) -> Optional[float]:
     """Held-out Brier DELTA from dropping ``attr``: >0 means the feature helps.
 
@@ -733,6 +790,12 @@ class FittedParams:
     # that cannot beat `brier_base_rate` is not adding information.
     brier_raw: float = -1.0
     brier_base_rate: float = -1.0
+    # 95% paired-bootstrap CI for (brier_cv - brier_base_rate). None when not
+    # computed (too few rows, or a params file written before this existed).
+    # THE SIGN OF THE INTERVAL, not of the point estimate, is what licenses a
+    # "beats the base rate" claim — see `_cv_delta_ci`.
+    brier_cv_delta_lo: Optional[float] = None
+    brier_cv_delta_hi: Optional[float] = None
     # How many of ``n_samples`` carried REAL observed logprob entropy. When
     # this is below `_MIN_ENTROPY_SAMPLES` the fit pins ``w_entropy`` to 0
     # deliberately — the number makes that visible instead of leaving an
@@ -1503,6 +1566,10 @@ class CalibrationTracker:
         # parameters; both are stored and the renderer labels which is which.
         # `composites` is already a list of (composite, outcome) PAIRS.
         brier_cv = _cv_brier(composites)
+        # ...and the UNCERTAINTY on the only comparison that matters. The
+        # point estimate alone let a 0.001 delta render as "beats the
+        # base-rate predictor" (queue #8).
+        _delta_ci = _cv_delta_ci(composites)
         n_negative = sum(1 for _c, y in composites if y < 0.5)
 
         # Per-feature ABLATION. `_separation_sigmas` is a difference-of-means
@@ -1555,6 +1622,10 @@ class CalibrationTracker:
             epoch=CURRENT_EPOCH,
             n_excluded_other_epochs=n_excluded,
             brier_cv=round(brier_cv, 6) if brier_cv is not None else -1.0,
+            brier_cv_delta_lo=(round(_delta_ci[1], 6)
+                               if _delta_ci is not None else None),
+            brier_cv_delta_hi=(round(_delta_ci[2], 6)
+                               if _delta_ci is not None else None),
             n_negative=n_negative,
             feature_contrib=feature_contrib or None,
         )
@@ -1600,6 +1671,15 @@ class CalibrationTracker:
                 # -1.0 / 0 / None each read as "not recorded", never as a
                 # measured value of zero.
                 brier_cv=float(d.get("brier_cv", -1.0)),
+                # None-preserving: a params file written before this existed
+                # must load as "no CI recorded", not as a CI of zero width
+                # (which would license a bogus verdict).
+                brier_cv_delta_lo=(
+                    float(d["brier_cv_delta_lo"])
+                    if d.get("brier_cv_delta_lo") is not None else None),
+                brier_cv_delta_hi=(
+                    float(d["brier_cv_delta_hi"])
+                    if d.get("brier_cv_delta_hi") is not None else None),
                 n_negative=int(d.get("n_negative", 0)),
                 feature_contrib=(d.get("feature_contrib")
                                  if isinstance(d.get("feature_contrib"), dict)

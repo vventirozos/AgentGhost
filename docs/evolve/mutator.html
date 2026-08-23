@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evolve.mutator — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Learning</h3>
+    <a href="fence.html">evolve fence</a>
+    <a class="current" href="mutator.html">evolve mutator</a>
+    <a href="../core/replay_engine.html">replay_engine</a>
+    <a href="../core/imagination.html">imagination</a>
+    <a href="../core/isolation.html">isolation</a>
+  </nav>
+</aside>
+<main>
+<h2>&#9888; The brief must contain the file</h2>
+<p>The template named the target and gave the evidence, and showed <em>none of the source</em>. So the model was asked for a unified diff &mdash; exact context lines, exact line numbers &mdash; against a file it had never seen, and did the only thing it could: it invented <code>class ExecuteTool(BaseTool)</code> for a module that has no classes at all. <code>patch --dry-run</code> refused all four hunks and <code>materialize</code> failed closed, so nothing downstream was corrupted &mdash; but E1 could not produce an applicable diff except by luck.</p>
+<p>The brief now embeds the numbered source. A file over the 120&nbsp;KB budget is <strong>refused with a stated reason</strong> rather than briefed blind: asking for exact-context hunks against a file the model cannot see is a request that cannot succeed, and spending a model call on it is the same error in a cheaper form.</p>
+<p>Two further defects surfaced with it. The existing 8&nbsp;KB prose cap applied to the <em>whole</em> brief, so embedding the source truncated the hard constraints off the end &mdash; the brief kept the evidence and dropped the rules the diff is judged by; prose and source are capped separately now. And the target path resolved against the process <strong>CWD</strong>, which is correct from the repo root and silently wrong under launchd, where the daemon's CWD is not the repo: it would have passed every test and lost its source in production.</p>
+
+<h2>The edit is the model's, the coordinates are the machine's</h2>
+<p>With the file in the brief, the model's <em>edits</em> came back right and its <em>bookkeeping</em> wrong &mdash; a correct three-line addition headed <code>@@ -466,6 +466,7 @@</code> when its body held 9 new lines (<code>patch</code>: malformed), then a correct one-line addition declaring line 468 when the context sat at 467 (<code>applied_where_it_said</code> refused, because the artefact an operator reviews must be the artefact that ran).</p>
+<p><code>repair_hunk_counts</code> recomputes the counts from the hunk's own body. <code>repair_hunk_starts</code> re-anchors the start line to the context's location in the real file &mdash; but <strong>only on an unambiguous match</strong>: zero matches or two both leave the header exactly as written so <code>patch</code> still refuses it, because guessing between two candidate locations is how a repair becomes a relocation nobody authorised. Both report what they changed (<code>hunks_reanchored</code>) rather than normalising silently, since a rising repair count is evidence the brief needs work.</p>
+
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>evolve / mutator.py — one proposal, from evidence or not at all</h1>
+  <p class="subtitle">Picks a parent from the archive, picks a target the recorded evidence actually indicts, asks the main model for a small unified diff, and materialises a candidate snapshot. It proposes; it never applies.</p>
+
+  <h2>Why the evidence floor is a mechanism and not a slogan</h2>
+  <p>A mutator with no evidence floor asks a model to improve a file it has no complaint about &mdash; and the model, being a model, produces a plausible diff anyway. Those diffs are then spent against an evaluation cascade whose expensive stage has single-digit throughput a night, so a stream of ungrounded candidates is a stream of coin flips dressed as evolution. A target with fewer than <code>MIN_EVIDENCE_ITEMS</code> recorded failures is <strong>not eligible</strong>, and a run with no eligible target produces nothing and says which nothing.</p>
+
+  <h2>The three sources, and the rule they carry</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Source</th><th>What it contributes</th><th>State on this box</th></tr></thead>
+    <tbody>
+      <tr><td><code>foresight</code></td><td>per-tool transition failures with their error heads, already redacted at write time</td><td><strong>present</strong> &mdash; 751 rows, 73 failures</td></tr>
+      <tr><td><code>postmortem</code></td><td><code>defects.jsonl</code> at ONE canonical path, capped and deduped by signature</td><td>absent &mdash; the engine is behind <code>--postmortem</code> and has never run</td></tr>
+      <tr><td><code>dream_credit</code></td><td>replay verdicts touching that tool</td><td>absent &mdash; <strong>admissibility-gated</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>Exactly one has data, and that is why <code>Evidence</code> carries <code>present</code> and <code>reason</code> rather than just a list. A brief built from one source is not the same artefact as a brief built from three, and a mutator that silently degrades to whichever source happens to be populated is inventing the difference. <strong>Every brief names the sources that were empty and why</strong>, under an explicit instruction not to read their silence as agreement, and every ledger row records which ones contributed.</p>
+  <p><code>dream_credit</code> is off twice over: the operator flag defaults off, <em>and</em> the admissibility row for <code>dream_credit</code> is still <code>real_only</code> because §4CM D4 has not returned PASS. The row is the authority &mdash; setting the flag alone does not open the source. A flag that overrides a reviewable file is how an unvalidated label source opens, which this project has now paid for twice (§4AO, §4BE).</p>
+
+  <h2>A guard that fires is not a defect</h2>
+  <p>This is the sharpest correctness point in the module. The live evidence for <code>execute</code> contains:</p>
+  <pre><code>SYSTEM BLOCK: shell command rejected by pre-execution validator:
+deny-listed pattern: \b(?:curl|wget|fetch)\b[^|]+\|\s*(?:sudo\s+)?(?:sh|bash|zsh…</code></pre>
+  <p>That is the security guard <em>working</em>. Handing it to a model under the instruction &ldquo;propose the smallest change that would prevent this failure&rdquo; is a request to weaken the deny-list &mdash; and <code>tools/execute.py</code> is inside the mutable fence while <code>tools/validators.py</code> is not, so the fence would not stop the resulting diff. Guard refusals are therefore excluded from the evidence and <strong>counted</strong>, so the brief can say <em>&ldquo;N further failures were excluded because they were the scaffold's own guards refusing&rdquo;</em> rather than quietly shrinking.</p>
+  <p>The effect on the live ranking is not cosmetic:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Target</th><th>Before the filter</th><th>After</th><th>Excluded</th></tr></thead>
+    <tbody>
+      <tr><td><code>file_system</code></td><td>15 &mdash; <strong>rank 1</strong></td><td>8 &mdash; rank 3</td><td>7 replace-guard refusals</td></tr>
+      <tr><td><code>execute</code></td><td>15 &mdash; rank 2</td><td>13 &mdash; <strong>rank 1</strong></td><td>2 pre-execution blocks</td></tr>
+      <tr><td><code>browser</code></td><td>10</td><td>10</td><td>&mdash;</td></tr>
+    </tbody>
+  </table></div>
+  <p>Without it, the first live brief would have asked a model to change the file-replace corruption guard &mdash; a guard installed after 50 of 99 replace calls arrived with byte-identical arguments.</p>
+  <p>Two details of the filter matter. It matches by <strong>containment</strong>, not <code>startswith</code> like <code>foresight.is_synthetic_result</code>, because the ledger stores the tool's whole result envelope (<code>--- execution result --- exit code: 1 stdout/stderr: system block: …</code>) and lowercases it &mdash; a prefix test finds <em>none</em> of them and the filter would be inert while appearing to work. And the marker list is <em>borrowed</em> from <code>foresight._SYNTHETIC_RESULT_PREFIXES</code>, not copied, plus a two-entry supplement for in-tool refusals that list does not cover (it enumerates results for calls that never executed; these come from a tool that ran and refused its arguments). A test fails if a supplement entry becomes redundant or stops being emitted, so it cannot quietly become a drifting second copy.</p>
+  <p><strong>⚠ This filter is ranking hygiene, not the security boundary &mdash; and the first version pretended otherwise.</strong> A fresh-eye review found it wired to exactly ONE of the three sources while the module docstring claimed the property for the module, and its two enumerated messages missed seven emitters: the SSRF guard, the destructive-operation guard, the read-budget refusals, the replace-size refusal, <code>Block REJECTED</code> and the vision size guard &mdash; all in <code>tools/file_system.py</code>, which is inside the fence. Filtering evidence is an open-ended blacklist over text nobody controls.</p>
+
+  <h2>Three attempts at a lexical gate, and why there isn't one</h2>
+  <p>The loop needed to stop a candidate from weakening a safety check. Three review rounds killed three versions of a mechanical gate, and the honest conclusion is that there should not be one.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Version</th><th>What it did</th><th>What measurement showed</th></tr></thead>
+    <tbody>
+      <tr><td>v1</td><td>reject a diff that removes a &ldquo;refusal-shaped&rdquo; line</td><td><strong>4 of 4 invented test fixtures matched; 5 of 7 real guard lines missed.</strong> Twelve of twenty alternatives matched nothing in the repo. Written from an imagined vocabulary and tested against the same imagination &mdash; and both mutation batches called it pinned, because a never-matching regex fails all six of its params.</td></tr>
+      <tr><td>v2</td><td>count refusal-emitting lines before/after the patch, reject any decrease</td><td>Marginal coverage over v1 contained <strong>zero</strong> guards; 8 of 15 markers appeared nowhere a candidate can edit; and the count went <strong>up (+1)</strong> when a real refusal was deleted alongside two added comments. Its false positives were terminal &mdash; outside the retry loop, blacklisting the diff permanently.</td></tr>
+      <tr><td>v3</td><td>widen the vocabulary until it reaches the real lines</td><td><strong>33% of its 382 matches across the mutable fence are pure comments.</strong> Six verbatim ordinary lines from the tree are rejected by it &mdash; a task-status set, a cache key, a health string, a prompt legend, a comment beside a timeout, and <code>_invalidate_form_token(&hellip;)</code> matched on &ldquo;VALIDATE&rdquo;. A 30-line hunk trips it 31&ndash;73% of the time depending on the file.</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>A lexical test cannot decide a semantic property.</strong> Each round bought recall with precision, and none of them could see the attacks that matter: an early <code>return</code> above a guard, an <code>or True</code> in a condition, a changed constant, a guard moved into dead code.</p>
+  <p>So <code>guard_flags</code> <strong>flags and does not judge</strong>. Removed lines that look like safety machinery ride on the proposal, on the archive node and on the ledger row, and <code>learning_health</code> prints <em>&ldquo;N proposal(s) removed a refusal-shaped line &mdash; read those diffs first&rdquo;</em>. The operator who applies the patch decides. Its measured reach, with the test selectors <em>fully decoupled</em> from the pattern, is <strong>11%</strong> of the enforcement-adjacent lines in the fence &mdash; and every earlier, larger number for this was inflated by selectors that were themselves alternatives of the regex being measured. 11% is a usable hint for a human reading a diff and would have been indefensible as a gate; that gap is the whole argument.</p>
+  <p><strong>What actually bounds this loop:</strong> the write fence (an allow-list, with the evaluator outside it), the target-file constraint, the diff-shape caps, the throwaway snapshot, and the fact that promotion is operator-applied. Nothing here is load-bearing on its own.</p>
+
+  <h3>The fence asks the filesystem, because a string transform is only a guess</h3>
+  <p>Found twice, one round apart. This volume is case-insensitive APFS, so <code>Registry.py</code> <em>is</em> <code>registry.py</code> &mdash; and an exact deny-list compared case-sensitively admitted it. Verified end to end: a diff headed <code>a/src/ghost_agent/tools/Registry.py</code> cleared <code>is_mutable</code>, cleared <code>check_diff_scope</code>, cleared <code>archive.admit</code>, and <code>patch</code> wrote the real tool registry &mdash; the first entry on the immutable list.</p>
+  <p>Applying <code>.lower()</code> was not enough: the volume's equivalence is <em>unicode fold</em>, and <code>regiſtry.py</code> (U+017F) opens the same file while <code>.lower()</code> leaves it alone. So the strings are compared with <code>.casefold()</code> &mdash; identical to <code>.lower()</code> for ASCII, so the allow-list is unchanged &mdash; <strong>and</strong> <code>resolves_to_immutable()</code> asks <code>os.path.samefile</code>, which compares device and inode. A case-fold can only ever approximate the filesystem's equivalence relation; <code>samefile</code> <em>is</em> it. (<code>Path.resolve()</code> is not enough either: on macOS it preserves the spelling it was given, so the two names resolve unequal while opening the same bytes.)</p>
+
+  <h2>Which file implements which tool</h2>  <h2>Which file implements which tool</h2>
+  <p>Resolved by walking the dispatch entry's closure &mdash; executed fact &mdash; and never guessed from the name. <code>inspect.getsourcefile</code> reports <code>registry.py</code> for all 41 tools, because every dispatch entry is a closure defined inside <code>get_available_tools</code>; and <code>registry.py</code> is immutable. A name-based or <code>getsourcefile</code>-based mapping would make every tool unmutable, and the mutator would propose nothing, forever, silently. It fails closed: anything unresolvable, or resolving only to immutable files, is simply not a target.</p>
+
+  <h2>Ranking by count, not by rate &mdash; and the floor is per source</h2>
+  <p>One failure in one call is a 100% failure rate and no evidence at all. Targets are ordered by absolute failure <em>count</em>; the rate is carried into the brief but does not order, and it is computed <em>within</em> the dominant source, because a summed rate is arithmetic over two different denominators.</p>
+  <p>Eligibility is measured against the most any <strong>single</strong> source saw, never the sum. The sources overlap with no key to join on &mdash; the postmortem engine files defects derived from the same failed runs the foresight ledger records &mdash; so two real failures seen twice used to clear a floor of three.</p>
+  <p><strong>The evidence sources are read from bounded, canonical paths.</strong> An earlier version globbed for <code>defects.jsonl</code> anywhere under <code>$GHOST_HOME</code>, which contains <code>sandbox/</code> &mdash; the model's own writable workspace. Anything the agent chose to name that became evidence: its <code>tool</code> field picked the target, its (uncapped, undeduped) count beat the real ranking outright, and its <code>summary</code> was copied verbatim into a brief asking a model to rewrite that tool. A prompt-injection channel from the sandbox into the self-modification loop, which the fence does not close &mdash; the fence bounds which file gets rewritten, not why.</p>
+
+  <h2>The diff, and what happens to it</h2>
+  <p>Rejections are mechanical and happen before anything reads intent: not a unified diff, no parseable paths, over the shape caps, touching anything outside the fence, or a normalised hash the archive has already seen. A rejected diff gets <strong>one</strong> retry carrying the rejection reason, because &ldquo;at most two files&rdquo; is a rule a model can comply with once told; more than that is paying for the same mistake.</p>
+  <p>Materialisation snapshots <code>src/</code> into <code>system/evolve/work/&lt;id&gt;/</code> and applies the diff to the <em>copy</em>. Three details are load-bearing:</p>
+  <ul>
+    <li><strong><code>patch</code> is dry-run first.</strong> Without it, a diff whose second hunk fails leaves the first applied &mdash; a candidate that compiles, evaluates, and corresponds to no diff anyone proposed.</li>
+    <li><strong><code>-F0</code>, and then a check that <code>-F0</code> is not enough.</strong> <code>-F0</code> disables <em>fuzz</em>; it does not disable <em>offset</em>. Measured on this box: Apple <code>patch 2.0-12u11</code> applies a hunk 25 lines from its declared position and says nothing at all, exit&nbsp;0 &mdash; so grepping its output for &ldquo;offset&rdquo; would have been a check that never fires. <code>applied_where_it_said</code> reconstructs each hunk's post-image and compares it against the file at the line the hunk <em>declared</em>. A self-modification fence cannot accept &ldquo;applied approximately&rdquo;: the artefact the operator reviews has to be the artefact that ran.</li>
+    <li><strong>Containment is verified after the fact.</strong> The fence tests path <em>strings</em>; an escape can live in the filesystem instead, and <code>MAX_FILES = 2</code> is exactly enough for the classic traversal &mdash; create a symlink inside an allowed prefix, then write through it. This box's <code>patch</code> ignores <code>new file mode 120000</code>, so the vector is inert here; <code>shutil.which</code> takes whatever <code>PATH</code> offers and GNU patch &ge;&nbsp;2.7 honours git extended headers.</li>
+    <li><strong>Every failure path discards the snapshot</strong>, and the failing diff is archived as <code>rejected</code>. Before that, a diff that would not apply left 12&nbsp;MB behind forever <em>and</em> was invisible to the novelty filter &mdash; so the model re-proposed it the next night, into a fresh directory, every night.</li>
+    <li><strong>The trailing newline is restored.</strong> Every model reply passes through a fence-stripper whose <code>.strip()</code> removes it, and <code>patch</code> then fails the hunk &mdash; so <em>every</em> proposal would have died at materialisation with a message that reads like a bad diff rather than a lost byte. Found by a test, not in production.</li>
+  </ul>
+  <p>A missing <code>patch</code> binary is refused before the snapshot rather than after, and never worked around: hand-applying a diff here would be a second implementation of <code>patch</code> inside a security fence.</p>
+
+  <h2>The ledger</h2>
+  <p>One row per <em>run</em>, including the runs that produced nothing. Without it, &ldquo;the mutator proposed nothing last night&rdquo; and &ldquo;the mutator never ran&rdquo; are the same observation &mdash; the activation-counter lesson, applied to the loop that is supposed to be improving things. The outcomes are distinct on purpose: <code>no_evidence</code>, <code>no_model_output</code>, <code>rejected</code>, <code>duplicate</code>, <code>materialize_failed</code> and <code>proposed</code> are five different problems with one symptom.</p>
+
+  <h2>Where it runs</h2>
+  <p>Biological phase <strong>3d</strong>, 15-minute idle floor (it spawns no containers and does not compete with a solve), 6-hour cooldown &mdash; at most four candidates a day, deliberately slower than the cascade that will consume them, because a proposal nobody has evaluated is a queue and not progress. Bounded by <code>asyncio.wait_for</code>, and the clock advances on <em>every</em> path including the failures, or a broken dependency re-imports and re-logs on every 60-second tick for as long as the box stays idle. Registered <code>EXPECT_GATED</code> in <code>PHASE_EXPECTATION</code>: <code>GHOST_EVOLVE</code> defaults off, so a zero must report the gate rather than manufacture an alarm.</p>
+
+  <h2>What does not exist yet</h2>
+  <p>The evaluation cascade (E2), the scheduled negative controls (E3), and the proof run (E4). <strong>Promotion is operator-applied by design</strong> &mdash; this module only ever writes a candidate and a ledger row.</p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="fence.html">evolve / fence.py + archive.py</a> &mdash; what may be touched, and the lineage the parent is sampled from.</li>
+    <li><a href="../core/replay_engine.html">core / replay_engine.py</a> &mdash; the gated third evidence source.</li>
+    <li><a href="../core/admissibility.html">core / admissibility.py</a> &mdash; the row that keeps it gated.</li>
+  </ul>
+</main>
+</body>
+</html>

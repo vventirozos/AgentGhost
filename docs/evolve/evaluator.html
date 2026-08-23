@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evolve.evaluator — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Learning</h3>
+    <a href="fence.html">evolve fence</a>
+    <a class="current" href="mutator.html">evolve mutator</a>
+    <a href="../core/replay_engine.html">replay_engine</a>
+    <a href="../core/imagination.html">imagination</a>
+    <a href="../core/isolation.html">isolation</a>
+  </nav>
+</aside>
+<main>
+<h1>The evaluation cascade (E2)</h1>
+<p>A candidate is a materialised snapshot &mdash; the repo with one mutator diff applied. This module decides whether that snapshot goes any further, and every stage runs in the <strong>parent</strong> process: the candidate is only ever the <em>subject</em>, never the harness.</p>
+
+<h2>Two rules shape all of it</h2>
+<p><strong>1. The harness is read from the canonical tree, never the candidate's copy.</strong> <code>fence.harness_digest</code> is taken before <em>and</em> after every stage. If it moves, the <strong>generation aborts</strong> &mdash; the stage does not merely fail, because a moved harness means no result from the run can be trusted, including passes already collected. Additions count: <em>"it only added things"</em> is the exact shape of a candidate writing its own passing test.</p>
+<p><strong>2. Nothing counts as a pass by default.</strong> A touched file that maps to no test, a pytest run that collected nothing, an empty diff &mdash; each produces zero failures, and zero failures is the shape of a green result that verified nothing. Each is an explicit refusal.</p>
+
+<h2>Stage 0 &mdash; static (seconds)</h2>
+<p>Diff-scope first, because a diff touching a file it may not touch is not a thing to compile and reason about, it is a thing to refuse. Then: every touched path exists in the snapshot (<code>materialize</code> can report success on a partial apply), every touched <code>.py</code> compiles, and no production module was rewritten to the <em>test</em> import form.</p>
+<p>That last check is not style. Production runs as <code>python -m src.ghost_agent.main</code> and imports <code>src.ghost_agent.*</code>; a production module rewritten to <code>ghost_agent.*</code> loads a <strong>second copy of the package with its own state</strong>, a defect this repo has already paid for.</p>
+
+<h2>Stage 1 &mdash; pin smoke (minutes)</h2>
+<p>The canonical tests that cover the touched files, run against the candidate's code: the subject is swapped, the judge is not. Test selection is mechanical from the repo's own naming (<code>tools/browser.py</code> &rarr; <code>tests/test_browser*.py</code>), and a touched file that maps to <strong>nothing</strong> fails the stage rather than passing it by running zero tests.</p>
+<p><strong>&#9888; The premise deserves its own test, and has one.</strong> This repo's suite uses <em>both</em> import forms: <code>ghost_agent.*</code> resolves through <code>PYTHONPATH</code>, <code>src.ghost_agent.*</code> through the working directory. Getting <code>PYTHONPATH</code> right and <code>cwd</code> wrong would satisfy the first and silently miss the second &mdash; every pin passing against the <em>incumbent</em> while the cascade certifies code it never executed. The pin builds a two-root mini-repo, asserts both import forms see the candidate, and includes the negative control: pointing the stage at the incumbent must <em>fail</em>, or the positive proves nothing.</p>
+<p>pytest's exit code alone is not read. It exits <code>5</code> on <em>"collected 0 items"</em> &mdash; a non-zero that looks like a failure and a zero-failure count that looks like a pass &mdash; so the summary line is parsed too.</p>
+
+<h2>The abort is a veto, not a decoration</h2>
+<p>The result is recorded <em>before</em> the final harness check, so the check can overturn it. Written the other way round, <code>passed</code> was still at its default every time the check could fire: the abort could never actually reverse a result, and deleting the line that forced it changed nothing. Mutation testing caught that; the ordering is now what makes a run whose pins passed and whose harness then moved come back <code>False</code>.</p>
+
+<h2>Stage 3 &mdash; paired confirm (overnight)</h2>
+<p>Candidate against incumbent on a <strong>held-out</strong> slice, the same items to both arms, scored with an exact two-sided McNemar over the discordant pairs.</p>
+<p><strong>The holdout is a pure function of the item id</strong> (sha256, 25% of every bank), not a saved list. A holdout that lives in a file can be regenerated, corrupted, or quietly re-rolled after a candidate scores badly on it &mdash; and the re-roll looks exactly like a fresh split. The disjointness is enforced in <em>one</em> place, inside the sampler, rather than by every caller remembering to filter: the mutator's brief may reference stage-2 results, so an item appearing in both pools is one the candidate was tuned against and is then judged on. Measured on the real corpus: 3,610 items &rarr; 888 held out (24.6%), 2,722 public, zero overlap between the two samples.</p>
+<p><strong>Both arms run in the same call, and through the same function.</strong> A cached incumbent would be a comparison across time &mdash; the model, the box and the sandbox all drift, and pairing exists precisely to remove that. Paying twice is the point. Two near-identical call sites would drift too, and that drift is indistinguishable from the effect being measured.</p>
+<p><strong>Promotion needs a significant win, not an absence of harm.</strong> "We could not tell the difference" is the answer for almost every candidate; treating it as success promotes noise. A tie gives <code>p&nbsp;=&nbsp;1.0</code> and fails. So does a narrow lead. And the direction guard is load-bearing on its own: an 8&ndash;0 loss to the incumbent scores <code>p&nbsp;=&nbsp;0.008</code>, comfortably significant, because <em>significance alone cannot tell a win from a loss</em>.</p>
+<p>An item that infra-aborted in one arm is <strong>dropped, not guessed</strong>. Scoring it as a failure charges a harness fault to the candidate; scoring it as a pass does the reverse. Either way the pairing is broken, so the count of dropped pairs is reported rather than absorbed.</p>
+
+<h2><code>passed</code> is not <code>promotable</code></h2>
+<p>Stages 2 and 3 cost an hour and a night, and run only when their items are supplied &mdash; most candidates die for free in stage 0. So <code>passed</code> means only <em>"nothing run so far said no"</em>. A candidate that cleared a four-second static check and a pin smoke would otherwise look identical to one that beat the incumbent on held-out data. <code>promotable</code> requires stage 3 to have actually run and passed, and any abort voids it however many stages went green.</p>
+
+<h2>Stage 4 &mdash; the operator packet</h2>
+<p>A JSON packet under <code>system/evolve/proposals/</code> carrying the diff, the brief, every stage result, the McNemar <em>p</em>, and the paired CI on <code>p_incumbent &minus; p_candidate</code> (negative means the candidate is ahead). A <em>p</em>-value tells an operator whether to believe the difference; the interval tells them how big it is, and both are needed to decide.</p>
+<p><strong>Only for a promotable candidate.</strong> A packet in that directory <em>is</em> an endorsement &mdash; it says the cascade believes this diff beat the incumbent on data it had never seen. Writing one for a candidate that merely compiled would put an unproven change in front of an operator carrying that implication, which is worse than writing nothing. The refusal names the missing gate, because "not promotable" alone sends someone to read the source.</p>
+<p><strong>And exactly once.</strong> Fire-once has bitten this project before. A second cascade over the same node rewrites the packet and stays <em>silent</em>: an operator already told, who has not yet acted, does not need telling again, and a ledger that repeats itself trains people to ignore it. Delivery is best-effort &mdash; a failed notification never loses the packet, because the file on disk is the durable record and Slack being down is the wrong reason to drop a result.</p>
+<p><strong>The packet is written last, after the final harness check.</strong> Written earlier it would be an endorsement on disk that a subsequent abort could not retract: the notification has already left, and <em>"we told you, then found the harness had moved"</em> is not a correction anyone can act on.</p>
+
+<h2>A graded signal beside the binary one</h2>
+<p>The binary gate counts only pass/fail, so a candidate that solves in one attempt where the incumbent needed three scores <em>identically</em> to one that changed nothing. Stage 3 also reports an exact two-sided <strong>sign test on attempt counts</strong> &mdash; the same primitive as the binary gate applied to the direction of the difference, so it needs no new statistics to validate. Ties are excluded (that is what a sign test does) and <em>reported</em>, because a verdict resting on two untied pairs out of twenty-four is a verdict about almost nothing.</p>
+<p><strong>It is reported, never a gate.</strong> Promotion still turns on the binary rule alone; a test asserts it. Adding a second route to an operator changes what reaches them, and that is a decision to take deliberately rather than acquire as a side effect of measuring something new.</p>
+<p>Measured on the first real run: 24 pairs, <strong>21 ties</strong>, candidate fewer 2, incumbent fewer 1, p&nbsp;=&nbsp;1.0, means 1.583&nbsp;&rarr;&nbsp;1.542. The extra resolution is real but thinner than it looks &mdash; <code>gsm8k_text</code> averages 2.75 attempts, but a stratified draw is mostly <code>gsm8k</code>, where attempts are nearly always 1.</p>
+
+<h2>&#9888; What the gate scores, and what the evidence said</h2>
+<p>The first real candidate exposed a mismatch that no amount of tuning fixes. E1's brief indicted <code>execute</code> on 13 real failures out of 56 calls &mdash; missing <code>deno</code>/<code>unzip</code>, a 600&nbsp;s timeout, yt-dlp errors &mdash; and the model wrote a fix for exactly that. Stage 3 then judged it on <em>"Janet's ducks lay 16 eggs per day&hellip;"</em>: arithmetic word problems and small Python functions.</p>
+<p>A correct fix for a shell-dependency failure is <strong>invisible</strong> on that benchmark; only a regression could show. This is the same wrong-regime error as the replay census measuring an empty fork, one level up &mdash; <strong>the evaluation cannot exercise the failure the evidence names</strong>. Until bench items are minted from the agent's own failure corpus, the cascade can reject a bad candidate but cannot demonstrate a good one.</p>
+<p>What the bar costs, measured from the gate itself: <strong>6 candidate-only wins with zero losses</strong> to clear &alpha;&nbsp;=&nbsp;0.05 &mdash; the same at n&nbsp;=&nbsp;24 and n&nbsp;=&nbsp;120, since McNemar counts only discordant pairs. One loss raises it to 8, two to 10, against an incumbent that fails 4 items in 24.</p>
+
+<h2>The invariant that outlives the stages</h2>
+<p>All four stages now exist, so "stage N is absent" has nothing left to guard &mdash; but the property it stood in for does. <strong>Promotion is operator-applied.</strong> The evaluator's job ends at a packet on disk: it may not copy a candidate over the canonical tree, shell out to <code>patch</code>, or call the mutator's <code>materialize</code>. A test asserts every one of those absences, because autonomy is earned in a later version, not acquired by a helper someone adds because it was convenient.</p>
+<h2>Related</h2>
+<ul>
+  <li><a href="mutator.html">evolve / mutator.py</a> &mdash; the E1 stage that produces the candidate this one judges.</li>
+  <li><a href="fence.html">evolve / fence.py</a> &mdash; the allow-list and the harness checksum used at every stage.</li>
+</ul>
+</main>
+</body>
+</html>

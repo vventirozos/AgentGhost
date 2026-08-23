@@ -144,7 +144,12 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
          (when still present) is mutated and stamped ``human_labeled`` so
          next-turn logic sees the verdict and a LATE machine verdict yields
          its whole consequence chain (``_human_label_locked``);
-      3. one pretty-log line — the operator watches the stream.
+      3. the autobiographical record via ``self_model.record_outcome`` —
+         the diary FOLLOWS the corpus (queue #7, 2026-08-21), so this runs
+         only after the sidecar write is committed, and on idempotent
+         repeats too (a re-click heals a stale diary row). Origin-gated
+         real_only like every other selfhood write site;
+      4. one pretty-log line — the operator watches the stream.
 
     The lesson-outcome stash flush deliberately does NOT happen here: this
     function runs on a ``to_thread`` worker, and the flush helper spawns
@@ -232,6 +237,34 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
             # overwrite. Stamped on repeats too — a stamp that failed its
             # first attempt is repaired by re-clicking.
             _stamp_cache(ctx, traj.id, outcome, reason)
+            # THE DIARY FOLLOWS THE CORPUS (queue #7, 2026-08-21). A human
+            # thumb is the strongest outcome signal this system can get, and
+            # until now it reached the trajectory corpus, the cache and the
+            # calibration clock but NEVER the agent's autobiographical
+            # record — which recall, the wake-up prefix and §4CC's derived
+            # mood all read. Runs on repeats too: `update_outcome` is a
+            # no-op when the record already carries this outcome, so a
+            # re-click also HEALS a diary row written before this leg
+            # existed (same doctrine as the cache stamp above).
+            try:
+                from .agent import turn_origin as _turn_origin
+                from ..selfhood import SelfModel as _SelfModel
+                _sm = getattr(ctx, "self_model", None)
+                # §4BF 1c: selfhood is a real_only row — the same origin
+                # gate every other selfhood write site carries.
+                if (isinstance(_sm, _SelfModel)
+                        and getattr(_sm, "enabled", False)
+                        and _turn_origin(ctx) == "user"):
+                    # A plain call, not spawned work: this whole function
+                    # already runs on a to_thread worker, so the full-file
+                    # rewrite is off the event loop — and spawning
+                    # loop-bound work from here is the R1 trap the
+                    # lesson-flush note in the docstring records.
+                    _sm.record_outcome(traj.id, outcome,
+                                       failure_reason=reason)
+            except Exception as _sfe:  # noqa: BLE001 — label already committed
+                logger.debug("selfhood human-label backfill skipped: %s: %s",
+                             type(_sfe).__name__, _sfe)
             if unchanged:
                 logger.debug("human label repeat ignored: %s already %s",
                              traj.id[:8], outcome)

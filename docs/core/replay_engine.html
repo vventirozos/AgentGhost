@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.replay_engine — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Learning</h3>
+    <a class="current" href="replay_engine.html">replay_engine</a>
+    <a href="isolation.html">isolation</a>
+    <a href="imagination.html">imagination</a>
+    <a href="dream.html">dream</a>
+    <a href="admissibility.html">admissibility</a>
+    <a href="../algorithms/dream_cycle.html">dream cycle</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / replay_engine.py — turning one episode into many graded labels</h1>
+  <p class="subtitle">Takes a recorded turn, changes exactly one thing, re-executes it forward, and grades the result against an executable check. The output is a <em>decision-level</em> credit &mdash; "did that lesson matter?" &mdash; which live traffic cannot produce at any volume.</p>
+
+  <h2>The rule the whole phase rests on</h2>
+  <p><strong>Always re-execute forward from the fork. Never splice a changed decision into a recorded suffix.</strong> Between 61% and 94% of post-fork actions get rewritten once a decision changes, so a spliced evaluation scores a world that never happens. Every perturbation here is "change one thing at step <em>k</em>, then let the agent run to the end on its own".</p>
+
+  <h2>What it can actually work on</h2>
+  <p>Three filters, cheapest first. Their cost, measured on the live corpus (46 days, 2026-08-22):</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Stage</th><th>Episodes</th><th>Share</th></tr></thead>
+    <tbody>
+      <tr><td><code>user_request</code> turns</td><td>1,607</td><td>100%</td></tr>
+      <tr><td>&hellip;decisive (<code>passed</code>/<code>failed</code>)</td><td>733</td><td>46%</td></tr>
+      <tr><td>&hellip;and &ge;2 steps with tool calls</td><td>521</td><td>32%</td></tr>
+      <tr><td>&hellip;and no containment-forbidden tool</td><td>208</td><td>13%</td></tr>
+      <tr><td>&hellip;and no network / irreproducible tool</td><td>77</td><td>5%</td></tr>
+      <tr><td>&hellip;and past the destructive denylist, with a request</td><td>67</td><td>4%</td></tr>
+      <tr><td>&hellip;and it <em>produces something a filesystem check can look at</em></td><td><strong>42</strong></td><td>3%</td></tr>
+      <tr><td><em>plus</em> the bench corpus (bank solves, own validators)</td><td><strong>85</strong></td><td>&mdash;</td></tr>
+      <tr><td><strong>total replayable</strong></td><td><strong>127</strong></td><td>&mdash;</td></tr>
+    </tbody>
+  </table></div>
+  <p>The last filter is <code>no_filesystem_checkable_deliverable</code>, and it is not a tightening for its own sake. An episode whose tools only <em>read</em> &mdash; <code>list_files</code>, <code>introspect</code>, <code>recall</code> &mdash; leaves nothing for a synthesised check to inspect, so its legs can only ever fail. Measured: the rule rejects 6 episodes an earlier census had &ldquo;successfully measured&rdquo;, and <strong>all six had scored exactly <code>p&nbsp;=&nbsp;0.00</code></strong>. Those zeros were structural, and counting them made the corpus look more deterministic than it is. The rule discards no signal; it removes rows that were inflating the count.</p>
+  <p>That is the honest ceiling, and it is an order of magnitude below what the plan's throughput target assumed. At three specs a night a batch produces at most <strong>three credit rows</strong>, so &ldquo;&ge;30 verdicts/night&rdquo; is ten times out of reach; draining the backlog is roughly 100 nights at one batch, or 17 days at the six batches a day the four-hour cooldown allows. <em>The multiplier is perturbations per episode, not episodes.</em></p>
+
+  <h3>Why the network filter is not (only) about safety</h3>
+  <p>A replay of an episode that searched the web is <strong>not reproducible</strong>: the search returns different results than it did on the day, so the control and perturbed legs both diverge for reasons that have nothing to do with the perturbation, and the paired consistency rule abstains. Non-reproducible episodes produce verdicts about noise. This is a reproducibility filter that happens to also be a safety one.</p>
+
+  <h3>The allow-list is not the complement of the deny-list</h3>
+  <p><code>REPLAYABLE_TOOLS</code> and <code>isolation.REPLAY_FORBIDDEN_TOOLS</code> are different lists doing different jobs &mdash; containment versus reproducibility &mdash; and they differ on exactly the tools that are safe to run but do not return the same thing twice. Crucially, the replay list is an <strong>allow-list</strong>: an acquired skill is registered at runtime under a name this module has never seen and runs arbitrary code, so a deny-list could not name it. Guard the thing, not a proxy.</p>
+
+  <h2>Perturbations, applied to the data</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Kind</th><th>The question</th><th>Premise it needs</th></tr></thead>
+    <tbody>
+      <tr><td><code>lesson_withhold</code></td><td>did that lesson matter?</td><td>the turn really hydrated it</td></tr>
+      <tr><td><code>lesson_inject</code></td><td>would that lesson have helped?</td><td>&mdash;</td></tr>
+      <tr><td><code>verify_toggle</code></td><td>did the verifier's gate change the outcome?</td><td>always satisfied</td></tr>
+      <tr><td><code>step_deny</code></td><td>did that step matter, or was there another route?</td><td>a step that really failed</td></tr>
+      <tr><td><code>tool_ablate</code></td><td>did that capability matter?</td><td>the tool was dispatchable</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>lesson_inject</code> and <code>tool_ablate</code> are <strong>implemented but never mined</strong>: <code>build_specs</code> emits only the other three. Nothing in a recording says which lesson the episode should have had, or which tool it could not have done without, and guessing would put an ungrounded generator inside a measurement whose whole value is that it is execution-grounded. <code>tool_ablate</code> exists because the <a href="#gate">seeded-truth gate</a> needs a perturbation whose effect is known in advance &mdash; it is a spike-in control, not a sample of the workload.</p>
+  <p>A spec whose premise is false produces a verdict about nothing, and a corpus of those is how a label source becomes a noise source. So a withhold is only generated for a lesson the episode genuinely hydrated, and a step-deny only where a recorded call actually failed &mdash; on a clean episode there is no step-deny spec, which is correct rather than a gap.</p>
+  <p><strong>The lesson perturbations are applied to the STORE, not to the retrieval code path.</strong> Filtering a rendered lesson string, or intercepting one of the two retrieval surfaces, would be a lexical proxy for "this lesson was not available" and would miss whichever surface the interception did not cover. A fork-local playbook that simply does not contain the lesson <em>is</em> the property, and every ranking, dedup and quarantine rule downstream keeps working unchanged.</p>
+
+  <h3>Two deviations from the plan, both deliberate</h3>
+  <ul>
+    <li><strong><code>tool_swap</code> became <code>step_deny</code>.</strong> Nothing in a recording says what the alternative call <em>should</em> be, so something would have to invent one &mdash; and an invented alternative puts an ungrounded generator inside a measurement whose entire value is that it is execution-grounded. Denying the recorded call asks the same counterfactual with nothing invented.</li>
+    <li><strong>The executor is built on the <a href="isolation.html">isolation substrate</a>, not on <code>synthetic_self_play</code>.</strong> That method is around 3,200 lines specialised for a different job, and every perturbation would have to be threaded through it as a new branch. The substrate is the part worth reusing, and it is separately tested. Self-play is not touched.</li>
+    <li><strong>The transferability gate is <em>not</em> reused.</strong> <code>_is_transferable_challenge</code> asks "can this be re-posed as <em>write a solution.py over the fixture in your working directory</em>" &mdash; it exists for the mined-challenge harness, which rewrites the task. A replay re-runs the recorded turn. The <em>safety</em> half is reused, because that one is about what the tools do, which is identical in both.</li>
+  </ul>
+
+  <h2>The validator, and its two-sided self-test</h2>
+  <p>Bench episodes carry executable validators already. A real episode needs one synthesised, and a synthesised check that cannot fail is not a check. Three gates:</p>
+  <ol>
+    <li><strong>Static screen.</strong> No subprocess, no <code>os.system</code>, no network, no deletion, no <code>eval</code>, parses, under 6&nbsp;KB. A check that shells out is not a check &mdash; it is a second agent with no supervision. (The first version named <code>subprocess</code> and not <code>os.system</code>: half a class, which reads as a closed door and is not one.)</li>
+    <li><strong>The negative control.</strong> Run the validator against an <em>empty</em> fork with no agent run at all, and require it to <em>fail</em>. This is the half the agreement test cannot do: <code>import sys; sys.exit(0)</code> passes the static screen and then agrees with the recording on every <code>passed</code> episode with probability 1.0 &mdash; the majority of the real ones &mdash; and would report <code>no_effect</code> for every perturbation of that episode forever. Agreement is exactly what a constant validator gives you.</li>
+    <li><strong>The agreement test.</strong> Run the unperturbed control leg and require the validator to reproduce the episode's <em>recorded</em> outcome. Disagreement means either the world drifted or the validator is wrong, and both mean "not replayable" &mdash; never "assume the validator".</li>
+  </ol>
+  <p>LLM-judged validators are not admitted at all; abstain beats opine.</p>
+
+  <h2>The paired verdict</h2>
+  <p>Every spec runs <em>n</em> control legs and <em>n</em> perturbed legs, and the rule is keep-first / abstain-on-tie, applied strictly:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Situation</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>any leg produced no verdict (timeout, infra fault, inconclusive validator)</td><td><code>abstain</code> &mdash; a missing leg is not a null result</td></tr>
+      <tr><td>legs <em>within</em> an arm disagreed</td><td><code>abstain</code> &mdash; that is the stochasticity the pairs exist to detect</td></tr>
+      <tr><td>the arms agree</td><td><code>no_effect</code></td></tr>
+      <tr><td>the arms differ consistently</td><td><code>mattered_pos</code> / <code>mattered_neg</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>Two failure modes are specifically not charged to the agent: the <code>[SANDBOX INFRA ERROR]</code> banner (<code>docker.execute</code> never raises &mdash; it <em>returns</em> that string, and self-play already paid for reading it as a genuine failure), and validator exit&nbsp;2, which is the validator's own "I cannot check this from the filesystem".</p>
+  <p>The control arm runs first. If it is already ungradable there is nothing to compare against, and running the perturbed arm anyway would spend the night's budget producing abstains.</p>
+
+  <h3>The rule has a noise floor, and it is on every row</h3>
+  <p>Unanimity across <em>n</em> legs makes a stochastic flip rarer; it does not make it distinguishable. For a genuinely <em>null</em> perturbation on a task with per-run pass probability <em>p</em>, the rule mislabels noise as an effect at <code>2·p<sup>n</sup>·q<sup>n</sup> / (p<sup>n</sup>+q<sup>n</sup>)²</code> of the cases it decides:</p>
+  <div class="scroll"><table>
+    <thead><tr><th><em>p</em></th><th>n = 2</th><th>n = 3</th></tr></thead>
+    <tbody>
+      <tr><td>0.50</td><td>0.500</td><td>0.500</td></tr>
+      <tr><td>0.70</td><td>0.262</td><td>0.135</td></tr>
+      <tr><td>0.80</td><td>0.111</td><td>0.030</td></tr>
+      <tr><td>0.90</td><td>0.024</td><td>0.003</td></tr>
+    </tbody>
+  </table></div>
+  <p>At <em>n</em>&nbsp;=&nbsp;2 the pre-registered specificity bar of 0.90 is <strong>unreachable</strong> unless the replayed tasks are near-deterministic (<em>p</em>&nbsp;&ge;&nbsp;0.815), so the default is three legs an arm. That still does not make the floor vanish, and until the A/A census below nothing measured <em>p</em> &mdash; so every credit row carries the observed <code>pass_rate</code> and the <code>noise_floor</code> it implies. The census has since measured it, and the corpus turns out to be near-deterministic almost everywhere, which is <em>why</em> the observed floor is small: it is a property of the episodes, not a guarantee about the rule. A consumer reading a <code>mattered_*</code> without them is reading a number whose error bar it does not know, and <code>credit_stats</code> counts those separately rather than folding them into the same total.</p>
+
+  <h3>The sign of a <code>mattered_pos</code> depends on the kind</h3>
+  <p>&ldquo;Control passed, perturbed failed&rdquo; means the perturbed thing <em>helped</em> when the perturbation REMOVED it (<code>lesson_withhold</code>, <code>step_deny</code>, <code>verify_toggle</code>, <code>tool_ablate</code>) and that it <em>hurt</em> when the perturbation ADDED it (<code>lesson_inject</code>). Every row carries the normalised <code>sign</code>, because a consumer summing <code>mattered_pos</code> across kinds without it is adding opposite facts. A kind that nobody classifies falls through to the additive branch and reports the exact opposite of the truth, so the suite fails on any kind that is in neither set rather than waiting for the ledger to show it.</p>
+
+  <h3>An unapplied perturbation is not a null result</h3>
+  <p>The single most load-bearing field on a leg is <code>applied</code>. Every way a perturbation can silently fail &mdash; a withheld lesson that is no longer in the store (88.5% of real withhold targets have been pruned since their recording), a step-deny whose tool the free-running replay never calls, a wrapper destroyed by a dispatch-miss rebuild &mdash; produces a perturbed arm <em>byte-identical</em> to the control arm, and therefore a confident <code>no_effect</code> about a counterfactual that never happened. Each of those is now detected and abstains.</p>
+
+  <h3>The fork the legs run in is part of the measurement</h3>
+  <p><code>run_spec</code> defaults <code>source_workspace</code> to <code>USE_LIVE_WORKSPACE</code>, so every leg starts from a <strong>copy of the live sandbox</strong> &mdash; the replayed agent has the inputs the original had. The A/A census that measures the rule's noise floor hardcoded an <em>empty</em> fork, and the difference is not cosmetic: probed on one episode, 3 top-level entries against 16. A floor measured in a world the rule never runs in is a number about the wrong regime. The regime is now a flag, it defaults to the engine's, and it is <strong>written on every run</strong> &mdash; a rows file that does not say which world it ran in cannot be compared with one that ran in the other.</p>
+
+  <h3>The trace must name paths the <em>fork</em> has, not the ones the recording had</h3>
+  <p><code>isolated_replay_context</code> nulls <code>current_project_id</code> on purpose, so a replayed agent writes at the <strong>fork root</strong>. The trace fed to the validator synthesiser still carried the recorded locations, so the model wrote checks against <code>projects/&lt;id&gt;/&hellip;</code>. In the seeded regime that is worse than a broken check: the fork <em>contains</em> the copied-in original under that exact path, so such a validator passes <strong>for free on every leg without the agent doing anything</strong>, while still failing the empty-fork negative control &mdash; presenting as a perfect reproduction. Four forms leaked before the sweep came back clean: the plain prefix, the tool <em>result</em> channel (<code>SUCCESS: Wrote 5202 chars to 'projects/&lt;id&gt;/x.py'</code>), the mount point with the <code>cd</code> hop, and an absolute host path. <code>content</code> was spared at first because it is the file's text, and that was the last leak &mdash; a script the agent wrote held the literal <code>path = "projects/&lt;id&gt;/model.py"</code>. One rule for every value now: an exemption becomes the next bypass.</p>
+
+  <h3>The floor on the corpus is not the floor the engine meets</h3>
+  <p>The census admits an episode when its validator <strong>discriminates</strong>; the engine admits one only when the control arm also <strong>reproduces the recording</strong>. Those are different bars, and the gap is most of the corpus &mdash; an episode that never reproduces contributes a guaranteed zero false-mattered and is one the engine <em>refuses to run</em>. Reported side by side: the corpus-wide rate, and an <code>engine_admissible</code> stratum weighted by <code>p_admit&nbsp;=&nbsp;p&#770;<sup>n</sup></code> (or <code>q&#770;<sup>n</sup></code> when the episode was recorded <code>failed</code> &mdash; agreement means <em>matches the recording</em>, not <em>passes</em>). The weighted number is the rate a consumer of the credit ledger actually meets.</p>
+  <p>Why episodes fail to reproduce was measured rather than assumed, and it is <em>not</em> the paths and <em>not</em> the seeding: one episode's synthesised check hardcodes the original environment's entry count, which no fork can match; another asks for a multi-step experiment the replay's single constrained turn &mdash; no network, verifier ablated, <code>force_final_response</code> &mdash; does not finish. Replay is a harder setting than the original turn, and that is a fact about the corpus the engine will run on.</p>
+
+  <h3>The floor, measured</h3>
+  <p>The A/A census ran the whole corpus in <strong>7.0&nbsp;hours</strong>: 128 episodes seen, <strong>57 measured</strong>, six identical control legs each, every 3+3 split put through the engine's own <code>decide_verdict</code>. Every arm is the same condition, so <em>every</em> <code>mattered_*</code> it produces is a false positive by construction.</p>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th>predicted</th><th>observed</th></tr></thead>
+    <tbody>
+      <tr><td>decides at all</td><td>0.972</td><td>0.967</td></tr>
+      <tr><td>false <code>mattered</code></td><td>0.001</td><td>0.002 &plusmn; 0.002</td></tr>
+      <tr><td>&hellip;over engine-admissible episodes</td><td>&mdash;</td><td><strong>0.0022</strong></td></tr>
+      <tr><td>&hellip;weighted by how often each <em>is</em> admitted</td><td>&mdash;</td><td><strong>0.0011</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>The closed form tracks observation, and the floor sits roughly 50&ndash;100&times; below the pre-registered 0.10 specificity bar. That is what licenses opening <code>dream_credit</code> <em>conditionally on a row's own <code>noise_floor</code></em> instead of on a blanket pass &mdash; it does <strong>not</strong> license arming the engine, which still needs the sensitivity gate.</p>
+  <p><strong>&#9888; The entire measured signal is one episode.</strong> With six legs a false <code>mattered</code> is possible <em>only</em> at exactly 3-of-6, and exactly one episode landed there (<code>[T,F,T,F,T,F]</code>, <code>p&#770;&nbsp;=&nbsp;0.50</code>). The theory behaves exactly as written, and the point estimate rests on a single stochastic episode &mdash; which is why the interval is as wide as the estimate. The corpus is overwhelmingly deterministic: 42 always-pass, 13 never-pass, <strong>2 stochastic</strong>. Quoting 0.0011 without that sentence is quoting a number whose error bar the reader does not know.</p>
+  <p><strong>The two halves are different populations and must not be pooled.</strong> Real traffic barely reproduces; bench is a bank of solved tasks that almost always does &mdash; and <code>dream_credit</code> is <code>real_only</code>, so the left column is the population the engine runs on.</p>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th>n</th><th>always-pass</th><th>never-pass</th><th>stochastic</th><th>false <code>mattered</code></th></tr></thead>
+    <tbody>
+      <tr><td>real</td><td>18</td><td>5</td><td>12</td><td>1</td><td>0.000</td></tr>
+      <tr><td>bench</td><td>39</td><td>37</td><td>1</td><td>1</td><td>0.003</td></tr>
+    </tbody>
+  </table></div>
+  <p>The regime-matched negative control &mdash; the screen added because a seeded fork can hand a validator its own answer &mdash; ran on all 66 episodes that reached it, cost 39&nbsp;seconds in total, and <strong>rejected none</strong>. It is verifiably live rather than silently inoperative, and it bought a clean guarantee rather than a correction. The prompt-slot leak found alongside it <em>was</em> live, in 4 of 42 episodes.</p>
+
+  <h3>A leg's budget is for many turns, so no one command may spend it</h3>
+  <p>The per-command clamp used to hand a single sandbox command everything left of the leg. A replayed episode ran <code>python3 -m http.server 8080</code> &mdash; a foreground server that never returns &mdash; and was handed <code>timeout -k 5s 569s</code> out of a 600&nbsp;s leg. The leg died ungradable and took the episode with it, and <em>raising</em> the leg cap had raised what one command could waste from 209&nbsp;s to 569&nbsp;s.</p>
+  <p>The execute tool's own guard does not catch this, and should not: <code>_SERVERISH_RE</code> matches <code>http.server</code>, but blocking additionally requires the command to <strong>detach</strong> (<code>… &amp;</code> / <code>setsid</code>), and the block message says so &mdash; <em>"foreground and short-lived commands are unaffected"</em>. That is correct for a live turn, where a blocking server is the operator's problem. In a replay leg nobody is watching, so the bound has to come from the budget:</p>
+  <pre><code>REPLAY_MAX_CMD_S = 120.0
+
+def _cmd_budget(leg_budget, elapsed):
+    remaining = leg_budget - elapsed - 30
+    return int(max(30.0, min(REPLAY_MAX_CMD_S, remaining)))</code></pre>
+  <p>Two bounds and the tighter one wins: what is left of the leg (a command outliving its leg blocks an executor thread the leg's cancellation cannot reach) and an absolute cap. 120&nbsp;s is measured rather than chosen &mdash; legs run a p50 of 26&nbsp;s and a p90 of 127&nbsp;s for <em>all</em> their commands and LLM turns together &mdash; so it is generous for a compile or a test run while leaving a timed-out command most of the leg to recover in, which is what the original turn had. The identity the fix rests on is pinned (<code>REPLAY_MAX_CMD_S * 2 &lt;= DEFAULT_LEG_TIMEOUT_S</code>): a cap that grows past a leg budget stops bounding anything and the defect returns silently.</p>
+  <p><strong>Raising the leg timeout is not the fix.</strong> Re-measuring the eight episodes lost to <code>ungradable_leg</code> at 600&nbsp;s split them cleanly: some were bounded-but-slow and came back gradable (one at <code>p&#770;&nbsp;=&nbsp;0.17</code>, a genuinely useful stochastic episode), the <code>http.server</code> one stayed ungradable as predicted, and several returned gradable but <code>p&#770;&nbsp;=&nbsp;0.00</code> &mdash; dead weight the engine abstains on forever. <em>Gradable is not usable.</em></p>
+
+  <h3>What the census costs, and the two things that made it cost more</h3>
+  <p>Measured on the live corpus, seeded forks, <strong>220 legs</strong>: median 26&nbsp;s, p90 127&nbsp;s, and only <strong>1.8% at the 240&nbsp;s cap</strong>. Tightening that cap is tempting and wrong &mdash; it would reclaim 16 minutes while converting the 10% of legs that finish between 120&nbsp;s and 240&nbsp;s into skips. Seeding is the real multiplier: the same legs run <strong>2.3&times; slower</strong> against a copied sandbox (median 53.4&nbsp;s) than against an empty one (23.6&nbsp;s). That is the price of measuring the regime that ships, and it is worth paying.</p>
+  <p>Two defects showed up only once it ran for real, and both were about <em>cost and control</em> rather than correctness:</p>
+  <ul>
+    <li><strong>Legs that could not change the answer kept running.</strong> An A/A episode needs every leg graded &mdash; one ungradable leg skips it whatever the rest do &mdash; so the five legs after the first ungradable one are provably wasted. One episode spent <strong>1,052&nbsp;s reaching a verdict its first leg had already settled</strong>: 81% of that run's entire cost, for a row the census then <em>excludes</em>. The abort keys on <code>passed is None</code> and <strong>not</strong> on <code>not passed</code> &mdash; a leg that ran and failed is a measurement, and most of this corpus is <code>p&nbsp;=&nbsp;0.00</code>, so aborting on it would compute a pass rate from one leg instead of six.</li>
+    <li><strong>The run could not be stopped.</strong> <code>kill -INT</code> was a no-op: a shell starting a background job sets SIGINT to <strong>SIG_IGN</strong> in the child, and CPython <em>preserves</em> an inherited SIG_IGN rather than installing its default handler. The signal arrived, nothing happened, and the census walked on to the next episode &mdash; writing no completion footer, which is precisely the case the footer exists for. SIGTERM has no default handler at all and loses it the same way. Both are installed explicitly now, and the footer records <em>how</em> the run ended so it can never claim a completion that did not happen.</li>
+  </ul>
+
+  <h2>Where it runs, and what it costs</h2>
+  <p>Biological phase <strong>3c</strong>, deep idle (&gt;60&nbsp;min), 4-hour cooldown, behind a §4U preflight that refuses on a memory-starved box &mdash; a batch spawns a container per leg, and this box runs llama-server at about 22.6&nbsp;GB wired. It does <em>not</em> reset the idle clock, for the reason bench does not: resetting it closes the deep-idle window and starves self-play for an hour.</p>
+  <p>Kill switches: <code>GHOST_DREAM_REPLAY</code> (default <strong>off</strong> &mdash; the whole engine is inert until an operator turns it on) and <code>--no-self-play</code>, which suppresses it because an ablation arm that ablates "self-play" must ablate everything riding the same clock or it measures something other than its name.</p>
+
+  <h2>What it can reach, and what it cannot</h2>
+  <p><code>network="none"</code> covers the container. It does <em>not</em> cover the agent's own process, and the first version of the deny list claimed to be a superset of self-play's while omitting <code>web_search</code> and <code>deep_research</code> &mdash; the two tools self-play has denied since the beginning, for exactly this reason. A replayed episode whose local routes are all denied will reach for a search. The list now covers every host-process egress tool, and self-play's own list was extracted from an inline literal into a constant so the superset claim is <em>testable</em> rather than merely asserted.</p>
+  <p>What a leg is left holding: <code>file_system</code>, <code>execute</code>, <code>workspace</code>, <code>recall</code>, <code>introspect</code>, <code>scratchpad</code>, <code>report_pdf</code> and a few read-only surfaces &mdash; all fork-scoped or inert.</p>
+  <p>The other escape was subtler. Swapping in a perturbed lesson store handed the isolate a plain <code>SkillMemory</code>, which has no <code>is_read_only</code> attribute &mdash; and that single attribute is how the entire repo derives "this turn is not real traffic". Two gates are not backstopped by a nulled handle: the metacog competence write (the per-domain prior the confidence composite reads on <em>real</em> turns) and the foresight predict hook (the live world-model index and its ledger). Lesson perturbations are 43% of all specs, so the majority of every night's legs were writing production learning corpora. The perturbed store carries the marker now, and every kind is pinned against <code>turn_origin</code>.</p>
+
+  <h2 id="gate">The gate: seeded truth before any consumer</h2>
+  <p>The engine's output will be read as <em>labels</em>, and this project's two worst label failures were both plausible mechanisms with no sensitivity number attached. <code>scripts/dream_replay_validate.py</code> is that number, built from challenges that carry their own executable ground truth (a <code>setup_script</code> that builds the fixture, a <code>validation_script</code> that runs the artefact) and a recorded <code>stable-pass</code> verdict, i.e. known solvable.</p>
+  <ul>
+    <li><strong>The positive</strong> ablates <code>file_system</code> <em>and</em> <code>execute</code> for the whole perturbed leg. Every qualifying challenge asks for a <code>solution.py</code> that its validator then runs, so with both tools gone there is no path to that file and the perturbed leg <em>must</em> fail &mdash; whatever the model tries. Effect size 1.0, by construction.</li>
+    <li><strong>The null</strong> ablates <code>recall</code> and <code>list_lessons</code>, which such a task never touches, through the <em>identical</em> code path &mdash; so a specificity number describes the same machinery the sensitivity number came from.</li>
+    <li><strong>Stability</strong> re-runs the null spec and counts a flip only where <em>both</em> runs decided.</li>
+  </ul>
+  <p>⚠ <strong>What this replaced.</strong> The first seeded positive wrapped a validator so its exit code flipped. That is applied <em>downstream</em> of the agent run, so the two arms differed no matter what the perturbation did: the instrument measured the validator-execution path and could not distinguish a working engine from one whose perturbations were all inoperative &mdash; which is precisely the defect class three review rounds then found. It was also sign-confounded, scoring a working engine as a miss and a crashing validator as a hit.</p>
+  <p>Three honesty rules the gate holds itself to, each of which it once broke:</p>
+  <ul>
+    <li><strong>The seed's truth is conditional.</strong> &ldquo;If the task was solved, the ablation must break it.&rdquo; A control arm that ran cleanly and <em>failed</em> is gradable, so the engine correctly reports <code>no_effect</code> &mdash; and scoring that as a sensitivity miss charges an engine with the agent's task-failure rate. The control condition is checked <em>before</em> the verdict is read, and the four abstain reasons (control errored / control failed / control split / perturbation did not apply) are counted separately, because they look identical in a ratio and mean opposite things.</li>
+    <li><strong>A bar needs power <em>and</em> a representative sample.</strong> 20 decided cases per arm is an absolute floor; an engine that abstains on 90% of seeded positives and is right about the rest clears it with a sensitivity of 1.00. The decided cases are exactly the tasks the agent could solve, so a yield below 50% reports <code>UNREPRESENTATIVE</code>, never <code>PASS</code>. Every ratio is printed with its exact (Clopper&ndash;Pearson) interval, and the verdict rule stays the pre-registered point estimate.</li>
+    <li><strong>A partial run cannot certify anything.</strong> A run that stood down on the mid-run preflight, hit its wall-clock deadline, or lost a case to an exception reports <code>INCOMPLETE</code>, whatever its partial numbers say. An intermediate version argued that a wall-clock truncation still left a uniform random subsample &mdash; the corpus is shuffled, and whole <em>unstarted</em> cases are what a deadline drops. That is wrong, and it is worth writing down why: a uniform random <em>order</em> does not give a uniform random <em>retained set</em> when the stopping rule is duration-dependent. The retained set is the maximal prefix that fits, so a case's chance of completing falls with its duration &mdash; and duration is outcome-correlated, because a case the agent flounders on burns <code>n_pairs &times; leg_timeout</code> per arm. Hard cases are dropped, and hard is exactly &ldquo;the control arm fails or abstains&rdquo;.</li>
+    <li><strong>A recovered run says so.</strong> Rows stream to disk as each case completes, bracketed by a run header and a completion footer; <code>--rescore</code> rebuilds the scoreboard from them and refuses to certify a file that carries no footer, because a file without one belongs to a run that did not finish. It scores the LAST run's rows only &mdash; the scratch path is fixed and the writer appends, so two runs' rows share a file.</li>
+  </ul>
+  <p>Status: the instrument works &mdash; seeded pairs come back <code>mattered_pos</code> / <code>no_effect</code> as constructed &mdash; and refuses to call the result a result until it is powered. Until it returns PASS, <code>dream_credit</code> stays closed.</p>
+
+  <h2>Admissibility: two rows, not one</h2>
+  <p><code>dream_replay</code> reads the corpus and admits bench episodes as a feature &mdash; they carry executable validators already, which makes them the cheapest source of seeded ground truth. <code>dream_credit</code> is anything that later reads a replay <em>verdict</em> and acts on it, and it is <code>real_only</code> until the seeded-truth bar is cleared. One row could not express "may read the corpus, may not yet believe the output", and a single permissive row is how an unvalidated label source opens.</p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="isolation.html">core / isolation.py</a> &mdash; the detached context, forked workspace and networkless sandbox every leg runs in.</li>
+    <li><a href="dream.html">core / dream.py</a> &mdash; self-play, which invents a challenge rather than replaying one.</li>
+    <li><a href="admissibility.html">core / admissibility.py</a> &mdash; who may consume what, and in what form.</li>
+    <li><a href="imagination.html">core / imagination.py</a> &mdash; the other half of the flywheel: replayed transitions thicken the precedent index the gate judges.</li>
+  </ul>
+</main>
+</body>
+</html>

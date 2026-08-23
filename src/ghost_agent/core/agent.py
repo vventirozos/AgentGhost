@@ -324,6 +324,22 @@ _SERVICE_READONLY_OPS = frozenset({"", "status", "logs", "log", "list", "ls"})
 _COMPOSED_SKILL_MUTATING_ACTIONS = frozenset({"define", "approve", "delete"})
 
 
+def _imagine_gate_built_at() -> "datetime.datetime":
+    """When the Imagine calibration gate was last rebuilt, from the gate
+    file itself — the durable anchor for an in-memory cooldown.
+
+    Returns ``datetime.min`` when there is no readable gate, which is the
+    correct answer: no gate means "rebuild on the first chance"."""
+    try:
+        from .imagination import load_gate
+        doc = load_gate() or {}
+        raw = str(doc.get("built") or "").rstrip("Z")
+        return datetime.datetime.fromisoformat(raw) if raw \
+            else datetime.datetime.min
+    except Exception:  # noqa: BLE001
+        return datetime.datetime.min
+
+
 def _call_mutated_world(fname: str, t_args: dict, is_mutating: bool) -> bool:
     """True when a SUCCESSFUL dispatch of this call changed state the pre-flight
     repeat-failure guard reasons about — the trigger for its world-changed
@@ -647,7 +663,7 @@ def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
     to informational bookkeeping output made `_lt` non-None on listing
     turns ("show me all projects"), and the pre-existing await would have
     taxed exactly those — the most common turn shape — with up to
-    `GHOST_CRITIC_REPAIR_BUDGET` (default 25s) of user-visible latency for
+    `GHOST_CRITIC_REPAIR_BUDGET` (default 65s since 2026-08-22) of user-visible latency for
     a repair that is low-value on a listing summary. Their verdict still
     lands through the deferred/late path (which is what feeds the outcome
     corpus); only the BLOCKING await is skipped.
@@ -795,6 +811,32 @@ def turn_origin(context) -> str:
         return label
     return "sim" if getattr(getattr(context, "skill_memory", None),
                             "is_read_only", False) is True else "user"
+
+
+def dream_ledger_summary(msg: str) -> str:
+    """The activity-ledger line for one REM cycle.
+
+    ⚠ WHY THIS IS A FUNCTION (queue #11, 2026-08-21). The ledger used to
+    record a CONSTANT: 919 live dream rows, every one reading "REM cycle ran
+    (memory consolidation / heuristic harvest)", on the surface that answers
+    "what did you do while I was away" for the subsystem driving two thirds
+    of traffic. `Dreamer.dream()` already returns "consolidated N fragments
+    into M new meta-memories and extracted H heuristics" or "produced nothing
+    this cycle" — the call site had it and threw it away.
+
+    Extracted so the shaping is reachable without driving a whole biological
+    tick: the first version of its test re-implemented the truncation inside
+    the test helper, and the "unbounded summary" mutant walked straight
+    through. A test that re-implements the code under test proves nothing.
+
+    Keeps the "REM cycle ran" prefix — `introspect` and the digest match on
+    it — collapses whitespace (the Dreamer's metrics note carries newlines,
+    the ledger is one line) and bounds the length.
+    """
+    summary = " ".join(str(msg or "").split())[:220]
+    if not summary:
+        return "REM cycle ran (memory consolidation / heuristic harvest)"
+    return f"REM cycle ran — {summary}"
 
 
 def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
@@ -5055,9 +5097,33 @@ class GhostAgent:
     _ROUTER_TRAIN_COOLDOWN = 10800   # 3 h between router-classifier retrains (phase 2.7b)
     _CALIB_REFIT_COOLDOWN = 3600  # 60 min between calibration refits (phase 2.7c)
     _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
+    # §4CL I0 phase 2.7e. NOT 24 h: `imagine_gate` is registered
+    # PERIODIC, and the liveness alarm fires on zero firings in a
+    # 24-HOUR window — a cooldown equal to the window guarantees an
+    # intermittent false alarm, since the phase also needs a deep-idle
+    # tick to land. Every other PERIODIC phase has an order of magnitude
+    # of headroom (dream 1800 s, self_play 3600, calibration 3600,
+    # skills_auto 7200, router_train 10800). 6 h matches the workspace
+    # tidy and costs ~11 ms per rebuild on the live ledger.
+    _IMAGINE_GATE_COOLDOWN = 21600
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     _BENCH_COOLDOWN = 2700        # 45 min between bench-bank items (§4BF 1b)
+    #: §4CM D3. A batch is `batch x 2 x n_pairs` full solve loops, so
+    #: it is the most expensive idle phase here — 4 h between batches,
+    #: which still leaves several firings inside the 24 h liveness
+    #: window that `dream_replay` is registered GATED against.
+    _DREAM_REPLAY_COOLDOWN = 14400
+    #: §4CN E1. One mutation proposal is a single background LLM call
+    #: plus a 12 MB snapshot — cheap next to a replay batch — but a
+    #: proposal nobody has evaluated is a queue, not progress, so the
+    #: cadence is deliberately slower than the cascade that will consume
+    #: them: 6 h, at most 4 candidates a day.
+    _EVOLVE_MUTATE_COOLDOWN = 21600
+    #: Wall-clock bound on one proposal. Raw, never `_bio_cooldown`-
+    #: scaled: the model call inside it does not speed up under
+    #: `--bio-time-scale`.
+    _EVOLVE_MUTATE_TIMEOUT = 600.0
     #: Seconds of quiet an operator-armed bench DRAIN waits for before it
     #: starts an item (§4BO). Not a cooldown between items — a drain runs
     #: back-to-back — but a floor that keeps a multi-minute solve from
@@ -5145,7 +5211,8 @@ class GhostAgent:
             f"runtime (an LLM call is ~60s at any scale). Dream will consume "
             f"the window and self-play will reset the idle clock, so "
             f"reflection / postmortem / skills-auto / PRM / router / "
-            f"calibration / tidy / narratives / autoadvance can NEVER fire — "
+            f"calibration / imagine-gate / tidy / narratives / autoadvance "
+            f"can NEVER fire — "
             f"they will silently report 0. Use a scale <= 20 "
             f"(window >= {self._MIN_USABLE_WINDOW_S:.0f}s) for a measurement "
             f"that includes them.")
@@ -5174,6 +5241,32 @@ class GhostAgent:
         if getattr(self, "_bio_deterministic", False):
             return True
         return random.random() < p
+
+    def _bio_roll_value(self) -> float:
+        """A draw in [0,1) for a phase that needs the VALUE, not a gate —
+        the Evolve archive samples a parent proportionally to weight.
+
+        Routed through the same `--bio-deterministic` seam as `_bio_roll`
+        so an accelerated ablation arm walks the archive the same way
+        every epoch; `pick_parent`'s docstring is explicit that the caller
+        supplies `rand` because "a nightly job that cannot be replayed
+        cannot be debugged", and a bare `random.random()` there would have
+        left that seam bypassed."""
+        # ⚠ A SEEDED SEQUENCE, not a constant. The first version
+        # returned 0.0 and the second 0.5, with a comment explaining that
+        # 0.0 "returns the first parent unconditionally so the arm would
+        # never walk the archive" — which is equally true of 0.5, and of
+        # every other literal: measured, 0.0 and 0.5 return the SAME node
+        # for a single-node archive and one fixed node for any archive.
+        # A constant was replaced by another constant and given a
+        # justification that does not survive reading `pick_parent`.
+        # Reproducible AND varying is a seeded PRNG.
+        if getattr(self, "_bio_deterministic", False):
+            rng = getattr(self, "_bio_det_rng", None)
+            if rng is None:
+                rng = self._bio_det_rng = random.Random(0)
+            return rng.random()
+        return random.random()
 
     def _record_autonomous_activity(self, phase, summary,
                                     severity: str = "info", **meta) -> None:
@@ -5284,12 +5377,23 @@ class GhostAgent:
             self._last_workspace_tidy_at = datetime.datetime.min
         if not hasattr(self, '_last_calib_refit_at'):
             self._last_calib_refit_at = datetime.datetime.min
+        if not hasattr(self, '_last_imagine_gate_at'):
+            # Seeded from the gate file's OWN `built` stamp, not from
+            # datetime.min. The anchor is in-memory and this process
+            # restarts often; without the seed every restart rebuilt on
+            # the first in-window tick, so the cooldown was not a rate
+            # limit at all and the real cadence was "once per deploy".
+            self._last_imagine_gate_at = _imagine_gate_built_at()
         if not hasattr(self, '_last_autoadvance_at'):
             self._last_autoadvance_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         if not hasattr(self, '_last_bench_at'):
             self._last_bench_at = datetime.datetime.min
+        if not hasattr(self, '_last_dream_replay_at'):
+            self._last_dream_replay_at = datetime.datetime.min
+        if not hasattr(self, '_last_evolve_mutate_at'):
+            self._last_evolve_mutate_at = datetime.datetime.min
         # Operator-armed bench drain (§4BO, 2026-08-15). `POST
         # /api/bench/drain` sets a BUDGET here and the watchdog spends it;
         # the endpoint never runs an item itself. That keeps the watchdog
@@ -5491,9 +5595,24 @@ class GhostAgent:
                             # "REM cycle ran" on a skip tick made the
                             # activity digest overcount consolidation.
                             if not _dream_skipped:
+                                # ⚠ CARRY THE DREAMER'S OWN OUTCOME (queue #11,
+                                # 2026-08-21). This ledgered a CONSTANT string,
+                                # so the busiest subsystem on the box wrote 919
+                                # identical rows into the one surface that
+                                # answers "what did you do while I was away".
+                                # The ran path already distinguishes
+                                # "consolidated N fragments into M meta-memories
+                                # and extracted H heuristics" from "produced
+                                # nothing this cycle: no consolidation met the
+                                # compression bar" — it is computed, streamed,
+                                # RETURNED to this very call site, and was then
+                                # thrown away here. A productive cycle and an
+                                # empty one were indistinguishable in the
+                                # digest. The "REM cycle ran" prefix is kept:
+                                # it is what introspect's consumers match on.
                                 self._record_autonomous_activity(
                                     "dream",
-                                    "REM cycle ran (memory consolidation / heuristic harvest)")
+                                    dream_ledger_summary(_dream_msg))
                         except Exception as _dream_exc:
                             # §4Q Lens-A: dream was the ONLY non-terminal phase
                             # with no except. `Dreamer.dream` has unguarded
@@ -6349,6 +6468,59 @@ class GhostAgent:
                 finally:
                     self._last_calib_refit_at = datetime.datetime.now()
 
+        # Phase 2.7e (§4CL I0): rebuild the IMAGINE CALIBRATION GATE.
+        # Aggregates the durable foresight ledger into a per-(tool,
+        # tclass) allow-list at $GHOST_HOME/system/foresight/gate.json,
+        # which every Imagine steering site is gated on. Pure file I/O +
+        # counting, no LLM, milliseconds.
+        #
+        # It runs even when GHOST_IMAGINE is off, and that is deliberate:
+        # a closed gate is a MEASUREMENT, and the question "has the
+        # precedent index become good enough to steer with yet?" should
+        # keep being answered while the feature is disabled. The master
+        # flag gates the CONSUMERS, not the instrument.
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
+            _since_gate = (datetime.datetime.now()
+                           - self._last_imagine_gate_at).total_seconds()
+            if _since_gate >= self._bio_cooldown(self._IMAGINE_GATE_COOLDOWN):
+                _idle_ran.append("imagine_gate")
+                # Anchor BEFORE the work and again in `finally`, so a
+                # mid-build crash cannot refire this every tick.
+                self._last_imagine_gate_at = datetime.datetime.now()
+                try:
+                    from .imagination import build_gate as _build_gate
+                    _gate = await asyncio.to_thread(_build_gate)
+                    _n_enabled = int(_gate.get("enabled_count", 0) or 0)
+                    _n_buckets = len(_gate.get("buckets") or {})
+                    # The summary names WHY when nothing is enabled: "no
+                    # data yet" and "measured not precise enough" lead
+                    # opposite places, and a line that says only "0
+                    # enabled" cannot tell them apart.
+                    if _n_enabled:
+                        _why = ", ".join(sorted(
+                            k for k, v in (_gate.get("buckets") or {}).items()
+                            if isinstance(v, dict)
+                            and v.get("enabled") is True)[:5])
+                        _summary = (f"imagine gate: {_n_enabled}/{_n_buckets} "
+                                    f"bucket(s) DISCRIMINATE — {_why}")
+                    else:
+                        from collections import Counter as _Ctr
+                        _reasons = _Ctr(
+                            str(v.get("why", "")).split(":")[0]
+                            for v in (_gate.get("buckets") or {}).values()
+                            if isinstance(v, dict))
+                        _summary = (
+                            f"imagine gate: 0/{_n_buckets} buckets enabled "
+                            f"over {_gate.get('ledger_rows', 0)} ledger rows "
+                            f"— " + "; ".join(
+                                f"{n}× {r}" for r, n in _reasons.most_common(3)))
+                    self._record_autonomous_activity("imagine_gate", _summary)
+                    logger.info("%s", _summary)
+                except Exception as _ige:  # noqa: BLE001
+                    logger.warning("imagine gate rebuild failed: %s", _ige)
+                finally:
+                    self._last_imagine_gate_at = datetime.datetime.now()
+
         # Phase 2.7d: Recurring workspace tidy (2026-07-18). The DONE
         # sweep fires once, on the transition — but verification and
         # post-completion debugging keep producing screenshots and
@@ -6806,7 +6978,9 @@ class GhostAgent:
                                     self._record_autonomous_activity(
                                         "self_play",
                                         f"counterfactual replay: "
-                                        f"{_cf['replayed']} challenge(s) — "
+                                        f"{_cf['replayed']} challenge(s) "
+                                        f"({_cf.get('past_failures', 0)} "
+                                        f"past-failure) — "
                                         f"{_cf['generalized']} generalized, "
                                         f"{_cf['regressions']} regression(s), "
                                         f"{_cf['stable']} stable")
@@ -7276,6 +7450,245 @@ class GhostAgent:
                                 icon=Icons.BRAIN_AIM,
                             )
 
+        # ── Phase 3c: DREAM REPLAY (§4CM D3, 2026-08-22) ─────────────────
+        # Turns recorded episodes into execution-graded counterfactual
+        # verdicts. Deep idle (>60 min) like its siblings, because a batch
+        # is `batch x 2 x n_pairs` full solve loops — the most expensive
+        # idle phase here.
+        #
+        # It does NOT reset `ctx.last_activity_time`, for the same reason
+        # bench does not (§4BF R2): resetting it closes the deep-idle
+        # window and starves self-play for an hour. The cost is that a
+        # replay batch and a self-play cycle can chain within one tick;
+        # the shared spec deadline is what bounds that.
+        #
+        # Kill: `GHOST_DREAM_REPLAY` (default OFF — the whole engine is
+        # inert until an operator turns it on) and `--no-self-play`, which
+        # suppresses it for the reason main.py already documents for the
+        # idle-clock confound: an ablation arm that ablates "self-play"
+        # must ablate everything that rides the same clock, or the arm
+        # measures something other than its name.
+        # ⚠ Same re-read as 3d, for the same measured reason: `idle_secs`
+        # is the value the TICK opened with, and by the time 3c is
+        # reached self-play may have reset that clock in its `finally`
+        # and 3b may have spent 900 s. A batch spawns a container per leg
+        # — starting one against a live user turn is the most expensive
+        # version of this mistake in the file.
+        _idle_replay = (datetime.datetime.now()
+                        - ctx.last_activity_time).total_seconds()
+        _fg_replay = int(getattr(getattr(ctx, "llm_client", None),
+                                 "foreground_requests", 0) or 0)
+        if (_idle_replay > self._bio_scaled(3600)
+                and _fg_replay <= 0
+                and getattr(getattr(ctx, "args", None),
+                            "no_self_play", False) is not True):
+            _since_replay = (datetime.datetime.now()
+                             - self._last_dream_replay_at).total_seconds()
+            if _since_replay >= self._bio_cooldown(
+                    self._DREAM_REPLAY_COOLDOWN):
+                try:
+                    from .replay_engine import (
+                        batch_summary as _rsum, run_batch as _rbatch,
+                        preflight as _replay_preflight,
+                        _enabled as _replay_enabled,
+                    )
+                except Exception as _rimp:  # noqa: BLE001
+                    _replay_enabled = None
+                    logger.debug("dream replay unavailable: %s", _rimp)
+                if _replay_enabled is None or not _replay_enabled():
+                    # ⚠ ADVANCE ON EVERY NON-RUNNING PATH — including the
+                    # DEFAULT one (`GHOST_DREAM_REPLAY` off). Without it
+                    # the gate re-imports and re-probes on every
+                    # 60-second tick for the whole idle stretch. 3d was
+                    # fixed for exactly this and the rule was written in
+                    # capitals; the round that edited 3c FOR CONSISTENCY
+                    # WITH 3d copied the clock re-read and left the
+                    # anchor behind. Restated is not checked.
+                    self._last_dream_replay_at = datetime.datetime.now()
+                elif True:
+                    # §4U: a >10-min unattended run gets a preflight.
+                    _ok, _why = _replay_preflight()
+                    if not _ok:
+                        # Advance the anchor: without it a failing
+                        # preflight re-imports, re-probes and logs EVERY
+                        # 60-SECOND TICK for as long as the box stays
+                        # idle — ~1,440 durable lines a night, with no
+                        # backoff, about a condition that is not going to
+                        # change on its own.
+                        self._last_dream_replay_at = datetime.datetime.now()
+                        logger.info("dream replay stood down: %s", _why)
+                    else:
+                        _idle_ran.append("dream_replay")
+                        self._last_dream_replay_at = datetime.datetime.now()
+                        _line = ""
+                        try:
+                            # The batch bounds ITSELF
+                            # (`DEFAULT_BATCH_TIMEOUT_S`, and it stops
+                            # between specs). This wait_for is the belt:
+                            # it is set ABOVE the batch's own budget so
+                            # that when it fires, the batch really did
+                            # fail to stop — which is a different fact
+                            # from "the batch used its budget".
+                            _out = await asyncio.wait_for(
+                                _rbatch(ctx),
+                                timeout=self._bio_cooldown(3600.0))
+                            _line = _rsum(_out)
+                        except asyncio.TimeoutError:
+                            _line = ("dream replay: HUNG — the batch did not "
+                                     "stop at its own deadline; partial "
+                                     "verdicts may be on disk")
+                            logger.warning("%s", _line)
+                        except Exception as _rexc:  # noqa: BLE001
+                            _line = f"dream replay: batch failed ({_rexc})"
+                            logger.warning("%s", _line)
+                        finally:
+                            self._last_dream_replay_at = \
+                                datetime.datetime.now()
+                            # ⚠ IN THE FINALLY. The first version recorded
+                            # the summary only on the happy path, so the
+                            # most expensive idle phase left NO ledger row
+                            # and NO stream line on its two most likely
+                            # failures — and the liveness registry then
+                            # disagreed with the data actually on disk.
+                            if _line:
+                                self._record_autonomous_activity(
+                                    "dream_replay", _line)
+                                self._safe_pretty_log(
+                                    "Dream Replay", _line,
+                                    icon=Icons.DREAM_REPLAY)
+
+        # ── Phase 3d: EVOLVE MUTATOR (§4CN E1, 2026-08-22) ───────────────
+        # Proposes ONE scaffold mutation from recorded evidence. Far
+        # cheaper than 3c — a background LLM call plus a snapshot — but
+        # deliberately slower, because a proposal nobody has evaluated is
+        # a queue and not progress; the cascade that consumes them does
+        # not exist yet (E2).
+        #
+        # A shallower idle floor than 3c (15 min, not 60) for the same
+        # reason: it does not spawn containers and does not compete with
+        # a solve. It does NOT reset `ctx.last_activity_time` — same
+        # deep-idle-window argument as bench and replay.
+        #
+        # ⚠ THE CLOCK IS RE-SAMPLED HERE, and so is the foreground lock.
+        # `idle_secs` was read once at the top of the tick, and by the
+        # time this phase is reached self-play may have RESET that clock
+        # in its `finally`, phase 3b may have burned 900 s, and phase 3c
+        # may have held the tick for an hour. Measured, on production
+        # code: with self-play firing first, real idle at this line was
+        # 0.0015 s; with a user turn completing during 3c, 0.00012 s with
+        # `foreground_requests == 1` — i.e. a background LLM call onto
+        # the shared llama-server slot against a live turn. That is the
+        # defect §4BF R1 found and fixed for the bench drain, whose
+        # comment sits 400 lines above ("it must read the clock NOW").
+        # The 15-minute floor makes it MORE likely than a 60-minute one,
+        # not less: this is precisely the window in which an operator who
+        # stepped away comes back.
+        #
+        # Kill: `GHOST_EVOLVE` (default OFF), and `--no-self-play`, which
+        # suppresses it for the reason 3c already documents — an ablation
+        # arm that ablates "self-play" must ablate everything riding the
+        # same clock or the arm measures something other than its name.
+        # Under `--no-self-play` nothing ever resets the clock, so a
+        # 15-minute floor is permanently true for the rest of an AFK
+        # stretch and this phase would burn an LLM call and a snapshot on
+        # the arm that is supposed to be doing less.
+        _idle_evolve = (datetime.datetime.now()
+                        - ctx.last_activity_time).total_seconds()
+        _fg_evolve = int(getattr(getattr(ctx, "llm_client", None),
+                                 "foreground_requests", 0) or 0)
+        if (_idle_evolve > self._bio_scaled(900)
+                and _fg_evolve <= 0
+                and getattr(getattr(ctx, "args", None),
+                            "no_self_play", False) is not True):
+            _since_evolve = (datetime.datetime.now()
+                             - self._last_evolve_mutate_at).total_seconds()
+            if _since_evolve >= self._bio_cooldown(
+                    self._EVOLVE_MUTATE_COOLDOWN):
+                try:
+                    from ..evolve.mutator import (
+                        run_mutation as _emut, OUT_PROPOSED as _E_PROPOSED,
+                        OUT_DISABLED as _E_OFF, _enabled as _evolve_enabled,
+                    )
+                except Exception as _eimp:  # noqa: BLE001
+                    _evolve_enabled = None
+                    logger.debug("evolve mutator unavailable: %s", _eimp)
+                if _evolve_enabled is None:
+                    # ⚠ ADVANCE ON EVERY NON-RUNNING PATH — the
+                    # broken-dependency one included, which the comment
+                    # below is about and which used to re-import on every
+                    # 60-second tick for the whole idle stretch.
+                    self._last_evolve_mutate_at = datetime.datetime.now()
+                else:
+                    # ⚠ THE GATE IS CHECKED INSIDE `run_mutation`, NOT
+                    # HERE. Short-circuiting on `_enabled()` made
+                    # `OUT_DISABLED` unreachable in production — so the
+                    # ledger could never distinguish "the gate is closed"
+                    # from "the phase never ran" (idle floor never
+                    # crossed, --no-self-play, import failed), which is
+                    # the single thing `write_mutation`'s docstring says
+                    # the ledger exists to do. One JSON append every six
+                    # hours buys that distinction, and the health report
+                    # stops asserting a ground truth nothing produces.
+                    # Anchor FIRST. Every failure path below has to leave
+                    # the clock advanced or a broken dependency re-imports
+                    # and re-logs on every 60-second tick for as long as
+                    # the box stays idle (the 3c lesson, paid once).
+                    self._last_evolve_mutate_at = datetime.datetime.now()
+                    _eline = ""
+                    try:
+                        # NOT `_bio_cooldown`: the bound scales but the
+                        # LLM call it bounds does not, so at
+                        # --bio-time-scale 20 a 30 s budget would make
+                        # every firing time out and the phase could never
+                        # propose. Scaling the GATES without scaling the
+                        # WORK is the error class `_bio_scaled`'s own
+                        # docstring names. Bench uses the raw constant
+                        # for the same reason.
+                        _erec = await asyncio.wait_for(
+                            _emut(ctx, rand=self._bio_roll_value()),
+                            timeout=self._EVOLVE_MUTATE_TIMEOUT)
+                        _eout = str(_erec.get("outcome") or "")
+                        if _eout != _E_OFF:
+                            _idle_ran.append("evolve_mutate")
+                        if _eout == _E_PROPOSED:
+                            # ⚠ THE FLAGS RIDE ON THIS LINE. The whole
+                            # argument for demoting the guard check from
+                            # a gate to a flag is that the operator reads
+                            # it — and the announcement of the proposal
+                            # was the one surface that dropped it,
+                            # leaving the operator to go find the archive
+                            # JSON. A flag nobody reads is no flag.
+                            _eflags = _erec.get("guard_flags") or []
+                            _eline = (f"proposed {_erec.get('node_id')} for "
+                                      f"{_erec.get('target_path')} "
+                                      f"({_erec.get('files')} file(s), "
+                                      f"{_erec.get('lines')} lines) — "
+                                      f"awaiting operator review"
+                                      + (f" ⚠ removes {len(_eflags)} "
+                                         f"refusal-shaped line(s): "
+                                         f"{_eflags[0][:60]!r}"
+                                         if _eflags else ""))
+                        elif _eout != _E_OFF:
+                            # A night that produced nothing must say WHICH
+                            # nothing: no evidence, a model that would not
+                            # comply, and a diff that would not apply are
+                            # three different problems with one symptom.
+                            _eline = (f"no candidate ({_eout}): "
+                                      f"{str(_erec.get('reason') or '')[:160]}")
+                    except asyncio.TimeoutError:
+                        _eline = ("evolve: mutation proposal did not return "
+                                  "within its bound")
+                        logger.warning("%s", _eline)
+                    except Exception as _eexc:  # noqa: BLE001
+                        _eline = f"evolve: mutation failed ({_eexc})"
+                        logger.warning("%s", _eline)
+                    finally:
+                        if _eline:
+                            self._record_autonomous_activity(
+                                "evolve_mutate", _eline)
+                            self._safe_pretty_log(
+                                "Evolve", _eline, icon=Icons.EVOLVE)
+
         # One durable summary per idle cycle that actually did work (phase-1
         # journal returns early above and logs itself). Reconstructs the loop:
         # "idle cycle: ran dream, reflection (idle 42m)".
@@ -7316,7 +7729,12 @@ class GhostAgent:
             JOURNAL_MAX_RETRIES as _JRL_MAX,
             RetryableConsolidationError as _RetryableConsolidation,
         )
-        if not hasattr(self.context, 'journal'): return
+        # `hasattr` was the wrong test: every isolated run sets
+        # `context.journal = None` (core/isolation), which PASSES hasattr
+        # and then raises AttributeError on `None.pop_all`. Latent — the
+        # isolate never starts a watchdog — but the guard has to mean
+        # "there is a journal", not "the attribute exists".
+        if getattr(self.context, 'journal', None) is None: return
 
         items = await asyncio.to_thread(self.context.journal.pop_all)
         if not items: return
@@ -9713,7 +10131,59 @@ class GhostAgent:
         Only meaningful in async-critic mode, where the verdict runs on the
         OFF-HOST second model — so this wait costs the MAIN inference slot
         nothing. Default 25s; ``GHOST_CRITIC_REPAIR_BUDGET`` overrides, 0
-        disables (pure defer, the pre-2026-07-07 async behaviour)."""
+        disables (pure defer, the pre-2026-07-07 async behaviour).
+
+        ⚠ MEASURED AGAINST THE POPULATION IT EXISTS FOR (2026-08-22, 115
+        verdicts over 16 days of live log). This window's whole purpose is to
+        catch a REFUTED verdict in time to repair the answer before it ships
+        — and refutes are the SLOW half:
+
+            verdict      n    p50     p90    within 25s
+            CONFIRMED   77   26.2s   51.8s      44%
+            REFUTED     23   48.0s   63.8s      22%   <- the ones that matter
+            UNCERTAIN   15   28.3s   32.7s      27%
+            ALL        115   28.0s   56.6s      37%
+
+        So the budget catches 5 refutes in 23. It was sized against the
+        overall distribution, which is dominated by the faster CONFIRMs it
+        has no use for — the §4BR "gate calibrated on the wrong statistic"
+        shape, in the constant rather than in a threshold.
+
+        ⚠ RAISED 25s → 65s ON THAT EVIDENCE (operator decision, 2026-08-22).
+        65s covers the REFUTED p90 of 63.8s, so ~90% of refutes are now
+        caught in time to repair the reply instead of ~22%.
+
+        THE PRICE, stated plainly: the await BLOCKS the reply, so a turn
+        whose verdict is still pending at loop-exit can now wait up to 65s
+        instead of 25s, and that cost falls on slow CONFIRMs too, where
+        there is nothing to repair. It buys correctness-before-shipping with
+        latency. Bounded four ways:
+          * the wait ends the INSTANT the verdict lands — a deadline, not a
+            sleep, so a fast verdict costs nothing;
+          * `_should_await_repair_verdict` keeps bookkeeping-evidence turns
+            on the pure-defer path;
+          * the verdict runs on the OFF-HOST critic node, so the wait costs
+            the main inference slot nothing;
+          * STREAMED TURNS NEVER REACH IT. The stream gate spawns the
+            verdict straight into `_attach_late_verdict_handler` with
+            `force_correction=True` — a streamed reply is already delivered
+            and cannot be repaired. So the web UI, where a human is actually
+            waiting, pays none of this; the cost lands on non-streamed
+            callers (the API, and Slack).
+
+        ⚠ CAVEAT ON THE TABLE ABOVE, since that last point cuts both ways:
+        the latencies were pooled over ALL verdicts in the log, streamed and
+        not. The repair window only ever governed the non-streamed subset,
+        and the log cannot be decomposed further. The DIRECTION is what the
+        decision rests on — refutes are ~2x slower than confirms — and that
+        is robust; the exact 22% is an estimate over a superset.
+
+        Reverting is one env var — ``GHOST_CRITIC_REPAIR_BUDGET=25`` — and
+        the fallback if the latency reads badly in practice: a late refute
+        still scrubs its poisoned lessons, still queues the next-turn
+        correction banner, and since 2026-08-21 still reaches the corpus AND
+        the diary (§4CD), so the pre-2026-08-22 behaviour is a correction one
+        turn later, not a lost one."""
         if not self._critic_async_enabled():
             return 0.0
         raw = os.getenv("GHOST_CRITIC_REPAIR_BUDGET")
@@ -9735,7 +10205,20 @@ class GhostAgent:
                 return 90.0
         except Exception:  # noqa: BLE001
             pass
-        return 25.0
+        # 65s: the measured REFUTED p90 (63.8s), rounded up. See the table
+        # above — sizing this on the ALL-verdict distribution is what made
+        # the old 25s catch 5 refutes in 23.
+        #
+        # ⚠ IT MUST ALSO SIT ABOVE `verifier._VOTE_BUDGET_DEFAULT_S` (60s),
+        # which is the ceiling the verdict bounds ITSELF by. Below it, this
+        # window would expire while the verdict was still legitimately
+        # running and the wait would buy nothing — which is precisely how
+        # the verifier's own budget was first mis-chosen (it was 20s,
+        # "picked to sit under _critic_repair_await_budget (25s)", and that
+        # truncated ordinary votes into control while still recording them
+        # as votes). The two constants are a PAIR: raise the vote budget and
+        # this must follow, or the await starts cutting verdicts off again.
+        return 65.0
 
     async def _adaptive_bon_final(self, *, messages, final_ai_content,
                                   last_user_content, model):
@@ -9989,7 +10472,10 @@ class GhostAgent:
         task.add_done_callback(_on_done)
 
     def _backfill_trajectory_outcome(self, trajectory_id, outcome, reason=""):
-        """Fold a late verifier verdict into the trajectory corpus.
+        """Fold a late verifier verdict into the trajectory corpus — and,
+        since 2026-08-21 (queue #7), into the agent's autobiographical
+        diary, which FOLLOWS the corpus write rather than arbitrating for
+        itself (see the leg's own comment below).
 
         In async-critic mode (production) the verdict lands after
         ``_record_turn_trajectory`` already wrote ``outcome=UNKNOWN``, so
@@ -10114,6 +10600,18 @@ class GhostAgent:
                 # withheld, which changes how the structural exception
                 # evaluates on a second verdict).
                 reason = ""
+            # §4BF 1c: selfhood is a real_only admissibility row, so the
+            # diary leg below carries the same origin gate as every other
+            # selfhood write site. Snapshotted SYNCHRONOUSLY here rather
+            # than read inside the background write: that write lands
+            # 20-60s after the turn, and reading a per-turn context flag
+            # that late is the §4CC R1 shape (a background read of state
+            # that by then belongs to the next request).
+            _selfhood_origin_ok = False
+            try:
+                _selfhood_origin_ok = turn_origin(self.context) == "user"
+            except Exception:  # noqa: BLE001 — gate closed on any doubt
+                _selfhood_origin_ok = False
             # spawn_bg: strong ref + warning-level failure logging + shutdown
             # drain — a GC'd or silently-failed backfill loses the corpus
             # outcome with no trace (same rule as the user-correction path).
@@ -10164,6 +10662,71 @@ class GhostAgent:
                         cached.failure_reason = ""   # incoherent otherwise
                     elif reason and not (cached.failure_reason or ""):
                         cached.failure_reason = reason
+                # THE DIARY FOLLOWS THE CORPUS (queue #7, 2026-08-21).
+                # Until now the autobiographical log was verdict-backfilled
+                # ONLY from finalize's inline `verifier_backfill` leg — i.e.
+                # only on turns where the bounded in-loop await happened to
+                # win its 25s race against the critic. Measured on the live
+                # store: 385 of 386 labelled diary records came from that
+                # race (the 386th from the user-correction hook), while THIS
+                # path — ~85% of all production verdicts — and 100% of human
+                # labels never reached the diary at all. So the agent's
+                # memory of its own past was verdict-blind by architecture,
+                # and §4CC's mood streak was reading a diary whose newest
+                # verdict was 5 days old on a box that had verdicts daily.
+                #
+                # Deliberately AFTER the corpus write returned accepted, and
+                # writing the outcome the corpus ACCEPTED: the authority
+                # ladder (human label, bench oracle, the shape rule above)
+                # then lives in exactly ONE place instead of being re-stated
+                # here — a second copy of a priority ladder is this
+                # project's signature defect, and the diary has no
+                # source-rank of its own to arbitrate with.
+                _diary_took_it = False
+                if _selfhood_origin_ok:
+                    try:
+                        from ..selfhood import SelfModel as _SelfModelLate
+                        _sm_late = getattr(self.context, "self_model", None)
+                        # ⚠ THE WINDOW THIS FOLLOWER STILL HAS (2026-08-21
+                        # review): the corpus write and this one are two
+                        # separate awaits, so a human label can land in the
+                        # gap — the collector said yes microseconds before
+                        # the human spoke, and writing anyway would leave
+                        # the diary carrying a machine verdict the corpus
+                        # no longer does, overruling the human in the
+                        # agent's own memory. Re-ask the COLLECTOR (its own
+                        # ever-human check, mtime-cached, whose stale
+                        # direction is deliberately the safe one) instead of
+                        # restating any authority rule here. Reaching this
+                        # line with a human label present means exactly that
+                        # race: an earlier label would have come back
+                        # "withheld" above, since this path always passes
+                        # yield_to_human=True.
+                        _human_spoke_late = False
+                        try:
+                            _hl = getattr(collector, "has_human_label", None)
+                            if callable(_hl):
+                                _human_spoke_late = bool(
+                                    await asyncio.to_thread(
+                                        _hl, trajectory_id))
+                        except Exception:  # noqa: BLE001 — absent check ≠ veto
+                            _human_spoke_late = False
+                        if (isinstance(_sm_late, _SelfModelLate)
+                                and getattr(_sm_late, "enabled", False)
+                                and not _human_spoke_late):
+                            # to_thread: at the diary's steady-state byte cap
+                            # this is a full-file read+rewrite (~1MB live) —
+                            # inline it stalls every concurrent SSE stream.
+                            _diary_took_it = bool(await asyncio.to_thread(
+                                _sm_late.record_outcome,
+                                trajectory_id, outcome,
+                                failure_reason=reason,
+                            ))
+                    except Exception as _sfe:  # noqa: BLE001 — never break
+                        logger.debug(
+                            "late selfhood outcome backfill skipped: %s: %s",
+                            type(_sfe).__name__, _sfe,
+                        )
                 # ⚠ CALIBRATION CORRECTION on the late path (§4L Lens-A
                 # MAJOR-1) — moved INSIDE the write result (R3 review):
                 # a source-rank supersession must not book a verdict the
@@ -10182,10 +10745,16 @@ class GhostAgent:
                             _ct.record_late_verdict_correction(_rid, 1.0)
                 except Exception:  # noqa: BLE001 — never break the writer
                     pass
+                # Says WHICH stores took it (§LOG: report only when it
+                # WORKS). "corpus + diary" vs "corpus" is the falsifiable
+                # difference between the queue-#7 leg running and a diary
+                # that has no row for this turn — the whole defect it fixes
+                # was a write path nothing in the stream ever contradicted.
                 pretty_log(
                     "Verifier",
-                    f"late verdict backfilled into the corpus: trajectory "
-                    f"{trajectory_id[:8]} → {outcome}",
+                    f"late verdict backfilled into the "
+                    f"{'corpus + diary' if _diary_took_it else 'corpus'}: "
+                    f"trajectory {trajectory_id[:8]} → {outcome}",
                     icon=Icons.VERIFIER_LAB,
                 )
             _glog.spawn_bg(_write_then_apply(),
@@ -11770,6 +12339,159 @@ class GhostAgent:
 
         return tool_calls, ui_content, parse_failure_reason
 
+    # ── §4CL I1: the Imagine PRE-FLIGHT STEER ───────────────────────────
+    #: Per-request cap on deferrals. The rule is "one revision per call,
+    #: then dispatch whatever comes back" — but a model that revises into
+    #: a SECOND flagged call would chain, and a turn that spends its
+    #: budget being steered has been steered into a wall. Two is enough
+    #: to be useful and small enough that a mis-firing gate costs a turn,
+    #: not a session.
+    _IMAGINE_PREFLIGHT_MAX_PER_REQUEST = 2
+
+    #: How many requests' deferral budgets are remembered. Same
+    #: bounded-ring discipline as every other per-request cache here;
+    #: a plain dict on a long-lived process grows forever.
+    _IMAGINE_PREFLIGHT_RING = 16
+
+    #: Marker the deferral message starts with. It is a SYNTHETIC result
+    #: (the call never executed), so it must be recognisable as one to
+    #: `foresight.is_synthetic_result` — a never-executed call carries no
+    #: transition information, and seeding on it would teach the index
+    #: from calls that never happened.
+    IMAGINE_PREFLIGHT_MARKER = "SYSTEM PREFLIGHT — imagine:"
+
+    def _imagine_preflight_note(self, fname: str, t_args: dict,
+                                a_hash: str, req_id: str):
+        """Return the deferral message for a call the precedent index says
+        will fail, or ``None`` to dispatch normally.
+
+        Today the `foresight_note` arm appends precedent to a result AFTER
+        the call has already failed. This moves the same knowledge BEFORE
+        dispatch: the call is not run, the model is told what happened the
+        last N times, and it gets one chance to revise.
+
+        Five gates, in cost order — the cheap ones first so a disabled
+        deployment pays almost nothing per call:
+
+          1. `GHOST_IMAGINE` master + `GHOST_IMAGINE_PREFLIGHT`;
+          2. the per-request cap and the once-per-args guard, so a
+             deferral can never become a loop;
+          3. `imagination.gate_allows(tool, tclass)` — the measured
+             allow-list. It is CLOSED on every bucket today, which makes
+             this whole path inert by construction; that is the design,
+             not an oversight (see §4CL I0);
+          4. the precedent itself must be strong: exact/class basis,
+             support ≥ 3, ≥ 2 real precedent failures, p(fail) ≥ 0.5, and
+             a non-empty error head to actually tell the model;
+          5. the experiment arm. CONTROL dispatches normally and is
+             still `mark_trigger`ed, so the two arms' trigger rates are
+             comparable — the metric only means something on the
+             TRIGGERED subset.
+
+        Never raises: a steer that breaks a turn is worse than no steer.
+        """
+        try:
+            if os.getenv("GHOST_IMAGINE", "0").strip().lower() not in (
+                    "1", "true", "yes", "on"):
+                return None
+            if os.getenv("GHOST_IMAGINE_PREFLIGHT", "1").strip().lower() in (
+                    "0", "false", "no", "off"):
+                return None
+
+            # Loop guard, both halves. Per-request state lives on the
+            # TurnState-scoped dict below, keyed by request so two
+            # conversations cannot consume each other's budget.
+            # An empty req_id means "no request context" — every such
+            # caller would otherwise SHARE one bucket, which exhausts
+            # after two deferrals and then disables the steer for all of
+            # them forever. No request identity, no steer.
+            if not str(req_id or "").strip():
+                return None
+            from collections import OrderedDict as _OD
+            seen = getattr(self, "_imagine_preflight_seen", None)
+            if not isinstance(seen, _OD):
+                seen = _OD()
+                self._imagine_preflight_seen = seen
+            bucket = seen.get(req_id)
+            if bucket is None:
+                bucket = set()
+                seen[req_id] = bucket
+            seen.move_to_end(req_id)
+            # Bounded like every other per-request ring in this file: the
+            # process is long-lived and this dict is never otherwise
+            # cleared.
+            while len(seen) > self._IMAGINE_PREFLIGHT_RING:
+                seen.popitem(last=False)
+            if a_hash in bucket:
+                return None          # already revised once — let it run
+            if len(bucket) >= self._IMAGINE_PREFLIGHT_MAX_PER_REQUEST:
+                return None
+
+            from .foresight import (
+                call_target as _ct, predict_for_call as _predict,
+                target_class as _tclass,
+            )
+            from .imagination import gate_allows as _gate_allows
+
+            op = str(t_args.get("operation") or t_args.get("action") or "")
+            target = _ct(fname, op, t_args)
+            tclass = _tclass(fname, op, target)
+            if not _gate_allows(fname, tclass):
+                return None
+
+            # `simulation=True`: this prediction is never resolved (the
+            # call does not run), and a stray resolve must not be able to
+            # write a synthetic transition into the production index.
+            pred = _predict(tool=fname, operation=op, target=target,
+                            simulation=True)
+            if pred is None or pred.basis not in ("exact", "class"):
+                return None
+            # ⚠ ONE definition of "the population a steer acts on",
+            # shared with the gate that certifies it. The gate's
+            # precision is computed over exactly the rows this predicate
+            # accepts; a second copy of these floors here is how the
+            # measured population and the steered population drift apart
+            # (§4CL R2 M3). `claims_failure` inside it is the strict
+            # majority on raw counts — `p_fail >= 0.5` admits the exact
+            # tie, which measured BELOW the base failure rate.
+            from .imagination import is_steerable_row as _steerable
+            if not _steerable({"basis": pred.basis,
+                               "support": pred.support,
+                               "fails": pred.fails,
+                               "p_fail": pred.p_fail,
+                               "pred_err": pred.predicted_error}):
+                return None
+
+            from . import experiments as _exp
+            arm = _exp.arm_for(self.context, "imagine_preflight",
+                               str(req_id or ""))
+            if not arm:
+                return None
+            treat = (arm == _exp.TREATMENT)
+            _exp.mark_trigger(self.context, str(req_id or ""),
+                              "imagine_preflight_fired", treat)
+            if not treat:
+                return None          # control: dispatch, unchanged
+
+            bucket.add(a_hash)
+            pretty_log(
+                "Imagine Pre-Flight",
+                f"{fname}: deferred — {pred.fails}/{pred.support} "
+                f"{pred.basis}-precedent failures; asking for a revision",
+                icon=Icons.IMAGINE)
+            return (
+                f"{self.IMAGINE_PREFLIGHT_MARKER} this call was NOT run. "
+                f"{pred.fails} of {pred.support} similar past '{fname}' "
+                f"calls ({pred.basis} precedent) failed like this; most "
+                f"common error: {pred.predicted_error[:160]}. Revise this "
+                f"call to address that cause, or re-issue it unchanged and "
+                f"state why it will succeed this time — the re-issue will "
+                f"be dispatched."
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("imagine pre-flight skipped: %s", exc)
+            return None
+
     async def _dispatch_and_process_tool_batch(self, ts: "TurnState") -> bool:
         """The tool guard / dispatch / result pipeline — one whole turn's
         tool batch: preamble-rollback bookkeeping, per-tool pre-flight
@@ -12456,6 +13178,35 @@ class GhostAgent:
                             )
                             last_was_failure = True
                             continue
+
+                    # ── §4CL I1: the Imagine PRE-FLIGHT STEER. Sibling of
+                    # the repeat-failure guard above, and deliberately
+                    # placed here rather than in the foresight predict
+                    # loop below: by that point the coroutine already
+                    # exists, and "do not dispatch" would mean closing an
+                    # un-awaited coroutine and threading a second kind of
+                    # placeholder through the dedup machinery. Here it is
+                    # the same shape every other pre-dispatch rejection
+                    # already uses — emit a synthetic tool message and
+                    # `continue`, which returns control to the model for
+                    # the revision.
+                    #
+                    # NOT a failure: `execution_failure_count` and
+                    # `last_was_failure` are deliberately untouched. A
+                    # deliberate steer that counted as a strike would
+                    # spend the turn's error budget on its own advice.
+                    _im_note = self._imagine_preflight_note(
+                        fname, t_args, a_hash,
+                        request_id_context.get() or "")
+                    if _im_note:
+                        _im_msg = {"role": "tool",
+                                   "tool_call_id": tool["id"],
+                                   "name": fname, "content": _im_note}
+                        messages.append(_im_msg)
+                        tools_run_this_turn.append(
+                            {**_im_msg, "_synthetic": True})
+                        continue
+
                     try:
                         # Wrap in a timing shim so each tool's wall-clock
                         # duration lands in tool_durations[idx] (parallel to

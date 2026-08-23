@@ -59,10 +59,16 @@ def _mandatory_tor_requested() -> bool:
         argv = list(sys.argv)
     except Exception:
         argv = []
-    if "--no-mandatory-tor" in argv:
-        return False
-    if "--mandatory-tor" in argv:
-        return True
+    # LAST occurrence wins, matching argparse's BooleanOptionalAction —
+    # main.py resolves the same pair the other way round, so a command
+    # line carrying both (the launcher passes `--mandatory-tor` and then
+    # appends "$@") resolved to fail-closed Tor with HF still ONLINE,
+    # which is precisely the hole this module exists to close.
+    for token in reversed(argv):
+        if token == "--no-mandatory-tor":
+            return False
+        if token == "--mandatory-tor":
+            return True
     env = os.environ.get("GHOST_MANDATORY_TOR", "").lower()
     if env in ("0", "false", "no"):
         return False

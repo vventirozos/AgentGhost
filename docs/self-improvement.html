@@ -230,6 +230,16 @@ idle 1..10s   …and round again, forever</code></pre>
     <dd>The post-mortem defect queue, if you have post-mortems enabled.</dd>
   </dl>
 
+  <h2 id="no-power">The second failure mode: a verdict with no power behind it</h2>
+  <p>Silence is the failure mode above. This is its twin, and it is harder to spot because it produces <em>output</em>: a measurement that reads like a result but could not have come out any other way.</p>
+  <p>Two of them were live until 2026-08-21, both on the instruments every keep/kill decision here rests on:</p>
+  <ul>
+    <li><strong>"no difference detected yet" on every randomized arm.</strong> True, and unfalsifiable. Measured across the whole live board, each arm's confidence interval was <em>two to six times wider</em> than the largest improvement the metric could physically make — <code>failure_rate</code> sat at 0.203 with a half-width of 0.367, so the rate would have had to fall below zero to be called. Five arms × two quality metrics reading "no difference" looks like evidence the features don't help. It was the instrument having no power. The report now says so, names the ceiling it cannot clear, and gives the sample size at which an improvement verdict first becomes possible.</li>
+    <li><strong>"Brier beats the base-rate predictor" on the confidence model.</strong> The comparison used a 1e-6 tolerance, which makes any numerical wobble a victory. The live model beat the base rate by 0.00108 — and the 95% paired-bootstrap interval on that delta is [−0.00246, +0.00017], straddling zero. The verdict now follows the interval and reads "is INDISTINGUISHABLE from the base-rate predictor", with the interval shown beside it.</li>
+  </ul>
+  <p>A third instrument was dead in the other direction. The arm-stamp coverage alarm exists so that a broken stamp can't hide, but its denominator was every user turn ever recorded — most of them from before the framework shipped — so a <em>total</em> stamp outage would have moved the headline from 16.8% to about 16.3%, under an "under half" warning that had been permanently on. It now reports a trailing window beside the lifetime figure, and the window is the one that raises the alarm.</p>
+  <p><strong>The general rule this leaves behind:</strong> absence of evidence is evidence of absence only when the design could have found something. Any instrument that reports a null result should be able to tell you what it <em>would</em> have taken to see one.</p>
+
   <div class="note warn">
     <strong>The characteristic failure mode here is silence.</strong> A learning pass that has stopped running looks exactly like a learning pass with nothing to do — both produce no output. If you want to know whether this machinery is alive, check <code>biological_watchdog_alive</code> on the health endpoint and ask for the activity ledger. Don't infer it from the absence of errors.
   </div>

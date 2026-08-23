@@ -380,8 +380,9 @@ def verify_confidence_sequence():
     print("\n[6] anytime-valid confidence sequence — the verdict instrument")
     import math as _m
 
-    from ghost_agent.core.experiments import (MetricComparison, _MIN_VERDICT_N,
-                                              _regularised_sigma, asymp_cs_radius)
+    from ghost_agent.core.experiments import (
+        MetricComparison, _MIN_VERDICT_N, _regularised_sigma,
+        asymp_cs_radius, n_for_detectable)
 
     rnd = random.Random(20260809)   # fixed: this section must be reproducible
 
@@ -552,6 +553,53 @@ def verify_confidence_sequence():
                     wrong.append((lo, hi, lib, v))
     check("verdict table: a winner only when the CS excludes zero",
           not wrong, f"12 sign arrangements enumerated; {len(wrong)} wrong", "E")
+
+    # THE POWER STATE (queue #8, 2026-08-21). The table above uses metric "m",
+    # which is not a RATE, so it never reaches the power branch — the state
+    # that distinguishes "no effect" from "this design cannot show one". It
+    # must be exhaustive over the same straddling arrangements for a bounded
+    # rate, or a straddling interval on a real metric could return something
+    # the table never enumerated.
+    powerless, powered = [], []
+    for lo, hi in [(-0.4, 0.4), (-0.3, 0.3), (-0.02, 0.02)]:
+        v = MetricComparison(metric="failure_rate", lower_is_better=True,
+                             control_mean=0.2, treatment_mean=0.2,
+                             control_n=99, treatment_n=99, diff=0.0,
+                             diff_lo=lo, diff_hi=hi,
+                             arm_alpha=0.00625).verdict
+        half = (hi - lo) / 2.0
+        # half >= 0.2 -> the interval cannot fit inside the achievable
+        # improvement, so the verdict must say so; below it, the ordinary
+        # "no difference" reading is the honest one.
+        if half >= 0.2 and not v.startswith("NO POWER"):
+            powerless.append((lo, hi, v))
+        if half < 0.2 and v != "no difference detected yet":
+            powered.append((lo, hi, v))
+    floor_v = MetricComparison(metric="failure_rate", lower_is_better=True,
+                               control_mean=0.0, treatment_mean=0.0,
+                               control_n=99, treatment_n=99, diff=0.0,
+                               diff_lo=-0.1, diff_hi=0.1,
+                               arm_alpha=0.00625).verdict
+    check("verdict table: 'no power' is claimed exactly when the interval "
+          "cannot fit the achievable improvement",
+          not powerless and not powered
+          and floor_v.startswith("no improvement is POSSIBLE"),
+          f"3 widths x rate metric; {len(powerless) + len(powered)} wrong; "
+          f"floor case -> {floor_v.split(' —')[0]!r}", "E")
+
+    # The power ANSWER must agree with the radius the operator is reading —
+    # a separately-derived power formula would be a second copy of the
+    # estimator, which is this project's signature defect.
+    _p = 0.203
+    _n = n_for_detectable(_p, _p, alpha=0.00625)
+
+    def _hw(k):
+        ones = int(round(_p * k))
+        return 2.0 * asymp_cs_radius([1.0] * ones + [0.0] * (k - ones),
+                                     alpha=0.00625)
+    check("n_for_detectable agrees with the real radius at n and n-1",
+          _n is not None and _hw(_n) < _p <= _hw(_n - 1),
+          f"n={_n}: half-width {_hw(_n):.4f} < {_p} <= {_hw(_n - 1):.4f}", "D")
 
 
 def main() -> int:

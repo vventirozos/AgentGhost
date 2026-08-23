@@ -1525,19 +1525,59 @@ def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[st
                 checks.append(f"{name}: up"
                               + (f" · port {port} reachable" if port else ""))
     else:
-        deliverables = store.list_deliverables(project_id)
-        proj = store.get_project(project_id) or {}
-        ws = Path(str(proj.get("workspace_dir") or ""))
-        missing = [p for p in deliverables if not (ws / p).is_file()]
-        if not deliverables:
+        if not store.list_deliverables(project_id):
             ok = False
             checks.append("no services registered AND no deliverables — "
                           "nothing to release")
-        elif missing:
+
+    # ── deliverables must EXIST, whether or not the project has services ──
+    # Two defects fixed here on operator instruction (2026-08-22):
+    #
+    # 1. THE CHECK ONLY RAN WHEN THERE WERE NO SERVICES. It lived in the
+    #    `else` above, so any project with a registered service was released
+    #    without its deliverables ever being looked at — the service half and
+    #    the file half were mutually exclusive when both are part of "is this
+    #    thing actually shippable".
+    #
+    # 2. IT STATTED THE RAW PAYLOAD. Some rows carry the redundant
+    #    `projects/<id>/` prefix (pre-2026-07-20 registrations), so
+    #    `ws / payload` resolved to `<ws>/projects/<id>/…` and read as
+    #    MISSING. Measured on the live WebOS project: the raw check called 3
+    #    deliverables missing, two of which — `index.html` and `server.js`,
+    #    the project's actual output — are right there. That is a permanent
+    #    FALSE block whose documented repair (`unregister_file`) would have
+    #    told the operator to delete the registration of a file that exists.
+    #    `missing_deliverables` normalises through the same path contract
+    #    registration uses and reports the one genuinely absent file.
+    # ⚠ A RELEASE GATE MUST BE CONSERVATIVE, and `missing_deliverables` is
+    # deliberately NOT: it returns nothing when the whole workspace is absent,
+    # because "the directory is gone" is not evidence about individual files
+    # and flagging all of them would bury a real single-file loss. That is the
+    # right call for the briefing and the WRONG one here — measured before
+    # this guard: deleting the entire workspace made the rehearsal report
+    # "all 1 deliverable(s) present" and PASS. The most complete failure
+    # available read as full success.
+    _delivs = store.list_deliverables(project_id)
+    if _delivs:
+        _ws_dir = Path(str((store.get_project(project_id) or {}).get(
+            "workspace_dir") or ""))
+        if not _ws_dir or not _ws_dir.is_dir():
             ok = False
-            checks.append(f"deliverable(s) missing on disk: {missing[:5]}")
-        else:
-            checks.append(f"all {len(deliverables)} deliverable(s) present")
+            checks.append(
+                f"{len(_delivs)} deliverable(s) recorded but the project "
+                f"workspace does not exist: {_ws_dir or '(unset)'}")
+    _missing = sorted(store.missing_deliverables(project_id))
+    if _missing:
+        ok = False
+        checks.append(
+            f"deliverable(s) recorded but NOT on disk: {_missing[:5]}"
+            + (f" (+{len(_missing) - 5} more)" if len(_missing) > 5 else "")
+            + " — restore the file(s), or drop the stale record with "
+              "manage_projects action=unregister_file")
+    elif store.list_deliverables(project_id):
+        checks.append(
+            f"all {len(store.list_deliverables(project_id))} "
+            f"deliverable(s) present")
     return {"ok": ok, "services": services, "checks": checks,
             "detail": "; ".join(checks)}
 
@@ -1601,6 +1641,12 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         deliverables = store.list_deliverables(project_id)[:20]
     except Exception:
         deliverables = []
+    try:
+        _missing_deliverables = {
+            p for p in store.missing_deliverables(project_id)
+            if p in deliverables}
+    except Exception:
+        _missing_deliverables = set()
     # File manifest (2026-07-24): per-file descriptions, additive key so
     # existing consumers of `deliverables` (bare paths) are untouched.
     try:
@@ -1645,6 +1691,12 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         ],
         "recent_work_log": work_log,
         "deliverables": deliverables,
+        # A registered deliverable is a CLAIM (queue #10): nothing verifies
+        # the file exists at registration and nothing reconciles later. The
+        # prompt briefing marks the gone ones ⚠ MISSING and points the reader
+        # HERE for detail — so this view has to carry the same warning, or
+        # the model walks from the caveat straight to an unqualified list.
+        "deliverables_missing": sorted(_missing_deliverables),
         "file_map": file_map,
         # RELEASED runbook (2026-07-25): present only on released projects —
         # the operational directions the resume/run flow leads with.
@@ -3532,7 +3584,18 @@ async def tool_manage_projects(
                 f"Apply requested changes (fork of {base_title} "
                 f"v{new_version - 1})")
             seed_tid = store.add_task(new_pid, seed_desc)
+            # Skip claims whose file is not in the SOURCE (queue #10): a fork
+            # copies files, so a registration for a path that was never there
+            # protects nothing — and re-registering it propagates the phantom
+            # into the child, where the briefing asserts it all over again.
+            # Phantom claims compound across forks otherwise.
+            try:
+                _src_missing = store.missing_deliverables(project_id)
+            except Exception:
+                _src_missing = set()
             for rel_path in store.list_deliverables(project_id):
+                if rel_path in _src_missing:
+                    continue
                 try:
                     store.register_file_artifact(seed_tid, rel_path)
                 except Exception:
@@ -3787,7 +3850,16 @@ async def tool_manage_projects(
             seed_tid = store.add_task(
                 new_pid, " ".join((description or "").split())
                 or f"Adapt the clone of '{src.get('title')}' to its new purpose")
+            # Same as the fork path (queue #10): do not copy a claim whose
+            # file is not in the source — it protects nothing and propagates
+            # a phantom deliverable into the clone.
+            try:
+                _src_missing = store.missing_deliverables(project_id)
+            except Exception:
+                _src_missing = set()
             for rel_path in store.list_deliverables(project_id):
+                if rel_path in _src_missing:
+                    continue
                 try:
                     store.register_file_artifact(seed_tid, rel_path)
                 except Exception:

@@ -176,6 +176,41 @@
   <code>last_dream_digest</code> keys. Covered by
   <code>tests/test_project_readside_plumbing.py</code>.</p>
 
+  <h2>Release blocks on a missing deliverable (2026-08-22, operator decision)</h2>
+  <p>The item queue&nbsp;#10 left open: the release dossier listed deliverables without checking they exist. The rehearsal <em>did</em> have a "deliverable(s) missing on disk" check — with two defects that made it both leaky and, on some projects, permanently wrong:</p>
+  <ul>
+    <li><strong>It only ran when the project had NO services.</strong> The check sat in the <code>else</code> of the service branch, so any project with a registered service was released without its files being looked at. Both halves are part of "is this shippable"; they are no longer mutually exclusive.</li>
+    <li><strong>It statted the raw payload.</strong> Rows carrying the redundant <code>projects/&lt;id&gt;/</code> prefix resolved to <code>&lt;ws&gt;/projects/&lt;id&gt;/…</code> and read as missing. Measured on the live WebOS project: 3 reported missing, two of which — <code>index.html</code> and <code>server.js</code>, its actual output — are present. That is a <em>permanent false block</em>, and its documented repair (<code>unregister_file</code>) would have had the operator delete the registration of a file that exists. The check now goes through <code>missing_deliverables()</code>, which normalises via the same path contract registration uses.</li>
+  </ul>
+  <p>A third hole appeared while attacking the fix: <code>missing_deliverables()</code> deliberately reports <em>nothing</em> when the whole workspace directory is absent — correct for the briefing, since a missing directory is not evidence about individual files, and badly wrong for a release gate. Deleting the entire workspace made the rehearsal report <em>"all 1 deliverable(s) present"</em> and pass. A release gate has to be conservative, so registered deliverables plus a non-existent workspace is now its own refusal.</p>
+  <p>The refusal names the repair (restore the file, or drop the stale record with <code>unregister_file</code>) — a block with no way forward is what stranded a project permanently the last time. Both live released projects re-pass the gate unchanged, and <code>action=release</code> remains the only path to <code>RELEASED</code>: <code>update</code> refuses the status outright, so the gate cannot be walked around.</p>
+
+  <h2>Release immutability leaked through four operations (2026-08-21, queue&nbsp;#12)</h2>
+  <p>A <code>RELEASED</code> project is human-attested and immutable, and the enforcement is deliberately not advisory: the briefing steers, but the agent's measured failure mode is regressing working artifacts, so <code>file_system</code>'s write path itself refuses. It refused from a <strong>deny-list of guarded operations</strong> — <code>("write", "replace", "delete", "move", "append")</code> — and a deny-list leaks exactly the way you would expect. Reproduced against a real released project:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Operation</th><th>Before</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>write</code></td><td>blocked</td><td>listed</td></tr>
+      <tr><td><code>copy</code></td><td><strong>allowed</strong></td><td>not listed at all</td></tr>
+      <tr><td><code>rename</code></td><td><strong>allowed</strong></td><td>the dispatcher accepts <code>["rename", "move"]</code>; only <code>move</code> was listed, so one alias of the SAME branch was guarded and the other open</td></tr>
+      <tr><td><code>download</code></td><td><strong>allowed</strong></td><td>not listed; would write a fetched file straight in</td></tr>
+      <tr><td><code>move</code></td><td><strong>allowed</strong></td><td>listed, but the guard read <code>path or filename or destination</code> — and <code>path</code> holds the SOURCE, so moving INTO a release was never inspected</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three of those four landed files inside the released workspace in a live reproduction. The guard is now an <strong>allow-list of read-only operations</strong> (<code>read</code>, <code>read_chunked</code>, <code>inspect</code>, <code>search</code>, <code>find</code>, and the seven <code>list</code> aliases) — everything else is checked, so a newly-added mutating operation is guarded by default instead of being forgotten. Every candidate target is inspected rather than the first one that happens to be set, which is what closes the move/copy destination hole. Reads of a released project stay open; over-blocking would make the guarantee useless in the other direction, and that is pinned too.</p>
+
+  <h2>A registered deliverable is a CLAIM, and the briefing said FACT (2026-08-21, queue&nbsp;#10)</h2>
+  <p><code>register_file_artifact</code> records a path. It normalises that path carefully — that part has its own incident history — but it never checks that a file is there, and nothing reconciles afterwards. The list is then rendered into every project briefing as <em>"DELIVERABLES (N file(s) the project built)"</em>, so an unverified claim reaches the model as an assertion, and the model will cite files it never produced.</p>
+  <p>Measured on the live store: <strong>3 of 66 registered deliverables did not exist</strong> — and none of them had been removed by the cleanup sweep. Every <code>workspace_tidy</code> event on that box deleted only debris (<code>.browser_runner.py</code>, <code>__pycache__</code>, screenshots), which is what ruled the sweep out as the cause.</p>
+  <p>The record is deliberately <strong>not</strong> rewritten: a file can legitimately be deleted after the fact, and the claim is audit data. The READ path learns to be honest instead — the same shape as the selfhood mood's staleness TTL and the diary's follow-the-corpus rule:</p>
+  <ul>
+    <li><code>ProjectStore.missing_deliverables()</code> stats each registered path <em>through the same normaliser registration uses</em>. That matters: some stored payloads carry the redundant <code>projects/&lt;id&gt;/</code> prefix (rows written before the 2026-07-20 fix), and comparing the raw payload against disk reported three <em>present</em> files as missing, including a project's actual <code>index.html</code>. Marking a real file MISSING is a worse lie than the one being fixed.</li>
+    <li>The prompt briefing counts them in the header and marks each one <code>⚠ MISSING</code> <em>next to the path</em> — not after 110 characters of description, where the warning is one the reader has already skipped. A missing file is never comma-packed with the present ones, because that packed line reads as a list of things that exist.</li>
+    <li>The tool briefing carries <code>deliverables_missing</code>, since the prompt header points the model at <code>artifact_list</code> for detail — otherwise the reader walks from the caveat straight to an unqualified list.</li>
+    <li><code>fork</code> and <code>clone</code> stop re-registering a claim whose file is not in the source. Registration there exists to put COPIED files in the child's keep-set; a path that was never there protects nothing, and copying it propagates the phantom into a new project. Phantoms compounded across forks otherwise.</li>
+  </ul>
+  <p>Unknown is never reported as missing: with no sandbox root configured, or a workspace directory that is gone entirely, the check returns nothing rather than flagging every deliverable — a checker that cannot see the disk must not bury a real single-file loss in noise.</p>
+
   <h2><code>cleanup</code> — tidy the workspace on demand (2026-07-18)</h2>
   <p><code>action=cleanup</code> runs the recurring tidy
   (<a href="../core/workspace_cleanup.html">workspace_cleanup.tidy_project_workspace</a>)

@@ -1,0 +1,10 @@
+--- a/src/ghost_agent/tools/execute.py
++++ b/src/ghost_agent/tools/execute.py
+@@ -467,6 +467,7 @@ def _looks_like_file_not_found(out) -> bool:
+         return False
+     return (
+         "can't open file" in o
++        or "no supported javascript runtime could be found" in o
+         or "no such file or directory" in o
+         or "cannot find" in o
+         or "not found" in o and ".py" in o

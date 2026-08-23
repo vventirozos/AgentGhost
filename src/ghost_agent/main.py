@@ -904,7 +904,19 @@ async def _reap_sandbox_jobs(context):
             sup = get_job_supervisor(getattr(context, "sandbox_manager", None))
             if sup is None:
                 continue
-            changed = await asyncio.to_thread(sup.reap)
+            # Land any finished jobs (state writes are durable)...
+            await asyncio.to_thread(sup.reap)
+            # ...then drain the transitions NOBODY HAS REPORTED YET, which is
+            # not the same set (queue #9). `reap()` hands each transition to
+            # whoever called it, once; three of its four callers drop that
+            # value — `_sync_sandbox_jobs` records but never wakes, and the
+            # two inside register/promote discard it entirely. Draining the
+            # durable marker instead means a landing observed during a tool
+            # call still reaches the ledger AND still wakes the model, and
+            # survives a restart in between. Measured before this: 6 landed
+            # jobs, 0 wakes, and the wake loop is what makes promoting at 90s
+            # instead of 600s safe.
+            changed = await asyncio.to_thread(sup.take_unreported)
             for entry in changed:
                 _line = (
                     f"{entry.get('id')} {entry.get('state')}"
@@ -918,9 +930,10 @@ async def _reap_sandbox_jobs(context):
             # …and into the ACTIVITY LEDGER, so it is answerable later. The
             # operator's live stream is watched, not queried; without this a
             # job that landed while nobody was looking is visible nowhere
-            # except a `jobs` call the model has no reason to make. Shared
-            # with the `jobs` tool's own reconcile, since either can be the
-            # one that observes a transition.
+            # except a `jobs` call the model has no reason to make. ONE owner
+            # now (queue #9): reporting used to belong to whoever called
+            # `reap()` first, which is why a landing observed during a tool
+            # call reached the ledger but never woke anything.
             from .tools.delegate import record_landings
             record_landings(context, changed)
             # …and WAKE THE MODEL. This is the half that makes promoting at
@@ -929,8 +942,23 @@ async def _reap_sandbox_jobs(context):
             # would end the turn and strand the work until the operator
             # spoke again. With it, the model gets its result either way —
             # just asynchronously — and keeps going on its own.
-            for entry in changed:
-                await _resume_after_job(context, entry)
+            # THE WAKE IS DRAINED SEPARATELY, and stamped only once it is
+            # actually delivered (R2). A wake DEFERS whenever a turn is
+            # already in flight; consuming the marker on read meant a
+            # deferred wake was lost for ever — the same defect this pass
+            # fixes, re-created inside the fix. `pending_wakes()` selects
+            # without stamping, so a deferral simply returns next tick.
+            for entry in await asyncio.to_thread(sup.pending_wakes):
+                _jid = str(entry.get("id") or "")
+                _ran = await _resume_after_job(context, entry)
+                # Stamp when the wake LANDED, or when it was permanently
+                # declined — the capped and already-woken paths both record
+                # themselves in `_RESUMED_JOBS` before returning False, and
+                # only the DEFERRAL leaves it untouched. Without that
+                # distinction a capped job would be retried every tick for
+                # ever, and a deferred one would never be retried at all.
+                if _ran or _jid in _RESUMED_JOBS:
+                    await asyncio.to_thread(sup.mark_woken, _jid)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — a reaper that dies is worse
@@ -1163,17 +1191,43 @@ async def lifespan(app):
 
     pretty_log("System Boot", "Initializing components", icon=Icons.BOOT_AWAKE)
 
+    # …and the DIRECTORIES an isolated run mounted (§4CL S1). The
+    # container sweep below reclaims a fork's CONTAINER; nothing reclaimed
+    # the fork itself, so every run killed by SIGKILL leaked a temp tree
+    # permanently. Deliberately OUTSIDE the `find_spec("docker")` guard:
+    # forks are plain `mkdtemp` directories and
+    # `isolated_replay_context(with_sandbox=False)` is a supported mode,
+    # so on a docker-less box the leak still happens and the sweep must
+    # still run. Age floor AND owner-liveness, like its sibling.
+    try:
+        from .core.isolation import sweep_fork_workspaces
+        _forks = await asyncio.to_thread(sweep_fork_workspaces)
+        if _forks:
+            pretty_log(
+                "Fork Sweep",
+                f"removed {len(_forks)} stale isolated-run workspace(s)",
+                icon=Icons.DREAM_REPLAY)
+    except Exception as _fwe:  # noqa: BLE001
+        logger.debug("fork sweep skipped: %s", _fwe)
+
     if importlib.util.find_spec("docker"):
         try:
             context.sandbox_manager = DockerSandbox(context.sandbox_dir, context.tor_proxy)
             # §4BO: reap sandboxes orphaned by a kill mid-solve, BEFORE
             # provisioning ours. A `finally` cannot run through SIGKILL,
-            # so those containers survive against a workspace Python has
-            # already deleted and nothing ever looks them up again. Only
-            # containers whose every mount source is gone are removed —
-            # ours mounts $GHOST_HOME/sandbox, which exists, so it can
-            # never match. Never fatal: a sweep failure must not cost a
-            # boot.
+            # so those containers survive against a workspace nothing
+            # will ever look up again.
+            #
+            # ⚠ The criterion is NOT "every mount source is gone" — that
+            # was the FIRST version and it was wrong (a SIGKILL is
+            # exactly the case where the workspace SURVIVES, because
+            # Python cannot run TemporaryDirectory.cleanup). It is the
+            # KIND of workspace: a `tmp*` basename under the system temp
+            # root. Ours mounts $GHOST_HOME/sandbox, which is outside the
+            # temp root, so it can never match — same conclusion, but for
+            # the reason that is actually in the code
+            # (`_is_per_solve_workspace`). Never fatal: a sweep failure
+            # must not cost a boot.
             try:
                 _swept = await asyncio.to_thread(
                     context.sandbox_manager.sweep_orphaned_containers)

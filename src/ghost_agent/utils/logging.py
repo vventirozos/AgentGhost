@@ -456,6 +456,14 @@ class Icons:
     JOB_PROMOTE      = "🏃"   # a sandbox command outran its budget and was
                               # DETACHED as a supervised job instead of killed
                               # (sandbox/jobs.py). Kills/expiries use STOP 🛑.
+    # --- IDE: Imagine / Dream / Evolve (§4CL-§4CN) ---
+    # Deliberately NOT reusing FORESIGHT 🔮: foresight is the shadow
+    # INSTRUMENT (predict → grade → ledger, steers nothing) and Imagine is
+    # its first steering consumer. One glyph for both would make the
+    # operator stream unable to say which one acted.
+    IMAGINE          = "🪄"   # planner: pre-flight steer / candidate ranking
+    DREAM_REPLAY     = "🌀"   # counterfactual replay of a recorded episode
+    EVOLVE           = "🦋"   # archive-based self-evolution of the scaffold
 
 
 logger = logging.getLogger("GhostAgent")

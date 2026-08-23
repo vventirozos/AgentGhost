@@ -223,14 +223,79 @@ def _derive_cluster(text: str) -> Optional[str]:
 
 def _outcome_phrase(outcome: str, failure_reason: str = "") -> str:
     """The trailing clause of a first-person turn summary. Extracted so the
-    capture path and the post-hoc outcome backfill phrase verdicts identically."""
+    capture path and the post-hoc outcome backfill phrase verdicts identically.
+
+    The reason is REDACTED here (2026-08-21 review of queue #7), which is the
+    one place every writer passes through — capture, the inline backfill, the
+    late verdict, a human label, and the reconciler script. It had been the
+    diary's redaction hole: ``capture_turn`` scrubs the quoted user_request
+    at the boundary, but the failure reason went in raw, and the reasons are
+    not the agent's own prose — they are verifier ``issues``/``reasoning``
+    (which quote tool output) and, on the user-correction path, text derived
+    from the USER'S OWN correcting message. The trajectory corpus's sibling
+    writer has always redacted its reason for exactly this ("redaction runs
+    on every write is the package contract"); the diary is the surface that
+    gets read back INTO prompts, so it needed it more, not less. Redact
+    BEFORE the 120-char clip — clipping first can cut a secret in half and
+    leave the pattern unmatchable."""
     out = (outcome or "unknown").lower()
     if out == "passed":
         return "and the answer landed"
     if out == "failed":
-        reason = (failure_reason or "").strip().replace("\n", " ")[:120]
+        reason = redact_pii(
+            (failure_reason or "").strip().replace("\n", " "))[:120]
         return f"and it didn't land: {reason}" if reason else "and it didn't land"
     return "without a verdict either way"
+
+
+# The three verdict clauses `_outcome_phrase` can produce. A backfill has to
+# find whichever one the summary ALREADY carries: patching only the "unknown"
+# clause (all this did until 2026-08-21) leaves a row that was captured
+# FAILED and later upgraded reading "…and it didn't land: <reason>." under
+# `outcome="passed"` — the prose contradicting the field, on the surface the
+# narrative layer and recall actually read. Three such rows exist on the live
+# box from July. The corpus refuses the same incoherence at both ends
+# ("`passed` + a failure reason is an incoherent record"); the diary should
+# not be looser about its own prose.
+_VERDICT_CLAUSE_STARTS = (
+    "without a verdict either way",
+    "and the answer landed",
+    "and it didn't land",
+)
+
+
+def _swap_verdict_clause(summary: str, new_clause: str) -> str:
+    """Replace the summary's existing verdict clause with ``new_clause``.
+
+    The clause is always LAST in the template
+    (``summarise_turn_first_person``), so it runs to the end of the string —
+    which is what makes this safe: a failure reason may itself contain a
+    period ("cannot open file.txt"), and cutting at the first period after
+    the clause start would splice the record. Returns the summary unchanged
+    when it carries no clause at all (rollup records).
+
+    ⚠ Matched from the RIGHT, and that is load-bearing. The summary QUOTES
+    the user's request, so a request containing one of these phrases
+    ("you claimed X and the answer landed but it did not") plants a decoy
+    earlier in the string — and because this rule cuts to the END, a
+    leftmost match does not merely mis-phrase the verdict, it TRUNCATES the
+    record mid-quote and drops the tool phrase entirely. Taking the last
+    match keeps the decoy in the quote where it belongs. (The pre-2026-08-21
+    code substituted the clause in place, so it could mis-phrase but never
+    truncate — this cut-to-end rule is what made leftmost matching
+    dangerous, i.e. the hazard arrived with the fix.) Residual, documented:
+    a failure REASON that itself ends in one of these phrases loses its
+    tail — degraded prose, never a truncated quote, and the reason is being
+    replaced anyway."""
+    best = -1
+    for start in _VERDICT_CLAUSE_STARTS:
+        i = summary.rfind(start)
+        if i > best:
+            best = i
+    if best < 0:
+        return summary
+    tail = "." if summary.rstrip().endswith(".") else ""
+    return summary[:best] + new_clause + tail
 
 
 class AutobiographicalMemory:
@@ -709,14 +774,15 @@ class AutobiographicalMemory:
                         return False  # already correct — nothing to do
                     d["outcome"] = new_outcome
                     # Patch the prose verdict clause too, so recall and the
-                    # narrative read a coherent summary. Only the "unknown"
-                    # clause is fixed text we can swap deterministically.
+                    # narrative read a coherent summary — whichever clause
+                    # the record already carries, not just the "unknown" one
+                    # (see `_swap_verdict_clause`: an upgrade off a captured
+                    # FAILED used to leave the prose contradicting the field).
                     summary = d.get("summary") or ""
-                    stale = "without a verdict either way"
-                    if stale in summary:
-                        d["summary"] = summary.replace(
-                            stale, _outcome_phrase(new_outcome, failure_reason), 1,
-                        )
+                    patched = _swap_verdict_clause(
+                        summary, _outcome_phrase(new_outcome, failure_reason))
+                    if patched != summary:
+                        d["summary"] = patched
                     lines[i] = json.dumps(d, ensure_ascii=False)
                     tmp = self.path.with_suffix(".jsonl.tmp")
                     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")

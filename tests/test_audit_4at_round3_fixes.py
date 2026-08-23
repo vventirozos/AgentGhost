@@ -82,27 +82,21 @@ def test_the_call_site_actually_uses_the_classifier():
 # ── G: simulation must not author real selfhood ─────────────────────────
 
 def _self_play_denylist():
-    """The literal set passed to `disabled_tools.update([...])` in dream.py.
+    """The set self-play denies its temp agent.
 
-    Read via AST rather than a source-window substring search: the first
-    version of this pin sliced 1800 chars after an anchor string and broke the
-    moment a comment grew — a pin that fails for a reason unrelated to the
-    property it guards.
+    ⚠ Read from the MODULE CONSTANT now, not from an AST walk of an
+    inline literal. The literal was extracted to
+    `dream.SELF_PLAY_FORBIDDEN_TOOLS` on 2026-08-22 (§4CM) because
+    `core/isolation.REPLAY_FORBIDDEN_TOOLS` claims to be a superset of
+    it — and while it was a literal, that claim was both FALSE (missing
+    `web_search`/`deep_research`, i.e. real host-process egress) and
+    unfalsifiable, since there was nothing to import.
+
+    This reads what the code actually uses; dream.py asserts the literal
+    it documents and the constant it applies have not drifted.
     """
-    import ast
-    tree = ast.parse(inspect.getsource(DREAM))
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "update"
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "disabled_tools"):
-            for arg in node.args:
-                if isinstance(arg, (ast.List, ast.Set, ast.Tuple)):
-                    return {e.value for e in arg.elts
-                            if isinstance(e, ast.Constant)
-                            and isinstance(e.value, str)}
-    raise AssertionError("disabled_tools.update([...]) not found in dream.py")
+    from ghost_agent.core.dream import SELF_PLAY_FORBIDDEN_TOOLS
+    return set(SELF_PLAY_FORBIDDEN_TOOLS)
 
 def test_self_state_is_denied_to_self_play():
     """`isolated_context.self_model` is the PRODUCTION SelfModel, so a
@@ -126,6 +120,12 @@ def test_self_state_is_denied_to_self_play():
     missing = {t for t in FORBIDDEN_TOOLS if t not in denied}
     assert not missing, (
         f"self-play allows tools its sibling subagent forbids: {sorted(missing)}")
+
+    # …and the constant is actually the set the code applies. Extracting a
+    # literal into a constant is only an improvement if the literal stops
+    # being the thing that runs.
+    src = inspect.getsource(DREAM.Dreamer.synthetic_self_play)
+    assert "disabled_tools.update(SELF_PLAY_FORBIDDEN_TOOLS)" in src
 
 
 # ── C: a string constraint must not shred into characters ───────────────

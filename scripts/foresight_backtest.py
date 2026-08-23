@@ -128,8 +128,8 @@ def iter_replay_rows(trajectories_root: Path = None):
     order — the same guard seeding has, so a stray `archive/` dir can
     never replay as "newest" and break leave-future-out."""
     from ghost_agent.core.foresight import (
-        _DAY_DIR_RE, Foresight, call_target, is_synthetic_result,
-        offline_call_failed)
+        _DAY_DIR_RE, Foresight, _normalize_error_head, call_target,
+        is_synthetic_result, offline_call_failed)
     from ghost_agent.distill.collector import TrajectoryCollector
 
     inst = Foresight()
@@ -167,13 +167,44 @@ def iter_replay_rows(trajectories_root: Path = None):
             pred = inst.predict(tool=tool, operation=op, target=target)
             if pred is None:            # kill switch — nothing to measure
                 return
-            row = {"tool": tool, "op": op, "basis": pred.basis,
-                   "support": pred.support, "ok": ok}
+            # `tclass` is carried so the offline instrument buckets by the
+            # SAME key as the live ledger (§4CL I0: core/imagination.py
+            # keys its per-bucket gate on `(tool, tclass)`). Without it
+            # the replay could only be bucketed by tool, which merges
+            # `file_system` on a .py file with `file_system` on a URL —
+            # a coarser key hides exactly the sub-buckets a gate is for.
+            # `collect()` ignores the field; nothing else changes.
+            # `fails` and `pred_err` join `tclass` for the same reason:
+            # `core/imagination.is_steerable_row` defines the population
+            # a steer would ACT on from exactly these fields, and an
+            # offline instrument that cannot express that population
+            # reports a different statistic than the live one under the
+            # same name. Mirrors `foresight._write_ledger`'s row.
+            row = {"tool": tool, "op": op, "tclass": pred.tclass,
+                   "basis": pred.basis,
+                   "support": pred.support, "fails": pred.fails,
+                   "ok": ok}
+            if pred.predicted_error:
+                row["pred_err"] = pred.predicted_error[:200]
             if pred.p_fail is not None:
                 row["p_fail"] = pred.p_fail
                 row["match"] = (pred.p_fail >= 0.5) == (not ok)
             yield row
-            inst.observe(pred.tool, pred.op, pred.tclass, pred.sig, ok)
+            # ⚠ The ERROR HEAD, not just the outcome. Seeding records it
+            # (`foresight._seed_from_trajectories`) and the live hook
+            # records it (`resolve`); this replay dropped it, so
+            # `predicted_error` was empty on every offline prediction —
+            # and `is_steerable_row` requires a non-empty error head,
+            # because a claim with nothing to tell the model cannot be
+            # acted on. The offline instrument was therefore reporting
+            # ZERO steerable rows on a corpus that has thousands, which
+            # reads as "no signal" rather than as "the instrument cannot
+            # see it".
+            err = ""
+            if not ok:
+                err = _normalize_error_head(
+                    getattr(tc, "error", "") or getattr(tc, "result", ""))
+            inst.observe(pred.tool, pred.op, pred.tclass, pred.sig, ok, err)
 
 
 def collect(rows):
@@ -212,6 +243,168 @@ def collect(rows):
     return stats, basis, cov, brier
 
 
+REGRET_FILENAME = "regret.jsonl"
+
+# ── The consistency ratio's own power ────────────────────────────────
+# Pre-registered bar 0.70 against a null of 0.50 (the estimator below is
+# conditional on exactly one branch passing, so the null IS a coin flip).
+# Exact binomial power, two-sided alpha 0.05:
+#
+#     n discordant   10     20     30     49     80
+#     power         0.149  0.416  0.589  0.803  0.941
+#
+# 49 is the smallest n reaching 80%. Via this project's own anytime-valid
+# instrument (interval must exclude 0.50) it takes ~80. Below the floor
+# the script refuses a verdict rather than printing one: a ratio of 1.000
+# over a single pair is the §4CE "verdict without power" shape, and it
+# would be sitting inside the very feature whose gate module exists
+# because "a subset of 1 with precision 1.00 is not evidence".
+MIN_DISCORDANT = 49
+CONSISTENCY_BAR = 0.70
+CONSISTENCY_NULL = 0.50
+
+# Exit codes. THREE states, not two: "the instrument is not wired yet"
+# and "it is wired and measured nothing" are opposite facts, and a loop
+# or a CI job polls the exit code, not the prose.
+EXIT_CONSISTENCY_PASS = 0
+EXIT_CONSISTENCY_FAIL = 1
+EXIT_CONSISTENCY_UNARMED = 2
+EXIT_CONSISTENCY_UNDERPOWERED = 3
+
+
+def _regret_path() -> Path:
+    return (Path(os.getenv("GHOST_HOME", "")) / "system" / "imagination"
+            / REGRET_FILENAME)
+
+
+def _consistency_report(as_json: bool = False) -> int:
+    """The consistency ratio, or an honest statement that it has no data.
+
+    ⚠ THIS INSTRUMENT IS UNARMED UNTIL §4CL I4 SHIPS. The regret ledger
+    is written by the nightly block that re-executes the REJECTED branch
+    of a past ranking and grades it; until that exists there is nothing
+    to compute a ratio over. It reports that state explicitly rather than
+    printing a number derived from an empty file — a 0.0 or a 1.00 from
+    zero rows is exactly the shape of a measurement nobody can act on.
+
+    Exit codes: 0 = ratio at or above the pre-registered 0.70 bar;
+    1 = below it; 2 = no data (unarmed).
+    """
+    path = _regret_path()
+    rows = []
+    for p in (Path(str(path) + ".1"), path):
+        if not p.exists():
+            continue
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+        except OSError:
+            continue
+
+    graded = [r for r in rows
+              if r.get("chosen_outcome") in ("pass", "fail")
+              and r.get("rejected_outcome") in ("pass", "fail")]
+    # Clustering: several regret pairs can come from ONE trajectory, and
+    # those are not independent (errors compound — the whole reason this
+    # is a trajectory-level metric). Reported so the dependence is
+    # visible; the binomial interval below still assumes independence,
+    # which makes it OPTIMISTIC when the clusters are large.
+    clusters = len({str(r.get("req_id") or r.get("trajectory_id") or i)
+                    for i, r in enumerate(graded)})
+    if not graded:
+        msg = ("consistency ratio: NO DATA — the regret ledger is empty "
+               f"({path}). This instrument is armed by §4CL I4 (the nightly "
+               "block that re-executes a rejected branch and grades it); "
+               "until then Imagine's go/no-go number does not exist and "
+               "must not be substituted for per-step accuracy.")
+        if as_json:
+            print(json.dumps({"instrument": "consistency", "n": 0,
+                              "ratio": None, "armed": False,
+                              "ledger": str(path)}))
+        else:
+            print(msg, file=sys.stderr)
+        return EXIT_CONSISTENCY_UNARMED
+
+    # "The predicted-better branch actually succeeded" — counted only on
+    # DISCRIMINATING pairs. A pair where both branches passed (or both
+    # failed) says nothing about the ranking and would dilute the ratio
+    # toward whatever the base pass rate happens to be.
+    disc = [r for r in graded
+            if r["chosen_outcome"] != r["rejected_outcome"]]
+    right = sum(1 for r in disc if r["chosen_outcome"] == "pass")
+    ratio = (right / len(disc)) if disc else None
+    by_bucket = defaultdict(lambda: [0, 0])
+    for r in disc:
+        b = f"{r.get('tool', '?')}|{r.get('tclass', '')}"
+        by_bucket[b][1] += 1
+        if r["chosen_outcome"] == "pass":
+            by_bucket[b][0] += 1
+
+    # The interval on the ratio, from the project's own instrument.
+    radius = None
+    if disc:
+        try:
+            radius = asymp_cs_radius([1.0 if r["chosen_outcome"] == "pass"
+                                      else 0.0 for r in disc])
+        except Exception:
+            radius = None
+    powered = len(disc) >= MIN_DISCORDANT
+    verdict = ("UNDERPOWERED" if not powered else
+               "PASS" if ratio is not None and ratio >= CONSISTENCY_BAR
+               else "BELOW BAR")
+
+    if as_json:
+        print(json.dumps({
+            "instrument": "consistency", "armed": True,
+            "n_graded": len(graded), "n_discriminating": len(disc),
+            "n_clusters": clusters,
+            "min_discordant": MIN_DISCORDANT,
+            "powered": powered, "verdict": verdict,
+            "ratio": ratio, "ci_radius": radius,
+            "bar": CONSISTENCY_BAR, "null": CONSISTENCY_NULL,
+            "by_bucket": {k: {"right": v[0], "n": v[1]}
+                          for k, v in by_bucket.items()},
+        }))
+    else:
+        print("§4CL I0 — trajectory-level consistency ratio")
+        # DISCORDANT first and largest: it is the effective sample size.
+        # `graded` is bigger and means less, and leading with it is how a
+        # reader mis-scales the bar.
+        print(f"  discordant pairs (the two branches disagreed): "
+              f"{len(disc)}   [the effective n]")
+        print(f"  graded regret pairs: {len(graded)} "
+              f"across {clusters} trajector(ies)")
+        if ratio is None:
+            print("  ratio: — (no pair where the branches disagreed. That "
+                  "is a MEASUREMENT — the ranking never changed an "
+                  "outcome — not an unwired instrument)")
+            return EXIT_CONSISTENCY_UNDERPOWERED
+        _ci = "" if radius is None else f" ±{radius:.3f}"
+        print(f"  ratio: {ratio:.3f}{_ci}   bar {CONSISTENCY_BAR:.2f} "
+              f"against a null of {CONSISTENCY_NULL:.2f}")
+        if not powered:
+            print(f"  VERDICT: UNDERPOWERED — {MIN_DISCORDANT} discordant "
+                  f"pairs are needed for 80% power at this bar; "
+                  f"{MIN_DISCORDANT - len(disc)} more to go. The point "
+                  f"estimate above is not a result.")
+        else:
+            print(f"  VERDICT: {verdict}")
+        for b, (right, n) in sorted(by_bucket.items(),
+                                    key=lambda kv: -kv[1][1]):
+            print(f"    {b:38} {right}/{n} = {right / n:.2f}")
+    if ratio is None or not powered:
+        return EXIT_CONSISTENCY_UNDERPOWERED
+    return (EXIT_CONSISTENCY_PASS if ratio >= CONSISTENCY_BAR
+            else EXIT_CONSISTENCY_FAIL)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ledger", default="")
@@ -223,6 +416,19 @@ def main() -> int:
     ap.add_argument("--min-per-bucket", type=int,
                     default=DEFAULT_MIN_PER_BUCKET)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--consistency", action="store_true",
+        help="§4CL I0: trajectory-level CONSISTENCY RATIO instead of the "
+             "bucket table. Over the pairs where the chosen and rejected "
+             "branches DISAGREED, the fraction where the chosen one was "
+             "the branch that worked — i.e. the McNemar discordant-pairs "
+             "estimator, whose null is 0.50. (On the marginal scale the "
+             "null would be the base pass rate ~0.90 and a 0.70 bar would "
+             "mean WORSE than doing nothing; the conditional scale is the "
+             "only one on which the pre-registered bar means anything.) "
+             "Per-step accuracy is a lying metric for a planner because "
+             "errors compound, so this is the phase's go/no-go number. "
+             "Reads system/imagination/regret.jsonl, which only I4 writes.")
     args = ap.parse_args()
 
     if not args.ledger and not args.trajectories \
@@ -232,6 +438,14 @@ def main() -> int:
         if args.json:
             print(json.dumps({"error": "no_ghost_home"}))
         return 2
+
+    # ⚠ BELOW the GHOST_HOME guard, deliberately. `_regret_path` is
+    # `Path(os.getenv("GHOST_HOME","")) / …`, which with the var unset is
+    # a RELATIVE path — and a go/no-go verdict computed from a stray
+    # `system/imagination/regret.jsonl` under the operator's cwd is
+    # exactly what the guard above refuses to do for the ledger.
+    if args.consistency:
+        return _consistency_report(as_json=args.json)
 
     if args.offline_replay:
         troot = (Path(args.trajectories) if args.trajectories

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evolve — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Learning</h3>
+    <a class="current" href="fence.html">evolve fence</a>
+    <a href="mutator.html">evolve mutator</a>
+    <a href="../core/replay_engine.html">replay_engine</a>
+    <a href="../core/imagination.html">imagination</a>
+    <a href="../core/isolation.html">isolation</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>evolve / — the fence and the archive</h1>
+  <p class="subtitle">Archive-based self-evolution of the scaffold, behind evaluators the candidate cannot touch. This page covers what exists: the write fence and the lineage archive. The mutator and the expensive evaluation stages do not exist yet.</p>
+
+  <h2>The failure mode this is shaped by</h2>
+  <p>It is not "the mutator writes bad code" &mdash; that is what an evaluator is for. It is <strong>the agent modifying the thing that measures it</strong>. DGM's agent learned to fabricate test logs. The AI Scientist raised its own timeout rather than finishing inside it. Neither was caught by a better mutation; both were caught, eventually, by somebody noticing the evaluator had moved.</p>
+  <p>So the fence is two separate mechanisms, and neither is sufficient alone.</p>
+
+  <h3>A path allow-list</h3>
+  <p><code>is_mutable(path)</code> admits tool implementations and prompt constants. It refuses <code>tests/</code>, <code>eval/</code>, <code>scripts/</code>, <code>evolve/</code> itself, <code>core/agent.py</code>, the isolation and replay modules, <code>memory/</code>, <code>selfhood/</code>, <code>sandbox/</code>, <code>main.py</code>, <code>conftest.py</code> and <code>pytest.ini</code>. Two paths <em>inside</em> a mutable tree are also refused: <code>tools/registry.py</code>, which is the tool surface itself, and <code>tools/validators.py</code>.</p>
+  <p>An allow-list rather than a deny-list, because the repo grows: a module added next month must be un-mutable until somebody decides otherwise. And it fails <strong>closed</strong> on anything it cannot classify &mdash; an absolute path, a path that escapes the repo, an empty string. "I could not tell" must never read as "allowed" for a write fence. Normalisation happens <em>before</em> the prefix test, which is the difference between a fence and a substring check: <code>a/../tests/conftest.py</code> is refused.</p>
+
+  <h3>A harness checksum</h3>
+  <p>The allow-list can only reject what it can see in a diff. A candidate that reaches the filesystem some other way &mdash; a fixture that writes, an import with a side effect &mdash; moves the checksum. <code>harness_digest()</code> hashes every file under the harness trees; <code>compare_harness()</code> reports what changed between two readings.</p>
+  <p>A dict rather than a single hash, so the alarm can name <em>which</em> file moved &mdash; a single digest says only that something did, which is the least actionable form of a true alarm. And <strong>additions count</strong>: a test file a candidate adds is a test file that runs, and "it only added things" is exactly the shape of a candidate writing its own passing test.</p>
+
+  <h2>Selection is not hill-climbing</h2>
+  <p>HGM's result is that a node's own score poorly predicts its descendants'. Greedy selection on own-score therefore walks into whichever local optimum scores best early, and discards the branch that would have gone furthest before it has children. So parents are sampled in proportion to what their <em>clade</em> has achieved:</p>
+  <pre><code>weight = best-DESCENDANT-score × 1/(1 + children)</code></pre>
+  <div class="scroll"><table>
+    <thead><tr><th>Term</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>best <em>descendant</em>, never own score</td><td>The HGM finding, and the entire reason this is not hill-climbing.</td></tr>
+      <tr><td><code>UNKNOWN_PRIOR = 0.35</code> for a node with no scored descendants</td><td>Deliberately <em>above</em> what a node whose descendants all scored zero would get. An archive that ranks the unknown below the known-bad stops exploring.</td></tr>
+      <tr><td><code>1/(1+children)</code></td><td>A node tried five times and still leading is worth trying again &mdash; but not five times as often as one nobody has touched.</td></tr>
+      <tr><td>the root is always selectable</td><td>A lineage that has painted itself into a corner must be able to start over from the unmodified tree.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The clade walk is cycle-safe. A hand-edited archive can name a parent that is also a descendant, and a naive walk recurses forever inside a nightly job nobody is watching.</p>
+
+  <h2>Novelty is an identity question, not a text question</h2>
+  <p>EvoTrace measured around 30% of evolved lines to be resurrections of code that already existed in the lineage. Re-evaluating a diff the archive has already seen costs a full cascade and can only reproduce a verdict already on disk.</p>
+  <p><code>normalized_diff_hash</code> keeps only added and removed lines, stripped and sorted. The same edit expressed against a shifted file, with different blob hashes or with its hunks reordered, hashes the same and is refused. A raw-text hash would let it re-enter under a new identity.</p>
+  <p><code>diff_touched_paths</code> reads <em>both</em> the <code>---</code> and <code>+++</code> headers, because a rename or a delete names its victim only on the <code>---</code> side &mdash; a fence that reads one side can be walked around by a diff that only deletes.</p>
+  <p>Shape caps (at most two files, at most 120 changed lines) run before the fence. Not a quality judgement: a bounded diff is one an operator can actually read before approving, and a whole-file rewrite is a replacement rather than a mutation.</p>
+
+  <h2>Rejects are kept &mdash; the design, and what of it runs today</h2>
+  <p>An archive that keeps only survivors cannot tell "the mutator improved" from "the evaluator got looser". The design is that every candidate stays, with the stage it died at recorded, and <code>archive_stats</code> reports the histogram &mdash; because "the mutator produced nothing usable" and "the mutator produced nothing" are different states.</p>
+  <p><strong>⚠ What actually runs, as of 2026-08-22:</strong> the mutator archives a node for a proposal and for a diff that failed to materialise, so those two are kept. <code>admit</code>, <code>record_stage</code> and <code>archive_stats</code> have <em>no production callers</em> &mdash; they belong to the evaluation cascade (E2), which does not exist, so no node leaves <code>candidate</code> status and nothing renders the histogram. Stated here because the paragraph above described all of it in the present tense for a while, which is how a reader ends up trusting a mechanism that never runs.</p>
+  <p>A node whose score is <code>None</code> has <em>never been measured</em>, which is not zero and must not be averaged as if it were.</p>
+
+  <h2>What does not exist yet</h2>
+  <p>The harness checksum (<code>harness_digest</code> / <code>compare_harness</code>) is <em>built and uncalled</em>: it is meant to be taken before and after every evaluation stage, and there are no evaluation stages yet. The section above describes it in the present tense because that is its design, not its current behaviour.</p>
+  <p><a href="mutator.html">The mutator</a> now exists (§4CN E1). Still missing: the expensive evaluation stages (bench smoke, the paired held-out confirm), the scheduled negative controls, and the post-promotion tripwire. <strong>Promotion is operator-applied by design in v1</strong> &mdash; the loop produces evidence-carrying proposals, never self-applied changes &mdash; so nothing here can act on its own regardless.</p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="../core/replay_engine.html">core / replay_engine.py</a> &mdash; where a mutation brief's evidence would come from.</li>
+    <li><a href="../core/isolation.html">core / isolation.py</a> &mdash; the substrate a candidate would be evaluated in.</li>
+    <li><a href="../eval/banks.html">eval / banks.py</a> &mdash; part of the harness the checksum protects.</li>
+  </ul>
+</main>
+</body>
+</html>

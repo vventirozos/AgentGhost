@@ -20,8 +20,18 @@ SRC = Path("src/ghost_agent/core/dream.py").read_text()
 
 
 def _completion_block() -> str:
+    """The whole completion block, bounded by a real ANCHOR rather than a
+    character count.
+
+    ⚠ It used to slice a fixed 2200 chars, so adding a comment inside the
+    block pushed the later message variants out of the window and the
+    "every variant keeps the marker" check silently stopped covering two of
+    the three paths (found 2026-08-21 when a queue-#11 comment did exactly
+    that). A window measured in characters is a check that stops checking
+    without failing."""
     i = SRC.index("Report what THIS PATH can actually produce")
-    return SRC[i:i + 2200]
+    j = SRC.index('self.last_dream_outcome = {"phase": "ran"', i)
+    return SRC[i:j]
 
 
 def test_trajectory_path_does_not_headline_meta_memories():

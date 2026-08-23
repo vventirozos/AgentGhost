@@ -373,7 +373,14 @@ async def test_the_reaper_records_a_landed_job_in_the_activity_ledger():
             return True
 
     class _Sup:
+        """Queue #9: the sweeper lands states with `reap()` but REPORTS from
+        `take_unreported()` — the durable marker — so a transition observed
+        by any other caller still reaches the ledger and the wake."""
+
         def reap(self):
+            return []          # someone else already observed the landing
+
+        def take_unreported(self):
             return [{"id": "job-1a2b3c4d", "state": "done", "exit_code": 0,
                      "command": "bash -c 'yt-dlp x'"}]
 
@@ -410,13 +417,22 @@ async def test_the_reaper_records_a_landed_job_in_the_activity_ledger():
 
 
 @pytest.mark.asyncio
-async def test_a_job_landing_during_a_jobs_call_also_reaches_the_ledger(wired):
-    """reap() returns the transitions IT observed and is the only writer of
-    terminal states, so whoever observes a landing owns recording it.
-    Discarding the return here made "every landed job reaches the ledger"
-    false for any job that landed during a `jobs` call."""
+async def test_a_jobs_call_lands_states_but_does_NOT_report_them(wired):
+    """Queue #9 (2026-08-21) — the ownership moved, deliberately.
+
+    `reap()` hands each transition to whoever called it, ONCE. This path
+    used to own recording it, which kept the ledger correct but never woke
+    the model: measured on the live box, 6 landed jobs, 6 ledger records
+    written from here, and ZERO wake turns for the loop whose whole job is
+    to stop a promoted command stranding until the operator speaks again.
+
+    Reporting now belongs to the single drain in main's sweeper, which both
+    records AND wakes. This path must therefore still LAND the states (so
+    the tool answers with fresh ones) and must NOT report — reporting here
+    too would double-count the ledger."""
     reg, sup, ctx = wired
     recorded = []
+    reaped = []
 
     class _Log:
         def record(self, phase, summary, **meta):
@@ -424,14 +440,20 @@ async def test_a_job_landing_during_a_jobs_call_also_reaches_the_ledger(wired):
             return True
 
     ctx.activity_log = _Log()
-    sup.reap = lambda: [{"id": "job-1a2b3c4d", "state": "done",
-                         "exit_code": 0, "command": "bash -c 'yt-dlp x'"}]
+
+    def _reap():
+        reaped.append(True)
+        return [{"id": "job-1a2b3c4d", "state": "done",
+                 "exit_code": 0, "command": "bash -c 'yt-dlp x'"}]
+
+    sup.reap = _reap
     sup.entries = [_entry(state=sbx_jobs.STATE_DONE, code=0)]
     _mirror(reg)
     await tool_jobs(action="status", context=ctx)
-    assert recorded, "a landing observed here must reach the activity ledger"
-    assert recorded[0][0] == "job"
-    assert "job-1a2b3c4d" in recorded[0][1]
+
+    assert reaped, "the tool must still LAND states before answering"
+    assert not recorded, ("reporting belongs to the sweeper's drain now; "
+                          "recording here too double-counts the ledger")
 
 
 @pytest.mark.asyncio

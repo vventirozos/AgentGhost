@@ -97,6 +97,7 @@ import logging
 import math
 import os
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -225,6 +226,24 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
             "blind retries; control gets the unmodified result. Unlocked "
             "by the offline Phase-2 replay verdict (DISCRIMINATES, spread "
             "0.306, monotone, 2026-08-05)."
+        ),
+    ),
+    ExperimentSpec(
+        name="imagine_preflight",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "§4CL I1: on a tool call the foresight precedent index says "
+            "will fail (exact/class basis, support >=3, >=2 real precedent "
+            "failures, p(fail) >=0.5) AND whose (tool, tclass) bucket the "
+            "measured calibration gate has ENABLED, the treatment DEFERS "
+            "the call and hands the model the precedent for one revision; "
+            "control dispatches unchanged. Both arms are trigger-marked, "
+            "so the TRIGGERED subset is comparable. Inert until the gate "
+            "opens — as of 2026-08-22 it enables zero buckets, which is "
+            "the pre-registered stop rule, not a bug. GHOST_IMAGINE=0 or "
+            "GHOST_IMAGINE_PREFLIGHT=0 kills."
         ),
     ),
     ExperimentSpec(
@@ -547,6 +566,12 @@ def load_registry(path: Optional[Any] = None,
 # skew. A small ring of recent assignments removes the race without touching
 # the streaming state machine.
 _RECENT_ARMS_MAX = 16
+
+#: How many of the most recently WALKED admitted records the coverage window
+#: spans. Sized so a stamp outage shows up within about a fortnight of live
+#: traffic (~3.5 user turns/day) rather than never — small enough to move,
+#: large enough that one quiet day cannot swing it.
+_RECENT_COVERAGE_WINDOW = 50
 
 
 def enroll_request(context, req_id: str, *, eligible: bool = True,
@@ -948,6 +973,18 @@ _HUMAN_SOURCE_PREFIX = "human_feedback"
 # every other interval (alpha/3 → alpha/4 per metric). That is the correct
 # price of testing one more hypothesis, and it buys the only metric §4BR's
 # decision rule accepts.
+# Every metric in `_METRICS` is either a per-turn 0/1 indicator (a RATE,
+# bounded in [0,1]) or an unbounded magnitude. The split is declared, not
+# inferred from the name: deriving a semantic property from a lexical one is
+# how this project has repeatedly shipped a guard that quietly stops matching
+# (see the `_regularised_sigma` note above — "every metric is binary today"
+# was already load-bearing and undeclared). `tests/test_experiments.py`
+# asserts the two sets PARTITION `_METRICS`, so a new metric cannot be added
+# without classifying it.
+_RATE_METRICS: frozenset = frozenset({
+    "failure_rate", "human_failure_rate", "human_label_rate"})
+_UNBOUNDED_METRICS: frozenset = frozenset({"n_steps", "duration_s"})
+
 _DESCRIPTIVE_METRICS: frozenset = frozenset({"human_label_rate"})
 
 # Metrics whose denominator is CONDITIONED on the outcome being resolved,
@@ -1202,6 +1239,73 @@ def asymp_cs_radius(vals: Sequence[float], *, alpha: float = 0.05,
         return None
 
 
+#: Cap on the power search below. Beyond this the answer is "not in any
+#: horizon this agent operates on" and an exact figure would be false
+#: precision.
+_POWER_SEARCH_MAX_N = 200_000
+
+
+def n_for_detectable(effect: float, rate: float, *, alpha: float) -> Optional[int]:
+    """Smallest n PER ARM at which a true difference of ``effect`` on a
+    Bernoulli metric of base ``rate`` would make the CS exclude zero.
+
+    Uses the REAL `asymp_cs_radius` against a synthetic series with exactly
+    that rate, and the report's own combination rule (the two arms' radii are
+    ADDED), so the answer cannot drift from the interval the operator is
+    looking at — a separately-derived power formula would be a second copy of
+    the estimator, which is this project's signature defect.
+
+    Deterministic: the synthetic series is constructed, never sampled, so the
+    same inputs always return the same n (an audit number that moves on its
+    own is not one). Returns None when the effect is non-positive or the
+    search cap is reached.
+    """
+    try:
+        eff = float(effect)
+        p = min(max(float(rate), 0.0), 1.0)
+        if not (eff > 0.0) or not (0.0 < float(alpha) < 1.0):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    def _half_width(n: int) -> Optional[float]:
+        ones = int(round(p * n))
+        series = [1.0] * ones + [0.0] * (n - ones)
+        r = asymp_cs_radius(series, alpha=alpha)
+        # Both arms contribute and the report ADDS the radii, so this
+        # doubles one arm's radius. MEASURED direction of that approximation
+        # (2026-08-21, p=0.203, n=231): modelling both arms at the control
+        # rate gives a half-width of 0.203 where the realistic case — a
+        # treatment arm that actually achieved the improvement, and so has
+        # near-zero variance — gives 0.110. It therefore OVER-estimates the
+        # requirement by roughly 2x, which is why the caller says "at most".
+        # Stated as measured rather than as reasoned: the first version of
+        # this comment asserted the opposite direction confidently.
+        return None if r is None else 2.0 * r
+
+    lo, hi = 2, 2
+    while True:
+        hw = _half_width(hi)
+        if hw is not None and hw < eff:
+            break
+        if hi >= _POWER_SEARCH_MAX_N:
+            return None
+        lo = hi
+        # Clamp to the cap so the CAP ITSELF is the last n probed. Plain
+        # doubling stopped at 131,072 and then reported "unreachable within
+        # 200,000/arm" — a bound it had never evaluated. Small, but it is the
+        # same false-precision shape this whole pass exists to remove.
+        hi = min(hi * 2, _POWER_SEARCH_MAX_N)
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        hw = _half_width(mid)
+        if hw is not None and hw < eff:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
 @dataclass
 class MetricComparison:
     metric: str
@@ -1223,6 +1327,32 @@ class MetricComparison:
     # arms resolve to UNKNOWN at different rates), and metrics whose movement
     # is the treatment's own mechanism rather than an outcome.
     confound: str = ""
+    # The per-ARM alpha that BUILT `diff_lo`/`diff_hi` (the global alpha after
+    # the metric and arm splits). Carried rather than recomputed so the power
+    # statement below cannot drift from the interval it describes. 0.0 = not
+    # supplied (power reporting is then skipped, never guessed).
+    arm_alpha: float = 0.0
+
+    @property
+    def half_width(self) -> Optional[float]:
+        """Half the CS width — the smallest |difference| that could be
+        called at the current n, i.e. this design's minimum detectable
+        effect right now."""
+        if self.diff_lo is None or self.diff_hi is None:
+            return None
+        return (self.diff_hi - self.diff_lo) / 2.0
+
+    @property
+    def max_possible_improvement(self) -> Optional[float]:
+        """The largest improvement this metric could physically show, given
+        where the control arm sits. A rate that is 0.20 and wants to be
+        LOWER can improve by at most 0.20 (to zero); one that wants to be
+        higher, by at most 1 - 0.20. Unbounded metrics have no such ceiling
+        and return None — for them "no difference detected yet" is honest."""
+        if self.metric not in _RATE_METRICS or self.control_mean is None:
+            return None
+        c = float(self.control_mean)
+        return c if self.lower_is_better else 1.0 - c
 
     @property
     def verdict(self) -> str:
@@ -1245,6 +1375,52 @@ class MetricComparison:
             # honest middle — the numbers stay visible, the conclusion waits.
             return f"insufficient data (n<{_MIN_VERDICT_N}/arm)"
         if self.diff_lo <= 0.0 <= self.diff_hi:
+            # ⚠ "no difference detected yet" and "this design cannot detect a
+            # difference" render identically, and on the live board they were
+            # ALL the second one: measured 2026-08-21, every live arm and both
+            # quality metrics had a half-width 2-6x LARGER than the biggest
+            # improvement the metric can physically show (e.g. failure_rate
+            # control 0.203, half-width 0.367 — the rate would have to fall
+            # below zero to be called). Five arms x two metrics of "no
+            # difference detected yet" reads as evidence the features do not
+            # help; it was the instrument having no power, which is the
+            # queue-#8 failure mode exactly ("a wrong verdict looks like a
+            # verdict"). Absence of evidence is only evidence of absence when
+            # the design could have found something.
+            _mp = self.max_possible_improvement
+            _hw = self.half_width
+            if _mp is not None and _hw is not None and _hw >= _mp:
+                _floor = "0" if self.lower_is_better else "1"
+                if _mp <= 0.0:
+                    # Not an instrument failure — the good case. The control
+                    # arm is already at the metric's best value, so there is
+                    # nothing left to improve, and "an improvement verdict
+                    # needs N/arm" would be false at every N.
+                    return (f"no improvement is POSSIBLE — the control arm is "
+                            f"already at {_floor} on this metric; only a harm "
+                            f"verdict remains available")
+                if self.arm_alpha > 0.0:
+                    _need = n_for_detectable(
+                        _mp, float(self.control_mean or 0.0),
+                        alpha=self.arm_alpha)
+                    # THREE cases, not two. "No alpha was supplied" is not
+                    # "no n can reach it", and collapsing them let a missing
+                    # field print a false impossibility claim — the exact
+                    # shape this whole pass is about.
+                    _needs = (
+                        f"; an improvement verdict needs at most "
+                        f"~{_need}/arm (have "
+                        f"{min(self.control_n, self.treatment_n)})"
+                        if _need else
+                        f"; unreachable within {_POWER_SEARCH_MAX_N:,}/arm")
+                else:
+                    _needs = ""
+                return (f"NO POWER for an improvement — the interval "
+                        f"(±{_hw:.3f}) is wider than the largest improvement "
+                        f"this metric can show ({_mp:.3f}, i.e. "
+                        f"{float(self.control_mean or 0.0):.3f} → {_floor}), "
+                        f"so 'no difference' here is the DESIGN, not "
+                        f"evidence{_needs}")
             return "no difference detected yet"
         better = (self.diff < 0) if self.lower_is_better else (self.diff > 0)
         base = "TREATMENT BETTER" if better else "TREATMENT WORSE"
@@ -1631,6 +1807,10 @@ def compare_arms(stats_by_arm: Dict[str, ArmStats], *,
             control_n=len(c_vals), treatment_n=len(t_vals),
             diff=diff, diff_lo=lo, diff_hi=hi, confound=confound,
             variance_reduction=round(reduction, 4),
+            # The SAME alpha that built the interval above, so the power
+            # statement in `verdict` describes this interval and not a
+            # differently-split one.
+            arm_alpha=arm_alpha,
         ))
     return out
 
@@ -1774,12 +1954,30 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
         _seen = int(coverage[_turns_key])
         _st = int(coverage.get("stamped", 0))
         _pct = (100.0 * _st / _seen) if _seen else 0.0
+        # The dilution caveat is CONDITIONAL on the arithmetic. Stated
+        # unconditionally it was false for the bench population, which reads
+        # 116/116: "100.0% ... cannot fall far even if the stamp dies" is
+        # exactly the kind of measured-sounding claim that isn't, i.e. the
+        # defect this whole pass is about, in the sentence fixing it.
+        _dilution = ("" if _pct >= 90.0 else
+                     " — dominated by turns recorded before the framework "
+                     "shipped, so it cannot fall far even if the stamp dies")
         lines.append(f"stamp coverage: {_st}/{_seen} {_noun} "
-                     f"({_pct:.1f}%) carry an arm")
-        if _pct < 50.0 and not _bench:
-            lines.append("  ⚠ under half — expected while the corpus still "
-                         "holds pre-ship turns; a sustained drop after that "
-                         "means the stamp is regressing")
+                     f"({_pct:.1f}%) carry an arm — LIFETIME{_dilution}")
+        # THE HALF THAT CAN MOVE. The lifetime ratio above is the number this
+        # instrument was built to alarm on and the one number that cannot do
+        # it (a total outage moves it by fractions of a point); the window
+        # below reaches 0% within a fortnight of a broken stamp.
+        _rec_n = int(coverage.get("recent_admitted", 0))
+        _rec_st = int(coverage.get("recent_stamped", 0))
+        if _rec_n:
+            _rec_pct = 100.0 * _rec_st / _rec_n
+            lines.append(f"  recent {_rec_st}/{_rec_n} ({_rec_pct:.0f}%) — "
+                         f"the trailing window, and the one to watch")
+            if _rec_pct < 90.0:
+                lines.append("  ⚠ the RECENT window is below 90% — the stamp "
+                             "is regressing NOW. Check enrollment, not the "
+                             "corpus age.")
         _sk = int(coverage.get("skipped_kind", 0))
         if _sk:
             # The read-side belt's own instrument (R5: it was JSON-only).
@@ -1919,7 +2117,23 @@ def summarize_streaming(trajectories: Iterable[Any], *,
     _names = set(admit_names) if admit_names is not None else None
     _deny = set(deny_names) if deny_names is not None else None
     coverage = {"user_turns": 0, "admitted_turns": 0, "stamped": 0,
-                "with_covariate": 0, "skipped_kind": 0}
+                "with_covariate": 0, "skipped_kind": 0,
+                "recent_admitted": 0, "recent_stamped": 0}
+    # ⚠ WHY A TRAILING WINDOW (2026-08-21, queue #8). The lifetime ratio is
+    # the number this instrument was built to raise an alarm on — its own
+    # docstring says "without them a broken stamp is indistinguishable from a
+    # young experiment". It cannot do that: the denominator is every user turn
+    # ever recorded, ~1,320 of which predate the framework, so a TOTAL stamp
+    # outage moves the headline from 16.8% to about 16.3%. Measured on the
+    # live corpus, per-day coverage has been 100% since 2026-08-04 while the
+    # lifetime figure sat at 16.8% under a permanent "under half" warning —
+    # an alarm that is always on is an alarm that is off. The trailing window
+    # is the half that can actually move.
+    # Chronological by construction: `iter_trajectories` walks sorted day
+    # partitions, then sorted `session-<UTC stamp>-*.jsonl` inside each, then
+    # append order inside a file — so "the last N walked" is "the most recent
+    # N", to within the interleaving of sessions open at the same time.
+    _recent = deque(maxlen=_RECENT_COVERAGE_WINDOW)
 
     def _fold(into: Dict[str, Dict[str, ArmStats]], name: str, arm: str,
               metrics: Dict[str, float], unknown: bool,
@@ -1947,6 +2161,16 @@ def summarize_streaming(trajectories: Iterable[Any], *,
             extra = getattr(traj, "extra", None) or {}
             stamped = extra.get(EXTRA_KEY) if isinstance(extra, dict) else None
             if not isinstance(stamped, dict) or not stamped:
+                # ⚠ THE WINDOW MUST SEE THIS RECORD. An unstamped admitted
+                # turn is the ENTIRE signal a coverage alarm exists for, and
+                # this early `continue` is what makes it easy to miss: the
+                # first version of the window appended only below, past this
+                # return, so it saw stamped records exclusively and read 100%
+                # however dead the stamp was — a health indicator that can
+                # only report good news, which is the very defect the window
+                # was added to fix, reproduced inside the fix.
+                if kind in admit:
+                    _recent.append(False)
                 continue
             if kind not in admit:
                 coverage["skipped_kind"] += 1
@@ -1955,9 +2179,20 @@ def summarize_streaming(trajectories: Iterable[Any], *,
             covariate = _covariate_of(traj)
             unknown = "failure_rate" not in metrics
             folded_any = False
+            # STAMP HEALTH vs REPORT SCOPE are different questions, and the
+            # window must answer the first. `folded_any` below is scoped: it
+            # is False when this report's admit/deny filter excludes every
+            # name the record carries — which is a property of the REPORT,
+            # not of the stamp. Feeding that to the window produced a false
+            # "the stamp is regressing NOW" alarm on a fully-stamped corpus
+            # (reproduced: 20 records stamped `tts_bon`, rendered under a
+            # report that denies it → window 0%). So the window asks only
+            # whether ENROLLMENT wrote a usable pair at all.
+            stamp_ok = False
             for name, arm in stamped.items():
                 if not isinstance(name, str) or not isinstance(arm, str) or not arm:
                     continue
+                stamp_ok = True
                 if _names is not None and name not in _names:
                     continue
                 if _deny is not None and name in _deny:
@@ -1973,8 +2208,22 @@ def summarize_streaming(trajectories: Iterable[Any], *,
                 coverage["stamped"] += 1
                 if covariate is not None:
                     coverage["with_covariate"] += 1
+            # No `kind in admit` guard here: the wrong-population
+            # `continue` above already returned, so one would be permanently
+            # true — and a guard that cannot fail reads to the next person as
+            # if this line were reachable by another population
+            # (mutation-confirmed equivalent, 2026-08-21).
+            #
+            # `stamp_ok`, NOT `folded_any` (see above): a malformed
+            # {"name": null} stamp is uncovered in BOTH the window and the
+            # lifetime counter, but a record excluded only by this report's
+            # name scope is uncovered in the lifetime counter and COVERED
+            # here — the stamp did its job.
+            _recent.append(bool(stamp_ok))
         except Exception:  # noqa: BLE001 — one bad record must not stop the walk
             continue
+    coverage["recent_admitted"] = len(_recent)
+    coverage["recent_stamped"] = sum(1 for hit in _recent if hit)
     return all_stats, trig_stats, coverage
 
 

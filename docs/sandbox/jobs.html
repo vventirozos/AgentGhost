@@ -247,6 +247,13 @@ STDOUT/STDERR:
   report back, which is a promise nothing in the system can keep and which
   the pending-promise guard would (correctly) reject.</p>
 
+  <div class="note warn">
+    <strong>The wake was dead for the first ten days, and the mechanism is worth knowing (queue&nbsp;#9, 2026-08-21).</strong>
+    <p><code>reap()</code> is the only writer of terminal states and returns each transition <em>exactly once</em>, to whoever happened to call it — and it has four callers. Three dropped that return value: the <code>jobs</code> tool's reconcile recorded the landing but never woke the model, and the two inside <code>register</code>/<code>promote</code> discarded it entirely, so a job that landed during an <code>execute</code> call was reported to nobody at all. Whoever got there first consumed the news.</p>
+    <p>Measured on the live box before the fix: <strong>7 jobs, 6 landed, none collected, 6 ledger rows written by the tool path, and zero wake turns in the entire corpus</strong> — for the loop whose whole purpose is to stop a promoted command stranding until the operator next speaks.</p>
+    <p>The state change was always durable; only the <em>notification</em> was ephemeral. A landing now carries two durable markers, <code>reported_at</code> and <code>woken_at</code>, and the 60&nbsp;s sweeper drains them: recording is stamped on read (it cannot meaningfully fail), while the <strong>wake is stamped only once delivered</strong> — because a wake defers whenever a turn is already in flight, and consuming that marker on read would lose the deferred wake for ever. A deferral simply comes back on the next tick; a wake that is <em>permanently</em> declined (the per-hour cap) is stamped so it stops. Rows that landed before the markers existed carry neither key and are treated as already handled, so deploying the fix could not wake the model once per historical landing.</p>
+  </div>
+
   <h2>Configuration</h2>
   <div class="scroll">
   <table>

@@ -3544,6 +3544,29 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
 _PROJECT_DIR_RE = re.compile(r"projects/([0-9a-f]{12})(?:/|$)")
 
 
+#: Operations that CANNOT mutate the workspace. Release immutability is
+#: enforced by guarding everything NOT in this set (queue #12, 2026-08-21).
+#:
+#: ⚠ IT USED TO BE THE OTHER WAY AROUND — a deny-list of guarded operations,
+#: `("write", "replace", "delete", "move", "append")` — and it leaked exactly
+#: as a deny-list does. Reproduced against a real RELEASED project:
+#:   * `copy`     — not listed at all → wrote into the released workspace;
+#:   * `rename`   — the dispatcher accepts ["rename", "move"] and only "move"
+#:                  was listed, so the SAME code path was guarded under one
+#:                  alias and open under the other;
+#:   * `download` — not listed → would write a fetched file straight in;
+#:   * `move`     — listed, but the guard only looked at the SOURCE path, so
+#:                  moving a file INTO a released project sailed through.
+#: Three of the four landed files in a workspace documented as
+#: "human-attested, immutable". An allow-list of READ-ONLY operations cannot
+#: miss a newly-added mutating one; a deny-list of guarded ones always can.
+_READ_ONLY_OPS = frozenset({
+    "read", "read_file", "read_chunked", "read_document", "inspect",
+    "search", "find", "list", "list_files", "ls", "dir", "tree", "list_dir",
+    "list_directory",
+})
+
+
 def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
     """Refusal message when a write would land inside a RELEASED project's
     workspace, else None. The hard half of release immutability (2026-07-25):
@@ -3580,12 +3603,19 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         return "SYSTEM INSTRUCTION: The 'operation' parameter is MANDATORY. You must specify it (e.g., operation='read')."
     # Release immutability: block mutations into a RELEASED project's
     # workspace at the WRITE PATH (see _released_write_block).
-    if operation in ("write", "replace", "delete", "move", "append"):
-        _rb = _released_write_block(
-            kwargs.get("project_store"), sandbox_dir,
-            path or kwargs.get("filename") or destination)
-        if _rb:
-            return _rb
+    if str(operation or "").strip().lower() not in _READ_ONLY_OPS:
+        # EVERY candidate target, not just the first one that happens to be
+        # set: `move`/`copy` carry the source in `path` and the real write in
+        # `destination`, and the old `path or filename or destination` chain
+        # therefore inspected the SOURCE and let the destination through.
+        for _target in (path, kwargs.get("filename"), destination,
+                        kwargs.get("destination"), kwargs.get("dest"),
+                        replace_with if operation in ("copy", "rename",
+                                                      "move") else None):
+            _rb = _released_write_block(
+                kwargs.get("project_store"), sandbox_dir, _target)
+            if _rb:
+                return _rb
     # Unified mapping for common parameter hallucinations
     url = kwargs.get("url")
     

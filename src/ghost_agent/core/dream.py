@@ -1691,6 +1691,19 @@ def _patch_with_fallback(
 
 
 # ── Self-play sandbox snapshot / restore ─────────────────────────────
+#: Tools self-play denies its temp agent. Extracted from an inline literal
+#: (2026-08-22) so `core/isolation.REPLAY_FORBIDDEN_TOOLS` can be TESTED
+#: as a superset of it — while it was a literal, the superset claim in
+#: that module's docstring was false and unfalsifiable at the same time.
+SELF_PLAY_FORBIDDEN_TOOLS = frozenset({
+    "self_play", "manage_tasks", "postgres_admin", "update_profile",
+    "learn_skill", "delegate_to_swarm", "system_utility", "create_skill",
+    "manage_skills", "self_state", "manage_projects", "manage_services",
+    "delegate", "self_play_loop", "stop_self_play",
+    "dream_mode", "web_search", "deep_research",
+})
+
+
 # Paths `_restore_mocks` must NEVER delete even when they're not in the
 # snapshot: the tooling files the self-play pipeline itself wrote, plus
 # acquired_skills/. Matching is on the TOP-LEVEL path component, so the
@@ -2471,7 +2484,15 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # what operators and tests key off. Only the misleading HEADLINE
             # changes.
             if seeded_from_trajectories:
-                msg = (f"Dream Complete (trajectory seed). Extracted "
+                # ⚠ "— extracted", NOT ". Extracted" (queue #11, 2026-08-21).
+                # The note above promises every variant contains
+                # "extracted N heuristics" so ONE grep finds them all, and
+                # this variant broke it with a sentence-initial capital:
+                # measured on 16 days of live log, **126 of 371** dream
+                # messages (34%) were invisible to the documented grep, and
+                # the existing tests only assert the lowercase variants. An
+                # em-dash keeps the sentence natural and the contract true.
+                msg = (f"Dream Complete (trajectory seed) — extracted "
                        f"{h_count} heuristics.{metrics_note}")
             elif applied_consolidations or h_count:
                 msg = (f"Dream Complete. Synthesized {applied_consolidations} "
@@ -3660,6 +3681,10 @@ Return ONLY a JSON object with:
         import tempfile
         from pathlib import Path
         from ..sandbox.docker import DockerSandbox
+        from .isolation import (
+            BackgroundOnlyLLM, ReadOnlyGraphMemory, ReadOnlySkillMemory,
+            ReadOnlyVectorMemory, null_production_state,
+        )
         from .agent import GhostAgent
         from .prompts import SYNTHETIC_CHALLENGE_PROMPT
 
@@ -4813,233 +4838,14 @@ Return ONLY a JSON object with:
         _pre_verified_shape = bool(
             journal_source or _tpl is not None or injected_challenge)
 
-        class ReadOnlySkillMemory:
-            # Marker: any callsite that wants to skip an expensive
-            # write-oriented code path during self-play can check
-            # `getattr(ctx.skill_memory, 'is_read_only', False)`. The
-            # Perfect-It follow-up LLM call does this so it doesn't
-            # burn ~15s per self-play cycle generating optimisation
-            # suggestions whose write lands in /dev/null anyway.
-            is_read_only = True
-
-            # Whitelist of read-only attributes that may legitimately pass
-            # through to the real playbook. Same M1 fix as
-            # ReadOnlyVectorMemory below: the previous `__getattr__`
-            # forwarded EVERYTHING, so the temp agent's fresh MemoryBus
-            # called record_retrievals_bulk on the PRODUCTION store —
-            # synthetic turns bumped real retrieval counters with no
-            # matching helpful-credit, pushing real lessons toward
-            # prune_low_utility eligibility.
-            # §4BF 1c (R5 review): `last_playbook_triggers` REMOVED from the
-            # passthrough — the sim read path deliberately stamps nothing
-            # (`stamp_triggers=False` below), so a passthrough read served
-            # the LAST REAL USER TURN's lesson set, and bench finalizes
-            # stamped it into `extra["hydrated_lessons"]` on bench
-            # trajectories (real lessons creditable for MBPP solves) and
-            # into the shared surfaced-triggers stash under bench ids. The
-            # wrapper's own doctrine is deny-by-default; the sim-side
-            # attribution channel is `hydrated_triggers`/`last_sim_triggers`.
-            _SAFE_PASSTHROUGH = frozenset({
-                "get_playbook_items", "get_recent_failures", "list_lessons",
-                "find_by_trigger", "file_path",
-                "_load_playbook", "_get_lock", "_playbook_items_and_branch",
-                "_filter_quarantined",
-            })
-
-            def __init__(self, real_sm):
-                self.real_sm = real_sm
-                # Triggers hydrated INSIDE this sim. The counterfactual
-                # quarantine snapshot (last_selfplay_hydrated_triggers) is
-                # built from this — NOT from the shared
-                # skill_memory.last_playbook_triggers attribute, which a
-                # concurrent user turn can re-stamp mid-replay.
-                self.hydrated_triggers = []
-
-            def _note_triggers(self, triggers):
-                if not isinstance(triggers, (list, tuple)):
-                    return
-                for trig in triggers:
-                    if trig and trig not in self.hydrated_triggers:
-                        self.hydrated_triggers.append(trig)
-
-            def get_playbook_context(self, *args, **kwargs):
-                if self.real_sm:
-                    # Reads must stay pure: the real method bumps retrieval
-                    # counters by default (keyword-only flag), and the
-                    # attribution stamp must go to the SIM side-channel —
-                    # stamping last_playbook_triggers here leaked the idle
-                    # sim's lesson set into the next user turn's outcome
-                    # attribution whenever that turn's own retrieval was
-                    # empty.
-                    kwargs["record_retrievals"] = False
-                    kwargs["stamp_triggers"] = False
-                    out = self.real_sm.get_playbook_context(*args, **kwargs)
-                    self._note_triggers(
-                        getattr(self.real_sm, "last_sim_triggers", None))
-                    return out
-                return ""
-
-            # Explicitly block all mutation methods. record_retrievals_bulk
-            # still CAPTURES the triggers it was asked to credit — that is
-            # the MemoryBus's post-fusion "these lessons entered the
-            # prompt" signal, i.e. exactly what "hydrated in this sim"
-            # means for the bus path.
-            def learn_lesson(self, *args, **kwargs):
-                pass
-
-            def save_playbook(self, *args, **kwargs):
-                pass
-
-            def record_retrieval(self, *args, **kwargs):
-                pass
-
-            def record_retrievals_bulk(self, triggers=None, *args, **kwargs):
-                self._note_triggers(list(triggers) if triggers else [])
-                return 0
-
-            def record_helpful_retrieval(self, *args, **kwargs):
-                pass
-
-            def credit_recent_retrievals(self, *args, **kwargs):
-                return 0
-
-            def record_surfaced_outcomes(self, *args, **kwargs):
-                return 0
-
-            def retract_lessons_from_trajectory(self, *args, **kwargs):
-                return 0
-
-            def prune_low_utility(self, *args, **kwargs):
-                return 0
-
-            def quarantine_lesson(self, *args, **kwargs):
-                return 0
-
-            def mark_verified(self, *args, **kwargs):
-                pass
-
-            def remove_by_trigger(self, *args, **kwargs):
-                return False
-
-            def _update_lesson_fields(self, *args, **kwargs):
-                return 0
-
-            def _save_playbook_unlocked(self, *args, **kwargs):
-                pass
-
-            def __getattr__(self, name):
-                # Only forward whitelisted read attributes; everything else
-                # raises so a future SkillMemory mutation method can't
-                # silently bypass this wrapper during self-play.
-                if name in type(self)._SAFE_PASSTHROUGH and self.real_sm is not None:
-                    return getattr(self.real_sm, name)
-                raise AttributeError(
-                    f"{type(self).__name__}: attribute {name!r} is not in the "
-                    "read-only passthrough whitelist"
-                )
-
-        class SafeCollection:
-            def __init__(self, real_collection):
-                self.real_collection = real_collection
-            def get(self, *args, **kwargs): return self.real_collection.get(*args, **kwargs) if self.real_collection else None
-            def query(self, *args, **kwargs): return self.real_collection.query(*args, **kwargs) if self.real_collection else None
-            def count(self, *args, **kwargs): return self.real_collection.count(*args, **kwargs) if self.real_collection else 0
-            def delete(self, *args, **kwargs): pass
-            def add(self, *args, **kwargs): pass
-            def upsert(self, *args, **kwargs): pass
-
-        class ReadOnlyVectorMemory:
-            # Whitelist of read-only methods that may legitimately pass
-            # through to the real store. Any other attribute access
-            # raises AttributeError rather than silently falling through
-            # — the previous `__getattr__` passthrough meant any new
-            # mutation method added to VectorMemory would bypass the
-            # wrapper by default (M1).
-            _SAFE_PASSTHROUGH = frozenset({
-                "search", "search_advanced", "search_items", "get_library",
-                "get_embedding", "embed", "format_search_result",
-            })
-
-            def __init__(self, real_vm):
-                object.__setattr__(self, "real_vm", real_vm)
-                object.__setattr__(
-                    self, "collection",
-                    SafeCollection(real_vm.collection)
-                    if real_vm and hasattr(real_vm, "collection") else None,
-                )
-
-            # §4M F1: a read that bumps retrieval stats is still a WRITE
-            # to operator memory (same contract as memory/readonly.py).
-            # These passed through raw, so every self-play hydration
-            # (~27/day) booked phantom `retrieval_count` credit on the
-            # production store pre-fusion — rc reached 690 on one episode,
-            # stretching its ranking half-life ~7× and self-reinforcing.
-            def search(self, *args, **kwargs):
-                if not self.real_vm:
-                    return []
-                kwargs["record_retrievals"] = False
-                return self.real_vm.search(*args, **kwargs)
-
-            def search_advanced(self, *args, **kwargs):
-                if not self.real_vm:
-                    return []
-                kwargs["record_retrievals"] = False
-                return self.real_vm.search_advanced(*args, **kwargs)
-
-            # §4M F1(b): without this the isolate's bus fell to the
-            # legacy `vector.search` branch — which both records
-            # retrievals AND bypasses the _VECTOR_MATCH_FLOOR off-topic
-            # gate. `search_items` never bumps stats by design (the bus
-            # credits survivors separately — and the strict whitelist
-            # makes those credit calls silent no-ops here, which is the
-            # point: self-play earns no production credit). Signature is
-            # mirrored explicitly so the bus's floor sniffer sees it.
-            def search_items(self, query, inject_identity=True,
-                             min_relevance_dist=None):
-                if not self.real_vm:
-                    return []
-                return self.real_vm.search_items(
-                    query, inject_identity=inject_identity,
-                    min_relevance_dist=min_relevance_dist)
-            def get_library(self, *args, **kwargs): return self.real_vm.get_library(*args, **kwargs) if self.real_vm else []
-
-            # Explicitly block all mutation methods
-            def add(self, *args, **kwargs): pass
-            def smart_update(self, *args, **kwargs): pass
-            def delete(self, *args, **kwargs): pass
-            def ingest_document(self, *args, **kwargs): return True, "Mock ingested"
-            def delete_document_by_name(self, *args, **kwargs): return True, "Mock deleted"
-            def delete_by_query(self, *args, **kwargs): return True, "Mock deleted"
-            def _update_library_index(self, *args, **kwargs): pass
-
-            def __getattr__(self, name):
-                # Only forward whitelisted read methods; everything else
-                # raises so a future VectorMemory mutation method can't
-                # silently bypass this wrapper during self-play.
-                if name in type(self)._SAFE_PASSTHROUGH and self.real_vm is not None:
-                    return getattr(self.real_vm, name)
-                raise AttributeError(
-                    f"{type(self).__name__}: attribute {name!r} is not in the "
-                    "read-only passthrough whitelist"
-                )
-
-        class ReadOnlyGraphMemory:
-            def __init__(self, real_gm):
-                self.real_gm = real_gm
-            def get_neighborhood(self, *args, **kwargs):
-                if self.real_gm: return self.real_gm.get_neighborhood(*args, **kwargs)
-                return []
-            def get_recent_triplets(self, *args, **kwargs):
-                if self.real_gm: return self.real_gm.get_recent_triplets(*args, **kwargs)
-                return []
-            def add_triplets(self, *args, **kwargs): return 0
-            def delete_by_target(self, *args, **kwargs): return 0
-            def wipe_all(self): pass
-            def execute_graph_compression(self, *args, **kwargs): return 0
-            def __getattr__(self, name):
-                if self.real_gm: return getattr(self.real_gm, name)
-                raise AttributeError(name)
-
+        # The read-only memory façades + the background-LLM wrapper moved
+        # to `core/isolation.py` on 2026-08-22 (§4CL S1) — VERBATIM, so
+        # every comment explaining why a method is on or off a whitelist
+        # moved with them. They were method-local classes here, which
+        # meant the Imagine fork and the Dream replay engine could not
+        # reuse the one proven isolation recipe in the codebase (and the
+        # only pin on the whitelist was a source-text assertion, which
+        # walks). `tests/test_isolation_replay.py` now exercises them.
         # 2. Setup an isolated, temporary context so we don't pollute the user's real workspace
         import shutil
         with tempfile.TemporaryDirectory() as temp_sandbox:
@@ -5051,24 +4857,23 @@ Return ONLY a JSON object with:
                 
             isolated_context = copy.copy(self.context)
             isolated_context.sandbox_dir = Path(temp_sandbox)
-            # Self-play runs in a fresh, project-less ephemeral sandbox. The
-            # shallow copy inherits whatever project the agent last opened,
-            # which would (via get_available_tools' _proj_ws scoping) redirect
-            # file_system/execute into <temp>/projects/<id>/ — while the
-            # setup/validator scripts read/write at the temp root (/workspace).
-            # That mismatch made the solver's solution.py invisible to the
-            # judge ("can't open file '/workspace/solution.py'"). Clear it so
-            # the worker stays unscoped at the sandbox root.
-            isolated_context.current_project_id = None
-            # Detach the SHARED workspace model entirely. The shallow copy
-            # kept the real WorkspaceModel, so the temp agent's turns (a) set
-            # the process-global event-stamp pointer to "" mid-flight — the
-            # temp agent has its OWN semaphore, so this raced a concurrent
-            # real turn's stamping — and (b) recorded synthetic self-play
-            # command/browser outcomes into the REAL activity log. Every
-            # record/prefix site guards on `workspace_model is None`, so None
-            # is the supported "no workspace" state (same as --no-memory).
-            isolated_context.workspace_model = None
+            # ── THE DETACH (§4CL S1). Every production-state handle a
+            # `copy.copy` shares is nulled here, from ONE inventory
+            # (`core/isolation.ISOLATION_NULLED_ATTRS`) that the Imagine
+            # fork and the Dream replay engine apply too — the same
+            # recipe in three copies drifts, and each entry in that
+            # tuple is a leak somebody already shipped. The individual
+            # `= None` lines that used to be scattered through the next
+            # 150 lines are gone; what each one was for is documented
+            # beside its name in the inventory.
+            #
+            # ⚠ ORDER: this runs BEFORE the bench block below, which
+            # ARMS `trajectory_collector` (bench turns are recorded on
+            # purpose, to a separate root). Nulling after it would
+            # silently disarm bench recording.
+            _iso_nulled = null_production_state(isolated_context)
+            logger.debug("self-play isolate: %d production handles "
+                         "detached", _iso_nulled)
             isolated_context.args = copy.copy(self.context.args)
             isolated_context.args.perfect_it = False
             isolated_context.args.smart_memory = 0.0
@@ -5088,15 +4893,6 @@ Return ONLY a JSON object with:
             # wired yet — hook point for later).
             if not getattr(isolated_context.args, "native_tools", False):
                 isolated_context.args.native_tools = True
-            isolated_context.profile_memory = None
-            isolated_context.scheduler = None
-            isolated_context.journal = None  # Prevent fake post-mortems from leaking to the real Hippocampus
-            # Same reason: the synthetic solver's handle_chat turns must NOT be
-            # appended to the production trajectory log — those fake trajectories
-            # were otherwise mined for auto-macros and consumed by the Reflector/
-            # PRM, poisoning the learning signal with self-play noise. Null the
-            # collector (and the episodic store, defense-in-depth) on the isolate.
-            isolated_context.trajectory_collector = None
             if bench_meta:
                 # BENCH runs are the exception to the null-collector rule —
                 # resolved outcomes are their entire point — but they write
@@ -5189,18 +4985,9 @@ Return ONLY a JSON object with:
                         (injected_challenge or {}).get("challenge") or "")
                 except Exception as _bexc:  # noqa: BLE001
                     logger.warning("bench collector unavailable: %s", _bexc)
-            isolated_context.episodic_memory = None
             isolated_context.memory_system = ReadOnlyVectorMemory(self.context.memory_system)
             isolated_context.skill_memory = ReadOnlySkillMemory(self.context.skill_memory)
             isolated_context.graph_memory = ReadOnlyGraphMemory(getattr(self.context, 'graph_memory', None))
-
-            # CRITICAL: the inherited MemoryBus on the parent context references
-            # the *production* memory subsystems directly. If we leave it in
-            # place, hydration AND publish_fact inside the dream bypass the
-            # ReadOnly wrappers and write straight to user memory. Drop it so
-            # GhostAgent._get_memory_bus() lazily builds a fresh bus over the
-            # wrapped (read-only) stores instead.
-            isolated_context.memory_bus = None
 
             # The dream still needs an LLM client to drive the synthetic
             # agent. For biological-hook (background) triggers, we MUST
@@ -5217,48 +5004,14 @@ Return ONLY a JSON object with:
             # foreground requests so the user doesn't stall.
             real_llm = isolated_context.llm_client
 
-            class _BackgroundOnlyLLM:
-                def __init__(self, inner):
-                    self._inner = inner
-
-                def __getattr__(self, name):
-                    return getattr(self._inner, name)
-
-                async def chat_completion(self, payload, *a, **kw):
-                    kw["is_background"] = True
-                    return await self._inner.chat_completion(payload, *a, **kw)
-
-                async def stream_chat_completion(self, payload, *a, **kw):
-                    kw["is_background"] = True
-                    async for chunk in self._inner.stream_chat_completion(payload, *a, **kw):
-                        yield chunk
-
             if real_llm is not None and is_background:
-                isolated_context.llm_client = _BackgroundOnlyLLM(real_llm)
+                isolated_context.llm_client = BackgroundOnlyLLM(real_llm)
 
-            # C4: shallow-copy leaves secondary modules (verifier,
-            # uncertainty_tracker, MCTS/hypothesis testers, frontier
-            # tracker) pointing at references captured from the REAL
-            # context — each carries its own copy of the original
-            # `llm_client` and would bypass the background wrapper
-            # above. Self-play doesn't need any of these mid-
-            # simulation; null them out so the agent's gates degrade to
-            # no-ops inside the isolated turn loop.
-            for _attr in (
-                "verifier", "uncertainty_tracker",
-                "mcts_reasoner", "hypothesis_tester", "frontier_tracker",
-                # Continuous self-play loop handles MUST be stripped from
-                # the isolated context. Otherwise the sub-agent's
-                # handle_chat call (solving the synthetic challenge) would
-                # see the outer loop's task + stop_event attached to its
-                # context and the user-message interrupt fires on the
-                # inner turn — killing the loop after its first cycle.
-                "selfplay_loop_task",
-                "selfplay_loop_stop",
-                "selfplay_loop_started_at",
-            ):
-                if hasattr(isolated_context, _attr):
-                    setattr(isolated_context, _attr, None)
+            # C4 (the secondary modules — verifier, uncertainty_tracker,
+            # MCTS/hypothesis testers, frontier tracker) and the outer
+            # self-play loop handles are part of the shared inventory
+            # applied at the top of this block; see
+            # `core/isolation.ISOLATION_NULLED_ATTRS`.
 
             # §4BF flip (ii): text-graded bench items get a FRESH
             # bench-local verifier — the C4 null above stays in force for
@@ -5698,7 +5451,8 @@ Return ONLY a JSON object with:
                 # (task tree), postgres_admin and system_utility (real
                 # services), and delegate_to_swarm (side effects on other
                 # nodes).
-                temp_agent.disabled_tools.update([
+                temp_agent.disabled_tools.update(SELF_PLAY_FORBIDDEN_TOOLS)
+                _SELF_PLAY_DENYLIST_RATIONALE = ([
                     "self_play", "manage_tasks", "postgres_admin",
                     "update_profile", "learn_skill", "delegate_to_swarm",
                     "system_utility", "create_skill", "manage_skills",
@@ -5748,6 +5502,18 @@ Return ONLY a JSON object with:
                     # sandbox state we just set up.
                     "dream_mode", "web_search", "deep_research",
                 ])
+                # ⚠ The list above is the RATIONALE — every comment in it is
+                # a defect somebody shipped — but the SET now lives in
+                # `SELF_PLAY_FORBIDDEN_TOOLS` at module level. An inline
+                # literal cannot be compared against, and `core/isolation.py`
+                # claims to be a superset of it: that claim was FALSE (it
+                # was missing `web_search`/`deep_research`, i.e. real
+                # host-process egress) and no test could see it, because
+                # there was nothing to import. `tests/test_isolation_replay.py`
+                # now asserts the containment against both precedents.
+                assert set(_SELF_PLAY_DENYLIST_RATIONALE) == \
+                    set(SELF_PLAY_FORBIDDEN_TOOLS), \
+                    "the self-play denylist and its rationale have drifted"
                 for t in temp_agent.disabled_tools:
                     temp_agent.available_tools.pop(t, None)
 

@@ -1290,6 +1290,63 @@ class ProjectStore:
                 out.append(p)
         return out
 
+    def missing_deliverables(self, project_id: str) -> set:
+        """Registered deliverables whose file is NOT on disk.
+
+        ⚠ WHY (queue #10, 2026-08-21). `register_file_artifact` records a
+        path; it never checks that anything is there, and nothing reconciles
+        afterwards. The list is a record of CLAIMS — but `core/prompts.py`
+        renders it into every project briefing as "DELIVERABLES (N file(s)
+        the project built)", so a claim is presented to the model as fact.
+        Measured on the live store: **3 of 66 registered files do not exist**
+        (`cascade_analysis.md`, `cascade_evidence.py`, `roms/sonic.md`),
+        across 2 of 5 projects, and none of them was removed by the cleanup
+        sweep — every `workspace_tidy` event on this box deleted only debris
+        (`.browser_runner.py`, `__pycache__`, screenshots). So the agent is
+        told it produced files it never produced, and will cite them.
+
+        The record is NOT rewritten — the claim is audit data, and a file can
+        legitimately be deleted after the fact. The READ path is what learns
+        to be honest, the same shape as §4CC's mood staleness and §4CD's
+        diary-follows-corpus: keep the record, age the presentation.
+
+        Returns an empty set when there is no sandbox root configured (tests,
+        `--no-sandbox`): unknown is not the same as missing, and marking every
+        deliverable gone because the checker cannot see the disk would be a
+        worse lie than the one being fixed.
+        """
+        if not self.sandbox_root:
+            return set()
+        try:
+            root = Path(self._default_workspace(project_id) or "")
+        except Exception:  # noqa: BLE001
+            return set()
+        if not root or not root.exists():
+            # The whole workspace is gone (deleted project, moved sandbox).
+            # That is not evidence about individual files, and flagging all
+            # of them would bury a real single-file loss in noise.
+            return set()
+        gone = set()
+        for rel in self.list_deliverables(project_id):
+            # ⚠ NORMALISE BEFORE STATTING, through the SAME function
+            # registration uses. Some stored payloads carry the redundant
+            # `projects/<id>/` prefix (rows written before the 2026-07-20
+            # H9 fix); the cleanup sweep already re-normalises defensively at
+            # read time, which is why those files were never swept. Comparing
+            # the RAW payload against disk reported three of them missing on
+            # the live store — including WebOS's `index.html` and
+            # `server.js`, the project's actual deliverables, which are right
+            # there. Marking a present file MISSING is a worse lie than the
+            # unverified claim this method exists to catch, so the check goes
+            # through the path contract rather than around it.
+            probe = self._normalize_rel_path(project_id, rel) or rel
+            try:
+                if not (root / probe).exists():
+                    gone.add(rel)
+            except (OSError, ValueError):  # noqa: PERF203 — per-path guard
+                continue
+        return gone
+
     def list_artifacts(self, project_id: Optional[str] = None,
                        task_id: Optional[str] = None) -> List[Dict[str, Any]]:
         project_id = _canon_id(project_id) or None

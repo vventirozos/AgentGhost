@@ -835,10 +835,24 @@ def test_dream_isolate_vector_reads_never_book_credit():
     store) and omitted search_items (dropping the bus to the legacy
     branch that also bypasses the off-topic floor). Behavioral pin lives
     in test_dream_synthetic.py; this pins the source contract."""
-    src = (REPO / "src" / "ghost_agent" / "core" / "dream.py").read_text()
-    assert src.count('kwargs["record_retrievals"] = False') >= 2
-    assert '"search_items"' in src          # whitelisted
-    assert "def search_items" in src        # and actually defined
+    # §4CL S1: the façade moved to `core/isolation.py` and this pin became
+    # executed — a source count of `record_retrievals = False` said nothing
+    # about whether the flag reached the store.
+    from unittest.mock import MagicMock
+    from ghost_agent.core.isolation import ReadOnlyVectorMemory
+
+    real = MagicMock()
+    ro = ReadOnlyVectorMemory(real)
+    ro.search("q")
+    ro.search_advanced("q")
+    assert real.search.call_args.kwargs["record_retrievals"] is False
+    assert real.search_advanced.call_args.kwargs["record_retrievals"] is False
+    # search_items exists AND is whitelisted — without it the bus falls to
+    # the legacy `vector.search` branch, which books credit and bypasses
+    # the off-topic floor.
+    assert "search_items" in ReadOnlyVectorMemory._SAFE_PASSTHROUGH
+    ro.search_items("q")
+    real.search_items.assert_called_once()
 
 
 def test_bus_malformed_profile_update_surfaces_as_error():

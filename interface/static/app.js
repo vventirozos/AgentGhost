@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=10.2';
+import * as matrixGraphFace from './matrix_graph.js?v=10.3';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -169,6 +169,9 @@ const ICON_CLASS = {
     '🎯': 'plan',     // BRAIN_AIM
     '🌳': 'plan',     // MCTS_TREE
     '🔮': 'plan',     // FORESIGHT — shadow world model
+    '🪄': 'plan',     // IMAGINE — pre-flight steer / candidate ranking
+    '🌀': 'plan',     // DREAM_REPLAY — counterfactual episode replay
+    '🦋': 'plan',     // EVOLVE — scaffold self-evolution
     '🔗': 'plan',     // CONSTRAINT
 
     // --- raw thinking (the floor) ---

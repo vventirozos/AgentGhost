@@ -141,21 +141,23 @@ def test_synthetic_self_play_resets_memory_bus_on_isolated_context():
     """Regression: the inherited MemoryBus must be cleared on the dream's
     isolated_context so the agent rebuilds one over ReadOnly wrappers
     instead of writing through to production stores."""
-    import ast
-    src = open("src/ghost_agent/core/dream.py").read()
-    tree = ast.parse(src)
-    # Find every assignment to `isolated_context.memory_bus`.
-    found = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if (isinstance(target, ast.Attribute)
-                        and target.attr == "memory_bus"
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id == "isolated_context"):
-                    if isinstance(node.value, ast.Constant) and node.value.value is None:
-                        found = True
-    assert found, "isolated_context.memory_bus must be explicitly set to None inside synthetic_self_play"
+    # §4CL S1: the clear moved into the shared detach inventory, so the AST
+    # walk for a literal assignment no longer describes the mechanism.
+    # Membership + the executed clear do.
+    from ghost_agent.core.isolation import (
+        ISOLATION_NULLED_ATTRS, null_production_state,
+    )
+
+    class _Ctx:
+        pass
+
+    assert "memory_bus" in ISOLATION_NULLED_ATTRS
+    ctx = _Ctx()
+    ctx.memory_bus = object()
+    null_production_state(ctx)
+    assert ctx.memory_bus is None, (
+        "the isolate must drop the inherited bus so the agent rebuilds one "
+        "over the ReadOnly wrappers")
 
 
 @pytest.mark.asyncio

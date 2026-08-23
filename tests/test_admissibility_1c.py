@@ -1104,12 +1104,20 @@ class TestSourceWindowPins:
         # caught the observable effect, but the fix itself was unpinned).
         # The passthrough serving the LAST REAL TURN's lesson set to sim
         # reads is the root cause; it must stay denied.
-        import inspect
-        import ghost_agent.core.dream as dream_mod
-        src = inspect.getsource(dream_mod)
-        i = src.index("_SAFE_PASSTHROUGH = frozenset({")
-        block = src[i:src.index("})", i)]
-        assert "last_playbook_triggers" not in block
+        #
+        # §4CL S1: the façade moved to `core/isolation.py`, and the pin
+        # moved from a source-window grep to the executed contract — a
+        # sim read of that attribute must RAISE, not serve.
+        import pytest as _pytest
+        from unittest.mock import MagicMock
+        from ghost_agent.core.isolation import ReadOnlySkillMemory
+
+        assert "last_playbook_triggers" not in (
+            ReadOnlySkillMemory._SAFE_PASSTHROUGH)
+        real = MagicMock()
+        real.last_playbook_triggers = ["a-real-users-lesson"]
+        with _pytest.raises(AttributeError, match="passthrough whitelist"):
+            ReadOnlySkillMemory(real).last_playbook_triggers
 
     def test_introspect_bench_section_is_scope_filtered(self):
         # R6: reverting the introspect deny wiring survived the suite.

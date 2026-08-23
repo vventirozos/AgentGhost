@@ -304,20 +304,42 @@ class TestBackgroundOnlyLLM_C1:
 
 
 class TestReadOnlyVectorMemoryWhitelist_M1:
-    def _ro(self, real):
-        # Exercise the class defined INSIDE synthetic_self_play by
-        # reconstructing its logic here — the whitelist is the
-        # important invariant.
-        from ghost_agent.core.dream import synthetic_self_play  # noqa: F401
+    """The façade is no longer a method-local class (§4CL S1), so the
+    whitelist is EXERCISED instead of grepped — the old version asserted
+    two strings were present in ``synthetic_self_play``'s source, which
+    passed just as happily when the class had been gutted."""
 
-        # The class lives inside the method; to test its contract we
-        # re-derive the expected behaviour: any method not in the
-        # whitelist should raise AttributeError.
-        import ghost_agent.core.dream as dmod
-        import inspect
-        src = inspect.getsource(dmod.Dreamer.synthetic_self_play)
-        assert "_SAFE_PASSTHROUGH" in src
-        assert "is not in the read-only passthrough whitelist" in src
+    def test_whitelisted_read_passes_through(self):
+        from unittest.mock import MagicMock
+        from ghost_agent.core.isolation import ReadOnlyVectorMemory
+
+        real = MagicMock()
+        real.search.return_value = ["hit"]
+        ro = ReadOnlyVectorMemory(real)
+        assert ro.search("q") == ["hit"]
+        # …and the read is de-fanged: it must not bump retrieval stats.
+        assert real.search.call_args.kwargs["record_retrievals"] is False
+
+    def test_mutator_is_a_no_op_not_a_passthrough(self):
+        from unittest.mock import MagicMock
+        from ghost_agent.core.isolation import ReadOnlyVectorMemory
+
+        real = MagicMock()
+        ro = ReadOnlyVectorMemory(real)
+        ro.add({"text": "x"})
+        ro.delete("x")
+        real.add.assert_not_called()
+        real.delete.assert_not_called()
+
+    def test_unknown_attribute_raises_instead_of_forwarding(self):
+        import pytest as _pytest
+        from unittest.mock import MagicMock
+        from ghost_agent.core.isolation import ReadOnlyVectorMemory
+
+        real = MagicMock()
+        ro = ReadOnlyVectorMemory(real)
+        with _pytest.raises(AttributeError, match="passthrough whitelist"):
+            ro.some_future_mutator
 
 
 # ------------------------------------------------------------------ #
@@ -462,16 +484,41 @@ class TestDisabledToolsBlocklist_C6:
 
 
 class TestIsolatedContextNulling_C4:
-    def test_source_nulls_secondary_modules(self):
-        import inspect
-        from ghost_agent.core.dream import Dreamer
+    """The C4 secondary modules moved into the shared detach inventory
+    (`core/isolation.ISOLATION_NULLED_ATTRS`, §4CL S1). The pin moved with
+    them and stopped being a source-text assertion on the way: the
+    EXECUTED end-to-end version — run the real solve loop, capture the
+    isolate the mocked GhostAgent was constructed with, and assert the
+    whole inventory is None on it — lives in
+    ``tests/test_isolation_replay.py``. What stays here is the membership
+    contract those attributes must keep."""
 
-        src = inspect.getsource(Dreamer.synthetic_self_play)
+    def test_secondary_modules_are_in_the_shared_inventory(self):
+        from ghost_agent.core.isolation import ISOLATION_NULLED_ATTRS
+
         for attr in (
             "verifier", "uncertainty_tracker",
             "mcts_reasoner", "hypothesis_tester", "frontier_tracker",
         ):
-            assert f'"{attr}"' in src, f"secondary module {attr} not nulled"
+            assert attr in ISOLATION_NULLED_ATTRS, (
+                f"secondary module {attr} dropped from the detach inventory")
+
+    def test_nulling_is_applied_by_the_shared_helper(self):
+        """`null_production_state` is what self-play calls; it must
+        actually clear a live handle, not merely enumerate names."""
+        from ghost_agent.core.isolation import (
+            ISOLATION_NULLED_ATTRS, null_production_state,
+        )
+
+        class _Ctx:
+            pass
+
+        ctx = _Ctx()
+        for attr in ISOLATION_NULLED_ATTRS:
+            setattr(ctx, attr, object())
+        assert set(null_production_state(ctx)) == set(ISOLATION_NULLED_ATTRS)
+        assert [a for a in ISOLATION_NULLED_ATTRS
+                if getattr(ctx, a) is not None] == []
 
 
 # ------------------------------------------------------------------ #

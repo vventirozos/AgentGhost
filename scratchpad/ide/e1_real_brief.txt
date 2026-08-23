@@ -1,0 +1,43 @@
+You are improving ONE file of a running agent's own scaffold.
+
+TARGET FILE: src/ghost_agent/tools/execute.py
+TOOL IT IMPLEMENTS: execute
+
+THE EVIDENCE AGAINST IT — 13 recorded failures out of 56 calls (23.2% of calls in foresight), from: foresight.
+These are real error heads from the agent's own transition ledger:
+
+  1. --- execution result --- exit code: 1 stdout/stderr: [system error]: process failed (exit 1) with no output.
+  2. --- execution result --- exit code: 137 (timed out / killed after 600s) stdout/stderr: === testing tor connectivity === tor: connection result: {"istor":true,"ip":"<REDACTED_IP>"} (exit: 0) === test
+  3. --- command result --- exit code: 0 stdout/stderr: === test 1: yt-dlp format listing via tor === failed (exit 1) error: warning: [youtube] no supported javascript runtime could be found. only deno is
+  4. --- execution result --- exit code: 1 stdout/stderr: file "/tmp/deno_install.sh", line 7 if ! command -v unzip >/dev/null && ! command -v 7z >/dev/null; then
+  5. --- command result --- exit code: 0 stdout/stderr: error: either unzip or 7z is required to install deno (see: https://github.com/denoland/deno_install#either-unzip-or-7z-is-required ).
+  6. --- command result --- exit code: 0 stdout/stderr: === test 1: yt-dlp format listing via tor === failed (exit 1) error: error: [youtube] jnqxac9irr0: video unavailable === test 2: download audio via
+
+(2 further failure(s) were EXCLUDED from this brief because they were the scaffold's own guards refusing — those are not defects and are not yours to remove.)
+
+⚠ READ THE EVIDENCE HONESTLY. Some of these are the COMMAND or ARGUMENT the
+tool was given failing, not the tool failing. Never make the tool hide,
+swallow or rewrite a non-zero exit code, and never widen or remove a
+safety check to make a failure go away — a guard that fires is the guard
+working. Preventing an avoidable precondition failure, or turning an
+unhelpful error into an actionable one, IS in scope.
+
+SOURCES THAT CONTRIBUTED NOTHING, and why (do not treat their silence as
+agreement):
+  * postmortem: no defects.jsonl at the canonical root — the postmortem engine is behind --postmortem and has not run on this box
+  * dream_credit: OFF by default: `dream_credit` is real_only and §4CM D4 has not returned PASS. Set GHOST_EVOLVE_DREAM_CREDIT=1 only after it does
+
+YOUR TASK. Propose the smallest change to src/ghost_agent/tools/execute.py that would prevent or
+correctly handle one of the failures above. Do not refactor. Do not add
+features. Do not rename anything a caller depends on.
+
+HARD CONSTRAINTS — a diff that breaks any of them is rejected mechanically,
+without being read:
+  * unified diff format ONLY, `--- a/<path>` / `+++ b/<path>` headers;
+  * **src/ghost_agent/tools/execute.py and nothing else** — a diff touching any other file is
+    rejected without being read, even a file on the allow-list;
+  * at most 120 changed lines;
+  * no changes to tests, evaluation harnesses, or scripts under any
+    circumstances — those score your work.
+
+Output the diff and nothing else. No prose, no fences, no explanation.

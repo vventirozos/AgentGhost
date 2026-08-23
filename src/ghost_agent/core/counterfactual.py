@@ -280,8 +280,18 @@ async def run_counterfactual_batch(dreamer, context,
     """Replay up to ``limit`` pending challenges via the dreamer's
     injected-challenge seam. Returns a summary dict (also written to the
     ledger + activity log). Never raises."""
+    # `past_failures` is what makes "0 generalized" READABLE (queue #11,
+    # 2026-08-21). A "generalized" verdict can only come from a challenge
+    # that originally FAILED, and the pool is overwhelmingly successes —
+    # measured on the live store: 299 SUCCESS vs 15 FAILURE, and 178 of 185
+    # replays were success-origin. So "0 generalized" was reported 84 times
+    # and means "we mostly did not TEST generalization", not "the learning
+    # does not generalize". Reporting the composition next to the verdict is
+    # the §4CE rule: a null result is only evidence when the design could
+    # have found something.
     summary = {"replayed": 0, "generalized": 0, "regressions": 0,
-               "stable": 0, "inconclusive": 0, "quarantined": []}
+               "stable": 0, "inconclusive": 0, "quarantined": [],
+               "past_failures": 0}
     try:
         from ..utils.logging import Icons, pretty_log
         allowed, gate_reason = should_replay()
@@ -298,6 +308,10 @@ async def run_counterfactual_batch(dreamer, context,
         if not candidates:
             return summary
         for cand in candidates:
+            # Count the class that can produce a "generalized" verdict at
+            # all — see the note on `summary` above.
+            if _normalize_status(cand.get("status")) == "FAILURE":
+                summary["past_failures"] += 1
             pretty_log(
                 "Counterfactual",
                 f"replaying challenge {cand['id']} "

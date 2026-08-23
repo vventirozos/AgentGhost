@@ -133,7 +133,21 @@ def test_dream_selfplay_detaches_shared_workspace_model():
     # The temp agent runs under its OWN semaphore; sharing the real
     # WorkspaceModel let it clobber the global stamp pointer and pollute
     # the real activity log with synthetic self-play outcomes.
-    assert "isolated_context.workspace_model = None" in _src("core/dream.py")
+    # §4CL S1: the detach moved into the shared inventory; the end-to-end
+    # pin (run the real solve loop, assert the isolate the agent was built
+    # with) lives in tests/test_isolation_replay.py.
+    from ghost_agent.core.isolation import (
+        ISOLATION_NULLED_ATTRS, null_production_state,
+    )
+
+    class _Ctx:
+        pass
+
+    assert "workspace_model" in ISOLATION_NULLED_ATTRS
+    ctx = _Ctx()
+    ctx.workspace_model = object()
+    null_production_state(ctx)
+    assert ctx.workspace_model is None
 
 
 def test_idle_autoadvance_pins_event_project():

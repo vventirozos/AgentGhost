@@ -1,0 +1,24 @@
+{"item_id": "gsm8k-1114", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 17.1}
+{"item_id": "gsm8k-549", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 17.2}
+{"item_id": "gsm8k-368", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 2 attempts)", "attempts": 2, "seconds": 131.8}
+{"item_id": "gsm8k-529", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 23.0}
+{"item_id": "gsm8k-975", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 16.9}
+{"item_id": "gsm8k-648", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 16.8}
+{"item_id": "gsm8k-875", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 20.3}
+{"item_id": "gsm8k-969", "bank": "gsm8k", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 18.3}
+{"item_id": "gsm8k_text-361", "bank": "gsm8k_text", "status": "ran", "passed": false, "bench_status": "FAILURE (Exhausted 3 attempts)", "attempts": 3, "seconds": 63.5}
+{"item_id": "gsm8k_text-1102", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 3 attempts)", "attempts": 3, "seconds": 111.5}
+{"item_id": "gsm8k_text-1114", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 2 attempts)", "attempts": 2, "seconds": 59.9}
+{"item_id": "gsm8k_text-523", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 2 attempts)", "attempts": 2, "seconds": 83.4}
+{"item_id": "gsm8k_text-1123", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 2 attempts)", "attempts": 2, "seconds": 74.0}
+{"item_id": "gsm8k_text-1162", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 3 attempts)", "attempts": 3, "seconds": 83.8}
+{"item_id": "gsm8k_text-595", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 2 attempts)", "attempts": 2, "seconds": 74.4}
+{"item_id": "gsm8k_text-987", "bank": "gsm8k_text", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 2 attempts)", "attempts": 2, "seconds": 70.5}
+{"item_id": "mbpp-212", "bank": "mbpp", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 27.1}
+{"item_id": "mbpp-695", "bank": "mbpp", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 21.1}
+{"item_id": "mbpp-337", "bank": "mbpp", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 27.4}
+{"item_id": "mbpp-461", "bank": "mbpp", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 121.8}
+{"item_id": "mbpp-542", "bank": "mbpp", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 24.8}
+{"item_id": "mbpp-848", "bank": "mbpp", "status": "ran", "passed": true, "bench_status": "SUCCESS (in 1 attempts)", "attempts": 1, "seconds": 27.4}
+{"item_id": "mbpp-111", "status": "infra", "passed": false, "reason": "item timed out"}
+{"item_id": "mbpp-138", "status": "infra", "passed": false, "reason": "budget exhausted before this item"}

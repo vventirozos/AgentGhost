@@ -1,0 +1,41 @@
+REAL CANDIDATE — node 20260823T104837-60b81d33
+  stage2 24 public | stage3 24 held-out | overlap 0
+
+STAGE 2: passed=True  (23.1 min)
+  {
+  "requested": 24,
+  "home": "/tmp/e1cascade/s2",
+  "stage2_returncode": 0,
+  "returncode": 0,
+  "historical_rate": 0.9849624060150376,
+  "floor_from": "/Users/vasilis/Data/AI/Data",
+  "ran": 23,
+  "passed": 22,
+  "infra": 1,
+  "pass_rate": 0.9565,
+  "min_pass_rate": 0.8185
+}
+
+STAGE 3: passed=False  (31.8 min)
+  reason: not better: incumbent won 2 discordant pair(s), candidate won 1 (p=1.000)
+  {
+  "requested": 24,
+  "alpha": 0.05,
+  "stage3_inc_returncode": 0,
+  "returncode": 0,
+  "stage3_can_returncode": 0,
+  "paired": 24,
+  "incumbent_ran": 24,
+  "candidate_ran": 24,
+  "dropped_unpaired": 0,
+  "incumbent_only": 2,
+  "candidate_only": 1,
+  "p_value": 1.0,
+  "diff_incumbent_minus_candidate": 0.0417,
+  "diff_ci95": [
+    -0.0988,
+    0.1821
+  ],
+  "incumbent_rate": 0.8333,
+  "candidate_rate": 0.7917
+}

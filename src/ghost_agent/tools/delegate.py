@@ -69,11 +69,16 @@ def _sandbox_supervisor(context):
 def record_landings(context, changed) -> None:
     """Write each observed sandbox-job landing to the activity ledger.
 
-    Shared by this module's reconcile and ``main``'s periodic sweeper, since
-    either can be the one that observes a transition. The ledger — not the
-    operator's live log stream — is what answers "what happened while I was
-    away" (``introspect action='activity'``); nothing re-engages the model
-    after a turn ends, so a landing that is only logged is effectively
+    ONE caller since queue #9 (2026-08-21): ``main``'s periodic sweeper,
+    driving off the durable ``reported_at`` marker. It used to be shared with
+    this module's reconcile on the theory that "whoever observes a transition
+    owns recording it" — but `reap()` hands each transition over exactly
+    once, and this module's copy recorded WITHOUT waking, so a job landing
+    during a tool call reached the ledger and then stranded (measured: 6
+    landed jobs, 6 ledger rows from here, zero wakes ever). The ledger — not
+    the operator's live log stream — is what answers "what happened while I
+    was away" (``introspect action='activity'``); nothing re-engages the
+    model after a turn ends, so a landing that is only logged is effectively
     invisible. Never raises."""
     for entry in changed or ():
         try:
@@ -93,9 +98,6 @@ def record_landings(context, changed) -> None:
             logger.debug("sandbox job activity record skipped", exc_info=True)
 
 
-# Private alias kept for the call site above (import-order readability).
-_record_landings = record_landings
-
 
 def _sync_sandbox_jobs(reg, context) -> None:
     """Reconcile ``sandbox``-kind rows against the container before answering.
@@ -111,12 +113,16 @@ def _sync_sandbox_jobs(reg, context) -> None:
         return
     try:
         from ..sandbox import jobs as sbx_jobs
-        # reap() returns the transitions IT observed, and it is the only
-        # writer of terminal states — so whoever observes a landing owns
-        # recording it. Discarding this made "every landed job reaches the
-        # activity ledger" false for any job that happened to land during a
-        # `jobs` call rather than during the sweeper's tick.
-        _record_landings(context, sup.reap())
+        # Land the states; do NOT report here (queue #9, 2026-08-21).
+        # Reporting used to be owned by whoever observed the transition,
+        # because `reap()` hands it over exactly once — but this path only
+        # ever recorded it, never WOKE the model, so a job landing during a
+        # `jobs`/`execute` call reached the ledger and then stranded. The
+        # transition is now marked durably at landing and drained by the
+        # single reporter (main's sweeper, within one tick), which both
+        # records and wakes. One reporter, so nothing is double-counted and
+        # nothing depends on who raced to observe it.
+        sup.reap()
         entries = {e.get("id"): e for e in sup.list_entries()}
     except Exception:  # noqa: BLE001
         logger.debug("sandbox job reap failed", exc_info=True)

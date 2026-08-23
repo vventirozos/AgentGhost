@@ -471,33 +471,67 @@ as the last step, mutation-pin every fix red-on-revert, docs + journal + restart
 
 **Queue refresh (2026-08-20, post-§4CC gap analysis — same ranking lens: instruments and
 seams that changed recently, whose failure mode is SILENT):**
-7. **OPEN — verifier→autobio outcome-backfill stoppage (INVESTIGATION, hours not a
-   campaign).** Found during §4CC: newest passed/failed record in the live
-   autobiographical log is 2026-08-16, 78 records back — the late-verifier backfill
-   appears to have landed nothing in ~4 days. Starves the §4CC mood streak AND any
-   consumer of autobio outcome labels. Distinguish real breakage from traffic drought
-   FIRST (the §4BT lesson: "discovering in October that the gate was starved by code,
-   not by traffic").
-8. **OPEN — measurement-instrument stack** (`core/experiments.py` ~2.2k, `core/calibration.py`
+7. **✅ CLOSED 2026-08-21 (§4CD) — verifier→autobio outcome backfill.** NOT the stoppage it
+   looked like: the drought explains the DATE (verdict-producing turns 18/day → 2/day; the
+   inline path wins only ~15-18% of verdicts, so 0 in 11 is p≈0.11), and underneath it was a
+   six-week architectural gap — the diary's ONLY live verdict feed was finalize's inline
+   leg, i.e. a 25s race. The late verdict (~85%) and 100% of human labels never reached it
+   (385 of 386 labelled rows came from the race). Both legs wired as FOLLOWERS of the corpus
+   write; 331-row backlog healed on the live store. 4 review rounds (R2/R3 each found
+   code defects, R3b found one the R3 FIX introduced), 37 pins, 19 mutants killed,
+   live-verified on both verdict paths after deploy. See §4CD.
+8. **✅ CONVERGED 2026-08-21 (§4CE) — measurement-instrument stack.** The queue's premise
+   confirmed literally: three instruments each stated a conclusion the data could not support
+   (ten of ten arm/metric pairs reported "no difference detected yet" for a difference that
+   was arithmetically undetectable; the confidence model was credited with beating the base
+   rate on a delta whose CI straddles zero; the stamp-coverage alarm could not fall far enough
+   to fire). 5 rounds, 45 pins, 21 mutants killed. See §4CE.
+
+8b. **(superseded) original entry — measurement-instrument stack** (`core/experiments.py` ~2.2k, `core/calibration.py`
    ~1.8k + their report surfaces). Never converged as a unit; four standing lessons say
    instruments lie plausibly (instruments-fail-not-runtime, judge-instrument-failures,
    §4BR wrong-statistic gate, restated-is-not-checked), and every keep/kill decision —
    verify_depth arm, §4BT labels, future A/Bs — rides them. Maximally silent failure mode:
    a wrong verdict looks exactly like a verdict.
-9. **OPEN — autonomous-dispatch seams in `main.py`** (~3.2k: lifespan wiring, scheduled
+9. **✅ CONVERGED 2026-08-21 (§4CF) — autonomous-dispatch seams.** The job-resume wake had
+   NEVER fired: `reap()` hands each transition to whoever calls it first, and 3 of its 4
+   callers drop it (two silently). Live: 6 landings, 6 ledger rows, 0 wakes. Notification made
+   durable (`reported_at` + `woken_at`); R2 caught the fix re-creating the same defect for
+   deferred wakes. 16 pins, 13 mutants killed. See §4CF.
+
+9b. **(superseded) original entry — autonomous-dispatch seams in `main.py`** (~3.2k: lifespan wiring, scheduled
    tasks, job resume, foreground marking, INTERNAL_REQUEST_PREFIXES contract). §4CC's R4
    MAJOR (sched-/job- turns masquerading as operator activity) came from exactly this seam
    and was caught only by a reviewer enumerating req_id producers. Never had a dedicated
    pass; wiring files are where silent-inoperative subsystems live.
-10. **OPEN — project-store stack** (`tools/projects.py` ~4.2k — largest tool file,
+10. **✅ CONVERGED 2026-08-21 (§4CG) — project-store stack.** A registered deliverable is a
+   CLAIM and the briefing said FACT: 3 of 66 live deliverables do not exist, and the sweep was
+   ruled out by its own event trail. Read path made honest (briefing + tool view), fork/clone
+   stop propagating phantoms. The DONE sweep and constraint retirement both came back SOUND —
+   WebOS's 7 armed constraints are legacy data (last DONE one day before the 08-01 fix), with
+   a dry-run reconciler staged. 5 rounds, 26 pins, 15 mutants killed. See §4CG.
+
+10b. **(superseded) original entry — project-store stack** (`tools/projects.py` ~4.2k — largest tool file,
    `memory/projects.py` ~2k, `core/project_advancer.py` ~1.6k, workspace sweep). Last
    converged look was the three-stack review 2026-07-20; §4G port leases, autoadvance and
    work_log write-back all shipped after. Failure mode includes the IRREVERSIBLE
    workspace sweep on DONE and silently-retired constraints.
-11. **OPEN (lower) — `core/dream.py` as a UNIT** (~6.9k; 2/3 of live traffic). Heavily
+11. **✅ CONVERGED 2026-08-21 (§4CH) — `core/dream.py` as a unit.** The isolation-list concern
+   came back CLEAN (the asymmetry vs subagent is correct and now explained). The findings were
+   in REPORTING: 919 identical ledger rows for the busiest subsystem, a greppability contract
+   false for 34% of messages, and "0 generalized" ledgered 84 times while mostly not testing
+   generalization. 16 pins, 6 mutants killed. See §4CH.
+
+11b. **(superseded) original entry — `core/dream.py` as a UNIT** (~6.9k; 2/3 of live traffic). Heavily
    incident-audited (§4AT containment, §4BF bench, curriculum) but never one converged
    whole-unit pass; its isolation lists have twice been found drifted from subagent.py's.
-12. **OPEN (lower) — `tools/file_system.py`** (~3.8k). Incident-fixed
+12. **✅ CONVERGED 2026-08-21 (§4CI) — `tools/file_system.py`.** Release immutability leaked
+   through FOUR operations (copy, rename, download, and move's destination) — three landed
+   files in a workspace documented as immutable. Guard inverted to an allow-list of read-only
+   ops. The `_get_safe_path` containment boundary came back clean under traversal AND symlink
+   fuzzing. 16 pins, 4 mutants killed. See §4CI.
+
+12b. **(superseded) original entry — `tools/file_system.py`** (~3.8k). Incident-fixed
    (partial-keepset wipe) but never converged-reviewed.
 
 **Deliberately NOT queued** (converged within ~10 days, or continuously re-audited as a side
@@ -22408,3 +22442,3405 @@ real streak.
 - Bounded gaps documented in selfhood.html (out-of-band surfaces don't count as operator
   activity; one-turn retirement lag; last-decisive evidence counts; held-idle 48h age-out;
   stale-acute fall-through) — all fail toward honest absence.
+
+## §4CD — Queue #7: the diary follows the corpus (verdict backfill, 2026-08-21)
+
+**Trigger.** §4CC's found-not-fixed list: "verdict backfill appears DEAD since 2026-08-16 —
+newest passed/failed autobio record is 78 back". Queue item #7 asked for an INVESTIGATION
+first, with the §4BT rule in force: distinguish real breakage from a traffic drought BEFORE
+touching code.
+
+### The investigation — and why the drought question had TWO answers
+Both stores were measured against each other, per day:
+
+| | 08-11 → 08-16 | 08-17 → 08-21 |
+|---|---|---|
+| trajectory records written `passed`/`failed` inline (user turns) | 5, 2, 4, 0, 3, 3 | **0 every day** |
+| `verifier_late` + `human_feedback` rows in `corrections.jsonl` | 10-31/day | 2-8/day, **every day** |
+| autobio rows `passed`/`failed` | 5, 2, 4, 0, 3, 3 | **0 every day** |
+
+So the verifier was never down: the corpus took a verdict on all five "dead" days. What
+stopped was the INLINE resolution — and the arithmetic says that is a drought, not a break.
+Verdict-producing turns fell from ~18/day to ~2/day; the inline path wins only ~15-18% of
+verdicts (the bounded in-loop await, `_critic_repair_await_budget` = 25s, against live
+claim-verifies at p50 27.6s); 0 inline wins in 11 verdicts is p ≈ 0.11. Ordinary.
+**The 08-16 date correlation — `experiments.json` gained the `verify_depth` arm at 18:41
+that day — is a coincidence, and the seductive one: it was the obvious culprit and it is
+not guilty.**
+
+The real finding was underneath, and it is six weeks old, not five days:
+
+**The diary had exactly ONE live verdict feed, and it was a race.** `record_outcome` was
+called from finalize's inline `verifier_backfill` leg (agent.py) and from the
+user-correction hook. The two paths carrying essentially every production verdict —
+`_backfill_trajectory_outcome` (the LATE async verdict, ~85% of verdicts) and
+`core/feedback.apply_human_label` (100% of human 👍/👎) — wrote the corpus, the correction
+cache and the calibration clock, and never touched the agent's own first-person record.
+Joined on `trajectory_id` against the day-files: **385 of 386** labelled diary rows came
+from that race (the 386th from the user-correction hook), and **331** diary rows sat at
+`unknown` while the corrections sidecar already carried their verdict (283 `verifier_late`,
+48 human). Verdict-blind by architecture, not by config. What the traffic collapse did was
+remove the only feed's last wins, which is what made a six-week gap look like a five-day
+stoppage.
+
+### The fix — a FOLLOWER, not a second ladder
+Both missing legs write AFTER the corpus write returns accepted, and write the outcome the
+corpus ACCEPTED:
+- **`agent._backfill_trajectory_outcome._write_then_apply`** — after the `"withheld"` and
+  write-failure returns, beside the calibration correction. A verdict the collector refused
+  (standing human label, bench oracle) or the shape rule withheld (`resolve_turn_outcome`
+  rule 2/2b) therefore cannot reach the diary either.
+- **`feedback.apply_human_label`** — after the sidecar commit and the cache stamp, on the
+  `unchanged` branch too, so a re-click HEALS a stale diary row (the `_stamp_cache` doctrine
+  one line above it). `update_outcome` no-ops when the row already agrees.
+
+Deliberately NOT a diary-side authority ladder. The diary has no source-rank to arbitrate
+with, and a second copy of a priority ladder is this project's signature defect — the same
+reasoning that made the late-backfill site CALL `resolve_turn_outcome` in 2026-08-04 instead
+of restating it. Sequencing behind the collector's in-lock `yield_to_human` /
+`bench_validator` guards buys the whole authority order for free, in both arrival orders.
+
+Both legs carry the real_only origin gate (`turn_origin(ctx) == "user"`, §4BF 1c) — matching
+the CAPTURE site exactly, since a diary row only exists for turns that passed the same gate.
+On the late path the origin is **snapshotted synchronously** when the verdict lands rather
+than read inside the background write: that write executes 20-60s later, and reading a
+per-turn context flag that late is the §4CC R1 shape. Both legs are non-fatal (a broken
+diary must not cost the corpus its verdict, nor turn a committed label into a 503).
+
+### The backlog heal (operator-approved)
+`scripts/heal_diary_outcomes.py` — one-shot reconciliation, dry-run by default. Reads the
+resolved outcome through `iter_trajectories` (the corrections OVERLAY), so it inherits the
+same authority order rather than re-deriving one; bounded by construction to rows that
+ALREADY EXIST in the diary and are ALREADY `unknown` (it can never create a row, which would
+launder a sim/bench turn past the real_only capture gate, and never re-labels a resolved
+row). `--apply` backs the diary up first.
+
+Applied to the live store 2026-08-21 17:42: **331 rows healed**, backup at
+`autobiographical.jsonl.pre-heal-20260821T174250`. Verified against the backup: row count
+2073 → 2073, row order id-identical, and the ONLY fields that changed anywhere in the file
+are `outcome` and `summary`. Labelled rows 386 → 717. Newest labelled record moved from
+**89 records back to 1**, and `recent_verdicts(5)` — starved when §4CC filed this — now
+returns five verdict-bearing records.
+
+### Verification
+`tests/test_selfhood_late_verdict_backfill.py` (19 pins) + `tests/test_heal_diary_outcomes_script.py`
+(11 pins), every one executed against a real diary file and asserting on the bytes on disk,
+not on a call count: the accepted-outcome IDENTITY in both directions (a hardcoded value
+diverges from the corpus argument), withheld/failed corpus writes leaving the diary
+untouched, the shape rule's withheld PASS *and* the structural-only upgrade it still allows
+(both directions, so the withhold pin is a gate and not a tautology), the origin gate on
+both legs, the call-time origin snapshot in both directions, repeat-heals-history,
+non-fatality on a raising diary; for the script, gap detection, overlay-not-raw-sidecar
+authority, dry-run-writes-nothing, no-new-rows, backup-is-the-pre-state, idempotence,
+`--limit`. **Mutation: 8/8 + 5/5 KILLED, both comment-only controls SURVIVED**, per-mutant
+restore, tree verified pristine by hash. Localized 484 + 30 green.
+
+Docs: `docs/algorithms/selfhood.html` §"The diary follows the corpus" (+ .md banner); the
+now-incomplete "Outcome backfill (proposal item #3)" paragraph points at it.
+
+### The lesson worth keeping
+**A feed that works only when it wins a race is not a feed — and its failure signature is
+indistinguishable from low traffic.** Both halves matter: the diary looked wired (there were
+labelled rows every busy day), and the day it went visibly quiet was the day traffic fell,
+which is exactly when a race-fed path goes silent. The §4BT drought question is what
+separated them — but the honest answer was "the drought explains the DATE, and there is a
+much older architectural gap underneath it", not one or the other. Sibling of
+[[built-but-unwired-loops]] and [[silent-inoperative-subsystems]]: this loop was not
+unwired, it was wired to the rarest of three paths.
+
+### Found-not-fixed (documented)
+- The inline win rate itself (~15-18%) is unchanged and unexamined: `_critic_repair_await_budget`
+  is 25s against live claim-verifies at p50 27.6s / p90 55.6s, so the in-loop REPAIR
+  opportunity (its actual purpose — repairing a REFUTED answer before it ships) misses more
+  often than it lands. Worth a measurement, not a blind budget bump: the wait costs the main
+  slot nothing but does hold the reply.
+- `verify_depth`'s effect on verdict latency (n=3 self-consistency on router-hard turns) was
+  NOT measured here; it was cleared as the cause of this defect, which is not the same thing.
+- Diary rows lost to the template-rollup compaction (`_bump_template_rollup`) can't be healed
+  by trajectory_id — the reconciler silently skips them (they no longer exist as rows).
+
+### §4CD Round 2 — fresh-eye review of the R1 fix (operator-requested, same day)
+
+Reviewed adversarially with probes rather than reading. **The round did NOT come back clean**
+— two code findings and, more usefully, two HARNESS findings.
+
+**MINOR-1 (code): the diary's failure reason went in unredacted.** `_outcome_phrase` splices
+up to 120 chars of `failure_reason` into the durable summary. `capture_turn` scrubs the
+quoted `user_request` at the boundary — the module's stated contract — but the reason went in
+raw, and the reasons are not the agent's own prose: verifier `issues`/`reasoning` (which
+quote tool output) and, on the user-correction path, text derived from the USER'S OWN
+correcting message. The trajectory corpus's sibling writer has always redacted
+("redaction runs on every write is the package contract"); the diary, which is the surface
+read back INTO prompts, had the hole. **Pre-existing, but R1 amplified it** from ~15% of
+verdicts to ~85%, which is the part this pass owns. Fixed at `_outcome_phrase` — the single
+shared helper every writer passes through (capture, inline backfill, late verdict, human
+label, the reconciler), redacting BEFORE the 120-char clip. Scope confirmed complete:
+`Experience` has no `failure_reason` field, so the summary is the only carrier.
+**Live check: 0 rows in the 2,073-row diary contain a PII pattern** — a latent contract
+violation, not an incident.
+
+**MINOR-2 (code): a human label landing in the write WINDOW could overrule the human in the
+diary.** The corpus write and the diary write are two separate awaits. A label landing in
+that gap gets the collector's "yes" microseconds before the human speaks, and the diary would
+then carry a machine verdict the corpus no longer does — the exact authority inversion the
+follower design exists to prevent, surviving at ms scale. Narrowed by re-asking the
+COLLECTOR's own `has_human_label` (ever-human, mtime-cached) immediately before the write —
+delegating to its authority, not restating it. Reaching that line with a label present means
+exactly the race, since this path always passes `yield_to_human=True`. Absence of the method
+fails OPEN (a stub or older collector must not silently disable the whole leg — that failure
+mode is the one being fixed). ⚠ **Still check-then-act: a ~ms residual window remains**, and
+the race-proof version needs a diary-side source rank. Documented, not fixed — the diary is a
+gauge nothing branches on.
+
+**HARNESS-1: a mutant reported SURVIVED that had never applied.** Two mutants were generated
+through a layer of Python-string escaping that collapsed `"\n"` in the anchor to a real
+newline, so the `str.replace` was a silent no-op and the battery reported "survived" — i.e.
+the harness accused the TESTS of a gap that did not exist. The battery now hashes the tree
+after applying each mutant and reports **ANCHOR MISS** when nothing changed, which can never
+again be confused with a survivor. (Same family as [[harness-grades-own-homework]]: the
+instrument's failure looked exactly like the finding it was built to report.)
+
+**HARNESS-2: the ordering pin could not distinguish the ordering.** With the fixed harness,
+the redact-after-clip mutant genuinely survived: the test padded the reason to 116 chars, so
+the 120-char clip never touched the address and BOTH orderings produced identical output —
+[[verify-cannot-distinguish]] exactly. Re-sized the padding so the address straddles the
+boundary (clip-then-redact leaves `ops@examp`, which has no TLD for the pattern to catch).
+Now killed.
+
+**Verified sound by attack (no defect found):** the byte cap is 2 MB and the healed file is
+1.006 MB, so the heal could not have triggered a compaction that drops history (the sharpest
+risk of the reconciliation — checked before it could bite); all 331 healed rows got their
+prose patched (0 rollup records silently taking another turn's verdict) and 0 incoherent
+passed-with-failure-prose rows; `recent()`, `search_my_past()`, `cluster_counts()`,
+`count()`, `boot_count()` all work on the healed file; `update_outcome` on the live-size
+diary takes **2.4 ms**, so the `to_thread` claim holds and the lock hold is trivial;
+no consumer parses the reason back out of the summary; the four corpus outcome writers are
+exactly the ones enumerated (the `task_reopened` retro-negative is calibration-only and never
+labels the corpus, so it is correctly out of scope); both arrival orders of
+verdict-vs-human-label converge to the same final state.
+
+### Verification (R2)
+7 new pins (27 total in test_selfhood_late_verdict_backfill.py) covering the redaction (secret
+scrubbed on disk, ordering, capture/backfill phrase IDENTITY), the write-window race, the
+fail-open absence, and a cache-MISS FAILED reaching the diary. **14/14 mutants KILLED +
+comment-only control SURVIVED**, per-mutant restore, tree hash-verified pristine. Localized
+173 + 377 green.
+
+### §4CD Round 3 — attacking R2's fixes; the code holds, the residue was all verification
+
+**No new CODE defect.** Every attack on the two R2 fixes failed: `Experience` has no
+`failure_reason` field, so redacting the phrase covers the entire durable surface (the summary
+is the only carrier); no consumer parses the reason back out of the summary; the
+`has_human_label` re-check cannot be reached with a pre-existing label (the collector would
+have returned `"withheld"`), fails open on absence by design, and shortens rather than widens
+the window it guards; the log flag stays honest when the guard suppresses the write.
+
+**But the third pin gap was the sharpest of the whole pass. PIN-1: every test drove a STUB
+collector, so the design's central claim — that authority is DELEGATED to the collector —
+was never actually exercised.** A stub ignores `yield_to_human`, so a mutant deleting that
+kwarg from the late-verdict corpus write passed all 27 tests. Fixed with end-to-end pins
+against the REAL `TrajectoryCollector` + real `apply_human_label` + real diary, asserting the
+property the design promises — **the diary equals what the corpus resolved** — in both
+arrival orders.
+
+**PIN-2, found because the first attempt at PIN-1 still didn't kill the mutant: the two
+authority layers are not interchangeable, and the e2e tests were exercising the wrong one.**
+`apply_human_label` stamps `human_labeled` on the cached trajectory, and
+`_backfill_trajectory_outcome` short-circuits on that stamp BEFORE it ever reaches the
+collector — so an e2e test whose cache carries the stamp never touches the writer-side guard.
+That guard exists for precisely the case this leg rides (the write is deferred through a
+background thread; the cached trajectory can be evicted entirely). Added the eviction pin: a
+human label with an EMPTY cache, so the machine verdict really does reach the collector and
+must be refused against the FILE. That kills the mutant.
+
+**⚠ An earlier draft of this section claimed Round 3 found no code defect and called
+convergence here. That was wrong and is corrected below** — the whole-file coherence sweep
+(also Round 3) found one, and attacking the fix for THAT found another. Recorded rather than
+quietly amended, because the premature convergence call is itself the recurring failure.
+
+### Verification (R3)
+4 new pins (31 total) — three end-to-end convergence pins against the real collector in both
+arrival orders, plus the cache-evicted writer-side pin. **15/15 mutants KILLED + comment-only
+control SURVIVED** (adding `yield_to_human` deletion, which only the e2e pins can see),
+per-mutant restore, tree hash-verified pristine.
+
+### Documented, not fixed (final)
+- The late leg's human-label re-check is **check-then-act**: a ~ms window remains in which a
+  label landing between the check and the diary write leaves the diary carrying a machine
+  verdict the corpus does not. Race-proof needs a source rank on the diary itself. Accepted —
+  the diary is a gauge nothing branches on, and the corpus (which everything DOES read) is
+  already race-proof.
+- The inline win rate (~15-18%) is unexamined; that race exists to REPAIR a refuted answer
+  before it ships and misses more often than it lands. Measure before bumping the budget.
+- `task_reopened` retro-negatives are calibration-only — they never label the corpus, so they
+  reach neither store's outcome. Pre-existing and deliberate (a bad label cannot be filtered
+  back out of the corpus), noted so the next reader does not re-derive it.
+- Diary rows lost to template-rollup compaction can't be healed by trajectory_id.
+
+**MINOR-3 (code, Round 3): the prose contradicted the field on any upgrade.**
+`update_outcome` patched only the `"without a verdict either way"` clause, so a row CAPTURED
+as failed and later upgraded read *"…and it didn't land: cannot open file.txt."* under
+`outcome="passed"` — on the surface the narrative layer and recall actually read. Found by a
+whole-file coherence scan of the live diary: **3 such rows exist from July**, all pre-dating
+this pass (checked against the pre-heal backup — the heal created none, since it only touched
+`unknown` rows). But this leg makes upgrades COMMON (a structural-only FAILED is liftable by
+a late PASS), so it makes the incoherence common. Fixed with `_swap_verdict_clause`, which
+replaces whichever clause the record carries. The 3 legacy rows are left as-is —
+`2026-07-14T16:39:34`, `2026-07-17T14:10:53`, `2026-07-30T17:37:33` — their outcome is
+correct and the reconciler only touches `unknown` rows; recorded here so the next reader
+doesn't re-derive them.
+
+### §4CD Round 3b — attacking the Round 3 fix; the streak holds for a third time
+
+**MAJOR (self-inflicted, caught before deploy): the clause swap could TRUNCATE a record.**
+The swap cuts from the clause to the end of the string (deliberately — a failure reason may
+contain a period, so cutting at the first period would splice the row). But the summary
+QUOTES the user's request, so a request containing a verdict phrase plants a decoy EARLIER in
+the string than the real clause, and a leftmost match then cuts from the decoy:
+
+```
+before: I worked on "you claimed X and the answer landed but it did not". I reached for
+        file_system and it didn't land: it crashed.
+after:  I worked on "you claimed X and the answer landed.
+```
+
+The quote is truncated mid-sentence, the closing quote is gone, the tool phrase is gone. **The
+code this replaced could not do that** — it substituted the clause in place, so it could
+mis-phrase but never truncate. The hazard arrived WITH the fix, which is the same shape as
+every other round here. Fixed by matching from the RIGHT, which is correct by construction
+rather than by luck: the template puts the quote BEFORE the clause, so a decoy is always at a
+smaller index than the real clause. Residual, documented: a failure reason that itself ends in
+a verdict phrase loses its tail — degraded prose, never a truncated quote, and the reason is
+being replaced anyway.
+
+### §4CD Round 4 — CONVERGED
+
+No code finding. The rightmost-match rule was checked structurally (the template orders quote
+before clause, so a decoy can never win) and then EMPIRICALLY, by running the new rule across
+every summary in the live 2,075-row diary: **1,059 real swaps, 0 mangled** — quote integrity
+preserved on every one, correct tail on every one; the 1,016 untouched are boot markers and
+rollups, which is exactly the population that carries no clause.
+
+**The §4CD arc (4 rounds, and the honest shape of it):** R1 shipped the two follower legs.
+R2 found 2 code defects (unredacted reason, the write-window race) + 2 HARNESS defects (a
+mutant that never applied reported as a survivor; a pin that could not discriminate the two
+orderings it tested). R3 found 1 code defect (prose contradicting the field) + 3 verification
+defects — the sharpest being that every pin drove a STUB collector, so the design's central
+claim (authority is DELEGATED) was unpinned, and even the first end-to-end fix for that
+exercised the wrong one of the two authority layers. R3b found that R3's fix could truncate a
+record. R4 clean. **19 mutants killed + comment-only control survived; 37 pins.**
+
+**What this pass adds to the standing lesson.** The streak ("the fix carries the defect") held
+three times in a row, and twice the defect was in the VERIFICATION rather than the code — the
+instrument accusing the tests, and pins that tested a stub instead of the thing they claimed
+to prove. Two rules worth keeping: **(1) if the design's claim is "authority is delegated to
+X", at least one pin must run the real X** — a stub silently satisfies every delegation
+contract; **(2) a mutation batch must prove each mutant APPLIED** (hash the tree) or a
+no-op anchor is indistinguishable from a survivor, and the harness will blame the tests.
+
+### §4CD live acceptance (2026-08-21 18:52, after deploy)
+
+Deployed (listener pid 3511 → 11374, verified CHANGED, `/api/health` ok) and then exercised
+BOTH verdict paths on the live box, because a green suite is not evidence the production wiring
+runs:
+
+* **Non-streamed probe** (`chatcmpl-218f0d1a`) — the verifier CONFIRMED at **+26.5s** and the
+  gate took it INLINE, so the trajectory was born `passed` and the diary row with it. That is
+  the ~15-18% race path, and it demonstrates the old behaviour still works. (It also shows the
+  race is a coin-flip: +26.5s against a 25s budget.)
+* **Streamed probe** (`chatcmpl-bae9cdb4`, trajectory `a8a24247`) — the stream gate deferred
+  the verdict as production always does; 15s later the operator stream printed
+  **`late verdict backfilled into the corpus + diary: trajectory a8a24247 → passed`**, and the
+  diary row flipped `unknown → passed` on disk. **This is the path that was dead for six weeks,
+  working in production**, and the `+ diary` half of the log line is what makes it falsifiable
+  from the stream alone.
+
+Downstream, immediately: `recent_verdicts(5)` returns five verdicts, and the live mood is now
+`satisfied` / `source=derived` / *"my last 5 verdict-bearing turns all passed"* — §4CC's gauge
+reading real evidence instead of a 23-day-old self-authored label. The reconciler re-run reports
+`0 rows to heal`, i.e. the two stores agree.
+
+**Full suite: 14,442 passed / 17 skipped / 0 failed.** Run as 6 foreground chunks (background
+runs are CPU-starved in this environment — 25% in ~40 min vs ~13 min foreground); the sum was
+cross-checked against `--collect-only`'s 14,459 collected, which passed+skipped matches exactly,
+so no chunk gap and no double-counted overlap.
+
+## §4CE — Queue #8: the measurement-instrument stack (2026-08-21)
+
+**The queue's own premise, confirmed literally.** #8 was ranked on "instruments whose failure
+mode is SILENT — a wrong verdict looks exactly like a verdict". Three were live, and none of
+them was wrong about a *number*: each stated a conclusion the data could not support.
+
+### The findings
+
+**1. Every live arm reported "no difference detected yet" for a difference it could not have
+detected.** Measured across the whole board 2026-08-21 — five experiments × both quality
+metrics, ten for ten — the CS half-width was 2-6× LARGER than the biggest improvement the
+metric can physically make:
+
+| experiment | metric | control | half-width | improvement reachable? |
+|---|---|---|---|---|
+| foresight_note | failure_rate | 0.203 | 0.367 | NO (max improvement 0.203) |
+| fs_batch | failure_rate | 0.185 | 0.346 | NO |
+| risk_steer | failure_rate | 0.165 | 0.349 | NO |
+| use_planning | failure_rate | 0.143 | 0.400 | NO |
+| verify_depth | failure_rate | 0.133 | 0.693 | NO |
+| (all five) | human_failure_rate | 0.100-0.200 | 0.621-0.895 | NO |
+
+A failure rate cannot fall below zero, so an *improvement* verdict was arithmetically
+impossible on every arm — only a catastrophic harm could ever have been called. Ten lines of
+"no difference detected yet" read as evidence the features don't help; it was the design
+having no power. Power confirmed by simulation under the report's own rule (α split 4 metrics
+× 2 arms, radii ADDED): detecting a HALVED failure rate (0.20→0.10) needs ~1,000 resolved
+turns/arm — at ~3.5 user turns/day, years. At the live n≈100/arm, power is **0.00**.
+
+**2. The confidence model was credited with beating the base rate on a 1e-6 tolerance.**
+`learning_health` scored WIN/LOSS by comparing two point estimates. Live: brier_cv 0.03889 vs
+base rate 0.03998, a delta of −0.00108 — whose 95% paired-bootstrap CI is
+**[−0.00246, +0.00017]**, straddling zero. The rendered verdict was "beats the base-rate
+predictor"; the honest one is "indistinguishable". (The module already had the hard-won half
+of this — `brier_cv` exists because the 2026-08-10 audit caught in-sample Brier being printed
+as the headline. What was missing was the uncertainty on the comparison it enabled.)
+
+**3. The stamp-coverage alarm could not fire.** Its own docstring says it exists so "a broken
+stamp is [not] indistinguishable from a young experiment". Its denominator was every user turn
+ever recorded, ~1,320 of them pre-framework, so a TOTAL outage moves the headline 16.8% →
+16.3% — under an "under half" warning that has been permanently on since the day it shipped.
+Per-day coverage has been 100% since 2026-08-04 throughout.
+
+### What shipped
+- `MetricComparison` gained `half_width` / `max_possible_improvement` and a THIRD straddling
+  verdict: **NO POWER for an improvement**, which names the ceiling it cannot clear and the
+  n at which one first becomes possible (`n_for_detectable`, which binary-searches the REAL
+  `asymp_cs_radius` rather than a second power formula — a separately-derived one would be
+  another copy of the estimator). A control already at the metric's floor gets its own honest
+  line ("no improvement is POSSIBLE") instead of the generic wording.
+- `_RATE_METRICS` / `_UNBOUNDED_METRICS` now PARTITION `_METRICS`, declared rather than
+  inferred from the name (a lexical proxy for a semantic property is how this project keeps
+  shipping guards that quietly stop matching); the partition is test-enforced, so a new metric
+  cannot be added without classifying it.
+- `summarize_streaming` tracks a trailing 50-record coverage window beside the lifetime
+  counts, and the report renders both — with the "cannot fall far" caveat CONDITIONAL on the
+  arithmetic and the alarm keyed on the window.
+- `calibration.fit` records `brier_cv_delta_lo/hi` (paired bootstrap, deterministic, 338 ms at
+  live n) and `learning_health` scores the verdict on the INTERVAL — "beats" / "LOSES TO" /
+  "is INDISTINGUISHABLE from" — falling back to a LABELLED point comparison when a params file
+  predates the fields.
+- `scripts/verify_core_math.py` extended: the exhaustive verdict table now covers the power
+  state (it used metric "m", which is not a rate, so it never reached the new branch), plus a
+  differential check that `n_for_detectable` agrees with the real radius at n and n−1. 28/28.
+
+### Verified sound by attack (no defect)
+The randomizer itself: per-experiment assignment is uniform (200k synthetic ids, |z|<2.2) and
+INDEPENDENT across experiments both synthetically and on live data (pairwise agreement
+0.451-0.588, all |z|<2). `risk_steer`'s 111/156 split (exact p=0.0070) and `use_planning`'s
+120/93 are ordinary hash luck across five specs, not a recording fault — and the
+enrollment-skew alarm's fair-coin assumption is currently correct because every live spec is
+50/50 (⚠ it would misfire on a weighted spec; latent, recorded). The identical
+`human_failure_rate` numbers on foresight_note and fs_batch (25/27, 0.200/0.222) are a genuine
+marginal coincidence — agreement on that 52-row slice is 0.577, not 1.0 — worth recording
+because a reviewer WILL chase it. The new NO-POWER string cannot leak into operator
+announcements (`announce_new_verdicts` filters on `startswith("TREATMENT ")`). And the coverage
+alarm cannot cry wolf on legitimately-unstamped turns: the only ineligibility marker that
+coexists with a collector (`suppress_meta_task_nudges`) is set exclusively on dream's isolated
+agents, which origin already excludes.
+
+### The five rounds
+R1 shipped the three fixes. **R2 found two defects in them**: the coverage window raised a
+FALSE "stamp is regressing NOW" alarm whenever the report's name scope excluded the only spec
+a record carried (reproduced: 20 fully-stamped records under a denying report → window 0%),
+because I had fed a REPORT-scoped answer to a STAMP-health question; and a control already at
+0.000 rendered as an instrument failure ("unreachable within 200,000/arm") when it is in fact
+the good case. **R3 found one more**: the "cannot fall far" caveat was stated
+unconditionally and so was false on the bench report, which reads 116/116 — a
+measured-sounding claim that isn't, inside the sentence fixing measured-sounding claims that
+aren't. **R4 found one more**: `n_for_detectable` reported "unreachable within 200,000/arm"
+while plain doubling stopped probing at 131,072 — false precision about a bound it never
+evaluated. **R5 clean.**
+
+Before that, R1 itself began with the same defect in its first draft: the coverage window
+appended only past the unstamped `continue`, so it saw stamped records exclusively and read
+100% however dead the stamp was — **a health indicator that could only report good news, which
+is precisely the defect it was written to fix.** Caught by its own test, which had been written
+to discriminate rather than to confirm.
+
+### Verification
+`tests/test_experiments_power_and_coverage.py` (32) + `tests/test_calibration_power_verdict.py`
+(13) — every pin drives the real estimator against real structures, including an identity pin
+that `n_for_detectable`'s answer is the n at which the REAL radius first clears the effect (and
+n−1 does not). **15/15 + 6/6 mutants KILLED, both comment-only controls SURVIVED**, per-mutant
+restore, tree hash-verified pristine; a mutant that changes nothing is reported as ANCHOR MISS,
+never as a survivor (the §4CD harness lesson, carried forward and used twice here). Full suite
+**14,487 passed / 17 skipped / 0 failed**, run as 6 foreground chunks and cross-checked against
+`--collect-only`'s 14,504 (passed + skipped matches exactly, so no chunk gap or overlap).
+
+### Found-not-fixed (documented)
+- **The live arms cannot conclude on quality at this traffic**, and that is now visible rather
+  than fixed. An improvement verdict on `failure_rate` needs ≥~230-260 resolved turns/arm
+  (have 67-76); `human_failure_rate` needs far more and collects at ~0.77 labelled turns/day.
+  The operator's real levers are fewer concurrent arms (the α split is 4 metrics × 2 arms), a
+  richer metric, or accepting that these arms are safety nets rather than experiments.
+- `use_planning` treatment shows 8/22 human-graded failures vs 3/30 control (Fisher exact
+  p=0.037) — the strongest live signal on the board, still short of the report's own α
+  discipline. Worth watching, not acting on.
+- The enrollment-skew alarm assumes a fair coin; a weighted spec would misfire.
+- `summarize_trajectories` and `summarize_streaming` carry two near-identical fold loops — I
+  edited the wrong one first and the broad `except` swallowed the resulting NameError silently.
+  The coverage counters exist in only one. A dedupe is a bigger refactor than this pass.
+- The calibration threshold's only consumer (`_METACOG_ARBITER_ENABLED`) is still hard-off, so
+  the whole fit remains an instrument with no actuator — already stated by the liveness probe
+  and the boot config line, so no change made.
+
+## §4CF — Queue #9: the autonomous-dispatch seams (2026-08-21)
+
+**The finding: the job-resume wake had never fired. Not once, in the ten days since it
+shipped.** `_resume_after_job` is "the half that makes promoting at 90s instead of 600s safe" —
+without it an early promotion on a `pytest`/`pip install` ends the turn and strands the work
+until the operator speaks again. Live evidence when this pass opened:
+
+| | |
+|---|---|
+| jobs in the registry | 7 (6 `done`, 1 `cancelled`) |
+| jobs marked `collected` | **0** |
+| `job-` req_ids anywhere in the trajectory corpus | **0** |
+| `Sandbox Job` lines in the operator log (reaper-only) | **0** |
+| `job` rows in the activity ledger | 6 |
+| `Job Resume Deferred` / `Capped` lines | 0 / 0 |
+
+Six landings reached the ledger and none reached the model. The ledger rows prove the
+transitions WERE observed — just not by the observer that wakes.
+
+**Mechanism: a fire-once notification with four consumers, three of which drop it.**
+`reap()` is the sole writer of terminal states and returns each transition exactly once, to
+whoever called it:
+
+1. `main._reap_sandbox_jobs` — records **and wakes**;
+2. `delegate._sync_sandbox_jobs` — records, never wakes (this is the one that won every race,
+   because it runs on every `jobs`/`execute` call);
+3. `jobs.register` and 4. `jobs.promote` — call `self.reap()` and **discard the value
+   entirely**, so a landing observed there is reported nowhere at all.
+
+Whoever got there first consumed the news. The delegate site even carries a comment recording
+the earlier half of this lesson ("Discarding this made 'every landed job reaches the activity
+ledger' false") — the fix was applied at that call site and never generalised to the mechanism.
+
+**The fix: the state change was always durable, so make the NOTIFICATION durable too.** A
+terminal transition now stamps two markers, `reported_at` and `woken_at`, both `None` at
+landing; the 60s sweeper drains them (`take_unreported()` / `pending_wakes()` + `mark_woken()`).
+Reporting has ONE owner again, so nothing double-counts and nothing depends on who raced.
+Rows that landed before the markers existed carry neither key and are treated as handled —
+"present and null", never "absent", so deploying could not wake the model once per historical
+landing (6 of them, against a cap of 12/hour).
+
+### The rounds
+R1 shipped a single `reported_at` marker draining both duties. **R2 found that this
+re-created the very defect it was fixing, one level down**: the drain stamped on read, and a
+wake DEFERS whenever a turn is already in flight — so a deferred wake was consumed and lost
+for ever, exactly as the fire-once return had been. Recording and waking fail differently and
+therefore cannot share a marker: recording is stamped on read, the wake is stamped **only once
+delivered**, and a permanently-declined wake (the per-hour cap, which records itself in
+`_RESUMED_JOBS`) is stamped so it stops — without that distinction a capped job would retry
+every 60s for ever, and a deferred one would never retry at all. R3 found no behavioural
+defect: a now-false docstring ("Shared by this module's reconcile and main's sweeper") and the
+dead `_record_landings` alias it left behind. R4 clean.
+
+Two test defects of my own along the way, both caught before they could pass vacuously: the
+first draft of the new test file hand-rolled a `JobSupervisor` that could not be constructed
+and **skipped itself** (four green-looking vacuous tests), and its replacement seeded registry
+rows that `_load()` validated away (`job-a` with no `pid`/`deadline_at`), so the drain looked
+broken when the fixture was.
+
+### Verified sound by attack (no defect)
+The supervisor is cached on the sandbox manager, so all four callers share one `RLock` and the
+read-modify-write on the registry cannot interleave in-process; `_save` is atomic (unique tmp +
+`os.replace`). A forever-deferred wake is self-limiting: `_trim_terminal` bounds terminal rows
+to 20, so the pending set is bounded and a stale wake ages out with its row. `take_unreported`
+and `pending_wakes` are independent, so recording on the same tick cannot swallow the wake.
+
+**The INTERNAL_REQUEST_PREFIXES contract** was enumerated against every producer:
+`sched-` (main), `job-` (main), `sub-` (subagent) and **`bench-` (dream)**. The first three are
+internal; `bench-` is deliberately NOT, because `enroll_request` refuses internal req_ids and
+adding it would silently kill bench-scoped enrolment (`tts_bon`). That exclusion was undocumented
+— now pinned, so nobody "completes" the tuple and takes the bench flywheel down with it. Every
+consumer was checked for a `bench-` misread: none, because both isolates (dream's and the
+subagent's) independently set `smart_memory = 0.0`, null the profile/journal/episodic stores and
+wrap memory read-only. The protection is the isolate, not the prefix.
+
+### Verification
+`tests/test_job_landing_report_drain.py` — 16 pins driving a REAL `SandboxJobSupervisor` over a
+real registry, plus the sweeper end-to-end: drained-once, legacy rows owe nothing, running jobs
+never drained, the stamp survives a fresh supervisor (restart), a source-level completeness check
+that every terminal branch in `reap()` stamps (counted against `changed.append`), deferral
+retried, permanent decline stamped, and recording not consuming the wake. **13/13 mutants KILLED
++ comment-only control SURVIVED**, tree hash-verified. Full suite **14,503 passed / 17 skipped /
+0 failed**, cross-checked against `--collect-only`'s 14,520.
+
+### An instrument error of my own, worth recording
+While verifying the deploy I printed the live registry with
+``{k: v.get(k) for k in (..., "reported_at", "woken_at")}`` and read the resulting ``None``s as
+"the historical rows were stamped after all — the wake storm I designed against is live".
+``dict.get`` returns ``None`` for an ABSENT key, which is precisely the distinction the whole
+deploy-safety property turns on ("present and null", never "absent"). Checking ``"reported_at"
+in v`` showed the legacy rows carry neither key and the guard was holding exactly as pinned.
+Third time this session that a diagnostic, not the system, produced the alarm — the same class
+as §4CD's mutation harness and §4CE's own coverage window.
+
+### Found-not-fixed (documented)
+- A landing can still be lost if more than 20 terminal rows accumulate between two 60s drains
+  (`_trim_terminal` prunes by count) — pre-existing, bounded, and it would take 20 jobs landing
+  inside one minute.
+- `get_job_supervisor`'s get-or-create is not atomic; two threads racing the first call could
+  briefly hold two instances with two locks. Pre-existing, microseconds wide, unchanged here.
+- The scheduled-task seam (`sched-`) still has zero live exercise: `scheduled_tasks.json` is
+  `{"tasks": {}}` and always has been, so that half of the dispatch surface is verified only by
+  tests. Its cron-retry nudge is the same defer-loss shape the job path had, already handled.
+
+### §4CF live acceptance (2026-08-21 20:41) — the wake fired for the first time
+
+Deployed (pid 16756 → 23242) and drove a real job end to end rather than trusting the pins.
+First attempt used `sleep 150`, which is deliberately NOT promotable — a sleeping process makes
+no I/O progress, which is exactly the wedge the progress rail exists to kill — so it ran inline.
+A command that actually progresses (`for i in $(seq 1 40); do echo tick $i; sleep 5; done`)
+promoted at 90s as designed, and on landing:
+
+```
+20:41:22  sandbox job — job-d3a47b2c done (exit 0)      ← ledger + operator stream
+20:41:22  job resume — job-d3a47b2c done — waking the model to continue.
+20:41:22  [job-job-d3a47b2c] memory bus — Hydrated context for: SYSTEM: the background job … finished
+20:42:03  [job-job-d3a47b2c] final reply — …ran successfully. It executed 40 iterations…
+```
+
+`reported_at` stamped 20:41:22, `woken_at` 20:42:03 — recorded first, stamped as woken only
+once the turn had actually landed, exactly as R2's split requires. **The first `job-` trajectory
+in the corpus's history.**
+
+### Two things the live run exposed
+- ❌ **RETRACTED 2026-08-22 — there is no second defect; the reaper lands fine.** This entry
+  originally read: *"the reaper's own `reap()` did not land the transition — the row still read
+  `running` five minutes and ~5 ticks later"*. That was **wrong, and it was my measurement, not
+  the system**. Re-derived from the file timestamps: the job's log last wrote at 20:40:29 and
+  the reaper drained at 20:41:22 — **53 seconds, inside ONE 60s period**; my `jobs` probe did
+  not even finish until 20:42:56, i.e. AFTER the drain. I had polled twice inside a single
+  reaper tick and concluded the reaper was not landing.
+  **Disproved by a clean experiment** (2026-08-22 00:40): a job run to completion with the
+  `jobs` tool never touched — sentinel at 00:40:49, reaper landed + logged + woke at 00:41:38
+  (**49s**), `reported_at` 00:41:38, `woken_at` 00:42:13 (stamped only after the wake turn
+  landed, as the R2 split requires), trajectory `job-job-b9747797` outcome `passed`.
+  The historical "0 reaper log lines in 16 days" is fully explained by the fire-once defect
+  this section fixes — the tool path won those races — and needs no second cause.
+  ⚠ A follow-up doubt during that same experiment ("`woken_at` never stamped, no trajectory")
+  was the SAME error a third time: I read the row while the wake turn was still in flight.
+- The resume req_id is `job-job-<id>`: `_resume_after_job` builds `f"job-{jid}"` where `jid` is
+  already `job-…`. Cosmetic (it still satisfies the `job-` prefix contract, and the log renders
+  `[job-job- +0.40s]`), left alone deliberately — req_ids are joined on across the corpus,
+  calibration and the activity ledger, so reformatting them is a bigger change than the wart.
+
+## §4CG — Queue #10: the project-store stack (2026-08-21)
+
+**The finding: a registered deliverable is a CLAIM, and the briefing presented it as FACT.**
+`register_file_artifact` records a path — normalising it carefully, that part has its own
+incident history — but never checks that a file is there, and nothing reconciles afterwards.
+`core/prompts.py` renders the list into every project briefing as *"DELIVERABLES (N file(s)
+the project built)"*, so an unverified claim reaches the model as an assertion and it will
+cite files it never produced.
+
+Measured on the live store: **3 of 66 registered deliverables do not exist**
+(`cascade_analysis.md`, `cascade_evidence.py`, `roms/sonic.md`) across 2 of 5 projects. The
+sweep was ruled out by its own event trail — all six `workspace_tidy` events on this box
+deleted debris only (`.browser_runner.py`, `__pycache__`, screenshots).
+
+### What shipped
+- `ProjectStore.missing_deliverables()` — stats each registered path THROUGH the same
+  normaliser registration uses. Load-bearing: some stored payloads carry the redundant
+  `projects/<id>/` prefix (rows predating the 2026-07-20 H9 fix, which the sweep re-normalises
+  defensively at read time, which is why they were never swept). Comparing the RAW payload
+  against disk reported three PRESENT files as missing — including WebOS's `index.html` and
+  `server.js`, its actual deliverables. Marking a real file MISSING is a worse lie than the
+  unverified claim being fixed. Caught by driving the real store against the live data before
+  shipping, not by review.
+- The prompt briefing counts them in the header and marks each `⚠ MISSING` **next to the
+  path** — R2 moved it there from the end of the line, where 110 chars of description had
+  buried it (the §LOG lesson about previews that died at 60, exactly on the why). A missing
+  file is never comma-packed with present ones: that packed line reads as a list of things
+  that exist.
+- The tool briefing carries `deliverables_missing` (R3): the prompt header points the model at
+  `artifact_list` for detail, so leaving that view unqualified walks the reader from the
+  caveat to the unqualified claim.
+- `fork` and `clone` stop re-registering a claim whose file is not in the source (R4).
+  Registration there exists to put COPIED files in the child's keep-set; a path that was never
+  there protects nothing, and copying it propagates the phantom into a new project, where the
+  briefing asserts it again. Phantoms compounded across forks.
+- Unknown is never reported as missing: no sandbox root, or an absent workspace directory,
+  returns nothing rather than flagging everything — a checker that cannot see the disk must
+  not bury a real single-file loss in noise.
+
+### The sweep and the constraints — checked, and the code is clean
+The queue named two other failure modes and both came back sound.
+
+**The irreversible DONE sweep behaved.** Six `workspace_tidy` events, every one debris-only;
+63 of 66 registered artifacts resolve on disk; the keep-set normaliser carries two documented
+incident fixes and both hold.
+
+**Constraint retirement is correct in code and stale in data.** WebOS is DONE carrying **7
+active constraints and none retired** — but its last `project_auto_rollup {"new_status":
+"DONE"}` was **2026-07-31 22:00**, one day before the 2026-08-01 lifecycle fix, and retirement
+fires ON the transition. Both DONE paths (`update_project` and the raw-SQL rollup) call
+`retire_constraints` today. So: legacy residue on one project, not a live defect — and it
+matters because those constraints re-arm the moment the project becomes active again, which is
+exactly the incident the fix was written for, while the next DONE transition (the thing that
+would retire them) only happens after they have had their run.
+`scripts/retire_stale_constraints.py` reconciles it through the store's own
+`retire_constraints`, dry-run by default.
+
+**APPLIED 2026-08-22 00:00 on operator instruction.** WebOS's 7 constraints moved
+`active 7 → 0`, `retired 0 → 7`; DB backed up first
+(`projects.db.pre-constraint-retire-20260821T235958`). Verified against that backup: the ONLY
+diffs are WebOS's two constraint lists and `project_events` +1 (the `constraints_retired` audit
+row the store writes itself) — projects 5, tasks 46, artifacts 69, deleted_projects 41 all
+unchanged, and the other four projects byte-identical. The seven texts are preserved verbatim
+in `constraints_retired`, so restating one still re-arms it. Re-running the reconciler now
+reports "nothing to retire" (idempotent), and the WebOS briefing carries the retirement as an
+event instead of replaying seven live constraints.
+
+### The rounds
+R1 shipped the store check + briefing. R2: the ⚠ marker was buried after the description. R3:
+the tool briefing — the surface my own header points at — still listed the paths unqualified.
+R4: fork and clone propagated the phantoms into new projects. R5 clean.
+
+Three diagnostic errors of my own, all caught by driving the real thing:
+- my first artifact-existence probe read `path`/`rel_path` columns that do not exist (the
+  payload holds the path), so it checked nothing and reported a clean 0 missing;
+- `missing_deliverables` v1 compared raw payloads and flagged present files;
+- the constraint reconciler read `metadata_json` (the SQL column) where `list_projects`
+  returns `metadata` already parsed, and printed **"nothing to retire"** against a store with
+  seven live examples — a reconciler that silently finds nothing looks exactly like a clean
+  store, which is this queue's whole subject.
+
+### Verification
+`tests/test_project_deliverable_honesty.py` (17) + `tests/test_retire_stale_constraints_script.py`
+(9), driving the real `ProjectStore`, the real briefing builder and the real tool helper.
+**11/11 + 4/4 mutants KILLED, both controls SURVIVED** (plus one declared-equivalent), tree
+hash-verified. One neighbour fixture updated honestly: `test_briefing_annotates_described_
+deliverables` registered two files it never wrote — the exact shape this defect is about — and
+now writes them. Full suite **14,529 passed / 17 skipped / 0 failed**, cross-checked against
+`--collect-only`'s 14,546.
+
+### Found-not-fixed (documented)
+- **The release dossier** (`tools/projects.py`, `set_release`) still lists deliverables
+  unqualified, and it is stored DURABLY — a warning written into it would go stale if the file
+  came back. The honest question is whether a release should be blocked on a missing
+  deliverable at all; that is a behaviour decision, not a review fix.
+- `dream.py`'s manifest backfill and the project digest read the same list; both only degrade
+  (a missing file fails to describe), so they were left alone.
+- Registration itself still does not verify. Verifying at WRITE time would reject on bind-mount
+  lag and on files written inside the container that the host has not seen yet; the read path
+  is the safe place, and it is now honest.
+
+## §4CH — Queue #11: core/dream.py as a unit (2026-08-21)
+
+**The queue's stated concern came back CLEAN, and the real findings were in what dream
+REPORTS.** Its isolation list was the thing to check ("twice found drifted from
+subagent.py's"): mechanically diffed, dream sets every memory attribute subagent does
+(`memory_system`/`skill_memory`/`graph_memory` read-only wrapped, `episodic_memory`,
+`memory_bus`, `llm_client`, `trajectory_collector`) at lines 5192-5237. The lists differ in the
+other direction — dream resets six per-turn caches (`_recent_trajectories_for_correction`,
+calibration stash, experiments ring, turn-facts, turn-outcome, surfaced-triggers) that
+subagent leaves inherited through its `copy.copy`. **That asymmetry is correct**: the
+correction path requires a wired `trajectory_collector`, subagent nulls it, and dream needs the
+resets precisely because its bench isolate ATTACHES a real collector. Recorded so nobody
+"harmonises" the two lists — or adds a collector to subagent without the resets.
+
+### Finding 1 — the busiest subsystem ledgered a constant
+919 dream records, every one *"REM cycle ran (memory consolidation / heuristic harvest)"*, on
+the one surface that answers "what did you do while I was away". `Dreamer.dream()` already
+returns *"Synthesized N new meta-memories and extracted H heuristics"* or *"produced nothing
+this cycle: no consolidation met the compression bar"*; the call site binds it as `_dream_msg`,
+uses it to classify skips, and then wrote a literal. Worse, `render_activity_digest` collapses
+identical `(phase, summary)` rows into one `×N` line — so the constant collapsed a productive
+cycle and an empty one into the same bullet. `agent.dream_ledger_summary()` now shapes the
+real message in (prefix kept — consumers match on "REM cycle ran"; whitespace collapsed;
+bounded), and the counts are pinned to survive the digest's 140-char clamp.
+
+### Finding 2 — the greppability contract was false for 34% of messages
+`dream.py` states that every variant contains `extracted N heuristics` "because that count is
+what operators and tests key off". The trajectory-seed path emitted a sentence-initial
+*". Extracted"* — **126 of 371** live messages invisible to that grep, and the existing tests
+only asserted the lowercase variants, so nothing caught it. Now *"(trajectory seed) —
+extracted N heuristics"*.
+
+### Finding 3 — "0 generalized" was not a result
+The counterfactual replay ledgers generalizations per cycle. A "generalized" verdict can only
+come from a challenge that originally FAILED — and the pool is **299 SUCCESS to 15 FAILURE**,
+with **178 of 185 replays success-origin**. So "0 generalized" was ledgered 84 times while
+mostly not testing generalization. `load_replay_candidates`' docstring ("alternates value…
+so no status filter here") explains why it does not filter; it does not promise balance, and
+the code takes an oldest-first slice, so the scarce informative class gets the pool's
+proportion. The line now reports the composition (`N challenge(s) (M past-failure)`) — the
+§4CE rule: a null result is evidence only when the design could have found something.
+Deliberately surfaced rather than re-tuned: preferring failure-origin candidates is a design
+change, and the replay is also catching real regressions (1 found, 4 generalized, 171 stable).
+
+### The rounds
+R1 shipped the two reporting fixes. R2: the digest's 140-char clamp could have cut the counts
+(pinned end to end), and my own two tests used `asyncio.get_event_loop()`, passing alone and
+failing in the suite — the known order-contamination shape here. R3: the mutation battery
+exposed that my "bounded/whitespace" tests **re-implemented the truncation inside the test
+helper**, so the "unbounded" mutant walked through; the shaping was extracted into
+`dream_ledger_summary` so the test drives the real thing — and then my fixtures turned out to
+use INVENTED message wording, which is how the greppability violation surfaced when the real
+strings were substituted. R4: my comment pushed two of three message variants out of
+`test_dream_message_honesty`'s fixed 2200-CHARACTER source slice, silently narrowing a
+coverage check; the slice is now bounded by a real anchor. R5 clean.
+
+A fifth diagnostic error of my own, same family as the rest: grepping `"Dream Complete — "`
+(em-dash) matched only the "produced nothing" variant and returned zero, which briefly read as
+"the ran path never completes". `"Dream Complete"` matches 371.
+
+### Verification
+`tests/test_dream_ledger_outcome.py` — 16 pins, including every real message shape measured
+from the live log and an end-to-end check that the counts survive the digest clamp.
+**6/6 mutants KILLED + comment-only control SURVIVED.** Full suite **14,546 passed / 17
+skipped / 0 failed**, cross-checked against `--collect-only`'s 14,563.
+
+### Found-not-fixed (documented)
+- The counterfactual replay budget follows the pool's composition, so generalization is tested
+  ~5% of the time. Preferring failure-origin candidates would test it more but spend less on
+  regression detection, which is currently finding real ones. A deliberate choice, now visible.
+- 59 `selfplay_selftest_skip` events (validator can't validate its own expected output) are the
+  gate WORKING — 8.5% of self-play sessions rejected before they can teach anything false.
+- 15 `Dream error` occurrences, all "all off-main nodes failed" on 2026-08-18 (worker node
+  down), correctly logged at ERROR and correctly excluded from the ledger by the §4CB fix.
+
+## §4CI — Queue #12: tools/file_system.py (2026-08-21)
+
+**Release immutability — "human-attested, immutable", enforced at the write path precisely
+because the agent's measured failure mode is regressing working artifacts — leaked through
+FOUR operations.** The guard ran from a deny-list, `("write", "replace", "delete", "move",
+"append")`. Reproduced against a real RELEASED project:
+
+| operation | before | why |
+|---|---|---|
+| `write` | blocked | listed |
+| `copy` | **allowed** | not listed at all |
+| `rename` | **allowed** | dispatcher accepts `["rename", "move"]`; only `move` was listed, so one alias of the SAME branch was guarded and the other open |
+| `download` | **allowed** | not listed; writes a fetched file straight in |
+| `move` | **allowed** | listed, but the guard read `path or filename or destination` and `path` holds the SOURCE — moving INTO a release was never inspected |
+
+Three of the four landed files in the released workspace in the live reproduction
+(`new.py`, `new2.py` written into a project the system calls immutable).
+
+**Fixed by inverting the list.** `_READ_ONLY_OPS` now names the operations that cannot mutate
+(`read`, `read_chunked`, `inspect`, `search`, `find`, and the seven `list` aliases) and
+everything else is guarded — a deny-list of guarded operations can always miss a newly-added
+mutating one; an allow-list of read-only ones cannot. Every candidate target is inspected
+(source AND destination AND `filename`), which closes the move/copy hole. Verified end to end:
+six mutations blocked, five read operations still allowed, released workspace untouched.
+
+**The containment boundary came back CLEAN.** `_get_safe_path` was fuzzed with 20 traversal
+shapes (`../`, encoded, doubled-slash, backslash, whitespace-padded, absolute, `~`) — **0
+escapes** — and with the bypass traversal tests usually miss: a **symlink inside the sandbox
+pointing out**, both directory and file. All three symlink probes raise. The security boundary
+of the largest tool file is sound.
+
+### The rounds
+R1 shipped the inversion. R2 attacked the risk the inversion creates — OVER-blocking: verified
+`operation` is never rewritten anywhere in the module (0 assignments), so the allow-list sees
+exactly the strings the dispatch branches match, and pinned every read alias; measured the cost
+at **0.77 ms/op**, so no short-circuit needed. R3 asked the question that matters most for any
+guard — *is it inert?* — and confirmed the registry threads `project_store` through at
+`registry.py:1249`, then checked the guard against the LIVE store: both real RELEASED projects
+(Jiu Jitsu Calendar, Chess Coach v3) block, the DONE one stays writable. R4 clean.
+
+### Verification
+`tests/test_release_immutability_ops.py` — 16 pins: every single-path mutation, every
+two-path mutation INTO a release, download, rename-and-move-guarded-identically, all five read
+families still open, the allow-list contract (no mutating op inside it; every dispatcher read
+alias present), and an unknown operation failing CLOSED. **4/4 mutants KILLED + 2 declared
+survivors** (a redundant-coverage kwarg, and the comment-only control), tree hash-verified.
+Full suite **14,562 passed / 17 skipped / 0 failed**, cross-checked against
+`--collect-only`'s 14,579.
+
+### Found-not-fixed (documented)
+- The SSRF guard on `download` refused a loopback host during testing, which is correct — but
+  it means the download path's release check had never been exercised end to end before this
+  pass; it is now pinned at the dispatcher rather than through a live fetch.
+- `_get_safe_path` is ~270 lines and carries its own history; it was fuzzed, not read
+  line-by-line. A converged read of that function alone is a reasonable future slice.
+
+## §4CJ — Release blocks on missing deliverables (2026-08-22, operator decision)
+
+Closes the item §4CG left open ("whether a release should be BLOCKED on a missing deliverable
+is a behaviour decision, not a review fix"). Operator: block.
+
+**A gate already existed — and had two defects that made it both leaky and, on some projects,
+permanently wrong.**
+
+1. **It only ran when the project had NO services.** The check lived in the `else` of
+   `if entries:` (service branch), so any project with a registered service was released
+   without its deliverables being looked at at all. Services and files are both part of "is
+   this shippable"; they were mutually exclusive.
+2. **It statted the RAW payload** — `(ws / payload).is_file()`. Rows carrying the redundant
+   `projects/<id>/` prefix resolve to `<ws>/projects/<id>/…` and read as missing. Measured on
+   live WebOS: the raw check calls **3** deliverables missing, two of which — `index.html` and
+   `server.js`, the project's actual output — are present; the normalised check finds the **1**
+   genuinely absent file (`roms/sonic.md`). A permanent FALSE block, whose documented repair
+   (`unregister_file`) would have told the operator to delete the registration of a file that
+   exists.
+
+Both fixed: the deliverable check now runs unconditionally and goes through
+`store.missing_deliverables()` (the §4CG method, which normalises through the same path
+contract registration uses). The refusal names the repair — restore the file, or drop the stale
+record with `unregister_file` — because a block with no way forward is exactly what stranded a
+project permanently in the 2026-07-25 incident.
+
+**R2 found a third hole, in the fix's own foundation.** `missing_deliverables()` deliberately
+returns NOTHING when the whole workspace directory is absent ("that is not evidence about
+individual files, and flagging all of them would bury a real single-file loss") — the right
+call for the briefing and the wrong one for a release gate. Reproduced: deleting the entire
+workspace made the rehearsal report **"all 1 deliverable(s) present"** and PASS. The most
+complete failure available read as full success. Registered deliverables + a non-existent
+workspace is now its own refusal.
+
+**R3 — no bypass, no false blocks on real data.** `action=release` is the only path to
+RELEASED: `update` refuses the status outright ("RELEASED is earned, never assigned"), and the
+other `set_release` caller is the UNRELEASE path. Both live released projects (Jiu Jitsu
+Calendar, Chess Coach v3) re-pass the gate unchanged — 0 missing, workspaces present. R4 clean.
+
+### Verification
+`tests/test_release_blocks_on_missing_deliverables.py` — 9 pins: the block, the repair hint,
+the all-present pass, a SERVICE-bearing project still checked, the prefixed-payload false
+positive, a prefixed payload that really is missing still blocking, the absent workspace, and
+"nothing to release". **6/6 mutants KILLED + comment-only control SURVIVED.** One of my own
+tests had to be fixed first: patching `get_service_supervisor` alone left `entries` empty, so
+it ran the no-services path and the "put the gate back in the else" mutant survived it —
+`_project_service_entries` is what decides. Full suite **14,571 passed / 17 skipped / 0
+failed** against `--collect-only`'s 14,588.
+
+## §4CK — The repair-await budget, measured (2026-08-22)
+
+Closes the item deferred twice (§4CD, §4CH): *"the ~15-18% inline win rate is unexamined —
+that race exists to REPAIR a refuted answer before it ships, so it misses its own purpose more
+often than it lands. Measure before bumping the budget."* Measured.
+
+**115 verdicts over 16 days of live log, against the 25s `_critic_repair_await_budget`:**
+
+| verdict | n | p50 | p90 | within 25s |
+|---|---|---|---|---|
+| CONFIRMED | 77 | 26.2s | 51.8s | 44% |
+| **REFUTED** | **23** | **48.0s** | **63.8s** | **22%** |
+| UNCERTAIN | 15 | 28.3s | 32.7s | 27% |
+| ALL | 115 | 28.0s | 56.6s | 37% |
+
+**The budget is sized against the wrong population.** Its entire purpose is catching a REFUTED
+verdict in time to repair the reply, and refutes are the SLOW half — p50 48.0s against
+CONFIRMED's 26.2s. It catches **5 refutes in 23**. The overall 37% figure that would justify a
+25s window is dominated by the faster CONFIRMs the window has no use for: the §4BR
+"gate calibrated on the wrong statistic" shape, living in a constant rather than a threshold.
+
+**RAISED 25s → 65s on operator instruction.** 65s covers the REFUTED p90 (63.8s), so ~90% of
+refutes are now caught in time to repair the reply rather than ~22%.
+
+**Two things found while implementing it that change the cost picture:**
+
+1. **65s must sit ABOVE `verifier._VOTE_BUDGET_DEFAULT_S` (60s)** — the ceiling the verdict
+   bounds ITSELF by. Below it, the window expires while the verdict is still legitimately
+   running and the wait buys nothing. This is not hypothetical: the verifier's own budget was
+   first mis-chosen at 20s *"picked to sit under `_critic_repair_await_budget` (25s)"*, which
+   truncated ordinary votes into control while still recording them as votes. The two are a
+   PAIR, and the pairing is now asserted in `test_track2_flip_ii` rather than left as a comment
+   — the pin asserts the RELATIONSHIP (bench > live > env override; live > vote budget) instead
+   of freezing a literal that is expected to be re-tuned.
+2. **STREAMED TURNS NEVER REACH THE AWAIT.** The stream gate spawns the verdict straight into
+   `_attach_late_verdict_handler` with `force_correction=True` — a streamed reply is already
+   delivered and cannot be repaired. So the web UI, where a human is actually waiting, pays
+   NONE of this latency; the cost lands on non-streamed callers (API, Slack). That makes the
+   change materially cheaper than the framing above assumed.
+
+⚠ **Caveat on the table, recorded because point 2 cuts both ways:** the latencies were pooled
+over ALL verdicts in the log, streamed and not, and the repair window only ever governed the
+non-streamed subset. The log cannot be decomposed further. The DIRECTION the decision rests on
+— refutes ~2x slower than confirms — is robust; the exact 22% is an estimate over a superset.
+
+Reverting is one env var (`GHOST_CRITIC_REPAIR_BUDGET=25`), and the fallback is unchanged: a
+late refute still scrubs its poisoned lessons, queues the next-turn correction banner, and
+reaches the corpus AND the diary (§4CD).
+
+## §4CL — IDE / Imagine: shared substrate (S1) + the calibration gate (I0) (2026-08-22)
+
+First landing of the **IDE** programme (`IDE.md` — *Imagine · Dream · Evolve*). Two
+housekeeping corrections before the work.
+
+**Section numbering.** `IDE.md` reserves §4CJ/§4CK/§4CL for the three phases. Both §4CJ and
+§4CK were taken earlier the same day (release-block on missing deliverables; the repair-await
+budget). IDE therefore lands under **§4CL Imagine · §4CM Dream · §4CN Evolve**.
+
+**Rule 0 — the traffic premise, measured.** IDE.md's Phase-D thesis opens *"~3.5 real turns/day
+gate every verdict clock"*. Wrong by roughly an order of magnitude. Over the 46-day trajectory
+corpus (2026-07-07 → 2026-08-21, `system/trajectories/`, corrections overlay applied):
+
+<div class="scroll">
+
+| metric | total | /calendar day | last 30 days |
+|---|---|---|---|
+| `user_request` turns | 1,607 | **34.9** | 29.2 |
+| decisive outcome (`passed`/`failed`) | 733 (46%) | **15.9** | 15.3 |
+| D0-eligible (decisive ∧ `n_steps` ≥ 2 ∧ tool calls) | 521 | **11.3** | 10.2 |
+| …of which FAILED (the §4E retro-negative supply) | 156 | 3.4 | — |
+
+</div>
+
+Consequences for the plan, recorded now so Phase D is not built on a premise that is 8× off:
+
+* **Dream's scarcity argument does not survive.** Its multiplication argument (one episode →
+  many execution-graded counterfactual verdicts) and its decision-level-credit argument (which
+  live traffic cannot produce at *any* volume) do.
+* **The real gap is `unknown`, not volume.** 874 of 1,607 turns (54%) end with no label at all.
+* **D1's control-leg self-test structurally confines Dream to the decisive 46%** — an episode
+  with no recorded outcome has nothing for the synthesised validator to reproduce. That is a
+  design consequence of the self-test rule, not a defect, but it caps the addressable corpus at
+  ~11 episodes/day before any perturbation multiplier.
+
+### S1 — `core/isolation.py`, the isolated-replay substrate
+
+The recipe existed only inline in `Dreamer.synthetic_self_play`: three method-local façade
+classes and ~10 scattered `= None` assignments spread over 150 lines, pinned by tests that
+asserted *strings were present in the method's source*. Three consumers now need it (self-play,
+the Imagine speculative fork, the Dream replay engine) and a recipe kept in three copies drifts.
+
+Extracted: the read-only vector/skill/graph façades and the background-LLM wrapper (moved
+**verbatim**, so every comment explaining why a method is on or off a whitelist moved with
+them); a two-tier detach inventory; `fork_workspace`; `isolated_replay_context`. `dream.py`'s
+scattered nulls collapse to one call against the shared floor, ordered **before** the bench
+block so bench recording stays armed. Behaviour-equivalence was verified by an executed probe
+(run the real solve loop, capture the context the agent was constructed with) across the
+non-bench, background and bench legs — no ordering break, no closure variable lost in the move,
+inventory identical element-for-element to the 8 scattered + 8 loop nulls it replaced.
+
+**Two tiers, because a replay is not a sim.** `ISOLATION_NULLED_ATTRS` (16) is the shared floor.
+`REPLAY_EXTRA_NULLED_ATTRS` (15) is what a replay additionally drops: self-play invents a
+challenge, a replay *re-executes a recorded real episode*, so its blast radius is the operator's
+world. The rule for what goes in: null what **writes** production state or reaches outward; keep
+what only reads or computes. `prm_scorer`, `complexity_dispatcher` and `metacog` are deliberate
+keepers and that decision is pinned — detaching them would change the very decision process a
+counterfactual exists to reproduce.
+
+**Four-lens fresh-eye review, round 1 — one CRITICAL, eight MAJOR.** The findings that mattered:
+
+1. **Teardown sat outside the `try`.** `@asynccontextmanager` runs the `finally` only if the
+   generator reaches its `yield`, and everything from the fork to `ensure_running` was above it.
+   `ensure_running` has five reachable raise sites; at the point they fire a container exists,
+   the docker client's ~11 unix sockets are open and the fork is on disk. None were cleaned —
+   i.e. the §4BO `[Errno 24] Too many open files` failure, with an unattended nightly batch
+   behind it. Both stub sandboxes in the tests had no-op `ensure_running`, so nothing could have
+   caught it.
+2. **Two escapes no tool denylist could close, because both fire upstream of dispatch.**
+   `memory_dir` was inherited: `AcquiredSkillManager` is constructed at *tool-table build time*,
+   mkdirs and writes a registry on construction, and after three failed calls **moves the
+   operator's live skill file into `acquired_skills/retired/`**. And `job_registry` is passed
+   into *every* `execute` call — a tool a replay must keep — where a budget-outrunning command
+   writes a row; 50 slots, FIFO, so a replay evicts the operator's real jobs from their own
+   status surface. `memory_dir` is now repointed into the fork (seeded with a copy of the
+   acquired/composed skills); `job_registry` is nulled.
+3. **No tool surface restriction at all** — strictly weaker than both siblings
+   (`subagent.py` allows 12; `dream.py` denies 16) on the workload with the largest blast
+   radius. `REPLAY_FORBIDDEN_TOOLS` is now a strict superset of both, plus six neither denies
+   (`manage_composed_skills`, `notify_operator`, `jobs`, `deploy`, `rotate_secrets`,
+   `knowledge_base`). Applied through all three gates, fail-closed, via `IsolatedRun.build_agent`
+   so no call site can forget it. It is a **containment** list, not a fidelity list: an episode
+   whose trajectory used one of these is *not replayable* and must be dropped at selection time.
+4. **`network="none"` covers the container and only the container.** Every LLM call and every
+   host-process fetch is a different boundary. Recorded on `IsolatedRun.network_isolated` so a
+   grader can tell "the perturbation failed" from "the episode needed a network".
+5. **`args` carries capabilities, not just settings.** `default_db` is a live Postgres URI
+   `postgres_admin` falls back to — and its SQL validator fails *open* on its own exception.
+   `notify_webhook`/`notify_ntfy` are what a real push transport is built from. All three cleared.
+6. **rsync exit 23/24 is routine, not failure.** macOS 15+ ships openrsync, which returns 23 for
+   one unreadable file after copying everything else — and on Linux that is the *normal* case,
+   since the sandbox writes into the bind mount as root. The old code discarded a 99%-complete
+   copy and re-did the tree through the slower, unbounded fallback. Now: kept, and reported as
+   `ForkResult.complete = False` so a grader can refuse to score it. Plus a 512 MB ceiling (the
+   live sandbox measures 17 MB / 665 files / 0.22 s), a bounded fallback, and `to_thread` for the
+   copy and the cleanup — the Imagine consumer runs this *during a live turn*.
+7. **The orphan sweeper could reap a live replay.** Its only identity check was "not *my*
+   container", and per-solve candidates get no liveness check at all — so a fork container 31
+   minutes into a replay is a reap candidate for any second agent that boots. Reaping it does not
+   merely fail the run: the next `ensure_running` recreates the container and silently discards
+   all in-sandbox state, so the replay produces a verdict on a half-executed episode. Containers
+   now carry `ghost.owner_pid` + a boot stamp (PIDs are reused — the postgres stale-lock
+   incident was that shape) and the sweeper spares a live owner. Unlabelled containers stay
+   reapable, so nothing pre-existing becomes immortal.
+8. **`rmtree(ignore_errors=True)` made a failed cleanup silent** — no log, no counter, no signal
+   — and on Linux it *cannot* succeed by default. Now: chmod-and-retry, WARNING with the residual
+   path, and `sweep_fork_workspaces()` at boot beside the container sweep (nothing reclaimed the
+   fork *directories*, so every SIGKILLed run leaked one permanently).
+
+Also: a promoted sandbox job outlives its command but not the context that tears its container
+down, so job promotion is off inside a replay; the Tor proxy is withheld from a networkless
+container (it would spawn a daemon that can never bootstrap); the provision path refuses to
+force-remove a container mounting a *different* workspace; a failed provision arms a
+module-level backoff (docker's own is an instance attribute, so it gives no protection across
+runs — an unattended batch would re-pay the same failing install per item);
+`ReadOnlyGraphMemory.__getattr__` forwarded by default, so `prune_stale_edges` and
+`initialize_graph` reached the production graph from inside an isolated run; and replay LLM
+traffic is now kept out of the recording corpus (coarse by construction, and the trade is stated
+in the code rather than hidden).
+
+**Two latent defects found in the neighbourhood and fixed:** `hasattr(context, 'journal')`
+passes when journal is `None` and then dereferences it — every isolated context sets exactly
+that; and `null_production_state` now returns the names it VERIFIED as cleared, not the ones it
+was asked to clear, because a caller storing the constant reports a live handle as detached.
+
+**Seven source-window pins went false** when the code moved. All seven were converted to
+executed pins rather than re-pointed at the new text — e.g. the ReadOnlyVectorMemory whitelist
+pin asserted that two *strings* appeared in `synthetic_self_play`'s source, which passes just as
+happily when the class has been gutted. Added in their place: a drift guard that reads the
+*other* side — every `context.X =` main.py performs, minus the nulled inventory, minus an
+explicitly-recorded keeper list, must be empty.
+
+### Verification (S1)
+
+`tests/test_isolation_replay.py` — 67 executed pins. **24/24 mutants KILLED across two batches,
+comment-only control SURVIVED.** Two of the first batch's survivors were my own vacuous tests:
+one asserted `"timeout" in fork.reason` while the message it accidentally matched was its own
+`AssertionError` text, and one exercised a code path the mocked `_is_container_ready` skipped
+entirely. Both replaced with counters and an exact-match on the reason.
+Icons 🪄 Imagine / 🌀 Dream-replay / 🦋 Evolve added and synced to all three consumers (web
+`app.js`, ClockworkPi `turnstatus.py`, Slack bot). Docs: `docs/core/isolation.html` + reference
+index.
+
+⚠ **Process note.** A reviewer agent's mutation harness ran against the live tree while this was
+being written and its restores silently reverted three of my edits (twice). The
+mutation-batch-needs-a-trap lesson has a corollary: a mutation harness must not run against a
+tree somebody is editing. Every file was re-verified `grep -rn MUTANT src/` clean and
+re-snapshotted before the suite run.
+
+### I0 — the calibration gate: BUILT, and it reports ZERO
+
+`core/imagination.py` ships the gate before any steering site exists. Per `(tool, tclass)`
+bucket it aggregates the durable foresight ledger and writes
+`$GHOST_HOME/system/foresight/gate.json`. `gate_allows()` is an allow-list: missing file, empty
+file, malformed file, unknown bucket, `enabled` not exactly `True`, or any exception all answer
+False.
+
+Enablement needs all four of: `n ≥ 30` resolved rows · `fail_n ≥ 10` rows where the index
+*claimed* p(fail) ≥ 0.5 · precision ≥ 0.60 on those · and the predicted-fail subset failing at
+least 0.10 more than the predicted-ok subset **with disjoint anytime-valid intervals**. The
+second and fourth conditions are additions to IDE.md's rule and both are §-lessons: a precision
+without a denominator is §4CE's *verdict without power*, and overall accuracy is §4BR's *wrong
+statistic* (the base failure rate here is ~10%, so "always predict success" scores 90%).
+
+**Measured on both instruments, 2026-08-22** (after the R2 correction below):
+
+<div class="scroll">
+
+| instrument | rows | buckets | steerable failure claims | precision on them | **enabled** |
+|---|---|---|---|---|---|
+| live ledger (`predictions.jsonl`, 16 days) | 751 | 63 | 14 | **0.071** | **0** |
+| offline leave-future-out replay of the whole corpus | 4,177 | 119 | 60 | **0.417** | **0** |
+
+</div>
+
+The live ledger closes on data volume — 57 of 63 buckets are under 30 rows. The offline replay,
+at 8× the rows, closes on something more useful to know: the only bucket clearing both size
+floors is `browser|scheme:http`, at precision **0.36**. **The precedent index discriminates but
+is not precise enough to veto with.** At precision ~0.4 a pre-flight steer interrupts more good
+calls than bad ones — the pre-registered stop rule firing on the *quality* of the signal rather
+than on the quantity of it. The whole-ledger backtest agrees independently: spread 0.302,
+monotone (0.059 → 0.148 → 0.361), "SPREAD BUT NOT SIGNIFICANT".
+
+The threshold was **not** relaxed to make the feature turn on. The gate stays closed, it says
+per bucket exactly *why* and *how many more rows it needs*, and it re-opens on its own.
+
+### The R2/R3 review round — two CRITICALs, and one of them moved the headline
+
+**C1 — "the index claimed this will fail" was admitting the exact tie, and the tie was holding
+the whole statistic up.** `p_fail = (fails+1)/(support+2)`, so `p_fail ≥ 0.5 ⟺ 2·fails ≥ support`
+— the Laplace prior's mean IS 0.5, contributing exactly zero shrinkage at the decision boundary.
+A cell with 2 failures in 4 tries reads 0.5000 and was scored as a failure claim. Live, over the
+24 rows the old rule admitted:
+
+| subset | n | really failed | precision |
+|---|---|---|---|
+| all `p_fail ≥ 0.5` | 24 | 6 | 0.250 |
+| ties (== 0.5000) | 9 | 5 | **0.556** |
+| strict (> 0.5) | 15 | 1 | **0.067** |
+
+Coin-flip cells were 37.5% of the population and carried ALL of its apparent precision; the
+index's real failure claims score 0.067, **below the ~10% base rate**. `support=3` and `support=4`
+are the two most common values among predicted-fail rows, so the tie is the modal case. Now
+strict, on the raw counts the row already carries (which also sidesteps `p_fail`'s 4-dp rounding,
+where at support ≈10⁴ a strict minority rounds *up*), and shared by all three readers — the gate,
+the steer, and `foresight.ledger_stats`.
+
+**C2 — the phase's go/no-go number returned PASS on one observation.** `--consistency` had no
+floor on the discordant count, no interval and no power statement: one pair at ratio 1.000 exited
+0. That is §4CE sitting inside the very feature whose gate module exists because "a subset of 1
+with precision 1.00 is not evidence". Exact binomial power at the 0.70 bar against a 0.50 null:
+n=10 → 0.149, n=20 → 0.416, n=30 → 0.589, **n=49 → 0.803**. Floor set at 49, the interval is
+printed, the distance to a verdict is printed, and there are now THREE exit codes — unarmed,
+underpowered and a real verdict are different facts and a CI job polls the code, not the prose.
+
+**M3 — the gate certified a different population than the consumer acts on.** Precision was over
+every row with a claim; the steer fires only on exact/class basis ∧ support ≥ 3 ∧ ≥ 2 failures ∧
+a non-empty error head. Nothing measured the second population, and on live data it is the *less*
+precise one (0.227 vs 0.250). One predicate now — `is_steerable_row` — used by both.
+
+**M6 — the sharpest number in the module was written and read by nobody.** The per-bucket Brier
+had no consumer and no skill baseline. Against a climatological forecast at each bucket's own
+claimed failure rate (`p(1−p)`), **14 of the 16 buckets with ≥30 claimed rows score NEGATIVE**
+(median −0.078; worst `manage_projects|` at −0.50). The index's probabilities are worse than
+simply knowing the bucket's base rate. `brier_base_rate` + `brier_skill` now ship beside it and
+`gate_stats` surfaces the summary.
+
+**M7 — the pre-registered 0.60 precision bar is not what binds, and that is now written down.**
+Monte Carlo against the real `asymp_cs_radius` (20k reps) puts the two-interval non-overlap test
+at 100–500× conservative against its nominal size: false-enable rate 0.0001–0.0005 per bucket
+under the null, 0.0013 worst case under continuous monitoring, so expected false enables at 119
+buckets is ≤0.15 and a bucket-level Bonferroni would buy nothing. The cost is on the other side —
+at `MIN_FAIL_N=10` against a 20-row predicted-ok subset failing at 0.05, disjointness needs
+precision ≈**0.80**. The economic bar only becomes binding as `fail_n` grows.
+
+Also fixed: the health report read `GHOST_HOME` while every sibling section is `memory_dir`-derived
+(so a `--memory-dir` archive comparison rendered the LIVE gate next to the archive's foresight);
+`--consistency` computed a verdict from a *relative* path when `GHOST_HOME` was unset, which the
+same script refuses to do three lines later for the ledger; one unevaluable bucket blanked the
+whole document and the writer then wrote the empty allow-list OVER a good one; the `why` histogram
+fragmented because the precision branch interpolated its value into the key; a `cmd:` bucket key
+could carry ANSI escapes into the operator stream; confidence radii above 1.0 were displayed for a
+statistic bounded in [0,1]; the `--consistency` help text named a *different estimator* than the
+code computes (marginal vs discordant-pairs — on the marginal scale a 0.70 bar would be worse than
+doing nothing).
+
+**And two instrument gaps that made the offline replay unable to see what the live one sees:** its
+rows carried no `tclass` (so it could only bucket by tool, merging `file_system` on a `.py` file
+with `file_system` on a URL), and it never passed the error head to `observe`, so
+`predicted_error` was empty on every offline prediction and the steerable population read as
+**zero** — "no signal" rather than "the instrument cannot see it". Both fixed; the offline number
+above is post-fix.
+
+`tests/test_imagine_gate.py` — 52 pins. **20/20 mutants KILLED across two batches**, control
+survived. Four survived the first batch (the gate falling back to the un-steerable population, the
+recording suppression, the deferral ring's bound, and the empty-`req_id` bucket) and got pins.
+
+### I1 — the pre-flight steer: BUILT, and inert by construction
+
+Moves the `foresight_note` knowledge from *after* a failure to *before* dispatch. The call is not
+run; the model is handed the precedent and gets one revision.
+
+Hook site: a sibling of the repeat-failure guard in the tool loop, deliberately at the point
+where the coroutine has **not yet been created**. In the foresight prediction loop further down
+(the position IDE.md names) the coroutines already exist, so "do not dispatch" would mean closing
+an un-awaited coroutine and threading a second kind of placeholder through the batch-dedup
+machinery — two changes to the most delicate loop in the codebase (§4BY) for no gain. At the
+guard's position it is the same shape every other pre-dispatch rejection already uses.
+
+Five gates, cost-ordered: the two kill switches (master default OFF) · the loop guard
+(once per args-hash, ≤2 per request) · `gate_allows(tool, tclass)` · the precedent floors
+(exact/class basis, support ≥ 3, ≥ 2 real failures, p(fail) ≥ 0.5, non-empty error head) · the
+`imagine_preflight` arm, where **control dispatches unchanged and is still trigger-marked** so
+the arms stay comparable.
+
+Two properties that are easy to get wrong, both pinned:
+
+* **A deferral is not a failure.** `execution_failure_count` / `last_was_failure` untouched — a
+  deliberate steer charged as a strike would spend the turn's error budget on its own advice.
+* **A deferral is synthetic.** Its message pairs with a `tool_call` in the reconstructed
+  trajectory exactly like a real result, and its label would be INVERTED (a deferral on a
+  repeatedly-failing target reads as a success). `SYSTEM PREFLIGHT` joins
+  `foresight._SYNTHETIC_RESULT_PREFIXES`, which is what stops a steer from teaching the index
+  that produced it.
+
+The arm is registered in `DEFAULT_SPECS` and in the live `system/experiments.json` (backed up
+first). It will report `trigger fired on 0/N turns` — that is the gate being closed, reported
+honestly, not a broken stamp.
+
+**Verification:** `tests/test_imagine_preflight.py` — 25 pins including the end-to-end OFF path
+(gate closed ⇒ the call dispatches, nothing synthetic is appended, no counter moves) driven
+through the REAL `_dispatch_and_process_tool_batch`. **14/14 mutants KILLED, control survived.**
+
+## §4CM — IDE / Dream: the counterfactual replay engine (D0–D4) (2026-08-22)
+
+Turns a recorded episode into execution-graded counterfactual verdicts: change one thing,
+re-execute forward, grade against an executable check. The value is **decision-level credit** —
+"did that lesson matter?" — which live traffic cannot produce at any volume.
+
+### The corpus is an order of magnitude thinner than the plan assumed
+
+The triage is three filters, cheapest first. Measured on the live corpus (46 days, 2026-08-22):
+
+<div class="scroll">
+
+| stage | episodes | share |
+|---|---|---|
+| `user_request` turns | 1,607 | 100% |
+| …decisive (`passed`/`failed`) | 733 | 46% |
+| …and ≥2 steps with tool calls | 521 | 32% |
+| …and no containment-forbidden tool | 208 | 13% |
+| …and no network / irreproducible tool | **77** | **5%** |
+| …and past the destructive denylist, with a request | **67** | 4% |
+
+</div>
+
+67 real episodes accruing ~1.5/day. **Plus the bench corpus**, which the first write-up omitted:
+`EpisodeSource` defaults `include_bench=True`, and bench solves contribute 77 more (their own
+executable validators are exactly what D1 must synthesise for a real episode). Measured by running
+the triage: **144 replayable episodes → 303 specs** (131 lesson_withhold — real turns only, since
+bench trajectories carry no hydrated lessons — 144 verify_toggle, 28 step_deny). IDE.md's D6 target
+of "≥30 verdicts/night" is not reachable from this corpus by adding nights — the multiplier is
+perturbations per episode, not episodes. **The throughput target needs restating against 144/303,
+and D6 cannot be run against the old one.**
+
+**The network filter is a REPRODUCIBILITY filter, not only a safety one.** A replay of an
+episode that searched the web is not reproducible: the search returns different results than it
+did on the day, so both legs diverge for reasons unrelated to the perturbation and the paired
+rule abstains. Non-reproducible episodes produce verdicts about noise.
+
+### Three deviations from IDE.md, all deliberate
+
+1. **The transferability gate is not reused.** `_is_transferable_challenge` asks "can this be
+   re-posed as *write a solution.py over the fixture in your working directory*" — it exists for
+   the mined-challenge harness, which REWRITES the task. A replay re-runs the recorded turn.
+   Applying a filter built for a different harness is a lexical proxy for a property nobody
+   measured. The safety half (`_is_unsafe_challenge`) IS reused, because that one is about what
+   the tools do, which is identical in both — and it is applied to the recorded COMMANDS as well
+   as the request, since the destructive thing an episode did lives in its commands.
+2. **`tool_swap` became `step_deny`.** Nothing in a recording says what the alternative call
+   *should* be, so something would have to invent one — and an invented alternative puts an
+   ungrounded generator inside a measurement whose entire value is that it is
+   execution-grounded. Denying the recorded call asks the same counterfactual with nothing
+   invented.
+3. **The executor is built on the §4CL S1 substrate, not on `synthetic_self_play`.** That method
+   is ~3,200 lines specialised for a different job and every perturbation would be a new branch
+   in it. The substrate is the part worth reusing and is separately tested. Self-play is
+   untouched.
+
+### The perturbation is applied to the DATA
+
+A fork-local playbook that simply does not contain the withheld lesson IS the property.
+Filtering a rendered lesson string, or intercepting one of the two retrieval surfaces
+(`get_playbook_context` for the volatile block, `get_playbook_items` for the bus tier), would be
+a lexical proxy that misses whichever surface the interception did not cover. The forked store
+is a real, writable `SkillMemory` in the fork, so every ranking, dedup and quarantine rule works
+unchanged and the replay's own lesson writes die with the workspace.
+
+### The validator, and its self-test
+
+Bench episodes carry executable validators; real ones need synthesis, and a synthesised check
+that cannot fail is not a check. Three gates: a **static screen** (no subprocess, no network, no
+deletion, parses, ≤6 KB — a check that shells out is a second agent with no supervision); the
+**self-test** (run the unperturbed control leg and require the validator to reproduce the
+episode's RECORDED outcome — disagreement means world drift or a wrong validator, and both mean
+"not replayable", never "assume the validator"); and **executable only** (no LLM judges; abstain
+beats opine).
+
+### The paired verdict refuses more than it decides
+
+Keep-first/abstain-on-tie, strictly: any leg that produced no verdict ⇒ abstain (a missing leg is
+not a null result); legs *within* an arm that disagree ⇒ abstain (that is the stochasticity the
+pairs exist to detect, and calling it an effect is §4BE). Two failure modes are specifically not
+charged to the agent — the `[SANDBOX INFRA ERROR]` banner (`docker.execute` never raises, it
+RETURNS that string; self-play already paid for reading it as a genuine failure) and validator
+exit 2 ("I cannot check this from the filesystem"). Control legs run first: an ungradable control
+means there is nothing to compare against, and running the perturbed arm anyway spends the
+night's budget producing abstains.
+
+### D3 — the schedule
+
+Biological phase **3c**, deep idle (>60 min), 4 h cooldown, behind an in-process §4U preflight
+that refuses on a memory-starved box (a batch spawns a container per leg; this box runs
+llama-server at ~22.6 GB wired). It does NOT reset the idle clock, for the same reason bench does
+not. `GHOST_DREAM_REPLAY` defaults **OFF** — the whole engine is inert until an operator arms it
+— and `--no-self-play` suppresses it, because an arm that ablates "self-play" must ablate
+everything riding the same clock or it measures something other than its name. Registered GATED
+in the liveness registry, so a zero reports the gate rather than manufacturing an alarm.
+
+### D4 — the gate before any consumer
+
+`scripts/dream_replay_validate.py`. Seeded positives are an episode replayed with its own
+validator INVERTED (which must flip, or the engine cannot detect anything); seeded nulls withhold
+a lesson the episode never hydrated. Pre-registered bars from IDE.md §6: sensitivity ≥ 0.80,
+specificity ≥ 0.90, flip rate ≤ 0.10.
+
+Two honesty rules the script holds itself to, both from this project's own history:
+
+* **An abstain is neither a hit nor a miss.** It is its own column, because an engine that
+  abstains on nine of ten seeded positives has a sensitivity of 1.00 on the decided cases and is
+  useless — and an aggregate that folds abstains into either bucket hides exactly that.
+* **A bar cannot be cleared without power.** 20 DECIDED cases per arm minimum (at n=10 the power
+  to reject "sensitivity = 0.5" when the truth is 0.8 is 0.53; at n=20 it is 0.87). Below the
+  floor the verdict is UNDERPOWERED, not PASS — §4CE applied to the instrument that exists to
+  prevent §4AO.
+
+**D5 is NOT opened.** `dream_credit` is registered `real_only` in the admissibility matrix and
+stays there until D4 reports PASS on real data, which requires a live agent context and hours of
+idle — it has not been run. Two admissibility rows exist deliberately: one could not express
+"may read the corpus, may not yet believe the output", and a single permissive row is how an
+unvalidated label source opens.
+
+### The two-lens review: four CRITICALs, and the engine did not mean what it said
+
+Both reviewers converged on the same verdict — **as first landed, the engine could not produce a
+verdict that meant what it claimed for any of its three live perturbation kinds.** Fixed:
+
+**C1 — the deny list was NOT a superset of self-play's, and the gap was host-process egress.**
+`REPLAY_FORBIDDEN_TOOLS`'s docstring claimed to be a superset of `core/subagent.py` and
+`core/dream.py`'s lists. It was missing `web_search` and `deep_research` — the two self-play has
+denied since the beginning, with the comment *"a synthetic training run must never leak traffic to
+external services"*. `network="none"` covers the CONTAINER; those tools reach the internet from
+the agent's own process carrying `context.tor_proxy`. A `step_deny` leg whose local routes are all
+denied will reach for a search — at 03:00, unattended, on a box whose stated rule is Tor-only
+no-identity egress. **Nothing could see the gap**, because self-play's list was an inline literal
+with nothing to import; it is now `dream.SELF_PLAY_FORBIDDEN_TOOLS` and the superset claim is an
+executed assertion.
+
+**C2 — 59% of specs silently disarmed the simulation marker and wrote two production corpora.**
+`apply_lesson_perturbation` returned a plain `SkillMemory`, which has no `is_read_only` —
+and that ONE attribute is how the whole repo derives "this turn is not real traffic"
+(`turn_origin` and ~nine gates). Two of those gates are not backstopped by a nulled handle: the
+metacog **competence prior** (the per-domain number the confidence composite reads on REAL turns —
+whose own comment says exactly this must not happen) and the **foresight predict hook** (the live
+index AND its ledger). Lesson perturbations were the majority of every night's legs.
+
+**C3 — `lesson_withhold` did not withhold.** Hydration is VECTOR-FIRST: `skills.py` queries Chroma
+for `type="skill"` documents and only then looks the trigger up in the JSON to pick a nicer
+rendering — falling back to the **embedded document** when that lookup misses. Withholding from the
+fork-local JSON therefore produced a perturbed arm in which the lesson was still in the prompt,
+merely rendered differently. The module docstring congratulated itself for avoiding "a lexical
+proxy for *this lesson was not available*"; there are two surfaces and it perturbed one. Now
+covered on both, with the parallel result columns filtered by one index set (dropping one and not
+another silently misaligns documents/distances/metadatas, which is worse than not filtering).
+
+**C4 — the control arm was not the recorded condition, and `verify_toggle`'s sign was inverted.**
+The isolation recipe nulls `verifier`; the live agent constructs one **unconditionally** at boot
+and every recorded episode ran with it — and the verifier is priority 1 and 3 in
+`resolve_turn_outcome`, i.e. the top signal that produced the very `recorded_outcome` the self-test
+compares against. Control now always has a verifier and `verify_toggle` REMOVES it, which is what
+"toggle" says.
+
+**Then the ones that made verdicts meaningless rather than unsafe:**
+
+* **An unapplied perturbation is not a null result.** Three ways a perturbation silently fails
+  produce a perturbed arm *byte-identical* to the control and a confident `no_effect`: a withheld
+  lesson no longer in the store (**88.5% of real withhold targets** have been pruned since their
+  recording — and the guard for it, `_withheld_was_present`, was **dead code with no caller**); a
+  step-deny that denied a positional INDEX the free-running replay never reaches; and a wrapper
+  destroyed by `_rebuild_available_tools`, which fires on any hallucinated tool name. All three now
+  detected; `ReplayLeg.applied` makes them ungradable.
+* **The self-test admitted vacuous validators.** `import sys; sys.exit(0)` passes the static screen
+  and then agrees with the recording on every `passed` episode with probability 1.0 — 47 of the 67
+  real ones — reporting `no_effect` forever. Agreement is exactly what a constant validator gives
+  you, so the agreement test cannot see it. Added a **negative control**: run the validator against
+  an empty fork with no agent run and require it to FAIL.
+* **The replay reproduced almost none of the recorded turn.** `source_workspace` was `None` at
+  every call site, so every leg replayed into an *empty tempdir* — while `fork_workspace` sat built
+  and tested and unused. Every task whose success is defined by pre-existing files failed in the
+  control arm, and the self-test then discarded the episode. Now forks from the live sandbox.
+* **The paired rule has a noise floor and it was unstated.** For a NULL perturbation at per-run
+  pass probability p, the unanimity rule mislabels noise as an effect at `2pⁿqⁿ/(pⁿ+qⁿ)²` of
+  decided cases: **0.262 at p=0.7, n=2**. The pre-registered specificity bar of 0.90 is
+  *unreachable* at n=2 unless tasks are near-deterministic (p ≥ 0.815). `n_pairs` is now 3 (0.135 at
+  p=0.7, 0.030 at p=0.8), and — because nothing measures p — every credit row carries the observed
+  `pass_rate` and the `noise_floor` it implies, with `credit_stats` counting verdicts *below* their
+  own floor separately instead of folding them into the same total.
+* **Specs were burned before they were answered.** `plan_batch` wrote every picked spec to the
+  durable ledger and `known_spec_ids` read THAT — so a spec skipped for any reason was marked
+  "already asked" forever with no row saying why. A week of a wedged Docker daemon would have
+  consumed ~21 specs of the corpus invisibly, while the abstain rate read *healthier* the more were
+  lost. Dedup is now keyed on `credits.jsonl`.
+* **The batch could not fit inside its own caller's bound.** 3 specs × a fresh 1500 s deadline plus
+  per-trajectory self-test legs is up to 5,400 s inside an hour-long `wait_for` — the bound would
+  fire every time and the warning blamed the spec deadline, which had held perfectly. There is a
+  derived batch deadline now, the per-spec one is clamped to it, and the summary is emitted from a
+  `finally` (the most expensive idle phase used to leave no ledger row and no stream line on its
+  two most likely failures).
+* **`mattered_pos` meant opposite things across kinds** — "the thing helped" for a perturbation
+  that removes, "the thing hurt" for one that adds — and `credit_stats` summed them. Rows carry a
+  normalised `sign` and the aggregate splits by kind.
+* Plus: the preflight probed the docker *package* instead of the *daemon* (a stopped OrbStack
+  passed every time — verified: it now correctly refuses on this box), returned True on a
+  precondition it could not read, checked no disk, and could not see a missing base image (a
+  `network=none` container cannot `apt-get`, so a routine marker bump would have made every leg
+  raise); a raising `DockerSandbox.__init__` leaked the docker client on the one path the §4BO fix
+  missed; forks were swept only at BOOT and the boot sweep spares this PID, so a fork leaked at
+  03:00 was never reclaimed while the agent ran; `tools/execute.py`'s 600 s budget is twice a leg's
+  and runs on a thread the leg's cancellation cannot stop, so the container was force-removed and
+  the workspace deleted while a process was writing into it; the master kill switch could not stop
+  an in-flight batch; and a failing preflight logged every 60 s without advancing its anchor.
+
+**And the corpus numbers in the first write-up were wrong.** The docstring headlined 77 (the
+pre-denylist row) while the code produces 67, and the bench half was omitted entirely —
+`EpisodeSource` defaults `include_bench=True`. Measured by running the triage: **144 replayable
+episodes → 303 specs** (131 lesson_withhold, 144 verify_toggle, 28 step_deny). At `DEFAULT_BATCH=3`
+that is at most **3 credit rows a night**, so IDE.md §6 P7's "≥30 verdicts/night" is 10× out of
+reach and the backlog is ~100 nights at one batch, ~17 days at the six the cooldown allows.
+
+### What is NOT fixed, and why the engine stays disarmed
+
+* **D4's seeded positive measures the validator-execution path only.** The inversion is applied
+  *downstream of the agent run*, so the arms differ no matter what the perturbation did — the
+  instrument cannot distinguish a working engine from one whose perturbations are all inoperative,
+  which is precisely the class of defect this round found. Worse, it is *confounded with the wrong
+  sign*: an effective perturbation makes the perturbed leg fail, the inversion flips it to pass, and
+  a working engine scores a MISS. A real seeded positive is available on disk and unused — bench
+  challenges carry `setup_script` + `validation_script`, so denying the one tool a challenge can be
+  solved with is a mechanically-guaranteed positive that exercises the perturbation, the store
+  rebuild and the agent run.
+* **`validate()` has no runnable driver.** `main()` returns "needs a live context" unconditionally.
+  The gate is written and cannot currently be run.
+* **The RSS watchdog is blocked for the whole batch.** `_biological_tick` is serial with
+  `_rss_watchdog_check`, whose job is to stop this process's known growth from OOM-killing the
+  22.6 GB llama-server. That is an agent.py restructure, not a replay-engine fix.
+
+`dream_credit` remains `real_only` and `GHOST_DREAM_REPLAY` remains **off**. The engine is inert,
+which is why none of the above was live — but it is not ready to arm.
+
+### Verification
+
+`tests/test_dream_replay_triage.py` (38) + `tests/test_dream_replay_executor.py` (111) +
+`tests/test_dream_replay_validate.py` (16). **Mutants: 14/14 on the first build, then 26 more
+across three review batches, all KILLED, controls survived.** Five survived their first batch and
+got real pins — the vector-surface withhold, the step-deny miss, the empty fork, the
+trajectory-level kill check, and the sandbox command cap. Two harness defects of my own were caught
+by the suite's random ordering: a class-attribute exit code shared across tests, and — the sharper
+one — the isolation backoff is module-level and process-wide *by design*, so a test that
+deliberately made the sandbox unavailable armed a 15-minute refusal for every test after it. That
+is the module working correctly and a harness that lies.
+
+## §4CM — Dream: D4b, the A/A census, and three defects it found in itself (2026-08-22)
+
+The noise floor of the paired-verdict rule was the last unmeasured input to arming the engine, and
+`scripts/replay_noise_floor.py` measures it the only honest way: **k = 6 identical control legs per
+episode**, every 3+3 split enumerated through the engine's own `decide_verdict`, so a `mattered`
+verdict on identical arms is by construction a false positive. Predicted per episode as
+`2p³q³/(p³+q³)²`; the estimator identity `E[split rate] = C(6,3)p³q³ × 1/10 = 2p³q³` is verified to
+1e-12.
+
+Run 3 was killed at 23 of 25 episodes. **Its numbers are void**, and the reasons are the point.
+
+### The census was measuring the wrong world
+
+`run_spec` — the engine's real path — defaults `source_workspace` to `USE_LIVE_WORKSPACE`, so every
+leg it runs starts from a **copy of the live sandbox**. The census hardcoded `source_workspace=None`,
+so its legs started **empty**. Probed on the same episode: 3 top-level entries in the census's fork
+against 16 in the engine's. A floor measured in a world the rule never runs in is a number about the
+wrong regime — the §4BR mistake with a different name. The regime is now a `--fork {live,empty}`
+flag defaulting to the engine's, threaded to every leg, and **written on the run header**, because a
+rows file that does not say which world it ran in cannot be compared with one that ran in the other.
+
+### The trace fed to the validator synthesiser leaked paths the fork does not have
+
+`isolated_replay_context` nulls `current_project_id` on purpose, so a replayed agent writes at the
+**fork root**. The trace still carried the RECORDED locations, so the synthesiser wrote checks
+against `projects/<id>/…`. Four distinct forms leaked, and **each was found by sweeping all 42
+replayable episodes, not by imagining what a path looks like**:
+
+* the plain prefix, `projects/<id>/x.json`;
+* the tool **RESULT** channel — after the arguments were fixed the trace still read
+  `SUCCESS: Wrote 5202 chars to 'projects/<id>/x.py'`;
+* the mount point and the `cd` hop, `cd /workspace/projects/<id> && python3 demo.py` — and the first
+  fix **still leaked** here, because the rules ran in the wrong order: `_PROJECT_CD_RE` cannot see
+  `cd projects/…` while the value still says `cd /workspace/projects/…`. Roots come off first now,
+  and the ordering has its own pin;
+* a HOST path, `/Users/<user>/Data/AI/Data/sandbox/projects/<id>`, reaching the trace through a
+  `list_files`.
+
+`content` was deliberately spared at first — it is the file's text — and that was the last leak: a
+script the agent wrote held the literal `path = "projects/<id>/model.py"`. It is normalised like
+every other value now. One rule for all four keys leaves no exemption to become the next bypass.
+
+**In the seeded regime this fix is load-bearing, not cosmetic.** The fork contains the copied-in
+original under `projects/<id>/`, so a validator naming that path passes **for free on every leg
+without the agent doing anything** — while still failing the empty-fork negative control, i.e.
+presenting as a perfect reproduction. Bare paths test the agent's own output at the fork root.
+
+Sweep after the fix: **0 leaking lines across all 42 replayable episodes.** Mutation-tested 12 ways,
+11 killed. The twelfth — the right-hand lookahead on `_PROJECT_DIR_RE` — **survives, and is reported
+as surviving**: `_PROJECT_PREFIX_RE` runs first and consumes every form it would exclude, and a fuzz
+over 219,558 strings found no input where it changes the result. It is redundant given the order,
+kept as a guard against a future reordering, and **no test is written for it**, because no test
+could distinguish the two.
+
+### The corpus is smaller than the last write-up said, and the missing episodes were never measurable
+
+Triage gained `no_filesystem_checkable_deliverable`: an episode whose tools produce **no artifact**
+has nothing a filesystem check can look at. Measured funnel, real traffic: **1800 seen → 42
+replayable** (877 `no_recorded_outcome`, 442 `used_a_non_replayable_tool`, 212 under-two-steps, 190
+not-a-user-turn, 25 the new rule, 12 destructive). With bench: **127 replayable** (real 42, bench
+85). The earlier §4CM figure of 144 → 303 specs is superseded.
+
+The rule rejects **6 episodes run 3 had successfully measured** — and all six scored exactly
+`p = 0.00`, all six being read-only (`list_files`, `introspect`, `recall`). Their zeros were
+structural. The rule discards no signal; it removes rows that were **inflating the deterministic
+count** and making the corpus look more decidable than it is.
+
+### The floor on this corpus is not the floor the engine meets
+
+The census admits an episode when its validator **discriminates** (fails an empty fork). The engine
+admits one only when the control arm also **reproduces** the recording — its agreement test. Run 3
+measured 17 never-pass of 23, so the corpus-wide figure was dominated by episodes the engine
+**refuses to run**, each contributing a guaranteed zero. `score()` now reports an
+`engine_admissible` stratum beside it: how many episodes could ever be admitted, how many the
+agreement test refuses, and the rate **weighted by `p_admit = p̂ⁿ`** (or `q̂ⁿ` for an episode recorded
+`failed` — agreement means *matches the recording*, not *passes*). That weighted number is the rate
+a consumer of the credit ledger actually meets.
+
+### Why the episodes do not reproduce — measured, and not what I claimed
+
+The first hypothesis was the leaked paths. It was wrong. With paths fixed and both regimes probed,
+the same episodes still fail: one asks for a count of workspace entries and its validator hardcodes
+the original environment's number, which no fork can match; another asks for a multi-step
+experiment the replay's single constrained turn (no network, verifier ablated,
+`force_final_response`) does not finish. **Non-reproduction is neither paths nor seeding — replay is
+a harder setting than the original turn.** That is a fact about the corpus the engine will run on,
+and it is why the `engine_admissible` stratum, not the corpus-wide one, is the headline.
+
+### Instrumentation the run needed and did not have
+
+* **Per-phase timings on every row, skips included.** Run 3's cost was one undifferentiated figure,
+  so sizing the next run meant guessing how it split. Skips are most of the bill — 36 of 59 episodes,
+  each paying for synthesis and 33 of them for a negative control. `synth_seconds` and
+  `neg_control_seconds` are recorded on the phase that actually ran, and **absent when it did not**.
+* **The completion footer survives an interrupt.** `rescore` reads a missing footer as "the run did
+  not finish" — correct, but a ten-hour census killed at hour nine has nine hours of usable rows. The
+  footer is written on every exit path and records **how** it ended, so it can never claim a
+  completion that did not happen.
+
+### Two defects the first live minutes surfaced, both about cost and control
+
+**81% of the run's cost bought nothing.** An A/A episode needs ALL `legs` graded — one ungradable
+leg skips the episode whatever the rest do — so the census ran five more legs after the outcome was
+already settled. Measured on the live run: one episode spent **1,052 s (6 legs at the 240 s cap)**
+reaching a verdict leg one had determined, against 1,294 s accounted for the whole run to that
+point. It aborts on the first ungradable leg now and records `legs_run`. Mutation surfaced two real
+gaps in my own pins: keying the abort on `not leg.passed` instead of `is None` would abort on a
+**failing but perfectly gradable** leg — most of this corpus is `p = 0.00` — computing `pass_rate`
+from one leg instead of six and handing the floor formula a rate it never measured.
+
+**`kill -INT` was a no-op, and the footer that exists for exactly that case never fired.** A shell
+starting a background job sets SIGINT to **SIG_IGN** in the child, and CPython **preserves** an
+inherited SIG_IGN rather than installing its default handler. The signal was delivered, nothing
+happened, and the census walked on to the next episode. SIGTERM has no default handler at all and
+loses the same footer. `main()` now installs both explicitly, and this was verified **end to end,
+not by unit test alone** — the earlier stop looked correct in every test and was inert in the real
+environment. SIGTERM against the live run now exits promptly and writes
+`{"__run__": "end", "interrupted": "CancelledError mid-run", "episodes_seen": 1}`: truthful that it
+was a stop, never claiming a completion.
+
+### The review round that invalidated two runs, and the free `p̂ = 1.0`
+
+Three read-only reviewers on the harness, the path rules, and whether the new tests bite. They
+found four things I had verified and one I had built wrong.
+
+**The fix guarded one prompt slot of three.** `_VALIDATOR_PROMPT` interpolates `{request}`,
+`{trace}` and `{final}`; only the trace went through `_fork_relative`. Measured across the 42
+replayable episodes: **trace leaked a project path in 0, `final_response` in 3, `user_request` in
+1.** The final reply is the worst channel of the three, because it is where the agent *announces*
+what it wrote — ``The file `projects/<id>/message_to_future.md` has been written`` — naming the
+recorded location in prose the synthesiser copies verbatim. All three slots are rewritten now; the
+sweep is 0/0/0.
+
+**And the reason that matters is the defect underneath it.** `run_validator_only` hardcodes an
+**empty** fork. That was a matched screen while the legs were empty too — but `--fork live` starts
+every leg from a **copy of the live sandbox**. So a validator asserting an artifact that is *still
+on disk* **fails** the empty screen (reading as "this check discriminates") and then **passes every
+seeded leg without the agent doing anything**. The episode scores `p̂ = 1.0`, lands in
+`always_pass`, contributes a guaranteed zero to the floor, and measured nothing at all. Two of the
+three leaked files were verified still present in the live sandbox. The run then in flight had 2 of
+7 measured episodes at `p̂ = 1.0` with near-zero leg variance — the signature.
+
+The census now runs **both** screens and records both: the empty one (the engine's) and one matched
+to the regime the legs run in. Admission requires the *matched* screen to fail, and an episode the
+empty screen would have admitted is counted as `engine_screen_would_admit`. **⚠ The engine has the
+same asymmetry** — `run_batch` screens empty and runs legs live-by-default — so this does not only
+fix the instrument, it *sizes the engine's blind spot* before anything is armed.
+
+**`p_admit` modelled a gate the engine does not have.** I weighted admission by `p̂ⁿ`, calling it
+"the n-leg control arm unanimous AND matching". `run_batch` admits on **one** control leg;
+`run_spec`'s n legs need only be *gradable*; the unanimity lives in `decide_verdict` and is already
+inside the split enumeration. So the exponent modelled a nonexistent gate **and** double-counted a
+real one. The bias was not random: with 6 legs `fp > 0` iff exactly 3 passed, i.e. `p̂ = 0.5`, and
+`w³ = w` exactly at `w ∈ {0,1}` — so cubing left every zero-fp episode at full weight and cut the
+weight of **the only episodes that can produce the quantity being measured** by 4×, understating the
+headline. My own test had pinned `0.5**3` and enshrined it.
+
+**A second stop signal destroyed the footer.** The `finally` runs with the handler still armed and
+the container teardown ahead of it takes seconds — so an operator who signals, sees the process
+alive, and signals again raised *inside* the footer write. Reproduced: no footer at all. The latch
+is one-shot now and the footer write catches `BaseException`, not `Exception`.
+
+**Two of my own pins were vacuous.** `test_a_CLEAN_run_footer_does_not_claim_an_interrupt` was a
+source-text pin: changing the write to `interrupted or "aborted"` — so *every* footer claims an
+interrupt — left both substrings present and the test green. And `my_projects/x.py` passed as a
+negative control for the wrong reason (`x.py` has a dot), so the project rules had **no** left
+boundary and `my_projects/abcd/x.py` became `my_x.py`; `_SANDBOX_ROOT_RE` had no negative control at
+all and ate `docs/sandbox/notes.md`. Both boundaries added, both now pinned by discriminating cases.
+
+Neither regex bug was live — swept the corpus, 0 episodes contain either shape — but the prompt-slot
+leak and the unmatched screen were, which is why runs 5 and 6 were discarded rather than rescored.
+
+**9 mutants on this round's fixes, all killed.** One "survivor" was a lying result of the same
+species as the `timeout` batch: an uncaught `KeyboardInterrupt` in a test **aborts the pytest
+session** rather than failing a test, so the run collapsed to "43 passed" and a naive classifier
+scored it as survived. The harness now compares the test COUNT against the baseline and reports
+`BROKEN-MUT` rather than a pass, and the pin itself catches the interrupt and calls `pytest.fail`.
+
+### THE RESULT — run 7, the whole corpus, 7.03 h, clean exhaustion
+
+`--episodes 200 --legs 6 --max-hours 10 --fork live`. **128 episodes seen, 57 measured**, footer
+`stopped_early: ""` — the loop ran out of corpus, not out of budget, with three hours to spare.
+Rows: `scratchpad/ide/aa_rows_FINAL.jsonl`.
+
+```
+FALSE `mattered`    : predicted 0.001   observed 0.002 ±0.002   (formula error +0.001)
+DECIDES at all      : predicted 0.972   observed 0.967
+ENGINE-ADMISSIBLE (1 control leg matching the recording — the engine's own gate):
+   45 of 57 episodes;  12 refused by the agreement test
+   false-mattered over those episodes : 0.0022
+   weighted by how often each IS admitted: 0.0011   (44.33 episode-equivalents)
+```
+
+The closed form `2p³q³/(p³+q³)²` **tracks observation**. Against the pre-registered 0.10
+specificity bar the floor is ~50–100× below, which is what licenses opening `dream_credit`
+**conditionally on the per-row `noise_floor`** rather than on a blanket pass. Skips: 46
+`no_admissible_validator`, 12 `episode_not_filesystem_checkable`, 9 `ungradable_leg`, 4
+`validator_did_not_discriminate`.
+
+**⚠ THE ENTIRE MEASURED SIGNAL IS ONE EPISODE.** `7d2abd4aea6a4e` (bench), legs
+`[T,F,T,F,T,F]`, `p̂ = 0.50`, `fp = 0.10`. That is the theory behaving exactly as written — with
+six legs a false `mattered` is possible *only* at exactly 3-of-6 — but it means the point estimate
+rests on a single stochastic episode, which is why the interval is as wide as the estimate itself.
+The corpus is overwhelmingly deterministic: **42 always-pass, 13 never-pass, 2 stochastic.** Anyone
+quoting 0.0011 without that sentence is quoting a number whose error bar they do not know.
+
+**The two halves are different populations and must not be pooled.**
+
+| | n | always-pass | never-pass | stochastic | false-mattered |
+|---|---|---|---|---|---|
+| real  | 18 | 5  | 12 | 1 | 0.000 |
+| bench | 39 | 37 | 1  | 1 | 0.003 |
+
+Real traffic barely reproduces (12 of 18 never pass); bench is a bank of solved tasks that almost
+always does. `dream_credit` is `real_only`, so the population the engine actually runs on is the
+left column — 18 measured episodes, one of them stochastic, zero false `mattered` observed.
+
+**The defect the restart was for did not materialise, and that is the honest finding.** The
+regime-matched negative control ran on all **66** episodes that reached it, at a total cost of
+**39.1 s**, and every one discriminated: **`engine_screen_would_admit: 0`**. No episode's validator
+passed the seeded fork for free. The guard is verifiably live rather than silently inoperative —
+`neg_seeded_passed` is on every row that reached it — but it bought a clean guarantee, not a
+correction. The prompt-slot leak it shipped alongside *was* live, in 4 of 42 episodes.
+
+Every headline number was **recomputed from the raw legs independently of `score()`** and matches to
+the digit: 45 admissible, weight 44.33, unweighted 0.0022, weighted 0.0011, pooled 1/570.
+
+**What it does NOT license.** The corpus is 42 real replayable episodes yielding at most ~231 specs,
+of which 18 measured and 5 reproduce — so P7's throughput target is still out of reach by an order
+of magnitude, and §4CM's earlier "144 replayable → 303 specs" remains superseded. The floor licenses
+*trusting a row's `noise_floor` field*; it does not license arming the engine, which still needs the
+D4 sensitivity gate.
+
+### One command could spend a whole leg — and raising the cap made it worse
+
+Chasing the 8 real episodes lost to `ungradable_leg`, I traced three of them and found the agents
+had reached only turns **8, 5 and 12 of 20** with no turn-limit signals: they were progressing and
+the wall clock cut them off. So I raised `--leg-timeout` 240 → 600 and re-measured. **That was
+treating the symptom, and the operator caught the reason** — a replayed episode ran
+`python3 -m http.server 8080`, a foreground server that never returns, and was handed
+`timeout -k 5s 569s`.
+
+The per-command clamp was `budget - elapsed - 30`: **essentially the entire remaining leg**. A
+leg's budget is meant to cover MANY turns, so one non-terminating command could consume all of it —
+and raising the leg cap raised what it could waste, 209 s → 569 s.
+
+`tools/execute.py`'s guard does not catch this and **should not**. `_SERVERISH_RE` matches
+`http.server`, but blocking additionally requires DETACHED signals (`… &` / `setsid`); the message
+says so plainly — *"Foreground and short-lived commands are unaffected."* That is right for a live
+turn, where a blocking server is the operator's problem. In a replay leg nobody is watching, so the
+bound has to come from the budget.
+
+```python
+REPLAY_MAX_CMD_S = 120.0
+
+def _cmd_budget(leg_budget, elapsed):
+    remaining = leg_budget - elapsed - 30
+    return int(max(30.0, min(REPLAY_MAX_CMD_S, remaining)))
+```
+
+Two bounds, tighter wins. Extracted as a pure function rather than left inline, because the defect
+lived at the call site and the arithmetic is worth testing without driving a coroutine. 120 s is
+measured, not chosen: legs run a p50 of 26 s and p90 of 127 s for all their commands and turns
+together, so it is generous for a compile or a test run and still leaves a timed-out command most
+of the leg to recover in — which is what the original turn had. The identity the fix rests on is
+pinned: `REPLAY_MAX_CMD_S * 2 <= DEFAULT_LEG_TIMEOUT_S`, because a cap that grows past a leg budget
+stops bounding anything and the defect returns silently. **6 mutants, all killed.**
+
+**The re-measure then answered a different question than I designed it to.** Measured:
+
+| episode | 600 s, uncapped | 300 s + 120 s cap |
+|---|---|---|
+| `40f636e95f1b` | **p = 0.17** (stochastic) | ungradable |
+| `64418ac31af4` | p = 0.00 | ungradable |
+| `76ba32433f14` | p = 0.00 | — |
+| `798af2077786` | ungradable (`http.server`) | — |
+
+**⚠ THE SECOND RUN CHANGED TWO VARIABLES AT ONCE** — leg 600 → 300 *and* the new cap — so it
+cannot attribute anything, and the variable I changed by accident was the one that mattered. These
+episodes spend their budget on **many short** greps and finds, so the 120 s cap **never binds for
+them**; shortening the leg simply lost both, including the only genuine gain. A clean test would
+have been 600 s capped against 600 s uncapped.
+
+I did not run it. It would establish whether the real working set is 6 or ~8, and the §4CM verdict —
+not viable as a nightly loop, 41× short of P7 — is identical at either number. **A measurement that
+cannot change a decision is not worth the box.**
+
+**Conclusion: keep the cap, leave the leg timeout at its default.** The cap is a correctness fix
+that stands alone — one command must not be able to spend a whole leg, whatever the leg is set to.
+Raising the leg recovers mostly `p = 0.00` dead weight at ~10 minutes per episode to discover it;
+the one real gain does not justify a new default, and with the cap in place a longer leg can now be
+set safely case-by-case, which was not true before. **Gradable is not usable**, and only usable
+moves the working set of 6.
+
+### `--postmortem` enabled on the daemon (operator-authorised)
+
+Evolve's eligibility is per-source — `independent_fails` is the most any SINGLE source saw, never
+the sum — so no evidence source is load-bearing. Measured live: **foresight present with 30 tools
+and 64 fails (8 tools clear the floor of 3)**, postmortem absent, `dream_credit` absent. So Evolve
+has a working supply today with Dream contributing **zero**, which is what makes the §4CM verdict
+survivable rather than fatal to IDE.
+
+Postmortem was dark for one reason: `--postmortem` is opt-in and had never run on this box. I
+suspected a path bug — `main.py`'s help says `$GHOST_HOME/postmortem/defects.jsonl` while the
+mutator reads `$GHOST_HOME/system/postmortem/defects.jsonl` — and **verified rather than assumed**:
+the writer is `context.memory_dir.parent / "postmortem"`, which resolves to exactly the mutator's
+path. Only the help string is stale.
+
+Enabled in `bin/start-ghost-agent.sh`'s **exec line** (the only flag truth on this box; a change
+anywhere else drifts back out), backed up to `.bak-20260823-prepostmortem`, daemon restarted via
+`launchctl kickstart -k system/com.local.ghost-agent`. Verified: pid 321 → 26850, argv carries
+`--postmortem`, log shows `phase 2.5c enabled`, authenticated `/health` returns `{"status":"ok"}`,
+exactly ONE boot marker (no crash loop), `.err` clean. `--postmortem-propose-patch` stays OFF — it
+attaches LLM-proposed diffs and is a separate, larger opt-in that was not requested.
+
+Fill is slow by design: worst FAILED runs only, behind a 3-hour cooldown. Re-run the evidence
+census in a few days rather than reading an empty file tomorrow as a failure.
+
+### Verification
+
+`tests/test_replay_noise_floor.py` (60) + `test_dream_replay_triage.py` (78) + executor + validate:
+**334 passed**. Full suite **15,269 passed, 17 skipped, 0 failed**. Mutants this round: 12 on the
+path rules (11 killed, 1 reported as unreachable), 3 on the footer, all killed; controls survived
+and every file verified byte-identical to a pristine copy afterwards. **The first mutation batch was
+a lying harness** — macOS has no `timeout`, so all 12 mutants "survived" without a single test being
+run. The rebuilt harness refuses to start unless a pristine baseline PASSES first.
+
+## §4CO — IDE session summary: what a day of running it actually established (2026-08-23)
+
+An index for the detail in §4CM/§4CN, and the one pattern worth carrying out of it.
+
+### What shipped
+
+| | |
+|---|---|
+| **D4b** the A/A noise-floor census | RUN — whole corpus, 7.0 h, floor **0.0011** weighted vs a 0.10 bar |
+| **E2** the evaluation cascade | stages **0–4** built; all four exercised on real code |
+| **E1** fixes | brief now embeds the source; hunk counts + start lines repaired |
+| `--postmortem` | enabled on the daemon (second evidence source for Evolve) |
+| Per-command cap, per-item cap | one unit of work can no longer spend a whole budget |
+| **IDE.md** | re-scoped: P7 and E4 withdrawn, both tracks operator-triggered |
+
+Full suite **14,571 → 15,406** over the IDE work; 0 failed.
+
+### The two results
+
+**Dream's floor is measured**: predicted 0.001, observed 0.002 ±0.002, engine-admissible weighted
+**0.0011**. ⚠ Its entire signal is ONE episode — with six legs a false `mattered` is possible only
+at exactly 3-of-6 — and the corpus is 42 always-pass, 13 never-pass, **2 stochastic**.
+
+**Evolve's cascade works and refuses almost everything, correctly.** It refused a null candidate
+that scored nominally HIGHER (22/22 vs 21/22 on character-identical code), refused three malformed
+diffs at three different guards, and refused the first real E1 mutation for being worse (b=2, c=1,
+p=1.0). No packet was written. That is the machine working.
+
+### ⚠ THE PATTERN: nine verified mechanisms that were wrong when run
+
+Every one had tests passing at the time; several had the FULL suite green. Each was caught only by
+running the thing end to end.
+
+1. `kill -INT` was a **no-op** — a background job inherits `SIGINT = SIG_IGN` and CPython preserves
+   it, so the footer the stop path exists for never fired.
+2. The path fix guarded **one prompt slot of three**; `final_response` leaked in 3 of 42 episodes.
+3. The census measured an **empty fork** while the engine ships **seeded**.
+4. `p_admit` used `p̂³` where the engine's gate is **one leg** — biased 4× in the flattering
+   direction, on exactly the episodes that produce the quantity being measured.
+5. The stage-2 child read the **return value**; the outcome rides `last_bench_result`. Every item
+   would have scored `False`.
+6. `build_brief` resolved the target against the **process CWD** — correct from the repo root,
+   silently wrong under launchd.
+7. The abort veto was **unreachable**: `passed` was assigned after the check that was supposed to
+   overturn it.
+8. A completion watcher **matched its own command line** and could never fire; later, a pattern that
+   matched **nothing** read as "finished" on a live process.
+9. A verdict test **recomputed the rule it was checking**, so promoting a tie, ignoring
+   significance, and promoting the LOSER all passed.
+
+**The generalisation** — already in memory as [[harness-that-cannot-run-reports-success]] — is that
+a check which cannot execute reports the FAVOURABLE outcome. A green suite is evidence the tests
+ran, not that the mechanism works.
+
+### The convergence, which is the real finding
+
+Three tracks bottomed out on one substrate. Live traffic yields **~1 replayable episode a day and
+~0.13 usable ones**; the two largest rejection buckets are structurally closed. Rule 0 was right that
+traffic is fine (~40 trajectories/day) — **replayability is the ceiling**, and it is upstream of
+everything the plan proposed to build. The only lever left open is changing what is RECORDED AT TURN
+TIME, which is a different project and is written down as one.
+
+### Still owed
+
+**E3 — scheduled negative controls.** One was run by hand today and passed. This project's own rule
+is that a guard which never demonstrably fires is presumed dead, and that now applies to a cascade
+whose entire value is refusing things.
+
+## §4CN — IDE re-scoped to the measured numbers (2026-08-23)
+
+`IDE.md`'s STATUS header now leads with what the plan below gets wrong, and the two withdrawn
+targets are marked at their own definitions so a reader landing mid-document is not misled.
+
+**Withdrawn, with the arithmetic beside each:**
+
+* **P7 — "≥30 verdicts/night".** Measured **0.73 specs/day**: 1800 trajectories → 42 replayable →
+  18 measured → **6 whose control arm ever passes**. 41× short, and the one-time backlog is ~33
+  specs — eleven nights at `DEFAULT_BATCH=3`, then dry.
+* **E4 — "2–4 candidates/night".** The gate needs **6 candidate-only wins with zero losses** to
+  clear α = 0.05 (identical at n = 24 and n = 120, since McNemar counts only discordant pairs)
+  against an incumbent that fails 4 of 24, at ~1.5–5 h per attempt. Expected promotions per month
+  ≈ 0.
+
+**Restated, not deleted.** Dream answers *"was this lesson load-bearing on that episode?"* with a
+validated per-row `noise_floor`; E2 answers *"is this change actually an improvement?"* about a
+candidate someone already cares about. Six usable episodes is nothing for a loop and plenty for a
+specific question. Both kill switches stay OFF by default — **nothing here becomes autonomous by
+having been built.**
+
+**Imagine left alone but flagged.** I0's stop rule fired and I2–I5 are correctly not started. D5.4
+was named as the unblock, but it draws on the SAME 42 episodes, so it should be sized before it is
+scheduled rather than inheriting the assumption that it will work.
+
+**The convergence is the result.** Three tracks, three independent bottom-outs, one substrate: live
+traffic yields ~1 replayable episode a day and ~0.13 usable ones. Rule 0 sent me to re-measure
+traffic and traffic is fine — ~40 trajectories/day. **Replayability is the ceiling**, and the two
+largest rejection buckets are structurally closed (877 `no_recorded_outcome`, of which ~7 would ever
+become replayable; 442 containment-forbidden, which cannot grow without weakening the fence).
+
+**The one lever left open** is changing what is RECORDED AT TURN TIME — not building anything
+further downstream. That is a different project from IDE as specified, and the header says so rather
+than leaving it as an implication.
+
+### Verification
+
+Full suite **15,406 passed / 17 skipped / 0 failed**. Docs: `docs/evolve/evaluator.html`,
+`docs/evolve/mutator.html`, `docs/core/replay_engine.html`.
+
+## §4CN — Evolve: E2, the evaluation cascade (stages 0–1) (2026-08-23)
+
+`evolve/evaluator.py`. A candidate is a materialised snapshot — the repo with one mutator diff
+applied — and this decides whether it goes further. Every stage runs in the **parent** process: the
+candidate is only ever the SUBJECT, never the harness.
+
+**Two rules, and everything else follows from them.**
+
+* **The harness comes from the canonical tree, never the candidate's copy.** `harness_digest` is
+  taken before AND after every stage; a move **aborts the generation** rather than failing a stage,
+  because a moved harness invalidates results already collected. E0 built the primitive and said
+  its call sites would arrive with E2 — they have.
+* **Nothing passes by default.** A touched file mapping to no test, a pytest run that collected
+  nothing, an empty diff: each yields zero failures, and zero failures is the shape of a green
+  result that verified nothing. Each is an explicit refusal.
+
+**Stage 0** checks scope FIRST (a diff touching what it may not touch is not a thing to reason
+about), then that every touched path exists in the snapshot — `materialize` can report success on a
+partial apply — that every `.py` compiles, and that no production module was rewritten to the TEST
+import form. That last is not style: production imports `src.ghost_agent.*`, and a module rewritten
+to `ghost_agent.*` loads a SECOND copy of the package with its own state.
+
+**Stage 1** runs the canonical tests covering the touched files against the candidate's code —
+subject swapped, judge not. Selection is mechanical (`tools/browser.py` → `tests/test_browser*.py`),
+and a touched file mapping to nothing FAILS rather than passing on zero tests.
+
+### The premise needed its own test, and the risk was concrete
+
+This repo's suite uses **both** import forms — `ghost_agent.*` via `PYTHONPATH` and
+`src.ghost_agent.*` via the working directory. Getting `PYTHONPATH` right and `cwd` wrong satisfies
+the first and silently misses the second: every pin passes **against the incumbent** while the
+cascade certifies code it never executed. The pin builds a two-root mini-repo, asserts both forms
+see the candidate, and carries the negative control — pointing the stage at the incumbent must FAIL,
+or the positive proves nothing. Mutating `cwd` to the canonical root is caught.
+
+Also read: pytest's **summary**, not only its exit code. It exits 5 on "collected 0 items" — a
+non-zero that looks like a failure and a zero-failure count that looks like a pass.
+
+### Mutation found a flaw in my own abort spine
+
+`res.passed` was assigned AFTER the final harness check, so `_harness_moved`'s `passed = False` was
+**unreachable**: `passed` sat at its default every time the check could fire, the abort could never
+overturn a result, and deleting that line changed nothing. Two mutants survived on it. Fixed by
+recording the result first and letting the check veto it — which is what makes a run whose pins
+passed and whose harness then moved come back False. The test was equally at fault: it asserted
+`passed is False` against a candidate that failed stage 0 anyway, holding for the wrong reason. It
+now runs a mini-repo that passes both stages, and moves the harness only on the FINAL check.
+
+**Stages 2 and 3 are ABSENT, not stubbed, and a test asserts their absence** — a stage returning a
+pass because nobody implemented it is the built-but-unwired failure this package exists to avoid.
+`evolve/__init__.py`'s status paragraph was updated in the same commit; it had described the cascade
+in the present tense while it did not exist.
+
+### Stage 2 — bench smoke, in a child that is not the harness
+
+The banks on disk are `gsm8k` (1,319, `python_general`), `gsm8k_text` (1,319, `math_text`) and
+`mbpp` (972, `algo`) — **3,610 items**, each carrying `setup_script` + `validation_script`, i.e.
+executable ground truth rather than a synthesised opinion.
+
+There is **no standalone bench runner** in this repo: the drain lives inside the live agent's
+biological watchdog, armed by `POST /api/bench/drain` setting a budget it spends over idle ticks. So
+stage 2 spawns a child that imports whatever `ghost_agent` is on its path and drives
+`dream.Dreamer.synthetic_self_play` per item — the same call the watchdog makes.
+
+* **The child lives in `scripts/`, which the fence marks IMMUTABLE.** The harness must not be a file
+  the subject can edit; verified by a test that asks the fence, not by assertion.
+* **Stratified and deterministic sampling.** Stratified because the banks are different skills and a
+  uniform draw over the pooled 3,610 would let the largest decide the stage; deterministic because a
+  candidate and its incumbent must sit the SAME exam — a fresh random draw per run makes every
+  comparison a different one.
+* **Infra is not charged to the candidate.** A crash in the runner is not the candidate being wrong,
+  and counting it as a failed item is how a broken harness reads as a bad candidate.
+* **Zero is not a pass**, again: a child that dies on startup leaves an empty results file — no
+  failures, and a rate that would otherwise be a division by zero.
+* **The budget is a deadline** shared across items, with a parent-side backstop for a child that
+  ignores it. That kill is a FAILURE, not a retryable timeout.
+
+**Mutation caught the two that mattered.** Dropping the candidate from the child's `PYTHONPATH`, and
+dropping the isolated `GHOST_HOME`, both survived the first sweep — meaning the child could have run
+the INCUMBENT's code, or written into the live corpus while being judged, with every test green.
+Stage 1 has a premise test for exactly this and stage 2 had none; it does now, and it works by having
+the child REPORT what it was handed (`PYTHONPATH`, `cwd`, `GHOST_HOME`) rather than the parent
+asserting what it believes it sent.
+
+### The first REAL stage-2 run, and what only running it could find
+
+A **null candidate** on purpose: a comment-only diff on `tools/database.py`, semantically identical,
+so a low score would indict the harness rather than the mutation. Materialised through E1's real
+`materialize` (patch dry-run, snapshot, marker verified present in the COPY and absent from the
+canonical tree).
+
+**⚠ THE CHILD READ THE WRONG THING, AND 27 GREEN TESTS COULD NOT SEE IT.**
+`synthetic_self_play` does not return its outcome — it surfaces it on `dreamer.last_bench_result`,
+a dict of `{passed, status, attempts, bank, item_id}` pre-cleared to `None` each run. The child read
+the RETURN value, so **every item scored `passed=False`**: stage 2 would have rejected every
+candidate, and the failure would have read as a bad mutation rather than a broken instrument. The
+A/B is exact, same item and same candidate:
+
+```
+before : gsm8k-1126  passed=false            (33.0s)
+after  : gsm8k-1126  passed=true   "SUCCESS (in 1 attempts)"  (19.0s)
+```
+
+Every test covering stage 2 used a **stand-in child**, and a fake child can only confirm the
+parent's contract with the fake. Now pinned by driving the REAL child against a stub `dream` module
+that returns something truthy while reporting the true outcome on the attribute — the exact shape
+that fooled the first version. Mutating it back is caught. A non-conclusion (`last_bench_result is
+None`) is recorded as **infra, not a failed item**: charging it to competence is how a broken
+harness reads as a bad candidate.
+
+Had this scaled straight to the spec's 120 items, it would have burned an hour to produce a
+confident 0% and a wrong conclusion.
+
+### The floor was a constant pretending to be derived
+
+`BENCH_MIN_PASS_RATE = 0.75` was commented "derived, not declared" and was neither. Measured from
+this box's ledger: **131/133 gradable = 0.985** (gsm8k 45/45, gsm8k_text 44/44, mbpp 42/44; one
+INFRA excluded, because an abort is not the incumbent failing an item). A Clopper–Pearson one-sided
+bound at α = 0.01 gives a floor that **moves with n**:
+
+| n | floor |
+|---|---|
+| 12 | 0.681 |
+| 30 | 0.858 |
+| 120 | **0.932** |
+
+So the old constant was wrong in the dangerous direction at the spec's own item count: at n = 120,
+`0.75` passes a candidate scoring 0.80 against an incumbent at 0.985. It is now computed on the
+number actually **graded** (infra shrinks the denominator), from the **live** home's history — an
+earlier version fell back through the isolated run home, which is empty by construction and which
+the candidate had just written into, so the bar could have been derived from the candidate's own
+output. No history reports `None` and an explicit fallback, never `1.0`.
+
+### Two findings from running the cascade on real code
+
+* **Stage 1 refused a real candidate, correctly.** `fallback_chains.py` has no
+  `tests/test_fallback_chains*.py`, so "zero is not a pass" fired against live code rather than a
+  fixture.
+* **28% of the mutable surface is unevaluable.** Of **29** mutable `tools/` files, **8 have no pin**
+  (`browser_runner`, `fallback_chains`, `notify_tool`, `postmortem_review`, `self_state`,
+  `uncertainty_tool`, `workspace_track`, `yt_download`). A candidate touching any of them can never
+  pass stage 1, so E1's usable target set is **21 files**, not 29. Worth knowing before generations
+  are spent on targets that cannot be evaluated.
+
+### The run itself — COMPLETE
+
+12 items, stratified, seed 1, null candidate. **12/12 passed, 0 infra, 10.8 min wall.** Stage 2
+returned `passed=True`.
+
+| bank | passed | attempts (mean) | seconds (mean) | total |
+|---|---|---|---|---|
+| gsm8k | 4/4 | 1.00 | 20.3 | 81 s |
+| gsm8k_text | 4/4 | **2.75** | 86.2 | 345 s |
+| mbpp | 4/4 | 1.00 | 54.9 | 220 s |
+| **all** | **12/12 = 1.000** | | | **10.8 min** |
+
+A null candidate scoring 1.000 is the result this run was designed to produce: it says the pipeline
+runs end to end and does not manufacture failures. It says **nothing** about the cascade's ability to
+detect a bad candidate — no negative control was run, and that is E3's job.
+
+**⚠ TWO HONEST GAPS IN THIS RUN.**
+
+1. **The derived floor never executed.** The run passed `min_pass_rate=0.5` explicitly, so
+   `detail.min_pass_rate` reads 0.5 — the fallback — and the Clopper–Pearson derivation was
+   bypassed. At n = 12 it would have been 0.681 and 1.000 clears it either way, but the code path
+   was not exercised by the thing that was supposed to exercise it. Now pinned by a test that leaves
+   the floor unset and drives the REAL child, asserting the derived bar and its provenance
+   (`floor_from`) reach the result — because a path that has only ever been unit-tested is precisely
+   what this session kept finding broken in reality.
+2. **Cost is ~1.8× the spec.** Projecting these per-bank rates to the spec's 120 items (40/bank)
+   gives **1.79 hours**, against IDE.md's "≈1h". `gsm8k_text` alone is ~57 min of that, at 2.75
+   attempts a item. A nightly budget written against the spec figure would be short.
+
+`attempts` is a finer signal than pass/fail and the child already records it: a candidate that still
+passes but needs three attempts where the incumbent needed one **is worse**, and binary scoring
+throws that resolution away. Stage 2 should not act on it — n = 12 noise would swamp it — but it is
+the graded signal stage 3's paired comparison should use rather than discarding it into McNemar.
+
+### Stage 3 — paired confirm, and the test that graded its own homework
+
+Candidate vs incumbent on a **held-out** slice, same items to both arms, exact two-sided McNemar.
+
+* **The holdout is a pure function of the item id** (sha256, 25% of every bank) — not a saved list,
+  which can be re-rolled after a candidate scores badly on it in a way indistinguishable from a
+  fresh split. Enforced in ONE place, inside the sampler, rather than by every caller remembering to
+  filter. Measured on the real corpus: **3,610 items → 888 held out (24.6%), 2,722 public, zero
+  overlap** between the stage-2 and stage-3 samples.
+* **Both arms run in the same call and through the same function** (`_run_items`). A cached
+  incumbent is a comparison across time — model, box and sandbox all drift, and pairing exists to
+  remove exactly that. Two near-identical call sites would drift too, and that drift is
+  indistinguishable from the effect being measured.
+* **An infra abort in either arm drops the pair** rather than guessing it. Failure charges a harness
+  fault to the candidate; pass does the reverse.
+* **`mcnemar_exact` is a second implementation, so it is pinned to the first** — a test asserts it
+  agrees with `scripts/ablation_paired._mcnemar_exact` across a 12×12 grid. Two copies that both
+  look right and drift apart is worse than one awkward import.
+
+**⚠ MY TEST WAS CHECKING ITS OWN ARITHMETIC.** Three mutants survived the first sweep — *a tie
+promotes*, *significance ignored*, *the LOSER promoted* — because the test recomputed
+`(c > b) and (p < alpha)` in the test file instead of calling the production decision. The rule now
+lives in `paired_verdict()` and the test calls it. All three are caught.
+
+Two more survived after that, and both were fixtures that could not discriminate: **every fixture
+gave p = 1.0 exactly**, so loosening `PAIRED_ALPHA` to 1.0 changed nothing anywhere. Added b=1/c=5
+(p = 0.219 — fails at 0.05, passes at 1.0) and a check that `paired_verdict([])` refuses.
+
+The `c_ <= b` **boundary** is unreachable and documented as such: when `c_ == b` the split is
+symmetric, McNemar gives exactly 1.0, and the significance test refuses it anyway. The **guard** is
+very much load-bearing — removing it entirely promotes an 8-0 LOSS at p = 0.008 — and is pinned by
+that case rather than by the boundary.
+
+### `passed` is not `promotable`
+
+Stages 2–3 run only when items are supplied, so a cascade that cleared a four-second static check
+and a pin smoke reports `passed=True`. Without a distinction that reads identically to a candidate
+that beat the incumbent on held-out data. `promotable` requires stage 3 to have RUN and passed, and
+any abort voids it however many stages went green.
+
+### The first REAL stage-3 run: a negative control, and it passed by REFUSING
+
+Null candidate (comment-only diff on `tools/database.py`), **24 held-out items**, both arms live,
+live daemon stopped so the arms did not compete with production for llama-server. 60.1 min.
+
+```
+STAGE3 passed=False
+reason: candidate won 1 vs 0 but p=1.000 >= 0.05 — not distinguishable from noise
+paired 22   incumbent_only 0   candidate_only 1   p_value 1.0
+incumbent_rate 0.9545   candidate_rate 1.0000
+```
+
+**⚠ THE CANDIDATE SCORED NOMINALLY HIGHER — 22/22 against 21/22 — ON CHARACTER-IDENTICAL CODE.** A
+naive comparator would have reported a 4.5-point improvement and promoted a comment. The instrument
+saw one discordant pair (`gsm8k_text-361`: FAIL in 3 attempts for the incumbent, pass in 2 for the
+candidate), computed p = 1.0, and refused. That is the control passing in its strongest form: not
+"nothing happened", but "something looked like a win and the rule declined to call it one".
+
+Rows kept at `scratchpad/ide/stage3_negctl_rows/`.
+
+### Three things the run found that no test had
+
+* **A BUDGET CASCADE.** Both arms infra'd the same two items, and the reasons differ:
+  `mbpp-111` **"item timed out"**, then `mbpp-138` **"budget exhausted before this item"**. One slow
+  item consumed the remainder and STARVED the next. It was deterministic across arms so the pairing
+  stayed clean (`dropped_unpaired: 0`), but at n = 120 a few slow items can silently eat a tail of
+  the sample — the run reports fewer pairs and nothing says why unless someone reads the reasons.
+* **The holdout is harder than the public pool.** Incumbent 21/22 here against 12/12 on stage 2's
+  public sample. A real property of the slice, not of the code — so a floor or a power calculation
+  tuned on public-pool rates is miscalibrated for the slice stage 3 actually scores on.
+* **Cost is ~5 h for the spec's 120 items, not 3.6.** My estimate came from stage-2 timings taken
+  WHILE the daemon competed; with the box quieter, `mbpp` items ran 2–3× SLOWER than in stage 2
+  (63 s vs 21 s on comparable items) and `gsm8k-368` took 132 s. IDE.md's "overnight" holds; my own
+  3.6 h did not.
+
+### The budget cascade, fixed
+
+The child's per-item timeout was `deadline - now` — **everything left** — so one pathological item
+could spend the whole run. That is what the negative control caught: `mbpp-111` timed out having
+been handed the remainder, and `mbpp-138` came back *"budget exhausted before this item"*. Identical
+shape to the `REPLAY_MAX_CMD_S` defect earlier the same day: **one unit of work allowed to consume a
+budget meant for many.**
+
+```python
+_ITEM_SLACK, _ITEM_HARD_CAP, _ITEM_FLOOR = 2.0, 300.0, 30.0
+
+def item_budget(remaining_s, items_left):
+    fair = (remaining_s / items_left) * _ITEM_SLACK
+    return max(_ITEM_FLOOR, min(remaining_s, fair, _ITEM_HARD_CAP))
+```
+
+Three bounds, each with a different job, tightest wins: never outlive the deadline, never starve the
+tail, never let one pathological item run unboundedly. Fair share is recomputed from what is LEFT,
+so a run of fast items hands the tail more room and a slow one hands it less — which is what stops a
+single overrun compounding. On the run's actual shape (1800 s, 24 items) the first item now gets
+**150 s instead of 1800**.
+
+**⚠ THE RULE LIVES IN `scripts/`, NOT IN `evolve/`.** The child imports `ghost_agent.*` from the
+CANDIDATE's path, so a budget rule imported from the package would be a rule the subject under
+judgement writes for itself. `scripts/` is fence-immutable, and a test asserts both facts.
+
+**Seven mutants, and the seventh was the call site again.** `item_budget` was fully pinned while the
+call still passed `max(30, deadline - now)` — the rule correct and unused, exactly the survivor the
+per-command cap produced hours earlier. Emitting the cap in the row would not have caught it either:
+a mutant can compute the right number and hand `wait_for` a different one. Only the timeout actually
+FIRING at the cap is evidence, so that test really does wait 62 s for it. Fixture trimmed to four
+items — only the first is evidence, and twenty timing out at 30 s each is ten minutes of nothing.
+
+### Stage 4 — the operator packet, and the invariant that replaces "stage N is absent"
+
+A JSON packet under `system/evolve/proposals/` with the diff, the brief, every stage result, the
+McNemar p, and the paired CI on `p_incumbent − p_candidate` (negative = candidate ahead). The
+p-value says whether to believe the difference; the interval says how big it is. `paired_diff_ci` is
+a second implementation and is **pinned by test to `scripts/ablation_paired._paired_diff_ci`**, same
+discipline as `mcnemar_exact`.
+
+* **Only for a promotable candidate.** A packet in that directory IS an endorsement — it says the
+  cascade believes this diff beat the incumbent on unseen data. Writing one for a candidate that
+  merely compiled is worse than writing nothing. The refusal **names the missing gate**; "not
+  promotable" alone sends an operator to read the source.
+* **Exactly once.** A second cascade over the same node rewrites the packet and stays SILENT. §4CF's
+  fire-once lesson: three of four callers had dropped it. A ledger that repeats itself trains people
+  to ignore it.
+* **Best-effort delivery, durable record.** A failed notification never loses the packet — Slack
+  being down is the wrong reason to drop a result.
+* **Written LAST, after the final harness check.** Earlier, it would be an endorsement on disk that
+  a later abort could not retract: the notification has already left, and "we told you, then found
+  the harness had moved" is not a correction anyone can act on.
+
+**The absence test had nothing left to guard, so it was replaced rather than deleted.** All four
+stages exist now — but the property "stage N is absent" was standing in for does not go away:
+**promotion is operator-applied.** The evaluator's job ends at a packet on disk, and a test asserts
+it contains no `materialize(`, no `shutil.copytree/copy2/move`, no `patch` invocation, no
+`os.replace`. Autonomy is earned in a later version, not acquired by a helper someone adds because
+it was convenient.
+
+**9 mutants on stage 4, all killed** — including a packet written for a non-promotable candidate, a
+notification on every run, a downgraded severity, and a flipped CI sign.
+
+### E1 produced a real candidate, and the full cascade ran on it
+
+Three defects stood between E1 and its first applicable diff, each found by RUNNING it:
+
+1. **The brief never contained the file.** `_BRIEF_TEMPLATE` had `TARGET FILE: {path}` and no slot
+   for the source, so the model was asked for a unified diff — exact context, exact line numbers —
+   against a file it had never seen. It invented `class ExecuteTool(BaseTool)` for a module with no
+   classes at all. `patch --dry-run` refused all four hunks and `materialize` failed closed; the
+   guards held, but E1 could not produce an applicable diff except by luck. The brief now embeds the
+   numbered source, and a file over 120 KB is REFUSED with a stated reason rather than briefed
+   blind — `execute` (92 KB) and `browser` (66 KB) fit, `file_system` (199 KB) does not.
+2. **The prose cap was spent on the file.** `MAX_BRIEF_BYTES = 8000` truncated the whole brief, so
+   embedding the source cut the HARD CONSTRAINTS off the end — the brief kept the evidence and
+   dropped the rules the diff is judged by. Prose and source are capped separately now.
+3. **`build_brief` resolved the path against the process CWD.** Correct from the repo root, and
+   silently wrong under launchd, where the daemon's CWD is not the repo — it would have passed every
+   test and lost its source in production. It takes `repo_root` now, same default as `materialize`.
+
+**Then two rounds of bookkeeping repair.** The model's EDITS were right and its COORDINATES were
+wrong: a correct three-line addition headed `@@ -466,6 +466,7 @@` when the body held 9 new lines
+(`patch`: "malformed"), and a correct one-line addition declaring 468 when the context sat at 467
+(`applied_where_it_said`: *"the artefact an operator reviews must be the artefact that ran"*).
+`repair_hunk_counts` recomputes counts from the body; `repair_hunk_starts` re-anchors to the unique
+match and **leaves ambiguous or unmatched hunks alone** — guessing between two locations is how a
+repair becomes a relocation nobody authorised. Both are REPORTED in the record
+(`hunks_reanchored: 1`), never silent, because a rising repair count is evidence the brief needs
+work.
+
+Result: `outcome: proposed`, node `20260823T104837-60b81d33`, one file, one line, one attempt.
+
+### The cascade's verdict on it
+
+```
+stage 0  PASS   scope / compile / import-shape
+stage 1  PASS   118 tests across 17 canonical pin files
+stage 2  PASS   ran 23, passed 22, infra 1 — pass_rate 0.9565 vs a floor of 0.8185
+                DERIVED from the incumbent's measured 0.985 at the GRADED count
+stage 3  REFUSE incumbent won 2 discordant pairs, candidate won 1 (p=1.000)
+stage 4  not reached — no packet written, correctly
+```
+
+24 paired, 0 dropped, both arms complete, production stopped so neither arm faced contention the
+other did not. The candidate was refused by the DIRECTION guard — worse, not merely
+indistinguishable — and would have failed significance regardless. **The derived floor fired in a
+real run for the first time**; every earlier run passed an explicit `min_pass_rate`, so that path had
+only ever been unit-tested.
+
+### ⚠ THE GATE SCORED A DIFFERENT FAILURE MODE THAN THE EVIDENCE IDENTIFIED
+
+The brief indicted `execute` on 13/56 real failures: missing `deno`/`unzip`, a 600 s timeout,
+yt-dlp errors. E1 wrote a fix for exactly that. **Stage 3 then judged it on "Janet's ducks lay 16
+eggs per day…"** — 8 gsm8k, 8 gsm8k_text, 8 mbpp.
+
+A correct fix for a shell-dependency failure is INVISIBLE on arithmetic word problems; only a
+regression could show. The candidate lost 2–1, which at this n is noise, but the design guaranteed
+it could not win. This is the same "wrong regime" error as §4CM's empty-fork census, one level up:
+**the evaluation cannot exercise the failure the evidence names.** Saturated banks and irrelevant
+banks are the same defect wearing two hats, and it means the E-track cannot demonstrate an
+improvement however good E1 becomes — until bench items are minted from the agent's OWN failure
+corpus (588 executed tool calls sit in the foresight ledger).
+
+### A graded statistic, and an honest correction to my own proposal
+
+I argued the binary gate throws away resolution — a candidate solving in 1 attempt where the
+incumbent needed 3 scores identically — and that a graded statistic on `attempts` would detect
+improvements McNemar cannot. Built it as the exact two-sided SIGN TEST (the same primitive as the
+binary gate, so no new statistics to validate), reported beside the binary result and **explicitly
+not a gate**: adding a second way to reach an operator is a decision to take deliberately, not to
+acquire as a side effect of measuring something new.
+
+Applied to this run's real data: **24 pairs, 21 TIES**, candidate fewer 2, incumbent fewer 1,
+p = 1.0, means 1.583 → 1.542. It agrees with the binary gate, and it shows the extra resolution is
+much THINNER than I claimed — I cited `gsm8k_text` averaging 2.75 attempts, but this holdout draw is
+mostly `gsm8k`, where attempts are nearly always 1. The idea is sound; it does not rescue the
+economics.
+
+### What the promotion bar actually costs
+
+Measured from the gate itself: **6 candidate-only wins with ZERO losses** to clear α = 0.05 — the
+same at n = 24 and n = 120, since McNemar counts only discordant pairs. One loss raises it to 8, two
+to 10. The incumbent fails 4 of 24 held-out items. A candidate must therefore convert essentially
+every failure the incumbent has, introduce none, and still fall short at n = 24. That is not a
+tuning problem; it is what "significant improvement over a 95%-accurate incumbent, measured
+binary" costs.
+
+**Verdict, matching §4CM's from an independent direction: the machinery is sound and the economics
+do not support autonomy.** E2 is shippable as an operator-triggered harness — it refused a null
+candidate that scored nominally higher, refused three malformed diffs at three different guards, and
+refused a real candidate for a defensible reason. It is not shippable as a nightly flywheel.
+
+Rows: `scratchpad/ide/e1_cascade_rows/`, log `scratchpad/ide/e1_cascade.log`.
+
+### Verification
+
+`tests/test_evolve_evaluator.py` — 75 tests. Full suite **15,367 passed, 17 skipped, 0 failed**
+before this fix; re-run after it. **Mutants this milestone: 15 across three sweeps, all
+killed** except the one boundary proven unreachable and reported as surviving. **12 mutants across two sweeps, all killed**, including
+the unreachable abort veto (stages 0–1) and the two path/home escapes (stage 2). Docs:
+`docs/evolve/evaluator.html`.
+
+⚠ The full suite caught what the localized run could not: the new docs page did not link back to the
+guide, which `test_docs_site.py` enforces for every reference page. Rebuilt on a sibling page's
+skeleton so every site convention is inherited rather than re-typed.
+
+## §4CN — IDE / Evolve: the write fence and the lineage archive (E0) (2026-08-22)
+
+Phase E's premise is that this repo already has the honest-evaluator infrastructure the
+DGM-lineage results depend on, and that the work is mostly *arranging* it. E0 is the part that
+has to exist before a mutator can: the fence that says what may be touched, and the archive that
+decides what to try next.
+
+**The failure mode this is shaped by is not "the mutator writes bad code"** — that is what the
+evaluator is for. It is *the agent modifying the thing that measures it*. DGM's agent learned to
+fabricate test logs; the AI Scientist raised its own timeout rather than finishing inside it.
+Neither was caught by a better mutation.
+
+### Two mechanisms, and the second is the one that matters
+
+* **A path ALLOW-LIST** (`evolve/fence.is_mutable`). Tool implementations and prompt constants
+  are mutable; `tests/`, `eval/`, `scripts/`, `evolve/` itself, `core/agent.py`, the isolation and
+  replay modules, `memory/`, `selfhood/`, `sandbox/`, `main.py`, `conftest.py` and `pytest.ini`
+  are not. An allow-list rather than a deny-list because the repo grows: a module added next month
+  must be un-mutable until somebody decides otherwise. It fails CLOSED on anything it cannot
+  classify — absolute paths, paths that escape the repo, `a/../tests/conftest.py`. Normalisation
+  happens BEFORE the prefix test, which is the difference between a fence and a substring check.
+  Two paths inside a mutable tree are explicitly immutable: `tools/registry.py` (the tool surface
+  itself) and `tools/validators.py`.
+* **A harness CHECKSUM** (`harness_digest` / `compare_harness`). The allow-list can only reject
+  what it can see in a diff; a candidate that reaches the filesystem some other way moves the
+  checksum. A dict rather than one hash, so the alarm names WHICH file — a single digest says only
+  that something moved, which is the least actionable form of a true alarm. **Additions count**:
+  a test file a candidate ADDS is a test file that runs, and "it only added things" is exactly the
+  shape of a candidate writing its own passing test.
+
+### Selection is clade-based because own-score does not predict descendants
+
+HGM's result is that a node's own score poorly predicts its descendants', so greedy selection
+walks into whichever local optimum scores best early and discards the branch that would have gone
+furthest before it has children. `selection_weights` is therefore
+`best-DESCENDANT-score × 1/(1+children)`:
+
+* the achievement term is the best score any descendant reached, never the node's own;
+* a node with no scored descendants gets `UNKNOWN_PRIOR = 0.35`, which is deliberately ABOVE what
+  a node whose descendants all scored zero would get — an archive that ranks the unknown below the
+  known-bad stops exploring;
+* the novelty discount means a node tried five times and still leading is worth trying again, but
+  not five times as often as one nobody has touched;
+* `ROOT` is always selectable, so a lineage that has painted itself into a corner can start over;
+* rejected nodes are never parents, and the clade walk is cycle-safe — a hand-edited archive can
+  name a parent that is also a descendant, and a naive walk recurses forever inside a nightly job
+  nobody is watching.
+
+### Novelty is an identity question, not a text question
+
+EvoTrace measured ~30% of evolved lines to be resurrections. `normalized_diff_hash` keeps only
+added and removed lines, stripped and sorted — so the same edit against a shifted file, with
+different blob hashes or reordered hunks, hashes the same and is refused. A raw-text hash would
+let it re-enter under a new identity and cost a full evaluation cascade to rediscover a verdict
+already on disk.
+
+`diff_touched_paths` reads BOTH the `---` and `+++` headers: a rename or a delete names its victim
+only on the `---` side, and a fence reading one side can be walked around by a diff that only
+deletes. Mechanical shape caps (≤2 files, ≤120 changed lines) run before the fence — not a quality
+judgement, but the "constant-tuning churn" mitigation from the other side: a bounded diff is one an
+operator can actually read before approving.
+
+Rejected candidates are KEPT. An archive that keeps only survivors cannot tell "the mutator
+improved" from "the evaluator got looser", and `archive_stats` reports which stage each rejection
+died at for the same reason.
+
+### Verification
+
+`tests/test_evolve_archive.py` — 59 pins, deliberately adversarial on the fence (every one is a
+way a candidate could reach the evaluator). **17 mutants attempted: 14 KILLED, 3 EQUIVALENT,
+control survived.** The three equivalents are worth naming rather than counting as kills: removing
+the absolute-path guard, the repo-escape guard, or the `---`-side header read each leaves the fence
+correct, because a later guard catches the same case (the allow-list rejects `/etc/passwd` on its
+own; `diff --git` carries both paths). That is defence in depth doing its job — but it also means
+those three lines are not independently pinned, and a future edit that removes BOTH members of a
+pair would pass.
+
+### What E does NOT have yet
+
+E1's mutator (a model writing a diff from an evidence brief), E2's stages 2–3 (bench smoke and the
+paired holdout confirm), E3's scheduled negative controls, and the post-promotion tripwire.
+Promotion is operator-applied by design in v1 — the loop produces evidence-carrying proposals,
+never self-applied changes — so nothing here can act on its own regardless.
+
+### §4CM smoke — the first live run, and the number everything rested on (2026-08-22)
+
+`scripts/dream_replay_smoke.py` — the driver D4 lacked, run by hand against a **copy** of
+`$GHOST_HOME` (the live agent holds the Chroma DB; a second writer is a corruption risk upstream
+of the isolation recipe). 16 episodes, newest-first, real LLM, real containers, ~17 minutes.
+
+<div class="scroll">
+
+| stage | n | note |
+|---|---|---|
+| episodes attempted | 16 | |
+| no admissible validator | 1 | the model returned commentary, not a script |
+| validator did not discriminate | 1 | **passed an EMPTY workspace** — the M4 negative control firing on live data |
+| episode not filesystem-checkable | 2 | validator exit 2 on a conversational turn |
+| control leg ungradable | 1 | exceeded the 240 s leg cap |
+| **gradable** | **11** | 69% of attempted |
+| **control AGREED with the recording** | **8** | **agreement rate 0.727** |
+| control DISAGREED | 3 | |
+
+</div>
+
+**The headline: 0.727 over 11 (95% CI ≈ [0.39, 0.94]).** Not catastrophic, nowhere near a
+verdict — but the assumption everything downstream rests on is not obviously false, which is what
+this run existed to find out. Net yield is **8 of 16 attempted episodes** surviving to a state
+where a perturbation could be measured.
+
+**Four things the run showed that no amount of reading would have:**
+
+1. **The preflight refused a healthy box**, and finding out cost one command. macOS allocates swap
+   dynamically: with 17.1 GB RAM free and llama-server up, `sysctl vm.swapusage` reads
+   `total = 0.00M, used = 0.00M, free = 0.00M` — the *healthiest* possible state — and the gate
+   read "only 0 MB swap free" and blocked. The journal's own "abort if swap_free < 250MB" rule
+   only means something when swap EXISTS; §4BR's shape, in my own new code, four hours old.
+   Now conditional on `swap.total > 0`.
+2. **The negative control caught a genuinely vacuous validator on live data** — one episode's
+   synthesised check exited 0 against an empty workspace, i.e. checked nothing, and would have
+   reported `no_effect` for every perturbation of that episode forever.
+3. **Validator exit 2 is NOT a vacuous validator**, and the first version of the smoke lumped them
+   together. Exit 2 is the check's reserved "I cannot verify this from the filesystem" — an honest
+   statement about a *conversational* episode whose deliverable was a reply. 2 of 16. It belongs
+   in D0's triage, upstream of a validator call; it is a separate skip reason now so the census can
+   show how much of the corpus that is.
+4. **Agreeing on a `failed` episode is cheap.** The split was 5/8 agreement on `passed` episodes
+   and 3/3 on `failed` ones — but a validator that fails for the wrong reason (a file it expects is
+   simply absent) also "agrees" with a failed recording. The informative half of 0.727 is the
+   **5/8**, and the self-test should weight it that way.
+
+**And the fidelity gap is visible in the step counts.** Recorded steps vs replayed steps on the
+same episode: (2→16), (3→5), (7→12), (22→3), (23→5), (25→2). The replay does not reproduce the
+recorded trajectory — expected under forward re-execution, but it means a long recorded episode
+gets a short replay and vice versa. One leg used 45 steps against 12 recorded and hit the cap.
+Leg wall clock: median ~55 s, p90 ~206 s, one timeout at 240 s — so the 300 s default is right
+and 240 was too tight.
+
+**Not yet answered:** whether an episode that agrees does so reliably (the stability question D4's
+flip-rate metric exists for). One episode flipped between the two runs — admitted with a
+discriminating validator on the second, rejected as non-discriminating on the first — so **the
+validator synthesis is itself stochastic**, and that variance is upstream of every verdict.
+
+
+### §4CM D4 — the real seeded positive (2026-08-22)
+
+The gate's first seeded positive could not detect the defect class the review rounds had just
+found, and its replacement is the sharpest change in this phase.
+
+**What was wrong.** `_invert(validator)` wrapped a validator so its exit code flipped, and paired
+a normal control leg with an inverted-validator perturbed leg. The inversion is applied
+**downstream of the agent run**, so the arms differ no matter what the perturbation did — the
+instrument measured the validator-execution path and nothing else, and could not distinguish a
+working engine from one whose perturbations were all inoperative. Three review rounds then found
+exactly that: a withhold that did not withhold, a step-deny that never fired, a control arm that
+was not the recorded condition. **The gate written to catch that class was structurally blind to
+every instance of it.** It was also confounded with the wrong sign — an effective perturbation
+made the perturbed leg fail, the inversion flipped it to pass, both arms read "passed", and a
+working engine scored a MISS — and a validator that merely crashed scored a HIT.
+
+**What replaced it, and why it is mechanically guaranteed.**
+`system/counterfactual/challenges.jsonl` holds 319 self-play challenges, each carrying a
+`setup_script` that builds its fixture and a `validation_script` that is REAL executable ground
+truth — no synthesis, no model opinion. 173 have a recorded `stable-pass` verdict, i.e. a later
+replay reproduced the original success, so they are known solvable. **Every one asks for a
+`solution.py` that its validator then runs with `subprocess`.**
+
+So the positive ablates `file_system` AND `execute` for the whole perturbed leg. With both gone
+there is no path to create that file, so the validator's `subprocess.run(["python3",
+"solution.py"])` MUST fail — whatever the model tries. Getting there exercises the fork, the
+setup script, the tool restriction, the agent run, the validator and the paired verdict rule:
+everything the inversion skipped.
+
+The matched NULL ablates `recall` and `list_lessons` — tools the task never touches — **through
+the identical code path**. The old pair could not claim that: its null was a lesson withhold and
+its positive was a validator wrapper, so a specificity number said nothing about the path the
+sensitivity number came from.
+
+This needed one new perturbation kind, `tool_ablate` (remove a tool set for the whole leg). Like
+`lesson_inject` it is **implemented, not mined**: nothing in a recording says which tools an
+episode could not have done without, and guessing would put an ungrounded generator inside an
+execution-grounded measurement. `IsolatedRun.build_agent` now records `ablated_tools` — what the
+ablation actually took away — because after the restriction runs, asking `allowed_tools` whether
+the tools are gone can only ever answer yes. An ablation that removed nothing is a leg whose
+perturbation did not apply, not a null.
+
+**First live run (2 seed challenges, real LLM, real containers):**
+
+| | |
+|---|---|
+| positives | n=2, hit=2, **sensitivity 1.000** (bar 0.80) |
+| nulls | n=2, hit=2, **specificity 1.000** (bar 0.90) |
+| stability | n=1, flips=0, **flip rate 0.000** (bar 0.10) |
+| verdict | **UNDERPOWERED** — 20 decided cases per arm are needed |
+
+Both seeded pairs behaved exactly as constructed: `positive=mattered_pos`, `null=no_effect`,
+`pass_rate=1.0` (the seed tasks are deterministic, so the paired rule's noise floor is 0 on them).
+The instrument works **and refuses to call 2-for-2 a result**, which is the property that matters.
+
+**Two more fixes the run prompted:**
+
+* **The gate now certifies the configuration that SHIPS.** `--pairs` defaulted to 2 while the
+  engine ships `DEFAULT_N_PAIRS = 3`; a gate certifying a cheaper configuration than the one that
+  runs is certifying a system nobody runs — the §4CL R2 M3 shape again, one level up.
+* **The preflight is re-checked between cases.** A run to power is hours long and spawns a
+  container per leg; a single resource reading at entry is not a guarantee. (Measured mid-run: the
+  box went from `no swap allocated` to `1065/2048 MB swap` under the load.)
+
+**Still open:** reaching the pre-registered power (20 decided cases per arm) is ~3 hours of
+inference alongside prod on a box that is already swapping. `dream_credit` stays `real_only`
+until it clears.
+
+
+### §4CM D4 — the two-lens review of the seeded positive (2026-08-22)
+
+Rule 2, two fresh-eye reviewers on the D4 work, one for measurement validity and one for state
+safety and operational honesty. Between them they found **one critical outside the gate, three
+criticals inside it, and eight majors**. Every finding below was reproduced before it was fixed;
+where a reviewer's claim did not survive checking it is said so.
+
+**⛔ CRITICAL, and not about D4 at all: the harness was egressing in clear.**
+`ghost_agent/__init__.py` was 0 bytes and `_env` — the module whose whole job is to apply the
+telemetry opt-outs and, under mandatory-tor, `HF_HUB_OFFLINE` — was imported only by `main.py`.
+`utils/token_counter.py` does `from transformers import AutoTokenizer` at module scope. So ANY
+entry point that reached a ghost module without going through `main` (a script, a test, a
+subagent) loaded `huggingface_hub` with the flags unset. huggingface_hub freezes `HF_HUB_OFFLINE`
+into a module **constant** at import, and `_OFFLINE_FLAGS` uses `setdefault` — so nothing
+downstream could correct it. Verified both halves directly: with the flag unset at import the
+constant is `False` and setting the env var afterwards leaves it `False`. The reviewer observed
+the consequence live: `lsof` on the running D4 process showed an open TCP connection to a public
+CDN on :443 plus a handle on the cached embedder blob, from the operator's own IP — against this
+project's hard no-identity-egress rule. Fixed by importing `_env` from the package `__init__`,
+which covers every entry point rather than the two scripts that happened to be looked at. Pinned
+with a subprocess test that asserts the **frozen constant**, not the env var, because the env var
+was never the thing that was wrong.
+
+Side effect worth recording: with the tokenizer never loading, every context-budget decision
+inside a replayed leg ran on `len//4` while production uses the real tokenizer. The gate was
+certifying a configuration production does not run — the same objection D4 raises about `n_pairs`,
+one level down.
+
+**CRITICAL 1 — a control arm that failed the task was scored as a sensitivity MISS.** `_leg_is_
+gradable` is `passed is not None and applied`, so a control leg that ran cleanly and FAILED is
+gradable; `run_spec` runs the perturbed arm, the ablated leg also fails, `decide_verdict` returns
+`no_effect` — which is **correct** — and the gate filed it under `miss`. If the agent solves 70%
+of the seed tasks, a perfect engine reports sensitivity ≈0.70, BELOW BAR, and `dream_credit` stays
+shut for a reason that has nothing to do with the engine. The counter meant to catch this
+(`control_failed`) was nested inside the `verdict == ABSTAIN` branch, and this case is never an
+abstain — **structurally unreachable for the case it was named after**, so the render would have
+printed "0 had a failing control leg" while those cases silently deflated the number.
+
+The fix is `classify()`, and the ORDER of its branches is the fix: the seed's ground truth is
+*conditional* — "if the task was solved, the ablation must break it" — so the condition is checked
+BEFORE the verdict is read. Four abstain reasons are now counted separately: control ERRORED
+(infra), control FAILED (unsolved), control SPLIT (stochastic), perturbation did not APPLY.
+
+**CRITICAL 2 — a 90%-abstaining engine PASSED. Demonstrated, not argued:** 20 hits and 180
+abstains per arm returns sensitivity 1.00, specificity 1.00, `powered=True`, `PASS`. `powered` was
+an ABSOLUTE count. Two things are wrong with that: the yield is itself a defect the bars cannot
+see, and the decided cases are exactly the tasks the agent could solve, so the estimate is
+conditioned on the easy tail. Added `MIN_DECIDED_FRACTION = 0.50` as a documented amendment to
+§6's pre-registration; below it the verdict is `UNREPRESENTATIVE`, never `PASS`.
+
+**CRITICAL 3 — scope.** `build_specs` never plans a `tool_ablate`, so the gate certifies the
+verdict machinery against a spike-in of effect size 1.0 and says nothing about how often the three
+MINED kinds find an effect. True, and it is the correct design for a seeded positive — but it was
+nowhere in the output. The render now says what the number does and does not cover, in the
+report itself rather than in a docstring nobody reads at 3am.
+
+**The majors, each reproduced:**
+
+| | |
+|---|---|
+| `mattered_neg` counted as a HIT | so swapping the sign in `decide_verdict` left sensitivity at 1.00 — the instrument was blind to the exact confound that killed its predecessor. Now a miss, labelled `SIGN INVERTED`. |
+| `_verdict_sign("tool_ablate", …)` **inverted** | `_REMOVES` was not updated when the kind was added, so ablating tools was filed as ADDITIVE and "control passed, ablated leg failed" came out as *the tools HURT*. Latent only because D4 passes `write=False`; the first `write=True` run poisons `credits.jsonl`, whose comment says exactly why. |
+| a PARTIAL ablation counted as applied | `if _ablated and not run.ablated_tools` is a truthiness test on the **intersection**. Rename `file_system` and every seeded positive silently degrades to "ablate `execute` only", the agent writes the artefact with the survivor, and all 173 positives become misses — reported as "the engine cannot detect perturbations", with no diagnostic anywhere. Now `set(_ablated) - ablated_tools`. |
+| `ablated_tools` proved ADVERTISED, not dispatchable | the baseline came from `TOOL_DEFINITIONS ∪ available_tools`, so a name in the registry that the agent could not dispatch counted as ablated. It now intersects the **dispatch dict captured before the restriction** — the only set that answers "could this leg have called it". |
+| the spec deadline was shorter than its own legs | `validate` passed no `spec_timeout_s`, so each spec got the flat 1500 s default while running 6 legs at 300 s. Control legs run FIRST, so the shortfall landed entirely on the perturbed arm — and asymmetrically between arms: the positive (3 full legs + 3 crippled ones) fits, the null (6 full legs) does not, so **specificity would have been estimated on the fastest subset while sensitivity was estimated on all of it**. A difference between the arms that is not the tool list is the one thing this design exists to prevent. |
+| a stopped run could print PASS, exit 0 | `stopped_early` was set, rendered — and never read by `score`. |
+| the flip-rate bar had no floor, and `abstain == abstain` counted as stable | `n=1, flips=0` cleared a 0.10 bar, and an engine that abstains on every null scored perfect stability. Now `MIN_STABILITY_N = 10` over DECIDED repeats only. |
+| `n_positives` was the ATTEMPTED count next to a ratio over DECIDED | the `--json` blob said `sensitivity 1.0, n 200` off 20 supporting cases. Both counts are now emitted. |
+| `--home $GHOST_HOME` ran against live state | both docstrings promised a copy; no code enforced it. `claim_scratch` now refuses any scratch path that overlaps the live home in either direction. |
+| the staging path was fixed and unlocked | `_stage_home` is `rsync -a --delete`; a second run would delete a measurement in flight, and the victim would not crash — it would **degrade into abstains, which looks exactly like an engine that cannot detect anything**. Now stamped with pid + start time, and a live owner is refused. (`os.kill(pid, 0)` raising `PermissionError` means the process EXISTS; treating that as dead is how a liveness check reports every process it cannot signal as reapable.) |
+| no wall-clock deadline for the run | 20 cases × 3 specs × 1500 s ≈ 25 h unattended. `--max-hours`, threaded through as `batch_deadline`. |
+| a run with `--cases 8` cannot clear `MIN_CASES_PER_ARM=20` | the verdict was decided before the first leg, after ~2 h of container work. Now said at parse time, in zero seconds. |
+| the whole measurement lived in RAM | one unhandled exception at hour five discarded it. Rows stream to `d4_rows.jsonl`, and a case that raises is counted as an ABSTAIN, never dropped. |
+| the sample was the OLDEST 40 | file order is chronological, so every re-run measured the same head with no held-out remainder to check a fix against. Seeded shuffle. |
+| the artefact property was assumed | the positive's guarantee is "no path to the file the validator runs". 173/173 rows satisfy it today; a future challenge validating stdout would enter the set silently. Now enforced per row. |
+
+**Also fixed and worth naming: three of the previous round's own pins were VACUOUS.**
+`test_an_ablation_that_removed_nothing_is_not_a_null` asserted a **dataclass default** and never
+called `build_agent`. `test_the_gate_defaults_to_the_ENGINES_leg_count` ran against an empty
+`GHOST_HOME`, so `run_spec` was never reached and deleting the `n_pairs=` argument left it green.
+`test_the_seed_corpus_is_real_ground_truth` pinned one filter, and its fixture's other rejects
+failed that same filter too, so deleting either of the other two left it green. All three are
+replaced with pins that read the value the engine was actually called with. This is the
+`token-pins-vs-executed-pins` and `restated-is-not-checked` pair, in code written two hours
+earlier by someone who had just written both lessons down.
+
+**Mutation batch: 20 killed, 1 equivalent, comment-only control survived.** The equivalent one is
+worth naming — an early `if verdict == want: return hit` at the top of `classify` cannot fire on
+any record `decide_verdict` can produce (a `mattered_*` verdict implies every leg was gradable and
+the control arm unanimous), so it is genuinely unreachable rather than a hole in the pins; the
+real shape of that bug — deleting the control guards entirely — kills **four** tests.
+
+**Suite: 14,998 passed, 17 skipped, 0 failed** (baseline 14,960; +38 pins). Docs updated:
+`replay_engine.html` gains the `tool_ablate` row, the sign-normalisation rule and a full
+seeded-truth gate section; `isolation.html` gains what `ablated_tools` measures and why the
+dispatch dict is the set that matters.
+
+
+### §4CM — the third "next thing" was measured, and its premise is false (2026-08-22)
+
+The open list said: *"the RSS watchdog is serial with `_biological_tick`, so a replay batch blocks
+it for an hour on a box where llama-server holds 22.6 GB — that gates arming `GHOST_DREAM_REPLAY`
+unattended."* Measured before restructuring anything, and **it is wrong on the load-bearing
+count.**
+
+`_rss_watchdog_check` reads `GHOST_MAX_RSS_MB` and returns immediately when it is `<= 0`, which is
+the default. It is **not exported by `bin/start-ghost-agent.sh`** (the only flag truth) and **not
+in the launchd daemon environment** — `launchctl print system/com.local.ghost-agent` shows exactly
+three variables: `OSLogRateLimit`, `GHOST_HOME`, `XPC_SERVICE_NAME`. So the check has never fired
+on this box. Its own docstring says it "must fire even in a degraded boot" because the known
+270 MB→2 GB growth can OOM-kill the shared llama-server; that defence is **off**, and a
+restructure to stop a long tick from blocking it would have protected nothing. The
+`silent-inoperative-subsystems` class, found by reading the environment instead of the code.
+
+What a phase-3c batch DOES block is the 60-second biological loop itself, for up to the
+`wait_for(3600)` belt — one hour in which no other phase runs. The cost is bounded and specific:
+up to one firing each of the six PERIODIC phases (`self_play`, `calibration`, `dream`,
+`skills_auto`, `router_train`, `imagine_gate`), which fire roughly hourly. That is a delay, not a
+loss, and on a 16 GB box that also runs llama-server, serialising heavy idle work is arguably the
+correct design rather than the bug — running self-play and a replay batch concurrently is how the
+box starts swapping.
+
+So the item is retired and replaced by two smaller, real ones: **(a)** decide whether to arm
+`GHOST_MAX_RSS_MB` at all — an `os.execv` restart on a live daemon is an operator call, not mine;
+**(b)** if 3c is armed unattended, shrink `DEFAULT_BATCH` rather than parallelise, so the block is
+minutes instead of an hour. Neither gates D4.
+
+
+### §4CM D4 — a run that ends badly must still be scoreable (2026-08-22)
+
+The first powered attempt exposed two things the review had not, both about a measurement that
+takes hours rather than seconds.
+
+**A stopped run is not one fact.** `score` refused to certify anything once `stopped_early` was
+set, which is right for a PREFLIGHT stand-down — resources were degrading *while legs ran*, so the
+legs near the boundary are suspect — and wrong for a WALL-CLOCK truncation. The corpus is shuffled
+and whole *unstarted* cases are what a deadline drops, so what ran is a uniform random subsample:
+a perfectly valid sample if it reached power. Collapsing the two either throws away good hours or
+certifies a degrading box. `stop_cause` now separates them; an UNKNOWN cause is treated as the
+fatal one, and the render says the run was truncated either way. Power and representativeness
+still gate it, so this is not a loosening that buys a PASS — a truncated run with 4 decided cases
+still reports UNDERPOWERED.
+
+**Streaming rows to disk only helps if something reads them back.** The review's fix wrote each
+case to `d4_rows.jsonl` as it completed; nothing could score that file. `--rescore` rebuilds the
+whole scoreboard from it, so a kill, a crash, an operator's ^C or a reboot at hour five costs the
+remaining cases and nothing else. It carries the same trap one file away — two abstains have the
+same verdict string, so an abstained repeat would score as perfect agreement — and the same
+decided-only rule, pinned by its own mutant. A rescored report says so in its own output, because
+`stop_cause` is not recoverable from rows and a reader must not assume the run ended cleanly.
+
+**Sizing, measured rather than assumed.** The first attempt ran 18 legs in ~33 min — ~110 s a leg,
+not the ~50 s the 2-case pilot suggested, because the box is sharing llama-server with production
+and swapping. 40 cases would have needed ~16 h against a 10 h belt. Relaunched at 28 cases
+(12 legs each, plus 6 more on the first 10 for stability = 396 legs) with a 14 h belt.
+
+Housekeeping from the same kill: two orphaned containers with dead owner PIDs. One was swept by
+`sweep_orphaned_containers` and one was under `_SWEEP_MIN_AGE_S` — correctly spared, since a
+solve genuinely in flight in another process must never be touched — and removed by hand.
+
+
+### §4CM D4 — the powered run had to be detached, and the gate was skipped (2026-08-22)
+
+Two operational facts, both paid for.
+
+**A multi-hour run launched as a background task of the coding session is SIGKILLed when the turn
+ends.** `nohup` does not save it — the whole process group goes. The second powered attempt died
+ten minutes in, mid-first-case, with zero rows on disk and two orphaned containers. Relaunched via
+`subprocess.Popen(..., start_new_session=True)` from a short foreground call, which reparents it to
+launchd (`ppid 1`, `pgid == pid`, verified) so it outlives the session. macOS ships no `setsid`
+binary, so the Python call is the portable form.
+
+**`scripts/preflight_longrun.py` exists precisely for this and was not run on any of the three
+attempts.** Run afterwards, all five gates pass — but the BOUNDED check would have killed the
+first attempt (`--cases 8` against `MIN_CASES_PER_ARM = 20`) in zero seconds instead of two hours
+of container work, and the MEASURED check produces the ETA range that actually matters here:
+**583–1167 min (9.7–19.4 h) against a 14 h belt**, from a rate measured on a real timed slice
+rather than the 2-case pilot's optimistic ~50 s/leg. A truncation is therefore likely and is now
+a scoreable outcome rather than a wasted night.
+
+The memory carrying the §4U gates has both facts appended, since the gate document already existed
+and being re-derived is exactly the failure it records.
+
+
+## §4CN — Evolve: E1, the mutator (2026-08-22)
+
+`evolve/mutator.py` (746 lines). Picks a parent from the E0 archive, picks a target the recorded
+evidence actually indicts, asks the main model for a small unified diff, materialises a candidate
+snapshot, records a node and a ledger row. It proposes; it never applies.
+
+**The evidence floor is a mechanism, not a slogan.** A mutator with no floor asks a model to
+improve a file it has no complaint about, and the model — being a model — produces a plausible
+diff anyway. Those diffs are then spent against a cascade whose expensive stage has single-digit
+throughput a night, so a stream of ungrounded candidates is a stream of coin flips dressed as
+evolution. A target under `MIN_EVIDENCE_ITEMS = 3` recorded failures is not eligible, and a run
+with no eligible target produces nothing and says WHICH nothing (`no_evidence`, `no_model_output`,
+`rejected`, `duplicate`, `materialize_failed` are five different problems with one symptom).
+
+**⛔ THE SHARPEST FINDING, and it was in the first live brief.** The evidence for `execute`
+contains `SYSTEM BLOCK: shell command rejected by pre-execution validator: deny-listed pattern:
+\b(?:curl|wget|fetch)\b[^|]+\|\s*(?:sudo\s+)?(?:sh|bash|zsh…`. **That is the security guard
+working.** Handing it to a model under "propose the smallest change that would prevent this
+failure" is a request to weaken the deny-list — and `tools/execute.py` is INSIDE the mutable fence
+while `tools/validators.py` is not, so the fence would not have stopped the resulting diff. The
+fence answers "what may be edited"; nothing answered "what counts as a defect", and those are not
+the same question.
+
+Guard refusals are now excluded from the evidence and **counted**, so the brief says how many it
+dropped rather than quietly shrinking. The effect on the live ranking is not cosmetic:
+
+| target | before | after | excluded |
+|---|---|---|---|
+| `file_system` | 15 — **rank 1** | 8 — rank 3 | 7 replace-guard refusals |
+| `execute` | 15 — rank 2 | 13 — **rank 1** | 2 pre-execution blocks |
+| `browser` | 10 | 10 | — |
+
+Without the filter the first live brief would have asked a model to change the file-replace
+corruption guard — the one installed after 50 of 99 replace calls arrived byte-identical.
+
+Two details of the filter. It matches by **containment**, not `startswith` like
+`foresight.is_synthetic_result`, because the ledger stores the tool's whole result envelope
+(`--- execution result --- exit code: 1 stdout/stderr: system block: …`) and lowercases it —
+measured: prefix matching finds **0 of 73** failure rows, containment finds them. And the marker
+list is BORROWED from `foresight._SYNTHETIC_RESULT_PREFIXES` rather than copied, plus a two-entry
+supplement for in-tool refusals that list does not cover (it enumerates results for calls that
+never executed; these come from a tool that ran and refused its arguments). A test fails if a
+supplement entry becomes redundant or stops being emitted, so it cannot drift into a second copy.
+The **known limit is stated rather than assumed away**: a tool that refuses in prose nobody
+enumerated still reaches the brief, which is why the brief also instructs the model that a guard
+firing is not a defect and a non-zero exit code must never be hidden — a mechanical filter AND a
+stated rule.
+
+**Which file implements which tool is resolved by walking the dispatch entry's closure.**
+`inspect.getsourcefile` reports `registry.py` for all 41 tools — every entry is a closure defined
+inside `get_available_tools` — and `registry.py` is immutable. A name-based or getsourcefile-based
+mapping would have made every tool unmutable and the mutator would have proposed nothing, forever,
+silently. 39 of 41 tools resolve; the rest are simply not targets (fail closed).
+
+**Ranking is by absolute failure COUNT, not rate.** One failure in one call is a 100% rate and no
+evidence at all.
+
+**Three materialisation details, each of which would have been a silent defect:**
+
+* **`patch` is dry-run first.** Without it a diff whose second hunk fails leaves the first applied
+  — a candidate that compiles, evaluates, and corresponds to no diff anyone proposed.
+* **`-F0` — no fuzz.** `patch` defaults to fuzz 2, so a hunk whose context does not match can still
+  land a few lines from where the diff said. Found because the two-hunk test PASSED when it should
+  have failed: patch had quietly applied a hunk against context that was not in the file. A
+  self-modification fence cannot accept "applied approximately".
+* **The trailing newline is restored.** `_strip_fence` removes it from every model reply and
+  `patch` then fails the hunk, so EVERY proposal would have died at materialisation with a message
+  that reads like a bad diff rather than a lost byte.
+
+**`dream_credit` is wired and OFF, twice over.** The operator flag defaults off, and
+`admissibility.ADMISSIBILITY["dream_credit"]` is still `real_only` because §4CM D4 has not
+returned PASS. Setting the flag alone does not open it — the row is the authority, and a flag that
+overrides a reviewable file is how an unvalidated label source opens (§4AO, §4BE, twice paid).
+
+**Wired, not shelved.** Biological phase **3d**, 15-minute idle floor (no containers, no
+competition with a solve), 6 h cooldown = at most 4 candidates a day — deliberately slower than
+the cascade that will consume them, because a proposal nobody evaluated is a queue and not
+progress. `EXPECT_GATED` in `PHASE_EXPECTATION`. The clock advances on every path including the
+failures (the 3c lesson: otherwise a broken dependency re-imports and re-logs every 60 s for as
+long as the box stays idle).
+
+**Tests: 55. Mutation: 22 killed (18 module + 4 wiring), comment-only control survived.** Four of
+the module mutants are the ones that matter — guard refusals counted as evidence again, the
+containment match downgraded to `startswith`, the fuzz re-enabled, the dry run skipped.
+
+⚠ **The mutation batch itself bit me again.** A `subprocess.run` without a per-mutant timeout hung
+on the "timeout bound removed" mutant, the 5-minute harness cap killed the script before its
+`finally`, and `agent.py` was left MUTATED — the `wait_for` bound simply gone from the live tree.
+Caught by grepping for the mutant text immediately afterwards, which is the only reason this is a
+paragraph and not an incident. The batch now traps EXIT/INT/TERM, bounds each mutant at 120 s, and
+verifies the file is byte-identical to a pristine copy at the end. This is the third time; the
+memory now says it in the imperative.
+
+**Not run yet: the full suite** — §4CM D4's powered run is in flight and a concurrent suite once
+already slowed its legs from ~33 s to ~110 s. Worse, the suite's memory peak could trip D4's
+between-case preflight floor and stand the whole 5-hour measurement down. Localized: 55 mutator +
+59 archive + 23 docs, all green.
+
+
+### §4CM/§4CN R1 — the four-lens review, and what it found (2026-08-22)
+
+Four fresh-eye reviewers over the whole session's changes: the E1 mutator, the phase-3d wiring,
+the package-level env change, and the D4 gate's newest deltas. **Four criticals and twenty-two
+majors**, every one reproduced before it was fixed. The three that matter most:
+
+**⛔ The self-modification loop had a prompt-injection channel from the model's own sandbox.**
+`postmortem_evidence` did `rglob("defects.jsonl")` over all of `$GHOST_HOME` — which contains
+`sandbox/`, the agent's writable workspace, currently five project directories that `file_system`
+and `execute` write to freely. Anything the agent chose to name that became EVIDENCE: the row's
+`tool` field picked the target, its count (uncapped, undeduped) beat the real ranking outright,
+and its `summary` was copied verbatim into a brief that asks a model to rewrite that tool, under
+the header "real error heads from the agent's own transition ledger". The fence does not close
+this — the fence bounds WHICH file gets rewritten, not WHY. Now one canonical path, capped in
+bytes and rows, deduped by signature.
+
+**⛔ The guard filter was wired to one of three sources, and its marker list missed seven
+emitters.** `is_guard_refusal` had a single call site inside the foresight reader while the module
+docstring claimed the property for the module. And the two exact messages it enumerated missed the
+SSRF guard, the destructive-operation guard, the read-budget refusals, the replace-size refusal,
+`Block REJECTED`, and the vision size guard — all emitted by `tools/file_system.py`, which is
+INSIDE the mutable fence.
+
+The fix that matters is not a longer list. **Filtering evidence is an open-ended blacklist over
+text nobody controls; the boundary now lives on the DIFF.** `_weakens_a_guard` rejects any
+candidate that deletes or edits a refusal-shaped line — a closed test over the few dozen lines the
+model actually wrote, failing in the safe direction (a false positive costs one logged proposal, a
+false negative costs a security check). The evidence filter stays as ranking hygiene, widened to
+deliberately over-inclusive SHAPES and measured: 9 of 73 live failure rows excluded, all 9 genuine
+refusals.
+
+**⛔ The idle phase could start a background LLM call against a live user turn.** `idle_secs` is
+sampled once at the top of the tick; phase 3d is the LAST consumer, after self-play (which resets
+that clock in its `finally`), after 3b's 900 s, and after 3c's `wait_for(3600)`. Measured by the
+reviewer on production code: with self-play firing first, real idle at that line was 0.0015 s;
+with a user turn completing during 3c, 0.00012 s and `foreground_requests == 1`. The bench drain
+paid for this exact defect in §4BF R1 and its comment sits 400 lines above. Both the clock and the
+foreground lock are re-read at the phase now, and the phase respects `--no-self-play` for 3c's
+stated reason.
+
+**The rest, briefly.** `materialize` ran three `subprocess.run` calls on the event loop inside a
+`wait_for` that cannot preempt a blocking call (now `to_thread`); a failed materialisation left
+12 MB behind forever AND was never archived, so the same diff was re-proposed nightly into a new
+directory; `validate_diff` accepted diffs `patch -p1` provably cannot apply (bare `src/…` headers,
+CRLF) at a snapshot each; nothing constrained the diff to the file the brief was about; the
+evidence floor summed across overlapping sources, so two real failures seen twice cleared a floor
+of three; `-F0` disables fuzz but not OFFSET, and Apple `patch` relocates a hunk 25 lines silently
+with exit 0 (the check is now a post-image comparison at the DECLARED line, because grepping
+`patch`'s stdout would have been a check that never fires on this box); `tools/__init__.py` was a
+0-byte import-time code-execution seam inside the mutable prefix; `_verdict_sign` fell open, so an
+unregistered perturbation string reported the OPPOSITE sign with confidence; an empty
+`tool_ablate` target ablated nothing and produced a confident `no_effect`; `mutation_stats()` had
+no consumer, the exact "instrument that never runs" class the bench section three lines below
+records.
+
+**And one the review found OUTSIDE the session's changes, caused by them:**
+`scripts/reembed_memory.py` migrates the vector store to a DIFFERENT embedding model, which is by
+definition not cached — and now inherits `HF_HUB_OFFLINE=1` from the package import. The
+sentence-transformers load does not raise when it cannot resolve a model; it silently degrades to
+an untrained mean-pooling embedder. The script would then re-embed every fragment through it and
+stamp the sidecar with the new model name, so the agent boots clean and nothing downstream ever
+notices. It now runs the store's OWN degradation probe before the delete, and refuses with the
+exact command to fetch the model.
+
+**Corrections to my own D4 reasoning, made because the reviewer was right:**
+the argument that a wall-clock truncation leaves a "uniform random subsample" is **wrong**. A
+uniform random ORDER does not give a uniform random RETAINED SET when the stopping rule is
+duration-dependent: the retained set is the maximal prefix that fits, so a case's chance of
+completing falls with its duration — and duration is outcome-correlated, because a case the agent
+flounders on burns `n_pairs × leg_timeout` per arm. Hard cases are dropped, and hard is exactly
+"the control arm fails or abstains". Truncation is fatal again, the yield denominator is the
+loaded corpus rather than the prefix, and `--rescore` now refuses to score a rows file that
+carries no completion footer — the previous version hardcoded `stopped_early: ""`, so the
+DOCUMENTED RECOVERY COMMAND turned a run that exited INCOMPLETE into exit 0.
+
+**Totals: 46 mutants killed across three batches (28 + 18), controls survived, every file verified
+byte-identical to a pristine copy afterwards.** Localized suites: 781 passed.
+
+⚠ **A vacuity shape worth naming.** `assert "malformed" in why` passed with the guard it names
+DELETED — because `why` embeds the scratch PATH, and pytest derives `tmp_path` from the TEST'S OWN
+NAME (`.../test_a_malformed_claim_names_t0/scratch`). The needle was in the haystack because the
+haystack was named after the needle. I spent six probes convinced the mutation harness was lying
+(stale bytecode, assertion-rewrite cache, collection order) before checking what the string
+actually contained. **When a harness and your reading of the code disagree, print the value, not
+the source.**
+
+
+### §4CM/§4CN R2 — the review of the fixes, and the one that mattered (2026-08-22)
+
+Round 2, two lenses, on the round-1 fixes. **Every round of this review has found its criticals
+inside the previous round's fixes**, and this one is the clearest example in the project so far.
+
+**⛔ THE "SECURITY BOUNDARY" I SHIPPED IN R1 WAS WRITTEN FROM AN IMAGINED VOCABULARY.**
+`_weakens_a_guard` rejects a candidate diff that removes a refusal-shaped line, and R1 presented
+it as *the* boundary of the self-modification loop — the honest inversion replacing an open-ended
+evidence blacklist. The reviewer ran its regex against guard lines lifted out of the actual tools:
+
+```
+fixture MATCH  if not _is_allowed(cmd):        real MATCH  _ssrf = _url_ssrf_reason(url)
+fixture MATCH  for pat in _DENY_LIST:          real MATCH  ok, reason = validate_shell(command)
+fixture MATCH  if host not in _ALLOW_LIST:     real MISS   for pat in _SHELL_DENY:
+fixture MATCH  validate_args(payload)          real MISS   r"\brm\s+-rf\s+/",
+                                               real MISS   if not target_path.is_relative_to(...)
+                                               real MISS   if target_path in _roots:
+                                               real MISS   _shell_ok, _shell_reason = _validate(...)
+```
+
+**4 of 4 invented fixtures matched. 5 of 7 real guard lines missed.** `_is_allowed`, `_DENY_LIST`,
+`_ALLOW_LIST`, `SecurityError`, `validate_args` **exist nowhere in `src/ghost_agent/tools/`**, and
+12 of the regex's 20 alternatives matched nothing in the repo at all. The regex and its tests were
+written together, from the same imagination, and never confronted with the code they protect:
+`harness-grades-own-homework` and `guard-a-proxy-not-the-thing` in one artifact. Both mutation
+batches said the feature was pinned — because a never-matching regex fails all six params. The
+*feature* was pinned; its *reach* was fiction.
+
+**What replaced it, and this time the mechanism is grounded in the file rather than in a
+vocabulary.** `guard_surface_delta(before, after)` counts the lines in each touched file that
+contain a marker the tools ACTUALLY emit — 69 in `file_system.py`, 20 in `execute.py`, 20 in
+`browser.py` — before and after the patch, and rejects any candidate that REDUCES the count. It
+asks the only question that is mechanically answerable: *did this change reduce the number of
+places the scaffold can refuse?* The regex stays as a cheap pre-check, now with alternatives
+measured against real lines (7/7, 0 false positives on ordinary code) and every alternative
+pinned to something that exists in the tree.
+
+**And the limits are stated rather than assumed away.** Neither check sees an early `return`
+inserted above a guard, an `or True` added to its condition, a constant a guard reads being
+changed, or a guard moved into a branch that never runs. Nothing lexical will. The actual boundary
+is that a candidate is only ever a proposal — a throwaway snapshot, applied by an operator.
+
+**⛔ The run in flight could not have passed, and the reviewer caught it at case 9.**
+Launched with `--stability-cases 10` — exactly `MIN_STABILITY_N` — so PASS required all ten
+repeats to be DECIDED. Measured on the live rows: 9 attempted, **6 decided** (a repeat counts only
+when both runs decide; observed rate ~0.67). The maximum achievable was 7, so the verdict was
+UNDERPOWERED from case 4 onward and the remaining 19 cases were going to cost four more hours to
+confirm it. Killed and relaunched at `--stability-cases 18`. The pre-flight warning checked only
+`--cases`, the one parameter that was fine; it now checks the stability budget against both the
+floor and the ~0.67 decided rate — and the docstring's own copy-paste invocation, which is where
+the 10 came from, was fixed.
+
+**The rest of R2:** the render still printed the retracted "uniform random subsample" line — the
+retraction reached `score`, the constant and the tests and stopped one function short of the only
+surface an operator reads; `claim_scratch` crashed on a non-numeric pid (exit 1, which the
+documented table reads as "a bar missed") and treated a stamp truncated mid-write — exactly what a
+killed run leaves — as NO claim, i.e. safe to `rsync --delete` over; `gate_open` in the health
+report read the RENDERING process's env while presenting it as a fact about the home;
+`_bio_roll_value` returning 0.0 made `pick_parent` return the first parent unconditionally, so a
+`--bio-deterministic` arm would never walk the archive — a determinism seam that makes the
+mechanism inert is an off switch; the `GHOST_EVOLVE`-off path (the DEFAULT) never advanced the
+cooldown anchor, so the phase re-imported every 60 s for the whole idle stretch; and **phase 3c
+had the same stale-clock defect 3d was just fixed for** — a batch spawns a container per leg, so
+starting one against a live user turn is the most expensive version of that mistake in the file.
+
+**Vacuity found in R1's own new tests:** the dry-run pin could not distinguish "never applied"
+from "applied then deleted" (the discard wipes the evidence either way — it now spies on the
+`patch` invocations); the CRLF pin was inert because `splitlines()` already handles `\r\n`; the
+brief's two caps hid each other (long errors make the byte cap bite, so the count cap was
+deletable — they are two tests now, each with an input where only one cap can fire); the foresight
+tail bound was satisfied by `49 < 50` because the partial-line trim drops one row on its own;
+`dominant_source` was indistinguishable from alphabetical order because the fixture's dominant
+source was also alphabetically first.
+
+**Mutation: 16/16 on the R2 batch, 46 earlier, controls survived every time, every file verified
+byte-identical to a pristine copy afterwards.** Localized suites: 812 passed.
+
+⚠ **The reviewer also found a live hazard I had created**: my own `scratchpad/pristine/` snapshot
+had gone 72 lines stale against the repo, so any restore from it would have silently reverted the
+round-1 fixes — `reverted-work-2026-08-12` armed and sitting in the working directory. Deleted and
+re-taken.
+
+
+### §4CM/§4CN R3 — NOT CONVERGED, and the diagnosis was structural (2026-08-22)
+
+Round 3's verdict, and it named the class rather than listing symptoms:
+
+> **every measurement in this area uses a denominator wider than the mechanism's reach.**
+
+`_GUARD_LINE_RE` only ever sees removed lines from MUTABLE files, and I measured it against all of
+`src/ghost_agent/**` — **including the module that defines it**, so `is_dangerous` "matched"
+nothing but the regex reading its own source, and five more alternatives survived on
+`validators.py`, which is IMMUTABLE and therefore a file the mechanism can never see.
+`guard_surface_delta` only ever sees files a candidate touched, and I gave it a vocabulary
+borrowed from a RUNTIME-ERROR classifier. Same mistake, one function apart, both in the fixes for
+the previous round's version of the same mistake.
+
+**⛔ THE GATE I ADDED IN R2 IS GONE, and removing it is the honest outcome.** Measured:
+
+* its **marginal coverage over the removed-line pre-check contains zero security guards** — 296
+  marker-lines across the mutable fence, 200 already caught; of the 96 remaining, 74 are
+  `SYSTEM ERROR:` argument-validation messages, 18 are `SYSTEM INSTRUCTION:` prompt steers, 4 are
+  word-boundary misses;
+* **8 of its 15 markers appear nowhere a candidate can edit** — they are minted by the dispatch
+  pipeline;
+* **the count is fungible**: on the real `execute.py`, deleting the deny-list refusal and
+  prepending two comments (`# note: this helper refuses nothing`, `# and this one is not rejected
+  either`) yields **delta +1** — the candidate removed the only refusal and the check reported
+  added surface;
+* **its false positives were terminal**: it fired inside `materialize`, outside the retry loop, so
+  one would burn the night, blacklist the diff permanently through the novelty filter, and write
+  an accusation into the ledger that `mutation_stats` shows the operator. Real ones exist:
+  deleting a COMMENT containing "refus" (−1); rewriting the SSRF guard as
+  `if (_ssrf := _url_ssrf_reason(url)):` — the identical guard — (−1).
+
+A proxy that misses every attack it was built for and permanently rejects legitimate refactors is
+worse than no check. `guard-a-proxy-not-the-thing`, applied to my own fix one round later. The
+number is still computed and RECORDED on the proposal for the operator; it decides nothing. And
+the docstring now carries the measurement that condemned it, so nobody re-promotes it.
+
+**What actually bounds this loop, stated once and plainly:** a candidate is only ever a proposal —
+a throwaway snapshot an operator applies. `_weakens_a_guard` is a cheap, retryable pre-check that
+catches a literal deletion of a refusal line and nothing subtler. Neither it nor anything lexical
+sees an early `return` above a guard, an `or True` in a condition, a changed constant, or a guard
+moved into dead code.
+
+**The fixtures are now READ FROM THE TREE.** `_real_enforcement_lines()` extracts enforcement
+lines from the mutable fence at test time. Two rounds running, that fixture was invented: R1's
+`_is_allowed` / `_DENY_LIST` / `_ALLOW_LIST` / `validate_args` exist nowhere in the repo, and R2's
+replacement — "lifted verbatim" — was **5 of 9 invented**, with a sixth from an immutable file. A
+fixture read from the files the mechanism operates on cannot be imagined. The coverage assertion
+is an ABSOLUTE floor (≥95% of extracted lines, plus named probes) rather than a self-consistency
+check computed from the pattern itself: "every alternative pulls its weight" shrinks with the
+pattern, so deleting an alternative made the check smaller instead of failing it.
+
+**The other R3 findings:**
+
+* **⛔ `rescore` reproduced both failures its own docstring forbids** for a rows file whose markers
+  carry no `run_id` (a build between two fixes, or two files concatenated): `last_run` was None,
+  the row filter degraded to "every row", and the footer matched via `None == None` — two runs
+  merged, `rescored_dropped_rows` reporting 0, `stopped_early` empty, **verdict PASS at exit 0**,
+  out of the documented recovery command for a killed run. The branch was keyed on "are there
+  markers" as a proxy for "is there a run id". Gated on the id now.
+* **`_bio_roll_value` returning 0.5 had the identical defect as the 0.0 it replaced** — measured,
+  both return one fixed node forever, and the same node for a single-node archive. A constant
+  swapped for a constant, with a justification that does not survive reading `pick_parent`.
+  Reproducible AND varying is a seeded PRNG.
+* **The `--stability-cases` machinery had two formulas** — a warning threshold of
+  `MIN_STABILITY_N * 1.5` (15) and a recommendation of `MIN_STABILITY_N/0.67 + 3` (17) — which
+  coincide only at `MIN_STABILITY_N == 10`, so the warning was **silent at exactly the default it
+  shipped**, and that default reached the floor with probability 0.63: a one-in-three chance of
+  returning UNDERPOWERED after eight hours. One constant now (`STABILITY_ATTEMPTS = 18`, P=0.898),
+  used by the default, the warning and the test, and the test asserts POWER rather than the mean.
+* **Phase 3c did not advance its anchor on the non-running paths** — including the DEFAULT one.
+  The round that edited 3c *for consistency with 3d* copied the clock re-read and left the anchor
+  rule behind, two hundred lines from where it had just been written in capitals.
+* `stamp_scratch`'s bool return was ignored by both callers, so an unwritable scratch printed one
+  stderr line and proceeded into a multi-hour UNCLAIMED run. It refuses now. And the re-stamp
+  after staging was dead code implying a window that does not exist — `_stage_home` rsyncs
+  `--delete` into SUBTREES while the claim sits at the root, verified rather than assumed.
+
+**Mutation: 11/11 on the R3 batch (one named equivalent), controls survived, files byte-identical
+afterwards.** Localized suites: 246 + 206 green.
+
+⚠ **And the tmp_path trap caught me a second time, three tests later.** A new pin asserted
+`"headroom" in text` — and pytest's `tmp_path` for
+`test_the_headroom_warning_uses_the_SHIPPING_formula` is `…/test_the_headroom_warning_uses0/`, so
+the needle was in the path again. The rule is now: assert a phrase containing a SPACE, which a
+path cannot hold.
+
+
+### §4CN R4 — a real hole in the fence, and the end of the lexical arms race (2026-08-22)
+
+Round 4 returned **NOT CONVERGED** again, and its diagnosis was one level down from round 3's:
+*"the denominator was fixed, the PREDICATE was not."* Round 3 correctly narrowed every measurement
+to the mutable fence — and then defined "a guard line" as "a line the regex matches", so the new
+measurements could not fail. The test extractor's seven selector terms were **every one of them an
+alternative of the pattern it was measuring**, coverage read 47/47 by construction, and 10 of 17
+alternatives could be deleted with the whole suite green.
+
+**⛔ AND IT FOUND A REAL HOLE IN THE FENCE.** `IMMUTABLE_EXACT` was compared case-SENSITIVELY on a
+case-INSENSITIVE filesystem. Verified end to end before the fix: a diff headed
+`a/src/ghost_agent/tools/Registry.py` cleared `is_mutable`, cleared `check_diff_scope`, cleared
+`archive.admit` — the archive's documented "full admission check" — and `patch` wrote the real
+`tools/registry.py`, **the first entry on the immutable list, "the tool surface itself"**. Same for
+`Validators.py` and `__Init__.py`, the file whose own comment says anything added there runs in
+every process that imports any tool. `deny-list-guards-leak` (§4CI) one layer down: a deny-list
+inside an allow-list, leaking. Both lists are case-folded now, with the exploit pinned as six
+parametrised cases.
+
+**THE LEXICAL GATE IS GONE, after three versions and three rounds.**
+
+| version | what it did | what measurement showed |
+|---|---|---|
+| v1 | reject a diff removing a "refusal-shaped" line | 4/4 invented fixtures matched, **5/7 real guard lines missed**; 12 of 20 alternatives matched nothing in the repo |
+| v2 | count refusal-emitting lines, reject any decrease | marginal coverage over v1 contained **zero** guards; 8/15 markers unreachable; the count went **+1** while a real refusal was deleted |
+| v3 | widen the vocabulary until it reaches the real lines | **33% of 382 fence matches are pure comments**; six verbatim ordinary lines get rejected; a 30-line hunk trips it 31–73% of the time |
+
+Each round bought recall with precision, and none could see the attacks that matter — an early
+`return` above a guard, an `or True` in a condition, a changed constant, a guard moved into dead
+code. **A lexical test cannot decide a semantic property.** `guard_flags` now flags and does not
+judge: the removed lines ride on the proposal, the archive node and the ledger row, and
+`learning_health` prints *"N proposal(s) removed a refusal-shaped line — read those diffs first"*.
+With the test selectors deliberately DECOUPLED from the pattern, the honest measured reach is
+**36%** — fine for a flag, indefensible for a gate, and that gap is most of the argument.
+
+What actually bounds this loop, stated once: the write fence, the target-file constraint, the
+diff-shape caps, the throwaway snapshot, and operator-applied promotion.
+
+**The other R4 findings:**
+
+* **`rescore` reproduced both failures its docstring forbids** for markers carrying no `run_id` —
+  `last_run` was None, the row filter degraded to "every row", and the footer matched via
+  `None == None`: two runs merged, verdict PASS at exit 0, out of the documented recovery command.
+* **`OUT_DISABLED` was unreachable in production** — the phase short-circuited on `_enabled()`
+  before calling `run_mutation`, so the ledger could never distinguish "the gate is closed" from
+  "the phase never ran", which is the single thing `write_mutation`'s docstring says it exists to
+  do; and the health report was printing that unreachable count as the daemon's ground truth. The
+  gate is checked inside the mutator now, at the cost of one JSON append every six hours.
+* **The `never ENFORCED` test could not fail — three independent reasons**: its right disjunct was
+  a tautology over every reachable outcome, its left disjunct hit the `tmp_path` trap for the
+  THIRD time this session (`"guard_surface" in str(rec)` matched `work_dir=…/test_the_guard_
+  surface_delta_i0/…`), and the run ended at `materialize_failed` before reaching the code it
+  named. Re-promoting the gate left 122 tests green.
+* The negative corpus was one hand-written line, and it passed for a reason unrelated to its claim
+  — only REMOVED lines are inspected and the thing it varied was an added one. Both corpora are
+  extracted from the tree now.
+* `validate()`'s own signature carried a fourth spelling of the stability budget: 10, the exact
+  value the CLI refuses with "CANNOT return PASS".
+
+**Mutation: 10/10 on the R4 batch, controls survived, files byte-identical afterwards.**
+Localized: 542 + 122 green.
+
+**Round-count: four rounds, seven reviewers, ~90 mutants across seven batches.** Three consecutive
+rounds concluded that a lexical guard did not work; the fourth is the one where I stopped building
+one. That is the convergence — not "no findings", but *the class stopped producing new mechanisms
+to be wrong about*.
+
+
+### §4CN R5 — the same class a third time, and the fence leaked one fold deeper (2026-08-22)
+
+**⛔ THE WRITE FENCE WAS STILL OPEN AFTER R4's FIX.** `.lower()` is not the filesystem's
+equivalence relation — this volume folds UNICODE. `regiſtry.py` (U+017F LATIN SMALL LETTER LONG S)
+opens the existing `registry.py`, and `.lower()` leaves `ſ` untouched while `.casefold()` maps it
+to `s`. Verified end to end in a scratch repo before the fix: `is_mutable` True,
+`check_diff_scope` clear, `validate_diff` clear, `archive.admit` ADMITTED, and the patched snapshot
+contained a modified `registry.py`. Same for `validatorſ.py`. The only thing standing in the way in
+the live loop was the brief-target compare — a check written for ledger consistency, standing in
+for a security boundary.
+
+Two fixes, because one of them is a guess and the other is an answer: `.casefold()` (identical to
+`.lower()` for ASCII, so the allow-list is unchanged), **and** `resolves_to_immutable()`, which
+asks `os.path.samefile` — device and inode, the volume's own answer. `Path.resolve()` is NOT that:
+on macOS it preserves the spelling it was given, so the two names resolve unequal while opening
+the same bytes. `materialize` now asks it about every touched path before it snapshots.
+
+**AND THE CIRCULAR MEASUREMENT CAME BACK A THIRD TIME.** R3 fixed the denominator; R4 found the
+predicate was still circular and I replaced the extractor's selectors; **3 of my 9 new terms were
+still alternatives of the very regex being measured** (`_url_ssrf_reason` contains "ssrf",
+`_validate_skill_name` contains "validate", `_deny_live` contains "_deny_"), **2 were invented** —
+`_is_destructive` and `_project_is_released` occur nowhere in `src/` — and 1 was unreachable
+(`_SHELL_DENY` lives in an immutable file). Measured: with the circular terms dropped, the reach
+falls from 35.7% to 18.2% and the `>= 0.25` assertion **fails**. The number was held above its own
+floor by the circularity it claimed to have removed. The anti-vacuity guard checked 5 of the 9
+terms — the 5 that passed.
+
+**What closed it was deleting the measurement, not repairing it.** The reach assertion is gone.
+What remains is: the corpus is non-trivial, the flag fires on two named undisputed guards, and
+ordinary lines extracted from the tree are never rejected — plus a test that **mechanically
+enforces, on every selector**, that it occurs in the fence AND is not matched by any alternative of
+the pattern. It caught two of my own invented terms the moment it ran. The honest fully-decoupled
+reach is **11%**, reported in the docstring and the docs as a fact with its caveat.
+
+**Also fixed:** a comment named `_weakens_a_guard` as "the security boundary" and survived that
+function's deletion by a whole round, telling a reader a gate existed that did not; the
+operator-facing proposal line dropped the guard flags, so the one surface that announces a
+proposal omitted the thing the demotion argument rests on; the health report keyed its disabled
+count on a hardcoded string; and `test_a_deterministic_draw_still_reaches_every_parent` was fully
+vacuous — it imported the archive without using it, defined a fake class without instantiating it,
+and **reimplemented `pick_parent`'s weight walk inline**, so `return ROOT_ID` at the top of the
+real function left it green.
+
+**Mutation: 9/9 on the R5 batch, controls survived, files byte-identical afterwards.** Localized:
+868 passed.
+
+
+### §4CN R6 — the class stopped; three ordinary defects remained (2026-08-22)
+
+Round 6's verdict: **the recurring class has stopped.** The reviewer recomputed the reach
+independently (33 fence files → 79-line corpus → 9 matches = 11.4%, against the 11% claimed in the
+module and the docs), confirmed no `_ENFORCEMENT_SELECTORS` term is matched by any of the
+pattern's 17 alternatives, and verified the new guard fires on both failure modes — injecting R4's
+invented `_is_destructive` fails one assertion, injecting the real-but-circular `_url_ssrf_reason`
+fails the other. Three rounds of *"the instrument was chosen so it produced the number"* ended
+because the rule is now mechanically enforced on every term rather than restated.
+
+**The three MAJORs it found were ordinary, and unrelated to each other:**
+
+* **A safety narrative describing mechanisms that do not run.** `evolve/fence.py`'s docstring said
+  in the present tense that the harness checksum is *"taken before AND after every evaluation
+  stage"* and that *"the second is the one that matters"*; `evolve/__init__.py` claimed *"negative
+  controls on a schedule"*. `harness_digest`/`compare_harness` have **zero production callers** —
+  they wait for E2, which does not exist — and there is no negative-control scheduler anywhere.
+  Two of the three things the package's own safety story claims to add were inert, and the reader
+  is told the load-bearing half is live. Both docstrings now say which mechanisms are wired.
+* **Successful snapshots were never reclaimed.** 12 MB of `src/` per proposal, four proposals a
+  day, no consumer yet, and no sweeper — while every other disposable tree in this project has one
+  (`sweep_fork_workspaces`, `sweep_orphaned_containers`). Worse, `wait_for` cancels the coroutine
+  but cannot cancel the `to_thread` already inside `materialize`, so a timeout can leave a
+  completed snapshot with no archive node, no ledger row and nothing referencing it.
+  `sweep_work_dirs` keeps the 8 newest and runs before each attempt.
+* **The brief invited what the validator rejects.** It said *"at most 2 files, anywhere on the
+  allow-list"* while `validate_diff` rejects any path outside the target's own — and all 38
+  resolvable targets have exactly ONE path. A compliant-looking 2-file diff burned attempt 1 of 2
+  and was logged as `rejected`. The brief now names the single file.
+
+**And two more vacuous tests of mine:**
+
+* `test_ORDINARY_lines_from_the_tree_are_never_rejected` asserted `validate_diff(...) is True` —
+  but `validate_diff` no longer consults the pattern at all, so the assertion held for ANY content:
+  mutating `guard_flags` to flag every removed line left 126/126 green. **The precision half — the
+  property that killed all three gate versions, and the property the 11% number is about — was
+  entirely unpinned.** It asserts on the flag now.
+* The prefix tree-walk in `resolves_to_immutable` was untested and looked redundant; the reviewer
+  could not construct a case with marginal coverage. There is one, and it is the interesting one:
+  **a symlink at an allow-listed path pointing into `tests/`** — ASCII, on the allow-list, invisible
+  to any case-fold, and caught only by `samefile`. Pinned. The function also failed OPEN for a path
+  escaping the repo (`/etc/passwd` → no objection); it fails closed now.
+
+`archive.diff_size` used `p.lstrip("ab/")`, a character-set strip that collapses distinct files
+onto one name and under-counts against `MAX_FILES`. Fixed and pinned — and the pin records that it
+is **unreachable in practice**, because every mutable prefix begins with `src/` or `tests/`, whose
+first character stops the strip. Correctness hygiene, not a live hole, and saying which is cheaper
+than a future reader re-deriving it.
+
+**Mutation: 8/8 on the R6 batch, controls survived, files byte-identical.** Localized: 839 passed.
+
+
+### §4CM/§4CN — CONVERGED after seven rounds (2026-08-22)
+
+Round 7 re-derived the numbers independently rather than trusting them, injected a defect into
+every guard added since round 4 and confirmed each one fires, and returned **converged**. Its one
+MAJOR was not a new instance of anything — it was a **missed surface** of the class round 6 had
+already closed in two of four places: `evolve/archive.py`'s docstrings and
+`docs/evolve/fence.html` still described `admit`, `record_stage` and `archive_stats` as current
+behaviour when all three have zero production callers and wait for E2. Measured consequence, which
+is the part worth keeping: with the archive populated exactly as `run_mutation` populates it,
+`selection_weights` returns `{'root': 0.04}` and `pick_parent` returns `root` for every roll — the
+clade-proportional sampling the module opens by describing is **structurally single-valued until
+E2 lands**. Both surfaces now say which half runs, and a test fails if anyone wires one up without
+updating the claim.
+
+Also closed: the new sweeper counted ATTEMPTS rather than deletions (`rmtree(ignore_errors=True)`
+never raises, so a read-only directory reported as reclaimed forever while disk never shrank), and
+it sat below the `GHOST_EVOLVE`-off return — gated behind the thing it cleans up, so an
+enable→disable cycle stranded ~110 MB permanently.
+
+**The arc, because the shape of it is the lesson.**
+
+| round | verdict | what it found |
+|---|---|---|
+| R1 | 4 criticals | a prompt-injection channel from the model's own sandbox into the mutation brief; a guard filter wired to 1 of 3 sources; an idle phase that could call the LLM against a live user turn; **the harness process egressing in clear** |
+| R2 | criticals inside R1's fixes | the "security boundary" regex was written from an **imagined vocabulary** — 4/4 invented fixtures matched, 5/7 real guard lines missed; the powered run could not have passed and the reviewer caught it at case 9 |
+| R3 | NOT CONVERGED | *"every measurement uses a denominator wider than the mechanism's reach"* — one of them included the module defining the pattern, so it matched itself |
+| R4 | NOT CONVERGED | *"the denominator was fixed, the PREDICATE was not"*; and a real hole: the write fence's deny-list was case-SENSITIVE on a case-INSENSITIVE filesystem |
+| R5 | NOT CONVERGED | the circular predicate a third time — 3 of 9 new selectors were still pattern alternatives and **2 were invented**; and `.lower()` was not the filesystem's fold: `regiſtry.py` still opened `registry.py` |
+| R6 | class stopped | three ordinary, unrelated defects; a safety narrative describing two mechanisms that do not run |
+| R7 | **converged** | one missed surface of R6's class; two sweeper blemishes |
+
+**Three consecutive rounds concluded that a lexical guard did not work, and the fourth is the one
+where I stopped building one.** That is what convergence looked like here — not "no findings", but
+the class ceasing to generate new mechanisms to be wrong about. The gate is gone; `guard_flags`
+reports to the operator with its honest 11% reach written down; the fence asks `os.path.samefile`
+instead of guessing at the volume's equivalence relation; and every measurement in the area now
+has a test that fails if its instrument is derived from what it measures.
+
+**Totals: 7 rounds, 10 reviewers, ~130 mutants across 9 batches, controls survived every batch,
+every file verified byte-identical to a pristine copy after each.** Localized suites: 842 passing.
+
+
+### §4CM D4b — measuring the regime instead of assuming it (2026-08-22)
+
+**The seeded gate was killed at 17 of 28 cases, on the operator's call, and the reason is the
+right one.** Its partial numbers were recovered by `--rescore` and are worth keeping as an
+observation: **sensitivity 0.933 [0.68, 1.00] over 15 decided**, specificity 1.000, flip rate
+0.000. The recovery path proved itself — it read the rows back, ignored 9 rows from an earlier run
+in the same file, and correctly refused a verdict because the file carried no completion footer.
+
+**Why it was not worth four more hours, measured rather than argued.** The gate has two arms that
+cannot fail:
+
+* The paired rule's false-`mattered` rate is `2pⁿqⁿ/(pⁿ+qⁿ)²`. At p = 1.0 it is **0.000 by
+  construction**. The seed corpus is `stable-pass` self-play challenges, and **15 of 17 measured
+  cases ran at p = 1.0** (largest noise floor seen anywhere in the run: 0.0159). A specificity of
+  1.000 and a flip rate of 0.000 measured there are close to arithmetic identities.
+* The live corpus is not in that regime. Its control legs agreed with the recording **72.7%** of
+  the time, and at p = 0.727 the floor is **0.096**.
+* And the kind is wrong: **zero of the 309 specs the engine plans are `tool_ablate`** (131
+  `lesson_withhold`, 150 `verify_toggle`, 28 `step_deny`), whose effects are far smaller than an
+  ablation that removes the only route to the artefact.
+
+So the gate certifies that the MACHINERY is operative — which three review rounds proved is worth
+certifying, since they kept finding perturbations that silently did not apply — and it does not
+license believing a `mattered_*` verdict. The gate now prints that regime caveat itself, with the
+numbers, so the limitation travels with the result instead of living in a journal.
+
+**What replaces it: `scripts/replay_noise_floor.py`, an A/A census on the real corpus.**
+
+`k = 6` IDENTICAL control legs per real episode. No perturbation is constructed at all — every leg
+is `arm="control"` — so nothing can be half-applied, `applied` cannot be corrupted, and the engine
+needed no change. Two numbers come off the same legs:
+
+1. **p̂ per episode**, and from it in closed form: `P(decided) = (pⁿ+qⁿ)²` and
+   `P(false mattered) = 2pⁿqⁿ`.
+2. **The empirical A/A rate**: every way to deal the 6 legs into two arms of 3, judged by the REAL
+   `decide_verdict`. Every arm is the same condition, so every `mattered_*` is a false positive by
+   construction. Exhaustive: 10 unordered splits, and a false `mattered` is possible **only when
+   exactly 3 of the 6 legs passed**, in 1 of the 10.
+
+**The comparison is the point, and it is a fair one — which took checking.** The two condition
+differently: the closed form averages over the legs, the split rate conditions on the legs
+observed, so per episode they differ (a 3-of-6 episode splits at 0.100 while its p̂ = 0.5 predicts
+0.031). In EXPECTATION they are identical, exactly: `P(3 of 6) = C(6,3)p³q³ = 20p³q³`, times 1/10
+of splits, is `2p³q³` — the closed form. Verified to 1e-12. That identity is the only reason
+`formula_error` is a check rather than two different quantities side by side.
+
+**If the formula tracks observation, `noise_floor` — already on every credit row — becomes a
+VALIDATED per-row trust score, and `dream_credit` can open conditionally on it rather than on a
+blanket pass.** That is a better gate than the one it replaces: it says which verdicts to believe,
+not merely whether the machinery runs.
+
+**Two claims corrected while building it, both mine:**
+
+* The docstring said pooling splits instead of episodes "would understate the error by about
+  sqrt(10)". Measured: it does not. The design effect is `1 + (m-1)·ICC`, and an episode's splits
+  are HETEROGENEOUS (one false `mattered`, nine abstains), so the intra-cluster correlation is low
+  and the two standard errors come out within 0.005 of each other. The episode is still the right
+  denominator in principle; claiming a factor nobody measured is exactly the habit seven review
+  rounds have been beating out of this work.
+* With a fixed leg count every episode contributes the same number of splits, so the pooled MEAN
+  and the per-episode mean are **arithmetically identical**. The per-episode framing is
+  load-bearing for the uncertainty and inert for the point estimate, and the docstring says so.
+
+29 tests, 9/10 mutants killed (one named equivalent — pooling, for the reason above), and the §4U
+long-run preflight cleared it at five for five, with an ETA range of 85–170 min.
+
+
+### §4CM — the 877 undecided turns are not the bottleneck (2026-08-22)
+
+I suggested the largest triage rejection — `no_recorded_outcome`, **877 episodes, 5.8× the entire
+replayable corpus** — might be the highest-leverage thing in Phase D, on the reasoning that an
+outcome-capture gap was throwing away most of the corpus. **Measured, that is wrong by a factor of
+40, and the measurement took ten minutes.**
+
+**Of the 877, exactly 7 would become replayable if the outcome were decisive.**
+
+| why the other 870 are unreplayable anyway | n |
+|---|---|
+| thin — under 2 steps or no tool calls at all | 650 |
+| uses a non-replayable tool | 220 |
+
+334 of them have **zero** steps and 180 have one: they are conversational turns where the agent
+answered without doing anything. There is nothing to re-execute, and no verifier verdict would
+change that. The corpus would go from 151 to 158 episodes, +4.6%.
+
+**And the capture gap it was supposed to represent is already closed.** Among turns that DID tool
+work — the only ones that could ever be replayed — 521 of 748 carry a decisive outcome (70%
+lifetime), and the trend is unambiguous: July runs 42–60%, August runs 80–100%, and the last ten
+active days are 2/2, 11/12, 12/12, 3/3, 3/3, 2/2. The 227 undecided tool-using turns are a
+**historical backlog** from before `_fold_late_verdict` (2026-08-21, queue #7) and the human
+feedback channel (§4BF Track 1a) landed. Nothing needs building; the fix already shipped and the
+data shows it working.
+
+**The real constraint is somewhere else, and it does not move.** 442 episodes are rejected for
+using a non-replayable tool, and the blockers are:
+
+| tool | blocks | containment status |
+|---|---|---|
+| `manage_services` | 134 | **already containment-FORBIDDEN** |
+| `manage_projects` | 110 | **already containment-FORBIDDEN** |
+| `browser` | 108 | **already containment-FORBIDDEN** |
+| `system_utility` | 80 | **already containment-FORBIDDEN** |
+| `web_search` | 62 | **already containment-FORBIDDEN** |
+| `vision_analysis`, `self_state`, `image_generation`, … | 41/31/25 | **all containment-FORBIDDEN** |
+
+**Every single one is in `REPLAY_FORBIDDEN_TOOLS`.** There is no conservative-allow-list slack to
+recover: the corpus cannot be grown by admitting a tool without weakening the containment boundary
+that three review rounds were just spent protecting. `REPLAYABLE_TOOLS` and the forbidden list are
+doing exactly what §4CM says they do, and they meet.
+
+**So 151 episodes / 310 specs is close to the honest CEILING, not a shortfall.** Which promotes the
+P7 restatement from bookkeeping to the central finding of the phase: at `DEFAULT_BATCH = 3` the
+backlog is **103 nights**, and "≥30 verdicts/night" is not merely 10× out of reach — it is
+unreachable **permanently**, and no capture work changes it. Any D6 proof must be designed against
+a corpus of this size, or the corpus must grow by the agent doing more work with the eleven
+replayable tools, which is not something Dream can arrange for itself.
+
+**Recorded as a measured negative because that is the point.** The suggestion was mine, it was
+plausible, it was quantitatively wrong, and finding that out cost four queries instead of a week.

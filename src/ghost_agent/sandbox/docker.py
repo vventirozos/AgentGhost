@@ -8,6 +8,43 @@ from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
 
+
+def _owner_boot_id() -> str:
+    """A stamp that changes across reboots, so a container labelled with
+    a PID from BEFORE a reboot is never mistaken for a live owner (PIDs
+    are reused — the postgres stale-lock incident on this box was exactly
+    that). Falls back to the empty string, which reads as "unknown owner"
+    and therefore as reapable, matching the pre-label behaviour."""
+    try:
+        import platform
+        import subprocess
+        if platform.system() == "Darwin":
+            out = subprocess.run(["sysctl", "-n", "kern.boottime"],
+                                 capture_output=True, timeout=5)
+            return (out.stdout or b"").decode("utf-8", "replace").strip()[:64]
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()[:64]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _pid_is_live(pid: str) -> bool:
+    """True when `pid` names a process on THIS host right now."""
+    try:
+        n = int(str(pid).strip())
+    except (TypeError, ValueError):
+        return False
+    if n <= 0:
+        return False
+    try:
+        os.kill(n, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # alive, owned by someone else
+    except Exception:  # noqa: BLE001
+        return False
+
 CONTAINER_NAME = "ghost-agent-sandbox"
 CONTAINER_WORKDIR = "/workspace"
 
@@ -151,7 +188,8 @@ class DockerSandbox:
     # stub answers hasattr for anything.
     supports_job_promotion = True
 
-    def __init__(self, host_workspace: Path, tor_proxy: str = None):
+    def __init__(self, host_workspace: Path, tor_proxy: str = None,
+                 network: str = None):
         import hashlib
         short_hash = hashlib.md5(str(host_workspace.absolute()).encode()).hexdigest()[:8]
         self.container_name = f"ghost-agent-sandbox-{short_hash}"
@@ -169,6 +207,15 @@ class DockerSandbox:
             self.client = self.docker_lib.from_env()
             self.client.ping()
         except self.docker_lib.errors.DockerException as handle_err:
+            # Carry the half-built client on the exception so a caller
+            # that never receives `self` can still close it. A client
+            # constructed and then abandoned holds ~11 unix sockets, and
+            # a nightly job that builds one per attempt reaches EMFILE
+            # in days (§4BO).
+            try:
+                handle_err.client = getattr(self, "client", None)
+            except Exception:  # noqa: BLE001
+                pass
             import sys
             import os
             if sys.platform == "darwin":
@@ -189,6 +236,14 @@ class DockerSandbox:
                 raise handle_err
         self.host_workspace = host_workspace.absolute()
         self.tor_proxy = tor_proxy
+        # EXPLICIT network mode for THIS manager, overriding the process-wide
+        # GHOST_SANDBOX_NETWORK. An isolated replay needs `none`, and the env
+        # var is the wrong lever for it: it is process-global, so a concurrent
+        # live turn creating its own container would inherit the replay's
+        # isolation (§4CL S1). Values: "host" | "bridge" | "none"; anything
+        # else (including None) falls through to the env/platform default.
+        _net = str(network or "").strip().lower()
+        self.network_override = _net if _net in ("host", "bridge", "none") else None
         self.container = None
         self.image = "python:3.11-slim-bookworm"
         # The service ports docker ACTUALLY published for the live container
@@ -223,6 +278,9 @@ class DockerSandbox:
         consults this to bind loopback instead. Mirrors the create-time logic
         (GHOST_SANDBOX_NETWORK override → Linux=host / else bridge)."""
         import sys as _sys
+        _override = getattr(self, "network_override", None)
+        if _override:
+            return _override == "host"
         _net = os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
         if _net in ("host", "bridge", "none"):
             return _net == "host"
@@ -528,6 +586,30 @@ class DockerSandbox:
             try:
                 try:
                     old = self.client.containers.get(self.container_name)
+                    # ⚠ The name is md5(workspace)[:8] — 32 bits. A
+                    # collision is ~1-in-4-billion, but the blast radius
+                    # is force-removing the LIVE agent's sandbox mid-turn
+                    # while an isolated replay provisions its own (§4CL S1
+                    # review). Cheap insurance: only reclaim a container
+                    # that actually mounts OUR workspace. A container we
+                    # cannot read mounts for is reclaimed as before —
+                    # "cannot tell" must not strand the sandbox.
+                    _mine = True
+                    try:
+                        _srcs = [m.get("Source") for m
+                                 in ((old.attrs or {}).get("Mounts") or [])
+                                 if m.get("Source")]
+                        if _srcs:
+                            _want = os.path.realpath(str(self.host_workspace))
+                            _mine = any(os.path.realpath(str(x)) == _want
+                                        for x in _srcs)
+                    except Exception as _mx:  # noqa: BLE001
+                        logger.debug("mount check skipped: %s", _mx)
+                    if not _mine:
+                        raise RuntimeError(
+                            f"container name {self.container_name} is held by "
+                            f"a container mounting a DIFFERENT workspace — "
+                            f"refusing to force-remove it")
                     old.remove(force=True)
                     time.sleep(1)
                 except self.NotFound: pass
@@ -582,6 +664,26 @@ class DockerSandbox:
                 # docker run tini as PID 1, which reaps orphans on arrival.
                 run_kwargs["init"] = True
 
+                # Owner stamp (§4CL S1 review). The orphan sweeper's only
+                # identity check is "not MY container_name", so a
+                # per-solve container belonging to a run IN FLIGHT in
+                # ANOTHER process becomes a reap candidate the moment it
+                # passes the 30-minute age floor — and per-solve
+                # candidates get no liveness check at all. A second agent
+                # booting (an ablation throwaway, the test suite, a
+                # manual restart) would then force-remove a live replay's
+                # container, and the next `ensure_running` would silently
+                # recreate it, discarding all in-sandbox state. The label
+                # lets the sweeper ask the one question that separates
+                # "orphaned by SIGKILL" from "somebody else is using it".
+                try:
+                    run_kwargs["labels"] = {
+                        "ghost.owner_pid": str(_os.getpid()),
+                        "ghost.owner_boot": _owner_boot_id(),
+                    }
+                except Exception as _lbl:  # noqa: BLE001
+                    logger.debug("owner label skipped: %s", _lbl)
+
                 # Optional capability hardening — OFF by default because the
                 # sandbox provisions passwordless sudo (setuid) for in-container
                 # apt installs, which `no-new-privileges` / `cap_drop=ALL` would
@@ -597,7 +699,9 @@ class DockerSandbox:
                 # also means sandboxed code shares the host's loopback — set
                 # GHOST_SANDBOX_NETWORK=bridge (or none) to ISOLATE when you
                 # don't rely on host-loopback services from the sandbox.
-                _net = _os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
+                _net = (getattr(self, "network_override", None)
+                        or _os.environ.get("GHOST_SANDBOX_NETWORK", "")
+                        ).strip().lower()
                 if _net in ("host", "bridge", "none"):
                     run_kwargs["network_mode"] = _net
                     if _net == "bridge" and not is_mac:
@@ -1126,6 +1230,16 @@ class DockerSandbox:
             max_output_chars=max_output_chars, quiet=quiet)
         return out, code
 
+    #: Optional per-manager ceiling on any command's budget. None = the
+    #: caller's timeout stands. An isolated replay sets it, because
+    #: `tools/execute.py` passes a module constant (600 s) that is twice
+    #: a replay leg's whole budget — and cancelling the leg's coroutine
+    #: cannot stop the executor thread the command is running on, so the
+    #: container gets force-removed and the workspace deleted while a
+    #: process is still writing into it. Clamping at the SANDBOX is the
+    #: only layer that works regardless of which caller passes what.
+    max_exec_timeout = None
+
     def _execute_impl(self, cmd: str, timeout: int = 600, workdir: str = None,
                       spill_large_output: bool = False,
                       max_output_chars: int = None,
@@ -1135,6 +1249,14 @@ class DockerSandbox:
         """Shared body of execute / execute_promotable → ``(output,
         exit_code, job_entry_or_None)``. ``job_entry`` is always None on the
         classic path."""
+        # Per-manager command ceiling (see `max_exec_timeout`). FIRST, so
+        # every caller is clamped regardless of what it passed.
+        _cap = getattr(self, "max_exec_timeout", None)
+        if _cap:
+            try:
+                timeout = max(5, min(int(timeout), int(_cap)))
+            except (TypeError, ValueError):
+                pass
         try:
             # ensure_running() either just probed readiness (steady path)
             # or raised (provision path) — re-probing here doubled the
@@ -1381,6 +1503,34 @@ class DockerSandbox:
         except Exception:  # noqa: BLE001
             return False                # cannot tell → not an orphan
 
+    def _owner_is_alive(self, container) -> bool:
+        """True when the container carries an owner stamp naming a
+        process that is STILL RUNNING on this host, from this boot.
+
+        Without this the age floor is the only protection a per-solve
+        container has, and a run legitimately in flight for more than 30
+        minutes in another process (an overnight replay, a long bench
+        item) is reaped out from under itself — which does not merely
+        fail it, it makes the next `ensure_running` recreate the
+        container and silently discard all in-sandbox state, so the run
+        produces a verdict on a half-executed episode.
+
+        Unlabelled containers (everything created before this shipped)
+        answer False, i.e. reapable — the pre-label behaviour."""
+        try:
+            labels = ((container.attrs or {}).get("Config", {})
+                      or {}).get("Labels") or {}
+            pid = labels.get("ghost.owner_pid")
+            if not pid:
+                return False
+            boot = labels.get("ghost.owner_boot") or ""
+            if boot and boot != _owner_boot_id():
+                return False          # pre-reboot PID: reuse, not owner
+            return _pid_is_live(pid)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("owner liveness check skipped: %s", exc)
+            return False
+
     def _container_age_s(self, container) -> float:
         """Seconds since creation; -1.0 when it cannot be determined
         (which the caller treats as "too young to touch")."""
@@ -1572,6 +1722,8 @@ class DockerSandbox:
                 if all(self._is_per_solve_workspace(s) for s in sources):
                     if age < self._SWEEP_MIN_AGE_S:
                         continue      # may belong to a live solve
+                    if self._owner_is_alive(c):
+                        continue      # in flight in ANOTHER process
                 elif not self._is_reapable_dead_ghostjob(c, sources, age):
                     # own sandbox, a LIVE detached job, or anything we cannot
                     # read as unambiguously dead — spare it.

@@ -115,8 +115,17 @@ async def test_file_history_action_returns_history_and_desc(context, store, pid)
 
 # ------------------------------------------------------- briefing surfaces
 
-def test_briefing_annotates_described_deliverables(store, pid):
+def test_briefing_annotates_described_deliverables(store, pid, tmp_path):
     tid = store.add_task(pid, "build")
+    # The files must EXIST: since queue #10 the briefing lifts a registered
+    # deliverable that is not on disk out of the packed "undescribed" line
+    # and marks it ⚠ MISSING, because that packed line reads as a list of
+    # things that exist. This fixture registered two files it never wrote —
+    # the very shape that defect is about — so it now writes them.
+    ws = tmp_path / "sandbox" / "projects" / pid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "server.js").write_text("//")
+    (ws / "notes.txt").write_text("n")
     store.register_file_artifact(tid, "server.js", description="Node service")
     store.register_file_artifact(tid, "notes.txt")  # undescribed
     text = build_project_briefing(store, pid)

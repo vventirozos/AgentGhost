@@ -169,6 +169,13 @@ _SYNTHETIC_RESULT_PREFIXES = (
     "SYSTEM BLOCK", "SYSTEM IDEMPOTENCY:", "SYSTEM PAUSE",
     "SYSTEM ERROR:", "SYSTEM ESCAPE HATCH", "Error invoking tool",
     "Error: Invalid JSON arguments", "Error: Unknown tool",
+    # §4CL I1: the Imagine pre-flight steer DEFERS a call rather than
+    # running it. Its message pairs with a tool_call in the reconstructed
+    # trajectory exactly like a real result, and its label would be
+    # INVERTED — a deferral on a repeatedly-failing target reads as a
+    # success. Recognising it as synthetic is what keeps a steer from
+    # teaching the very index that produced it.
+    "SYSTEM PREFLIGHT",
 )
 
 # The `foresight_note` treatment appends this marker block to a FAILED
@@ -754,8 +761,16 @@ def ledger_stats(path: Optional[Path] = None,
                     claimed += 1
                     if rec.get("match"):
                         matched += 1
-                    _pf = rec.get("p_fail")
-                    if isinstance(_pf, (int, float)) and _pf >= 0.5:
+                    # §4CL R2: the SHARED definition of "the index
+                    # claimed failure" — strict majority on raw counts.
+                    # `p_fail >= 0.5` admits the exact tie, and on the
+                    # live ledger the ties carried the entire apparent
+                    # precision (0.556 over 9 rows) while the real claims
+                    # scored 0.067 over 15. Three readers must not
+                    # disagree about what this statistic counts.
+                    from .imagination import claims_failure as _claims_fail
+                    if _claims_fail(rec.get("support"), rec.get("fails"),
+                                    rec.get("p_fail")):
                         pred_fail_total += 1
                         if not rec.get("ok", True):
                             pred_fail_hits += 1

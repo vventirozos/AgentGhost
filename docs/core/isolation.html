@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.isolation — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="dream.html">dream</a>
+    <a class="current" href="isolation.html">isolation</a>
+    <a href="mcts.html">mcts</a>
+    <a href="foresight.html">foresight</a>
+    <a href="../algorithms/dream_cycle.html">dream cycle</a>
+    <a href="delegation.html">delegation</a>
+    <a href="../sandbox/docker.html">sandbox / docker</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / isolation.py — running the agent against a detached copy of itself</h1>
+  <p class="subtitle">One recipe for "run this, for real, but where nothing it does can reach the operator's world": a detached context, a throwaway workspace, a fresh sandbox with no network. Extracted 2026-08-22 from <a href="dream.html">self-play</a>, which is where it grew — one production incident at a time.</p>
+
+  <h2>Why it is a module</h2>
+  <p>The recipe used to live inline in <code>Dreamer.synthetic_self_play</code>: three method-local façade classes and about ten <code>= None</code> assignments scattered through 150 lines. That was fine while self-play was its only user. It stopped being fine when two more arrived — the Imagine speculative fork and the <a href="../algorithms/dream_cycle.html">Dream</a> replay engine — because a recipe kept in three copies drifts, and the copies that drift are the ones nobody is looking at.</p>
+  <p>It was also effectively <em>unpinned</em>. The tests that guarded it asserted that certain strings appeared in the method's source. A source-window assertion passes just as happily when the class it names has been gutted; every one of those pins is now an executed test in <code>tests/test_isolation_replay.py</code>.</p>
+
+  <h2>The two tiers</h2>
+  <p>A <code>copy.copy(context)</code> shares every handle on the live context. The inventory below is what an isolated run drops, and every entry is a leak somebody already shipped.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Tier</th><th>Constant</th><th>Applied by</th><th>What it drops</th></tr></thead>
+    <tbody>
+      <tr><td>Floor</td><td><code>ISOLATION_NULLED_ATTRS</code></td><td>self-play <em>and</em> replay</td><td>project scope, workspace model, profile, scheduler, journal, trajectory collector, episodic store, memory bus, and the secondary modules that carry their own <code>llm_client</code> (verifier, uncertainty, MCTS, hypothesis, frontier) plus the outer self-play loop handles</td></tr>
+      <tr><td>Replay</td><td><code>REPLAY_EXTRA_NULLED_ATTRS</code></td><td>replay only</td><td>the outward-effect and durable-corpus writers: self model, activity ledger, outbound notifier, session store, project store, calibration tracker, reflector, postmortem engine, defect queue, graduated skills, contradiction log, adaptive threshold, and the back-reference to the live agent</td></tr>
+    </tbody>
+  </table></div>
+  <p>Self-play invents a challenge; a replay <em>re-executes a recorded real episode</em>, so its blast radius is the operator's world rather than a made-up one. That is the whole reason for the second tier — without it a replayed episode could page the operator on Slack or append to the agent's diary.</p>
+
+  <h3>Isolation versus fidelity</h3>
+  <p>Detaching is not free. A counterfactual replay exists to measure what the agent <em>would have done</em>, so anything gratuitously nulled changes the thing being measured. The rule drawn here: null what <strong>writes</strong> production state or reaches outward; keep what only reads or computes. <code>prm_scorer</code>, <code>complexity_dispatcher</code> and <code>metacog</code> are deliberately <em>kept</em>, and that decision is pinned so it cannot be reversed by accident.</p>
+
+  <h2>Read-only memory façades</h2>
+  <p>Deny-by-default whitelists over the vector, skill and graph stores, moved verbatim out of self-play. Anything not explicitly whitelisted raises <code>AttributeError</code> rather than falling through, so a store growing a new mutator cannot silently bypass the wrapper.</p>
+  <p>Two subtleties worth keeping in mind:</p>
+  <ul>
+    <li><strong>A read that bumps a counter is a write.</strong> <code>search</code> / <code>search_advanced</code> are forced to <code>record_retrievals=False</code>. Before that, every self-play hydration booked phantom retrieval credit on the production store — one episode reached a retrieval count of 690, stretching its ranking half-life about sevenfold, self-reinforcing.</li>
+    <li><strong><code>last_playbook_triggers</code> is off the whitelist on purpose.</strong> The sim read path stamps nothing, so a passthrough served the <em>last real user turn's</em> lesson set to a synthetic run. The sim-side attribution channel is <code>hydrated_triggers</code>.</li>
+  </ul>
+  <p>These are the strict counterpart to <code>memory/readonly.py</code>, which the delegated sub-agent uses: that module intercepts writers by name and proxies everything else; this one raises on anything unlisted. Both doctrines are deliberate and neither replaces the other.</p>
+  <p>The façade is also what tells <a href="foresight.html">foresight</a> that a run is a simulation — the prediction hook asks <code>context.skill_memory.is_read_only</code>, and a simulated prediction updates neither the ledger nor the precedent index.</p>
+
+  <h2>Forked workspaces</h2>
+  <p><code>fork_workspace(src)</code> copies a workspace into a throwaway directory so a branch that was never chosen cannot mutate the real one. <code>rsync</code> when it is on <code>PATH</code> (fast, and it handles symlinks, sockets and fifos), <code>shutil.copytree</code> otherwise &mdash; the fallback is not an optimisation detail, it is what makes this work on a box without rsync.</p>
+  <p>It returns a <code>ForkResult</code>, not a bare path, and the field that matters is <code>complete</code>. A replay graded against a partial workspace produces a verdict about a world that never existed, so "the copy is not faithful" has to be something a grader can read &mdash; a log line is not a signal anything consumes. Three things set it false:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Cause</th><th>Why it happens</th></tr></thead>
+    <tbody>
+      <tr><td>over the byte ceiling</td><td>The sandbox is where the agent <em>builds</em> things. <code>FORK_MAX_BYTES</code> (512&nbsp;MB) refuses rather than stalling its caller on a downloaded checkpoint; the measuring walk stops as soon as the limit is passed, because a size check that itself walks 40&nbsp;GB is not a guard.</td></tr>
+      <tr><td>rsync exit 23 / 24</td><td>Routine, not exceptional: 23 is one unreadable file (the sandbox runs as root, so its files land in the bind mount root-owned), 24 is a file that vanished mid-copy. macOS&nbsp;15+ ships openrsync, which returns 23 for a single permission error after copying everything else correctly. Treating these as failure threw away a 99%-complete copy and re-did the whole tree through the slower, unbounded fallback &mdash; so they now mean "usable but incomplete".</td></tr>
+      <tr><td>rsync timeout</td><td>Refused outright. Falling back after a 300&nbsp;s timeout would mean a second, <em>unbounded</em> attempt at the same tree.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The prefix matters more than it looks. <code>FORK_PREFIX</code> starts with <code>tmp</code> because <code>sandbox/docker.py</code> classifies a container's mount as a throwaway per-solve workspace by exactly that test, and that classification is the only thing that reclaims a container whose run died to a <code>SIGKILL</code> &mdash; the one case a <code>finally</code> block cannot cover. The container sweeper reclaimed the container and nothing reclaimed the <em>directory</em>, so <code>sweep_fork_workspaces()</code> now runs beside it at boot, on the same 30-minute age floor.</p>
+
+  <h3>Two containers, one name</h3>
+  <p>A container's name is <code>md5(workspace)[:8]</code>. Distinct forks get distinct names, but two protections were missing once a replay could be provisioning its own sandbox while the live agent runs:</p>
+  <ul>
+    <li><strong>Reclaim only your own mount.</strong> The provision path force-removes whatever holds the name it wants. It now refuses when that container mounts a <em>different</em> workspace &mdash; a 32-bit collision is remote, but the blast radius is destroying the live sandbox mid-turn.</li>
+    <li><strong>Owner labels.</strong> The orphan sweeper's only identity check was "not <em>my</em> container", so a fork container belonging to a run in flight <em>in another process</em> became a reap candidate the moment it passed the age floor &mdash; and per-solve candidates got no liveness check at all. Containers now carry <code>ghost.owner_pid</code> and a boot stamp; the sweeper spares one whose owner is still running. The boot stamp is what stops a recycled PID from reading as a live owner, which is the shape of the stale-lock incident this box has already seen once.</li>
+  </ul>
+
+  <h2>Tool containment</h2>
+  <p>Detaching handles closes the durable-write paths that go <em>through</em> the context. It does not close the ones that go around it, and those are all tool-shaped. <code>REPLAY_FORBIDDEN_TOOLS</code> is the deny list, and it is a strict superset of both existing precedents &mdash; <code>subagent.py</code>'s <code>FORBIDDEN_TOOLS</code> and the self-play list in <code>dream.py</code> &mdash; because it is applied to the workload with the largest blast radius. It also covers several that neither sibling denies: <code>manage_composed_skills</code>, <code>notify_operator</code>, <code>jobs</code>, <code>deploy</code>, <code>rotate_secrets</code>, <code>knowledge_base</code>.</p>
+  <p>It is a <em>containment</em> list, not a fidelity list. An episode whose recorded trajectory used one of these is <strong>not replayable</strong> and must be dropped at selection time &mdash; running it with the tool denied produces a verdict about a crippled agent, which is worse than no verdict.</p>
+  <p>Restriction needs three gates, and any one alone is bypassable: <code>disabled_tools</code> (the only lever that filters the <em>schema</em> the model is shown), a narrowed <code>available_tools</code>, and <code>_subagent_allowed_tools</code> on the context so a dispatch miss cannot heal the dict back to the full registry. <code>IsolatedRun.build_agent()</code> applies all three and fails closed; the third is set on the context by the context manager itself, so a caller that builds its own agent still gets the rebuild guard.</p>
+  <p><code>build_agent(extra_forbidden=&hellip;)</code> denies <em>more</em> tools for one leg only &mdash; the <code>tool_ablate</code> perturbation &mdash; through the same three gates rather than a fourth mechanism, so an ablation can never be weaker than a denial. What it records is <code>ablated_tools</code>: the requested names that were <strong>dispatchable before the restriction</strong> and not already contained. Two distinctions are load-bearing there. Asking <code>allowed_tools</code> afterwards can only ever answer &ldquo;yes, they are gone&rdquo;, because the second pass removed them by construction &mdash; the question worth recording is whether they were <em>there</em>. And a name in <code>TOOL_DEFINITIONS</code> proves only that a tool is <em>advertised</em>; whether the leg could have called it is the dispatch dict. An ablation that removes only some of its targets, or an advertised name the agent could not dispatch, has taken away no capability &mdash; the caller marks that leg <code>applied = False</code>, because a perturbed arm that kept the capability is the control arm wearing a label.</p>
+
+  <h3>Two escapes no deny list could have closed</h3>
+  <ul>
+    <li><strong><code>memory_dir</code></strong> is repointed into the fork, not nulled. The acquired-skill manager is built at <em>tool-table build time</em> &mdash; before any tool is dispatched &mdash; from <code>context.memory_dir</code>; it creates directories and writes a registry on construction, and after three failed calls it <em>moves</em> the operator's live skill file into <code>acquired_skills/retired/</code>. Nothing downstream of dispatch reaches that. The fork-local directory is seeded with a copy of the acquired and composed skills, so the isolate keeps the shape of the real one without being able to write to it.</li>
+    <li><strong><code>job_registry</code></strong> is detached, because <code>execute</code> &mdash; a tool a replay must keep &mdash; is handed the registry on every call, and a command that outruns its budget writes a row into it. Fifty slots, FIFO: a replay's rows evict the operator's real jobs from their own status surface. Job promotion is also turned off on the fork's sandbox, since a promoted job outlives its command but not the context that would tear its container down.</li>
+  </ul>
+
+  <h2>Network isolation is Docker's job</h2>
+  <p><code>eval/network_guard.py</code> is best-effort and blind to subprocesses and <code>curl_cffi</code>. The isolation that actually holds is the container's network mode, so <code>isolated_replay_context</code> asks for <code>network="none"</code> at container-create time.</p>
+  <p>It is passed <strong>explicitly</strong>, as a <code>DockerSandbox(..., network=...)</code> argument, not through <code>GHOST_SANDBOX_NETWORK</code>: that variable is process-global, and a live turn creating its own container while a replay was running would inherit the replay's isolation. The same override also drives <code>binds_host_netns()</code>, so the create path and the service-binding path cannot disagree about what network the sandbox is on. The Tor proxy is withheld from a networkless container for the same reason &mdash; in a namespace with only loopback the sandbox would spawn a Tor daemon that can never bootstrap.</p>
+  <p><strong>It covers the container, and only the container.</strong> Everything the agent's own process does &mdash; every LLM call, every search, every fetch &mdash; is a different boundary, and the tool deny list above is what closes that one. Conflating the two is the easy mistake here; <code>IsolatedRun.network_isolated</code> exists so a grader can tell whether a replay's failure was the perturbation under test or simply the absence of a network the original episode had.</p>
+
+  <h2>Using it</h2>
+  <pre><code>async with isolated_replay_context(context, network="none",
+                                  source_workspace=live_ws,
+                                  label="dream-replay") as run:
+    agent = run.build_agent()            # containment applied, or it raises
+    await agent.handle_chat(body)        # run.workspace is the fork
+    out, code = run.sandbox.execute("python3 check.py", 30)</code></pre>
+  <p>On exit the sandbox is closed with <code>remove=True</code> and the workspace is deleted &mdash; <strong>including when construction itself fails</strong>. That is not a detail: <code>ensure_running</code> has five reachable raise sites, and at the point they fire a container exists and the docker client's sockets are open. With construction outside the <code>try</code>, an unattended nightly batch leaked a container, roughly eleven unix sockets and a temp tree per item, which is the <code>[Errno 24] Too many open files</code> failure with a scheduler behind it. Closing rather than removing the container directly is deliberate for the same reason: a sandbox that failed midway through provisioning has no <code>.container</code> attribute but does have a container, and <code>close()</code> looks it up by name.</p>
+  <p>Failure surfaces as <code>IsolationUnavailable</code>, distinct from an error <em>inside</em> a replay: the caller should skip the work, not record a verdict. A failed provision also arms a module-level backoff, because every isolated run builds a fresh <code>DockerSandbox</code> &mdash; docker's own provisioning backoff is an instance attribute and gives no protection across runs, so a nightly batch would re-pay the same failing multi-minute install on every item.</p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="dream.html">core / dream.py</a> — self-play, the recipe's first consumer.</li>
+    <li><a href="../algorithms/dream_cycle.html">The dream cycle</a> — where self-play, consolidation and challenge-level replay fit together.</li>
+    <li><a href="delegation.html">core / subagent.py</a> — the delegated sub-agent's own, separately proven, context build.</li>
+    <li><a href="../sandbox/docker.html">sandbox / docker.py</a> — container lifecycle, network modes, and the orphan sweeper.</li>
+  </ul>
+</main>
+</body>
+</html>

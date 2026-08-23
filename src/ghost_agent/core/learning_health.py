@@ -404,6 +404,9 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             # renderer scores the WIN/LOSS verdict on `brier_cv` and shows
             # `brier` explicitly labelled as in-sample.
             "brier_cv": params.get("brier_cv"),
+            # The interval the WIN/LOSS verdict is scored on (queue #8).
+            "brier_cv_delta_lo": params.get("brier_cv_delta_lo"),
+            "brier_cv_delta_hi": params.get("brier_cv_delta_hi"),
             "n_negative": params.get("n_negative"),
             "n_samples": params.get("n_samples"),
             "feature_contrib": params.get("feature_contrib"),
@@ -492,6 +495,63 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             md.parent / "foresight" / "predictions.jsonl")
     except Exception:
         pass
+
+    # -- §4CL I0: the Imagine calibration gate ---------------------------
+    # Read from the mechanism, same rule as above. This is the ONLY place
+    # an operator can see whether the gate is closed because there is no
+    # data yet or because the signal measured not-precise-enough — and
+    # those two states lead to opposite decisions.
+    try:
+        from .imagination import gate_stats as _imagine_gate_stats
+        # ⚠ home=… , NOT the env. Every other section of this report is
+        # derived from `memory_dir`; reading GHOST_HOME here made the
+        # IMAGINE GATE block describe a DIFFERENT home than the rest of
+        # the page whenever the two disagree — which is exactly the
+        # headless/archive comparison an operator runs this script for.
+        # Same derivation as `_bench_stats` below.
+        report["imagine_gate"] = _imagine_gate_stats(
+            home=str(Path(md).parent.parent))
+    except Exception as _ig_exc:  # noqa: BLE001
+        report["imagine_gate"] = {
+            "present": False,
+            "reason": f"instrument unavailable ({type(_ig_exc).__name__})",
+        }
+
+    # -- §4CM: counterfactual replay verdicts ----------------------------
+    try:
+        from .replay_engine import credit_stats as _replay_stats
+        report["dream_replay"] = _replay_stats(
+            home=str(Path(md).parent.parent))
+    except Exception as _dr_exc:  # noqa: BLE001
+        report["dream_replay"] = {
+            "present": False,
+            "reason": f"instrument unavailable ({type(_dr_exc).__name__})",
+        }
+
+    # -- §4CN: the Evolve mutator ----------------------------------------
+    # `mutation_stats()` had NO consumer when E1 shipped — the same
+    # "instrument that never actually runs" class the bench section
+    # below records. The phase is EXPECT_GATED, so a zero row cannot
+    # distinguish "GHOST_EVOLVE is off" from "the model refuses every
+    # night"; the outcome mix is what separates them, and it only exists
+    # here.
+    try:
+        from ..evolve.mutator import mutation_stats as _mut_stats, _enabled
+        _ms = _mut_stats(home=str(Path(md).parent.parent))
+        # ⚠ THIS READS THE RENDERING PROCESS'S ENV, not the home's. When
+        # `scripts/learning_health.py --memory-dir <archive>` renders, or
+        # when an operator shell renders without the daemon's env, this
+        # says nothing about the box that produced the rows — the
+        # experiments section carries the same caveat for the same
+        # reason. Named `gate_open_in_this_process` so a reader cannot
+        # mistake it for a fact about the home.
+        _ms["gate_open_in_this_process"] = bool(_enabled())
+        report["evolve_mutate"] = _ms
+    except Exception as _ev_exc:  # noqa: BLE001
+        report["evolve_mutate"] = {
+            "present": False,
+            "reason": f"instrument unavailable ({type(_ev_exc).__name__})",
+        }
 
     # -- bench flywheel scoreboard (§4BF Tracks 1b/1c) --------------------
     # eval/banks.stats() had NO consumer when 1b shipped — the exact
@@ -1638,16 +1698,38 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             _honest = (_cv if isinstance(_cv, (int, float)) and _cv >= 0
                        else None)
             _score = _honest if _honest is not None else cal["brier"]
-            if _score < _bb - 1e-6:
-                _verdict = "beats"
+            # ⚠ THE VERDICT NEEDS THE INTERVAL, NOT THE POINT (queue #8,
+            # 2026-08-21). A 1e-6 tolerance makes any wobble a victory: on
+            # the live store the model beat the base rate by 0.00108 and this
+            # rendered "beats", while the 95% paired-bootstrap CI of that
+            # delta is [-0.00246, +0.00017] — it straddles zero, so the
+            # honest word is "is indistinguishable from". Same defect as the
+            # experiment report's "no difference detected yet": a verdict
+            # stated without the power to support it. When no CI is recorded
+            # (params written before this existed) fall back to the point
+            # comparison, but SAY so rather than implying a tested claim.
+            _dlo, _dhi = cal.get("brier_cv_delta_lo"), cal.get(
+                "brier_cv_delta_hi")
+            _ci_note = ""
+            if isinstance(_dlo, (int, float)) and isinstance(_dhi, (int, float)):
+                if _dhi < 0:
+                    _verdict = "beats"
+                elif _dlo > 0:
+                    _verdict = "LOSES TO"
+                else:
+                    _verdict = "is INDISTINGUISHABLE from"
+                _ci_note = (f" [95% CI of the delta {_dlo:+.5f}..{_dhi:+.5f}"
+                            f"{'' if _verdict != 'is INDISTINGUISHABLE from' else ' — straddles zero'}]")
+            elif _score < _bb - 1e-6:
+                _verdict = "beats (point estimate only — no CI recorded)"
             elif _score > _bb + 1e-6:
-                _verdict = "LOSES TO"
+                _verdict = "LOSES TO (point estimate only — no CI recorded)"
             else:
                 _verdict = "matches"
             if _honest is not None:
                 lines.append(
                     f"  Brier {_honest} (5-fold CV, out-of-sample) {_verdict} "
-                    f"the base-rate predictor ({_bb})")
+                    f"the base-rate predictor ({_bb}){_ci_note}")
                 lines.append(
                     f"    in-sample {cal['brier']} · raw composite {_br} "
                     f"— in-sample is NOT performance, it is the fit scored on "
@@ -2034,6 +2116,77 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             f"(seed {fs.get('seed_state', '?')}, enabled "
             f"{fs.get('enabled', '?')})"
             + (" — PER-PROCESS reading (headless run)" if _fs_headless else ""))
+
+    ig = r.get("imagine_gate") or {}
+    if ig.get("present"):
+        _en = ig.get("enabled_count", 0)
+        lines.append("\nIMAGINE GATE (§4CL — the allow-list every steer "
+                     "is gated on):")
+        if _en:
+            lines.append(
+                f"  {_en}/{ig.get('buckets', 0)} (tool, tclass) buckets "
+                f"DISCRIMINATE: {', '.join(ig.get('enabled') or [])}")
+        else:
+            _why = "; ".join(f"{n}× {r}" for r, n
+                             in (ig.get("closed_reasons") or {}).items())
+            lines.append(
+                f"  CLOSED — 0/{ig.get('buckets', 0)} buckets enabled over "
+                f"{ig.get('ledger_rows', 0)} ledger rows"
+                + (f" ({_why})" if _why else ""))
+        _p = ig.get("params") or {}
+        lines.append(
+            f"  built {ig.get('built', '?')}; bar: n≥{_p.get('min_bucket_n')}, "
+            f"predicted-fail n≥{_p.get('min_fail_n')}, precision≥"
+            f"{_p.get('min_fail_precision')}, spread≥{_p.get('min_spread')} "
+            f"with disjoint intervals")
+    elif ig:
+        lines.append(f"\nIMAGINE GATE: {ig.get('reason', 'unknown')}")
+
+    dr = r.get("dream_replay") or {}
+    if dr.get("present"):
+        lines.append("\nDREAM REPLAY (§4CM — execution-graded "
+                     "counterfactuals):")
+        lines.append(
+            f"  {dr.get('verdicts', 0)} verdict(s) over "
+            f"{dr.get('specs', 0)} spec(s); {dr.get('decisive', 0)} decisive, "
+            f"abstain rate {dr.get('abstain_rate', 0.0):.0%}")
+        # The abstain rate sits NEXT TO the count on purpose: an engine
+        # whose output is mostly abstains is not producing labels, and an
+        # aggregate that hides that reads as throughput.
+        lines.append(f"  {dr.get('by_verdict')}; last {dr.get('last_ts', '?')}")
+    elif dr:
+        lines.append(f"\nDREAM REPLAY: {dr.get('reason', 'unknown')}")
+
+    em = r.get("evolve_mutate") or {}
+    if em.get("present") is False:
+        lines.append(f"\nEVOLVE MUTATOR: {em.get('reason', 'unknown')}")
+    elif em:
+        lines.append("\nEVOLVE MUTATOR (§4CN — scaffold candidates):")
+        # ⚠ Reports the flag, never a CAUSE. The previous wording said
+        # "a zero below is the gate, not a failure" — an explanation of
+        # rows this process did not produce, from an env this process
+        # happens to have. The rows carry their own answer:
+        # `by_outcome["disabled"]` is the daemon's ground truth.
+        _gate = "OPEN" if em.get("gate_open_in_this_process") else "closed"
+        from ..evolve.mutator import OUT_DISABLED as _E_OFF
+        _off = (em.get("by_outcome") or {}).get(_E_OFF, 0)
+        lines.append(f"  GHOST_EVOLVE is {_gate} IN THIS PROCESS (the "
+                     f"daemon's env may differ); {_off} of "
+                     f"{em.get('runs', 0)} recorded run(s) found it off")
+        if em.get("guard_flagged"):
+            # Flags, not rejections — three rounds of review established
+            # that a lexical test cannot decide whether a diff weakens a
+            # guard, so the operator decides.
+            lines.append(f"  ⚠ {em['guard_flagged']} proposal(s) removed a "
+                         f"refusal-shaped line — read those diffs first")
+        lines.append(
+            f"  {em.get('runs', 0)} run(s), {em.get('proposed', 0)} "
+            f"proposal(s); {em.get('by_outcome') or '{}'}")
+        # WHY a night produced nothing is the whole value of the row:
+        # "no evidence", "the model would not comply" and "the diff would
+        # not apply" are three different problems with one symptom.
+        if em.get("by_reason"):
+            lines.append(f"  reasons: {em['by_reason']}")
 
     lines.extend(_experiment_health_lines(memory_dir))
     lines.extend(_bench_health_lines(memory_dir))

@@ -464,15 +464,43 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             _mf = store.get_file_manifest(project_id)
         except Exception:
             _mf = {}
-        lines.append(
-            f"DELIVERABLES ({len(deliverables)} file(s) the project built — "
-            "per-task detail via manage_projects action=artifact_list):")
+        # ⚠ REGISTRATION IS A CLAIM, NOT A FACT (queue #10, 2026-08-21).
+        # `register_file_artifact` records a path and never checks that a
+        # file is there; nothing reconciles afterwards. This line then tells
+        # the model "N file(s) the project built", so a claim is presented as
+        # fact and the model cites files it never produced. Measured on the
+        # live store: 3 of 66 registered deliverables did not exist, and NONE
+        # had been removed by the cleanup sweep (every workspace_tidy event
+        # deleted only debris). The record is kept — a file can legitimately
+        # be deleted later, and the claim is audit data — but the READ path
+        # says which ones are gone.
+        try:
+            _gone = store.missing_deliverables(project_id)
+        except Exception:
+            _gone = set()
+        _hdr = f"DELIVERABLES ({len(deliverables)} file(s) the project built"
+        if _gone:
+            _hdr += (f"; {len(_gone)} RECORDED BUT NOT ON DISK — do not cite "
+                     f"those as existing work")
+        lines.append(_hdr + " — per-task detail via manage_projects "
+                     "action=artifact_list):")
         _undescribed = []
         for p in shown_files:
             e = _mf.get(p) or {}
+            # The marker goes NEXT TO THE PATH, not at the end of the line:
+            # a described file renders 110 chars of prose after the path, and
+            # a warning that arrives after the description is a warning the
+            # reader has already skipped (the §LOG lesson about previews that
+            # died at 60 chars, exactly on the why).
+            _miss = " ⚠ MISSING" if p in _gone else ""
             if e.get("desc"):
                 role = f" [{e['role']}]" if e.get("role") else ""
-                lines.append(f"  - {p}{role} — {str(e['desc'])[:110]}")
+                lines.append(
+                    f"  - {p}{_miss}{role} — {str(e['desc'])[:110]}")
+            elif _miss:
+                # Never comma-pack a missing file: the packed line reads as a
+                # list of things that exist.
+                lines.append(f"  - {p}{_miss}")
             else:
                 _undescribed.append(p)
         if _undescribed:

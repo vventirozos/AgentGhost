@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.imagination — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Measurement</h3>
+    <a href="foresight.html">foresight</a>
+    <a class="current" href="imagination.html">imagination</a>
+    <a href="experiments.html">experiments</a>
+    <a href="calibration.html">calibration</a>
+    <a href="risk.html">risk</a>
+    <a href="isolation.html">isolation</a>
+    <a href="mcts.html">mcts</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / imagination.py — the gate that ships before the planner</h1>
+  <p class="subtitle">Decides, per <code>(tool, tclass)</code> bucket and from ledger data alone, whether <a href="foresight.html">foresight</a> precedent is good enough to steer with. It is the only reason any Imagine steering site is allowed to exist &mdash; and as of 2026-08-22 it says <strong>no</strong>, for every bucket.</p>
+
+  <h2>Why the gate comes first</h2>
+  <p>Two negative results from the literature are load-bearing for the whole Imagine phase: an agent <em>offered</em> a simulation tool uses it under 1% of the time and gets worse, and a planner gated on a model's <em>self-reported</em> confidence is gated on nothing. So imagination has to be forced into the loop rather than offered &mdash; and gated on measured historical accuracy rather than on a model saying it feels sure.</p>
+  <p>This project's own history says the same thing more sharply. <a href="mcts.html">MCTS turn-start</a> was disabled precisely because its value function scored the model's self-prediction of un-executed actions. Foresight was built to be the grounded replacement, and its verdict on the live ledger has been "underpowered-promising" for weeks &mdash; never "measured usable". The gate is what turns that sentence into a per-bucket boolean that code can read.</p>
+
+  <h2>What "the index claimed this will fail" means</h2>
+  <p>This looks like a detail and it decided the phase's headline number.</p>
+  <p>Foresight's probability is Laplace-smoothed: <code>p_fail = (fails+1)/(support+2)</code>. So</p>
+  <pre><code>p_fail &gt;= 0.5   ⟺   2(f+1) &gt;= n+2   ⟺   2f &gt;= n</code></pre>
+  <p>The prior's mean <em>is</em> 0.5, so it contributes exactly zero shrinkage at the decision boundary — the test reduces to a bare majority on raw counts, <strong>inclusive of the tie</strong>. A cell that has seen 2 failures in 4 tries reads <code>p_fail = 0.5000</code> and was scored as a failure claim. Measured on the live ledger over the 24 rows the old rule admitted:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Subset</th><th>n</th><th>Really failed</th><th>Precision</th></tr></thead>
+    <tbody>
+      <tr><td>all <code>p_fail &ge; 0.5</code></td><td>24</td><td>6</td><td>0.250</td></tr>
+      <tr><td>ties, exactly <code>0.5000</code></td><td>9</td><td>5</td><td><strong>0.556</strong></td></tr>
+      <tr><td>strict, <code>&gt; 0.5</code></td><td>15</td><td>1</td><td><strong>0.067</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>Coin-flip cells were 37.5% of the "predicted-fail" population and carried <em>all</em> of its apparent precision. The index's real failure claims are right 6.7% of the time — <em>below</em> the ~10% base rate. And <code>support=3</code> and <code>support=4</code> are the two most common values among predicted-fail rows, so the tie is the modal case, not a corner.</p>
+  <p><code>claims_failure()</code> is therefore strict (<code>2·fails &gt; support</code>) and works on the raw counts the ledger row already carries — which also sidesteps the four-decimal rounding of <code>p_fail</code>, where at support ≈ 10⁴ a strict minority rounds <em>up</em> to 0.5000. All three readers — the gate, the pre-flight steer and <code>foresight.ledger_stats</code> — share the one definition.</p>
+
+  <h3>…and it is measured over the population the steer will touch</h3>
+  <p>The steer additionally requires exact-or-class basis, support ≥ 3, at least two real failures, and a non-empty error head. Certifying precision over <em>every</em> row carrying a claim would be certifying a statistic about rows nothing acts on — and on live data that is the <em>more</em> precise subset, so the gate would read better than the mechanism it authorises. <code>is_steerable_row()</code> is one predicate, shared by the gate and the consumer, for exactly that reason.</p>
+
+  <h2>The bar</h2>
+  <p>A bucket is enabled only when <em>all four</em> hold. Each one is a separate lesson, and the order below is the order a reader should think about them &mdash; the first failure wins the bucket's <code>why</code> string, so the message always names the binding constraint.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Condition</th><th>Default</th><th>Why it is there</th></tr></thead>
+    <tbody>
+      <tr><td>resolved rows in the bucket</td><td><code>n &ge; 30</code></td><td>The same "no verdict on thin data" floor the whole-ledger backtest uses.</td></tr>
+      <tr><td>rows where the index <em>claimed</em> p(fail) &ge; 0.5</td><td><code>fail_n &ge; 10</code></td><td>The steer only ever acts on that subset, so its accuracy is the statistic that matters &mdash; and a precision of 1.00 over three rows is not a measurement. This is the denominator floor; it is checked <em>before</em> the precision is even looked at.</td></tr>
+      <tr><td>precision on those rows</td><td><code>&ge; 0.60</code></td><td>A pre-flight steer costs a model round-trip. Below this it interrupts more good calls than bad ones.</td></tr>
+      <tr><td>discrimination <em>within</em> the bucket</td><td>spread <code>&ge; 0.10</code>, intervals disjoint</td><td>Overall accuracy is the wrong statistic: the base failure rate is about 10%, so "always predict success" scores 90%. What matters is whether the predicted-fail rows fail <em>more</em> than the predicted-ok ones, by a margin, with disjoint anytime-valid intervals.</td></tr>
+    </tbody>
+  </table></div>
+  <p>The thresholds are recorded <em>into</em> the gate file. A gate on disk always names the rules that produced it &mdash; otherwise a threshold change silently re-reads a file that means something nobody chose.</p>
+
+  <h3>Allow-list, not deny-list</h3>
+  <p><code>gate_allows(tool, tclass)</code> answers <code>False</code> for a missing file, an empty file, a truncated file, a document of the wrong shape, an unknown bucket, an <code>enabled</code> that is truthy but not exactly <code>True</code>, and any exception on the way. There is no path through it that opens a bucket by accident. The write is atomic, so a reader can never catch a half-written allow-list that happens to parse.</p>
+
+  <h2>What it measured</h2>
+  <p>Run on both instruments, 2026-08-22:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Instrument</th><th>Rows</th><th>Buckets</th><th>Steerable failure claims</th><th>Precision on them</th><th>Enabled</th></tr></thead>
+    <tbody>
+      <tr><td>live ledger (16 days)</td><td>751</td><td>63</td><td>14</td><td><strong>0.071</strong></td><td><strong>0</strong></td></tr>
+      <tr><td>offline leave-future-out replay of the whole corpus</td><td>4,177</td><td>119</td><td>60</td><td><strong>0.417</strong></td><td><strong>0</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>The live ledger closes on volume &mdash; 57 of 63 buckets hold fewer than 30 rows. The offline replay, at eight times the rows, closes on something more useful to know: the only bucket clearing both size floors is <code>browser|scheme:http</code>, at precision <strong>0.36</strong>.</p>
+  <p><strong>The precedent index discriminates, but it is not precise enough to veto with.</strong> That is a different result from "not enough data", and it is the one that matters: at precision around 0.4 a pre-flight steer interrupts more good calls than bad ones. The whole-ledger backtest agrees independently &mdash; spread 0.302, monotone (0.059 &rarr; 0.148 &rarr; 0.361), verdict "SPREAD BUT NOT SIGNIFICANT".</p>
+
+  <h3>The sharpest number is one nobody was reading</h3>
+  <p>The per-bucket Brier score was being computed, stored and read by nothing. Given a skill baseline &mdash; a climatological forecast at the bucket's own claimed failure rate, scoring <code>p(1−p)</code> &mdash; it says something the enabled-count cannot:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Bucket</th><th>Claimed</th><th>Brier</th><th>Base rate</th><th>Skill</th></tr></thead>
+    <tbody>
+      <tr><td><code>web_search|other</code></td><td>114</td><td>0.0443</td><td>0.0419</td><td>−0.057</td></tr>
+      <tr><td><code>manage_projects|</code></td><td>83</td><td>0.0354</td><td>0.0235</td><td><strong>−0.504</strong></td></tr>
+      <tr><td><code>browser|scheme:http</code></td><td>49</td><td>0.1038</td><td>0.0916</td><td>−0.133</td></tr>
+      <tr><td><code>browser|scheme:https</code></td><td>34</td><td>0.0974</td><td>0.0804</td><td>−0.211</td></tr>
+    </tbody>
+  </table></div>
+  <p>Across the offline corpus, <strong>14 of the 16 buckets with at least 30 claimed rows score negative</strong> (median −0.078). The index's probabilities are <em>worse than a constant forecast at each bucket's own failure rate</em>. That is a fact about the thing the gate exists to certify, and it was invisible while the number was written and unread. <code>brier_base_rate</code> and <code>brier_skill</code> now ship beside it, and <code>gate_stats</code> surfaces the summary.</p>
+  <p>The threshold was not relaxed to make the feature turn on. The gate stays closed, it says per bucket exactly why (and how many more rows it needs), and it re-opens on its own when the data changes.</p>
+
+  <h2>Saying <em>why</em> it is closed</h2>
+  <p>Every bucket carries a <code>why</code>. A gate that reports only <code>false</code> is unmeasurable: nobody can tell "no data yet" from "measured dead", and those lead in opposite directions &mdash; one says wait, the other says redesign. The health surface (<code>introspect action='learning'</code>) shows the histogram, which today reads <em>57&times; thin bucket; 6&times; no denominator</em>.</p>
+
+  <h2>Where it runs</h2>
+  <p>Biological phase <strong>2.7e</strong>, in the 15&ndash;60 minute idle band beside the other calibration siblings, on a 24-hour cooldown. Pure file I/O and counting &mdash; no model call, milliseconds. It is registered as <code>PERIODIC</code> in the liveness registry, so a week with no rebuild reads as an alarm rather than as silence.</p>
+  <p>It runs <strong>even when <code>GHOST_IMAGINE</code> is off</strong>, and that is deliberate: a closed gate is a measurement, and the question "has the precedent index become good enough to steer with yet?" should keep being answered while the feature is disabled. Otherwise the day it becomes usable never arrives. The master flag gates the consumers, not the instrument.</p>
+
+  <h2>The first consumer: the pre-flight steer (I1)</h2>
+  <p>Today the <code>foresight_note</code> arm appends precedent to a tool result <em>after</em> the call has already failed. The pre-flight steer moves the same knowledge <em>before</em> dispatch: the call is not run, the model is handed the precedent, and it gets one revision.</p>
+  <p>It lives in <code>GhostAgent._imagine_preflight_note</code>, hooked in as a sibling of the repeat-failure guard in the tool loop — deliberately at the point where the coroutine has <em>not yet been created</em>. In the foresight prediction loop further down, "do not dispatch" would mean closing an un-awaited coroutine and threading a second kind of placeholder through the batch-dedup machinery. At the guard's position it is the same shape every other pre-dispatch rejection already uses: emit a synthetic tool message, <code>continue</code>, and control returns to the model.</p>
+  <p>Five gates, in cost order, so a disabled deployment pays almost nothing per call:</p>
+  <ol>
+    <li><code>GHOST_IMAGINE</code> (default off) and <code>GHOST_IMAGINE_PREFLIGHT</code>;</li>
+    <li>the loop guard — once per argument hash, at most twice per request. Without the first half a model can re-propose the identical call forever and the turn never acts; without the second, a model that revises <em>into</em> a second flagged call chains;</li>
+    <li><code>gate_allows(tool, tclass)</code> — the measured allow-list above, which enables nothing today, so this whole path is inert by construction;</li>
+    <li>the precedent itself: exact or class basis, support &ge; 3, at least two <em>real</em> precedent failures, p(fail) &ge; 0.5, and a non-empty error head to actually tell the model;</li>
+    <li>the <code>imagine_preflight</code> experiment arm. Control dispatches unchanged and is still trigger-marked, so the two arms' trigger rates stay comparable — the metric only means anything on the triggered subset.</li>
+  </ol>
+  <p>Two properties that are easy to get wrong and are pinned:</p>
+  <ul>
+    <li><strong>A deferral is not a failure.</strong> <code>execution_failure_count</code> and <code>last_was_failure</code> are untouched. A deliberate steer charged as a strike would spend the turn's error budget on its own advice, and six strikes ends the turn.</li>
+    <li><strong>A deferral is synthetic.</strong> The message pairs with a <code>tool_call</code> in the reconstructed trajectory exactly like a real result, and its label would be <em>inverted</em> — a deferral on a repeatedly-failing target reads as a success. Its marker is registered with <code>foresight.is_synthetic_result</code>, which is what stops a steer from teaching the very index that produced it.</li>
+  </ul>
+
+  <h2>The consistency ratio</h2>
+  <p><code>scripts/foresight_backtest.py --consistency</code> is the phase's go/no-go number: over the steps imagination actually re-ranked, the fraction where the branch it preferred was the one that worked. Per-step accuracy is a lying metric for a planner, because errors compound &mdash; a ranker that is 90% right per step is wrong most of the way through a ten-step trajectory.</p>
+  <p>It counts only <em>discriminating</em> pairs. A pair where both branches passed says nothing about the ranking, and including it drags the ratio toward whatever the base pass rate happens to be.</p>
+  <p>It also refuses a verdict it does not have the power for. Against a null of 0.50 (the estimator is conditional on exactly one branch passing, so a coin flip <em>is</em> the null), reaching 80% power at the 0.70 bar takes <strong>49 discordant pairs</strong>; via this project's own anytime-valid interval it takes about 80. Below that floor it prints the point estimate, says how many more pairs are needed, and exits with a distinct code. Before that guard, a single pair at ratio 1.000 exited as PASS &mdash; the §4CE shape, sitting inside the very feature whose gate exists because "a subset of 1 with precision 1.00 is not evidence".</p>
+  <p><strong>The instrument is currently unarmed</strong>, and says so with its own exit code rather than printing a number derived from an empty file. Its data source is the regret ledger, which is written by the nightly block that re-executes a rejected branch and grades it &mdash; a component that does not exist yet. Three exit codes, not two: unarmed, underpowered and a real verdict are different facts, and a loop polls the code rather than the prose.</p>
+
+  <h2>Knobs</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Variable</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_IMAGINE</code></td><td>off &mdash; the master switch for consumers</td></tr>
+      <tr><td><code>GHOST_IMAGINE_GATE_MIN_N</code></td><td>30</td></tr>
+      <tr><td><code>GHOST_IMAGINE_GATE_MIN_FAIL_N</code></td><td>10</td></tr>
+      <tr><td><code>GHOST_IMAGINE_GATE_MIN_PRECISION</code></td><td>0.60</td></tr>
+      <tr><td><code>GHOST_IMAGINE_GATE_MIN_SPREAD</code></td><td>0.10</td></tr>
+    </tbody>
+  </table></div>
+  <p>Changing any of them requires a rebuild &mdash; the file records the bar it was built under, so a stale gate is always readable as stale.</p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="foresight.html">core / foresight.py</a> &mdash; the precedent index this gate judges.</li>
+    <li><a href="isolation.html">core / isolation.py</a> &mdash; the substrate a speculative branch would run in.</li>
+    <li><a href="mcts.html">core / mcts.py</a> &mdash; the parked K-candidate planner waiting on a grounded value function.</li>
+    <li><a href="experiments.html">core / experiments.py</a> &mdash; where a steering consumer would be enrolled as a live arm.</li>
+  </ul>
+</main>
+</body>
+</html>

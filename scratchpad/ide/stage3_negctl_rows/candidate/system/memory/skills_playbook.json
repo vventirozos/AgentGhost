@@ -1,0 +1,31 @@
+[
+  {
+    "timestamp": "2026-08-23T12:33:09.020420",
+    "task": "hard cases in the python_general cluster requiring retry-on-failure",
+    "mistake": "Re-emitting the same logic with cosmetic tweaks instead of reading the expected-vs-actual diff.",
+    "solution": "On a python_general task, when the first attempt fails the validator, re-read the validator feedback (expected vs. actual diff) and identify the specific mismatch \u2014 most common shapes are float formatting (`round()` vs. f-string), tie-break ordering, off-by-one bounds, and edge cases on empty / missing rows.",
+    "frequency": 1,
+    "graduated": false,
+    "schema_version": 2,
+    "trigger": "hard cases in the python_general cluster requiring retry-on-failure",
+    "anti_pattern": "Re-emitting the same logic with cosmetic tweaks instead of reading the expected-vs-actual diff.",
+    "correct_pattern": "On a python_general task, when the first attempt fails the validator, re-read the validator feedback (expected vs. actual diff) and identify the specific mismatch \u2014 most common shapes are float formatting (`round()` vs. f-string), tie-break ordering, off-by-one bounds, and edge cases on empty / missing rows.",
+    "code_example": "",
+    "domains": [
+      "python_general"
+    ],
+    "confidence": 0.3,
+    "source_challenge_hash": "74a3d5afa8f797cb",
+    "verified": false,
+    "verification_attempted": false,
+    "retrievals": 0,
+    "helpful_retrievals": 0,
+    "succeeded_retrievals": 0,
+    "failed_retrievals": 0,
+    "last_retrieved_at": "",
+    "source": "bench",
+    "source_trajectory_id": "",
+    "source_refs": [],
+    "dimension": ""
+  }
+]

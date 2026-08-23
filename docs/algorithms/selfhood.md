@@ -1,5 +1,15 @@
 # Selfhood
 
+> **2026-08-21 verdict backfill:** the diary now FOLLOWS the trajectory
+> corpus. Both the late async verifier verdict
+> (`_backfill_trajectory_outcome`) and every human 👍/👎
+> (`core.feedback.apply_human_label`) write `record_outcome` after their
+> corpus write is accepted — previously the only live feed was finalize's
+> inline `verifier_backfill`, i.e. the ~15% of verdicts that won a 25s
+> race, leaving 331 diary rows at `unknown` that the corrections sidecar
+> had already labelled. See `docs/algorithms/selfhood.html`, section
+> "The diary follows the corpus".
+
 > **2026-08-20 mood rework:** mood is now DERIVED from live signals
 > (verdict streaks, context pressure, open-question freshness, idle
 > clock; `selfhood/mood.py`) with provenance (`source="self"|"derived"`),

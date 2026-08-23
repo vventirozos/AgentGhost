@@ -201,10 +201,24 @@ class TestWorkspaceCleanupDotfiles:
 
 class TestDreamIsolation:
     def test_isolation_nulls_trajectory_collector(self):
-        import inspect
-        import ghost_agent.core.dream as dream
-        src = inspect.getsource(dream)
         # The isolated context must null the trajectory collector so synthetic
         # self-play turns don't leak into the production trajectory log.
-        assert "isolated_context.trajectory_collector = None" in src
-        assert "isolated_context.episodic_memory = None" in src
+        # §4CL S1: both handles moved into the shared detach inventory, and
+        # this pin moved with them — membership plus the EXECUTED clear.
+        # (The end-to-end version, asserted on the isolate the real solve
+        # loop constructs, is in tests/test_isolation_replay.py.)
+        from ghost_agent.core.isolation import (
+            ISOLATION_NULLED_ATTRS, null_production_state,
+        )
+
+        class _Ctx:
+            pass
+
+        for attr in ("trajectory_collector", "episodic_memory"):
+            assert attr in ISOLATION_NULLED_ATTRS
+        ctx = _Ctx()
+        ctx.trajectory_collector = object()
+        ctx.episodic_memory = object()
+        null_production_state(ctx)
+        assert ctx.trajectory_collector is None
+        assert ctx.episodic_memory is None

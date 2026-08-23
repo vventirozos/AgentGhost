@@ -72,6 +72,10 @@ _PHASE_LABELS = {
     "native_tool_repair": "native tool-call repair",
     "workspace_tidy": "workspace tidy",
     "bench": "bench bank",
+    "imagine_gate": "imagine calibration gate",
+    "dream_replay": "counterfactual replay",
+    "evolve_mutate": "Evolve mutator",
+    "evolve_proposal": "Evolve proposal",
 }
 
 # ── LIVENESS REGISTRY ───────────────────────────────────────────────────────
@@ -135,6 +139,32 @@ PHASE_EXPECTATION = {
     # disk and killable via --no-bench — a zero must report the gate, not
     # alarm.
     "bench": EXPECT_GATED,
+    # §4CL I0: the Imagine calibration gate rebuild. PERIODIC because it
+    # is what keeps the gate from going stale, and a stale allow-list is
+    # exactly the failure this registry exists to make visible — a zero
+    # here means the question "is the precedent index good enough to
+    # steer with yet?" has stopped being asked.
+    "imagine_gate": EXPECT_PERIODIC,
+    # §4CM D3: the counterfactual replay batch. GATED, not periodic —
+    # `GHOST_DREAM_REPLAY` defaults OFF and the whole engine is inert
+    # until an operator turns it on, so a zero must report the gate
+    # rather than manufacture an alarm (the `bench` precedent).
+    "dream_replay": EXPECT_GATED,
+    # §4CN E1: the Evolve mutator. GATED for the same reason —
+    # `GHOST_EVOLVE` defaults OFF and the loop is inert until an operator
+    # turns it on, so a zero must report the gate rather than manufacture
+    # an alarm. When it IS on it writes a row every firing, including the
+    # firings that proposed nothing, so a zero here means the phase never
+    # ran — not that it had nothing to say.
+    "evolve_mutate": EXPECT_GATED,
+    # §4CN E2 stage 4: a proposal packet reaching an operator. GATED, and
+    # a zero here is the EXPECTED reading twice over — `GHOST_EVOLVE` is
+    # off by default, and even with it on a candidate must clear static,
+    # pins, bench smoke AND a significant paired win on held-out items
+    # before one is written. Most generations end in an honest refusal,
+    # so a zero means "nothing earned an operator's attention", never
+    # "the phase is broken".
+    "evolve_proposal": EXPECT_GATED,
 }
 
 

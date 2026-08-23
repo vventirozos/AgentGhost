@@ -990,17 +990,31 @@ async def test_r1_repairing_final_never_runs_bon(tmp_path, monkeypatch):
 
 def test_r1_bench_turns_get_a_patient_repair_budget(tmp_path, monkeypatch):
     # R1 consumer C1 remedy: bench turns await the verdict for 90s (deep
-    # idle — the wait is free); live turns keep 25s; the env override
-    # still wins everywhere.
+    # idle — the wait is free); live turns get the LIVE budget; the env
+    # override still wins everywhere.
+    #
+    # The live default was 25s until 2026-08-22 and is 65s now (§4CK: the
+    # REFUTED p90 is 63.8s, so 25s caught 5 refutes in 23). Asserted against
+    # the two real constants rather than a literal, so this pin keeps
+    # testing the RELATIONSHIP — bench > live > env-override wins — instead
+    # of freezing a number that is expected to be re-tuned.
     from ghost_agent.core.agent import GhostAgent
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
     monkeypatch.delenv("GHOST_CRITIC_REPAIR_BUDGET", raising=False)
     ex.reset_registry_cache()
     context, _ = _bench_chat_context(tmp_path, "gsm8k_text-0")
     agent = GhostAgent(context)
+    from ghost_agent.core.verifier import _VOTE_BUDGET_DEFAULT_S
+
     assert agent._critic_repair_await_budget() == 90.0
     context.turn_origin_label = None
-    assert agent._critic_repair_await_budget() == 25.0
+    _live = agent._critic_repair_await_budget()
+    assert _live == 65.0
+    # The pairing that makes the number mean something: the await must
+    # outlast the ceiling the verdict bounds itself by, or it expires while
+    # the verdict is still legitimately running and buys nothing.
+    assert _live > _VOTE_BUDGET_DEFAULT_S
+    assert agent._critic_repair_await_budget() < 90.0   # bench stays patient
     monkeypatch.setenv("GHOST_CRITIC_REPAIR_BUDGET", "12")
     context.turn_origin_label = "bench"
     assert agent._critic_repair_await_budget() == 12.0

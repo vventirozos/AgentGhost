@@ -98,6 +98,19 @@ ADMISSIBILITY = {
     # lived experience (capture site origin-gated; dream's bench isolate
     # nulls self_model).
     "selfhood": POLICY_REAL_ONLY,                 # selfhood capture, agent.py
+    # §4CM D0: the Dream replay engine. TWO rows on purpose.
+    #   * `dream_replay` READS the corpus to pick episodes. Bench is
+    #     admitted as a feature because bench items already carry an
+    #     EXECUTABLE validator — exactly what D1 must synthesise for a
+    #     real episode — which makes them the cheapest source of seeded
+    #     ground truth for D4's sensitivity/specificity check.
+    #   * `dream_credit` is anything that later reads a replay VERDICT
+    #     and acts on it. It is REAL_ONLY and stays that way until D4's
+    #     seeded-truth bar is cleared: one row could not express "may
+    #     read the corpus, may not yet believe the output", and a single
+    #     permissive row is how an unvalidated label source opens.
+    "dream_replay": POLICY_BENCH_FEATURE,         # core/replay_engine.py
+    "dream_credit": POLICY_REAL_ONLY,             # D5 consumers (unopened)
 }
 
 

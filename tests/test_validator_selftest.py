@@ -373,12 +373,16 @@ class TestPerfectItSkipDuringSelfPlay:
         """The marker must live on the class (not an instance
         attribute) so `getattr(wrapper, 'is_read_only', False)`
         works on any wrapper instance built inside self-play."""
-        import inspect
-        from ghost_agent.core import dream as dream_module
-        src = inspect.getsource(dream_module)
-        # The marker is defined inside the isolated synthetic_self_play
-        # scope; structural check against the source is sufficient.
-        assert "is_read_only = True" in src
+        # §4CL S1: the façade is a real module-level class now, so the
+        # marker is checked where it has to live — in the CLASS dict, so
+        # `getattr(wrapper, "is_read_only", False)` works on every
+        # instance without each one setting it.
+        from unittest.mock import MagicMock
+        from ghost_agent.core.isolation import ReadOnlySkillMemory
+
+        assert vars(ReadOnlySkillMemory).get("is_read_only") is True
+        assert getattr(ReadOnlySkillMemory(MagicMock()),
+                       "is_read_only", False) is True
 
     def test_perfect_it_block_checks_read_only_marker(self):
         """The entry condition for the Perfect-It block must gate on

@@ -273,11 +273,54 @@ _recorder: Optional[LLMRecorder] = None
 _recorder_lock = threading.Lock()
 
 
+#: In-flight isolated replays (§4CL S1). Recordings are a CORPUS — GEPA
+#: trainsets and the drift matcher read them — so a replayed episode's
+#: traffic must not mix in with the operator's. The gate is a counter
+#: rather than a per-call flag because the recording hook is a
+#: `@staticmethod` on LLMClient with no route to the context: there is no
+#: per-call signal to read.
+#:
+#: ⚠ Deliberately COARSE, and the trade is stated rather than hidden: a
+#: live turn that happens to run while a replay is in flight loses its
+#: recording too. That is a missing fixture (recoverable — the next
+#: identical call records) against synthetic traffic entering a corpus
+#: that trains prompt optimisation (not recoverable — nothing downstream
+#: can tell the rows apart afterwards).
+_SIM_DEPTH = 0
+_SIM_LOCK = threading.Lock()
+
+
+def suppress_recording() -> None:
+    """Enter one level of replay suppression."""
+    global _SIM_DEPTH
+    with _SIM_LOCK:
+        _SIM_DEPTH += 1
+
+
+def resume_recording() -> None:
+    """Leave one level. Never goes below zero — an unbalanced resume must
+    not re-enable recording for an enclosing replay still running."""
+    global _SIM_DEPTH
+    with _SIM_LOCK:
+        _SIM_DEPTH = max(0, _SIM_DEPTH - 1)
+
+
+def recording_suppressed() -> bool:
+    with _SIM_LOCK:
+        return _SIM_DEPTH > 0
+
+
+def reset_suppression_for_tests() -> None:
+    global _SIM_DEPTH
+    with _SIM_LOCK:
+        _SIM_DEPTH = 0
+
+
 def maybe_record(kind: str, payload: Dict[str, Any], response: Any,
                  **meta) -> None:
     """Module-level hook for LLMClient — resolves the enabled flag and the
     singleton lazily so the env can be flipped without a restart."""
-    if not recording_enabled():
+    if not recording_enabled() or recording_suppressed():
         return
     global _recorder
     with _recorder_lock:

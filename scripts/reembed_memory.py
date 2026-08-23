@@ -111,6 +111,38 @@ def main() -> int:
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBED_MODEL_NAME)
 
+    # ⚠ SELF-CHECK BEFORE THE DELETE. The load above does NOT raise when
+    # the model config cannot be resolved — it silently degrades to an
+    # untrained mean-pooling model that returns wrong embeddings, and
+    # this script then re-embeds every fragment through it and stamps the
+    # sidecar with the new model name, so the agent boots clean and
+    # nothing downstream ever notices. `VectorMemory.__init__` probes for
+    # exactly this; the migration path did not.
+    #
+    # The failure became reachable when `ghost_agent/__init__.py` began
+    # importing `_env`: this script's own imports now apply
+    # `HF_HUB_OFFLINE=1` under mandatory-tor, and the whole point of the
+    # script is migrating to a model that is BY DEFINITION not cached
+    # yet. Reuses the store's own degradation test rather than a second
+    # copy of it.
+    try:
+        from ghost_agent.memory.vector import _embedding_degradation_reason
+        _probe = embed_fn(["ghost embedder self-check probe"])
+        _bad = _embedding_degradation_reason(_probe[0] if _probe else None)
+    except Exception as exc:            # noqa: BLE001
+        _bad = f"the probe could not be embedded ({exc})"
+    if _bad:
+        print(f"REFUSING: the new embedder is DEGRADED — {_bad}\n"
+              f"  model  : {EMBED_MODEL_NAME}\n"
+              f"  offline: HF_HUB_OFFLINE={os.environ.get('HF_HUB_OFFLINE')}"
+              f" (set by ghost_agent under --mandatory-tor)\n"
+              f"  Nothing was deleted; the backup above is intact.\n"
+              f"  Fetch the model once, then re-run:\n"
+              f"    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "
+              f"PYTHONPATH=src python scripts/reembed_memory.py",
+              file=sys.stderr)
+        return 2
+
     client.delete_collection(name="agent_memory")
     new_col = client.get_or_create_collection(
         name="agent_memory", embedding_function=embed_fn)
