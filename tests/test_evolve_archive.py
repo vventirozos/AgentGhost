@@ -159,16 +159,38 @@ def test_an_unchanged_harness_reports_nothing():
     assert F.compare_harness(d, F.harness_digest()) == []
 
 
-def test_pycache_does_not_make_the_digest_flap(tmp_path):
-    """A digest that changes on its own teaches the operator to ignore
-    it — the same lesson as a monitor that cries on a benign zero."""
+def test_pycache_is_WATCHED_and_reported_as_BYTECODE(tmp_path):
+    """⚠ THIS TEST ASSERTED THE OPPOSITE, and the reasoning was
+    plausible: "a digest that changes on its own teaches the operator to
+    ignore it — the same lesson as a monitor that cries on a benign
+    zero." The flaw is that a `.pyc` is not a by-product of the file
+    being hashed, it is a file Python imports **ahead of** it. An
+    unchecked-hash `.pyc` is loaded without consulting the `.py` at all,
+    so excluding bytecode from the digest let a planted one replace a
+    module the digest still reported as pristine — the check made
+    decorative by the one exclusion that mattered.
+
+    The alarm-fatigue concern was real, so it is answered by a
+    DISTINGUISHABLE LABEL rather than by looking away: an operator sees
+    whether source moved or only bytecode did, and both abort, because
+    both mean the harness changed under a run in progress. The cascade's
+    own children never write bytecode, so inside a cascade window this
+    is not churn."""
     tree = tmp_path / "tests"
     (tree / "__pycache__").mkdir(parents=True)
     (tree / "t.py").write_text("x = 1")
     before = F.harness_digest(tmp_path, trees=("tests",))
     (tree / "__pycache__" / "t.cpython-310.pyc").write_bytes(b"\x00\x01")
-    assert F.compare_harness(before,
-                             F.harness_digest(tmp_path, trees=("tests",))) == []
+    moved = F.compare_harness(before, F.harness_digest(tmp_path,
+                                                       trees=("tests",)))
+    assert moved, "a planted .pyc was invisible to the digest"
+    assert all(m.startswith("BYTECODE ") for m in moved), moved
+    # …and a source change is NOT mislabelled as bytecode.
+    (tree / "t.py").write_text("x = 2")
+    src_moved = F.compare_harness(before, F.harness_digest(
+        tmp_path, trees=("tests",)))
+    assert any(m.startswith("MODIFIED") and m.endswith("t.py")
+               for m in src_moved), src_moved
 
 
 # ------------------------------------------------------------------ #
@@ -544,3 +566,76 @@ def test_diff_size_counts_files_by_PREFIX_not_by_character_set():
     # strip — so this cannot fire on a path the fence would admit. The
     # fix is correctness hygiene, not a live hole, and saying so is
     # cheaper than a future reader re-deriving it.
+
+
+def test_a_planted_SYMLINK_is_visible_to_the_digest(tmp_path):
+    """⚠ `is_file()` FOLLOWS SYMLINKS AND SO MISSES THEM. A DANGLING
+    symlink is not a file, and `rglob` does not descend into a symlinked
+    DIRECTORY — so both could be ADDED inside a watched, immutable tree
+    and stay permanently invisible. That is worse than the
+    modify-use-restore window the docstring concedes: a permanent
+    addition the checksum can never see. Combined with a runner check
+    that only inspects spelling, it yields an executable outside the
+    canonical tree that the digest never notices."""
+    import os
+    tree = tmp_path / "scripts"
+    tree.mkdir()
+    (tree / "a.py").write_text("x = 1\n")
+    before = F.harness_digest(tmp_path, trees=("scripts",))
+
+    os.symlink("/nonexistent/target", str(tree / "dangling"))
+    os.symlink(str(tmp_path), str(tree / "dirlink"))
+    moved = F.harness_digest(tmp_path, trees=("scripts",))
+    added = F.compare_harness(before, moved)
+    assert sorted(added) == ["ADDED scripts/dangling",
+                             "ADDED scripts/dirlink"], added
+
+    # …and RE-POINTING a link is a change, because the link's own target
+    # is what is hashed — the target may sit outside every watched tree.
+    os.remove(str(tree / "dangling"))
+    os.symlink("/etc", str(tree / "dangling"))
+    repointed = F.compare_harness(moved, F.harness_digest(tmp_path,
+                                                          trees=("scripts",)))
+    assert repointed == ["MODIFIED scripts/dangling"], repointed
+
+
+def test_a_RE_POINTED_link_is_caught_even_when_the_bytes_match(tmp_path):
+    """⚠ WHY THE LINK'S TARGET STRING IS HASHED, NOT THE TARGET'S BYTES.
+    Hashing the bytes makes re-pointing a link to a different file with
+    IDENTICAL content invisible — and that is the move: the link keeps
+    its name and its content hash while pointing somewhere the digest
+    does not watch. Mutating this to hash the target's bytes survived
+    the suite, because the only existing test distinguished two
+    UNREADABLE reasons."""
+    import os
+    tree = tmp_path / "scripts"
+    tree.mkdir()
+    (tmp_path / "a.py").write_text("SAME = 1\n")
+    (tmp_path / "b.py").write_text("SAME = 1\n")       # identical bytes
+    os.symlink(str(tmp_path / "a.py"), str(tree / "link.py"))
+    before = F.harness_digest(tmp_path, trees=("scripts",))
+
+    os.remove(str(tree / "link.py"))
+    os.symlink(str(tmp_path / "b.py"), str(tree / "link.py"))
+    moved = F.compare_harness(before, F.harness_digest(tmp_path,
+                                                       trees=("scripts",)))
+    assert moved == ["MODIFIED scripts/link.py"], \
+        f"a re-pointed link with identical target bytes was invisible: {moved}"
+
+
+def test_src_INIT_is_refused_as_immutable_not_by_the_catch_all(tmp_path):
+    """⚠ THE FILE DOES NOT EXIST, AND THAT IS THE POINT. Creating
+    `src/__init__.py` turns `src/` from a PEP-420 namespace package into
+    a regular one whose body runs on every `import src.ghost_agent.*` —
+    the production import shape. It was refused only by the catch-all
+    ("not on the mutable allow-list"), which is the same answer a typo
+    gets; the entry one level down (`tools/__init__.py`) is named
+    explicitly for exactly this hazard."""
+    ok, why = F.is_mutable("src/__init__.py")
+    assert not ok, why
+    assert "immutable" in why, \
+        f"refused, but by the catch-all rather than as immutable: {why}"
+    assert not (Path(__file__).resolve().parents[1] / "src"
+                / "__init__.py").exists(), \
+        "src/__init__.py now EXISTS — `src` is no longer a namespace " \
+        "package, and the production import shape has changed"

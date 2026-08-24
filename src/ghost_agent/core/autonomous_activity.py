@@ -76,6 +76,7 @@ _PHASE_LABELS = {
     "dream_replay": "counterfactual replay",
     "evolve_mutate": "Evolve mutator",
     "evolve_proposal": "Evolve proposal",
+    "negative_controls": "Negative Controls",
 }
 
 # ── LIVENESS REGISTRY ───────────────────────────────────────────────────────
@@ -157,6 +158,16 @@ PHASE_EXPECTATION = {
     # firings that proposed nothing, so a zero here means the phase never
     # ran — not that it had nothing to say.
     "evolve_mutate": EXPECT_GATED,
+    # §4CS item E: the scheduled E3 negative controls. PERIODIC, and the
+    # zero here is the alarm — E2's entire value is REFUSING things, and
+    # this project's rule is that a guard which never demonstrably fires is
+    # presumed dead. It fires WEEKLY (a run costs minutes: the guard
+    # control runs stage 1 for real over ~45 pin files), and it writes a
+    # row on EVERY path including the ones where a control could not be
+    # built, so a zero means the phase stopped running rather than that it
+    # had nothing to say. `GHOST_NEGCTRL=0` disables it, and that is the
+    # only state in which a zero is benign.
+    "negative_controls": EXPECT_PERIODIC,
     # §4CN E2 stage 4: a proposal packet reaching an operator. GATED, and
     # a zero here is the EXPECTED reading twice over — `GHOST_EVOLVE` is
     # off by default, and even with it on a candidate must clear static,

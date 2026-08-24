@@ -196,6 +196,493 @@ def _step_result_ok(result_str: str) -> bool:
     )
 
 
+# ── Auto-mint: a param SCHEMA, not baked literals (§4CS, 2026-08-23) ──
+#
+# An auto-mined macro used to get, per step, the MOST COMMON observed
+# argument dict. That replays a stale one-off WRITE verbatim on every run
+# (live: manage_projects(action='task_update', status='DONE',
+# project_id=<old>, task_id=<old>, description='Simplified demo.py…')).
+# The 2026-07-29 remedy was a tool DENY-LIST in core/dream.py that blanked
+# the whole template for eleven tools — it removed the hazard and the
+# artifact with it. A param-less macro advertises zero inputs, so every
+# step runs with no args and it can never be activated. Measured
+# 2026-08-23: 25 auto-mined macros, 0 invocations, all time.
+#
+# This mints a SCHEMA instead. Per (step, key) the observed values decide:
+#
+#   literal — the value is CONSTANT across every observation AND is drawn
+#             from the tool's OWN DECLARED ``enum``. That is the whole
+#             rule. An enum is a closed set the tool itself publishes, so
+#             an enum member is a MODE — the macro's identity — and cannot
+#             be a path, a command, an id, or free text.
+#   dropped — a constant flag or blank (bool / None / "" / an empty
+#             container) that the tool does not require. It carries no
+#             identity, and dropping is strictly safer than freezing: an
+#             omitted flag cannot pre-authorise anything.
+#   slot    — EVERYTHING ELSE becomes ``$name``, which ``to_tool_definitions``
+#             already advertises as a REQUIRED runtime param and
+#             ``_resolve_args`` already substitutes at call time. No new
+#             execution machinery: this fills a hole in an existing one.
+#
+# ⚠ THE FIRST VERSION OF THIS RULE ALSO FROZE ANY "payload-free" CONSTANT
+# — bool, number, None, "" — on the reasoning that such a value cannot
+# carry a path or a command. A reviewer ran it and found two holes, and
+# both are the same mistake: the predicate named a SHAPE and the property
+# needed was a ROLE.
+#   * `postgres_admin.confirm=True` is a bool, and it is the DESTRUCTIVE-DDL
+#     AUTHORISATION. The macro would have pre-consented to DROP/TRUNCATE
+#     and asked the caller only for `$sql`.
+#   * `manage_projects(task_id=42)` is an int — the exact stale-id replay
+#     the deny-list existed for, reproduced through its replacement. It did
+#     not fire live only because this project's ids happen to be hex
+#     strings. `manage_services(port=5055)` WAS being frozen for real.
+# So the licence is now enum-membership alone, which is the tool's own
+# statement about its own closed sets rather than our guess about its
+# values. The test is on the VALUE, not the tool NAME, so it still
+# subsumes the deny-list — and now the claim it makes is true.
+
+#: A macro needing more runtime inputs than this is not a macro, it is a
+#: form — minting it produces an artifact no caller can fill.
+MACRO_MAX_RUNTIME_SLOTS = 6
+
+_SLOT_KEY_RE = re.compile(r"[^A-Za-z0-9_]")
+_SLOT_HEAD_RE = re.compile(r"^[A-Za-z_]")
+
+#: Built once from the tool registry. Never populated with a FAILURE —
+#: see `_tool_schema_index`.
+_TOOL_SCHEMA_INDEX: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+# ⚠ `_carries_no_identity` LIVED HERE and is GONE (review round 2). It named
+# a value's SHAPE — bool / number / None / "" / empty container — and licensed
+# first FREEZING and then DROPPING such a constant. Both were wrong, because
+# the property needed was a ROLE, not a shape: `postgres_admin.confirm=True`
+# is a bool AND the destructive-DDL authorisation, and `browser.stop_on_error`
+# defaults to False so dropping an observed True inverts a fail-fast interlock
+# to fail-open. Only the tool's own dispatch selector is frozen now, and
+# everything else slots — so nothing needs this predicate. Deleted rather than
+# left behind: a helper nobody calls reads as a guard that is still guarding.
+
+
+def _tool_schema_index(force: bool = False):
+    """``{tool: {"enums": {param: [values]}, "required": (params,)}}``, or
+    ``None`` when the tool registry cannot be read.
+
+    ``None`` is NOT an empty index. Without the registry we cannot tell a
+    mode selector from a payload, and cannot tell whether a step's
+    template covers its required params — so callers must treat ``None``
+    as "mint nothing this pass". The alternative is the shape this project
+    keeps finding, where a check that cannot run reports the favourable
+    outcome.
+
+    A tool that is simply ABSENT from a registry that loaded is a genuine
+    absence (no enums, no known required params), which is a different
+    answer from a registry that failed.
+    """
+    global _TOOL_SCHEMA_INDEX
+    if _TOOL_SCHEMA_INDEX is not None and not force:
+        return _TOOL_SCHEMA_INDEX
+    try:
+        # Lazy: registry.py imports THIS module at import time, so a
+        # module-level import here is a cycle.
+        from .registry import TOOL_DEFINITIONS, get_active_tool_definitions
+    except Exception as exc:                                # pragma: no cover
+        logger.warning("macro mint: tool registry unreadable (%s) — no "
+                       "macro can be minted this pass", exc)
+        return None
+    # ⚠ REVIEW ROUND 1: the static list is NOT the tool set. `vision_analysis`
+    # (unconditionally) and `image_generation` (with an image node) are
+    # APPENDED in `get_active_tool_definitions`, so an index built from
+    # `TOOL_DEFINITIONS` alone did not know `vision_analysis` — the tool in
+    # the single highest-support mined sequence on the live corpus. Union
+    # the two: the context-free call adds what it can, the static list
+    # backstops anything that call drops for want of a context.
+    entries = list(TOOL_DEFINITIONS or ())
+    try:
+        entries += list(get_active_tool_definitions(None) or ())
+    except Exception as exc:                                # noqa: BLE001
+        logger.debug("macro mint: active tool definitions unavailable (%s); "
+                     "falling back to the static list", exc)
+    idx: Dict[str, Dict[str, Any]] = {}
+    for entry in entries:
+        fn = (entry or {}).get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        schema = fn.get("parameters") or {}
+        props = schema.get("properties") or {}
+        enums = {p: list(spec["enum"]) for p, spec in props.items()
+                 if isinstance(spec, dict) and isinstance(spec.get("enum"), list)}
+        required = tuple(schema.get("required") or ())
+        # ⚠ REVIEW ROUND 2. "Enum-typed" is NOT the same as "a mode". A
+        # tool's PRIMARY DISPATCH SELECTOR — the enum it requires, which
+        # decides which operation runs — is the macro's identity. Its
+        # OTHER enums are payload: `manage_projects.status` is enum-typed
+        # and it is the VALUE BEING WRITTEN, so freezing it re-froze half
+        # of the very artifact the retired deny-list existed for
+        # (`task_update status=DONE` with stale ids), live, on 2 of 12
+        # mintable sequences. Same for `.kind`, `.artifact_kind`,
+        # `.dependency_type`, `browser.wait_until`,
+        # `manage_composed_skills.mode` and `list_lessons.scope`.
+        #
+        # A tool that requires no enum but publishes exactly one named
+        # `action`/`operation` still has a selector (`workspace`,
+        # `introspect`); anything else does not.
+        req_enums = [k for k in enums if k in required]
+        if req_enums:
+            selector = req_enums[0]
+        else:
+            named = [k for k in enums if k in ("action", "operation")]
+            selector = named[0] if len(named) == 1 else None
+        idx[str(name)] = {"enums": enums,
+                          "selector": selector,
+                          "params": tuple(props),
+                          "required": required}
+    _TOOL_SCHEMA_INDEX = idx
+    return idx
+
+
+def macro_step_inputs(param_template) -> List[str]:
+    """Slot names one step's ``param_template`` references, first-seen order."""
+    out: List[str] = []
+    for v in (param_template or {}).values():
+        if not isinstance(v, str):
+            continue
+        for mo in _VAR_RE.finditer(v):
+            nm = mo.group(1) or mo.group(2)
+            if nm and nm not in out:
+                out.append(nm)
+    return out
+
+
+def macro_mode_key(tool_name: str, args) -> tuple:
+    """The modes a single observed call FIXES, as a canonical key.
+
+    A tool's ``enum``-declared params are its mode selectors — the closed
+    sets it publishes (``file_system.operation``, ``manage_services.action``).
+    Only values actually drawn from the declared enum count, so this agrees
+    exactly with what ``mint_param_schema`` is willing to freeze as a
+    literal.
+
+    §4CS: the miner keys its windows on ``(tool, mode)`` rather than the
+    tool name alone. Measured on the live corpus, name-only keying collapsed
+    "read a file then START a service", "edit a file then RESTART a service"
+    and "list a dir then start a service" into ONE signature whose operation
+    and action therefore varied, so every mode became a runtime slot and the
+    macro lost its identity: 2 of 106 windows were mintable. Keying on the
+    mode separates them and 91 are — and they read as real workflows.
+    """
+    idx = _tool_schema_index()
+    if idx is None:
+        return ()
+    enums = (idx.get(tool_name) or {}).get("enums") or {}
+    args = args if isinstance(args, dict) else {}
+    return tuple(sorted((k, str(args[k])) for k, allowed in enums.items()
+                        if k in args and args[k] in allowed))
+
+
+def macro_identity(steps) -> tuple:
+    """Canonical identity of a macro: its tools AND the modes it FIXES.
+
+    ``steps`` is an iterable of ``(tool_name, param_template)``. This is the
+    ONE definition both sides of the re-propose guard use — the miner stamps
+    it onto a proposal, and `Dreamer._propose_macros_sync` derives it from
+    what is already on file. Deriving each side separately is how the guard
+    used to compare a mined ``(tool, mode)`` window against a stored
+    tool-name tuple and suppress every mode variant after the first.
+    """
+    idx = _tool_schema_index() or {}
+    out = []
+    for tool, template in steps:
+        enums = (idx.get(tool) or {}).get("enums") or {}
+        fixed = tuple(sorted(
+            (k, str(v)) for k, v in (template or {}).items()
+            if k in enums and not (isinstance(v, str) and v.startswith("$"))))
+        out.append((str(tool), fixed))
+    return tuple(out)
+
+
+#: Tools that must never anchor an auto-proposed macro: meta / control-flow
+#: tools, or one-off side-effecting tools that are not reusable as a bundled
+#: step. A sequence made up entirely of these is dropped.
+#:
+#: ⚠ REVIEW ROUND 2 moved this here from `core/dream.py`. It gated the DREAM
+#: producer only, so the skills_auto graduation producer — which reaches
+#: `compile_from_pattern` by a different route — applied NO admission rule
+#: at all. Over the live corpus that path offered
+#: `manage_composed_skills{action:run, name:$name, params:$params} → …`:
+#: a macro whose first step RUNS AN ARBITRARY COMPOSED SKILL by name, which
+#: is exactly the meta-recursion this set exists to prevent (and the same
+#: enum publishes `approve` and `delete`). It also offered
+#: `notify_operator → notify_operator` and `web_search × 3`, all of which
+#: the dream miner's same-tool rule refuses. Nothing shipped from them only
+#: because an unrelated statistical threshold happened to bite first.
+MACRO_IGNORE_TOOLS = frozenset({
+    "replan", "abort_attempt", "flag_uncertainty", "manage_composed_skills",
+    "create_skill", "manage_skills", "self_play", "self_play_loop",
+    "stop_self_play", "dream_mode", "self_state", "introspect",
+})
+
+
+#: The stamps BOTH auto-mint producers write into a macro's
+#: `trigger_description`, and that `core/liveness._is_loop_minted_macro`
+#: reads back to decide whether a stored macro is the LOOP's output.
+#:
+#: ⚠ ONE definition, deliberately. The reader used to hold COPIES of the
+#: producers' strings with nothing linking them, so rewording either
+#: producer — a pure refactor — made the loop's own output invisible to
+#: the yield surface AND made the row assert a fabricated provenance fact
+#: ("2 hand-written macro(s) excluded" about two macros the loop had just
+#: minted), with the suite green. Provenance is a semantic property, and a
+#: detached copy of a string is a lexical proxy for it.
+MACRO_MARK_MINED = "Auto-discovered recurring sequence"
+MACRO_MARK_GRADUATED = "sequence graduated from"
+
+
+def macro_sequence_admissible(tool_names) -> Optional[str]:
+    """Why this tool sequence must not become a macro, or None.
+
+    ONE definition, called by BOTH producers. Splitting it is how the
+    graduation path ended up with no admission rule at all.
+    """
+    tools = [str(t) for t in (tool_names or ())]
+    if not tools:
+        return "empty tool sequence"
+    if not all(tools):
+        return "the sequence contains an unnamed tool call"
+    if all(t in MACRO_IGNORE_TOOLS for t in tools):
+        return ("every step is a meta / control-flow tool, which is not "
+                "reusable as a bundled step")
+    if any(t in MACRO_IGNORE_TOOLS for t in tools):
+        return (f"step tool(s) {sorted(set(tools) & MACRO_IGNORE_TOOLS)} are "
+                f"meta / control-flow tools — a macro that drives the macro "
+                f"system, self-play, or the skill store is not a workflow")
+    if len(set(tools)) == 1:
+        return (f"every step is `{tools[0]}` — a single tool repeated is a "
+                f"loop, not a composed skill")
+    return None
+
+
+def harvest_step_observations(trajectories, tool_sequence) -> List[List[dict]]:
+    """Index-aligned argument sets for a name-only candidate sequence.
+
+    `skills_auto`'s `SkillCandidate` carries only tool NAMES ("Arg-level
+    consolidation is the consolidator's job" — skills_auto/extractor.py),
+    which is why the graduation mint passed ``params: {}`` for every step
+    and produced nine permanently unactivatable `auto_generic_*` macros.
+    The arguments were never missing, only unread: they are on the same
+    trajectories that phase already walked.
+
+    Matches a trajectory only when its WHOLE named tool sequence equals
+    ``tool_sequence`` — the candidate's identity is the whole chain, so a
+    sub-window would pair position k with a different call. Only ``passed``
+    trajectories count, matching the miner's own support rule.
+    """
+    seq = tuple(str(t) for t in (tool_sequence or ()))
+    out: List[List[dict]] = [[] for _ in seq]
+    if not seq:
+        return out
+    for traj in trajectories or ():
+        if (getattr(traj, "outcome", "") or "") != "passed":
+            continue
+        named = [c for c in (getattr(traj, "tool_calls", None) or ())
+                 if c is not None and (getattr(c, "name", "") or "").strip()]
+        if tuple((c.name or "").strip() for c in named) != seq:
+            continue
+        for pos, call in enumerate(named):
+            args = getattr(call, "arguments", None)
+            out[pos].append(args if isinstance(args, dict) else {})
+    return out
+
+
+def mint_param_schema(tool_names, observations, *,
+                      max_slots: int = MACRO_MAX_RUNTIME_SLOTS):
+    """Build per-step ``param_template``s for a mined tool sequence.
+
+    Parameters
+    ----------
+    tool_names
+        Ordered tool names, one per step.
+    observations
+        One list per step, INDEX-ALIGNED across steps:
+        ``observations[pos][k]`` is the argument dict the tool at ``pos``
+        was called with on occurrence ``k``. The alignment is what lets
+        two positions share one slot when they always carried the same
+        value — "read then edit the SAME file" is one input, not two.
+
+    Returns
+    -------
+    ``(templates, slots, reason)``. ``reason`` is ``None`` when the result
+    is mintable; otherwise it names why and ``templates`` must not be used.
+    """
+    idx = _tool_schema_index()
+    tool_names = list(tool_names or ())
+    if idx is None:
+        return [], [], "tool registry unreadable"
+    n_steps = len(tool_names)
+    if not n_steps:
+        return [], [], "empty tool sequence"
+
+    obs = [list(observations[i]) if i < len(observations) else []
+           for i in range(n_steps)]
+    # Occurrences are index-aligned across positions; a ragged sample set
+    # would pair position 0's occurrence k with position 1's occurrence k
+    # from a DIFFERENT window, so truncate to the common prefix.
+    n_obs = min(len(o) for o in obs)
+    obs = [[d if isinstance(d, dict) else {} for d in o[:n_obs]] for o in obs]
+
+    literals: List[Dict[str, Any]] = [{} for _ in range(n_steps)]
+    slot_groups: Dict[tuple, List[tuple]] = {}
+    group_order: List[tuple] = []
+
+    for pos, tool in enumerate(tool_names):
+        spec = idx.get(tool) or {}
+        enums = spec.get("enums") or {}
+        selector = spec.get("selector")
+        dicts = obs[pos]
+        if not dicts:
+            continue
+        keys = set(dicts[0])
+        for d in dicts[1:]:
+            keys &= set(d)
+        for key in sorted(keys):
+            values = [d.get(key) for d in dicts]
+            try:
+                norm = tuple(json.dumps(v, sort_keys=True, default=str)
+                             for v in values)
+            except Exception:
+                norm = tuple(repr(v) for v in values)
+            v0 = values[0]
+            constant = len(set(norm)) == 1
+            if (constant and key == selector
+                    and v0 in (enums.get(key) or ())):
+                # THE MODE, and the only thing ever frozen: the value of
+                # the tool's own primary dispatch selector, drawn from the
+                # closed set the tool publishes.
+                literals[pos][key] = v0
+                continue
+            # ⚠ REVIEW ROUND 2 REMOVED THE "DROP" BRANCH that used to sit
+            # here for a constant flag or blank. Its comment claimed
+            # "dropping is strictly the safe direction", and two of its
+            # three examples (`port`, `limit`) were numbers this same fix
+            # already routes to slots — it was defending a branch that had
+            # been removed. Worse, the claim was FALSE for live booleans:
+            # `browser.stop_on_error` defaults to False, so dropping an
+            # observed True silently inverts a fail-fast interlock to
+            # fail-open, and `browser.full_page` defaults True in the
+            # other direction. Exactly one param in the whole registry
+            # declares a schema `default`, so there was no sound basis for
+            # deciding what an omission means. Everything that is not the
+            # selector now becomes an explicit runtime slot: the caller
+            # decides each time, and nothing is silently unset.
+            gk = (key, norm)
+            if gk not in slot_groups:
+                slot_groups[gk] = []
+                group_order.append(gk)
+            slot_groups[gk].append((pos, key))
+
+    slot_for: Dict[tuple, str] = {}
+    used: set = set()
+    for gk in group_order:
+        base = _SLOT_KEY_RE.sub("_", str(gk[0]))[:40] or "arg"
+        if not _SLOT_HEAD_RE.match(base):
+            base = f"a_{base}"[:40]
+        name, n = base, 1
+        while name in used:
+            n += 1
+            name = f"{base}_{n}"
+        used.add(name)
+        slot_for[gk] = name
+
+    templates = [dict(literals[pos]) for pos in range(n_steps)]
+    for gk, members in slot_groups.items():
+        for pos, key in members:
+            templates[pos][key] = f"${slot_for[gk]}"
+
+    slots = sorted(used)
+    if len(slots) > max_slots:
+        return templates, slots, (
+            f"needs {len(slots)} runtime inputs (max {max_slots})")
+    for pos, tool in enumerate(tool_names):
+        spec = idx.get(tool)
+        if spec is None:
+            # ⚠ REVIEW ROUND 1. This used to `continue`, on the reasoning
+            # that an absent tool has "unknown requirements, nothing to
+            # check". But `continue` skips ALL THREE refusal checks —
+            # required-param coverage, the empty template, and the mode
+            # identity — so a tool outside the registry was silently
+            # exempt from every one of them. Live effect: `vision_analysis`
+            # is appended by `get_active_tool_definitions`, not present in
+            # the static `TOOL_DEFINITIONS`, so `browser:screenshot →
+            # vision_analysis{$action,$target}` minted with step 2 fixing
+            # no mode and asking the model to supply the tool's own action
+            # — precisely the degenerate artifact the checks reject.
+            # Registry membership was a PROXY for "we know this tool's
+            # modes"; a check that cannot run must not report the
+            # favourable outcome.
+            return templates, slots, (
+                f"step {pos + 1} ({tool}) is not in the tool registry, so "
+                f"its required params and its modes cannot be checked")
+        template = templates[pos]
+        missing = [r for r in spec["required"] if r not in template]
+        if missing:
+            return templates, slots, (
+                f"step {pos + 1} ({tool}) has neither a value nor a slot "
+                f"for required param(s): {', '.join(missing)}")
+        # ── The macro must have an IDENTITY ──────────────────────────
+        # Coverage alone admits degenerate artifacts. Measured against the
+        # live corpus 2026-08-23: of 47 sequences that passed the coverage
+        # check, most minted as `file_system{$operation,$path} →
+        # manage_services{$action}` — every mode selector left to the
+        # caller. That is not a macro, it is a re-spelling of "call these
+        # two tool types in this order", and the model will always reach
+        # for the tools directly instead. Minting 47 of them into a
+        # 50-entry registry with LRU-ish eviction would also push out the
+        # macros that do mean something.
+        if spec["params"] and not template:
+            # The observations shared no key at all (e.g. some `execute`
+            # calls carried `command`, others `filename`+`content`), so we
+            # learned nothing about how this step is called.
+            return templates, slots, (
+                f"step {pos + 1} ({tool}) has an empty template: the "
+                f"observed calls share no common argument")
+        selector = spec.get("selector")
+        if selector and not (selector in template
+                             and not str(template[selector]).startswith("$")):
+            return templates, slots, (
+                f"step {pos + 1} ({tool}) fixes no mode: its dispatch "
+                f"selector `{selector}` varied across observations, so the "
+                f"macro has no identity")
+        # ⚠ EVERY STEP MUST CARRY A RUNTIME INPUT. Review round 2, and it
+        # is the CRITICAL of that round: a step with no slot is a call
+        # FULLY DETERMINED AT MINT TIME, which is the literal definition
+        # of the replay hazard the retired deny-list existed for, stated
+        # at the step level. Confirmed mintable before this check:
+        #
+        #     file_system{operation:read, path:$path}
+        #     knowledge_base{action:reset_all}     ← no runtime input
+        #     manage_services{action:stop-all}     ← no runtime input
+        #
+        # `knowledge_base(action='reset_all')` deletes every id in the
+        # vector store, truncates the library index and calls
+        # `graph_memory.wipe_all()`, with no confirmation gate of any
+        # kind; and a macro's steps are dispatched through
+        # `build_step_executor`, which calls the tool function directly
+        # and never reaches the turn loop's mutation classification. So a
+        # zero-input mutating step has no guard above it at all.
+        #
+        # This is deliberately a STRUCTURAL rule and not a list of
+        # dangerous verbs: every exemption in this project's deny-lists
+        # became the next bypass (§4CI). The measured cost is one benign
+        # read-only bundle (`introspect:summary → workspace:summary`),
+        # which is the price of not having a list to leak.
+        if not macro_step_inputs(template):
+            return templates, slots, (
+                f"step {pos + 1} ({tool}) takes NO runtime input: the call "
+                f"would be fully determined at mint time, which is a replay")
+    return templates, slots, None
+
+
 @dataclass
 class SkillStep:
     """A single step in a composed skill."""
@@ -438,6 +925,7 @@ class ComposedSkillRegistry:
         # "proposed" (vanishing from the tool list) and wiping its stats.
         existing = self.skills.get(safe_name)
         if existing is not None:
+            self._upgrade_paramless(existing, tool_sequence)
             return existing
 
         steps = []
@@ -456,6 +944,54 @@ class ComposedSkillRegistry:
         )
         self.register(skill)
         return skill
+
+    def _upgrade_paramless(self, existing: "ComposedSkill",
+                           tool_sequence: List[Dict[str, Any]]) -> bool:
+        """Give a still-PROPOSED macro the runtime slots it was minted without.
+
+        §4CS. Re-minting an existing macro is a no-op BY DESIGN — it must
+        never demote an operator-approved macro back to "proposed" and wipe
+        its stats. The side effect was that the 25 macros minted before the
+        param-schema mint existed could never acquire one: they were parked
+        with empty templates, advertising zero inputs, permanently
+        unactivatable.
+
+        This is one MONOTONE upgrade step. A macro that is not active and
+        carries ZERO ``$slot`` references adopts the incoming templates iff
+        those carry at least one, and iff the step tools still match
+        position-for-position. An ACTIVE macro is never touched; a macro
+        that already has slots is never rewritten. So it is idempotent and
+        it terminates.
+        """
+        if existing.status == "active":
+            return False
+        if any(macro_step_inputs(s.param_template) for s in existing.steps):
+            return False
+        entries = list(tool_sequence or ())
+        if len(entries) != len(existing.steps):
+            return False
+        incoming = [(e or {}).get("params") or {} for e in entries]
+        if not any(macro_step_inputs(p) for p in incoming):
+            return False
+        for step, entry in zip(existing.steps, entries):
+            if step.tool_name != (entry or {}).get("tool"):
+                return False
+        for step, entry, params in zip(existing.steps, entries, incoming):
+            step.param_template = dict(params)
+            desc = (entry or {}).get("description")
+            if desc:
+                step.description = desc
+        self.save()
+        pretty_log(
+            "Macro Schema",
+            f"'{existing.name}' was minted param-less and could not be "
+            f"activated; it now carries runtime slots "
+            f"({', '.join('$' + s for s in sorted({n for st in existing.steps for n in macro_step_inputs(st.param_template)}))}). "
+            f"Still status=proposed — approve it with "
+            f"manage_composed_skills(action='approve').",
+            icon=Icons.BRAIN_PLAN,
+        )
+        return True
 
     def to_tool_definitions(self) -> List[dict]:
         """Render each registered composed skill as an LLM-facing tool definition.
@@ -1124,10 +1660,24 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         # not per-step args), so the old blanket "mined from past calls"
         # claim was false on that path and the approved macro surprised the
         # operator by demanding args at run time.
+        # ⚠ REVIEW ROUND 2: `_has_params` is now TRUE for every minted
+        # macro (§4CS gives each step a schema), so the "mined from past
+        # calls" branch fired for macros whose templates are `$slots`, not
+        # mined values — and the branch that tells the operator inputs are
+        # required at invocation became unreachable for exactly the macros
+        # that require them. Three states, not two.
+        _slots = sorted({n for st in sk.steps
+                         for n in macro_step_inputs(
+                             getattr(st, "param_template", None))})
         _has_params = any(getattr(st, "param_template", None) for st in sk.steps)
         _param_note = (
-            "Its step parameters were mined from past calls; delete + "
-            "redefine if you want to adjust them."
+            f"It takes {len(_slots)} runtime input(s): "
+            + ", ".join("$" + n for n in _slots)
+            + ". Those are SLOTS, not values mined from past calls — supply "
+              "them when you call the macro."
+            if _slots else
+            "Its step parameters are fixed values with no runtime inputs; "
+            "delete + redefine if you want to adjust them."
             if _has_params else
             "NOTE: its step parameter templates are EMPTY (auto-graduated "
             "sequences carry tool order only) — each step's mandatory "

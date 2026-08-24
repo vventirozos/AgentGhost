@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import re
+import stat
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -1105,6 +1106,52 @@ _HUNK_FULL_RE = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 
 
+#: A re-anchor never needs more than this, and the path it reads comes
+#: from a line the MODEL wrote.
+MAX_ANCHOR_SOURCE_BYTES = 4_000_000
+
+
+def _read_anchor_source(root: Path, target: str):
+    """The candidate file to re-anchor against, or None to leave the hunk.
+
+    ⚠ THIS PATH IS MODEL-CONTROLLED AND UNVETTED AT THIS POINT.
+    `repair_hunk_starts` runs BEFORE `validate_diff`, so the `+++` line
+    has not yet been checked against the fence. Reading it naively:
+
+    * `+++ b/../outside_secret.txt` read a file OUTSIDE the repo and
+      re-anchored against it — `validate_diff` only objected afterwards;
+    * `root / "/etc/hosts"` discards `root` entirely, because that is
+      what `pathlib` does with an absolute right-hand side;
+    * `+++ /dev/zero` reached **3.9 GB RSS in 2 seconds and never
+      returned**, and a FIFO blocked indefinitely — and this runs
+      SYNCHRONOUSLY on the event loop, unlike `materialize`, which is
+      deliberately wrapped in `asyncio.to_thread` for exactly this
+      hazard. One model-authored line wedges the process, and
+      `/dev/null` is one character from `/dev/zero`.
+
+    So: repo-relative only, no escapes, a regular file, and bounded.
+    None of this replaces `validate_diff` — it makes the read that
+    happens before it survivable.
+    """
+    rel = str(target or "")
+    if not rel or Path(rel).is_absolute():
+        return None
+    try:
+        base = Path(root).resolve()
+        cand = (base / rel).resolve()
+        if not str(cand).startswith(str(base) + os.sep):
+            return None                       # escapes the repo
+        st = cand.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return None                       # device, FIFO, socket, symlink
+        if st.st_size > MAX_ANCHOR_SOURCE_BYTES:
+            return None
+        return cand.read_text(encoding="utf-8",
+                              errors="replace").splitlines()
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
 def repair_hunk_starts(diff: str, repo_root: Path = None) -> Tuple[str, int]:
     """Re-anchor each hunk's START LINE by finding its context in the file.
 
@@ -1125,43 +1172,129 @@ def repair_hunk_starts(diff: str, repo_root: Path = None) -> Tuple[str, int]:
     root = Path(repo_root or Path(__file__).resolve().parents[3])
     lines = str(diff or "").splitlines()
     target, out, moved, i = None, [], 0, 0
+    # ⚠ KEYED BY PATH, NOT RESET PER SECTION. A diff may carry two
+    # `--- `/`+++ ` sections naming the SAME file — `check_diff_shape`
+    # counts unique paths, so `files=1` and the shape is allowed — and
+    # `patch` applies the second to the ALREADY-PATCHED file. Resetting
+    # the offset on every `+++` made the second section's new-side
+    # starts one short, `patch` still produced exactly correct bytes,
+    # and `applied_where_it_said` then objected — discarding a perfectly
+    # good candidate and recording it, by normalised hash, as one the
+    # model may never propose again.
+    offsets: Dict[str, int] = {}
     while i < len(lines):
         ln = lines[i]
         if ln.startswith("+++ "):
             rel = ln[4:].strip().split("\t")[0]
             target = rel[2:] if rel.startswith(("a/", "b/")) else rel
+            offsets.setdefault(target, 0)
             out.append(ln); i += 1; continue
         m = _HUNK_FULL_RE.match(ln)
         if not m or not target:
             out.append(ln); i += 1; continue
         a_start, a_len, b_start, b_len, trailer = m.groups()
         body, j = [], i + 1
-        while j < len(lines) and lines[j][:1] in (" ", "+", "-", "\\"):
-            if lines[j].startswith(("--- ", "+++ ")):
-                break
+        while not _body_ends_here(lines, j):
             body.append(lines[j]); j += 1
-        old_side = [x[1:] for x in body if x[:1] in (" ", "-")]
-        try:
-            src = (root / target).read_text(encoding="utf-8",
-                                            errors="replace").splitlines()
-        except OSError:
+        old_side = [x[1:] if x else "" for x in body
+                    if x[:1] in (" ", "-") or x == ""]
+        new_len = sum(1 for x in body if x[:1] in (" ", "+") or x == "")
+        src = _read_anchor_source(root, target)
+        if src is None:
             out.append(ln); out.extend(body); i = j; continue
         hits = [k for k in range(len(src) - len(old_side) + 1)
                 if src[k:k + len(old_side)] == old_side] if old_side else []
         if len(hits) == 1:
-            new_start = hits[0] + 1
-            if str(new_start) != a_start:
+            new_a = hits[0] + 1
+            # ⚠ THE NEW-SIDE START IS NOT THE OLD-SIDE START. It is offset
+            # by the net lines every EARLIER hunk in this file added.
+            # Setting them equal silently rewrote `@@ -6,2 +7,3 @@` to
+            # `@@ -6,2 +6,3 @@` on a diff that was already correct — and
+            # `applied_where_it_said` then rejected the candidate with a
+            # message blaming `patch`. Every multi-hunk proposal was a
+            # self-inflicted permanent failure, reported as someone
+            # else's fault.
+            new_b = new_a + offsets.get(target, 0)
+            head = (f"@@ -{new_a},{len(old_side)} "
+                    f"+{new_b},{new_len} @@{trailer}")
+            # ⚠ COUNT MOVES, NOT NORMALISATIONS. `@@ -1 +1,2 @@` is the
+            # valid short spelling of `@@ -1,1 +1,2 @@`, and comparing
+            # the STRINGS counted that rewrite as a relocation — so
+            # `hunks_reanchored` over-reported and an operator reading
+            # the ledger saw the model missing anchors it had hit. The
+            # question is whether the START changed.
+            if (new_a != int(a_start)) or (new_b != int(b_start)):
                 moved += 1
-            head = (f"@@ -{new_start},{a_len or len(old_side)} "
-                    f"+{new_start},{b_len or len(old_side)} @@{trailer}")
             out.append(head)
         else:
             out.append(ln)
+        # …and the offset advances on EVERY hunk, repaired or not.
+        offsets[target] = offsets.get(target, 0) + new_len - len(old_side)
         out.extend(body); i = j
     text = "\n".join(out)
     if diff.endswith("\n"):
         text += "\n"
     return text, moved
+
+
+def _is_file_header(lines: List[str], j: int) -> bool:
+    """Is `lines[j]` a diff FILE HEADER rather than diff CONTENT?
+
+    ⚠ `--- ` IS AMBIGUOUS. A deleted source line whose text is `-- x`
+    becomes `--- x` in the diff — byte-identical in prefix to the `---
+    a/path` header. Breaking the hunk-body scan on the prefix alone
+    truncated the body, which (a) mis-counts the header, and (b) since
+    the re-anchor's running `offset` is computed from body lengths,
+    poisons the NEW-SIDE START OF EVERY LATER HUNK IN THE FILE — one
+    ambiguous line silently relocating everything after it.
+
+    A real header always comes in a pair: `--- a/…` immediately followed
+    by `+++ b/…`. Content never does, because the `+++ ` line would have
+    to be an added line reading `++ …` on exactly the next line.
+    """
+    ln = lines[j] if 0 <= j < len(lines) else ""
+    if ln.startswith("--- "):
+        return j + 1 < len(lines) and lines[j + 1].startswith("+++ ")
+    if ln.startswith("+++ "):
+        return j > 0 and lines[j - 1].startswith("--- ")
+    return False
+
+
+def _body_ends_here(lines: List[str], j: int) -> bool:
+    """Should the hunk-body scan stop at `lines[j]`?
+
+    A bare "" is accepted as a body line — models strip the trailing
+    space off blank CONTEXT lines constantly — but a "" that SEPARATES
+    two file sections is not part of anything, and swallowing it
+    inflated both counts and made `patch` reject the result. Look ahead:
+    a blank followed by a header or a new hunk is a separator.
+    """
+    if j >= len(lines):
+        return True
+    ln = lines[j]
+    if _is_file_header(lines, j) or _HUNK_FULL_RE.match(ln):
+        return True
+    if ln == "":
+        # ⚠ A BLANK BEFORE `@@` IS THE HUNK'S LAST CONTEXT LINE, NOT A
+        # SEPARATOR. Within one file section hunks follow each other
+        # directly, so nothing separates them; only a `--- `/`+++ ` pair
+        # (a new file) or the end of the diff does. Treating `@@` as a
+        # separator dropped that context line from the body — shrinking
+        # both counts while still emitting the line — and `patch` then
+        # saw a stray blank plus `@@` and started a headerless section.
+        # MEASURED: it broke 26 of 299 diffs over real repo files that
+        # applied cleanly BEFORE the repair, on the one model behaviour
+        # this module's own comments say happens constantly (a blank
+        # context line arriving as "" rather than " "). A repair that
+        # breaks working diffs is worse than no repair, and the cost is
+        # permanent: the failure is archived by normalised hash, so the
+        # novelty filter blocks the model from ever re-proposing the
+        # same correct edit.
+        k = j + 1
+        while k < len(lines) and lines[k] == "":
+            k += 1
+        return k >= len(lines) or _is_file_header(lines, k)
+    return ln[:1] not in (" ", "+", "-", "\\")
 
 
 def repair_hunk_counts(diff: str) -> Tuple[str, int]:
@@ -1194,11 +1327,7 @@ def repair_hunk_counts(diff: str) -> Tuple[str, int]:
             continue
         a_start, _a_len, b_start, _b_len, trailer = m.groups()
         body, j = [], i + 1
-        while j < len(lines) and (
-                lines[j][:1] in (" ", "+", "-", "\\") or lines[j] == ""):
-            if lines[j].startswith(("--- ", "+++ ")) or \
-                    _HUNK_FULL_RE.match(lines[j]):
-                break
+        while not _body_ends_here(lines, j):
             body.append(lines[j])
             j += 1
         old_n = sum(1 for x in body if x[:1] in (" ", "-") or x == "")
@@ -1232,12 +1361,42 @@ def applied_where_it_said(dest: Path, diff: str) -> str:
     """
     files: dict = {}
     current = None
+    deleting = None          # repo-relative path this section REMOVES
+    last_old = None          # the `--- a/<path>` most recently seen
     hunk_start = None
     post: list = []
 
     def _flush() -> str:
+        # ⚠ A DELETED FILE STILL HAS TO BE DELETED. `+++ /dev/null` set
+        # `current = None`, so every hunk of a whole-file removal was
+        # skipped and this returned "no objection". Measured: Apple
+        # `patch` leaves a **0-byte file** rather than removing it, and
+        # both containment checks stayed silent about a tree that did
+        # not match the diff's own claim.
+        if current is None and deleting:
+            leftover = dest / deleting
+            if leftover.exists():
+                return (f"{deleting}: the diff deletes this file but it is "
+                        f"still present after patching "
+                        f"({leftover.stat().st_size} bytes) — the artefact "
+                        f"an operator reviews must be the artefact that ran")
+            return ""
         if current is None or hunk_start is None:
             return ""
+        # ⚠ AN EMPTY POST-IMAGE CANNOT BE CHECKED, AND MUST NOT PASS.
+        # A pure-deletion hunk with no context line leaves `post == []`,
+        # so the comparison below was `[] == []` — true wherever the
+        # hunk landed. Measured: a two-line deletion declared at line 1
+        # was applied 400 lines away, `patch` exited 0, and this
+        # returned "" while `materialize` archived the candidate and
+        # offered it to an operator. The re-anchor cannot cover it
+        # either: two matching blocks are ambiguous by design and left
+        # alone. Refusing is the only honest answer — a model can always
+        # emit context, and `difflib` always does.
+        if not post:
+            return (f"{current}: a hunk at line {hunk_start} has no context "
+                    f"or added lines, so there is nothing to compare and "
+                    f"nothing can show it landed where it said")
         try:
             body = (dest / current).read_text(errors="replace").splitlines()
         except Exception:          # noqa: BLE001
@@ -1250,7 +1409,8 @@ def applied_where_it_said(dest: Path, diff: str) -> str:
                     f"artefact that ran")
         return ""
 
-    for line in str(diff or "").replace("\r\n", "\n").splitlines():
+    all_lines = str(diff or "").replace("\r\n", "\n").splitlines()
+    for idx, line in enumerate(all_lines):
         m = _HUNK_HEAD_RE.match(line)
         if m:
             bad = _flush()
@@ -1258,14 +1418,31 @@ def applied_where_it_said(dest: Path, diff: str) -> str:
                 return bad
             hunk_start, post = int(m.group(1)), []
             continue
+        # ⚠ AN ADDED LINE CAN SPELL A FILE HEADER. Source text `++ x`
+        # becomes `+++ x` in the diff, and treating that as a header set
+        # `current = None` — after which every remaining hunk was
+        # skipped and this check returned "" for a diff it had stopped
+        # reading. A header is only ever the second half of a
+        # `--- `/`+++ ` pair.
+
+        if line.startswith("+++ ") and not (
+                idx and all_lines[idx - 1].startswith("--- ")):
+            post.append(line[1:])
+            continue
         if line.startswith("+++ "):
             bad = _flush()
             if bad:
                 return bad
             name = line[4:].split("\t")[0].strip()
             current = F._norm(name) if name != "/dev/null" else None
+            deleting = last_old if current is None else None
             files[current] = True
             hunk_start, post = None, []
+            continue
+        if line.startswith("--- "):
+            old_name = line[4:].split("\t")[0].strip()
+            last_old = (F._norm(old_name) if old_name != "/dev/null"
+                        else None)
             continue
         if line.startswith("---") or line.startswith("diff "):
             continue

@@ -63,6 +63,21 @@
     <li><code>record_usage(skill_name, success)</code> updates counters.</li>
   </ul>
 
+  <h2 id="schema-mint">Auto-minted macros carry a param SCHEMA (§4CS, 2026-08-24)</h2>
+  <p>An auto-mined macro's <code>param_template</code> is a <strong>schema</strong>, not arguments observed in the past. Per <code>(step, key)</code> a value survives as a literal only when it is constant across every observation <em>and</em> is the value of that tool's <strong>primary dispatch selector</strong> — the enum parameter the tool requires. Everything else becomes a <code>$slot</code>, so <code>to_tool_definitions()</code> advertises it as a REQUIRED runtime param and <code>_resolve_args()</code> fills it at call time. Two positions that always carried the same value <strong>share one slot</strong> ("read then edit the SAME file" is one input, not two).</p>
+  <p><strong>Why it changed.</strong> 25 auto-mined macros sat at <code>proposed</code> with 0 invocations, all time, because both producers emitted param-less templates — a macro that advertises no inputs cannot be activated. The full rationale, and the four holes two review rounds found in the first version of the rule, are in <a href="../core/dream.html#macro-schema">core/dream</a>.</p>
+  <p><strong>New API in this module:</strong></p>
+  <div class="scroll"><table>
+    <tr><th>Function</th><th>What it does</th></tr>
+    <tr><td><code>mint_param_schema(tool_names, observations) → (templates, slots, reason)</code></td><td>The schema builder both producers call. <code>reason</code> is <code>None</code> only when the result is activatable; otherwise it names why and <code>templates</code> must not be used.</td></tr>
+    <tr><td><code>macro_sequence_admissible(tool_names) → str | None</code></td><td>ONE admission rule for both producers: no meta / control-flow tool (<code>MACRO_IGNORE_TOOLS</code>), no single tool repeated.</td></tr>
+    <tr><td><code>macro_mode_key(tool, args)</code> · <code>macro_identity(steps)</code></td><td>A macro's identity is its tools <em>and</em> the modes it fixes. The miner keys its windows on this and the re-propose guard compares it, from ONE definition.</td></tr>
+    <tr><td><code>harvest_step_observations(trajectories, tool_sequence)</code></td><td>Index-aligned argument sets for a name-only graduation candidate. The arguments were never missing — only unread.</td></tr>
+    <tr><td><code>macro_step_inputs(template) → [slot, …]</code></td><td>The slot names one step references.</td></tr>
+    <tr><td><code>MACRO_MARK_MINED</code> · <code>MACRO_MARK_GRADUATED</code></td><td>The provenance stamps both producers write into <code>trigger_description</code> and <code>core/liveness</code> reads back. One definition: a detached copy is a lexical proxy for a provenance fact, and rewording a producer used to make the loop's own output invisible.</td></tr>
+    <tr><td><code>ComposedSkillRegistry._upgrade_paramless(existing, tool_sequence)</code></td><td>One MONOTONE upgrade: a still-<em>proposed</em> macro carrying zero slots adopts an incoming schema. An ACTIVE macro is never touched; a macro that already has slots is never rewritten.</td></tr>
+  </table></div>
+
   <h2>Status: active vs. proposed</h2>
   <p>The <code>status</code> field gates visibility:</p>
   <ul>

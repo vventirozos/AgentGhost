@@ -153,6 +153,77 @@ class GraduatedSkillStore:
             # the store won't surface.
             return entry if sig in data else None
 
+    #: Turn keys whose bookings are already on disk. Bounded, and keyed on
+    #: the TURN rather than kept in a single slot: the lesson system's
+    #: equivalent uses one `_retrieval_turn_key` that any interleaved
+    #: retrieval resets, which a review found to be one of three routes by
+    #: which it double-books. There is exactly one call site here and it is
+    #: not inside a loop, so this is insurance rather than load-bearing —
+    #: but a counter that can over-report is not an honest number.
+    _TURN_DEDUP_MAX = 64
+
+    def record_surfaced(self, hashes, *, turn_key: str = "") -> int:
+        """Book a retrieval for each graduated skill surfaced this turn.
+
+        §4CT — the write half of the gap. ONE load+save for the whole set
+        (the lesson store paid ~20 synchronous ~100KB rewrites per turn
+        before its bulk variant existed; this one starts bulk).
+
+        ⚠ WHAT THIS NUMBER MEANS, and what it does not. It counts times a
+        skill was INJECTED INTO THE PROMPT, which is the question the yield
+        surface could not answer. It is NOT a helpfulness signal: nothing
+        here says the model read it, used it, or benefited. The lessons
+        store has a second pair of arms (`succeeded_retrievals` /
+        `failed_retrievals`) fed from the turn's verified outcome; this
+        store does not, and the note on the yield row says so rather than
+        letting `invoked` be read as usefulness.
+
+        Idempotent per ``turn_key``: re-booking the same (turn, skill) is a
+        no-op. An EMPTY turn key cannot be deduped, so it books — that is
+        the honest direction for a real turn that somehow carries no
+        request id, and the caller gates simulated turns out before ever
+        getting here.
+
+        Returns the number of skills updated. Never raises: post-injection
+        bookkeeping must not break a turn.
+        """
+        keys = [str(h) for h in (hashes or []) if h and str(h).strip()]
+        if not keys:
+            return 0
+        with self._lock:
+            tk = str(turn_key or "")
+            if tk:
+                booked = getattr(self, "_booked_by_turn", None)
+                if booked is None:
+                    from collections import OrderedDict
+                    booked = OrderedDict()
+                    self._booked_by_turn = booked
+                seen = booked.setdefault(tk, set())
+                booked.move_to_end(tk)
+                while len(booked) > self._TURN_DEDUP_MAX:
+                    booked.popitem(last=False)
+                keys = [k for k in keys if k not in seen]
+                if not keys:
+                    return 0
+                seen.update(keys)
+            try:
+                data = self._load()
+                now = datetime.utcnow().isoformat() + "Z"
+                updated = 0
+                for k in keys:
+                    entry = data.get(k)
+                    if not isinstance(entry, dict):
+                        continue
+                    entry["retrievals"] = int(entry.get("retrievals") or 0) + 1
+                    entry["last_retrieved_at"] = now
+                    updated += 1
+                if updated:
+                    self._save(data)
+                return updated
+            except Exception as e:            # noqa: BLE001
+                logger.debug("record_surfaced skipped (non-critical): %s", e)
+                return 0
+
     def remove(self, signature_hash: str) -> bool:
         """Remove a graduated skill by signature hash. Returns True when an
         entry was actually deleted.
@@ -214,12 +285,35 @@ class GraduatedSkillStore:
         scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
         return [s for _, _, s in scored[:limit]]
 
+    def surfaced_for_prompt(self, *, query: Optional[str] = None,
+                            limit: int = 3):
+        """``(block, [signature_hash, ...])`` — the prompt block AND which
+        skills it surfaced.
+
+        §4CT. `format_for_prompt` returned only the text, so the ONE thing
+        the caller needed in order to record that a skill had been used was
+        thrown away at the moment it was known. That is why this loop read
+        `unmeasured` on the yield surface: the skills ARE injected on every
+        matching turn, and nothing anywhere counted it — an instrumentation
+        gap, not a dead loop, and the two lead opposite places.
+
+        `format_for_prompt` is now a thin wrapper over this, so there is one
+        formatter and the hashes cannot drift from the block that listed
+        them.
+        """
+        skills = self.relevant(query, limit=limit) if query else self.all_skills()[:limit]
+        if not skills:
+            return "", []
+        hashes = [str(s.get("signature_hash") or "") for s in skills
+                  if s.get("signature_hash")]
+        return self._render(skills), hashes
+
     def format_for_prompt(self, *, query: Optional[str] = None, limit: int = 3) -> str:
         """A system-prompt block surfacing proven approaches. Empty when
         there is nothing relevant to surface."""
-        skills = self.relevant(query, limit=limit) if query else self.all_skills()[:limit]
-        if not skills:
-            return ""
+        return self.surfaced_for_prompt(query=query, limit=limit)[0]
+
+    def _render(self, skills: List[dict]) -> str:
         lines = [
             "### PROVEN APPROACHES (auto-acquired from your own validated runs)"
         ]

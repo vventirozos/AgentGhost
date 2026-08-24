@@ -80,6 +80,18 @@ async def main() -> int:
     # it is the only direct evidence in the record that the subject was
     # swapped, and stage 1's premise test exists because that swap is
     # easy to get silently wrong.
+    #
+    # ⚠⚠ AND THIS LINE MUST COME BEFORE THE `dream_replay_smoke` IMPORT
+    # BELOW. That module does `sys.path.insert(0, REPO_ROOT/"src")` at
+    # import time, and under this child `__file__` is the CANONICAL
+    # scripts dir — so it puts the INCUMBENT's `src/` at `sys.path[0]`
+    # inside the candidate's own process. Binding `ghost_agent` first
+    # freezes its `__path__` to the candidate, and every later submodule
+    # then resolves from there regardless. MEASURED, both ways: in this
+    # order a module imported afterwards still comes from the candidate;
+    # with the two imports swapped, `ghost_agent.core.dream` resolves to
+    # the INCUMBENT and stages 2 and 3 grade the wrong tree in silence.
+    # A test pins the ordering — moving this line is not a refactor.
     from ghost_agent.core import dream as _dream
     print(f"agent module: {_dream.__file__}", flush=True)
 

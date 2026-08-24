@@ -38,9 +38,25 @@ class TestMining:
         props = mine_recurring_tool_sequences(trajs, min_support=3)
         assert len(props) == 1
         p = props[0]
-        assert p["signature"] == ("web_search", "deep_research")
+        # §4CS: the signature is the macro IDENTITY — tools AND the modes
+        # each step fixes. Neither tool declares an enum param, so both
+        # modes are empty here. Recomputed from the shared definition
+        # rather than restated, so the two cannot drift apart.
+        from ghost_agent.tools.composed_skills import macro_identity
+        assert p["signature"] == macro_identity(
+            (st["tool"], st["params"]) for st in p["steps"])
+        assert tuple(t for t, _m in p["signature"]) == (
+            "web_search", "deep_research")
         assert p["support"] == 3
-        assert p["steps"][0]["params"] == {"query": "x"}  # mined args, not empty
+        # §4CS: a mined arg becomes a runtime SLOT, never a frozen literal.
+        # Assert against the OBSERVED value, recomputed here, rather than
+        # restating the rule: whatever `web_search` was actually called
+        # with must not survive into the template.
+        observed = seq[0][1]["query"]
+        assert p["steps"][0]["params"] == {"query": "$query"}
+        assert observed not in p["steps"][0]["params"].values()
+        # The two steps' `query` values differed, so they are two inputs.
+        assert p["steps"][1]["params"] == {"query": "$query_2"}
         assert p["name"] == "auto_web_search_deep_research"
 
     def test_respects_min_support(self):
@@ -71,28 +87,74 @@ class TestMining:
 
     def test_subwindow_dedup(self):
         # A recurring triple subsumes its same-support sub-pairs.
-        seq = [("a", {}), ("b", {}), ("c", {})]
+        # ⚠ REAL tools: since §4CS a step whose tool is absent from the
+        # registry is refused outright (its required params and its modes
+        # cannot be checked), so placeholder names never reach the
+        # sub-window logic this test is about.
+        seq = [("web_search", {"query": "q"}),
+               ("browser", {"operation": "navigate", "url": "u"}),
+               ("file_system", {"operation": "write", "path": "/p",
+                                "content": "c"})]
         trajs = [_traj(f"t{i}", seq) for i in range(4)]
-        sigs = [p["signature"] for p in mine_recurring_tool_sequences(trajs, min_support=3, max_proposals=5)]
-        assert ("a", "b", "c") in sigs
-        assert ("a", "b") not in sigs
-        assert ("b", "c") not in sigs
+        sigs = [tuple(t for t, _m in p["signature"])
+                for p in mine_recurring_tool_sequences(
+                    trajs, min_support=3, max_proposals=5)]
+        assert ("web_search", "browser", "file_system") in sigs
+        assert ("web_search", "browser") not in sigs
+        assert ("browser", "file_system") not in sigs
 
-    def test_most_common_args_wins(self):
+    def test_majority_arg_no_longer_wins_it_becomes_a_slot(self):
+        """§4CS retires "most common args wins".
+
+        The old miner froze the MAJORITY argument dict into the template,
+        so a macro replayed one past call's payload on every run. A value
+        that varies across observations is now a runtime slot, and the
+        majority value must not appear anywhere in the minted template.
+        """
+        values = ["common", "common", "common", "rare"]
         trajs = [
-            _traj("t1", [("web_search", {"q": "common"}), ("deep_research", {})]),
-            _traj("t2", [("web_search", {"q": "common"}), ("deep_research", {})]),
-            _traj("t3", [("web_search", {"q": "common"}), ("deep_research", {})]),
-            _traj("t4", [("web_search", {"q": "rare"}), ("deep_research", {})]),
+            _traj(f"t{i}", [("web_search", {"query": v}),
+                            ("deep_research", {"query": v})])
+            for i, v in enumerate(values)
         ]
         props = mine_recurring_tool_sequences(trajs, min_support=3)
-        assert props[0]["steps"][0]["params"] == {"q": "common"}
+        assert props, "a 4-support pair must still be mined"
+        templates = [st["params"] for st in props[0]["steps"]]
+        assert templates[0] == {"query": "$query"}
+        # Identity check against the recomputed observation set: no value
+        # the tool was ever called with survives as a literal.
+        frozen = {v for t in templates for v in t.values()}
+        assert frozen & set(values) == set(), frozen
+        # Both steps always carried the SAME value, so they share ONE slot.
+        assert templates[1] == {"query": "$query"}
 
     def test_caps_at_max_proposals(self):
+        # Four distinct REAL pairs, each of which mints (see the note in
+        # test_subwindow_dedup for why placeholder tool names cannot).
+        pairs = (
+            [("web_search", {"query": "q"}),
+             ("browser", {"operation": "navigate", "url": "u"})],
+            [("file_system", {"operation": "read", "path": "/p"}),
+             ("manage_services", {"action": "start", "name": "s",
+                                  "command": "c"})],
+            # ⚠ NOT introspect/workspace: §4CS review round 2 refuses a
+            # step that takes NO runtime input (a call fully determined at
+            # mint time is a replay), and refuses any sequence containing a
+            # meta tool. A read-only summary bundle is the measured cost of
+            # not keeping a list of dangerous verbs to leak.
+            [("file_system", {"operation": "replace", "path": "/p",
+                              "content": "c"}),
+             ("manage_services", {"action": "restart", "name": "s"})],
+            [("browser", {"operation": "screenshot", "out_path": "/o.png"}),
+             ("vision_analysis", {"action": "describe_picture",
+                                  "target": "/o.png"})],
+        )
         trajs = []
-        for pair in (("a", "b"), ("c", "d"), ("e", "f"), ("g", "h")):
+        for n, seq in enumerate(pairs):
             for i in range(3):
-                trajs.append(_traj(f"{pair}-{i}", [(pair[0], {}), (pair[1], {})]))
+                trajs.append(_traj(f"p{n}-{i}", seq))
+        assert len(mine_recurring_tool_sequences(
+            trajs, min_support=3, max_proposals=10)) == 4
         props = mine_recurring_tool_sequences(trajs, min_support=3, max_proposals=2)
         assert len(props) == 2
 

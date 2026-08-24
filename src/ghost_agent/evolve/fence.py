@@ -59,6 +59,15 @@ MUTABLE_PREFIXES: Tuple[str, ...] = (
 #: Every entry is a thing that either scores a candidate, contains the
 #: fence itself, or is load-bearing for containment.
 IMMUTABLE_EXACT: Tuple[str, ...] = (
+    #: ⚠ `src/__init__.py` DOES NOT EXIST TODAY, AND THAT IS THE POINT.
+    #: `src/` is a PEP-420 namespace package; CREATING this file makes
+    #: it a regular package whose body runs on every
+    #: `import src.ghost_agent.*` — the production import shape. It was
+    #: refused only by the catch-all ("not on the mutable allow-list")
+    #: and `resolves_to_immutable` returned "" for it, while the entry
+    #: one level down (`tools/__init__.py`) is listed here by name for
+    #: exactly this hazard.
+    "src/__init__.py",
     "src/ghost_agent/tools/registry.py",   # the tool surface itself
     "src/ghost_agent/tools/validators.py",  # argument validation
     # A 0-byte package init inside the mutable prefix is an import-time
@@ -85,18 +94,47 @@ IMMUTABLE_PREFIXES: Tuple[str, ...] = (
     "src/ghost_agent/selfhood/",
     "src/ghost_agent/sandbox/",
     "src/ghost_agent/main.py",
+    # (No repo-root `conftest.py` exists — the real one is
+    # `tests/conftest.py`, covered by the `tests` tree. Kept as
+    # forward-cover: the day someone adds one, it is watched from the
+    # first commit rather than from the first incident.)
     "conftest.py",
     "pytest.ini",
 )
 
 #: What the harness digest covers. If a candidate can change any of
 #: this, it can change its own score.
+#: ⚠ THE DIGEST MUST COVER EVERYTHING THE FENCE CALLS IMMUTABLE. It did
+#: not: 13 of 18 immutable entries were unwatched, including
+#: `core/dream.py` — the module the stage-3 INCUMBENT arm runs. The
+#: cleanest attack was never to inflate the candidate but to DEFLATE the
+#: baseline: write to the canonical `core/` during a pin run and stage
+#: 3's "incumbent" is no longer the incumbent. The fence declared those
+#: paths immutable for the DIFF; the digest was supposed to be what
+#: catches out-of-band writes, and for those paths it did not exist.
 HARNESS_TREES: Tuple[str, ...] = (
     "tests",
     "src/ghost_agent/eval",
     "scripts",
     "src/ghost_agent/evolve",
     "pytest.ini",
+    "conftest.py",
+    # ⚠ THE WHOLE PACKAGE, NOT THE FENCE'S IMMUTABLE LIST. Watching the
+    # paths the fence calls immutable answers the wrong question: what
+    # matters is what the INCUMBENT ARM EXECUTES. Measured: of the 66
+    # modules `import ghost_agent.core.dream` loads, 42 were unwatched
+    # — `ghost_agent/__init__.py` (which runs in every process that
+    # imports anything), all of `utils/`, `distill/`, `reflection/`, and
+    # 22 tool modules. Those files were on NEITHER list: no diff may
+    # touch them, and an out-of-band write to them was invisible. That
+    # is precisely the gap this file's own docstring describes — "a path
+    # check is a claim about the diff; a checksum is a fact about the
+    # files" — reopened by scoping the checksum to the path check.
+    #
+    # The mutable tree is watched too. A candidate's own diff moves it,
+    # which the cascade compares against the diff it approved; a write
+    # that arrives any other way has no such alibi.
+    "src/ghost_agent",
 )
 
 
@@ -272,15 +310,42 @@ def harness_digest(repo_root: Path = None,
         if base.is_file():
             files = [base]
         elif base.is_dir():
+            # ⚠ BYTECODE IS WATCHED TOO. Excluding `__pycache__`/`.pyc`
+            # left the one artefact Python imports AHEAD OF SOURCE
+            # invisible to the check whose whole job is to notice the
+            # harness changing. An unchecked-hash `.pyc` is loaded
+            # without consulting the `.py` at all, so a planted one
+            # replaces a module the digest still reports as pristine.
+            # The cascade's own children never write bytecode
+            # (PYTHONDONTWRITEBYTECODE), and the before/after window is
+            # minutes, so a `.pyc` appearing inside it is exactly the
+            # event this exists to catch — including the benign version
+            # (an operator running pytest concurrently), which is also a
+            # harness moving under a run and worth aborting on.
+            # ⚠ `is_file()` FOLLOWS SYMLINKS AND SO MISSES THEM. A
+            # DANGLING symlink is not a file, and `rglob` does not
+            # descend into a symlinked DIRECTORY — so both could be
+            # ADDED inside a watched, immutable tree and stay
+            # permanently invisible. That is worse than the
+            # modify-use-restore window this docstring concedes: it is a
+            # permanent addition the checksum can never see. Combined
+            # with a runner check that only inspects spelling, it yields
+            # an executable outside the canonical tree that the digest
+            # never notices. Enumerate entries, not files.
             files = sorted(p for p in base.rglob("*")
-                           if p.is_file()
-                           and "__pycache__" not in p.parts
-                           and not p.name.endswith(".pyc"))
+                           if p.is_symlink() or p.is_file())
         else:
             continue
         for f in files:
             try:
-                h = hashlib.sha256(f.read_bytes()).hexdigest()
+                if f.is_symlink():
+                    # Hash the LINK, not its target: the target may sit
+                    # outside every watched tree, and re-pointing the
+                    # link is exactly the move to catch.
+                    h = "SYMLINK:" + hashlib.sha256(
+                        os.readlink(f).encode("utf-8")).hexdigest()
+                else:
+                    h = hashlib.sha256(f.read_bytes()).hexdigest()
             except OSError as exc:
                 # Unreadable is NOT skippable: a file the digest cannot
                 # read is a file the digest cannot protect.
@@ -301,12 +366,22 @@ def compare_harness(before: Dict[str, str],
         b, a = before.get(path), after.get(path)
         if b == a:
             continue
+        # ⚠ BYTECODE IS NAMED, NOT EXCUSED. An earlier version dropped
+        # `.pyc` from the digest entirely so it would not "flap" — which
+        # made the check decorative, since a `.pyc` is imported AHEAD OF
+        # the source being hashed. The alarm-fatigue concern behind that
+        # was real, so the answer is a distinguishable label: an
+        # operator can see at a glance whether SOURCE moved or only
+        # bytecode did, and both still abort the generation, because
+        # both mean the harness changed under a run in progress.
+        kind = "BYTECODE " if (path.endswith(".pyc")
+                               or "__pycache__" in path) else ""
         if b is None:
-            changed.append(f"ADDED {path}")
+            changed.append(f"{kind}ADDED {path}")
         elif a is None:
-            changed.append(f"REMOVED {path}")
+            changed.append(f"{kind}REMOVED {path}")
         else:
-            changed.append(f"MODIFIED {path}")
+            changed.append(f"{kind}MODIFIED {path}")
     return changed
 
 

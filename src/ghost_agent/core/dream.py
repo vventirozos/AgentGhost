@@ -1217,34 +1217,89 @@ from ..memory.lesson_quality import _is_actionable_heuristic  # noqa: E402,F401
 # Tools that should never anchor an auto-proposed macro: meta / control-flow
 # tools, or one-off side-effecting tools that aren't reusable as a bundled
 # step. A mined window made up entirely of these is dropped.
-_MACRO_IGNORE_TOOLS = frozenset({
-    "replan", "abort_attempt", "flag_uncertainty", "manage_composed_skills",
-    "create_skill", "manage_skills", "self_play", "self_play_loop",
-    "stop_self_play", "dream_mode", "self_state", "introspect",
-})
+# ⚠ MOVED to `tools/composed_skills.MACRO_IGNORE_TOOLS` (review round 2) so
+# BOTH producers share one admission rule — the graduation producer had none.
+# Re-exported here because this module's public miner takes it as a default
+# argument and tests pass it explicitly.
+from ..tools.composed_skills import (            # noqa: E402
+    MACRO_IGNORE_TOOLS as _MACRO_IGNORE_TOOLS,
+)
 
 # A composed-skill name must be a bare identifier (it becomes an LLM tool
 # name on approval). Mirror the validator in composed_skills without importing.
 _MACRO_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_]")
 
-# Tools whose args must NEVER be frozen into a macro's param template:
-# baking the most-common CONCRETE arg set for a mutating tool replays a
-# stale one-off WRITE verbatim on every macro run (live: a proposed macro
-# carried manage_projects(action='task_update', status='DONE',
-# project_id=<old>, task_id=<old>, description='Simplified demo.py…')).
-# These steps get empty templates; args are supplied at run time.
-_MACRO_UNSAFE_PARAM_TOOLS = {
-    "execute", "file_system", "manage_projects", "manage_services",
-    "browser", "knowledge_base", "manage_skills", "manage_composed_skills",
-    "update_profile", "remember", "forget",
-}
+# ⚠ RETIRED 2026-08-23 (§4CS). This was a tool DENY-LIST: baking the
+# most-common CONCRETE arg set for a mutating tool replays a stale one-off
+# WRITE verbatim on every macro run (live: a proposed macro carried
+# manage_projects(action='task_update', status='DONE', project_id=<old>,
+# task_id=<old>, description='Simplified demo.py…')), so these eleven tools
+# got EMPTY templates. It removed the hazard and the artifact with it — a
+# param-less macro advertises zero inputs and can never be activated, which
+# is why 25 auto-mined macros sat at "proposed" with 0 invocations for six
+# weeks. `tools/composed_skills.mint_param_schema` now tests the VALUE
+# rather than the tool NAME (constant + enum-declared or payload-free =>
+# literal, everything else => a `$slot` the caller fills), which is strictly
+# stronger: there is no tool for which a path, a command, an id, or free
+# text can be frozen. The name is kept only so a reader who greps for it
+# lands here instead of on nothing.
+_MACRO_UNSAFE_PARAM_TOOLS: frozenset = frozenset()
 
 
 def _safe_macro_name(tools_seq) -> str:
-    """Build a valid-identifier macro name from a tool-name sequence."""
-    raw = "auto_" + "_".join(tools_seq)
-    cleaned = _MACRO_NAME_UNSAFE_RE.sub("_", raw)[:64]
+    """Build a valid-identifier macro name from a mined window.
+
+    Accepts either a bare tool-name sequence or the mode-aware window the
+    miner now keys on — ``(tool_name, ((param, value), ...))`` per step
+    (§4CS). The fixed MODE goes into the name because it is part of the
+    macro's identity: "edit a file then restart a service" and "read a file
+    then start a service" are different macros over the same two tools, and
+    a name-only identifier would collide and suppress one of them.
+
+    Names are capped at 64 chars (they enter the LLM function catalogue).
+    A window whose rendered name would overflow gets a deterministic 6-char
+    digest instead of a silent truncation, so two long distinct windows
+    cannot collapse onto one name.
+    """
+    parts = []
+    for item in tools_seq:
+        if isinstance(item, (tuple, list)) and len(item) == 2 \
+                and isinstance(item[1], (tuple, list)):
+            tool, mode = item[0], item[1]
+            parts.append(str(tool))
+            parts.extend(str(v) for _k, v in mode)
+        else:
+            parts.append(str(item))
+    raw = "auto_" + "_".join(parts)
+    cleaned = _MACRO_NAME_UNSAFE_RE.sub("_", raw)
+    if len(cleaned) > 64:
+        import hashlib
+        # hashlib, NOT builtin hash(): PYTHONHASHSEED randomises str hashes
+        # per process, so a builtin-hash suffix would rename the same macro
+        # on every restart and re-propose it forever.
+        digest = hashlib.sha1(
+            repr(tuple(tools_seq)).encode("utf-8")).hexdigest()[:6]
+        cleaned = cleaned[:57].rstrip("_") + "_" + digest
     return cleaned or "auto_macro"
+
+
+def _macro_step_inputs(template):
+    """`macro_step_inputs`, imported lazily so this module keeps its
+    no-import-at-module-scope relationship with `tools.composed_skills`."""
+    from ..tools.composed_skills import macro_step_inputs
+    return macro_step_inputs(template)
+
+
+def _render_step(tool: str, template) -> str:
+    """`file_system:replace` — the tool plus the modes the macro FIXES.
+
+    Used only in the operator-facing description. A macro's identity is its
+    tools AND its fixed modes (§4CS), so a description that named only the
+    tools would read identically for three different macros.
+    """
+    from ..tools.composed_skills import macro_identity
+    (_t, fixed), = macro_identity([(tool, template)])
+    return tool + ("".join(":" + v for _k, v in fixed) if fixed else "")
 
 
 def mine_recurring_tool_sequences(
@@ -1270,18 +1325,25 @@ def mine_recurring_tool_sequences(
          "support", "signature"}
 
     where ``support`` is the number of DISTINCT trajectories the sequence
-    appears in (and is >= ``min_support``), and each step's ``params`` is
-    the MOST COMMON argument set observed at that position across all
-    occurrences — so an approved macro replays realistic arguments, not an
-    empty skeleton. Only trajectories whose outcome is ``"passed"`` count
+    appears in (and is >= ``min_support``).
+
+    ⚠ ``params`` is a SCHEMA, not observed arguments (§4CS). It used to be
+    the MOST COMMON argument set at that position, which replayed one past
+    call's payload on every run. Each step's template now carries the modes
+    the macro FIXES as literals and a ``$slot`` for everything else; a
+    sequence whose schema cannot be filled is not proposed at all. The
+    window is keyed on ``(tool, mode)``, so "edit a file then RESTART a
+    service" and "read a file then START one" are different macros.
+
+    Only trajectories whose outcome is ``"passed"`` count
     as support: the old bar (skip only ``"failed"``) let UNKNOWN-outcome —
     i.e. never-validated — turns underwrite a macro advertised to the
     operator as a proven sequence.
     """
-    from collections import Counter
-
     sig_traj_ids: Dict[tuple, set] = {}       # signature -> set of distinct traj ids
     sig_arg_samples: Dict[tuple, list] = {}   # signature -> [ [json-args, ...] per position ]
+
+    from ..tools.composed_skills import macro_mode_key
 
     for traj in trajectories:
         if (getattr(traj, "outcome", "") or "") != "passed":
@@ -1289,18 +1351,25 @@ def mine_recurring_tool_sequences(
         calls = getattr(traj, "tool_calls", None) or []
         names = [getattr(c, "name", "") or "" for c in calls]
         args = [getattr(c, "arguments", {}) or {} for c in calls]
+        # §4CS: the window key carries each call's FIXED MODE, not just its
+        # tool name. See `macro_mode_key` for why — name-only keying merged
+        # workflows whose modes differed, which forced every mode selector
+        # to become a runtime slot and left the macro with no identity.
+        keys = [(names[k], macro_mode_key(names[k], args[k]))
+                for k in range(len(names))]
         tid = getattr(traj, "id", None) or id(traj)
         n = len(names)
         for L in range(min_len, min(max_len, n) + 1):
             for i in range(n - L + 1):
-                window = tuple(names[i:i + L])
-                if not all(window):
+                window = tuple(keys[i:i + L])
+                tools = tuple(k[0] for k in window)
+                if not all(tools):
                     continue
                 # Drop windows that are entirely meta tools, or a single
                 # tool repeated (low value as a reusable macro).
-                if all(t in ignore_tools for t in window):
+                if all(t in ignore_tools for t in tools):
                     continue
-                if len(set(window)) == 1:
+                if len(set(tools)) == 1:
                     continue
                 sig_traj_ids.setdefault(window, set()).add(tid)
                 samples = sig_arg_samples.setdefault(window, [[] for _ in range(L)])
@@ -1334,37 +1403,83 @@ def mine_recurring_tool_sequences(
         if len(accepted) >= max_proposals:
             break
 
+    from ..tools.composed_skills import (
+        MACRO_MARK_MINED, macro_identity, macro_sequence_admissible,
+        macro_step_inputs, mint_param_schema,
+    )
+
     proposals = []
     for sig, support in accepted:
+        tools = tuple(k[0] for k in sig)
+        # The SHARED admission rule, which is stricter than the windowing
+        # filters above: those drop a window that is ENTIRELY meta tools,
+        # this drops one that merely CONTAINS one. Both producers call it.
+        _inadmissible = macro_sequence_admissible(tools)
+        if _inadmissible:
+            pretty_log(
+                "Macro Mint",
+                f"skipped {_safe_macro_name(sig)} ({' → '.join(tools)}): "
+                f"{_inadmissible}",
+                icon=Icons.BRAIN_PLAN,
+            )
+            continue
         samples = sig_arg_samples.get(sig, [])
-        steps = []
-        for pos, tool in enumerate(sig):
-            params: Dict[str, Any] = {}
-            if (pos < len(samples) and samples[pos]
-                    and tool not in _MACRO_UNSAFE_PARAM_TOOLS):
-                common_json, _ = Counter(samples[pos]).most_common(1)[0]
+        # §4CS: hand the mint the FULL index-aligned observation set, not
+        # the most-common arg dict. Alignment is what lets two positions
+        # share one slot when they always carried the same value ("read
+        # then edit the SAME file" is one input, not two).
+        observations = []
+        for pos in range(len(tools)):
+            row = []
+            for raw in (samples[pos] if pos < len(samples) else ()):
                 try:
-                    decoded = json.loads(common_json)
-                    if isinstance(decoded, dict):
-                        params = decoded
+                    decoded = json.loads(raw)
                 except Exception:
-                    params = {}
+                    decoded = {}
+                row.append(decoded if isinstance(decoded, dict) else {})
+            observations.append(row)
+        templates, slots, reason = mint_param_schema(tools, observations)
+        if reason:
+            # Refusing to mint is the honest outcome: an artifact whose
+            # required params have neither a value nor a slot cannot be
+            # activated, and minting it anyway is what produced a
+            # 25-deep backlog of macros nobody could ever run.
+            pretty_log(
+                "Macro Mint",
+                f"skipped {_safe_macro_name(sig)} ({' → '.join(tools)}): "
+                f"{reason}",
+                icon=Icons.BRAIN_PLAN,
+            )
+            continue
+        steps = []
+        for pos, tool in enumerate(tools):
+            step_slots = macro_step_inputs(templates[pos])
             steps.append({
                 "tool": tool,
                 "description": f"{tool} (step {pos + 1})"
-                               + ("" if params or tool not in _MACRO_UNSAFE_PARAM_TOOLS
-                                  else " — params required at run time"),
-                "params": params,
+                               + (" — runtime inputs: "
+                                  + ", ".join("$" + s for s in step_slots)
+                                  if step_slots else ""),
+                "params": templates[pos],
             })
         proposals.append({
             "name": _safe_macro_name(sig),
+            # ⚠ The stamp comes from `MACRO_MARK_MINED`, not a literal:
+            # `liveness._is_loop_minted_macro` reads it back to decide
+            # whether a stored macro is THIS LOOP's output, and a copy on
+            # each side drifts. Rewording this string used to make the
+            # loop's own output invisible to the yield surface.
             "description": (
-                f"Auto-discovered recurring sequence ({' → '.join(sig)}) "
+                f"{MACRO_MARK_MINED} "
+                f"({' → '.join(_render_step(t, templates[i]) for i, t in enumerate(tools))}) "
                 f"seen in {support} past turns."
             ),
             "steps": steps,
             "support": support,
-            "signature": sig,
+            # The SHARED identity — `Dreamer._propose_macros_sync` derives
+            # the same tuple from macros already on file, so the two sides
+            # of the re-propose guard cannot drift apart.
+            "signature": macro_identity(zip(tools, templates)),
         })
     return proposals
 
@@ -3029,8 +3144,15 @@ Return ONLY valid JSON:
 
             # Signatures already on file (active OR proposed) so we never
             # re-propose the same sequence on every REM cycle.
+            # §4CS: this derived a TOOL-NAME tuple while the miner now
+            # stamps a (tool, fixed-mode) identity, so every mode variant
+            # after the first would have been suppressed forever — the same
+            # two tools in a different mode is a DIFFERENT macro. Both sides
+            # now call `macro_identity`, so they cannot drift apart.
+            from ..tools.composed_skills import macro_identity
             existing_sigs = {
-                tuple(s.tool_name for s in sk.steps) for sk in reg.skills.values()
+                macro_identity((s.tool_name, s.param_template) for s in sk.steps)
+                for sk in reg.skills.values()
             }
             active_count = sum(1 for sk in reg.skills.values() if sk.status == "active")
 
@@ -3048,13 +3170,52 @@ Return ONLY valid JSON:
                 result["proposed"] += 1
                 pretty_log(
                     "Macro Proposed",
+                    # ⚠ `p["signature"]` is the macro IDENTITY — a tuple of
+                    # (tool, fixed-modes) pairs since §4CS, NOT a tuple of
+                    # strings. Joining it directly raised TypeError INSIDE
+                    # this loop, which the blanket handler below swallowed at
+                    # DEBUG: the first proposal registered, the announcement
+                    # never printed, and the remaining proposals were never
+                    # reached. Approval is the ONLY route from "proposed" to
+                    # invocable and this line is its only announcement, so
+                    # the change silently severed the channel it existed to
+                    # feed. Render from `steps`, which carries the same
+                    # identity in a form `_render_step` already formats.
                     f"Auto-discovered macro '{p['name']}' from {p['support']} turns: "
-                    f"{' → '.join(p['signature'])}. Review with "
-                    f"manage_composed_skills(action='list').",
+                    + " → ".join(_render_step(st["tool"], st["params"])
+                                 for st in p["steps"])
+                    + (f". Runtime inputs: "
+                       + ", ".join("$" + n for n in sorted(
+                           {n for st in p["steps"]
+                            for n in _macro_step_inputs(st["params"])}))
+                       if any(_macro_step_inputs(st["params"])
+                              for st in p["steps"]) else "")
+                    + ". Review with manage_composed_skills(action='list').",
                     icon=Icons.IDEA,
                 )
         except Exception as e:
-            logger.debug(f"Macro proposal mining failed: {e}")
+            # ⚠ DEBUG hid a TypeError that cost every proposal after the
+            # first, on every cycle, for as long as it was live. A mining
+            # failure must not break the dream cycle, but it must not be
+            # invisible either.
+            logger.warning("Macro proposal mining failed: %s: %s",
+                           type(e).__name__, e)
+            try:
+                # ⚠ REVIEW ROUND 2: this announcement had no guard of its
+                # own. It sits INSIDE the handler, so when IT raised the
+                # exception escaped a method whose docstring says "Never
+                # raises" and landed one frame up in another
+                # `logger.debug` — re-creating, at the caller, exactly the
+                # invisibility this ERROR line was added to remove.
+                pretty_log(
+                    "Macro Proposed",
+                    f"macro mining FAILED after {result['proposed']} "
+                    f"proposal(s): {type(e).__name__}: {e}",
+                    level="ERROR", icon=Icons.WARN,
+                )
+            except Exception:                     # noqa: BLE001
+                logger.error("Macro proposal mining failed AND its own "
+                             "error announcement failed: %s", e)
         return result
 
     async def graduate_lessons(self, model_name: str = "qwen-3.6-35b-a3") -> str:

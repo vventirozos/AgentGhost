@@ -655,7 +655,13 @@ class TestMinerSupportAndParams:
 
     def test_mutating_tool_params_not_baked(self):
         from ghost_agent.core.dream import mine_recurring_tool_sequences
-        seq = [("workspace", {"action": "summary"}),
+        # ⚠ The first step was `workspace{action: summary}`. §4CS review
+        # round 2 refuses a step that takes NO runtime input — a call fully
+        # determined at mint time is a replay — so the whole sequence
+        # stopped minting and this test could no longer reach the
+        # `manage_projects` assertion it exists for. A first step with a
+        # real runtime input, same test.
+        seq = [("file_system", {"operation": "read", "path": "/a/b.py"}),
                ("manage_projects", {"action": "task_update",
                                     "project_id": "f36f04",
                                     "task_id": "eed65d",
@@ -665,8 +671,22 @@ class TestMinerSupportAndParams:
         assert proposals
         steps = proposals[0]["steps"]
         by_tool = {s["tool"]: s for s in steps}
-        assert by_tool["workspace"]["params"] == {"action": "summary"}
-        assert by_tool["manage_projects"]["params"] == {}
+        assert by_tool["file_system"]["params"] == {"operation": "read",
+                                                    "path": "$path"}
+        # §4CS: the deny-list that blanked this whole template is retired.
+        # The property it protected is now enforced per VALUE — recompute
+        # the observation and assert that none of its volatile values
+        # survives, while the enum-declared mode selectors do.
+        observed = dict(seq[1][1])
+        minted = by_tool["manage_projects"]["params"]
+        assert minted["action"] == observed["action"]      # the SELECTOR
+        # ⚠ §4CS review round 2: `status` is enum-TYPED but is NOT the
+        # dispatch selector — it is the value being WRITTEN, i.e. the other
+        # half of the very artifact this test is named for.
+        assert minted["status"] == "$status"
+        for volatile in ("project_id", "task_id", "status"):
+            assert minted[volatile] == f"${volatile}"
+            assert observed[volatile] not in minted.values()
 
 
 # --------------------------------------------------------------------------

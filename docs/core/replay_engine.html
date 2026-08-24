@@ -199,6 +199,27 @@ def _cmd_budget(leg_budget, elapsed):
   </ul>
   <p>Status: the instrument works &mdash; seeded pairs come back <code>mattered_pos</code> / <code>no_effect</code> as constructed &mdash; and refuses to call the result a result until it is powered. Until it returns PASS, <code>dream_credit</code> stays closed.</p>
 
+  <h2 id="undecidable">Why 54% of turns are undecidable — measured, §4CS 2026-08-24</h2>
+  <p>§4CM measured what the largest triage rejection costs DOWNSTREAM: of the 877 <code>no_recorded_outcome</code> episodes, exactly 7 would ever become replayable. §4CN then named changing what is RECORDED AT TURN TIME as the only lever still open. This is the upstream question — <em>what stage failed, per turn?</em> — asked so the lever is chosen from data rather than from an assumed cause. It is MEASURE-ONLY: nothing here changed a recording path.</p>
+  <p>Re-derive it with <code>scripts/measure_undecidable_turns.py</code>. Live corpus: 1,803 trajectories, 1,613 <code>user_request</code>, <strong>736 decided (45.6%)</strong>, 877 undecidable.</p>
+  <div class="scroll"><table>
+    <tr><th>Why the turn is undecidable</th><th>n</th><th>%</th></tr>
+    <tr><td><strong>No tool call at all</strong> — nothing was executed to check</td><td>511</td><td>58.3%</td></tr>
+    <tr><td><strong>Tool-using, no verdict ever recorded</strong> — 355 of 361 predate 2026-08-13</td><td>361</td><td>41.2%</td></tr>
+    <tr><td>Verdict PRODUCED but never attached — all four are <code>UNCERTAIN</code>, which is correctly not decisive</td><td>4</td><td>0.5%</td></tr>
+    <tr><td>Correction row exists, outcome still undecided — one, an <em>operator overlay</em> deliberately reverting a false-positive REFUTED back to <code>unknown</code></td><td>1</td><td>0.1%</td></tr>
+  </table></div>
+  <p><strong>There are zero lost verdicts.</strong> Every one of the 877 is explained by a mechanism working as designed.</p>
+  <p><b>The ceiling, and where it comes from.</b> Split by turn shape, the two populations behave completely differently:</p>
+  <div class="scroll"><table>
+    <tr><th>Turn shape</th><th>decided</th><th>last 14 days</th><th>who decides it</th></tr>
+    <tr><td>chat (0 tool calls)</td><td>29 / 540 = <strong>5.4%</strong></td><td>19 / 75 = 25%</td><td>19 of 20 by a HUMAN (<code>human_feedback:*</code>, <code>user_correction</code>); the machine verifier has resolved exactly <strong>ONE</strong> in the corpus's lifetime</td></tr>
+    <tr><td>tool-using</td><td>707 / 1073 = <strong>65.9%</strong></td><td>128 / 161 = 80%</td><td>inline at write time (348) + <code>verifier_late</code> (322) + human labels (36)</td></tr>
+  </table></div>
+  <p>The verifier is not failing on chat turns — it is DECLINING, by design. Its dominant skip reason on the live log is "turn carried no verifiable evidence (bookkeeping-only tools); skipped by design" (406 lines). A conversational answer with nothing executed has nothing a filesystem or execution check can inspect.</p>
+  <p><b>So the honest conclusions are:</b> (1) the tool-using capture gap §4CM said was closed IS closed — 355 of the 361 undecided tool-using turns predate the human-feedback channel (2026-08-13) and the late-verdict backfill (2026-08-21), and only ONE post-dates the latter; (2) the remaining 58% is chat, and it is machine-undecidable rather than outcome-free — the only channel that resolves it is human labelling, already shipped and running at ~25% on recent traffic. Neither is a recording bug, and building a recording change against either would have been building against an assumed cause.</p>
+  <p class="note"><strong>Correction to a figure in circulation:</strong> "1,607 → 733 → <em>67</em> replayable" does not reproduce. 67 is the count <em>before</em> the <code>no_filesystem_checkable_deliverable</code> filter (25) is applied; the current number is <strong>42</strong>, which is what §4CN and §4CO record.</p>
+
   <h2>Admissibility: two rows, not one</h2>
   <p><code>dream_replay</code> reads the corpus and admits bench episodes as a feature &mdash; they carry executable validators already, which makes them the cheapest source of seeded ground truth. <code>dream_credit</code> is anything that later reads a replay <em>verdict</em> and acts on it, and it is <code>real_only</code> until the seeded-truth bar is cleared. One row could not express "may read the corpus, may not yet believe the output", and a single permissive row is how an unvalidated label source opens.</p>
 

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>evolve.negative_controls — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Learning</h3>
+    <a href="fence.html">evolve fence</a>
+    <a href="evaluator.html">evolve evaluator</a>
+    <a class="current" href="negative_controls.html">evolve negative controls</a>
+    <a href="mutator.html">evolve mutator</a>
+    <a href="../core/replay_engine.html">replay_engine</a>
+    <a href="../core/imagination.html">imagination</a>
+    <a href="../core/isolation.html">isolation</a>
+  </nav>
+</aside>
+<main>
+<h1>Negative controls (E3)</h1>
+<p>Every stage of the <a href="evaluator.html">evaluation cascade</a> is a guard, and a guard that has never visibly fired is not known to be alive. E3 builds three <strong>known-bad candidates</strong> and checks the cascade refuses each one, <em>at the stage it should die at</em>.</p>
+
+<div class="note"><strong>SCHEDULED as of §4CS, 2026-08-24.</strong>
+§4CO recorded this as still owed: one control run was performed by hand on 2026-08-23 and passed &mdash; into a throwaway home, so nothing durable recorded that it had ever happened. This project's own rule is that <em>a guard which never demonstrably fires is presumed dead</em>, and E2's entire value is refusing things.
+<p><strong>The schedule.</strong> Idle phase 2.7f in <code>core/agent.py</code> runs the controls weekly (<code>INTERVAL_S</code> &mdash; ONE definition, shared with the liveness probe's staleness bound so the two cannot drift). Shallow by design (each control stops at the stage it is supposed to die at), but still minutes of work because the guard control runs stage 1 for real over ~45 pin files. The cooldown anchor is <strong>durable</strong>, read from <code>negative_controls.json</code>'s own timestamp: an in-memory anchor makes the cadence "once per deploy", so on a box that restarts often a weekly job runs every boot. <code>GHOST_NEGCTRL=0</code> disables it. It runs the CONTROLS, not the Evolve loop &mdash; three deliberately-bad candidates are built in a temporary tree, refused, and discarded; nothing is promoted and nothing is written to the repo.</p>
+<p><strong>The firing is visible.</strong> An <code>evolve.negative_controls</code> probe in <code>core/liveness.py</code> reads the result file under <code>introspect action='learning'</code>. Never run reads <code>no_source</code> &mdash; an instrumentation gap, and it must not render as a tick. The phase is registered in <code>PHASE_EXPECTATION</code> as <code>periodic</code>, so its absence from the activity ledger is a row rather than a silence.</p>
+<p><strong>A control that fails to fire is LOUD, and that is NOT a zero.</strong> A run where two of three controls held has a POSITIVE count and is the single most important line on the view, so <code>alarm_if_zero</code> cannot express it &mdash; <code>ProbeResult</code> grew an explicit <code>alarm</code>. It fires on: a control that did not reject; a control missing from its own results; an unverified control; a PARTIAL run (a control that was never selected contributes to a green suite by being ABSENT); and a schedule that has STOPPED (older than two intervals). One missed window does not alarm &mdash; a monitor that cries on a benign zero is one the operator learns to scroll past. The denominator is <code>DEN_NONE</code>: it runs off the idle clock, so no amount of quiet excuses its silence.</p>
+<p><strong>First live run, 2026-08-24</strong> &mdash; all three fired and held against the real tree: <code>edits_a_test</code> refused at <code>stage0_static</code> (diff scope), <code>deletes_a_guard</code> at <code>stage1_pins</code> (1 failed / 289 passed in the pin set), <code>no_op_claiming_improvement</code> at <code>stage3_paired</code> (not better, p=1.000). Tests: <code>tests/test_4cs_negative_controls_schedule.py</code> (15 tests, all mutation-pinned).</p>
+</div>
+
+<h2>The three controls</h2>
+<ul>
+  <li><strong>edits a test</strong> &rarr; must die at <strong>stage 0</strong>, on diff-scope, before anything is compiled. A candidate that may edit the tests judging it is not a candidate.</li>
+  <li><strong>deletes a guard</strong> &rarr; must <em>pass</em> stage 0 (it is in scope and it compiles) and die at <strong>stage 1</strong>, because a pin asserts the guard fires. This is the strongest of the three: it generates a diff against the live tree, materialises a snapshot, and runs the canonical pins in a subprocess. Measured: <code>pins failed: 2 failed, 116 passed</code>.</li>
+  <li><strong>a no-op claiming improvement</strong> &rarr; must die at <strong>stage 3</strong>, where identical arms are "not better".</li>
+</ul>
+<p>The diffs are <strong>generated, not stored</strong>. A stored diff rots the moment the file it patches moves, and a control that no longer applies reports a cascade failure that is really a stale fixture. A control whose target has <em>moved</em> is reported as a named failure &mdash; never as a traceback, which says nothing about which controls held, and never as a pass.</p>
+
+<h2>&#9888; Three ways a control lies about itself</h2>
+<p>Each of these was live in this file, and each made the suite <em>greener</em> than the truth.</p>
+
+<h3>1. The control that ignored its own diff</h3>
+<p>The shallow no-op check called <code>paired_verdict([(True, True)] * 20)</code> &mdash; a hard-coded input. Pointing the target at a file that does not exist, or making the "no-op" delete half of <code>database.py</code>, left the control <strong>green</strong>: it was a test of the decision function wearing the name of a control over a no-op candidate. The premise is now established first &mdash; the diff is materialised and the candidate's syntax tree compared to the canonical one &mdash; and only then is the decision function asked to rule.</p>
+
+<h3>2. The report that contradicted its own verdict</h3>
+<p>The guard control's detail line read <code>reason or "pins failed as required"</code>. <code>reason</code> is empty on success, so a run in which <strong>the pins let the deleted guard through</strong> printed "pins failed as required". The one outcome the control exists to catch was the one it described as a pass.</p>
+
+<h3>3. The phrase that could not tell "failed" from "never ran"</h3>
+<p>The control scored itself on <code>"pins failed" in reason</code>. Stage 1 phrased <em>every</em> decline that way, including <em>"no tests ran"</em>. A run in which the pins never executed therefore scored the control green. Stage 1 now reports the failure <strong>kind</strong> as a field &mdash; <code>failed</code> / <code>not_run</code> / <code>unreadable</code> &mdash; and only <code>failed</code> counts. A substring is not an identity.</p>
+
+<h2>&#9888; "Not run" is a third state</h2>
+<p><code>all_ok</code> is not <code>all(r.ok)</code>. Deep mode cannot drive stage 3 yet, and a control that reports <code>ok=True</code> because nothing executed made the <strong>thorough</strong> mode greener than the shallow one &mdash; this module's own rule inverted by its own reporting field. A result carries <code>verified</code> alongside <code>ok</code>, <code>all_ok</code> requires both, and the persisted record names what was left unverified so a health view can render the gap rather than a tick.</p>
+
+<h2>What reads the result</h2>
+<p><strong>Nothing yet.</strong> <code>last_run()</code> was documented as "what the learning-health view reads" while no learning-health code opened it &mdash; a reader checking whether the controls are surfaced would have stopped at that line and concluded they were. The suite is run on demand by the operator; nothing calls it automatically.</p>
+
+<h2>Cost and hygiene</h2>
+<p>Shallow mode stops each control at the stage it is supposed to die at, which is both faster and exactly what is being asserted &mdash; only the no-op needs stages 2&ndash;3, and those cost hours. Every snapshot is reclaimed: <code>sweep_work_dirs</code> keeps a bounded number, so a control leaking ~10&nbsp;MB per run would <strong>evict real candidates</strong> &mdash; the suite that checks the loop quietly destroying the loop's own work.</p>
+
+<h2>Related</h2>
+<ul>
+  <li><a href="evaluator.html">evolve / evaluator.py</a> &mdash; the cascade these controls exercise.</li>
+  <li><a href="fence.html">evolve / fence.py</a> &mdash; the allow-list stage 0 enforces.</li>
+  <li><a href="mutator.html">evolve / mutator.py</a> &mdash; materialises each control's snapshot.</li>
+</ul>
+</main>
+</body>
+</html>

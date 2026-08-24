@@ -577,6 +577,19 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # ── LOOP YIELD, machine-readable (§4CS item B, review round 2) ──
+    # The axis existed only in the human RENDER, so nothing could alarm on
+    # it programmatically and `--json` carried no yield key at all: the
+    # §4CS failure mode ("the loop produced nothing and no instrument said
+    # so") was fixed only for a human who reads the report. Same read-only
+    # probes, same GHOST_HOME resolution as the rendered block.
+    try:
+        from .liveness import yield_all as _yield_all
+        report["loop_yield"] = _yield_all(md.parent.parent)
+    except Exception as e:  # noqa: BLE001 — telemetry must never break a report
+        report["loop_yield"] = {"error": f"{type(e).__name__}: {e}"}
+
+
     return report
 
 
@@ -802,6 +815,56 @@ def _prm_gate_note() -> str:
             "they are missing. Idle retrain SKIPS unless a CONSUMER is "
             "live in THAT sense; the producer is correctly not counted "
             "(§4BN).")
+
+
+#: Operator decision, §4CS 2026-08-23. Recorded as a DATE so the park is a
+#: decision with a provenance rather than an accident, and so a reader can
+#: tell "nobody ever turned this on" from "we looked and chose not to".
+PRM_PARKED_ON = "2026-08-23"
+
+
+def _prm_parked_state(prm: Dict[str, Any]) -> str:
+    """PARKED / LIFTED / undetermined — DERIVED from the same leg states the
+    rows above render, never asserted.
+
+    §4CS. The PRM's two consumers are both off and its checkpoint directory
+    holds only `checkpoint.json.pre-1c-schema`. `prm_consumer_is_live`
+    correctly refuses to retrain a model nothing reads — that gate exists
+    because of a real 41-wasted-retrains incident, so it is not the bug.
+    The bug was that NOTHING said this was a decision: the wiring rows read
+    as a configuration that might change at any moment, which is
+    indistinguishable from a subsystem that is quietly broken. §4CN parked
+    P7 and E4 with their arithmetic beside them; this does the same.
+
+    ⚠ It must AUTO-RETRACT. A hardcoded "PARKED" banner would keep claiming
+    the decision after an operator adds `--frontier-selfplay` to the
+    launcher, which is the lying-instrument class this file is full of
+    fixes for. So the park is CLAIMED only when both consumer legs read
+    False; an unknown leg claims nothing.
+    """
+    legs = (prm.get("score_consumer_enabled"),
+            prm.get("uncertainty_consumer_enabled"))
+    if any(v is True for v in legs):
+        return ("park LIFTED — a PRM consumer is live, so the "
+                f"{PRM_PARKED_ON} decision no longer describes this box")
+    if any(v is None for v in legs):
+        return ("park undetermined — at least one consumer leg is not "
+                "readable from this args namespace, so no park is claimed "
+                "(an unreadable leg is not an off one)")
+    return (
+        f"PARKED by operator decision {PRM_PARKED_ON}. Both consumers are "
+        "off, no checkpoint has been fitted, and the retrain gate is "
+        "correctly refusing — this is a CHOICE, not a fault. Re-open by "
+        "EITHER (a) adding --frontier-selfplay to the launcher exec line, "
+        "which creates a live consumer and unlocks the retrain — but note "
+        "the frontier picker also requires a fitted model, so the first "
+        "boots fall back to the unweighted pick_seed, and with an "
+        "untrained PRM `uncertainty()` returns 1.0 uniformly so the "
+        "weighting degenerates to rarity alone: show that seed selection "
+        "differs from uniform-over-rarity BEFORE claiming a win; or (b) "
+        "meeting _MCTS_TURNSTART_ENABLED's re-enable criterion, an "
+        "EXECUTION-GROUNDED value function — NOT met, and self-prediction "
+        "of un-executed actions is what it was turned off for.")
 
 
 def _prm_rows_framing() -> str:
@@ -1881,6 +1944,25 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
     except Exception as e:  # noqa: BLE001 — telemetry must never break a report
         lines.append(f"\nSUBSYSTEM LIVENESS: unavailable ({type(e).__name__})")
 
+    # ── LOOP YIELD (§4CS) ────────────────────────────────────────────────
+    # The SECOND axis, and the one the macro loop had to be found by hand
+    # to expose. Liveness above asks "did this mechanism RUN?"; this asks
+    # "did it produce anything anyone CONSUMED?". Dream fired on schedule
+    # for six weeks and minted 25 macros that were invoked ZERO times, and
+    # every liveness probe would have read FIRED throughout.
+    #
+    # Extended here rather than given its own introspect action on purpose:
+    # a parallel surface is one more thing an operator has to remember to
+    # look at, and this report already carries the probe-per-mechanism
+    # section it belongs beside.
+    try:
+        from .liveness import render_yield as _yield_render
+        # Same two-levels-up resolution as the liveness block above:
+        # `memory_dir` is $GHOST_HOME/system/memory.
+        lines.append("\n" + _yield_render(Path(memory_dir).parent.parent))
+    except Exception as e:  # noqa: BLE001 — telemetry must never break a report
+        lines.append(f"\nLOOP YIELD: unavailable ({type(e).__name__})")
+
     act = r.get("activity")
     if act:
         # NO top-N CUT. It used to sort by count descending and slice [:8], so
@@ -1934,6 +2016,10 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             + " via --prm-online-update"
             + " — NOTE (§4BN R22/R24/R28): " + _prm_rows_framing()
             + _prm_gate_note())
+        # §4CS: the rows above say WHAT is off; this says whether that is a
+        # DECISION. Derived, so it retracts itself the moment a consumer
+        # goes live.
+        lines.append("  PRM status: " + _prm_parked_state(prm))
         # R5 MIN-6: this row was collected and rendered NOWHERE, so the
         # wiring report silently omitted one of its five flag rows — the
         # metacog arbiter, whose 0-lifetime deadness the docs already

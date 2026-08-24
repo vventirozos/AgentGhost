@@ -461,10 +461,20 @@ as the last step, mutation-pin every fix red-on-revert, docs + journal + restart
 2. **✅ CONVERGED 2026-08-17 (§4BU) — web workspace console / session bridge**. 3 rounds x 3
    lenses, ~75 defects, every fix mutation-pinned. See §4BU.
 3. **✅ CONVERGED 2026-08-18 (§4BV) — LLM client / routing** (`core/llm.py`). 7 rounds.
-4. **✅ REVIEWED 2026-08-19 (§4BW) — sandbox / execute stack.** Fixes landed through R2;
-   **item C (classic-exec whole-output RAM buffering → bounded head+tail sink) is STAGED,
-   NOT LANDED** — blocked on a real-container byte-equivalence smoke test, the reload-trap
-   test fix, and an operator call on default-on. Still the open tail of this queue.
+4. **✅ CLOSED 2026-08-24 (§4BW) — sandbox / execute stack.** Fixes landed through R2, and
+   **item C (classic-exec whole-output RAM buffering → bounded head+tail sink) LANDED
+   2026-08-19** — all three blockers were cleared the same day (real-container
+   byte-equivalence on the live daemon, the `importlib.reload` trap removed from its test,
+   streaming default ON with `GHOST_SANDBOX_EXEC_STREAM=0` as the kill switch). See the
+   §4BW tail. ⚠ **This line said "STAGED, NOT LANDED" until 2026-08-24** — the queue index
+   was never updated when the work closed, so the review queue carried a phantom open tail
+   for five days. RE-VERIFIED LIVE 2026-08-24 rather than taken from the journal's own
+   claim (§4CO's operating assumption): the running daemon (started 08-23 14:56) loaded a
+   `sandbox/docker.py` last modified 08-22 04:46, `GHOST_SANDBOX_EXEC_STREAM` is unset in
+   both its environment and the launcher so `_EXEC_STREAM_ENABLED` is True at module load,
+   and `_exec_run_streamed` against the live `ghost-agent-sandbox-ecf4109f` container is
+   byte-identical to the buffered `exec_run` for text, binary (NUL/0xFF), exit codes and
+   8 MB of output, while bounding 64 MB of produced output to 1.0× a 1 MB cap.
 5. **✅ CONVERGED 2026-08-19 (§4BX) — `tools/browser.py` runner** (+ recorded bounded
    not-fixed items; raw-Playwright proxy backstop shipped in follow-ups).
 6. **✅ CONVERGED 2026-08-19 (§4BX) — launcher / daemon layer.**
@@ -24344,8 +24354,15 @@ Full suite **15,406 passed / 17 skipped / 0 failed**. Docs: `docs/evolve/evaluat
 ## §4CN — Evolve: E2, the evaluation cascade (stages 0–1) (2026-08-23)
 
 `evolve/evaluator.py`. A candidate is a materialised snapshot — the repo with one mutator diff
-applied — and this decides whether it goes further. Every stage runs in the **parent** process: the
-candidate is only ever the SUBJECT, never the harness.
+applied — and this decides whether it goes further. ~~Every stage runs in the **parent** process:
+the candidate is only ever the SUBJECT, never the harness.~~
+
+> **⚠ CORRECTED 2026-08-23 — see §4CP.** That sentence was **false when written**. Stages 1, 2 and
+> 3 each spawn a child that imports and executes candidate code at full user privilege. It was
+> repeated in the module docstring and in `docs/evolve/evaluator.html`, and it is the reason the
+> exit-code hole below went unlooked-for: a claim that the candidate is never the harness is a
+> claim there is nothing to look for. Left struck through rather than deleted, because the belief
+> is the finding.
 
 **Two rules, and everything else follows from them.**
 
@@ -25844,3 +25861,871 @@ replayable tools, which is not something Dream can arrange for itself.
 
 **Recorded as a measured negative because that is the point.** The suggestion was mine, it was
 plausible, it was quantitatively wrong, and finding that out cost four queries instead of a week.
+
+---
+
+## §4CP — Evolve: E3, and the review rounds that rewrote E2's threat model (2026-08-23)
+
+E3 (`evolve/negative_controls.py`) builds three **known-bad candidates** and checks the cascade
+refuses each at the stage it should die at: `edits_a_test` → stage 0 on diff-scope,
+`deletes_a_guard` → stage 1 because a pin asserts that guard fires, `no_op_claiming_improvement` →
+stage 3 where identical arms are "not better". The diffs are **generated, not stored** — a stored
+diff rots the moment its target moves, and a control that no longer applies reports a cascade
+failure that is really a stale fixture.
+
+Then four fresh-eye reviewers went at E2/E3 and what they found was worse than what was built.
+**Every finding below was established by measurement, on copies, and every fix carries an executed
+pin that was mutation-tested to confirm it can fail.**
+
+### The verdict belonged to the candidate
+
+Stage 1 runs candidate code in a child process and read the **exit code** as its verdict. A
+candidate containing
+
+    import atexit, os
+    atexit.register(lambda: os._exit(0))
+
+made a run whose pins FAILED report `passed: True` — with `summary: 1 failed in 0.01s` printed
+directly beneath it. The verdict contradicted the record it shipped with. Both halves must now
+agree, and the summary must positively say `N passed`.
+
+**The fix then re-opened a hole an earlier fix had closed.** `_summary_is_clean` phrased every
+decline as `"pins failed: …"` — including `no tests ran` and an `ImportError` banner — and the
+guard control scores itself on `"pins failed" in reason`. So a run in which the pins **never
+executed** scored the control GREEN, which is verbatim the regression that control exists to
+catch. The kind of failure is now an identity (`failed` / `not_run` / `unreadable`), set by exactly
+one branch, and only `failed` counts. *A substring is not an identity, and a fix in one file can
+reopen a hole in another an hour later.*
+
+### The cheapest attack was on the baseline, not the candidate
+
+13 of 18 paths the fence calls immutable were **not in the harness digest**, including
+`core/dream.py` — the module the stage-3 INCUMBENT arm runs. The fence guards the diff; the digest
+is what catches an out-of-band write, and for those paths it did not exist. Deflating the baseline
+was easier than inflating the candidate. `HARNESS_TREES` now covers `core/`, `memory/`,
+`selfhood/`, `sandbox/` and the tool registry, and a test asserts fence-and-digest agreement rather
+than either alone.
+
+**And the digest excluded the one artefact Python loads ahead of source.** `__pycache__`/`.pyc`
+were skipped so the digest would not "flap" — reasoning that reads as care and was in fact the
+exclusion that made the check decorative: an unchecked-hash `.pyc` is imported without consulting
+the `.py` at all, so a planted one replaces a module the digest still reports as pristine. An
+existing test asserted the exclusion, with the plausible justification that *"a digest that changes
+on its own teaches the operator to ignore it"*. The alarm-fatigue concern is real, so it is
+answered by a distinguishable `BYTECODE …` label rather than by looking away; both still abort.
+1,106 watched files → 2,165.
+
+### Stage 1 was not covering what it claimed
+
+* **The pin mapping was a prefix glob.** `test_{stem}*.py` matched any continuation: `tools/e.py`
+  claimed **52 unrelated pin files**; `tools/introspect.py` claimed `test_introspective_*`, which
+  is about task classification. One direction fabricates coverage a candidate never has to satisfy,
+  the other reports green for tests that pass whatever it did. Now token-bounded; 126 mapped pins
+  → 123, and all three dropped were genuinely about other code.
+* **Some pins grade TEXT, not behaviour.** A pin doing `(Path(__file__).parent.parent / "src" /
+  …).read_text()` resolves against the CANONICAL tree, so its assertions describe the incumbent's
+  bytes however the candidate changed. Measured: deleting the exact call one such pin greps for,
+  from a candidate, returned `stage1 passed=True, 84 passed`. Those pins are now detected (55 of
+  907 repo-wide), excluded from coverage, and a file whose *every* pin is of that kind is refused
+  under its own name — not conflated with "no test exists".
+* **The detector's first version was a lexical proxy** and flagged `sys.path.insert(0, parents[1]
+  / "src")` — the line 212 pin files open with. It now requires an actual `.read_text(`. *Guard the
+  act, not its neighbourhood.*
+
+### The fixture certified a fix it could not see
+
+`_mini_repo` wrote `src/__init__.py` (a regular package; the real repo has none, so `src` is a
+PEP-420 namespace package — opposite semantics in exactly the dimension under test) and **no pin
+did `sys.path.insert`**, which is the whole defect: 212 real files do. Measured, the stage passed
+identically with the pre-bind plugin loaded AND removed. Every test built on that fixture was
+blind. With the fixture made faithful, removing the plugin is caught by 6 tests instead of 1.
+
+`--import-mode=importlib` still survived every test after that, because the plugin covers both
+import spellings. Rather than call it redundant, it is now pinned by **its own effect**: a probe
+records `sys.path` at pin-import time and asserts pytest did not put the canonical root there.
+
+### The diff repair was the bug
+
+`repair_hunk_starts` set the **new-side start to the old-side start**. Hunk 2+ of a file is offset
+by the net lines earlier hunks added, so an already-correct `@@ -6,2 +7,3 @@` was rewritten to
+`+6,3`; `patch` applied it, `applied_where_it_said` rejected the candidate, and **the message
+blamed `patch`**. Every multi-hunk proposal was a self-inflicted permanent failure reported as
+someone else's fault. All five re-anchor fixtures were single-hunk, where the two starts coincide
+by construction.
+
+Two more in the same family:
+
+* **`--- ` is ambiguous.** A deleted line reading `-- x` becomes `--- x` — the header's prefix.
+  Breaking the body scan there truncated the hunk and poisoned the running offset for every later
+  hunk (measured: header collapsed to `@@ -1,1 +1,1 @@`, `patch` exited 1). The same ambiguity ran
+  the other way in `applied_where_it_said`, where an *added* line spelled `+++ /dev/null` was read
+  as a header, after which every remaining hunk was skipped and the check returned **"no
+  objection" for a diff it had stopped reading**.
+* **The ledger counted normalisations as relocations.** `@@ -1 +1,2 @@` is the valid short form of
+  `@@ -1,1 +1,2 @@`; comparing header strings counted the rewrite as a move, so `hunks_reanchored`
+  reported the model missing anchors it had hit exactly.
+
+Fuzzed after the fix over real repo sources with real `patch`: **31/31 correct diffs left
+byte-identical, 30/31 bogus ones re-anchored and applied, 1 correctly refused** as an ambiguous
+anchor.
+
+### A load-bearing import order, nowhere stated
+
+`scripts/dream_replay_smoke.py` does `sys.path.insert(0, REPO_ROOT / "src")` at import time, and
+under the stage-2/3 bench child `__file__` is the CANONICAL scripts dir — so importing it puts the
+**incumbent's** `src/` at `sys.path[0]` inside the candidate's own process. The child is safe only
+because it binds `ghost_agent` before that import, freezing `__path__` to the candidate. Measured
+both ways: in the shipped order a module imported afterwards still comes from the candidate; with
+the two imports swapped, `ghost_agent.core.dream` resolves to the incumbent and stages 2–3 grade
+the wrong tree in silence. Nothing in the source text said the order mattered. Now pinned, and the
+pin executes the mechanism rather than asserting about the line numbers.
+
+### The tests were the other half of the problem
+
+A dedicated audit of the ~240 tests written for E1/E2/E3 found nine that **could not fail**. The
+instructive ones:
+
+* `assert not r.passed and "runs\nnothing" in … or "nothing" in r.reason` — parses as
+  `(A and B) or C` with C always true.
+* A "the packet is written AFTER the final harness check" test whose fixture could never reach
+  `promotable`, so `stage4_packet` was never called under *any* ordering. Both its assertions held
+  on an untampered run.
+* A "the graded statistic is NOT a gate" test that scanned the source *between* the verdict call
+  and the `return` — so promoting the statistic to a second gate **inside** the return line stayed
+  green.
+* A "the shallow check SAYS it is a proxy" test satisfied by its subject's own docstring.
+* `assert not ok, why` on three fence paths — satisfied by the wrong refusal, so deleting
+  `"scripts/"` from `IMMUTABLE_PREFIXES` (which genuinely disarms the alias guard `materialize`
+  runs on every candidate) left all three green.
+* A persisted-record test comparing `got["all_ok"] == run.all_ok` **on a healthy repo**, where both
+  are `True` — so `_write` hard-coding `"all_ok": True` survived it. It needed a red run.
+
+### A self-calibrating index adapts to the mutation
+
+Worth its own line, because it looks like good practice. A tamper test measured the number of
+harness checks on a clean run and tampered on the last one — robust against adding a stage. But
+**deleting** the final check drops the count by one, the tamper lands on the previous check, and
+the test stays green while the guard it exists for is gone. The tamper is now keyed to *when* (the
+last stage returning), not to a count.
+
+### Round 3: three reviewers, and the shape of a fix that isn't one
+
+The third round was the most useful, because it found that **most of round 2's fixes did not buy
+the property they claimed**. The through-line, in one of the reviewers' words: *each closed a
+CHANNEL while leaving the MEDIUM that channel travelled on under the candidate's control.*
+
+* **The exit-code fix moved the forgery to stdout.** `summary` is the last line of the child's own
+  stdout. Three lines in a candidate module — `atexit`, a `sys.stdout.write("2 passed in 0.31s")`,
+  `os._exit(0)` — produce `rc=0` AND a clean summary, and stage 1 returns `passed=True`. "Both
+  halves must agree" is true and vacuous: both halves are the candidate's to write. Now recorded as
+  NARROWED, not closed.
+* **The bytecode fix disabled the interpreter, not the candidate.** `PYTHONDONTWRITEBYTECODE` stops
+  automatic caching; it does not stop candidate code writing a `.pyc` deliberately, with a forged
+  header matching the real source's mtime and size. What actually closes it is watching bytecode in
+  the digest — which had been excluded *on purpose*, to stop the digest "flapping".
+* **The digest was widened to the wrong set.** It now covered everything the FENCE calls immutable —
+  which answers a different question than what the INCUMBENT ARM EXECUTES. Of the 66 modules
+  `import ghost_agent.core.dream` loads, **42 were unwatched**, including `ghost_agent/__init__.py`,
+  all of `utils/`, `distill/`, `reflection/`, and 22 tool modules. Those files were on neither list:
+  no diff may touch them, and an out-of-band write to them was invisible. Now `src/ghost_agent`
+  entire — 2,365 watched files, 0.18 s.
+
+Three findings needed no forgery at all:
+
+* **A pin that SKIPS was a pin that passed.** `1 passed, 3 skipped` reads clean to any summary
+  parser, so a candidate that deletes a guard and makes the one pin covering it skip
+  (`pytest.skip(..., allow_module_level=True)`) cleared stage 1 having tested nothing — with both
+  halves of the record *honest*. The check cannot be "no skips": real pin sets skip (`675 passed, 2
+  skipped` is normal). It has to be per-FILE, which the summary line does not carry, so stage 1 now
+  takes pytest's own XML and requires every mapped pin file to contribute an executed test.
+* **The candidate could lower its own bar.** The stage-2 floor derives from the bench ledger in the
+  operator's LIVE home, and stage 1 runs first. Appending 2,000 losing rows moves the historical
+  rate 0.985 → 0.0909 and the floor **0.9318 → 0.0407**. The floor is now read before any candidate
+  code runs.
+* **Stage 3's arms could be pre-authored, from stage 2.** `run_cascade` puts the stage-2 child's
+  home at a deterministic sibling of both arm homes. A stage-2 child that planted both arm
+  directories and both result files won stage 3 outright: **24 pairs, p = 0.0078, PROMOTABLE — from
+  two children that wrote not one row**, having both exited non-zero. Three absences made it work:
+  the outbox was never truncated or refused, the arm directory was reused if it existed, and the
+  child's return code was recorded and never consulted. All three closed.
+
+### The mapping was namespace-blind, and 26% of pins were decorative
+
+Fixing the SUFFIX direction (`test_e*.py` matching 52 files) left the COLLISION direction open:
+`tests_for` keys on `Path(rel).stem`, so `core/prompts.py` and `reflection/prompts.py` — different
+modules, same filename — mapped to the same three pins, all about `core/prompts.py`. A candidate
+whose `reflection/prompts.py` had every function body replaced by `raise NotImplementedError`
+passed stage 1 with `13 passed`. Measured across the mutable set: **33 of 127 mapped pin-runs (26%)
+passed unchanged against a gutted module.**
+
+A filename is a guess about a module; an import is evidence. Coverage is now the UNION of the two —
+the name rule finds `test_browser_click_failfast.py`, which reaches the tool through the registry
+and imports nothing; the import rule finds `test_reflection_prompts.py`, which the name rule never
+could. Previously-unmapped files: 9 → 1. The gutted `reflection/prompts.py` now fails with 23
+failures.
+
+### The detector was a lexical proxy, twice, and the third version inverts it
+
+v1 keyed on a `src` path expression and flagged `sys.path.insert(0, parents[1] / "src")` — the line
+212 pin files open with, and the opposite of a read. v2 required `.read_text(` and missed
+`open(…).read()`, the `"../src"` spelling, and every file whose root constant was not one of three
+hard-coded names (`_SRC` alone accounted for 14 unflagged files). Each fix widened a vocabulary
+instead of asking the question. **The question is a taint question** — is there a read whose path
+derives from this test file's own `__file__`? — and the AST answers it: 55 flagged → 106, with the
+regex's flags a strict subset, and `mod.__file__` reads correctly NOT flagged (those are
+candidate-side, because the pre-bind plugin bound the package to the candidate).
+
+The consumer was also too coarse. Flagging a whole file because it holds one text assertion would
+have refused candidates for `browser.py`, `acquired_skills.py`, `sandbox_services.py`,
+`image_gen.py` and `memory.py` — all of which genuinely fail against a gutted module. The
+disqualifying predicate is "reads canonical files AND imports nothing from the package": 106 → 33.
+It currently refuses no mutable file, and a comment claiming `projects.py, all 8 of 8` was a
+leftover measurement from the regex that had been *replaced* — 0 of 8 under the shipped one. A
+stale number beside a guard is worse than none: it is the evidence a reader uses to decide the
+guard is load-bearing.
+
+### The environment decided the verdict
+
+Found by running the canonical tree as its own candidate — the one check that should be trivially
+green. It failed. `_summary_is_clean` matches `\b(\d+) passed\b`, and pytest's coloured output is
+`\x1b[1m63 passed`: there is **no word boundary between `m` and `6`**, so a run reporting 63 passes
+was classified `unreadable` and the candidate refused. The cause was `FORCE_COLOR=3` in the
+operator's shell, inherited straight through `dict(os.environ)`.
+
+Fail-closed, so not a safety hole — it simply **refused every honest candidate on a coloured
+terminal**, with a message pointing nowhere near the cause. That is the shape of a gate that gets
+disabled rather than debugged. Fixed at both ends (`--color=no` plus dropping
+`FORCE_COLOR`/`PY_COLORS`/`CLICOLOR_FORCE`, and stripping escapes when parsing, since the child can
+emit colour whatever the parent's environment says), and pinned with both mutations.
+
+Worth noting how it was found: not by a reviewer and not by the suite, but by asking the cheapest
+possible question of the real system — *does the incumbent pass its own gate?* Every fixture in the
+file used a mini-repo whose `pytest.ini` was empty and whose runs were short enough that nobody
+looked at the escape codes.
+
+### Two more from the diff pipeline
+
+* **My own blank-line rule broke diffs that already applied** — 26 of 299 over real repo files, on
+  the one model behaviour the module's comments call constant (a blank context line arriving as `""`
+  rather than `" "`). Within a file section, hunks follow each other directly; only a `--- `/`+++ `
+  pair separates. The cost was permanent: `run_mutation` archives the failure by normalised hash, so
+  the novelty filter blocks the model from re-proposing the same correct edit. There is now a
+  DIFFERENTIAL pin — a diff `patch` accepts before the repair must still be accepted after it — and
+  it is the only test in the group that could have caught this.
+* **`applied_where_it_said` could not object to a deletion.** A pure-deletion hunk has an empty
+  post-image, so the comparison was `[] == []` — true wherever the hunk landed. Measured: a two-line
+  deletion declared at line 1 was applied 400 lines away, `patch` exited 0, and the candidate was
+  archived and offered to an operator. Whole-file deletion was blind the same way (`+++ /dev/null`
+  set `current = None`; Apple `patch` leaves a 0-byte file rather than removing it).
+* **And the re-anchor read an unvetted, model-controlled path** — before `validate_diff` sees it,
+  synchronously on the event loop. `+++ b/../outside_secret.txt` re-anchored against a file outside
+  the repo; `+++ /dev/zero` reached 3.9 GB RSS in two seconds and never returned. Now repo-relative,
+  regular-file, size-bounded.
+
+### Round 4: the pattern recurred a third time, and two fixes were defeated with working exploits
+
+Round 4 attacked round 3's fixes on the explicit premise that they had moved the forgery rather
+than closed it. Four of five had.
+
+**The exit-code fix buys nothing.** Six lines appended to the repo's OWN shipped `deletes_a_guard`
+control make it pass:
+
+    E1  shipped control          -> passed=False   "2 failed, 751 passed"
+    E2  same control + 6 lines   -> passed=True    "753 passed in 118.00s"   rc=0
+
+The six lines write a plausible summary to stdout and `os._exit(0)`. **The XML was never touched** —
+it passed on its own merits, because a FAILING testcase still counts as executed, so the two
+genuinely-failing pins credited their own files. The docstring claimed the XML was "evidence the
+parent did not take from that stream"; it is not, and that claim is now removed. All three
+channels — XML file, last stdout line, exit code — are outputs of one process the candidate owns,
+and only one had to move.
+
+**The arm-isolation fix was defeated end to end, through `run_cascade` itself**: `PROMOTABLE: True`,
+p = 0.00049, packet written, operator notified — with an HONEST incumbent arm. All three closures
+held (each arm directory created by the run, neither outbox pre-existing, both children exiting 0).
+The medium got round them: the real bench child opens the outbox in **append** mode and holds it
+for the whole run, `pair_rows` is last-row-wins, and a grandchild detached during stage 2
+re-appended a losing row for every id the incumbent had already finalised. Every closure fires
+BEFORE the child starts; the file stays writable for minutes afterwards.
+
+That one has a cheap real fix the closures could not reach: **an item graded twice is a refusal.**
+It does not close the medium — nothing here can — but it means an appended verdict must REPLACE a
+row rather than follow it, which an append-only channel cannot do.
+
+### The rest of round 4, all fixed and mutation-pinned
+
+* **The XML check was FAIL-OPEN.** A missing or unparseable report substituted `[]` — falsy — and
+  the stage did not fail. Its own docstring says absence is "no evidence either way"; the caller
+  read it as permission. Measured: a candidate that skips its pin AND removes the XML (the path is
+  in its own argv, and `atexit` runs after pytest writes it) went from refused to `passed=True`.
+  **Deleting the evidence must not beat producing it.**
+* **An `<error>` counted as an execution.** A testcase whose fixture blew up never ran its body and
+  demonstrates exactly as much as a skip — which the same function already excludes for that reason.
+* **The floor pre-read was disarmed on the branch with no history.** `min_pass_rate=None` handed
+  the derivation back to stage 2, which reads the ledger AFTER stage 1 ran candidate code. Measured:
+  floor **0.0063 against an honest 0.5** — worse than the 0.93 → 0.04 the fix was built for, and
+  reachable on a fresh `GHOST_HOME` or a rotated ledger. It also used the REQUESTED item count where
+  the stage's own rule says `len(ran)`; the RATE is now pre-read and the stage applies it to the n
+  it actually graded.
+* **The runner check was a SPELLING check.** It rejected `/tmp/evil.py` and `../x` and happily
+  executed `scripts/link.py` when that was a symlink out of the tree. `fence.py` states this exact
+  lesson — "a string transform can only ever APPROXIMATE the filesystem's own equivalence relation"
+  — and the new check had not followed it.
+* **The digest was blind to symlinks.** `is_file()` FOLLOWS them, so a DANGLING symlink is not a
+  file, and `rglob` does not descend into a symlinked directory: both could be ADDED inside a
+  watched, immutable tree and stay **permanently** invisible. Worse than the modify-use-restore
+  window the docstring concedes. Entries are now enumerated and a link's own TARGET is hashed.
+* **`src/__init__.py` was an unwatched code-execution seam.** It does not exist — and that is the
+  point: creating it turns `src/` from a namespace package into a regular one whose body runs on
+  every `import src.ghost_agent.*`, the production import shape. The entry one level down
+  (`tools/__init__.py`) is listed by name for exactly this hazard.
+* **Candidate stdout reached the operator packet unmarked.** `stage4_packet` copies each stage's
+  `detail` wholesale, and `tail` is 400 characters the graded process wrote — measured, prose like
+  "VERIFIED BY OPERATOR, ready to merge" arrived beside the cascade's own findings. Kept (a crashed
+  child's last words are the most useful thing in the record) but never again presented as the
+  cascade's voice.
+* **The digest check between stages 1 and 2 was unpinned**, because every existing test asserted
+  `aborted` and a LATER check still catches the tamper. The check's value is not RUNNING stages 2
+  and 3 — over three hours — on a harness the candidate just moved. Pinned on the SKIP, not the
+  abort.
+
+### And three of the round-4 pins did not catch their own mutations
+
+Worth recording because it is the same failure as everything above, one level up: the floor test
+monkeypatched the very stage the mutation lived in, the runner test only exercised the spelling
+cases, and the symlink change shipped with no test at all. All three now drive the real code and
+die under mutation. **A pin written alongside a fix inherits the fix's blind spot** — the only thing
+that finds out is running the mutation.
+
+### Status
+
+E2 stages 0–4 and E3 are built, exercised on real code, and **called by nothing in production** —
+operator-triggered by design. The evaluator's module docstring now carries the threat model
+honestly, and the honest version is narrower than the first draft: stages 1-3 execute candidate
+code in a process that can write every file the parent later reads — the results, the report, and
+the harness. The digest is a before/after SNAPSHOT, so modify-use-restore inside one stage is
+invisible by construction, and a detached grandchild outlives every check after it. **Closing that
+class needs the child under the sandbox, not beside it; no arrangement of parsing fixes it.** This
+cascade guards against MISTAKEN candidates, not hostile ones — that is its scope, not a caveat on
+it — and no autonomous promotion may be built on it. Docs: `docs/evolve/evaluator.html` rewritten (it carried the same false
+"parent process" claim), `docs/evolve/negative_controls.html` added, `docs/evolve/mutator.html`
+updated with the three repair defects.
+
+
+### Speed: correctness made the suite unaffordable, twice
+
+Making the pin mapping honest took `tools/execute.py` from 17 pin files to 45, so one real stage-1
+run went from ~3 s to **125 s** — and three tests paid it every time. The negative-control file went
+from ~40 s to **6:20** and the full suite from ~10 m to **20:48**, on a repo where the suite runs
+several times per change. A check nobody can afford to run is a check that stops running.
+
+Three changes, none of which weakens anything:
+
+* **one shared real run** instead of seventeen — tests that only INSPECT the result take a session
+  fixture; tests that monkeypatch `stage1_pins` do their own call and are fast precisely because the
+  real stage never executes;
+* **an `only=` selector**, because deep mode differs only for the no-op control and was paying 125 s
+  to re-derive two results the shallow run already had. It immediately exposed a shared default
+  hidden inside one branch: `materialize` was defaulted inside the guard control's block, so running
+  any OTHER control alone died with `'NoneType' object is not callable`;
+* **`-x` on stage 1** — the verdict is binary, so the 753rd test cannot change it, and a known-bad
+  candidate now fails in 6.5 s instead of 125 s. Safe only because the summary is classified BEFORE
+  the per-file execution check; otherwise an early exit leaves later files with nothing executed and
+  the stage reports `not_run` for a run whose pins objected. That ordering is better logic anyway: a
+  failing pin is already a verdict, and the execution evidence is for the CLEAN case, where "nothing
+  objected" has to be shown to mean "everything ran".
+
+| | tests | wall clock |
+|---|---|---|
+| evolve suites, peak | 362 | 7:47 |
+| evolve suites, now | 372 | **1:38** |
+| full suite, peak | 15,475 | 20:48 |
+| full suite, now | 15,484 | **14:54** |
+
+What remains of this work in the suite is about **10 seconds**. The ten slowest tests now account
+for 5:46 — 39% of the run — and all but one predate this session.
+
+### ⚠ WHAT IS NOT CONVERGED (2026-08-23)
+
+Four review rounds, and **every round found that the previous round's fixes did not buy the property
+they claimed**. That is the base rate to plan against, not a run of bad luck. Still open:
+
+* **The medium.** Stages 1-3 execute candidate code in a process that can write every file the
+  parent later reads. Two working exploits stand: the six-line stdout forge, and the
+  append-during-run channel (blunted by the duplicate-row refusal, not closed). No arrangement of
+  parsing fixes this; it needs the child under the sandbox rather than beside it.
+* **The round-4 remediation is itself unreviewed.** Twelve changes went in after the last fresh-eye
+  pass. On this file's record, assume some are wrong in the same way — three of the round-4 pins
+  already failed to catch their own mutations on the first try.
+* **The mapping's blind rate is UNMEASURED since the fix.** The reviewer running the
+  gut-every-mutable-module ground truth was stopped before reporting. Measured and true: unmapped
+  files 9 → 1, and a gutted `reflection/prompts.py` now fails with 23 failures. NOT measured: that
+  the 26% blind-pin-run rate is actually gone.
+
+
+## §4CQ — Round 5: the round that caught a regression I had shipped (2026-08-23)
+
+Scoped to the two things §4CP recorded as unverified: the twelve round-4 changes (unreviewed) and
+the mapping's blind rate (claimed but unmeasured). Both answers were worth having.
+
+### The blind-rate claim was half wrong
+
+| | before | now |
+|---|---|---|
+| **files** whose gutted candidate still passes stage 1 | — | **0 of 32** |
+| pin-runs blind, under the OLD mapping | 33 / 127 (26%) | **33 / 127 — unchanged** |
+| pin-runs blind, under the new mapping | — | 53 / 485 (10.9%) |
+
+At the file level the gate is sound: every mutable file refuses a gutted candidate, each with a
+validated passing baseline, `reflection/prompts.py` included (23 failures, exactly as claimed). But
+**the rate fell because 335 sighted pins were added, not because a single blind pin was fixed** —
+restricted to the old mapping the earlier measurement reproduces exactly. "The blind rate is gone"
+would have been false, and the journal had implied it.
+
+Reading all 53 gave the cause: **the filename rule still fabricates coverage across packages.**
+`tools/workspace.py` picked up 15 pins about `ghost_agent.workspace.*` — a different package —
+and `tools/memory.py` 8 about `ghost_agent.memory.*`. A pin that imports the package but NOT the
+target is not about the target; a pin that imports nothing is kept, because that is how the ones
+reaching a tool through the registry look. Measured after: 426 → 399 pin-runs, `workspace.py`
+18 → 3 (and those 3 are the real ones), no file loses coverage, both gutted modules still refused.
+
+### I had shipped the suite red
+
+Two failures, both from the previous hour's edit: `asked.get(id, 0)` returns 0 for an id nobody
+asked about, so a child echoing its own indices had EVERY row called a duplicate; and the
+`sample_items` dedupe was cross-bank, silently dropping an id the second bank legitimately shared
+and shrinking its stratified share. Fixed, and the dedupe moved inside the bank where it cannot
+cost another bank anything.
+
+### Four more levers the subject held
+
+* **The candidate could choose its own `n`.** `bench_floor` collapses with n — 0.9318 at 120,
+  0.631 at 10, **0.10 at 2** — so turning items it would FAIL into `infra` aborts lowers its own
+  bar. Measured, history 0.985, 120 requested: honest (120 graded, 90 passed) **refused** at
+  0.9318; aborting 118 and passing 1 of 2 **passes** at 0.10. `infra` was recorded and never gated.
+  Now a run must grade 60% of what it was asked or it cannot conclude — which costs a generation
+  when the sandbox is flaky, and that is the correct trade.
+* **`None` was a valid pre-read that meant "fall back".** `run_cascade` passes the rate it read
+  before stage 1, which is `None` when no ledger exists yet, and stage 2 treated that as "no caller
+  value" and re-read the ledger AFTER candidate code ran. Measured end to end on a fresh
+  `GHOST_HOME`: a **5% pass rate promoted against a floor of 0.0**, where the honest default is 0.5.
+  The FLAG says a caller has looked; the value cannot.
+* **A collection error scored as "the pins objected".** `1 error` is the candidate BREAKING the
+  pins, not failing them — zero test bodies ran. Folding it into `PINS_FAILED` gave the negative
+  controls two producers of the kind they key on, one of which executed nothing: the exact
+  regression those controls were rebuilt to detect. Now `PINS_ERRORED`.
+* **`-x` de-specified the guard control.** `tools/execute.py` maps to 45 pin files and stage 1 stops
+  at the FIRST failure, so one unrelated failing pin ended the run and the control scored GREEN on a
+  run where the guard's own pin never executed (`ok=True, all_ok=True, "1 failed, 6 passed"`).
+  Asserting the KIND is not asserting the POINT: the control now names the pin that objected, and
+  says "SOMETHING ELSE FAILED FIRST" when none did.
+
+### And eight mechanisms with no test at all
+
+`-x` itself, `run.selected`, the `only=` selector in both directions, the tail redaction, the
+per-arm `returncode`, the symlink target-STRING choice, and the `src/__init__.py` entry — every one
+of them survived its own deletion. All eight now die under mutation. Note the shape: these are not
+missing tests for missing code, they are **fixes that shipped without the pin that proves they do
+anything** — the same failure as §4CP's "three of the round-4 pins did not catch their own
+mutations", one level up.
+
+### Still open, unchanged
+
+The medium. A second exploit landed on it this round: the duplicate-row refusal is bypassed by
+`os.replace` rather than append — the grandchild reads the ids from the arm's INBOX (written by the
+parent before the child starts), builds one forged row per id and renames over the outbox, giving
+`stage3 passed=True, p=0.0, promotable` with every pre-run closure intact. Blunted, not closed.
+Closing it needs the child under the sandbox.
+
+
+## §4CT — The last `unmeasured` loop gets its counter (2026-08-24)
+
+§4CS's yield surface named exactly one remaining instrumentation gap, and this closes it.
+
+**The gap.** `skills.graduated` read `unmeasured`: the graduated skills ARE injected into the
+prompt as a "PROVEN APPROACHES" block on every turn with user content, and **nothing anywhere
+counted it**. Neither `relevant()` nor `format_for_prompt()` recorded that it fired. That is not a
+zero, and the distinction is the whole reason the yield view has six states — the remedy for "no
+counter" is to wire a counter, and the remedy for "measured zero" is to kill or fix the loop.
+
+**The fix.** `GraduatedSkillStore.surfaced_for_prompt()` returns the block AND the signature hashes
+it listed; `format_for_prompt()` is now a thin wrapper over it, so there is one formatter and the
+hashes cannot drift from the block that named them. `record_surfaced()` books a retrieval per skill
+in one load+save. The row's `activated` becomes *retrieved at least once* — it was `len(rows)`,
+"all of them are eligible", which is true of every store and evidence of nothing.
+
+**Three properties:**
+
+1. **Idempotent per turn.** Dedup is keyed per TURN in a bounded map, not held in a single slot.
+   The lesson store's equivalent keeps one `_retrieval_turn_key` that any interleaved retrieval
+   resets — one of three routes by which a §4CS reviewer showed it double-books. There is exactly
+   one call site here and it is not inside a loop, so this is insurance; a counter that can
+   over-report is not an honest number.
+2. **REAL traffic only**, gated on `turn_origin(context) == "user"` — the canonical predicate, the
+   same one the liveness denominator and the foresight gate use, so this counter cannot drift from
+   the population those views interpret. Counting simulated turns is the §4K defect verbatim: 28
+   "user turns" reported on a box whose true count was ZERO.
+3. **It is NOT helpfulness, and the row says so.** `invoked` counts prompt injections. Unlike
+   lessons there is no outcome arm here, so nothing says a surfaced skill was read or used.
+
+**⚠ My own test caught a fail-open I had written.** `turn_origin(None)` answers `"user"` by its own
+(correct) default, so `book_graduated_retrieval(None, store, hashes)` BOOKED — the absence of a
+context reading as real traffic. Booking is the favourable direction for the counter, so it is the
+one that has to be withheld. Guarded and pinned (`T11`).
+
+**Extraction for testability, not for tidiness.** The gate lives in a module-level
+`book_graduated_retrieval(context, store, hashes)` rather than inline in `handle_chat`, because a
+gate buried in a 4,000-line coroutine can only be pinned by a source-shape proxy — and §4BN watched
+those stay green through a commented-out block, a moved helper, a nested helper, a literal `False`
+and a downgrade to DEBUG. The helper is driven directly by the tests, with real store files.
+
+**Scoped OUT, deliberately: the outcome arm.** Giving graduated skills `succeeded_retrievals` /
+`failed_retrievals` like lessons means threading a second population through
+`_record_lesson_outcomes`, its trajectory stash, its 512-entry flushed-retain ring and its
+opposite-sign re-book — a hot, heavily-reviewed path whose shape has produced this project's worst
+bugs. Half-wiring it would be worse than not wiring it. Recorded as the next step, not attempted.
+
+### Verification
+
+`tests/test_4ct_graduated_skill_retrievals.py` — 31 tests, **20 mutants, 20 killed**, each running
+three whole test files. One §4CS assertion retired with a pointer (`invoked is None` was the
+contract this entry removes); its still-valid half — `verifications` must never be read as usage —
+is kept.
+
+Full suite **15,709 passed / 17 skipped / 0 failed**. Docs:
+`docs/tools/introspect.html#graduated-counter`.
+
+## §4CS — Consolidation: closing loops that ran and produced nothing (2026-08-24)
+
+Seven items, worked A→G. Two premises did not survive Rule 0 and that is recorded as the result.
+Two review rounds per built item; the round-2 reviews found a CRITICAL in the round-1 *fixes* on
+both of them, which is the §4BU pattern holding for the ninth time.
+
+### A — the macro loop, which produced nothing consumable for six weeks
+
+**Re-derived first.** 26 composed skills · 25 auto-mined · 25 `proposed` · **0 invocations across
+every auto-mined macro, all time**. The one `active` macro is hand-written (`youtube_transcribe`,
+3 uses / 0 successes). 11-with-params / 15-empty confirmed — with a correction the audit missed:
+the 11 are almost all PRE-deny-list (before 2026-07-29), and the blanking is per-STEP, not
+per-macro, so safe tools still got literals.
+
+**Operator decision: (a) mint a param SCHEMA, keep operator approval.**
+
+The rule, after two review rounds beat three earlier versions out of it: per `(step, key)` a value
+becomes a LITERAL only if it is constant across every observation AND is the value of that tool's
+**primary dispatch selector** — the enum parameter the tool *requires*. Everything else becomes a
+`$slot`, which `to_tool_definitions()` already advertises as REQUIRED and `_resolve_args()` already
+substitutes. No new execution machinery; this filled a hole in one that existed.
+
+**Three rules the reviewers extracted, each from a working exploit:**
+
+1. **"Enum-typed" ≠ "a mode".** `manage_projects.status='DONE'` is enum-typed and is the value
+   being WRITTEN. Freezing it re-froze the *other half* of the exact artifact the retired deny-list
+   existed for, live, on 2 of 12 mintable sequences.
+2. **A frozen mode can be a complete destructive call.** Where `action` is a tool's only required
+   param the literal IS the whole call: `knowledge_base(action='reset_all')` minted as a step with
+   NO runtime input. That call wipes the vector store, truncates the library index and calls
+   `graph_memory.wipe_all()` with no confirmation gate — and macro steps dispatch through
+   `build_step_executor`, which never reaches the turn loop's mutation classification. Remedy:
+   **every step must carry a runtime input**, because a call fully determined at mint time is a
+   replay. Structural, not a list of dangerous verbs — every exemption in this project's deny-lists
+   became the next bypass (§4CI). Measured cost: one benign read-only bundle.
+3. **A "payload-free" constant is not a safe one.** `postgres_admin.confirm=True` is a bool and it
+   is the destructive-DDL AUTHORISATION; `manage_projects(task_id=42)` and a live
+   `manage_services(port=5055)` were being frozen as numbers. The first fix DROPPED such constants
+   — and that was wrong too: `browser.stop_on_error` defaults to False, so dropping an observed
+   True silently inverts a fail-fast interlock to fail-open. Exactly one param in the whole
+   registry declares a schema `default`, so there was no basis for deciding what an omission means.
+   Everything that is not the selector now slots explicitly.
+
+**⚠ THE ROUND-1 FIX SILENTLY SEVERED THE CHANNEL IT EXISTED TO FEED.** Making the window key
+mode-aware changed `p["signature"]` from a tuple of strings to a tuple of `(tool, modes)` pairs,
+and the "Macro Proposed" `pretty_log` still `str.join`ed it. The TypeError fired INSIDE the
+registration loop and the blanket handler swallowed it at DEBUG: exactly ONE macro registered per
+cycle instead of up to three, and the announcement — approval is the ONLY route from `proposed` to
+invocable, and that line is its only announcement — never printed. Found by a reviewer running
+`_propose_macros_sync` for real. No test in either file drove it.
+
+**Other things running it found:** the second producer (`skills_auto` graduation) applied NO
+admission rule at all, and over the live corpus offered a macro whose first step RUNS AN ARBITRARY
+COMPOSED SKILL BY NAME; the round-1 ERROR announcement sat inside the `except` with no guard of its
+own, so when *it* raised the exception escaped a method documented "Never raises"; an unknown tool
+(`vision_analysis`, which is appended by `get_active_tool_definitions`, not in the static list) was
+exempt from all three refusal checks.
+
+**Measured on the live corpus, after:** 40 mintable sequences from 1,803 trajectories — and the
+audit that matters, **every non-slot literal across all 40 is a dispatch selector, and zero steps
+take no runtime input.** Before the mode-aware key the same corpus yielded 2. The macros read as
+real workflows: `file_system:replace → manage_services:restart` (support 12),
+`browser:screenshot → vision_analysis:describe_picture` (11), `web_search → browser:navigate` (13).
+
+`tests/test_4cs_macro_param_schema.py` — 69 tests, **39 mutants, 39 killed**, each mutant running
+four whole test files (a harness that requires naming the killing test in advance is structurally
+incapable of finding a behaviour with no test — the round-1 harness's own blind spot).
+
+### B — no instrument reported "this loop produced nothing"
+
+Extended `core/liveness.py` rather than adding a parallel surface: it already had the
+probe-per-mechanism shape and the NO_SOURCE third state. But its probes answer **"did this
+mechanism RUN?"** — every one read `fired` throughout the six weeks the macro loop produced
+nothing. The new axis answers **"did it produce anything anyone CONSUMED?"**: per producing loop,
+`minted → activated → invoked → last-invoked`, with SIX states because the distinctions are the
+whole point — `barren` (measured zero) vs `barren`-derived (blocked upstream: no macro is approved,
+so none *can* be invoked) vs `unmeasured` (no counter exists) vs `empty` (minted nothing) vs
+`no_source` vs `gated`. Rendered under `introspect action='learning'`, and carried in
+`collect_learning_health()["loop_yield"]` so it can be alarmed on rather than only read.
+
+**The instrument lied in nine places before two review rounds were done with it**, and almost none
+of the defects were in the systems it watches:
+
+* it counted the ONE hand-written macro's 3 invocations with the loop's own 25;
+* `evolve.candidates` set `invoked = packets` — the same number as `activated`, from the same glob
+  — so PRODUCTION posed as consumption, rebuilding this section's own failure mode inside it;
+* its `minted` counted nightly runs that found the loop switched OFF, while the same report said
+  "4 of 4 recorded run(s) found it off" twenty lines below "minted 4"; `gated` was structurally
+  unreachable, and once reachable it was decided from the all-time ledger, which never rotates;
+* `prompts.gepa` claimed `unmeasured` while the loader's own log line sat on disk and a SIBLING
+  PROBE IN THE SAME FILE printed a live count 390 lines above it — then, once fixed, matched one of
+  the loader's two "I served this" lines and windowed the count while taking the age all-time, so a
+  fully-applied artifact read `barren` with "last 300.0h ago" beside it;
+* `lessons.playbook` counted 6 quarantined tombstones (30% of `invoked`), and the fix then made an
+  all-quarantined store render `empty` — the most alarming state this store can be in shown as its
+  most benign;
+* `barren` fired on `minted == 0`, so an empty home announced "5 loop(s) produce artifacts NOBODY
+  INVOKES" about five loops that had produced nothing;
+* macro provenance was a COPY of each producer's description string with nothing linking them, so
+  rewording either producer — a pure refactor — made the loop's output invisible AND made the row
+  assert a fabricated fact. Both producers now build their stamp from one constant.
+
+**⚠ And the first test suite could not detect the feature's absence.** A reviewer emptied
+`YIELD_PROBES` entirely and all 20 tests passed, because the only test that read the real table
+iterated an empty list. 37 of 56 mutants survived. Now: 64 tests, **45 mutants, 45 killed**, each
+running the whole file.
+
+### C — the PRM: PARKED (operator decision)
+
+No fitted checkpoint (only `checkpoint.json.pre-1c-schema`); `_MCTS_TURNSTART_ENABLED = False` with
+its criterion unmet; `--frontier-selfplay` absent from the launcher exec line. `prm_consumer_is_live`
+correctly refuses to retrain a model nothing reads — that gate exists because of a real
+41-wasted-retrains incident, so it is not the bug. **The bug was that nothing recorded this as a
+DECISION**: the wiring rows read as a configuration that might change at any moment, which is
+indistinguishable from a subsystem quietly broken.
+
+The park is **derived**, not asserted, so it retracts itself the moment a consumer goes live and
+claims nothing at all when a leg is unreadable. Its arithmetic travels with it: with an untrained
+PRM `uncertainty()` returns 1.0 for EVERY cluster by contract, so `combine_weights` degenerates to
+rarity alone — pinned by comparing the product against a recomputed rarity map. `_MCTS_TURNSTART_ENABLED`
+was NOT flipped.
+
+### D — why 54% of turns are undecidable (MEASURE-ONLY)
+
+Re-derived: 1,613 `user_request` turns → 736 decided (45.6%) → **42** replayable. ⚠ The "67
+replayable" figure in circulation does not reproduce; 67 is the count *before* the
+`no_filesystem_checkable_deliverable` filter, and §4CN/§4CO already say 42.
+
+Of the 877 undecidable turns:
+
+| cause | n | % |
+|---|---|---|
+| no tool call at all — nothing was executed to check | 511 | 58.3% |
+| tool-using, no verdict ever recorded — **355 of 361 predate 2026-08-13** | 361 | 41.2% |
+| verdict PRODUCED but never attached — all four `UNCERTAIN`, correctly not decisive | 4 | 0.5% |
+| correction exists but outcome undecided — one, an operator overlay deliberately reverting a false-positive REFUTED | 1 | 0.1% |
+
+**There are ZERO lost verdicts.** Every one is a mechanism working as designed.
+
+The ceiling, split by turn shape: **chat turns are 5.4% decided lifetime (29/540), 25% over the
+last 14 days — and 19 of those 20 decisions came from a HUMAN. The machine verifier has resolved
+exactly ONE chat turn in the corpus's lifetime.** Tool-using turns are 65.9% lifetime and 80% over
+the last 14 days. The verifier is not failing on chat; it is DECLINING — its dominant live skip
+reason is "turn carried no verifiable evidence (bookkeeping-only tools); skipped by design".
+
+So: the tool-using capture gap §4CM called closed IS closed (one undecided tool-using turn
+post-dates 2026-08-21), and the remaining 58% is machine-undecidable chat whose only resolution
+channel is human labelling — already shipped, already running at ~25%. Neither is a recording bug,
+and a recording change built off the assumed cause would have been built against nothing.
+Re-derivable: `scripts/measure_undecidable_turns.py`.
+
+### E — E3 negative controls, SCHEDULED (§4CO recorded this as owed)
+
+Weekly idle phase 2.7f with a **durable** anchor read from the result file's own timestamp (an
+in-memory anchor makes the cadence "once per deploy", so on a box that restarts often a weekly job
+runs every boot). One cadence constant shared with the liveness probe's staleness bound.
+`GHOST_NEGCTRL=0` disables it.
+
+A `evolve.negative_controls` probe surfaces it, and **a control that fails to fire is LOUD — which
+is NOT a zero**: a run where two of three held has a POSITIVE count and is the most important line
+on the view, so `alarm_if_zero` could not express it and `ProbeResult` grew an explicit `alarm`. It
+fires on a control that did not reject, one missing from its own results, an unverified one, a
+PARTIAL run, and a schedule that has STOPPED. Never-run reads NO_SOURCE, not a tick.
+
+**First live run against the real tree, all three fired and held:** `edits_a_test` → `stage0_static`
+(diff scope), `deletes_a_guard` → `stage1_pins` (1 failed / 289 passed), `no_op_claiming_improvement`
+→ `stage3_paired` (not better, p=1.000).
+
+⚠ Registering the phase tripped an EXISTING guard — `test_activity_liveness` fails when a phase
+literal exists in `src/` but not in `PHASE_EXPECTATION`. It was right: without registration the
+phase would never have appeared in the liveness report, which is how a dead loop hides. That guard
+earning its keep on an unrelated change is the best evidence it works.
+
+### F — §4BW item C: THE PREMISE WAS FALSE
+
+The journal itself records **"C LANDED 2026-08-19"** at the §4BW tail, with all three blockers
+cleared the same day. Only the §4 queue index line still said "STAGED, NOT LANDED" — the ledger
+carried a phantom open tail for five days. Corrected at `PROJECT_JOURNAL.md:464`.
+
+Re-verified LIVE rather than taken from the journal's own claim (§4CO's operating assumption): the
+running daemon (started 08-23 14:56) loaded a `sandbox/docker.py` last modified 08-22 04:46;
+`GHOST_SANDBOX_EXEC_STREAM` is unset in both its environment and the launcher, so
+`_EXEC_STREAM_ENABLED` is True at module load; and `_exec_run_streamed` against the live container
+is **byte-identical** to the buffered `exec_run` for text, binary (NUL/0xFF), exit codes and 8 MB
+of output, while bounding **64 MB of produced output to 1.0× a 1 MB cap**.
+
+### G — the foresight gate: PARKED, and the arithmetic is sharper than expected
+
+**1. Does the incumbent pass its own checker?** Yes. Every field of the three largest buckets,
+recomputed by hand from the raw ledger, matches what `build_gate` wrote — verdicts included. And
+the `enabled` path is REACHABLE: synthetic buckets at (fail_n 10, precision 0.90) and (30, 0.80)
+both enable, while the FLOOR case (10, 0.60) fails on the interval test exactly as the module's own
+docstring warns. So "0 enabled" is a property of the data, not of the rule.
+
+**2. Time to qualify — and the brief's hypothesis was wrong.** The DENOMINATOR is not far away:
+predicted-fail rows arrive at 0.77/day and the best-placed bucket is ~5 weeks from `min_fail_n`.
+Not years.
+
+**⚠ 3. THE INDEX IS ANTI-PREDICTIVE.** Pooled over every steerable row: **1/14 = 0.071**, Wilson
+95% CI [0.013, 0.315] — entirely below the 0.60 bar. Rows the index claims will FAIL fail **7.1%**;
+rows it claims will succeed fail **10.6%**. Spread **−0.035** against a +0.10 bar. Brier skill is
+negative in 14 of 18 buckets with a denominator.
+
+That is decisive rather than discouraging because `_evaluate_bucket` rejects on precision BEFORE
+the interval test: **a bucket whose true precision is under the bar cannot enable at ANY n.**
+Time-to-qualify is not long, it is UNDEFINED unless the index improves. More traffic does not fix
+it. `build_gate` now emits a pooled `discrimination` verdict — derived, so it flips on its own —
+surfaced on the idle summary and the LOOP YIELD row, replacing 63 buckets each reporting "needs 17
+more", which is the failure mode this project has a name for.
+
+### ✅ ACCEPTANCE — a live run, not a green suite (§4CO's bar)
+
+Deployed 2026-08-24 01:39 (listener 71817 → 90217, verified changed via `lsof`). Then, on the
+running daemon, with no intervention beyond the operator turns:
+
+1. **MINT.** The idle dream cycle fired at 01:55 and minted **three** schema-carrying macros —
+   `auto_web_search_browser_navigate`, `auto_file_system_write_execute`,
+   `auto_browser_screenshot_vision_analysis_describe_picture` — and **announced all three**. That
+   is the round-1 CRITICAL fixed in production: before it, exactly one would have registered and
+   none would have been announced.
+2. **UPGRADE.** At 01:59 `_upgrade_paramless` fired on the live store:
+   `auto_generic_browser_vision_analysis_vision_analysis_a562a8` "was minted param-less and could
+   not be activated; it now carries runtime slots". A parked artifact un-parked itself.
+3. **REFUSALS** were announced too, by name and reason — five `auto.generic.*` candidates skipped.
+4. **ACTIVATION.** `manage_composed_skills(action='approve')` on `auto_file_system_write_execute`
+   returned: *"approved and activated… It takes 3 runtime input(s): $command, $content, $path.
+   Those are SLOTS, not values mined from past calls."* — the round-2 approve-note fix, live.
+5. **INVOCATION on a real turn.** `turn outcome — ok · tools: auto_file_system_write_execute`.
+   The macro wrote `$path` with `$content` and ran `$command`: `EXIT CODE: 0 / STDOUT: 42`.
+   Store: `usage_count=3, success_count=1, last_used=2026-08-24 02:05:06`.
+6. **The instrument reported the flip.** `macros.auto_mined` moved from
+   `barren · minted 25 · activated 0 · invoked 0 · last never` to
+   `yielding · minted 28 · activated 1 · invoked 3 · last 0.0h ago`.
+
+Item B was verified the same way — the live agent was asked to run `introspect action='learning'`
+and paste the LOOP YIELD section back verbatim, and it rendered the real numbers off the live
+stores.
+
+### Verification
+
+Full suite **15,677 passed / 17 skipped / 0 failed**, run as 6 foreground chunks whose sum
+(15,693 + 1) matches `--collect-only` (15,694) exactly. Skips within the healthy 14–17 band.
+
+Mutation pins: A 39/39, B 45/45, C 8/8, E 15 tests all pinned, G 10/10 — every mutant running whole
+test files.
+
+⚠ One cross-test contamination found and fixed: a new test called `asyncio.run` inside a sync test,
+which leaves the policy's current loop closed and broke 16 later tests in
+`tests/test_auth_rejection_logging.py`. The file passed alone and failed in a suite chunk — which
+is why the discipline is chunks, not files.
+
+Docs: `docs/core/dream.html#macro-schema`, `docs/tools/composed_skills.html#schema-mint`,
+`docs/tools/introspect.html#loop-yield`, `docs/core/frontier_selection.html`,
+`docs/core/imagination.html`, `docs/core/replay_engine.html#undecidable`,
+`docs/evolve/negative_controls.html`.
+
+### The pattern, which is §4CO's pattern one level in
+
+§4CO's finding was "nine verified mechanisms that were wrong when run". This session's round-2
+reviews found the CRITICAL of each item **inside the round-1 fix for it** — the announcement that
+existed to make a macro approvable was severed by the change that made macros worth approving; the
+yield surface built to catch "production posing as yield" counted packets as consumption. Neither
+was findable by reading. Both were found by a reviewer executing the code against the live corpus.
+
+## §4CR — The medium, closed (2026-08-23)
+
+Five review rounds found the same defect five times, each time by a different route, each time
+patched at the route: the exit code, then automatic bytecode, then the digest's scope, then an
+outbox that could be appended to, then one that could be renamed over. Every fix was a correct
+implementation of a true statement and every one left the MEDIUM alone — a graded process holding
+the parent's own write privileges. §4CQ recorded the conclusion: *closing this class needs the
+child under the sandbox, not beside it.*
+
+**The mechanism.** Not a container. The repo's 241 packages (torch, chromadb, transformers) make a
+Linux image for the pin suite a multi-gigabyte build with a different interpreter, and stages 2-3
+would need the model and docker-in-docker besides. macOS ships `sandbox-exec`, which applies a
+**kernel-enforced** policy that a process cannot lift and that its children inherit — including a
+`start_new_session=True` grandchild. Same interpreter, same packages, no image, and it confines
+exactly the thing that needed confining.
+
+`evolve/confine.py` builds a policy that allows reads (the property is INTEGRITY, not
+confidentiality — a read-tight policy would refuse the pin suite for reasons unrelated to the
+candidate) and denies every write except the stage's own scratch: its XML dir, its own `TMPDIR`,
+its own home or arm directory.
+
+**Measured, one candidate attempting all five routes, run both ways:**
+
+| route | unconfined | confined |
+|---|---|---|
+| write the canonical harness mid-stage | SUCCEEDED | PermissionError |
+| plant a `.pyc` ahead of the hashed source | SUCCEEDED | PermissionError |
+| write the operator's bench ledger | SUCCEEDED | PermissionError |
+| `os.replace` over a sibling arm's outbox | SUCCEEDED | PermissionError |
+| detached grandchild, after its parent exited | got in | blocked |
+
+The negative control is the half that makes it mean anything: the identical candidate succeeds at
+all five with `GHOST_EVOLVE_CONFINE=0`, and the confined run's own report — written from inside the
+sandbox to the one directory it may touch — is the source of the right-hand column. The
+modify-use-restore window the snapshot digest could never see is gone with it: there is no window
+in which the write succeeds.
+
+**What stays open, stated as such in the module docstring.** The child still PRODUCES its own
+result, so it can still lie about its own arm — stdout, exit code, its own results file. That is
+what the child is for, and no arrangement fixes it. The difference now is between *"a candidate may
+misreport itself"* and *"a candidate may rewrite the exam"*. And there is no seatbelt off macOS:
+`confine()` returns the command unchanged with `confined=False`, every stage records that in its
+detail, and the docstring says so — a cascade that silently ran unconfined while claiming otherwise
+would be worse than one that never had this.
+
+**Two things it broke, both the right kind.** A pin probe writing into `tmp_path` was denied and the
+test failed for a reason unrelated to its subject — fixed by writing to the `TMPDIR` the stage
+hands over. And `stage1_pins` had been putting the graded process's home at
+`candidate/_stage1_home`, i.e. INSIDE the tree being graded (and, when the candidate was the repo
+itself, inside the tree the fence protects); it now gets its own.
+
+**A dead guard removed.** `_both_spellings` carried two string branches for `/tmp` <-> `/private/tmp`
+until a mutation showed deleting them changed nothing: `Path("/tmp/x").resolve()` already returns
+`/private/tmp/x`, and the kernel matches the policy against the resolved path. The replacement test
+is behavioural — a write handed in either spelling must LAND — because the string assertion had
+passed while the branch it named was gone. Dead guard code reads as defence.
+
+**And it broke two more things, both worth the entry.** The docs page gained a `<table>` outside the
+site's `.scroll` wrapper — caught by the docs test, fixed. More interesting: writing the threat
+model DOWN broke `test_the_cascade_NEVER_APPLIES_ANYTHING`, whose forbidden-token scan read
+`inspect.getsource(EV)` whole. The moment the module documented "a grandchild renamed a forged file
+over the outbox with `os.replace`", the test failed — **for describing the attack it defends
+against**. A guard that punishes writing down what it guards teaches the opposite of what it wants.
+
+The fix nearly became the worse bug. A first stripper emitted `" ".join(tok.string …)`, which turns
+`os.replace(` into `os . replace (` — matching NONE of the forbidden tokens and silently disabling
+the entire scan while looking like a targeted fix for one false positive. It was caught only
+because the test now asserts the stripper keeps a REAL call findable and a prose mention not, and
+confirmed by planting an actual `shutil.copytree` in the evaluator and watching the guard bite.
+Blanking the token spans in place, rather than re-joining tokens, is what preserves both.

@@ -95,6 +95,18 @@ FACTUAL_SAMPLING_PARAMS = {
 #    of un-executed actions). OFF until it has an execution-grounded value fn.
 _MCTS_TURNSTART_ENABLED = False
 
+class _MacroMintSkipped(Exception):
+    """§4CS: the phase-2.6 macro mint refused this candidate.
+
+    A sentinel, not an error — the reason has already been reported on the
+    operator stream. It exists because the mint's `compile_from_pattern`
+    call sits inside a blanket `except Exception` that logs at DEBUG, so a
+    plain early-return would need the skip decision and the call to be
+    restructured, and a plain `raise` would be swallowed as a mint failure
+    and misreported.
+    """
+
+
 # R22 MAJOR-1: minimum holdout for a guarded online PRM step. Below this
 # the BCE comparison is not a check, and at ZERO `online_update` commits
 # unconditionally — see `_run_prm_online_update`.
@@ -338,6 +350,46 @@ def _imagine_gate_built_at() -> "datetime.datetime":
             else datetime.datetime.min
     except Exception:  # noqa: BLE001
         return datetime.datetime.min
+
+
+def _negctrl_last_run_at() -> "datetime.datetime":
+    """When E3's negative controls last ran, from their own result file —
+    the durable anchor for an in-memory cooldown (§4CS item E).
+
+    Same shape as `_imagine_gate_built_at`, for the same reason: an
+    in-memory `datetime.min` anchor makes the cooldown "once per deploy"
+    rather than a cadence, and on a box that restarts often that means a
+    weekly control runs every boot.
+
+    `datetime.min` when there is no readable record, which is correct:
+    never run means run at the first chance.
+    """
+    try:
+        from ..evolve.negative_controls import last_run_ts
+        ts = last_run_ts(os.getenv("GHOST_HOME", "") or ".")
+        return (datetime.datetime.fromtimestamp(ts) if ts
+                else datetime.datetime.min)
+    except Exception:  # noqa: BLE001
+        return datetime.datetime.min
+
+
+def _evolve_canonical_root() -> "Optional[Path]":
+    """The repo root, resolved from THIS FILE — never from the CWD.
+
+    §4CO #6: `build_brief` resolved its target against the process CWD,
+    which is correct from a shell in the repo and silently wrong under
+    launchd, where the daemon's CWD is not the checkout. Returns None
+    unless the resolved tree actually looks like the repo, so a moved
+    package fails CLOSED rather than running the controls against
+    whatever happens to be there.
+    """
+    try:
+        root = Path(__file__).resolve().parents[3]
+        if (root / "src" / "ghost_agent").is_dir() and (root / "tests").is_dir():
+            return root
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def _call_mutated_world(fname: str, t_args: dict, is_mutating: bool) -> bool:
@@ -811,6 +863,51 @@ def turn_origin(context) -> str:
         return label
     return "sim" if getattr(getattr(context, "skill_memory", None),
                             "is_read_only", False) is True else "user"
+
+
+def book_graduated_retrieval(context, store, hashes) -> int:
+    """Credit a prompt injection to each graduated skill surfaced this turn.
+
+    §4CT. Extracted from the injection site rather than written inline so
+    the DECISION is drivable by a test: a gate buried in `handle_chat` can
+    only be pinned by a source-shape proxy, and this project has watched
+    those stay green through a commented-out block, a moved helper and a
+    literal `False` (§4BN). Sync, so the caller owns the thread.
+
+    REAL TRAFFIC ONLY. `turn_origin` is the canonical predicate — the same
+    one the liveness denominator and the foresight gate use — so this
+    counter cannot drift from the population those views interpret.
+    Self-play, dream, subagent and bench turns inject the block too, and
+    counting them is exactly the §4K defect: 28 "user turns" reported on a
+    box whose true count was ZERO, while every ledger that had its own
+    simulation gate was correctly silent.
+
+    Returns the number of skills credited (0 when gated out, when there is
+    nothing to book, or on any failure). Never raises — post-injection
+    bookkeeping must not break a turn.
+    """
+    try:
+        keys = [h for h in (hashes or []) if h]
+        rec = getattr(store, "record_surfaced", None)
+        if not keys or not callable(rec):
+            return 0
+        # ⚠ NO CONTEXT ⇒ NO BOOKING. `turn_origin(None)` answers "user" by
+        # its own (correct) default, so without this the absence of a
+        # context reads as real traffic — a check that cannot run reporting
+        # the favourable outcome, which is the shape this project keeps
+        # paying for. Booking is the favourable direction for the counter,
+        # so it is the one that must be withheld.
+        if context is None or turn_origin(context) != "user":
+            return 0
+        try:
+            from ..utils.logging import request_id_context
+            turn_key = str(request_id_context.get() or "")
+        except Exception:                                    # noqa: BLE001
+            turn_key = ""
+        return int(rec(keys, turn_key=turn_key) or 0)
+    except Exception as e:                                   # noqa: BLE001
+        logger.debug("graduated-skill retrieval booking skipped: %s", e)
+        return 0
 
 
 def dream_ledger_summary(msg: str) -> str:
@@ -5106,6 +5203,14 @@ class GhostAgent:
     # skills_auto 7200, router_train 10800). 6 h matches the workspace
     # tidy and costs ~11 ms per rebuild on the live ledger.
     _IMAGINE_GATE_COOLDOWN = 21600
+    # §4CS item E. Sourced from ONE definition in the module that owns the
+    # controls, so the phase's cadence and the liveness probe's staleness
+    # bound cannot drift apart.
+    try:
+        from ..evolve.negative_controls import INTERVAL_S as _NEGCTRL_INTERVAL_S
+    except Exception:                                        # noqa: BLE001
+        _NEGCTRL_INTERVAL_S = 7 * 24 * 3600
+    _NEGCTRL_COOLDOWN = _NEGCTRL_INTERVAL_S
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     _BENCH_COOLDOWN = 2700        # 45 min between bench-bank items (§4BF 1b)
@@ -5384,6 +5489,9 @@ class GhostAgent:
             # the first in-window tick, so the cooldown was not a rate
             # limit at all and the real cadence was "once per deploy".
             self._last_imagine_gate_at = _imagine_gate_built_at()
+        if not hasattr(self, '_last_negctrl_at'):
+            # Durable anchor — see `_negctrl_last_run_at`.
+            self._last_negctrl_at = _negctrl_last_run_at()
         if not hasattr(self, '_last_autoadvance_at'):
             self._last_autoadvance_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
@@ -5955,22 +6063,98 @@ class GhostAgent:
                                             # rather than risk a param-less
                                             # active tool. Best-effort.
                                             try:
-                                                from ..tools.composed_skills import _registry_from_context
+                                                from ..tools.composed_skills import (
+                                                    MACRO_MARK_GRADUATED,
+                                                    _registry_from_context,
+                                                    harvest_step_observations,
+                                                    macro_sequence_admissible,
+                                                    macro_step_inputs,
+                                                    mint_param_schema,
+                                                )
                                                 _reg = _registry_from_context(ctx)
-                                                _seq = getattr(_cand, 'tool_sequence', ()) or ()
+                                                _seq = tuple(getattr(_cand, 'tool_sequence', ()) or ())
                                                 if _reg is not None and _seq:
+                                                    # §4CS: this used to pass
+                                                    # `params: {}` for every step
+                                                    # because SkillCandidate keeps
+                                                    # only tool NAMES ("Arg-level
+                                                    # consolidation is the
+                                                    # consolidator's job" —
+                                                    # skills_auto/extractor.py).
+                                                    # A param-less macro advertises
+                                                    # zero inputs and can never be
+                                                    # activated, which is what the
+                                                    # nine live `auto_generic_*`
+                                                    # artifacts are. The arguments
+                                                    # were available all along: the
+                                                    # same `trajs` this phase just
+                                                    # walked. Re-derive them for the
+                                                    # candidate's exact sequence and
+                                                    # mint a schema off the SAME
+                                                    # builder core/dream.py uses —
+                                                    # one design, two call sites, no
+                                                    # third producer.
+                                                    # ⚠ REVIEW ROUND 2: this
+                                                    # producer applied NO
+                                                    # admission rule — the
+                                                    # meta-tool and
+                                                    # single-tool-repeated
+                                                    # filters gated the DREAM
+                                                    # miner only. Over the live
+                                                    # corpus it offered a macro
+                                                    # whose first step RUNS AN
+                                                    # ARBITRARY COMPOSED SKILL
+                                                    # by name. One shared rule.
+                                                    _why = macro_sequence_admissible(_seq)
+                                                    if _why is None:
+                                                        _obs = harvest_step_observations(
+                                                            trajs, _seq)
+                                                        _tpl, _slots, _why = mint_param_schema(
+                                                            _seq, _obs)
+                                                    if _why:
+                                                        pretty_log(
+                                                            "Macro Mint",
+                                                            f"skipped {getattr(_cand, 'name', 'skill')} "
+                                                            f"({' → '.join(_seq)}): {_why}",
+                                                            icon=Icons.BRAIN_PLAN,
+                                                        )
+                                                        raise _MacroMintSkipped(_why)
                                                     _steps = [
-                                                        {"tool": _t, "description": "", "params": {}}
-                                                        for _t in _seq
+                                                        {"tool": _t,
+                                                         # The tool name and
+                                                         # index belong here:
+                                                         # `compile_from_pattern`
+                                                         # only falls back to
+                                                         # "Step N" when the key
+                                                         # is ABSENT, so an empty
+                                                         # string landed as a
+                                                         # blank description.
+                                                         "description": (
+                                                             f"{_t} (step {_i + 1})"
+                                                             + (" — runtime inputs: "
+                                                                + ", ".join(
+                                                                    "$" + _s for _s in
+                                                                    macro_step_inputs(_tpl[_i]))
+                                                                if macro_step_inputs(_tpl[_i])
+                                                                else "")),
+                                                         "params": _tpl[_i]}
+                                                        for _i, _t in enumerate(_seq)
                                                     ]
                                                     _reg.compile_from_pattern(
                                                         getattr(_cand, 'name', 'skill') or 'skill',
                                                         _steps,
-                                                        f"Proven {len(_seq)}-step sequence graduated "
-                                                        f"from {getattr(_cand, 'support', 0)} successful runs",
+                                                        # The stamp comes
+                                                        # from the shared
+                                                        # constant — see
+                                                        # dream.py's twin.
+                                                        f"Proven {len(_seq)}-step "
+                                                        f"{MACRO_MARK_GRADUATED} "
+                                                        f"{getattr(_cand, 'support', 0)} successful runs",
                                                         status="proposed",
                                                         execution_mode="sequential",
                                                     )
+                                            except _MacroMintSkipped:
+                                                pass          # already reported
                                             except Exception as _ce:
                                                 logger.debug(
                                                     "composed-macro mint skipped: %s", _ce)
@@ -6514,12 +6698,125 @@ class GhostAgent:
                             f"over {_gate.get('ledger_rows', 0)} ledger rows "
                             f"— " + "; ".join(
                                 f"{n}× {r}" for r, n in _reasons.most_common(3)))
+                        # §4CS item G: the per-bucket histogram above says
+                        # "needs N more" for every bucket, which reads as a
+                        # gate waiting for data. Only the POOLED numbers can
+                        # tell that apart from a gate that will never open,
+                        # and they are already in the document.
+                        _disc = (_gate.get("discrimination") or {}).get("verdict")
+                        if _disc:
+                            _summary += f" | {_disc}"
                     self._record_autonomous_activity("imagine_gate", _summary)
                     logger.info("%s", _summary)
                 except Exception as _ige:  # noqa: BLE001
                     logger.warning("imagine gate rebuild failed: %s", _ige)
                 finally:
                     self._last_imagine_gate_at = datetime.datetime.now()
+
+        # Phase 2.7f (§4CS item E): E3 NEGATIVE CONTROLS, on a schedule.
+        #
+        # ⚠ A GUARD THAT NEVER DEMONSTRABLY FIRES IS PRESUMED DEAD, and
+        # E2's entire value is REFUSING things. Three known-bad candidates
+        # are pushed through the cascade and each must be rejected, at the
+        # named stage. One run was performed by hand on 2026-08-23 and
+        # passed — into a throwaway home, so nothing durable recorded that
+        # it had ever happened, and none of it is evidence next month when
+        # the code has moved.
+        #
+        # This runs the CONTROLS, not the Evolve loop: it builds three
+        # deliberately-bad candidates in a temporary tree, asserts the
+        # cascade refuses them, and discards them. Nothing is promoted,
+        # nothing is written to the repo. §4CN's "nothing becomes
+        # autonomous by having been built" is about the loop, not about
+        # its self-test — but the kill switch is here anyway.
+        #
+        # Shallow by design: `deep=False` stops each control at the stage
+        # it is supposed to die at, which is both faster and exactly what
+        # is being asserted. It is still minutes of work (the guard control
+        # runs stage 1 for real — 45 pin files, ~753 tests), which is why
+        # the cadence is weekly and the anchor is DURABLE.
+        if (os.getenv("GHOST_NEGCTRL", "1").strip().lower()
+                not in ("0", "false", "no", "off")
+                and self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600)):
+            _since_nc = (datetime.datetime.now()
+                         - self._last_negctrl_at).total_seconds()
+            # NOT `_bio_cooldown`: the gate would scale but the pytest runs
+            # it bounds do not, so a scaled clock would fire a multi-minute
+            # job far more often than the work can absorb. Same reasoning
+            # as the evolve-mutate timeout.
+            if _since_nc >= self._NEGCTRL_COOLDOWN:
+                # Anchor BEFORE the work and again in `finally`: a crash
+                # mid-run must not re-fire this on every 60-second tick.
+                self._last_negctrl_at = datetime.datetime.now()
+                _nc_root = _evolve_canonical_root()
+                _nc_home = os.getenv("GHOST_HOME", "").strip()
+                if _nc_root is None or not _nc_home:
+                    # FAIL LOUD, not silent. "Could not run" and "ran and
+                    # passed" must never look alike — that conflation is
+                    # exactly what this phase exists to remove.
+                    pretty_log(
+                        "Negative Controls",
+                        "CANNOT RUN — "
+                        + ("the repo root could not be resolved from the "
+                           "package location" if _nc_root is None
+                           else "GHOST_HOME is unset")
+                        + ". The cascade's refusals are UNVERIFIED.",
+                        level="ERROR", icon=Icons.WARN,
+                    )
+                    self._record_autonomous_activity(
+                        "negative_controls",
+                        "could not run — see the ERROR on the stream")
+                else:
+                    _idle_ran.append("negative_controls")
+                    try:
+                        from ..evolve import negative_controls as _NC
+                        _ncrun = await asyncio.to_thread(
+                            _NC.run_negative_controls,
+                            _nc_root, Path(_nc_home))
+                        _held = [r.name for r in _ncrun.results
+                                 if r.ok and r.verified]
+                        _dead = [r.name for r in _ncrun.results
+                                 if not (r.ok and r.verified)]
+                        # A control that did NOT fire is the loudest thing
+                        # this phase can say, and it is NOT a zero: two of
+                        # three holding still means one guard is presumed
+                        # dead. `all_ok` is the only green.
+                        if _ncrun.all_ok:
+                            _ncmsg = (f"all {len(_held)} controls FIRED and "
+                                      f"held: {', '.join(sorted(_held))}")
+                            pretty_log("Negative Controls", _ncmsg,
+                                       icon=Icons.VERIFIER_LAB)
+                        else:
+                            _detail = "; ".join(
+                                f"{r.name}: {r.detail[:90]}"
+                                for r in _ncrun.results
+                                if not (r.ok and r.verified)) or "partial run"
+                            _ncmsg = (
+                                f"⚠ A CONTROL DID NOT FIRE — held "
+                                f"{len(_held)}/{len(_NC.ALL_CONTROLS)}"
+                                + (f", DEAD: {', '.join(sorted(_dead))}"
+                                   if _dead else "")
+                                + f". The cascade may have stopped refusing. "
+                                  f"{_detail}")
+                            pretty_log("Negative Controls", _ncmsg,
+                                       level="ERROR", icon=Icons.WARN)
+                        self._record_autonomous_activity(
+                            "negative_controls", _ncmsg)
+                    except Exception as _nce:  # noqa: BLE001
+                        # An exception here means the controls did not run.
+                        # Loud, for the same reason as the fail-closed
+                        # branch above.
+                        pretty_log(
+                            "Negative Controls",
+                            f"RUN FAILED ({type(_nce).__name__}: {_nce}) — "
+                            f"the cascade's refusals are UNVERIFIED this "
+                            f"cycle.",
+                            level="ERROR", icon=Icons.WARN)
+                        self._record_autonomous_activity(
+                            "negative_controls",
+                            f"run FAILED: {type(_nce).__name__}")
+                    finally:
+                        self._last_negctrl_at = datetime.datetime.now()
 
         # Phase 2.7d: Recurring workspace tidy (2026-07-18). The DONE
         # sweep fires once, on the transition — but verification and
@@ -17627,14 +17924,40 @@ class GhostAgent:
                 try:
                     _askstore = getattr(self.context, 'auto_skill_store', None)
                     if _askstore is not None and last_user_content:
-                        _skblock = _askstore.format_for_prompt(
-                            query=last_user_content, limit=3,
-                        )
+                        # §4CT: `surfaced_for_prompt` returns the block AND
+                        # the hashes it listed. `format_for_prompt` threw the
+                        # hashes away, which is why this loop reported
+                        # `unmeasured` on the yield surface — the skills ARE
+                        # injected on every matching turn and nothing counted
+                        # it. Falls back to the text-only call so a stub or an
+                        # older store still injects.
+                        _skhashes = []
+                        _surf = getattr(_askstore, 'surfaced_for_prompt', None)
+                        if callable(_surf):
+                            _skblock, _skhashes = _surf(
+                                query=last_user_content, limit=3)
+                        else:
+                            _skblock = _askstore.format_for_prompt(
+                                query=last_user_content, limit=3,
+                            )
                         # isinstance(str) guard — see the uncertainty
                         # injection above: a MagicMock context must not
                         # corrupt base_prompt.
                         if isinstance(_skblock, str) and _skblock:
                             continuity_blocks.append(_skblock)
+                            # Book the injection — REAL traffic only; the
+                            # gate and the turn key live in
+                            # `book_graduated_retrieval` so they are
+                            # drivable by a test. Off-thread: this is a
+                            # JSON rewrite and the turn must not pay for
+                            # bookkeeping.
+                            if _skhashes:
+                                _glog.spawn_bg(
+                                    asyncio.to_thread(
+                                        book_graduated_retrieval,
+                                        self.context, _askstore, _skhashes),
+                                    name="graduated-skill-retrieval",
+                                )
                 except Exception as e:
                     logger.debug(f"graduated-skill injection skipped: {e}")
 

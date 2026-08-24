@@ -14,9 +14,12 @@ guard WORKING — and `execute.py` is inside the mutable fence while
 the fence.
 """
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import subprocess
 
 import pytest
 
@@ -2087,7 +2090,8 @@ def test_the_real_targets_are_briefable_or_refused_EXPLICITLY():
     assert "file_system" in refused, "199KB must not be briefed blind"
 
 
-def test_the_brief_resolves_the_target_against_the_REPO_not_the_CWD(tmp_path):
+def test_the_brief_resolves_the_target_against_the_REPO_not_the_CWD(
+        tmp_path, monkeypatch):
     """⚠ The target's path is repo-relative. Resolving it against the
     process CWD makes the brief depend on where the interpreter was
     started — and under launchd the daemon's CWD is not the repo, so the
@@ -2103,9 +2107,19 @@ def test_the_brief_resolves_the_target_against_the_REPO_not_the_CWD(tmp_path):
     brief = M.build_brief(t, [], repo_root=repo)
     assert "only_in_the_fake_repo" in brief
 
-    # …and without the root it looks in the real repo, where that file
+    # …and without the root it looks in the REAL repo, where that file
     # does not exist, so it refuses rather than inventing one.
-    assert M.build_brief(t, []) == ""
+    #
+    # ⚠ THE CHDIR IS THE WHOLE TEST. pytest runs with CWD == the repo
+    # root, so `Path(repo_root or Path.cwd())` — the exact defect this
+    # test is named after — produced the identical "" here and the
+    # assertion held under both. Standing somewhere else is what makes
+    # the two implementations disagree: the real one still resolves
+    # against the repo and finds nothing, the CWD one resolves against
+    # `repo` and happily returns the fake file's source.
+    monkeypatch.chdir(repo)
+    assert M.build_brief(t, []) == "", \
+        "it resolved against the CWD, not the repo"
 
 
 # ── hunk-count repair ───────────────────────────────────────────────── #
@@ -2234,3 +2248,501 @@ def test_the_reanchor_is_REPORTED_not_silent():
     import inspect
     src = inspect.getsource(M.run_mutation)
     assert 'rec["hunks_reanchored"]' in src
+
+
+def test_a_CORRECT_multi_hunk_diff_survives_the_MINI_REPO_fixture(tmp_path):
+    """⚠ THIS TEST WAS SHADOWED. A second function with the identical
+    name was defined later in the file, so pytest collected only that one
+    and this body was dead code — editing it changed nothing. Same
+    property, different fixture, so both are worth keeping; they just
+    cannot share a name.
+
+    ⚠ MEASURED PRODUCTION BUG. The new-side start was set to the
+    OLD-side start, so an already-correct `@@ -6,2 +7,3 @@` was rewritten
+    to `@@ -6,2 +6,3 @@` — and `moved` reported 0, so the ledger said
+    nothing happened. Every multi-hunk candidate was corrupted and then
+    rejected by `applied_where_it_said` with a message blaming `patch`.
+    All five earlier fixtures were single-hunk, where old-start ==
+    new-start by construction, so none of them could see it."""
+    repo = _mini_repo_file(tmp_path, "a1\na2\na3\nmid1\nmid2\nb1\nb2\nb3\n")
+    good = ("--- a/src/ghost_agent/tools/w.py\n"
+            "+++ b/src/ghost_agent/tools/w.py\n"
+            "@@ -1,2 +1,3 @@\n a1\n+INS1\n a2\n"
+            "@@ -6,2 +7,3 @@\n b1\n+INS2\n b2\n")
+    assert M.repair_hunk_starts(good, repo) == (good, 0)
+
+
+def test_a_REANCHORED_multi_hunk_diff_declares_where_it_LANDS(tmp_path):
+    """The pin that matters: check the repair against the consumer that
+    judges it, not against a hand-written expected string."""
+    repo = _mini_repo_file(tmp_path, "a1\na2\na3\nmid1\nmid2\nb1\nb2\nb3\n")
+    bogus = ("--- a/src/ghost_agent/tools/w.py\n"
+             "+++ b/src/ghost_agent/tools/w.py\n"
+             "@@ -99,2 +99,3 @@\n a1\n+INS1\n a2\n"
+             "@@ -50,2 +50,3 @@\n b1\n+INS2\n b2\n")
+    fixed, moved = M.repair_hunk_starts(bogus, repo)
+    assert moved == 2
+    heads = [l for l in fixed.splitlines() if l.startswith("@@")]
+    # the SECOND hunk's new side is offset by the line the first added
+    assert heads == ["@@ -1,2 +1,3 @@", "@@ -6,2 +7,3 @@"], heads
+
+
+def test_a_BLANK_context_line_does_not_truncate_the_hunk(tmp_path):
+    """Models strip trailing whitespace constantly, so a context line
+    arrives as "". The two repairs disagreed about it — counts treated it
+    as body, starts stopped the scan there — which silently shortened
+    `old_side` and weakened the anchor."""
+    repo = _mini_repo_file(tmp_path, "x\n\ny\nz\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -80,3 +80,4 @@\n x\n\n+NEW\n y\n")
+    fixed, moved = M.repair_hunk_starts(d, repo)
+    assert moved == 1
+    assert "@@ -1,3 +1,4 @@" in fixed, fixed
+
+
+def test_the_offset_RESETS_at_each_file(tmp_path):
+    """⚠ The running offset is per-FILE. Carrying it across the `+++`
+    boundary shifts every hunk of the second file by whatever the first
+    file happened to add — and the fence permits two files, so this is
+    reachable, not theoretical."""
+    d0 = tmp_path / "src" / "ghost_agent" / "tools"
+    d0.mkdir(parents=True)
+    (d0 / "w.py").write_text("a1\na2\na3\nmid\nb1\nb2\nb3\n")
+    (d0 / "v.py").write_text("q1\nq2\nq3\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -90,2 +90,3 @@\n a1\n+INS1\n a2\n"
+         "@@ -91,2 +91,3 @@\n b1\n+INS2\n b2\n"
+         "--- a/src/ghost_agent/tools/v.py\n"
+         "+++ b/src/ghost_agent/tools/v.py\n"
+         "@@ -90,2 +90,3 @@\n q1\n+INS3\n q2\n")
+    fixed, moved = M.repair_hunk_starts(d, tmp_path)
+    heads = [l for l in fixed.splitlines() if l.startswith("@@")]
+    # w.py: hunk 2 offset by +1; v.py: offset RESET, so +1 not +3
+    assert heads == ["@@ -1,2 +1,3 @@", "@@ -5,2 +6,3 @@",
+                     "@@ -1,2 +1,3 @@"], heads
+    assert moved == 3
+
+
+# ── multi-hunk re-anchoring ─────────────────────────────────────────── #
+
+def _multi_hunk_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    (repo / "src" / "ghost_agent" / "tools" / "w.py").write_text(
+        "a1\na2\na3\nmid1\nmid2\nb1\nb2\nb3\n")
+    return repo
+
+
+_GOOD_MULTI = ("--- a/src/ghost_agent/tools/w.py\n"
+               "+++ b/src/ghost_agent/tools/w.py\n"
+               "@@ -1,2 +1,3 @@\n a1\n+INS1\n a2\n"
+               "@@ -6,2 +7,3 @@\n b1\n+INS2\n b2\n")
+
+
+def test_a_CORRECT_multi_hunk_diff_is_left_EXACTLY_alone(tmp_path):
+    """⚠ THE NEW-SIDE START IS NOT THE OLD-SIDE START. Hunk 2+ of a file
+    is offset by the net lines the earlier hunks added. Setting them
+    equal rewrote an ALREADY-CORRECT `@@ -6,2 +7,3 @@` to `+6,3` — so
+    the repair broke every multi-hunk proposal, `applied_where_it_said`
+    then rejected it, and the message blamed `patch`. All five earlier
+    fixtures were single-hunk, where old-start == new-start by
+    construction, so nothing could see it."""
+    repo = _multi_hunk_repo(tmp_path)
+    out, moved = M.repair_hunk_starts(_GOOD_MULTI, repo)
+    assert out == _GOOD_MULTI, "a correct diff was rewritten"
+    assert moved == 0
+
+
+def test_a_REANCHORED_multi_hunk_diff_DECLARES_WHERE_IT_LANDS(tmp_path):
+    """Pinned against the consumer, not against a hand-written string:
+    whatever the repair emits, the containment check must agree with it
+    after the patch actually applies. That is the property; the header
+    text is just one way to satisfy it."""
+    repo = _multi_hunk_repo(tmp_path)
+    bogus = (_GOOD_MULTI.replace("@@ -1,2 +1,3 @@", "@@ -40,2 +40,3 @@")
+                        .replace("@@ -6,2 +7,3 @@", "@@ -90,2 +91,3 @@"))
+    fixed, moved = M.repair_hunk_starts(bogus, repo)
+    assert moved == 2, "both hunks moved and the ledger must say so"
+    proc = subprocess.run(["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                          cwd=repo, input=fixed, text=True,
+                          capture_output=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert M.applied_where_it_said(repo, fixed) == "", \
+        "the diff landed somewhere other than its own headers said"
+
+
+def test_a_BLANK_context_line_does_not_truncate_the_body(tmp_path):
+    """Models strip trailing whitespace, so a blank context line arrives
+    as "" rather than " ". If the body scan stops there, `old_side` is
+    truncated and the anchor search matches the wrong place — or
+    nothing, silently disabling the repair."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    (repo / "src" / "ghost_agent" / "tools" / "w.py").write_text(
+        "x1\n\nx2\nx3\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -50,3 +50,4 @@\n x1\n\n x2\n+ADDED\n")
+    fixed, moved = M.repair_hunk_starts(d, repo)
+    assert moved == 1, "the blank line truncated the body and the anchor was lost"
+    assert "@@ -1,3 +1,4 @@" in fixed, fixed
+
+
+def test_a_DELETED_line_that_looks_like_a_file_header_does_not_truncate(
+        tmp_path):
+    """⚠ `--- ` IS AMBIGUOUS. A deleted source line reading `-- x`
+    becomes `--- x` in the diff — the same prefix as `--- a/path`. The
+    body scan broke on it, and because the re-anchor's running `offset`
+    is computed from body lengths, one such line silently relocated
+    every later hunk in the file. Measured under the old rule: the
+    header collapsed to `@@ -1,1 +1,1 @@` and `patch` exited 1."""
+    import difflib
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    f = repo / "src" / "ghost_agent" / "tools" / "w.py"
+    orig = "h1\n-- ambiguous\nh3\nmid\nmid2\nt1\nt2\nt3\n"
+    want = "h1\nh3\nINS\nmid\nmid2\nt1\nADDED\nt2\nt3\n"
+    f.write_text(orig)
+    raw = "".join(difflib.unified_diff(
+        orig.splitlines(True), want.splitlines(True),
+        "a/src/ghost_agent/tools/w.py", "b/src/ghost_agent/tools/w.py", n=1))
+    assert "--- ambiguous" in raw, "the fixture no longer contains the trap"
+
+    fixed, _ = M.repair_hunk_starts(raw, repo)
+    counted, _ = M.repair_hunk_counts(fixed)
+    heads = [l for l in counted.splitlines() if l.startswith("@@")]
+    assert heads == ["@@ -1,4 +1,4 @@", "@@ -6,2 +6,3 @@"], heads
+    proc = subprocess.run(["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                          cwd=repo, input=counted, text=True,
+                          capture_output=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f.read_text() == want
+    assert M.applied_where_it_said(repo, counted) == ""
+
+
+def test_a_BLANK_line_BETWEEN_file_sections_is_not_eaten_as_context(tmp_path):
+    """A blank separating two file sections belongs to neither. Counting
+    it as context inflated both counts and `patch` refused the diff."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    for name in ("a.py", "b.py"):
+        (repo / "src" / "ghost_agent" / "tools" / name).write_text(
+            "one\ntwo\nthree\n")
+    d = ("--- a/src/ghost_agent/tools/a.py\n"
+         "+++ b/src/ghost_agent/tools/a.py\n"
+         "@@ -1,2 +1,3 @@\n one\n+X\n two\n"
+         "\n"
+         "--- a/src/ghost_agent/tools/b.py\n"
+         "+++ b/src/ghost_agent/tools/b.py\n"
+         "@@ -1,2 +1,3 @@\n one\n+Y\n two\n")
+    counted, _ = M.repair_hunk_counts(d)
+    heads = [l for l in counted.splitlines() if l.startswith("@@")]
+    assert heads == ["@@ -1,2 +1,3 @@", "@@ -1,2 +1,3 @@"], heads
+    proc = subprocess.run(["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                          cwd=repo, input=counted, text=True,
+                          capture_output=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_an_ADDED_line_spelled_like_a_file_header_does_not_blind_the_check(
+        tmp_path):
+    """⚠ FAIL-OPEN. Source text `++ x` becomes `+++ x` in a diff. Read
+    as a file header it set `current = None`, and every hunk after it
+    was skipped — so `applied_where_it_said` returned "" (no objection)
+    for a diff it had stopped checking. A relocation in a later hunk
+    would have gone unreported."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    f = repo / "src" / "ghost_agent" / "tools" / "w.py"
+    f.write_text("a\nb\nc\nd\ne\nf\ng\nh\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -1,2 +1,3 @@\n a\n+++ /dev/null\n b\n"
+         "@@ -6,2 +7,3 @@\n f\n+ADDED\n g\n")
+    # The file is NOT patched, so both hunks are wrong about where they
+    # land — the check must say so rather than fall silent.
+    why = M.applied_where_it_said(repo, d)
+    assert why, "the check went blind after an added line spelled '+++ '"
+    assert "w.py" in why, why
+
+
+def test_the_SHORT_hunk_spelling_is_normalised_without_counting_as_a_move(
+        tmp_path):
+    """⚠ `@@ -1 +1,2 @@` is the valid short form of `@@ -1,1 +1,2 @@`.
+    Comparing header STRINGS counted the rewrite as a relocation, so
+    `hunks_reanchored` reported the model missing anchors it had in fact
+    hit exactly — a ledger that overstates how sloppy the model is, in a
+    ledger whose only job is to say that honestly."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    (repo / "src" / "ghost_agent" / "tools" / "w.py").write_text("a\nb\nc\n")
+    short = ("--- a/src/ghost_agent/tools/w.py\n"
+             "+++ b/src/ghost_agent/tools/w.py\n"
+             "@@ -1 +1,2 @@\n a\n+X\n")
+    out, moved = M.repair_hunk_starts(short, repo)
+    assert moved == 0, "a spelling change was counted as a relocation"
+    assert "@@ -1,1 +1,2 @@" in out, out
+    # …and a genuine relocation still counts.
+    bogus = short.replace("@@ -1 +1,2 @@", "@@ -90 +90,2 @@")
+    out2, moved2 = M.repair_hunk_starts(bogus, repo)
+    assert moved2 == 1, out2
+
+
+def test_the_REPAIR_NEVER_BREAKS_A_DIFF_THAT_ALREADY_APPLIED(tmp_path):
+    """⚠ THE PROPERTY THE UNIT TESTS KEPT MISSING. Each repair was
+    tested against hand-written headers, which only ever asked "is the
+    output what I expected?". The question that matters is differential:
+    a diff that `patch` accepts BEFORE the repair must still be accepted
+    after it, with the same resulting bytes. A blank-line rule that
+    looked right by inspection broke 26 of 299 such diffs over real repo
+    files — and the cost is permanent, because `run_mutation` archives
+    the failure by normalised hash and the novelty filter then blocks
+    the model from re-proposing the same correct edit.
+
+    The perturbation is the one this module's own comments call
+    constant: a blank context line arriving as "" instead of " ".
+    """
+    import difflib
+    import random
+    rng = random.Random(20260823)
+    repo_src = Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
+    sources = [f for f in sorted((repo_src / "tools").glob("*.py"))
+               if len(f.read_text().splitlines()) > 60][:8]
+    assert sources, "no source files to fuzz against"
+
+    applied_raw = broken = 0
+    for sp in sources:
+        lines = sp.read_text().splitlines(True)
+        rel = f"src/ghost_agent/tools/{sp.name}"
+        for _ in range(4):
+            new = list(lines)
+            for pos in sorted(rng.sample(range(5, len(lines) - 5), 2),
+                              reverse=True):
+                new.insert(pos, "# fuzz\n")
+            raw = "".join(difflib.unified_diff(lines, new,
+                                               "a/" + rel, "b/" + rel, n=3))
+            raw = "\n".join("" if l == " " else l
+                             for l in raw.splitlines()) + "\n"
+            work = tmp_path / f"w{applied_raw}{broken}{rng.random()}"
+            tgt = work / rel
+            tgt.parent.mkdir(parents=True)
+            tgt.write_text("".join(lines))
+            first = subprocess.run(
+                ["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                cwd=work, input=raw, text=True, capture_output=True)
+            if first.returncode != 0 or tgt.read_text() != "".join(new):
+                continue                  # raw did not apply: not our business
+            applied_raw += 1
+
+            tgt.write_text("".join(lines))
+            rep, _ = M.repair_hunk_counts(raw)
+            rep, _ = M.repair_hunk_starts(rep, work)
+            second = subprocess.run(
+                ["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                cwd=work, input=rep, text=True, capture_output=True)
+            if (second.returncode != 0
+                    or tgt.read_text() != "".join(new)
+                    or M.applied_where_it_said(work, rep)):
+                broken += 1
+
+    assert applied_raw >= 10, f"the fixture produced only {applied_raw} cases"
+    assert broken == 0, \
+        f"the repair broke {broken} of {applied_raw} diffs that already applied"
+
+
+def test_the_reanchor_REFUSES_a_path_the_fence_has_not_seen_yet(tmp_path):
+    """⚠ THE `+++` LINE IS MODEL-CONTROLLED AND UNVETTED HERE.
+    `repair_hunk_starts` runs BEFORE `validate_diff`, and it opened
+    whatever that line named. Measured on the unfixed code:
+    `+++ b/../outside_secret.txt` read a file outside the repo and
+    re-anchored against it; an absolute path discarded the root
+    entirely (that is what `pathlib` does with an absolute right-hand
+    side); `+++ /dev/zero` reached 3.9 GB RSS in two seconds and never
+    returned; a FIFO blocked indefinitely. And this runs SYNCHRONOUSLY
+    on the event loop, unlike `materialize`, which is wrapped in
+    `asyncio.to_thread` for exactly this hazard."""
+    import signal
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    (repo / "src" / "ghost_agent" / "tools" / "w.py").write_text("a\nb\nc\n")
+    (tmp_path / "outside_secret.txt").write_text("S1\nS2\nS3\n")
+    os.mkfifo(str(repo / "fifo"))
+
+    def _hung(_s, _f):
+        raise TimeoutError("the read never returned")
+    old = signal.signal(signal.SIGALRM, _hung)
+    try:
+        for header in ("+++ b/../outside_secret.txt", "+++ /etc/hosts",
+                       "+++ /dev/zero", "+++ b/fifo"):
+            diff = f"--- a/x\n{header}\n@@ -90,2 +90,3 @@\n a\n+X\n b\n"
+            signal.alarm(10)
+            try:
+                out, moved = M.repair_hunk_starts(diff, repo)
+            finally:
+                signal.alarm(0)
+            assert moved == 0, f"{header} was re-anchored against"
+            assert "@@ -90,2 +90,3 @@" in out, (header, out)
+
+        # …and a legitimate repo-relative path still re-anchors.
+        ok = ("--- a/src/ghost_agent/tools/w.py\n"
+              "+++ b/src/ghost_agent/tools/w.py\n"
+              "@@ -90,2 +90,3 @@\n a\n+X\n b\n")
+        out, moved = M.repair_hunk_starts(ok, repo)
+        assert moved == 1 and "@@ -1,2 +1,3 @@" in out, out
+    finally:
+        signal.signal(signal.SIGALRM, old)
+
+
+def test_the_reanchor_read_is_SIZE_BOUNDED(tmp_path):
+    """A 100 MB file cost seconds of read plus an O(n·m) scan. The cap
+    is a refusal to re-anchor, not a truncated read: a partial file
+    would anchor against content that is not there."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    big = repo / "src" / "ghost_agent" / "tools" / "w.py"
+    big.write_text("a\nb\nc\n" + ("# pad\n" * 10))
+    assert M._read_anchor_source(repo, "src/ghost_agent/tools/w.py")
+
+    import ghost_agent.evolve.mutator as MM
+    keep = MM.MAX_ANCHOR_SOURCE_BYTES
+    try:
+        MM.MAX_ANCHOR_SOURCE_BYTES = 4
+        assert M._read_anchor_source(repo, "src/ghost_agent/tools/w.py") is None
+    finally:
+        MM.MAX_ANCHOR_SOURCE_BYTES = keep
+
+
+def test_the_OFFSET_advances_on_every_hunk_repaired_or_not(tmp_path):
+    """⚠ THE COMMENT SAID SO; NOTHING CHECKED IT. A hunk left alone
+    because its anchor is AMBIGUOUS still consumed lines, so the running
+    offset must advance for it too. Advancing only on repaired hunks
+    shifts every later hunk in the file by the un-repaired one's net
+    change — a silent relocation, in the code path whose whole purpose
+    is to stop silent relocations."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    (repo / "src" / "ghost_agent" / "tools" / "w.py").write_text(
+        "DUP\nq\nDUP\nq\nmid1\nmid2\nUNIQ1\nUNIQ2\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -1,2 +1,3 @@\n DUP\n+INS1\n q\n"        # ambiguous: left alone
+         "@@ -80,2 +80,3 @@\n UNIQ1\n+INS2\n UNIQ2\n")  # unique: re-anchored
+    out, _ = M.repair_hunk_starts(d, repo)
+    heads = [l for l in out.splitlines() if l.startswith("@@")]
+    assert heads == ["@@ -1,2 +1,3 @@", "@@ -7,2 +8,3 @@"], heads
+
+
+def test_an_ADDED_line_spelled_like_a_header_does_not_truncate_the_BODY(
+        tmp_path):
+    """The `+++`-half of the pair rule, which no test reached: the
+    existing coverage was on `applied_where_it_said`, not on the body
+    scanner the repairs share. A source line `++ note` becomes `+++
+    note`; read as a header it collapses the hunk."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    (repo / "src" / "ghost_agent" / "tools" / "w.py").write_text("a\nb\nc\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -1,3 +1,4 @@\n a\n+++ note\n b\n c\n")
+    out, _ = M.repair_hunk_counts(d)
+    heads = [l for l in out.splitlines() if l.startswith("@@")]
+    assert heads == ["@@ -1,3 +1,4 @@"], heads
+
+
+def test_a_hunk_with_NO_CONTEXT_cannot_be_shown_to_have_landed(tmp_path):
+    """⚠ `[] == []` IS NOT A CHECK. A pure-deletion hunk with no context
+    leaves an empty post-image, so the comparison was true wherever the
+    hunk landed. Measured: a two-line deletion declared at line 1 was
+    applied 400 lines away, `patch` exited 0, and this returned "no
+    objection" — the candidate was archived and offered to an operator.
+    """
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    f = repo / "src" / "ghost_agent" / "tools" / "w.py"
+    body = ([f"pad{i}" for i in range(400)] + ["DEL1", "DEL2"]
+            + [f"x{i}" for i in range(5)] + ["DEL1", "DEL2"])
+    f.write_text("\n".join(body) + "\n")
+    d = ("--- a/src/ghost_agent/tools/w.py\n"
+         "+++ b/src/ghost_agent/tools/w.py\n"
+         "@@ -1,2 +1,0 @@\n-DEL1\n-DEL2\n")
+    proc = subprocess.run(["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                          cwd=repo, input=d, text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f.read_text().splitlines()[400] == "x0", \
+        "the fixture no longer reproduces the mis-landing"
+    why = M.applied_where_it_said(repo, d)
+    assert why, "a deletion 400 lines from its declared position passed"
+    assert "no context" in why, why
+
+
+def test_a_DELETED_FILE_that_is_still_there_is_reported(tmp_path):
+    """⚠ `+++ /dev/null` SET `current = None` AND EVERY HUNK WAS
+    SKIPPED. Apple `patch` leaves a 0-byte file rather than removing it,
+    so the tree did not match the diff's own claim and both containment
+    checks stayed silent."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    f = repo / "src" / "ghost_agent" / "tools" / "v.py"
+    f.write_text("one\ntwo\n")
+    d = ("--- a/src/ghost_agent/tools/v.py\n+++ /dev/null\n"
+         "@@ -1,2 +0,0 @@\n-one\n-two\n")
+    subprocess.run(["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                   cwd=repo, input=d, text=True, capture_output=True)
+    why = M.applied_where_it_said(repo, d)
+    if f.exists():
+        assert why and "still present" in why, (why, f.stat().st_size)
+    else:                      # a `patch` that really removes it is fine
+        assert why == "", why
+
+
+def test_TWO_SECTIONS_for_one_file_do_not_discard_a_good_candidate(tmp_path):
+    """⚠ A WORKING DIFF THROWN AWAY, PERMANENTLY. `check_diff_shape`
+    counts unique paths, so two `--- `/`+++ ` sections naming the SAME
+    file is an allowed shape, and `patch` applies the second to the
+    already-patched file and produces exactly correct bytes. Resetting
+    the running offset on every `+++` made the second section's new-side
+    start one short, so `applied_where_it_said` objected and
+    `materialize` discarded it — and `run_mutation` archives that
+    rejection by normalised hash, so the novelty filter blocks the model
+    from ever proposing the same correct edit again."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    f = repo / "src" / "ghost_agent" / "tools" / "w.py"
+    f.write_text("a1\na2\na3\nmid1\nmid2\nb1\nb2\nb3\n")
+    two = ("--- a/src/ghost_agent/tools/w.py\n"
+           "+++ b/src/ghost_agent/tools/w.py\n"
+           "@@ -70,2 +70,3 @@\n a1\n+INS1\n a2\n"
+           "--- a/src/ghost_agent/tools/w.py\n"
+           "+++ b/src/ghost_agent/tools/w.py\n"
+           "@@ -80,2 +80,3 @@\n b1\n+INS2\n b2\n")
+    out, moved = M.repair_hunk_starts(two, repo)
+    assert moved == 2, out
+    assert [l for l in out.splitlines() if l.startswith("@@")] == [
+        "@@ -1,2 +1,3 @@", "@@ -6,2 +7,3 @@"], out
+    proc = subprocess.run(["patch", "-p1", "-F0", "--no-backup-if-mismatch"],
+                          cwd=repo, input=out, text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f.read_text() == "a1\nINS1\na2\na3\nmid1\nmid2\nb1\nINS2\nb2\nb3\n"
+    assert M.applied_where_it_said(repo, out) == "", \
+        "a diff that applied correctly was rejected by its own repair"
+
+
+def test_a_NEW_FILE_section_still_starts_its_own_offset(tmp_path):
+    """The other half: per-path means per PATH. A second file's hunks
+    must not inherit the first file's running offset."""
+    repo = tmp_path / "repo"
+    (repo / "src" / "ghost_agent" / "tools").mkdir(parents=True)
+    for name in ("a.py", "b.py"):
+        (repo / "src" / "ghost_agent" / "tools" / name).write_text(
+            "p1\np2\np3\np4\n")
+    d = ("--- a/src/ghost_agent/tools/a.py\n"
+         "+++ b/src/ghost_agent/tools/a.py\n"
+         "@@ -70,2 +70,3 @@\n p1\n+X\n p2\n"
+         "--- a/src/ghost_agent/tools/b.py\n"
+         "+++ b/src/ghost_agent/tools/b.py\n"
+         "@@ -80,2 +80,3 @@\n p1\n+Y\n p2\n")
+    out, _ = M.repair_hunk_starts(d, repo)
+    heads = [l for l in out.splitlines() if l.startswith("@@")]
+    assert heads == ["@@ -1,2 +1,3 @@", "@@ -1,2 +1,3 @@"], heads

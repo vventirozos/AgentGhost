@@ -30,6 +30,27 @@ rarity) drop out automatically.
 All functions are pure: no I/O, no globals, no logging side effects.
 The caller (typically ``FrontierTracker.pick_frontier_seed``) wires
 them together with the storage layer.
+
+⚠ PARKED IN PRODUCTION — operator decision, §4CS 2026-08-23.
+
+Everything below is written, tested, and UNREACHABLE on the live box.
+``pick_frontier_seed`` is gated on ``--frontier-selfplay``, which is NOT
+in the launcher exec line (``~/Data/AI/bin/start-ghost-agent.sh`` — the
+only flag truth), and it additionally requires a fitted PRM, of which
+there is none: ``$GHOST_HOME/system/prm/`` holds only
+``checkpoint.json.pre-1c-schema``. So ``uncertainty()`` is dead code in
+production and the picker falls back to ``pick_seed``.
+
+That is a DECISION, not a fault. The retrain gate
+(``core.agent.prm_consumer_is_live``) is correctly refusing to fit a
+model nothing reads — it exists because of a real 41-wasted-retrains
+incident. Re-opening is one flag, but read the arithmetic first: with an
+untrained PRM ``uncertainty()`` returns 1.0 for EVERY cluster by
+contract (see ``compute_cluster_uncertainty``), so ``combine_weights``
+degenerates to rarity alone. Any claim that the epistemic term helped
+must first show that seed selection differs from uniform-over-rarity.
+``introspect action='learning'`` renders the live park status, derived,
+so it retracts itself the moment a consumer goes live.
 """
 
 from __future__ import annotations

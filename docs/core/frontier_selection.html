@@ -36,6 +36,13 @@
   <h1>core / frontier_selection.py</h1>
   <p class="subtitle">Pure-function weighting layer that turns PRM uncertainty + trajectory rarity into a frontier-aware cluster pick for self-play.</p>
 
+  <div class="note"><strong>⚠ PARKED IN PRODUCTION — operator decision, §4CS 2026-08-24.</strong>
+  Everything on this page is written, tested and <em>unreachable on the live box</em>. <code>pick_frontier_seed</code> is gated on <code>--frontier-selfplay</code>, which is not in the launcher exec line (<code>bin/start-ghost-agent.sh</code> — the only flag truth), and it additionally requires a fitted PRM, of which there is none: <code>$GHOST_HOME/system/prm/</code> holds only <code>checkpoint.json.pre-1c-schema</code>. So <code>PRMScorer.uncertainty()</code> is dead code in production and the picker falls back to <code>pick_seed</code>.
+  <p>That is a DECISION, not a fault. The retrain gate (<code>core.agent.prm_consumer_is_live</code>) is correctly refusing to fit a model nothing reads — it exists because of a real 41-wasted-retrains incident. The other consumer, <code>.score()</code> behind <code>_MCTS_TURNSTART_ENABLED</code>, is parked on a written criterion (an <em>execution-grounded</em> value function) that is <strong>not met</strong>.</p>
+  <p><strong>Read the arithmetic before re-opening.</strong> With an untrained PRM <code>uncertainty()</code> returns <strong>1.0 for every cluster</strong> by contract, so <code>combine_weights</code> degenerates to rarity alone — the product IS the rarity map, exactly. Any claim that the epistemic term helped must first show that seed selection differs from uniform-over-rarity.</p>
+  <p><code>introspect action='learning'</code> renders the park status under COGNITIVE WIRING, <strong>derived</strong> from the same leg states the rows above it show — so it retracts itself the moment a consumer goes live, and claims nothing at all when a leg is unreadable. Tests: <code>tests/test_4cs_prm_parked.py</code> (12 tests, 8 mutants, 8 killed).</p>
+  </div>
+
   <h2>What it solves</h2>
   <p>The brittle-pool scoring in <a href="../memory/frontier.html"><code>FrontierTracker.pick_seed</code></a> sees <em>outcomes</em> but not <em>coverage</em>. A cluster the agent has barely tried looks identical to a cluster it solves first-try: both look quiet to a signal that only watches recent failures. Frontier weighting splits these by adding two complementary signals:</p>
   <ul>

@@ -379,6 +379,7 @@ def build_gate(rows: Iterable[dict] = None, *, ledger: Path = None,
                     "why": f"not evaluable: {type(exc).__name__}"}
         doc["enabled_count"] = sum(
             1 for e in doc["buckets"].values() if e.get("enabled") is True)
+        doc["discrimination"] = _pooled_discrimination(agg, params)
     except Exception as exc:  # noqa: BLE001
         doc["reason"] = f"build failed ({type(exc).__name__}: {exc})"
         doc["buckets"] = {}
@@ -387,6 +388,76 @@ def build_gate(rows: Iterable[dict] = None, *, ledger: Path = None,
     if write:
         _write_gate(doc, home=home)
     return doc
+
+
+def _pooled_discrimination(agg: Dict[str, Dict[str, Any]],
+                           params: dict) -> Dict[str, Any]:
+    """Does the index discriminate AT ALL, pooled across every bucket?
+
+    §4CS item G. Sixty-three buckets each saying "needs 17 more" is the
+    failure mode this project has a name for: it reads as a gate waiting
+    for data, and an operator cannot tell that from a gate that will never
+    open. Per-bucket counts cannot answer it — every bucket is individually
+    under-powered — but the POOLED numbers can, and they are already being
+    computed one aggregation earlier.
+
+    Measured 2026-08-23 on 754 live rows: predicted-fail rows failed 7.1%
+    while predicted-ok rows failed 10.6%. The spread is NEGATIVE. That is
+    not an under-powered gate, it is an ANTI-PREDICTIVE index, and the two
+    lead opposite places — one waits, the other stops.
+
+    ⚠ Why this matters more than a time-to-qualify estimate:
+    `_evaluate_bucket` rejects on `precision < min_fail_precision` BEFORE
+    the interval test, so a bucket whose TRUE precision is under the bar
+    cannot enable at ANY n. Time-to-qualify for such a bucket is not long,
+    it is UNDEFINED. The denominator arrives soon (the best-placed bucket
+    is ~5 weeks from `min_fail_n` at its observed rate); the precision
+    never does, unless the index itself gets better.
+
+    DERIVED, so it retracts itself: the moment predicted-fail rows start
+    failing more than predicted-ok ones, the verdict flips on its own.
+    """
+    fail_n = sum(b["fail_n"] for b in agg.values())
+    fail_hits = sum(b["fail_hits"] for b in agg.values())
+    ok_n = sum(len(b["ok_outcomes"]) for b in agg.values())
+    ok_hits = sum(int(sum(b["ok_outcomes"])) for b in agg.values())
+    out: Dict[str, Any] = {
+        "fail_n": fail_n, "fail_hits": fail_hits,
+        "ok_n": ok_n, "ok_hits": ok_hits,
+        "precision": (fail_hits / fail_n) if fail_n else None,
+        "ok_fail_rate": (ok_hits / ok_n) if ok_n else None,
+    }
+    if not fail_n or not ok_n:
+        out["spread"] = None
+        out["verdict"] = ("no pooled comparison yet: "
+                          f"{fail_n} predicted-fail and {ok_n} predicted-ok "
+                          f"rows — the index has not been asked enough")
+        return out
+    spread = out["precision"] - out["ok_fail_rate"]
+    out["spread"] = spread
+    if spread <= 0:
+        out["verdict"] = (
+            f"⚠ ANTI-PREDICTIVE, pooled over ALL buckets: rows the index "
+            f"claims will FAIL fail {out['precision']:.1%}, rows it claims "
+            f"will succeed fail {out['ok_fail_rate']:.1%} — spread "
+            f"{spread:+.3f} against a {params['min_spread']:+.2f} bar. THE "
+            f"SIGN IS WRONG, so no bucket is waiting for data: the "
+            f"precision test is checked before the interval test, so a "
+            f"bucket under the {params['min_fail_precision']:.2f} bar "
+            f"cannot enable at any n. More traffic does not fix this; only "
+            f"a better index does.")
+    elif out["precision"] < params["min_fail_precision"]:
+        out["verdict"] = (
+            f"discriminates in the right direction (spread {spread:+.3f}) "
+            f"but pooled precision {out['precision']:.2f} is under the "
+            f"{params['min_fail_precision']:.2f} bar — under-powered "
+            f"buckets are not the constraint yet")
+    else:
+        out["verdict"] = (
+            f"pooled precision {out['precision']:.2f} and spread "
+            f"{spread:+.3f} clear both bars — individual buckets are "
+            f"genuinely waiting for their denominators")
+    return out
 
 
 def _evaluate_bucket(key: str, b: dict, params: dict) -> dict:
