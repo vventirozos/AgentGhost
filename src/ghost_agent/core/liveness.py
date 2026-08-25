@@ -30,6 +30,7 @@ nicety — it is the finding.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -609,6 +610,41 @@ def _negative_controls_probe(home: Path) -> ProbeResult:
     )
 
 
+def _gepa_applies_probe(home: Path) -> ProbeResult:
+    """Loader loads over 7 days — ANNOTATED when the loop is retired.
+
+    ⚠ Two views on ONE screen said opposite things about the same loop.
+    After the 2026-08-24 retirement, SUBSYSTEM LIVENESS printed
+    `gepa.applies fired n=28 last 12.3h ago` fifty lines above LOOP
+    YIELD's `† END prompts.gepa retired`. Both were literally true — the
+    window is 168h and the loads are real history — and the older probe
+    would keep reading FIRED for another seven days about a loop that is
+    settled dead. Neither view knew about the other.
+
+    A count inside a window is not wrong; a count presented without the
+    fact that its subject has been withdrawn is. So this probe asks the
+    yield side and says so.
+    """
+    res = _log_probe(r"GEPA: loaded tuned instruction", window_h=168.0)(home)
+    try:
+        d = home / "system" / "optim"
+        live = [f for f in d.glob("*.json")] if d.is_dir() else []
+        withdrawn = ([f for f in d.iterdir()
+                      if f.is_file() and ".json." in f.name
+                      and any(k in f.name
+                              for k in ("retired", "rejected", "noop"))]
+                     if d.is_dir() else [])
+    except Exception:                                       # noqa: BLE001
+        return res
+    if withdrawn and not live and (res.count or 0):
+        res.note = ((res.note + ". ") if res.note else "") + (
+            f"⚠ these are HISTORICAL: every artifact has since been "
+            f"withdrawn ({len(withdrawn)} on disk, 0 live), so the loads "
+            f"in this 168h window are of prompts no longer served. See "
+            f"LOOP YIELD `prompts.gepa`, which reads RETIRED")
+    return res
+
+
 PROBES: List[Probe] = [
     # ⚠ DEN_NONE, deliberately: these run off the idle clock, not off
     # traffic, so no amount of quiet excuses their silence.
@@ -705,7 +741,7 @@ PROBES: List[Probe] = [
           denominator=DEN_USER_TURNS),
     Probe("gepa.applies", EXPECT_ON_DEMAND,
           "system/ghost-agent.log — loader INFO on artifact load",
-          _log_probe(r"GEPA: loaded tuned instruction", window_h=168.0)),
+          _gepa_applies_probe),
 ]
 
 
@@ -862,6 +898,242 @@ UNMEASURED = "unmeasured"
 #: first write reads that way. "Minted nothing" and "minted things nobody
 #: invokes" are different findings with different remedies.
 EMPTY = "empty"
+#: A SEVENTH state, and the one BARREN could not express (2026-08-24).
+#: (Seven: NO_SOURCE, BARREN, UNMEASURED, EMPTY, GATED, RETIRED,
+#: YIELDING. An earlier comment said "sixth", having counted the five
+#: the §4CS docstring lists and forgotten GATED, which that docstring
+#: also omits.)
+#:
+#: BARREN means "measurable, measured at zero, and the remedy is to find
+#: it a consumer". `foresight.gate` read BARREN for weeks while the real
+#: answer was that the question is SETTLED: §4CS item G measured the index
+#: ANTI-PREDICTIVE over 761 rows — rows it claims will fail fail 7.1%,
+#: rows it claims will succeed fail 10.6%. `_evaluate_bucket` rejects on
+#: precision BEFORE the interval test, so a bucket under the bar cannot
+#: enable at ANY n. More traffic does not fix it.
+#:
+#: Sorting that at the TOP of a worst-news-first view spends an operator's
+#: attention on a decided question every time they read it, and the row
+#: says "the remedy is upstream", which reads as owed work. RETIRED says
+#: measured dead, decision recorded, nothing owed.
+#:
+#: ⚠ IT IS DERIVED, NEVER ASSERTED — the same rule as §4CS item C's park.
+#: The status is read off the loop's own live verdict, so the moment the
+#: index discriminates in the right direction the row un-retires itself
+#: with no code change. A hardcoded flag would freeze a measurement into
+#: a belief, which is the failure `derived_zero` already exists to avoid.
+RETIRED = "retired"
+
+
+# ── The retrieval-CONCENTRATION axis (2026-08-24) ──────────────────────
+#
+# `invoked` is a SUM over per-item counters. A sum cannot distinguish a
+# store whose 50 items are all being retrieved from a store where one item
+# takes every retrieval and 49 never surface — and those are opposite
+# findings with opposite remedies (the first is healthy; the second means
+# the RETRIEVER is broken, not the store).
+#
+# This is not hypothetical. arXiv:2604.27003 ("When Continual Learning
+# Moves to Memory") measures the failure directly: external memory does
+# not remove continual learning's interference problem, it RELOCATES it
+# from parameter updates to retrieval, and in their homogeneous-store
+# condition **88.5% of queries retrieved the identical top item** despite
+# high key-level diversity. Their conclusion — "pool size alone predicts
+# nothing about retrieval effectiveness" — is a direct statement that
+# `minted` and `invoked`, the two numbers this view already had, cannot
+# see the pathology.
+#
+# NOTHING NEW IS RECORDED. Every store already carries the per-item
+# counter that `invoked` sums (`retrievals` on lessons and graduated
+# skills, `usage_count` on macros and acquired skills). This is a second
+# statistic over the SAME vector, which is why `total` must equal the
+# row's `invoked` — pinned, because a spread computed over a different
+# population than the row describes would be a plausible lie.
+
+#: Expected count per item under a uniform null, below which no verdict is
+#: reported. This is the standard expected-cell-count convention (≥5 per
+#: cell) rather than a tuned constant: with fewer draws than that, a top-1
+#: share carries no information about concentration — 3 retrievals over 10
+#: items puts top-1 at 33% no matter how the retriever behaves.
+#:
+#: §4CE ("verdict without power") is the reason this gate exists at all:
+#: ten of ten arm/metric pairs there reported "no difference detected" for
+#: a difference that was arithmetically undetectable. A concentration
+#: number printed under this floor would be the same instrument failure.
+_SPREAD_MIN_PER_ITEM = 5
+
+#: Both bars are MAJORITY statements, not tuned knobs, and that is
+#: deliberate — this project's constants have twice been found calibrated
+#: on the wrong statistic (§4BR) or the wrong regime. "One item takes more
+#: than all the others combined" and "most of the store never surfaced"
+#: are facts about a majority; they do not move when the corpus does.
+_SPREAD_TOP1_BAR = 0.5
+_SPREAD_COVERAGE_BAR = 0.5
+
+CONCENTRATED = "concentrated"
+SPREAD_OK = "distributed"
+UNDERPOWERED = "underpowered"
+UNDEFINED = "undefined"
+
+
+@dataclass
+class Spread:
+    """How a loop's retrievals are distributed across its OWN items.
+
+    `n` is the ELIGIBLE population — what could have been retrieved — not
+    the minted one.
+
+    ⚠ THE REASON FIRST GIVEN FOR THIS WAS FALSE, and it was repeated in
+    four places before a reviewer executed it. The claim was "scoring
+    over all 29 would report 100% top-1 for a store with one runnable
+    item". Top-1 SHARE is `top1 / total` and is INVARIANT to adding
+    zero-count items — measured on the live macro shape, eligible-only
+    and all-29 both give `top1_share = 1.0`. (There are also three
+    runnable macros, not one.)
+
+    What the eligible population actually changes is everything ELSE:
+    `coverage` (0.333 vs 0.034), the UNDERPOWERED floor (`5*n` = 15 vs
+    145, so the whole row would be withheld), and the entropy. The
+    filter is right; the illustration was not, and a right thing held
+    for a wrong reason is one refactor away from being removed.
+    """
+    n: int = 0                          # eligible items
+    total: int = 0                      # retrievals — MUST equal `invoked`
+    top1: int = 0                       # count on the busiest item
+    nonzero: int = 0                    # items retrieved at least once
+    top1_share: Optional[float] = None
+    coverage: Optional[float] = None    # nonzero / n
+    entropy_ratio: Optional[float] = None   # H / log(n): 1 uniform, 0 all-one
+    verdict: str = UNDEFINED
+    why: str = ""
+
+
+def _eligible_counts(rows, count_of, eligible_now) -> List[int]:
+    """The per-item counts to score concentration over — ONE formula, so
+    the four probes cannot drift apart on the question that decides what
+    the statistic means.
+
+    Eligible = currently eligible, UNION anything with a non-zero count.
+
+    The union half is not generosity, it is an INVARIANT. `invoked` is
+    summed over every row the probe owns; if an item was retrieved while
+    active and later demoted (a macro un-approved, a skill degraded), a
+    "currently eligible" population would drop its retrievals from `total`
+    while the row still counts them in `invoked` — and a spread computed
+    over a different population than its own row is exactly the kind of
+    plausible lie §4CE found three instruments telling. A non-zero count
+    is itself proof the item was eligible when it was drawn.
+
+    `total == invoked` is therefore true BY CONSTRUCTION here, and pinned
+    as an executed test rather than trusted (`pin identity, not property`).
+    """
+    out = []
+    for r in rows:
+        c = int(count_of(r) or 0)
+        if c > 0 or eligible_now(r):
+            out.append(c)
+    return out
+
+
+def _spread(counts: List[int]) -> Spread:
+    """Concentration over one loop's per-item retrieval counts.
+
+    Descriptive, not inferential, and deliberately so. A significance test
+    against a UNIFORM null is the wrong instrument here: with 922
+    retrievals over 50 lessons every real store rejects uniformity at
+    p≈0, because relevance-ranked retrieval is SUPPOSED to be non-uniform.
+    The pathology 2604.27003 names is not "non-uniform", it is "one item
+    dominates and the tail never surfaces" — so the numbers reported are
+    the ones that state exactly that, against a published comparator
+    (their 88.5%) rather than against a null nobody believes.
+    """
+    counts = [int(c or 0) for c in counts]
+    n = len(counts)
+    total = sum(counts)
+    nonzero = sum(1 for c in counts if c > 0)
+    top1 = max(counts) if counts else 0
+    sp = Spread(n=n, total=total, top1=top1, nonzero=nonzero)
+
+    if n < 2:
+        sp.why = (f"only {n} item(s) eligible — with fewer than two there "
+                  f"is nothing for retrieval to concentrate ON, so a share "
+                  f"here would be 100% by construction")
+        return sp
+    if total <= 0:
+        # NOT underpowered and NOT concentrated: nothing was retrieved at
+        # all. The row's own status (BARREN/EMPTY/derived) is the finding;
+        # repeating it as a concentration verdict would double-count it.
+        sp.why = "nothing retrieved yet — the row's own status is the finding"
+        return sp
+
+    sp.top1_share = top1 / total
+    sp.coverage = nonzero / n
+    ps = [c / total for c in counts if c > 0]
+    h = -sum(p * math.log(p) for p in ps)
+    hmax = math.log(n)
+    # Clamped: floating error can push a perfectly uniform ratio a hair
+    # over 1.0, and a "1.0000000002 uniform" reads as a bug in the
+    # instrument rather than in the store.
+    sp.entropy_ratio = max(0.0, min(1.0, h / hmax)) if hmax > 0 else 0.0
+
+    need = _SPREAD_MIN_PER_ITEM * n
+    if total < need:
+        sp.verdict = UNDERPOWERED
+        # ⚠ THE PIGEONHOLE BOUND, not 1/total. With `total` draws over
+        # `n` items the busiest holds at least ceil(total/n), so the
+        # minimum possible top-1 SHARE is ceil(total/n)/total — equal to
+        # 1/total only when n >= total. The first version printed 1/total
+        # unconditionally and was wrong on a live row by 5x ("cannot fall
+        # below 4%" for 24 retrievals over 5 items, true floor 20.8%), in
+        # the direction that makes the observed concentration look more
+        # meaningful than it is. At n=100/total=499 it printed "cannot
+        # fall below 0%" — a vacuous floor offered as the REASON a verdict
+        # is withheld about a 100%-collapsed store.
+        floor = math.ceil(total / n) / total
+        # ⚠ The formula is exact and the FORMAT was not: at n=201,
+        # total=200 the true floor is 0.5% and `{:.0%}` printed "0%" —
+        # the vacuous sentence this comment block cites as the defect,
+        # reintroduced by rounding.
+        # ⚠ STRICT `<` LET THE CITED CASE THROUGH: `f"{0.005:.0%}"` is
+        # "0%" (round-half-even), and a brute force over the underpowered
+        # region found 816 (n, total) pairs still printing the vacuous
+        # floor — including n=201/total=200, literally the example the
+        # comment above names. Compare against what will be PRINTED, not
+        # against a threshold that approximates it.
+        _floor_s = f"{floor:.0%}"
+        if floor > 0 and _floor_s == "0%":
+            _floor_s = "<1%"
+        sp.why = (f"{total} retrieval(s) over {n} eligible item(s) — under "
+                  f"the {need} ({_SPREAD_MIN_PER_ITEM}/item) floor, so the "
+                  f"share below is REPORTED BUT NOT JUDGED: at this "
+                  f"denominator top-1 cannot fall below "
+                  f"{_floor_s} however well the retriever behaves")
+        return sp
+
+    # ⚠ STRICTLY GREATER. This branch prints "more than every other item
+    # combined", and `>=` does not mean that: at n == 2 a uniform [5, 5]
+    # store scored exactly 0.5, tripped the bar, and was reported as a
+    # broken retriever with a false claim (5 is not more than 5).
+    # Exhaustively checked: under `>=`, DISTRIBUTED was UNREACHABLE at
+    # n == 2 for every total from 1 to 2000 — a dead verdict on an
+    # ordinary store shape (two active skills, two approved macros). The
+    # operator now matches the sentence.
+    if sp.top1_share > _SPREAD_TOP1_BAR:
+        sp.verdict = CONCENTRATED
+        sp.why = (f"ONE item takes {sp.top1_share:.0%} of all retrievals — "
+                  f"more than every other item combined. The store is not "
+                  f"the finding; the RETRIEVER is")
+    elif sp.coverage <= _SPREAD_COVERAGE_BAR:
+        sp.verdict = CONCENTRATED
+        sp.why = (f"{nonzero} of {n} eligible item(s) have EVER been "
+                  f"retrieved — most of the store has never surfaced, so "
+                  f"minting more of it cannot help")
+    else:
+        sp.verdict = SPREAD_OK
+        sp.why = ("no item takes a majority and most of the store is "
+                  "reached — the collapse signature in arXiv:2604.27003 "
+                  "is 88.5% top-1")
+    return sp
 
 
 @dataclass
@@ -871,7 +1143,15 @@ class YieldResult:
     invoked: Optional[int] = None
     last_invoked: Optional[float] = None
     note: str = ""
-    #: Set only to force GATED. Otherwise derived — see `_yield_status`.
+    #: An ASSERTED status, overriding the derivation. Used for GATED and
+    #: for RETIRED. ⚠ The comment here said "only to force GATED" for
+    #: three rounds after RETIRED started using it — a contract that
+    #: describes a subset of its own callers.
+    #:
+    #: The distinction that matters is unchanged and is pinned: the
+    #: retirement DECISION is computed from the gate's data every time
+    #: `_yield_foresight_gate` runs. This field carries that decision; it
+    #: does not stand in for one.
     status: Optional[str] = None
     #: ⚠ REVIEW ROUND 2. BARREN's contract is "measurable, and MEASURED at
     #: zero", and both live members violated it: the foresight gate's zero
@@ -882,6 +1162,12 @@ class YieldResult:
     #: the truth is they are BLOCKED UPSTREAM, which is a different remedy.
     #: Same BARREN/UNMEASURED distinction, one level finer.
     derived_zero: str = ""
+    #: How `invoked` is distributed across the loop's OWN items, when the
+    #: loop keeps per-item counters. None means the loop has no per-item
+    #: channel to distribute over (gepa serves ONE artifact; the foresight
+    #: gate and evolve have no per-item use counter at all) — which is
+    #: distinct from a computed spread whose verdict is UNDEFINED.
+    spread: Optional[Spread] = None
 
 
 @dataclass
@@ -1001,7 +1287,11 @@ def _yield_macros(home: Path) -> YieldResult:
                if isinstance(v, dict) and not _is_loop_minted_macro(k, v))
     invoked = sum(int(v.get("usage_count") or 0) for v in auto.values())
     succeeded = sum(int(v.get("success_count") or 0) for v in auto.values())
-    last = max((float(v.get("last_used") or 0.0) for v in auto.values()),
+    # `_parse_ts`, like every peer probe. A raw `float()` raised
+    # ValueError on an ISO stamp — the shape `auto_skills.json` writes for
+    # the same concept — and the whole row rendered `no_source`
+    # ("probe raised: ValueError"): a populated store reported as missing.
+    last = max((_parse_ts(v.get("last_used")) or 0.0 for v in auto.values()),
                default=0.0)
     parked = sum(1 for v in auto.values() if v.get("status") != "active")
     note = (f"{hand} hand-written macro(s) excluded — they are not this "
@@ -1027,6 +1317,16 @@ def _yield_macros(home: Path) -> YieldResult:
         invoked=invoked,
         last_invoked=last or None,
         note=note,
+        # ELIGIBLE = active (∪ anything already invoked). A `proposed`
+        # macro is not advertised and `action='run'` refuses it, so it
+        # cannot appear in the denominator of "where did the retrievals
+        # go" — scoring over all 29 would report 100% top-1 about a store
+        # with one runnable macro, which is the derived-zero error
+        # transplanted into the new axis.
+        spread=_spread(_eligible_counts(
+            auto.values(),
+            lambda v: v.get("usage_count"),
+            lambda v: v.get("status") == "active")),
         # ⚠ REVIEW ROUND 2: with NOTHING approved this zero is structural,
         # not measured — a proposed macro is not advertised, not
         # dispatchable, and `action='run'` refuses it, so `usage_count`
@@ -1064,6 +1364,12 @@ def _yield_acquired_skills(home: Path) -> YieldResult:
                  if degraded else "")
               + ". The registry carries usage_count but no last-used "
                 "timestamp, so the age column cannot be filled from it"),
+        # ELIGIBLE = active (∪ already used). `degraded` gates advertising,
+        # dispatch AND embedding, so a degraded skill cannot be drawn.
+        spread=_spread(_eligible_counts(
+            rows,
+            lambda v: v.get("usage_count"),
+            lambda v: v.get("status") == "active")),
     )
 
 
@@ -1117,6 +1423,12 @@ def _yield_graduated_skills(home: Path) -> YieldResult:
               f"this shares the liveness view's denominator."),
         derived_zero=("nothing has graduated, so nothing can be surfaced"
                       if not rows else ""),
+        # ELIGIBLE = every graduated skill. There is no activation gate on
+        # this store — `relevant()` considers all of them on every turn
+        # with user content — so the minted and eligible populations are
+        # genuinely the same here, unlike the other three.
+        spread=_spread(_eligible_counts(
+            rows, lambda v: v.get("retrievals"), lambda v: True)),
     )
 
 
@@ -1161,6 +1473,14 @@ def _yield_lessons(home: Path) -> YieldResult:
         note=note,
         derived_zero=("every lesson is quarantined, so none can be "
                       "retrieved" if all_rows and not rows else ""),
+        # ELIGIBLE = SERVED, i.e. not quarantined — `_filter_quarantined`
+        # runs at both retrieval surfaces, so a quarantined lesson can
+        # never be drawn again. Scoring over `all_rows` would credit the
+        # store with a tail that is structurally unreachable, and read as
+        # poor coverage when the truth is deliberate withdrawal. This
+        # mirrors `invoked`, which is already summed over `rows`.
+        spread=_spread(_eligible_counts(
+            rows, lambda v: v.get("retrievals"), lambda v: True)),
     )
 
 
@@ -1209,8 +1529,50 @@ def _yield_gepa(home: Path) -> YieldResult:
         opt = (data or {}).get("optimized_instruction")
         if isinstance(opt, str) and opt.strip():
             valid += 1
+    # ⚠ A RETIRED ARTIFACT IS NOT "MINTED NOTHING". Retiring
+    # `planning.decompose` (2026-08-24, measured worse than its own seed)
+    # left zero live `.json` files, and the row rendered
+    # `empty · minted 0 · invoked 135` — "this loop has minted NOTHING
+    # yet" printed beside 135 recorded loads of the thing it minted. The
+    # suffix filter is right (a retired artifact must not count as live
+    # output); the STATE was wrong, because EMPTY's contract is "produced
+    # nothing" and this loop produced something that was then withdrawn.
+    #
+    # Retired/rejected files are counted separately and reported, so the
+    # row can say "the gate worked" rather than "nothing happened" —
+    # opposite findings with opposite remedies.
+    withdrawn = sorted(
+        f.name for f in d.iterdir()
+        if f.is_file() and ".json." in f.name
+        and any(k in f.name for k in ("retired", "rejected", "noop")))
     loads = _log_probe(_GEPA_LOAD_PATTERN,
                        window_h=_GEPA_LOAD_WINDOW_H)(home)
+    if not names and withdrawn:
+        # ⚠ RETURNED BEFORE THE NO_SOURCE CHECK BELOW, so an unreadable
+        # log became `invoked 0` with the note "the 0 loads are
+        # historical" — a FABRICATED zero, which is the missing-vs-empty
+        # conflation this module's own docstring calls "the finding".
+        # A live artifact with no log correctly claims no count; a
+        # retired one must do the same.
+        if loads.status == NO_SOURCE:
+            return YieldResult(
+                minted=0, activated=0, invoked=None, status=RETIRED,
+                note=(f"no LIVE artifact, {len(withdrawn)} withdrawn one(s) "
+                      f"on disk — the loop produced artifacts and every one "
+                      f"has been retired or rejected. "
+                      f"{loads.note or 'the agent log is unreadable'}, so no "
+                      f"load count is claimed"))
+        return YieldResult(
+            minted=0, activated=0, invoked=loads.count or 0,
+            last_invoked=loads.last_ts, status=RETIRED,
+            note=(f"no LIVE artifact, but {len(withdrawn)} withdrawn one(s) "
+                  f"on disk ({', '.join(withdrawn[:3])}"
+                  f"{'…' if len(withdrawn) > 3 else ''}) — this loop has "
+                  f"produced artifacts and every one has since been retired "
+                  f"or rejected. That is the GATE WORKING, not a loop that "
+                  f"minted nothing; the read sites fall back to the "
+                  f"hand-written instruction. The {loads.count or 0} loads "
+                  f"are historical, of artifacts no longer served"))
     if loads.status == NO_SOURCE:
         return YieldResult(
             minted=len(names), activated=valid, invoked=None,
@@ -1232,6 +1594,244 @@ def _yield_gepa(home: Path) -> YieldResult:
         derived_zero=("the agent log has been rotated or truncated"
                       if valid and not (loads.count or 0) else ""),
     )
+
+
+def _wilson_upper(k: int, n: int, z: float = 1.96) -> Optional[float]:
+    """Upper bound of the Wilson interval for k/n.
+
+    Wilson rather than Wald because the live numbers sit at the end of
+    the scale (1 of 14), where a Wald interval runs off the end and
+    manufactures confidence.
+    """
+    if n <= 0 or k < 0 or k > n:
+        return None
+    p = k / n
+    d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return min(1.0, centre + half)
+
+
+def _anti_predictive(disc: Any, *, bar: float = 0.60,
+                     min_fail_n: int = 10) -> bool:
+    """Can this index's predicted-fail precision NEVER clear the bar?
+
+    ⚠ REWRITTEN AFTER ROUND 1. The first version returned `spread <= 0`
+    with no power requirement at all — both denominators merely had to be
+    truthy. Two reviewers demonstrated the consequences independently and
+    both are disqualifying:
+
+      * `{spread: 0.0, fail_n: 1, ok_n: 1}` RETIRED a loop. On the LIVE
+        gate the retirement rested on 14 predicted-fail rows of which ONE
+        failed: Fisher exact two-sided p = 1.00, and the Newcombe interval
+        for the spread is [-0.100, +0.209] — it contains zero AND contains
+        the +0.10 bar the verdict cites as the thing it fails. A terminal
+        "nothing owed" verdict on an arithmetically undetectable
+        difference is §4CE VERBATIM, in the instrument added to prevent it.
+      * The sign of a POOLED spread is a proxy, and it fails both ways. A
+        Simpson reversal (every bucket +0.10, pooled -0.47) retired a loop
+        whose every bucket discriminates correctly; and precision 0.07 at
+        fail_n 500 with a hair-positive spread was NOT retired, i.e.
+        reported as owed work forever.
+
+    So the test is now the THING, with power. `_evaluate_bucket` rejects
+    on `precision < min_fail_precision` BEFORE the interval test, so a
+    bucket whose TRUE precision is under the bar cannot enable at ANY n —
+    that is the property that makes a retirement honest, and it is
+    established only when the precision interval's UPPER bound is below
+    the bar. On the live row: 1/14, Wilson upper 0.315 < 0.60, so the
+    retirement stands — on sound grounds rather than on a sign.
+
+    AND the pooled figure alone is not enough. A bucket can still be
+    alive under a dead pool, so any bucket whose own precision interval
+    reaches the bar keeps the loop out of RETIRED.
+    """
+    if not isinstance(disc, dict):
+        return False
+    fail_n = disc.get("fail_n")
+    fail_hits = disc.get("fail_hits")
+    ok_n = disc.get("ok_n")
+    ok_hits = disc.get("ok_hits")
+    for v in (fail_n, fail_hits, ok_n, ok_hits):
+        if isinstance(v, bool) or not isinstance(v, int):
+            return False
+    if fail_hits < 0 or fail_hits > fail_n or ok_hits < 0 or ok_hits > ok_n:
+        return False
+
+    # ⚠ POWER ON *THIS* LEG TOO. Round 2 measured the asymmetry round 1
+    # left: retirement needed 3 predicted-fail rows (0/3 has a Wilson
+    # upper of 0.562, under the 0.60 bar) while a bucket needed 10 before
+    # it was allowed to OBJECT. Every tie broke toward "settled". Both
+    # legs now use the gate's own `min_fail_n`.
+    if fail_n < min_fail_n or ok_n <= 0:
+        return False
+
+    # ⚠ AND THE SIGN IS BACK, because dropping it was an over-correction.
+    # Round 1 tested `spread <= 0` with no power. Round 2 replaced it with
+    # a precision test that HAD power and lost the semantics — measured on
+    # a synthetic index where predicted-fail rows fail 40% and
+    # predicted-ok rows fail 2% (spread +0.38, hugely predictive), the
+    # rule RETIRED it, and the row printed the builder's verdict
+    # ("discriminates in the right direction… but pooled precision is
+    # under the bar") directly above "SETTLED, nothing is owed".
+    #
+    # Two different findings with two different remedies:
+    #   spread <= 0  ..... the INDEX is backwards. Nothing to do but
+    #                      build a better one. RETIRED.
+    #   spread  > 0  ..... the index works and the BAR is wrong for it.
+    #                      That is owed work, so NOT retired.
+    #
+    # Retirement therefore needs BOTH: the index fails to discriminate,
+    # AND its precision is provably unable to reach the bar.
+    precision = fail_hits / fail_n
+    ok_fail_rate = ok_hits / ok_n
+    if precision > ok_fail_rate:
+        return False
+
+    # `hi is not None` is reachable ONLY through a malformed count that
+    # the bounds check above already rejects — kept because
+    # `_wilson_upper` is a public-ish helper whose contract allows None,
+    # and a caller that stops honouring it should fail closed rather than
+    # TypeError. Pinned by the malformed-input cases.
+    hi = _wilson_upper(fail_hits, fail_n)
+    return hi is not None and hi < bar
+
+
+def _gate_bucket_n(data: Any) -> int:
+    """`min_bucket_n` — the gate's OTHER power floor.
+
+    `_evaluate_bucket` refuses a bucket with fewer than this many
+    RESOLVED rows ("thin bucket: 12 resolved rows < 30") regardless of
+    its predicted-fail count, so a bucket under it can never enable and
+    must not be allowed to veto retirement. Round 3: a bucket at
+    `n=12, fail_n=11` blocked RETIRED forever.
+    """
+    params = (data or {}).get("params") if isinstance(data, dict) else None
+    if isinstance(params, dict):
+        m = params.get("min_bucket_n")
+        if isinstance(m, int) and not isinstance(m, bool) and m > 0:
+            return m
+    return 30
+
+
+def _gate_bars(data: Any) -> tuple:
+    """`(min_fail_precision, min_fail_n)` READ FROM THE GATE FILE.
+
+    The builder records its thresholds into the artifact precisely so a
+    stale gate says which thresholds produced it. Reading them here —
+    rather than copying the defaults — is what stops this view and the
+    gate from drifting into disagreeing about the same numbers.
+    """
+    params = (data or {}).get("params") if isinstance(data, dict) else None
+    bar, min_fail_n = 0.60, 10
+    if isinstance(params, dict):
+        b, m = params.get("min_fail_precision"), params.get("min_fail_n")
+        if isinstance(b, (int, float)) and not isinstance(b, bool) and 0 < b <= 1:
+            bar = float(b)
+        if isinstance(m, int) and not isinstance(m, bool) and m > 0:
+            min_fail_n = m
+    return bar, min_fail_n
+
+
+def _assessable_buckets(buckets: Any, min_fail_n: int,
+                        min_bucket_n: int = 0) -> int:
+    """How many buckets have enough predicted-fail rows to be judged.
+
+    Reported so the retirement note can distinguish "we checked the
+    buckets and none qualifies" from "none was eligible to be checked".
+    """
+    if not isinstance(buckets, dict):
+        return 0
+    out = 0
+    for b in buckets.values():
+        if not isinstance(b, dict):
+            continue
+        fn = b.get("fail_n")
+        if isinstance(fn, bool) or not isinstance(fn, int) or fn < min_fail_n:
+            continue
+        # ⚠ AND `fail_hits` MUST BE READABLE. Round 3: a bucket with
+        # `fail_hits=None` was counted assessable and then silently
+        # skipped by the qualify check, so the note printed "of the
+        # buckets with 10+ rows, none can still reach the bar" about a
+        # bucket it never examined — the same unrun-check-presented-as-
+        # passed shape that sentence was added to fix.
+        fh = b.get("fail_hits")
+        if isinstance(fh, bool) or not isinstance(fh, int):
+            continue
+        rn = b.get("n")
+        if (min_bucket_n and not isinstance(rn, bool) and isinstance(rn, int)
+                and rn < min_bucket_n):
+            continue
+        out += 1
+    return out
+
+
+def _live_bucket_can_still_qualify(buckets: Any, *, bar: float = 0.60,
+                                   min_fail_n: int = 10,
+                                   min_bucket_n: int = 0) -> bool:
+    """Does any bucket have ENOUGH DATA to still reach the bar?
+
+    The pooled verdict is an aggregate, and an aggregate can be dead
+    while a stratum is alive — this project has paid for pooling across
+    strata once already (the negative Platt slope on the calibration
+    corpus). So a genuinely live bucket keeps the loop out of RETIRED.
+
+    ⚠ BUT "ALIVE" NEEDS ITS OWN POWER, and this is where round 1's fix
+    would have gone wrong a second time. Measured on the live gate: 4 of
+    64 buckets have a precision interval reaching the bar — and every one
+    of them sits at `fail_n` of 1 to 3, where the Wilson upper bound is
+    wide BY CONSTRUCTION (`0/1` reads 0.793). Counting those as alive is
+    absence of evidence read as evidence, and it would make RETIRED
+    unreachable forever, since some 1-row bucket always exists.
+
+    The threshold is the GATE'S OWN `min_fail_n` — the denominator it
+    already refuses to evaluate a bucket below — not a number invented
+    here. Under it a bucket is UNMEASURED, and only the pooled figure can
+    speak.
+
+    This does not foreclose anything: RETIRED is derived and
+    self-retracting, so the moment a bucket accumulates enough
+    predicted-fail rows to reach the bar, the row un-retires itself with
+    no code change.
+    """
+    if not isinstance(buckets, dict):
+        return False
+    for b in buckets.values():
+        if not isinstance(b, dict):
+            continue
+        fn, fh = b.get("fail_n"), b.get("fail_hits")
+        if isinstance(fn, bool) or not isinstance(fn, int) or fn < min_fail_n:
+            continue
+        if isinstance(fh, bool) or not isinstance(fh, int):
+            continue
+        # `min_bucket_n` too: `_evaluate_bucket` refuses a thin bucket
+        # outright, so one that can never enable must not block RETIRED.
+        rn = b.get("n")
+        if (min_bucket_n and not isinstance(rn, bool) and isinstance(rn, int)
+                and rn < min_bucket_n):
+            continue
+        hi = _wilson_upper(max(0, min(fh, fn)), fn)
+        if hi is not None and hi >= bar:
+            return True
+        # ⚠ AND A BUCKET THAT DISCRIMINATES IS ALIVE EVEN UNDER THE BAR,
+        # which round 3 showed this function could not see: it read only
+        # `fail_n`/`fail_hits`, never the bucket's own `ok_*`, so it
+        # could not detect bucket-level discrimination at all. A
+        # Simpson-reversed gate — every bucket +spread, pooled negative —
+        # was RETIRED as "nothing owed" while every stratum discriminated
+        # correctly. That is the exact scenario `_anti_predictive`'s own
+        # docstring calls disqualifying, applied to the pooled figure and
+        # not to the strata.
+        #
+        # Same rule as the pooled one, one level down: spread > 0 means
+        # the BAR is wrong for this bucket, which is owed work.
+        okn, okh = b.get("ok_n"), b.get("ok_hits")
+        if (not isinstance(okn, bool) and isinstance(okn, int) and okn > 0
+                and not isinstance(okh, bool) and isinstance(okh, int)
+                and 0 <= okh <= okn):
+            if (fh / fn) > (okh / okn):
+                return True
+    return False
 
 
 def _yield_foresight_gate(home: Path) -> YieldResult:
@@ -1259,9 +1859,61 @@ def _yield_foresight_gate(home: Path) -> YieldResult:
         # §4CS item G: 63 buckets each saying "needs 17 more" reads as a
         # gate waiting for data, and an operator cannot tell that from a
         # gate that will never open. The POOLED verdict can.
-        verdict = str(((data.get("discrimination") or {}).get("verdict")) or "")
+        disc = data.get("discrimination") or {}
+        verdict = str(disc.get("verdict") or "")
         if verdict:
             note += f". POOLED: {verdict}"
+        # RETIRED — measured dead, decision recorded, nothing owed
+        # (2026-08-24). DERIVED from the gate's own pooled COUNTS, never
+        # from a flag.
+        #
+        # ⚠ It does NOT read `disc["spread"]`, despite what this comment
+        # said for three rounds — it recomputes precision and
+        # ok_fail_rate from `fail_hits/fail_n` and `ok_hits/ok_n` and
+        # applies a Wilson interval. Verified: a gate whose `spread` key
+        # says +0.99, or is absent entirely, retires identically. An
+        # operator debugging a retirement was being pointed at a field
+        # with no causal role.
+        #
+        # Why the distinction is worth a state: BARREN prescribes "find it
+        # a consumer" and sorts FIRST in a worst-news-first view. That is
+        # the correct handling of a loop that might yet work, and the
+        # wrong handling of one whose index has the WRONG SIGN — where
+        # `_evaluate_bucket` checks precision before the interval test, so
+        # no bucket can enable at any n and more traffic cannot help.
+        _bar, _min_fn = _gate_bars(data)
+        _min_bn = _gate_bucket_n(data)
+        if (_anti_predictive(disc, bar=_bar, min_fail_n=_min_fn)
+                and not _live_bucket_can_still_qualify(
+                    buckets, bar=_bar, min_fail_n=_min_fn,
+                    min_bucket_n=_min_bn)):
+            return YieldResult(
+                minted=n, activated=0, invoked=0, status=RETIRED,
+                note=note.rstrip(". ") + (
+                     f". RETIRED 2026-08-24 (§4CU): the predicted-fail "
+                     f"precision is {disc.get('fail_hits')}/"
+                     f"{disc.get('fail_n')}, whose 95% interval tops out at "
+                     f"{(_wilson_upper(int(disc.get('fail_hits') or 0), int(disc.get('fail_n') or 1)) or 0):.2f} "
+                     f"— BELOW the {_bar:.2f} bar, and `_evaluate_bucket` "
+                     f"rejects on precision BEFORE the interval test, so no "
+                     f"bucket can enable at any n. "
+                     # ⚠ SAY WHICH IT IS. Round 2: the live gate has ZERO
+                     # buckets with >= min_fail_n rows, so "no bucket can
+                     # still reach the bar" read to an operator as "we
+                     # checked and none qualifies" when in fact NONE WAS
+                     # ELIGIBLE TO BE CHECKED — an unrun check presented
+                     # as a passed one.
+                     + (f"No bucket has {_min_fn}+ predicted-fail rows yet, "
+                        f"so no bucket could be assessed individually. "
+                        if not _assessable_buckets(buckets, _min_fn,
+                                                   _min_bn) else
+                        f"Of the buckets with {_min_fn}+ predicted-fail "
+                        f"rows, none can still reach the bar. ")
+                     + f"SETTLED, not waiting: nothing is owed here. "
+                     f"Derived, so it RETRACTS ITSELF the moment a bucket "
+                     f"accumulates enough rows to qualify; the builder keeps "
+                     f"running, because a closed gate is a measurement"),
+                derived_zero="no bucket is enabled, so no steering site exists")
         return YieldResult(
             minted=n, activated=0, invoked=0, note=note,
             derived_zero="no bucket is enabled, so no steering site exists")
@@ -1342,6 +1994,227 @@ def _yield_evolve(home: Path) -> YieldResult:
     )
 
 
+def _yield_rubric_shadow(home: Path) -> YieldResult:
+    """§4CU — the rubric shadow on declined chat turns.
+
+    Registered on day one, not once it matters. The §4CS finding was a
+    loop that ran for six weeks producing nothing consumable while every
+    probe read FIRED; the remedy is not to notice faster next time, it is
+    to give a new loop its yield row before it has any output to hide.
+
+    `minted` = shadow judgements written. `activated` = those that
+    actually GRADED (an ABSTAIN is a correct outcome but not a usable
+    one). `invoked` is deliberately the number a HUMAN LABEL has since
+    landed on, because that — not the row count — is what could ever
+    promote this out of shadow. A shadow verdict nobody can check against
+    ground truth is production posing as consumption, which is the exact
+    defect round 1 of §4CS item B built into `evolve.candidates`.
+    """
+    p = home / "system" / "verifier" / "rubric_shadow.jsonl"
+    if not p.is_file():
+        # NOT a gap: OFF-by-default means "no file" is the expected state
+        # of a correctly-configured box, and NO_SOURCE would put a
+        # permanent ⚠ on a feature nobody switched on.
+        try:
+            from .rubric_grader import shadow_enabled
+            on = shadow_enabled()
+        except Exception:                                   # noqa: BLE001
+            on = False
+        if not on:
+            return YieldResult(
+                minted=0, activated=0, invoked=0, status=GATED,
+                note="GHOST_RUBRIC_SHADOW is off — the shadow grader is "
+                     "built and wired but does not run. Flip it to start "
+                     "accruing paired rows; nothing consumes them until "
+                     "the agreement report clears its own gate")
+        return YieldResult(minted=0, activated=0, invoked=0,
+                           note="switched ON but no judgement written yet")
+    try:
+        from .rubric_grader import (
+            GRADED, MIN_PAIRED, RUBRIC_EPOCH, agreement, read_shadow,
+        )
+        rows = read_shadow(home)
+    except Exception as e:                                  # noqa: BLE001
+        return YieldResult(note=f"shadow ledger unreadable: {type(e).__name__}")
+    cur = [r for r in rows if r.get("epoch") == RUBRIC_EPOCH]
+    stale = len(rows) - len(cur)
+    if rows and not cur:
+        # ⚠ NOT `empty`. A file full of rows from a superseded epoch is
+        # not a loop that minted nothing — EMPTY's own docstring says it
+        # must mean "produced nothing", and rendering an epoch bump as
+        # the most benign state hides that every row was just invalidated.
+        return YieldResult(
+            minted=0, activated=0, invoked=0, status=GATED,
+            note=(f"all {len(rows)} judgement(s) predate the current epoch "
+                  f"{RUBRIC_EPOCH} and are not comparable to it — the store "
+                  f"is NOT empty, it was invalidated by a prompt or scale "
+                  f"change. New rows accrue from the next qualifying turn"))
+    graded = [r for r in cur if r.get("status") == GRADED]
+    last = max((float(r.get("ts") or 0.0) for r in cur), default=0.0)
+    labels = _human_labels(home)
+    ag = agreement(cur, labels)
+    note = (f"{len(graded)}/{len(cur)} judgement(s) GRADED, the rest "
+            f"ABSTAINED (small talk and unparseable grades abstain by "
+            f"design — an abstain is a correct outcome, not a failure). "
+            f"{ag['verdict']}")
+    if stale:
+        note += (f". {stale} row(s) from an earlier epoch excluded — a "
+                 f"prompt or scale change makes rows incomparable")
+    return YieldResult(
+        minted=len(cur),
+        activated=len(graded),
+        invoked=ag["n"],
+        last_invoked=last or None,
+        note=note,
+        # ⚠ BOTH derived zeros, not one. A store of correct ABSTAINs read
+        # "✗ produces artifacts NOBODY INVOKES" — but an ABSTAIN can
+        # never join a label, so that zero is arithmetic, not neglect.
+        # Round 1 covered only the `graded > 0` half.
+        derived_zero=(
+            (f"{len(graded)} graded judgement(s) exist but none has a human "
+             f"label to be checked against yet — the zero is the LABEL "
+             f"channel, not the grader")
+            if graded and not ag["n"] else
+            (f"all {len(cur)} judgement(s) ABSTAINED, and an abstain can "
+             f"never join a label — this zero is arithmetic, not neglect")
+            if cur and not graded else ""),
+    )
+
+
+def _human_labels(home: Path) -> Dict[str, str]:
+    """trajectory_id → outcome, HUMAN rows only.
+
+    Machine verdicts are excluded on purpose: scoring a judge against
+    another judge measures their shared blind spot, and §4CE found an
+    instrument credited with beating a base rate on a delta whose CI
+    straddled zero. The corrections sidecar is the human channel's
+    durable record (§4BT).
+    """
+    out: Dict[str, str] = {}
+    p = home / "system" / "trajectories" / "corrections.jsonl"
+    if not p.is_file():
+        return out
+    try:
+        for line in p.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:                               # noqa: BLE001
+                continue
+            if not isinstance(r, dict):
+                continue
+            src = str(r.get("source") or "")
+            # `operator_overlay` is documented in core/agent.py as "a
+            # manual out-of-process edit" — a HUMAN channel that failed
+            # both the prefix test and the allow-list, silently dropping
+            # rows from the only ground truth this view has.
+            # A PREFIX is a proxy: `startswith("human")` also admits
+            # `humanoid_autoverifier`, i.e. a machine, into the only
+            # ground truth this view has. The live channels are
+            # `human_feedback:*`; require the separator.
+            if not (src.startswith("human_feedback:") or src in (
+                    "human_feedback", "user_correction", "feedback",
+                    "slack_reaction", "operator_overlay", "operator")):
+                continue
+            tid = str(r.get("trajectory_id") or r.get("id") or "")
+            oc = str(r.get("outcome") or "")
+            if tid and oc in ("passed", "failed"):
+                out[tid] = oc
+    except Exception:                                       # noqa: BLE001
+        return out
+    return out
+
+
+def _yield_mined_envs(home: Path) -> YieldResult:
+    """§4CV — failure environments mined into verifiable-reward tasks.
+
+    Registered on day one, like the rubric shadow, and for the reason a
+    round-1 reviewer gave when §4CV shipped WITHOUT one: "the loop that
+    can actually go dark is the one without a yield row". §4CS is the
+    whole precedent — the macro loop ran for six weeks producing nothing
+    consumable while every liveness probe read FIRED.
+
+    `minted` = items that survived BOTH gates and are staged.
+    `activated` = those PROMOTED into the live bank directory (an
+    explicit operator act; staging deliberately is not arming).
+    ⚠ `invoked` IS UNMEASURED, and saying so is the point. The first
+    version counted "staged items a GEPA metric COULD train on", which is
+    a property of the rows — production wearing a consumption label, the
+    exact defect §4CS item B's round 1 built into `evolve.candidates`,
+    rebuilt in the probe that cites it. Nothing durable records a GEPA
+    run touching this bank: `run_gepa` PRINTS its oracle counts and
+    writes nothing. Compare `verifier.rubric_shadow`, whose `invoked` is
+    a real external join (paired human labels).
+    `activated` (promoted into the live bank) is a real state change and
+    stays. The trainable count moves to the note, where it is a fact
+    about the store rather than a claim about consumption.
+    """
+    try:
+        from ..optim.env_mining import (
+            GRADED_TEXT, MINING_EPOCH, _read_raw, read_staging, staging_path,
+        )
+    except Exception as e:                                  # noqa: BLE001
+        return YieldResult(note=f"env_mining unreadable: {type(e).__name__}")
+    try:
+        p = staging_path("ghost_failures", str(home))
+    except Exception:                                       # noqa: BLE001
+        return YieldResult(note="staging path unavailable")
+    if not p.is_file():
+        # NOT a gap: the miner is operator-triggered, so "never run" is
+        # the expected state of a correctly-configured box.
+        # ⚠ NOT "never run". This is derived from the STAGING FILE's
+        # absence, and `mine_failure_envs.py` returns before writing when
+        # a run accepts nothing — so a real run that mined 12 candidates
+        # and accepted 0 produces exactly this state. Asserting "never
+        # run" about a loop that ran and refused everything is the
+        # opposite finding.
+        return YieldResult(
+            minted=0, activated=0, invoked=None, status=GATED,
+            note="no staged items. Either the miner has not been run, or "
+                 "a run accepted nothing — the staging file is only "
+                 "written on acceptance, so those two are "
+                 "INDISTINGUISHABLE from here. Operator-triggered by "
+                 "design (scripts/mine_failure_envs.py); nothing "
+                 "schedules it")
+    cur = read_staging("ghost_failures", str(home))
+    stale = len(_read_raw("ghost_failures", str(home))) - len(cur)
+    usable = [r for r in cur
+              if str(r.get("graded_on") or "") == GRADED_TEXT]
+    promoted = 0
+    try:
+        bank = home / "system" / "bench" / "banks" / "ghost_failures.jsonl"
+        if bank.is_file():
+            promoted = sum(1 for ln in bank.read_text(
+                errors="replace").splitlines() if ln.strip())
+    except Exception:                                       # noqa: BLE001
+        promoted = 0
+    unconfined = sum(1 for r in cur if r.get("verified_confined") is not True)
+    note = (f"{len(usable)}/{len(cur)} staged item(s) are text-graded and can "
+            f"reach a GEPA metric; the rest are artifact-graded and are bench "
+            f"output this consumer cannot train on")
+    if stale:
+        note += (f". {stale} row(s) from a superseded mining epoch are kept "
+                 f"on disk and not served (current: {MINING_EPOCH})")
+    if unconfined:
+        note += (f". ⚠ {unconfined} item(s) were verified by execution that "
+                 f"was NOT kernel-sandboxed — their oracles ran with the "
+                 f"agent's own privileges")
+    return YieldResult(
+        minted=len(cur),
+        activated=promoted,
+        # None, not len(usable) — see the docstring. UNMEASURED is the
+        # honest state, and its remedy (wire a counter) differs from
+        # BARREN's (find a consumer).
+        invoked=None,
+        note=note,
+        derived_zero=("nothing is promoted, so no bench run can reach these "
+                      "— staging is deliberately not arming"
+                      if cur and not promoted else ""),
+    )
+
+
 YIELD_PROBES: List[YieldProbe] = [
     YieldProbe("macros.auto_mined",
                "system/memory/composed_skills/composed_skills.json",
@@ -1367,7 +2240,8 @@ YIELD_PROBES: List[YieldProbe] = [
                "system/optim/*.json",
                _yield_gepa,
                activated_means="artifact carries a usable instruction",
-               invoked_means="loader log lines over 7 days (a lower bound)"),
+               invoked_means=("artifact LOADS from the loader's own log, "
+                              "ALL-TIME — a lower bound; see the note")),
     YieldProbe("foresight.gate",
                "system/foresight/gate.json",
                _yield_foresight_gate,
@@ -1378,6 +2252,19 @@ YIELD_PROBES: List[YieldProbe] = [
                _yield_evolve,
                activated_means="operator packets written",
                invoked_means="an operator acting on a packet — NOT RECORDED"),
+    YieldProbe("mining.failure_envs",
+               "system/optim/mined_envs/ghost_failures.jsonl",
+               _yield_mined_envs,
+               activated_means="items PROMOTED into the live bank directory",
+               invoked_means=("a GEPA run consuming the bank — NOT "
+                              "RECORDED; run_gepa prints its oracle "
+                              "counts and writes nothing")),
+    YieldProbe("verifier.rubric_shadow",
+               "system/verifier/rubric_shadow.jsonl",
+               _yield_rubric_shadow,
+               activated_means="judgements that GRADED (not ABSTAIN)",
+               invoked_means="graded rows a HUMAN label can be checked "
+                             "against — NOT the row count"),
 ]
 
 
@@ -1404,9 +2291,22 @@ def yield_all(ghost_home: Optional[Path] = None) -> Dict[str, Any]:
             "derived_zero": res.derived_zero,
             "activated_means": pr.activated_means,
             "invoked_means": pr.invoked_means,
+            "spread": (None if res.spread is None
+                       else {"n": res.spread.n,
+                             "total": res.spread.total,
+                             "top1": res.spread.top1,
+                             "nonzero": res.spread.nonzero,
+                             "top1_share": res.spread.top1_share,
+                             "coverage": res.spread.coverage,
+                             "entropy_ratio": res.spread.entropy_ratio,
+                             "verdict": res.spread.verdict,
+                             "why": res.spread.why}),
         })
+    # RETIRED sorts with the SETTLED states, not the actionable ones. It
+    # is deliberately below GATED: a gated loop can be switched back on by
+    # an operator decision, a retired one is waiting on a better index.
     order = {NO_SOURCE: 0, BARREN: 1, UNMEASURED: 2, EMPTY: 3, GATED: 4,
-             YIELDING: 5}
+             RETIRED: 5, YIELDING: 6}
     rows.sort(key=lambda r: (order.get(r["status"], 9), r["name"]))
     return {
         "rows": rows,
@@ -1426,6 +2326,17 @@ def yield_all(ghost_home: Optional[Path] = None) -> Dict[str, Any]:
         # Minted nothing at all — a different finding from "minted things
         # nobody invokes", and NOT the same remedy.
         "empty": [r["name"] for r in rows if r["status"] == EMPTY],
+        # Measured dead and recorded as such. Listed so it can be ALARMED
+        # ON in the opposite direction from everything else here: a name
+        # LEAVING this list means a retired loop came back, which is the
+        # one event on this view worth waking somebody for.
+        "retired": [r["name"] for r in rows if r["status"] == RETIRED],
+        # Loops whose retrieval is measurably collapsed onto one item, or
+        # whose store is mostly unreachable. Separate from `barren`
+        # because the remedy is the RETRIEVER, not the producer — minting
+        # more of a store nobody draws from cannot help.
+        "concentrated": [r["name"] for r in rows
+                         if (r["spread"] or {}).get("verdict") == CONCENTRATED],
     }
 
 
@@ -1433,6 +2344,13 @@ def render_yield(ghost_home: Optional[Path] = None) -> str:
     r = yield_all(ghost_home)
     out = ["LOOP YIELD (minted → activated → invoked — did the loop produce "
            "anything anyone CONSUMED?):"]
+    # ⚠ SIZED FROM THE DATA, not a literal. A hardcoded 20 silently ate
+    # the column separator the moment a probe named `verifier.rubric_
+    # shadow` (22 chars) was registered — the row read
+    # "verifier.rubric_shadowgated". Same class as the 8-char mark: a
+    # fixed width is a constant that has to be re-derived every time the
+    # data changes, and nothing fails when it is not.
+    _w = max([20] + [len(row["name"]) + 2 for row in r["rows"]])
     for row in r["rows"]:
         def _n(v):
             return "    ?" if v is None else f"{v:>5}"
@@ -1444,15 +2362,41 @@ def render_yield(ghost_home: Optional[Path] = None) -> str:
                 EMPTY: "  · NIL ",
                 NO_SOURCE: "  ⚠ SRC ",
                 GATED: "  - off ",
+                RETIRED: "  † END ",
                 YIELDING: "        "}.get(row["status"], "        ")
         age = "never" if row["age_h"] is None else f"{row['age_h']}h ago"
-        out.append(f"{mark}{row['name']:<20}{row['status']:<11}"
+        out.append(f"{mark}{row['name']:<{_w}}{row['status']:<11}"
                    f"minted{_n(row['minted'])}  activated{_n(row['activated'])}"
                    f"  invoked{_n(row['invoked'])}  last {age}")
         out.append(f"        └ activated = {row['activated_means']}; "
                    f"invoked = {row['invoked_means']}")
         if row["note"]:
             out.append(f"        └ {row['note']}")
+        # ⚠ `derived_zero` reached the mark and the `blocked` summary and
+        # NOTHING ELSE, so on any non-BARREN row the one line explaining
+        # the zero was computed and thrown away — `mining.failure_envs`
+        # knew "staging is deliberately not arming" and never said it.
+        # An explanation that only survives in the JSON payload is an
+        # explanation the operator does not get.
+        if row["derived_zero"] and row["status"] != BARREN:
+            out.append(f"        └ why the zero: {row['derived_zero']}")
+        sp = row["spread"]
+        if sp:
+            # A sum cannot see concentration, so the shares are printed
+            # even when the verdict is withheld — the numbers are facts,
+            # the verdict is a judgement, and only the judgement needs a
+            # denominator. Never printing them would hide the very thing
+            # the axis was added to expose; printing a VERDICT under the
+            # floor would be §4CE's failure rebuilt here.
+            share = ("—" if sp["top1_share"] is None
+                     else f"{sp['top1_share']:.0%}")
+            cov = ("—" if sp["coverage"] is None
+                   else f"{sp['nonzero']}/{sp['n']}")
+            ent = ("—" if sp["entropy_ratio"] is None
+                   else f"{sp['entropy_ratio']:.2f}")
+            out.append(f"        └ retrieval spread: {sp['verdict']} — "
+                       f"top-1 {share} of {sp['total']}, reached {cov}, "
+                       f"evenness {ent} ({sp['why']})")
         out.append(f"        └ source: {row['source']}")
     if r["barren"]:
         out.append(f"  ✗ {len(r['barren'])} loop(s) produce artifacts NOBODY "
@@ -1476,7 +2420,30 @@ def render_yield(ghost_home: Optional[Path] = None) -> str:
         out.append(f"  · {len(r['empty'])} loop(s) have minted NOTHING yet "
                    f"(not the same as artifacts nobody invokes): "
                    + ", ".join(r["empty"]))
+    if r["concentrated"]:
+        out.append(f"  ◑ {len(r['concentrated'])} loop(s) are CONSUMED BUT "
+                   f"COLLAPSED — the retrievals land on a fraction of the "
+                   f"store, so the remedy is the RETRIEVER, not more "
+                   f"minting: " + ", ".join(r["concentrated"]))
+    if r["retired"]:
+        out.append(f"  † {len(r['retired'])} loop(s) RETIRED — measured "
+                   f"dead, decision recorded, nothing owed. Derived, so "
+                   f"this retracts itself if the measurement flips: "
+                   + ", ".join(r["retired"]))
+    # ⚠ The closing all-clear must account for EVERY non-yielding state,
+    # not just the actionable ones. Before RETIRED existed the one settled
+    # state (GATED) never coincided with an otherwise empty finding list,
+    # so the omission was unreachable — adding another settled
+    # state made "every probed loop has a live consumer" printable on a
+    # view whose top two rows were a retired loop and a switched-off one.
+    # A summary that contradicts the rows above it is worse than none.
+    settled = [row["name"] for row in r["rows"]
+               if row["status"] in (GATED, RETIRED)]
     if not (r["barren"] or r["blocked"] or r["unmeasured"] or r["gaps"]
-            or r["empty"]):
-        out.append("  every probed loop has a live consumer")
+            or r["empty"] or r["concentrated"]):
+        if settled:
+            out.append(f"  every loop with a live consumer has one; "
+                       f"{len(settled)} not in service: " + ", ".join(settled))
+        else:
+            out.append("  every probed loop has a live consumer")
     return "\n".join(out)

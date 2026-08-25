@@ -174,12 +174,28 @@ python interface/externals/image_generation/img_gen_server.py
   <p>If you skip this step, the fallback inline provisioning still produces a correct image; it just takes longer on the first turn.</p>
 
   <h2>Test runner</h2>
-<pre><code>pytest                                   # full suite (asyncio_mode=auto)
+<pre><code>pytest -n 8 --dist loadfile              # full suite — ~4 min
+pytest                                   # same suite, serially — ~24 min
 pytest tests/test_agent_planning.py      # single file
 pytest -k "memory and not slack"         # filter
 black src interface tests
 pylint src/ghost_agent
 </code></pre>
+  <p>The suite is <strong>16,200+ tests</strong>. Serially that is ~24 minutes, which is too slow to
+  run after every change &mdash; and the whole discipline here depends on running it after every
+  change. <code>pytest-xdist</code> brings it to just over four minutes on a 14-core machine.</p>
+  <p><code>--dist loadfile</code> is not optional. It keeps every test in a file on one worker, so
+  module-level state a file sets up in one test and reads in another still works. Plain
+  <code>--dist load</code> scatters tests within a file across workers and produces failures that
+  are artifacts of the scheduler.</p>
+  <p><strong>Parallelism finds latent order-dependence; it does not create it.</strong> Enabling it
+  surfaced seven contaminations that serial alphabetical ordering had been hiding, every one of them
+  a real defect &mdash; a test-body <code>monkeypatch.undo()</code> that un-isolated
+  <code>GHOST_HOME</code> and repointed it at the operator&rsquo;s live data directory mid-test, and a
+  <code>_PrettyLogHandler</code> that outlived the test attaching it and piped every later test&rsquo;s
+  agent warnings into that test&rsquo;s captured stdout.
+  A test that fails under <code>-n 8</code> and passes alone is reporting a bug in the suite, not
+  in xdist. See <code>PROJECT_JOURNAL.md</code> &sect;4CX.</p>
 
   <footer><a href="index.html">← Back to index</a></footer>
 </main>

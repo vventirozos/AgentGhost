@@ -80,18 +80,35 @@ async def test_streaming_circuit_breaker_and_newlines(mock_agent, capsys):
     stdout = captured.out
 
     # 💭 icon must appear (live token lines AND the summary line both use it).
-    assert "💭" in stdout, "Thought icon missing."
+    assert "💭" in stdout, (
+        "Thought icon missing. Captured stdout was:\n" + stdout)
 
     # The new format emits a one-line summary instead of an open/close frame.
-    assert "thinking" in stdout, "Thinking summary line missing."
-    assert "tokens" in stdout, "Token count missing from summary."
+    assert "thinking" in stdout, (
+        "Thinking summary line missing. Captured stdout was:\n" + stdout)
+    assert "tokens" in stdout, (
+        "Token count missing from summary. Captured stdout was:\n" + stdout)
 
     # 1. Newlines preserved: both words make it out as live token lines.
     # (Each emitted line is .strip()ed before printing, so we drop trailing
     # whitespace from the assertions.)
-    assert "Thinking" in stdout
-    assert "about this." in stdout
+    assert "Thinking" in stdout, (
+        "live thinking token missing. Captured stdout was:\n" + stdout)
+    assert "about this." in stdout, (
+        "live thinking token missing. Captured stdout was:\n" + stdout)
 
     # 2. Circuit breaker still hides post-</think> and post-<tool_call> content.
-    assert "hidden" not in stdout.lower(), "Circuit breaker failed to silence output after </think or <tool_call"
+    #
+    # ⚠ THE FAILURE MESSAGE NAMES THE OFFENDING LINES. This assertion spans
+    # the WHOLE capsys buffer, so anything else printing into this test's
+    # window fails it too — and a bare "circuit breaker failed" then sends
+    # the reader after the wrong mechanism. Under `-n 8 --dist loadfile`
+    # this test failed in roughly 1 run in 3 while passing 30/30 alone,
+    # which is the signature of a neighbour on the same worker rather than
+    # of the parser under test.
+    _offending = [ln for ln in stdout.splitlines() if "hidden" in ln.lower()]
+    assert not _offending, (
+        "Circuit breaker failed to silence output after </think or "
+        "<tool_call — or something else printed into this test's capture. "
+        "Offending lines:\n  " + "\n  ".join(repr(l) for l in _offending))
     

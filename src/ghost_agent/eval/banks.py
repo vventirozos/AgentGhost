@@ -400,6 +400,17 @@ def verify_item_against_reference(item: Dict[str, str], reference_code: str,
 
 def write_bank(items: List[Dict[str, str]], name: str,
                home: Optional[str] = None) -> Path:
+    # ⚠ `name` becomes a FILENAME under `banks/`, and this is a public
+    # function. `promote_to_bank` is safe only because `env_mining`'s
+    # `_check_name` runs upstream — a second caller reaching here with
+    # `"../../x"` would traverse out of the bank directory. Defence in
+    # depth: the boundary is checked where the path is BUILT, not only
+    # where it happens to be built today (§4CV round 2).
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(name or "")):
+        raise ValueError(
+            f"bank name {name!r} must be [A-Za-z0-9_-]{{1,64}} — no path "
+            f"separators")
     """Write a normalized bank atomically. Returns the bank path."""
     d = banks_dir(home)
     d.mkdir(parents=True, exist_ok=True)

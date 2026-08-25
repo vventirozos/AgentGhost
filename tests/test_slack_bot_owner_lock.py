@@ -29,25 +29,41 @@ BOT = "UBOTBOT12"
 
 @pytest.fixture(scope="module")
 def bot():
+    # ⚠ ASSIGNED, then RESTORED. The assignment above is deliberate and
+    # stays (a dev shell that sourced the bot's live .env must never hand a
+    # real token to AsyncApp) — but it used to be a RAW `os.environ[...] =`
+    # that nothing undid, so `GHOST_API_KEY=test-key` outlived this module
+    # for the whole worker process. `test_interface_chat_timeout.py` then
+    # reloads `interface.server`, which re-reads the env, and the server
+    # came up holding "test-key" while `test_interface_proxy_auth.py` still
+    # held the REAL key it had bound at import:
+    #
+    #   assert {'X-Ghost-Key': 'test-key'} == {'X-Ghost-Key': '0dc28f40...'}
+    #
+    # Six interface tests failed that way, in roughly 1 run in 4 under
+    # `-n 8 --dist loadfile`, and 0/15 alone. A private `pytest.MonkeyPatch`
+    # keeps the assign-not-setdefault safety property and gives it a scope.
+    _mp = pytest.MonkeyPatch()
     """Load the bot module once, with the env its import requires."""
     # ASSIGNED, not setdefault (R1 test review): a dev shell that sourced
     # the bot's live .env would otherwise hand a REAL token to AsyncApp —
     # one un-patched auth_test away from a live API call.
-    os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
-    os.environ["GHOST_API_KEY"] = "test-key"
+    _mp.setenv("SLACK_BOT_TOKEN", "xoxb-test-not-real")
+    _mp.setenv("GHOST_API_KEY", "test-key")
     # Explicitly EMPTY (ASSIGNED, not setdefault): no rotating-file handler
     # at import. A dev shell that sourced the bot's .env would otherwise
     # carry the live path into the env and every module (re)load here would
     # attach a handler on the LIVE bot log to this pytest process.
-    os.environ["GHOST_SLACKBOT_LOG"] = ""
+    _mp.setenv("GHOST_SLACKBOT_LOG", "")
     # Same rationale for the reply index: without this, a test added here
     # that drives _process_message would write the OPERATOR'S LIVE index.
-    os.environ["GHOST_SLACK_REPLY_INDEX"] = ""
+    _mp.setenv("GHOST_SLACK_REPLY_INDEX", "")
     spec = importlib.util.spec_from_file_location("ghost_slack_bot_under_test",
                                                   _BOT_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    yield mod
+    _mp.undo()
 
 
 @pytest.fixture(autouse=True)

@@ -115,11 +115,20 @@ async def test_non_streaming_chat_passes_chat_timeout():
 
 def test_env_override_changes_ceiling():
     """GHOST_CHAT_TIMEOUT overrides the default ceiling on (re)import."""
-    with patch.dict(os.environ, {"GHOST_CHAT_TIMEOUT": "4242"}):
-        reloaded = importlib.reload(server)
-        try:
+    try:
+        with patch.dict(os.environ, {"GHOST_CHAT_TIMEOUT": "4242"}):
+            reloaded = importlib.reload(server)
             assert reloaded.CHAT_TIMEOUT_S == 4242.0
             assert reloaded._chat_timeout().read == 4242.0
-        finally:
-            # Restore the module to its env-default state for other tests.
-            importlib.reload(reloaded)
+    finally:
+        # ⚠ THE RESTORE MUST BE OUTSIDE `patch.dict`. It used to sit in a
+        # `finally` INSIDE the with-block, so it reloaded while
+        # GHOST_CHAT_TIMEOUT was still 4242 — restoring the module to the
+        # PATCHED state, not the default. `importlib.reload` rebinds
+        # run-wide, so every later test in the same process inherited a
+        # server module built from a patched environment.
+        #
+        # Invisible serially (this file sorts late and nothing after it
+        # reads CHAT_TIMEOUT_S); found 2026-08-24 when pytest-xdist put
+        # other interface suites on the same worker.
+        importlib.reload(server)

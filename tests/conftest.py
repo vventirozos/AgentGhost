@@ -51,6 +51,142 @@ from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401  #
 
 
 @pytest.fixture(autouse=True)
+def _logging_handlers_are_per_test():
+    """Handlers attached to the Ghost loggers must not outlive the test.
+
+    ⚠ `utils.logging.setup_logging` attaches a `_PrettyLogHandler` to every
+    logger in `_GHOST_LOGGERS`, which renders stdlib WARNING+ records into
+    the pretty **stdout** stream. It is process-global and nothing ever
+    removed it, so the FIRST test in a worker that calls `setup_logging`
+    (five files do) silently redirected every later test's agent warnings
+    into that test's `capsys` buffer.
+
+    Measured 2026-08-24. `test_agent_streaming_circuit_breaker.py` asserts
+    that post-`</think>` content is silenced, over the whole capture:
+
+        pytest <a file calling setup_logging> test_agent_streaming_circuit_breaker.py
+            -> FAILED: 'Parser emitted system_parse_error. Block content
+                        (truncated to 4 KB): Hidden content.'
+
+    The circuit breaker was working. A stdlib `logger.warning` in the
+    parser's give-up path dumps the offending block by design, and the
+    block legitimately contains the test's own "Hidden content." Solo the
+    line went nowhere (with no handler, Python's `lastResort` writes to
+    STDERR, which `captured.out` never sees) — 0 occurrences in 12 solo
+    runs, and roughly 1 failure in 4 under `-n 8 --dist loadfile`,
+    depending on whether a `setup_logging` caller shared the worker.
+
+    Restoring per test is the structural fix, for the same reason the
+    event-loop policy is repaired here rather than at 60 call sites: the
+    next test that calls `setup_logging` would re-open it.
+
+    Handlers added during the test are removed; only ghost-owned ones and
+    `FileHandler`s are CLOSED, so pytest's own `caplog` handler is never
+    closed out from under it.
+    """
+    import logging
+    from ghost_agent.utils.logging import _GHOST_LOGGERS
+    names = (None,) + tuple(_GHOST_LOGGERS)
+
+    def _get(n):
+        return logging.getLogger(n) if n else logging.getLogger()
+
+    saved = {n: (list(_get(n).handlers), _get(n).level, _get(n).propagate)
+             for n in names}
+    yield
+    for n in names:
+        lg = _get(n)
+        had, lvl, prop = saved[n]
+        for extra in [h for h in lg.handlers if h not in had]:
+            lg.removeHandler(extra)
+            owned = (type(extra).__module__.startswith("ghost_agent")
+                     or isinstance(extra, logging.FileHandler))
+            if owned:                       # else it may be caplog's
+                try:
+                    extra.close()
+                except Exception:           # noqa: BLE001 — teardown
+                    pass
+        for missing in [h for h in had if h not in lg.handlers]:
+            lg.addHandler(missing)
+        lg.setLevel(lvl)
+        lg.propagate = prop
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_log_width(monkeypatch):
+    """`pretty_log` wraps at `shutil.get_terminal_size((120, 24)).columns`,
+    so any test asserting on a log LINE is asserting on a layout decided
+    by the runner's terminal.
+
+    ⚠ MEASURED 2026-08-24 while enabling pytest-xdist. Serial runs see the
+    120-column fallback (stdout is a pipe, no tty); an xdist worker sees a
+    narrower one, and
+    `test_selfhood_late_verdict_backfill.py::test_line_says_corpus_and_diary…`
+    failed on `assert "corpus + diary" in out` — while the text WAS
+    present, wrapped as `"corpus +\n    diary:"`. Nothing to do with
+    parallelism: the test asserted on a wrap position.
+
+    `shutil.get_terminal_size` consults COLUMNS first, so pinning it makes
+    wrapping identical under pytest, pytest-xdist, a tty, or CI. No test
+    in the suite depends on a particular width (grepped), so this only
+    removes a variable. Individual assertions should STILL be
+    whitespace-normalised — this stops the class, not the habit.
+    """
+    monkeypatch.setenv("COLUMNS", "120")
+    monkeypatch.setenv("LINES", "24")
+
+
+@pytest.fixture(autouse=True)
+def _event_loop_policy_is_usable():
+    """`asyncio.run()` in a SYNC test closes its loop and leaves the policy
+    with NO current loop. Anything later calling `asyncio.get_event_loop()`
+    then dies with "There is no current event loop in thread 'MainThread'".
+
+    ⚠ THE SUITE HAS BEEN CARRYING THIS, HIDDEN BY THE ALPHABET. Measured
+    2026-08-24 while enabling pytest-xdist:
+
+        pytest test_delegation_and_dataflow.py test_auth_rejection_logging.py
+            -> 16 failed
+        pytest test_auth_rejection_logging.py test_delegation_and_dataflow.py
+            -> 73 passed
+
+    `test_auth_rejection_logging.py` starts with 'a', so in serial
+    alphabetical order it runs BEFORE every contaminator and the defect is
+    invisible. Under `-n 8 --dist loadfile` the file lands on a worker that
+    may run a contaminator first, and 17 tests fail — not a parallel bug, a
+    latent one that ordering was masking. **60 test files call
+    `asyncio.run` inside a sync test**, so this is a property of the suite,
+    not of one file.
+
+    Chasing all 60 call sites is the wrong fix: the next one written
+    re-opens it. Repairing the policy once, here, is structural — the same
+    reasoning `_reset_bg_task_registry` below records for its own leak
+    ("rescued only by two INCIDENTAL `clear()` calls in alphabetically-
+    earlier files: rename one of those and three suites break at once").
+
+    Repair happens at SETUP only. A running loop is never touched, so
+    pytest-asyncio's own per-test loop in `asyncio_mode = auto` is
+    unaffected; whatever a test leaves behind is fixed before the next one
+    starts.
+    """
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+        yield                       # a loop is live — do not interfere
+        return
+    except RuntimeError:
+        pass
+    try:
+        loop = asyncio.get_event_loop_policy().get_event_loop()
+        broken = loop.is_closed()
+    except RuntimeError:
+        broken = True               # no current loop at all
+    if broken:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_bg_task_registry():
     """`utils.logging._BG_TASKS` is a module-global set that leaks across
     files. A test that patches `spawn_task` with something returning None
@@ -64,9 +200,32 @@ def _reset_bg_task_registry():
     refuses a None task; this makes the isolation structural regardless.
     """
     from ghost_agent.utils import logging as _glog
-    _glog._BG_TASKS.clear()
+
+    def _drain():
+        """CANCEL outstanding tasks, then clear.
+
+        ⚠ Clearing alone only stops TRACKING them. A `spawn_bg` task from
+        an earlier test keeps running and can still write files, emit log
+        lines, and mutate stores DURING a later test — which is exactly
+        what a capsys assertion or a record-count assertion then reads.
+        Measured 2026-08-24 under pytest-xdist: exactly one failure per
+        full run, ALTERNATING between
+        `test_notify_promise::test_fire_restores_flag_when_record_write_fails`
+        (an extra record) and
+        `test_agent_streaming_circuit_breaker::…_and_newlines` (extra
+        stdout) — two symptoms, one leak.
+        """
+        for t in list(_glog._BG_TASKS):
+            try:
+                if hasattr(t, "cancel") and not t.done():
+                    t.cancel()
+            except Exception:      # noqa: BLE001 — best effort teardown
+                pass
+        _glog._BG_TASKS.clear()
+
+    _drain()
     yield
-    _glog._BG_TASKS.clear()
+    _drain()
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +251,7 @@ def _ghost_home_base(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_ghost_home(monkeypatch, _ghost_home_base):
+def _isolate_ghost_home(_ghost_home_base):
     """Tests must never resolve the operator's live GHOST_HOME.
 
     The developer shell exports GHOST_HOME for the live agent, and modules
@@ -113,14 +272,35 @@ def _isolate_ghost_home(monkeypatch, _ghost_home_base):
     O(1) per test (R6 review): `tmp_path_factory.mktemp` scans the whole
     basetemp per call — O(n²) over the run, measured at ~44s of the full
     suite's wall time by 13k tests. One session base + a counter child
-    keeps the isolation at constant cost."""
+    keeps the isolation at constant cost.
+
+    ⚠ ISOLATED WITH A PRIVATE PATCHER, NOT THE SHARED `monkeypatch`.
+    `monkeypatch` is ONE instance per test, shared by every fixture and
+    the test body, so a body-level `monkeypatch.undo()` pops THIS
+    fixture's patch too. Measured 2026-08-24:
+
+        GHOST_HOME during test : .../isolated_ghost_homes0/0
+        GHOST_HOME after undo(): /Users/vasilis/Data/AI/Data
+
+    — the live store, for the remainder of the test. Four tests call
+    `undo()` in their body today; the guard above exists precisely
+    because a test once wrote into the operator's live ledger. A guard
+    with a bypass any test can trip by accident is the pattern
+    `guard-a-proxy-not-the-thing` names. A private `pytest.MonkeyPatch`
+    cannot be reached by the test's stack, and ordering is unchanged: a
+    test's own `monkeypatch.setenv` still applies later, so it still
+    wins.
+    """
     d = _ghost_home_base / str(next(_GHOST_HOME_COUNTER))
     d.mkdir()
-    monkeypatch.setenv("GHOST_HOME", str(d))
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GHOST_HOME", str(d))
+    yield
+    mp.undo()
 
 
 @pytest.fixture(autouse=True)
-def _isolate_live_side_files(monkeypatch):
+def _isolate_live_side_files():
     """The same lesson as `_isolate_ghost_home`, for paths that do NOT live
     under GHOST_HOME — so isolating the home was never enough.
 
@@ -144,9 +324,43 @@ def _isolate_live_side_files(monkeypatch):
 
     Empty string is the documented "disabled" value for both: the bot
     checks `if not REPLY_INDEX_PATH` before every read and write.
+
+    ⚠ PRIVATE PATCHER, FOR UNIFORMITY WITH `_isolate_ghost_home` — but
+    for THESE two vars it is defense-in-depth, not the load-bearing
+    layer. The module-level loop at the top of this file already assigns
+    both process-wide at import time, outside monkeypatch entirely, so a
+    test-body `monkeypatch.undo()` cannot reach them. Verified 2026-08-24
+    by mutation: putting this fixture back on the shared stack does NOT
+    make `test_conftest_isolation_survives_undo.py` fail. GHOST_HOME has
+    no such import-time layer, which is why it was the one genuinely
+    exposed. Recorded so nobody later reads a passing pin as evidence
+    this fixture is what holds the line.
+
+    The original reasoning follows; it still applies to the shared-stack
+    hazard in general.
+
+    ⚠ ISOLATED WITH A PRIVATE PATCHER, NOT THE SHARED `monkeypatch`.
+    `monkeypatch` is ONE instance per test, shared by every fixture and
+    the test body, so a body-level `monkeypatch.undo()` pops THIS
+    fixture's patch too. Measured 2026-08-24:
+
+        GHOST_HOME during test : .../isolated_ghost_homes0/0
+        GHOST_HOME after undo(): /Users/vasilis/Data/AI/Data
+
+    — the live store, for the remainder of the test. Four tests call
+    `undo()` in their body today; the guard above exists precisely
+    because a test once wrote into the operator's live ledger. A guard
+    with a bypass any test can trip by accident is the pattern
+    `guard-a-proxy-not-the-thing` names. A private `pytest.MonkeyPatch`
+    cannot be reached by the test's stack, and ordering is unchanged: a
+    test's own `monkeypatch.setenv` still applies later, so it still
+    wins.
     """
+    mp = pytest.MonkeyPatch()
     for var in ("GHOST_SLACK_REPLY_INDEX", "GHOST_SLACKBOT_LOG"):
-        monkeypatch.setenv(var, "")
+        mp.setenv(var, "")
+    yield
+    mp.undo()
 
 
 @pytest.fixture

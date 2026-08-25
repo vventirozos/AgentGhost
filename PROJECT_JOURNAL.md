@@ -26338,6 +26338,591 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4CX — The suite went parallel, and seven latent bugs fell out of it (2026-08-24)
+
+The full suite took **24 minutes**. The rule here is that it runs after every change, and a
+24-minute suite does not get run after every change — it gets run after every third change, which
+is how a discipline decays without anyone deciding to abandon it. `pytest-xdist` at `-n 8
+--dist loadfile` brings 16,203 tests to **4:05** on the 14-core box.
+
+The interesting part is not the speedup. Turning parallelism on produced **18 failures**, and every
+one of them was a real defect that serial alphabetical ordering had been hiding. Parallelism did
+not create them; it removed the ordering that made them invisible.
+
+`--dist loadfile` is load-bearing, not a tuning knob: it keeps a file's tests on one worker, so
+module-level state set up in one test and read in another still works. Plain `--dist load` scatters
+them and manufactures failures that really are scheduler artifacts.
+
+### 1. `asyncio.run` in a sync test, hidden by the alphabet
+
+`asyncio.run()` in a **sync** test closes its loop and leaves the policy with no current loop.
+Anything later calling `asyncio.get_event_loop()` dies with *"There is no current event loop"*.
+Measured:
+
+```
+pytest test_delegation_and_dataflow.py test_auth_rejection_logging.py   ->  16 failed
+pytest test_auth_rejection_logging.py test_delegation_and_dataflow.py   ->  73 passed
+```
+
+`test_auth_rejection_logging.py` starts with `a`, so serially it ran before every contaminator and
+the defect could not be seen. **60 test files call `asyncio.run` inside a sync test** — this is a
+property of the suite, not of one file, so chasing the 60 call sites is the wrong fix; the next one
+written re-opens it. `tests/conftest.py` now repairs the policy at setup, and never touches a
+running loop, so pytest-asyncio's own per-test loop is unaffected.
+
+### 2. Assertions on a wrap position
+
+`pretty_log` wraps at `shutil.get_terminal_size((120, 24)).columns`. Serially, stdout is a pipe and
+the 120-column fallback applies; an xdist worker sees something narrower. So
+`assert "corpus + diary" in out` failed while the text was *present* — as `"corpus +\n    diary"`.
+The test was asserting on a layout decision. conftest now pins `COLUMNS`, and the assertions
+themselves normalise whitespace: both, because pinning removes the variable and normalising makes
+the assertion correct if the pin is ever dropped.
+
+### 3. A reload that restored the module to the patched environment
+
+`test_interface_chat_timeout.py` did its restoring `importlib.reload` **inside** the `patch.dict`
+block, so the "restore" re-read the patched env and left the module holding the test's value for
+whatever ran next.
+
+### 4. A sandbox-escape check that snapshotted the shared temp directory
+
+`test_acquired_skills_name_traversal.py` treated `sandbox.parent` as the escape boundary — and
+`sandbox.parent` was the **shared system temp dir**. Eight workers creating temp directories there
+read as escapes. Given a private parent it is correct; the negative control (planting a real
+escape) still bites.
+
+### 5. `monkeypatch.undo()` reaches the operator's live data directory
+
+This is the one worth remembering. `test_notify_promise.py` failed intermittently on
+`assert fire_promise_if_settled(...) is True`, and passed **30/30 alone**.
+
+`monkeypatch` is **one instance per test** — every fixture that requests it and the test body share
+a single undo stack. A body-level `monkeypatch.undo()` therefore pops *the fixtures' patches too*.
+Here it popped an autouse notify-budget reset, handing the second fire the process-global
+`notify_tool._sent_timestamps` with whatever earlier tests on that xdist worker had spent. At the
+12/hour cap the notify is suppressed and the assertion fails — on a neighbour's spending. Proven by
+priming the global with 12 stamps and watching the exact reported failure appear deterministically.
+
+The flake was the small half. `tests/conftest.py` has four autouse fixtures taking `monkeypatch`,
+and two of them are the **production-data safety guards**. Measured:
+
+```
+GHOST_HOME during test : .../isolated_ghost_homes0/0
+GHOST_HOME after undo(): /Users/vasilis/Data/AI/Data      # the LIVE store
+```
+
+That guard exists because a test run once wrote 112 synthetic challenges into the live replay
+ledger (§4 2026-07-20). It had a bypass any test could trip by accident, and four tests call
+`undo()` in their body today. `guard-a-proxy-not-the-thing`: the isolation fixtures now hold a
+**private `pytest.MonkeyPatch`**, unreachable from the test's stack. Ordering is unchanged — a
+test's own `setenv` still applies later and still wins.
+
+`tests/test_conftest_isolation_survives_undo.py` drives the bypass rather than asserting on the
+fixture's source. Reverting the fixture to the shared stack kills the GHOST_HOME pin.
+
+**And one of those five pins is honest about not pinning anything.** The Slack-side-files pin
+passes under its own mutation: `conftest` already assigns those two vars process-wide at *import*
+time, outside monkeypatch, so they were never reachable by `undo()`. GHOST_HOME has no such
+import-time layer, which is exactly why it was the one genuinely exposed. Mutation-checked, and
+both the pin and the fixture now say so — a green test read as evidence for a mechanism it does not
+exercise is the same false confidence the leak was sitting behind
+(`a-verification-that-cannot-distinguish`).
+
+### 6. A logging handler that outlives its test
+
+The last intermittent failure,
+`test_agent_streaming_circuit_breaker.py::test_streaming_circuit_breaker_and_newlines`, ~1 run in 4,
+30/30 alone. Two plausible suspects were tested and disposed of rather than believed: leaked
+background tasks (fixed anyway — clearing `_BG_TASKS` stopped *tracking* a `spawn_bg` task, not the
+task, so they are now **cancelled** at teardown) and stale collapse state (already reset). Neither
+was it.
+
+Catching it needed the test to be able to testify. Its `assert "hidden" not in stdout.lower()`
+spans the whole capsys buffer, so a bare *"circuit breaker failed"* points at the wrong mechanism;
+made to name the offending lines, it gave the answer on the next occurrence:
+
+```
+│  **  🔶  +0.00s  agent   Parser emitted system_parse_error. Block content
+                           (truncated to 4 KB): HEAD: This should be hidden.\n</think>\n<tool_call>…
+```
+
+**The circuit breaker was working.** That is a stdlib `logger.warning` in the parser's give-up
+path, which dumps the offending block by design — and the block contains the test's own
+`"Hidden content."`. Whether it reaches *stdout* is process-global: `setup_logging` attaches a
+`_PrettyLogHandler`, which renders stdlib WARNING+ into the pretty **stdout** stream, to every
+logger in `_GHOST_LOGGERS` — and nothing ever removed it. Solo, with no handler, Python's
+`lastResort` writes to STDERR, which `captured.out` never sees: **0 occurrences in 12 solo runs.**
+Five test files call `setup_logging`; the first to run in a worker redirected every later test's
+agent warnings into that test's capture. Reproduced deterministically by attaching the handler in a
+preceding test.
+
+`tests/conftest.py` now snapshots and restores handlers, levels and `propagate` per test — the same
+choice as the event-loop policy, and for the same reason: the next `setup_logging` caller would
+re-open a per-file convention. Handlers added during a test are removed; only ghost-owned ones and
+`FileHandler`s are *closed*, so pytest's own `caplog` handler is never closed out from under it —
+pinned, because breaking it would silently empty every caplog-based assertion in the suite.
+
+**And the first version of those pins failed against a working fixture.** `test_f` asserted
+`not isinstance(h, logging.NullHandler)` on the root logger — but pytest installs a permanent
+`_LiveLoggingNullHandler`, which *subclasses* `NullHandler`. The check could not distinguish my
+handler from pytest's, so it reported a defect that was not there
+(`a-verification-that-cannot-distinguish`). A distinctly-typed sentinel fixed it. Under mutation —
+the fixture kept but its restore neutered, which is the realistic regression rather than a deleted
+fixture — three of the six pins die.
+
+### 7. A key frozen at import, and an environment variable nobody put back
+
+Fixing #6 uncovered the next one: six interface tests failing together, ~1 run in 4, **0/15 alone**.
+
+```
+assert {'X-Ghost-Key': 'test-key'} == {'X-Ghost-Key': '0dc28f40...'}
+```
+
+Two independent defects had to meet. `tests/test_slack_bot_owner_lock.py` and
+`test_slack_bot_feedback.py` wrote `os.environ["GHOST_API_KEY"] = "test-key"` **raw** — deliberately
+ASSIGNED rather than `setdefault`, for a good documented reason (a dev shell that sourced the bot's
+live `.env` must never hand a real token to `AsyncApp`) — but nothing ever put it back. Then
+`test_interface_chat_timeout.py` calls `importlib.reload(interface.server)`, which re-reads the
+environment, so the server came up holding `"test-key"` while `test_interface_proxy_auth.py` still
+held the real key it had bound at import via `from interface.server import GHOST_API_KEY`.
+
+Both halves are fixed. The Slack fixtures keep the assign-not-setdefault safety property and gain a
+scope (a private `pytest.MonkeyPatch`, plus save/restore in the module-loading helper). The
+interface tests read `server.GHOST_API_KEY` **at assert time**, which is also what the assertion
+actually means: *the proxy forwards the server's key, whatever it is.* With the leak simulated and
+the reloader in front of them, all thirteen now pass; reverting the by-value import reproduces
+exactly the four observed failures.
+
+**The first pin I wrote for this could not fail.** It rotated `server.GHOST_API_KEY` and asserted
+the forwarded header matched — but that compares against a literal and against the module
+attribute, and *both follow the rotation*, so the by-value mutant stayed green in a clean process.
+It could only have failed once a neighbour had already diverged the two, which is the exact
+condition that kept the defect invisible. The binding is a property of the test module's
+**namespace**, so the pin now checks the namespace — `assert not hasattr(mod, "GHOST_API_KEY")` —
+and dies under mutation with no neighbour required.
+
+That is twice in one session (`test_f`'s `NullHandler` was the other) that I wrote a check unable
+to distinguish the broken state from the fixed one, and both times it was the *mutation step*, not
+the passing test, that said so.
+
+### The shape worth keeping
+
+Every one of the seven was a **latent order-dependence that serial alphabetical execution was
+hiding**, and five of them were process-global state nobody scoped: an event-loop policy, a
+terminal width, a rate-limiter list, a logging handler, an environment variable. Parallelism did
+not introduce them; it removed the ordering that made them invisible. A test that fails under
+`-n 8` and passes alone is reporting a bug in the suite.
+
+**An assertion that names what it saw is worth more than one that merely fails.** #7 was diagnosed
+in a single glance because `==` prints both sides (`'test-key'` vs `'0dc28f40...'`). #6 took four
+full-suite runs and two wrong theories because `assert "hidden" not in stdout.lower()` prints
+nothing at all — a broad negative over a whole capture buffer is a detector with no diagnosis
+attached, and it points at whatever mechanism the test's NAME suggests rather than the one that
+actually fired. Made to list the offending lines, it answered on its next occurrence.
+
+**And a pin that cannot fail is worse than no pin**, because it is read as coverage. Two written
+this session could not distinguish the broken state from the fixed one — an `isinstance` check
+against a base class pytest also subclasses, and a rotation both sides of the comparison followed.
+Both passed. Both were caught by mutating the fix, never by running the test.
+
+## §4CW — The GEPA gate ratcheted away from its own baseline (2026-08-24)
+
+`does-the-incumbent-pass-its-own-gate`, run for real, on a live artifact serving every
+planner turn.
+
+**The question.** `planning.decompose.json` was promoted 2026-08-07 (F1 0.071 -> 0.393,
++0.321 on a 28-example private tier) and has served 135 recorded loads. A promotion is a
+MEASUREMENT taken on one day against one holdout; it is not a property the artifact carries
+forever. Nobody had re-asked.
+
+**⚠ THE ANSWER I FIRST RECORDED WAS WRONG, AND A ROUND-4 REVIEWER FLIPPED ITS SIGN.** Both
+numbers are below; the second is the real one.
+
+| arm | BROKEN metric | **CORRECTED metric** |
+|---|---|---|
+| hand-written seed | 0.4959 | 0.4959 |
+| GEPA artifact | 0.3740 | **0.5041** |
+| delta | -0.1220 | **+0.0081** |
+| discordant | 21 seed / 6 artifact | 12 artifact / 11 seed |
+| McNemar exact | p = 0.0059 | **p = 1.0000** |
+
+**The artifact is statistically INDISTINGUISHABLE from the baseline. It was never measured
+worse.** What produced -0.1220 was the metric grading a **two-field prediction against a
+one-field gold**: `planning.decompose` declares outputs `(plan, rationale)`,
+`build_trainset` never stamps `rationale`, and the prediction side joined both. token-F1
+precision was capped BY CONSTRUCTION, and the more a prompt invested in the ungraded field
+the worse it scored. Decomposed on the private tier: the artifact's RECALL is **better**
+(0.366 vs 0.294, p=0.005 in its favour); only its precision suffers (0.223 vs 0.339),
+because its `### rationale` adds a median 26 distinct tokens against a median 30-token gold
+— it nearly doubles precision's denominator.
+
+**And the p=0.0059 headline was population-shopped.** The PRIVATE tier — the only one the
+gate's own doctrine permits judging on — returned p=0.289. I then widened to the pooled set,
+which includes the 92 public examples the optimizer trained on, and reported that. The
+contamination is conservative against a false positive FOR the artifact; it is not a licence
+to use a contaminated tier to decide an UNSHIP.
+
+Both fixed: `_gold_field` / `_prediction_for` make the metric symmetric, and the re-check
+reports the private tier first.
+
+**⚠ HOW THIS HAPPENED, AND IT IS THE FINDING.** `run_gepa`'s gate compares each candidate
+against `_live_incumbent()` — the PREVIOUS ARTIFACT — never against the hand-written seed.
+That is correct for measuring an improvement and blind to a slow drift away from the
+instruction the chain started from:
+
+* 2026-07-29 artifact: **0.071**
+* 2026-08-07 candidate: **0.393** — a real +0.321, correctly promoted
+* hand-written seed, never in either comparison: **0.496**
+
+**Every promotion was honest and the chain still ratcheted away from the thing it should
+have been beating.** No amount of per-run rigour could have caught it, because the arm that
+would have shown it was not in the comparison.
+
+**SO WAS RETIRING IT RIGHT? YES — BUT NOT FOR THE REASON I RECORDED.** Keep the action,
+rewrite the reason. What survives:
+
+* under the corrected metric the artifact is indistinguishable from NO artifact (+0.008,
+  p=1.00), so it buys nothing while running on every planner turn;
+* its 2026-07-29 promotion was under the recall metric and was already recorded as invalid;
+* it was armed SILENTLY on 08-21 by a `--use-planning` launcher edit, against a doc that
+  certified the read site as dark, and never had any evidence of PRODUCTION benefit;
+* its terminal directive *"Output exactly `### plan` and `### rationale` with no extra
+  text"* is PREPENDED ahead of *"Return ONLY valid JSON"* under a JSON grammar — **a live
+  format conflict on every planner turn**, and the strongest argument for retirement, which
+  my original write-up never made;
+* replayed on 8 REAL recorded planner payloads in the production regime: 7/8 parsed with it,
+  8/8 without; one truncated with it and produced a clean tree without. Direction only
+  (n=8, one discordant pair, p=1.00) — but it is the only evidence on the axis that matters.
+
+⚠ **Neither gate arm is a prompt production has ever issued.** Production is
+*(artifact + 4104-char JSON-schema planner prompt)* with `response_format=json_object`; the
+gate runs the bare instruction as the sole system prompt against free text. So "retiring it
+restores the hand-written instruction" — which I wrote in two places — **is false for this
+read site**: retirement removes the prefix and nothing replaces it. The sibling
+`optimize_verifier.py` already has `--escalate gate` for exactly this production-equivalence
+problem; `run_gepa`'s planning gate has no such notion, and that is now the top open item.
+
+**Two fixes.**
+
+1. **The artifact is RETIRED** -> `planning.decompose.json.retired-4cw`, with the measurement,
+   the cause and the one-line reversal stamped INTO the file so it explains itself without
+   this entry. Verified live: `tuned_instruction("planning.decompose")` now returns empty and
+   the read site falls back to the hand-written instruction. ⚠ **The running daemon caches
+   per process — it is still serving the retired artifact until the next restart.**
+2. **The gate gained a SEED ARM.** A candidate must also not lose to `result.baseline_instruction`,
+   or it is refused (`--allow-seed-loss` overrides, and the override is now stamped into the
+   artifact as `gate.seed_arm.overridden`). It runs only when the candidate would otherwise ship.
+
+   ⚠ **AS FIRST WRITTEN THIS FIX WAS WORSE THAN THE BUG.** It refused on ANY negative delta —
+   no noise floor, no significance — while the ship direction requires `min_delta`. A reviewer
+   drove it end to end: **a candidate taking the artifact from 0.40 to 0.90 was thrown away
+   over ONE flipped example** (0.032 on a 31-tier, smaller than the gate's own 0.05 floor). A
+   gate that calls a difference noise in one direction and decisive in the other is calibrated
+   on the wrong statistic (§4BR). Combined with the metric asymmetry above, **any** candidate
+   that wrote a `rationale` would have lost the seed arm by construction — it would not have
+   fixed the ratchet, it would have welded the chain to a terse baseline forever. The refusal
+   now needs BOTH a delta past `--ab-min-delta` AND a significant McNemar over the discordant
+   pairs — the same standard the ship direction already uses.
+
+**⚠ AND THE RE-CHECK SCRIPT LIED ON ITS FIRST RUN.** It printed a confident *"THE INCUMBENT
+NO LONGER CLEARS ITS OWN BAR"* off a result where BOTH arms scored 0.0000 on all 31 examples.
+Cause: `_expected_target` was NESTED inside `run_gepa.main()`, so the runner raised
+AttributeError every time and `ab_eval._run_one`'s broad `except` turned that into
+`passed=False` for both arms — an instrument that could only report zero, reporting a verdict.
+The §4F comment two hundred lines away describes the identical shape from the other direction
+("both arms scored at the noise floor — a gate that can only ever reject").
+
+Fixed three ways: `_overlap` and `_expected_target` lifted to MODULE level (one definition of
+"did this prompt win", shared by the optimizer's gate and any re-check — they were unreachable
+by design), `_expected_target` takes `sig` explicitly instead of closing over it, and the
+re-check now **refuses to conclude when both arms score zero**.
+
+⚠ One more of my own: the provenance field made `_promote_staging` close over `_seed_cmp`,
+which is computed near the END of `main()` — so `--no-ab-gate`, the one path that adopts a
+prompt UNVERIFIED, would have raised NameError. Hoisted.
+
+**A reporting defect the retirement exposed.** With zero live `.json` files the yield row read
+`empty · minted 0 · invoked 135` — *"this loop has minted NOTHING yet"* printed beside 135
+loads of the thing it minted. The suffix filter is right (a retired artifact must not count as
+live output); the STATE was wrong. `prompts.gepa` now reads RETIRED and says "5 withdrawn
+artifact(s) on disk — that is the GATE WORKING, not a loop that minted nothing".
+
+### Verification
+
+`tests/test_4cu_retrieval_spread_and_retired.py` and `tests/test_4cv_failure_env_mining.py`
+carry pins for the seed arm, the refusal, the override, the `_seed_cmp` ordering, the
+zero-zero guard, the module-level metric, and the retired-vs-empty distinction. 366 green
+across both files.
+
+**Owed:** a restart, to stop serving the retired artifact. And the open question this leaves —
+whether a GEPA run against the *current* 123-example corpus can beat the seed at all — is now
+answerable, because the gate will finally ask.
+
+## §4CU / §4CV — Three features, three review rounds, and the pattern holding for the tenth time (2026-08-24)
+
+Direction set by a fresh SOTA sweep against the §4CO/§4CS state. Two items from it built
+(§4CU), a third scoped and built after an operator decision (§4CV), then **three fresh-eye
+review rounds across six reviewers**. Every round found its criticals inside the PREVIOUS
+round's fixes. That is §4BU's pattern for the tenth time, and this entry is organised around
+it because the pattern is the reusable part.
+
+### Rule 0: the label-supply premise had moved, in the GOOD direction
+
+§4CS item D's headline — chat turns 5.4% decided lifetime, 25% over 14 days — is what "the
+only lever is what's RECORDED AT TURN TIME" was written against. Re-derived off
+`system/trajectories/` with the corrections overlay (386/386 rows joined; the lifetime cut
+reproduces the canonical instrument to a decimal — chat 5.7% vs 5.4%, tool 66.1% vs 65.9%):
+
+| `user_request` turns | older 33 days | **last 14 days** |
+|---|---|---|
+| tool-using, decided | 63.5% (583/918) | **80.7%** (130/161) |
+| chat, decided | 2.1% (10/473) | **30.4%** (21/69) |
+| overall | — | **65.7%** (151/230), 16.4 turns/day |
+
+⚠ **THAT OVERALL ROW READ 67.3% (175/260), 18.6/day UNTIL A REVIEWER RE-DERIVED IT.** The
+table is headed `user_request` turns and the two component rows are — they reproduce exactly
+and sum to 151/230 — but the overall row silently added the window's 31 `reflection` turns.
+**§4K's defect verbatim** (self-generated turns counted as user traffic) **in this entry's own
+Rule-0 measurement**, written while correcting someone else's population error. The
+conclusion is unchanged; the number was not the one the header promised.
+
+The §4BT human channel and the §4CD corpus-follower backfill are visibly working. What is
+left binding is not label supply — it is that almost nothing CONSUMES what the loops produce.
+
+### §4CU-A — the retrieval-CONCENTRATION axis
+
+`invoked` is a SUM over per-item counters, and a sum cannot tell a store whose 50 items are
+all being drawn from one where a single item takes every retrieval and 49 never surface.
+arXiv:2604.27003 measures the signature — **88.5% of queries retrieving the identical top
+item** — and concludes "pool size alone predicts nothing about retrieval effectiveness",
+which is a direct statement that the two numbers this view had cannot see it.
+
+Nothing new is recorded: the spread is a second statistic over the SAME vector `invoked`
+sums, which is why `total` must EQUAL the row's `invoked` — pinned as an executed test.
+
+**⚠ AND THE FIRST FINDING WAS AN EXONERATION.** I went in expecting collapse — the research
+predicts it and 7-of-10 graduated skills never surfacing looks like it. `lessons.playbook`,
+the only loop with real throughput, reads **distributed**: top-1 21% of 676, 40 of 45 served
+lessons reached, evenness 0.82. Nowhere near 88.5%. Acting on the hypothesis would have been
+work against a store that is working.
+
+### §4CU-B — `retired`, and a rule that was wrong TWICE in OPPOSITE directions
+
+`foresight.gate` read `barren` — "produces artifacts nobody invokes", sorted FIRST in a
+worst-news-first view — while §4CS item G had SETTLED it. `retired` says measured dead,
+nothing owed, and sorts with the settled states.
+
+The interesting part is the rule, which took three versions:
+
+* **v1 — the sign, no power.** `spread <= 0` with both denominators merely truthy. On the
+  live gate that retired a loop on **14 predicted-fail rows of which ONE failed**: Fisher
+  exact p = 1.00, and the interval for the spread contains both zero AND the +0.10 bar the
+  verdict cites as the thing it fails. **§4CE verbatim, committed inside the instrument added
+  to prevent it.**
+* **v2 — power, no sign.** "Is the pooled precision provably below the bar" fixed the power
+  and lost the semantics: it RETIRED an index where predicted-fail rows fail 40% and
+  predicted-ok rows fail 2% (spread +0.38), and the row printed the builder's own verdict
+  ("discriminates in the right direction… but pooled precision is under the bar") directly
+  above "SETTLED, nothing is owed". Two sentences in one string saying opposite things.
+* **v3 needs BOTH**, because they are different findings with different remedies. `spread <= 0`
+  = the INDEX is backwards (retire). `spread > 0` = the index works and the BAR is wrong for
+  it (owed work). Plus the gate's own `min_fail_n` on **both legs** — v2 retired on 3 rows
+  while a bucket needed 10 before it could object, so every tie broke toward "settled".
+
+⚠ The bucket veto needed its own power too, and that is the second-order trap: 4 of the live
+gate's 64 buckets have an interval reaching the bar and **every one sits at 1-3 rows**, where
+the Wilson upper bound is wide by construction. Counting those is absence of evidence read as
+evidence, and makes RETIRED unreachable forever. And when no bucket is eligible to be
+assessed, the note now SAYS SO rather than claiming a check that could not have run.
+
+### §4CU-C — `verifier.rubric_shadow`, and the gate calibrated on the wrong population
+
+Rubrics as Rewards (arXiv:2507.17746, ICLR 2026) on the turns the verifier DECLINES. It ships
+in SHADOW and that is not timidity: §4BE's checklist nudge asserted the user had given
+learning instructions, **59 of 59 arming turns had none**, and a model that reasoned "there's
+no explicit learning instruction… But the system is requiring it" complied and minted a lesson
+dedup reinforced to freq=11. A checklist the model feels obliged to satisfy manufactures the
+evidence it asks for.
+
+Structural contract: cannot write a label; the rubric is synthesised from the REQUEST ALONE
+(`build_rubric` does not take the response AS A PARAMETER); ABSTAIN is real; epoched; default
+OFF but WIRED.
+
+**⚠ THE PROMOTION GATE WAS CALIBRATED ON THE WRONG POPULATION AND THREE REVIEWERS FOUND IT
+INDEPENDENTLY.** `rate` was measured over the joined rows while `base_rate` came from EVERY
+human label on the box. Because ABSTAIN concentrates on ungradable turns, the scored subset is
+more class-skewed than the label pool — so a judge emitting 1.0 for every row, zero
+information content, read *"agrees 95%, whose LOWER bound beats the 78% majority-class
+baseline: USABLE"*. It failed the other way too. **The §4BR wrong-statistic trap inside the
+function whose own comment cites §4BR.**
+
+### §4CV — mining failed turns into verifiable-reward tasks (operator-scoped to GEPA)
+
+GEPA scores candidates by token overlap against a recorded reply, and the 191 FAILED turns
+contribute nothing (a failure has no gold answer to overlap against). An executable oracle
+fixes both.
+
+**The funnel has now been wrong twice, and both corrections are recorded because the funnel IS
+the argument for the scope:**
+
+* first draft said 67 containment-clean seeds — a hand-written "live-world" list; the real
+  `REPLAY_FORBIDDEN_TOOLS` is far stricter. Measured: 1,813 trajectories → **35**.
+* then "~12 items" by applying Envs-FORGE's ~34% acceptance. Measured live once both gates
+  worked: **12 synthesized, 1 accepted (~8%)**.
+
+**So the honest expectation is ONE TO TWO items, not twelve** — below GEPA's 20-100 range,
+i.e. it does not yet supply the consumer it was scoped for. Recorded as a measured result:
+the remedy is a better synthesizer or a different seed population, and loosening the gates
+would restore the count while destroying the reason to want it.
+
+⚠ A design assumption also died on contact: **112 of 176 failing turns carry no
+`failure_reason` at all**. SENTINEL's Controller mines RECURRING failure modes; this corpus
+does not have them, so mining is per-trajectory.
+
+**Two gates, and the second exists because the first was not enough.** `oracle_is_sound` asks
+"can this checker FAIL?" (reference accepted, two MECHANICAL negative controls rejected, every
+leg repeated). The first live run then shipped a bad item through a sound oracle: a chess task
+validating `data['move'] != 'e7e6'` — one of many reasonable moves. The oracle discriminates;
+the TASK is indeterminate. `solvability_probe` asks "is there ONE right answer?".
+
+⚠ **And the pass-rate band alone could not answer that either.** It cannot tell
+hard-but-determinate from indeterminate-whose-answer-is-sometimes-produced. The signal is not
+the pass rate — it is whether the independent samples AGREE WITH EACH OTHER. A determinate
+task pulls samples toward one answer; an indeterminate one scatters them.
+
+### THE ROUND-BY-ROUND FINDINGS — every critical was inside a previous fix
+
+**Round 1 (4 lenses) — 3 CRITICALs, each confirmed by two or three reviewers with executed proofs:**
+
+1. **Model-authored validators ran UNSANDBOXED with the agent's own privileges.**
+   `subprocess.run(..., cwd=tmpdir)` is not confinement, and the guard was a tuple of 11
+   module names. **13 of 15 bypasses walked through** — `os.system("curl")`, `http.client`
+   (top-level name is `http`), `ctypes`, `webbrowser`, `shutil.rmtree` of the live bank,
+   reading `~/.ghost_api_key`. One reviewer executed a validator that wrote outside the temp
+   dir and spawned a socket-holding grandchild WHILE the gate reported "sound". I had written
+   the AST fix congratulating myself for removing "a lexical proxy for a semantic property";
+   it moved the proxy. `evolve/confine.py` already existed.
+2. The agreement-baseline defect above.
+3. `_anti_predictive` v1 above.
+4. **`oracle_score` was called by NOTHING** — §4CV's one novel mechanism, in a module whose
+   scope argument is "this is a GEPA trainset producer".
+
+**Round 2 (2 lenses) — the containment HELD against every executed escape**, including detached
+grandchildren after the parent exited, with the negative control verified. But:
+
+5. **`--mined-bank` was built-but-unwired AGAIN.** `trainset_from_items` stamped
+   `{"final_response": ref, "plan": ""}` and `run_gepa`'s `keyed` filter twelve lines later
+   keeps only TRUTHY `sig.outputs` fields. **100% of mined examples dropped**, measured live:
+   0 of 1 survived, the oracle never fired, nothing said so. **The round-1 consumer fix had
+   exactly the defect it was added to remove.**
+6. The confine-required backstop guarded ONE CALLER, not the execution choke point — so
+   `oracle_score` (once per GEPA rollout) ignored it entirely.
+7. `write_staging` DESTROYED rows from a superseded epoch — data loss in the fix whose purpose
+   is accumulation.
+8. The nondeterminism repeat guarded the FLATTERING leg: coin-flip-on-correct 50%→4%, but
+   coin-flip-on-WRONG (which manufactures false PASSes) stayed at 26%.
+9. `_extract_answer`'s last-fence rule did not fix its own cited example and was worse on a
+   commoner shape. The mistake was picking a POSITION at all.
+
+**A test-validity reviewer found the deepest ones**: three mutants surviving all 83 rubric
+tests — swapping the call site's first two arguments so the rubric is built FROM THE ANSWER,
+switching the feature off, and ignoring the population gate. The class written to prevent
+exactly that checked `hasattr`, a source substring and `iscoroutinefunction`. §4CS item B
+verbatim. Also: `top1 = max(counts)` survived as `counts[0]` because EVERY fixture put the
+busiest item first — under which the published 88.5% collapse signature reads as healthy.
+
+### MY OWN MISTAKES, recorded because they are the transferable part
+
+* **A patch silently DELETED an entire test class.** `TestForesightGateRetires` sat between two
+  anchors a scripted edit replaced. Nothing failed — deleting tests is invisible to a test run.
+  The mutation harness caught it: a mutant suddenly SURVIVED because the only test reading that
+  bucket had ceased to exist. `pin-the-deletion`, one level up.
+* **The mutation harness lied first.** Its patterns went through a shell double-quoted argument;
+  every `\"` became a SyntaxError, those mutants NEVER APPLIED, and the driver ran pytest
+  against unmutated source and reported SURVIVED. `harness-that-cannot-run-reports-success`,
+  inside a harness written to detect that class. 18/30 became 33/33 once fixed.
+* **A flaky pin, then a FALSE one.** First I asserted a coin-flipping oracle is caught within 12
+  tries — ~3% false-fail, and a pin that fails 3% of the time gets muted. Then I asserted it is
+  ALWAYS refused, which is simply false: with N identical runs a fair coin ships at 0.5^(N-1).
+  The honest version pins the BOUND, tests the mechanism deterministically, and makes the module
+  say out loud that this is "a filter with a known leak, not a proof".
+* **A fix introduced its own counting bug**: splitting the probe's exclusion counters, an empty
+  generation was subtracted from the denominator twice, flipping a mixed item to TRIVIAL.
+* **A bare `spawn_bg(...)`** — a NameError in `agent.py`, which imports it as `_glog.spawn_bg`.
+  `test_spawn_bg.py` went GREEN on it, because it only forbids `create_task` and says nothing
+  about whether the replacement RESOLVES.
+* **`asyncio.run` in sync tests** — §4CS's contamination verbatim, same 16 downstream failures.
+
+### One limit left open, stated rather than closed
+
+The sandbox is an INTEGRITY boundary, not a confidentiality one: reads stay open by design, so
+a validator CAN read a secret even though it cannot write, network, or land it anywhere. The
+residual is `(allow default)` permitting mach IPC. Documented in `_confined_cmd`, because the
+bypass list enumerates the read and a reader would otherwise assume it closed.
+
+### Verification
+
+`tests/test_4cu_retrieval_spread_and_retired.py` **111** ·
+`tests/test_4cu_rubric_shadow.py` **100** · `tests/test_4cv_failure_env_mining.py` **240**.
+Mutation, re-measured on the FINAL tree: **42/42** (spread+retired), **36/36** (rubric),
+**14/14** (round-3 fixes), **10/10** on the test-validity reviewer's own mutant set. Full
+suite **16,159 passed / 17 skipped / 0 failed**, and `--collect-only` (16,176) equals
+passed + skipped exactly.
+
+⚠ **AND THE MUTATION NUMBER I PUBLISHED BEFORE THIS ONE DID NOT REPRODUCE.** A reviewer
+re-ran the session's own harnesses against the tree as it stood after the round-3 edits and
+got **37/42 and 34/36, with 3 harness errors**. I had measured 42/42 BEFORE those edits and
+restated it afterwards — `restated-is-not-checked`, on the one number that certifies every
+other claim in this entry. Four real survivors were hiding behind it, two of them on §4CU-B's
+load-bearing property:
+
+* `_anti_predictive` using the POINT estimate instead of the interval — the entire v1→v3
+  argument — was **unpinned**, because the only LIVE input (1/14) gives 0.315 by Wilson,
+  0.206 by Wald and 0.071 as a point estimate, all three under the 0.60 bar.
+  `verify-cannot-distinguish`: one input cannot separate three formulas that agree on it.
+* Wald-for-Wilson, likewise unpinned for the same reason.
+* `agreement()`'s ABSTAIN exclusion — and it survived because of MY OWN round-3 fix: the
+  `try/except` around `float(row["score"])` books a `None` as skipped anyway, so every
+  existing fixture behaved identically with and without the guard. `the fix inherits the
+  blind spot`. The input that separates them is an ABSTAIN row carrying a NUMERIC score.
+* `MIN_CRITERIA`, which my id-filter had made redundant — a genuinely dead guard, now removed
+  rather than pinned (§4CR: dead guard code reads as defence).
+
+**A mutation score is a measurement, not a property.** It expires the moment the source
+changes, and this one was quoted across a journal entry, a docs page and three summaries
+while stale.
+
+### ⚠ THE §4CV CONSUMER, THIRD TIME — and the scope conclusion it forces
+
+Round 3 found the round-2 consumer fix ALSO not working: `_metric` handed the oracle a
+CONCATENATION of every signature output field, and `planning.decompose` — the only joinable
+signature — emits `(plan, rationale)`. A bare `42` scored 1.0; the realistic
+`"42 Because 6 times 7 is 42."` scored **0.0**. A constant-zero column for essentially every
+real rollout, i.e. "a metric that can only ever reject" — and `_report_oracle_use` could not
+see it, because the oracle DOES fire. **The round-2 fix verified the join and never that the
+joined score could be non-zero.** Fixed by scoring per FIELD through the same
+`_extract_answer` the probe uses, plus a report line for how many PASSED and a loud warning
+when the oracle fires and nothing ever does.
+
+**But the deeper mismatch is the finding, and it should not be engineered around.** A mined
+challenge asks for an ANSWER ("reply with only the number"); `planning.decompose` optimises
+PLAN production. Scoring a plan against an answer oracle measures the wrong thing however it
+is extracted. Combined with the measured 1-2 usable items, the honest position is:
+
+* **§4CV works as a BENCH-BANK producer** — its `graded_on=final_response` items are exactly
+  the `gsm8k_text` shape the flywheel already runs, and `--promote` arms them.
+* **The GEPA path is built, correct, and a poor fit**, and is recorded as such rather than
+  maintained as a claim. Revisiting it means either a signature whose output IS an answer, or
+  a different consumer.
+
+Live acceptance for §4CV: the miner runs end to end, both gates bite, and the self-consistency
+rule visibly rejects items the pass-rate band would have accepted ("2 of 4 scored attempts
+passed, but all 4 independent samples gave a DIFFERENT answer").
+
+Docs: `docs/tools/introspect.html#retrieval-spread`, `#rubric-shadow`,
+`docs/algorithms/failure_env_mining.html`.
+
 ## §4CT — The last `unmeasured` loop gets its counter (2026-08-24)
 
 §4CS's yield surface named exactly one remaining instrumentation gap, and this closes it.

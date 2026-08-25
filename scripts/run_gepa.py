@@ -47,6 +47,167 @@ from ghost_agent.optim.trainset import (  # noqa: E402
 )
 
 
+
+# ── THE METRIC, AT MODULE LEVEL ─────────────────────────────────────
+# ⚠ These were NESTED inside `main()`, so no other tool could reach
+# them. `scripts/recheck_gepa_incumbent.py` tried, got AttributeError
+# on every example, and `ab_eval._run_one`'s broad except turned that
+# into `passed=False` for BOTH arms — an instrument that could only
+# report zero, which then printed a confident verdict about the live
+# artifact. Lifted so there is ONE definition of 'did this prompt
+# win', shared by the optimizer's gate and by any re-check.
+def _overlap(want: str, got: str) -> float:
+    """Token F1 — NOT recall.
+
+    Recall (`|w & g| / |w|`) makes VERBOSITY the optimum. Re-measured
+    2026-08-04 against a real 87-token gold plan from the live corpus
+    (`planning.decompose`, n=96 plan targets, median 35 distinct tokens):
+
+        candidate                 recall     F1
+        terse correct subset       0.333    0.500
+        gold + 300 filler tokens   1.000    0.367
+        that soup vs UNRELATED gold 0.250   0.047
+
+    Recall ranks the soup ABOVE the correct answer and still gives it
+    0.250 against a gold it never addressed; F1 inverts both. A hidden
+    holdout defends against memorising items — it cannot defend against
+    a metric whose optimum generalises.
+
+    The cost of F1 is length sensitivity in the OTHER direction: a
+    perfectly-recalling answer much longer than the gold falls under the
+    0.3 pass bar. That is survivable here only because the gold is a
+    PLAN (n=96, median 35 distinct tokens, p90 58 — re-measured
+    2026-08-04; an earlier revision said p90 61) rather than a whole
+    final reply — which is exactly why `build_trainset` must keep
+    yielding plan targets (see the per-field kind filter there). If that
+    ever collapses to the `final_response` fallback, revisit this bar.
+
+    ⚠ THIS METRIC CHANGE INVALIDATES THE PROMOTED planning.decompose
+    ARTIFACT AS A MEASURED WIN. Re-run 2026-08-04 on the same hash-stable
+    28-example private tier, both arms at temp 0 / no-think: under RECALL
+    the promoted artifact scores 0.857 vs the seed's 0.429 (+0.429 —
+    reproducing the 2026-07-29 promotion, journal 0.45 -> 0.80); under F1
+    it scores 0.071 vs 0.500 (-0.429). Its outputs run a median 111
+    distinct tokens against a 32-token median gold. Neither metric
+    measures plan QUALITY, so this is a correctness-of-record finding,
+    not proof the artifact is bad — but the promotion decision does not
+    reproduce under the objective this function now implements. The
+    read-site is dark — and until 2026-08-07 was UNREACHABLE in any
+    configuration: no `--use-planning` flag existed anywhere, only
+    tests set the attribute (§4L Lens-C MAJOR-3). The flag is real
+    now; the artifact stays unapplied until the operator boots with
+    it.
+    """
+    w = set(re.findall(r"[a-z0-9_]+", want.lower()))
+    g = set(re.findall(r"[a-z0-9_]+", got.lower()))
+    if not w or not g:
+        return 0.0
+    hits = len(w & g)
+    if not hits:
+        return 0.0
+    recall = hits / len(w)
+    precision = hits / len(g)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _gold_field(fields_obj, sig=None) -> str:
+    """WHICH output field the gold actually carries.
+
+    ⚠ THIS EXISTS BECAUSE THE METRIC WAS ASYMMETRIC AND THE ASYMMETRY SET
+    A VERDICT'S SIGN. `_expected_target` returns the FIRST non-empty
+    output field — `plan` for `planning.decompose` — while the prediction
+    side joined EVERY output field (`plan` + `rationale`). `build_trainset`
+    never stamps `rationale` on a gold, so a two-field prediction was
+    scored against a one-field target and token-F1 precision was capped
+    by construction: the more a prompt invested in the ungraded field, the
+    worse it scored.
+
+    Measured 2026-08-24 on the retired `planning.decompose` artifact,
+    n=31 private tier:
+
+        arm                     recall  precision      F1   pass@0.3
+        hand-written seed        0.294      0.339   0.285      15/31
+        artifact, as measured    0.366      0.223   0.258      11/31
+        artifact, `plan` only    0.309      0.400   0.315      14/31
+
+    Its ONLY deficit was precision, and its `### rationale` section adds a
+    median 26 distinct tokens against a median 30-token gold — it nearly
+    doubles precision's denominator. Grade its plan alone and the sign of
+    the F1 delta FLIPS (+0.029), and its recall is better at p=0.005.
+
+    The fix is symmetry: score the same field the gold carries.
+    """
+    for f in list(getattr(sig, "outputs", ()) or ()) + ["final_response"]:
+        v = (fields_obj.get(f, "") if isinstance(fields_obj, dict)
+             else getattr(fields_obj, f, ""))
+        if str(v or "").strip():
+            return f
+    return ""
+
+
+def _prediction_for(pred, field: str, sig=None) -> str:
+    """The prediction text to score, matched to the gold's field.
+
+    Falls back to the joined output fields, then to the raw completion,
+    when the structured field is absent — a candidate that ignored the
+    format should be scored on what it did emit, not on "".
+    """
+    if field:
+        v = str(getattr(pred, field, "") or "").strip()
+        if v:
+            return v
+    joined = " ".join(str(getattr(pred, f, "") or "")
+                      for f in (getattr(sig, "outputs", ()) or ())).strip()
+    return joined or str(pred or "")
+
+
+#: The token-F1 bar a prediction must clear. ONE literal, because
+#: `scripts/recheck_gepa_incumbent.py` carried a second copy of it — two
+#: definitions of "did this prompt win" is how two answers to the same
+#: question come to disagree.
+_PASS_BAR = 0.3
+
+#: A free-text completion has no attributes, so the A/B runner has to
+#: find the gold's field in the raw text. The artifact instructs
+#: `### plan` / `### rationale`; the seed emits neither, and then the
+#: whole reply IS the plan — which is why this returns "" rather than
+#: guessing, and the caller falls back to the full text.
+_SECTION_RX = r"(?:^|\n)\s*#{1,4}\s*%s\b[^\n]*\n(.*?)(?=\n\s*#{1,4}\s|\Z)"
+
+
+def _section_of(text: str, field: str) -> str:
+    """The `### <field>` section of a free-text completion, or ""."""
+    import re as _re
+    m = _re.search(_SECTION_RX % _re.escape(field), str(text or ""),
+                   _re.S | _re.I)
+    return m.group(1).strip() if m else ""
+
+
+def _expected_target(fields_obj, sig=None) -> str:
+    """First non-empty signature-output field on the gold (falling back
+    to final_response). `fields_obj` is a dspy.Example after
+    `_to_dspy_examples` — attribute access — or a raw dict.
+
+    ⚠ `sig` is a PARAMETER now. Nested inside `main()` it closed over the
+    signature, which is what made it unreachable from any other tool —
+    and a re-check that could not call it produced `passed=False` for
+    both arms and a confident wrong verdict.
+    """
+    outputs = list(getattr(sig, "outputs", ()) or ())
+    for f in outputs + ["final_response"]:
+        if isinstance(fields_obj, dict):
+            v = fields_obj.get(f, "")
+        else:
+            v = getattr(fields_obj, f, "")
+        v = str(v or "").strip()
+        if v:
+            return v
+    return ""
+
+# dspy 3.x GEPA validates this exact 5-positional signature at
+# construction: (gold, pred, trace, pred_name, pred_trace).
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--signature", required=True,
@@ -67,6 +228,23 @@ async def main() -> int:
     # baseline on the eval split. `--ab-gate` is kept as a deprecated no-op
     # (the gate always runs unless explicitly opted out) so old invocations
     # still parse; `--no-ab-gate` opts out to adopt an unverified candidate.
+    # §4CV: mined verifiable-reward examples. OPT-IN — a trainset that
+    # silently changed shape would invalidate every comparison against a
+    # previous run.
+    parser.add_argument("--allow-seed-loss", action="store_true",
+                        help="promote even when the candidate LOSES to the "
+                             "hand-written seed instruction. The gate "
+                             "normally refuses that, because comparing only "
+                             "against the previous artifact lets the chain "
+                             "ratchet away from the baseline unnoticed.")
+    parser.add_argument("--mined-bank", default=None, metavar="NAME",
+                        help="Add §4CV mined failure-environment examples "
+                             "from system/optim/mined_envs/NAME.jsonl. They "
+                             "carry origin='bench', so `real_only_gate` keeps "
+                             "them out of the PRIVATE ship tier: they may "
+                             "TEACH, never GRADE. Their examples are scored "
+                             "by their own EXECUTABLE ORACLE instead of token "
+                             "overlap.")
     parser.add_argument("--ab-gate", action="store_true", default=False,
                         help="(deprecated no-op — the A/B gate is on by default)")
     parser.add_argument("--no-ab-gate", action="store_true", default=False,
@@ -122,6 +300,59 @@ async def main() -> int:
         signature_name=sig.name,
         max_examples=None,
     )
+
+    # §4CV — mined failure environments. Each carries an EXECUTABLE
+    # checker, so `_metric` below scores it by RUNNING the checker rather
+    # than by token overlap against a recorded reply. That is the whole
+    # point of the mining: the 191 FAILED turns in the corpus contribute
+    # nothing to `build_trainset` (a failure has no gold answer to overlap
+    # against), and overlap rewards LOOKING like the recorded answer.
+    _mined_by_request = {}
+    if args.mined_bank:
+        try:
+            from ghost_agent.optim.env_mining import (
+                read_staging, signature_can_use_mined, trainset_from_items,
+            )
+            # ⚠ REFUSE SIGNATURES THE JOIN KEY CANNOT SURVIVE. `_metric`
+            # keys on `gold.user_request`, and `_to_dspy_examples` copies
+            # only the signature's DECLARED inputs — so for
+            # `tool_selection.pick` / `reflection.critique` the challenge
+            # text is discarded and the golds arrive all-empty, scoring
+            # 0.0 in BOTH arms. Round 2 measured exactly that. Adding
+            # noise that looks like data is worse than adding nothing.
+            if not signature_can_use_mined(sig):
+                raise RuntimeError(
+                    f"{sig.name} has no 'user_request' input, so a mined "
+                    f"challenge cannot reach the metric — mined examples "
+                    f"would arrive empty and score 0.0 in both arms")
+            _rows = read_staging(args.mined_bank)   # $GHOST_HOME
+            # Stamp the reference into THIS signature's own output
+            # fields, or the `keyed` filter below drops every one of them
+            # (round 2: 0 of 1 survived on the live corpus).
+            _mined = trainset_from_items(_rows, sig.name,
+                                         outputs=sorted(sig.outputs))
+            _by_id = {str(r.get("item_id") or ""): r for r in _rows}
+            for _ex in _mined:
+                _row = _by_id.get(_ex.source_trajectory_id)
+                if _row:
+                    _mined_by_request[_ex.inputs["user_request"]] = _row
+            _dropped = len(_rows) - len(_mined)
+            _artifact = sum(1 for r in _rows
+                            if str(r.get("graded_on") or "artifact")
+                            != "final_response")
+            print(f"§4CV: {len(_mined)} mined example(s) with executable "
+                  f"oracles from '{args.mined_bank}'"
+                  + (f" ({_dropped} row(s) dropped: {_artifact} "
+                     f"artifact-graded — a GEPA rollout produces TEXT and "
+                     f"cannot write a solution file — and "
+                     f"{_dropped - _artifact} malformed)" if _dropped else ""))
+            if not _mined and _rows:
+                print("⚠ every mined row was dropped — nothing from this "
+                      "bank reaches the optimizer", file=sys.stderr)
+            examples = examples + _mined
+        except Exception as e:  # noqa: BLE001 — mined examples are additive
+            print(f"mined bank skipped: {e}", file=sys.stderr)
+
     if not examples:
         print(
             f"trainset empty — 0 validator-passing trajectories suitable for "
@@ -148,6 +379,22 @@ async def main() -> int:
     # a planning.decompose run as trained on ordinary user turns.
     keyed = [e for e in examples
              if any((e.expected_output or {}).get(f) for f in sig.outputs)]
+    # ⚠ SAY IT IF IT HAPPENS ANYWAY. Round 2 found `--mined-bank` losing
+    # 100% of its examples to this filter with no message at all — the
+    # run looked normal and the oracle simply never fired. A silent
+    # zeroing of the thing the flag exists to add is the failure mode
+    # this whole section is about.
+    if args.mined_bank:
+        _mined_kept = sum(1 for e in keyed
+                          if getattr(e, "origin", "") == "bench"
+                          and e.inputs.get("user_request") in _mined_by_request)
+        if _mined_by_request and not _mined_kept:
+            print(f"⚠ §4CV: ALL {len(_mined_by_request)} mined example(s) "
+                  f"were dropped by the {sorted(sig.outputs)} target filter "
+                  f"— the oracle cannot fire. Aborting rather than running "
+                  f"a trainset that silently lost the flag's whole effect.",
+                  file=sys.stderr)
+            return 2
     if len(keyed) >= 20:
         if len(keyed) < len(examples):
             print(f"filtered to {len(keyed)}/{len(examples)} examples with a "
@@ -228,83 +475,101 @@ async def main() -> int:
     # calls, and GRADED — GEPA needs a gradient, and the old binary
     # substring check scored ~everything 0. Replaced by real benches
     # (verify_bench / replay fixtures) in §4F Phase 2.
-    def _overlap(want: str, got: str) -> float:
-        """Token F1 — NOT recall.
+    _oracle_stats = {"scored": 0, "unrunnable": 0, "passed": 0}
 
-        Recall (`|w & g| / |w|`) makes VERBOSITY the optimum. Re-measured
-        2026-08-04 against a real 87-token gold plan from the live corpus
-        (`planning.decompose`, n=96 plan targets, median 35 distinct tokens):
-
-            candidate                 recall     F1
-            terse correct subset       0.333    0.500
-            gold + 300 filler tokens   1.000    0.367
-            that soup vs UNRELATED gold 0.250   0.047
-
-        Recall ranks the soup ABOVE the correct answer and still gives it
-        0.250 against a gold it never addressed; F1 inverts both. A hidden
-        holdout defends against memorising items — it cannot defend against
-        a metric whose optimum generalises.
-
-        The cost of F1 is length sensitivity in the OTHER direction: a
-        perfectly-recalling answer much longer than the gold falls under the
-        0.3 pass bar. That is survivable here only because the gold is a
-        PLAN (n=96, median 35 distinct tokens, p90 58 — re-measured
-        2026-08-04; an earlier revision said p90 61) rather than a whole
-        final reply — which is exactly why `build_trainset` must keep
-        yielding plan targets (see the per-field kind filter there). If that
-        ever collapses to the `final_response` fallback, revisit this bar.
-
-        ⚠ THIS METRIC CHANGE INVALIDATES THE PROMOTED planning.decompose
-        ARTIFACT AS A MEASURED WIN. Re-run 2026-08-04 on the same hash-stable
-        28-example private tier, both arms at temp 0 / no-think: under RECALL
-        the promoted artifact scores 0.857 vs the seed's 0.429 (+0.429 —
-        reproducing the 2026-07-29 promotion, journal 0.45 -> 0.80); under F1
-        it scores 0.071 vs 0.500 (-0.429). Its outputs run a median 111
-        distinct tokens against a 32-token median gold. Neither metric
-        measures plan QUALITY, so this is a correctness-of-record finding,
-        not proof the artifact is bad — but the promotion decision does not
-        reproduce under the objective this function now implements. The
-        read-site is dark — and until 2026-08-07 was UNREACHABLE in any
-        configuration: no `--use-planning` flag existed anywhere, only
-        tests set the attribute (§4L Lens-C MAJOR-3). The flag is real
-        now; the artifact stays unapplied until the operator boots with
-        it.
-        """
-        w = set(re.findall(r"[a-z0-9_]+", want.lower()))
-        g = set(re.findall(r"[a-z0-9_]+", got.lower()))
-        if not w or not g:
-            return 0.0
-        hits = len(w & g)
-        if not hits:
-            return 0.0
-        recall = hits / len(w)
-        precision = hits / len(g)
-        return 2.0 * precision * recall / (precision + recall)
-
-    def _expected_target(fields_obj) -> str:
-        """First non-empty signature-output field on the gold (falling back
-        to final_response). `fields_obj` is a dspy.Example after
-        `_to_dspy_examples` — attribute access — or a raw dict."""
-        for f in list(sig.outputs) + ["final_response"]:
-            if isinstance(fields_obj, dict):
-                v = fields_obj.get(f, "")
-            else:
-                v = getattr(fields_obj, f, "")
-            v = str(v or "").strip()
-            if v:
-                return v
-        return ""
-
-    # dspy 3.x GEPA validates this exact 5-positional signature at
-    # construction: (gold, pred, trace, pred_name, pred_trace).
     def _metric(gold, pred, trace=None, pred_name=None, pred_trace=None) -> float:
-        want = _expected_target(gold)
-        got = " ".join(
-            str(getattr(pred, f, "") or "") for f in sig.outputs
-        ).strip() or str(pred or "")
+        # ⚠ SYMMETRIC. This used to join EVERY output field against a
+        # gold that carries ONE — see `_gold_field`. Score what the gold
+        # is, or the metric measures format compliance.
+        _gf = _gold_field(gold, sig)
+        got = _prediction_for(pred, _gf, sig)
+
+        # §4CV: a mined example carries its own EXECUTABLE checker, and a
+        # verifiable reward beats a string-similarity proxy — that is the
+        # entire reason the mining exists. Keyed on the request text,
+        # which is what dspy carries through into `gold`.
+        _req = str(getattr(gold, "user_request", "") or "")
+        _row = _mined_by_request.get(_req)
+        if _row is not None:
+            from ghost_agent.optim.env_mining import (
+                _extract_answer, oracle_score,
+            )
+            # ⚠ NOT THE CONCATENATION. `got` joins EVERY output field,
+            # and `planning.decompose` — the only joinable signature —
+            # emits (plan, rationale). Round 3 measured the consequence:
+            # a bare `42` scores 1.0, but the realistic
+            # `"42 Because 6 times 7 is 42."` scores 0.0, so a mined
+            # example becomes a CONSTANT-ZERO column for essentially
+            # every real rollout. "A metric that can only ever reject" —
+            # the failure these docstrings cite three times — and
+            # `_report_oracle_use` could not see it, because the oracle
+            # DOES fire. The round-2 fix verified the join and never
+            # that the joined score could be non-zero.
+            #
+            # Scored per FIELD, through the same `_extract_answer` the
+            # probe uses, so the metric and the gate that admitted the
+            # item ask the same question of the same string. Best field
+            # wins: the challenge says "reply with only the value", and a
+            # candidate that put the value in one field answered it.
+            _cands = [str(getattr(pred, f, "") or "") for f in sig.outputs]
+            _cands.append(got)
+            _scores = [oracle_score(_row, _extract_answer(c))
+                       for c in _cands if c.strip()]
+            _real = [x for x in _scores if x is not None]
+            if _real:
+                _oracle_stats["scored"] += 1
+                if max(_real) >= 1.0:
+                    _oracle_stats["passed"] += 1
+                return max(_real)
+            # ⚠ NOT 0.0. `oracle_score` returns None when the checker
+            # could not be RUN, and scoring an infrastructure failure as
+            # "the candidate was wrong" optimises against noise. Falling
+            # back to overlap keeps the example in play on a signal that
+            # at least means something; the count is reported after the
+            # run so a silent all-fallback run cannot pass as an oracle
+            # run.
+            _oracle_stats["unrunnable"] += 1
+
+        want = _expected_target(gold, sig)
         if not want:
             return 0.0
         return _overlap(want, got)
+
+    def _report_oracle_use():
+        """Say whether the oracle metric actually FIRED.
+
+        A mined bank whose checker never ran is a trainset scored by
+        overlap wearing a verifiable-reward label — the built-but-unwired
+        failure, one level in. `§4CS` is the standing lesson: give the
+        number, not the intention.
+        """
+        if not args.mined_bank:
+            return
+        sc, un = _oracle_stats["scored"], _oracle_stats["unrunnable"]
+        ps = _oracle_stats["passed"]
+        if not sc and not un:
+            print("⚠ §4CV: the mined bank was loaded but its oracle NEVER "
+                  "FIRED — every example was scored by token overlap. "
+                  "Check that the mined requests reach the metric.",
+                  file=sys.stderr)
+            return
+        print(f"§4CV: the executable oracle scored {sc} rollout(s), "
+              f"{ps} of them PASSING"
+              + (f"; {un} fell back to overlap because the checker "
+                 f"could not be run" if un else ""))
+        # ⚠ FIRING IS NOT THE SAME AS DISCRIMINATING. Round 3: the
+        # oracle fired on every rollout and returned 0.0 on all of them,
+        # because the signature emits structured fields and the mined
+        # challenges ask for a bare value. A constant-zero column carries
+        # no gradient and the run looks normal — so the number that
+        # matters is how many PASSED, and zero says so out loud.
+        if sc and not ps:
+            print(f"⚠ §4CV: the oracle fired {sc} time(s) and NOTHING "
+                  f"PASSED. A constant-zero column gives the optimizer no "
+                  f"gradient — the mined items are not answerable in this "
+                  f"signature's output shape. Treat this run's mined "
+                  f"contribution as ABSENT, not as evidence.",
+                  file=sys.stderr)
 
     # Write the tuned instruction to a STAGING path, NOT the live path the
     # agent reads. It is only promoted after passing the A/B gate below, so a
@@ -339,6 +604,17 @@ async def main() -> int:
                        Path(str(staging_path) + ".rejected"))
         except FileNotFoundError:
             pass
+
+    # ⚠ INITIALISED BEFORE `_promote_staging` is even DEFINED. The seed
+    # arm is computed near the END of `main()`, and the closure below
+    # reads it for provenance — so the `--no-ab-gate` path, which
+    # promotes long before that line runs, raised NameError. A
+    # provenance field that crashes the one path adopting a prompt
+    # UNVERIFIED is the worst possible place to put one.
+    _seed_cmp = None
+    #: Mutable so the promotion stamp (a closure defined above) can see an
+    #: override decided below it.
+    _seed_override = [False]
 
     def _promote_staging():
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,6 +656,14 @@ async def main() -> int:
                 _art["gate_arm"] = "token-F1 A/B, private holdout"
                 _art["gate"] = {
                     "metric": "token_f1_overlap>=0.3",
+                    "seed_arm": (None if _seed_cmp is None else {
+                        "seed_pass_rate": _seed_cmp.baseline_pass_rate,
+                        "candidate_pass_rate": _seed_cmp.candidate_pass_rate,
+                        "delta": _seed_cmp.delta,
+                        "seed_wins": _seed_cmp.baseline_wins,
+                        "candidate_wins": _seed_cmp.candidate_wins,
+                        "overridden": _seed_override[0],
+                    }),
                     "n_private": len(private_set),
                     "incumbent_pass_rate": round(_cmp.baseline_pass_rate, 4),
                     "candidate_pass_rate": round(_cmp.candidate_pass_rate, 4),
@@ -433,6 +717,11 @@ async def main() -> int:
     # Previously the gate was opt-in (`--ab-gate`) AND the tuned file was
     # written straight to the live path, so the documented invocation adopted
     # an UNPROVEN prompt globally (planning / tool-selection / reflection).
+    # ⚠ BEFORE the early returns. Round 2 found this unreachable on the
+    # `--no-ab-gate` path — the "did the oracle actually fire" guard was
+    # skipped on exactly the path that adopts a prompt UNVERIFIED.
+    _report_oracle_use()
+
     if args.no_ab_gate:
         _promote_staging()
         print(f"A/B gate DISABLED (--no-ab-gate) — adopted UNVERIFIED at {output_path}")
@@ -476,8 +765,15 @@ async def main() -> int:
         # Same graded target/overlap as the optimizer metric so baseline and
         # candidate are judged on identical semantics; 0.3 recall = "the
         # prediction substantially covers the validator-approved target".
-        want = _expected_target(payload.get("expected_output") or {})
-        passed = bool(want) and _overlap(want, got) >= 0.3
+        _fields = payload.get("expected_output") or {}
+        want = _expected_target(_fields, sig)
+        # Symmetric with the optimizer metric: the arms are compared on
+        # the field the gold carries, not on everything the prompt
+        # happened to emit.
+        _gf = _gold_field(_fields, sig)
+        if _gf:
+            got = _section_of(got, _gf) or got
+        passed = bool(want) and _overlap(want, got) >= _PASS_BAR
         return {"passed": passed, "output": got}
 
     incumbent = _live_incumbent()
@@ -506,6 +802,90 @@ async def main() -> int:
           f"incumbent={cmp.baseline_pass_rate:.2f} "
           f"candidate={cmp.candidate_pass_rate:.2f} "
           f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
+    # ⚠ THE GATE RATCHETS, AND NOBODY WAS CHECKING WHERE IT RATCHETED TO.
+    # `_live_incumbent()` makes each run "new candidate vs PREVIOUS
+    # ARTIFACT", which is right for measuring an improvement and blind to
+    # a slow drift away from the hand-written instruction the chain
+    # started from. Nothing in three promotions ever asked "is any of
+    # this better than the baseline?".
+    #
+    # Measured 2026-08-24 on `planning.decompose`: the 2026-07-29
+    # artifact scored 0.071, the 2026-08-07 candidate 0.393 (+0.321 —
+    # a real improvement, correctly promoted) — and the HAND-WRITTEN
+    # BASELINE, never in either comparison, scores 0.484. Every
+    # promotion was honest and the chain still walked away from the
+    # thing it should have been beating.
+    #
+    # So the gate now runs a THIRD arm: the candidate must also not lose
+    # to the seed instruction. Cheap (one more pass over the same private
+    # tier) and it closes a hole that no amount of per-run rigour could.
+    _seed = result.baseline_instruction
+    # Only when the candidate would otherwise ship — a rejected candidate
+    # does not need a second N-example pass to stay rejected.
+    if (cmp.candidate_ships and _seed and _seed.strip()
+            and _seed != incumbent):
+        print(f"\nbaseline arm: candidate vs the HAND-WRITTEN seed "
+              f"({len(_seed)} chars) — the arm the ratchet cannot see")
+        _seed_cmp = await compare_prompts(
+            _seed, result.optimized_instruction,
+            private_set, _ab_runner, min_delta=0.0,
+            # the same ceiling the main arm uses, for the same reason
+            per_example_timeout_s=360.0)
+        print(f"  seed {_seed_cmp.baseline_pass_rate:.4f} vs candidate "
+              f"{_seed_cmp.candidate_pass_rate:.4f} "
+              f"(delta {_seed_cmp.delta:+.4f}; candidate wins "
+              f"{_seed_cmp.candidate_wins}, seed wins "
+              f"{_seed_cmp.baseline_wins}, ties {_seed_cmp.ties})")
+
+    # ⚠ THE REFUSAL NEEDS THE SAME NOISE FLOOR THE SHIP DIRECTION HAS.
+    # Round 4 drove this end to end: written as `delta < 0`, a candidate
+    # taking the artifact from 0.40 to 0.90 was THROWN AWAY over ONE
+    # flipped example on a 31-tier — a 0.032 delta, smaller than the
+    # gate's own 0.05 noise floor. A gate that calls a difference noise
+    # in one direction and decisive in the other is calibrated on the
+    # wrong statistic (§4BR), and this one would have welded the chain to
+    # a terse baseline forever.
+    _seed_loses = False
+    _seed_p = None
+    if _seed_cmp is not None:
+        _b, _c = _seed_cmp.baseline_wins, _seed_cmp.candidate_wins
+        if _b + _c:
+            from math import comb as _comb
+            _nd, _k = _b + _c, min(_b, _c)
+            _seed_p = min(1.0, sum(_comb(_nd, i)
+                                   for i in range(_k + 1)) / (2 ** _nd) * 2)
+        # Refuse only when the seed beats the candidate by MORE than the
+        # same margin the candidate needed to ship, AND the discordant
+        # pairs support it. Either alone is a verdict without power.
+        _seed_loses = (_seed_cmp.delta < -args.ab_min_delta
+                       and _seed_p is not None and _seed_p <= 0.05)
+        print(f"  seed arm: delta {_seed_cmp.delta:+.4f} vs the "
+              f"{-args.ab_min_delta:+.4f} refusal bar"
+              + (f", McNemar p={_seed_p:.4f} over {_b + _c} discordant "
+                 f"pairs" if _seed_p is not None else
+                 " (no discordant pairs)"))
+
+    if cmp.candidate_ships and _seed_loses:
+        print(f"\n⛔ NOT PROMOTING. The candidate beats the live artifact "
+              f"({cmp.delta:+.4f}) but LOSES to the hand-written seed "
+              f"({_seed_cmp.delta:+.4f}, McNemar p={_seed_p:.4f}). "
+              f"Promoting it would ratchet the chain further from the "
+              f"instruction it should be beating — which is how the live "
+              f"artifact came to be serving every planner turn with no "
+              f"valid measured win.\n"
+              f"   If the seed is genuinely worse for this signature, say "
+              f"so with a measurement and re-run with --allow-seed-loss.",
+              file=sys.stderr)
+        if not args.allow_seed_loss:
+            _discard_staging()
+            return 1
+        print("   --allow-seed-loss given; promoting anyway.",
+              file=sys.stderr)
+        # Recorded IN the artifact, not only on stderr: an override that
+        # leaves no trace in the thing it overrode is an override nobody
+        # can audit later.
+        _seed_override[0] = True
+
     if not cmp.candidate_ships:
         _discard_staging()
         print(f"A/B gate REJECTED the candidate (delta {cmp.delta:+.2f} "

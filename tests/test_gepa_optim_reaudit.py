@@ -706,3 +706,231 @@ class TestExperimentFilterReporting:
         assert st["experiment_filter_errors"] == 1
         assert len(fx) == 1, "the turn is still included — that is the point"
         assert st["experiment_filter_unavailable"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# §4CW — the SEED ARM, driven end-to-end
+# ══════════════════════════════════════════════════════════════════════
+class TestTheSeedArmIsDrivenNotAsserted:
+    """⚠ THE FIRST PINS FOR THIS GUARD WERE `assert "<literal>" in
+    read_text()`, AND A REVIEWER DELETED THE WHOLE GUARD WITH THEM GREEN.
+    Two mutants, byte-identical suites:
+
+      * `if not args.allow_seed_loss:` -> `if False and ...` (the refusal
+        prints and promotes anyway);
+      * `_seed = result.baseline_instruction` -> `_seed = incumbent`,
+        which reinstates the exact ratchet §4CW removed — and the literal
+        still appears in `_live_incumbent`'s return, so the token pin
+        stayed green.
+
+    `token-pins-vs-executed-pins`. These drive `main()`.
+    """
+
+    def _live(self, tmp_path, text):
+        out = tmp_path / "optim" / "planning.decompose.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "signature_name": "planning.decompose",
+            "baseline_instruction": "SEED",
+            "optimized_instruction": text}))
+        return out
+
+    def _cmp(self, main_delta, seed_delta, *, seed_wins=0, cand_wins=0):
+        """Two-call comparison stub: the first call is the incumbent arm,
+        the second is the seed arm."""
+        from ghost_agent.optim.ab_eval import PromptComparison
+        calls = {"n": 0}
+
+        def _c(baseline, candidate, examples):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return PromptComparison(
+                    baseline, candidate, len(examples), 0.40,
+                    0.40 + main_delta, main_delta,
+                    candidate_ships=main_delta > 0.05)
+            return PromptComparison(
+                baseline, candidate, len(examples), 0.40,
+                0.40 + seed_delta, seed_delta,
+                baseline_wins=seed_wins, candidate_wins=cand_wins)
+        _c.calls = calls
+        return _c
+
+    def _run(self, tmp_path, cmp_fn, extra=()):
+        _corpus(tmp_path / "traj")
+        out = self._live(tmp_path, "THE LIVE ARTIFACT")
+        rc, seen = _drive(
+            ["--signature", "planning.decompose",
+             "--trajectories", str(tmp_path / "traj"),
+             "--output", str(out), "--ab-min-delta", "0.05", *extra],
+            gepa_result=_result(), comparison=cmp_fn)
+        return rc, out, seen
+
+    def test_a_candidate_that_LOSES_BADLY_to_the_seed_is_refused(self,
+                                                                 tmp_path):
+        """Beats the artifact by +0.50, loses to the seed by -0.30 over
+        12 discordant pairs all one way (p ~= 0.0005)."""
+        rc, out, _ = self._run(tmp_path, self._cmp(
+            0.50, -0.30, seed_wins=12, cand_wins=0))
+        assert rc == 1, "a candidate that clearly loses to the seed shipped"
+        assert "NEW CANDIDATE" not in out.read_text()
+
+    def test_a_candidate_that_loses_by_NOISE_is_still_promoted(self,
+                                                               tmp_path):
+        """⚠ THE ROUND-4 CRITICAL. Written as `delta < 0`, a candidate
+        taking the artifact from 0.40 to 0.90 was THROWN AWAY over ONE
+        flipped example — a 0.032 delta on a 31-tier, smaller than the
+        gate's own 0.05 noise floor. A gate that calls a difference noise
+        in one direction and decisive in the other is calibrated on the
+        wrong statistic."""
+        rc, out, _ = self._run(tmp_path, self._cmp(
+            0.50, -0.032, seed_wins=1, cand_wins=0))
+        assert rc == 0, "a NOISE-sized seed loss blocked a large real win"
+        assert "NEW CANDIDATE" in out.read_text()
+
+    def test_a_large_but_INSIGNIFICANT_seed_loss_is_still_promoted(self,
+                                                                   tmp_path):
+        """Both conditions are required: past the margin AND supported by
+        the discordant pairs."""
+        rc, out, _ = self._run(tmp_path, self._cmp(
+            0.50, -0.30, seed_wins=2, cand_wins=1))
+        assert rc == 0
+        assert "NEW CANDIDATE" in out.read_text()
+
+    def test_the_override_actually_promotes(self, tmp_path):
+        rc, out, _ = self._run(tmp_path, self._cmp(
+            0.50, -0.30, seed_wins=12, cand_wins=0),
+            extra=("--allow-seed-loss",))
+        assert rc == 0
+        assert "NEW CANDIDATE" in out.read_text()
+
+    def test_the_override_is_RECORDED_in_the_artifact(self, tmp_path):
+        """An override that leaves no trace in the thing it overrode is
+        one nobody can audit later."""
+        rc, out, _ = self._run(tmp_path, self._cmp(
+            0.50, -0.30, seed_wins=12, cand_wins=0),
+            extra=("--allow-seed-loss",))
+        art = json.loads(out.read_text())
+        assert art["gate"]["seed_arm"]["overridden"] is True
+        assert art["gate"]["seed_arm"]["delta"] < 0
+
+    def test_the_seed_arm_compares_against_the_SEED_not_the_incumbent(
+            self, tmp_path):
+        """⚠ KILLS THE RATCHET MUTANT. `_seed = incumbent` reinstates the
+        bug §4CW removed, and the token pin could not see it. Here the
+        two arms' baseline strings are captured and must DIFFER."""
+        rc, out, seen = self._run(tmp_path, self._cmp(
+            0.50, 0.10, seed_wins=0, cand_wins=3))
+        assert rc == 0
+        assert len(seen["compare"]) == 2, seen["compare"]
+        incumbent_arm, seed_arm = seen["compare"]
+        assert incumbent_arm == "THE LIVE ARTIFACT"
+        assert seed_arm != incumbent_arm, (
+            "the seed arm compared against the LIVE ARTIFACT — that is "
+            "the ratchet, reinstated")
+
+    def test_the_seed_arm_is_SKIPPED_when_the_candidate_would_not_ship(
+            self, tmp_path):
+        """A rejected candidate does not need a second N-example pass."""
+        rc, _out, seen = self._run(tmp_path, self._cmp(
+            0.01, -0.50, seed_wins=12, cand_wins=0))
+        assert rc == 1
+        assert len(seen["compare"]) == 1, (
+            "the seed arm ran on a candidate that was already rejected")
+
+    def test_the_FIRST_promotion_for_a_signature_does_not_crash(self,
+                                                                tmp_path):
+        """⚠ THE REAL `_seed_cmp` FAILURE PATH. §4CW recorded it as
+        `--no-ab-gate`, which was never broken (the name is read only
+        inside `if _cmp is not None`). What actually breaks is the FIRST
+        promotion for a signature: no live artifact means
+        `_live_incumbent()` returns the seed, so `_seed != incumbent` is
+        False, the seed arm is skipped — and an unhoisted `_seed_cmp`
+        raised UnboundLocalError in `main()`'s own body, aborting AFTER
+        the whole optimization had been paid for."""
+        _corpus(tmp_path / "traj")
+        out = tmp_path / "optim" / "planning.decompose.json"
+        out.parent.mkdir(parents=True, exist_ok=True)   # no artifact yet
+        rc, _seen = _drive(
+            ["--signature", "planning.decompose",
+             "--trajectories", str(tmp_path / "traj"),
+             "--output", str(out), "--ab-min-delta", "0.05"],
+            gepa_result=_result(), comparison=_ships)
+        assert rc == 0
+        assert out.exists() and "NEW CANDIDATE" in out.read_text()
+
+    def test_no_ab_gate_also_does_not_crash(self, tmp_path):
+        _corpus(tmp_path / "traj")
+        out = self._live(tmp_path, "THE LIVE ARTIFACT")
+        rc, _ = _drive(
+            ["--signature", "planning.decompose",
+             "--trajectories", str(tmp_path / "traj"),
+             "--output", str(out), "--ab-min-delta", "0.05",
+             "--no-ab-gate"],
+            gepa_result=_result(), comparison=_ships)
+        assert rc == 0
+
+
+class TestTheMetricIsSymmetric:
+    """⚠ THE METRIC GRADED A 2-FIELD PREDICTION AGAINST A 1-FIELD GOLD,
+    and the asymmetry set a verdict's SIGN. `planning.decompose` declares
+    outputs (plan, rationale); `build_trainset` never stamps `rationale`;
+    the prediction side joined both. Token-F1 precision was therefore
+    capped by construction, and the more a prompt invested in the
+    ungraded field the worse it scored.
+
+    Measured on the retired artifact, n=31: recall 0.366 vs the seed's
+    0.294 (BETTER), precision 0.223 vs 0.339 (worse), and scoring its
+    `plan` section alone flips the F1 delta to +0.029."""
+
+    def _rg(self):
+        return _load("rg_sym", "scripts/run_gepa.py")
+
+    def test_the_gold_field_is_identified(self):
+        rg = self._rg()
+        from ghost_agent.optim.signatures import PLANNING_SIGNATURE as S
+        assert rg._gold_field({"plan": "do X", "rationale": ""}, S) == "plan"
+        assert rg._gold_field({"plan": "", "final_response": "y"}, S) \
+            == "final_response"
+        assert rg._gold_field({}, S) == ""
+
+    def test_the_prediction_is_taken_from_THAT_field(self):
+        rg = self._rg()
+        from ghost_agent.optim.signatures import PLANNING_SIGNATURE as S
+
+        class P:
+            plan = "step one; step two"
+            rationale = "a long justification that would dilute precision"
+        got = rg._prediction_for(P(), "plan", S)
+        assert got == "step one; step two"
+        assert "justification" not in got, (
+            "the ungraded field leaked into the scored string — precision "
+            "is then capped by construction")
+
+    def test_it_falls_back_when_the_field_is_absent(self):
+        rg = self._rg()
+        from ghost_agent.optim.signatures import PLANNING_SIGNATURE as S
+
+        class P:
+            plan = ""
+            rationale = "only this"
+        assert "only this" in rg._prediction_for(P(), "plan", S)
+
+    def test_a_free_text_section_is_extracted_for_the_AB_runner(self):
+        rg = self._rg()
+        reply = ("### plan\n1. do X\n2. do Y\n\n"
+                 "### rationale\nbecause of Z, and many more words here")
+        assert rg._section_of(reply, "plan") == "1. do X\n2. do Y"
+        assert "because of Z" in rg._section_of(reply, "rationale")
+
+    def test_no_section_returns_empty_so_the_caller_can_fall_back(self):
+        """The seed emits no `###` headings — the whole reply IS the
+        plan, so guessing a section would score the wrong string."""
+        assert self._rg()._section_of("just a plain plan", "plan") == ""
+
+    def test_the_pass_bar_is_ONE_literal(self):
+        rg = self._rg()
+        assert rg._PASS_BAR == 0.3
+        src = Path("scripts/recheck_gepa_incumbent.py").read_text()
+        assert "rg._PASS_BAR" in src, (
+            "the re-check carried a SECOND copy of the pass bar — two "
+            "definitions of 'did this prompt win'")

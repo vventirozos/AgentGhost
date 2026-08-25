@@ -177,11 +177,21 @@ def test_fire_restores_flag_when_record_write_fails(store, alog, tmp_path,
     tid = store.add_task(pid, "task")
     capture_promise(store, pid, "notify me when done")
     store.update_task(tid, status="DONE")
-    monkeypatch.setattr(type(alog), "record",
-                        lambda self, *a, **kw: False)
-    assert fire_promise_if_settled(store, alog, pid) is False
-    assert peek_promise(store, pid) is not None      # restored
-    monkeypatch.undo()
+    # ⚠ SCOPED, because `monkeypatch` is ONE instance per test — the
+    # autouse `_fresh_notify_budget` above shares it. A bare
+    # `monkeypatch.undo()` here therefore also undid the budget reset,
+    # handing the second fire back the PROCESS-GLOBAL
+    # `notify_tool._sent_timestamps` with whatever earlier tests in this
+    # worker had left in it. At the 12/hour cap the notify is suppressed,
+    # `fire_promise_if_settled` returns False, and this test fails on a
+    # neighbour's spending. Reproduced 2026-08-24 by priming the global
+    # with 12 stamps: `assert False is True` at the line below — the exact
+    # failure `-n 8 --dist loadfile` reported intermittently, because which
+    # files share a worker changes run to run. It passed 30/30 alone.
+    with monkeypatch.context() as m:
+        m.setattr(type(alog), "record", lambda self, *a, **kw: False)
+        assert fire_promise_if_settled(store, alog, pid) is False
+        assert peek_promise(store, pid) is not None      # restored
     assert fire_promise_if_settled(store, alog, pid) is True
     assert len(_records(tmp_path)) == 1
 

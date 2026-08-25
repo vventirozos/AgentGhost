@@ -21,12 +21,27 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import interface.server as server  # noqa: E402
-from interface.server import GHOST_API_KEY, get  # noqa: E402
+from interface.server import get  # noqa: E402
+# ⚠ THE KEY IS READ FROM THE MODULE AT ASSERT TIME, never bound by value at
+# import. `interface.server` computes `GHOST_API_KEY` from the environment
+# at import, and `test_interface_chat_timeout.py` calls
+# `importlib.reload(server)` — so a module-level `from ... import
+# GHOST_API_KEY` here freezes whatever the env held when THIS file was
+# imported, while the proxies under test read the module's CURRENT value.
+# When a neighbour left `GHOST_API_KEY=test-key` in the environment, the two
+# diverged and six interface tests failed under xdist:
+#
+#   assert {'X-Ghost-Key': 'test-key'} == {'X-Ghost-Key': '0dc28f40...'}
+#
+# The leak is fixed at its source (the Slack suites now restore the env),
+# but reading it dynamically is what makes this file's assertion state what
+# it means: the proxy forwards THE SERVER'S key, whatever it is.
+
 
 
 @pytest.mark.asyncio
 async def test_root_html_sets_no_cache():
-    resp = await get(key=GHOST_API_KEY)
+    resp = await get(key=server.GHOST_API_KEY)
     assert resp.status_code == 200
     cc = resp.headers.get("cache-control", "")
     assert "no-cache" in cc
@@ -38,7 +53,7 @@ async def test_root_html_sets_no_cache():
 async def test_root_html_injects_key_and_serves_fresh_from_disk():
     """Body is read from disk per request (no restart needed) and carries
     the injected key global the front-end reads."""
-    resp = await get(key=GHOST_API_KEY)
+    resp = await get(key=server.GHOST_API_KEY)
     body = resp.body.decode("utf-8")
     assert "window.GHOST_API_KEY=" in body
     # Served body reflects the current on-disk index.html (proves the

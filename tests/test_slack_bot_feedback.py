@@ -36,35 +36,71 @@ BOT = "UBOTBOT12"
 
 @pytest.fixture(scope="module")
 def bot():
+    # ⚠ ASSIGNED, then RESTORED. The assignment above is deliberate and
+    # stays (a dev shell that sourced the bot's live .env must never hand a
+    # real token to AsyncApp) — but it used to be a RAW `os.environ[...] =`
+    # that nothing undid, so `GHOST_API_KEY=test-key` outlived this module
+    # for the whole worker process. `test_interface_chat_timeout.py` then
+    # reloads `interface.server`, which re-reads the env, and the server
+    # came up holding "test-key" while `test_interface_proxy_auth.py` still
+    # held the REAL key it had bound at import:
+    #
+    #   assert {'X-Ghost-Key': 'test-key'} == {'X-Ghost-Key': '0dc28f40...'}
+    #
+    # Six interface tests failed that way, in roughly 1 run in 4 under
+    # `-n 8 --dist loadfile`, and 0/15 alone. A private `pytest.MonkeyPatch`
+    # keeps the assign-not-setdefault safety property and gives it a scope.
+    _mp = pytest.MonkeyPatch()
     # ASSIGNED, not setdefault (R1 test review H2): a dev shell that sourced
     # the bot's live .env would otherwise hand a REAL token to AsyncApp and
     # put one un-patched auth_test away from a live API call.
-    os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
-    os.environ["GHOST_API_KEY"] = "test-key"
+    _mp.setenv("SLACK_BOT_TOKEN", "xoxb-test-not-real")
+    _mp.setenv("GHOST_API_KEY", "test-key")
     # Explicitly EMPTY (same rationale as the owner-lock suite): no live
     # log handler and NO reply-index persistence from a pytest process.
-    os.environ["GHOST_SLACKBOT_LOG"] = ""
-    os.environ["GHOST_SLACK_REPLY_INDEX"] = ""
+    _mp.setenv("GHOST_SLACKBOT_LOG", "")
+    _mp.setenv("GHOST_SLACK_REPLY_INDEX", "")
     spec = importlib.util.spec_from_file_location(
         "ghost_slack_bot_feedback_under_test", _BOT_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod
+    yield mod
+    _mp.undo()
 
 
 def _load_bot_module(name):
     """Fresh module instance under ``name`` with the CURRENT environment —
     for pins on module-level constants (the open-channel default). Sets the
     import-required env itself so these tests don't depend on fixture
-    ordering."""
+    ordering.
+
+    ⚠ The env is assigned for the import and then PUT BACK. A raw write
+    here leaked `GHOST_API_KEY=test-key` into every later test in the
+    worker; `test_interface_chat_timeout.py` reloads `interface.server`,
+    which re-reads the env, so the server came up holding "test-key" while
+    `test_interface_proxy_auth.py` still held the real key bound at import
+    — six interface failures, ~1 run in 4 under xdist, 0/15 alone.
+    Restoring afterwards does not affect the module just built: its
+    constants were already evaluated under the patched env, which is the
+    whole point of this helper."""
+    _keys = ("SLACK_BOT_TOKEN", "GHOST_API_KEY",
+             "GHOST_SLACKBOT_LOG", "GHOST_SLACK_REPLY_INDEX")
+    _saved = {k: os.environ.get(k) for k in _keys}
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
     os.environ["GHOST_API_KEY"] = "test-key"
     os.environ["GHOST_SLACKBOT_LOG"] = ""
     os.environ["GHOST_SLACK_REPLY_INDEX"] = ""
-    spec = importlib.util.spec_from_file_location(name, _BOT_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    try:
+        spec = importlib.util.spec_from_file_location(name, _BOT_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for k in _keys:
+            if _saved[k] is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = _saved[k]
 
 
 @pytest.fixture(autouse=True)

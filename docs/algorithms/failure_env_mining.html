@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Failure-environment mining — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Self-improvement</h3>
+    <a href="tool_ontology.html">tool ontology</a>
+    <a class="current" href="failure_env_mining.html">failure-env mining</a>
+    <a href="../core/experiments.html">experiments</a>
+    <a href="../core/risk.html">risk</a>
+    <a href="../core/foresight.html">foresight</a>
+    <a href="metacognition.html">metacognition</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>optim / env_mining.py — turning the agent's own failures into verifiable-reward tasks</h1>
+  <p class="subtitle">§4CV. GEPA scores a candidate prompt by token overlap against a recorded reply. An executable oracle replaces that proxy — and unlocks the 191 FAILED turns that contribute nothing today.</p>
+
+  <h2>Why</h2>
+  <p><code>optim/trainset.py</code> builds GEPA's examples from <strong>PASSED</strong> trajectories and scores a candidate by token overlap against the recorded <code>final_response</code>. Two consequences follow. The <strong>191 failed turns</strong> in the corpus contribute nothing — a failure has no gold answer to overlap against. And the metric rewards <em>looking like</em> the recorded reply rather than being right. An executable checker fixes the second and unlocks the first: a mined failure becomes an example whose target is "the checker exits 0", which is a verifiable reward rather than a string-similarity proxy.</p>
+  <p>The shape is <a href="https://arxiv.org/html/2608.14312">Envs-FORGE</a> and <a href="https://arxiv.org/pdf/2606.12908">SENTINEL</a> reduced to what this corpus can actually support.</p>
+
+  <h2 id="funnel">The funnel, which decides the scope — and has been wrong twice</h2>
+  <div class="scroll"><table>
+    <tr><th>stage</th><th>count</th></tr>
+    <tr><td>failed <code>user_request</code> turns, all time</td><td>191</td></tr>
+    <tr><td>…with &ge;1 tool call</td><td>176</td></tr>
+    <tr><td>…containment-clean (real <code>REPLAY_FORBIDDEN_TOOLS</code>)</td><td><b>35</b></td></tr>
+    <tr><td>…that synthesise into a parseable triple</td><td>~45% of seeds</td></tr>
+    <tr><td>…that clear <b>both</b> gates (measured live)</td><td><b>~8%</b> of synthesised</td></tr>
+    <tr><td><b>usable items, first pass</b></td><td><b>1–2</b></td></tr>
+  </table></div>
+  <p><b>Both corrections are recorded here rather than somewhere quieter, because the funnel <em>is</em> the argument for the scope.</b> The first draft said 67 containment-clean seeds — that used a hand-written list of "live-world" tools, where the real <code>REPLAY_FORBIDDEN_TOOLS</code> also denies <code>manage_services</code>, <code>system_utility</code>, <code>postgres_admin</code> and <code>knowledge_base</code>. The second said "~12 items" by applying Envs-FORGE's ~34% acceptance rate to those 35; measured over live runs once both gates worked, it is <b>12 synthesised, 1 accepted</b>.</p>
+  <p><b>So the honest expectation is one to two usable items, not twelve</b> — below GEPA's documented 20–100 range, which means this does not yet supply the consumer it was scoped for. That is a measured result, not a setback to work around: the remedy is a better synthesiser or a different seed population, and loosening the gates would restore the count while destroying the reason to want it.</p>
+  <p>One design assumption also died on contact: <b>112 of 176 failing turns carry no <code>failure_reason</code> at all</b>, and only ~10 have a specific diagnosable one. SENTINEL's Controller mines <em>recurring failure modes</em>; this corpus does not have them, so mining is per-trajectory and no recurrence threshold is applied — one would look principled and reduce 35 seeds to almost none.</p>
+
+  <h2 id="gates">Two gates, and the second exists because the first was not enough</h2>
+  <p><b>Gate 1 — <code>oracle_is_sound</code>: can this checker FAIL?</b> The reference answer must be accepted and two <em>mechanical</em> negative controls — a sentinel string and the empty string — must be rejected. Mechanical, not model-authored: a model asked for a "wrong answer" can produce an accidentally correct one, and the resulting rejection would be a real oracle failing a real answer, exactly backwards. Every run is repeated (currently 4&times;) on <b>both</b> legs, because a validator that sometimes accepts a <em>wrong</em> answer manufactures false PASSes — label noise pointed straight at the learning corpus.</p>
+  <p><b>Gate 2 — <code>solvability_probe</code>: is there ONE right answer?</b> These are different questions, and the first live run proved it. A mined chess item validated <code>if data['move'] != 'e7e6': sys.exit(1)</code>. That oracle passes every check in gate 1 — it accepts its reference and rejects both controls, so it demonstrably discriminates — but <code>e7e6</code> is one of many reasonable moves. The task is <b>indeterminate</b> and the validator encodes a preference as a fact.</p>
+  <p>The probe samples the challenge <em>k</em> times independently and scores each with the item's own checker:</p>
+  <div class="scroll"><table>
+    <tr><th>outcome</th><th>meaning</th></tr>
+    <tr><td><code>0 of k</code></td><td>unreachable or arbitrary — a metric that can only reject.</td></tr>
+    <tr><td><code>k of k</code></td><td>every candidate prompt scores 1.0, so the item cannot <em>discriminate</em> between prompts. A constant column, which the optimiser can only lose by weighting.</td></tr>
+    <tr><td>samples all differ</td><td><b>indeterminate</b> — see below.</td></tr>
+    <tr><td>otherwise</td><td>the item separates. The only useful state.</td></tr>
+  </table></div>
+  <p><b>⚠ The pass-rate band alone was not enough either.</b> It cannot distinguish <em>hard-but-determinate</em> from <em>indeterminate-whose-preferred-answer-is-sometimes-produced</em>: a "favourite colour" item was accepted at 1/4 while a determinate 6&times;7 item was rejected as trivial at 4/4. The distinguishing signal is not the pass rate — it is whether the independent samples <b>agree with each other</b>. A determinate task pulls samples toward one answer; an indeterminate one scatters them, and the checker's preferred value is merely one of the scatter. So the modal answer must recur. It costs nothing extra (the samples were already drawn) and errs toward rejection, which is the safe direction for a trainset.</p>
+  <p>Two counters are kept apart on purpose: a sample the <em>checker</em> could not score, and a call that produced <em>no output at all</em>. Folding them together subtracted an empty generation from the denominator twice and flipped a mixed item to <code>TRIVIAL</code>.</p>
+
+  <h2 id="confinement">Model-authored code runs under the kernel sandbox</h2>
+  <p>The first version ran validators with <code>subprocess.run(..., cwd=tmpdir)</code> and called a tuple of 11 module names its containment. <b><code>cwd</code> is not confinement.</b> Reviewers walked <b>13 of 15 bypasses</b> straight through the deny-list — <code>os.system("curl …")</code>, <code>subprocess</code> with an absolute path, <code>import http.client</code> (the top-level name is <code>http</code>), <code>ctypes</code>, <code>webbrowser</code>, <code>shutil.rmtree</code> of the live bank directory — and executed one that wrote outside the temp dir and spawned a socket-holding grandchild <em>while the gate reported "accepts its reference, rejects both negative controls"</em>.</p>
+  <p>A deny-list of module <em>names</em> is a lexical proxy for "cannot touch the box"; the AST rewrite moved that proxy rather than removing it. §4CI's lesson is that every exemption in a deny-list becomes the next bypass, and §4CR's is that closing this class needs the child <em>under</em> the sandbox rather than beside it. <code>evolve/confine.py</code> already existed for exactly this. The static checks remain as a cheap pre-filter; they are no longer the containment.</p>
+  <p>Verified by execution, both directions: every attempted escape is a <code>PermissionError</code> under confinement — direct writes, <code>os.replace</code>, symlinks, hardlinks, <code>../</code> traversal, rewriting the child's own policy file, detached grandchildren <em>after the parent exited</em>, <code>os.fork</code>, TCP/UDP/<code>AF_UNIX</code> — and the identical validator succeeds with <code>GHOST_EVOLVE_CONFINE=0</code>, which is the half that makes the other half mean anything.</p>
+  <p><b>What it does not close, stated because the bypass list enumerates it.</b> The policy is an <em>integrity</em> boundary, not a confidentiality one: reads stay open (a read-tight policy would refuse the interpreter its own stdlib), so a validator <em>can</em> read a secret. What it cannot do is make that value land anywhere — writes, network and every destination outside the workdir are denied, and stdout is discarded. The residual is <code>(allow default)</code> permitting mach IPC. The honest statement is <em>"a validator may read what this box can read; it may not change or transmit anything"</em>, and that is the property the gate relies on.</p>
+
+  <h2 id="staging">Staging is not arming</h2>
+  <p><code>eval.banks.pick_next_item</code> walks <b>every</b> bank in <code>system/bench/banks/</code>, and the biological watchdog calls it in production. Writing there is not "saving a file", it is arming a live loop with unvetted synthetic items. Mining writes to <code>system/optim/mined_envs/</code>; <code>--promote</code> is a separate operator act. The separation was a <em>path convention</em> until a reviewer wrote straight through it with <code>--name ../../bench/banks/live_bank</code> — it is now a checked boundary on both sides.</p>
+  <p>Staging <b>accumulates</b>: the first version truncated, so each run deleted the previous run's items and the corpus could never grow toward GEPA's range. It also read through the epoch filter before rewriting the whole file, which meant the first run after an <code>MINING_EPOCH</code> bump silently <em>erased</em> the superseded corpus. Superseded rows now stay on disk unserved, and the write is atomic.</p>
+
+  <h2 id="consumer">The consumer — and the loop that shipped unwired twice</h2>
+  <p><code>scripts/run_gepa.py --mined-bank NAME</code> loads staged items, stamps the reference into the <b>signature's own output fields</b>, and scores those rollouts by <b>running the checker</b> instead of by token overlap. Items carry <code>origin="bench"</code>, so <code>trainset.real_only_gate</code> keeps them out of the private ship tier: <b>bench may teach, it may never grade</b> (§4BH).</p>
+  <p><b>⚠ This is the third time this loop has been built without a working consumer, and the second was inside the fix for the first.</b> Version 1 shipped with <code>oracle_score</code> called by nothing at all. Version 2 added the flag — and stamped <code>{"final_response": ref, "plan": ""}</code>, which <code>run_gepa</code>'s <code>keyed</code> filter twelve lines later drops, because it keeps only examples with a <em>truthy</em> field named in <code>sig.outputs</code>. Measured on the live corpus: <b>0 of 1 mined examples survived</b>, the oracle never fired, and nothing said so. Now: 12 of 12 survive, none reaches the private tier, signatures without a <code>user_request</code> input are <b>refused</b> (their golds would arrive empty and score 0.0 in both arms), and if the filter ever zeroes them anyway the run <b>aborts</b> rather than silently losing the flag's whole effect.</p>
+  <p>The loop also has a <code>mining.failure_envs</code> row on the <a href="../tools/introspect.html#loop-yield">LOOP YIELD</a> view from day one, where <code>invoked</code> counts <em>items a GEPA metric can train on</em> rather than items staged — counting production as consumption is the defect that view exists to expose.</p>
+
+  <h2>Running it</h2>
+  <div class="scroll"><pre><code># the seed funnel only — no LLM calls, nothing written
+PYTHONPATH=src python3 scripts/mine_failure_envs.py --dry-run
+
+# mine into STAGING (never the live bank)
+PYTHONPATH=src python3 scripts/mine_failure_envs.py --limit 20
+
+# arm the live bench flywheel with the staged items (SEPARATE act)
+PYTHONPATH=src python3 scripts/mine_failure_envs.py --promote
+
+# train a prompt against the executable oracles
+PYTHONPATH=src python3 scripts/run_gepa.py --signature planning.decompose \
+    --mined-bank ghost_failures …</code></pre></div>
+  <p>Environment: <code>GHOST_MINE_REQUIRE_CONFINE=1</code> refuses to execute model-authored code without the kernel sandbox (default off, so the miner still works off macOS — the item records <code>verified_confined</code> either way). <code>--no-probe</code> skips the determinacy gate and the report says so, because "accepted" means something weaker without it.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_4cv_failure_env_mining.py</code>. Every fix in this page has a pin, and several pins exist only because a mutation showed the first version green.</p>
+</main>
+</body>
+</html>

@@ -190,6 +190,19 @@ class TestLateVerdictReachesTheDiary:
             assert _diary_outcome(sm, tid) == corpus_outcome
 
 
+def _flat(text: str) -> str:
+    """Log output with wrapping collapsed.
+
+    ⚠ `pretty_log` wraps at terminal width, so `"corpus + diary"` arrives
+    as `"corpus +\n        diary"` whenever the runner is narrower than
+    the message. Asserting on the raw string tests the WRAP POSITION, not
+    the content — it passed serially and failed under xdist for no reason
+    the test was about. conftest now pins COLUMNS as well; this makes the
+    assertion correct even if that is ever removed.
+    """
+    return " ".join(str(text or "").split())
+
+
 class TestTheOperatorStreamSaysWhichStoresTookIt:
     """§LOG doctrine: report only when it WORKS. The defect this fixes was a
     write path nothing in the live stream ever contradicted, so the success
@@ -206,7 +219,7 @@ class TestTheOperatorStreamSaysWhichStoresTookIt:
 
         _run_late(fake, tid, "passed")
 
-        out = capsys.readouterr().out
+        out = _flat(capsys.readouterr().out)
         assert "corpus + diary" in out
         assert _diary_outcome(sm, tid) == "passed"
 
@@ -223,6 +236,7 @@ class TestTheOperatorStreamSaysWhichStoresTookIt:
         _run_late(fake, tid, "passed")
 
         out = capsys.readouterr().out
+        out = _flat(out)
         assert "backfilled into the corpus" in out
         assert "corpus + diary" not in out
 

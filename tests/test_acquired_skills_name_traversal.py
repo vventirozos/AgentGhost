@@ -69,8 +69,22 @@ def test_unsafe_name_raises_validator(bad_name):
 def test_unsafe_name_never_writes_outside_sandbox(bad_name):
     """Exercise the full save_skill path — even without raising, the
     filesystem must remain untouched outside skills_dir."""
+    # ⚠ THE SANDBOX NEEDS ITS OWN PRIVATE PARENT. This used to make the
+    # TemporaryDirectory itself the sandbox, so `sandbox.parent` was the
+    # SHARED SYSTEM TEMP DIR — and the assertion below compared two
+    # snapshots of it. Serially that is stable; under pytest-xdist eight
+    # workers create temp dirs in the same place, one appears between the
+    # snapshots, and the test reports "traversal write escaped to parent
+    # dir" about another worker's scratch directory.
+    #
+    # Nesting one level keeps the test's claim EXACTLY as strong — a
+    # traversal out of `skills_dir` still lands in `root` and is still
+    # caught — while making the observed directory one this test alone
+    # writes to.
     with tempfile.TemporaryDirectory() as td:
-        sandbox = Path(td).resolve()
+        root = Path(td).resolve()
+        sandbox = root / "sandbox"
+        sandbox.mkdir()
         mgr = AcquiredSkillManager(sandbox_dir=sandbox, memory_system=MagicMock())
 
         parent_before = {p.name for p in sandbox.parent.iterdir()}

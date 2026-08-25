@@ -520,11 +520,58 @@ The promoted prompt's outputs run a median **111 distinct tokens against a
 for. The recall column also *reproduces the original promotion* (journal:
 0.45 → 0.80), which is what makes the F1 column evidence rather than noise.
 
-Read this as **correctness-of-record, not a live emergency**: neither metric
+~~Read this as **correctness-of-record, not a live emergency**: neither metric
 measures plan QUALITY, and the read-site is dark (no `--use-planning` on the
-live exec line, activation counter 0). The artifact is kept, not deleted —
-its promotion is simply no longer a measured win, and re-promoting it would
-require a bench that grades plans rather than token overlap.
+live exec line, activation counter 0). The artifact is kept, not deleted.~~
+
+> ### ⚠ THE PARAGRAPH ABOVE WENT FALSE ON 2026-08-21, AND IT IS WHY NOBODY RE-OPENED THIS
+>
+> It was true when written (2026-08-16: zero planner calls recorded on 08-15,
+> 08-16, 08-17). Then `--use-planning` was added to the launcher exec line —
+> `start-ghost-agent.sh.bak-20260807` does not carry the flag,
+> `.bak-20260821` does — and the read site fired on **every planner turn**:
+> 24 planner calls on 08-21, 77 on 08-22, 58 on 08-23, each carrying the
+> 3314-char artifact. **A launcher edit silently armed a read site this
+> document certified as dark, and the certification is what suppressed the
+> urgency.** `launcher-flag-drift` × `gepa-promoted-artifact-invalidation`.
+>
+> **Resolved 2026-08-24 (§4CW): the artifact is RETIRED, not kept** — now at
+> `system/optim/planning.decompose.json.retired-4cw`, with the measurement
+> and a one-line reversal stamped into the file.
+>
+> ⚠ **But NOT for the reason first recorded, and the correction matters.**
+> The initial write-up said "measured worse than the seed" (−0.1220,
+> p = 0.0059). Re-measured under a corrected metric the sign **flips**:
+> seed 0.4959 vs artifact **0.5041**, delta **+0.0081**, McNemar
+> **p = 1.0000**. The artifact is *indistinguishable* from the baseline.
+> token-F1 had been grading a **two-field prediction (`plan` + `rationale`)
+> against a one-field gold** — `build_trainset` never stamps `rationale` —
+> so precision was capped by construction and the more a prompt invested in
+> the ungraded field the worse it scored. Its *recall* was better all along
+> (0.366 vs 0.294, p = 0.005 in its favour).
+>
+> It is retired for having **no measured win** while running on every
+> planner turn — it buys nothing — and because its terminal directive
+> *"Output exactly `### plan` and `### rationale` with no extra text"* is
+> prepended ahead of *"Return ONLY valid JSON"* under a JSON grammar: a live
+> format conflict. On 8 real recorded planner payloads replayed in the
+> production regime, 7/8 parsed with it against 8/8 without.
+>
+> **And the cause was structural**: `run_gepa`'s gate compares each candidate
+> against `_live_incumbent()` — the PREVIOUS artifact — never against the
+> hand-written seed. 2026-07-29 artifact 0.071 → 2026-08-07 candidate 0.393
+> (+0.321, a real improvement, correctly promoted) → seed, never in either
+> comparison, **0.496**. Every promotion was honest and the chain still
+> ratcheted away from the thing it should have been beating. The gate now
+> runs a third SEED arm and refuses a candidate that loses to it.
+>
+> Verified live after the 2026-08-24 20:35 restart: planner system prompts
+> dropped 7420 → 4104 chars (the difference is the artifact plus its join),
+> zero `GEPA: loaded tuned instruction` lines since, and the in-process
+> counter reads `planning.decompose: no artifact (baseline)`.
+
+Re-promoting anything here would still require a bench that grades plans
+rather than token overlap — that part of the original note stands.
 
 The full list, including ~12 clusters deliberately left unfixed with reasons,
 is `PROJECT_JOURNAL.md` §4J.

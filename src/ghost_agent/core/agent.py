@@ -865,6 +865,62 @@ def turn_origin(context) -> str:
                             "is_read_only", False) is True else "user"
 
 
+def rubric_shadow_eligible(context, traj) -> bool:
+    """Is this turn one the verifier DECLINED, on real traffic?
+
+    §4CU. The rubric shadow exists for exactly one population — the turns
+    §4CS item D measured as machine-undecidable: real user turns that ran
+    no tool, so nothing was executed to check and
+    `_find_substantive_tool_for_verifier` correctly returns None. Anything
+    else already has, or can have, a verdict from the evidence path, and
+    shadowing it would be measuring the rubric against a judge rather than
+    against the gap.
+
+    Extracted module-level for the §4CT reason: a gate written inline in a
+    4,000-line coroutine can only be pinned by a source-shape proxy, and
+    §4BN watched those stay green through a commented-out block, a moved
+    helper, a nested helper and a literal `False`.
+
+    Four conditions, and each one is load-bearing:
+
+    * **the feature is ON** — default OFF, checked FIRST so a disabled
+      build does no work at all;
+    * **real traffic** — `turn_origin`, the canonical predicate, so this
+      population cannot drift from the one the liveness denominator and
+      the yield view interpret. Self-play and dream turns reach this same
+      record site;
+    * **no tool ran** — the declined bucket. A turn WITH tool output is
+      the verifier's own population;
+    * **still unknown** — a turn already resolved (by the inline verdict
+      or a human label) needs no shadow, and grading it would spend a
+      call to re-answer a settled question.
+
+    ⚠ `context is None` must NOT be eligible. `turn_origin(None)` answers
+    "user" by its own correct default, so the absence of a context would
+    otherwise read as real traffic — the §4CT fail-open verbatim, in the
+    favourable direction, which is the one that has to be withheld.
+    """
+    try:
+        from .rubric_grader import shadow_enabled
+        if not shadow_enabled():
+            return False
+        if context is None or traj is None:
+            return False
+        if turn_origin(context) != "user":
+            return False
+        if str(getattr(traj, "task_kind", "") or "") != "user_request":
+            return False
+        if getattr(traj, "tool_calls", None):
+            return False
+        outcome = str(getattr(traj, "outcome", "") or "").lower()
+        if outcome not in ("", "unknown"):
+            return False
+        return bool(str(getattr(traj, "user_request", "") or "").strip()
+                    and str(getattr(traj, "final_response", "") or "").strip())
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
 def book_graduated_retrieval(context, store, hashes) -> int:
     """Credit a prompt injection to each graduated skill surfaced this turn.
 
@@ -24157,6 +24213,61 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 self.context._last_bench_traj_id = str(traj.id or "")
         except Exception:  # noqa: BLE001
             pass
+        # §4CU — rubric SHADOW on the turns the verifier declines. Fires
+        # only when `GHOST_RUBRIC_SHADOW=1` (default OFF), only on real
+        # user turns that ran no tool, and writes ONLY to
+        # `system/verifier/rubric_shadow.jsonl` — no learning path reads
+        # that file, and `traj.outcome` is never touched here. It is
+        # deliberately fire-and-forget on the loop: the reply has already
+        # shipped, so a judging call must not add latency, and a failure
+        # must not reach the turn.
+        #
+        # ⚠ THIS METHOD IS SYNC. Both production callers
+        # (`_finalize_and_return`, `stream_wrapper`) are async, so a loop
+        # is running — but relying on that implicitly is how a subsystem
+        # goes silently inoperative: with a blanket DEBUG handler, a
+        # future sync caller would turn "the operator switched this on"
+        # into "it never ran" with nothing saying so. The loop is
+        # therefore looked up EXPLICITLY, and a failure AFTER the gate
+        # said yes is logged at WARNING — the gate and the scheduling
+        # have different failure meanings and must not share a line.
+        _eligible = False
+        try:
+            _eligible = rubric_shadow_eligible(self.context, traj)
+        except Exception as e:  # noqa: BLE001 — the gate never breaks a turn
+            logger.debug("rubric shadow gate skipped: %s: %s",
+                         type(e).__name__, e)
+        if _eligible:
+            try:
+                asyncio.get_running_loop()
+                from .rubric_grader import shadow_grade_and_record
+                # `spawn_bg`, NOT a bare `create_task` — it is the one
+                # fire-and-forget primitive here and it already composes
+                # the three things a hand-rolled holder list gets only
+                # some of: contextvar propagation (so the judgement logs
+                # under THIS request id), a strong reference held in a
+                # drainable registry (asyncio keeps only a weak one, and
+                # a GC'd task is a silently-missing row indistinguishable
+                # from a turn the gate declined), and a done-callback that
+                # surfaces any exception at WARNING instead of letting it
+                # vanish. `tests/test_spawn_bg.py` enforces this, and it
+                # caught the first version of this call.
+                _glog.spawn_bg(shadow_grade_and_record(
+                    str(traj.user_request or ""),
+                    str(traj.final_response or ""),
+                    getattr(self.context, "llm_client", None),
+                    trajectory_id=str(traj.id or ""),
+                    req_id=str(req_id or ""),
+                ), name="rubric-shadow")
+            except Exception as e:  # noqa: BLE001 — never breaks a turn
+                pretty_log(
+                    "Verifier",
+                    f"rubric shadow is ON and the turn qualified, but the "
+                    f"judgement could not be scheduled: "
+                    f"{type(e).__name__}: {str(e)[:200]}",
+                    level="WARNING", icon=Icons.WARN,
+                )
+
         # Stage-1 self-improvement: cache the just-recorded trajectory
         # keyed by its response fingerprint so the NEXT user message's
         # correction-classifier hook can locate it via `messages[-2]`.
