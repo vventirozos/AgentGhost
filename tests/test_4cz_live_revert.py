@@ -370,14 +370,14 @@ class TestTheScriptOnlyActsOnREVERT:
             _sys.argv = old
         return rc, art
 
-    def test_the_retirement_says_it_needs_a_RESTART(self, tmp_path,
-                                                     capsys):
+    def test_the_retirement_states_the_DEPLOY_path(self, tmp_path,
+                                                    capsys):
         """⚠ THE ONE ACTION §4CZ CAN TAKE WAS REPORTED AS DONE WHEN IT HAD
-        NOT HAPPENED. `loader` caches the artifact text per process and its
-        `clear_cache()` must not be called on a live agent, so a rename
-        takes effect only on restart — meanwhile every planner turn keeps
-        using the retired artifact and `activation_stats` keeps counting it
-        as applied. `claim-vs-fact-deliverables`."""
+        NOT HAPPENED (`claim-vs-fact-deliverables`). Pre-§4DE the honest
+        statement was "restart needed"; §4DE's epoch swap deploys the
+        retirement live within ~a tick, so the honest statement CHANGED —
+        and a stale "restart needed" instruction is operator noise the
+        other way."""
         rows = ([_t("treatment", "failed")] * 18
                 + [_t("treatment", "passed")] * 2
                 + [_t("control", "passed")] * 15
@@ -385,8 +385,9 @@ class TestTheScriptOnlyActsOnREVERT:
         self._run(tmp_path, rows, ("--revert",))
         out = capsys.readouterr().out
         assert "RETIRED ON DISK" in out
-        assert "still serving it" in out.lower()
-        assert "launchctl kickstart" in out
+        assert "epoch swap" in out and "No restart needed" in out, out
+        assert "launchctl kickstart" not in out, (
+            "the pre-§4DE restart instruction is back — it is FALSE now")
         assert "REMOVES A PREFIX" in out and "prepends" in out, (
             "the retirement's effect on the prompt was misdescribed")
 

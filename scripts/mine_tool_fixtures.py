@@ -95,7 +95,8 @@ def main() -> int:
 
     recordings_dir = args.recordings or _ghost_home() / "system" / "llm_recordings"
     trajectory_root = args.trajectories or _ghost_home() / "system" / "trajectories"
-    out_path = args.out or _ghost_home() / "system" / "optim" / "tool_choice_fixtures.jsonl"
+    out_path = args.out or (_ghost_home() / "system" / "optim"
+                            / gate_contract.TOOL_FIXTURES_BASENAME)
 
     day_files = sorted(recordings_dir.glob("*.jsonl"))
     if not day_files:

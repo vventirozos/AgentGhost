@@ -614,11 +614,11 @@ class TestTheToolDescRejectionNamesTheUSABLE_count:
 
 
 class TestTheArtifactOnDiskIsNotAlwaysTheOneServing:
-    """⚠ A HAZARD ROUND 8'S OWN FIX INTRODUCED. Deploy is a RESTART:
-    `optim/loader.py` caches the artifact text per process and its
-    `clear_cache()` must not be called on a live agent. So an operator
-    who promotes and does not restart has a corpus whose treatment turns
-    all carry the PREVIOUS sha, while the file on disk hashes to the new
+    """⚠ A HAZARD ROUND 8'S OWN FIX INTRODUCED. Since §4DE the window is
+    ~a minute (the epoch swap re-snapshots on directory change), but it
+    still EXISTS: right after a promotion — and for the full corpus age
+    when the tick is dead — the treatment turns on disk carry the
+    PREVIOUS sha while the file hashes to the new
     one — and round 8's sha scoping then drops every one of them and
     reports "treatment n=0, need 12 per arm". Safe direction (no false
     REVERT), and an actively misleading message: it says there is no
@@ -669,7 +669,13 @@ class TestTheArtifactOnDiskIsNotAlwaysTheOneServing:
         assert "NOTHING IN THIS CORPUS WAS SERVED THE ARTIFACT ON DISK" \
             in out, out
         assert "0ldserved" in out, out
-        assert "launchctl kickstart" in out, out
+        # §4DE: the remedy is no longer a restart — the epoch swap
+        # deploys within ~a tick, so this state is transient on a live
+        # agent and the message says so (and how to tell if it is NOT
+        # transient: the gepa.autonomy liveness probe).
+        assert "launchctl kickstart" not in out, (
+            "the pre-§4DE restart instruction is back — it is FALSE now")
+        assert "epoch swap" in out and "TRANSIENT" in out, out
 
     def test_a_MATCHING_corpus_says_none_of_that(self, tmp_path,
                                                  monkeypatch, capsys):

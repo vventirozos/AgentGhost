@@ -526,6 +526,18 @@ def served_leg(result) -> dict:
     return {"served_by": "", "fell_back_from": "", "requested": ""}
 
 
+#: The ONE default for the local inference upstream (§4DF CRIT-1).
+#: llama-server listens on 8088; 8080 is the TLS web console. Four
+#: files each carried their own default and two of them said 8080 — so
+#: the autonomous launcher's minimal argv (correctly no overrides)
+#: pointed 3 of 4 optimizer targets at a port that answers TLS to a
+#: plaintext client. Every argparse `--upstream-url` default and every
+#: in-code fallback imports THIS; the prod launchd exec line still
+#: overrides it explicitly (`launcher-flag-drift`: the exec line is the
+#: flag truth — this constant only has to agree with it).
+DEFAULT_UPSTREAM_URL = "http://127.0.0.1:8088"
+
+
 class LLMClient:
     def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None, node_api_key: Optional[str] = None):
         self.upstream_url = upstream_url

@@ -203,7 +203,7 @@
       <tr>
         <td><strong>Memory across sessions</strong></td>
         <td>A mature field now, with several dedicated frameworks. Usually one store — vectors, sometimes plus a graph — retrieved by top-<em>k</em> similarity.</td>
-        <td>Six stores queried in parallel and merged by <strong>rank rather than score</strong>, because similarity numbers from different stores aren't comparable. Source weights are learned per query intent.</td>
+        <td>Six stores, queried together and merged by <strong>rank rather than score</strong>, because similarity numbers from different stores aren't comparable. Source weights are learned per query intent.</td>
       </tr>
       <tr>
         <td><strong>Anonymous egress</strong></td>
@@ -262,7 +262,7 @@
   <p>The mechanism behind each of the rows above.</p>
 
   <h3>It remembers across sessions, in six different shapes</h3>
-  <p>Closing the chat wipes nothing. Facts, relationships between things, a profile of you, lessons from its own mistakes, a running journal, and full past episodes are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. All six are searched at once and merged by rank rather than score. <a href="memory.html">How memory works →</a></p>
+  <p>Closing the chat wipes nothing. Facts, relationships between things, a profile of you, lessons from its own mistakes, a running journal, and full past episodes are stored separately — because "what do I know about Postgres?", "who is Anna to me?" and "what went wrong last time?" want different shapes of answer. They're searched together and merged by rank rather than score. <a href="memory.html">How memory works →</a></p>
 
   <h3>It refuses its own answers</h3>
   <p>A second model reads the final answer against the evidence the tools actually returned, and asks whether it answers the question <em>before</em> asking whether it's correct — because answering a different question is the more common failure. A high-confidence refusal sends Ghost back to fix it rather than shipping. <a href="self-improvement.html">How the self-check works →</a></p>
@@ -282,6 +282,340 @@
   <h3>It works while you're away</h3>
   <p>Given a quiet stretch, Ghost consolidates memory, reviews turns that failed, extracts skills, retrains two small local models (&#9888; &sect;4BN: only the router leg retrains on a default box &mdash; the PRM leg is consumer-gated and skips), and practises against problems it invents for itself. None of it interrupts you, and none of it runs while you're active. Ask it what it did — the answer reads from a real ledger, not the model's recollection. <a href="self-improvement.html">The full idle schedule →</a></p>
 
+  <h2>Every advanced feature, in one table</h2>
+
+  <p>The seven sections above are the ones worth prose. This is the rest of them — the whole advanced surface in one place, each row linking to the page that explains it properly.</p>
+
+  <div class="note">
+    <strong>The right-hand column is the honest part.</strong> <span class="badge good">on</span> means it runs on a stock install with no flag. A flag or environment variable means it doesn't, and that's what turns it on. <span class="badge warn">opt-in</span> marks the ones that are off by default because they're experimental or expensive — they are listed here rather than quietly omitted, because a feature you believe is running and isn't is worse than one you know is off.
+  </div>
+
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Feature</th><th>What it does</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr class="group"><td colspan="3">Memory and context</td></tr>
+      <tr>
+        <td><a href="core/bus.html"><strong>Rank-fusion memory</strong></a></td>
+        <td>Five stores searched in parallel and merged by <em>rank</em>, because similarity scores from different stores aren't comparable to each other.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="memory/episodes.html"><strong>Episodic memory</strong></a></td>
+        <td>Whole past episodes — the sequence of actions and how it turned out — recalled by resemblance to the situation you're in now.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="memory/graph.html"><strong>Knowledge graph</strong></a></td>
+        <td>Entities and the relationships between them, walked outward from whatever you just mentioned.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="memory/profile.html"><strong>User profile</strong></a></td>
+        <td>What it knows about you, corrected key by key — a new answer replaces the old one instead of piling up beside it.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="memory/skills.html"><strong>Lessons playbook</strong></a></td>
+        <td>What it learned from its own failures, retrieved when the current situation rhymes with the one that taught it.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="memory/contradiction_log.html"><strong>Belief revision log</strong></a></td>
+        <td>Every time it changes its mind about a stored fact, the old belief and the reason are kept — so it can tell you why.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/context_manager.html"><strong>Context-pressure governor</strong></a></td>
+        <td>Read budgets that tighten as the context window fills, and a five-step compression ladder before anything is thrown away.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/memory_tools.html"><strong>Document Q&amp;A</strong></a></td>
+        <td>PDFs, pages and recordings ingested into a searchable store, then questioned scoped to one document rather than to everything it knows.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/memory_tools.html"><strong>Local transcription</strong></a></td>
+        <td>Long audio and video transcribed on your own machine in twelve-minute windows, with timestamps kept as breadcrumbs.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+
+      <tr class="group"><td colspan="3">Answering, and checking the answer</td></tr>
+      <tr>
+        <td><a href="core/verifier.html"><strong>Two-stage verifier</strong></a></td>
+        <td>A second model names the reply's weakest claims, then judges each one against what the tools actually returned.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/verifier.html"><strong>Verify-depth routing</strong></a></td>
+        <td>Turns that look hard get a three-vote verdict instead of a single sample; easy ones don't pay for it.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/objection.html"><strong>Objection adjudication</strong></a></td>
+        <td>A judge's objection about a number or a quote is settled by arithmetic and string search <em>before</em> anyone's opinion is consulted.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/uncertainty.html"><strong>Uncertainty tracker</strong></a></td>
+        <td>Assumptions and unknowns are recorded as it works; one that matters enough stops the turn and asks you.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/planning.html"><strong>Complexity router</strong></a></td>
+        <td>A small model trained on its own history predicts how hard your request is, which decides whether to plan and how hard to verify.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="configuration.html"><strong>Pre-flight failure guard</strong></a></td>
+        <td>A tool call that just failed the same way is refused up front, handing back the previous error instead of repeating it.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/foresight.html"><strong>Foresight world model</strong></a></td>
+        <td>Predicts what each tool call will return before running it, then grades the prediction against what actually happened.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/hypothesis.html"><strong>Hypothesis grounding</strong></a></td>
+        <td>After something fails, each theory about why gets a minimal test in the sandbox rather than a confident guess.</td>
+        <td><code>--deep-reason</code></td>
+      </tr>
+      <tr>
+        <td><a href="core/confidence.html"><strong>Confidence and calibration</strong></a></td>
+        <td>Token-level entropy and its own track record per domain fused into one score, refit hourly against what really happened.</td>
+        <td><code>--enable-metacog</code></td>
+      </tr>
+      <tr>
+        <td><a href="core/risk.html"><strong>Risk governor</strong></a></td>
+        <td>On a turn that's visibly struggling, one nudge to bank the progress made or stop and report honestly.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+
+      <tr class="group"><td colspan="3">Learning from its own runs</td></tr>
+      <tr>
+        <td><a href="self-improvement.html"><strong>Prompt tuning (GEPA)</strong></a></td>
+        <td>Three internal prompts rewritten by an optimizer trained on its own successful turns — shipped only if they beat the hand-written one.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="self-improvement.html"><strong>Autonomous tuning loop</strong></a></td>
+        <td>That loop runs itself end to end: mines its own training data, launches the runs, promotes winners, retires losers, no operator.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="self-improvement.html"><strong>Live prompt deploys</strong></a></td>
+        <td>A promoted prompt is serving within a minute, and requests already in flight finish on the version they started with.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/skill_acquisition.html"><strong>Skill acquisition</strong></a></td>
+        <td>Tool sequences that keep working become named skills, kept at the shortest validated path and re-tested later rather than trusted forever.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/acquired_skills.html"><strong>Tools it writes itself</strong></a></td>
+        <td>It can write and register a new Python tool for itself, available on the next turn and retired automatically if it stops earning its place.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/composed_skills.html"><strong>Composed skills</strong></a></td>
+        <td>Multi-step tool sequences with branching, compiled into a single macro instead of re-derived each time.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/dream_cycle.html"><strong>Dream cycle</strong></a></td>
+        <td>Idle-time consolidation: recent turns become durable memory and heuristics while you're away.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/dream_cycle.html"><strong>Self-play</strong></a></td>
+        <td>Invents problems for itself and solves them in an isolated sandbox, scored on whether the answer was actually right.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/adversarial_generator.html"><strong>Adversarial practice</strong></a></td>
+        <td>Practice is aimed at the problem families it currently fails most, not the ones it already handles.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="self-improvement.html"><strong>Reflection</strong></a></td>
+        <td>Failed turns are reviewed on idle time and become lessons the playbook can retrieve later.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="audit_fixes.html"><strong>Post-mortems</strong></a></td>
+        <td>Its worst runs get a whole-transcript review that files a classified defect report about its own tooling.</td>
+        <td><code>--postmortem</code></td>
+      </tr>
+      <tr>
+        <td><a href="eval/banks.html"><strong>Benchmark flywheel</strong></a></td>
+        <td>One externally-graded task per idle tick, kept strictly apart from evidence it graded itself.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/experiments.html"><strong>Live randomised arms</strong></a></td>
+        <td>Changes ship as A/B arms on real traffic with anytime-valid intervals — production <em>is</em> the experiment.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/feedback.html"><strong>Human feedback</strong></a></td>
+        <td>A thumbs up or down writes a ground-truth label that outranks every machine verdict about that turn.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+
+      <tr class="group"><td colspan="3">Doing the work</td></tr>
+      <tr>
+        <td><a href="sandbox/docker.html"><strong>Docker sandbox</strong></a></td>
+        <td>Code runs in a persistent container with its own process and network namespaces — not on your actual system.</td>
+        <td>needs Docker</td>
+      </tr>
+      <tr>
+        <td><a href="sandbox/jobs.html"><strong>Background jobs</strong></a></td>
+        <td>A command that outgrows its time budget is detached and supervised instead of killed halfway.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="sandbox/services.html"><strong>Sandbox services</strong></a></td>
+        <td>Long-running servers it starts for itself, with pidfiles, logs, liveness probes and leased ports.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/browser.html"><strong>Browser automation</strong></a></td>
+        <td>Headless Chromium with DNS forced through Tor and a cookie profile that survives between sessions.</td>
+        <td>needs Docker</td>
+      </tr>
+      <tr>
+        <td><a href="tools/search.html"><strong>Web search</strong></a></td>
+        <td>Several scraped engines over Tor, plus deeper research and fact-check passes — no search API key anywhere.</td>
+        <td>needs Tor</td>
+      </tr>
+      <tr>
+        <td><a href="tools/darkweb_search.html"><strong>Onion search</strong></a></td>
+        <td>Hidden-service engines, a fresh circuit per retry, and engines sharing an index counted once so corroboration means independent sources.</td>
+        <td>needs Tor</td>
+      </tr>
+      <tr>
+        <td><a href="tools/vision.html"><strong>Vision</strong></a></td>
+        <td>Reads images and PDFs; a UI check comes back as a pass/fail verdict rather than a description.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/image_gen.html"><strong>Image generation</strong></a></td>
+        <td>Generates images on a GPU node. Without the node the tool isn't advertised to the model at all.</td>
+        <td><code>--image-gen-nodes</code></td>
+      </tr>
+      <tr>
+        <td><a href="tools/report_pdf.html"><strong>PDF reports</strong></a></td>
+        <td>Multi-page styled documents rendered locally and served back as a download.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="tools/database.html"><strong>Database work</strong></a></td>
+        <td>A DBA agent over PostgreSQL, with the SQL validated before it's allowed to run.</td>
+        <td>needs Postgres</td>
+      </tr>
+      <tr>
+        <td><a href="tools/projects.html"><strong>Projects</strong></a></td>
+        <td>Work that outlives a conversation: a task tree, artifacts, and an append-only event log of what happened.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/project_advancer.html"><strong>Project autoadvance</strong></a></td>
+        <td>While idle, pushes one active project forward by a single step under hard budgets, stopping at anything that needs you.</td>
+        <td><code>--autoadvance-idle</code></td>
+      </tr>
+      <tr>
+        <td><a href="tools/tasks.html"><strong>Scheduled and watch tasks</strong></a></td>
+        <td>Cron and interval jobs, plus watches that poll a condition and fire the moment it becomes true.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/delegation.html"><strong>Sub-agent delegation</strong></a></td>
+        <td>Bounded sub-agents with read-only memory, for work that would otherwise flood the main conversation.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/node_offload.html"><strong>Node offload</strong></a></td>
+        <td>Background, critic, vision and coding work sent to other machines, sized to each node's measured throughput.</td>
+        <td><code>--worker-nodes</code> etc.</td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/workspace.html"><strong>Workspace continuity</strong></a></td>
+        <td>Watches your files, remembers how tasks turned out, and knows what it has already looked up.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="interfaces/voice_server.html"><strong>Voice</strong></a></td>
+        <td>Speech in and speech out, with transcription on a local audio model.</td>
+        <td>needs a node</td>
+      </tr>
+
+      <tr class="group"><td colspan="3">Privacy, safety and operations</td></tr>
+      <tr>
+        <td><a href="algorithms/mandatory_tor.html"><strong>Mandatory Tor egress</strong></a></td>
+        <td>A process-wide socket guard: any direct connection to a public address raises, and unreachable Tor means Ghost won't start.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="safety.html"><strong>Stylometric scrubbing</strong></a></td>
+        <td>Outbound search text is normalised toward neutral phrasing, so your writing style isn't itself a fingerprint.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/circuit_breaker.html"><strong>Circuit breaker</strong></a></td>
+        <td>Three consecutive failures takes a node out of rotation; it half-opens to probe after a cooldown.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="logging.html"><strong>Log redaction</strong></a></td>
+        <td>Secrets, onion addresses, home paths and personal details masked in both console and file logs.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/autonomous_activity.html"><strong>Activity ledger and liveness probes</strong></a></td>
+        <td>What it did while you were away, read from a real ledger — plus a probe per subsystem answering whether that subsystem actually fired.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="core/sessions.html"><strong>Durable sessions</strong></a></td>
+        <td>A conversation started in Slack carries on in the web UI; the history lives on the server, not the client.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+      <tr>
+        <td><a href="algorithms/selfhood.html"><strong>Self-model</strong></a></td>
+        <td>An autobiographical log and a functional mood derived from recent verdicts, context pressure and how long it's been idle.</td>
+        <td><span class="badge good">on</span></td>
+      </tr>
+
+      <tr class="group"><td colspan="3">Off by default — opt-in and experimental</td></tr>
+      <tr>
+        <td><a href="evolve/mutator.html"><strong>Scaffold evolution</strong></a></td>
+        <td>Proposes one evidence-backed change to its own scaffolding every few hours, behind a fence that forbids it editing its own judge.</td>
+        <td><span class="badge warn">opt-in</span> <code>GHOST_EVOLVE=1</code></td>
+      </tr>
+      <tr>
+        <td><a href="core/replay_engine.html"><strong>Counterfactual replay</strong></a></td>
+        <td>Re-runs a recorded episode from a fork point with one thing changed, to see whether the change would have helped.</td>
+        <td><span class="badge warn">opt-in</span> <code>GHOST_DREAM_REPLAY=1</code></td>
+      </tr>
+      <tr>
+        <td><a href="self-improvement.html"><strong>Test-time scaling</strong></a></td>
+        <td>On a borderline verdict, generates several candidate answers and picks the winner by comparing them against each other.</td>
+        <td><span class="badge warn">opt-in</span> <code>GHOST_TTS_ADAPTIVE_BON=1</code></td>
+      </tr>
+      <tr>
+        <td><a href="configuration.html"><strong>Push notifications</strong></a></td>
+        <td>Webhook, ntfy or iOS Web Push when something happens while you're away — public targets go out over Tor like everything else.</td>
+        <td><span class="badge warn">opt-in</span> <code>--notify-ntfy</code></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p class="caption">Anything not in this table is either a detail of something that is, or lives in the <a href="reference.html">deep reference</a> — a page per module, 115 of them.</p>
+
   <div class="note">
     <strong>New to the project?</strong> Read this page, then <a href="getting-started.html">Install and run it</a>, then <a href="how-it-works.html">One message, end to end</a>. That's about twenty minutes and covers everything you need to run Ghost day to day. The <a href="reference.html">deep reference</a> is there when you need to change the code.
   </div>
@@ -295,7 +629,7 @@
   </div>
 
   <footer>
-    <p>These pages are written from the source in <code>src/ghost_agent/</code> and <code>interface/</code>, and were last checked against it on <strong>2026-08-04</strong>.</p>
+    <p>These pages are written from the source in <code>src/ghost_agent/</code> and <code>interface/</code>, and were last checked against it on <strong>2026-08-04</strong>. The feature table above — including every entry in its <em>Default</em> column — was verified against the code on <strong>2026-08-26</strong>.</p>
     <p>Where a page says something the code contradicts, the code is right — please open an issue.</p>
   </footer>
 </main>

@@ -719,7 +719,11 @@ def parse_args():
                         help="enable the planning path (router-gated "
                              "decompose; consumes the planning.decompose "
                              "GEPA artifact)")
-    parser.add_argument("--upstream-url", default="http://127.0.0.1:8080")
+    # One home for the default (§4DF CRIT-1): 8080 is the TLS web
+    # console, not the LLM. Prod's launchd exec line passes the flag
+    # explicitly, so this only changes what a bare invocation gets.
+    from .core.llm import DEFAULT_UPSTREAM_URL as _DEF_UP
+    parser.add_argument("--upstream-url", default=_DEF_UP)
     parser.add_argument("--swarm-nodes", default=None, help="Comma-separated list of url|model nodes")
     parser.add_argument("--worker-nodes", default=None, help="Comma-separated list of url|model nodes for background/edge tasks")
     parser.add_argument("--visual-nodes", default=None, help="Comma-separated list of url|model nodes for vision models")

@@ -26338,6 +26338,219 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4DF — GEPA autonomy Phase 3: the loop launches its own optimizer runs (2026-08-26)
+
+**The design, before the first line of code (the §4DC/§4DE day-one discipline).** With §4DE live,
+a promotion deploys itself within ~a minute and the daily judge already watches what ships — so the
+missing piece is the middle of the loop: nobody LAUNCHES the gates. Phase 3 adds a third autonomy
+job, `run_optimizer`, that does exactly that and nothing else.
+
+**The insight that keeps this small: the §4DA-hardened gates ARE the decision-makers.** Every
+"should we run?" question — supply, corpus size, resolution, re-draw age, upstream health — is
+already a cheap pre-flight inside the gate that exits 2 in seconds without paying for the
+optimizer. So the orchestrator does NOT duplicate those checks ([[the-sibling-one-revision-behind]]:
+two implementations drift); it runs the gate on a schedule and consumes the exit contract.
+
+**Vocabulary before the first consumer** (§4DC's day-one rule): the two gate scripts today have NO
+run banner — and their exit 2 is the same triply-overloaded code (argparse bad-usage, CPython
+can't-open-file, COULD_NOT_MEASURE) the judges' banners were invented for. Worse, their
+action-bearing codes are marker-less: a crash after the banner exits 1, the same code as "measured
+and rejected" — and rejection is LOG-ONLY in this design, so a permanently crashing optimizer would
+read as "rejected weekly" forever, the exact judge-A1 impersonation one instrument over. So BEFORE
+the consumer exists: `gate_contract` grows `GATE_RUN_BANNER_GEPA/OTD` (printed immediately after
+argparse, before any I/O), `GATE_PROMOTED_MARKER_GEPA/OTD`, one shared `GATE_REJECTED_MARKER`
+(both gates' rejection lines already begin with the same words — lifted, not invented), and
+`GATE_NO_CANDIDATE_MARKER`; both scripts print THROUGH the constants; the consumer believes an
+exit code only with its marker (0 without PROMOTED, 1 without REJECTED, 3 without NO CANDIDATE =
+instrument failure, cause-keyed notify-once). `run_gepa`'s seed-veto rejection and no-candidate
+exits print to stderr only today — each gains its marker line on stdout, because the marker channel
+is stdout by contract.
+
+**The job.** Targets, round-robin by staleness: `tool_descriptions`
+(scripts/optimize_tool_descriptions.py, no args) then run_gepa per allow-listed signature
+(`planning.decompose`, `tool_selection.pick`, `reflection.critique`). At most ONE target attempted
+per day (`OPTIMIZER_INTERVAL_S = 86400`), each target at most once per
+`OPTIMIZER_TARGET_INTERVAL_S = 7d` — a politeness mirror of the gates' own re-draw guard, which
+remains the authority. State per target in the same `gepa_autonomy_state.json`. Exit consumption:
+0 PROMOTED → notify (the epoch swap will separately announce the deploy); 3 NO_CANDIDATE → notify
+once per condition (a broken reflection LM is news; weekly repeats are not); 1 REJECTED and
+2 COULD_NOT_MEASURE → log-only (the system working as designed; the artifact record is on disk);
+undeclared/marker-less/spawn failures → cause-keyed notify-once. Preflight: the shared disk floor
+PLUS a RAM floor via psutil, fail-closed (`replay_engine`'s rule: a preflight that cannot read a
+precondition reports that, never clears the launch) — this IS a >10-minute unattended run (§4U),
+`MIN_RAM_FREE_MB = 1500`. Timeouts: 6h inner subprocess, outer `wait_for` +10min. Idle gating at
+the tick: DEEP idle only (`idle > bio_scaled(3600)`) — an hours-long sequential main-slot run
+should START in the quietest window; it tolerates traffic arriving mid-run (llama-server queues;
+each replay is seconds). Kill switches: `GHOST_GEPA_AUTONOMY` (master, existing) +
+`GHOST_GEPA_AUTO_OPTIMIZE` (default ON per the operator's stated goal; =0 disables just this job).
+Liveness: the `gepa.autonomy` probe grows the third job, bounded at 3×7d — the job legitimately
+attempts one target/day and deep idle can be scarce, so a 3×1d bound would false-alarm on a busy
+week.
+
+**What Phase 3 will NEVER do:** pass `--allow-*`, `--force-supply`, `--no-ab-gate`, or touch
+`--min-promotion-age-days` (operator-only overrides — the §4DA lesson that the one flag bypassing
+the gate carried its own bypass); run `scripts/optimize_verifier.py` (outside the contract by
+operator decision, pinned perimeter); retry a failed run same-day (the state cadence IS the retry
+policy).
+
+**SHIPPED (same day).** `gate_contract` grew the gate banners/markers plus
+`TOOL_FIXTURES_BASENAME`; both gate scripts print through the constants (run_gepa's seed-veto and
+no-candidate paths gained their stdout marker lines); `optim/autonomy.py` grew
+`run_optimizer` + `auto_optimize_enabled` + `_optimizer_preflight` (disk floor shared, RAM floor
+psutil fail-closed) + `_pick_target`; the tick grew the deep-idle phase (own anchor
+`_last_gepa_optimizer_at`, `now`-not-min, outer watchdog `OPTIMIZER_TIMEOUT_S + 600`, to_thread);
+the `gepa.autonomy` probe watches the third job at 3×7d. Docs: `configuration.html`
+(GHOST_GEPA_AUTO_OPTIMIZE row), `self_improvement.md` §4DF, `self-improvement.html`. Tests:
+`tests/test_gepa_autonomy_phase3.py` (41) — exit table, marker gating (crash-as-0/1/3, cross-wired
+markers), cadence (one/day, 7d/target, staleness robin, clock jump, hand-edited state), no
+override flags ever, verifier perimeter, kill switches, preflight stand-downs, markers-one-home,
+REAL subprocess refusals both gates, tick wiring (deep-idle only, cooldown, fresh-boot quiet, both
+kill switches, raising job contained, off-loop thread), probe. The real-subprocess pin found the
+first defect before review did: the launcher spawned the real otd gate with NO argv — `--fixtures`
+is argparse-required, exit 2 BEFORE the banner, every launch an instrument failure. Fix: the argv
+is built from the one shared basename the miner's default output also uses (both pinned).
+Battery: 15/15 mutants killed after driving the one survivor (M9: never-attempted demoted to
+fallback — the distinguishing world is MIXED state, a stale-eligible target declared EARLIER than
+a never-attempted one; a new target added mid-life must not wait behind the stale rotation),
+CONTROL survived. Full suite 17,523 passed / 17 skipped. Post-ship self-review caught a placement
+hazard before the reviewers did: the phase originally sat ABOVE self-play, so after an hours-long
+await every later phase would have run on hours-stale idle_secs/foreground state — self-play
+launching into live traffic. The block now sits LAST in the tick (only the idle-cycle summary
+below it), which also keeps every other idle phase off the inference slot while the optimizer
+owns it — serialized ticks as the §4U politeness. Placement pinned structurally (42 tests).
+Fresh-eyes rounds follow.
+
+### Round 1 — the fix and the bug agree in exactly one region, again
+
+The fresh-eyes reviewer's verdict: NOT converged, one CRIT. **CRIT-1**: `scripts/run_gepa.py`'s
+argparse default was `http://127.0.0.1:8080` — the TLS web console, not the LLM (llama-server is
+8088) — and the launcher's deliberately-minimal argv (correctly no overrides: the FIX) made the
+wrong default load-bearing (the BUG) for 3 of its 4 targets: every autonomous run_gepa launch
+would have burned its run against a TLS port and terminated wearing a benign code (exit 3
+"broken reflection LM" — ironically accurate — or crash-as-1 or evidence-bar 2), silently dead
+forever after one notification. The upstream URL had FOUR homes (8080 ×2, 8088 ×2 — the §4DA
+shape-1 defect on a value instead of a string). Fixed: `core.llm.DEFAULT_UPSTREAM_URL` is the one
+home; all four sites import it; and run_gepa gained the upstream pre-flight it never had — a
+1-token ping through the SAME client the run uses (not a side-channel HTTP probe: it must fail
+exactly like the run would, and the in-process harnesses' client stubs answer it transparently),
+refusing exit-2 BEFORE the optimizer. Pinned: conformance one-home test + an executed
+dead-upstream drive asserting `seen["run_gepa"] == 0`. **MAJOR-2**: the OTD gate printed verdict
+markers and THEN decided the exit — an underpowered/seed-undecidable run carried "A/B gate
+REJECTED" beside exit 2, right after §4DF made that string load-bearing. The tail now computes the
+code first and each marker prints only on the exit that claims it (the conformance literal-scan
+refuses a Name in a return, so the guard order is deliberately stated twice, one statement
+apart); exit 2 prints "A/B gate ABORTED: <causes>". Driven through the round-17 seed-outage
+world. **MAJOR-4**: OTD promoted per-component, so an OSError on component N (backup/staging,
+ENOSPC) left 1..N-1 LIVE while the launcher notified "nothing was believed or acted on" — a false
+claim about a deploying promotion, with every record naming a `co_promoted` set that never fully
+promoted. Now stage-all-then-swap-all (every failure-prone write before the first rename; abort
+unlinks staged siblings), and the consumer notices a PROMOTED marker beside a non-zero exit as
+its own cause ("partial-promotion") whose notification says components ARE live. Driven: forced
+ENOSPC on the second backup leaves both incumbents byte-identical and no staging debris.
+**MAJOR-3**: five §4DF-surface mutants survived every suite — the marker "one home" pins were
+token pins. All five now have executed distinguishing worlds: MUT-A oldest-first needs TWO
+eligible stale targets (the existing test had one — a verification that cannot distinguish);
+MUT-B the outer watchdog value had no pin (the sibling's scaling bound did — one revision
+behind); MUT-C a stand-down must not consume the target's 7d window; MUT-D the seed-veto stdout
+marker, executed through the reaudit harness's real rc==1 veto (the source-level pin was
+satisfied by the OTHER print sites); MUT-G two consecutive promotions must BOTH notify
+(`_notify_once` would swallow the second deploy). The conformance suite grew the §4DF constants
+it had missed (the sibling one revision behind, on the mechanism §4DA built to prevent exactly
+that). MINs: probe stand-down notes now name the preflight instead of suggesting "kill switch?"
+(both suggested causes were excluded by the state it had just read); NaN stamps coerce to "never"
+at every level (a hand-edited NaN parked the job or silently starved one target forever, and the
+probe printed "nand ago"); every gepa target pinned ⊆ SIGNATURES (a registry rename = argparse
+exit 2 before the banner = one notification then a dead target). Accepted + documented, not
+fixed: the RSS watchdog and epoch swap pause for the length of the optimizer await (the
+serialized tick IS the §4U politeness; a hand retirement during a 6h run deploys late), the
+orphaned-outer-timeout stale state write (the `_save_state` last-writer-wins class, window
+widened), tick-vs-liveness default-home divergence (latent; GHOST_HOME is set in prod). Docs:
+five stale `--upstream-url 8080` examples retired across installation/getting-started/
+cli_reference/configuration/metacognition/self_improvement. Fix battery: 14/14 killed, CONTROL
+survived. Full suite **17,545 passed / 17 skipped** (+22).
+
+### Round 2 — every finding inside a round-1 fix, each reproducing the law its fix cited
+
+The second fresh-eyes round attacked the round-1 diff (16 mutants, CONTROL survived, 5 survived)
+and the recorded law held again. **MAJOR-3 (live)**: the round-1 probe-wording fix checked
+`stood_down` BEFORE staleness, so a job whose last act was a stand-down could never raise
+SCHEDULE STOPPED — the 100-day-stopped and 5-minute-fresh worlds produced byte-identical notes,
+each asserting "the tick reaches the phase" in the present tense about a state file 100 days old
+(MIN-5's own defect class, reintroduced by MIN-5's fix). Now staleness outranks the label; a
+stale row says its last act was a stand-down; both worlds pinned distinguishable. **MAJOR-1 (pin
+gap, MB7)**: deleting the OTD PROMOTED print survived 405 tests — the one-home checks are token
+scans and every consumer test drives a stub, so every genuine autonomous promotion would be
+notified "not a promotion" while the epoch swap deploys it. [[token-pins-vs-executed-pins]]
+reproduced INSIDE the fix that cited it: round 1 executed exactly this lesson for run_gepa's
+seed-veto marker and left the sibling marker token-pinned. Now a real 2-component promotion is
+driven to rc==0 and the marker read off captured stdout, per component. **MAJOR-2 (pin gap,
+MB5+MB6)**: the verdict order is stated twice by conformance-scan necessity, the comment claimed
+the scan "forces" agreement, and BOTH divergence directions survived — every tested no-candidate
+world had underpowered=False, [[verify-cannot-distinguish]] verbatim. The combined world
+(seed-returned-verbatim AND transport gutting usable below the bar: `mutate=False, transport=15`)
+pins rc==3 with the NO CANDIDATE marker and no ABORTED line — one drive kills both mutants.
+**MINs, all fixed+pinned**: the partial-promotion arm rode `_notify_once` (MUT-G's law applied to
+the clean arm only — the sibling inside the same fix), now notifies directly, two consecutive
+partial deploys = 2 notifications; `TimeoutExpired.stdout` was discarded, so a timeout kill after
+PROMOTED lines read "nothing was acted on" — the child's output is now harvested and the marker
+found there files as partial-promotion (executed); the ping's `choices` guard was load-bearing
+(the real client answers a 200-with-error-JSON as a choices-less dict — driven through the
+harness) and unpinned, as was the 30s bound (MUT-B's lesson missing on the fix's own new value —
+both pinned); the placement pin enumerated 6 phases and went blind to new ones — it now scans
+every `_idle_ran.append` ([[mark-it-where-you-catch-it]]); two env-fallback restatements of 8088
+(`recheck_gepa_incumbent`, `mine_failure_envs`) moved onto `DEFAULT_UPSTREAM_URL` and into the
+conformance pin; the ping refusal now says "pass the bare server root, not a /v1 path".
+**Accepted, documented, not fixed**: an exit-2 ABORTED run still writes `.candidate.rejected`
+records — round 17's pin REQUIRES the record (it carries `seed_arm.undecidable`, and
+`discordant_pairs`/`p_value` expose the underpowered case), so the disk channel is
+reader-distinguishable even though it lacks an explicit abort flag; the cold-start false refusal
+(a 503-loading upstream refuses in ~2s and the target waits its 7d window) — rare
+operator-restart exposure, and NOT stamping refusals would let a permanently-refusing target
+starve the rotation, which is worse; the OTD gate has no 1-token ping (its outage sentinel aborts
+after one bounded replay pass — the configuration.html claim now says so); a SIGKILL's
+block-buffered stdout loss stays inside the documented crash-between-renames residual. Fix
+battery: 9/9 killed (the five reviewer survivors MB1/MB2/MB5/MB6/MB7 + four new-fix mutants),
+CONTROL survived — the reviewer's own stated convergence procedure, executed. Full suite
+**17,553 passed / 17 skipped** (+8).
+
+### Round 3 — the diff was clean; the law fired one file-scroll away. CONVERGED.
+
+The final bounded round attacked only the round-2 diff: all six regions came back clean under
+executed attack (125-world probe grid, 17 driven notify sequences, --help/refusal runs of the
+re-wired scripts, five mutants against the new pins each killed by exactly the intended pin). The
+one remaining MAJOR was precisely where the law points: the round-2 timeout-harvest fix was
+applied to ONE of THREE identical exception handlers in the same file — and the unharvested
+sibling belonged to the only child that ACTS. A 600s timeout kill landing after
+`gepa_live_check --revert`'s rename left the retirement ON DISK (the §4DE swap deploys it within
+~a minute) while the judge's notification said "no action taken" — MAJOR-4's false claim,
+through the timeout door, one sibling over ([[the-sibling-one-revision-behind]], executed:
+both worlds produced identical headlines). Fixed: the judge's handler harvests
+`TimeoutExpired.stdout` and a banner+marker pair restores `rc = NO_LONGER_WINS`, so the normal
+branch notifies the retirement under its real `retired:{sha}` key (the pre-run `_art_sha` is the
+pre-retirement artifact's — correct); the supply watch's handler (third sibling) harvests too,
+naming a kill-after-completed-mine `timeout-after-complete` (distinct cause → a later different
+failure re-notifies; the pool on disk is authoritative and nothing is acted on). The banner
+requirement now holds across every harvest (a marker without proof the script started is
+believed nowhere — pinned for optimizer and judge both). MIN-2: the round-2 conformance rows
+were re-mutable token scans (a dead-expression token beside a rewired default survived 113
+tests) — a new executed pin runs each of the four scripts' main() to its parser and asserts
+`get_default(...) == DEFAULT_UPSTREAM_URL`. MIN-4: the partial headline no longer claims an
+exit that never happened ("non-zero exit, or killed at the deadline"). Round-3 battery: 5/5
+killed (judge harvest, supply cause, both banner-requirements, dead-token rewire),
+docstring-only CONTROL survived at the exact 118 baseline. Full suite **17,558 passed /
+17 skipped** (+5). Known-accepted residuals stand as documented in rounds 1-3 (SIGKILL
+buffered-stdout loss inside the crash-between-renames window; FIRED-with-stopped-sibling probe
+semantics predating this section; cold-start 503 refusal consuming one 7d target window).
+
+**§4DF CONVERGED — three rounds, 1 CRIT + 6 MAJORs (3 live, 3 pin-gaps), 28 fix-battery
+mutants all killed, 73 pins in `test_gepa_epoch_swap`-style discipline across
+`test_gepa_autonomy_phase3.py` (70) and the conformance suite. The §4DC roadmap is now
+complete end to end: supply watch (Phase 0) → optimizer launcher (§4DF) → gates → epoch-swap
+deploy (§4DE) → daily judge → autonomous revert (Phase 1), no operator in the loop. ⚠ One
+operator action remains: the running agent predates today's §4DE+§4DF code — a restart
+activates the epoch-pinned loader and the launcher (artifact deploys are restart-free only
+AFTER that).**
+
 ## §4DE — GEPA autonomy Phase 2: the epoch-pinned loader (2026-08-26)
 
 **The design, before the first line of code — because the obvious design is wrong.** Phase 2's brief
@@ -26401,6 +26614,96 @@ dropped, an unpinned old one always is; (4) the negative cache never outlives it
 (5) req-id-less reads always see the current generation; (6) the registry's name-set and the
 loader's generation move together. Plus the §4DA-grade batteries and the land/verify split — the
 peer session verifies.
+
+### SHIPPED (2026-08-26, same day)
+
+The loader now holds numbered immutable generations (`_Epoch`: gen, directory stamp, present-only
+cache, shas, pin count). `tuned_instruction`'s entire lazy disk-load block moved into `_snapshot` —
+the request hot path never touches the filesystem, and an epoch's content is bound at snapshot time
+so two signatures read across an unnoticed disk change can never serve two eras under one generation
+id. Pinning: `_epoch_for_request` pins on first touch (bounded `_PINNED` table, ring-eviction and
+`forget_request` both release; unpinned non-current generations die immediately). `artifact_text` and
+the registry's `_tuned_desc_names`/`_optim_loader_artifact_text` all carry the req_id so the
+withheld-side sums, the name-set gate and the renders describe ONE era per request — the round-16
+last-call-wins shape, closed through time as well as through call sites. The registry name-set (the
+"second cache `clear_cache()` never touched") is generation-keyed and derives from the loader's
+epoch: one home. Provenance warnings moved to snapshot time, keyed (artifact, sha) — a re-promoted
+artifact re-warns, and the old per-process promise is gone. The tick hook sits ABOVE the
+memory-system guard and the idle gates (a degraded boot or a busy box must not stall a retirement's
+deploy), notifies `severity="notify"` with each signature's old→new sha, and boot / no-change /
+identical-rewrite are not news. The stale "deploy = restart" contract was retired in SIX places:
+loader `clear_cache`, the registry KV-contract comment, `_reset_tool_desc_cache`, `gepa_live_check`'s
+two operator blocks, the autonomy retirement notification, and three docs pages.
+
+21 world-space tests over {swap timing} × {promote / re-promote / retire} × {pinned request / second
+request / req-id-less}, asserting the seven invariants (one generation per request; own worlds across
+a straddle; pin lifecycle incl. eviction; negative cache dies with its generation; req-id-less reads
+current; registry moves with the generation; the swap summary tells the truth — boot, no-change and
+identical-rewrite are quiet). Battery: **15 of 15 real mutants killed** after one round (the survivor
+was snapshot validation weakened to accept a non-string `optimized_instruction` — load-bearing twice,
+since `gepa_live_check` matches the loader "EXACTLY" on that rule to derive the era sha; pinned with
+five malformed shapes plus a corrupt-file-doesn't-take-down-the-epoch pin), docstring CONTROL
+survived. Handed to the peer session for the fresh-eyes verification pass.
+
+### Round 1 — four executed MAJORs, every one in the fix's own agree region
+
+The fresh-eyes reviewer drove all four end-to-end. **MAJOR-1**: `_dir_stamp`'s string sentinel could
+not survive `_snapshot`'s 3-tuple unpack — a retirement rename racing the glob crashed "Never raises"
+`tuned_instruction` out of a request — while being UNREACHABLE for the unmount it was written for
+(glob over a missing dir returns [] silently), so "an unmounted GHOST_HOME is a visible epoch change"
+was exactly backwards: the unmount WAS a silent mass retirement. Now: `None` = cannot-read (the swap
+HOLDS the current epoch and warns), `()` = genuinely empty; one stat per file (the old double-stat
+cost 3x and permitted a torn mtime/size pair); a file vanishing mid-glob is skipped and noticed one
+tick later. **MAJOR-2**: `clear_cache` reset the generation counter, and the reborn gen 1 collided
+with the registry's generation-keyed name-set — which then served the pre-clear names FOREVER while
+`maybe_advance_epoch` saw no disk change: the "second cache" defect resurrected through the fix's own
+key. `_NEXT_GEN` is monotonic for the life of the process now. **MAJOR-3**: the request-id
+contextvar's DEFAULT is the truthy string "SYSTEM", so the boot warmup pinned the boot generation
+forever (nothing calls `forget_request("SYSTEM")`) and later out-of-request builds were served the
+RETIRED era. "" and "SYSTEM" are `_UNPINNED_IDS` now. **MAJOR-4**: the provenance warn-once key
+`(sig, sha)` was consumed by a GATED artifact, silencing the "no A/B measured it" warning for a later
+UNGATED promotion of the same text — and made the suite order-dependent (the landed "17468 passed"
+was alphabetical-order luck). The key carries the gate state now, and `clear_cache` clears the set.
+
+Also from the round: five more stale "deploy = restart" claims (autonomy's own module docstring
+contradicting its own line 443, `optimize_tool_descriptions.py`'s header, two `self_improvement.md`
+sites, one HTML paragraph) — the sweep that claimed "retired everywhere" had itself missed a
+seventh place, per the pattern; pin eviction is LRU (FIFO's victim at the cap was precisely the
+longest-lived in-flight request); and the >128-concurrent-pins era-mix bound is documented against
+the ring's 64 cap (stamps are LOST before they can MIX). Battery over the fixes: 10 of 10 killed
+after driving the two survivors' exact worlds (the re-pin fallback needed the orphan planted
+directly — clear_cache empties `_PINNED` too, so the "obvious" sequence never entered the branch;
+LRU needed a touched-mid-flood pin), CONTROL survived.
+
+### Round 2 — no code defects; the property rested on luck, not pins. CONVERGED.
+
+The second fresh-eyes round (18 mutants, CONTROL survived, 5 survivor worlds all driven) found
+**zero code defects** — and refused convergence anyway, correctly: two load-bearing guards and two
+round-1 fix components were deletable with all 31 tests green. By [[pin-must-fail-somewhere]] that
+is documentation, not verification. The bounded final round, all executed: **F1** — deleting
+`_release_gen`'s `ep is not _CURRENT_EPOCH` guard survived the suite while its world is the
+section's core invariant failing (b1 pins current and ends → mutant deletes the CURRENT epoch →
+b2 pins it → promotion swaps → b2's vanished-gen fallback re-pins current: turn 1 = ERA A,
+turn 2 = ERA B, stamp says B). Pinned by driving exactly that sequence. **F2** — `(stamp or ())`
+was the only thing between a fresh home (no `system/optim` at all → stamp None) and "Never raises"
+`tuned_instruction` raising TypeError at boot; no test had ever booted with the dir ABSENT.
+**F4** — `clear_cache` clearing `_WARNED_PROVENANCE` (MAJOR-4's order-dependence half) had no pin;
+removing it re-armed the cross-test leakage the fix closed. Pinned: two cache lives → two warnings.
+**F5a** — the hold-warning guard's `if True:` mutant survived because only the never-warn direction
+was pinned; now an EMPTY held epoch (fresh boot, no dir) is pinned quiet. All four named mutants
+re-run and killed (F1: 1 failed; F2: 2 failed; F4: 1 failed; F5: 1 failed). Deliberately NOT
+changed: the dead `stamp is not None` conjunct stays (defensive restatement, harmless) and the
+~1/min HOLDING warn stays loud (an unmounted GHOST_HOME **is** an emergency; deduping it trades
+operator visibility for log aesthetics). Also retired the round's three residual "deploy = restart"
+claims — the `self_improvement.md` operator blockquote (which still instructed
+`sudo launchctl kickstart`), the §4DC Phase-1 paragraph, and `test_4da_round8_fixes.py`'s class
+docstring, which now states the true §4DE hazard window (~a minute, or the full corpus age when
+the tick is dead). That is the **eighth and ninth** stale restart site after two sweeps each
+claiming completeness — [[restated-is-not-checked]] in its purest form. Two accepted-and-documented
+era-mix channels remain, both operator-triggered or overload-only: `clear_cache()` mid-request, and
+the >64/128 pin-cap flood where stamps are lost before they can mix. Full suite:
+**17,482 passed / 17 skipped** (+4 pins, exact). **§4DE CONVERGED** — two rounds, four executed
+MAJORs, four guard pins, 35 tests in `test_gepa_epoch_swap.py`, every kill verified.
 
 ## §4DD — Boot-race sandbox death, and the lazy re-init (2026-08-26)
 

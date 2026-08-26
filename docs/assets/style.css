@@ -393,6 +393,23 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.018); }
    split across two lines is unreadable, and it also lets the column collapse. */
 td code { font-size: 0.82em; white-space: nowrap; }
 
+/* Category header row inside a long table. The landing page's feature index
+   runs past thirty rows: a repeated category column would be noise, and with
+   no grouping at all the reader loses the thread halfway down. */
+tbody tr.group td {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--ember);
+  border-bottom: 1px solid var(--line);
+  padding-top: 1.6rem;
+  padding-bottom: 0.5rem;
+}
+tbody tr.group:first-child td { padding-top: 0.2rem; }
+tbody tr.group:hover td { background: none; }
+
 /* Wrap a wide table in this so the page never scrolls sideways. */
 .scroll { overflow-x: auto; margin: 1.3rem 0 1.7rem; }
 .scroll table { margin: 0; }

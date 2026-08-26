@@ -138,6 +138,35 @@ MINER_DONE_MARKER = "mine complete:"
 # colon, the shape-1 defect this module exists to close.
 JUDGE_RUN_BANNER = "gepa_live_check: judging"
 MINER_RUN_BANNER = "mine_tool_fixtures: mining"
+# ─── §4DF: the GATES join the banner/marker discipline ───────────────
+# The two gate scripts had NO banner — their exit 2 is the same triply-
+# overloaded code the judges' banners were invented for — and their
+# action-bearing codes were marker-less: a crash AFTER the banner exits
+# 1, the same code as "measured and rejected", and rejection is LOG-ONLY
+# for the autonomous launcher, so a permanently crashing optimizer would
+# read as "rejected weekly" forever (the judge-A1 impersonation, one
+# instrument over). Exit 0 without its PROMOTED marker, 1 without
+# REJECTED, 3 without NO CANDIDATE: instrument failure, nothing believed.
+# The marker channel is STDOUT — `run_gepa`'s seed-veto rejection and
+# no-candidate paths printed only to stderr and each now also prints its
+# marker line to stdout through these constants.
+GATE_RUN_BANNER_GEPA = "run_gepa: gating"
+GATE_RUN_BANNER_OTD = "optimize_tool_descriptions: gating"
+#: run_gepa's promote line has always started with this; the otd gate
+#: prints one "PROMOTED <path>" line per shipped component. Lifted from
+#: the scripts' existing output, not invented — the consumer keys on
+#: what the operator already reads.
+GATE_PROMOTED_MARKER_GEPA = "A/B gate PASSED — candidate promoted"
+GATE_PROMOTED_MARKER_OTD = "PROMOTED "
+#: Both gates' rejection lines already began with the same three words.
+GATE_REJECTED_MARKER = "A/B gate REJECTED"
+GATE_NO_CANDIDATE_MARKER = "NO CANDIDATE"
+#: The miner's output file IS the tool-description gate's `--fixtures`
+#: input. Stated once: the §4DF launcher builds the gate's argv from
+#: this, and a restated basename is how the launcher would one day mine
+#: to one file and gate on another (`.jsonl`, deliberately — a `*.json`
+#: under `system/optim/` reads as a live artifact).
+TOOL_FIXTURES_BASENAME = "tool_choice_fixtures.jsonl"
 assert GateExit.COULD_NOT_MEASURE == JudgeExit.COULD_NOT_MEASURE == \
     COULD_NOT_MEASURE
 

@@ -104,6 +104,11 @@ def _drive(argv, *, gepa_result, comparison=None, chat=None):
 
         async def chat_completion(self, payload):
             text = chat(payload) if chat else "x"
+            # A dict is a FULL response (so a test can hand back the
+            # real client's 200-with-error-JSON shape — a dict WITHOUT
+            # "choices"); anything else wraps as content.
+            if isinstance(text, dict):
+                return text
             return {"choices": [{"message": {"content": text}}]}
 
     og.run_gepa, oa.compare_prompts, ol.LLMClient = _rg, _cp, _LLM

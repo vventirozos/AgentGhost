@@ -224,9 +224,11 @@ mechanisms enforce this, all live before the first real GEPA run:
   this exact loop was once write-only, and the field's 2026 finding is
   that harness components failing to *fire* (not bad content) is the
   dominant failure mode. Counters survive `clear_cache()` by design.
-  Operational rule: **never call `clear_cache()` on a live process** —
-  a mid-session prompt reload shifts the KV stable-prefix pin; retrain
-  offline, deploy via restart.
+  Operational rule (updated by §4DE): deploy is the **epoch swap** — the
+  biological tick notices a changed `system/optim` within ~a minute and
+  serves the new generation, with in-flight requests pinned to their old
+  one. `clear_cache()` is for tests; on a live process it is merely
+  wasteful (one extra KV re-prime), no longer forbidden.
 
 Tests: `tests/test_optim_eval_hygiene.py` (split stability under corpus
 growth, cross-signature tier consistency, clamp-before-optimize, counter
@@ -433,6 +435,27 @@ turn-shaped and one-sided: over 200 turns with an artifact neutral **by
 construction**, `KEEP p=0.8020` became `REVERT p=0.0001`. Both refusal points now
 ask what the withheld arm *would* have rendered and prune symmetrically.
 
+**§4DE — Phase 2: the epoch-pinned loader.** Deploy is no longer a restart.
+The loader holds numbered, immutable generations — eager snapshots of
+`system/optim/*.json` — and a request PINS the current generation at its
+first loader touch: every later read for that req_id (later turns' planner
+calls, the registry's withheld-side sums, a post-`create_skill` re-resolve)
+serves from the pinned epoch, so no request can straddle two eras however
+many swaps land mid-flight. The swap check rides the biological tick (one
+directory-shape stat per minute — sorted name/mtime/size, the only cheap
+check that sees added AND removed files) and runs ABOVE the idle gates,
+because pinning makes quiescence unnecessary — which matters, since
+quiescence is unattainable here anyway (background agents and the async
+verifier read the loader with the foreground counters at zero). A swap is
+the DEPLOY event: it announces each signature's old→new sha on the operator
+stream and the notification ledger (severity=notify), and costs one KV
+prefix re-prime. Promotions and retirements now go live within ~a minute;
+the registry's tool-name set is generation-keyed so it can never disagree
+with the content; req-id-less readers (verifier, reflection, warmup) read
+the current generation and stamp nothing. The old "NEVER call clear_cache
+on a live agent / deploy = restart" contract is retired everywhere it was
+stated.
+
 **§4DC — the first autonomous GEPA actors (Phase 0+1).** The goal is a
 fully autonomous mine→optimize→gate→promote→judge→revert loop; the §4DA
 hardening was the prerequisite, because an autonomous caller acts on exit
@@ -441,13 +464,39 @@ once when the miner's gate flips parked→ready. Phase 1 (live judge) runs
 `gepa_live_check --revert` daily over every live artifact and acts only on
 the declared contract: KEEP/could-not-measure are log-only, a REVERT retires
 the artifact (the one autonomous action — it can only undo GEPA's own work)
-and notifies that a restart is still the operator's, an undeclared code is an
+and notifies; the §4DE epoch swap then deploys the retirement live within
+~a minute, no restart. An undeclared code is an
 instrument failure that acts on nothing. Cadence is wall-clock and persisted
 (`system/gepa_autonomy_state.json`), notifications fire on transitions
 with re-arming, and two kill switches exist: `GHOST_GEPA_AUTONOMY=0` (master)
-and `GHOST_GEPA_AUTO_REVERT=0` (judge becomes report-only). Phases 2-4
-(loader hot-reload to remove the root-restart dependency, autonomous
-optimizer runs, closing the loop) are journaled in §4DC.
+and `GHOST_GEPA_AUTO_REVERT=0` (judge becomes report-only). Phase 2 shipped
+as the §4DE epoch-pinned loader (above); the roadmap is journaled in §4DC.
+
+**§4DF — Phase 3: the loop launches its own optimizer runs.** A third
+autonomy job, `run_optimizer`, runs ONE gate script per day in deep idle
+(> 1h), round-robin by staleness over `tool_descriptions`
+(`optimize_tool_descriptions.py`) and `run_gepa --signature X` for the
+allow-listed signatures (`planning.decompose`, `tool_selection.pick`,
+`reflection.critique`), each target at most once per 7 days. The gates ARE
+the decision-makers — supply, corpus size, resolution, re-draw age and
+upstream health are pre-flights INSIDE the gate that exit 2 in seconds —
+so the launcher duplicates none of them, and never passes `--allow-*`,
+`--force-supply` or `--no-ab-gate` (operator-only), and never runs
+`optimize_verifier.py` (outside the contract, pinned perimeter). Both gate
+scripts joined the banner/marker discipline: a run banner printed before
+any I/O, plus PROMOTED / REJECTED / NO CANDIDATE markers on stdout, all
+single-homed in `gate_contract` — an exit code arriving without its marker
+is an instrument failure, believed and acted on by nothing. Consumption:
+0 PROMOTED notifies (the §4DE swap separately announces the deploy);
+3 NO CANDIDATE notifies once per condition (a broken reflection LM);
+1 REJECTED and 2 COULD-NOT-MEASURE are log-only (the system working as
+designed). Preflight adds a 1500MB RAM floor (psutil, fail-closed) to the
+shared 512MB disk floor — this is a §4U >10-minute unattended run — with a
+6h inner subprocess watchdog. Kill switch: `GHOST_GEPA_AUTO_OPTIMIZE=0`
+disables just this job. The `gepa.autonomy` liveness probe bounds the
+job's persisted clock at 3× the 7d target interval (a daily bound would
+false-alarm on any busy week, since the job stamps `nothing_due` days
+too).
 
 **Post-redesign round 2 closed §4DA.** The final pass mutation-tested round
 1's own diff and found `run_gepa` promoting BEFORE validating (a schema
@@ -737,13 +786,14 @@ shown to operators who had already registered it.
 measurably losing artifact by renaming it `…​.retired-live-<UTC>` — the same
 move §4CW made by hand.
 
-> ⚠ **The rename does not stop the running agent.** `optim/loader.py` caches
-> the artifact text per process and its `clear_cache()` must not be called on
-> a live agent, so retirement takes effect only on the next restart
-> (`sudo launchctl kickstart -k system/com.local.ghost-agent`). Until then
-> every planner turn keeps using the retired artifact and `activation_stats`
-> keeps counting it as applied. The script prints this; do not read
-> `RETIRED ON DISK` as "no longer serving".
+> **The rename deploys itself (§4DE).** The biological tick's epoch swap
+> notices the changed `system/optim/` directory shape within ~a minute and
+> snapshots a new generation without the retired artifact — no restart.
+> In-flight requests stay pinned to the generation they started on (one era
+> per request), so a request mid-turn at retirement time finishes on the
+> retired text by design; every request that starts after the swap serves
+> the baseline. If the swap line never appears in the log, the tick is dead —
+> check the `gepa.autonomy` liveness probe rather than restarting on reflex.
 
 `--revert` acts **only** on a `REVERT` verdict, so the flag cannot override the
 refusal to conclude. Retiring removes a *prefix*: the read site prepends the
@@ -1300,9 +1350,9 @@ of the loop exist; the GEPA run itself waits for fixture supply
   process (and ONLY under an explicit `GHOST_HOME` — the loader's
   `~/ghost_llamacpp` fallback is never scanned, which also keeps
   GHOST_HOME-less test runs from baking a live operator's artifacts
-  into the process) and content is loader-cached — warmup and every
-  request render identical bytes; deploy = restart, never a live
-  cache reset. Copy-on-write: the shared `TOOL_DEFINITIONS` dicts are
+  into the process) and content comes from the loader's epoch (§4DE) —
+  every request renders one generation's bytes, and deploy is the epoch
+  swap (~a minute after promotion), no restart. Copy-on-write: the shared `TOOL_DEFINITIONS` dicts are
   never mutated, and the no-artifact path returns the assembled list
   untouched.
 
@@ -2090,7 +2140,7 @@ CLI:
 ```bash
 # Production: load a previously-trained checkpoint at startup.
 python -m src.ghost_agent.main \
-    --upstream-url "http://127.0.0.1:8080" \
+    --upstream-url "http://127.0.0.1:8088" \
     --prm-model "$GHOST_HOME/system/prm/checkpoint.json"
 
 # Bootstrap: ⚠ THIS RECIPE DOES NOT WORK AS WRITTEN (corrected §4BN).
@@ -2173,16 +2223,16 @@ CLI:
 # --no-frontier-selfplay A/B is a no-op against the real default.
 
 # Frontier weighting ON (it is OFF by default) with 20% sanity floor:
-python -m src.ghost_agent.main --upstream-url "http://127.0.0.1:8080" \
+python -m src.ghost_agent.main --upstream-url "http://127.0.0.1:8088" \
     --frontier-selfplay
 
 # A/B comparison — the DEFAULT, legacy brittle-pool pick:
 python -m src.ghost_agent.main \
-    --upstream-url "http://127.0.0.1:8080"
+    --upstream-url "http://127.0.0.1:8088"
 
 # Aggressive — drop sanity floor to 5% if the PRM is well-trained:
 python -m src.ghost_agent.main \
-    --upstream-url "http://127.0.0.1:8080" \
+    --upstream-url "http://127.0.0.1:8088" \
     --frontier-uniform-sample-prob 0.05
 ```
 

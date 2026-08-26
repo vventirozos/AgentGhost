@@ -5481,6 +5481,37 @@ class GhostAgent:
         except Exception:      # noqa: BLE001 — never break the tick
             pass
 
+        # ── §4DE: the epoch swap — GEPA autonomy's DEPLOY event ──
+        # Above the memory_system guard and the foreground lock ON
+        # PURPOSE: pinning makes the swap safe at any time (in-flight
+        # requests keep their generation), and a degraded boot or a
+        # busy box must not stall a retirement's deploy indefinitely.
+        # One directory stat per tick; the snapshot itself only runs on
+        # an actual change (a promotion or retirement — weeks apart).
+        try:
+            from ..optim import loader as _ep_loader
+            _ep_changes = _ep_loader.maybe_advance_epoch()
+            if _ep_changes:
+                _parts = []
+                for _sig, (_o, _n) in sorted(_ep_changes.items()):
+                    if _o and _n:
+                        _parts.append(f"{_sig}: {_o} -> {_n}")
+                    elif _n:
+                        _parts.append(f"{_sig}: PROMOTED ({_n})")
+                    else:
+                        _parts.append(f"{_sig}: RETIRED (was {_o})")
+                _ep_line = ("epoch swap — now serving: "
+                            + "; ".join(_parts)
+                            + ". In-flight requests finish on their "
+                              "pinned generation; the KV prefix "
+                              "re-primes once.")
+                self._safe_pretty_log("GEPA Autonomy", _ep_line,
+                                      icon=Icons.GEPA_AUTONOMY)
+                self._record_autonomous_activity(
+                    "gepa_autonomy", _ep_line, severity="notify")
+        except Exception as _epe:  # noqa: BLE001 — never break the tick
+            logger.debug("epoch swap check failed: %s", _epe)
+
         if not getattr(ctx, 'memory_system', None):
             return
 
@@ -5538,6 +5569,12 @@ class GhostAgent:
             # real spawn). A due job runs at the first probe, one
             # cooldown after boot.
             self._last_gepa_autonomy_at = datetime.datetime.now()
+        if not hasattr(self, '_last_gepa_optimizer_at'):
+            # §4DF: same `now`-not-min reasoning as above — and doubly
+            # so here, because this phase can launch an HOURS-long
+            # main-slot subprocess and must never do that in the first
+            # idle window after a boot.
+            self._last_gepa_optimizer_at = datetime.datetime.now()
         # Corpus fingerprints from the last COMPLETED PRM / router refit.
         # When the trajectory corpus hasn't changed since, the refit would
         # reproduce the identical model — skip the pass entirely (the
@@ -8145,6 +8182,81 @@ class GhostAgent:
                                 "evolve_mutate", _eline)
                             self._safe_pretty_log(
                                 "Evolve", _eline, icon=Icons.EVOLVE)
+
+        # ── §4DF Phase 3: the autonomous optimizer launcher ──
+        # ⚠ LAST PHASE IN THE TICK, deliberately. The await below can
+        # hold this tick for HOURS, and every phase after it would then
+        # run on hours-stale idle_secs/foreground state — self-play
+        # launching into live traffic. Below this block only the
+        # idle-cycle summary remains. (Ticks themselves are serialized,
+        # so the block also keeps every other idle phase OFF the
+        # inference slot while the optimizer owns it — that part is a
+        # feature, the §4U politeness.)
+        # DEEP idle only (> 1h): unlike the supply watch and the judge —
+        # file readers in the (15m, 1h] band — this launches HOURS of
+        # sequential main-slot replays, so it starts in the quietest
+        # window and tolerates traffic arriving mid-run (llama-server
+        # queues; each replay is seconds). Real cadence (one target/day,
+        # 7d per target) lives in gepa_autonomy_state.json; the tick
+        # anchor only keeps the state probe out of the 60s tick.
+        if idle_secs > self._bio_scaled(3600):
+            _since_opt = (datetime.datetime.now()
+                          - self._last_gepa_optimizer_at).total_seconds()
+            # NOT `_bio_cooldown` — subprocess wall-clock does not scale.
+            if _since_opt >= self._GEPA_AUTONOMY_COOLDOWN:
+                self._last_gepa_optimizer_at = datetime.datetime.now()
+                try:
+                    from ..optim import autonomy as _gepa_auto
+                    if (_gepa_auto.autonomy_enabled()
+                            and _gepa_auto.auto_optimize_enabled()):
+                        _go_home = (os.getenv("GHOST_HOME", "").strip()
+                                    or str(Path.home()
+                                           / "ghost_llamacpp"))
+
+                        def _go_notify(msg):
+                            self._record_autonomous_activity(
+                                "gepa_autonomy", msg, severity="notify")
+                            self._safe_pretty_log(
+                                "GEPA Autonomy", msg,
+                                icon=Icons.GEPA_AUTONOMY)
+
+                        def _go_log(msg):
+                            self._safe_pretty_log(
+                                "GEPA Autonomy", msg,
+                                icon=Icons.GEPA_AUTONOMY)
+                        # Inner 6h watchdog kills a wedged child; the
+                        # outer bound (+10min) kills a wedged spawn.
+                        _or = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _gepa_auto.run_optimizer, _go_home,
+                                notify=_go_notify, log=_go_log),
+                            timeout=(_gepa_auto.OPTIMIZER_TIMEOUT_S
+                                     + 600))
+                        if _or is not None:
+                            _idle_ran.append("gepa-optimizer")
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    self._safe_pretty_log(
+                        "GEPA Autonomy",
+                        "the optimizer launch HUNG past the outer "
+                        "watchdog — the child may still be running; "
+                        "investigate before the next window",
+                        level="ERROR", icon=Icons.WARN)
+                    self._record_autonomous_activity(
+                        "gepa_autonomy",
+                        "optimizer hung past the watchdog",
+                        severity="notify")
+                except Exception as _goe:  # noqa: BLE001
+                    # FAIL LOUD — "could not run" and "ran, nothing to
+                    # do" must never look alike (the negctrl rule).
+                    self._safe_pretty_log(
+                        "GEPA Autonomy",
+                        f"optimizer phase FAILED: "
+                        f"{type(_goe).__name__}: {_goe}",
+                        level="ERROR", icon=Icons.WARN)
+                finally:
+                    self._last_gepa_optimizer_at = datetime.datetime.now()
 
         # One durable summary per idle cycle that actually did work (phase-1
         # journal returns early above and logs itself). Reconstructs the loop:

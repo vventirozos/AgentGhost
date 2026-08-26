@@ -25,11 +25,299 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("GhostAgent")
 
-# signature_name -> tuned instruction str (or None when absent/invalid)
-_CACHE: Dict[str, Optional[str]] = {}
-# sha8 of each served artifact, for attribution (§4L Lens-D MINOR-1:
-# nothing anywhere recorded WHICH artifact version built a prompt).
-_ARTIFACT_SHAS: Dict[str, str] = {}
+# ── §4DE: the epoch-pinned artifact store ────────────────────────────────
+# Phase 2 of GEPA autonomy replaced the per-process `_CACHE`/`_ARTIFACT_SHAS`
+# pair with numbered, IMMUTABLE generations, because "reload when quiescent"
+# is not implementable here: self-play/dream/bench/replay agents read this
+# module through `BackgroundOnlyLLM` with both foreground counters at zero,
+# the async verifier reads templates after its request ended, and one
+# request can re-resolve tool defs mid-flight (`invalidate_tool_defs`). A
+# swap gated on quiescence reproduces round 16's "last call wins" through
+# TIME: a ring stamp overwritten mid-request, a trajectory recording era B
+# for turns planned under era A.
+#
+# The model instead: an epoch is an EAGER SNAPSHOT of `system/optim/*.json`
+# (content + sha per signature), identified by a process-local generation
+# counter — deliberately NOT a sha, so it can never be mistaken for an era
+# marker (three sha meanings already exist in this tree; the era sha remains
+# the instruction-text sha below, its one definition). A request PINS the
+# current epoch at its first loader touch and every later read for that
+# req_id — later turns' planner calls, the registry's withheld-side
+# `artifact_text` sums, a post-`create_skill` re-resolve — serves from the
+# pinned epoch. In-flight requests keep the old world; new requests get the
+# new one; nobody waits. Req-id-less readers (async verifier, reflection,
+# boot warmup) read the current epoch at call time: they stamp nothing, so
+# era integrity is not at stake.
+#
+# The swap check (`maybe_advance_epoch`) rides the biological tick — not
+# because the tick is quiescent (pinning makes quiescence unnecessary) but
+# to keep the directory stat off the request hot path. The stamp is the
+# DIRECTORY SHAPE — sorted (name, mtime_ns, size) — because it is the only
+# cheap check that sees added AND removed files: promotion is `os.replace`,
+# retirement is a rename-away, and a per-file mtime cache misses births and
+# deaths. Within an epoch the negative cache is a plain dict miss, so
+# today's zero-artifact production state keeps its fast path.
+
+class _Epoch:
+    __slots__ = ("gen", "stamp", "cache", "shas", "pins")
+
+    def __init__(self, gen, stamp, cache, shas):
+        self.gen = gen
+        self.stamp = stamp
+        #: {signature: instruction text} — PRESENT artifacts only; a dict
+        #: miss is the negative cache for this generation.
+        self.cache = cache
+        self.shas = shas
+        self.pins = 0
+
+
+_EPOCHS: Dict[int, _Epoch] = {}
+_CURRENT_EPOCH: Optional[_Epoch] = None
+#: Monotonic for the LIFE OF THE PROCESS — `clear_cache` must NOT reset
+#: it. §4DE round 1 (MAJOR-2): a reborn gen 1 after clear_cache collided
+#: with the registry's generation-keyed name-set, which then served the
+#: pre-clear names forever while `maybe_advance_epoch` saw no disk change
+#: — the "second cache" defect resurrected through the fix's own key.
+_NEXT_GEN = 1
+#: req_id -> generation. Bounded like the served ring: a request that never
+#: reaches `forget_request` (crash, eviction) must not pin a generation
+#: forever.
+_PINNED: "OrderedDict[str, int]" = OrderedDict()
+_PINNED_MAX = 128
+#: (signature, sha) pairs already provenance-warned — per ARTIFACT, not per
+#: process: after an epoch swap a re-promoted artifact is new news, and the
+#: old per-process promise would silence it.
+_WARNED_PROVENANCE: set = set()
+
+
+def _dir_stamp() -> Optional[tuple]:
+    """The optim directory's shape: sorted (name, mtime_ns, size) over
+    `*.json`.
+
+    Returns ``None`` when the directory CANNOT BE READ (missing or
+    erroring) and ``()`` only when it exists and is empty. §4DE round 1
+    (MAJOR-1) found the first version's string sentinel crashed the
+    3-tuple unpack in `_snapshot` — through "Never raises"
+    `tuned_instruction` and out of a request — while being UNREACHABLE
+    for every case its docstring promised (on this Python, glob over a
+    missing dir returns [] silently). The distinction matters because an
+    unmounted GHOST_HOME must HOLD the current epoch, not deploy a mass
+    retirement; `maybe_advance_epoch` refuses to advance on None.
+
+    One `stat` per file (the old double-stat cost 3x the calls and
+    permitted a torn (mtime, size) pair); a file vanishing mid-glob —
+    a retirement rename racing this — is skipped, and the next stamp
+    differs, so the change is noticed one tick later.
+    """
+    try:
+        d = _optim_dir()
+        if not d.is_dir():
+            return None
+        out = []
+        for f in d.glob("*.json"):
+            try:
+                st = f.stat()
+                out.append((f.name, st.st_mtime_ns, st.st_size))
+            except OSError:
+                continue
+        return tuple(sorted(out))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _snapshot(gen: int, stamp: tuple) -> _Epoch:
+    """Read every live artifact into an immutable generation.
+
+    Eager on purpose: a lazy per-read load inside a generation would bind
+    file content at read time, so two signatures read across an unnoticed
+    disk change would serve two eras under ONE generation id — the exact
+    mixing the epoch exists to prevent. ~10 small files; runs off the
+    request hot path (the tick)."""
+    cache: Dict[str, str] = {}
+    shas: Dict[str, str] = {}
+    for entry in (stamp or ()):
+        try:
+            name = entry[0]
+        except Exception:  # noqa: BLE001 — a malformed entry is skipped,
+            continue       # never a crash out of "Never raises" callers
+        if not isinstance(name, str) or not name.endswith(".json"):
+            continue
+        sig = name[:-len(".json")]
+        try:
+            data = json.loads((_optim_dir() / name).read_text())
+            opt = data.get("optimized_instruction")
+            if not (isinstance(opt, str) and opt.strip()):
+                continue
+            value = opt.strip()
+            sha8 = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+            cache[sig] = value
+            shas[sig] = sha8
+            # Provenance warning, once per (artifact, sha) — see
+            # `_WARNED_PROVENANCE`. "UNGATED" is not provenance: §4DA
+            # round 5's renamed-rejection fix used a different KEY; the
+            # `--no-ab-gate` writer reuses this one, so it is matched by
+            # prefix.
+            # ⚠ THE KEY CARRIES THE GATE STATE. Keyed (sig, sha) alone,
+            # a GATED artifact consumed the key and a later UNGATED
+            # promotion of the SAME text never fired the "no A/B
+            # measured it" warning — the one alert that path exists for
+            # (round 1, MAJOR-4; it also made the suite order-dependent).
+            _gate_arm = str(data.get("gate_arm") or "")
+            _ungated = (not _gate_arm) or _gate_arm.startswith("UNGATED")
+            _wkey = (sig, sha8, "ungated" if _ungated else "gated")
+            if _wkey not in _WARNED_PROVENANCE:
+                _WARNED_PROVENANCE.add(_wkey)
+                if _ungated:
+                    logger.warning(
+                        "GEPA: artifact '%s' (sha %s) %s — re-promote "
+                        "under the current gate before trusting it",
+                        sig, sha8,
+                        ("was promoted UNGATED (--no-ab-gate): no A/B "
+                         "measured it against the incumbent"
+                         if _gate_arm.startswith("UNGATED") else
+                         "predates the gate schema — no gate "
+                         "identity/scores recorded"))
+                else:
+                    logger.info(
+                        "GEPA: loaded tuned instruction for '%s' "
+                        "(%d chars, sha %s, gate %s)", sig,
+                        len(value), sha8, data.get("gate_arm"))
+        except Exception as e:  # noqa: BLE001 — one bad file must not
+            logger.debug(          # take down the whole epoch
+                "GEPA epoch snapshot: skipping %s (%s)", name, e)
+    return _Epoch(gen, stamp, cache, shas)
+
+
+def _ensure_epoch() -> _Epoch:
+    global _CURRENT_EPOCH, _NEXT_GEN
+    if _CURRENT_EPOCH is None:
+        stamp = _dir_stamp()
+        gen = _NEXT_GEN
+        _NEXT_GEN += 1
+        _CURRENT_EPOCH = _snapshot(gen, stamp)
+        _EPOCHS[gen] = _CURRENT_EPOCH
+    return _CURRENT_EPOCH
+
+
+def maybe_advance_epoch() -> Optional[Dict[str, Any]]:
+    """Notice a changed `system/optim` and swap to a new generation.
+
+    Returns None when nothing changed (or on the boot snapshot — a boot
+    is not a deploy event); otherwise a summary
+    ``{signature: (old_sha or None, new_sha or None)}`` for the caller's
+    notification. Safe to call at ANY time — in-flight requests are
+    pinned to their generation, so this never changes what an active
+    request serves."""
+    global _CURRENT_EPOCH, _NEXT_GEN
+    if _CURRENT_EPOCH is None:
+        _ensure_epoch()
+        return None
+    stamp = _dir_stamp()
+    if stamp is None:
+        # ⚠ CANNOT-READ IS NOT EMPTY. An unmounted/unreadable GHOST_HOME
+        # must HOLD the current epoch — swapping to an empty snapshot
+        # would deploy a mass retirement (and re-promote everything when
+        # the mount returns, churning the KV prefix twice for nothing).
+        # Warn only when there is something being held.
+        if _CURRENT_EPOCH.shas and _CURRENT_EPOCH.stamp is not None:
+            logger.warning(
+                "GEPA epoch: system/optim is unreadable — HOLDING "
+                "generation %d (%d artifacts) rather than deploying a "
+                "mass retirement", _CURRENT_EPOCH.gen,
+                len(_CURRENT_EPOCH.shas))
+        return None
+    if stamp == _CURRENT_EPOCH.stamp:
+        return None
+    old = _CURRENT_EPOCH
+    gen = _NEXT_GEN
+    _NEXT_GEN += 1
+    new = _snapshot(gen, stamp)
+    _EPOCHS[gen] = new
+    _CURRENT_EPOCH = new
+    _drop_unpinned()
+    changes: Dict[str, Any] = {}
+    for sig in set(old.shas) | set(new.shas):
+        if old.shas.get(sig) != new.shas.get(sig):
+            changes[sig] = (old.shas.get(sig), new.shas.get(sig))
+    # A stamp change with identical content (e.g. a rewrite of the same
+    # bytes, or a non-artifact *.json touched) is a new generation but
+    # not news.
+    return changes or None
+
+
+def _drop_unpinned() -> None:
+    for gen in list(_EPOCHS):
+        ep = _EPOCHS[gen]
+        if ep is not _CURRENT_EPOCH and ep.pins <= 0:
+            del _EPOCHS[gen]
+
+
+#: Pseudo request ids that must NOT pin an epoch. "" is the loader's own
+#: no-request convention; "SYSTEM" is `utils/logging.py`'s contextvar
+#: DEFAULT, live for the boot prefix warmup and every out-of-request
+#: prompt build — §4DE round 1 (MAJOR-3) executed the boot generation
+#: pinned under {'SYSTEM': 1} forever (nothing calls
+#: forget_request("SYSTEM")), with later SYSTEM-context builds served the
+#: RETIRED era.
+_UNPINNED_IDS = ("", "SYSTEM")
+
+
+def _epoch_for_request(req_id: str) -> _Epoch:
+    """The epoch this req_id is pinned to, pinning the current one on the
+    request's FIRST loader touch."""
+    cur = _ensure_epoch()
+    if not req_id or req_id in _UNPINNED_IDS:
+        return cur
+    gen = _PINNED.get(req_id)
+    if gen is not None:
+        ep = _EPOCHS.get(gen)
+        if ep is not None:
+            # LRU, not FIFO: without this the eviction victim at the cap
+            # is precisely the LONGEST-LIVED in-flight request — the one
+            # whose era-mix would span the most turns (round 1).
+            _PINNED.move_to_end(req_id)
+            return ep
+        # The pinned generation is gone (clear_cache in a test, or a
+        # bug): fall through and re-pin the current one rather than
+        # crash a turn.
+        _PINNED.pop(req_id, None)
+    _PINNED[req_id] = cur.gen
+    cur.pins += 1
+    while len(_PINNED) > _PINNED_MAX:
+        _old_req, _old_gen = _PINNED.popitem(last=False)
+        _release_gen(_old_gen)
+    return cur
+
+
+def _release_gen(gen: Optional[int]) -> None:
+    ep = _EPOCHS.get(gen) if gen is not None else None
+    if ep is not None:
+        ep.pins = max(0, ep.pins - 1)
+        if ep is not _CURRENT_EPOCH and ep.pins <= 0:
+            del _EPOCHS[ep.gen]
+
+
+def current_generation() -> int:
+    """For cross-module caches (tools/registry) that must move with the
+    epoch."""
+    return _ensure_epoch().gen
+
+
+def signature_names_for_request(req_id: str, prefix: str = "") -> set:
+    """The signatures PRESENT in this request's epoch — the registry's
+    replacement for its own process-wide glob (`_TUNED_DESC_NAMES`, the
+    second cache `clear_cache()` never touched: a newly promoted tool
+    artifact was permanently unreachable through it)."""
+    ep = _epoch_for_request(req_id)
+    return {s for s in ep.cache if s.startswith(prefix)}
+
+
+def __getattr__(name):  # PEP 562 — legacy views for tests/introspection
+    if name == "_CACHE":
+        return _ensure_epoch().cache
+    if name == "_ARTIFACT_SHAS":
+        return _ensure_epoch().shas
+    raise AttributeError(name)
 
 # Activation telemetry: how often each signature's prompt-build actually
 # APPLIED a tuned instruction vs fell back to the hand-written baseline.
@@ -191,8 +479,13 @@ def served_for_request(req_id: str) -> Dict[str, Dict[str, str]]:
 
 
 def forget_request(req_id: str) -> None:
-    """Drop a finished request's attribution (called after the stamp)."""
+    """Drop a finished request's attribution (called after the stamp) —
+    and release its epoch pin, so an old generation dies when its last
+    in-flight request does."""
     _SERVED_RING.pop(req_id, None)
+    _gen = _PINNED.pop(req_id, None)
+    if _gen is not None:
+        _release_gen(_gen)
 
 
 #: The only two arm names this loader can act on. The registry accepts any
@@ -307,10 +600,16 @@ def _resolve_arm(signature_name: str, context: Any, req_id: str) -> str:
     return arm
 
 
-def artifact_text(signature_name: str) -> str:
+def artifact_text(signature_name: str, req_id: str = "") -> str:
     """The artifact's text REGARDLESS of arm, for the read site's
     would-it-have-applied check. Cache-only: never loads, never stamps,
     never randomizes.
+
+    §4DE: pass the request's `req_id` so the withheld-side sums read the
+    SAME epoch the request's renders were pinned to — without it, a swap
+    landing mid-request (possible for background agents, whose turns the
+    tick's foreground lock cannot see) would sum era B artifacts against
+    era A renders.
 
     ⚠ THE READ SITE'S REFUSAL IS A PROPERTY OF THE TURN, NOT THE ARM.
     A control turn is served the baseline and returns before the
@@ -323,7 +622,7 @@ def artifact_text(signature_name: str) -> str:
     STOPS BEING RANDOMIZED" — surviving one layer out, in the refusal
     path rather than the sha path.
     """
-    v = _CACHE.get(signature_name)
+    v = _epoch_for_request(req_id).cache.get(signature_name)
     return v if isinstance(v, str) else ""
 
 
@@ -351,10 +650,9 @@ def tuned_instruction(signature_name: str, default: str = "", *,
     # populated. Found by driving two calls instead of one.
     _arm = _resolve_arm(signature_name, context, req_id)
 
-    _MISS = object()
-    _hit = _CACHE.get(signature_name, _MISS)
-    if _hit is not _MISS:
-        cached = _hit
+    _ep = _epoch_for_request(req_id)
+    if True:
+        cached = _ep.cache.get(signature_name)
         # ⚠ A CONTROL TURN IS A FALLBACK, NOT AN APPLICATION. The counter
         # ran before the arm check, so ten deliberately-withheld turns
         # reported `applied: 10` — corrupting the project's own
@@ -380,106 +678,22 @@ def tuned_instruction(signature_name: str, default: str = "", *,
                 # retired on control turns belonging to the artifact it
                 # replaced.
                 _note_served(req_id, signature_name,
-                             _ARTIFACT_SHAS.get(signature_name, ""),
+                             _ep.shas.get(signature_name, ""),
                              "control")
             return default
         if cached:
             _APPLIED_COUNTS[signature_name] = _APPLIED_COUNTS.get(signature_name, 0) + 1
             _note_served(req_id, signature_name,
-                         _ARTIFACT_SHAS.get(signature_name, ""),
+                         _ep.shas.get(signature_name, ""),
                          _arm or "unenrolled")
         else:
             _FALLBACK_COUNTS[signature_name] = _FALLBACK_COUNTS.get(signature_name, 0) + 1
         return cached if cached else default
 
-    value: Optional[str] = None
-    try:
-        path = _optim_dir() / f"{signature_name}.json"
-        if path.exists():
-            data = json.loads(path.read_text())
-            opt = data.get("optimized_instruction")
-            if isinstance(opt, str) and opt.strip():
-                value = opt.strip()
-                # ⚠ PROVENANCE WARNING, once per artifact per process
-                # (§4L Lens-D MAJOR-1): a pre-gate-schema artifact (no
-                # gate identity, no scores) is served with no evidence
-                # it would still win under the CURRENT metric — the
-                # planning.decompose case: promoted under the OLD recall
-                # metric, known to LOSE on F1, and served to every
-                # planner call anyway. The promoted-artifact
-                # invalidation rule ("re-score the incumbent when the
-                # metric or gate changes") was convention only; this at
-                # least makes the un-validated state VISIBLE at apply
-                # time. sha8 gives the operator an attribution handle.
-                import hashlib as _hl
-                _sha8 = _hl.sha256(value.encode("utf-8")).hexdigest()[:8]
-                _ARTIFACT_SHAS[signature_name] = _sha8
-                # ⚠ "UNGATED" IS NOT PROVENANCE. `--no-ab-gate` stamps
-                # `gate_arm: "UNGATED (--no-ab-gate)"`, which satisfied a
-                # bare truthiness test — so an artifact whose own record
-                # says `metric: "none — adopted unverified"` loaded at
-                # the same level and shape as a gated one, silencing the
-                # only apply-time warning that an unverified prompt is
-                # serving production. §4DA round 5 closed the same class
-                # for renamed rejections by using a DIFFERENT key; the
-                # ungated writer reuses this one.
-                # ⚠ NOT `_arm` — that name already holds this request's
-                # EXPERIMENT arm, and shadowing it here stamped the gate
-                # identity string as the arm on every served turn. Caught
-                # by the neighbouring tests within a minute; it would
-                # have made every trajectory's arm unreadable.
-                _gate_arm = str(data.get("gate_arm") or "")
-                if not _gate_arm or _gate_arm.startswith("UNGATED"):
-                    logger.warning(
-                        "GEPA: artifact '%s' (sha %s) %s — re-promote "
-                        "under the current gate before trusting it",
-                        signature_name, _sha8,
-                        ("was promoted UNGATED (--no-ab-gate): no A/B "
-                         "measured it against the incumbent"
-                         if _gate_arm.startswith("UNGATED") else
-                         "predates the gate schema — no gate "
-                         "identity/scores recorded"))
-                else:
-                    logger.info(
-                        "GEPA: loaded tuned instruction for '%s' "
-                        "(%d chars, sha %s, gate %s)", signature_name,
-                        len(value), _sha8, data.get("gate_arm"))
-    except Exception as e:
-        logger.debug("GEPA tuned_instruction('%s') load failed: %s", signature_name, e)
-
-    # ⚠ THE CONTROL ARM MUST GET THE BASELINE, and must be stamped even
-    # though it was served nothing — a withheld turn is half the
-    # comparison. Consumers treat "" as control per `arm_for`'s contract,
-    # but "" here means NOT ENROLLED, which is a third state: served the
-    # artifact, outside any experiment. Kept distinct so a later analysis
-    # cannot silently pool un-randomized turns into a control group.
-    # ⚠ POPULATE THE CACHE BEFORE ANY EARLY RETURN. The control branch used
-    # to return first, so `_CACHE` stayed empty and every control turn
-    # re-did `exists` + `read_text` + `json.loads` + `sha256` on the request
-    # hot path AND re-emitted the "once per artifact per process" provenance
-    # warning — one warning per control turn, against a docstring promising
-    # one per process (measured six for six).
-    _CACHE[signature_name] = value
-    if _arm == "control":
-        _FALLBACK_COUNTS[signature_name] = (
-            _FALLBACK_COUNTS.get(signature_name, 0) + 1)
-        if value:
-            # The era marker, as above — a control turn belongs to the
-            # era of the artifact it was withheld.
-            _note_served(req_id, signature_name,
-                         _ARTIFACT_SHAS.get(signature_name, ""),
-                         "control")
-        return default
-    if value:
-        _note_served(req_id, signature_name,
-                     _ARTIFACT_SHAS.get(signature_name, ""),
-                     _arm or "unenrolled")
-
-    if value:
-        _APPLIED_COUNTS[signature_name] = _APPLIED_COUNTS.get(signature_name, 0) + 1
-    else:
-        _FALLBACK_COUNTS[signature_name] = _FALLBACK_COUNTS.get(signature_name, 0) + 1
-    return value if value else default
+    # §4DE: the lazy per-read disk load that used to live here moved into
+    # `_snapshot` — an epoch's content is bound at snapshot time, so a
+    # request can never observe two eras under one generation id, and the
+    # request hot path never touches the filesystem.
 
 
 def note_rejected(signature_name: str, reason: str = "") -> None:
@@ -530,13 +744,19 @@ def activation_stats() -> Dict[str, Dict[str, int]]:
 
 
 def clear_cache() -> None:
-    """Drop the in-process cache so the next lookup re-reads disk (e.g. after
-    an offline GEPA retrain produced new tuned files).
+    """Drop every epoch so the next lookup re-snapshots the disk.
 
-    ⚠ NEVER call on a live agent process: a mid-session reload changes the
-    prompt bytes under the KV stable-prefix pin and forces a full re-prime
-    every turn thereafter. Retrain offline, then deploy via restart.
+    §4DE made the old ⚠ here ("NEVER call on a live agent — deploy via
+    restart") obsolete: the epoch swap in the biological tick IS the live
+    deploy path now, and it reloads without this hammer. This function
+    remains for tests and offline tooling; on a live agent it still costs
+    one KV prefix re-prime and — unlike the swap — it un-pins in-flight
+    requests (their next read re-pins the fresh epoch), so the swap is
+    strictly better whenever the process is serving.
     Activation counters are deliberately NOT cleared — they describe the
     process, not the cache."""
-    _CACHE.clear()
-    _ARTIFACT_SHAS.clear()
+    global _CURRENT_EPOCH
+    _EPOCHS.clear()
+    _PINNED.clear()
+    _WARNED_PROVENANCE.clear()
+    _CURRENT_EPOCH = None

@@ -39,7 +39,7 @@
   <ul>
     <li>Python 3.10+ (tokenizer + dataclasses + <code>asyncio.to_thread</code>).</li>
     <li>A running Docker daemon. The sandbox uses the Docker SDK; on macOS it auto-detects OrbStack / Docker Desktop sockets (<code>sandbox/docker.py:13-54</code>).</li>
-    <li>An OpenAI-compatible LLM endpoint reachable from the agent (llama.cpp, vLLM, Ollama). Default expectation: <code>http://127.0.0.1:8080</code>.</li>
+    <li>An OpenAI-compatible LLM endpoint reachable from the agent (llama.cpp, vLLM, Ollama). Default expectation: <code>http://127.0.0.1:8088</code>.</li>
     <li><strong>Required</strong>: a Tor SOCKS proxy for outbound traffic (<code>TOR_PROXY=socks5h://127.0.0.1:9050</code>). Ghost Agent fails closed if it is unreachable — see <a href="index.html#anonymity">Anonymity &amp; Tor routing</a>.</li>
     <li><strong>Optional</strong>: a Postgres database for the <code>postgres_admin</code> tool; GPU servers for image generation / vision.</li>
   </ul>
@@ -143,7 +143,7 @@
   <h2>Process commands</h2>
 <pre><code># core agent
 python -m src.ghost_agent.main \
-    --upstream-url "http://127.0.0.1:8080" \
+    --upstream-url "http://127.0.0.1:8088" \
     --host 0.0.0.0 --port 8000 --verbose
 
 # web UI proxy (separate port)

@@ -6,7 +6,7 @@ Usage:
   python -m scripts.run_gepa \\
       --signature planning.decompose \\
       --trajectories $GHOST_HOME/system/trajectories \\
-      --upstream-url http://127.0.0.1:8080 \\
+      --upstream-url http://127.0.0.1:8088 \\
       --model qwen-3.6-35b-a3 \\
       --max-iterations 8 \\
       --output $GHOST_HOME/system/optim/planning.decompose.json
@@ -226,7 +226,12 @@ async def main() -> int:
                         help="Which optimizable signature to tune.")
     parser.add_argument("--trajectories", type=Path, default=None,
                         help="Path to the trajectory store root. Defaults to $GHOST_HOME/system/trajectories (where the live agent writes).")
-    parser.add_argument("--upstream-url", default="http://127.0.0.1:8080")
+    # ⚠ THE DEFAULT HAS ONE HOME (§4DF round 1, CRIT-1). This said
+    # 8080 — the TLS web console, not the LLM — while the sibling gate
+    # said 8088, and the §4DF launcher's deliberately-minimal argv made
+    # the wrong default LOAD-BEARING for 3 of its 4 targets.
+    from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
+    parser.add_argument("--upstream-url", default=DEFAULT_UPSTREAM_URL)
     parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
     parser.add_argument("--max-iterations", type=int, default=8)
     parser.add_argument("--optimizer", default="GEPA")
@@ -284,6 +289,12 @@ async def main() -> int:
                              "holdout the A/B ship-gate judges on. The optimizer never sees "
                              "them. Membership is stable per trajectory across runs. Default 30.")
     args = parser.parse_args()
+    # ⚠ BEFORE ANY I/O (§4DF). The caller's proof the SCRIPT ran, as
+    # opposed to argparse / a moved script / a broken interpreter — all
+    # of which share exit 2 with COULD_NOT_MEASURE. Same discipline as
+    # the judge and the miner; the string has ONE home.
+    print(f"{gate_contract.GATE_RUN_BANNER_GEPA} {args.signature}",
+          flush=True)
 
     # Resolve default paths
     base = Path(os.getenv("GHOST_HOME", str(Path.home() / "ghost_llamacpp")))
@@ -657,6 +668,39 @@ async def main() -> int:
     # Build LLM client + metric
     from ghost_agent.core.llm import LLMClient
     llm_client = LLMClient(args.upstream_url)
+
+    # ⚠ UPSTREAM PRE-FLIGHT (§4DF round 1, CRIT-1). This gate had NO
+    # reachability check before paying for the optimizer — its
+    # pre-flights are all corpus-shaped — so a dead (or TLS-only) port
+    # burned the full run and terminated wearing a benign code: exit 3
+    # ("no candidate"), a crash-as-1, or an evidence-bar 2. The launcher
+    # relies on this refusal ("the gates ARE the decision-makers"), so
+    # it happens HERE, before the optimizer burns anything, and exits 2:
+    # nothing was measured.
+    # Probed through the SAME client the run will use — a 1-token ping
+    # down the real API path (TLS-to-plaintext, wrong port, wrong path
+    # and auth all fail exactly like the run would), not a side-channel
+    # HTTP check that could pass while the run fails.
+    try:
+        _ping = await asyncio.wait_for(
+            llm_client.chat_completion({
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1, "temperature": 0.0}),
+            timeout=30.0)
+        _ping_ok = bool(isinstance(_ping, dict) and _ping.get("choices"))
+        _ping_err = "" if _ping_ok else f"unexpected reply: {_ping!r:.200}"
+    except Exception as _pe:  # noqa: BLE001 — refused/TLS/timeout/DNS
+        _ping_ok, _ping_err = False, f"{type(_pe).__name__}: {_pe}"
+    if not _ping_ok:
+        print(f"REFUSING TO RUN: upstream {args.upstream_url} did not "
+              f"answer a 1-token ping ({_ping_err}) — nothing can be "
+              f"optimized or measured against it. Check the llama-server "
+              f"port (the defaults share ONE home in "
+              f"core.llm.DEFAULT_UPSTREAM_URL), and pass the bare "
+              f"server root, not a /v1 path — the A/B client appends "
+              f"its own; re-run when the upstream is stable.",
+              file=sys.stderr)
+        return 2
 
     # Ignition metric: graded token recall of the expected target inside the
     # prediction's declared output fields. Deterministic, zero extra LLM
@@ -1127,6 +1171,12 @@ async def main() -> int:
     if (str(result.optimized_instruction or "").strip()
             == str(incumbent or "").strip()):
         _discard_staging()
+        # The MARKER goes to stdout (§4DF: the marker channel is stdout
+        # by contract — exit 3 without it is a crash, not a verdict);
+        # the explanation stays on stderr where it always was.
+        print(f"{gate_contract.GATE_NO_CANDIDATE_MARKER} — the optimizer "
+              f"returned the incumbent verbatim; nothing to promote, "
+              f"nothing to reject.", flush=True)
         print("NO CANDIDATE: the optimizer returned the incumbent "
               "verbatim — there is nothing to promote and nothing to "
               "reject, and an A/B between two identical prompts would "
@@ -1370,6 +1420,15 @@ async def main() -> int:
               file=sys.stderr)
         if _seed_veto_stands:
             _discard_staging()
+            # §4DF: exit 1 is claimed only with the REJECTED marker on
+            # stdout — this path printed only to stderr, so an
+            # autonomous caller filed a real seed-veto verdict as an
+            # instrument failure (crash-as-1 is the thing the marker
+            # exists to catch; a marker-less verdict is its mirror).
+            print(f"{gate_contract.GATE_REJECTED_MARKER} the candidate: "
+                  f"seed veto — it beats the live artifact but loses to "
+                  f"the hand-written seed (details on stderr).",
+                  flush=True)
             return 1
         print("   --allow-seed-loss given; promoting anyway.",
               file=sys.stderr)
@@ -1419,7 +1478,8 @@ async def main() -> int:
             # 2/100 - 0/100 is 0.020000000000000018 and ANY rounding that
             # matches the bar's own precision prints a comparison that
             # reads false. State the two numbers; let the reader compare.
-            print(f"A/B gate REJECTED the candidate: it cleared the margin "
+            print(f"{gate_contract.GATE_REJECTED_MARKER} the candidate: "
+                  f"it cleared the margin "
                   f"(delta {cmp.delta:+.4f}, bar {args.ab_min_delta}) but the "
                   f"discordant pairs do not support it "
                   f"(McNemar p={_p_str} > {ab_eval.SHIP_ALPHA}, "
@@ -1429,7 +1489,8 @@ async def main() -> int:
                   f"Collect more graded turns, or override deliberately "
                   f"with --allow-insignificant-ship.")
         else:
-            print(f"A/B gate REJECTED the candidate (delta "
+            print(f"{gate_contract.GATE_REJECTED_MARKER} the candidate "
+                  f"(delta "
                   f"{cmp.delta:+.4f}, bar {args.ab_min_delta}); discarded "
                   f"staging — baseline stands.")
         # ⚠ AN ABORT IS NOT A REJECTION. The evidence-bar and seed-arm
@@ -1439,7 +1500,7 @@ async def main() -> int:
         # split for. Lens C, C4(iii): both gates shared this.
         return 2 if _below_evidence_bar else 1
     _promote_staging()
-    print(f"A/B gate PASSED — candidate promoted to {output_path}")
+    print(f"{gate_contract.GATE_PROMOTED_MARKER_GEPA} to {output_path}")
     return 0
 
 

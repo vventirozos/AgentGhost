@@ -47,7 +47,7 @@
       <li>
         <h4>An LLM server</h4>
         <p>Anything that speaks the OpenAI chat API: llama.cpp's <code>llama-server</code>, vLLM, or Ollama. Ghost's prompts are tuned for <strong>Qwen 3.6 35B-A3</strong>; a much smaller model will follow the tool-calling format badly and you'll see a lot of failed turns.</p>
-        <span class="where">Ghost connects to this via <code>--upstream-url</code>. Default: <code>http://127.0.0.1:8080</code></span>
+        <span class="where">Ghost connects to this via <code>--upstream-url</code>. Default: <code>http://127.0.0.1:8088</code></span>
       </li>
       <li>
         <h4>Docker</h4>
@@ -132,7 +132,7 @@ export TOR_PROXY="socks5://127.0.0.1:9050"</pre>
   <h2>Start it</h2>
 
   <pre class="shell">python -m src.ghost_agent.main \
-    --upstream-url "http://127.0.0.1:8080" \
+    --upstream-url "http://127.0.0.1:8088" \
     --host 127.0.0.1 --port 8000 \
     --verbose</pre>
 

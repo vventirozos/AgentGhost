@@ -230,8 +230,9 @@ def run_gepa(
     # the api_base pin preserves the no-external-endpoint invariant.
     # _GhostLMAdapter stays for existing callers/tests but no longer drives
     # GEPA.
+    from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
     upstream = str(
-        getattr(llm_client, "upstream_url", "") or "http://127.0.0.1:8088"
+        getattr(llm_client, "upstream_url", "") or DEFAULT_UPSTREAM_URL
     ).rstrip("/")
     if not upstream.endswith("/v1"):
         upstream += "/v1"

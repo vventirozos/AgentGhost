@@ -82,8 +82,9 @@ async def main() -> int:
                          "what this script is for.")
     ap.add_argument("--home", default=os.environ.get("GHOST_HOME") or
                     str(Path.home() / "Data" / "AI" / "Data"))
+    from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
     ap.add_argument("--upstream", default=os.environ.get(
-        "GHOST_UPSTREAM_URL", "http://127.0.0.1:8088"))
+        "GHOST_UPSTREAM_URL", DEFAULT_UPSTREAM_URL))
     ap.add_argument("--private-pct", type=int, default=30)
     ap.add_argument("--min-delta", type=float, default=None,
                     help="the MARGIN half of the gate (the significance "

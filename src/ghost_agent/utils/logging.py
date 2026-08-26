@@ -462,7 +462,7 @@ class Icons:
     # its first steering consumer. One glyph for both would make the
     # operator stream unable to say which one acted.
     IMAGINE          = "🪄"   # planner: pre-flight steer / candidate ranking
-    GEPA_AUTONOMY    = "🚜"   # §4DC autonomous GEPA loop (supply watch / live judge)
+    GEPA_AUTONOMY    = "🚜"   # §4DC/§4DF autonomous GEPA loop (supply watch / live judge / optimizer launcher / epoch swap)
     DREAM_REPLAY     = "🌀"   # counterfactual replay of a recorded episode
     EVOLVE           = "🦋"   # archive-based self-evolution of the scaffold
 

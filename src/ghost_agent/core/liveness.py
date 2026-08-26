@@ -555,6 +555,7 @@ def _gepa_autonomy_probe(home: Path) -> ProbeResult:
 
     from ..optim.autonomy import (
         LIVE_JUDGE_INTERVAL_S,
+        OPTIMIZER_TARGET_INTERVAL_S,
         SUPPLY_WATCH_INTERVAL_S,
     )
     path = Path(home) / "system" / "gepa_autonomy_state.json"
@@ -573,12 +574,23 @@ def _gepa_autonomy_probe(home: Path) -> ProbeResult:
     #: 3x the cadence: one missed window is idle-alignment luck, three
     #: is a stopped schedule (the negctrl STALE_AFTER_S reasoning).
     bounds = {"live_judge": 3 * LIVE_JUDGE_INTERVAL_S,
-              "supply_watch": 3 * SUPPLY_WATCH_INTERVAL_S}
-    fresh, stale_jobs, last_ts = [], [], None
+              "supply_watch": 3 * SUPPLY_WATCH_INTERVAL_S,
+              # §4DF: bounded on the 7d TARGET interval, not the daily
+              # job interval — the job legitimately decides "nothing
+              # due" most days and deep idle can be scarce, so a 3×1d
+              # bound would false-alarm on any busy week. (The state
+              # stamps `last_run_epoch` on every due probe, including
+              # `nothing_due`, so 21d of silence really is a stall.)
+              "optimizer": 3 * OPTIMIZER_TARGET_INTERVAL_S}
+    fresh, stale_jobs, standing, last_ts = [], [], [], None
     for job, bound in bounds.items():
         slot = st.get(job) if isinstance(st.get(job), dict) else {}
         _last = slot.get("last_run_epoch")
-        if not isinstance(_last, (int, float)):
+        # `_last != _last` is NaN (§4DF round 1, MIN-6): NaN IS a float,
+        # every comparison below is False, and the row printed as
+        # "(nand ago)" — a hand-edited NaN reads as "never", same as the
+        # jobs' own coercion.
+        if not isinstance(_last, (int, float)) or _last != _last:
             stale_jobs.append(f"{job} (never)")
             continue
         last_ts = max(last_ts or 0, _last)
@@ -586,18 +598,36 @@ def _gepa_autonomy_probe(home: Path) -> ProbeResult:
         # stamp `last_run_epoch` before the preflight (so a stood-down
         # job does not retry every tick), which made a box below the
         # disk floor read FIRED for months (lens B, B2). The outcome
-        # field separates the two.
-        if slot.get("last_outcome") == "stood_down":
-            stale_jobs.append(f"{job} (STANDING DOWN — see "
-                              f"last_summary in the state file)")
-        elif (now - _last) <= bound:
-            fresh.append(job)
-        else:
+        # field separates the two — and it gets its OWN note (§4DF
+        # round 1, MIN-5): the generic "the tick is not reaching the
+        # phase (kill switch?)" named two causes the state itself
+        # excludes — the tick DID reach the phase; the preflight
+        # refused.
+        if (now - _last) > bound:
+            # ⚠ STALENESS OUTRANKS THE STAND-DOWN LABEL (§4DF round 2,
+            # MAJOR-3). The round-1 wording fix checked `stood_down`
+            # FIRST, so a job whose LAST act was a stand-down could
+            # never raise "SCHEDULE STOPPED" — a probe note asserting
+            # "the tick reaches the phase", in the present tense, about
+            # a state file it just read as 100 days old. Driven: the
+            # 100d-stopped and 5m-fresh stand-down worlds produced
+            # byte-identical notes.
+            _sd = (", last outcome was a stand-down"
+                   if slot.get("last_outcome") == "stood_down" else "")
             stale_jobs.append(
-                f"{job} ({(now - _last) / 86400.0:.1f}d ago)")
+                f"{job} ({(now - _last) / 86400.0:.1f}d ago{_sd})")
+        elif slot.get("last_outcome") == "stood_down":
+            standing.append(job)
+        else:
+            fresh.append(job)
     note = ""
     if fresh:
         note = "advancing: " + ", ".join(sorted(fresh))
+    if standing:
+        note += ("; " if note else "") + (
+            "STANDING DOWN: " + ", ".join(sorted(standing))
+            + " — the tick reaches the phase but the preflight refuses "
+              "(disk/RAM floor); see last_summary in the state file")
     if stale_jobs:
         note += ("; " if note else "") + (
             "SCHEDULE STOPPED for " + ", ".join(sorted(stale_jobs))

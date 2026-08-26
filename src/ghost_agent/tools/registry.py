@@ -99,11 +99,14 @@ _SKILL_ROUTING_MIN_SKILLS = 25
 # in-process override (offline optimizer only) -> tuned artifact via
 # optim.loader (activation-counted, surfaced in learning-health) -> baseline.
 #
-# KV-stability contract: the available-artifact set is scanned ONCE per
-# process and the loader caches artifact content, so warmup and every
-# request render byte-identical descriptions. A newly promoted artifact is
-# picked up at the next restart — deploy = restart, same as the verifier
-# templates. NEVER reset these caches on a live agent.
+# KV-stability contract (§4DE): artifact content comes from the loader's
+# EPOCH — an immutable per-generation snapshot — and every read here rides
+# the request's PINNED generation, so all renders within one request are
+# byte-identical by construction. A newly promoted or retired artifact is
+# picked up by the next epoch swap (the biological tick, ~60s), which
+# costs one KV prefix re-prime and announces itself; deploy is no longer
+# a restart. The name-set below is cached per GENERATION and derives from
+# the same epoch, so it can never disagree with the content.
 #
 # ⚠ THE BYTE-IDENTICAL HALF HOLDS ONLY WHILE NO ARM IS REGISTERED. §4CZ/§4DA
 # made this read site randomizable: with a live `gepa_tool_description_*`
@@ -141,35 +144,52 @@ _TUNED_DESC_NAMES = None  # lazy frozenset of tool names with an artifact
 _DESC_WARNED: set = set()  # warn-once keys (per-call sites re-fire hourly+)
 
 
-def _tuned_desc_names():
+def _tuned_desc_names(req_id: str = ""):
+    """Tool names with a live artifact IN THIS REQUEST'S EPOCH.
+
+    §4DE: this was a process-wide frozenset built from its own glob — a
+    SECOND cache `loader.clear_cache()` never touched, so a newly
+    promoted tool artifact stayed permanently unreachable through the
+    `name not in _tuned_desc_names()` gate even with a hot loader. It
+    now derives from the loader's epoch (one home) and is cached per
+    GENERATION, so the epoch swap invalidates it by construction.
+    Pass the request's `req_id` where one exists so the gate reads the
+    same epoch the request's renders are pinned to.
+    """
     global _TUNED_DESC_NAMES
-    if _TUNED_DESC_NAMES is None:
-        names = set()
-        try:
-            # Only an EXPLICIT GHOST_HOME is trusted: optim.loader's
-            # ~/ghost_llamacpp fallback would let STRAY SHELLS (env
-            # unset) scan a live operator home and bake its artifacts
-            # into this process-wide set. (Test runs now SET a throwaway
-            # GHOST_HOME — §4BF 1c R5 — so they pass this guard and scan
-            # an empty tmp home; the guard still protects bare shells.)
-            if os.getenv("GHOST_HOME"):
-                from ..optim import loader as _optim_loader
-                optim_dir = _optim_loader._optim_dir()
-                for p in optim_dir.glob(f"{TOOL_DESC_SIGNATURE_PREFIX}*.json"):
-                    stem = p.name[: -len(".json")]
-                    name = stem[len(TOOL_DESC_SIGNATURE_PREFIX):]
-                    if name:
-                        names.add(name)
-        except Exception as e:
-            logger.debug("tuned tool-description scan failed: %s", e)
-        _TUNED_DESC_NAMES = frozenset(names)
-    return _TUNED_DESC_NAMES
+    try:
+        # Only an EXPLICIT GHOST_HOME is trusted: optim.loader's
+        # ~/ghost_llamacpp fallback would let STRAY SHELLS (env unset)
+        # scan a live operator home and bake its artifacts into this
+        # set. (Test runs SET a throwaway GHOST_HOME — §4BF 1c R5.)
+        if not os.getenv("GHOST_HOME"):
+            return frozenset()
+        from ..optim import loader as _optim_loader
+        if req_id:
+            # Pinned-epoch read: cheap (set over dict keys), no cache.
+            return frozenset(
+                s[len(TOOL_DESC_SIGNATURE_PREFIX):]
+                for s in _optim_loader.signature_names_for_request(
+                    req_id, TOOL_DESC_SIGNATURE_PREFIX))
+        _gen = _optim_loader.current_generation()
+        if _TUNED_DESC_NAMES is not None \
+                and _TUNED_DESC_NAMES[0] == _gen:
+            return _TUNED_DESC_NAMES[1]
+        names = frozenset(
+            s[len(TOOL_DESC_SIGNATURE_PREFIX):]
+            for s in _optim_loader.signature_names_for_request(
+                "", TOOL_DESC_SIGNATURE_PREFIX))
+        _TUNED_DESC_NAMES = (_gen, names)
+        return names
+    except Exception as e:  # noqa: BLE001
+        logger.debug("tuned tool-description scan failed: %s", e)
+        return frozenset()
 
 
 def _reset_tool_desc_cache():
-    """Tests/offline only. NEVER on a live agent — changing the rendered
-    descriptions mid-process busts the KV stable prefix (see optim.loader
-    .clear_cache for the same warning)."""
+    """Tests/offline only. §4DE made the old "NEVER on a live agent"
+    warning moot — the name-set is generation-keyed and moves with the
+    epoch swap on its own; this hammer just forces a recompute."""
     global _TUNED_DESC_NAMES
     _TUNED_DESC_NAMES = None
     _DESC_WARNED.clear()
@@ -202,7 +222,7 @@ def _tuned_tool_description(name: str, baseline: str, *,
     if override is not None:
         return override.strip() if _validate_tool_description(
             name, baseline, override) else baseline
-    if name not in _tuned_desc_names():
+    if name not in _tuned_desc_names(req_id):
         return baseline
     from ..optim import loader as _optim_loader
     # ⚠ ATTRIBUTED, LIKE THE PLANNER READ-SITE. Called without
@@ -233,7 +253,7 @@ def _tuned_tool_description(name: str, baseline: str, *,
         # artifact". A turn whose arm would not have rendered it either
         # way is not, whichever arm it drew.
         _withheld = _optim_loader_artifact_text(
-            f"{TOOL_DESC_SIGNATURE_PREFIX}{name}")
+            f"{TOOL_DESC_SIGNATURE_PREFIX}{name}", req_id)
         if _withheld and not _validate_tool_description(
                 name, baseline, _withheld):
             _unnote_optim_served(req_id,
@@ -264,13 +284,14 @@ def _note_optim_rejection(signature: str, reason: str) -> None:
         pass
 
 
-def _optim_loader_artifact_text(signature: str) -> str:
+def _optim_loader_artifact_text(signature: str, req_id: str = "") -> str:
     """The artifact's text regardless of arm — cache-only, no stamp, no
     randomization. Used to ask "would this turn have rendered the set?"
-    for the arm that was withheld it."""
+    for the arm that was withheld it. §4DE: reads the request's PINNED
+    epoch, so the withheld-side sums and the renders describe one era."""
     try:
         from ..optim.loader import artifact_text
-        return artifact_text(signature)
+        return artifact_text(signature, req_id)
     except Exception:  # noqa: BLE001 — never break a turn on attribution
         return ""
 
@@ -314,8 +335,6 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]],
     (and, with a registered experiment, randomized) exactly as the planner
     read-site is. Without it the behaviour is what it has always been.
     """
-    if not _TOOL_DESC_OVERRIDES and not _tuned_desc_names():
-        return tools
     _req_id = ""
     if context is not None:
         try:
@@ -323,6 +342,11 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]],
             _req_id = str(request_id_context.get() or "")
         except Exception:  # noqa: BLE001 — attribution never breaks a turn
             _req_id = ""
+    # Fast path AFTER req_id resolution, so the emptiness check reads the
+    # request's own epoch (§4DE) — before it, the check read the current
+    # epoch while the renders below would read the pinned one.
+    if not _TOOL_DESC_OVERRIDES and not _tuned_desc_names(_req_id):
+        return tools
     out = []
     inflation = 0
     swapped = False
@@ -379,7 +403,7 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]],
         else:
             if name and _req_id:
                 _w = _optim_loader_artifact_text(
-                    f"{TOOL_DESC_SIGNATURE_PREFIX}{name}")
+                    f"{TOOL_DESC_SIGNATURE_PREFIX}{name}", _req_id)
                 if _w and _w != baseline and _validate_tool_description(
                         name, baseline, _w):
                     # Valid per-tool, withheld by the arm: it counts

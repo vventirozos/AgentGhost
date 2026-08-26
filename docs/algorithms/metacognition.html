@@ -644,14 +644,14 @@ metacog summary   arbitrations=1 ask_user=1 validator_blocks=1 host_signals=1 ho
   <h2>Operator quickstart</h2>
   <pre>
 # default: legacy behaviour, uplift OFF
-python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080
+python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8088
 
 # uplift ON, defaults
-python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080 \
+python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8088 \
     --enable-metacog
 
 # uplift ON, custom threshold + no arbiter (cost-sensitive)
-python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080 \
+python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8088 \
     --enable-metacog \
     --metacog-confidence-threshold 0.45 \
     --metacog-disable-arbiter

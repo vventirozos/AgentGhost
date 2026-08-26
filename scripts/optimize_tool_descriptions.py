@@ -13,7 +13,7 @@ fixtures; the ship-gate judges only `tier == "private"`; iterations clamp
 to MAX_OPT_ITERATIONS. Components = the top-N tools by public-fixture
 count. Ships per-tool artifacts (`tool_description.<name>.json`) consumed
 by the registry read-site (`_apply_tuned_descriptions`, validator +
-aggregate inflation guard); deploy = agent restart.
+aggregate inflation guard); deploy = the §4DE epoch swap (live within ~a minute of promotion — no restart).
 
 ⚠ SUPPLY GATE — REAL POSITIVES, not fixtures and not all positives.
 Negatives cannot score a tool-choice replay, and bench fixtures may TEACH
@@ -788,8 +788,10 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fixtures", required=True)
-    ap.add_argument("--upstream-url", default="http://127.0.0.1:8088",
-                    help="MAIN model endpoint (descriptions target it)")
+    from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
+    ap.add_argument("--upstream-url", default=DEFAULT_UPSTREAM_URL,
+                    help="MAIN model endpoint (descriptions target it); "
+                         "default has ONE home: core.llm (§4DF CRIT-1)")
     ap.add_argument("--recordings", default="",
                     help="day-file dir (default $GHOST_HOME/system/llm_recordings)")
     ap.add_argument("--components", type=int, default=6,
@@ -857,6 +859,10 @@ def main() -> int:
                          "whether the toolbox needs re-carving or just "
                          "re-wording.")
     args = ap.parse_args()
+    # ⚠ BEFORE ANY I/O (§4DF). The caller's proof the SCRIPT ran — the
+    # same banner discipline as the judge and the miner, because this
+    # gate's exit 2 is the same triply-overloaded code. ONE home.
+    print(gate_contract.GATE_RUN_BANNER_OTD, flush=True)
 
     # ⚠ THE CONSTRAINT WAS PROSE. Both the module docstring and this
     # flag's help say "smoke runs only", nothing enforced it, and no test
@@ -1559,6 +1565,17 @@ def main() -> int:
     # `co_promoted` list that did not contain the file itself. An
     # untouched component has no candidate — there is nothing to reject
     # and nothing to record. `_changed` on BOTH paths.
+    # ⚠ STAGE ALL, THEN SWAP ALL (§4DF round 1, MAJOR-4). The old loop
+    # backed up + replaced PER COMPONENT, so an OSError on component N
+    # (ENOSPC is the realistic one — the backup/staging writes) aborted
+    # with components 1..N-1 already LIVE, exit 1, no REJECTED marker:
+    # the launcher then notified "nothing was believed or acted on"
+    # about a partial promotion the epoch swap was busy deploying, and
+    # every record named a `co_promoted` set that never fully promoted.
+    # Now every failure-prone write (backup copy, staging write, record
+    # validation) happens BEFORE the first `os.replace`; the only
+    # residual partial window is a crash between the bare renames.
+    _to_swap = []
     for comp, text in _changed.items():
         payload = json.dumps({
             "signature_name": comp,
@@ -1724,59 +1741,101 @@ def main() -> int:
             # stronger incumbent unrecoverably. A promotion made under
             # --allow-insignificant-ship is an operator judgement call, and
             # this was destroying the only thing that could undo it.
-            if live.exists():
-                backup = live.with_suffix(live.suffix + ".prev")
-                try:
-                    shutil.copy2(live, backup)
-                    print(f"incumbent backed up to {backup}")
-                except OSError as e:
-                    print(f"WARNING: could not back up {live} ({e}) — "
-                          f"promotion of {comp} aborted", file=sys.stderr)
-                    raise
-            # ⚠ STAGE + os.replace, NOT write_text. The comment above
-            # cites `run_gepa.py`'s `.prev` backup for the backup; `run_gepa.py`'s `os.replace(staging_path, output_path)`
-            # ALSO does `os.replace(staging_path, output_path)`, and round
-            # 2 ported half the discipline. A torn `write_text` (crash,
-            # ENOSPC, or a first read landing inside the truncate window)
-            # leaves invalid JSON, and `loader.py` caches the failure as
-            # `None` for the life of the PROCESS — so repairing the file
-            # on disk does not bring the signature back, and the only
-            # trace is a `logger.debug`. Re-promoting an already-live tool
-            # is the normal case.
-            _staged = live.with_suffix(live.suffix + ".staging")
-            _staged.write_text(payload)
-            os.replace(_staged, live)
-            print(f"PROMOTED {live}")
+            try:
+                if live.exists():
+                    backup = live.with_suffix(live.suffix + ".prev")
+                    try:
+                        shutil.copy2(live, backup)
+                        print(f"incumbent backed up to {backup}")
+                    except OSError as e:
+                        print(f"WARNING: could not back up {live} ({e}) "
+                              f"— promotion of {comp} aborted",
+                              file=sys.stderr)
+                        raise
+                # ⚠ STAGE + os.replace, NOT write_text. The comment above
+                # cites `run_gepa.py`'s `.prev` backup for the backup; `run_gepa.py`'s `os.replace(staging_path, output_path)`
+                # ALSO does `os.replace(staging_path, output_path)`, and round
+                # 2 ported half the discipline. A torn `write_text` (crash,
+                # ENOSPC, or a first read landing inside the truncate window)
+                # leaves invalid JSON, and `loader.py` caches the failure as
+                # `None` for the life of the PROCESS — so repairing the file
+                # on disk does not bring the signature back, and the only
+                # trace is a `logger.debug`. Re-promoting an already-live tool
+                # is the normal case.
+                _staged = live.with_suffix(live.suffix + ".staging")
+                _staged.write_text(payload)
+            except OSError:
+                # An abort must leave NOTHING promoted: drop every
+                # already-staged sibling so a re-run starts clean, then
+                # let the abort propagate (exit 1, no verdict marker —
+                # the launcher files it as an instrument failure, which
+                # is now TRUE: no component went live).
+                for _s, _l in _to_swap:
+                    try:
+                        _s.unlink()
+                    except OSError:
+                        pass
+                raise
+            _to_swap.append((_staged, live))
         else:
             (optim_dir / f"{comp}.json.candidate.rejected").write_text(payload)
-    if not ships:
-        if _cleared_margin and not _significant:
-            print(f"A/B gate REJECTED: the candidate cleared the margin "
-                  f"(paired delta {_dec.paired_delta:+.4f}, bar "
-                  f"{args.min_delta}) but the "
-                  f"discordant replays do not support it (McNemar "
-                  f"p={_p_str}, bar {ab_eval.SHIP_ALPHA}, {_cand_wins} "
-                  f"candidate / {_inc_wins} incumbent). This is an "
-                  f"UNDERPOWERED verdict on {_dec.usable} usable pairs "
-                  f"of {len(priv)}, not a measured "
-                  f"loss — mine more fixtures, or override deliberately "
-                  f"with --allow-insignificant-ship.")
-        elif not _no_candidate:
-            print("A/B gate REJECTED — live descriptions stand.")
-    # ⚠ AND THE VERDICT LINE MUST NOT CONTRADICT THE ONE ABOVE IT. A run
-    # with no candidate printed "A/B gate REJECTED — live descriptions
-    # stand." on stdout and "no component actually changed" on stderr, in
-    # that order, about the same run.
-    if _no_candidate:
-        print("NO CANDIDATE — live descriptions stand, and nothing was "
+    # Every failure-prone write is done; the renames are the cheap tail.
+    for _staged, live in _to_swap:
+        os.replace(_staged, live)
+        print(f"{gate_contract.GATE_PROMOTED_MARKER_OTD}{live}")
+    # ⚠ THE VERDICT LINE MUST MATCH THE EXIT IT CLAIMS (§4DF round 1,
+    # MAJOR-2). The old order printed the REJECTED (or NO CANDIDATE)
+    # marker and THEN decided the exit — so an underpowered run carried
+    # a verdict marker on stdout beside exit 2, and §4DF had just made
+    # those exact strings load-bearing for an autonomous caller. The
+    # code is computed FIRST; each marker prints only on the exit that
+    # claims it. Precedence: no-candidate outranks underpowered — "no
+    # candidate" is a property of the OPTIMIZER'S OUTPUT, and two
+    # byte-identical arms are GUARANTEED underpowered, so the old
+    # 2-before-3 order could relabel every wasted run as thin data.
+    # (An abort is still not a rejection: lens C, C4(iii).)
+    # The if/elif GUARDS below mirror the return conditional's order
+    # exactly — the conformance suite's fail-closed literal scan refuses
+    # a Name in a return value, so the ordering is stated twice, one
+    # statement apart, on purpose.
+    if ships:
+        pass  # the PROMOTED lines printed at the swap loop above
+    elif _no_candidate:
+        # The verdict line must not contradict the one above it: a run
+        # with no candidate must not ALSO print a rejection.
+        print(f"{gate_contract.GATE_NO_CANDIDATE_MARKER} — live "
+              f"descriptions stand, and nothing was "
               "measured about them.")
-    # ⚠ AN ABORT IS NOT A REJECTION here either: a mid-run outage that
-    # guts the tier below the pre-flight bar measured nothing and prints
-    # "re-run when the upstream is stable" — it must not share 1 with a
-    # measured loss (lens C, C4(iii)).
-    if not ships and (_dec.underpowered or _seed_undecidable):
-        return 2
-    return 0 if ships else (3 if _no_candidate else 1)
+    elif _dec.underpowered or _seed_undecidable:
+        _causes = []
+        if _dec.underpowered:
+            _causes.append(f"underpowered ({_dec.usable} usable pairs "
+                           f"of {len(priv)})")
+        if _seed_undecidable:
+            _causes.append("the seed arm was undecidable (outage)")
+        print(f"A/B gate ABORTED: {' and '.join(_causes)} — nothing "
+              f"decidable was measured; live descriptions stand "
+              f"untouched. Mine more fixtures, or re-run when the "
+              f"upstream is stable.")
+    elif _cleared_margin and not _significant:
+        print(f"{gate_contract.GATE_REJECTED_MARKER}: "
+              f"the candidate cleared the margin "
+              f"(paired delta {_dec.paired_delta:+.4f}, bar "
+              f"{args.min_delta}) but the "
+              f"discordant replays do not support it (McNemar "
+              f"p={_p_str}, bar {ab_eval.SHIP_ALPHA}, {_cand_wins} "
+              f"candidate / {_inc_wins} incumbent). This is an "
+              f"UNDERPOWERED verdict on {_dec.usable} usable pairs "
+              f"of {len(priv)}, not a measured "
+              f"loss — mine more fixtures, or override deliberately "
+              f"with --allow-insignificant-ship.")
+    else:
+        print(f"{gate_contract.GATE_REJECTED_MARKER} — live "
+              f"descriptions stand.")
+    return (0 if ships
+            else 3 if _no_candidate
+            else 2 if (_dec.underpowered or _seed_undecidable)
+            else 1)
 
 
 if __name__ == "__main__":

@@ -58,8 +58,9 @@ async def main() -> int:
     ap.add_argument("--promote", action="store_true",
                     help="copy STAGED items into the live bank directory. "
                          "This ARMS the bench flywheel; it is not a save.")
+    from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
     ap.add_argument("--upstream", default=os.environ.get(
-        "GHOST_UPSTREAM_URL", "http://127.0.0.1:8088"))
+        "GHOST_UPSTREAM_URL", DEFAULT_UPSTREAM_URL))
     ap.add_argument("--no-probe", action="store_true",
                     help="skip the DETERMINACY gate (saves 4 LLM calls per "
                          "surviving candidate). An item accepted without it "

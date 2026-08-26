@@ -184,11 +184,11 @@ def main() -> int:
               f"predate the era stamp, so their era cannot be "
               f"established and waiting will not resolve them. Only "
               f"turns recorded since the stamp landed can be compared.")
-    # ⚠ DEPLOY IS A RESTART, so the artifact ON DISK is not necessarily the
-    # one being SERVED: `optim/loader.py` caches the text per process, and
-    # its `clear_cache()` must not be called on a live agent. If every
-    # treatment turn carries some OTHER sha, the operator has promoted a
-    # new artifact and not restarted — and without this the scoping added
+    # ⚠ THE ARTIFACT ON DISK may briefly not be the one being SERVED:
+    # §4DE's epoch swap deploys within ~a tick, but a corpus recorded
+    # before the swap carries the previous sha — and on a pre-§4DE build
+    # (or a dead tick) the gap is unbounded. If every treatment turn
+    # carries some OTHER sha — without this, the scoping added
     # in §4DA round 8 reports "treatment n=0, need 12 per arm", which says
     # there is no evidence when there is 20 turns of it about the artifact
     # actually in production. Safe direction (no false REVERT), actively
@@ -229,14 +229,14 @@ def main() -> int:
               f"DISK. {_which}, while {_art_path.name} now hashes to "
               f"{_live_sha}.")
         if _one_era:
-            print(f"  Deploy is a RESTART — the loader caches the "
-                  f"artifact text per process — so the file was replaced "
-                  f"and the agent is still serving the previous one. "
-                  f"Either:\n"
-                  f"    sudo launchctl kickstart -k "
-                  f"system/com.local.ghost-agent\n"
-                  f"  and let turns accrue against the new artifact, or "
-                  f"judge the one that is actually running.")
+            print(f"  The file was replaced and the corpus predates the "
+                  f"swap. §4DE deploys promotions live within ~a minute "
+                  f"(the epoch swap in the biological tick), so on a "
+                  f"running agent this state is TRANSIENT: let turns "
+                  f"accrue against the new artifact and re-run. If it "
+                  f"persists across days, the agent is not running the "
+                  f"epoch-swap code (pre-§4DE build, or the tick is "
+                  f"dead — check the gepa.autonomy liveness probe).")
         else:
             print(f"  This corpus predates the current artifact entirely "
                   f"— it is history for several earlier ones, not "
@@ -373,11 +373,12 @@ def main() -> int:
                            + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
     art.rename(dest)
     print(f"\n{gate_contract.JUDGE_RETIRED_MARKER} {art} -> {dest}")
-    print("  ⚠ THE RUNNING AGENT IS STILL SERVING IT. `optim/loader.py`"
-          " caches the artifact text per process and its `clear_cache()`"
-          " must not be called on a live agent, so this rename takes"
-          " effect only on the next restart:")
-    print("      sudo launchctl kickstart -k system/com.local.ghost-agent")
+    print("  ⚠ The running agent serves the retired artifact for up to"
+          " ~one more minute: the §4DE epoch swap in the biological tick"
+          " notices the rename on its next pass and deploys the"
+          " retirement live (in-flight requests finish on their pinned"
+          " generation). No restart needed; the swap is announced on the"
+          " operator stream and the notification ledger.")
     if args.signature.startswith("tool_description."):
         print("  Until then every TOOL-BLOCK BUILD keeps using the retired"
               " artifact (not only planner turns). `activation_stats` counts"

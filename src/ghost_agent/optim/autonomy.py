@@ -1,6 +1,6 @@
-"""§4DC Phase 0+1 — the first autonomous GEPA actors.
+"""§4DC Phase 0+1 + §4DF Phase 3 — the autonomous GEPA actors.
 
-Two jobs, both riding the instruments' EXIT CONTRACTS (`gate_contract`),
+Three jobs, all riding the instruments' EXIT CONTRACTS (`gate_contract`),
 which is the whole design: an autonomous caller acts on exit codes, and
 §4DA spent eighteen rounds making those codes stop lying before anything
 was allowed to act on them.
@@ -18,6 +18,16 @@ not acted on. The only action this grants the loop is the one that can
 exclusively UNDO GEPA's own work — retiring a losing artifact back to
 the hand-written baseline.
 
+**Phase 3 — the optimizer launcher (§4DF).** Runs one gate script per
+day, round-robin over `OPTIMIZER_TARGETS`, and consumes `GateExit`
+(0 = promoted → the §4DE epoch swap deploys it, 1 = rejected,
+2 = could not measure, 3 = no candidate). The GATES are the
+decision-makers: every "should we run?" question is a cheap pre-flight
+inside the gate that exits 2 in seconds, so this job re-implements none
+of them and NEVER passes an override flag (no `--allow-*`, no
+`--force-supply`, no `--no-ab-gate` — operator-only), and never runs
+`scripts/optimize_verifier.py` (outside the contract, pinned perimeter).
+
 Design constraints, each from a recorded failure:
 
 * **Wall-clock cadence, persisted** (`traffic-gated-clocks`): at ~3.5
@@ -34,15 +44,19 @@ Design constraints, each from a recorded failure:
   once per distinct code, never acted on
   (`instruments-fail-not-runtime`).
 * **Kill switches** (`outcome-gated-learning-loop`):
-  `GHOST_GEPA_AUTONOMY=0` disables both jobs; `GHOST_GEPA_AUTO_REVERT=0`
-  demotes the judge to report-only (drops `--revert`).
-* **Neither job touches the inference slot**: the miner and the judge
-  are file readers. Timeouts are watchdogs against a wedged filesystem,
-  not against model latency.
-* **Retirement needs a restart to take effect** and restarts are the
-  operator's (root launchd; see the respawn-loop incident). The REVERT
-  notification says so explicitly — Phase 2 (loader hot-reload) removes
-  this, not Phase 1.
+  `GHOST_GEPA_AUTONOMY=0` disables all three jobs;
+  `GHOST_GEPA_AUTO_REVERT=0` demotes the judge to report-only (drops
+  `--revert`); `GHOST_GEPA_AUTO_OPTIMIZE=0` disables just the launcher.
+* **Only the optimizer touches the inference slot**: the miner and the
+  judge are file readers whose timeouts watchdog a wedged filesystem.
+  The optimizer is hours of sequential main-slot replays by design,
+  which is why it launches in DEEP idle only and carries §4U's RAM
+  floor on top of the shared disk floor.
+* **Retirement deploys itself** (§4DE): the epoch swap in the biological
+  tick notices the rename within ~a minute and the loader serves the
+  baseline again — no restart, no operator action. (Phase 1 shipped
+  before Phase 2 and this line then said the opposite; a stale "restart
+  needed" instruction is operator noise.)
 """
 
 from __future__ import annotations
@@ -56,11 +70,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .gate_contract import (
+    GATE_NO_CANDIDATE_MARKER,
+    GATE_PROMOTED_MARKER_GEPA,
+    GATE_PROMOTED_MARKER_OTD,
+    GATE_REJECTED_MARKER,
+    GATE_RUN_BANNER_GEPA,
+    GATE_RUN_BANNER_OTD,
     JUDGE_RETIRED_MARKER,
     JUDGE_REVERT_MARKER,
     JUDGE_RUN_BANNER,
     MINER_DONE_MARKER,
     MINER_RUN_BANNER,
+    GateExit,
     JudgeExit,
 )
 
@@ -69,10 +90,21 @@ from .gate_contract import (
 #: clocks pointless.
 SUPPLY_WATCH_INTERVAL_S = 7 * 86400
 LIVE_JUDGE_INTERVAL_S = 86400
+#: §4DF Phase 3 — at most ONE optimizer target attempted per day, each
+#: target at most once per 7 days. The 7d is a politeness mirror of the
+#: gates' own `--min-promotion-age-days` re-draw guard, which remains
+#: the authority (the gate refuses with exit 2 either way; ours only
+#: avoids paying a subprocess spawn to be told no).
+OPTIMIZER_INTERVAL_S = 86400
+OPTIMIZER_TARGET_INTERVAL_S = 7 * 86400
 
 #: Watchdog deadlines for the subprocesses (file readers; generous).
 SUPPLY_WATCH_TIMEOUT_S = 900
 LIVE_JUDGE_TIMEOUT_S = 600
+#: The optimizer is NOT a file reader — it is hours of sequential
+#: main-slot replays by design (the politeness the gates document).
+#: 6h bounds a wedged run without truncating an honest slow one.
+OPTIMIZER_TIMEOUT_S = 6 * 3600
 
 _STATE_NAME = "gepa_autonomy_state.json"
 
@@ -179,7 +211,11 @@ def _due(state: Dict[str, Any], key: str, interval_s: float,
          now: Optional[float] = None) -> bool:
     slot = state.get(key)
     last = slot.get("last_run_epoch") if isinstance(slot, dict) else None
-    if not isinstance(last, (int, float)):
+    # `last != last` is NaN (§4DF round 1, MIN-6): every comparison
+    # against it is False, so a hand-edited NaN read as "not in the
+    # future, not yet due" FOREVER — a silently parked job. Non-finite
+    # means "never ran", the same coercion rule as every other level.
+    if not isinstance(last, (int, float)) or last != last:
         return True
     _now = time.time() if now is None else now
     # A last-run in the FUTURE is a clock jump, not a recent run — the
@@ -279,6 +315,23 @@ def run_supply_watch(home: str, *, notify: Callable[[str], None],
     except Exception as e:  # noqa: BLE001 — timeout / spawn failure
         rc, tail = None, f"{type(e).__name__}: {e}"
         _cause = type(e).__name__
+        # §4DF round 3 (MIN-3): the harvest, applied to THIS handler
+        # too — a timeout kill AFTER the pool write + DONE marker is a
+        # COMPLETED mine, not a supply verdict failure. The exit code
+        # died with the kill so READY/PARKED is unknown and nothing is
+        # acted on, but the cause is named distinctly (a later
+        # different failure re-notifies) and the tail carries the clue.
+        _t_out = getattr(e, "stdout", None) or getattr(e, "output", None)
+        if _t_out:
+            if isinstance(_t_out, bytes):
+                _t_out = _t_out.decode("utf-8", "replace")
+            _t_out = str(_t_out)
+            tail += "\n" + "\n".join(_t_out.strip().splitlines()[-6:])
+            if MINER_RUN_BANNER in _t_out and MINER_DONE_MARKER in _t_out:
+                _cause = "timeout-after-complete"
+                tail = ("[the mine COMPLETED before the kill — the pool "
+                        "on disk is authoritative; check whether it "
+                        "went live or parked]\n" + tail)
     job["last_exit"] = rc
     job["last_summary"] = tail[-2000:]
     if rc == MINER_READY:
@@ -422,6 +475,30 @@ def run_live_judge(home: str, *, notify: Callable[[str], None],
         except Exception as e:  # noqa: BLE001
             rc, tail = None, f"{type(e).__name__}: {e}"
             _cause = type(e).__name__
+            # ⚠ §4DF round 3 (MAJOR-1): the round-2 harvest, applied to
+            # the one handler whose child is the autonomous ACTOR. A
+            # timeout kill landing AFTER the rename + RETIRED marker
+            # left the retirement ON DISK — the §4DE swap deploys it
+            # within ~a minute — while the notification said "no action
+            # taken": MAJOR-4's false claim back through the timeout
+            # door, one sibling over. The banner+marker in the
+            # harvested output ARE the verdict (same discipline as the
+            # live path); rc is restored so the normal branch notifies
+            # the retirement under its real `retired:{sha}` key
+            # (`_art_sha` was computed before the run, so it is the
+            # pre-retirement artifact's — correct).
+            _t_out = (getattr(e, "stdout", None)
+                      or getattr(e, "output", None))
+            if _t_out:
+                if isinstance(_t_out, bytes):
+                    _t_out = _t_out.decode("utf-8", "replace")
+                _t_out = str(_t_out)
+                tail += "\n" + "\n".join(
+                    _t_out.strip().splitlines()[-8:])
+                _want = (JUDGE_RETIRED_MARKER if auto_revert_enabled()
+                         else JUDGE_REVERT_MARKER)
+                if JUDGE_RUN_BANNER in _t_out and _want in _t_out:
+                    rc = JudgeExit.NO_LONGER_WINS
         sig_state = per_sig.setdefault(sig, {})
         if not isinstance(sig_state, dict):
             sig_state = per_sig[sig] = {}
@@ -439,11 +516,9 @@ def run_live_judge(home: str, *, notify: Callable[[str], None],
                     sig_state, f"retired:{_art_sha}", notify,
                     f"GEPA LIVE JUDGE: {sig} measurably LOSES to its "
                     f"baseline on production turns and was RETIRED on "
-                    f"disk. ⚠ The running agent still serves it until "
-                    f"the next restart (operator action: "
-                    f"`sudo launchctl kickstart -k "
-                    f"system/com.local.ghost-agent` when convenient).\n"
-                    + tail)
+                    f"disk. The epoch swap deploys the retirement live "
+                    f"within ~a minute (§4DE) — no restart needed; the "
+                    f"swap announces itself when it lands.\n" + tail)
             else:
                 _notify_once(
                     sig_state, f"revert-reported:{_art_sha}", notify,
@@ -489,3 +564,288 @@ def run_live_judge(home: str, *, notify: Callable[[str], None],
         log("live judge: no live artifacts to judge")
     _save_state(home, state)
     return results
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase 3 (§4DF) — the loop launches its own optimizer runs
+# ─────────────────────────────────────────────────────────────────────
+
+#: Round-robin targets. ⚠ scripts/optimize_verifier.py is DELIBERATELY
+#: absent — outside the gate contract by operator decision, and the
+#: perimeter is pinned. Adding a target here means adding its banner and
+#: markers to `gate_contract` FIRST (the §4DF day-one rule).
+OPTIMIZER_TARGETS = (
+    "tool_descriptions",
+    "gepa:planning.decompose",
+    "gepa:tool_selection.pick",
+    "gepa:reflection.critique",
+)
+
+#: §4U: an optimizer run is hours of unattended main-slot replays, so it
+#: gets the RAM floor the file-reader jobs deliberately skip.
+#: `replay_engine`'s precedent (1.5GB headroom above the llama-server
+#: working set on the 16GB box).
+MIN_RAM_FREE_MB = 1500
+
+
+def auto_optimize_enabled() -> bool:
+    """`GHOST_GEPA_AUTO_OPTIMIZE=0` disables just the optimizer job
+    (default ON — the operator's stated goal is the closed loop)."""
+    return os.getenv("GHOST_GEPA_AUTO_OPTIMIZE", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _optimizer_preflight(home: str) -> Optional[str]:
+    """Disk floor (shared) + RAM floor, both fail-CLOSED: a preflight
+    that cannot read a precondition reports that, never clears the
+    launch (`replay_engine`'s psutil rule, §4U)."""
+    blocked = _preflight(home)
+    if blocked is not None:
+        return blocked
+    try:
+        import psutil as _ps
+        avail_mb = _ps.virtual_memory().available / 1e6
+    except Exception as e:  # noqa: BLE001
+        return f"preflight could not read available RAM ({e})"
+    if avail_mb < MIN_RAM_FREE_MB:
+        return (f"only {avail_mb:.0f}MB RAM available "
+                f"(floor {MIN_RAM_FREE_MB}MB)")
+    return None
+
+
+def _target_command(target: str, home: str):
+    """(script, args, banner, promoted_marker) for one target string.
+    The `--fixtures` argv is the MINER'S OUTPUT PATH, built from the one
+    shared basename — driven before this line existed: the launcher
+    spawned the real gate with no argv and argparse exited 2 BEFORE the
+    banner, filing every launch as an instrument failure."""
+    if target == "tool_descriptions":
+        from .gate_contract import TOOL_FIXTURES_BASENAME
+        pool = str(Path(home) / "system" / "optim"
+                   / TOOL_FIXTURES_BASENAME)
+        return ("scripts/optimize_tool_descriptions.py",
+                ["--fixtures", pool],
+                GATE_RUN_BANNER_OTD, GATE_PROMOTED_MARKER_OTD)
+    sig = target.split(":", 1)[1]
+    return ("scripts/run_gepa.py", ["--signature", sig],
+            GATE_RUN_BANNER_GEPA, GATE_PROMOTED_MARKER_GEPA)
+
+
+def _pick_target(per_target: Dict[str, Any],
+                 now: float) -> Optional[str]:
+    """Staleness-ordered round-robin: never-attempted targets first in
+    declared order, then the longest-since-attempted whose age clears
+    `OPTIMIZER_TARGET_INTERVAL_S`. A last-attempt in the FUTURE is a
+    clock jump, not a recent attempt (the `_due` rule). None when every
+    target is fresh — a healthy state, not a stall."""
+    best, best_age = None, None
+    for target in OPTIMIZER_TARGETS:
+        slot = per_target.get(target)
+        last = slot.get("last_attempt_epoch") \
+            if isinstance(slot, dict) else None
+        # `last != last` is NaN (MIN-6): with it, `age` is NaN, every
+        # eligibility comparison is False, and ONE target silently
+        # starves forever while the job clock keeps advancing —
+        # unalarmed. Non-finite means "never attempted".
+        if not isinstance(last, (int, float)) or last != last \
+                or last > now:
+            return target
+        age = now - last
+        if age >= OPTIMIZER_TARGET_INTERVAL_S \
+                and (best_age is None or age > best_age):
+            best, best_age = target, age
+    return best
+
+
+def run_optimizer(home: str, *, notify: Callable[[str], None],
+                  log: Callable[[str], None],
+                  run_script: Callable = _run_script,
+                  now: Optional[float] = None,
+                  force: bool = False) -> Optional[tuple]:
+    """One tick: launch at most ONE gate run and consume its exit
+    contract. Returns (target, exit_code) — exit_code None on an
+    instrument failure — or None when not due / disabled / every target
+    fresh. Never raises.
+
+    ⚠ THE GATES ARE THE DECISION-MAKERS. Every "should we run?"
+    question — supply, corpus size, resolution, re-draw age, upstream
+    health — is a cheap pre-flight INSIDE the gate that exits 2 in
+    seconds without paying for the optimizer. This job deliberately
+    re-implements none of them (`the-sibling-one-revision-behind`), and
+    NEVER passes an override flag: no `--allow-*`, no `--force-supply`,
+    no `--no-ab-gate` (operator-only; §4DA's lesson is that the one
+    flag bypassing a gate carries its own bypass).
+    """
+    if not autonomy_enabled() or not auto_optimize_enabled():
+        return None
+    state = _load_state(home)
+    if not force and not _due(state, "optimizer",
+                              OPTIMIZER_INTERVAL_S, now):
+        return None
+    _now = time.time() if now is None else now
+    job = _job_slot(state, "optimizer")
+    job["last_run_epoch"] = _now
+    per_target = job.get("per_target")
+    if not isinstance(per_target, dict):  # the B3 coercion rule
+        per_target = job["per_target"] = {}
+    target = _pick_target(per_target, _now)
+    if target is None:
+        # Every target attempted within its 7d window: the day's
+        # decision is "nothing to do", which is health, not a stall —
+        # the outcome field says so for the liveness probe.
+        job["last_outcome"] = "nothing_due"
+        job["last_summary"] = "all targets fresh (7d/target)"
+        log("optimizer: all targets fresh — nothing to launch")
+        _save_state(home, state)
+        return None
+    _blocked = _optimizer_preflight(home)
+    if _blocked is not None:
+        job["last_outcome"] = "stood_down"
+        job["last_summary"] = f"stood down: {_blocked}"
+        log(f"optimizer: stood down — {_blocked}")
+        _save_state(home, state)
+        return None
+    job["last_outcome"] = "ran"
+    job["last_target"] = target
+    tslot = per_target.setdefault(target, {})
+    if not isinstance(tslot, dict):
+        tslot = per_target[target] = {}
+    tslot["last_attempt_epoch"] = _now
+    script, args, banner, promoted_marker = _target_command(target, home)
+    log(f"optimizer: launching {target} ({script}) — this can run for "
+        f"hours on the main slot")
+    try:
+        proc = run_script(script, args, home=home,
+                          timeout_s=OPTIMIZER_TIMEOUT_S)
+        rc: Optional[int] = proc.returncode
+        out_full = proc.stdout or ""
+        tail = "\n".join(out_full.strip().splitlines()[-8:])
+        if rc != 0 and (proc.stderr or "").strip():
+            tail += "\n[stderr] " + "\n".join(
+                proc.stderr.strip().splitlines()[-6:])
+        # ⚠ AN EXIT CODE IS BELIEVED ONLY WITH ITS MARKER. The banner
+        # catches the triply-overloaded exit 2 (argparse, missing file,
+        # COULD_NOT_MEASURE); the per-code markers catch a crash
+        # impersonating a verdict — and here REJECTED is LOG-ONLY, so a
+        # permanently crashing optimizer without this check would read
+        # as "rejected weekly" forever (the judge-A1 shape).
+        _cause = f"rc-{rc}"
+        if banner not in out_full:
+            rc, _cause = None, "no-banner"
+            tail = ("[no '" + banner + "' banner — the script did not "
+                    "start: bad argv, moved script, or broken "
+                    "interpreter]\n" + tail)
+        elif rc != GateExit.PROMOTED and promoted_marker in out_full:
+            # ⚠ A PROMOTED MARKER BESIDE A NON-ZERO EXIT IS A PARTIAL
+            # PROMOTION (§4DF round 1, MAJOR-4): components that
+            # reached disk ARE live (the epoch swap deploys whatever it
+            # finds), and the generic "nothing was acted on" text was a
+            # false claim about exactly this world. The gate now stages
+            # all before swapping any, so this is the residual
+            # crash-between-renames window — rare, and worth a look.
+            rc, _cause = None, "partial-promotion"
+            tail = ("[the '" + promoted_marker + "' marker is present "
+                    "but the exit was " + str(proc.returncode)
+                    + " — a PARTIAL promotion: the components named in "
+                    "the PROMOTED lines ARE live via the epoch swap "
+                    "while the rest of the run failed. Inspect "
+                    "system/optim/.]\n" + tail)
+        elif rc == GateExit.PROMOTED and promoted_marker not in out_full:
+            rc, _cause = None, "no-promoted-marker"
+            tail = ("[exit 0 without the '" + promoted_marker
+                    + "' marker — not a promotion]\n" + tail)
+        elif rc == GateExit.REJECTED \
+                and GATE_REJECTED_MARKER not in out_full:
+            rc, _cause = None, "no-rejected-marker"
+            tail = ("[exit 1 without the '" + GATE_REJECTED_MARKER
+                    + "' marker — a crash, not a verdict]\n" + tail)
+        elif rc == GateExit.NO_CANDIDATE \
+                and GATE_NO_CANDIDATE_MARKER not in out_full:
+            rc, _cause = None, "no-no-candidate-marker"
+            tail = ("[exit 3 without the '" + GATE_NO_CANDIDATE_MARKER
+                    + "' marker — a crash, not a verdict]\n" + tail)
+    except Exception as e:  # noqa: BLE001 — timeout / spawn failure
+        rc, tail = None, f"{type(e).__name__}: {e}"
+        _cause = type(e).__name__
+        # ⚠ A TIMEOUT KILL CARRIES THE CHILD'S OUTPUT (§4DF round 2):
+        # `TimeoutExpired.stdout` holds everything printed before the
+        # kill, and discarding it filed a timeout AFTER the PROMOTED
+        # lines as "nothing was believed or acted on" — the MAJOR-4
+        # false claim, back through the timeout door.
+        _t_out = getattr(e, "stdout", None) or getattr(e, "output", None)
+        if _t_out:
+            if isinstance(_t_out, bytes):
+                _t_out = _t_out.decode("utf-8", "replace")
+            tail += "\n" + "\n".join(str(_t_out).strip().splitlines()[-8:])
+            # Banner required, like the live path — a marker without
+            # proof the script started is believed nowhere (round 3).
+            if banner in str(_t_out) and promoted_marker in str(_t_out):
+                _cause = "partial-promotion"
+    tslot["last_exit"] = rc
+    tslot["last_summary"] = tail[-2000:]
+    if rc == GateExit.PROMOTED:
+        tslot["last_outcome"] = "promoted"
+        # A promotion is at most one per target per 7 days — each one is
+        # genuinely news, so this notifies directly rather than
+        # per-condition. The §4DE epoch swap will separately announce
+        # the DEPLOY when it lands (~a minute).
+        tslot["last_notified_condition"] = "promoted"
+        notify(f"GEPA OPTIMIZER: {target} ran the gate and a candidate "
+               f"was PROMOTED. The epoch swap deploys it live within "
+               f"~a minute (§4DE) and announces itself; the daily judge "
+               f"now watches it.\n{tail}")
+        log(f"optimizer: {target} PROMOTED")
+    elif rc == GateExit.REJECTED:
+        # The system working as designed — measured, and the incumbent
+        # stands. The full record is on disk (`.candidate.rejected`).
+        tslot["last_outcome"] = "rejected"
+        tslot["last_notified_condition"] = "rejected"
+        log(f"optimizer: {target} measured a candidate and REJECTED it "
+            f"— incumbent stands")
+    elif rc == GateExit.COULD_NOT_MEASURE:
+        # The gate's own pre-flights refusing (supply, re-draw age,
+        # upstream health) or a mid-run abort: routine, log-only.
+        tslot["last_outcome"] = "could_not_measure"
+        tslot["last_notified_condition"] = "insufficient"
+        _last = tail.splitlines()[-1] if tail else ""
+        log(f"optimizer: {target} could not measure"
+            + (f" — {_last}" if _last else ""))
+    elif rc == GateExit.NO_CANDIDATE:
+        # A wasted run or a broken reflection LM — news ONCE; weekly
+        # repeats of the same condition are not.
+        tslot["last_outcome"] = "no_candidate"
+        _notify_once(
+            tslot, "no-candidate", notify,
+            f"GEPA OPTIMIZER: {target} ran to completion but the "
+            f"optimizer produced NO candidate (returned the seed "
+            f"verbatim). One wasted run is luck; repeats suggest a "
+            f"broken reflection LM.\n{tail}")
+        log(f"optimizer: {target} produced no candidate")
+    elif _cause == "partial-promotion":
+        # The one instrument failure whose honest message is NOT
+        # "nothing was acted on": promoted components ARE live — so it
+        # notifies DIRECTLY, like the clean promotion arm (§4DF round
+        # 2, MIN-2: MUT-G's law is "a deploy must always notify", and
+        # routing this arm through `_notify_once` swallowed the second
+        # of two consecutive partial deploys).
+        tslot["last_outcome"] = "instrument_failure"
+        tslot["last_notified_condition"] = "partial-promotion"
+        notify(
+            f"GEPA OPTIMIZER: {script} for {target} printed a PROMOTED "
+            f"marker but did not exit 0 (a non-zero exit, or killed at "
+            f"the deadline) — a PARTIAL promotion. The "
+            f"components named in the PROMOTED lines are LIVE (the "
+            f"epoch swap deploys them); the rest of the run failed. "
+            f"Inspect system/optim/.\n{tail}")
+        log(f"optimizer: {target} PARTIAL promotion — inspect "
+            f"system/optim/")
+    else:
+        tslot["last_outcome"] = "instrument_failure"
+        _notify_once(
+            tslot, f"instrument:{_cause}", notify,
+            f"GEPA OPTIMIZER: {script} did not run cleanly for {target} "
+            f"(exit={rc}, cause={_cause}). Instrument failure — nothing "
+            f"was believed or acted on.\n{tail}")
+        log(f"optimizer: {target} instrument failure exit={rc}")
+    _save_state(home, state)
+    return (target, rc)

@@ -628,3 +628,118 @@ class TestTheFifthInstrumentIsAnExplicitPerimeter:
         assert '"gate":' not in src, (
             "optimize_verifier.py now writes a gate block; bring it "
             "inside the conformance perimeter")
+
+
+class TestTheGateMarkersHaveOneHomeToo:
+    """§4DF round 1 (MAJOR-3): the gate banners/markers joined the
+    contract and the conformance instrument did not — the sibling one
+    revision behind, on the mechanism this module exists to provide.
+    The scripts must PRINT through the constants; the constants must
+    still be the operator-facing lines they were LIFTED from; and the
+    launcher's `--fixtures` basename must be the miner's output name."""
+
+    def test_run_gepa_prints_through_every_gate_constant(self):
+        src = Path("scripts/run_gepa.py").read_text()
+        for const in ("GATE_RUN_BANNER_GEPA", "GATE_PROMOTED_MARKER_GEPA",
+                      "GATE_REJECTED_MARKER", "GATE_NO_CANDIDATE_MARKER"):
+            assert f"gate_contract.{const}" in src, (
+                f"run_gepa.py no longer prints through {const} — a "
+                f"restated marker string is the shape-1 defect")
+
+    def test_the_otd_gate_prints_through_every_gate_constant(self):
+        src = Path("scripts/optimize_tool_descriptions.py").read_text()
+        for const in ("GATE_RUN_BANNER_OTD", "GATE_PROMOTED_MARKER_OTD",
+                      "GATE_REJECTED_MARKER", "GATE_NO_CANDIDATE_MARKER"):
+            assert f"gate_contract.{const}" in src, const
+
+    def test_the_lifted_values_did_not_drift(self):
+        assert GC.GATE_REJECTED_MARKER == "A/B gate REJECTED"
+        assert GC.GATE_PROMOTED_MARKER_GEPA == (
+            "A/B gate PASSED — candidate promoted")
+        assert GC.GATE_PROMOTED_MARKER_OTD == "PROMOTED "
+        assert GC.GATE_NO_CANDIDATE_MARKER == "NO CANDIDATE"
+        assert GC.GATE_RUN_BANNER_GEPA == "run_gepa: gating"
+        assert GC.GATE_RUN_BANNER_OTD == "optimize_tool_descriptions: gating"
+
+    def test_the_fixtures_basename_has_one_home(self):
+        assert GC.TOOL_FIXTURES_BASENAME == "tool_choice_fixtures.jsonl"
+        miner = Path("scripts/mine_tool_fixtures.py").read_text()
+        assert "gate_contract.TOOL_FIXTURES_BASENAME" in miner
+        from ghost_agent.optim import autonomy as A
+        assert A._target_command("tool_descriptions", "/h")[1][1].endswith(
+            GC.TOOL_FIXTURES_BASENAME)
+
+    def test_the_upstream_default_has_one_home(self):
+        """§4DF round 1, CRIT-1: 8080 (the TLS web console) in two files
+        and 8088 (llama-server) in two others — and the launcher's
+        deliberately-minimal argv made run_gepa's wrong default
+        load-bearing for 3 of 4 targets. Every default now references
+        `core.llm.DEFAULT_UPSTREAM_URL`."""
+        from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
+        assert DEFAULT_UPSTREAM_URL == "http://127.0.0.1:8088"
+        for path, ref in (
+                ("scripts/run_gepa.py", "default=DEFAULT_UPSTREAM_URL"),
+                ("scripts/optimize_tool_descriptions.py",
+                 "default=DEFAULT_UPSTREAM_URL"),
+                ("src/ghost_agent/main.py", "default=_DEF_UP"),
+                # §4DF round 2, MIN-6: the env-fallback restatements the
+                # round-1 pin did not see — correct VALUE, drift hazard.
+                ("scripts/recheck_gepa_incumbent.py",
+                 '"GHOST_UPSTREAM_URL", DEFAULT_UPSTREAM_URL'),
+                ("scripts/mine_failure_envs.py",
+                 '"GHOST_UPSTREAM_URL", DEFAULT_UPSTREAM_URL'),
+                ("src/ghost_agent/optim/run_gepa.py",
+                 "DEFAULT_UPSTREAM_URL")):
+            src = Path(path).read_text()
+            assert ref in src, (path, ref)
+            # No re-stated literal default may remain: the constant's
+            # value appearing as a URL literal outside prose is drift
+            # waiting to happen. (Usage examples in docstrings/help are
+            # prose; argparse `default="http...` is not.)
+            assert 'default="http://127.0.0.1:80' not in src, path
+
+    def test_the_wired_defaults_EXECUTE_to_the_constant(self,
+                                                        monkeypatch):
+        """§4DF round 3 (MIN-2): the rows above are token scans — a
+        mutant kept the token alive in a dead expression while rewiring
+        the REAL default, and 113 tests stayed green. This one runs
+        each script's main() far enough to build its parser and reads
+        the default the parser will actually serve
+        (`token-pins-vs-executed-pins`)."""
+        import argparse
+        import asyncio as _aio
+        import importlib.util as _iu
+        import sys
+
+        from ghost_agent.core.llm import DEFAULT_UPSTREAM_URL
+        captured = {}
+        _orig = argparse.ArgumentParser.parse_args
+
+        def _spy(self, *a, **k):
+            for dest in ("upstream", "upstream_url"):
+                d = self.get_default(dest)
+                if d is not None:
+                    captured["d"] = d
+                    break
+            raise SystemExit(0)
+        monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _spy)
+        monkeypatch.setattr(sys, "argv", ["x"])
+        for rel, is_async in (
+                ("scripts/run_gepa.py", True),
+                ("scripts/optimize_tool_descriptions.py", False),
+                ("scripts/recheck_gepa_incumbent.py", True),
+                ("scripts/mine_failure_envs.py", True)):
+            captured.clear()
+            spec = _iu.spec_from_file_location(
+                f"conf_{Path(rel).stem}", str(Path(rel).resolve()))
+            mod = _iu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            with pytest.raises(SystemExit):
+                if is_async:
+                    _aio.run(mod.main())
+                else:
+                    mod.main()
+            assert captured.get("d") == DEFAULT_UPSTREAM_URL, (
+                f"{rel}'s parser serves "
+                f"{captured.get('d')!r} — the wired default and the "
+                f"token the row above scans have diverged")
