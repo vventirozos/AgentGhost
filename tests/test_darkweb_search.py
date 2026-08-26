@@ -405,8 +405,16 @@ async def test_research_uses_cache():
 
 @pytest.mark.asyncio
 async def test_small_max_context_bounds_extract():
-    """A tiny worker context window shrinks the per-source extract well below
-    the 40k-char default, so the distill call can't overflow it."""
+    """A small MAIN-model window tightens each source's share of the report.
+
+    ⚠ REPOINTED 2026-08-25. This used to claim `max_context` was "the worker's
+    context window" and asserted the extract shrank with it — but registry.py
+    fills it with the MAIN model's window (240,000 live), so it never bound
+    and the distill went out at its 40k ceiling regardless. The worker's own
+    limit now comes from `plan_distill`; what `max_context` legitimately
+    bounds is how much of the assembled report is read back into the main
+    model, i.e. each source's SHARE, and that is what is pinned here.
+    """
     html = f'<a href="http://{V3_A}.onion/">Target</a>'
     stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "xmh57jrk": html})
     huge = "Z" * 200000
@@ -419,6 +427,14 @@ async def test_small_max_context_bounds_extract():
 
     llm = MagicMock()
     llm.chat_completion = AsyncMock(side_effect=_cc)
+    # A REAL planner, so the caller's ceiling actually flows through. With a
+    # bare MagicMock the plan's char_limit is `MagicMock.__index__` == 1 and
+    # the assertion below passes on a one-character prompt — true, and
+    # meaningless.
+    from ghost_agent.core.node_throughput import NodeThroughput
+    _nt = NodeThroughput()
+    _nt._rates["worker"] = [3000.0, 300.0, 9]     # fast enough to want more
+    llm.plan_distill = lambda budget_s, **kw: _nt.plan(budget_s, "worker", **kw)
 
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):
         with patch.object(dw, "_fetch_onion_text", new_callable=AsyncMock, return_value=huge):
@@ -426,6 +442,16 @@ async def test_small_max_context_bounds_extract():
                 "ctx topic", tor_proxy="socks5://127.0.0.1:9050", llm_client=llm, max_context=2048
             )
 
-    # Tiny 2048-token window -> 4096-char floor, far below the 40k default.
+    # A tiny main window collapses each source's share to the sizing module's
+    # own floor — far below both the 40k ceiling and what this fast node would
+    # otherwise be asked to read.
+    # ⚠ DERIVED, NOT A LITERAL. This asserted `<= 4096`, a number that came
+    # from MIN_CHARS being 4,000; re-basing the floor silently broke it.
+    from ghost_agent.core.node_throughput import CHARS_PER_TOKEN, MIN_CHARS
+    share = max(MIN_CHARS, int(2048 * CHARS_PER_TOKEN * 0.4))
     assert "Z" in captured["content"]
-    assert captured["content"].count("Z") <= 4096
+    zs = captured["content"].count("Z")
+    assert zs <= share, (zs, share)
+    assert zs < 40_000
+    # ...and NOT vacuously small: the ceiling is what bound it, not a stub.
+    assert zs > 1000

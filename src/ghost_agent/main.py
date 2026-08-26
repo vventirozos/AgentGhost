@@ -59,7 +59,7 @@ from .core.mcts import MCTSReasoner
 from .core.hypothesis import HypothesisTester
 
 print(" - Importing utilities and tools...", flush=True)
-from .sandbox.docker import DockerSandbox
+from .sandbox.docker import DockerSandbox, register_lazy_sandbox
 from .utils.logging import setup_logging, pretty_log, Icons, set_log_redaction
 from .utils.token_counter import load_tokenizer
 from .tools.registry import TOOL_DEFINITIONS
@@ -1211,6 +1211,14 @@ async def lifespan(app):
         logger.debug("fork sweep skipped: %s", _fwe)
 
     if importlib.util.find_spec("docker"):
+        # Registered BEFORE the construction attempt: when the constructor
+        # itself raises (daemon socket not up yet — the 08-26 OrbStack boot
+        # race left execute/browser dead for 7 hours), `sandbox_manager` is
+        # never assigned and nothing below retries. Registration lets
+        # registry.py rebuild the manager lazily once docker recovers
+        # (sandbox/docker.ensure_sandbox_manager, identity-guarded so an
+        # isolated-replay copy can never resurrect a detached sandbox).
+        register_lazy_sandbox(context)
         try:
             context.sandbox_manager = DockerSandbox(context.sandbox_dir, context.tor_proxy)
             # §4BO: reap sandboxes orphaned by a kill mid-solve, BEFORE
@@ -1284,8 +1292,10 @@ async def lifespan(app):
             pretty_log("Sandbox Failed", str(e), level="ERROR", icon=Icons.FAIL)
 
         # The reaper starts REGARDLESS of how the block above went. A docker
-        # failure at boot still leaves `context.sandbox_manager` assigned, so
-        # `execute` promotes normally once docker recovers — and without this
+        # failure AFTER construction leaves `context.sandbox_manager`
+        # assigned, and a failure IN the constructor (daemon down at boot)
+        # leaves it None until the lazy re-init above rebuilds it — either
+        # way `execute` promotes normally once docker recovers, and without this
         # the lifetime cap would then be enforced only when something
         # happened to call the `jobs` tool, i.e. the unbounded wait would be
         # back, just relocated. The loop no-ops while no supervisor exists.
@@ -1976,7 +1986,7 @@ async def lifespan(app):
     # --- Stage-1 self-improvement wiring ---
     # Trajectory collector: the passive corpus-builder used by
     # reflection, skills_auto, and optim downstream. Writing to
-    # $GHOST_HOME/trajectories/YYYY-MM-DD/session-<sid>.jsonl via the
+    # $GHOST_HOME/system/trajectories/YYYY-MM-DD/session-<sid>.jsonl via the
     # collector's day-partitioning + redaction pipeline. Disabled by
     # --no-trajectories.
     if not getattr(args, "no_trajectories", False):

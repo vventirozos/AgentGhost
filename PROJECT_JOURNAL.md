@@ -26338,6 +26338,2683 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4DE — GEPA autonomy Phase 2: the epoch-pinned loader (2026-08-26)
+
+**The design, before the first line of code — because the obvious design is wrong.** Phase 2's brief
+("hot-reload epoch swap at request boundaries") assumed a quiescent instant exists. The scout's map
+says it does not: `foreground_requests == 0` is not "no loader reader active" — self-play, dream,
+bench and replay turns run separate `GhostAgent` instances through `BackgroundOnlyLLM` precisely so
+they DON'T raise the foreground counters, and bench turns are an ENROLLED population; the two-stage
+verifier under `GHOST_CRITIC_ASYNC=1` (exported by the launcher) reads `verifier.*` templates after
+its request has ended; and an in-flight request re-resolves tool defs after `create_skill`
+(`invalidate_tool_defs`), so even one request can straddle a swap. A swap gated on quiescence
+reproduces round 16's "last call wins" through TIME instead of through call sites: the ring slot's
+sha overwritten mid-request, a trajectory recording era B for turns planned under era A.
+
+**So the design is epoch PINNING, not a global freeze.** The loader gains numbered, immutable
+generations:
+
+- **Generation = an eager snapshot.** `maybe_advance_epoch()` computes a DIRECTORY-SHAPE stamp over
+  `system/optim/*.json` — sorted `(name, mtime_ns, size)`, the `evolve/evaluator` pattern, because it
+  is the only cheap check that sees ADDED and REMOVED files (promotion is `os.replace`, retirement is
+  a rename-away; a per-file mtime cache misses both births and deaths). On change it reads every live
+  artifact's content into a NEW immutable generation (~10 small files) and bumps `_CURRENT_GEN`.
+  Within a generation the world cannot shift under a lazy read, and the per-generation NEGATIVE cache
+  stays load-bearing (today's zero-artifact state keeps its dict-hit fast path; new files are noticed
+  by the next stamp, not by per-read stats).
+- **First loader touch pins the request's generation.** `tuned_instruction`'s first call for a req_id
+  records the current generation in the ring slot and refcounts it; every later call for that req_id
+  — later turns' planner reads, a re-resolve after `invalidate_tool_defs`, the registry's withheld-side
+  `artifact_text` reads (which gain a req_id) — serves from the PINNED generation. In-flight requests
+  keep the old world; new requests get the new one; nobody waits for anybody. `forget_request`
+  releases the pin; unpinned non-current generations are dropped.
+- **Req-id-less readers** (async verifier, reflection, boot warmup) read the current generation at
+  call time — accepted and documented: they stamp nothing, so era integrity is not at stake; a
+  mid-verification template change is a one-off inconsistency, not a corrupted comparison.
+- **The swap check rides the biological tick** (60s cadence, one dir-stat) — not because the tick is
+  quiescent (pinning makes quiescence unnecessary) but to keep stats off the request hot path.
+  Deploy latency after a promotion or retirement: ≤ ~one tick.
+- **Cross-module invalidation is part of the swap, not a hope**: `registry._TUNED_DESC_NAMES` (a
+  second process-wide cache `clear_cache()` never touched — a newly promoted tool artifact would be
+  permanently unreachable without this) rebuilds when the generation it was built under is no longer
+  current. Warn-once keys (`_WARNED_ARMS`, `_DESC_WARNED`) become (name, sha) so a re-promoted
+  artifact re-warns without reopening the set-mutation crash their permanence was protecting against.
+- **The swap is the DEPLOY event and is told to the operator**: each advance records a
+  `gepa_autonomy` ledger row (severity=notify) naming each signature's old→new sha (or
+  promoted/retired), and the known cost — the KV prefix re-primes once. The stale
+  "deploy = restart" claims (loader/clear_cache docstring, registry read-site contract,
+  `gepa_live_check`'s "STILL SERVING IT" block, autonomy's retirement notification) all get updated:
+  after Phase 2 they are FALSE, and a false "restart needed" instruction is operator noise.
+- **Era vocabulary stays where it lives**: the era sha remains the instruction-text sha with its ONE
+  loader definition (the scout found THREE sha meanings in the tree — loader/live_check's
+  instruction-text sha, autonomy's whole-file notify key; the epoch id is deliberately NOT a sha but
+  a process-local counter, so it can never be mistaken for an era marker). What crosses module
+  boundaries goes in `gate_contract` before the first consumer, per the §4DC day-one mandate.
+
+**Invariant world-space (the test design):** axes = {swap timing: before request / between requests /
+mid-request between turns / during the streamed drain / during an async verify}, × {change kind:
+promote-new, re-promote-changed, retire, no-op touch}, × {reader: pinned request, req-id-less,
+second concurrent request}. Invariants: (1) every stamp a request writes carries the sha its
+generation actually served — driven by comparing rendered text to stamped sha per turn; (2) two
+requests straddling a swap stamp their OWN generations; (3) a generation with live pins is never
+dropped, an unpinned old one always is; (4) the negative cache never outlives its generation;
+(5) req-id-less reads always see the current generation; (6) the registry's name-set and the
+loader's generation move together. Plus the §4DA-grade batteries and the land/verify split — the
+peer session verifies.
+
+## §4DD — Boot-race sandbox death, and the lazy re-init (2026-08-26)
+
+**The incident:** the agent daemon booted at 08:11:52, seconds before OrbStack's docker socket
+answered (~08:12). `DockerSandbox.__init__` pings the daemon, so the constructor raised,
+`context.sandbox_manager` was never assigned, and every `execute`/`browser` call for the next
+**7 hours** returned "Sandbox manager not initialized" — while the hourly isolated bench runs,
+which construct their own managers, proved docker had recovered minutes after boot. Boot init was
+one-shot with no retry: a comment in `main.py` even claimed "a docker failure at boot still leaves
+`context.sandbox_manager` assigned", which is only true for failures AFTER construction. The live
+request that surfaced it (302f8868, the webOS build) could write files (host-side) but never verify
+or serve them. Classic [[silent-inoperative-subsystems]]: one ERROR line at boot, then hours of
+plausible per-call failures.
+
+**The fix (shipped):** `sandbox/docker.py` grows `register_lazy_sandbox(context)` +
+`ensure_sandbox_manager(context)`. main.py registers the live context (a **weakref identity**, not
+a flag — a `copy.copy`'d isolated-replay context, which nulls its manager ON PURPOSE for
+`network=none` replays, is a different object and can never resurrect a detached sandbox).
+registry.py's `execute`/`browser` resolve the manager through it, off-loop via `asyncio.to_thread`;
+on success the manager is assigned back onto the context so every other reader (file_system,
+manage_services, tree lister, job reaper) recovers the same turn. Guards: 60s backoff between
+attempts, non-blocking lock (concurrent caller bails, never queues a second daemon ping), and a
+socket-existence pre-check so a docker-less box pays a stat(), not a client timeout.
+`ensure_running` is deliberately not called — `execute()` runs it per command.
+
+**The review catch:** a failed construction leaks its half-built docker client (~11 unix sockets,
+§4BO). Boot leaked it at most once; the retry path makes it recurring, so the helper now closes the
+exception-carried client, and the constructor's darwin fallback client — built AFTER
+`handle_err.client` was attached, so no caller could ever close it — is now closed in the
+constructor itself. The fix's own blast radius contained a pre-existing leak it would have promoted
+from harmless to EMFILE. A second review round swept the remaining constructor call sites and found
+`dream.py`'s self-play construction bare — same leak, nightly retries — so the close now lives in a
+shared `close_carried_client(exc)` used by the lazy path and dream.py both (isolation.py keeps its
+older inline version, already pinned). Verified negative on the same sweep: `supports_job_promotion`
+is a class attribute (a lazy manager inherits it), and the job reaper + supervisor re-key off
+`context.sandbox_manager` per cycle, so the whole jobs subsystem heals on recovery without wiring.
+Live-fire check: a registered manager-less context against the real daemon recovered, wrote back,
+and logged `Sandbox Recovered`.
+
+**Pins:** `tests/test_lazy_sandbox_reinit.py`, 12 tests, five mutation-checked (identity guard,
+write-back, backoff, both leak-closes — each mutant killed). One test-harness trap worth recording:
+the "must never construct" sentinel originally raised `AssertionError`, which the helper's
+`except Exception` **swallows** — the guard tests passed vacuously until the sentinel became a
+`BaseException` subclass. Full suite 17,436 passed / 17 skipped = 17,453 collected, exact.
+Docs: `docs/sandbox/docker.html#lazy-reinit`, troubleshooting entry under Docker/OrbStack. No
+restart needed: the race only bites at boot, and any future boot loads this code from disk.
+
+
+## §4DC — GEPA autonomy: the roadmap, and Phase 0+1 (2026-08-26)
+
+**The goal, stated by the operator: make the GEPA loop completely autonomous.** §4DA's eighteen
+rounds were the prerequisite — an autonomous caller acts on the instruments' exit codes, and until
+that work the codes lied. Now every gate and judge verdict is machine-actionable, which is what makes
+this section possible.
+
+**Where the stack stands:** nothing is live (every artifact retired or rejected); the tool-description
+pool is supply-blocked at 121/200 real positives; and every step of the loop — mine, optimize, gate,
+promote, deploy, judge, revert — requires the operator to type a command.
+
+**The four blockers, in dependency order:**
+
+1. **Supply.** No run can start until the miner's gate passes, and positives accrue from real traffic
+   only (bench never grades — admissibility is load-bearing). Nothing to build but a watch.
+2. **Deploy.** Promotion and revert take effect only on agent restart, and restart is root
+   `launchctl` — the one step the agent cannot do itself, with a respawn-loop incident behind it.
+   The structural blocker.
+3. **Trigger.** Nothing decides WHEN to run. Every precondition is already computable (supply gate,
+   re-draw age, upstream health, idle main slot, §4U preflight); they need an orchestrator job.
+4. **The clock.** At ~3.5 turns/day a live verdict needs weeks (12/arm, era-scoped, halved by the
+   50/50 split). Autonomy does not fix traffic; the loop is a slow metabolism by design, and the
+   7-day re-draw guard already paces it correctly.
+
+**The phases:**
+
+- **Phase 0 — supply watch** (this entry): a scheduled job re-mines weekly, tracks the real-positive
+  projection, and notifies when the gate becomes runnable. Read/report only.
+- **Phase 1 — autonomous judge** (this entry): a daily run of `gepa_live_check` over every signature
+  with a live artifact, acting on the exit contract — auto-`--revert` on a REVERT verdict, no action
+  on 0/2/3, notify on every action. The first unsupervised decision is the one that can only ever
+  UNDO GEPA's own work.
+- **Phase 2 — hot-reload in the loader**: an epoch swap at request boundaries (loader notices a
+  new/removed artifact sha between requests and reloads, stamping consistently). Removes the
+  root-restart dependency for promote AND revert, and closes today's promoted-on-disk-but-serving-old
+  gap. Touches era integrity — needs §4DA-grade review rounds. Agreed between the two working
+  sessions at §4DC close (2026-08-26): Phase 2 inherits the §4DA discipline FROM DAY ONE — a
+  gate_contract-style single home for any new era/epoch vocabulary before the first consumer exists,
+  an invariant world-space over the reload-timing axes (swap-during-turn, swap-between-requests,
+  retire-vs-promote ordering, cold cache), and the land/verify session split (one session lands,
+  the other runs the fresh-eyes verification; ownership handshake before touching loader.py or era
+  code — the round-3 class-shadowing collision is why).
+- **Phase 3 — autonomous optimizer runs**: the orchestrator launches the gate run itself when all
+  preconditions hold, idle-scheduled on the main slot, one run per re-draw window, kill switch,
+  watchdog budget, every action logged and notified — inform, never ask.
+- **Phase 4 — close the loop**: the orchestrator consumes gate exits (0 → arm the live-check watch on
+  the new era; 1/2/3 → log, cool down, reschedule), per-signature cool-downs, journal write-back.
+
+**Out of scope by standing operator decision:** `scripts/optimize_verifier.py` stays outside the
+contract (pinned perimeter test). Autonomy is scoped to the two contract gates until that changes.
+
+### Phase 0+1 SHIPPED (2026-08-26)
+
+`src/ghost_agent/optim/autonomy.py` — `run_supply_watch` (weekly) and `run_live_judge` (daily), both
+consuming the instruments' exit contracts through the subprocess boundary (argv/env/exit code is the
+tested, mutation-hardened surface; in-process imports would consume internals instead of the
+contract). Wall-clock cadence persisted in `system/gepa_autonomy_state.json` (atomic staged
+write; a future `last_run_epoch` is a clock jump, not a recent run — the re-draw guard's rule).
+Notifications ride the autonomous-activity ledger (`severity="notify"` → digest + Slack poller) and
+fire on TRANSITIONS with re-arming: supply parked→ready once (re-armed by a fallback), a retirement
+once per artifact (re-armed by a KEEP), an undeclared exit code once per distinct code. The judge's
+one action — `--revert` on a REVERT verdict — is the only decision the loop makes unsupervised, and
+it can only restore the hand-written baseline; the notification says the retirement takes effect on
+the next operator restart (Phase 2 removes that). Kill switches: `GHOST_GEPA_AUTONOMY=0` (master),
+`GHOST_GEPA_AUTO_REVERT=0` (report-only), both default ON per the operator's stated goal, off-set
+idiom matching `verifier.py`. §4U trimmed to the job class: a disk-only preflight (the full
+`replay_engine.preflight` gates on Docker, which these file-readers never touch — importing it
+unchanged would stand the supply watch down whenever OrbStack is off).
+
+Wiring: a phase in `_biological_tick` after negative controls — idle window (900, 3600], tick-level
+probe anchor at ONE HOUR (the real cadence lives in the state file; the lazy anchor is `now`, not
+`datetime.min`, so a boot's first idle window does not spawn subprocesses — and neither does every
+tick-level test), `asyncio.to_thread` inside an outer `asyncio.wait_for` above the child's own
+timeout (a 15-minute mine must not stall the event loop; the outer watchdog bounds a wedged spawn),
+anchor advanced before the work and in `finally`, fail-LOUD on exceptions (the negctrl rule: "could
+not run" and "ran, nothing to do" must never look alike). Phase registered in `_PHASE_LABELS` +
+`PHASE_EXPECTATION` (ON_OUTPUT — ledger rows are transition-only, so a zero means "nothing changed",
+and the LIVENESS signal is the state file itself) and a `gepa.autonomy` probe in `liveness.PROBES`
+reading `last_run_epoch` against 3× each job's cadence, bounds imported from the owning module.
+New icon `Icons.GEPA_AUTONOMY` 🚜 — which pulled in the three interface constraints the §LOG audit
+recorded: the glyph classified in `app.js` ICON_CLASS AND the hand-synced ClockworkPi copy
+(`turnstatus.py`), and the cache-bust chain bumped root-down (`app.js` 10.3→10.4, `matrix_graph.js`
+with it) with the manifest re-recorded. Flags documented in `docs/configuration.html`; 27 driven tests in
+`tests/test_gepa_autonomy_phase01.py`, including two REAL-subprocess pins (the judge against an empty
+corpus keeps the artifact and exits 2; the miner reports a missing corpus as exit 2, honestly) and
+five tick-wiring pins driving the real `_biological_tick`.
+
+**Round 1 (lens B) landed six fixes before lens A even reported.** The HIGH: a crashing judge child
+exits 1 — Python's uncaught-exception code, which is also the judge's most actionable declared code —
+and the caller notified *"RETIRED on disk"* about an untouched artifact (executed: a
+NotADirectoryError child), after which the false `retired` condition suppressed the REAL retirement's
+notification forever while the traceback sat on unread stderr. The action-bearing codes are
+MARKER-GATED now: `JUDGE_RETIRED_MARKER` / `JUDGE_REVERT_MARKER` / `MINER_RAN_MARKER` live in
+`gate_contract` (one home — a string restated in writer and reader is the §4DA shape-1 defect), the
+scripts print through them, and code-without-marker is an instrument failure carrying the stderr
+tail. Second: the judge renamed WHATEVER file was at the path after its corpus walk, so a promotion
+completing mid-run had its fresh artifact retired on the old one's evidence — the script re-derives
+the sha immediately before the rename and exits 3 on mismatch (driven: a mid-run swap leaves the new
+artifact untouched). Also: the state file moved OUT of `system/optim/` (its `*.json` glob means
+"live artifact" — parking it there gave learning_health a phantom invalid-artifact row and flipped
+liveness' RETIRED branch); the probe distinguishes a stood-down job from a run (`last_outcome` — the
+pre-preflight `last_run_epoch` stamp had read FIRED on a disk-starved box); `_save_state` cannot
+raise and stages per-PID (two writers shared one staging name); the notify-once key is the artifact
+FILE's sha, so retire→re-promote→retire notifies twice (the docstring had claimed this and the
+signature-keyed code did not deliver it); the judge's outer watchdog scales with the live-signature
+count; and the tick tests disarm the neighbouring self-play/dream phases (the idle=4000 arm was a
+1-in-5 coin flip on self-play's dice, executed: 4 failures in 12 runs).
+
+**Round 1 (lens A) — 53 mutants against the revised tree, and one MAJOR the exit-1 fix had left one
+code over.** Exit 2 is TRIPLY overloaded: argparse bad-usage, CPython "can't open file", and the
+judge's benign COULD_NOT_MEASURE — so a moved script, broken venv or renamed argument read as "could
+not measure yet", log-only, FOREVER: a silently dead judge whose REVERTs never happen, with every
+surface showing the expected thin-data steady state. Both scripts now print a RUN BANNER
+(`JUDGE_RUN_BANNER` / `MINER_RUN_BANNER`, in the contract) immediately after argparse, before any
+I/O; ANY exit code arriving without the banner is an instrument failure — driven with a genuinely
+missing script, the stderr diagnosis riding the note. Lens A also independently reproduced all six
+lens-B defects before reading the fixes, verified each fix end-to-end, and ran the differential: all
+six round-1 pins fail on the pre-fix tree.
+
+Its battery then showed the round-1 fix set had shipped with its two highest-value properties
+unpinned on the WRITER side — the `stood_down` outcome write (the probe pin hand-wrote its fixture:
+reader pinned, writer free), and the tick's `severity="notify"` (one word, and every retirement
+notification silently demotes to digest-only) — plus the save-hardening entirely unpinned, the inner
+subprocess timeout unpinned (the timeout test injected the exception rather than arming the
+mechanism), the to_thread/wait_for wiring indistinguishable from a sync call under sync stubs, and
+the outer-bound scaling revertible. All pinned now, each by a test that distinguishes: a 1.2s job
+must leave the event loop responsive at 0.3s; the outer watchdog must carry `(n_live+1)` with seven
+artifacts on disk; a stand-down must be READ BACK from the state file; two saves must stage under
+different names (per-call uuid — per-PID did not separate the orphaned-thread-beside-next-tick pair
+its own comment named, lens A B-2, driven). Smaller: the Slack bot's own label/emoji tables now know
+`gepa_autonomy` (a retirement rendered as a raw slug at the exact moment it must read as news); the
+judge's rc!=0 stderr rides every tail; the stale state-file path in two docs; and today's section
+letter collided with 2026-08-25's §4DB ("The node was never out of slots") — this work is **§4DC**
+everywhere now.
+
+**Round 2 (convergence-deciding) — two code defects inside round 1's own fix region, per the standing
+pattern.** F1: the miner's `Labels:` marker prints BEFORE the supply gates and the pool write, so a
+crash AT the write exited 1 with banner+marker present and was filed as the parked steady state —
+executed: `system/optim` as a file gave rc=1, zero notifications, "still parked — FileExistsError",
+and Phase 0's only action (the supply-gate-open notification) was silently dead. A marker certifies
+the outcome it PRECEDES, which is nothing: the gate key is now `MINER_DONE_MARKER` ("mine complete:"),
+the miner's LAST line, printed after the write/park. F2: the B3 hand-edited-state coercion missed the
+level between `job` and `sig_state` — `"per_signature": "oops"` raised AttributeError, aborting the
+phase BEFORE the supply watch with no state save, stalling BOTH jobs with hourly ERROR spam until
+hand repair (the sibling one revision behind: the level below it WAS coerced). Every level coerces
+now, parameterised over three poisons.
+
+Four unfailable pins from its battery, all closed with executed ones: MUT21 — the report-only
+`REVERT:` marker existed only because the verdict f-string happened to use a colon (the shape-1
+restated-string defect, inside the module built to close it); the script prints the REVERT head
+through the contract constant now, `TestTheMarkersHaveOneHome` pins every script→constant binding,
+and a real report-only REVERT is driven end-to-end. MUT25 — "exit 1 + REVERT: present + RETIRED
+absent" (a crash between the verdict print and the rename — the narrowest resurrection of lens B's
+false-RETIRED) had no pin. MUT22 — banner-before-any-I/O was comment-enforced; a real missing-root
+run now pins that exit 2 carries the banner. MUT23 became an equivalent mutant under the DONE-marker
+redesign (Labels is informational now). Plus the smaller findings: the exit-3 notification said
+"vanished mid-run" for the sha-mismatch cause where nothing vanished — a promotion completed — and
+one shared condition meant a later different cause never re-notified (cause-specific text and
+condition keys now); the judge's stand-down writes the `last_summary` the probe's note points at;
+`docs/configuration.html` carried the §4DB reference in entity form (`&sect;`) that the rename grep
+could not see.
+
+Round 2 also confirmed the disk action itself is mutation-hardened in both directions (the sha
+re-check killed both ways): nothing found can wrongly RETIRE an artifact — the residue was all in the
+quieter lose-a-right-action direction.
+
+**And the round-2 pin battery's own instrument flaked once more before settling.** The
+loop-responsiveness pin went through three shapes: a single 0.3s sample (the tick's earlier phases
+yield, so it completed before the GEPA phase ran — the sync-call mutant survived), a whole-tick
+heartbeat asserting max-gap < 0.9s (killed the mutant, then FLAKED under full-suite CPU contention
+when the parallel run stretched to 9:39 — a wall-clock PROXY for the property), and finally the
+property itself: the job must execute OFF the event-loop thread, asserted by `threading.get_ident()`
+— deterministic under any load, and the sync-call mutant still dies (`guard-the-thing-not-a-proxy`,
+third instance in this section alone). Round-2 battery: 8/8 real mutants killed, control survived.
+
+**Round 3 (final verdict) — the action path held; four items, all in the fix regions, all closed with
+the PARALLEL SESSION coordinating.** Two sessions had been fixing round 2 concurrently, and the
+collision itself produced round 3's sharpest find: both added a test class named
+`TestTheMarkersHaveOneHome`, the second SHADOWED the first, and its driven report-only pin silently
+dropped from collection while the total (62) matched the recorded count — a green suite vouching for
+a dead test (renamed; 65 collect now, and the resurrected pin kills the marker-drift mutant that had
+survived the whole shipped suite). The live-code find (F1): every rc-to-None coercion shared the
+`instrument:None` notify-once condition, so a DIFFERENT later instrument failure never re-notified —
+executed, week-1 moved script + week-2 crash-at-write = one notification. Conditions are keyed by
+CAUSE now (`no-banner` / `no-done-marker` / `no-verdict-marker` / exception type / `rc-N`), the same
+rule the exit-3 split applied one branch over. The thread-identity pin now probes BOTH legs, asserts
+exactly ONE call per leg (the sync-pre-call-beside-to_thread survivor shape), and every ident
+off-loop; the swap-phrase fixture moved to STDERR only, mirroring the real script (with the phrase in
+stdout too, a stdout-only-slice consumer mutant survived); RETIRED-prints-only-after-the-rename is
+pinned via a read-only optim dir (a failed rename must not notify a retirement that never happened);
+and the READY leg's DONE gate got its own pin (exit 0 without the marker must not fire SUPPLY GATE
+OPEN). Sessions split the close: this one landed, the peer runs the fresh-eyes verification over the
+landing diff — no self-review. Round-3 battery: 7/7 killed, CONTROL survived.
+
+**Verification pass (this session, over the peer's landing) — CONVERGED.** Differential trust held:
+all seven of the landing's claimed mutants die under an independently-written battery (not the
+landing session's own), the docstring CONTROL survived, and the journal dedupe, class rename (69
+collect) and every claimed pin were verified against the tree rather than the report. One gap the
+landing's battery missed, in the agree region of its own cause-keying fix: the EXCEPTION path's cause
+(`type(e).__name__`) had no pin in either job — fixing it to a constant survived 69 tests, meaning a
+TimeoutExpired week one and an OSError week two would share one notify-once condition and the second
+would never notify. Pinned in both jobs (two exception types = two notifications; the same type twice
+stays fire-once), and both mutants now die. Final battery: CONTROL survived, every mutant killed.
+
+**§4DC Phase 0+1 is CONVERGED.** The supply watch and live judge go live at the next agent restart.
+Three rounds, two sessions (one landing, one verifying — the split that avoids self-review), and the
+section's standing pattern held to the end: every round's finding sat in the previous fix's own
+region, and the last defect found was in the verifier's favourite hiding place — the fix's
+notification keys, one code path over from where they were just fixed. Next: Phase 2, the loader
+hot-reload epoch swap (removes the root-restart dependency for promote AND revert; touches era
+integrity; gets its own §4DA-grade review cycle before anything autonomous depends on it).
+
+## §4DA — The second of three ship gates (2026-08-25)
+
+§4CY took seven review rounds to make one ship gate honest, and landed in **one of three**.
+`scripts/optimize_tool_descriptions.py:634` still read `ships = valid and aggregate_ok and delta >
+args.min_delta` — the exact rule §4CY replaced.
+
+⚠ **My reason for picking this gate first was wrong, and wrong in the way the script warns about.**
+I wrote "192 mined fixtures against its own threshold of 200". The pool holds 192 **rows** and **66
+positives**; the supply gate counts positives, so the real gap is 66 of 200 — *further* from running
+than GEPA, not nearer. `test_the_supply_gate_counts_positives_not_rows` exists to prevent exactly
+that confusion and I made it while citing the file. I also wrote "every GEPA signature sits at 32
+private examples": `planning.decompose` has 31 on plan-keyed examples, and the other two have **zero**
+keyed examples for their own output fields, reaching 60 only through a fallback `run_gepa` itself
+flags as grading a different objective. The port is still worth having — this gate carried the defect
+§4CY spent seven rounds characterising — but the ranking that chose it was not measured.
+
+Ported: margin **and** one-sided McNemar at `ab_eval.SHIP_ALPHA`, the same constant the GEPA gate and
+the §4CW seed veto read; `--allow-insignificant-ship` as a recorded override that lifts the
+significance bar only; the significance floor added to the pre-flight beside the resolution check,
+so an unwinnable run costs nothing instead of `iterations × len(pub)` main-model calls; the offered
+`--min-delta` rounded UP and asserted (printed down, it is a fixed point); the step printed as a
+fraction beside its decimal, because no fixed precision stops a decimal colliding with the bar it is
+compared against; and the refusal split so "clear the margin" and "collect more fixtures" are
+different sentences.
+
+**McNemar here, Fisher in §4CZ, and the difference is load-bearing.** Both arms replay the SAME
+fixture list in order, so fixture *i* is a matched pair. §4CZ's live arms are different requests —
+unpaired. The gate refuses outright rather than pairing by position across lists of different
+lengths, which would compare fixture *i* against fixture *j* and still produce a p.
+
+**The decision was extracted into `_ship_decision()` before it was pinned.** Every §4CY/§4CZ round
+that went wrong went wrong inside a harness that stubbed out the component under test — four times.
+A pure function taking two real trajectory lists has nothing to stub, and the pre-flight call site
+that stays inside `main()` is covered by an AST walk instead of a fake optimizer.
+
+### Round 2, second lens — my round-2 fix poisoned the optimizer, and four guards were decorative
+
+The lens that re-read the round-1 fixes found the pattern again, one level further in: **the round-1
+transport marker created a new state and left a consumer reading the old two-valued world.**
+`make_reflective_dataset` skipped `err == "unreplayable"` and treated every *other* truthy err as a
+per-tool-cap rejection, whose feedback reads *"it fails the production validator. Propose a SHORTER
+one — length is the problem, not the content."* `err="transport"` is not `"unreplayable"`, so it fell
+into that branch. `evaluate()` runs the public trainset every GEPA iteration, and the whole premise of
+the round-1 fix is that llama-server restarts happen mid-run — so a transient outage now taught the
+reflector, on every affected fixture at once, to shorten a description that was fine. The fix for a
+lying instrument became a lying teacher. The suite could not tell the bug from the fix: the mirror
+mutant (removing the `unreplayable` skip) is killed by an existing pin, and the `transport` half was
+pinned in neither direction.
+
+**Four guards wired into `main()` and pinned nowhere**, each surviving a one-line hardcode against the
+full suite including the brand-new round-2 file:
+
+- `aggregate_ok = _inflation <= _slack` → `= True` survives. Driven with a real over-ceiling
+  candidate, the mutant PROMOTES while printing `aggregate_ok=True (+1000/100 chars)` — the exact
+  measured failure its own comment records (6 individually-valid descriptions summing to 38,248 chars
+  against a 20,000 ceiling, 0 of 6 reaching the model, ship line saying `ships=True`).
+- `_need = max(_min_discordant, _resolution_need)` → `= _resolution_need` survives, because at the
+  0.02 default `ceil(1/0.02) = 50` dwarfs the 5-pair floor and **the floor never binds**. My round-1
+  entry said the AST pin "asserts the floor is derived, never that it is used" and claimed driving
+  `main()` had closed that. It had not — the region where the fix and the bug agree was the entire
+  default margin. Now pinned at `n=4, --min-delta 0.25`, where the two halves disagree. Since round 2
+  the same `_need` also arms the `underpowered` guard, so one mutation weakened two things.
+- Only the *candidate* side of the transport exclusion was pinned: the round-1 fixture builds an
+  incumbent-arm outage and asserts `candidate_wins == 0`, where `incumbent_wins` is 0 whatever the
+  guard does. The mirror — a candidate-arm outage manufacturing incumbent wins — *suppresses* honest
+  ships rather than faking them, which is the quieter failure and was unexercised.
+- `_by_tool`'s prefix strip survives `{k: v}`: the new `main()` harness *executes* it but the stub
+  discards `candidate`, so its output is never observed. Unstripped, `_swap_descriptions` matches no
+  tool, both arms replay the incumbent text, delta is always 0 — and `valid` still says True, because
+  the per-tool cap is computed against an empty baseline.
+
+And the operator-facing count: `n_err` printed `(N unreplayable)` over every truthy err, saying the
+same thing about a corpus gap (stable across both arms) and an outage (the thing that invalidates the
+pairing). Reported apart now, for both arms.
+
+**Three of my own new tests were passing for the wrong reason.** `test_reject_side` read `capsys` once
+*after* a five-margin loop, so one iteration emitting the message satisfied it for all five — the
+other four could have refused for any reason at all. `test_admit_side` used `--min-delta 1e-06`, which
+is inside the *bounds* and then refuses at the *resolution* pre-flight, so the admit side never
+admitted anything and asserted only the absence of a string. And two docstring numbers described a
+corpus the harness does not build. A pin has to fail somewhere, and these three had no such world.
+
+### Post-redesign round 2 (final) — one ordering bug, four pin gaps, CONVERGED
+
+The convergence-deciding pass mutation-tested round 1's own diff (39 mutants, 33 killed, control
+survived, every survivor investigated) and found one thing that changes what is live on disk, plus
+four pins that could not fail. All fixed and mutation-verified (7/7 killed, control survived);
+full suite green.
+
+**`run_gepa` promoted before it validated.** The gate stamp was built AFTER `os.replace`, so both of
+round 1's guards misreported the world when they fired: a `validate_gate_record` refusal exited 2 —
+"nothing changed, re-run when stable" — with the CANDIDATE already live and unstamped (the next run
+would gate against the unaudited candidate: the ratchet), and a `build_seed_arm` refusal — the
+delta-identity check, the one that catches a rate swap — fired inside the stamp's I/O swallow and
+exited **0**, promoted, gate block absent. The fix and the bug agreed exactly in the region the fix
+was reviewed in: the round moved ONE validator out of the swallow and left the other in it. The whole
+stamp is now built and validated in `_build_gate_stamp()` BEFORE anything moves — a contract breach
+exits 2 with the incumbent untouched and the candidate kept in staging — and the pin checks the DISK,
+not just the code.
+
+**Three exit-code stragglers one frame past the scan.** `optimize_tool_descriptions.py`'s
+`_load_fixtures` raised `SystemExit(<string>)` — exit 1, a measured rejection — for a missing pool,
+which has been the DEFAULT invocation's exit code since the pool parked at `.notready`; and
+`recheck`'s `_load_signature` used `SystemExit` as an internal signal (caught by its only caller, but
+one refactor from exiting 1 on a typo — it is `LookupError` now, which is what it means). The
+conformance scan gained a whole-file rule: every `raise SystemExit(x)` must carry a declared literal,
+except the `__main__` idiom.
+
+**Four unfailable pins closed with executed ones:** the `disabled=` binding at its ONLY production
+call site (`disabled=None` there had survived 1325 tests — the post-filters keep the prompt right, so
+the regression was invisible everywhere except the attribution); recheck driven against the
+pre-contract tool-description seed-arm shape (bypassing `read_seed_arm` with a raw dict read had
+survived — the round-16 defect's regression channel); the absent-`undecidable` default (flip to True
+printed "AN OUTAGE ATE THE PAIRS" for every legacy record, unpinned); and
+`overridden=bool(args.allow_seed_loss)` alone (the flag on a veto-free run recorded an override of a
+veto that never fired — the exact state `validate_seed_arm` refuses).
+
+**§4DA is CONVERGED.** The ship rule has been stable since round 3; the vocabulary has one home with
+an executed conformance layer that failed a real orphan on its first run and now validates the
+artifact ON DISK; the read site's invariants hold over an enumerated world-space whose expected
+memberships are derived, not compared; and the final pass's findings were all one diff wide.
+Known-open by explicit decision: `scripts/optimize_verifier.py` stays outside the contract (operator
+scope: "build #4 scoped for gepa"), with a pinned perimeter test that fails the day it half-adopts.
+
+### Post-redesign round 1 — the names held; the bindings did not
+
+Three lenses attacked the redesign itself. The name half of shape 1 is genuinely closed — every
+defect found uses only registered keys and declared codes — and the enumerated world-space killed its
+whole family, including both round-14 signed-sum directions. What survived review is one level up, in
+the BINDINGS: which arm a named field receives, which state a declared code maps to, whether a flag
+means "the condition held" or "the check was refused", and the two factors the world-space held
+constant (call topology; the input-set = prompt-set identity). All fixed and driven this round:
+
+**The redesign's own schema carried a false record on its first flight.** The tool-description gate's
+seed arm called `_ship_decision(cand, seed, …)` — the slot inversion that makes "ships" mean the
+hand-written text wins — and then recorded `paired_incumbent` under `seed_pass_rate`: the artifact
+promoted under `--allow-seed-loss`, promoted BECAUSE it lost, carried rates saying it won, and the
+SEED ARM print contradicted itself mid-sentence (raw rates right, paired rates swapped).
+`validate_seed_arm` now enforces `delta == seed_rate − candidate_rate` — the only check a swap cannot
+pass; names cannot see it. And an outage that gutted the seed arm recorded `vetoed: true` about a
+check that never ran, which the shared reader printed back as "THE SEED ARM FIRED THE VETO";
+`undecidable` is its own schema field now, mutually exclusive with `vetoed`.
+
+**Two exit codes still inverted an actionable verdict.** `recheck`'s middle band (`0 ≤ delta ≤
+margin`) returned 1 unconditionally, so with 2 discordant pairs (p=0.25 either way) delta −0.044
+exited 2 while +0.044 exited 1 — the point-estimate-BETTER direction got the harsher code, and which
+one a wrapper saw was the sign of noise. The band now requires the tier to RESOLVE the margin
+(`_retire_need` pairs), else 2. And `gepa_live_check` gave a pooled-history REVERT about a signature
+with NO artifact the actionable exit 1 (printing "--revert not given; <path> left in place." about a
+path that does not exist); the no-artifact refusal now covers every verdict, keyed on the derived sha
+so the genuine race (artifact vanished between measurement and rename) still reaches exit 3.
+
+**The world-space's fixed factors were the next thinness.** `disabled_tools` was filtered on the
+RETURNED list — after the read site had drawn arms, stamped the request and summed the ceiling over
+tools the model would never see; self-play forbids `web_search` and contained delegates run
+allowlists, so exposure-free treatment turns would attenuate a true REVERT toward KEEP. Disabled
+tools come out BEFORE serving now. And the per-QUERY-KEY request cache let one request SERVE TWICE
+(empty first query → superset; `stable_tool_query` pins the later substantive one → routed subset),
+with the LAST call owning the stamps — driven both orders, one order leaves `{}` after a rendered
+turn, the other stamps a tool the final set never contained. The cache is single-slot per request:
+the first resolution IS the advertised set, which is also optimisation #7's stated goal.
+
+**The guard layer itself was unexecuted.** `validate_gate_record` had zero calls in the test tree;
+in `run_gepa` its refusal was swallowed by the stamp's `except Exception` into the same "promoted
+without provenance" warning as a disk error (now: stderr + exit 2, out of the swallow's reach — a
+SystemExit(<string>) would have exited 1, the rejected-candidate code). The conformance scan's driven
+bypasses are closed the honest way: the artifact ON DISK is validated through both gates' harnesses
+(subscript writes and computed keys cannot hide from a file), the reader scan is receiver-agnostic
+and fail-CLOSED on unknown names, `main()` may return only literal-valued expressions (a Name in an
+IfExp branch smuggled a code past the first version), and `optimize_verifier.py`'s exclusion is a
+PINNED operator decision, not an oversight — the pin fails the day it half-adopts the contract.
+
+**And two self-catches in the new instruments themselves.** The derived era test re-pointed itself
+when the contract lost the third arm — dropping EXCLUDED_ARM from ERA_SCOPED_ARMS passed the whole
+conformance file (`self-calibrating-index-adapts`); the content is pinned beside the derivation now.
+And the world-space briefly carried two fake axes: "invalid"/"identical" landed in SHAPES while the
+`_text` branches that give them meaning did not, so 384 tests passed with the new shapes silently
+aliasing "equal" — caught because the derived-membership arithmetic then disagreed with the code on
+worlds where byte-identical artifacts (correctly, arm-invariantly) keep their stamps through a prune.
+
+Also: `run_gepa` gained its NO_CANDIDATE site (a verbatim-incumbent run exits 3 BEFORE paying for two
+identical A/B arms), both gates exit 2 for mid-run evidence-bar/seed-arm aborts ("re-run when the
+upstream is stable" is not a rejection), the mid-band/abort messages say ABORTED, arm labels have one
+home in `gate_contract` (ERA_SCOPED_ARMS / RENDERED_ARMS, imported by loader, live_check, agent), the
+`_SERVED_RING` has a two-in-flight concurrency pin (capacity 64→1 had survived 876 tests), an
+over-cap `_TOOL_DESC_OVERRIDES` entry has a validation pin, and the docs carry the two exit
+contracts, the recheck evidence rules, and the corrected five-cause refusal list.
+
+### The design change — why sixteen rounds did not converge, and what stops the seventeenth
+
+The operator called it: *"apparently something needs a redesign if it doesn't converge after 16
+rounds… this won't converge as it is."* That is right, and the reason is measurable rather than a
+matter of judgement.
+
+**The ship rule converged at round 3.** Margin AND one-sided McNemar at `ab_eval.SHIP_ALPHA` has not
+changed since. Almost everything found in rounds 4-16 was one of two shapes.
+
+**Shape 1 — a concept with no single definition, restated in every file that touches it.** Measured on
+the round-16 tree: **17 files** hard-code the arm labels `treatment`/`control`/`excluded`/`unenrolled`;
+**7 files** hard-code gate-record key names; the four instruments return **40 raw integer exit codes**
+between them. Round 4 was a corpus gap given the semantics of an outage. Round 7 was a gate stamping
+seven fields the only reader could not open. Round 9 was the veto arm nobody gave the outage handling
+to. Rounds 11 and 12 were one-armed guards. Round 13 was a set-level win stamped as a per-component
+one. Round 14 was a third arm label left outside the era filter. Round 15 was four exit vocabularies.
+Round 16 was two seed-arm schemas — **and that one was introduced by round 16's own fix**, in the seed
+veto it had just ported, reproducing round 7's defect verbatim: `recheck_gepa_incumbent.py` reads
+`overridden` and the tool-description gate wrote `seed_loss_overridden`, so the *"THAT PROMOTION USED
+--allow-seed-loss"* warning was structurally unreachable for every artifact that gate writes.
+
+A review round samples ONE pair of restatements. There are O(n²) pairs and the graph regrows whenever
+anything is added. Reviewing cannot close it.
+
+**Shape 2 — hand-picked fixtures, with the defects living where the picked family is thin.** Round 11's
+fixtures were all-treatment, so the withheld arm had no coverage. Round 13's corpus had one tool, so
+set-level defects were invisible. Round 14's artifacts were all LONGER than their baselines, so the
+sign of the inflation delta had zero coverage. Round 15's harness could produce "all changed" or
+"none", so the only boundary that separates them — two — was unreachable. Round 16's fixtures called
+the read site once per request, so the second caller was unreachable. Each round widened the family by
+one axis and found the one mutant that axis exposed. The number of axes is not bounded by the number
+of rounds anyone runs.
+
+**The fix for shape 1: `src/ghost_agent/optim/gate_contract.py`.** One module owns the vocabulary —
+`GateExit` / `JudgeExit` (two contracts, because a gate's 0 means the incumbent was REPLACED and a
+judge's 0 means it STANDS; what all four share is 2), `build_seed_arm` / `read_seed_arm` /
+`SEED_ARM_KEYS`, and the gate-record key registry with `validate_gate_record`, which both gates now
+call at write time. `tests/test_gate_contract_conformance.py` enforces it by AST over the real files:
+no gate may invent a key no reader opens, no judge may read a key no gate writes, both gates must
+BUILD the seed arm rather than write a literal, no instrument may return an undeclared exit code, and
+the era filter must name every randomized arm. It found a real orphan on its first run. 8 of 8
+mutants killed, docstring CONTROL survived.
+
+One detail worth keeping: the seed-arm field is `seed_minus_candidate_delta`, not `delta`. The two
+gates printed that quantity with **opposite signs**, so one key would have carried two meanings —
+`one name per number`, with the direction in the name. And `read_seed_arm` deliberately does NOT infer
+`vetoed` from the sign, because an earlier draft did and would have been wrong for exactly the legacy
+files it was meant to help.
+
+**The fix for shape 2: `tests/test_read_site_invariants.py`.** The axes are enumerated instead of
+chosen — {longer, shorter, equal-but-different} × every tool subset × every arm draw — and the
+assertions are INVARIANTS rather than expected values, because an invariant is the only kind of claim
+that survives a new axis. The ceilings are **derived per world**, not chosen: the read site has two
+(the rendered `inflation` and the arm-invariant `_worst_inflation`) and every defect of this class
+lives in the band between them, whose position depends on the artifact lengths. My first version used
+constants and let two round-14-class mutants straight through. With the band computed: 8 of 8 killed,
+control survived — including `_worst_inflation += len(_w) - len(baseline)` (round 14's exact defect)
+and `if _withheld_names and …` (round 11's, and round 14's, "one conjunct out").
+
+**And one suite-level fix.** `registry_diagnosis` branches on three per-PROCESS counters in
+`optim/loader.py`, and two tests patched one of the three — green alone, green under `-n 8 --dist
+loadfile` (one file per worker), red in a single process behind a neighbour, which is how both escaped
+sixteen rounds. Rounds 14 and 16 each fixed one by hand. An autouse fixture in `conftest.py` now
+resets all three before every test, which closes the class instead of the instances.
+
+### Round 16 — the turn's attribution described a tool set the model never saw
+
+Applying the tuned descriptions is not a pure read: it draws an experiment arm per artifact, STAMPS
+the request's attribution, and prunes that stamp when the assembled set busts the aggregate ceiling —
+all three properties of *the tool list passed in*. So a second call with a DIFFERENT list overwrites
+the first one's verdict, and the last call wins.
+
+The planner's "available tools" line built a **name list** with `query=None`, i.e. over the un-routed
+superset, while the prompt was built from the routed subset and **cached per request**. Turn 1 was
+correct (the prompt build ran last); from turn 2 the prompt build came from cache and the name-list
+call was the only one:
+
+```
+turn 1  rendered ['file_system', 'execute'], stamps treatment/treatment
+turn 2  stamps {}   ->  gepa_artifact_applied False
+```
+
+That is round 14's headline defect — renders the artifact, keeps no stamp, and is therefore mined
+into the pool that trains and ship-gates the next run — reached through a call site round 14 did not
+consider. It also blinds `gepa_live_check` permanently, so `--revert` is structurally unreachable and
+a losing artifact is never retired. `get_active_tool_definitions` takes `serve_tuned=` now, the two
+name-only callers pass `False`, and an AST pin refuses any new naked caller — a default-on hazard
+needs a guard at the call sites, not only at the one that was fixed.
+
+**Round 14's own third arm label was left outside the era filter.** `excluded` turns that busted a
+PREVIOUS artifact's ceiling counted against whatever is live now: driven with 40 such turns and a
+20-char current artifact that cannot bust a 20,000 ceiling, `CONFOUNDED … Shorten the tuned
+descriptions or raise the ceiling; waiting will not resolve it` — with *"Nothing is misconfigured"*
+printed one line above. The same 40 turns labelled `treatment` give the correct era diagnosis. And
+round 14's operator-facing sentence had no pin past `collect()`: three mutants survived 836 tests —
+the branch made dead, its message inverted to *"this will resolve by waiting"*, and `_excluded_note()`
+forced to `""`. The exclusion notes now ride the KEEP and REVERT details too, which are the two
+verdicts anyone acts on.
+
+**Exit 3 could not fire for the case it documents.** `_no_candidate = bool(ships and not _changed)`:
+replays run at temperature 0, so a byte-identical candidate produces byte-identical requests in both
+arms, the paired delta is exactly 0, `ships` is False — and the run exited **1**, the collision the
+branch was added to close. Round 15's pin reached 3 only because the harness scores by fixture INDEX
+and ignores the candidate text, awarding a byte-identical candidate a 6-0 sweep at p=0.0156: a corpus
+the pipeline cannot produce. "No candidate" is a property of the optimizer's output, not of the gate's
+arithmetic over it.
+
+**The gate ratcheted away from the hand-written text, unrecorded.** It seeds from the LIVE artifact
+when one exists, so run N's arms are artifact-(N−1) vs artifact-N and the hand-written description is
+in NEITHER. Driven, two consecutive promotions in one home: `run1 baseline_instruction` is the
+registry text (569 chars), `run2`'s is run 1's *optimized* text (599). §4CW exists for exactly this
+and measured the damage on the sibling gate (chain 0.393 vs hand-written 0.484) — and here both escape
+hatches are shut: `recheck_gepa_incumbent.py` exits 3 for every `tool_description.*` signature, so
+`gepa_live_check` at ~3.5 turns/day is the only judge and every re-promotion resets its era. The seed
+arm is ported: one extra private-tier evaluation, paid only on a re-promotion whose main gate already
+passed, with the same exclusion and power treatment as the main arm (an underpowered seed arm refuses
+the run rather than promoting on a suppressed check), `--allow-seed-loss` recorded, and the whole arm
+written to `gate.seed_arm`. `hand_written_baseline` is recorded beside `baseline_instruction`, because
+the two gates had been using that one key for two different things and `recheck` reads it as the
+hand-written one.
+
+**A retirement required no evidence while a KEEP required significance.** `return 0 if cmp.delta >
+_margin else 1`, driven with identical evidence in both directions — 2 discordant pairs, p=0.25,
+|delta| 0.30 — gave exit **1** ("it no longer earns its place") for the loss and exit 2 for the win,
+with *"read it as a direction, not a verdict"* printed three lines above the verdict it returned.
+Every sibling is symmetric in its own direction. And the artifact's own recorded bar — the DEFAULT
+path — was never validated: `gate.min_delta: -0.4` made `delta > _margin` trivially true, so an
+incumbent losing by 0.30 printed *"NOW WORSE THAN THE BASELINE"* and exited **0**.
+
+**`run_gepa.py` — the gate the §4CY rule was ported FROM — returned 1 from five refusals that measured
+nothing** (unusable margin, empty holdout, tier below the combined need, the re-draw guard, a zeroed
+mined bank — the count said five and the list said four until a reviewer counted), while
+already using 2 for "no corpus". Round 15's journal claim that "the three instruments share one
+contract" was itself false: the gates and the judges invert 0 and 1, because a gate's 0 means the
+incumbent was REPLACED and a judge's 0 means it STANDS. What all four share is 2. The claim is
+corrected, the gates agree with each other, and the judges' four codes are driven end to end —
+replacing a substring search over unparsed `return` expressions that let `return 3` → `return 13`
+through.
+
+Four more: `gepa_live_check` exited **0** for a signature with no artifact at all (`collect(sha="")`
+pools every era by design, which is right for the report and a lie in the exit code — driven, 40
+era-A plus 40 era-B turns gave `KEEP p=0.5884`, exit 0); the re-draw guard's component scoping was
+pinned for the top-ranked component only (`most_common(args.components)` → `most_common(1)` survived,
+and re-promoted a one-day-old artifact); `--force-supply` in the resolution pre-flight's own pin made
+it refuse four checks earlier, so disabling the pre-flight left it green; and `_first_choice` raised
+`AttributeError` on a torn `chosen_tools` row from inside the component ranking.
+
+And the supply-gate paragraph at the top of the runner — printed by `--help` — was **false in both
+halves**: the miner gained `--min-positives` with the same real-positive predicate, so it refuses too
+(exit 1), and the remedy it offered ("read the miner's `Labels:` line, not its exit code") pointed at
+the bench-inflated count the same paragraph condemns.
+
+**My own first battery left three survivors, all of them mine.** The `--min-promotion-age-days`
+boundary pin aged the last artifact in FILENAME order rather than count rank; the underpowered-seed-arm
+pin starved the CANDIDATE arm, which refuses on the main gate's power guard long before the seed arm
+runs; and the artifact-recorded-margin validation had no pin at all. Second battery: 20 of 20 real
+mutants killed, docstring CONTROL survived.
+
+**And one order-dependent test.** `test_a_SPECIFIC_registry_cause_still_wins` patched
+`_APPLIED_COUNTS` and left `_REJECTED_COUNTS` carrying whatever an earlier file put there — green
+alone and green under `-n 8 --dist loadfile`, red in a single process behind
+`test_gepa_optim_reaudit.py`. The sibling test twenty lines above it patches all three.
+
+### Round 15 — the RETIRE code was pinned by its own source text
+
+Round 13 gave `recheck_gepa_incumbent.py` a fourth exit code so a *script* could tell "the incumbent
+still earns its place" from "this holdout cannot settle the question". Its only guard was a
+**source-shape assertion** — `body.index("if _unmeasurable:")` then `assert "return 2" in
+body[i:i+80]`. A reviewer inserted one line above the branch:
+
+```python
+_unmeasurable = _unmeasurable and False
+```
+
+which restores the exact pre-fix defect — exit `0`, *"still wins"*, from the branch that has just
+printed *"it is evidence that this holdout cannot settle the question"* — and it **survives the whole
+855-test battery**. The ten tests that DO run that branch each asserted `rc in (0, 1, 2)`, which
+admits the pre-fix `0`, three lines under a comment naming the very fix they cannot see. Round 8's own
+⚠ recorded *"SIX of round 8's own first pins were SOURCE GREPS"*; round 13 did it again, in the branch
+a script acts on to retire a live artifact. Every exit code in all three instruments is now driven —
+the module runs and the assertion is on the integer it returns — and the ten vacuous `rc in (0,1,2)`
+became exact.
+
+**Three instruments, one exit contract.** `gepa_live_check.py` returned **0** for KEEP, INSUFFICIENT,
+CONFOUNDED *and* a REVERT that `--revert` was not given for, so a caller could not tell "still earns
+its place" from "this data cannot say anything" from "it is losing and nobody retired it" — the
+collision rounds 11 and 13 carved codes out for in the sibling, left whole here. All three now read
+`0` = still earns its place, `1` = it does not, `2` = could not measure, `3` = reported but the action
+could not be performed.
+
+**The reject path was the round-13 defect, unfixed.** Round 13 changed the promotion loop from `best`
+to the CHANGED subset and left `(_changed if ships else best)`, so a rejected run still wrote a
+`.candidate.rejected` record for every untouched component. Driven with one of three mutated: two
+records **byte-identical to the incumbent**, each stamped with the set's `p_value` and
+`candidate_wins`, and a `co_promoted` list that **did not contain the file itself**. Both paths read
+`_changed` now, and a rejection record carries `co_candidates` — `co_promoted` is what
+`recheck_gepa_incumbent.py` prints back as *"this win belongs to the SET"*, and nothing on that path
+was promoted.
+
+**And `gate_scope` was false in the common case.** With a single changed component the A/B compared
+seed-set against seed-set-with-that-one-change — it measured exactly that component's contribution —
+and the record said *"no per-component contribution was measured"* anyway. One changed component is
+what a real proposal produces, so the false wording was the ordinary one, on a record an operator
+weighs before retiring. Round 13's own pin for that field ran on the DEFAULT one-tool corpus, where
+`best` and `_changed` are the same dict: `"co_promoted": sorted(best)` — round 13's headline shape, in
+the field added to close it — survived. Round 13 fixed the one-tool blind spot for the promotion pin
+next door and not for this one.
+
+**A gate that PASSED and promoted nothing exited 1**, the same code as a measured rejection, so a
+caller could not tell "the candidate lost" from "the reflection LM returned the seed verbatim" — a
+wasted run, not a verdict about the incumbent. That is exit `3` now.
+
+**Two pins whose spies were never installed.** Round 13's outage- and gap-abort tests each built a
+`_spy`, `monkeypatch.setattr(_gepa, "optimize", _spy)`, then called a harness that patches
+`gepa.optimize` *after* them — the trap the scope file's own closing ⚠ documents. Demonstrated by
+putting the outage abort back under `--smoke`: the run **paid for the optimizer** and `assert
+calls["n"] == 0` still passed. The harness takes an `on_optimize=` hook now, called from the stub that
+is actually installed, so the "1032 rollouts" claim has an assertion behind it.
+
+Four more battery survivors, each a property with no world in which its pin fails: both `.strip()`s in
+the `_changed` comparison (a whitespace-only candidate would promote, resetting the live check's era
+for a prompt production renders identically); the re-draw guard's `>=` boundary (the one round 10
+pinned for both power guards); the age it *reports* (`_young[stem] = 0.0` passed, because the only
+pin asserted the literal `"was promoted 0.0 days ago"` — the fresh case's own value — so a 6.4-day-old
+artifact reported as `0.0` was green); and round 13's `len(baseline or "")` None guard, whose "both
+arms" pin makes the artifact APPLY, so the withheld branch it widened to cover was never entered.
+
+**And round 15's own first battery left a survivor of exactly the shape this entry keeps finding.**
+`len(_changed) == 1` → `<= 2` survived all 297 tests: with TWO components changed, every artifact
+claimed *"the A/B differed from the seed set in this component alone, so the numbers above ARE this
+component's contribution"* — false, in the over-claiming direction, on the record an operator weighs
+before retiring. The pins drove one changed component and three, and skipped the only boundary that
+separates them, because the harness could produce "all", "exactly one" and "none" and nothing else.
+It takes an integer now. Second battery: 29 of 29 real mutants killed, docstring CONTROL survived.
+
+Three divergences between instruments that are supposed to measure the same thing: `recheck` did not
+validate `--min-delta` (its own docstring said so — a negative margin makes `cmp.delta > _margin`
+trivially true, so an artifact losing by -0.40 exits *"IT STILL EARNS ITS PLACE"*), the gate's replay
+deadline was hard-coded at 120s while both siblings use 360 (a replay this gate calls a TRANSPORT
+FAILURE — excluded from the statistic, and in bulk an abort — is one the instrument that re-checks the
+same artifact scores normally), and `docs/cli_reference.html`, the only HTML surface for this runner,
+omitted `--min-promotion-age-days` — the sole new reason the script refuses to start, defaulting
+to ON — along with four other flags. That row is now checked against argparse by a test.
+
+### Round 14 — my premise was contradicted by a comment 200 lines above it
+
+Round 11's fix stated, in the code: *"whether the set is dropped does not depend on which arm THIS
+turn drew."* The `_TOOL_DESC_AGGREGATE_SLACK` comment 200 lines up in the same file says the opposite
+**and cites a measurement**: *"the ceiling can fire on one request and not the next — measured, 1 of
+40 with 8 registered experiments."* The second one is right.
+
+The union of the two ceiling branches is arm-independent **only while every artifact is at least as
+long as its baseline** — and the reflector is explicitly told to *"propose a SHORTER one"* when the
+per-tool cap bites. Driven with one artifact 5,000 chars shorter and five others already serving:
+
+```
+treatment 156/313   control 96/132   ->  REVERT, Fisher one-sided p = 5.16e-06
+```
+
+on an artifact **neutral by construction**. A control draw of the short one pushed the sum over the
+ceiling; a treatment draw did not. Confirmed by mutation: wrapping the withheld delta in `abs()`
+survived the whole selection, because every round-11 fixture pads uniformly positive — the sign had
+zero coverage. The render decision still reads this arm's actual inflation (it is a real prompt-size
+guard); the **prune** now reads the positive deltas of everything the turn could render, which is a
+property of the turn.
+
+**And the same fix deleted a stamp it still needed.** The hypothetical branch unnoted and then
+returned the **tuned** descriptions. Driven: **194 of 200 turns rendered a tuned description and 0 of
+200 kept a stamp.** The stamp answers two questions — *"compare this turn"* and *"this turn's context
+was mutated"* — and only the first was considered, so `gepa_live_check` saw zero attributed turns
+forever *and* all 194 turns were mined into the pool that trains and ship-gates the next run as if no
+arm had touched them. Round 11 traded a false REVERT for blindness plus corpus contamination. Those
+turns are marked `excluded` now: in neither arm, so `collect` drops them; still stamped, so the miner
+still excludes them.
+
+**My first version of that fix routed around itself.** `agent.py` derives `gepa_artifact_applied` from
+`arm == "treatment"`, so marking the stamp `excluded` left the turn un-flagged and mined anyway — the
+exclusion marker only works if every reader agrees what it means. Caught by the pin, not by reading.
+
+Three more, each a fix that could not fire: the read-site diagnosis reads `activation_stats`, whose
+counters are **per-process**, and its only production caller is a CLI that never serves a turn — so
+the branch added to stop a permanently-false *"resolves as NEW turns arrive"* could never fire from
+the one place that prints it (the round-11 pin passed by monkeypatching the counters straight in,
+which is stubbing the exact thing whose availability is the question). `--private-pct 0` traded a
+`ZeroDivisionError` for an `AssertionError` on the very next line. And three "could not measure"
+branches returned **1** — "no longer wins" — under a contract this file itself declares.
+
+And the ledger: a round-12 reviewer found the round-8 entry still asserting, unmarked, the reasoning
+round 10 refuted and round 12 closed. I had corrected the code comment, the docs and the tests, and
+left the sentence that caused the defect standing in the record — verbatim the hazard round 11 named
+when it fixed the §4CZ pin.
+
+### Round 13 — a set-level win, stamped on every member as its own
+
+The direct answer to the closing question this whole entry exists to ask, and it had been there since
+§4F: **`ships` is ONE decision from ONE A/B over the whole candidate SET, and the promotion loop wrote
+N per-component artifacts each carrying that set-level gate block.** Driven with the optimizer mutating
+exactly one component — which is what a real proposal does:
+
+```
+A/B: delta=+0.133  McNemar p=0.0039 over 8 discordant replays  ships=True
+PROMOTED tool_description.execute.json       text_UNCHANGED=False
+PROMOTED tool_description.file_system.json   text_UNCHANGED=True
+PROMOTED tool_description.web_search.json    text_UNCHANGED=True
+   each stamped  gate_arm "…[paired-v2]"  p_value 0.003906  candidate_wins 8
+```
+
+Two descriptions **byte-identical to the incumbent**, each carrying a claim of a measured, significant
+win belonging entirely to a third component — and §4DA is the entry that **added** those fields so a
+promotion could be re-examined. `recheck_gepa_incumbent` prints them back per-signature as the report
+an operator weighs before retiring. An unchanged component is no longer promoted (there is nothing to
+promote, and it resets the live-check era for nothing), and a changed one records `co_promoted` and
+`gate_scope: "set — one A/B over all co-promoted components; no per-component contribution was
+measured"`. Measuring per-component contribution would need N more A/B passes; saying that the number
+is the set's costs nothing.
+
+**And the gate had no re-draw guard.** `run_gepa` refuses when the live artifact is younger than
+`--min-promotion-age-days` — *"each run is a fresh draw at the gate, so re-promoting before the last
+one can be judged turns one decision into many"*. This gate **wrote** `promoted_utc` and never read
+it: the computed-and-thrown-away shape, in the field §4DA itself added. It bites harder here — α=0.05
+promotes under the null 5% *per run*; `recheck_gepa_incumbent` exits 3 for every `tool_description.*`
+so it cannot re-score them, leaving `gepa_live_check` the only judge; and every re-promotion changes
+the text, changes the sha and **resets the era**, discarding every accrued turn as stale. At ~3.5
+turns/day an unguarded loop keeps the live check permanently INSUFFICIENT.
+
+Three more: the outage abort was inside `if args.smoke:`, so the expensive path fell through and paid
+for **1032 rollouts** against a dead upstream before refusing — a guard with an exemption exempting the
+expensive path, two rounds after this entry named that shape. `--no-ab-gate` stamps
+`gate_arm: "UNGATED (--no-ab-gate)"`, which satisfied the loader's bare truthiness test, so an
+artifact whose own record says `metric: "none — adopted unverified"` loaded at the same level as a
+gated one — silencing the only apply-time warning that an unverified prompt is serving production.
+And the re-check returned **0** ("still wins") from the branch that had just printed *"it is evidence
+that this holdout cannot settle the question"*.
+
+**My fix for the UNGATED one was a live bug for two minutes**: I named the gate-identity string `_arm`
+inside `tuned_instruction`, shadowing the variable that holds this request's **experiment** arm — so
+every served turn was stamped with the gate identity instead of control/treatment, making every
+trajectory's arm unreadable. The neighbouring tests caught it immediately. Third time this entry that
+a fix's first shape broke something the tests noticed within a minute, and the third time the
+alternative was reading rather than running.
+
+### Round 12 — the fail-open was one-armed too, and I had pinned it as the contract
+
+Round 10's filter carried `and _sha` — an exemption for a turn with no sha at all. That clause is
+**one-armed by construction**: no path through `tuned_instruction` emits an empty sha any more, so
+empty shas exist only on CONTROL turns from the pre-era-stamp corpus, while their treatment
+counterparts always carried a real sha and were already dropped as stale. Keeping the control half
+*was* the de-randomization round 10's headline is about. Driven end to end through `--revert`:
+
+```
+era B only                 T=10/20  C=10/20  p=0.6238 -> KEEP
+era B + a pre-stamp corpus T=10/20  C=40/50  p=0.0148 -> REVERT, RETIRED ON DISK, exit 0
+```
+
+The only warning printed was about the *treatment* side. And I had written the fail-open into
+`test_a_LEGACY_control_turn_without_a_sha_is_kept` as the intended contract, with the rationale
+inverted — *"those turns must not vanish from the comparison — that would be the same defect one
+migration later"* — twenty minutes after fixing a §4CZ pin for exactly that hazard. The symmetric
+options are drop-both or scope-neither; control-only is neither. Dropped from both, counted apart
+(`stale_unstamped`), and given its own remedy, because a known other era resolves by waiting and an
+unstamped turn never will.
+
+Three more from the same review, all "the reporting surface one revision behind" again: the treatment
+line labelled a **both-arms** breakdown as treatment turns (ten turns, broken down as nineteen);
+`registry_diagnosis` was handed `randomized = treatment.n + control.n`, which excludes the stale ones,
+so the operator got *"no randomized turn has accumulated a graded outcome yet"* printed between two
+lines reporting forty excluded randomized turns — the contradiction that function is named for; and
+round 10's own `isinstance`-vs-`str()` bullet was pinned only by a fixture where both rules return
+False (`{"x": 1}` leaves the value `None`), so the loose form survived. The separating values — `42`,
+`["a","b"]`, `true` — are parametrised now.
+
+### Round 11 — the un-stamping was one-armed, one layer out from where I fixed it
+
+Round 3 made the read site **prune** a stamp when it refuses the artifact. Round 10 made the loader
+**stamp control turns** so both arms carry an era. Together they produce one-armed attrition: a
+control turn is served the baseline and returns at `if not tuned: return baseline`, **before** the
+per-tool validator and before either unnote call — so control stamps were created and never removed
+while treatment's were removed on every refusal.
+
+The aggregate ceiling is per-**turn** (the read site gets the `_intent_filter`ed subset, and each
+signature randomizes independently), so whether the set is dropped does not depend on which arm the
+turn drew. Driven over 200 turns with an artifact neutral **by construction** — outcome a function of
+turn shape only, identical in both arms:
+
+| same corpus, same neutral artifact | treatment | control | verdict |
+|---|---|---|---|
+| ceiling never fires | 51/97 | 49/103 | **KEEP, p=0.8020** |
+| ceiling fires on broad turns | 9/55 | 49/103 | **REVERT, p=0.0001** |
+
+42 treatment stamps pruned, 0 control, and `--revert` renames on that. It is the principle
+`live_check` states in capitals — *"BOTH ARMS, OR THE COMPARISON STOPS BEING RANDOMIZED"* — surviving
+one layer out, in the **refusal** path rather than the sha path, two rounds after I wrote the
+sentence. Both refusal points now ask what the withheld arm *would* have rendered and prune
+symmetrically.
+
+Four smaller ones from the same review: `registry_diagnosis` tested **loader** servability while the
+layer that decides is the **read site**, so an artifact valid to the loader and over the per-tool cap
+got *"Nothing is misconfigured … this resolves as NEW turns arrive"* while `activation_stats` already
+read `applied: 0, rejected: 29`; `run_gepa`'s offer arithmetic divided by an unguarded
+`len(private_set)`, so `--private-pct 0` gave a `ZeroDivisionError` instead of the "the PRIVATE
+holdout is empty" message 350 lines below — its own neighbour already used `max(1, …)`; the re-check
+returned **0** from all four verdict branches, so "still earns its place" and "now WORSE than the
+baseline" were the same exit code; and `ArmCounts.rate` had no consumer anywhere, so the one place
+that says "an empty arm has no rate, and folding it to 0.0 would read as total failure" was dead — it
+now backs the operator report.
+
+**And a §4CZ pin still asserted the reasoning round 10 refuted**, in those words: *"control turns
+carry `sha=""` by construction … and must not be partitioned, since the control population is the same
+whichever artifact is live."* Round 10 corrected the code comment, the journal and the §4DA pin and
+missed this one — the single artifact a future reviewer would have read as evidence against the
+change. It passed only because its fixture built a corpus the loader can no longer produce.
+
+> ⚠ **And this claim was still standing in the ledger itself.** A round-12 reviewer found the
+> round-8 entry above still asserting, unmarked, that "control turns … are never filtered — which is
+> correct: the control arm is the same population whichever artifact is live", two rounds after round
+> 10 refuted it and one after round 12 closed the fail-open that survived it. I corrected the code
+> comment, the docs and the tests and left the sentence that had caused the defect in the record —
+> the exact hazard this paragraph is about, one file over. Struck at the round-8 entry.
+
+### Round 10 (fourth lens) — the decision half converged; the reporting half was five rounds behind
+
+The lens that mutation-tested round 9 reached the split cleanly: **the decision half is pinned.**
+Disarming `_seed_underpowered`, weakening its bar, dropping either of its two assignments, reverting
+round 8's `_insignificant` fix, flipping the McNemar direction, swapping the win counts, and
+`_n_paired = len(private_set)` are all killed; nine flag combinations driven through the real `main()`
+(total outage, partial outage, the boundary, healthy loss, healthy win, each × both override flags)
+and **none promotes on an unmeasured seed arm, none refuses a healthy one.**
+
+What survived — six one-line mutants against 876 tests — is everything round 9 claims the seed arm now
+*reports* and *records*: the win columns swapped in the audit record (a promotion where the seed won
+5-0 recording `seed_wins: 0, candidate_wins: 5`); "raw over all examples" printing the **paired**
+rates, so the clause added to show what the exclusion did shows the same numbers either way;
+`raw_delta` equal to `delta`; and the rejection reading *"the SEED ARM … reached a verdict on only
+**45 of 45** examples, under the 20 the pre-flight required"* — the exact sentence round 9 added so the
+rejection names the right arm's count. Every pin that should have caught them asserted **phrase
+presence and never the number**. Fifth consecutive round with the reporting surface one revision
+behind the ship surface.
+
+The costliest was quieter: dropping `and _seed != incumbent` **doubles the next real run's gate cost**.
+With no live artifact — `planning.decompose`'s state today — `_live_incumbent()` falls back to the
+seed, so seed *is* incumbent and the second full private-tier pass is pure waste plus a second outage
+surface that can refuse a promotion the main arm supported. 876 tests noticed nothing.
+
+**And a defect I had recorded as unreproducible reproduces.** `tests/test_foresight.py` was reported
+flaky by one reviewer, I could not reproduce it, and I wrote "treat that claim as unconfirmed" into
+the scope file. A later reviewer proved the mechanism: `_seed_from_trajectories()` did not set
+`_seed_state`, so a **direct** call left the index `pending` and the next `predict()` launched a
+background thread that seeded the same corpus **again**. Driven — 3 corpus calls, direct seed, then
+predict → **support 6**. Whether the assertion sees 3 or 6 is a race with a daemon thread, which is
+why it is ~50% on one machine and 0% on another; the mechanism is not machine-dependent. I still
+cannot make it fail here, six runs each way, so the pin asserts the **mechanism** (`_seed_state` is
+`done` after any seed; support is 3, not 6) rather than the timing. "I could not reproduce it" was not
+the same as "it does not happen", and I had written the weaker claim down as the stronger one.
+
+### Round 10 (third lens) — my own fix de-randomized the comparison, and I defended it twice
+
+The worst finding of the entry, because the code comment, the journal and a **passing test** all
+asserted the opposite.
+
+Round 8 scoped the treatment arm to the live artifact's sha and left control unfiltered, on the stated
+reasoning that *"the control arm is the same population whichever artifact is live"*. That is true
+across eras and **false about the sample**: the treatment arm became a time window while control
+stayed all of history, so the two arms were no longer drawn from the same request stream. Driven on
+one corpus:
+
+```
+CONTEMPORANEOUS (both arms, current era):       t=10/20  c=10/20  -> KEEP   p=0.6238
+AS SHIPPED (treatment scoped, control pooled):  t=10/20  c=40/50  -> REVERT p=0.0148
+```
+
+A healthy artifact retired, with `--revert`, on control turns belonging to the artifact it replaced.
+And round 8's own "correct" answer has the same shape — `KEEP 14/20 vs 28/40` is 20 treatment turns
+from one era against 40 control turns from two. The pin that locked it in was named
+`test_a_CONTROL_turn_carrying_a_sha_is_not_dropped`.
+
+Fixed at the source: a control turn is served the baseline and has no artifact of its own, but it
+belongs to the era of the artifact it was **withheld** — so `loader._note_served` now stamps that sha
+on control turns, and `collect` filters both randomized arms on it. Un-enrolled turns are in neither
+arm and are never filtered, because they are exactly the population CONFOUNDED counts.
+
+**And half of round 9's headline finding had no pin that could fail for the stated reason.** My
+"partial seed outage manufactures the veto" fixture passed `seed_excluded=10_000` against a
+45-example tier, so `usable` clamped to 0, `baseline_wins` to 0, and there were **zero** discordant
+pairs — it exercised the same total-outage shape as the test above it, while the docstring and the
+journal described `delta -1.0000, p=0.0312`. It also drove the real code into printing `n=-9950` and a
+negative pass rate, unasserted. The fixture is clamped now and the pin asserts the McNemar line it is
+named for.
+
+Also closed from the same review: both power guards' boundaries (`< _need` → `<= _need` survived on
+the seed arm — the port copied the code and not the pin); the seed line's paired count as a *number*
+rather than the clauses around it; the recheck's bar driven at three margins instead of only the one
+where the right answer and the hardcode coincide; and three operator sentences that were false in
+states round 8's own filter creates — `INSUFFICIENT: no attributed turns for this signature yet`
+printed with 20 attributed turns, a restart banner that fired on a corpus of current-sha turns, and
+*"Every one of the 20 treatment turns was served sha aaaaaaaa"* printed two lines under
+`(aaaaaaaax10, bbbbbbbbx10)`.
+
+### Round 10 (second lens) — "no artifact" and "an unreadable artifact" are not the same state
+
+`collect(sha="")` means **do not filter**. That is correct when nothing is promoted, and a silent
+disabling of round 8's scoping when the file exists and no sha can be derived from it — truncated
+JSON, a missing `optimized_instruction`, an empty one, a non-string one. Driven on round 8's own
+corpus:
+
+| artifact on disk | printed | `--revert` |
+|---|---|---|
+| healthy | `KEEP: treatment 14/20 vs control 28/40, p=0.6122` | left in place |
+| **truncated JSON** | `REVERT: treatment 16/40 vs control 28/40, p=0.0065` | **RETIRED, exit 0** |
+| **`optimized_instruction: ""`** | `REVERT … p=0.0065` | **RETIRED, exit 0** |
+
+Those are the same two numbers round 8's entry records as the defect it closed, reached through a
+different door. No warning anywhere: no `live sha` line, no stale-turn line, and the `artifacts :`
+line listing two shas beside a single verdict never said the arm was pooled.
+
+**And a truncated live artifact was reachable from our own promoter.** `run_gepa.py` stamped the gate
+by re-opening the **live** path with `write_text` — a truncate-then-write — *twenty lines after* it
+had correctly done `os.replace(staging, output)`. That is the discipline round 3 fixed in the sibling
+promoter, in the same function, one paragraph down. A torn write leaves invalid JSON,
+`loader._CACHE[sig]` caches `None` for the life of the process, and repairing the file does not
+recover the signature. Staged and replaced now.
+
+Two more of the same family: `registry_diagnosis` keyed on `_art.exists()` — a **proxy** for "the
+loader can serve it" — so a corrupt artifact, which yields zero attributed turns *forever*, got the
+healthy sentence *"this resolves as NEW turns arrive"*, byte-identical and permanently false; and the
+script's sha used `str(x or "").strip()` where the loader uses `isinstance(x, str)`, so an
+`optimized_instruction: 42` produced a live sha, found no turn carrying it, and told the operator to
+restart an agent whose loader would refuse the artifact anyway.
+
+**My own fix for the first of those was a live bug for ten minutes.** It read the artifact with a
+module alias that is not imported at that scope; the `NameError` was swallowed by the bare `except`,
+so `_servable` was False for **every** artifact and the branch condemned every healthy one. Caught by
+running the neighbouring tests, not by reading. A guard whose failure mode is "always fires" needs its
+admit side driven — the pin now does.
+
+**And two of my own pins could not see the defects they name.** One was a literal self-comparison,
+`assert sa["n_usable_pairs"] == sa["n_usable_pairs"]`, in the test whose docstring is about
+`gate.seed_arm` recording a fabricated tie "with the exclusions nowhere in the file" — mutating the
+writer survived all 843 tests. The other greped three strings out of `gepa_live_check.py` under a
+docstring saying it "pins them equal rather than restating the formula"; it restated it, and dropping
+`.strip()` survived. Repairing the second was itself two attempts: the first fixture had no
+surrounding whitespace, so `.strip()` was a no-op and the mutant was still invisible.
+
+Also closed: `--smoke` exited **0** against a dead upstream with 35 of 35 replays failing — the one
+thing it exists to detect — and `⛔ NOT PROMOTING` printed unconditionally before the
+`--allow-seed-loss` branch promoted four lines later.
+
+### Round 10 — the first round whose fixes closed with executed pins on the first pass
+
+The reviewer who found the seed-arm defect re-drove everything against the fixed tree and confirmed
+both directions now refuse for the honest reason, with mutants that reinstate them killed rather than
+merely absent. Its own note is the one worth keeping:
+
+> "the first time in this entry a round's fix has closed with executed pins on the first pass rather
+> than a token pin. The only thing I would still not call settled is that four rounds in a row have
+> found the *veto* or *reporting* side one revision behind the ship side; the seed arm was the last
+> such surface I could find, but that is an absence of evidence from one lens, not proof the pattern
+> is exhausted."
+
+It also corrected **itself**, which is the discipline this entry keeps failing at: one mutant it had
+listed as a live survivor turned out to be **equivalent on the fixture it used** — a corpus where the
+candidate passed every example, so `candidate_pass_rate == raw_candidate_pass_rate` and the fix and
+the bug agreed on every input. Rebuilt with the outage confined to examples the candidate passes, the
+consequence is real and the current code kills it. *"Flagging it because I ran a battery and it
+survived was, for one mutant, not evidence."*
+
+One real gap closed: `run_gepa`'s gate block recorded `raw_delta` with **neither** raw rate, so a
+`planning.decompose` artifact could not reconstruct its own all-rows comparison — the sibling gate's
+raw pair lives at top level under names this runner has no equivalent of. Both rates recorded now, and
+`cli_reference.html`'s claim about where they live is true of both runners for the first time.
+
+### Round 9 — the veto arm nobody gave the outage handling to
+
+Rounds 5, 7 and 8 excluded unreached calls, reported the exclusion, and refused below the pre-flight's
+bar. Every one of them on the **main** arm. `_seed_cmp.transport_excluded` was read nowhere — nine
+occurrences of the field in `run_gepa.py`, none in the seed block. Driven on one corpus with only the
+seed arm's transport changed:
+
+| seed arm | the line it printed | verdict | rc |
+|---|---|---|---|
+| healthy | `seed 1.0000 vs candidate 0.4667 (delta -0.5333; seed wins 24)` | ⛔ NOT PROMOTING — loses to the seed (p=0.0000) | 1 |
+| **total outage** | `seed 0.0000 vs candidate 0.0000 (delta +0.0000; 0 wins, 0 ties)` | **A/B gate PASSED — promoted** | **0** |
+
+Indistinguishable from a perfect tie, the veto suppressed, and `gate.seed_arm` recording the
+fabricated tie with 45 exclusions nowhere in the file. The mirror fires too: a partial outage leaving
+5 of 45 pairs **manufactures** the veto at p=0.0312 and refuses an honest promotion.
+
+A veto is a refusal to ship, so an underpowered one is not "the safe direction" — it welds the chain
+to whatever is already live, which is the ratchet §4CW added the seed arm to prevent. The seed arm now
+excludes, reports, and refuses to decide below the same `_need` the pre-flight used; the rejection
+names **which arm** could not be measured, because reporting the healthy main arm's counts sends the
+operator to fix the wrong thing.
+
+**And round 8's headline pin was a lie I had written into the journal.** It claimed in its own
+docstring to "drive the real `main()` with the outage AND the flag"; it was two AST greps, the
+`_outage_chat` helper written for it was defined and never used, and no test in the file passed
+`--allow-insignificant-ship` at all. A reviewer's one-line mutant left every grepped string in place
+and **survived the full 16,728-test suite**, promoting on 5 usable pairs. Worse: my first *driven*
+replacement **also** passed that mutant — the stub answered both arms alike, so the seed arm's new
+guard refused first and the main-arm bar was never exercised. It had to be split per arm before it
+could see the thing it was written for. Three layers of the same mistake in one fix.
+
+Two smaller ones from the same pass: the retire-side underpowered guard used `significance_floor()`
+(5) where both gates use `max(floor, ceil(1/min_delta))` (20-50), so its firing window was 1-4
+surviving pairs — where the pre-existing "not significant" caveat already fires. Driven at 8 of 45
+pairs, neither fired and the retire recommendation rendered uncaveated. Round 2 recorded this exact
+half-of-`_need` shape. And `_gate_block`, the extractor round 7 added so the artifact's *values*
+rather than its key names would be pinned, never asserted either pass rate and swallowed any key it
+could not evaluate — so recording the raw rates under the paired names, and swapping the two exclusion
+causes, both survived.
+
+### Round 9 — a hazard round 8's own fix introduced, caught before a reviewer had to
+
+Scoping the treatment arm to the live artifact's sha is right about the mechanism and, on one path,
+wrong about what it tells the operator. **Deploy is a restart**: `optim/loader.py` caches the artifact
+text per process and its `clear_cache()` must not be called on a live agent. So an operator who
+promotes and does not restart has a corpus whose treatment turns all carry the *previous* sha, while
+the file on disk hashes to the new one. Driven:
+
+```
+treatment: 0  control: 20  stale: 20  verdict: INSUFFICIENT
+detail: treatment n=0, control n=20; need 12 per arm before a verdict is worth computing
+```
+
+Twenty turns of evidence about the artifact **actually in production**, silently dropped, reported as
+"there is no evidence" and pointing the operator at "collect more turns". The direction is safe — no
+false REVERT — and the message is the kind this entry keeps producing: a filter correct about the
+mechanism, misleading about the situation. `gepa_live_check` now names the state, names the sha that
+*is* serving, and prints the restart, instead of reporting a data drought.
+
+### Round 8 — the guard whose own message said it could not be overridden
+
+I framed round 8 as the last, with an explicit bar: close §4DA unless it finds something that changes
+a **ship** or a **retire** decision. It found three.
+
+**`--allow-insignificant-ship` walked straight through round 7's evidence guard.** The guard set
+`cmp.candidate_ships = False`; forty-five lines below, `_insignificant = (cmp.delta > min_delta and
+not cmp.candidate_ships)` reads that same `False` as *"the discordant pairs were too few"*, so the
+override set it back to True. Driven end to end through the real `main()`:
+
+```
+⚠ EVIDENCE BELOW THE PRE-FLIGHT BAR: only 19 of 64 examples reached a verdict in BOTH
+  arms ... Nothing ships — (--allow-insignificant-ship does NOT override this; it waives
+  significance, not evidence).
+A/B gate PASSED — candidate promoted to .../planning.decompose.json
+```
+
+The message was accurate about intent and false about behaviour, and the promoted artifact recorded
+`significance_overridden: true` beside `p_value: 2e-06` — so the re-check would later report "it
+cleared the margin but NOT the significance bar" about a promotion whose pairs supported it perfectly
+well. The sibling gate does this correctly *side by side, same flag, same message text*: it folds
+`not underpowered` into `cleared_margin` and gates the override on that, which makes the hole
+structurally unreachable. Round 7 ported the message and not the structure. And the refusal that
+*does* fire when the flag is absent printed **"McNemar p=0.0000 > 0.05"** — an arithmetic falsehood —
+then recommended the flag that (correctly) cannot help. Both now name the cause that actually fired.
+
+**The only pin was an AST grep** for the strings `"_n_paired < _need"` and
+`"cmp.candidate_ships = False"`. Both mutants that *delete* the guard fail it; the override hole
+passes, because both strings are still there. That is why seven rounds did not see it.
+
+> ⚠ **And my replacement pin claimed, in its own docstring, to "drive the real `main()` with the
+> outage AND the flag" — and did not.** It was two more AST greps; the `_outage_chat` helper written
+> for it was defined and never used; no test in the file passed `--allow-insignificant-ship` at all.
+> A reviewer's one-line mutant — `if (_insignificant or _below_evidence_bar) and
+> args.allow_insignificant_ship:` — left every grepped string in the right AST node and **survived
+> the full 16,728-test suite**, promoting on 5 usable pairs. I had written the false claim into the
+> journal and the docs as well. The pin now drives `main()`, and its first driven version *still*
+> passed the mutant — because the stub answered both arms alike and the **seed** arm's new guard
+> refused first. It had to be split per arm before it could see the thing it was written for.
+
+**`recheck_gepa_incumbent` reported the exclusion for the recorded gate block and never for the run it
+had just performed.** `transport_excluded`, `raw_delta` and both raw rates were on the live `cmp` and
+read nowhere; there was no power guard. Driven, a 45-example tier that lost 40 to a one-arm outage:
+
+| | healthy | 40 of 45 lost |
+|---|---|---|
+| `running N x 2 arms` | 45 | **45** |
+| delta | −1.0000 | **−1.0000** |
+| verdict | *"THE INCUMBENT IS NOW WORSE THAN THE BASELINE. It is serving every planner turn."* | **byte-identical** |
+
+The only trace was a buried `discordant n=5`, and because `p_loss ≤ SHIP_ALPHA` the
+"not significant" caveat was suppressed. This is the script its own docstring calls the one an
+operator uses to decide whether to **retire** a live artifact.
+
+**And `live_check.collect` pooled treatment turns across artifact SHAs.** It buckets on `arm` alone;
+`sha` was tallied for display and never read. `collect` walks the whole trajectory history, and
+"re-promoting an already-live tool is the normal case" — so this arms on the **second** promotion of
+any signature. Driven: a superseded artifact's 20 turns pooled with the current one's 20 gave
+`REVERT, 16/40 vs 28/40, p=0.0065`, where the current artifact alone is `KEEP, 14/20 vs 28/40,
+p=0.6122`. **The healthy artifact retired on the evidence of the one it replaced.** The treatment arm
+is now scoped to the live artifact's sha — computed the way the loader stamps it, and pinned equal to
+it rather than restated — and the excluded count is reported. ~~Control turns carry `sha=""` by
+construction and are never filtered, which is correct: the control population is the same whichever
+artifact is live.~~
+> ⚠ **FALSE, and left standing here for two rounds after the code was fixed.** Round 10 refuted it —
+> scoping one arm to a time window against a control arm of all history turned a KEEP (p=0.6238) into
+> a REVERT (p=0.0148) — and round 12 closed the `and _sha` fail-open that survived it. Control turns
+> now carry the sha of the artifact they were WITHHELD, and both randomized arms are scoped. A
+> round-12 reviewer found this paragraph still asserting the original reasoning, unmarked: verbatim
+> the hazard round 11 named when fixing the §4CZ pin — "the single artifact a future reviewer would
+> read as evidence against the change" — surviving in the ledger while I corrected the code, the
+> docs and the tests.
+
+Everything the same lens checked and found **sound**: the round-7 revert of the arm resolution is
+right at traffic 1.0 / 0.5 / 0.2 / 0.0, disabled, unregistered, kill-switched, and under non-standard
+arm names; CONFOUNDED now fires in all three parked states where round 3 had made it unreachable; the
+ring-eviction hazard round 3 was reaching for is handled conservatively (an evicted turn drops out of
+*both* arms rather than polluting one); the versioned `gate_arm` breaks no reader; `run_gepa`'s new
+code is correct in the normal `transport_excluded == 0` case; and every message, remedy and exit code
+in the operator loop is true against the real corpus.
+
+### Round 7 — the fix that could not fire, and the promoter nobody told
+
+Two lenses, and between them the sharpest pair of findings in the entry.
+
+**Round 5's headline fix was inert.** `_unreached` matched `failure_reason` against a prefix list of
+exception names — and the list named **aiohttp** and **http.client** exceptions
+(`ClientConnectorError`, `ClientOSError`, `ServerDisconnectedError`, `RemoteDisconnected`,
+`IncompleteRead`) plus socket ones. `core/llm.py` uses **httpx exclusively**; aiohttp appears nowhere
+in this repo, and no httpx exception subclasses `ConnectionError` or `OSError`. So of everything
+`LLMClient` re-raises — `ConnectError`, `RemoteProtocolError`, `ReadError`, `WriteError`,
+`PoolTimeout`, `RuntimeError` on an empty body, `Exception("Max retries exceeded")` — **only
+`ReadTimeout`/`ConnectTimeout` could ever match.** Driven, 50 examples, identical prompts, a 6-call
+one-arm outage:
+
+| raised | excluded | delta | p | ships |
+|---|---|---|---|---|
+| `asyncio.TimeoutError` *(the round-5 pin)* | 6 | +0.000 | None | False |
+| **`httpx.ConnectError`** | 0 | **+0.120** | **0.0156** | **True** |
+| `PoolTimeout` / `ReadError` / `WriteError` / `RemoteProtocolError` | 0 | +0.120 | 0.0156 | **True** |
+| `RuntimeError` (empty body) / `Exception("Max retries exceeded")` | 0 | +0.120 | 0.0156 | **True** |
+
+End to end through the real `run_gepa.main()` with both arms returning byte-identical correct answers,
+`+6 ConnectError` **PROMOTED**. A llama-server restart — the scenario the exclusion exists for —
+produces `ConnectError` when it is down between requests and `RemoteProtocolError`/`ReadError` when
+it is killed mid-request. All three missed. `ReadTimeout`, the one that *did* match, requires the
+server to accept the connection and then hang for the full 360 s.
+
+The lesson is sharper than "the list was wrong": **a library matching its caller's exception NAMES is
+guessing at someone else's dependency.** `_run_one` is the code that catches the exception, so it now
+sets a marker and `_unreached` reads the marker. An exception type nobody has heard of is excluded
+correctly, and a `failure_reason` a *runner* produced — a grading verdict, real evidence — is not.
+That distinction was unreachable by text: `'expected an OSError, model returned nothing'` is a grading
+verdict a name-matching rule silently excluded.
+
+**And the candidate half of the exclusion passed the entire 16,656-test suite.**
+`_unreached(b) or _unreached(c)` → `_unreached(b)`, byte-identical green. Every round-5 pin put the
+outage on the baseline arm. Round 2 found exactly this asymmetry in the sibling gate and pinned both
+sides; round 5 ported the rule upstream and neither pin. It matters most in
+`recheck_gepa_incumbent`, where the candidate arm **is the live incumbent** — so a missed exclusion
+there manufactures a retirement signal for an artifact that did nothing wrong. Two more mutants in the
+same agree region (`deciding_candidate_rate_is_raw`, `raw_rates_over_paired`) were alive for the same
+reason: with the outage always on one arm, the paired and raw candidate rates are equal.
+
+**`run_gepa.py`, the only thing that promotes on this gate, was never told `delta` had changed
+meaning.** It printed `n={len(private_set)}` beside a paired delta; it recorded none of
+`n_usable_pairs`, `transport_excluded`, `raw_delta` — exactly the fields rounds 4-5 taught
+`recheck_gepa_incumbent` to branch on, so that reader's exclusion warning was **structurally
+unreachable for every `run_gepa` artifact**, i.e. for `planning.decompose`, the signature its
+docstring is entirely about. And it had no power guard: driven, 50 examples cleared the pre-flight, a
+45-call outage left **5 usable pairs**, `delta=+1.0000`, `p=0.03125`, **SHIPS=True**. The sibling gate
+refuses that exact shape. All three ported.
+
+**The metric changed and `gate_arm` did not.** `gate_arm` exists so "this artifact won under THIS
+metric" is checkable — it is the whole evidence behind this project's own
+`gepa-promoted-artifact-invalidation` rule. §4DA changed the **denominator** of `delta` and both pass
+rates, and left the string byte-identical to the one on `planning.decompose.json.retired-4cw`, decided
+under the old meaning. `ab_eval.GATE_METRIC_VERSION = "paired-v2"` is now stamped into both gates'
+`gate_arm`, so the rule has something to fire on.
+
+**And I reverted round 3's control-path change.** `arm_for() == ""` never means "assigned control" —
+control is spelled `"control"`; `assign_all` only records experiments the unit actually enrolled in.
+Round 3 made `""` mean control whenever the experiment was *registered and enabled*, which is a
+**proxy** for "was this turn enrolled", and the two differ exactly where it matters: `assign` returns
+`""` for a unit outside `traffic`, `names_for_scope` ignores traffic entirely. Measured over 400
+requests at `traffic: 0.2` — 308 un-enrolled turns served the baseline and stamped `control`, so
+`live_check` compared treatment 30/46 against a control arm inflated to 354 and returned **REVERT at
+p=0.0195**, where the real randomized 46-vs-46 comparison is **KEEP at p=0.2485**. A false REVERT
+retiring a live artifact, with `unenrolled` reading 0 so the CONFOUNDED diagnosis built to catch
+precisely this could never fire. A ramped rollout also withheld the artifact from the un-enrolled
+majority, and `traffic: 0` — the standard way to park a spec — disabled it for 100% of traffic.
+`guard-a-proxy-not-the-thing`, in a fix I wrote four rounds after saving that lesson.
+
+### Round 6 — a guard disarmed on a premise that makes the disarming pointless if true
+
+The clearest single finding of the whole entry, and it is about round 4's headline fix.
+
+**The narrowed power guard is a no-op in the world it assumes and a removed guard in the world it
+doesn't.** Round 4 restricted `underpowered` to fire only on a transport outage, on the reasoning that
+the pre-flight's replayability probe makes a corpus gap impossible afterwards. Swept across every gap
+size through the real `main()`: **there is no gap at which that clause changes the outcome** — below
+the bar the pre-flight refuses first, above it the guard is never consulted. And where the premise
+fails, the clause removes the guard. The incumbent arm runs before `gepa.optimize`; the candidate arm
+runs 318 main-model calls later. Driven with the recordings pruned in that window:
+
+```
+A/B (PRIVATE fixtures, n=60, 5 usable pairs): incumbent=0.000 candidate=1.000
+  delta=+1.000 (bar 0.02) ... ships=True
+PROMOTED  gate: {"n_usable_pairs": 5, "outage_excluded": 0, "corpus_gap_excluded": 55}
+```
+
+Five of the sixty pairs the pre-flight demanded fifty of, promoted, no warning. Round 2's rule blocked
+exactly that. A guard disarmed on a property that makes the disarming pointless if true and dangerous
+if false — and this script's own docstring names the moving-recordings hazard two hundred lines above.
+The guard blocks on the **shortfall** again; only the **message** is cause-aware, which is the half
+round 4 was actually right about.
+
+The same review found that **round 4's flagship pin drives a state `main()` cannot produce** — the
+60-row/12-gap/6-0 corpus it asserts now ships is refused by the pre-flight probe, earlier and with a
+working remedy — so the fix's call site could not be reached by its own test. And that the one line
+which actually *reports* an exclusion still said *"transport failed in one or both arms"* for a pure
+corpus gap: round 4 split the two causes, updated the two fidelity lines and the artifact, and left
+the reporting line carrying the conflation whose fix round 2 is named for.
+
+**Ten mutants survived a 47-mutant battery, and nine of them are one shape:** a printed or recorded
+NUMBER that nothing asserted, sitting next to a LABEL that several pins did. Under those mutants the
+A/B line reads `incumbent=0.000 candidate=0.800 delta=+1.000` — arithmetically impossible on its own
+face — the rejection says `paired delta +0.1333` one row under an A/B line saying `delta=+0.037`, and
+`(12 unreplayable, 12 transport-failed, -12 other)` prints a **negative count**. `restated-is-not-checked`
+is the lesson, and my pins were the restatement. They now parse the numbers out of each line and check
+that `candidate − incumbent == delta`, that the paired and raw triples actually differ when something
+was excluded, and that the rejection's number equals the A/B line's.
+
+The tenth: `_outage(i) or _outage(c)` → `_outage(i)` survived, so a **candidate-arm** outage — the arm
+that runs last, hours later, the one an upstream restart is most likely to hit — was invisible to the
+outage count. Round 2's entry names that exact asymmetry as its own defect; round 4 recreated it
+mirrored onto the new field.
+
+Two more, both in code round 4 widened: `recheck_gepa_incumbent` reported a **misspelled** signature
+(`planning.decompos`) as *"ARTIFACT-ONLY — no signature and no trainset"* with two dead remedies, while
+holding the disproof in `art["signature_name"]`; and the replayability probe, which runs *before* the
+refusal branch, raised `AttributeError` on a `null` JSON line and `UnicodeDecodeError` on invalid
+UTF-8 — so a pool that would have refused cleanly died with a traceback. A torn append mid-line is the
+reachable case; a scan of all 89,853 lines of the live 636 MB corpus found no offender today.
+
+Falsified claims, corrected: *"a tier big enough to start is now big enough to finish"* (the prune run
+disproves it), the probe's cost (**0.88 s** for the real pool's 13 private fixtures, not ~8 s), and a
+`cli_reference` line still documenting `raw_*_pass_rate` fields round 5 had removed.
+
+### Round 5 — the lesson never went upstream, and the loop around the gate was one revision behind
+
+The lens that drove the whole operator loop against the real corpus found the shape of the problem
+rather than another instance of it: **each round hardened one more point on the ship path and left the
+instruments that report it — and the sibling gate that shares its statistic — one revision behind.**
+
+**§4DA's founding defect was still live in the gate it ported the rule FROM.**
+`optim/ab_eval._run_one` turns a timeout or any exception into `passed=False` with a `failure_reason`,
+and `compare_prompts` then scored that row like a wrong answer. Driven: 50 examples, **identical**
+prompts, a 6-call outage confined to the baseline arm → `delta +0.120`, `candidate_wins 6`,
+`baseline_wins 0`, `p=0.0156`, **SHIPS=True**. That is `optimize_tool_descriptions.py`'s own comment
+word for word, reproduced in the **first** ship gate — the one `run_gepa.py` promotes on. I measured
+this defect, closed it in gate two, wrote three journal entries about it, and never carried it back.
+
+It is worse than random in `recheck_gepa_incumbent.py`, and that script *already says so*: a timeout
+scores as a failure and the incumbent is **by construction** the longer-output arm, so the instrument
+deciding whether to **retire** a live artifact was biased toward retirement. The neighbours' chosen
+remedy had been to raise the timeout to 360 s. The marker existed the whole time; nothing consumed it.
+Excluded now — at first by a **prefix list** rather than "any failure_reason" (round 7 replaced that
+with a marker set where the exception is caught, because the list named aiohttp for an httpx
+codebase); the distinction it was drawing is real, because a `failure_reason` is also how a
+runner reports a legitimate grading failure, and dropping those would discard the evidence the
+comparison exists to weigh, so an unknown exception type stays in.
+
+**Six operator-facing outputs in the loop were false or dead**, four of them introduced or left in
+place by rounds 2-4, and two of them are the remedy strings printed at the end of the very path §4DA
+built:
+
+- The **miner** wrote the live pool and exited 0 for a mine the runner refuses. §4DA made the
+  *runner's* supply gate real-positives-only and left the miner's counting bench — re-opening, one
+  abstraction over, the exact divergence the miner's own comment exists to close. Measured today: the
+  miner wrote the pool on 403 positives while the runner refused at *"121 REAL positive fixtures <
+  200"*. `docs/self_improvement.md` still asserted the fixed state.
+- **`--recordings` was inert.** Every fixture a real mine emits carries an **absolute** `source.file`,
+  and `Path("/x") / "/abs"` is `/abs` — so pointing it at `/tmp/DOES_NOT_EXIST` still reported 35/35
+  replayable. Round 4's replayability probe was built on that call, and its own justification is "a
+  pruned or moved recordings dir makes the whole tier unreplayable in one step" — the one flag that
+  would let an operator repoint could not affect the number the refusal prints.
+- **`--force-supply` was documented smoke-only and promoted.** Both the docstring and the flag's help
+  say "smoke runs only"; nothing enforced it and no test pinned it. Driven: `--force-supply
+  --min-delta 0.029` on 121 real positives promoted **6 artifacts** and exited 0.
+- The **`.candidate.rejected` file claimed a promotion** — `gate_arm` and `promoted_utc` were stamped
+  unconditionally, so a rejected candidate renamed into place (plausible right beside the `.prev`
+  restore workflow) loaded as a *gated* artifact instead of raising the provenance warning.
+- `recheck_gepa_incumbent` printed **n=60 for a gate that decided on 48 pairs**, with `n_usable_pairs`
+  sitting unread in the same file — round 4's own outage/gap distinction leaking into the only reader
+  of the trail. And its exit code for "artifact-only, nothing re-scored" was **0**, the same code as
+  "re-scored and it still wins".
+- Both tail remedies named the **wrong script**: the artifact-only bail-out named
+  `optimize_tool_descriptions.py` for every family (the only artifact-only files on disk today are
+  `verifier.*`), and `live_check`'s no-artifact branch — *the state production is in* — said "Promote
+  one with `scripts/run_gepa.py`", which exits 2 with `invalid choice` for a tool-description
+  signature.
+
+**And the schema I built was 40% duplicate.** `delta` and `paired_delta` were byte-identical;
+`raw_*_pass_rate` duplicated the top-level `private_incumbent`/`private_candidate`. Four names for one
+delta, three for each rate. One name per number now. `gap_excluded` was computed by **subtraction**
+— the shape round 4 condemned for the printed error counts, still present one round later — and
+`ShipDecision.discordant` was computed and never read, which is exactly the state round 3 found for
+`transport_excluded`, one field over.
+
+### Round 4 — a corpus gap given the semantics of an outage, and the reader that still refused the file
+
+**Round 2 fixed the printed line for exactly this confusion and then armed a new gate on the merged
+set.** Its own entry says `n_err` conflated *"a corpus gap (stable across both arms)"* with *"an
+outage (the thing that invalidates the pairing)"* — and the `underpowered` guard it added in the same
+round read `_TRANSPORT_ERRS`, which contains both. `err="unreplayable"` means the fixture has **no
+recorded payload**: deterministic, identical in both arms, identical on every re-run. Driven through
+the real `main()`: 60 rows, 12 with no payload, an honest **6-0 sweep on the 48 replayable ones** —
+`paired_delta +0.125`, `p=0.0156`, *both bars cleared* — refused with **"nothing ships — re-run when
+the upstream is stable"**. The upstream was never involved, so re-running is a fixed point costing
+`iterations × len(pub)` main-model calls per attempt. Reachable in one step: every fixture in the live
+pool carries an **absolute** `source.file`, so pruning or moving the 604 MB recordings directory makes
+the whole tier unreplayable at once.
+
+Two fixes, because the confusion had two halves. The **pre-flight now counts replayable rows**,
+probing `_load_recorded_payload` before it spends anything: 0.88 s of file reads against 318 model
+calls. And the power guard's **message** names the cause, because "re-run when the upstream is stable"
+is a no-op remedy for a corpus gap.
+
+> ⚠ **Round 5 reversed the other half of this, and the reversal is the lesson.** I also narrowed the
+> guard itself to fire only on an outage, reasoning that the probe makes a corpus gap impossible
+> afterwards. Swept through the real `main()`, **no gap size changes the outcome** — the pre-flight
+> refuses first, so the clause is unreachable. And where the premise fails it *removes* the guard: the
+> incumbent arm runs before `gepa.optimize` and the candidate arm 318 model calls later, so the
+> recordings can move in between. Driven with them pruned in that window: 60 pairs collapsed to **5**,
+> `delta=+1.000`, **PROMOTED**, no warning. A guard disarmed on a property that makes the disarming
+> pointless if true and dangerous if false. It blocks on the shortfall again; only the message is
+> cause-aware.
+
+**The reader the whole round-2 artifact reshape was for still could not open the file.**
+`recheck_gepa_incumbent.py:93` runs `_load_signature` *unconditionally*, before `--artifact` is
+consulted, and `SystemExit`s on any artifact-only signature — and tool descriptions are deliberately
+artifact-only. So `--signature tool_description.<tool>` died with *"unknown signature"* by every
+invocation, and the "⚠ THAT PROMOTION USED --allow-insignificant-ship" warning the reshape existed to
+enable **still could not print**. `docs/cli_reference.html` said *"so this reads either."* It did not.
+
+The reason it survived is the one this whole entry keeps circling: `test_the_recheck_readers_OPEN_it`
+**re-typed the reader's expressions inside the test** — `art.get("gate")`,
+`prev.get("discordant_pairs")` — and cited the reader's line numbers in its docstring, without ever
+importing or running it. A test written to close the §4DA failure mode, containing the §4DA failure
+mode. The re-score genuinely needs a signature; the audit report does not, so an artifact-only
+signature now reports and then says plainly why it cannot re-score. Round 4's version drives the real
+script in a subprocess and asserts the sentence appears.
+
+**And every decision-facing number stated the raw margin while the gate decided on the paired one.**
+Driven with candidate-arm outages on rows the incumbent passed, the rejection read *"the candidate
+cleared the margin (delta -0.0500, bar 0.02)"* — a negative delta against a positive bar, in the same
+sentence as "cleared" — and with the offered override it promoted while the A/B line said
+`delta=-0.050 ships=True`. `paired_incumbent`/`paired_candidate` were computed, printed to stderr and
+never recorded, so the artifact could not reconstruct its own comparison, and a
+re-check reading that block would compare a **raw** delta against a bar cleared on a **paired** one
+(not reachable today, since `recheck` never re-scores an artifact-only signature — the hazard was in
+the record, not yet in a live path). `delta`
+in the artifact is now the deciding number (matching every sibling gate's use of the key) with
+`raw_delta` beside it, the rates are the paired ones (the raw pair stays at top level as
+`private_incumbent`/`private_candidate` — round 5 removed the duplicates), and both messages say which
+is which.
+
+Three smaller ones, each a "the check cannot distinguish" case: the error counts were computed by
+**subtraction**, so a third err state (a candidate over the per-tool cap) printed as "60 unreplayable"
+when nothing was unreplayable, and `n_down` used a bare `== "transport"` while the exclusion used
+`_TRANSPORT_ERRS` — two definitions of one thing. The supply-gate pin asserted `"20 REAL positive
+fixtures < 200"`, which also passes on `"220 REAL..."`, so it could not distinguish the two numbers it
+existed to distinguish. And the attribution was pinned on the **key** being present, not on the
+**arm**: `context=context → context=None` survived 626 tests while making every turn `unenrolled`,
+`live_check` CONFOUNDED forever and `--revert` unreachable — the exact state round 2 says it closed.
+That one is now driven through the real registry with a real registered experiment, asserting both
+arms actually appear.
+
+### Round 3 — the artefact round 2 shipped was a stamp that could lie
+
+The production-safety lens audited the round-2 change as what it is: code on the live agent's
+per-turn path. It cleared the parts I was most worried about — 9 hostile context shapes × 6 `req_id`
+shapes produced **0 raises**, 640 interleaved async turns showed **zero contextvar leakage**, and in
+today's live state (no `tool_description.*.json` on disk) the whole path is a measured **0.09 µs**
+no-op. Then it found three ways the causal claim `--revert` acts on is corrupted, and all three are
+mine.
+
+**The stamp fires at LOAD time; the refusal happens two layers up.** `_note_served` runs inside
+`tuned_instruction`, and whether the artifact is actually *applied* is decided afterwards by the
+per-tool validator and the aggregate-inflation ceiling in `tools/registry.py`. Driven with 8
+individually-valid artifacts summing past the 20,000-char ceiling: **40 of 40 requests rendered
+hand-written baselines only**, while 21 treatment turns carried a served-stamp and `gepa_live_check`
+returned a **KEEP** verdict comparing two arms whose prompts were byte-identical. The same 21 turns
+carry `gepa_artifact_applied=True`, so the fixture miner drops them as "context mutated" when nothing
+was mutated — starving the very optimizer the artifact came from. `activation_stats` already knew
+(`applied: 0, rejected: 21`); only the stamp disagreed. Both refusal points now un-stamp.
+
+**The randomization key collides on live names.** `_NAME_RE` caps an experiment name at 40 chars and
+`gepa_` + `tool_description_` spends 22, leaving 18 characters of tool name. The 39 static tools are
+clean — but this read site also covers **composed skills**, which the optimizer's own docstring
+anticipates artifacts for, and the live `composed_skills.json` holds 31. Over the 70 live names a bare
+truncation gives **7 collision groups covering 17 names**. Colliding signatures are never
+independently randomized: measured over 60 requests, two of them drew
+`{(treatment,treatment): 28, (control,control): 32}` and never split — control withholds *both*,
+treatment serves *both*, so `--revert` on one signature can retire an artifact whose measured loss
+belongs entirely to the other. Names over 40 chars now carry a 6-hex digest of the **whole** name;
+the three already-registered short names are byte-identical to before.
+
+**`arm_for() == ""` means control to the framework and "serve the artifact" to this loader.**
+`core/experiments.py` is explicit — *"Consumers MUST treat `""` as the control path"* — and the loader
+treated it as a third state. That is not academic: `_experiment_arms_recent` is capped at 16, so a
+request whose slot has been evicted reads `""`. At 32 concurrent enrolled turns, **16 of 32 lost their
+arm** and were served the artifact while stamped `unenrolled`. The leak is one-directional, control
+into treatment, which shrinks the control arm and makes REVERT *harder* to reach — the direction that
+keeps a losing artifact live. `""` now takes the control path when the experiment is registered, and
+keeps the un-randomized status quo when it is not.
+
+**And the promotion write ported half a discipline.** My round-2 comment cites `run_gepa.py:804` for
+the `.prev` backup; `run_gepa.py:799` also does `os.replace(staging, output)`. A torn `write_text`
+leaves invalid JSON, and `loader.py` caches that failure as `None` **for the life of the process** —
+repairing the file on disk does not bring the signature back, and the only trace is a `logger.debug`.
+Staged + replaced now.
+
+Two comments in `tools/registry.py` had also become false: the KV-stability contract's
+"byte-identical descriptions" and the aggregate ceiling's "trivially deterministic" are both true only
+while **no arm is registered** — §4CZ/§4DA made this read site randomizable, so the tool block has two
+shapes and the boot warm-up warms the treatment one. Stated in place rather than left to contradict
+their own module.
+
+What the lens confirmed sound: every optim-dir scanner ignores `.prev`, `.candidate.rejected` and
+`.retired-live-*` (`Path.with_suffix` puts them after `.json`, which no glob matches); the attribution
+writer, `forget_request`, and the 64-entry ring line up; `registry_diagnosis` is correct for
+`tool_description.*` on every branch including post-revert; and steps 4→7 of the loop close end to end
+— 120 turns → `treatment 10/46 vs control 70/74, Fisher p=0.0000` → REVERT → rename.
+
+### Round 2 — the fix was half a fix, and nothing downstream of the gate had been looked at
+
+Two lenses. The first re-read the round-1 fixes; the second asked the question I had not
+asked at all: **after this gate ships something, what reads it?**
+
+**The round-1 transport fix was half a fix.** I excluded transport failures from the *pairing* and
+left `delta` — computed in `main()` over every row, where a transport failure scores 0.0 — feeding
+the *margin* unchanged. `--allow-insignificant-ship` ships on the margin ALONE, so the exact 6-replay
+one-arm outage I had just recorded as closed still promoted: delta +0.100 on effectively identical
+descriptions, `p_value: null`, `discordant_pairs: 0`, `ships=True` — an artifact recording **zero
+supporting evidence** as the reason it shipped. And that is not a corner case: today's private tier
+is 13-33 replays, so significance is unreachable and the override is *the* documented path.
+
+The margin is now derived inside `_ship_decision` from usable pairs only, and **`delta` is no longer
+a parameter at all**. It could contradict the trajectories beside it, and both callers were doing
+exactly that — `main()` passing a contaminated number, and my own round-1 tests passing `delta=0.30`
+next to arms built for something else, so every pin that "relied on the margin being cleared" was
+asserting a number nothing had produced. A parameter that can disagree with the evidence beside it
+will. Second guard added: an outage that walks the usable tier below the number the **pre-flight**
+required to start is now `underpowered` and cannot ship, override or not — it waives significance,
+never evidence.
+
+**Nothing that exists to audit a promotion could read one.** §4DA stamped seven evidence fields flat
+and named the count `discordant_replays`; `run_gepa.py` writes the same seven nested under `gate` as
+`discordant_pairs`, and `recheck_gepa_incumbent.py:107` reads `art["gate"]`. So the audit trail added
+specifically so an override could be re-examined was written in the one shape its only reader cannot
+open — the "⚠ THAT PROMOTION USED --allow-insignificant-ship" warning could never print. Worse, §4DA
+omitted `gate_arm`, which `loader.py:272` keys the provenance check on: driven through the real
+loader, a promotion made **under the current gate** logs *"predates the gate schema — re-promote
+under the current gate before trusting it"*, a false claim whose remedy is a no-op loop, and it splits
+the two liveness probes (`gepa.applies` reads ZERO while LOOP YIELD counts the load). One vocabulary
+across the gates now, plus `promoted_utc`, plus both margins — the raw one the operator saw printed
+and the paired one the gate decided on. They differ exactly when transport failed.
+
+**The promotion was one-way.** It overwrote the live artifact in place. `run_gepa.py:804` copies to
+`.prev` first and *aborts the promotion if the copy fails*, and its comment says why. An override is
+an operator judgement call, and this was destroying the only thing that could reverse it.
+
+**And the one optimizer §4DA gates had no live judge.** The tool-description read site called
+`tuned_instruction(sig, "")` with no context and no `req_id`, so `_note_served` returned at its
+empty-`req_id` guard and no trajectory stamp was ever written: `activation_stats` counted the
+artifact applied while `served_for_request()` was empty. §4CZ's whole live-revert path reads that
+stamp, so `gepa_live_check --signature tool_description.*` could only ever say CONFOUNDED and
+`--revert` was structurally unreachable. §4CZ shipped attribution for the two planner signatures and
+§4DA gated a third that could not use it. The context was already at the call site and the request-id
+ContextVar was already used ten lines away for the `fs_batch` arm. Wired. And `gepa_live_check`'s
+retirement message told the operator retirement "REMOVES A PREFIX, nothing replaces it" — true for
+the planner signatures, and the **opposite** of true for tool descriptions, where the read site
+REPLACES and retiring restores the hand-written baseline. It inverted the question the operator was
+about to answer.
+
+**Two numbers that were simply wrong.** The refusal's remedy divided `_need * ALL positives` (bench
+included) by a real-only private tier: 608 against the miner's 181 on the same mine, 3.4×. The miner
+records that exact bug as fixed on its own side; the runner, which claims to report the same number,
+still had it. And the **supply gate counted bench too** — the hazard named in its own neighbouring
+comment ("bench volume alone could clear the supply/resolution gates for a run whose real evidence is
+too thin"). §4BF-1c fixed the *tier* and left the *gate*: a fresh mine is 403 positives of which 121
+are real, so the gate passed on 282 bench rows. Both now real-over-real. Going the other way, the
+miner's "is it time yet?" line reported only the RESOLUTION half of the runner's refusal and printed
+`OK` for a tier the runner refuses; the floor now lives once in `ab_eval.significance_floor()` and all
+three consumers read it, rather than three private copies of a derived constant.
+
+**Round 1 fixed a guard by giving it an exemption, and never drove the exempt path**: `--smoke` was
+exempted from the `--min-delta` validation and left running `math.ceil(1/x)` below it, so
+`--smoke --min-delta 0` raised the very ZeroDivisionError that check was added to close.
+
+Operator surface, all measured on this machine: the path in the module's own docstring **has never
+existed** (the miner parks at `<pool>.notready` when its gates fail, which is the state since
+2026-08-04) and produced a bare `FileNotFoundError` traceback; `--help` rendered
+`__doc__.splitlines()[0]`, putting the ⚠ SUPPLY GATE warning and the usage block out of reach of the
+one command an operator runs first; `--min-delta` had no help text and no stated default.
+
+### Round 1 review — I extracted the decision to escape the trap, then pinned only the extract
+
+Two independent lenses, converging on one thing: **the rule was pinned; its only call site was not.**
+`ships = _dec.ships` → `_dec.cleared_margin` restores the exact pre-§4DA rule and passes the entire
+16k-test suite. So do `allow_insignificant=True`, `valid=True, aggregate_ok=True`, swapped
+trajectory lists, `if True:` on the live-artifact write, `return 0` unconditionally, and **all seven
+fields §4DA added to the payload**, and the printed A/B line, and the pre-flight refusal as distinct
+from its derivation.
+
+I pulled `_ship_decision` out precisely to avoid the harness trap that hid four defects across
+§4CY/§4CZ — and the region where the fix and the bug agree simply moved one level out, to the wiring.
+The AST pin I wrote asserts the floor is *derived*; it never asserts it is *used*.
+
+Fixed by driving the real `main()` with **only the optimizer and the replay transport stubbed** — the
+decision, payload, artifact writer and printed line all real. Getting that harness honest took three
+attempts, each instructive: the fixtures needed the real schema (`chosen_tools`, an explicit `tier`),
+the scores had to be **derived from the actual batch** rather than hard-coded lists that silently
+mismatch `len(priv)`, and the private tier had to be sized to 60 — at 250 a 4-replay swing is delta
+0.016 and the *margin* blocks it before significance is ever consulted, so the override branch is
+unreachable and its test proves nothing.
+
+**Three live defects the reviewers found by driving past the pre-flight**, none of them mine but all
+now closed: `--min-delta 0` raised an uncaught `ZeroDivisionError`, `1e-320` an uncaught
+`OverflowError`, `1.0` passed both pre-flights and paid for the whole optimizer before refusing
+everything, and a **negative** margin made `delta > min_delta` trivially true so
+`--allow-insignificant-ship` shipped a candidate measurably worse than the incumbent. `run_gepa.py`
+already guards all four, and its comment names each as fixed there.
+
+**And one that changes what the gate means.** `_call` swallowed every exception into a bare `None`,
+making "the upstream was down" and "the model called no tool" the same observation — scored 0.0 with
+`err=""`, invisible in the unreplayable count and in the artifact. The two arms run hours apart on
+the same shared slot (the candidate pass follows the whole GEPA run), so a llama-server restart
+during one of them manufactures discordant pairs **in one direction**. Measured: a 6-replay outage
+confined to the incumbent arm gave p=0.0156 and ships=True on descriptions that were effectively
+identical. Transport failures are now marked at the source and excluded from pairing — "fixture *i*
+is a matched pair", the premise this whole entry rests on, holds only if the transport was up for
+both passes.
+
+That fix broke four tests on its first shape (`_call` returning a tuple → `ValueError: too many
+values to unpack`), so it became a **sentinel** instead: the contract stays one value wide and every
+existing stub keeps working. Second time in one entry that a clean-looking change silently imposed a
+new requirement on every consumer.
+
+The two pre-flights were also combined into one requirement, as `run_gepa` does — reported separately,
+an operator satisfies the weaker one, re-runs, and only then learns the real number.
+
+Round-1 battery after the fixes: **24 mutants including a docstring-only control, 23 killed, control
+SURVIVED, 0 harness errors.** Full suite 16,501 passed / 17 skipped, twice.
+
+### The full suite caught what my own pins could not
+
+I wrote `ShipDecision` as a `@dataclass`. All 23 pins passed. The full suite then failed with **3
+failures and 14 collection errors** in `test_audit_response_2026_08_04.py`: `dataclasses` resolves
+annotations through `sys.modules[cls.__module__].__dict__`, and every existing consumer loads this
+script with `module_from_spec` + `exec_module` **without registering it** — so that lookup returns
+None and the import dies. My own helper registered the module, which is exactly why my pins were
+blind to it.
+
+The fix is a plain class, not a change to fourteen call sites: **my change had silently imposed a new
+requirement on every consumer of the script**, and the next loader would have hit it again. There is
+now a pin that loads the module the way its consumers actually do
+(`test_it_imports_WITHOUT_sys_modules_registration`).
+
+That is the same lesson as the session's other fourteen, arriving from a new direction: the pin was
+written in the region where the fix and the bug agree — and this time the region was *how the test
+loads the module*.
+
+Battery: **19 mutants including a docstring-only control, 18 killed, control SURVIVED, 0 harness
+errors.** Two survived the first attempt: the alpha bound's admit side, which needs a **dyadic**
+alpha to be reachable at all (exact McNemar p is m/2^k, and 0.05 carries a factor of 5, so
+`p == SHIP_ALPHA` cannot occur at the live constant), and the pre-flight's floor derivation, which
+lives in `main()`.
+
+**Still open: `scripts/optimize_verifier.py:943`**, the third gate. Its metric is a balanced score
+over two class arms, so it needs a stratified paired test — porting this change unchanged would give
+a number for the wrong question, which is the mistake this entry is about.
+
+## §4DB — The node was never out of slots (2026-08-25)
+
+`deep_research` had been failing quietly for some time and the log said `Nova: ReadTimeout` — the
+same string this project has already chased down four separate causes for (cold Tailscale path,
+`-np 2` slot contention, internal-request load, and the query-expansion leash). The obvious fifth
+reading was slot exhaustion. **It was not.** `/slots` read 3 of 4 busy for the whole window: a slot
+was free, nothing queued, and llama-server accepted and served every request. They were simply
+larger than the budget could pay for.
+
+**The arithmetic, measured on the live box rather than argued.** The distill prompt is a flat
+40,000 chars with `max_tokens=2048` on a flat 45s budget. On Nova that is ~12,500 prompt tokens at
+~300 tok/s prefill:
+
+    solo, cold, node COMPLETELY IDLE : 42.7s — of which 41.1s is prefill
+    3 concurrent (the live shape)    : 135s / 258s / 258s
+
+It could not finish **with the node idle and a slot free**. Under the real concurrency prefill
+*alone* (52–62s) exceeded the budget before the first output token, and 2 of 3 runs hit the
+`max_tokens` cap for another 133–205s of decode. The live log window held **1 `Distilled facts`
+against 7 `summary degraded`** — seven of eight sources were feeding `fact_check` raw truncated
+HTML dressed as distilled evidence.
+
+**The guard that should have caught it was reading the wrong number.** `search.py` sized the
+extract from `max_context` — which `registry.py` fills with `args.max_context`, the *main* 35B's
+240,000-token window, not the worker's — so `min(40000, (max_context-2560)*4)` pinned to its own
+ceiling on every call and never constrained anything, while its comment claimed it was sizing "to
+the worker's context window". A limit that cannot bind is not a limit; it is a comment.
+
+**Three more defects were sitting underneath.** The per-URL clock started at `asyncio.gather`, so
+all eight `_bounded` coroutines opened their 55s windows *simultaneously* while `Semaphore(3)` let
+three run — URLs 4-8 arrived at the distiller with almost nothing left, and the 4th was handed
+**6s for a 27s job and posted it anyway**, producing a `ReadTimeout` indistinguishable in the log
+from the three genuine 45s ones ahead of it. The shortfall check that was supposed to prevent
+exactly that `raise`d **outside** its try block, so the URL it claimed to be "taking the raw-text
+path" for was swallowed by `gather(return_exceptions=True)` and dropped from the report entirely —
+the message described the safe behaviour and the code did the lossy one. And the distill shipped
+40,000 chars to the slow node while the fallback kept only 10,000: we asked the worker to read 4×
+what we would keep if it failed.
+
+**The breaker was decorative twice over.** With one node per pool `get_worker_node` returns the
+node anyway when all are tripped (deliberate, documented). More to the point, the 45s keepalive is
+`max_tokens=1` with the content "ok" — it completes in under a second on a fully saturated node, so
+it cannot observe a 12k-token prefill overrunning a budget. In the trace the breaker opened on three
+real timeouts at +101s and a keepalive **closed it at +108s, 7 seconds into a 60-second cooldown**,
+while every real request was still failing. `record_success` now ignores `keepalive`/`warmup`. The
+asymmetry is deliberate and stated at the call site: a *failing* heartbeat is still admissible,
+because it is the cheapest request we can make. Evidence of sickness, never evidence of health.
+
+**The fix is `core/node_throughput.py`:** per-node prefill/decode rates learned from the `timings`
+block llama.cpp already returns, and a `plan()` that pays for the floors first and refuses when the
+budget cannot buy them. Both knobs come from the node, not from a constant and not from the main
+model's context window. It re-tunes itself when the hardware, the model, or the concurrency changes
+— the failure mode of the hand-set number it replaced. Sampling floors matter more than they look:
+on the same node that prefills at 300 tok/s, the keepalive ping reports 13–25 tok/s and a
+prompt-cache hit reports ~1, so learning from either would collapse the estimate and starve every
+later distill.
+
+**Two bugs found in the fix, both by the suite, both the same shape as the original.** A
+`{plan.char_limit:,}` format spec inside the *degradation handler* raised against a non-numeric
+plan — escaping `process_url`, swallowed by `gather`, dropping the source. The handler that exists
+to save the URL destroyed it, which is precisely defect (3) above re-created by its own repair. Then
+`text[:plan.char_limit]` turned out to sit outside the same guard. The plan's numbers are now
+coerced once, and the telemetry cannot reach the fallback. **Telemetry that can break the call it
+describes is not telemetry.**
+
+Six mutants (hardcoded 2048, ignore the char limit, post the declined plan, clock back at `gather`,
+keepalive closes the breaker, floors removed) are each killed by a test. Five existing tests went
+red: two were crash-induced and are now green, two had pinned the defect itself — one asserting
+`max_tokens == 2048`, one asserting the worker prompt *scales with the main model's context* — and
+were inverted, and one AST pin followed the mechanism into `_bounded`, where it now also pins the
+phase clock it never knew about. Suite: 16,501 passed / 17 skipped.
+
+**ROUND 2 — the timeouts came back, and the reason was a unit error.** Sizing to a measured rate
+is not enough if the rate is measured in a different world from the one the request runs in. A
+research wave plans EVERY url before ANY of them is in flight, so the node looks idle to all of
+them: four plans of ~19,936 chars / 596 tok were built at ~306/32 tok/s and then ran at 115/11 —
+**126s of work against a 45s budget**. No amount of learning fixes that, because the learning
+happens after the wave is already planned.
+
+The fix is a scaling law, measured rather than assumed: prefill 304→220 tok/s from 1 to 3
+concurrent (**aggregate ×2.17** — llama.cpp batches prefill), decode 31.6→12 (**aggregate ×1.14** —
+bandwidth-bound at a fixed total). So `prefill ~ solo/√N`, `decode ~ solo/N`, and the caller
+DECLARES the fan-out it is about to create. Two follow-on bugs, both found by measuring rather than
+reasoning: recording concurrency at ACQUIRE time makes the first request of a wave claim it ran
+alone (three that start together see 1, 2, 3) so its loaded rate is learned as the node's solo
+speed; and our concurrency counter is blind to any caller that states no total budget, because
+`_gate_wait` returns None for those and they hold no permit — prod learned a solo-equivalent decode
+of **4 tok/s on a node that does 31.6** and declined every source at "54.0s available". The bias is
+one-directional, so the answer is a floor (never plan below half the best rate ever seen), not a
+re-estimate.
+
+**And a constant that had quietly become wrong.** The 45s leash was set when concurrency was
+invisible. A useful distill costs 18.9s alone, 31.3s at 2-way, 42.7s at 3-way and **53.6s at
+4-way** — and this deployment runs at 4-way routinely, because `--worker-nodes` and
+`--critic-nodes` point at the same box. 45s could not fund the work at all, so the sizing did the
+only honest thing left and REFUSED: 5 of 8 sources declining to raw HTML. That is the original
+defect reached by refusal instead of by timeout, and it is the third time this entry records the
+same shape. Leash 45→65s, per-url 55→80s, phase 120→150s: a deliberate latency trade, bought back
+in practice because a distill that succeeds is cheaper than one that burns 45s and fails.
+
+Verified in prod twice after redeploy: **8/8 sources distilled, 0 degraded, 0 declined, 0
+ReadTimeouts**, at 116-137s per request against the 172s the failing turn took.
+
+**ROUND 3 — three fresh-eye reviews, and the worst finding was that the fix was not running.**
+`_on_node_success` is called AFTER the `async with _node_slot(...)` block, so by the time
+`observe()` ran the gate's `finally` had already discarded the concurrency bookkeeping: measured
+**3 inside the permit, 1 after it**. Every sample was recorded as "ran alone", loaded rates were
+stored as solo rates and then divided a SECOND time at plan time, and the distiller settled at
+~4,600 chars of a page — **less than the 10,000-char raw fallback it exists to beat**. Every live
+check I ran said 7/7 distilled and I read that as success; it was "small plans always finish". I
+was measuring whether it distilled, not how much it read.
+
+My own pin sampled the value INSIDE the block, where production never reads it. Rewritten as a
+"live path" test it STILL let the mutation through, because it hand-rolled the dispatch instead of
+driving it — and the first mutation run gave a false pass because it patched only the first of five
+pool branches. It bites only now that it calls `_do_chat_completion` for real.
+
+Fixed with it: concurrency is now TIME-WEIGHTED (peak over-attributes symmetrically — a request
+alone for 95% of its life with three joining at the end scored 4), keyed by **(task, url)** (a task
+holding permits on two nodes read one's figure for the other and popped its entry), and
+`_node_inflight` returns OTHERS with 0 for idle, clamped by the gate's own cap — it had conflated
+"idle" with "cannot tell", so an idle node could never be planned at concurrency 1. The
+`PLAN_RATE_FLOOR_FRACTION` clamp was **removed**: it was a band-aid over the poisoned estimator,
+measured to change nothing, and it could not decay — a node downgraded by more than 2x was pinned
+at a speed it could no longer reach, forever, since a timeout returns no `timings` to move the
+high-water mark.
+
+**Two containers had been grown inconsistently.** The phase clock grew 25% (120→150) while the
+per-URL leash grew 45% (55→80), so 3 waves × 80 = 240 against 150 — measured, urls 7 and 8 declined
+with "14.0s available" and "0.1s available". And `_QUEUE_ALLOWANCE_S` stayed at 8s against a distill
+that now plans ~46s of work: three batched research calls measured 8/0, 3/5, **0/8** distilled,
+i.e. 13 of 24 sources reaching `fact_check` as raw HTML. Raising the leash had made that WORSE.
+Phase → 190 (the value a new structural pin demands), queue → 16. `MIN_CHARS` 4,000 → 6,000,
+because a floor-sized plan READ less of the page than declining would hand over — the floor had
+been defended on coverage when it can only be defended on signal.
+
+**Mutation: 38 mutants, 26 killed at the start of the round; the 12 survivors now have pins and all
+9 still-anchored ones are killed, control surviving.** The recurring shape in the survivors is a
+test that imports the constant it is supposed to pin (`assert char_limit <= MAX_CHARS` moves with
+the mutation), or asserts a NAME appears in an AST rather than driving what it does — the per-URL
+deadline pin passed happily against `monotonic() + (budget_s and 55.0)` until a ceiling was added.
+
+Prod, verified twice: **6-7 of 8 distilled, 0 degraded, 0 ReadTimeouts**, 145-174s per request.
+Honest cost: that is at the latency of the original failing turn, buying real distillation instead
+of one source in eight.
+
+**What generalises.** Four causes for `ReadTimeout` were already written down and every one was
+about the node or the network; this one was about *us*, and the instrument that should have said so
+— the circuit breaker — was being reset by a probe that could not fail the way real traffic was
+failing. When a guard and the traffic it guards do not share a failure mode, the guard is measuring
+a proxy. And when a symptom already has four documented causes, that is a reason to measure, not a
+reason to pick one.
+
+## §4CZ — Judging a prompt by what it did, not by what it promised (2026-08-25)
+
+§4CY made the promotion gate honest. It did nothing about the question that matters once a prompt
+is live: **is this artifact helping real turns?** Nothing could answer it, because the provenance
+was computed and thrown away — `optim/loader.py` has always derived an sha8 for every artifact it
+serves and **nothing outside that module ever read it**. The §4CW artifact served every planner turn
+for weeks on a win nobody could reproduce, and that was invisible for exactly this reason.
+
+### Attribution (#2)
+
+Turns now carry `extra.optim_artifacts = {signature: {sha, arm}}`, stamped where the experiment
+arms and token accounting already are. `tuned_instruction` gained optional `context`/`req_id`; a
+bounded per-request ring keeps the attribution, because the agent runs concurrent turns in one
+process and a module-global would file one request's artifact on another's trajectory.
+
+**Attribution alone is confounded, and I did not want to build a revert on it.** An artifact is
+deployed to everything at once, so before/after compares the prompt against the rest of the week.
+So the loader also honours a randomized arm: with an experiment named `gepa_<signature>` registered,
+**the control arm is served the hand-written baseline**. Three states, kept distinct on purpose —
+`treatment`, `control`, and `unenrolled` — because pooling unenrolled turns into a control group
+would reintroduce the exact comparison the arm exists to avoid. Nothing changes until an operator
+registers the experiment.
+
+**The bug I shipped first**: the stamp sat *after* the `_CACHE` short-circuit, so it ran on a
+process's FIRST call and silently not on any later one — a corpus that looks populated and is almost
+entirely unattributed, which is worse than none. Found by driving two calls instead of one. Both
+the arm resolution and the stamp now precede the cache check, and the warm path is pinned
+separately: mutating only the cached branch survived the whole file until those pins existed.
+
+### Retiring on production evidence, and a rate cap (#3)
+
+`optim/live_check.py` buckets attributed turns by arm and returns REVERT / KEEP / INSUFFICIENT /
+**CONFOUNDED** — the last for any non-randomized shape, rather than a number.
+`scripts/gepa_live_check.py --revert` retires a measurably losing artifact by renaming it, the same
+move §4CW made by hand, and acts only on REVERT so the flag cannot override the refusal to conclude.
+
+**The test is Fisher's exact, not McNemar.** The offline gate runs both prompts on the SAME
+examples — matched pairs, sign test. Here the arms are different requests, so they are unpaired and
+McNemar does not apply; reaching for the gate's statistic because it was to hand would be a category
+error that still produces a number. Cross-checked against `scipy.stats.fisher_exact(...,
+alternative="less")` over 396 random tables: zero mismatches. `MIN_PER_ARM` is the same
+"resolution is not power" distinction §4CY drew, one layer over.
+
+UNKNOWN outcomes are **dropped, not counted as failures** — scoring an unlabelled turn against the
+artifact would let a change in *labelling* rate masquerade as a change in quality.
+
+`run_gepa --min-promotion-age-days` (default 7) refuses a re-promotion inside the window, at the
+pre-flight so a capped run costs nothing. The reason is not tidiness: each run draws a fresh
+candidate, so repeated runs against a slowly-growing holdout are repeated draws at one gate. At **0.62**
+private examples/day (31 over the corpus's 50 calendar days; **0.21/day over the trailing 14**, and
+the newest private example is dated 2026-08-14) a weekly cadence re-decides on essentially the same
+evidence, and §4CY's 1–3% per-run false-promotion rate compounds to ~0.5–0.8 over 52 draws.
+
+### What this is, honestly
+
+**Zero attributed turns exist.** Attribution landed after the running agent started, and
+`planning.decompose` cannot re-run until 19 more private examples accrue — ~31 days at the
+whole-history average (0.62/day), ~90 at the trailing-14-day rate (0.21/day). The average is a
+ceiling on the pace, not an estimate. `gepa_live_check.py` reports
+INSUFFICIENT, which is the correct answer. This is instrumentation waiting for data, and the
+`built-but-unwired-loops` question — *does anything consume it?* — is answered by the script and by
+the pins, not by a running loop. The trigger is operator-invoked on purpose; wiring an automatic
+revert into the idle path before a single randomized turn exists would be the mistake this whole
+session has been about.
+
+### Round 1 review — the randomized arm could never be registered
+
+Two fresh-eye lenses. The headline: **the experiment name was illegal, so the entire causal half of
+§4CZ was inert.** `experiment_name` returned `gepa.planning.decompose`; `core.experiments._NAME_RE`
+is `^[a-z][a-z0-9_]{0,39}$` — no dots — and `_spec_from_dict` *silently skips* a spec whose name
+fails. So `_resolve_arm` always returned "", every turn was `unenrolled`, `verdict()` could only ever
+say CONFOUNDED, `--revert` could never fire — and `live_check` printed an instruction telling the
+operator to register a name the registry throws away.
+
+Twenty-one tests passed over it because **every one hand-built the arm stash**. The component that
+had to produce the arm was the one the harness stubbed out — the same shape as §4CY's pin that drove
+`main()` through a helper that stubbed `compare_prompts`. Worse, a mutant fixing the name *killed 8
+tests*: the suite would have rejected the fix. There is now a pin that runs the real
+`_spec_from_dict` and a real `load_registry` round-trip.
+
+Three more that the reviewers reproduced before I fixed them, all in the same function:
+
+* **Withheld turns were counted as applied.** The counter ran before the arm check, so ten
+  deliberately-control turns reported `applied: 10` — corrupting the project's own
+  `silent-inoperative-subsystems` instrument, whose entire job is to say whether a read site *used*
+  the artifact.
+* **The cold control path returned before `_CACHE` was set**, so every control turn re-did
+  `exists` + `read_text` + `json.loads` + `sha256` on the request hot path and re-emitted the
+  "once per artifact per process" warning — six warnings for six turns.
+* **Stamping was asymmetric with no artifact on disk** — today's live state. Control was stamped and
+  treatment was not, so a registered experiment would fill the corpus with control-only rows: it
+  looks like data accruing and can never be compared.
+
+Also fixed: the registry legally accepts arms like `["baseline","tuned"]`, neither of which is
+"control", so **both arms were served the artifact** and both stamped with a label `collect` files
+under `unenrolled` — unknown arms are now treated as not-enrolled, loudly. An empty `req_id` with a
+context read *another request's* arm (`arm_for` trusts the current stash). A future `promoted_utc`
+blocked GEPA forever, so clock skew or a restored backup would freeze a signature. `--min-per-arm 0`
+returned KEEP off "treatment 0/0 vs control 15/20". A `clear_cache()` between a check-then-get could
+raise from a function whose contract says it never raises. And the served artifact now registers in
+`CONTEXT_MUTATING_KEYS` — it is *prepended to the planner system prompt*, so a treatment turn's plan
+is downstream of text the control arm never saw.
+
+**The pins were weak in the ways this session keeps producing.** Deleting `context=`/`req_id=` from
+the planner call — which turns the feature off in production — left 319 tests green, because every
+§4CZ test called the loader directly; there is now an AST-walking pin over `core/agent.py`. Every
+Fisher table was **arm-balanced**, making the hypergeometric's two margins indistinguishable, so
+transposing them survived while flipping REVERT/KEEP on 6,669 tables. `t.n < floor OR c.n < floor`
+→ `AND` survived because no test had one arm above and one below — under it a 3-turn control arm
+reverts a live artifact, and asymmetric splits are the *first* shape live randomization produces.
+Both shipped defaults (`MIN_PER_ARM`, `--min-promotion-age-days`) were unpinned because every test
+passed the value explicitly.
+
+### Round 2 — the new pins repeated the shape they were written to close
+
+**My AST pin checked keyword NAMES, not values.** `context=None, req_id=""` turns the feature off
+exactly as deleting the keywords does — `_resolve_arm` returns "" on a None context and
+`_note_served` early-returns on an empty req_id — and all 188 tests stayed green. That is round 1's
+own headline defect, recreated one level up by the pin written to prevent it.
+`guard-a-proxy-not-the-thing`. It now asserts the AST of each value.
+
+**`gepa_artifact_applied` broke the invariant of the tuple it joined.** Stamped on `any(sha)`, it
+flagged UNENROLLED turns — and every other member of `CONTEXT_MUTATING_KEYS` is True only on an
+*enrolled treatment* turn, which is what the tuple means. `optim/tool_fixtures.py` drops flagged
+turns because "replaying it would optimize against a prompt only one arm ever sees" — false when the
+artifact served everyone, and it would have **starved that miner of every planner turn** the moment
+any artifact was promoted. Live impact today is zero (no artifact on disk); it armed itself on the
+next promotion. Now treatment-only.
+
+**`--revert` never reached the running agent.** The loader caches artifact text per process and
+`clear_cache()` must not be called on a live agent, so a rename takes effect only on restart —
+meanwhile every planner turn keeps using the retired artifact and `activation_stats` keeps counting
+it as applied. The script printed `RETIRED:` and said nothing about it; the HTML doc said the
+retirement was **automatic**, which the journal contradicted two sections away.
+`claim-vs-fact-deliverables`. The script now prints the `launchctl kickstart` line and both docs say
+what actually happens.
+
+**The unknown-arm guard was loader-local.** With a real registry carrying `["baseline","tuned"]` —
+which `_spec_from_dict` accepts — the loader correctly refuses to act, but the report still said
+"none randomized … register the experiment", to an operator who had just registered it, while
+`experiments.summarize_trajectories` rendered a two-arm comparison in which **both arms received the
+artifact**. `gepa_live_check.py` now cross-checks the registry and names the real cause.
+
+Smaller, all fixed: the stamping-symmetry pin covered two of four (path × arm) cells, so the mirror
+defect survived in the other two; the negative cache — load-bearing *right now*, since there is no
+artifact on disk — was unpinned and its removal costs a `Path.exists()` per turn; the rate-cap
+boundary test **could not reach its own boundary** (`strftime` floors the stamp, so the age was
+7.000007 and `<` vs `<=` never differed) and now freezes the clock; `experiment_name`'s 40-character
+truncation — the other half of `_NAME_RE`, the same silent-skip class as the critical defect — was
+unpinned because the loop only walked today's short names; the unknown-arm warning fired every turn
+where its sibling fires once per process.
+
+Corrected numbers: the corpus spans **50 calendar days**, not 48, so whole-history accrual is
+**0.62/day** (not 0.65) and the projection is ~31 days (not ~29); the "0.43/day trailing-30"
+figure was not reproducible and is gone.
+
+### Round 3 — severity decaying, pattern unchanged
+
+Five findings, none as severe as rounds 1-2, and the reviewer confirmed the round-2 fixes themselves
+hold. Two of those fixes had introduced new **operator-facing** defects, and one doc correction
+landed in one of two places.
+
+**The registry cross-check answered only one of the four ways an experiment can fail to randomize.**
+`load_registry().specs` KEEPS disabled specs and `assign` returns "" for them, so a *disabled*
+experiment is byte-identical to an unregistered one at the call site — and the report told the
+operator to register what they had already registered. Nothing else in the codebase reports a
+disabled spec, so that message is their only feedback channel. Same for `traffic: 0`. And a
+legitimate **3-arm** design was condemned wholesale with a false claim: *"every arm was served the
+artifact and every turn recorded unenrolled"* — false, the control turns were served the baseline
+and stamped `control`; the prescribed re-register would have thrown away a working two-arm subset.
+
+**The once-per-process arm warning hid a mid-run configuration change.** `load_registry` is
+mtime-keyed — editing the file is how an operator turns an experiment off without a deploy. Driven
+in one process: broken → 2 warnings, fixed → 0, **broken again with the same arm names → 0**, with
+the artifact silently serving both arms and every turn filed `unenrolled`. The dedup set now clears
+on a good assignment, so it only suppresses a repeat of a *current* misconfiguration. That branch
+also had **zero coverage** — replacing it with `raise AssertionError` passed 394 tests.
+
+**`--signature` was unpinned, and the artifact path is built from it.** Hardcoding the signature in
+the `collect()` call survived all 192 tests, so `--signature tool_selection.pick --revert` would
+compute `planning.decompose`'s verdict and **retire the wrong artifact**. Both signatures are real
+attributed read sites.
+
+Smaller: `_SERVED_RING_MAX` was compared against its own constant, so setting it to 1 passed
+(`self-calibrating-index-adapts`) — and at 1 a second concurrent request unattributes the first,
+which is the concurrency case the ring exists to prevent. `docs/self_improvement.md` carried BOTH
+the corrected accrual figures and a stale duplicate of the superseded ones (0.65 / 48 days /
+~29 days), and the restart caveat had reached the HTML but not the `.md` while the journal claimed
+"both docs". A third fixture leak (`_WARNED_ARMS`) made a new test read one warning instead of two.
+
+Independently re-measured: 31 private examples, span **50 calendar days**, **0.620/day**,
+19 more needed → **~31 days**; trailing-14 **0.214/day** → ~90. Every corrected figure checks out.
+
+One honest limitation recorded rather than fixed: restricting `gepa_artifact_applied` to treatment
+does **under**-exclude at `traffic < 1.0` — measured 151/200 turns served the artifact but only 48
+flagged, so 103 unenrolled turns that saw a one-arm prompt stay in the replay corpus. At
+`traffic: 1.0` with two arms — the configuration the tool tells the operator to register — there are
+no unenrolled turns and the restriction is exactly right. The round-1 shape was strictly worse.
+
+### Round 4 — my "re-arm" fix made the warning worse, measured
+
+**The dedup fix used a proxy and the randomizer defeated it.** Clearing `_WARNED_ARMS` on a *good
+assignment* treats "a known arm arrived" as "the configuration changed". Under randomization both
+arms alternate inside one UNCHANGED registry, so over 1000 turns with the real registry a
+`["control","treatment","aggressive"]` design produced **224** warnings instead of 1, and
+`["control","baseline"]` produced 254 — re-creating the every-turn noise round 2 had removed.
+`guard-a-proxy-not-the-thing`, third instance this session.
+
+Reverted to a permanent per-(signature, unknown arm) dedup, with the trade-off **stated** rather
+than hidden: a registry fixed and re-broken with the same arm names will not warn twice, and
+`gepa_live_check.py` is the standing-misconfiguration channel. That also removed a latent crash the
+reviewer reproduced — the clearing loop iterated the set while another thread could add to it, and
+`RuntimeError: Set changed size during iteration` escaped a function documented "never raises"
+(6 escapes in 6.1M calls; unreachable today because the other three read sites pass no context, and
+it armed on the next attributed read site).
+
+**The four-way cross-check had no `else`, so it was silent for the CORRECT configuration** — and the
+fallback then told an operator with the exact spec the tool asks for (registered, enabled, traffic
+1.0, `["control","treatment"]`) to register it. Byte-identical to the unregistered case. That is
+the defect the cross-check was built to fix, surviving in the state that matters most, and it is
+reachable in the normal workflow: pre-registration turns are durable and graded while new randomized
+turns lag. Same silence for partial traffic, the `GHOST_EXPERIMENTS` kill switch, and a registry
+file that exists but cannot be parsed — where `load_registry` sets `degraded=True` precisely so a
+report can say so.
+
+**And the "every arm was served the artifact" falsehood survived in the branch I did not touch.**
+Round 3 fixed it for the both-known-arms case; with `["control","baseline"]` the one-known-arm branch
+still claimed it, while 154/300 turns had been served the hand-written baseline and stamped
+`control`. The pin I wrote checked only the arm set where fix and bug agree.
+
+The diagnosis now lives in `optim/live_check.registry_diagnosis()` — one function, in the library,
+covering every registry state and testable without driving the script — and the verdict detail no
+longer prescribes a fix it cannot know is right.
+
+**Two of my round-3 pins could not fail.** One asserted a phrase's absence from
+`out.split(banner)[0].split("\n")[-1]` — a 29-character fragment, structurally unfalsifiable, while
+the phrase *was* in the real output. The other asserted `"Register the experiment" in out`, true in
+**all twelve** registry states the reviewer drove.
+
+### Round 5 — the branch that mattered most never printed
+
+**The diagnosis was gated on CONFOUNDED, and the state it was written for produces INSUFFICIENT.** A
+one-known-arm registry stamps ~half the turns with the known arm, so `control.n > 0` and the verdict
+is INSUFFICIENT — the operator is never told the registry is the reason. Its pin passed only because
+the harness handed the script a hard-coded all-`unenrolled` corpus **regardless of the registry it
+installed** — a corpus that registry can never produce. The harness stubbed out the thing under
+test, for the third time this session, and 8 of the 9 registry-state tests sat in that agree-region.
+The gate now covers any verdict short of an actual comparison, and the harness takes a corpus that
+matches the registry.
+
+**"IS NOT REGISTERED" was printed for six states where it IS registered.** `load_registry` silently
+drops a spec for duplicate arms, arms that are not a list, more than eight arms, a malformed arm
+name, an unknown scope, a bad or sensitive name — and for a cap on the number of specs. All produced
+byte-identical output to genuinely-unregistered, told to an operator whose file already contains the
+entry. That is verbatim the defect round 4 fixed for the CORRECT branch, reproduced one branch over.
+There is now a "present in the file but REJECTED when it was loaded" state that points at the
+registry's own warnings.
+
+**`scope: "bench"` reached the CORRECT branch with a permanently false sentence.** `assign_all`
+filters on scope and `enroll_request` asks for `SCOPE_LIVE`, so such a spec never enrolls a user turn
+— and the report said *"this resolves as NEW turns arrive, not by re-running"*. The live registry
+already carries a bench-scoped spec, so it is the copy-paste template sitting next to the entry the
+operator is being told to add.
+
+**And the trade-off I documented named a channel that does not fire.** The permanent-dedup comment
+said `gepa_live_check.py` "names the state on every run". It does not fire on a KEEP/REVERT verdict,
+so a registry broken *after* enough turns accumulated prints **KEEP off a stale arm split** while the
+artifact serves 100% of turns. The comment now says exactly that, as a stated hole in the mitigation
+rather than an implied guarantee. A stale round-3 comment describing the reverted clear-on-good
+behaviour was also still sitting above the round-4 code that contradicts it.
+
+Twelve message-text mutants survived the first battery, all in round 4's own new sentences, because
+the pins checked framing words rather than the arm names **in their roles**: `other = list(arms)`
+produced *"turns assigned ['control','baseline'] were served the artifact… while the 'control' turns
+were handled correctly"* — self-contradictory — and passed all three assertions. Likewise the
+honoured-arm slot, the 3-arm sibling branch, the durability sentence (invertible to "re-run this
+script", the opposite instruction), a traffic threshold that only 0.25 and 1.0 pinned so 0.9 read as
+full traffic, a dedup key that could drop the signature — where the absence-assertion was *trivially
+true under the bug* — and the report body itself, where swapping the treatment and control lines
+made a losing artifact read as winning next to a REVERT verdict.
+
+The revert itself was confirmed right on the merits: round-3 logic reproduces at **224** warnings per
+1000 turns, round 4 at **1**. No import cycle, no hot-path cost.
+
+### Round 6 — widening a gate without widening what the function can see
+
+**Round 5's own fix printed a false sentence in the common healthy case.** The diagnosis used to fire
+only on CONFOUNDED, which by construction means both arms are empty — so the healthy branch could
+say *"no randomized turn has accumulated a graded outcome yet"* and be right. Widening the gate to
+INSUFFICIENT made that sentence false in the state the tool occupies for **the entire on-ramp**
+between the first randomized turn and the twelfth:
+
+```
+  treatment : 5/11        control : 6/11
+i gepa_planning_decompose IS REGISTERED AND ENABLED ...
+  Nothing is misconfigured — no randomized turn has accumulated a graded outcome yet.
+INSUFFICIENT: treatment n=11, control n=11; need 12 per arm
+```
+
+Two adjacent lines contradicting each other, which is worse than the silence the widening replaced.
+Structurally: `registry_diagnosis` has no access to the comparison, so it cannot distinguish
+"nothing enrolled" from "enrolled but short of the floor" — **I widened the gate without giving the
+function the data the widening made it need.** It now takes the randomized count.
+
+**And the pin could not see it, because it ran on a corpus its own registry cannot produce.** At
+`traffic: 1.0` every turn is enrolled, so the all-`unenrolled` corpus the harness defaults to has
+probability zero. Round 5 added a `rows` parameter and then applied it to the *one* test that
+motivated it rather than to the class that shared the flaw — three registry-state tests were still
+running on impossible corpora, and the journal's "the harness takes a corpus that matches the
+registry" was claim-not-fact. Fixed for all three.
+
+**`_name_in_registry_file` aborted on the first non-dict entry.** `(e or {})` rescues `None` but not
+a truthy non-dict, which `load_registry` deliberately tolerates — so a junk entry *before* ours made
+the scan raise into the blanket `except` and print "IS NOT REGISTERED" for a spec that is in the
+file. The same file with its entries reordered gave two different diagnoses. One `isinstance`
+clause. Its case/whitespace normalisation was also unpinned in both halves.
+
+Smaller: the REJECTED reason list enumerated six causes and omitted the spec-count cap this branch
+also fires for, so an operator checks all six and finds none; *"the verdict above"* pointed at a
+verdict printed **below**; the widened gate had no upper bound, so a registry lecture next to a
+REVERT verdict survived; the healthy state's `i` prefix could become `⚠`, erasing the only signal
+that nothing is wrong while every word after it stays true. And **the 0.65/day figure round 2
+corrected survived four more rounds in `run_gepa.py` and a test docstring** — both presenting it as
+current fact.
+
+Round-6 battery, private tree, green baseline, docstring-only control: **13 mutants, 12 killed,
+control SURVIVED, 0 harness errors.**
+
+### Round 7 — the pattern broke, and what remained was the state nobody drove
+
+**Every round-6 fix was correct.** For the first time in seven rounds the finding was not "the
+previous fix introduced a defect". What it was instead is worth more:
+
+**The diagnosis exhaustively covers the registry and never looks at the artifact — and production has
+no artifact.** The loader stamps `optim_artifacts` only when there is something to serve
+(`if value:`), so with no artifact on disk **both arms randomize correctly and zero turns are
+attributed**. Measured: 20 turns, arms assigned, 0 stamped. `system/optim/` holds only `.prev`,
+`.retired-*` and `.rejected` files, so this is the state the operator meets *first* — and the tool
+told them to register an experiment, which would have changed nothing, forever. Two of the sentences
+it printed in that state were false in the same way §4CZ has been false three times now: *"no
+randomized turn has accumulated a graded outcome yet"* (hundreds did — they were never stamped) and
+*"this resolves as NEW turns arrive"* (it never will).
+
+Six rounds missed it for one reason: **all eight script-driving helpers write an artifact first.**
+The journal's own stated reason for expecting convergence — "the tool's output is finally being
+checked against a corpus the registry can genuinely produce" — was right about the corpus and blind
+to the artifact. The reviewer put it precisely: the round-6 prediction "reasoned about corpora the
+registry can produce, and the blocking variable turned out to be the artifact, which the diagnosis
+has never read and no test has ever omitted."
+
+The artifact check now runs first and says what to do. Also pinned this round: the on-ramp branch,
+which round 6 created and left held by **one literal string** — five mutants survived it, including
+a hardcoded count printed above a contradicting verdict and the `i`/`⚠` prefix swap; the gate's
+admit side for **KEEP**, the commoner completed verdict, where only REVERT was pinned; and a single
+batch of role-asserting pins for twelve messages whose *actionable half* — `Set "enabled": true`,
+`Raise traffic above 0`, `Re-register with…`, `Check the agent log` — was deletable with the suite
+green. Two load-bearing theses in the report body were likewise invertible: *"NOT a control group"*
+and *"This REMOVES A PREFIX"*.
+
+Round-7 battery, private tree, green baseline, docstring-only control: **15 mutants, 14 applied and
+all 14 killed, control SURVIVED, 1 harness error** (my own escaping, re-run separately and killed).
+
+### Where this stands
+
+Seven rounds. Severity: unreachable feature → behaviour → message correctness → message wording →
+an unexercised state. Rounds 1-6 each found a defect *introduced by the previous round's fix*;
+round 7 did not — every round-6 fix held, and what it found instead was the one configuration the
+whole chain had never driven.
+
+Round 6's reviewer predicted round 7 would be cosmetic and was **wrong for an instructive reason**:
+they reasoned about corpora the *registry* can produce, while the blocking variable was the
+*artifact* — which the diagnosis never read and no test ever omitted. A prediction about the space
+you have been searching cannot cover the axis you did not know was there.
+
+That is the honest stopping condition, and it is not "no more findings". It is: the behavioural
+surface is killed (every behavioural mutant aimed at rounds 5-7 died), the twelve registry states
+each print text verified true against a real registry and a corpus that registry can genuinely
+produce, and the remaining exposure is text drift now covered by role-asserting pins. **The next
+round would most likely find another axis rather than another defect** — and the way to find those
+is to run the thing, not to review it again. Nothing here is running yet: zero attributed turns, no
+artifact, and `planning.decompose` cannot re-optimize for ~31 days.
+
+Round-5 battery, private tree, green baseline, docstring-only control: **14 mutants, 13 killed,
+control SURVIVED, 0 harness errors.**
+
+Round-4 battery, private tree, green baseline, docstring-only control: **15 mutants, 14 killed,
+control SURVIVED, 0 harness errors.** Five of my new pins survived their first attempt — the mixed-
+registry pin used ONE bad arm so a mutant clearing *other* arms lived; `"traffic=0" in out` also
+matched the partial-traffic clause; and the kill-switch, degraded-registry and third `--signature`
+use had no pins at all.
+
+Round-3 battery, private tree, green baseline, docstring-only control: **11 mutants, 10 killed,
+control SURVIVED, 0 harness errors.**
+
+Round-2 battery, private tree, green baseline, docstring-only control: **11 mutants, 10 killed, the
+control SURVIVED, 0 harness errors.**
+
+⚠ Process: two round-1 reviewers mutated the same `/tmp` copy, and one reviewer's restore froze the
+other's transient mutant into it — a silently red baseline, which reports every mutant as killed.
+Private per-agent trees and a control mutant in every battery are now the rule, and the control
+mutant is what caught it.
+
+Re-run with a **control mutant** in the battery: **17 mutants, 16 killed, 0 harness errors**, and the
+docstring-only control survived as required — without it a contaminated tree reports every mutant as
+killed. One reviewer discovered exactly that: two review agents mutating the same `/tmp` copy, and a
+restore froze the other's transient mutant into the shared tree. Per-agent mutation trees and a
+control mutant are now the rule.
+
+Mutation battery, green baseline: **19 verified mutants, 19 killed, 0 harness errors** — including
+"control is served the artifact", "unenrolled pooled into control", "Fisher replaced by McNemar",
+"CONFOUNDED reported as KEEP", "the agent never stamps the trajectory", and three on the rate cap.
+Three of those survived their first attempt: two because every attribution test ran on a COLD cache
+while `tuned_instruction` has two control branches, and one because the agent-side wiring had no
+test at all.
+
+## §4CY — A margin is not a result (2026-08-25)
+
+Asked whether GEPA could be made autonomous. It can — the read side already is, and the write side
+needs only a trigger. The answer was **not yet**, for one reason that turned out to be cheap to fix,
+and this is the fix.
+
+### The defect
+
+`ab_eval.compare_prompts` decided the entire ship question with one line:
+
+```python
+cmp.candidate_ships = cmp.delta > min_delta
+```
+
+A margin, and **no significance test**. A pre-existing resolution guard forces
+`n >= ceil(1/min_delta)`, so at the 0.02 default the holdout is at least 50 and the smallest
+shipping swing is **2 examples out of 50**. Under the null — a candidate no better than the
+incumbent — that promotes 25-40% of the time depending on how many pairs disagree:
+
+| discordant pairs | 2 | 4 | 6 | 8 | 10 | 14 |
+|---|---|---|---|---|---|---|
+| P(ship \| null) | 0.25 | 0.31 | 0.34 | 0.36 | 0.38 | 0.40 |
+
+Weekly and unattended, P(at least one spurious promotion in a year) = **1.000**. Under a human it
+was survivable, and §4CW is the evidence: I re-checked the live artifact by hand and retired it at
+delta +0.0081 with no significant difference behind it. Autonomy removes the hand.
+
+**Resolution is not power, and the repo had conflated them.** The existing guard asks whether the
+metric can *represent* the threshold (`1/n` vs `min_delta`) — a real check, and it is the reason
+`planning.decompose` cannot run at its defaults today (31 private examples, 50 needed). It says
+nothing about whether an observed gap is distinguishable from noise. Nothing else did either.
+
+**And it was asymmetric — which I did.** §4CW gave the seed-arm veto a McNemar test needing >=6
+discordant pairs all one way. Shipping took two examples; refusing took a landslide. I added rigor
+to the veto and left the primary decision bare, which is `gate-calibrated-on-wrong-statistic`
+reintroduced from the other side, by the person who had just written that lesson down.
+
+### The fix
+
+Promotion requires **both**: past the margin, and supported by the discordant pairs at
+`ab_eval.SHIP_ALPHA` (0.05, **one-sided** exact McNemar in each direction's own tail, ties excluded
+— only examples where exactly one arm passed carry information). Both directions read that one
+constant. *(Written two-sided first; round 3 corrected it — see below.)*
+
+**There were two inline implementations of the statistic**: `run_gepa.py`'s seed arm and
+`recheck_gepa_incumbent.py`'s. (I first wrote *three*, counting the library — wrong, the library had
+none until this change created `p_value`.) One now, `ab_eval.mcnemar_p`. *(The re-check briefly read `cmp.p_value`
+for the same reason; round 3 showed that was wrong — it asks a different question and needs a
+different tail. See below.)* Same
+reasoning that collapsed `_PASS_BAR` in §4CW; the hazard recurred one layer down because I fixed the
+literal and not the habit. **Scope**: that "one" is true *inside the GEPA gate only* — the ablation
+runners and `evolve/evaluator.py` carry their own exact-McNemar, out of this blast radius but not
+covered by the word.
+
+`p_value`, `discordant_pairs`, `candidate_wins`, `incumbent_wins`, `ship_alpha` and
+`significance_overridden` are now recorded in the artifact's `gate` block. A promotion whose record
+cannot answer "how many examples actually moved?" is unauditable — which is how the §4CW artifact
+served every planner turn for weeks on a win nobody could reproduce.
+
+`mcnemar_p` returns **None** with no discordant pairs, never 1.0. Folding "nothing disagreed" to
+p=1.0 lets *we learned nothing* read as *they are the same* (`verdict-without-power`); the re-check
+carried exactly that fold and now says so in words.
+
+### The cost, not hidden
+
+A 4-0 sweep is p=0.0625 one-sided. The smallest possible evidence misses the bar, so a genuine
+improvement on a small corpus can be refused. `--allow-insignificant-ship` lifts the significance
+bar **only** — never the margin, pinned — and stamps `significance_overridden: true`. The refusal
+message distinguishes the two failures, because "clear the margin" and "collect more evidence" are
+different instructions and one message would send the reader to re-tune a prompt that may already
+be better.
+
+### Two corrections to my own analysis
+
+I told the operator a net swing of **one** example promotes a prompt. Wrong: the resolution guard
+refuses the run before that can happen, so the floor is two. I had read `ab_eval` and not looked
+for a caller-side guard — the conclusion held, the supporting number did not.
+
+Then three of the new pins passed **for the wrong reason**. Driving `main()` with the 0.02 default
+on a 45-example harness corpus, every one returned rc=1 from the *resolution* refusal without ever
+reaching the ship rule they were named for. They only became real at `--ab-min-delta 0.05`.
+`a-verification-that-cannot-distinguish`, third time this session — and again it was not the
+passing test that revealed it but the moment I asked *why* it passed.
+
+Mutation-checked in both halves: reverting the library rule to `delta > min_delta` kills 3 pins;
+removing `main()`'s override block kills 2.
+
+### Round 2 — four fresh-eye reviewers, and the fix was half-right
+
+Four independent lenses (statistic / control flow / pins / integration+prose). Three of them
+independently found the same top defect, which is the strongest signal available that it was real.
+
+**The instrument I did not update when I changed what its input means.** `candidate_ships` used to
+be `delta > min_delta`, so `recheck_gepa_incumbent.py`'s `else` branch could safely say "no longer
+clears its own bar". Once significance joined the rule, a large-margin-but-underpowered incumbent
+fell into that `else` and the script printed an arithmetic falsehood:
+
+```
+delta=+0.1290  p=0.219  ->  "⚠ THE INCUMBENT NO LONGER CLEARS ITS OWN BAR (+0.1290 < 0.02)"
+```
+
+That is the script the operator reads when deciding whether to **retire a live artifact**. `the-fix
+-severs-what-it-feeds`: I changed a shared meaning and checked only the caller I was editing.
+
+**The statistic was two-sided, and the constant lied about the bar.** The ship rule already fixes
+direction with `delta > min_delta`, so doubling the tail spent half of `SHIP_ALPHA` on an outcome
+the rule cannot reach — realised alpha 0.011-0.020 against a name saying 0.05. The cost lands in
+power, where nothing looks wrong: at n=50 a genuinely +10pp better prompt shipped **18%** of the
+time instead of 28%. I had reasoned "conservative is safe" and never computed the other column.
+Both directions are now one-sided in their own direction.
+
+A corollary I had also missed: one-sided significance needs 5 discordant pairs, implying
+`delta >= 5/n`, which **exceeds a 0.02 margin for any n < 250**. So "requires BOTH" — which I wrote
+in the docstring, the docs and this journal — is false on every corpus this project has. The margin
+decides nothing on the ship path. Documented rather than removed, because `--ab-min-delta` still
+governs the pre-flight refusal and the seed veto.
+
+**The pre-flight was necessary but not sufficient.** It refused when `1/n > min_delta` (resolution)
+but not when `n` was too small for significance at all. Measured: a 5-example holdout paid for the
+entire optimization and then refused a PERFECT 5-0 sweep — exactly the waste that block was hoisted
+above `run_gepa()` to prevent. Now both preconditions.
+
+**And `mcnemar_p` failed toward shipping.** `int()` looked like validation and was truncation:
+`mcnemar_p(0.9, 6.9)` silently became (0, 6), and a negative count gave an empty range, tail 0,
+**p = 0.0** — significant, ship. Unreachable from current callers, but it is exported public API,
+and a silent wrong-direction failure in a promotion gate is the one outcome that must not exist.
+Rejects now.
+
+### The pins were the weakest part, and I would not have known
+
+The pins reviewer ran 35 verified mutants: **24 killed, 11 survived**. The whole
+`TestTheTwoHalvesOfTheGateAgree` class — three tests named for exactly these failures — was
+source-text greps:
+
+* `assert "from math import comb as _comb" not in src` detects one SPELLING. `import math as _m` +
+  `_m.comb(...)` reinstates the inline McNemar with the suite green. `deny-list-guards-leak`, and
+  the deny-list was of **my own historical text**.
+* One test was killed only by inserting a SPACE (`cmp .p_value`) and by nothing else in 35 mutants.
+* `assert SHIP_ALPHA == 0.05` pins the constant's *value*, not any read site — so the seed-arm bar
+  could drift to 0.5 or 0.99 unnoticed. The §4CW pins bracketed it only within (0.0005, 1.0).
+
+Replaced with executed pins: a **sentinel implementation** is installed and the decision must carry
+it, which no second implementation can satisfy in any spelling. The seed bar is bracketed to a
+single discordant pair (4-0 must promote, 5-0 must veto).
+
+Control flow found the one that would have hurt: **the ordering that stops `--allow-insignificant-
+ship` from deleting the seed veto had no pin at all.** Moving those five lines below the seed
+trigger — a plausible tidy-up — lets one flag silently remove the other gate arm, promoting a
+candidate whose seed arm loses 12-0 and stamping `seed_arm: null`. Suite green. The blind spot was
+in my harness: the override class's stub returned the SAME comparison object for both arms, so
+nothing in it could tell "the seed arm ran and passed" from "the seed arm never ran".
+
+`recheck_gepa_incumbent.py` had **zero executed coverage anywhere in the repo** — seven greps, no
+test ever imported or ran it. It is now driven end to end.
+
+Round-2 battery: **13 verified mutants, 13 killed, 0 harness errors** — including every survivor the
+reviewers demonstrated. Two of my round-2 pins survived their first attempt, both for the same
+reason I keep hitting: `assert gate["ship_alpha"] == ab_eval.SHIP_ALPHA` compares **two copies of
+0.05**, so hardcoding the stamp survives it (fixed by moving the constant and requiring the stamp to
+follow), and the significance-floor test refused via the older *resolution* guard until its
+parameters were tuned so only the floor could fire. Fifth and sixth instances of
+`a-verification-that-cannot-distinguish` in two days.
+
+### Round 3 — the fix broke its own reader, and I did it
+
+Three more lenses on the round-2 work. The headline: **the one-sided switch fixed the gate and broke
+the instrument that reads it**, found independently by two reviewers.
+
+`recheck_gepa_incumbent.py` calls `compare_prompts(baseline=seed, candidate=incumbent)`, so
+`cmp.p_value` is one-sided **toward the incumbent**. When the incumbent *loses*, that tail goes to
+~1.0 by construction. Driven, 8-1 against the incumbent:
+
+```
+  McNemar exact (discordant n=9): p = 0.9980
+⚠ THE INCUMBENT IS NOW WORSE THAN THE BASELINE (-0.2000).
+   ⚠ AND THE DIFFERENCE IS NOT SIGNIFICANT (p=0.998 > 0.05) ... read it as a direction, not a verdict.
+```
+
+True two-sided value: **0.0391**. The script that decides whether to retire a live artifact
+announced "not significant" on the strongest evidence for retiring it — and it was *correct before
+round 2*. `the-fix-severs-what-it-feeds`, committed by the person who filed that lesson. The gate
+asks a directional question; the diagnostic asks a two-sided one; they must not share a number.
+
+**And my pins fed it values its own counts could not produce.** `p=0.03` alongside `bw=8, cw=1`,
+whose real value is 0.998. A stub that cannot represent reality cannot detect a divergence from it
+(`harness-grades-own-homework`). Every recheck pin now COMPUTES `p` from the counts.
+
+Round 3 also found that **round 2 broke two existing tests into passing for the wrong reason** —
+the mirror of the defect round 2 had just fixed:
+
+* The resolution-guard test now refused via the *new* significance floor (its tier was 3, below 5),
+  so **deleting the resolution requirement entirely left it green**.
+* A §4CW pin, `test_a_candidate_that_loses_by_NOISE_is_still_promoted`, was decided by the
+  significance arm rather than the margin arm it is named for — so **the §4CW round-4 critical it
+  exists to prevent could be reinstated with it green**. Retuned to 6 discordant pairs, where only
+  the margin stands between the candidate and a veto.
+
+Smaller, all fixed: the floor guard's own comment cited a scenario it cannot catch (n=5 at
+`--ab-min-delta 0.2` — neither guard fires, and post-switch that run correctly *ships*); the floor
+only binds for `--ab-min-delta >= 0.25`, so it is a coarse-margin backstop, not a safety net at
+defaults; the two guards reported separate requirements, letting an operator satisfy the weaker one
+and re-run before learning the real one (now one combined number); `SHIP_ALPHA = 0` produced a bare
+`min() arg is an empty sequence` out of `main()`; `alternative` was validated lazily, so a typo hid
+until the first discordant pair; a `None` p could reach a `:.4f`.
+
+### Round 4 — the same reader, broken a second time, by the fix for the first
+
+Two more lenses, both landing on the same thing: **round 3's fix created a fourth MAJOR in the very
+instrument it was fixing.**
+
+Round 3 switched the re-check's displayed p to two-sided — and left that doubled p wired into the
+suppression *decision*, which compares against `SHIP_ALPHA`, a **one-sided** bar. A two-sided
+statistic judged at a one-sided bar is a 0.025 bar wearing a 0.05 label. Consequence:
+
+```
+McNemar exact, two-sided (5 incumbent / 0 seed): p = 0.0625
+⚠ AND THE DIFFERENCE IS NOT SIGNIFICANT (p=0.062 > 0.05 on 5 discordant pairs)
+```
+
+A 5-0 sweep is the *smallest evidence `run_gepa._significance_floor()` calls shippable*
+(one-sided 0.03125). The gate ships it; the instrument called it noise. Reachable on the live
+corpus today via the documented `--full` invocation.
+
+The mistake was treating "one-sided vs two-sided" as a property of the SCRIPT rather than of the
+QUESTION. Both branches ask pre-specified directional questions — *"does the incumbent still earn
+its place?"* and *"is the incumbent worse?"* — so each now takes its own tail against the same
+`SHIP_ALPHA`. Choosing by which verdict is being reported is not choosing after seeing the data.
+
+**And "ITS OWN BAR" was not its own bar.** The re-check defaulted to `--min-delta 0.05` while an
+artifact records the margin it was promoted under — and printed that margin three lines earlier
+before ignoring it. A delta clearing the recorded bar was reported as failing "its own bar".
+(Worked example uses 0.02; note that on the live store **five of six artifacts record no margin at
+all**, so the fallback path is the common one — which round 5 then found was also mis-attributed.)
+`--min-delta` now defaults to the artifact's recorded margin, and the branch condition, the message
+and `compare_prompts` all read the SAME number — fixing only the message would have moved the false
+inequality to the other branch.
+
+Elsewhere, all fixed: `run_gepa`'s underpowered refusal printed `(delta +0.02 > 0.02)` at two
+decimals against an unrounded threshold — the identical "instrument states an arithmetic
+impossibility" shape, in the message round 2 added to *distinguish* the two rejections;
+`--ab-min-delta 0` crashed with `ZeroDivisionError` (round 3's combined guard introduced the
+division; the older form refused cleanly) and `>= 1` bought the whole optimization before refusing
+everything; the refusal asserted **"No candidate could ship"** in 81% of cases where a candidate
+demonstrably could, and offered *"or raise --ab-min-delta"* in exactly the branch where raising it
+can never help while withholding it from the branch where it is the one-flag fix. *(Round 5: the
+replacement offer was itself a fixed point — see below.)*
+
+**The §4CY audit fields had no reader.** `p_value`, `discordant_pairs`, `ship_alpha`,
+`significance_overridden` were written so a promotion could be re-examined — and the only instrument
+that opens the gate block printed none of them, so an *overridden* promotion was byte-identical on
+screen to an honest one. The change's own justification — "a promotion whose record cannot answer
+how many examples actually moved is unauditable" — was recorded and not delivered.
+`built-but-unwired-loops`, inside the fix for an auditability problem.
+
+Round-4 battery: **15 verified mutants, 15 killed, 0 harness errors.** Three of my round-4 pins
+survived their first attempt, one of them because `assert "seed better" in out` collided with the
+branch's OWN question text (*"is the seed better?"*) printed on the same line — a pin satisfied by
+the string it was meant to discriminate against.
+
+### Round 5 — the remedy was a fixed point
+
+A fifth lens, ~800 structured end-to-end drives plus 46 mutants, machine-checking every printed
+inequality against ground truth. The verdict logic held; **the round-4 message plumbing did not.**
+
+**The refusal's advice looped forever.** Round 4 replaced "No candidate could ship" with a real
+remedy — *"or raise --ab-min-delta to at least X"* — and computed X as `1/n` formatted to three
+decimals. That rounds **down**, so the value it suggests re-triggers the identical refusal. At the
+live 31-example tier it offered 0.032, and `ceil(1/0.032) = 32 > 31`. Broken for **172 of the 396
+tier sizes** in 5..400, including both the live tier and the test harness's own. The pin was named
+`..._offers_the_remedy_that_WORKS` and asserted only that the words appeared; it never ran the
+number. It now follows the advice and requires the second run to succeed.
+
+**Widening the precision did not fix the false inequality — removing the operator did.** Round 4
+changed `{delta:+.2f}` to `+.4f` to stop `(delta +0.02 > 0.02)`. Still wrong: `delta` is a
+difference of ratios, so `2/100 - 0/100` is `0.020000000000000018`, and *any* rounding that matches
+the bar's own precision prints a comparison that reads false. Both refusal messages, and the
+re-check's, now print `delta X, bar Y` with **no `>` or `<=` glyph at all**. There is no rounding
+that makes a float comparison safe to render as an inequality; the fix is not to render one.
+
+**And the fallback lied in the same words the fix condemned.** `--min-delta` defaulting to the
+artifact's recorded bar falls back to a hardcoded 0.05 when there is none — and announced *that* as
+"the artifact's own bar". Five of the six artifacts in the live store record no margin, so the
+mis-attributed path was the common one. Also: the invariant the whole fix is named for — branch
+condition, message and `compare_prompts` all reading one number — had **no pin**; hardcoding
+`min_delta=0.05` in the call left all 100 tests green.
+
+Smaller: `--ab-min-delta 1e-320` passed the new `0 < x < 1` guard and then raised an uncaught
+`OverflowError` from `math.ceil(1/x)` — the same crash, from the same expression, that guard was
+added to close; the `--full` verdict called public-tier examples "held-out" three lines after
+warning they were not; the §4CY audit fields were printed but the seed-override half was never
+exercised.
+
+**Two more self-collisions, and a battery that lied.** `assert "+0.1290" in out` was satisfied by a
+summary line printed three lines earlier, so reverting the message's precision left it green.
+`assert "(bar 0.02)" in out` was satisfied by the ORIGINAL line's own `(bar {min_delta})` — and the
+fixture I wrote to fix it contained **`ship_alpha` twice**, so the later value silently won. Worse:
+the first re-run of the battery reported **14/14 killed while the baseline was RED** — every mutant
+"killed" an already-failing suite. `harness-that-cannot-run-reports-success`, in the harness built
+to check for exactly that. The runner now refuses to score unless the unmutated suite is green.
+
+Round-5 battery, green baseline: **14 verified mutants, 13 killed, 0 harness errors.** The one
+survivor is an `assert` that duplicates a real pin, kept and documented as defence in depth.
+
+### Round 6 — the fix was unpinned by both of its own defences
+
+**The round-5 remedy fix could be reverted with the whole suite green**, and neither of the two
+things I shipped to prevent that could see it:
+
+* **The assert guarded a proxy.** It checked `ceil(1.0 / _offer) <= n` on the computed float, while
+  the operator types `f"{_offer:.3f}"`. For the buggy `_offer = 1/n` that assert reads
+  `ceil(1/(1/n)) <= n`, which holds for almost every n — so it passed while the *rendered* value
+  re-triggered the refusal. `guard-a-proxy-not-the-thing`: it guarded a number nobody types.
+
+  ⚠ I first wrote that as "true by construction, for every n". Round 7 disproved it: float
+  reciprocation makes `ceil(1.0/(1.0/n)) > n` for **6,018 of the first 100,000 n**, the first being
+  **n = 49** — the very tier the next paragraph uses as its other example, where the old assert
+  would in fact have fired. The change is still right; the reason I gave was not, and a wrong
+  justification for a right fix is how the next person removes the fix. It now
+  asserts the ROUNDED value the message renders.
+* **The pin ran where the fix and the bug agree.** It used a 5-example tier, and `1/5 = 0.200`
+  exactly — rounding down changes nothing there. Machine-checked: of the 396 tier sizes in 5..400,
+  172 are broken by the bug and **5 is not one of them**; 31 (live) and 45 (the harness default) are.
+  Moved to 45.
+
+Also live, twelve lines above the code I had just edited: `a smallest step of 0.020 cannot resolve
+--ab-min-delta 0.02` — `:.3f` truncated the step into the bar, so n=49 refused and n=50 ran while
+printing the same two numbers. Round 5 swept for exactly this shape and missed the instance inside
+its own edit.
+
+**Thirteenth twin** — and round 7 found only half of it was closed here. Every §4CW seed-arm test
+runs at `--ab-min-delta 0.05` — simultaneously the
+twin of `SHIP_ALPHA` and of the literal a mutant would hardcode. Replacing *both* reads with `0.05`
+kept 105 tests green while flipping a real promotion to a refusal, and the log could not expose it
+because the mutant still printed the correct bar. Pinned at 0.1, where the two separate.
+
+Round-6 battery, green baseline: **10 verified mutants, 9 killed.** The survivor is the `_offer`
+assert, now in its correct form, whose reversion is invisible because a real pin catches the actual
+bug — kept as defence in depth and documented as redundant rather than claimed as coverage.
+
+### Round 7 — the two lines the whole change is named for had no pin
+
+139 mutants over green baselines. Round 6's own edits all held — every retuned pin was shown to sit
+outside its agree-region — and the pattern reappeared **one operand to the left of each fix**.
+
+**The critical one.** `ab_eval`'s ship rule and `run_gepa`'s seed veto are the two sites
+`ab_eval.py` says "now read the same bar from here". Replacing **both** with the literal `0.05`
+passed the **entire 16,270-test repo suite**. Every other read of the constant — the significance
+floor, the artifact stamp, the re-check's suppression — had a move-the-constant pin. The two that
+decide promotions did not. `TestTheTwoHalvesOfTheGateAgree` pinned everything except the two halves.
+
+**And my first attempt at that pin could not have caught it either**, for a new reason: it drove
+`main()` through `_ship_run`, which stubs `compare_prompts` and sets `candidate_ships` directly — so
+the library rule it was named for never executed. That time the agree-region was the **harness**,
+not the inputs. Split: the ship half now calls the real `compare_prompts`, the veto half stays
+driven.
+
+**Fourteenth twin, in a round-2 pin still standing.** `assert "delta +0.0301, bar 0.03" in out` —
+that fragment is printed by **both** rejection branches, so it could not tell them apart, and
+`_insignificant`'s bar could be hardcoded. It was the only `_insignificant` test running at a bar
+other than 0.05; round 6 moved the seed-veto pin off that twin and left this one on it, one line
+away.
+
+Also fixed: the re-check's `_PASS_BAR` grep matched the **comment** above the read site, so
+replacing the comparison with the literal `0.3` — the exact second definition the pin is named for —
+survived; the re-check's margin boundary (`>` → `>=`) announced "it clears the margin (delta
++0.0500, bar 0.05)" at delta == bar while `compare_prompts` uses strict `>`; the suppression
+condition's **margin** operand was unpinned while its **alpha** operand was pinned; the second
+remedy — "Collect at least N private examples" — had never been followed, and reverting N to the
+resolution requirement printed "4 private examples is not enough … Collect at least 4", the same
+fixed point round 5 fixed for the other remedy; `_from_artifact`'s admit side; and all three
+`verdict-without-power` folds, each carrying the lesson in a comment and none of them pinned.
+
+The step format went to `1/n` alongside the decimal: `:.3f` collided with the bar for a whole class
+of tiers and `:.6g` narrowed it to 191 of 400 rather than closing it. **No fixed-precision decimal
+can close it**, because the bar can always be written at that precision — a fraction cannot collide
+with a decimal.
+
+Round-7 battery after the fixes: **10 verified mutants, 10 killed, 0 harness errors.**
+
+### The lesson, stated once
+
+Six rounds, and the sixth reviewer named what the first five had been circling:
+
+> **the checks keep being written in the region where the fix and the bug agree.**
+
+Every recurring shape in this session is that one sentence. A pin at n=5 where `1/n` is exact. An
+`assert` on a float the operator never types. `ship_alpha == 0.05` against a run using 0.05. A
+fixture whose `min_delta` and `ship_alpha` are both 0.02. `isinstance(h, NullHandler)` against a
+base class pytest subclasses. `assert "seed better" in out` against a line that prints *"is the seed
+better?"*. Thirteen instances across two days, every one green, every one found by mutation and
+never by running the test.
+
+**The operational rule:** before writing an assertion, state the world in which it fails, then
+choose inputs that put you in it. If the fix and the bug produce the same output at your chosen
+inputs, you have written documentation, not a test. Corollaries that would have caught all thirteen:
+never compare a value to its own twin — move one of them; never assert a substring the same output
+prints elsewhere — anchor it; never check a derived value when the consumer reads a different
+rendering of it; and run the mutation battery only against a **verified-green baseline**, because a
+red one reports every mutant as killed (that happened here too).
+
+### The failure mode of this whole session, named
+
+**Eight times now I have written a check that compares a value to its own twin.** `ship_alpha == 0.05`
+against a run using 0.05. `min_delta == 0.05` against a run using 0.05. `isinstance(h, NullHandler)`
+against a base class pytest also subclasses. A rotation both sides of the comparison followed. Each
+time the test passed, and each time only *mutating the fix* revealed that it could not have failed.
+
+The rule that would have caught all eight: **a pin must be run against a world where the property
+is false.** If you cannot state what that world looks like, the pin is decoration. Concretely — move
+the constant and require the artifact to follow; pick a p that sits between the real bar and the
+hardcoded one; use a sentinel no recomputation can produce.
+
+Round-3 battery: **15 verified mutants, 15 killed, 0 harness errors**, including every survivor the
+reviewers demonstrated and both of my own twin-value pins after they were rewritten.
+
+### Not done, and named
+
+`scripts/optimize_verifier.py:943` and `scripts/optimize_tool_descriptions.py:634` carry their own
+`ships = ... and delta > args.min_delta` — the same margin-only rule, same 0.02 default, same
+resolution guard, no significance test. This fix landed in **one of three ship gates**.
+`optimize_tool_descriptions` is directly portable (binary per-fixture score, paired evals);
+`optimize_verifier` needs a stratified paired test because its metric is a balanced score over two
+class arms. Recorded here rather than fixed, because the operator asked for the GEPA gate.
+
 ## §4CX — The suite went parallel, and seven latent bugs fell out of it (2026-08-24)
 
 The full suite took **24 minutes**. The rule here is that it runs after every change, and a

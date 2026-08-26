@@ -285,6 +285,44 @@ def test_resolve_never_raises_on_unwritable_home(monkeypatch, tmp_path):
 # Seeding from the trajectory corpus
 # ---------------------------------------------------------------------------
 
+def test_seeding_MARKS_the_index_seeded_whoever_did_it(monkeypatch,
+                                                       tmp_path):
+    """⚠ A DIRECT `_seed_from_trajectories()` LEFT THE STATE `pending`,
+    so the next `predict()` launched a background thread that seeded the
+    SAME corpus again — every observation counted twice.
+
+    Driven: 3 corpus calls, direct seed, then predict → support **6**.
+    The double-seed races the assertion, which is why this file was
+    reported as ~50% flaky by one §4DA reviewer and "NOT REPRODUCED" by
+    another (it is timing- and machine-dependent; the MECHANISM is not).
+    Production only reaches the seeder through `_seed_worker`, so the
+    defect was confined to direct callers — but "the index is seeded" is
+    a property of the INDEX, not of who noticed first.
+    """
+    import time
+    monkeypatch.setenv("GHOST_HOME", str(tmp_path))
+    monkeypatch.setenv("GHOST_FORESIGHT_SEED_DAYS", "14")
+    coll = TrajectoryCollector(session_id="dblseed")
+    for i in range(3):
+        coll.append(Trajectory(
+            task_kind="user_request", outcome="passed",
+            tool_calls=[ToolCall(name="file_system",
+                                 arguments={"operation": "read",
+                                            "path": f"a{i}.py"},
+                                 result="ok")]))
+    f = fs.get_foresight()
+    assert f._seed_state == "pending"
+    f._seed_from_trajectories()
+    assert f._seed_state == "done", (
+        "a direct seed left the index 'pending' — the next predict() "
+        "will seed the same corpus again")
+    f.predict(tool="file_system", operation="read", target="z.py")
+    time.sleep(0.3)
+    p = f.predict(tool="file_system", operation="read", target="z.py")
+    assert p.support == 3, (
+        f"the corpus was seeded twice: support {p.support} for 3 calls")
+
+
 def test_seeding_uses_shared_failure_sniffer_and_skips_synthetic(
         monkeypatch, tmp_path):
     monkeypatch.setenv("GHOST_HOME", str(tmp_path))

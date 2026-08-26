@@ -5267,6 +5267,11 @@ class GhostAgent:
     except Exception:                                        # noqa: BLE001
         _NEGCTRL_INTERVAL_S = 7 * 24 * 3600
     _NEGCTRL_COOLDOWN = _NEGCTRL_INTERVAL_S
+    # §4DC: how often the tick PROBES the GEPA-autonomy state file (the
+    # jobs' real weekly/daily cadence lives in that file and survives
+    # restarts). One hour keeps the probe out of the 60s tick without
+    # delaying a due job meaningfully against a daily clock.
+    _GEPA_AUTONOMY_COOLDOWN = 3600
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     _BENCH_COOLDOWN = 2700        # 45 min between bench-bank items (§4BF 1b)
@@ -5524,6 +5529,15 @@ class GhostAgent:
             self._last_derived_mood_at = datetime.datetime.min
         if not hasattr(self, '_last_router_train_at'):
             self._last_router_train_at = datetime.datetime.min
+        if not hasattr(self, '_last_gepa_autonomy_at'):
+            # ⚠ `now`, NOT datetime.min. Real due-ness is persisted in
+            # gepa_autonomy_state.json, so nothing is lost by waiting —
+            # and a min anchor would fire subprocess spawns in the FIRST
+            # idle window after every boot (when RSS pressure is highest,
+            # and in every tick-level test whose mocked home would eat a
+            # real spawn). A due job runs at the first probe, one
+            # cooldown after boot.
+            self._last_gepa_autonomy_at = datetime.datetime.now()
         # Corpus fingerprints from the last COMPLETED PRM / router refit.
         # When the trajectory corpus hasn't changed since, the refit would
         # reproduce the identical model — skip the pass entirely (the
@@ -6873,6 +6887,96 @@ class GhostAgent:
                             f"run FAILED: {type(_nce).__name__}")
                     finally:
                         self._last_negctrl_at = datetime.datetime.now()
+
+        # ── §4DC Phase 0+1: autonomous GEPA supply watch + live judge ──
+        # The real cadence (weekly mine, daily judgement) lives in the
+        # module's OWN persisted state file — `_due()` against
+        # `gepa_autonomy_state.json` — so it survives restarts (the
+        # negctrl lesson: a datetime.min anchor makes a weekly job "once
+        # per deploy"). The tick-level anchor below only stops the state
+        # file being probed every 60s. Both jobs are subprocess FILE
+        # READERS (no LLM, no network); the subprocess boundary is the
+        # point — §4DA spent eighteen rounds making those exit codes
+        # honest so an autonomous caller could act on them.
+        if (self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600)):
+            _since_gepa = (datetime.datetime.now()
+                           - self._last_gepa_autonomy_at).total_seconds()
+            # NOT `_bio_cooldown` — the subprocess wall-clock does not
+            # scale under --bio-time-scale (the negctrl/evolve reasoning).
+            if _since_gepa >= self._GEPA_AUTONOMY_COOLDOWN:
+                # Anchor BEFORE the work and again in `finally`.
+                self._last_gepa_autonomy_at = datetime.datetime.now()
+                try:
+                    from ..optim import autonomy as _gepa_auto
+                    if _gepa_auto.autonomy_enabled():
+                        _ga_home = (os.getenv("GHOST_HOME", "").strip()
+                                    or str(Path.home()
+                                           / "ghost_llamacpp"))
+
+                        def _ga_notify(msg):
+                            # Runs on the to_thread worker; both sinks
+                            # are thread-safe (ActivityLog locks, logging
+                            # is thread-safe) and fail-safe by contract.
+                            self._record_autonomous_activity(
+                                "gepa_autonomy", msg, severity="notify")
+                            self._safe_pretty_log(
+                                "GEPA Autonomy", msg,
+                                icon=Icons.GEPA_AUTONOMY)
+
+                        def _ga_log(msg):
+                            self._safe_pretty_log(
+                                "GEPA Autonomy", msg,
+                                icon=Icons.GEPA_AUTONOMY)
+                        # wait_for ABOVE the subprocess timeout (dream-
+                        # replay belt-and-braces): the inner watchdog
+                        # kills a wedged child; the outer one bounds a
+                        # wedged spawn. to_thread keeps a 15-minute mine
+                        # off the event loop.
+                        # ⚠ THE OUTER BOUND SCALES WITH THE WORK. A
+                        # hard-coded 4x assumed few live artifacts; the
+                        # tool_description family can be dozens, and a
+                        # too-small outer watchdog kills the thread's
+                        # awaiter while the child chain keeps running —
+                        # daily "HUNG" notifies beside orphan writes
+                        # (lens B, B4). The glob is cheap.
+                        _n_live = max(
+                            1, len(_gepa_auto.live_signatures(_ga_home)))
+                        _jr = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _gepa_auto.run_live_judge, _ga_home,
+                                notify=_ga_notify, log=_ga_log),
+                            timeout=(_gepa_auto.LIVE_JUDGE_TIMEOUT_S
+                                     * (_n_live + 1) + 60))
+                        if _jr is not None:
+                            _idle_ran.append("gepa-judge")
+                        _sr = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _gepa_auto.run_supply_watch, _ga_home,
+                                notify=_ga_notify, log=_ga_log),
+                            timeout=(_gepa_auto.SUPPLY_WATCH_TIMEOUT_S
+                                     + 60))
+                        if _sr is not None:
+                            _idle_ran.append("gepa-supply")
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    self._safe_pretty_log(
+                        "GEPA Autonomy",
+                        "a job HUNG past its outer watchdog — the child "
+                        "may still be running; investigate before the "
+                        "next window", level="ERROR", icon=Icons.WARN)
+                    self._record_autonomous_activity(
+                        "gepa_autonomy", "job hung past the watchdog",
+                        severity="notify")
+                except Exception as _gae:  # noqa: BLE001
+                    # FAIL LOUD — "could not run" and "ran, nothing to
+                    # do" must never look alike (the negctrl rule).
+                    self._safe_pretty_log(
+                        "GEPA Autonomy",
+                        f"phase FAILED: {type(_gae).__name__}: {_gae}",
+                        level="ERROR", icon=Icons.WARN)
+                finally:
+                    self._last_gepa_autonomy_at = datetime.datetime.now()
 
         # Phase 2.7d: Recurring workspace tidy (2026-07-18). The DONE
         # sweep fires once, on the transition — but verification and
@@ -8771,7 +8875,8 @@ class GhostAgent:
     class _RequestState:
         __slots__ = (
             "_agent_ref", "_profile_str", "_profile_loaded",
-            "_active_tool_defs_cache", "_xml_schema_cache",
+            "_active_tool_defs_cache", "_active_tool_defs_resolved",
+            "_xml_schema_cache",
             "_skill_playbook_cache", "_sandbox_state",
             "_stable_tool_query", "_edit_churn",
         )
@@ -8786,6 +8891,7 @@ class GhostAgent:
             # Cache by (intent_query) so a query-shift between turns still
             # benefits when the same query repeats.
             self._active_tool_defs_cache: Dict[str, list] = {}
+            self._active_tool_defs_resolved = None
             self._xml_schema_cache: Dict[str, str] = {}
             self._skill_playbook_cache: Dict[str, str] = {}
             self._sandbox_state = None
@@ -8820,13 +8926,29 @@ class GhostAgent:
             return self._profile_str or ""
 
         def get_active_tool_defs(self, query: str) -> list:
-            key = query or ""
-            cached = self._active_tool_defs_cache.get(key)
-            if cached is not None:
-                return cached
+            # ⚠ SINGLE-SLOT PER REQUEST, NOT PER QUERY KEY. Serving tuned
+            # descriptions is not a pure read (it draws arms, stamps the
+            # request, prunes on the aggregate ceiling), and a per-key
+            # cache let one request SERVE TWICE with different tool sets:
+            # an empty first-turn query resolved "" (the un-routed
+            # superset) and `stable_tool_query` then pinned the first
+            # substantive one, so a later turn re-resolved a routed
+            # subset — the LAST call owned the stamps, describing a set
+            # the model never saw (post-redesign lens B, F1b; the same
+            # mechanism as round 16's name-list defect, through the
+            # cache instead of past it). The FIRST resolution is THE
+            # advertised set for the whole request — which is also
+            # optimisation #7's stated goal: a tool header that stays
+            # byte-identical across the request's turns.
+            _slot = getattr(self, "_active_tool_defs_resolved", None)
+            if _slot is not None:
+                return _slot
             from ..tools.registry import get_active_tool_definitions
-            defs = get_active_tool_definitions(self._agent_ref.context, query=key) or []
-            self._active_tool_defs_cache[key] = defs
+            defs = get_active_tool_definitions(
+                self._agent_ref.context, query=query or "",
+                disabled=getattr(self._agent_ref, "disabled_tools",
+                                 None)) or []
+            self._active_tool_defs_resolved = defs
             return defs
 
         def get_xml_schema(self, tool_defs: list) -> str:
@@ -8890,6 +9012,7 @@ class GhostAgent:
             skill appears in the very next turn-iteration's tool list
             rather than being stranded until the next user message."""
             self._active_tool_defs_cache.clear()
+            self._active_tool_defs_resolved = None
             self._xml_schema_cache.clear()
 
     async def warm_up_main_prefix(self) -> None:
@@ -18918,7 +19041,16 @@ class GhostAgent:
                         }
                         available_tools_list = ", ".join([
                             f"{t['function']['name']} ({tool_hints.get(t['function']['name'], 'native tool')})"
-                            for t in get_active_tool_definitions(self.context)
+                            # ⚠ `serve_tuned=False` — A NAME LIST MUST NOT SERVE.
+                            # This call passes no query, so it assembles the
+                            # UN-ROUTED superset; applying the tuned
+                            # descriptions here re-ran the aggregate-ceiling
+                            # prune over a set the model never saw and, from
+                            # turn 2 on (the prompt build is cached per
+                            # request), was the ONLY call that stamped the
+                            # turn. §4DA round 16.
+                            for t in get_active_tool_definitions(
+                                self.context, serve_tuned=False)
                         ])
                         state_limit = max(1500, int(char_budget * 0.05))
                         safe_scratch = str(scratch_data)
@@ -18973,14 +19105,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # the tuned text is a short instruction, the baseline is a
                         # full multi-section system prompt. Falls back to baseline
                         # when no tuned file exists. (Was write-only before.)
+                        # ⚠ ATTRIBUTED. `context`/`req_id` are what let the
+                        # trajectory record WHICH artifact served this turn —
+                        # the loader computed that provenance from the start
+                        # and nothing ever read it, so no promoted prompt
+                        # could be judged by what it did in production. They
+                        # also enable the optional randomized arm: with the
+                        # experiment named by
+                        # `optim.loader.experiment_name(signature)`
+                        # registered (`gepa_<signature>` — the registry
+                        # rejects dots and SKIPS a bad name silently), the
+                        # control arm gets the hand-written baseline. Without
+                        # one, behaviour is unchanged.
                         from ..optim.loader import tuned_instruction as _tuned_instruction
-                        _tuned_plan = _tuned_instruction("planning.decompose", "")
+                        _tuned_plan = _tuned_instruction(
+                            "planning.decompose", "",
+                            context=self.context, req_id=req_id)
                         # Also surface the tuned tool-selection instruction:
                         # the planner's next_action_id / required_tool IS the
                         # tool-selection decision, so this is its natural
                         # read-site. tool_selection.pick was previously
                         # tuned-but-never-read (GEPA wrote it, nothing loaded it).
-                        _tuned_toolsel = _tuned_instruction("tool_selection.pick", "")
+                        _tuned_toolsel = _tuned_instruction(
+                            "tool_selection.pick", "",
+                            context=self.context, req_id=req_id)
                         _tuned_prefix = "\n\n".join(
                             t for t in (_tuned_plan, _tuned_toolsel) if t
                         )
@@ -24093,6 +24241,50 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 _extra.update(
                     _experiments_mod.trigger_flags(self.context, req_id))
         except Exception:
+            pass
+        # ⚠ WHICH TUNED ARTIFACT SERVED THIS TURN. Written so a promoted
+        # prompt can be judged by lived outcomes instead of only by a
+        # pre-ship holdout of a few dozen examples. Records the arm too:
+        # "control" (deliberately withheld — the other half of the
+        # comparison), "treatment", or "unenrolled" (served outside any
+        # experiment, so NOT poolable into a control group).
+        try:
+            from ..optim import loader as _optim_loader
+            from ..optim.gate_contract import RENDERED_ARMS as _RENDERED_ARMS
+            _served = _optim_loader.served_for_request(req_id)
+            if _served:
+                _extra["optim_artifacts"] = _served
+                # ⚠ THE CONTEXT-MUTATION CONTRACT. A served artifact is
+                # PREPENDED to the planner system prompt, so this turn's
+                # plan — and everything downstream of it in the
+                # conversation and the trajectory — came from text the
+                # control arm never saw. `experiments.context_was_mutated`
+                # reads this flag to exclude such turns from replay, and
+                # the tuple's own docstring says any treatment altering
+                # what the model sees must register.
+                # ⚠ TREATMENT ONLY. Stamped on `any(sha)` this also
+                # flagged UNENROLLED turns — and every other member of
+                # CONTEXT_MUTATING_KEYS is True only on an enrolled
+                # TREATMENT turn, which is what the tuple means: "one arm
+                # saw this". `optim/tool_fixtures.py` drops flagged turns
+                # because "replaying it would optimize against a prompt
+                # only one arm ever sees" — false when the artifact served
+                # everyone, and it would have starved that miner of every
+                # planner turn the moment any artifact was promoted.
+                # ⚠ "excluded" IS A RENDERED TURN TOO. §4DA round 14
+                # marks a stamp `excluded` when the arm DID render the
+                # artifact but the turn is not comparable (the tuned set
+                # would bust the read-site's aggregate ceiling under some
+                # draw). Those turns are dropped from the A/B and must
+                # still be kept OUT of the fixture mine — their context
+                # was mutated. Keying on "treatment" alone reversed that
+                # half silently.
+                if any(v.get("arm") in _RENDERED_ARMS
+                       and v.get("sha")
+                       for v in _served.values()):
+                    _extra["gepa_artifact_applied"] = True
+            _optim_loader.forget_request(req_id)
+        except Exception:  # noqa: BLE001 — attribution never breaks a turn
             pass
         # Upstream token accounting. `tokens_in`/`tokens_out` were declared on
         # the Trajectory schema from the start and read 0 on all 1515 records,

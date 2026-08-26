@@ -38,7 +38,8 @@ from .trainset import (
     filter_by_outcome,
     split_train_eval,
 )
-from .ab_eval import compare_prompts, PromptComparison
+from .ab_eval import (compare_prompts, mcnemar_p, PromptComparison,
+                      SHIP_ALPHA)
 
 __all__ = [
     "OptimizableSignature",
@@ -51,5 +52,7 @@ __all__ = [
     "filter_by_outcome",
     "split_train_eval",
     "compare_prompts",
+    "mcnemar_p",
+    "SHIP_ALPHA",
     "PromptComparison",
 ]

@@ -26,6 +26,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
+from ghost_agent.optim import gate_contract  # noqa: E402
 from ghost_agent.optim.tool_fixtures import (  # noqa: E402
     DEFAULT_ERA_CUTOFF_LOCAL,
     mine_fixtures,
@@ -87,6 +88,10 @@ def main() -> int:
                              "sees. See the drop accounting line "
                              "'experiment_context_excluded'.")
     args = parser.parse_args()
+    # ⚠ BEFORE ANY I/O — the caller's proof the SCRIPT ran (argparse and
+    # the interpreter both exit 2, the same code as "no corpus").
+    print(f"{gate_contract.MINER_RUN_BANNER} (recordings "
+          f"{args.recordings or 'default'})")
 
     recordings_dir = args.recordings or _ghost_home() / "system" / "llm_recordings"
     trajectory_root = args.trajectories or _ghost_home() / "system" / "trajectories"
@@ -114,7 +119,9 @@ def main() -> int:
     labels = Counter("positive" if f.label >= 0.5 else "negative" for f in fixtures)
     tools = Counter(c["name"] for f in fixtures for c in f.chosen_tools)
     print(f"Tiers: {dict(tiers)}")
-    print(f"Labels: {dict(labels)}")
+    # The marker an autonomous caller requires before trusting this
+    # run's exit code as a SUPPLY verdict (a crash also exits 1).
+    print(f"{gate_contract.MINER_RAN_MARKER} {dict(labels)}")
     print("Per-tool distribution (chosen):")
     for name, count in tools.most_common():
         print(f"  {name:26s} {count}")
@@ -143,9 +150,21 @@ def main() -> int:
     # positives-only and calls that count `--min-fixtures` too, so a total-only
     # gate here reads "ready" while the runner refuses — and this gate is the
     # one guarding an atomic overwrite of the live pool.
-    if n_pos < args.min_positives:
-        print(f"⚠ Positives {n_pos} < --min-positives {args.min_positives} — "
-              "the runner scores positives only and will refuse to start.")
+    #
+    # ⚠ REAL POSITIVES, because that is what the runner counts. §4DA made the
+    # runner's supply gate real-only (bench may TEACH on the public side,
+    # never GRADE, and never be the reason a run starts) and did not touch
+    # this one — re-opening the exact divergence the paragraph above exists
+    # to close, one abstraction over. Measured 2026-08-25 on the real corpus:
+    # the miner wrote the live pool and exited 0 on 403 positives while the
+    # runner refused at "121 REAL positive fixtures < 200".
+    n_pos_real = sum(1 for f in fixtures
+                     if f.label >= 0.5 and getattr(f, "origin", "") != "bench")
+    if n_pos_real < args.min_positives:
+        print(f"⚠ REAL positives {n_pos_real} < --min-positives "
+              f"{args.min_positives} ({n_pos} counting bench, which may "
+              f"teach but never grade) — the runner scores REAL positives "
+              f"only and will refuse to start.")
         ready = False
 
     # Advisory: the runner's resolution refusal, reported BEFORE a run is
@@ -178,18 +197,29 @@ def main() -> int:
                          if f.label >= 0.5
                          and getattr(f, "origin", "") != "bench")
         share = priv_pos / n_pos_real if n_pos_real else 0.0
-        verdict = "OK" if resolution <= args.min_delta else "TOO COARSE"
+        # ⚠ THE RUNNER'S REFUSAL IS max(RESOLUTION, SIGNIFICANCE FLOOR) and
+        # this reported only the RESOLUTION half, so at a coarse
+        # --min-delta this instrument printed `OK` for a tier the runner
+        # refuses — measured, priv_pos=4 at --min-delta 0.25: verdict OK
+        # here, REFUSING TO RUN there. This is the operator's "is it time
+        # yet?" instrument and its own comment claims to report the
+        # runner's refusal; reporting the weaker half is how an operator
+        # learns the real number only after paying for a run. The floor
+        # comes from `ab_eval` rather than a fourth private copy.
+        from ghost_agent.optim.ab_eval import significance_floor
+        need_priv = max(significance_floor(), math.ceil(1.0 / args.min_delta))
+        verdict = "OK" if priv_pos >= need_priv else "TOO COARSE"
         print(f"Private REAL positives: {priv_pos}/{n_pos_real} real "
               f"(+{priv_bench} bench private, excluded — the runner's gate "
               f"is real-only) "
               f"(realised share {share:.0%}, requested {args.private_pct}%); "
               f"smallest step {resolution:.3f} vs --min-delta "
-              f"{args.min_delta} — {verdict}")
-        if resolution > args.min_delta:
-            need_priv = math.ceil(1.0 / args.min_delta)
+              f"{args.min_delta}, floor {significance_floor()} discordant "
+              f"— {verdict}")
+        if priv_pos < need_priv:
             need_pos = math.ceil(need_priv / share) if share else 0
             print(f"  → needs ~{need_priv} private positives "
-                  f"(~{need_pos} positives at today's realised share) "
+                  f"(~{need_pos} REAL positives at today's realised share) "
                   "or a larger --min-delta; the runner refuses below this.")
 
     if ready or args.force_write:
@@ -202,6 +232,12 @@ def main() -> int:
         write_fixtures_jsonl(fixtures, parked)
         print(f"Gates NOT met — live artifact left untouched at {out_path}; "
               f"this mine parked at {parked} (--force-write to overwrite).")
+    # ⚠ AFTER the writes — this is what an autonomous caller trusts
+    # before filing exit 0/1 as a SUPPLY verdict. `Labels:` prints before
+    # the gates and the pool write, so a crash at the write carried it
+    # anyway (round 2, F1).
+    print(f"{gate_contract.MINER_DONE_MARKER} "
+          f"{'ready' if ready else 'parked'}")
     return 0 if ready else 1
 
 

@@ -77,6 +77,8 @@ _PHASE_LABELS = {
     "evolve_mutate": "Evolve mutator",
     "evolve_proposal": "Evolve proposal",
     "negative_controls": "Negative Controls",
+    # §4DC Phase 0+1: the autonomous GEPA supply watch + live judge.
+    "gepa_autonomy": "GEPA autonomy",
 }
 
 # ── LIVENESS REGISTRY ───────────────────────────────────────────────────────
@@ -146,6 +148,15 @@ PHASE_EXPECTATION = {
     # here means the question "is the precedent index good enough to
     # steer with yet?" has stopped being asked.
     "imagine_gate": EXPECT_PERIODIC,
+    # §4DC Phase 0+1: the GEPA supply watch / live judge. ON_OUTPUT —
+    # the jobs run on their own wall clock, but a ledger row is written
+    # only on a TRANSITION (supply parked->ready, a retirement, an
+    # instrument failure); the steady state (parked / KEEP / nothing
+    # live) is console-log-only by design (`chat-noise-preference`), so
+    # a zero here means "nothing changed", not "the loop is dead" — the
+    # loop's own liveness is the pretty_log lines and the state file's
+    # last_run_epoch.
+    "gepa_autonomy": EXPECT_ON_OUTPUT,
     # §4CM D3: the counterfactual replay batch. GATED, not periodic —
     # `GHOST_DREAM_REPLAY` defaults OFF and the whole engine is inert
     # until an operator turns it on, so a zero must report the gate

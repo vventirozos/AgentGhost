@@ -321,8 +321,15 @@ def test_request_state_caches_active_tool_defs():
         b = state.get_active_tool_defs("query-A")
         c = state.get_active_tool_defs("query-B")
     assert a == b
-    # Same query cached; different query refetches.
-    assert mock_get.call_count == 2
+    # ⚠ SINGLE-SLOT NOW, NOT PER-KEY (§4DA post-redesign, lens B F1b):
+    # serving tuned descriptions is not a pure read — it draws arms,
+    # stamps the request and prunes on the ceiling — and a per-key cache
+    # let one request SERVE TWICE with different tool sets, the last
+    # call owning the stamps. The FIRST resolution is the advertised set
+    # for the whole request, which is also optimisation #7's stated goal
+    # (a byte-stable tool header across the request's turns).
+    assert c is a
+    assert mock_get.call_count == 1
 
 
 def test_request_state_caches_xml_schema():

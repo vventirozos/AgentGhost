@@ -299,7 +299,11 @@ def _tool_schema_index(force: bool = False):
     # backstops anything that call drops for want of a context.
     entries = list(TOOL_DEFINITIONS or ())
     try:
-        entries += list(get_active_tool_definitions(None) or ())
+        # `serve_tuned=False`: this builds a NAME index, and applying
+        # the tuned descriptions stamps and prunes the caller's request
+        # attribution over whatever set it assembled. §4DA round 16.
+        entries += list(get_active_tool_definitions(
+            None, serve_tuned=False) or ())
     except Exception as exc:                                # noqa: BLE001
         logger.debug("macro mint: active tool definitions unavailable (%s); "
                      "falling back to the static list", exc)

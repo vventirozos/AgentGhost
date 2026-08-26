@@ -75,7 +75,7 @@ def _fn_named(tree, name):
 
 @pytest.mark.parametrize("rel_path,outer_const", [
     ("tools/search.py", "PER_URL_TIMEOUT"),
-    ("tools/darkweb_search.py", "_ONION_PAGE_TIMEOUT"),
+    ("tools/darkweb_search.py", "_ONION_URL_CEILING_S"),
 ])
 def test_the_per_url_distill_budget_derives_from_the_clock(
         rel_path, outer_const):
@@ -90,8 +90,20 @@ def test_the_per_url_distill_budget_derives_from_the_clock(
     two mutants that hardcode an absurd budget survived (R7 lens C).
 
     The property is a RELATIONSHIP: the budget passed must be computed from
-    a deadline that is itself computed from the clock, inside `process_url`
-    — so it shrinks as the fetch consumes time."""
+    a deadline that is itself computed from the clock — so it shrinks as the
+    fetch consumes time.
+
+    ⚠ UPDATED 2026-08-25: the ceiling moved one frame out, to `_bounded`, and
+    this pin follows the mechanism rather than the name. `process_url` used to
+    open its own `PER_URL_TIMEOUT` window on entry — but every `_bounded`
+    coroutine is created by one `asyncio.gather`, so all eight windows opened
+    SIMULTANEOUSLY while `Semaphore(3)` let only three run, and URLs 4-8
+    reached the distiller with seconds left (the 4th was handed 6s for a 27s
+    job and posted it anyway — req 08766aa1). The ceiling is now applied
+    after the semaphore is acquired and passed in as `budget_s`, so both
+    halves are pinned here: `_bounded` derives the budget from the outer
+    ceiling AND the phase deadline, and `process_url` turns that into a
+    clock-based deadline."""
     tree = ast.parse((_SRC / rel_path).read_text(encoding="utf-8"))
     fn = _fn_named(tree, "process_url")
     assert fn is not None, f"{rel_path}: process_url is gone"
@@ -110,9 +122,38 @@ def test_the_per_url_distill_budget_derives_from_the_clock(
              if isinstance(n, ast.Attribute)}
     assert "monotonic" in attrs, (
         f"{rel_path}: the per-URL deadline is not read from the clock")
-    assert outer_const in names, (
-        f"{rel_path}: the per-URL deadline is not derived from "
-        f"{outer_const}, the ceiling the outer wait_for actually applies")
+    # The window must be the one HANDED IN, not a constant re-opened here —
+    # a constant would restore the simultaneous-clock defect.
+    assert "budget_s" in names, (
+        f"{rel_path}: the per-URL deadline is not derived from the budget "
+        f"issued after the semaphore was acquired")
+    assert {a.arg for a in fn.args.args} >= {"budget_s"}, (
+        f"{rel_path}: process_url does not accept a budget")
+
+    # ...and the ISSUER must clip that budget by both the per-URL ceiling and
+    # the whole-phase deadline, after acquiring the semaphore.
+    issuer = _fn_named(tree, "_bounded")
+    assert issuer is not None, f"{rel_path}: _bounded is gone"
+    issued = [n for n in ast.walk(issuer)
+              if isinstance(n, ast.Assign)
+              and any(isinstance(t, ast.Name) and t.id == "budget"
+                      for t in n.targets)]
+    assert issued, f"{rel_path}: _bounded issues no budget"
+    inames = {n.id for b in issued for n in ast.walk(b)
+              if isinstance(n, ast.Name)}
+    iattrs = {n.attr for b in issued for n in ast.walk(b)
+              if isinstance(n, ast.Attribute)}
+    assert outer_const in inames, (
+        f"{rel_path}: the issued budget ignores {outer_const}, the ceiling "
+        f"the outer wait_for actually applies")
+    assert "_phase_deadline" in inames, (
+        f"{rel_path}: the issued budget ignores the whole-phase deadline, so "
+        f"a late URL can be started with work that cannot finish")
+    assert "monotonic" in iattrs, (
+        f"{rel_path}: the issued budget is not read from the clock")
+    assert any(isinstance(n, ast.AsyncWith) for n in ast.walk(issuer)), (
+        f"{rel_path}: _bounded no longer acquires the semaphore, so the "
+        f"budget is issued before the URL actually starts")
 
     # ...and the budget handed to the model must derive from that deadline
     budgets = [n for n in ast.walk(fn)
@@ -129,11 +170,36 @@ def test_the_per_url_distill_budget_derives_from_the_clock(
     calls = _call_kwargs(rel_path, "web summary")
     assert calls
     for kw in calls:
-        for name in ("timeout", "slot_wait", "total_budget"):
+        for name in ("timeout", "total_budget"):
             v = kw[name]
             assert isinstance(v, ast.Name) and v.id == "_summary_budget", (
                 f"{rel_path}: {name}={ast.unparse(v)} is not the clock-"
                 f"derived budget")
+        # ⚠ SLOT_WAIT IS NO LONGER THE WHOLE BUDGET, DELIBERATELY (2026-08-25).
+        # Passing timeout == slot_wait == total_budget let a call sit in the
+        # per-node permit queue for nearly the entire budget and then POST a
+        # request sized for ALL of it — the plan's arithmetic measured against
+        # time already spent. That is req 08766aa1's "6s for a 27s job"
+        # relocated from the tool's semaphore to `_node_slot`, and it still
+        # ends as a ReadTimeout charged to the node. The permit wait is now a
+        # bounded allowance, and the distill is sized for the budget MINUS it.
+        sw = kw["slot_wait"]
+        assert isinstance(sw, ast.Name) and sw.id == "_QUEUE_ALLOWANCE_S", (
+            f"{rel_path}: slot_wait={ast.unparse(sw)} — queueing must be "
+            f"bounded by an allowance the plan reserved, not by the whole "
+            f"budget")
+
+    # ...and the plan must actually subtract that allowance, or the reserve
+    # is a comment rather than a constraint.
+    plans = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "plan_distill"]
+    assert plans, f"{rel_path}: the distill is not sized by a plan"
+    pnames = {n.id for c in plans for n in ast.walk(c)
+              if isinstance(n, ast.Name)}
+    assert {"_summary_budget", "_QUEUE_ALLOWANCE_S"} <= pnames, (
+        f"{rel_path}: plan_distill is not sized against the clock-derived "
+        f"budget minus the queue allowance")
 
 
 def test_the_background_gate_still_refuses_to_dogpile_main():

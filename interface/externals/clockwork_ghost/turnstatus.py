@@ -128,6 +128,7 @@ ICON_CLASS = {
     "🪄": "plan",
     "🌀": "plan",
     "🦋": "plan",
+    "🚜": "plan",   # GEPA_AUTONOMY — §4DC supply watch / live judge
     "🔗": "plan",
 
     # --- raw thinking (the floor) ---

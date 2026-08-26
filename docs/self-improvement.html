@@ -150,7 +150,7 @@ idle 1..10s   …and round again, forever</code></pre>
 
   <h2>What all of this is actually reading</h2>
 
-  <p>Every one of those passes reads the same thing: a <strong>trajectory</strong> — one JSON line per turn recording what was asked, which tools ran in what order, what came back, and how it ended. They're written append-only to <code>$GHOST_HOME/trajectories/</code>, redacted on the way out, and if the write fails the turn carries on regardless. A logging failure must never break a user request.</p>
+  <p>Every one of those passes reads the same thing: a <strong>trajectory</strong> — one JSON line per turn recording what was asked, which tools ran in what order, what came back, and how it ended. They're written append-only to <code>$GHOST_HOME/system/trajectories/</code>, redacted on the way out, and if the write fails the turn carries on regardless. A logging failure must never break a user request.</p>
 
   <p>That one log is the input to five different consumers, each asking a different question of it:</p>
 
@@ -201,10 +201,26 @@ idle 1..10s   …and round again, forever</code></pre>
         <p>Capped at 16 iterations. Longer optimization runs drift toward gaming the metric rather than doing the task — measured elsewhere at a 26% → 58% rate of that between 10 and 100 steps. The cap is the mitigation; raising it needs a stronger held-out test first, not just patience.</p>
       </li>
       <li>
-        <h4>Beat the hand-written prompt, or don't ship</h4>
+        <h4>Beat the hand-written prompt <em>measurably</em>, or don't ship</h4>
         <p>The tuned version is A/B'd against the existing one. Losing means it isn't promoted. The hand-written baseline is the thing to beat, not a formality.</p>
+        <p>Winning now takes two separate things: the improvement must clear a margin, <em>and</em> it must be big enough that noise is an unlikely explanation. Those really are different questions, and until 2026-08-25 only the first was asked. In practice the second is the one that decides — at the holdout sizes this project actually has, anything statistically convincing has already cleared the margin several times over.</p>
       </li>
     </ol>
+  </div>
+
+  <div class="note">
+    <strong>Does the tuned prompt actually help, once it's live?</strong> Until now nothing could answer that. The optimizer's decision rests entirely on a few dozen test examples checked <em>before</em> deployment; afterwards the prompt just runs, and no record connected a real turn to the prompt version that produced it — even though the code had been computing that identifier all along and discarding it. One tuned prompt served every planning turn for weeks on a result nobody could reproduce, and that was invisible for exactly this reason.
+    <p>Turns now record which tuned prompt served them. But that on its own isn't enough to justify <em>removing</em> one: a new prompt goes live everywhere at once, so "things got worse after we deployed it" is confounded by everything else that changed that week. So the agent can optionally <em>withhold</em> the tuned prompt from a random share of turns and compare the two groups — which is the difference between a comparison that can support a decision and one that just looks like it can. Where that randomisation isn't switched on, the analysis says so and declines to give a number.</p>
+    <p>When the withheld group does better by a clear margin, a maintenance command retires the tuned prompt — that step is run deliberately, not on a schedule, and the retirement only takes effect when the agent next restarts, because the running process holds the prompt in memory. There's also a cooling-off period between promotions: each optimisation run is a fresh roll of the dice, so running it every week against a slowly-growing test set is really just rolling repeatedly until something passes.</p>
+    <p><em>Nothing is switched on by default, and there is no data yet</em> — the recording started after the current agent did. The tool reports "not enough evidence", which is the correct answer and worth more than a confident one.</p>
+  </div>
+
+  <div class="note warn">
+    <strong>A margin is not a result.</strong> The ship rule used to be one line — <em>did the tuned prompt beat the old one by more than 2 percentage points?</em> — with no check on whether that gap could just be luck. On a fifty-example holdout that means <strong>two examples going the other way is enough to promote a prompt into every planning turn</strong>, and if the two prompts were genuinely equally good it would still happen roughly a third of the time. Nobody notices, because the number it prints looks like a result.
+    <p>It was lopsided, too. A safety check added a few days earlier — <em>does this candidate actually beat the original hand-written prompt, or has the chain drifted?</em> — already demanded proper statistical support before it would <em>block</em> a promotion. So blocking one took strong evidence while making one took almost none.</p>
+    <p>Both directions now use the same bar, and every promotion records how many examples actually moved. That last part matters more than it sounds: a promoted prompt whose record can't answer <em>"what changed?"</em> can't be re-checked later, which is exactly how one of them ended up serving every planning turn for weeks on a win nobody could reproduce.</p>
+    <p><strong>The cost, stated plainly:</strong> a small holdout may not be able to prove a real improvement, so a genuinely better prompt can be refused for lack of evidence. There's a deliberate override for that, and it stamps itself into the artifact so the call can be second-guessed later. The refusal also says <em>which</em> of the two tests failed — "clear the margin" and "collect more data" are different instructions.</p>
+    <p><strong>And the first version of this fix was itself too strict, in a way that only showed up under review.</strong> It asked <em>"are these two prompts different?"</em> when the decision only ever ships an improvement — so it spent half its error budget guarding against an outcome it could never act on. The practical effect: on a fifty-example holdout, a prompt that really was 10 points better got promoted about 18% of the time instead of 28%. Being too strict looks safe and isn't — it just throws away real improvements where nobody is counting. Asking the directional question instead fixed it.</p>
   </div>
 
   <div class="note warn">

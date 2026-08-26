@@ -3084,7 +3084,7 @@ Return ONLY valid JSON:
 
         Mirrors main.py's wiring (``<memory_dir>/../trajectories``) so it reads
         the SAME corpus the live collector writes; falls back to the
-        collector's own default root ($GHOST_HOME/trajectories or
+        collector's own default root ($GHOST_HOME/system/trajectories or
         ~/.ghost/trajectories) when ``memory_dir`` isn't available. Returns
         ``None`` when trajectory logging is disabled via ``--no-trajectories``
         or the collector can't be constructed. ``enabled=False`` because this
@@ -5200,7 +5200,15 @@ Return ONLY a JSON object with:
             from ..memory.scratchpad import Scratchpad
             isolated_context.scratchpad = Scratchpad()
 
-            isolated_context.sandbox_manager = DockerSandbox(isolated_context.sandbox_dir, isolated_context.tor_proxy)
+            try:
+                isolated_context.sandbox_manager = DockerSandbox(isolated_context.sandbox_dir, isolated_context.tor_proxy)
+            except Exception as _sb_ctor_exc:  # noqa: BLE001
+                # §4BO: a failed constructor carries its half-built client
+                # (~11 unix sockets); self-play retries nightly, so an
+                # unclosed client per attempt walks to EMFILE.
+                from ..sandbox.docker import close_carried_client
+                close_carried_client(_sb_ctor_exc)
+                raise
 
             try:
                 await asyncio.to_thread(isolated_context.sandbox_manager.ensure_running)

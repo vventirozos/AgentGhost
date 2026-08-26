@@ -1205,6 +1205,8 @@ _PHASE_EMOJI = {
     "agent_message": ":speech_balloon:",
     "service": ":gear:",
     "job": ":package:",
+    # §4DC: the autonomous GEPA loop (supply watch / live judge).
+    "gepa_autonomy": ":tractor:",
 }
 
 # Human labels for the Slack line — mirrors the agent's digest labels
@@ -1217,6 +1219,9 @@ _PHASE_LABELS = {
     "service": "service",
     "job": "background job",
     "open_questions": "open questions",
+    # §4DC — a retirement notification rendered as `[gepa_autonomy]`
+    # reads as debug output at the exact moment it must read as news.
+    "gepa_autonomy": "GEPA autonomy",
 }
 
 # Records older than this get an age suffix: after downtime/a wedge the

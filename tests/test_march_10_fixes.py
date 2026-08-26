@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 import json
@@ -109,7 +110,15 @@ async def test_agent_rambling_exit_markers():
     except Exception:
         pass # Timeout/Error expected if it loops forever without mocked DB
         
-    # We can directly test the specific logic unit for the marker trap:
+    # ⚠ THIS TEST PINS A LOCAL RE-IMPLEMENTATION, NOT THE PRODUCT (flagged by
+    # a mutation audit 2026-08-25). `asyncio` was never imported, so the call
+    # above raised NameError on every run and the bare `except` swallowed it —
+    # the assertions below then exercised `check_rambling_trap`, a copy of the
+    # rule defined inside the test, which no mutation of the agent can ever
+    # kill. The import is restored so a real failure surfaces; the deeper
+    # problem is left visible rather than papered over, because the
+    # conversational-rambling guardrail it describes was since REMOVED from
+    # the agent, so there may no longer be a product function to pin.
     def check_rambling_trap(content, has_img=False):
         is_valid_final = any(marker in content.upper() for marker in ["```", "SUCCESS", "DONE", "COMPLETE"])
         return 0 < len(content) < 300 and not is_valid_final and not has_img

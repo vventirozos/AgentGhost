@@ -9,6 +9,9 @@ import time
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import helper_fetch_url_content
+from ..core.node_throughput import (
+    CHARS_PER_TOKEN, MIN_CHARS as _MIN_DISTILL_CHARS, env_float,
+    log_plan as log_distill_plan)
 
 # Low-value / bot-walled domains filtered out of search results. Module-level
 # (NOT function-local) so web_search's query-reformulation fallback can
@@ -380,7 +383,107 @@ def _fetch_error_is_retryable(err: str) -> bool:
 
 # A per-url distillation is one of many inside a research call and its
 # fallback is free, so it gets a short leash.
-_WEB_SUMMARY_TIMEOUT_S = 45.0
+#
+# ⚠ 45s WAS SIZED FOR A WORLD WITHOUT CONCURRENCY. Measured on Nova, a useful
+# distill (8,000 chars + 250 tokens) costs 18.9s alone, 31.3s at 2-way, 42.7s
+# at 3-way and **53.6s at 4-way** — because decode is bandwidth-bound at a
+# roughly fixed aggregate rate, so N concurrent requests each get about 1/N.
+# A 45s leash therefore cannot fund a 4-way distill at all, and this
+# deployment runs at 4-way routinely: `--worker-nodes` and `--critic-nodes`
+# point at the SAME box, so a turn-gate verify shares these slots with the
+# research wave. The result was not a timeout any more (the sizing prevents
+# that) but a REFUSAL — 5 of 8 sources declining and falling back to raw
+# HTML, which is the outcome this whole change exists to eliminate.
+#
+# This is a deliberate latency trade, and it was measured: at a 14s fetch the
+# old constants produced 5,131 chars/143 tok per source in 93.8s and the new
+# ones 11,576/233 in 130.9s — +40% wall for +126% page coverage and +63%
+# output. In the RETRY regime the old set produced ZERO distillations at all.
+# Typical measured completion is 105-131s. Tune with GHOST_WEB_SUMMARY_S.
+_WEB_SUMMARY_TIMEOUT_S = env_float("GHOST_WEB_SUMMARY_S", 65.0)
+
+# ⚠ THE WHOLE PHASE NEEDS A CLOCK, not just each URL. Every `_bounded()`
+# coroutine starts from one `asyncio.gather`, so per-URL timers that begin
+# there all run simultaneously and URLs 4-8 spend their budget queued on
+# `Semaphore(3)` (see `_bounded`). The phase holds the deadline; each URL is
+# issued its budget when it actually starts, clipped by what is left here.
+# ⚠ GROW THE CONTAINER WITH ITS CONSUMER. This said "3 waves x
+# PER_URL_TIMEOUT = 165s" — 165 is 3 x 55, the OLD per-URL value. The rebase
+# grew the phase 25% (120->150) while growing the per-URL leash 45% (55->80),
+# so RELATIVE coverage got worse: 8 urls through Semaphore(3) is 3 waves, and
+# 3 x 80 = 240 against a 150s phase. Measured end-to-end in the retry regime
+# (attempt 1 times out at 22s, the retry succeeds): urls 7 and 8 were declined
+# with "14.0s available" and "0.1s available" and fell back to raw HTML, while
+# 180 recovered 8/8 for +18.5s. 190 is what the structural pin demands: the
+# last wave must still be STARTABLE, i.e. `(waves-1) * per_url +
+# _MIN_URL_BUDGET_S`. This still does not cover the true worst case (240s) —
+# it covers the measured one plus a startable tail. The pin fails if the ratio
+# drifts again, which is what let a container grow 25% while its consumer grew
+# 45%.
+# ⚠ THIS IS A LATENCY TRADE, STATED. The OLD structure was bounded at ~55s
+# only because all eight per-URL clocks ran from `gather` and expired together
+# — the same fact that starved URLs 4-8 into posting doomed work. Giving each
+# URL a real window means 3 waves, so the phase needs its own ceiling. 120s
+# keeps the worst case near 2x the old bound rather than 3x (measured: the cap
+# is genuinely enforced), while typical completion is ~60-90s now that a
+# distill is sized to finish. Nothing above this bounds a tool call, and the
+# model can batch several research calls at once, so it must stay modest.
+_RESEARCH_PHASE_TIMEOUT_S = env_float("GHOST_RESEARCH_PHASE_S", 190.0)
+
+# A URL that cannot be given at least this much is not started at all —
+# reporting the source as uncovered beats burning a Tor circuit on a fetch
+# that provably cannot finish.
+#
+# ⚠ DERIVED, NOT ASSERTED. This was a flat 12.0, which sits BELOW a single
+# fetch attempt (22s): a URL admitted with 12s could not complete even the
+# fetch, so the guard was authorising exactly what its comment says it
+# prevents. The floor is now one full fetch attempt plus the margin
+# `process_url` reserves — admit a URL only if it can at least come back with
+# a page. Note this funds ONE of `_FETCH_ATTEMPTS`: a URL admitted at exactly
+# this floor whose first attempt times out has no room for the retry. That is
+# deliberate — covering both attempts (46.5s) would reject URLs whose first
+# attempt would have succeeded, and a source that fetches but only yields raw
+# text is still a source. (Distillation on top is a further question, answered per-URL by
+# `plan_distill`; a source that fetches but only yields raw text is still a
+# source, so it is not required here.)
+_MIN_URL_BUDGET_S = _FETCH_ATTEMPT_TIMEOUT + 2.0
+
+# ⚠ THE PLAN ASSUMES IT STARTS SOON — SO ENFORCE THAT. `chat_completion` was
+# passed timeout == slot_wait == total_budget, so a call could sit in the
+# per-node permit queue for nearly the whole budget and then POST a request
+# sized for ALL of it: the plan's arithmetic was measured against time that
+# had already been spent. (llama.cpp's `prompt_ms` starts at slot assignment,
+# so the learned prefill rate structurally cannot see this cost.) The distill
+# is now sized for `budget - _QUEUE_ALLOWANCE_S` and refuses to wait longer
+# than that for a permit — `NodeSaturated` is explicitly NOT a node fault, and
+# the caller degrades to raw text, which beats posting a doomed request.
+#
+# ⚠ AND IT MUST GROW WITH THE SERVICE TIME IT QUEUES BEHIND. At 8.0s, against
+# a distill that now plans ~46s of work, this tolerates a queue depth of less
+# than one caller — and the model batches research calls (three in one tool
+# batch is on record, giving 9 concurrent worker requests at a 4-slot node).
+# Measured with 3 concurrent deep_research calls: 8/0, 3/5, 0/8 distilled vs
+# raw, i.e. 13 of 24 sources reaching `fact_check` as raw HTML on NodeSaturated
+# alone. Raising `_WEB_SUMMARY_TIMEOUT_S` made this WORSE, not better: longer
+# distills mean a longer queue behind an unchanged reserve.
+#
+# ⚠ 8.0 is also the exact value of `llm.py`'s own hidden floor
+# (`_MIN_SLOT_WAIT + _MIN_HTTP_FLOOR` = 5.0 + 3.0), so any value BELOW 8 is
+# silently ignored there while still being subtracted from the planner's
+# budget — the plan would over-reserve. Keep this at or above 8.
+_QUEUE_ALLOWANCE_S = 16.0
+
+# The per-call distill fan-out, mirrored at module scope so the budget pins
+# can check `waves x per-URL <= phase` without executing a research call.
+_DISTILL_FANOUT_FOR_TESTS = 3
+
+# Ceiling on ONE url: fetch (≤2 circuits) + LLM distillation.
+_PER_URL_TIMEOUT_S = env_float("GHOST_PER_URL_S", 80.0)
+
+# The raw page text kept when distillation is declined or fails. Deliberately
+# NOT the distill limit: this text goes to the MAIN model unfiltered, so it is
+# capped by what is worth reading, not by what the worker could have read.
+_RAW_FALLBACK_CHARS = 10_000
 
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             max_results: int = 20) -> List[Dict]:
@@ -761,6 +864,18 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
 
     if not urls: return "ERROR: No search results found. The internet might be blocking your request. Try a different query."
 
+    # ⚠ WHAT `max_context` ACTUALLY BOUNDS. registry.py fills it with
+    # `args.max_context` — the MAIN model's window (240,000 live) — and the
+    # assembled report is what gets read back into that window, so it is a
+    # ceiling on each source's SHARE of the report. It is NOT the worker's
+    # limit: sizing the distill prompt by it is the defect this rewrite
+    # removes (it never once bound below the 40k ceiling). The worker's own
+    # limit comes from `plan_distill`, which reads that node's measured
+    # throughput and its advertised context window.
+    _report_share_chars = max(
+        _MIN_DISTILL_CHARS,
+        int(int(max_context) * CHARS_PER_TOKEN * 0.4) // max(1, len(urls)))
+
     # Page-fetch concurrency. Raised 2→3 (2026-07-08): with a distinct Tor
     # circuit per URL (below) the fetches no longer share one exit, so more
     # of them can run at once without correlated blocking. Kept modest so a
@@ -778,7 +893,11 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     # semaphore can actually govern: Tor circuits and page fetches for THIS
     # call.
     sem = asyncio.Semaphore(3)
-    PER_URL_TIMEOUT = 55.0  # ceiling on fetch (≤2 circuits) + LLM distillation
+    _DISTILL_FANOUT = 3      # == the semaphore width above
+    # Read from the module global at CALL time, so the operator (and the
+    # budget tests) can move it without editing this function.
+    PER_URL_TIMEOUT = _PER_URL_TIMEOUT_S
+    _phase_deadline = time.monotonic() + _RESEARCH_PHASE_TIMEOUT_S
 
     async def _fetch_with_timeout(url):
         # Resilient per-URL fetch: each URL rides its OWN Tor circuit, and a
@@ -824,142 +943,288 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
                 await asyncio.sleep(0.5)
         return last
 
-    async def process_url(url):
+    async def process_url(url, budget_s):
         # ⚠ THE DISTILL BUDGET IS WHAT THE CLOCK LEAVES, NOT A CONSTANT.
         # R6 gave `darkweb_search.py` this treatment and left THIS, the
         # original, on a flat `_WEB_SUMMARY_TIMEOUT_S`. 45 is not the
         # remainder of `PER_URL_TIMEOUT`; it is merely smaller than it. The
-        # outer `wait_for` below covers the semaphore wait, up to two 22s
-        # fetch attempts AND the distill, so a normal slow fetch plus a
-        # normal distill blows it and the URL is LOST — measured at 55.00s
-        # with the worker node COMPLETELY FREE (R7 lens A). Losing the URL
-        # is strictly worse than the raw-text degradation sitting in the
-        # `except` block below, and `fact_check` consumes the result either
-        # way.
+        # outer `wait_for` covers up to two 22s fetch attempts AND the
+        # distill, so a normal slow fetch plus a normal distill blows it and
+        # the URL is LOST — measured at 55.00s with the worker node
+        # COMPLETELY FREE (R7 lens A). Losing the URL is strictly worse than
+        # the raw-text degradation below, and `fact_check` consumes the
+        # result either way.
         #
-        # The deadline starts HERE, before `async with sem`: at concurrency
-        # 3 the 4th and later URLs spend part of their per-URL budget queued
-        # on that semaphore, and that time is already gone when we get here.
-        _url_deadline = time.monotonic() + PER_URL_TIMEOUT
-        async with sem:
-            # Shorten URL for log
-            short_url = (url[:35] + "..") if len(url) > 35 else url
-            pretty_log("Parsing Data", url, icon=Icons.TOOL_FILE_R)
-            text = await _fetch_with_timeout(url)
+        # `budget_s` is issued by `_bounded` AFTER the semaphore is acquired,
+        # so it is time this URL actually HAS rather than time that was
+        # already spent queueing behind three other URLs.
+        _url_deadline = time.monotonic() + budget_s
+        # Shorten URL for log
+        url = str(url)
+        short_url = (url[:35] + "..") if len(url) > 35 else url
+        pretty_log("Parsing Data", url, icon=Icons.TOOL_FILE_R)
+        text = await _fetch_with_timeout(url)
 
-            # ⚠ A FAILED FETCH MUST NOT REACH THE DISTILLER. `text` is the
-            # error STRING on failure ("Error: Fetch of <url> timed out
-            # after 22s"), and handing that to a worker prompted with
-            # "Extract ONLY the hard facts... If no relevant info is
-            # found, state that" produces "The provided source text does
-            # not contain any information relevant to the query."
-            #
-            # Measured with 8/8 fetches failing: the report contained the
-            # word "Error" ZERO times and read as POSITIVE NEGATIVE
-            # EVIDENCE — "I checked 8 named sources, none support this".
-            # `fact_check` pipes exactly this into a TRUE/FALSE verifier,
-            # so a Tor blackout became a confident, citation-backed
-            # refutation of a possibly-true claim. The `llm_client=None`
-            # fallback was the only honest path, and registry.py always
-            # wires a client.
-            if isinstance(text, str) and text.startswith("Error:"):
-                pretty_log("Research Source Failed", f"{short_url} — {text[:90]}",
+        # ⚠ A FAILED FETCH MUST NOT REACH THE DISTILLER. `text` is the
+        # error STRING on failure ("Error: Fetch of <url> timed out
+        # after 22s"), and handing that to a worker prompted with
+        # "Extract ONLY the hard facts... If no relevant info is
+        # found, state that" produces "The provided source text does
+        # not contain any information relevant to the query."
+        #
+        # Measured with 8/8 fetches failing: the report contained the
+        # word "Error" ZERO times and read as POSITIVE NEGATIVE
+        # EVIDENCE — "I checked 8 named sources, none support this".
+        # `fact_check` pipes exactly this into a TRUE/FALSE verifier,
+        # so a Tor blackout became a confident, citation-backed
+        # refutation of a possibly-true claim. The `llm_client=None`
+        # fallback was the only honest path, and registry.py always
+        # wires a client.
+        if isinstance(text, str) and text.startswith("Error:"):
+            pretty_log("Research Source Failed", f"{short_url} — {text[:90]}",
+                       level="WARNING", icon=Icons.WARN)
+            return f"### SOURCE: {url}\n{text}\n"
+
+        # ⚠ CLEAN THE RAW-TEXT FALLBACK TOO. Unscrubbed surrogates / control
+        # chars in a fetched page can crash the downstream C++ JSON/grammar
+        # parser — the exact thing `_clean_for_cpp` exists to prevent — and
+        # this path used raw `text`. Built once here because BOTH degradation
+        # routes below (declined plan, failed call) return it.
+        raw_preview = (_clean_for_cpp(text[:_RAW_FALLBACK_CHARS])
+                       + "\n[...truncated...]\n")
+
+        # ⚠ SIZE THE REQUEST TO WHAT THE NODE CAN FINISH — not to a constant,
+        # and not to the MAIN model's context window. The arithmetic that
+        # stood here derived `url_char_limit` from `max_context`, which
+        # registry.py fills with `args.max_context` = 240,000 (the 35B's
+        # window, NOT the worker's), so it pinned to its own 40,000-char
+        # ceiling on every call and never constrained anything. On Nova that
+        # is ~12,500 prompt tokens at ~300 tok/s prefill: **41s before the
+        # first output token, against a 45s budget** — a request that cannot
+        # finish even with the node completely idle and a slot free. Measured
+        # live 2026-08-25 (req 08766aa1): 42.7s solo, 135/258/258s at this
+        # function's own concurrency, and 1 success against 7 degradations in
+        # the log window. `plan_distill` derives BOTH knobs (how much we send,
+        # how much it may write) from throughput measured on the node itself.
+        # See core/node_throughput.py.
+        _summary_budget = 0.0
+        plan = None
+        if llm_client is not None:
+            _summary_budget = min(
+                _WEB_SUMMARY_TIMEOUT_S,
+                _url_deadline - time.monotonic() - 2.0)
+            # ⚠ PLANNING MUST NOT BE ABLE TO LOSE THE URL. A client without
+            # `plan_distill` (an older or hand-rolled one) would raise here,
+            # escape `process_url`, and be swallowed by
+            # `gather(return_exceptions=True)` — dropping the source, which is
+            # the precise loss this rewrite exists to remove. Degrade to raw
+            # text instead, and say so.
+            try:
+                plan = llm_client.plan_distill(
+                    _summary_budget - _QUEUE_ALLOWANCE_S,
+                    max_chars=_report_share_chars,
+                    # ⚠ DECLARE THE FAN-OUT. Every URL in a wave is planned
+                    # before any of it is in flight, so the node looks idle to
+                    # all of them and each plan is sized as if it had the box
+                    # to itself. That is how four ~19,936-char plans built at
+                    # ~306/32 tok/s ended up running at 115/11 (req b86cdd59).
+                    concurrency=_DISTILL_FANOUT)
+            except Exception as _plan_exc:                      # noqa: BLE001
+                pretty_log("Summary Degraded",
+                           f"{short_url}: could not size the distill "
+                           f"({type(_plan_exc).__name__}) — falling back to "
+                           f"raw page text", level="WARNING", icon=Icons.WARN)
+                plan = None
+
+        # ⚠ DECLINE, DO NOT POST. The predecessor computed the same shortfall
+        # and then `raise`d a TimeoutError whose message said it was "taking
+        # the raw-text path" — but the raise sat OUTSIDE the try below, so it
+        # escaped `process_url`, was swallowed by `gather(return_exceptions=
+        # True)`, and the source was dropped from the report entirely. The
+        # message described the safe behaviour; the code did the lossy one.
+        # A declined plan now degrades exactly like a failed call.
+        try:
+            _feasible = bool(plan is not None and plan.feasible)
+        except Exception:                                       # noqa: BLE001
+            _feasible = False          # `getattr(..., False)` swallows only
+                                       # AttributeError; a property that
+                                       # raises anything else got through.
+        if not _feasible:
+            if plan is not None:
+                log_distill_plan(short_url, plan)
+            return f"### SOURCE: {url}\n{raw_preview}\n"
+
+        # ⚠ CONSUMING THE PLAN MUST NOT BE ABLE TO LOSE THE URL EITHER.
+        # `text[:plan.char_limit]` and the `max_tokens` field are the two
+        # places a malformed plan reaches real work; both raise OUTSIDE the
+        # try below, so they escape `process_url` and the source is dropped by
+        # `gather(return_exceptions=True)`. Coerce once, here, and degrade
+        # like any other failure. Downstream code uses these ints, never the
+        # attributes — which also keeps the log's format specs total.
+        try:
+            _chars = int(plan.char_limit)
+            _tokens = int(plan.max_tokens)
+            if _chars < 1 or _tokens < 1:
+                raise ValueError(f"non-positive plan {_chars}/{_tokens}")
+        except Exception as _bad_plan:                          # noqa: BLE001
+            pretty_log("Summary Degraded",
+                       f"{short_url}: unusable distill plan "
+                       f"({type(_bad_plan).__name__}) — falling back to raw "
+                       f"page text", level="WARNING", icon=Icons.WARN)
+            return f"### SOURCE: {url}\n{raw_preview}\n"
+
+        # Sanitize text to remove surrogate unicode characters and raw control
+        # characters that crash C++ JSON parsers.
+        safe_text = _clean_for_cpp(text[:_chars])
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": f"Extract ONLY the hard facts explicitly relevant to this query: '{query}'. Ignore all other boilerplate. If no relevant info is found, state that.\n\nSource text:\n{safe_text}"}],
+            "temperature": 0.0,
+            "max_tokens": _tokens
+        }
+        try:
+            summary_data = await llm_client.chat_completion(
+                payload, use_worker=True,
+                # ⚠ The fallback is FREE — the `except`
+                # two lines below keeps the raw page text.
+                # Without this, a worker outage sent EVERY
+                # url's distillation to the main 35B,
+                # foreground, serialised behind the main
+                # lock, each racing a 55s per-url deadline —
+                # one research call becoming N unbounded 35B
+                # generations (LLM review R3 lens B, B2).
+                off_main_only=True,
+                # ⚠ BOUND THE TOTAL, NOT JUST THE POST. This whole
+                # coroutine runs under an outer per-url deadline; if
+                # the pool budget can exceed it, a saturated node
+                # makes the outer `wait_for` cancel fetch AND distill
+                # and the URL is LOST — strictly worse than the
+                # raw-text degradation sitting in the except block
+                # below. R2 capped this implicitly via
+                # `min(_slot_wait, timeout)`; R4 removed that cap
+                # without replacing it, which took the budget to the
+                # 90s operator ceiling, 1.6x the outer deadline
+                # (R5 lens A). Now stated explicitly, as R4's own
+                # doctrine requires.
+                timeout=_summary_budget,
+                # Bounded, and equal to what the plan reserved for it.
+                slot_wait=_QUEUE_ALLOWANCE_S,
+                # ⚠ THE TOTAL IS WHAT MATTERS HERE. `slot_wait` alone
+                # bounds only the queueing, and queue + POST then
+                # exceeded the outer `wait_for` anyway — measured URL
+                # LOSS at 55.00s on the shipped R5 code (R6 lens A).
+                total_budget=_summary_budget,
+                task_label="web summary")
+            # Say the SIZING, not just "done". The 40k-on-45s mismatch
+            # survived for as long as it did because the stream showed a
+            # timeout and never the arithmetic that guaranteed one.
+            try:
+                _sized = plan.describe()
+            except Exception:                                   # noqa: BLE001
+                _sized = "sizing unavailable"
+            pretty_log("Worker Compute",
+                       f"Distilled facts from {short_url} — {_sized}",
+                       icon=Icons.TOOL_DEEP)
+            try:
+                # The last hand-tuned constant in the sizing path, measured
+                # instead: we know the chars we sent, llama.cpp reports the
+                # tokens they became.
+                llm_client.note_distill_density(len(safe_text), summary_data)
+            except Exception:                                   # noqa: BLE001
+                pass
+            preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
+        except Exception as _sum_exc:
+            # ⚠ SAY SO. This was a bare `except Exception:` with no
+            # log at all, so every degradation here was invisible:
+            # the source silently reverts to raw truncated page text,
+            # which then feeds `fact_check` as if it were distilled
+            # evidence. A whole research call could run on raw HTML
+            # and read identically in the stream (R4 lens B).
+            # ⚠ THE DEGRADATION LOG MUST NOT DESTROY THE DEGRADATION. This
+            # block exists to SAVE the source as raw text; anything raised
+            # while describing the failure escapes `process_url`, is swallowed
+            # by `gather(return_exceptions=True)`, and drops the URL — exactly
+            # the loss this rewrite removed. Caught for real by the suite: a
+            # `{plan.char_limit:,}` format spec against a non-numeric plan
+            # took out two previously-passing tests. Preview is assigned
+            # FIRST, and the telemetry cannot reach it.
+            preview = raw_preview
+            try:
+                # ⚠ AFTER the assignment, and inside the guard. This import is
+                # telemetry-only, yet it was the FIRST statement in the
+                # handler — so a renamed helper, a partially-initialised
+                # `core.llm` under reload, or a first-time import raised here
+                # and the source was dropped by the very block written to save
+                # it (review, CONFIRMED by injection).
+                from ..core.llm import _err_text
+                pretty_log(
+                    "Summary Degraded",
+                    f"{short_url}: {_err_text(_sum_exc)} — planned "
+                    f"{_chars:,} chars/{_tokens} tok in "
+                    f"{_summary_budget:.0f}s — falling back to raw page text",
+                    level="WARNING", icon=Icons.WARN)
+            except Exception:                                   # noqa: BLE001
+                pretty_log("Summary Degraded",
+                           f"{short_url}: falling back to raw page text",
                            level="WARNING", icon=Icons.WARN)
-                return f"### SOURCE: {url}\n{text}\n"
-
-            # 1. Size the per-source extract to the worker's context window
-            # (~4 chars/token, reserving room for the prompt + max_tokens) so a
-            # small-context worker can't overflow on the distill call — was a
-            # hardcoded 40k that ignored max_context. Mirrors darkweb_research.
-            reserve_tokens = 2048 + 512
-            usable_tokens = max(1024, int(max_context) - reserve_tokens)
-            url_char_limit = max(4000, min(40000, usable_tokens * 4))
-            fallback_limit = min(10000, url_char_limit)
-
-            # 2. Sanitize text to remove surrogate unicode characters and raw control characters that crash C++ JSON parsers
-            safe_text = _clean_for_cpp(text[:url_char_limit])
-
-            if llm_client:
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": f"Extract ONLY the hard facts explicitly relevant to this query: '{query}'. Ignore all other boilerplate. If no relevant info is found, state that.\n\nSource text:\n{safe_text}"}],
-                    "temperature": 0.0,
-                    "max_tokens": 2048
-                }
-                # What the fetch left us, less a small margin for the
-                # response to come back. Below the floor there is no point
-                # starting a distillation we cannot finish — take the
-                # raw-text path instead of losing the URL.
-                _summary_budget = min(
-                    _WEB_SUMMARY_TIMEOUT_S,
-                    _url_deadline - time.monotonic() - 2.0)
-                if _summary_budget < 5.0:
-                    raise TimeoutError(
-                        f"only {_summary_budget:.1f}s left of the per-URL "
-                        f"budget — taking the raw-text path rather than "
-                        f"starting a distillation that cannot finish")
-                try:
-                    summary_data = await llm_client.chat_completion(
-                        payload, use_worker=True,
-                        # ⚠ The fallback is FREE — the `except`
-                        # two lines below keeps the raw page text.
-                        # Without this, a worker outage sent EVERY
-                        # url's distillation to the main 35B,
-                        # foreground, serialised behind the main
-                        # lock, each racing a 55s per-url deadline —
-                        # one research call becoming N unbounded 35B
-                        # generations (LLM review R3 lens B, B2).
-                        off_main_only=True,
-                        # ⚠ BOUND THE TOTAL, NOT JUST THE POST. This whole
-                        # coroutine runs under an outer per-url deadline; if
-                        # the pool budget can exceed it, a saturated node
-                        # makes the outer `wait_for` cancel fetch AND distill
-                        # and the URL is LOST — strictly worse than the
-                        # raw-text degradation sitting in the except block
-                        # below. R2 capped this implicitly via
-                        # `min(_slot_wait, timeout)`; R4 removed that cap
-                        # without replacing it, which took the budget to the
-                        # 90s operator ceiling, 1.6x the outer deadline
-                        # (R5 lens A). Now stated explicitly, as R4's own
-                        # doctrine requires.
-                        timeout=_summary_budget,
-                        slot_wait=_summary_budget,
-                        # ⚠ THE TOTAL IS WHAT MATTERS HERE. `slot_wait` alone
-                        # bounds only the queueing, and queue + POST then
-                        # exceeded the outer `wait_for` anyway — measured URL
-                        # LOSS at 55.00s on the shipped R5 code (R6 lens A).
-                        total_budget=_summary_budget,
-                        task_label="web summary")
-                    pretty_log("Worker Compute", f"Distilled facts from {short_url}", icon=Icons.TOOL_DEEP)
-                    preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
-                except Exception as _sum_exc:
-                    from ..core.llm import _err_text
-                    # ⚠ SAY SO. This was a bare `except Exception:` with no
-                    # log at all, so every degradation here was invisible:
-                    # the source silently reverts to raw truncated page text,
-                    # which then feeds `fact_check` as if it were distilled
-                    # evidence. A whole research call could run on raw HTML
-                    # and read identically in the stream (R4 lens B).
-                    pretty_log(
-                        "Summary Degraded",
-                        f"{short_url}: {_err_text(_sum_exc)} — falling back "
-                        f"to raw page text",
-                        level="WARNING", icon=Icons.WARN)
-                    # Clean the raw-text fallback too: unscrubbed surrogates /
-                    # control chars in a fetched page can crash the downstream
-                    # C++ JSON/grammar parser (the exact thing _clean_for_cpp
-                    # exists to prevent). safe_text is already cleaned; the
-                    # fallback used raw `text`.
-                    preview = _clean_for_cpp(text[:fallback_limit]) + "\n[...truncated...]\n"
-            else:
-                preview = _clean_for_cpp(text[:fallback_limit]) + "\n[...truncated...]\n"
-            return f"### SOURCE: {url}\n{preview}\n"
+        return f"### SOURCE: {url}\n{preview}\n"
 
     async def _bounded(url):
-        try:
-            return await asyncio.wait_for(process_url(url), timeout=PER_URL_TIMEOUT)
-        except asyncio.TimeoutError:
-            return f"### SOURCE: {url}\nError: per-URL timeout exceeded ({PER_URL_TIMEOUT}s)\n"
+        # ⚠ THE PER-URL CLOCK STARTS WHEN THE URL STARTS, NOT AT `gather`.
+        # This used to be `wait_for(process_url(url), PER_URL_TIMEOUT)` with
+        # `process_url` setting its own deadline on entry — but every
+        # `_bounded` coroutine is created by ONE `asyncio.gather`, so all
+        # eight clocks started simultaneously while `Semaphore(3)` let only
+        # three run. URLs 4-8 therefore arrived at the distiller with almost
+        # nothing left: measured live (req 08766aa1) the 4th URL was handed a
+        # 6s budget for a job needing 27s, posted it anyway, and ReadTimeout'd
+        # in 6s — indistinguishable in the log from the three genuine 45s
+        # timeouts ahead of it, and it counted as a node fault just the same.
+        # The semaphore is acquired HERE, so the budget below is time this URL
+        # actually has, clipped by what the whole phase has left.
+        async with sem:
+            budget = min(PER_URL_TIMEOUT, _phase_deadline - time.monotonic())
+            if budget < _MIN_URL_BUDGET_S:
+                # Report it as uncovered rather than burning a Tor circuit
+                # and a worker slot on work that provably cannot finish. The
+                # `_banner` below counts this, so the model is told.
+                return (f"### SOURCE: {url}\nError: research phase deadline "
+                        f"({_RESEARCH_PHASE_TIMEOUT_S:.0f}s) reached before "
+                        f"this source could be fetched\n")
+            try:
+                return await asyncio.wait_for(process_url(url, budget),
+                                              timeout=budget)
+            except asyncio.TimeoutError:
+                return (f"### SOURCE: {url}\nError: per-URL timeout exceeded "
+                        f"({budget:.0f}s)\n")
+            except Exception as _url_exc:                        # noqa: BLE001
+                # ⚠ THE NET. Anything that escapes reaches
+                # `gather(return_exceptions=True)` and is filtered out by
+                # `isinstance(c, str)` — a SOURCE SILENTLY DROPPED, invisible
+                # to operator and model alike and indistinguishable from "the
+                # topic has nothing". Guarding each hazard individually has
+                # now failed twice (an escaping `raise`, then a format spec
+                # inside the degradation handler), so the CLASS is closed here
+                # rather than instance by instance: a failed log sink, a
+                # renamed helper, a hostile plan object, a non-str url — every
+                # one becomes a REPORTED failure.
+                #
+                # ⚠ `Exception`, never `BaseException` and never a bare
+                # `except`: on 3.10 `asyncio.CancelledError` is a
+                # BaseException, and swallowing it here would break shutdown
+                # and the enclosing `wait_for`.
+                try:
+                    pretty_log(
+                        "Research Source Failed",
+                        f"{str(url)[:60]} — internal error "
+                        f"{type(_url_exc).__name__}: reported as a failed "
+                        f"source rather than silently dropped",
+                        level="WARNING", icon=Icons.WARN)
+                except Exception:                               # noqa: BLE001
+                    pass
+                return (f"### SOURCE: {url}\nError: internal error while "
+                        f"processing this source "
+                        f"({type(_url_exc).__name__})\n")
 
     tasks = [_bounded(u) for u in urls]
     page_contents = await asyncio.gather(*tasks, return_exceptions=True)
@@ -970,8 +1235,16 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     # identically — and the model has no way to weigh what follows.
     _failed = [c for c in valid_contents if "\nError:" in c]
     _lost = len(urls) - len(valid_contents)
+    # ⚠ A DEGRADED SOURCE IS NEITHER FAILED NOR DISTILLED, and the banner
+    # counted only the first two — so a run where every source fell back to
+    # raw truncated HTML (the original defect's steady state: 1 distilled, 7
+    # degraded) reported ZERO problems. The model was reading raw page dumps
+    # presented as extracted evidence, with nothing saying so.
+    _degraded = [c for c in valid_contents
+                 if "\nError:" not in c
+                 and "[EDGE EXTRACTED FACTS]" not in c] if llm_client else []
     _banner = ""
-    if _failed or _lost:
+    if _failed or _lost or _degraded:
         _banner = (
             f"[⚠ SOURCE FAILURES: {len(_failed) + _lost} of {len(urls)} "
             f"sources could not be fetched (timeout, block, or unreachable). "
@@ -979,7 +1252,13 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
             f"{len(valid_contents) - len(_failed)} that loaded. This is a "
             f"COVERAGE limit, not evidence of absence — do not conclude a "
             f"claim is unsupported because a failed source did not support "
-            f"it.]\n\n")
+            f"it.]\n\n") if (_failed or _lost) else ""
+        if _degraded:
+            _banner += (
+                f"[⚠ {len(_degraded)} of {len(urls)} sources could not be "
+                f"distilled in the time available and appear below as RAW, "
+                f"TRUNCATED page text rather than extracted facts. Treat "
+                f"those sections as unfiltered page dumps.]\n\n")
     full_report = _banner + "\n\n".join(valid_contents)
     # Workspace research dedup: record every URL we pulled so a later
     # research turn can ask "did I already see this?" via the workspace

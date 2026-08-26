@@ -104,6 +104,17 @@ _SKILL_ROUTING_MIN_SKILLS = 25
 # request render byte-identical descriptions. A newly promoted artifact is
 # picked up at the next restart — deploy = restart, same as the verifier
 # templates. NEVER reset these caches on a live agent.
+#
+# ⚠ THE BYTE-IDENTICAL HALF HOLDS ONLY WHILE NO ARM IS REGISTERED. §4CZ/§4DA
+# made this read site randomizable: with a live `gepa_tool_description_*`
+# experiment the control arm renders baselines and the treatment arm renders
+# the artifact, so the tool block has TWO shapes (measured h=2cc89490 vs
+# h=97c93458) and `warm_up_main_prefix` warms the treatment one — control
+# requests miss the warmed prefix and pay a re-prefill. That is the same
+# cost the already-live `fs_batch` arm carries, and it is the price of a
+# causal answer; it is stated here rather than left to contradict the
+# paragraph above. With no experiment registered (today's state) nothing
+# changes.
 # --------------------------------------------------------------------------
 TOOL_DESC_SIGNATURE_PREFIX = "tool_description."
 
@@ -117,6 +128,13 @@ _TOOL_DESC_OVERRIDES: Dict[str, str] = {}
 # If the total tuned-vs-baseline delta across the assembled list exceeds
 # this many chars, NO swap is applied (all-or-nothing keeps the rendered
 # bytes trivially deterministic) and a warning fires once per process.
+# ⚠ "TRIVIALLY DETERMINISTIC" IS ALSO ARM-CONDITIONAL. Under per-signature
+# randomization the SUM depends on which arms this request drew, so the
+# ceiling can fire on one request and not the next — measured, 1 of 40 with
+# 8 registered experiments, the draw where all 8 landed in treatment. The
+# once-per-process `_warn_once("aggregate")` then reports an INTERMITTENT
+# condition once, and charges the rejection only to that request's swapped
+# names. Deterministic again the moment no experiment is registered.
 _TOOL_DESC_AGGREGATE_SLACK = 20_000
 
 _TUNED_DESC_NAMES = None  # lazy frozenset of tool names with an artifact
@@ -177,7 +195,9 @@ def _validate_tool_description(name: str, baseline: str, candidate) -> bool:
     return True
 
 
-def _tuned_tool_description(name: str, baseline: str) -> str:
+def _tuned_tool_description(name: str, baseline: str, *,
+                            context: Any = None,
+                            req_id: str = "") -> str:
     override = _TOOL_DESC_OVERRIDES.get(name)
     if override is not None:
         return override.strip() if _validate_tool_description(
@@ -185,9 +205,39 @@ def _tuned_tool_description(name: str, baseline: str) -> str:
     if name not in _tuned_desc_names():
         return baseline
     from ..optim import loader as _optim_loader
+    # ⚠ ATTRIBUTED, LIKE THE PLANNER READ-SITE. Called without
+    # context/req_id, `tuned_instruction` returns at `_note_served`'s
+    # empty-req_id guard, so no `optim_artifacts` stamp is ever written for
+    # a tool description — measured: `activation_stats` counted the
+    # artifact applied while `served_for_request()` was empty and
+    # `_SERVED_RING` had nothing in it. §4CZ's live judge reads exactly
+    # that stamp, so `gepa_live_check --signature tool_description.*` could
+    # only ever say CONFOUNDED and `--revert` was structurally unreachable:
+    # the ONE optimizer §4DA gates had no way to be judged in production
+    # afterwards. This also makes the randomized control arm available here
+    # (control gets the hand-written baseline), which is the only evidence
+    # that can support a causal claim about a live artifact.
     tuned = _optim_loader.tuned_instruction(
-        f"{TOOL_DESC_SIGNATURE_PREFIX}{name}", "")
+        f"{TOOL_DESC_SIGNATURE_PREFIX}{name}", "",
+        context=context, req_id=req_id)
     if not tuned:
+        # ⚠ A CONTROL TURN MUST BE PRUNED BY THE SAME REFUSALS. It is
+        # served the baseline and returns here, before the validator —
+        # so the stamp round 10 started writing for control turns was
+        # never removed, while treatment's was removed whenever the read
+        # site refused. Measured over 200 turns with an artifact neutral
+        # by construction: 42 treatment stamps pruned, 0 control, and
+        # `KEEP p=0.8020` became `REVERT p=0.0001`.
+        #
+        # What the stamp means is "this turn is an observation ABOUT the
+        # artifact". A turn whose arm would not have rendered it either
+        # way is not, whichever arm it drew.
+        _withheld = _optim_loader_artifact_text(
+            f"{TOOL_DESC_SIGNATURE_PREFIX}{name}")
+        if _withheld and not _validate_tool_description(
+                name, baseline, _withheld):
+            _unnote_optim_served(req_id,
+                                 f"{TOOL_DESC_SIGNATURE_PREFIX}{name}")
         return baseline
     if not _validate_tool_description(name, baseline, tuned):
         _warn_once(
@@ -196,6 +246,11 @@ def _tuned_tool_description(name: str, baseline: str) -> str:
             "baseline kept")
         _note_optim_rejection(f"{TOOL_DESC_SIGNATURE_PREFIX}{name}",
                               "per-tool validator")
+        # ⚠ AND UNDO THE STAMP. `tuned_instruction` stamps at LOAD time;
+        # this is where the artifact is actually refused, so leaving the
+        # stamp asserts "this artifact served this turn" about a turn that
+        # saw the hand-written baseline.
+        _unnote_optim_served(req_id, f"{TOOL_DESC_SIGNATURE_PREFIX}{name}")
         return baseline
     return tuned
 
@@ -209,28 +264,137 @@ def _note_optim_rejection(signature: str, reason: str) -> None:
         pass
 
 
-def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _optim_loader_artifact_text(signature: str) -> str:
+    """The artifact's text regardless of arm — cache-only, no stamp, no
+    randomization. Used to ask "would this turn have rendered the set?"
+    for the arm that was withheld it."""
+    try:
+        from ..optim.loader import artifact_text
+        return artifact_text(signature)
+    except Exception:  # noqa: BLE001 — never break a turn on attribution
+        return ""
+
+
+def _exclude_optim_served(req_id: str, signature: str) -> None:
+    """Mark this request's stamp as EXCLUDED from the live comparison,
+    without deleting it. Used when the arm rendered the artifact but the
+    turn is not comparable — `collect` buckets only control/treatment, so
+    an `excluded` turn drops out of the A/B, while
+    `experiments.context_was_mutated` still sees that this turn's context
+    WAS mutated and keeps it out of the fixture mine."""
+    if not req_id:
+        return
+    try:
+        from ..optim.loader import exclude_served
+        exclude_served(req_id, signature)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _unnote_optim_served(req_id: str, signature: str) -> None:
+    """Drop this request's served-stamp for a signature the read site
+    refused. Never raises — attribution must not break a turn."""
+    if not req_id:
+        return
+    try:
+        from ..optim.loader import unnote_served
+        unnote_served(req_id, signature)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _apply_tuned_descriptions(tools: List[Dict[str, Any]],
+                             context: Any = None) -> List[Dict[str, Any]]:
     """Swap in tuned descriptions copy-on-write; the shared TOOL_DEFINITIONS
     dicts are never mutated. Fast path: no artifacts and no overrides ->
     the input list is returned untouched. If the aggregate inflation
-    exceeds _TOOL_DESC_AGGREGATE_SLACK, nothing is swapped."""
+    exceeds _TOOL_DESC_AGGREGATE_SLACK, nothing is swapped.
+
+    ``context`` is optional and additive: with it the read is ATTRIBUTED
+    (and, with a registered experiment, randomized) exactly as the planner
+    read-site is. Without it the behaviour is what it has always been.
+    """
     if not _TOOL_DESC_OVERRIDES and not _tuned_desc_names():
         return tools
+    _req_id = ""
+    if context is not None:
+        try:
+            from ..utils.logging import request_id_context
+            _req_id = str(request_id_context.get() or "")
+        except Exception:  # noqa: BLE001 — attribution never breaks a turn
+            _req_id = ""
     out = []
     inflation = 0
     swapped = False
     _swapped_names = []
+    # ⚠ THE HYPOTHETICAL SET, FOR THE OTHER ARM'S SAKE.
+    #
+    # ⚠⚠ AND THE PREMISE THE FIRST VERSION STATED HERE WAS FALSE. It
+    # said "whether the set is dropped does not depend on which arm THIS
+    # turn drew" — contradicted by the measurement 200 lines above
+    # (`_TOOL_DESC_AGGREGATE_SLACK`'s own comment: "the ceiling can fire
+    # on one request and not the next — measured, 1 of 40"). The union of
+    # the two branches is arm-independent ONLY while every artifact is at
+    # least as long as its baseline, and the reflector is explicitly told
+    # to "propose a SHORTER one" when the per-tool cap bites. Driven with
+    # one artifact 5,000 chars SHORTER than its baseline and five others
+    # already serving: treatment 156/313 vs control 96/132, REVERT at
+    # p=5.16e-06, on an artifact NEUTRAL BY CONSTRUCTION — because a
+    # control draw of the short one pushed the sum over the ceiling and a
+    # treatment draw did not.
+    #
+    # So the RENDER decision stays on this arm's actual inflation (it is
+    # a real prompt-size guard), and the PRUNE decision uses an
+    # arm-invariant quantity: the positive deltas of every artifact this
+    # turn could render. "Could ANY draw of this turn have busted it?"
+    # is a property of the turn. A
+    # control turn is served the baseline and never reaches the ceiling
+    # check, so round 10's control stamps were never pruned while
+    # treatment's were: measured over 200 turns with an artifact neutral
+    # BY CONSTRUCTION, 42 treatment stamps pruned and 0 control, turning
+    # `KEEP p=0.8020` into `REVERT p=0.0001`, on which `--revert`
+    # retires. Tracked here so the same refusal prunes both arms.
+    _withheld_names = []
+    #: The arm-INVARIANT worst case: the positive deltas of every
+    #: artifact this turn could render, whichever arm each drew. The
+    #: prune decision reads this; the render decision reads `inflation`.
+    _worst_inflation = 0
     for t in tools:
         fn = t.get("function") or {}
         name = fn.get("name") or ""
-        baseline = fn.get("description", "")
-        tuned = _tuned_tool_description(name, baseline) if name else baseline
+        # `or ""` — a tool whose description is None would raise in the
+        # inflation arithmetic on BOTH arms. Not reachable from
+        # TOOL_DEFINITIONS or the skill builders today; a crash in prompt
+        # assembly is not worth the bet.
+        baseline = fn.get("description") or ""
+        tuned = (_tuned_tool_description(name, baseline, context=context,
+                                         req_id=_req_id)
+                 if name else baseline)
         if tuned != baseline:
-            inflation += len(tuned) - len(baseline)
+            inflation += len(tuned) - len(baseline or "")
+            _worst_inflation += max(0, len(tuned) - len(baseline or ""))
             swapped = True
             _swapped_names.append(name)
             out.append({**t, "function": {**fn, "description": tuned}})
         else:
+            if name and _req_id:
+                _w = _optim_loader_artifact_text(
+                    f"{TOOL_DESC_SIGNATURE_PREFIX}{name}")
+                if _w and _w != baseline and _validate_tool_description(
+                        name, baseline, _w):
+                    # Valid per-tool, withheld by the arm: it counts
+                    # toward the set this turn WOULD have rendered.
+                    _withheld_names.append(name)
+                    # `len(baseline or "")` — a tool whose description
+                    # is None would raise here, and round 11 widened that
+                    # from one arm to both. Not reachable from
+                    # TOOL_DEFINITIONS or the skill builders today; a
+                    # crash in prompt assembly is not worth the bet.
+                    # ⚠ POSITIVE PART ONLY. A negative delta (a SHORTER
+                    # artifact) must not subtract from the worst case —
+                    # that is what made the prune arm-dependent.
+                    _worst_inflation += max(
+                        0, len(_w) - len(baseline or ""))
             out.append(t)
     if swapped and inflation > _TOOL_DESC_AGGREGATE_SLACK:
         _warn_once(
@@ -254,7 +418,61 @@ def _apply_tuned_descriptions(tools: List[Dict[str, Any]]) -> List[Dict[str, Any
         for _n in _swapped_names:
             _note_optim_rejection(f"{TOOL_DESC_SIGNATURE_PREFIX}{_n}",
                                   "aggregate inflation ceiling")
+            # ⚠ THE WHOLE SET IS DROPPED HERE, SO THE WHOLE SET'S STAMPS
+            # ARE FALSE. This is the branch that produced 40 of 40
+            # baseline-only requests carrying 21 served-stamps and a KEEP
+            # verdict over two arms with byte-identical prompts.
+            _unnote_optim_served(_req_id,
+                                 f"{TOOL_DESC_SIGNATURE_PREFIX}{_n}")
+        # And the arms this turn WITHHELD: they are observations about the
+        # same dropped set, so leaving their stamps in place is the
+        # one-armed attrition above.
+        for _n in _withheld_names:
+            _unnote_optim_served(_req_id,
+                                 f"{TOOL_DESC_SIGNATURE_PREFIX}{_n}")
         return tools
+    # ⚠ AND WHEN THE SET WOULD HAVE BUSTED THE CEILING HAD THE WITHHELD
+    # ARMS BEEN RENDERED. The turn's tuned set is `swapped + withheld`;
+    # this arm rendered only part of it. If the whole set is over the
+    # ceiling, then no arm of this turn is an observation about a set
+    # that production would ever serve — so neither arm's stamp stands.
+    # ⚠ THIS ARM RENDERED `out`, SO THE STAMP MUST NOT BE DELETED.
+    # The first version unnoted here and returned the TUNED descriptions:
+    # driven with 6 artifacts over the ceiling, 194 of 200 turns rendered
+    # a tuned description and **0 of 200** kept a stamp — so
+    # `gepa_live_check` saw zero attributed turns forever (permanent
+    # INSUFFICIENT), and, because `agent.py` derives
+    # `gepa_artifact_applied` from the same stamp, all 194 turns were
+    # mined into the pool that trains AND ship-gates the next run as if
+    # no arm had mutated their context. The stamp carries two meanings —
+    # "compare this turn" and "this turn's context was mutated" — and
+    # only one of them was considered.
+    #
+    # `arm="excluded"` drops the turn from the comparison (`collect`
+    # buckets only control/treatment) while leaving it visible to
+    # `context_was_mutated`.
+    # ⚠⚠ AND NO `_withheld_names` GATE. A turn that drew TREATMENT on
+    # every artifact-carrying tool has no withheld names, so it escaped
+    # the prune entirely — while a control turn always has some and never
+    # could. Survivorship became arm-dependent again, in the fix for
+    # arm-dependent survivorship. Driven over 12,000 turns with an
+    # artifact neutral BY CONSTRUCTION (outcome a function of the tool
+    # subset only): treatment 1518/3414 vs control 1480/2964,
+    # **REVERT p=0.0000**, and `--revert` retired it. Dropping the one
+    # conjunct turns the identical corpus into `KEEP p=0.5311`.
+    #
+    # The question "is this turn comparable?" is answered by
+    # `_worst_inflation` alone — it is arm-invariant by construction, so
+    # gating it on anything arm-shaped reintroduces exactly what it
+    # exists to remove. Third round in a row this same principle
+    # survived one conjunct out.
+    if _worst_inflation > _TOOL_DESC_AGGREGATE_SLACK:
+        for _n in _swapped_names:
+            _exclude_optim_served(_req_id,
+                                  f"{TOOL_DESC_SIGNATURE_PREFIX}{_n}")
+        for _n in _withheld_names:
+            _unnote_optim_served(_req_id,
+                                 f"{TOOL_DESC_SIGNATURE_PREFIX}{_n}")
     return out
 
 TOOL_DEFINITIONS = [
@@ -896,7 +1114,39 @@ CONDITIONALLY_ADVERTISED_BUILTIN_NAMES = frozenset({
 })
 
 
-def get_active_tool_definitions(context, query: str = None):
+def get_active_tool_definitions(context, query: str = None, *,
+                                serve_tuned: bool = True,
+                                disabled=None):
+    """The advertised tool set.
+
+    ⚠ `serve_tuned=False` FOR ANY CALLER THAT IS NOT BUILDING THE PROMPT.
+    Applying the tuned descriptions is not a pure read: it draws an
+    experiment arm per artifact, STAMPS the request's attribution, and
+    prunes that stamp when the assembled set busts the aggregate ceiling.
+    All three are properties of *the tool set passed in*, so a second call
+    with a DIFFERENT set silently overwrites the first one's verdict —
+    and the last call wins.
+
+    Driven (§4DA round 16): the planner's "available tools" line built a
+    name list with `query=None`, i.e. over the UN-ROUTED superset, while
+    the prompt was built from the routed subset and cached per request.
+    On turn 1 the prompt build ran last and was correct; from turn 2 the
+    prompt build was served from cache and the name-list call was the
+    ONLY one — so the turn's attribution described a set the model never
+    saw. Ten tools x 3000 chars busts a 20,000 ceiling that the routed
+    two never approach:
+
+        turn 1  rendered ['file_system', 'execute'], stamps treatment/treatment
+        turn 2  stamps {}   ->  gepa_artifact_applied False
+
+    That is round 14's headline defect — renders the artifact, keeps no
+    stamp, and is therefore mined into the pool that ship-gates the next
+    run — reached through a call site round 14 did not consider. It also
+    blinds `gepa_live_check` permanently, so `--revert` is unreachable
+    and a losing artifact is never retired.
+
+    A name list does not need descriptions. Pass `serve_tuned=False`.
+    """
     active_tools = list(TOOL_DEFINITIONS)
 
     # Don't advertise delegate_to_swarm when no swarm cluster is configured
@@ -1143,8 +1393,24 @@ def get_active_tool_definitions(context, query: str = None):
         default_db = getattr(getattr(context, "args", None), "default_db", None)
         if not default_db:
             unconfigured.add("postgres_admin")
-    active_tools = _apply_tuned_descriptions(
-        _intent_filter(active_tools, query, drop_unconfigured=unconfigured))
+    active_tools = _intent_filter(active_tools, query,
+                                  drop_unconfigured=unconfigured)
+    # ⚠ DISABLED TOOLS COME OUT BEFORE SERVING, not after. Every caller
+    # used to filter `self.disabled_tools` on the RETURNED list — after
+    # `_apply_tuned_descriptions` had already drawn arms, stamped the
+    # request and summed the ceiling over tools the model would never
+    # see. Self-play forbids `web_search`; contained delegates run on an
+    # allowlist — so once a tool_description artifact ships, every such
+    # turn was stamped `treatment` for a description that was not in its
+    # prompt, and `collect()` walks ALL trajectories: exposure-free
+    # treatment turns attenuate a true REVERT toward KEEP (post-redesign
+    # lens B, F1a). Callers may still post-filter (a mid-request change
+    # is their business); the ATTRIBUTION is decided here.
+    if disabled:
+        active_tools = [t for t in active_tools
+                        if t.get("function", {}).get("name") not in disabled]
+    if serve_tuned:
+        active_tools = _apply_tuned_descriptions(active_tools, context)
     # §4F item 1: the batch-capable file_system schema, treatment arm only.
     # Runs AFTER the GEPA swap on purpose. `_tuned_tool_description` REPLACES
     # a description wholesale and validates it against the BASELINE, so
@@ -1178,6 +1444,24 @@ def get_available_tools(context):
         from .file_system import project_scoped_sandbox
         return project_scoped_sandbox(context, stateful=stateful)
 
+    async def _live_sandbox_manager():
+        """context.sandbox_manager, with lazy re-init after a failed boot.
+
+        When the DockerSandbox constructor failed at boot (daemon socket
+        not up yet — the 08-26 OrbStack race), the live context has no
+        manager and nothing retries, so execute/browser stay dead until
+        the next restart. ensure_sandbox_manager (sandbox/docker.py)
+        rebuilds it, backoff-gated and identity-guarded; run off-loop
+        because the constructor pings the daemon. A success is assigned
+        back onto `context`, so file_system/manage_services and the tree
+        lister recover on the same turn without their own wiring."""
+        sm = context.sandbox_manager
+        if sm is None:
+            import asyncio
+            from ..sandbox.docker import ensure_sandbox_manager
+            sm = await asyncio.to_thread(ensure_sandbox_manager, context)
+        return sm
+
     async def _run_execute(**kwargs):
         # Stateful kernel sessions can't be project-scoped (kernel conn file
         # is pinned to /workspace), so they opt out; everything else runs
@@ -1187,7 +1471,7 @@ def get_available_tools(context):
         return await tool_execute(
             sandbox_dir=host_dir,
             container_workdir=workdir,
-            sandbox_manager=context.sandbox_manager,
+            sandbox_manager=await _live_sandbox_manager(),
             memory_dir=context.memory_dir,
             _metacog_bundle=getattr(context, "metacog", None),
             workspace_model=getattr(context, "workspace_model", None),
@@ -1210,13 +1494,14 @@ def get_available_tools(context):
         # admitted through the browser SSRF guard so the agent can drive an
         # app it is hosting. Registry-driven; empty when none are running.
         from ..sandbox.services import active_service_ports
+        sm = await _live_sandbox_manager()
         return await tool_browser(
             sandbox_dir=host_dir,
             container_workdir=workdir,
-            sandbox_manager=context.sandbox_manager,
+            sandbox_manager=sm,
             tor_proxy=context.tor_proxy,
             workspace_model=getattr(context, "workspace_model", None),
-            allowed_local_ports=active_service_ports(context.sandbox_manager),
+            allowed_local_ports=active_service_ports(sm),
             **kwargs,
         )
 

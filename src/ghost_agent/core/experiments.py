@@ -772,6 +772,19 @@ def arm_for(context, name: str, req_id: str = "") -> str:
     Consumers MUST treat "" as the control path: a disabled framework, an
     internal request, and a genuine control assignment are indistinguishable
     on purpose, so there is exactly one code path to reason about.
+
+    ⚠ "THE CONTROL PATH" MEANS THE INCUMBENT BEHAVIOUR, NOT THE STRING
+    "control". A genuine control assignment returns the arm NAME —
+    `assign_all` only records experiments the unit actually enrolled in —
+    so "" is always "this request is outside this experiment". A consumer
+    whose incumbent behaviour is "do the new thing" (e.g.
+    `optim/loader.py`, where an artifact serves everything until an
+    experiment is registered) must keep doing that, and must NOT record
+    the turn as a control observation: §4DA round 3 read this sentence as
+    "stamp it control", and at `traffic: 0.2` that inflated a live A/B's
+    control arm from 46 to 354 and turned a KEEP (p=0.2485) into a REVERT
+    (p=0.0195). Stamp such turns `unenrolled` so no later analysis can
+    pool them into either arm.
     """
     try:
         stash = getattr(context, "_experiment_arms", None)
@@ -829,6 +842,15 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context"
                                           "foresight_note_fired",
                                           "use_planning_fired",
                                           "verify_depth_context",
+                                          # §4CZ: a served GEPA artifact is
+                                          # PREPENDED to the planner system
+                                          # prompt, so the plan a treatment
+                                          # turn produces — and therefore the
+                                          # conversation and the recorded
+                                          # trajectory — is downstream of text
+                                          # only that arm saw. Same argument
+                                          # as verify_depth_context.
+                                          "gepa_artifact_applied",
                                           # §4BF flip (ii): BoN substitutes the
                                           # FINAL response — it never mutates
                                           # what the model saw generating this

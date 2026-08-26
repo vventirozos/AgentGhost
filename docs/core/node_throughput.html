@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.node_throughput — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="llm.html">llm</a>
+    <a class="current" href="node_throughput.html">node_throughput</a>
+    <a href="planning.html">planning</a>
+    <a href="prompts.html">prompts</a>
+    <a href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a href="verifier.html">verifier</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / node_throughput.py</h1>
+  <p class="subtitle">Learns each node's prefill/decode speed from llama.cpp <code>timings</code>, and sizes off-main work to what that node can actually finish inside its budget.</p>
+
+  <h2>The defect it exists to kill</h2>
+  <p><code>deep_research</code> shipped every fetched page to the worker as a flat
+  <strong>40,000-char</strong> distill prompt with <code>max_tokens=2048</code>, on a flat
+  <strong>45s</strong> budget. On Nova (Gemma 4 E4B, <code>-np 4</code>, 32k/slot) that is
+  ~12,500 prompt tokens against a ~300 tok/s prefill &mdash; <strong>41 seconds of prefill
+  before the first output token</strong>. Measured live on 2026-08-25 (req 08766aa1):</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Condition</th><th>Wall time</th><th>vs the 45s budget</th></tr></thead>
+    <tbody>
+      <tr><td>Solo, cold prompt, node completely <em>idle</em></td><td>42.7s (41.1s of it prefill)</td><td>passes only if the model writes ~40 tokens</td></tr>
+      <tr><td>3 concurrent (the live <code>Semaphore(3)</code> shape)</td><td>135s / 258s / 258s</td><td>all fail</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><strong>It was never slot exhaustion.</strong> <code>/slots</code> read 3 of 4 busy
+  throughout &mdash; a slot was free and nothing queued. The requests were accepted and
+  served; they were simply larger than the budget could pay for. Each one then timed out,
+  was counted as a <em>node fault</em> against the circuit breaker, and silently degraded
+  its source to raw truncated HTML &mdash; which <code>fact_check</code> consumes as if it
+  were distilled evidence. The log window at the time held
+  <strong>1 success against 7 degradations</strong>.</p>
+
+  <p>The guard that was supposed to prevent this read the wrong number. It derived the char
+  limit from <code>max_context</code>, which <code>registry.py</code> fills with
+  <code>args.max_context</code> &mdash; the <em>main</em> 35B's 240,000-token window, not the
+  worker's. So it pinned to its own 40,000-char ceiling on every call and never once
+  constrained anything, while its comment claimed it was sizing "to the worker's context
+  window".</p>
+
+  <h2>The rule</h2>
+  <p><strong>Never send a request the node cannot finish in the time available.</strong> Both
+  knobs &mdash; how much text we send (prefill seconds) and how much the model may write
+  (decode seconds) &mdash; come from throughput measured <em>on that node</em>. When the
+  budget cannot buy a useful answer, the honest move is to decline the call, not to post one
+  that is arithmetically doomed.</p>
+
+  <h2>How the rates are learned</h2>
+  <p>llama.cpp returns a <code>timings</code> block on every response.
+  <code>NodeThroughput.observe()</code> folds <code>prompt_n/prompt_ms</code> and
+  <code>predicted_n/predicted_ms</code> into a per-node EWMA (&alpha; = 0.3), so the sizing
+  re-tunes itself when the hardware, the model, or the concurrency changes.</p>
+
+  <div class="callout warn">
+    <p><strong>A small sample is not a slow node.</strong> llama.cpp reports
+    <code>prompt_per_second</code> over the whole prefill <em>including</em> fixed
+    per-request overhead, so a tiny prompt measures absurdly low. On the same Nova that
+    prefills at 300 tok/s, the 45s keepalive ping (<code>max_tokens=1</code>, content
+    "ok") reports <strong>13&ndash;25 tok/s</strong>, and a prompt-cache hit reports 4 tokens
+    in 6.2s (~1 tok/s) because the count is the cache <em>miss</em> while the clock is the
+    whole wait. Learning from either would collapse the estimate and starve every later
+    distill. Hence the floors: <code>MIN_PREFILL_SAMPLE_TOKENS = 512</code>,
+    <code>MIN_DECODE_SAMPLE_TOKENS = 16</code>.</p>
+  </div>
+
+  <h2>How a request is sized</h2>
+  <p><code>plan(budget_s, node_url)</code> pays for the smallest request worth making, then
+  spends the surplus:</p>
+  <ol>
+    <li>Take <code>SAFETY_MARGIN_S</code> (3s) off the budget &mdash; HTTP and the JSON encode/decode of a multi-KB body sit outside the two measured rates. (The permit queue is handled separately, by the caller's explicit <code>_QUEUE_ALLOWANCE_S</code>.)</li>
+    <li>Cost the floors: <code>MIN_CHARS</code> (6,000) of prefill plus <code>MIN_TOKENS</code> (128) of decode. If that alone exceeds the budget, <strong>refuse</strong>. The floors are judged against the <em>whole</em> budget and the surplus against <code>BUDGET_UTILISATION</code> (85%) of it &mdash; folding the two together let the headroom veto the floor, so an unmeasured node refused everything and then learned nothing from the calls it never made.</li>
+    <li>Split the surplus <code>SURPLUS_TO_PREFILL</code> (60%) toward reading, 40% toward writing &mdash; for fact extraction, reading more of the page beats writing a longer answer.</li>
+    <li>Clamp to <code>MAX_CHARS</code> (40,000) and <code>MAX_TOKENS</code> (768), and to the node's advertised per-slot <code>n_ctx</code> when it has published one.</li>
+  </ol>
+
+  <p>Chars-per-token converts the token budget into a char limit. <code>CHARS_PER_TOKEN =
+  3.2</code> is only the <em>prior</em>: it is the mean density of the pages in the original
+  incident (40,000 chars = 12,500 tokens is exactly 3.20), so it carries no margin at all, and
+  <code>deep_research</code> fetches arbitrary URLs &mdash; markup/JSON-dense pages run ~2.6,
+  Greek/Cyrillic ~1.8, CJK and minified assets ~1.3, where a prompt sized on 3.2 is 2.5&times;
+  the tokens the budget paid for. Density is a property of the <em>corpus</em>, not of a node,
+  so it is learned once and shared: every distill response reports <code>prompt_n</code> and the
+  caller knows how many chars it sent. Measured live on real pages: <strong>2.42</strong>. A
+  safety factor biases toward denser text, which sends fewer chars &mdash; the safe direction.</p>
+
+  <h3>What that produces on the live worker</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Node state</th><th>Rates (prefill / decode)</th><th>Plan at a 45s budget</th></tr></thead>
+    <tbody>
+      <tr><td>Unmeasured (priors, solo-equivalent)</td><td>200 / 26 tok/s</td><td>~7,000 chars, 194 tok</td></tr>
+      <tr><td>Nova, idle</td><td>304 / 31.6 tok/s</td><td>~20,900 chars, 607 tok</td></tr>
+      <tr><td>Nova, 3-way contended</td><td>220 / 12 tok/s</td><td>~10,300 chars, 327 tok</td></tr>
+      <tr><td>Nova solo, declared fan-out 3</td><td>304 / 31.6 tok/s</td><td>~11,000 chars, 236 tok</td></tr>
+      <tr><td>Starved 4th URL (6s left)</td><td>220 / 12 tok/s</td><td><strong>declined</strong> &mdash; needs 27s</td></tr>
+    </tbody>
+  </table></div>
+  <p>The priors sit below the measured figures, because an optimistic prior blows the very
+  first budget on an unmeasured node. But <strong>not arbitrarily below</strong>: a prior that
+  cannot afford the floors declines every distillation, and a declined plan posts no request, so
+  the node never produces the sample that would correct it. The two failure directions are not
+  symmetric &mdash; an over-optimistic prior costs one call, which falls back to raw text and
+  teaches the real rate; an over-pessimistic one latches. They are also
+  <strong>solo-equivalent</strong>: <code>plan()</code> divides by the fan-out explicitly, so a
+  loaded-looking prior would be divided a second time.</p>
+
+  <h2>Concurrency is half of every rate</h2>
+  <p>A rate without its concurrency is not a measurement. Measured on Nova going
+  from one request to three concurrent:</p>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th>alone</th><th>3 concurrent (each)</th><th>per request</th><th>aggregate</th></tr></thead>
+    <tbody>
+      <tr><td>prefill</td><td>304 tok/s</td><td>220 tok/s</td><td>&times;0.72</td><td><strong>&times;2.17</strong></td></tr>
+      <tr><td>decode</td><td>31.6 tok/s</td><td>12.0 tok/s</td><td>&times;0.38</td><td>&times;1.14</td></tr>
+    </tbody>
+  </table></div>
+  <p>The two halves scale differently for a physical reason: llama.cpp
+  <strong>batches prefill</strong> across slots, so aggregate prefill throughput
+  rises and each request degrades only mildly; decode is bandwidth-bound at a
+  roughly <strong>fixed aggregate rate</strong>, so N concurrent decodes each get
+  about 1/N. Hence <code>prefill ~ solo/&radic;N</code> and
+  <code>decode ~ solo/N</code> — which at N=3 predicts 176/10.5 where the node
+  really did 220/12, i.e. conservative on both halves.</p>
+
+  <div class="callout warn">
+    <p><strong>The caller must DECLARE its fan-out.</strong> A research wave plans
+    every URL <em>before any of them is in flight</em>, so the node looks idle to
+    all of them and each is sized as if it owned the box. This is the one thing
+    the slow-rate tracker could not fix. Live evidence (req b86cdd59): four plans
+    of ~19,936 chars / 596 tok were built at ~306/32 tok/s and then ran at
+    115/11 — <strong>126s of work against a 45s budget</strong>.
+    <code>plan_distill</code> takes the larger of the declared fan-out and
+    "what is already running, plus me".</p>
+  </div>
+
+  <p>Samples are normalised the other way, back to a solo equivalent, so a rate
+  measured under load is not penalised twice. Two subtleties that cost real
+  debugging:</p>
+  <ul>
+    <li><strong>Peak, not acquire-time.</strong> Three requests that start
+    together see 1, 2 and 3 in flight; recording the value at acquire made the
+    first one claim it had run alone, so its loaded rate was learned as the
+    node's solo speed.</li>
+    <li><strong>Read inside the permit.</strong> <code>_on_node_success</code>
+    runs <em>after</em> the gate's block, by which point its <code>finally</code>
+    has discarded the bookkeeping — measured 3 inside the permit and 1 after it.
+    For a while this made the whole normalisation dead code: loaded rates were
+    stored as solo rates and divided a second time at plan time, and the
+    distiller read ~4,600 chars of a page instead of ~15,000, <em>less than the
+    raw-text fallback it exists to beat</em>. It looked healthy from outside,
+    because small plans always finish.</li>
+    <li><strong>No permanent rate floor.</strong> A "never plan below half the
+    best rate ever seen" clamp was added while that poisoned estimator was
+    learning ~4 tok/s on a node that does 31.6. A floor derived from a corrupted
+    estimator is corrupted the same way — measured, it changed nothing — and it
+    could not decay, so a genuinely downgraded node was pinned at a speed it
+    could no longer reach, with timeouts returning no <code>timings</code> to
+    ever move it. Removed. Fix the measurement, not the symptom.</li>
+  </ul>
+
+  <h2>Refusal is load-bearing</h2>
+  <p><code>feasible=False</code> means <em>do not post</em>. In req 08766aa1 the 4th URL
+  reached the distiller with ~6s of deadline left, for a job needing ~27s, and posted it
+  anyway &mdash; burning a worker slot on a request that could not finish and producing a
+  <code>ReadTimeout</code> indistinguishable in the log from the three genuine 45s timeouts
+  ahead of it. Callers now take their raw-text fallback instead.</p>
+
+  <h2>Callers</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Caller</th><th>Uses</th></tr></thead>
+    <tbody>
+      <tr><td><code>LLMClient.plan_distill()</code></td><td>Picks the pool's most conservative feasible plan &mdash; we do not know which node round-robin will hand us.</td></tr>
+      <tr><td><code>LLMClient._on_node_success()</code></td><td>The one place a healthy pool response is recorded: breaker reset <em>and</em> throughput sample.</td></tr>
+      <tr><td><code>LLMClient._node_capacity()</code></td><td>Records the node's per-slot <code>n_ctx</code> from the <code>/props</code> probe it already runs.</td></tr>
+      <tr><td><code>tools/search.py</code>, <code>tools/darkweb_search.py</code></td><td>Size each per-source distillation; decline when the clock cannot pay for one.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>A heartbeat is not evidence of health</h2>
+  <p>The circuit breaker could not see any of this. The 45s keepalive is
+  <code>max_tokens=1</code> with the content "ok"; it completes in well under a second on a
+  fully saturated node, so it cannot observe a 12k-token prefill overrunning its budget. In
+  the live trace the breaker opened on three real timeouts at +101s and a keepalive
+  <strong>closed it again at +108s &mdash; 7 seconds into a 60-second cooldown</strong>,
+  while every real request was still failing.</p>
+  <p><code>_on_node_success</code> therefore ignores <code>keepalive</code> and
+  <code>warmup</code> labels when resetting the breaker. The asymmetry is deliberate: a
+  <em>failing</em> heartbeat is still admissible, because it is the cheapest request we can
+  make and if even that fails the node is genuinely unreachable. Evidence of sickness,
+  never evidence of health.</p>
+
+  <h2>Operator knobs</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Env var</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_NODE_PREFILL_TOK_S</code></td><td>150</td><td>Prior prefill rate for an unmeasured node.</td></tr>
+      <tr><td><code>GHOST_NODE_DECODE_TOK_S</code></td><td>10</td><td>Prior decode rate for an unmeasured node.</td></tr>
+      <tr><td><code>GHOST_RESEARCH_PHASE_S</code></td><td>190</td><td>Backstop on a whole research call's fetch+distill phase. It must fund <code>(waves&minus;1) &times; per-URL + the start floor</code> &mdash; a pin fails if that ratio drifts, which is how a container that grew 25% while its consumer grew 45% came to ship.</td></tr>
+      <tr><td><code>GHOST_PER_URL_S</code></td><td>80</td><td>Ceiling on one URL: fetch (&le;2 circuits) + distillation.</td></tr>
+      <tr><td><code>GHOST_WEB_SUMMARY_S</code></td><td>65</td><td>Leash on one distillation. 45s could not fund a 4-way distill (53.6s of work), and this deployment runs at 4-way because the critic pool shares the worker's box.</td></tr>
+    </tbody>
+  </table></div>
+  <p>A malformed value falls back to the default rather than to zero &mdash; a <code>0</code>
+  or <code>abc</code> in a sizing input would silently disable distillation agent-wide.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_node_throughput.py</code> (the estimator and its arithmetic) and
+  <code>tests/test_distill_budget_sizing.py</code> (the research integration, the per-URL
+  clock, and the breaker asymmetry). Both were mutation-checked: reverting
+  <code>max_tokens</code> to 2048, ignoring the plan's char limit, posting a declined plan,
+  moving the clock back to <code>gather</code> time, dropping the sampling floors, and
+  letting a keepalive close the breaker are each killed by a test.</p>
+</main>
+</body>
+</html>

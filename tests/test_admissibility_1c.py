@@ -1064,8 +1064,18 @@ class TestSourceWindowPins:
     def test_run_gepa_ungated_promotion_is_stamped(self):
         p = Path(__file__).resolve().parent.parent / "scripts" / "run_gepa.py"
         src = p.read_text(encoding="utf-8")
-        i = src.index("def _promote_staging")
-        window = src[i:i + 4000]
+        # ⚠ THE WINDOW IS THE FUNCTION, NOT A CHARACTER COUNT. A fixed
+        # 4000-char slice made this fail the moment §4DA added comments
+        # inside `_promote_staging` — a pin that breaks on prose is a pin
+        # that gets widened without being read.
+        import ast as _ast
+        # §4DA final round: the stamp is built and VALIDATED in
+        # `_build_gate_stamp` before `os.replace` — that function is the
+        # window now.
+        fn = next(n for n in _ast.walk(_ast.parse(src))
+                  if isinstance(n, _ast.FunctionDef)
+                  and n.name == "_build_gate_stamp")
+        window = _ast.get_source_segment(src, fn) or ""
         assert "except NameError" in window
         assert "UNGATED (--no-ab-gate)" in window
 

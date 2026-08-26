@@ -334,6 +334,9 @@ def _node_error_detail(exc) -> str:
     return type(exc).__name__
 
 
+from .node_throughput import NodeThroughput, DistillPlan
+
+
 class NodeCircuitBreaker:
     """Circuit breaker for LLM nodes.
 
@@ -537,9 +540,17 @@ class LLMClient:
             pretty_log("LLM Connection", f"Routing upstream traffic via Tor ({proxy_url})", icon=Icons.SHIELD)
 
         self.circuit_breaker = NodeCircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)
+        # Per-node prefill/decode rates, learned from llama.cpp `timings`.
+        # What sizes an off-main request to something the node can FINISH —
+        # see node_throughput.py for the 40k-chars-on-a-45s-budget defect
+        # this replaced.
+        self.node_throughput = NodeThroughput()
         self.foreground_tasks = 0
         # url -> monotonic deadline before which not to re-probe capacity
         self._node_cap_retry_at: Dict[str, float] = {}
+        # url -> {task id: [concurrency-seconds, last_settle_ts, start_ts]}
+        # for every task currently holding one of that node's permits.
+        self._node_run_tasks: Dict[str, Dict[int, list]] = {}
         # url -> the capacity each live semaphore was sized from
         self._node_slot_built_cap: Dict[str, int] = {}
         # Per-URL, so one unreachable node cannot stall dispatch
@@ -1107,6 +1118,10 @@ class LLMClient:
         # a reused object account for permits against clients that are gone.
         self._node_slots.clear()
         self._node_slot_caps.clear()
+        # Rates and context windows are per-URL, and a reconfigure can point
+        # the same URL at a different model — stale rates would size the
+        # first calls against hardware that is no longer there.
+        self.node_throughput.clear()
         self._node_slot_built_cap.clear()
         self._node_slot_locks.clear()
         self._node_cap_retry_at.clear()
@@ -1442,6 +1457,150 @@ class LLMClient:
                 else:
                     raise Exception(f"Image generation failed after 3 attempts: {_err_text(e)}")
 
+    def _on_node_success(self, node: Dict[str, Any], resp: Any,
+                         pool_leg: str, task_label: str = "",
+                         concurrency: int = 1) -> Any:
+        """The ONE place a healthy pool response is recorded.
+
+        The breaker reset and the throughput sample are two readings of the
+        same event, and this used to be five copy-pasted pairs across the
+        pool branches — the shape in which one reading drifts out of one
+        branch and nobody notices for months.
+
+        ⚠ A HEARTBEAT DOES NOT VOUCH FOR THE NODE, and the asymmetry below is
+        deliberate. The 45s keepalive is `max_tokens=1` with the content
+        "ok"; it completes in well under a second on a node that is fully
+        saturated, so it CANNOT observe the failure mode that trips the
+        breaker (a 12k-token prefill overrunning its budget). Live evidence,
+        req 08766aa1: the breaker opened on three real timeouts at +101s and
+        a keepalive closed it again at **+108s — 7s into a 60s cooldown**,
+        while every real request was still failing. A failing heartbeat is
+        still admissible in the other direction: it is the cheapest request
+        we can make, so if even that fails the node is genuinely unreachable.
+        Evidence of sickness, never evidence of health.
+        """
+        data = _stamp_leg(resp.json(), pool_leg)
+        url = node.get("url") or ""
+        if task_label not in ("keepalive", "warmup"):
+            self.circuit_breaker.record_success(url)
+        # Learned from every real call regardless of label — the sampling
+        # floors in `NodeThroughput.observe` already reject a 1-token ping.
+        # The concurrency is what makes the sample comparable across regimes.
+        self.node_throughput.observe(url, data, concurrency=concurrency)
+        return data
+
+    def plan_distill(self, budget_s: float, *, use_critic: bool = False,
+                     **kwargs: Any) -> DistillPlan:
+        """Size an off-main distillation to fit ``budget_s`` on this pool.
+
+        Returns a plan whose `feasible=False` means DO NOT POST — the caller
+        should take its fallback. That refusal is load-bearing: the original
+        defect posted a distillation with 6s of deadline left against a job
+        needing 27s, burning a worker slot on a request that could not
+        finish (req 08766aa1, the 4th URL).
+        """
+        pool = (getattr(self, "critic_clients", None) if use_critic
+                else getattr(self, "worker_clients", None)) or []
+        # A caller that is ABOUT to fan out says so: the whole wave is planned
+        # before any of it is in flight, so in-flight is 0 and tells us
+        # nothing. This is the first-wave blind spot that survived the slow
+        # tracker — every plan in a burst was built from pre-burst rates.
+        # ⚠ SIZE FOR A SYNTHETIC NODE NO POOL MEMBER IS WORSE THAN. The first
+        # version took `min(plans, key=char_limit)`, which is wrong on a pool
+        # that is not dominated: `char_limit` projects the PREFILL rate alone,
+        # so the smallest-chars plan is also the LARGEST-tokens plan, and
+        # round-robin can hand it to the node that cannot pay for the decode.
+        # Review measured the case — A [1000 prefill, 8 decode], B [120, 60]:
+        # the chosen plan cost **99.2s against a 42s budget** on A, producing
+        # exactly the doomed request, ReadTimeout and node-fault this module
+        # exists to remove. `plan_worst_of` takes the pool-wise minimum of
+        # EACH rate and the smallest advertised context.
+        # ⚠ AND IT MUST NOT UNDER-COUNT. The declared fan-out is what THIS
+        # caller is about to create; the node may already be serving other
+        # traffic (this deployment points --worker-nodes AND --critic-nodes at
+        # the same box, so a turn-gate verify shares these slots). Take the
+        # larger of "what I am about to do" and "what is already running,
+        # plus me".
+        _declared = int(kwargs.pop("concurrency", 1) or 1)
+        _busiest = max(
+            [self._node_inflight(n.get("url") or "") for n in pool] or [0])
+        _cap = max([self._node_slot_built_cap.get(n.get("url") or "", 0)
+                    for n in pool] or [0]) or None
+        _conc = max(1, _declared, _busiest + 1)
+        # The gate itself guarantees no more than `cap` run at once, so a
+        # larger number is planning for a node that cannot exist — and it is
+        # the over-count that produced blanket refusals.
+        kwargs["concurrency"] = min(_conc, _cap) if _cap else _conc
+        return self.node_throughput.plan_worst_of(
+            [n.get("url") or "" for n in pool], budget_s, **kwargs)
+
+    def note_distill_density(self, prompt_chars: int, response: Any) -> bool:
+        """Teach the corpus-wide chars/token from a prompt we actually sent.
+
+        The caller knows how many characters it put in; llama.cpp reports how
+        many tokens they became. That ratio was the last hand-tuned constant
+        in the sizing path, and it is the one that decides whether a
+        CJK/markup-dense page overruns the budget a Latin page fits.
+        """
+        try:
+            timings = (response or {}).get("timings") or {}
+            return self.node_throughput.observe_density(
+                prompt_chars, timings.get("prompt_n"))
+        except Exception:                                       # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _settle_conc(held: Dict[int, list]) -> None:
+        """Charge everyone currently holding for the interval just ended."""
+        if not held:
+            return
+        now = time.monotonic()
+        n = len(held)
+        for rec in held.values():
+            rec[0] += (now - rec[1]) * n
+            rec[1] = now
+
+    def _node_inflight(self, url: str) -> int:
+        """How many OTHER requests are holding this node's permits right now.
+
+        ⚠ RETURNS 0 FOR AN IDLE NODE. It used to return `max(1, ...)`, which
+        made "idle" and "we cannot tell" the same value — and the caller then
+        added one on top, so a genuinely idle node could never be planned at
+        concurrency 1: every single-shot distill had its decode halved for
+        company that was not there.
+        """
+        try:
+            sem = self._node_slots.get(url)
+            cap = self._node_slot_built_cap.get(url)
+            if sem is None or not cap:
+                return 0
+            return max(0, min(int(cap), int(cap) - int(sem._value)))
+        except Exception:                                       # noqa: BLE001
+            return 0
+
+    def _run_concurrency(self, url: str = "") -> int:
+        """Average concurrency this request has actually experienced so far.
+
+        ⚠ KEYED BY (task, url). Keying by task alone meant a task holding a
+        permit on node A and then acquiring one on node B read A's figure for
+        B — and popped A's entry when B's block exited.
+        """
+        try:
+            key = id(asyncio.current_task())
+            held = self._node_run_tasks.get(url) or {}
+            rec = held.get(key)
+            if rec is None:
+                return 1
+            now = time.monotonic()
+            n = len(held)
+            acc = rec[0] + (now - rec[1]) * n
+            dur = now - rec[2]
+            if dur <= 0:
+                return max(1, n)
+            return max(1, int(round(acc / dur)))
+        except Exception:                                       # noqa: BLE001
+            return 1
+
     async def _node_capacity(self, node: Dict[str, Any]) -> int:
         """How many requests this node can genuinely serve at once.
 
@@ -1472,6 +1631,14 @@ class LLMClient:
                 r = await client.get("/props", timeout=5.0)
                 r.raise_for_status()
                 data = r.json() or {}
+                # ⚠ THE PER-SLOT WINDOW, from the node's OWN /props. The
+                # distill sizing used to read `args.max_context` — the MAIN
+                # model's 240k — while claiming to size to "the worker's
+                # context window", so it never constrained anything. Recorded
+                # here because this is the one probe that already runs.
+                self.node_throughput.note_context(
+                    url, (data.get("default_generation_settings") or {}
+                          ).get("n_ctx"))
                 raw = data.get("total_slots") or data.get("n_parallel")
                 if not (isinstance(raw, int) and raw > 0):
                     # Reached the node but learned nothing — a backend with no
@@ -1645,9 +1812,45 @@ class LLMClient:
                 f"no free slot on {node.get('model') or url} within "
                 f"{wait_timeout:.2f}s "
                 f"(cap {self._node_slot_built_cap.get(url, '?')})")
+        # ⚠ RECORD THE CONCURRENCY THIS REQUEST RAN AT. A rate is meaningless
+        # without it: on Nova, decode is 31.6 tok/s alone and 12 at 3-way,
+        # because a GPU decodes at a roughly FIXED AGGREGATE rate and N
+        # requests split it. Learning the loaded number as if it were the
+        # node's speed, then planning another loaded request with it, is what
+        # left plans 2.6x too large. Normalising by the observed concurrency
+        # gives a solo-equivalent rate that can be re-scaled for whatever
+        # concurrency the NEXT request will actually see.
+        # ⚠ TIME-WEIGHTED, not the value at acquire and not the peak either.
+        # A rate is an AVERAGE over the whole request, so the concurrency it
+        # must be normalised by is the average concurrency over that same
+        # window. Acquire-time UNDER-counts (three distills that start
+        # together see 1, 2, 3, so the first records "I ran alone" for a
+        # request that spent its life 3-way). Peak OVER-counts symmetrically:
+        # a request that ran alone for 95% of its life and had three others
+        # join at the end is attributed 4, and since the solo-equivalent is
+        # `rate * N^exp`, that inflates the learned rate permanently. Each
+        # holder accumulates concurrency-seconds; every acquire and release
+        # settles the accumulator for everyone currently holding.
+        _task_key = None
+        try:
+            _task_key = id(asyncio.current_task())
+            _held = self._node_run_tasks.setdefault(url, {})
+            self._settle_conc(_held)
+            _now = time.monotonic()
+            _held[_task_key] = [0.0, _now, _now]   # accum, last_ts, start_ts
+        except Exception:                                       # noqa: BLE001
+            _task_key = None
         try:
             yield
         finally:
+            if _task_key is not None:
+                try:
+                    _held = self._node_run_tasks.get(url) or {}
+                    self._settle_conc(_held)
+                    _held.pop(_task_key, None)
+                    self._settle_conc(_held)
+                except Exception:                               # noqa: BLE001
+                    pass
             sem.release()
 
     # ── STALL ATTRIBUTION HELPERS (§4BV R7) ─────────────────────────────
@@ -2008,9 +2211,15 @@ class LLMClient:
                                 if _t is not None:
                                     kwargs["timeout"] = _t
                                 resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                                # ⚠ READ IT INSIDE THE PERMIT. `_on_node_success`
+                                # runs after this block, by which point the gate's
+                                # `finally` has already discarded the bookkeeping —
+                                # so `observe()` was handed 1 on EVERY call and the
+                                # whole normalisation was dead code. Measured: 3
+                                # inside the permit, 1 after it.
+                                _conc = self._run_concurrency(node.get("url") or "")
                             resp.raise_for_status()
-                            self.circuit_breaker.record_success(node["url"])
-                            return _stamp_leg(resp.json(), _pool_leg)
+                            return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                         except Exception as e:
                             if _is_node_fault(e) and task_label != "warmup":
                                 self.circuit_breaker.record_failure(node["url"])
@@ -2109,9 +2318,15 @@ class LLMClient:
                             if _t is not None:
                                 kwargs["timeout"] = _t
                             resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                            # ⚠ READ IT INSIDE THE PERMIT. `_on_node_success`
+                            # runs after this block, by which point the gate's
+                            # `finally` has already discarded the bookkeeping —
+                            # so `observe()` was handed 1 on EVERY call and the
+                            # whole normalisation was dead code. Measured: 3
+                            # inside the permit, 1 after it.
+                            _conc = self._run_concurrency(node.get("url") or "")
                         resp.raise_for_status()
-                        self.circuit_breaker.record_success(node["url"])
-                        return _stamp_leg(resp.json(), _pool_leg)
+                        return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
                         if _is_node_fault(e) and task_label != "warmup":
                             self.circuit_breaker.record_failure(node["url"])
@@ -2228,9 +2443,15 @@ class LLMClient:
                             if _t is not None:
                                 kwargs["timeout"] = _t
                             resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                            # ⚠ READ IT INSIDE THE PERMIT. `_on_node_success`
+                            # runs after this block, by which point the gate's
+                            # `finally` has already discarded the bookkeeping —
+                            # so `observe()` was handed 1 on EVERY call and the
+                            # whole normalisation was dead code. Measured: 3
+                            # inside the permit, 1 after it.
+                            _conc = self._run_concurrency(node.get("url") or "")
                         resp.raise_for_status()
-                        self.circuit_breaker.record_success(node["url"])
-                        return _stamp_leg(resp.json(), _pool_leg)
+                        return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
                         if _is_node_fault(e) and task_label != "warmup":
                             self.circuit_breaker.record_failure(node["url"])
@@ -2314,9 +2535,15 @@ class LLMClient:
                             if _t is not None:
                                 kwargs["timeout"] = _t
                             resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                            # ⚠ READ IT INSIDE THE PERMIT. `_on_node_success`
+                            # runs after this block, by which point the gate's
+                            # `finally` has already discarded the bookkeeping —
+                            # so `observe()` was handed 1 on EVERY call and the
+                            # whole normalisation was dead code. Measured: 3
+                            # inside the permit, 1 after it.
+                            _conc = self._run_concurrency(node.get("url") or "")
                         resp.raise_for_status()
-                        self.circuit_breaker.record_success(node["url"])
-                        return _stamp_leg(resp.json(), _pool_leg)
+                        return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
                         if _is_node_fault(e) and task_label != "warmup":
                             self.circuit_breaker.record_failure(node["url"])
@@ -2401,9 +2628,15 @@ class LLMClient:
                             if _t is not None:
                                 kwargs["timeout"] = _t
                             resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                            # ⚠ READ IT INSIDE THE PERMIT. `_on_node_success`
+                            # runs after this block, by which point the gate's
+                            # `finally` has already discarded the bookkeeping —
+                            # so `observe()` was handed 1 on EVERY call and the
+                            # whole normalisation was dead code. Measured: 3
+                            # inside the permit, 1 after it.
+                            _conc = self._run_concurrency(node.get("url") or "")
                         resp.raise_for_status()
-                        self.circuit_breaker.record_success(node["url"])
-                        return _stamp_leg(resp.json(), _pool_leg)
+                        return self._on_node_success(node, resp, _pool_leg, task_label, _conc)
                     except Exception as e:
                         if _is_node_fault(e) and task_label != "warmup":
                             self.circuit_breaker.record_failure(node["url"])

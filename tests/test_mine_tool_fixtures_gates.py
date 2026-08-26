@@ -79,7 +79,11 @@ class TestPositiveGate:
         """THE defect: enough total supply, not enough positives."""
         rc, out, out_path = run(_corpus(n_pos=71, n_neg=140, private_pos=20))
         assert rc == 1
-        assert "Positives 71 < --min-positives 200" in out
+        # §4DA R5: REAL positives, said so — the runner counts real-only
+        # (bench may teach on the public side, never grade), and a
+        # bench-counting gate here wrote the live pool and exited 0 on 403
+        # positives while the runner refused at 121 REAL.
+        assert "REAL positives 71 < --min-positives 200" in out
         assert not out_path.exists(), "live pool was overwritten below the gate"
 
     def test_both_gates_satisfied_writes(self, run):
@@ -125,7 +129,11 @@ class TestResolutionAdvisory:
         assert "smallest step 0.077" in out
         assert "TOO COARSE" in out
         assert "needs ~50 private positives" in out
-        assert "~250 positives" in out
+        # §4DA R2: REAL positives, said so — the runner's own projection
+        # had a bench-inflated numerator over a real-only denominator and
+        # over-stated the remaining work 3.4x, so both instruments now name
+        # which population the number is over.
+        assert "~250 REAL positives" in out
 
     def test_advisory_does_not_block_a_refresh(self, run):
         """Deliberate: the runner owns the resolution REFUSAL. Blocking the

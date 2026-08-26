@@ -115,6 +115,7 @@ async def test_tool_read_document_chunked_dynamic_limit(tmp_path):
 @pytest.mark.asyncio
 async def test_deep_research_dynamic_limit():
     from unittest.mock import AsyncMock
+    from ghost_agent.core.node_throughput import DistillPlan
     
     tor_proxy = None
     query = "test query"
@@ -125,29 +126,51 @@ async def test_deep_research_dynamic_limit():
     
     long_html = "E" * 50000
     
-    # Mock DuckDuckGo and the fetcher
-    with patch("duckduckgo_search.DDGS", autospec=True) as mock_ddgs, \
+    # ⚠ THIS TEST WAS NOT HERMETIC AND WAS EGRESSING (found 2026-08-25).
+    # It patched `duckduckgo_search.DDGS`, but `_race_search_wave` does
+    # `from ddgs import DDGS` — a DIFFERENT package
+    # (`ddgs.DDGS is duckduckgo_search.DDGS` -> False), so the mock never
+    # applied and every run performed LIVE clearnet searches against
+    # duckduckgo/yahoo/brave/google/yandex/mojeek with `tor_proxy=None`.
+    # That is a direct breach of the project's Tor-only egress posture, from
+    # a test, on the pre-push gate. Patch the search entry point instead —
+    # the same thing `test_search_map_reduce.py` already does.
+    async def _no_egress(query, tor_proxy, wave, max_results=20):
+        return [{"href": "http://example.com"}]
+
+    with patch("ghost_agent.tools.search._race_search_wave",
+               side_effect=_no_egress) as mock_ddgs, \
          patch("ghost_agent.tools.search.helper_fetch_url_content", new_callable=AsyncMock) as mock_fetch:
-         
-        mock_ddgs.return_value.__enter__.return_value.text.return_value = [{"href": "http://example.com"}]
+
         mock_fetch.return_value = long_html
         
-        # max_context = 100000
-        # url_char_limit = max(15000, int(100000 * 3.5 * 0.2)) = 70000
-        # The payload should contain the text sliced to 70000 chars, but text is only 50k here,
-        # so let's make text 80000 config
         long_html = "E" * 80000
         mock_fetch.return_value = long_html
-        
-        result = await tool_deep_research(query, anonymous, tor_proxy, llm_client=llm_client, model_name="test", max_context=100000)
-        
-        # Verify the payload sizing logic
-        assert llm_client.chat_completion.called
-        call_args = llm_client.chat_completion.call_args[0][0]
-        user_msg = call_args["messages"][0]["content"]
-        assert len(call_args['messages'][0]['content']) < 41000      
-        # Check that exactly 15000 chars (approx) of 'E's are in the message
-        # len("Extract ONLY the hard facts... Source text:\n") + 15000
-        assert len(user_msg) > 40000
-        assert len(user_msg) < 41000
-        assert "E" * 15000 in user_msg
+
+        # ⚠ INVERTED 2026-08-25. This test asserted that the WORKER's distill
+        # prompt scaled with `max_context` — the MAIN model's window — and
+        # landed at ~40,000 chars. That was the defect, not the property:
+        # registry.py passes `args.max_context` (240,000 live), so the limit
+        # pinned to its 40k ceiling on every call, which on Nova is 41s of
+        # prefill against a 45s budget — unfinishable even with the node idle
+        # and a slot free (req 08766aa1). The worker's prompt must be sized by
+        # the WORKER's measured throughput and be INDEPENDENT of the main
+        # model's window.
+        llm_client.plan_distill = lambda budget_s, **kw: DistillPlan(
+            9_000, 300, True, "", 220.0, 12.0, 5, 40.0)
+
+        seen = []
+        for ctx in (8_192, 100_000):
+            llm_client.chat_completion.reset_mock()
+            await tool_deep_research(query, anonymous, tor_proxy,
+                                     llm_client=llm_client, model_name="test",
+                                     max_context=ctx)
+            assert llm_client.chat_completion.called
+            call_args = llm_client.chat_completion.call_args[0][0]
+            user_msg = call_args["messages"][0]["content"]
+            seen.append(len(user_msg.split("Source text:\n", 1)[1]))
+
+        # A 12x swing in the MAIN model's window must not move the worker's
+        # prompt by one character.
+        assert seen[0] == seen[1] == 9_000
+        assert all(n < 40_000 for n in seen)

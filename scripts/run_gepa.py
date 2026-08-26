@@ -23,7 +23,9 @@ import asyncio
 import math
 import os
 import shutil
+import calendar as _calendar_mod
 import json as _json_mod
+import time as _time_mod
 import re
 import sys
 from pathlib import Path
@@ -37,6 +39,8 @@ os.environ.setdefault("POSTHOG_DISABLED", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 from ghost_agent.distill.collector import TrajectoryCollector  # noqa: E402
+from ghost_agent.optim import ab_eval
+from ghost_agent.optim import gate_contract  # noqa: E402
 from ghost_agent.optim.signatures import SIGNATURES  # noqa: E402
 from ghost_agent.optim.trainset import (  # noqa: E402
     build_trainset,
@@ -161,6 +165,13 @@ def _prediction_for(pred, field: str, sig=None) -> str:
     return joined or str(pred or "")
 
 
+def _significance_floor() -> int:
+    """Delegates to `ab_eval.significance_floor` — one derivation shared by
+    both GEPA runners and the miner, so the instrument cannot drift from
+    the gate it reports."""
+    return ab_eval.significance_floor()
+
+
 #: The token-F1 bar a prediction must clear. ONE literal, because
 #: `scripts/recheck_gepa_incumbent.py` carried a second copy of it — two
 #: definitions of "did this prompt win" is how two answers to the same
@@ -251,6 +262,23 @@ async def main() -> int:
                         help="Skip the A/B gate and adopt the tuned prompt UNVERIFIED. Use only when there is no eval split to compare on.")
     parser.add_argument("--ab-min-delta", type=float, default=0.02,
                         help="Minimum eval pass-rate improvement for --ab-gate to ship the candidate. Default 0.02.")
+    parser.add_argument(
+        "--min-promotion-age-days", type=float, default=7.0,
+        help="Refuse to re-promote a signature whose live artifact is "
+             "younger than this many days (0 disables). Each run draws a "
+             "fresh candidate, so frequent runs against a slowly-growing "
+             "holdout are repeated draws at the same gate.")
+    parser.add_argument(
+        "--allow-insignificant-ship", action="store_true",
+        help="Promote a candidate that clears --ab-min-delta but whose "
+             "discordant pairs do not reach McNemar p<=SHIP_ALPHA. The "
+             "default refuses, because `delta > margin` alone promoted on "
+             "a net swing of TWO examples out of a 50-example holdout — "
+             "25-40%% of the time under the null. Use this when the margin "
+             "is large and the holdout is simply too small to reach "
+             "significance (a 4-0 sweep sits at p=0.0625); it is RECORDED "
+             "in the artifact's gate block so the call can be audited "
+             "later.")
     parser.add_argument("--private-pct", type=int, default=30,
                         help="Percent of examples reserved (by per-item hash) for the PRIVATE "
                              "holdout the A/B ship-gate judges on. The optimizer never sees "
@@ -455,16 +483,176 @@ async def main() -> int:
     # never ship burned the whole optimization first and then exited 1. The
     # sibling optimize_verifier.py gates before `gepa.optimize` and says
     # "REFUSING TO RUN"; this now matches.
-    _resolution = 1.0 / max(1, len(private_set))
-    if _resolution > args.ab_min_delta:
-        _need = math.ceil(1.0 / args.ab_min_delta)
-        print(f"REFUSING TO RUN: the A/B gate cannot resolve its own "
-              f"threshold. {len(private_set)} private examples give a "
-              f"smallest step of {_resolution:.3f}, coarser than "
-              f"--ab-min-delta {args.ab_min_delta}. One flipped example "
-              f"would decide the run. Collect at least {_need} private "
-              f"examples, or raise --ab-min-delta.", file=sys.stderr)
-        return 1
+    # ⚠ TWO preconditions, and the operator must be told the BINDING one.
+    #
+    # Resolution (`1/n <= min_delta`) says the metric can REPRESENT the
+    # threshold. It says nothing about power. A one-sided exact McNemar
+    # cannot reach SHIP_ALPHA=0.05 with fewer than 5 discordant pairs
+    # (4-0 is p=0.0625), so a holdout below that cannot ship whatever the
+    # candidate does — the whole optimization would be paid for and then
+    # refused.
+    #
+    # ⚠ An earlier version of this comment claimed the floor catches
+    # `--max-examples 10 --private-pct 60 --ab-min-delta 0.2`. It does
+    # not: that gives n=5, and 5 < 5 is False while 0.2 > 0.2 is also
+    # False — neither guard fires, and after the one-sided switch that run
+    # SHIPS a 5-0 sweep correctly. At the 0.02 default the resolution
+    # requirement (50) dwarfs the floor (5), so the floor only binds for
+    # `--ab-min-delta >= 0.25`. It is a backstop for coarse-margin runs,
+    # not a safety net at defaults. Reporting the two separately let the
+    # operator satisfy the weaker one, re-run, and only then learn the
+    # real requirement, so they are combined into one number.
+    # ⚠ `--ab-min-delta` must be a usable margin BEFORE anything divides
+    # by it. `0` gave an uncaught ZeroDivisionError out of `main()` (the
+    # older, division-free form refused cleanly); `>= 1` is arithmetically
+    # unsatisfiable — `delta > 1.0` cannot happen — so the run would pay
+    # for the whole optimization and then refuse everything.
+    # ⚠ RATE CAP — refuse a re-promotion that arrives before the last one
+    # could possibly have been judged. Checked HERE, with the resolution and
+    # significance pre-flights, so a capped run costs nothing rather than
+    # buying the whole optimization first.
+    #
+    # The point is not tidiness. Each GEPA run draws a fresh candidate, so
+    # repeated runs against a near-static holdout are repeated draws at the
+    # gate: at the measured accrual (0.62 private examples/day) a weekly
+    # cadence re-decides on essentially the same evidence, and even the
+    # §4CY gate's 1-3% per-run false-promotion rate compounds to ~0.5-0.8
+    # over 52 draws. Spacing promotions is what converts that back into a
+    # per-run number.
+    if args.min_promotion_age_days > 0 and output_path.exists():
+        try:
+            _stamp = ((_json_mod.loads(output_path.read_text()).get("gate")
+                       or {}).get("promoted_utc") or "")
+            _age = None
+            if _stamp:
+                _t = _time_mod.strptime(_stamp, "%Y-%m-%dT%H:%M:%SZ")
+                _age = (_time_mod.time() - _calendar_mod.timegm(_t)) / 86400.0
+        except Exception:  # noqa: BLE001 — an unreadable stamp must not
+            _age = None   # block a run; it is treated as "age unknown".
+        # ⚠ A NEGATIVE AGE IS A CLOCK, NOT A RECENT PROMOTION. A stamp in
+        # the future (skew, a hand-edited artifact, a restored backup) is
+        # "less than the cap" on a naive comparison, so the signature would
+        # refuse every run until wall-clock caught up — an unbounded outage
+        # from a one-character bug in someone else's file. Treated as
+        # "age unknown", the same as a missing or corrupt stamp.
+        if _age is not None and _age < 0:
+            _age = None
+        if _age is not None and _age < args.min_promotion_age_days:
+            print(f"REFUSING TO RUN: the live artifact was promoted "
+                  f"{_age:.1f} days ago and --min-promotion-age-days is "
+                  f"{args.min_promotion_age_days}. Each run is a fresh draw "
+                  f"at the gate, so re-promoting before the last one can be "
+                  f"judged turns one decision into many. Wait, or pass "
+                  f"--min-promotion-age-days 0 to override deliberately.",
+                  file=sys.stderr)
+            # ⚠ 2, NOT 1. This file already uses 2 for "cannot run"
+            # (no corpus, no trajectories, too few examples) and used
+            # 1 — "the gate rejected the candidate" — for five states
+            # in which nothing was measured. That is the collision
+            # §4DA rounds 11/13/15 carved codes out for in the two
+            # judges, left whole in the gate the rule was ported FROM.
+            return 2
+
+    # ⚠ A LOWER BOUND, not just >0. `1e-320` passes `0 < x` and then
+    # `math.ceil(1.0 / x)` raises an uncaught OverflowError out of
+    # `main()` — the same failure, from the same expression, as the
+    # ZeroDivisionError this guard was added to close.
+    if not 1e-6 <= args.ab_min_delta < 1:
+        print(f"REFUSING TO RUN: --ab-min-delta {args.ab_min_delta} is not "
+              f"a usable margin. It must be >=1e-6 (a bar of 0 admits any "
+              f"non-zero swing; anything smaller cannot be resolved by a "
+              f"holdout of any size this project can build) and <1 (no "
+              f"pass-rate delta can exceed 1.0, so nothing could ship).",
+              file=sys.stderr)
+        # ⚠ 2, NOT 1 — see the re-draw guard above. An unusable margin is
+        # a broken invocation, not a verdict about the candidate.
+        return 2
+
+    _min_discordant = _significance_floor()
+    _resolution_need = math.ceil(1.0 / args.ab_min_delta)
+    _need = max(_min_discordant, _resolution_need)
+    if len(private_set) < _need:
+        # ⚠ SAY THE TRUE THING PER REASON, AND OFFER THE REMEDY THAT WORKS.
+        # A single "No candidate could ship" was FALSE in 81% of refusals:
+        # it is true only when the tier is below the significance floor.
+        # Below the RESOLUTION requirement a candidate can still ship — a
+        # 5-0 sweep at n=45 is delta +0.111 at p=0.031 — the run is refused
+        # because one flipped example would decide it, which is policy, not
+        # impossibility. The remedy hint was also exactly inverted: raising
+        # the margin fixes a resolution refusal and can NEVER fix a floor
+        # refusal, and it was offered in precisely the wrong branch.
+        _below_floor = len(private_set) < _min_discordant
+        # `<`, not `<=`: at n == _resolution_need the margin IS
+        # resolvable, so adding the resolution reason there states a
+        # second, false cause for a refusal the floor alone produced.
+        _below_res = len(private_set) < _resolution_need
+        _why = []
+        if _below_floor:
+            _why.append(f"even a perfect sweep needs {_min_discordant} "
+                        f"discordant pairs to reach "
+                        f"p<={ab_eval.SHIP_ALPHA}, so NO candidate could "
+                        f"ship at any margin")
+        if _below_res:
+            # ⚠ `:.3f` TRUNCATED THE STEP INTO THE BAR. At n=49 vs 50 and
+            # --ab-min-delta 0.02 the clause printed "a smallest step of
+            # 0.020 cannot resolve --ab-min-delta 0.02" for the refusal and
+            # nothing for the run that proceeded — two identically-rendering
+            # numbers, opposite decisions, and the near-miss tier is exactly
+            # the one an operator sees while the corpus grows.
+            # ⚠ THE EXACT FRACTION, not only its decimal. `:.3f` collided
+            # with the bar for a whole class of tiers; `:.6g` narrowed that
+            # to 191 of 400 (a bar chosen AS the 6-figure rounding of 1/n,
+            # e.g. n=7 -> "step of 0.142857 cannot resolve 0.142857"). No
+            # fixed-precision decimal closes it, because the bar can always
+            # be written at that precision. `1/n` cannot collide with a
+            # decimal, so the reader can always see which is larger.
+            _why.append(f"a smallest step of 1/{len(private_set)} "
+                        f"({1.0 / max(1, len(private_set)):.6g}) cannot "
+                        f"resolve --ab-min-delta {args.ab_min_delta}, so a "
+                        f"single flipped example would decide the run")
+        # ⚠ VERIFY THE STRING THE OPERATOR WILL TYPE, NOT THE FLOAT.
+        # Printed as `{1/n:.3f}` the offer rounds DOWN and re-triggers the
+        # identical refusal — a fixed point at 172 of the 396 tier sizes
+        # in 5..400, including the live 31 and the harness's 45.
+        #
+        # The first fix asserted `ceil(1.0 / _offer) <= n` on the computed
+        # float. That is TRUE BY CONSTRUCTION for `_offer = 1/n`, so it
+        # guarded a proxy and could not see the bug it was written for
+        # (`guard-a-proxy-not-the-thing`). What matters is the rounded
+        # value the message actually renders, so that is what is checked.
+        _OFFER_DP = 3
+        _offer = math.ceil(10 ** _OFFER_DP / max(1, len(private_set))) / 10 ** _OFFER_DP
+        _typed = float(f"{_offer:.{_OFFER_DP}f}")
+        # ⚠ AND AN EMPTY TIER HAS NO OFFER TO MAKE. Round 11 guarded the
+        # DIVISION with `max(1, …)` and left this assertion reading the
+        # real length, so `--private-pct 0` traded a ZeroDivisionError
+        # for an AssertionError and the "the PRIVATE holdout is empty"
+        # message 350 lines below stayed unreachable. Brute-forced
+        # n=0..5000: n=0 is the only failing tier — exactly the case the
+        # fix was written for.
+        assert not private_set or (
+            _typed > 0 and math.ceil(1.0 / _typed) <= len(private_set)), (
+            f"the offer as PRINTED ({_typed}) still refuses at "
+            f"n={len(private_set)}")
+        if not private_set:
+            print("REFUSING TO RUN: the PRIVATE holdout is EMPTY (0 "
+                  "examples). With --private-pct 0 there is nothing to "
+                  "gate on, so no candidate could ever ship. Raise "
+                  "--private-pct, or pass --no-ab-gate to promote "
+                  "deliberately without a measurement.", file=sys.stderr)
+            # ⚠ 2, NOT 1 — an empty holdout measured nothing.
+            return 2
+        _fix = (f"Collect at least {_need} private examples"
+                + ("." if _below_floor else
+                   f", or raise --ab-min-delta to at least "
+                   f"{_offer:.{_OFFER_DP}f} (which does NOT lower the "
+                   f"{_min_discordant}-pair significance floor)."))
+        print(f"REFUSING TO RUN: {len(private_set)} private examples is "
+              f"not enough — {'; and '.join(_why)}. {_fix}", file=sys.stderr)
+        # ⚠ 2, NOT 1 — a tier that cannot resolve the margin measured
+        # nothing; the candidate was never scored.
+        return 2
+
 
     # Build LLM client + metric
     from ghost_agent.core.llm import LLMClient
@@ -615,8 +803,23 @@ async def main() -> int:
     #: Mutable so the promotion stamp (a closure defined above) can see an
     #: override decided below it.
     _seed_override = [False]
+    #: Same, for a deliberate ship-side override of the significance bar.
+    _ship_override = [False]
 
     def _promote_staging():
+        # ⚠ BUILD AND VALIDATE THE STAMP BEFORE ANYTHING MOVES. The stamp
+        # used to be constructed AFTER `os.replace`, so both of this
+        # round's guards misreported the world when they fired (final
+        # verification pass, finding 1): a `validate_gate_record` refusal
+        # exited 2 — "nothing changed, re-run when stable" — with the
+        # CANDIDATE already live and unstamped, and a `build_seed_arm`
+        # refusal (the delta-identity check, the one that catches a rate
+        # swap) fired inside the stamp's I/O swallow and exited 0 —
+        # PROMOTED, gate block absent. The sibling gate validates before
+        # promoting; now this one does too: a contract breach leaves the
+        # incumbent untouched and the staging file on disk for
+        # post-mortem.
+        _stamp = _build_gate_stamp()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # Keep the incumbent. `os.replace` onto the live path used to be the
         # ONLY copy operation, so a candidate that beat a stale baseline
@@ -644,47 +847,172 @@ async def main() -> int:
         # change unchallenged.
         try:
             _art = _json_mod.loads(output_path.read_text(encoding="utf-8"))
-            # `cmp` exists only on the GATED path (R2 review: the
-            # --no-ab-gate promotion hit a NameError here, was swallowed,
-            # and every ungated promotion shipped with the "promoted
-            # without provenance" warning instead of an honest stamp).
-            try:
-                _cmp = cmp
-            except NameError:
-                _cmp = None
-            if _cmp is not None:
-                _art["gate_arm"] = "token-F1 A/B, private holdout"
-                _art["gate"] = {
-                    "metric": "token_f1_overlap>=0.3",
-                    "seed_arm": (None if _seed_cmp is None else {
-                        "seed_pass_rate": _seed_cmp.baseline_pass_rate,
-                        "candidate_pass_rate": _seed_cmp.candidate_pass_rate,
-                        "delta": _seed_cmp.delta,
-                        "seed_wins": _seed_cmp.baseline_wins,
-                        "candidate_wins": _seed_cmp.candidate_wins,
-                        "overridden": _seed_override[0],
-                    }),
-                    "n_private": len(private_set),
-                    "incumbent_pass_rate": round(_cmp.baseline_pass_rate, 4),
-                    "candidate_pass_rate": round(_cmp.candidate_pass_rate, 4),
-                    "delta": round(_cmp.delta, 4),
-                    "min_delta": args.ab_min_delta,
-                    "promoted_utc": __import__("time").strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
-                }
-            else:
-                _art["gate_arm"] = "UNGATED (--no-ab-gate)"
-                _art["gate"] = {
-                    "metric": "none — adopted unverified",
-                    "promoted_utc": __import__("time").strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
-                }
-            output_path.write_text(_json_mod.dumps(_art, indent=1),
-                                   encoding="utf-8")
+            _art["gate_arm"], _art["gate"] = _stamp
+            # ⚠ STAGED + os.replace, LIKE THE PROMOTION TWENTY LINES
+            # ABOVE. This was a truncate-then-write on the LIVE path —
+            # the very shape §4DA round 3 fixed in the sibling promoter,
+            # in a function that had already done
+            # `os.replace(staging_path, output_path)` and then re-opened
+            # the file to stamp it. A torn write leaves invalid JSON,
+            # `loader._CACHE[sig]` caches `None` for the life of the
+            # process (repairing the file does NOT recover it), and
+            # `gepa_live_check` could then derive no sha and acted on a
+            # POOLED arm — driven, that turned KEEP p=0.6122 into
+            # REVERT p=0.0065 and retired a healthy artifact.
+            _stamp_tmp = output_path.with_suffix(
+                output_path.suffix + ".stamp")
+            _stamp_tmp.write_text(_json_mod.dumps(_art, indent=1),
+                                  encoding="utf-8")
+            os.replace(_stamp_tmp, output_path)
         except Exception as _se:  # noqa: BLE001 — stamp must not unship
             print(f"WARNING: gate stamp failed ({_se}) — artifact "
                   f"promoted without provenance", file=sys.stderr)
 
+    def _build_gate_stamp():
+        """(gate_arm, gate) — built and VALIDATED before anything moves.
+
+        A ValueError from ANY schema check here (`validate_gate_record`,
+        `build_seed_arm`'s identity and exclusivity rules) becomes a loud
+        exit 2 with the incumbent untouched — never a live-but-unstamped
+        candidate, and never the I/O swallow's "promoted without
+        provenance".
+        """
+        # `cmp` exists only on the GATED path (R2 review: the
+        # --no-ab-gate promotion hit a NameError here, was swallowed,
+        # and every ungated promotion shipped with the "promoted
+        # without provenance" warning instead of an honest stamp).
+        try:
+            _cmp = cmp
+        except NameError:
+            _cmp = None
+        try:
+            if _cmp is not None:
+                # ⚠ VERSIONED. `gate_arm` exists so "this artifact won
+                # under THIS metric" is checkable, and §4DA changed the
+                # DENOMINATOR of delta and both pass rates (all examples
+                # -> examples that reached a verdict in both arms) while
+                # leaving this string byte-identical to the one on
+                # `planning.decompose.json.retired-4cw`, decided under the
+                # old meaning. Two artifacts whose gate_arm matches are
+                # supposed to be comparable; these were not. The project's
+                # own `gepa-promoted-artifact-invalidation` rule ("re-score
+                # the incumbent when the metric or gate changes") had no
+                # way to fire.
+                _gate_arm = ("token-F1 A/B, private holdout "
+                                    f"[{ab_eval.GATE_METRIC_VERSION}]")
+                _gate = {
+                    "metric": "token_f1_overlap>=0.3",
+                    # ⚠ BUILT FROM THE SHARED SCHEMA. This block and the
+                    # tool-description gate's had drifted into two
+                    # different shapes for the same arm; one builder now
+                    # owns both. `delta` is seed-minus-candidate, the
+                    # direction the veto fires in. Without the exclusion
+                    # fields the block once recorded a FABRICATED perfect
+                    # tie for a totally-outaged seed arm: 0.0/0.0, 0 wins,
+                    # 0 ties, with 45 exclusions nowhere in the file.
+                    "seed_arm": (None if _seed_cmp is None else
+                                 gate_contract.build_seed_arm(
+                                     seed_pass_rate=(
+                                         _seed_cmp.baseline_pass_rate),
+                                     candidate_pass_rate=(
+                                         _seed_cmp.candidate_pass_rate),
+                                     seed_minus_candidate_delta=(
+                                         -_seed_cmp.delta),
+                                     seed_minus_candidate_raw_delta=(
+                                         -_seed_cmp.raw_delta),
+                                     n_usable_pairs=(
+                                         len(private_set)
+                                         - _seed_cmp.transport_excluded),
+                                     transport_excluded=(
+                                         _seed_cmp.transport_excluded),
+                                     seed_wins=_seed_cmp.baseline_wins,
+                                     candidate_wins=(
+                                         _seed_cmp.candidate_wins),
+                                     p_value=_seed_cmp.p_value,
+                                     vetoed=bool(_seed_loses),
+                                     overridden=bool(_seed_override[0]))),
+                    "n_private": len(private_set),
+                    # ⚠ THE FIELDS `recheck_gepa_incumbent` WAS BUILT TO
+                    # READ. §4DA rounds 4-5 taught that reader to report
+                    # the usable pair count and the exclusion causes, and
+                    # only the SIBLING optimizer wrote them — so the
+                    # warning was structurally unreachable for every
+                    # `run_gepa` artifact, i.e. for `planning.decompose`,
+                    # the signature that reader's docstring is about.
+                    "n_usable_pairs": (len(private_set)
+                                       - _cmp.transport_excluded),
+                    "transport_excluded": _cmp.transport_excluded,
+                    "outage_excluded": _cmp.transport_excluded,
+                    "corpus_gap_excluded": 0,
+                    # ⚠ AND SAY THAT THE SPLIT ABOVE IS NOT MEASURED HERE.
+                    # `recheck_gepa_incumbent.py` prints these two back
+                    # verbatim as "(N transport outage, 0 no recorded
+                    # payload)", and `ab_eval._run_one` marks ANY runner
+                    # exception `UNREACHED` — a metric bug, a malformed
+                    # example and a per-example timeout all land in the
+                    # first bucket, which is the one the reader calls
+                    # re-runnable. This gate replays LIVE, so there is no
+                    # recorded payload to lose and no predicate to
+                    # separate the causes with; the sibling gate replays
+                    # RECORDINGS and counts both by predicate. Same key
+                    # names as round 7 established — one more field
+                    # saying how much they are worth.
+                    "exclusion_cause_distinguished": False,
+                    "incumbent_pass_rate": round(_cmp.baseline_pass_rate, 4),
+                    "candidate_pass_rate": round(_cmp.candidate_pass_rate, 4),
+                    "delta": round(_cmp.delta, 4),
+                    # ⚠ THE RAW RATES TOO, NOT JUST THE RAW MARGIN. This
+                    # block recorded `raw_delta` with neither rate, so a
+                    # `planning.decompose` artifact could not reconstruct
+                    # the all-rows comparison at all — and the sibling
+                    # gate's raw pair lives at TOP level as
+                    # `private_incumbent`/`private_candidate`, which this
+                    # runner has no equivalent of. Recording them here
+                    # duplicates nothing in this file and makes the gate
+                    # block self-contained in both runners.
+                    "raw_incumbent_pass_rate": round(
+                        _cmp.raw_baseline_pass_rate, 4),
+                    "raw_candidate_pass_rate": round(
+                        _cmp.raw_candidate_pass_rate, 4),
+                    "raw_delta": round(_cmp.raw_delta, 4),
+                    "min_delta": args.ab_min_delta,
+                    # The evidence behind the delta, not just the delta.
+                    # A promotion whose record cannot answer "how many
+                    # examples actually moved?" is unauditable — which is
+                    # how the §4CW artifact served every planner turn for
+                    # weeks on a win nobody could reproduce.
+                    "p_value": (None if _cmp.p_value is None
+                                else round(_cmp.p_value, 6)),
+                    "ship_alpha": ab_eval.SHIP_ALPHA,
+                    "discordant_pairs": (_cmp.baseline_wins
+                                         + _cmp.candidate_wins),
+                    "candidate_wins": _cmp.candidate_wins,
+                    "incumbent_wins": _cmp.baseline_wins,
+                    "significance_overridden": _ship_override[0],
+                    "promoted_utc": __import__("time").strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+                }
+            else:
+                _gate_arm = "UNGATED (--no-ab-gate)"
+                _gate = {
+                    "metric": "none — adopted unverified",
+                    "promoted_utc": __import__("time").strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
+                }
+            gate_contract.validate_gate_record(
+                _gate, writer="scripts/run_gepa.py")
+        except ValueError as _ve:
+            # ⚠ SystemExit(<string>) exits 1 — "the gate rejected the
+            # candidate" — which is the collision the codes were split
+            # for. Message to stderr, code 2: the run cannot produce a
+            # record a reader can audit, and nothing was moved.
+            print(f"FATAL: the gate record this run built violates the "
+                  f"shared contract ({_ve}) — refusing to promote. The "
+                  f"incumbent stands; the candidate is still in staging "
+                  f"for post-mortem. Fix the writer; do not widen the "
+                  f"reader.", file=sys.stderr)
+            raise SystemExit(2) from None
+        return _gate_arm, _gate
 
     def _live_incumbent() -> str:
         """The instruction production ACTUALLY runs for this signature.
@@ -699,7 +1027,7 @@ async def main() -> int:
         try:
             data = _json_mod.loads(output_path.read_text(encoding="utf-8"))
             live = data.get("optimized_instruction")
-            # `isinstance(str)` — matching optim/loader.py:69 EXACTLY. A
+            # `isinstance(str)` — matching optim/the loader's experiment-name note EXACTLY. A
             # bare `str(...)` accepted artifacts the loader rejects: an
             # artifact holding `42` became the 2-char baseline "42" here
             # while production ran the hand-written instruction, so any
@@ -733,7 +1061,13 @@ async def main() -> int:
               "the candidate; NOT promoting. Log more passing trajectories "
               "(or raise --private-pct); --no-ab-gate adopts it unverified.",
               file=sys.stderr)
-        return 1
+        # ⚠ 2, NOT 1. Dead today (the pre-flight refuses an empty holdout
+        # before the optimizer runs) and kept correct anyway — this
+        # entry's history is guards that stopped being reachable when
+        # something upstream moved, and a could-not-measure state
+        # labelled "the gate rejected the candidate" is the exact
+        # collision the codes were split for.
+        return 2
 
     from ghost_agent.optim.ab_eval import compare_prompts
     import json as _json
@@ -781,6 +1115,26 @@ async def main() -> int:
         print(f"gating against the LIVE artifact ({len(incumbent)} chars), "
               f"not the seed baseline ({len(result.baseline_instruction)} chars)")
 
+    # ⚠ NO CANDIDATE IS NOT A REJECTION — the sibling gate's round-16
+    # lesson, ported. An optimizer that returns the incumbent verbatim
+    # produced nothing: the two A/B arms would be byte-identical, every
+    # pair concordant, delta exactly 0, and the run exited 1 — "the gate
+    # rejected the candidate" — about a candidate that does not exist.
+    # `GateExit.NO_CANDIDATE = 3` names this file in its docstring, and
+    # until now this file had no site that could return it (lens C, C4i).
+    # Checked BEFORE the A/B: two identical arms would also burn
+    # 2 x len(private_set) main-model calls to measure a guaranteed zero.
+    if (str(result.optimized_instruction or "").strip()
+            == str(incumbent or "").strip()):
+        _discard_staging()
+        print("NO CANDIDATE: the optimizer returned the incumbent "
+              "verbatim — there is nothing to promote and nothing to "
+              "reject, and an A/B between two identical prompts would "
+              "measure a guaranteed zero. This is a wasted run (or a "
+              "broken reflection LM), not a verdict about the incumbent.",
+              file=sys.stderr)
+        return 3
+
     cmp = await compare_prompts(
         incumbent, result.optimized_instruction,
         private_set, _ab_runner, min_delta=args.ab_min_delta,
@@ -798,10 +1152,88 @@ async def main() -> int:
         # stall: 8192 tokens at the measured ~25 tok/s is ~330s.
         per_example_timeout_s=360.0,
     )
-    print(f"A/B (PRIVATE holdout, n={len(private_set)}): "
+    # ⚠ THE PRE-FLIGHT'S BAR MUST STILL HOLD AFTER THE RUN. `:564`
+    # refuses to start below `_need` examples; round 5 made the DECIDING
+    # tier the paired one, which can be far smaller, and nothing
+    # re-checked it. Driven end to end: 50 examples cleared the
+    # pre-flight, a 45-call outage left 5 usable pairs, delta +1.0000,
+    # p=0.03125, SHIPS=True — promoted on 5 pairs. The sibling gate
+    # refuses this exact shape (`ShipDecision.underpowered`).
+    _n_paired = len(private_set) - cmp.transport_excluded
+    # ⚠ A FLAG, NOT AN ASSIGNMENT. The first version set
+    # `cmp.candidate_ships = False` here — and 45 lines below,
+    # `_insignificant = (cmp.delta > min_delta and not
+    # cmp.candidate_ships)` reads that same False as "the discordant
+    # pairs were too few", so `--allow-insignificant-ship` set it back to
+    # True. Driven end to end: 19 of 64 examples reached a verdict, the
+    # guard printed "Nothing ships — --allow-insignificant-ship does NOT
+    # override this", and the next line promoted. The message was
+    # accurate about intent and false about behaviour.
+    #
+    # `_need` is the pre-flight's own bar, so `transport_excluded == 0`
+    # already implies `_n_paired >= _need`; the condition is stated in
+    # full anyway, because relying on that invariant is how the guard
+    # silently disarms if the pre-flight ever moves.
+    _below_evidence_bar = bool(cmp.transport_excluded
+                               and _n_paired < _need)
+    if _below_evidence_bar:
+        print(f"⚠ EVIDENCE BELOW THE PRE-FLIGHT BAR: only {_n_paired} of "
+              f"{len(private_set)} examples reached a verdict in BOTH "
+              f"arms, under the {_need} this run was allowed to start on. "
+              f"Nothing ships — re-run when the upstream is stable "
+              f"(--allow-insignificant-ship does NOT override this; it "
+              f"waives significance, not evidence).", file=sys.stderr)
+        cmp.candidate_ships = False
+
+    _p_str = ("n/a (no discordant pairs)" if cmp.p_value is None
+              else f"{cmp.p_value:.4f}")
+    # ⚠ n IS THE PAIRED COUNT, NOT THE TIER SIZE. §4DA round 5 made
+    # `compare_prompts` decide over examples that reached a verdict in
+    # BOTH arms — and left this line printing `len(private_set)` beside
+    # the paired delta. Measured with a 10-call outage confined to one
+    # arm: the delta is over 50 pairs and the line said n=60, with
+    # `cmp.transport_excluded` printed nowhere. Round 5 diagnosed exactly
+    # this shape ("each round leaves the instruments that report it one
+    # revision behind") in the sibling gate and then did it here.
+    _excl = ("" if not cmp.transport_excluded else
+             f", {cmp.transport_excluded} of {len(private_set)} excluded "
+             f"(no verdict in one or both arms; raw over all examples "
+             f"{cmp.raw_baseline_pass_rate:.2f}/"
+             f"{cmp.raw_candidate_pass_rate:.2f}, {cmp.raw_delta:+.2f})")
+    print(f"A/B (PRIVATE holdout, n={_n_paired}{_excl}): "
           f"incumbent={cmp.baseline_pass_rate:.2f} "
           f"candidate={cmp.candidate_pass_rate:.2f} "
-          f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
+          f"delta={cmp.delta:+.2f} "
+          f"McNemar p={_p_str} over "
+          f"{cmp.baseline_wins + cmp.candidate_wins} discordant pairs "
+          f"({cmp.candidate_wins} candidate / {cmp.baseline_wins} incumbent) "
+          f"ships={cmp.candidate_ships}")
+
+    # ⚠ THE MARGIN WAS THE WHOLE GATE, AND A MARGIN IS NOT A RESULT.
+    # `candidate_ships` was `delta > min_delta` with no significance test.
+    # The resolution guard above forces n >= ceil(1/min_delta), so at the
+    # 0.02 default the smallest shipping swing was TWO examples out of 50
+    # — which promotes 25-40% of the time under the null, depending on how
+    # many pairs disagree. (An earlier version of this comment said ONE
+    # example out of 31; that is unreachable, because the guard refuses
+    # the run first. The conclusion held, the number did not.)
+    # Meanwhile §4CW had already given the seed-arm VETO a significance
+    # test. Shipping took two examples; refusing took a landslide.
+    #
+    # The bar now lives in `ab_eval.SHIP_ALPHA` and both directions read it.
+    # ⚠ AND THE OVERRIDE MUST NOT SEE THE EVIDENCE GUARD'S False AS ITS
+    # OWN. The sibling gate folds `not underpowered` into `cleared_margin`
+    # and gates the override on that, which makes this structurally
+    # unreachable; round 7 ported the sibling's MESSAGE and not its
+    # STRUCTURE.
+    _insignificant = (cmp.delta > args.ab_min_delta
+                      and not cmp.candidate_ships
+                      and not _below_evidence_bar)
+    if _insignificant and args.allow_insignificant_ship:
+        print("   --allow-insignificant-ship given; treating the margin as "
+              "sufficient despite the discordant pairs.", file=sys.stderr)
+        cmp.candidate_ships = True
+        _ship_override[0] = True
     # ⚠ THE GATE RATCHETS, AND NOBODY WAS CHECKING WHERE IT RATCHETED TO.
     # `_live_incumbent()` makes each run "new candidate vs PREVIOUS
     # ARTIFACT", which is right for measuring an improvement and blind to
@@ -831,9 +1263,17 @@ async def main() -> int:
             private_set, _ab_runner, min_delta=0.0,
             # the same ceiling the main arm uses, for the same reason
             per_example_timeout_s=360.0)
+        _seed_paired = len(private_set) - _seed_cmp.transport_excluded
+        _seed_excl = ("" if not _seed_cmp.transport_excluded else
+                      f"; {_seed_cmp.transport_excluded} of "
+                      f"{len(private_set)} excluded (no verdict in one or "
+                      f"both arms), raw over all examples "
+                      f"{_seed_cmp.raw_baseline_pass_rate:.4f}/"
+                      f"{_seed_cmp.raw_candidate_pass_rate:.4f}")
         print(f"  seed {_seed_cmp.baseline_pass_rate:.4f} vs candidate "
               f"{_seed_cmp.candidate_pass_rate:.4f} "
-              f"(delta {_seed_cmp.delta:+.4f}; candidate wins "
+              f"(n={_seed_paired}{_seed_excl}; delta "
+              f"{_seed_cmp.delta:+.4f}; candidate wins "
               f"{_seed_cmp.candidate_wins}, seed wins "
               f"{_seed_cmp.baseline_wins}, ties {_seed_cmp.ties})")
 
@@ -845,28 +1285,80 @@ async def main() -> int:
     # in one direction and decisive in the other is calibrated on the
     # wrong statistic (§4BR), and this one would have welded the chain to
     # a terse baseline forever.
+    # ⚠ THE VETO ARM NEEDS THE SAME OUTAGE HANDLING THE SHIP ARM GOT.
+    # Rounds 5, 7 and 8 excluded unreached calls, reported the exclusion,
+    # and refused below the pre-flight's bar — all on the MAIN arm, and
+    # `_seed_cmp.transport_excluded` was read nowhere. It breaks BOTH
+    # ways, driven on one corpus with only the seed arm's transport
+    # changed:
+    #   * total outage  -> "seed 0.0000 vs candidate 0.0000 (delta
+    #     +0.0000 ... ties 0)", indistinguishable from a perfect tie, the
+    #     VETO SUPPRESSED and the candidate PROMOTED over a seed it
+    #     genuinely loses to (p=0.0000 when healthy);
+    #   * partial outage leaving 5 of 45 -> delta -1.0000, p=0.0312, the
+    #     veto MANUFACTURED and an honest promotion refused.
+    # The exclusion is symmetric, so the direction is not manufactured by
+    # the marker — the SAMPLE is. A veto is a refusal to ship, so an
+    # underpowered one is not "safe": it welds the chain to whatever is
+    # live, which is the failure §4CW added the seed arm to prevent.
     _seed_loses = False
     _seed_p = None
+    _seed_underpowered = False
     if _seed_cmp is not None:
+        _seed_underpowered = bool(
+            _seed_cmp.transport_excluded
+            and (len(private_set) - _seed_cmp.transport_excluded) < _need)
+        if _seed_underpowered:
+            print(f"  ⚠ SEED ARM BELOW THE PRE-FLIGHT BAR: only "
+                  f"{len(private_set) - _seed_cmp.transport_excluded} of "
+                  f"{len(private_set)} examples reached a verdict in both "
+                  f"arms, under the {_need} this run started on. The seed "
+                  f"veto is NOT DECIDABLE on this run — it is neither "
+                  f"applied nor waived, and nothing ships, because a "
+                  f"promotion whose seed arm was never measured is the "
+                  f"ratchet §4CW exists to stop.", file=sys.stderr)
+            cmp.candidate_ships = False
+            _below_evidence_bar = True
         _b, _c = _seed_cmp.baseline_wins, _seed_cmp.candidate_wins
-        if _b + _c:
-            from math import comb as _comb
-            _nd, _k = _b + _c, min(_b, _c)
-            _seed_p = min(1.0, sum(_comb(_nd, i)
-                                   for i in range(_k + 1)) / (2 ** _nd) * 2)
+        # ONE implementation, in ab_eval — this used to be an inline copy,
+        # and a second definition of the same statistic is how the two
+        # halves of one gate drift apart (§4CW's `_PASS_BAR`, same shape).
+        # One-sided in the veto's own direction — the question is "does
+        # the SEED beat the candidate?", not "do they differ".
+        _seed_p = ab_eval.mcnemar_p(_b, _c, alternative="baseline")
         # Refuse only when the seed beats the candidate by MORE than the
         # same margin the candidate needed to ship, AND the discordant
         # pairs support it. Either alone is a verdict without power.
-        _seed_loses = (_seed_cmp.delta < -args.ab_min_delta
-                       and _seed_p is not None and _seed_p <= 0.05)
-        print(f"  seed arm: delta {_seed_cmp.delta:+.4f} vs the "
+        # ⚠ `not _seed_underpowered` IS REDUNDANT HERE AND KEPT ANYWAY.
+        # The guard above already sets `cmp.candidate_ships = False`, and
+        # the only reader of `_seed_loses` is gated on that — so dropping
+        # this clause is an EQUIVALENT MUTANT today. It is kept because
+        # the equivalence depends entirely on that ordering, and this
+        # entry's own history is a list of guards that stopped being
+        # reachable when something upstream moved. Stating the condition
+        # where the verdict is computed costs nothing and survives the
+        # reordering.
+        _seed_loses = (not _seed_underpowered
+                       and _seed_cmp.delta < -args.ab_min_delta
+                       and _seed_p is not None
+                       and _seed_p <= ab_eval.SHIP_ALPHA)
+        print(f"  seed arm: candidate-minus-seed delta "
+              f"{_seed_cmp.delta:+.4f} vs the "
               f"{-args.ab_min_delta:+.4f} refusal bar"
               + (f", McNemar p={_seed_p:.4f} over {_b + _c} discordant "
                  f"pairs" if _seed_p is not None else
                  " (no discordant pairs)"))
 
     if cmp.candidate_ships and _seed_loses:
-        print(f"\n⛔ NOT PROMOTING. The candidate beats the live artifact "
+        # ⚠ THE HEADLINE MUST MATCH WHAT HAPPENS. "⛔ NOT PROMOTING"
+        # printed unconditionally, and `--allow-seed-loss` then promoted
+        # four lines later — behaviour correct, headline false, which is
+        # round 8's exact shape (a guard that REPORTS a refusal it does
+        # not enforce). The verdict is decided first and the line says
+        # which one it is.
+        _seed_veto_stands = not args.allow_seed_loss
+        print(f"\n{'⛔ NOT PROMOTING' if _seed_veto_stands else '⚠ SEED VETO OVERRIDDEN'}"
+              f". The candidate beats the live artifact "
               f"({cmp.delta:+.4f}) but LOSES to the hand-written seed "
               f"({_seed_cmp.delta:+.4f}, McNemar p={_seed_p:.4f}). "
               f"Promoting it would ratchet the chain further from the "
@@ -876,7 +1368,7 @@ async def main() -> int:
               f"   If the seed is genuinely worse for this signature, say "
               f"so with a measurement and re-run with --allow-seed-loss.",
               file=sys.stderr)
-        if not args.allow_seed_loss:
+        if _seed_veto_stands:
             _discard_staging()
             return 1
         print("   --allow-seed-loss given; promoting anyway.",
@@ -888,9 +1380,64 @@ async def main() -> int:
 
     if not cmp.candidate_ships:
         _discard_staging()
-        print(f"A/B gate REJECTED the candidate (delta {cmp.delta:+.2f} "
-              f"≤ {args.ab_min_delta}); discarded staging — baseline stands.")
-        return 1
+        if _below_evidence_bar:
+            # ⚠ NAME THE CAUSE THAT ACTUALLY FIRED, AND THE ARM IT FIRED
+            # ON. The insignificance branch below printed "McNemar
+            # p=0.0000 > 0.05" — an arithmetic falsehood; the pairs DID
+            # support it — and then told the operator to override with a
+            # flag that (correctly) cannot help. And a seed-arm outage
+            # reported the MAIN arm's healthy counts, which name the
+            # wrong arm to go and fix.
+            if _seed_underpowered:
+                _arm_n = (len(private_set)
+                          - _seed_cmp.transport_excluded)
+                print(f"A/B gate ABORTED: the SEED ARM "
+                      f"(candidate vs the hand-written seed) reached a "
+                      f"verdict on only {_arm_n} of {len(private_set)} "
+                      f"examples, under the {_need} the pre-flight "
+                      f"required. The main arm was fine "
+                      f"({cmp.delta:+.4f} over {_n_paired} pairs) — it is "
+                      f"the VETO that could not be decided, and shipping "
+                      f"without it is the ratchet the seed arm exists to "
+                      f"stop. Re-run when the upstream is stable.")
+            else:
+                print(f"A/B gate ABORTED: only {_n_paired} "
+                      f"of {len(private_set)} examples reached a verdict "
+                      f"in both arms, under the {_need} the pre-flight "
+                      f"required. This is a TRANSPORT failure, not a "
+                      f"measured loss — the margin ({cmp.delta:+.4f}) and "
+                      f"the pairs ({cmp.candidate_wins} candidate / "
+                      f"{cmp.baseline_wins} incumbent) are computed over "
+                      f"too little evidence to act on. Re-run when the "
+                      f"upstream is stable.")
+        elif _insignificant:
+            # Distinguishing the two rejections matters: "clear the margin"
+            # and "collect more evidence" are different instructions, and a
+            # single message would send the reader to re-tune a prompt that
+            # may already be better.
+            # No `>` glyph: `delta` is a float difference of ratios, so
+            # 2/100 - 0/100 is 0.020000000000000018 and ANY rounding that
+            # matches the bar's own precision prints a comparison that
+            # reads false. State the two numbers; let the reader compare.
+            print(f"A/B gate REJECTED the candidate: it cleared the margin "
+                  f"(delta {cmp.delta:+.4f}, bar {args.ab_min_delta}) but the "
+                  f"discordant pairs do not support it "
+                  f"(McNemar p={_p_str} > {ab_eval.SHIP_ALPHA}, "
+                  f"{cmp.candidate_wins} candidate / {cmp.baseline_wins} "
+                  f"incumbent). This is an UNDERPOWERED verdict, not a "
+                  f"measured loss — the holdout is n={_n_paired}. "
+                  f"Collect more graded turns, or override deliberately "
+                  f"with --allow-insignificant-ship.")
+        else:
+            print(f"A/B gate REJECTED the candidate (delta "
+                  f"{cmp.delta:+.4f}, bar {args.ab_min_delta}); discarded "
+                  f"staging — baseline stands.")
+        # ⚠ AN ABORT IS NOT A REJECTION. The evidence-bar and seed-arm
+        # outage branches print "re-run when the upstream is stable" —
+        # nothing was measured there, so exiting 1 ("the gate rejected
+        # the candidate") was the same collision the judges' codes were
+        # split for. Lens C, C4(iii): both gates shared this.
+        return 2 if _below_evidence_bar else 1
     _promote_staging()
     print(f"A/B gate PASSED — candidate promoted to {output_path}")
     return 0

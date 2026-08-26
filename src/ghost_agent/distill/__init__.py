@@ -4,7 +4,7 @@ Local-only corpus of (prompt, plan, tool_calls, final_response, outcome)
 tuples. Two uses:
 
   1. Passive: every real user turn / self-play round gets logged (after
-     redaction) to `$GHOST_HOME/trajectories/YYYY-MM-DD/*.jsonl`.
+     redaction) to `$GHOST_HOME/system/trajectories/YYYY-MM-DD/*.jsonl`.
      This corpus is the input for Stage 2 rejection-sample SFT — the
      pipeline builds a dataset without ever having run a data-collection
      campaign.

@@ -229,6 +229,18 @@ class DockerSandbox:
                         self.client = self.docker_lib.DockerClient(base_url=f"unix://{sock_to_use}")
                         self.client.ping()
                     except:
+                        # The fallback client is OURS alone — the caller
+                        # only ever sees handle_err.client (the from_env
+                        # one), so an unping-able fallback must be closed
+                        # HERE or its ~11 sockets leak on every failed
+                        # construction (recurring since the lazy re-init
+                        # path retries per backoff window).
+                        _fb = self.__dict__.get("client")
+                        if _fb is not None and _fb is not getattr(handle_err, "client", None):
+                            try:
+                                _fb.close()
+                            except Exception:  # noqa: BLE001
+                                pass
                         raise handle_err
                 else:
                     raise handle_err
@@ -1825,3 +1837,131 @@ class DockerSandbox:
             pass
         except Exception as e:
             logger.debug(f"Sandbox close() failed: {e}")
+
+# ── Lazy sandbox re-init (2026-08-26) ────────────────────────────────
+# Boot init is ONE-SHOT: main.py constructs the live DockerSandbox once,
+# and the constructor pings the daemon. When the agent boots seconds
+# before the docker socket appears (08-26: agent up at 08:11:52,
+# OrbStack's socket answering at ~08:12), the constructor raises,
+# `context.sandbox_manager` is never assigned, and every execute/browser
+# call fails with "Sandbox manager not initialized" until the next
+# restart — 7 hours that day, while hourly isolated bench runs proved
+# docker had recovered minutes after boot. These two functions are the
+# retry path: registry.py calls ensure_sandbox_manager() when the live
+# context has no manager, and a successful (backoff-gated) construction
+# is assigned back onto the context so every other reader — file_system,
+# manage_services, the tree lister — recovers on the same turn.
+#
+# Identity guard: ONLY the exact context object registered at boot is
+# eligible. isolated_replay_context sets sandbox_manager=None on its
+# copy.copy'd context ON PURPOSE (a network=none replay must never touch
+# docker, §4CL), and a dream/bench fork owns its own explicitly-managed
+# sandbox — a weakref identity check excludes every copy for free, so
+# this path can never resurrect a sandbox that isolation deliberately
+# detached.
+
+_LAZY_REINIT_BACKOFF_S = 60.0
+_lazy_ctx_ref = None            # weakref to THE live context (set at boot)
+_lazy_lock = threading.Lock()   # one attempt at a time — never queue
+_lazy_next_attempt = 0.0        # time.monotonic() gate between attempts
+
+
+def register_lazy_sandbox(context) -> None:
+    """Mark ``context`` as the one object whose ``sandbox_manager`` may be
+    lazily (re)constructed. Called from main.py boot inside the
+    ``find_spec("docker")`` branch — a docker-less install never
+    registers, so ensure_sandbox_manager() stays a no-op there."""
+    global _lazy_ctx_ref, _lazy_next_attempt
+    import weakref
+    _lazy_ctx_ref = weakref.ref(context)
+    _lazy_next_attempt = 0.0
+
+
+def _docker_endpoint_plausible() -> bool:
+    """Cheap pre-check before paying for a DockerSandbox construction.
+
+    Without any daemon endpoint the constructor's ping raises anyway, but
+    when the daemon is WEDGED (socket present, not answering) the ping can
+    block for the client timeout — so when NO plausible endpoint exists,
+    skip the attempt for the price of a few stat() calls. A remote
+    DOCKER_HOST (tcp/ssh) can't be stat'd; let the ping decide there."""
+    host = os.environ.get("DOCKER_HOST", "").strip()
+    if host:
+        if host.startswith("unix://"):
+            return os.path.exists(host[len("unix://"):])
+        return True
+    candidates = ["/var/run/docker.sock"]
+    import sys
+    if sys.platform == "darwin":
+        candidates += [os.path.expanduser("~/.orbstack/run/docker.sock"),
+                       os.path.expanduser("~/.docker/run/docker.sock")]
+    return any(os.path.exists(c) for c in candidates)
+
+
+def close_carried_client(exc) -> None:
+    """Close the half-built docker client a failed DockerSandbox
+    constructor carries on its exception (§4BO: ~11 unix sockets each;
+    any caller that retries construction walks to EMFILE without this).
+    Safe on any exception — missing attribute and a close() that raises
+    are both swallowed."""
+    for attr in ("client", "docker_client"):
+        cl = getattr(exc, attr, None)
+        try:
+            if cl is not None:
+                cl.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def ensure_sandbox_manager(context):
+    """Return a live sandbox manager for ``context``, constructing one if
+    boot-time init failed and docker has since recovered.
+
+    Never raises; returns None while the manager stays unavailable. The
+    caller's error path ("Sandbox manager not initialized") is unchanged —
+    this only shrinks how long that state can last. Blocking (the
+    constructor pings the daemon): call via asyncio.to_thread from async
+    code. ensure_running is NOT called here — execute() runs it before
+    every command, so the container provisions itself on first use."""
+    global _lazy_next_attempt
+    sm = getattr(context, "sandbox_manager", None)
+    if sm is not None:
+        return sm
+    ref = _lazy_ctx_ref
+    if ref is None or ref() is not context:
+        return None
+    if time.monotonic() < _lazy_next_attempt:
+        return None
+    if not _lazy_lock.acquire(blocking=False):
+        # Another thread is mid-attempt; if it succeeds, its result is
+        # already on the context for the caller's NEXT read.
+        return None
+    try:
+        # Re-check under the lock: a racing attempt may have just
+        # succeeded (manager set) or failed (backoff armed).
+        sm = getattr(context, "sandbox_manager", None)
+        if sm is not None:
+            return sm
+        if time.monotonic() < _lazy_next_attempt:
+            return None
+        _lazy_next_attempt = time.monotonic() + _LAZY_REINIT_BACKOFF_S
+        if not _docker_endpoint_plausible():
+            return None
+        try:
+            candidate = DockerSandbox(context.sandbox_dir,
+                                      getattr(context, "tor_proxy", None))
+        except Exception as exc:  # noqa: BLE001
+            # Boot leaked the carried client at most once; THIS path
+            # retries every backoff window, so the close is load-bearing.
+            close_carried_client(exc)
+            logger.debug("lazy sandbox re-init failed (next attempt in "
+                         "%.0fs): %s", _LAZY_REINIT_BACKOFF_S, exc)
+            return None
+        context.sandbox_manager = candidate
+        pretty_log("Sandbox Recovered",
+                   "Docker reachable again — sandbox manager rebuilt after "
+                   "failed boot-time init (execute/browser re-enabled)",
+                   icon=Icons.SANDBOX_BOX)
+        return candidate
+    finally:
+        _lazy_lock.release()

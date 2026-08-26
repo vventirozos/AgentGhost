@@ -568,11 +568,28 @@ class Foresight:
             logger.debug("foresight seeding failed: %s", exc)
 
     def _seed_from_trajectories(self) -> tuple:
+        # ⚠ SEEDING MARKS THE INDEX SEEDED, WHOEVER DID IT. This used to
+        # be set only by `_seed_worker`, so a DIRECT call left
+        # `_seed_state == "pending"` and the next `predict()` launched a
+        # background thread that seeded the SAME corpus again — every
+        # observation counted twice, non-deterministically, because the
+        # thread races the assertion. Measured in `test_foresight.py`:
+        # support 3 or 6 depending on timing, ~50% failure standalone and
+        # in the full suite. A §4DA reviewer reported that file as flaky;
+        # a later one proved the mechanism, and this entry had recorded
+        # the first report as "NOT REPRODUCED".
+        #
+        # Production only ever reaches this through the worker, so the
+        # defect was confined to direct callers — but "the index is
+        # seeded" is a property of the INDEX, not of who noticed first.
         from ..distill.collector import TrajectoryCollector
 
         collector = TrajectoryCollector()
         root = collector.root
         if not root.exists():
+            with self._lock:
+                if self._seed_state in ('pending', 'running'):
+                    self._seed_state = 'done'
             return (0, 0)
         # Only real day partitions: a stray `archive/` sorts after the
         # dates and would silently evict the ENTIRE window (fresh-eye
@@ -622,6 +639,9 @@ class Foresight:
                     counted = True
                 if counted:
                     n_trajs += 1
+        with self._lock:
+            if self._seed_state in ('pending', 'running'):
+                self._seed_state = 'done'
         return (n_calls, n_trajs)
 
     # -- stats ------------------------------------------------------------

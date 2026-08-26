@@ -1,7 +1,7 @@
 """Training pipeline: trajectories → step samples → fit → save.
 
 Entry point for both the manual CLI workflow (a script that points at
-``$GHOST_HOME/trajectories`` and produces a checkpoint) and the idle
+``$GHOST_HOME/system/trajectories`` and produces a checkpoint) and the idle
 biological retrain phase (phase 2.7 in ``core/agent.py``).
 
 Design notes:

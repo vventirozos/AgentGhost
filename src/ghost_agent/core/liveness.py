@@ -541,6 +541,72 @@ def _arbitration_probe(home: Path) -> ProbeResult:
 # Everything here is DELIBERATELY outside autonomous_activity.jsonl. The phases
 # inside it stay with `learning_health.activity_liveness`; duplicating them
 # would create the two-implementations drift this repo keeps being bitten by.
+def _gepa_autonomy_probe(home: Path) -> ProbeResult:
+    """§4DC — is the autonomous GEPA loop's own clock still advancing?
+
+    Reads `system/gepa_autonomy_state.json`'s `last_run_epoch`
+    fields — the jobs' persisted wall clock — rather than the activity
+    ledger, whose rows are transition-only by design (a quiet week is
+    healthy; a state file that stopped advancing is a dead loop wearing
+    a quiet week's clothes). Staleness bounds come from the module that
+    owns the cadence, so probe and phase cannot drift apart.
+    """
+    import json as _js
+
+    from ..optim.autonomy import (
+        LIVE_JUDGE_INTERVAL_S,
+        SUPPLY_WATCH_INTERVAL_S,
+    )
+    path = Path(home) / "system" / "gepa_autonomy_state.json"
+    try:
+        st = _js.loads(path.read_text())
+    except FileNotFoundError:
+        return ProbeResult(
+            NO_SOURCE,
+            note="no state file yet — the loop has never ticked (the "
+                 "first probe comes one cooldown after boot; if this "
+                 "persists across days, the phase is not being reached)")
+    except Exception as e:  # noqa: BLE001
+        return ProbeResult(
+            NO_SOURCE, note=f"state file unreadable ({type(e).__name__})")
+    now = time.time()
+    #: 3x the cadence: one missed window is idle-alignment luck, three
+    #: is a stopped schedule (the negctrl STALE_AFTER_S reasoning).
+    bounds = {"live_judge": 3 * LIVE_JUDGE_INTERVAL_S,
+              "supply_watch": 3 * SUPPLY_WATCH_INTERVAL_S}
+    fresh, stale_jobs, last_ts = [], [], None
+    for job, bound in bounds.items():
+        slot = st.get(job) if isinstance(st.get(job), dict) else {}
+        _last = slot.get("last_run_epoch")
+        if not isinstance(_last, (int, float)):
+            stale_jobs.append(f"{job} (never)")
+            continue
+        last_ts = max(last_ts or 0, _last)
+        # ⚠ A STAND-DOWN ADVANCES THE CLOCK BUT IS NOT A RUN. The jobs
+        # stamp `last_run_epoch` before the preflight (so a stood-down
+        # job does not retry every tick), which made a box below the
+        # disk floor read FIRED for months (lens B, B2). The outcome
+        # field separates the two.
+        if slot.get("last_outcome") == "stood_down":
+            stale_jobs.append(f"{job} (STANDING DOWN — see "
+                              f"last_summary in the state file)")
+        elif (now - _last) <= bound:
+            fresh.append(job)
+        else:
+            stale_jobs.append(
+                f"{job} ({(now - _last) / 86400.0:.1f}d ago)")
+    note = ""
+    if fresh:
+        note = "advancing: " + ", ".join(sorted(fresh))
+    if stale_jobs:
+        note += ("; " if note else "") + (
+            "SCHEDULE STOPPED for " + ", ".join(sorted(stale_jobs))
+            + " — the tick is not reaching the phase (kill switch? "
+              "idle window never sampled?)")
+    return ProbeResult(ZERO if not fresh else FIRED,
+                       count=len(fresh), last_ts=last_ts, note=note)
+
+
 def _negative_controls_probe(home: Path) -> ProbeResult:
     """E3 — do the cascade's negative controls still demonstrably FIRE?
 
@@ -625,7 +691,10 @@ def _gepa_applies_probe(home: Path) -> ProbeResult:
     fact that its subject has been withdrawn is. So this probe asks the
     yield side and says so.
     """
-    res = _log_probe(r"GEPA: loaded tuned instruction", window_h=168.0)(home)
+    # ⚠ THE SAME THREE LINES. A narrow pattern here read ZERO for a
+    # fully-applied artifact whose load line happened to be the WARNING
+    # form — and after round 13 there are two warning forms.
+    res = _log_probe(_GEPA_LOAD_PATTERN, window_h=168.0)(home)
     try:
         d = home / "system" / "optim"
         live = [f for f in d.glob("*.json")] if d.is_dir() else []
@@ -651,6 +720,16 @@ PROBES: List[Probe] = [
     Probe("evolve.negative_controls", EXPECT_PERIODIC,
           "system/evolve/negative_controls.json",
           _negative_controls_probe,
+          alarm_if_zero=True,
+          denominator=DEN_NONE),
+    # §4DC: the autonomous GEPA loop. Same class as negative controls —
+    # wall-clock jobs whose ledger rows are transition-only, so the
+    # LIVENESS signal is the state file's own last_run_epoch, not the
+    # ledger count (a quiet week is healthy; a state file that stopped
+    # advancing is a dead loop wearing a quiet week's clothes).
+    Probe("gepa.autonomy", EXPECT_PERIODIC,
+          "system/gepa_autonomy_state.json",
+          _gepa_autonomy_probe,
           alarm_if_zero=True,
           denominator=DEN_NONE),
     Probe("metacog.arbitration", EXPECT_GATED,
@@ -1500,8 +1579,18 @@ def _yield_lessons(home: Path) -> YieldResult:
 #:    would be the same category error as round 1's `invoked = packets`.
 #:    The column says LOADS, and the note says what that means.
 _GEPA_LOAD_WINDOW_H = 24.0 * 365 * 20          # effectively all-time
+# ⚠ EVERY LOAD LINE, AND THERE ARE NOW THREE. §4DA round 13 added a
+# third — an artifact promoted with `--no-ab-gate` warns "was promoted
+# UNGATED" instead of "predates the gate schema" — and neither probe
+# matched it, so the `silent-inoperative-subsystems` instrument went
+# blind precisely for the artifacts adopted with NO A/B, the ones it most
+# needs to watch. The comment below records the same defect one shape
+# earlier ("a fully-applied artifact read BARREN"); the pattern is
+# anchored on the shared prefix now so a fourth phrasing cannot repeat
+# it.
 _GEPA_LOAD_PATTERN = (r"GEPA: (loaded tuned instruction|artifact '[^']+' "
-                      r"\(sha [0-9a-f]+\) predates the gate schema)")
+                      r"\(sha [0-9a-f]+\) (?:predates the gate schema"
+                      r"|was promoted UNGATED))")
 
 
 def _yield_gepa(home: Path) -> YieldResult:

@@ -533,6 +533,35 @@ def inject_global_stream_adapter(monkeypatch):
 
     monkeypatch.setattr(GhostAgent, '__init__', wrapped_init)
 
+@pytest.fixture(autouse=True)
+def _isolate_optim_activation_counters():
+    """Reset `optim/loader.py`'s three per-PROCESS activation counters
+    before every test.
+
+    ⚠ THEY ARE MODULE GLOBALS AND `registry_diagnosis` BRANCHES ON THEM,
+    so a value one test file leaves behind selects a different diagnosis
+    branch in another. §4DA rounds 14 and 16 each fixed one such test by
+    hand — green alone, green under `-n 8 --dist loadfile` (one file per
+    worker process), red in a single process behind a neighbour, which is
+    how both escaped review. `parallel-suite-order-dependence`: a suite
+    whose result depends on file order is a suite bug, and patching the
+    victims one at a time leaves the next one armed.
+
+    Reset rather than snapshot-and-restore: nothing in the suite is
+    entitled to counts accumulated by an earlier test.
+    """
+    try:
+        from ghost_agent.optim import loader as _L
+    except Exception:                                # pragma: no cover
+        yield
+        return
+    for _name in ("_APPLIED_COUNTS", "_FALLBACK_COUNTS", "_REJECTED_COUNTS"):
+        _d = getattr(_L, _name, None)
+        if isinstance(_d, dict):
+            _d.clear()
+    yield
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _no_mock_path_residue():
     """Session safety net: fail loudly if any test splattered a mock-derived

@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from ghost_agent.tools.search import tool_deep_research
+from ghost_agent.core.node_throughput import DistillPlan
 
 # Stub the search wave itself (the URL source): the wave runs each engine on
 # a dedicated executor now, not asyncio.to_thread, so patch at that seam — it
@@ -29,9 +30,14 @@ async def test_deep_research_map_reduce_online(mock_ddgs, mock_fetch):
         "choices": [{"message": {"content": "Extracted facts."}}]
     })
     
-    # Large max_context so the per-source extract uses the full 40k-char
-    # ceiling (the extract now scales with max_context instead of a hardcoded
-    # 40k; a small worker context shrinks it, which is the fix).
+    # ⚠ SIZED BY THE WORKER'S PLAN, 2026-08-25. This test used to assert
+    # `max_tokens == 2048` and a ~40k-char prompt, i.e. it pinned the defect:
+    # on Nova that request is 41s of prefill against a 45s budget and could
+    # not finish even with the node idle (req 08766aa1). Both numbers now come
+    # from `plan_distill`, which reads the node's measured throughput.
+    llm_client.plan_distill = lambda budget_s, **kw: DistillPlan(
+        12_000, 320, True, "", 220.0, 12.0, 5, 40.0)
+
     result = await tool_deep_research(
         query="test",
         anonymous=False,
@@ -46,11 +52,14 @@ async def test_deep_research_map_reduce_online(mock_ddgs, mock_fetch):
     call_args = llm_client.chat_completion.call_args[0][0]
 
     assert call_args["model"] == "Test-Model"
-    assert call_args["max_tokens"] == 2048
+    assert call_args["max_tokens"] == 320          # the plan's, not a constant
+    assert call_args["max_tokens"] != 2048         # the number that shipped
 
-    # The 50k-char source is truncated to the ~40k ceiling at this context.
-    content_len = len(call_args["messages"][0]["content"])
-    assert 40000 < content_len < 41000
+    # The source is truncated to the plan's char limit, plus the instruction
+    # boilerplate — NOT to a 40k ceiling derived from the main model.
+    body = call_args["messages"][0]["content"].split("Source text:\n", 1)[1]
+    assert len(body) == 12_000
+    assert len(call_args["messages"][0]["content"]) < 40_000
     
     # The result should contain the edge extracted facts label
     assert "[EDGE EXTRACTED FACTS]:" in result
