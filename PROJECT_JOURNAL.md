@@ -26338,6 +26338,315 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4DI round 14 — the fix severed what it fed, and the stamp moved home (2026-08-27)
+
+**The final lens verified fixes 2–4 and rejected fix 1 with the cleanest severance yet.** The
+ownership gate added in round 13 was correct in intent and unreachable in fact:
+`_park_current_project`'s ONLY callers are the two request-start hygiene branches, both entered
+precisely because the conversation does NOT own the binding — so the gate its own call sites
+falsify by construction. Every genuine close (exit, archive, hard delete) goes through
+`_set_current(context, None)`, which deletes the sentinels and never stamped. The close-time heal
+this series shipped, documented and mutation-covered could never fire, and the same-turn-close
+false-refute class was silently back. **The pin could not see it** — it monkeypatched the ownership
+read, and every heal test seeded the stamp by hand.
+
+The stamp now lives in `_set_current(context, None)` — the one point every genuine close passes
+through — one line BEFORE the sentinel it reads is deleted; the park site carries a comment saying
+why there is deliberately no stamp there. The new pin drives the REAL route with the REAL sentinel
+keys through a dict-backed scratchpad, and a foreign-conversation binding stamps nothing.
+[[fix-inherits-the-blind-spot]] and [[the-fix-severs-what-it-feeds]] in one finding; the mutant is
+re-pointed at the live site.
+
+**State: 92 mutants, 90 killed, the two documented-redundancy survivors; suite 17,741 green;
+tree hashes stamped for the next verification.**
+
+## §4DI round 13 — the convergence lens earns its keep (2026-08-27)
+
+**Four findings, and the second is the one this series exists for.** The final convergence check
+verified the tree at rest, reproduced every load-bearing number — and then found that
+**the harness's multi-edit arm had been installing the WRONG mutant**: an incomplete rewrite left
+the loop reading the single-edit loop's leftover variables, so both redundancy-proof groups
+installed the last single mutant and reported ITS kill count as their own. The tell was in plain
+sight — both MULTI lines printed the same "(6 failing)" as the last shape mutant. The redundancy
+properties are true in substance (the lens applied the intended mutants by hand and both die), but
+the shipped proof was vacuous and would have stayed green if the redundancy were ever broken. The
+loop is rewritten scoped to its own names, per-file, and its first honest run prints the true
+counts again (6 and 2). **A proof that cannot fail is not stale — it is not a proof**, and this one
+was cited in three documents.
+
+**The close-time heal stamped parks it did not own.** `_park_current_project` also runs as
+request-start HYGIENE, deactivating ANOTHER conversation's leftover binding — and stamping those
+healed an unscoped turn to a project this conversation never touched, where a stale empty namesake
+refuted a healthy file. The stamp is now gated on the same ownership sentinel the heal itself uses:
+only a park of a project this conversation binds records anything.
+
+**Two smaller holes, both fixed with pins and mutants:** the sweep-mark match accepted bare
+BASENAME equality (a deleted `vendor/x.md` "explained" a missing top-level `x.md` — path-wise,
+project-relative equality now, and a second sweep inside the window UNIONS with the first instead
+of overwriting it); and the shell-evidence marker scanned ANY tool's content, so a web page quoting
+CI output disarmed the absence check — the marker is line-start anchored now and retrieval surfaces
+(browser, search, recall) are excluded outright, with the residual adversarial-quote case written
+down as an accepted fail-open limit. The editor-race abort in the harness also no longer restores
+over the very edits it aborted to protect.
+
+**State: 92 single-edit mutants (4 cross-file), 90 killed, two survivors the documented redundancy
+pair — now proven by a multi-edit arm that actually installs its mutants; suite 17,740 green.**
+
+## §4DI addendum — the closures reviewed, and rebuilt where they failed (2026-08-27)
+
+**The attack lens broke the first sweep mark four ways at once, and the fix is a redesign, not
+patches.** A DRY-RUN armed it (status stays "ok" and `deleted` lists what WOULD go); a second sweep
+of any project evicted the single slot inside the window, re-opening the race for the first; the
+mark carried no file list, so a tidy that deleted one stale screenshot "explained" the absence of
+`app.py` — a file tidy is structurally incapable of deleting; and the pid was stamped raw while
+`_project_dir` lowercases, so a mixed-case id missed in the false-refute direction.
+`_mark_removal` replaces it: a per-project capped dict of (timestamp, deleted-file list), dry-run
+guarded, casefolded, with `None` meaning "the whole tree went" — because the audit also found the
+one removal route with NO mark, `delete_project(hard=True)`, which rmtrees the workspace and is
+exactly the route the removal-capable name gate excludes on the claim that store marks cover it.
+The verdict's consumer now requires the mark to NAME the missing file (or be a whole-tree
+removal).
+
+**The removal-capable gate was wrong in both directions, and the fix is evidence over names.** The
+name list included `workspace` — a READ-ONLY reporting tool — and `system_utility` (weather and
+diagnostics), each of which silently neutralised real turns' absence checks; meanwhile an
+arbitrarily-named composed skill embedding an `execute` step walked straight past it. A shell run
+is recognised by the record itself now: the execute tool's own result markers, which composed-skill
+records embed verbatim for their shell steps.
+
+**Two more, same shape as ever.** The reversed ordering walk decided each key at its FIRST produce
+instead of its last — a rewrite after the exec left the earlier write's verdict standing (caught by
+probing the attack line before the lens reported it); and pair spellings were decided separately,
+so a post-exec rewrite under one spelling left the OTHER spelling "removable" for the same bytes.
+Keys are grouped by pair and decided once, at the last write.
+
+**The scope heal's third fallback was replaced, not patched.** `request_start_project_id` is one
+shared never-cleared slot — a CONCURRENT request's start overwrote it before the capture — and a
+turn that started under A, switched to B, wrote under B and closed B healed to A, refuting B's real
+files. The park path now records `(conversation_key, pid)` at the moment it clears the binding, so
+the heal is conversation-scoped and names the project actually closed.
+
+**Instrument fixes from the same round:** the downgrade now leaves a durable trace
+(`skipped_removable` rides the VerifyResult into the verdict sidecar — a mechanism that decides
+verdicts must not live only in a one-day log); the override report separates label provenance
+(45 of its first 65 joined labels were the verifier's own late verdicts — counting those as
+agreement is the instrument grading itself; real human labels ran 16/4) and joins on (at, seq)
+because seq is a per-process counter that resets on restart; the tripwire rejects
+`project_id=self.context.current_project_id` — the live-global SPELLING passed the old scan while
+being exactly the race it forbids; the `~` capture branch is greedy so `~/.config/app/x.json`
+cannot restart mid-path as a plausible relative; `file://` over a sandbox path is stripped to the
+path it names; and the mutation harness takes per-mutant TARGET FILES, because `_mark_removal`
+lives in workspace_cleanup.py and sat entirely outside the battery — its dry-run guard could have
+been deleted with every test green.
+
+**Corpus reach of the evidence gate, re-derived:** 39 of 123 ledger turns are fully downgraded
+(31.7%, down from 42 under the name gate — the read-only tools no longer disarm anything), 40.2% of
+hard keys; the other 68% of turns keep a live absence check, plus every emptiness check everywhere.
+
+**State at close: 88 single-edit mutants (3 cross-file), 86 killed, two survivors the documented
+redundancy pair proven by killed multi-edit mutants; suite 17,735 green.** The convergence lens's
+four pre-restart requirements are all met: the rework finished green, the harness re-pointed and
+re-run, the gate's corpus behaviour re-derived, and journal and docs describe the SHIPPED
+mechanisms.
+
+## §4DI — Closing the written-down limits (2026-08-27)
+
+**The operator asked for everything pending to be closed.** Six items stood: the two design limits
+the ledger's docstring carried, three minor residuals from the final lens reports, and the
+override-precision measurement that had no instrument. All closed.
+
+**1. Absence after a CONFIRMED write proves removal, not non-production.** That reframe closes the
+ledger's oldest limit. A `SUCCESS: Wrote …` confirmation IS the production evidence; a later
+absence proves only that something removed the file. Two removal routes leave no file_system
+confirmation to cancel the write, and both now downgrade the missing-refute to a logged skip —
+never to a refute the repair loop cannot win (the GlassOS shape, one tool over):
+
+- **A later shell/script step** (`rm` through `execute`, a composed skill's embedded run). ORDER is
+  the evidence: `_keys_removable_after_write` walks the record once, and only files written BEFORE
+  a removal-capable tool ran are downgraded. An execute that ran before the write proves nothing,
+  and those keys still refute — without the ordering gate, every turn that ran any script would
+  lose its absence check entirely.
+- **A workspace sweep racing the re-read** from another request during the async verdict window.
+  The sweep marks the store itself (`_mark_sweep` — mark it where you catch it; only a REAL
+  deletion arms it, a dry-run proves nothing), and the verdict consults the mark recency-gated at
+  15 minutes, the same window `_locate_entry_page` already uses. A sweep of ANOTHER project
+  explains nothing and still refutes.
+
+Emptiness is exempt from both downgrades on purpose: a file that is back on disk and 0 bytes is a
+real defect regardless of what ran after it.
+
+**2. The three residuals.** `${HOME}`-brace fragments now capture whole and are rejected (the
+un-braced form was fixed last round; the brace form still fragmented to `/a.txt`). The verdict
+tripwire now forbids taking a bare REFERENCE to `_compute_verifier_verdict` at all — aliasing and
+`functools.partial` evaded the call-site scan, so the scan refuses the shape rather than chasing
+its uses. And `_captured_project_id` gained a third fallback: `request_start_project_id`, captured
+at request start — a same-turn project close clears both the global and the conversation binding,
+and the turn's scoped writes then resolved against the raw root as fail-closed false refutes; the
+request-start capture still names the project whose directory holds the files.
+
+**3. The measurement has an instrument.** `scripts/verdict_override_report.py` joins the verdict
+sidecar's `override` provenance with corrections/human labels — per-override verdict counts and
+label agreement in one command. First run against the pre-provenance era: 88 shipped verdicts, 65
+labelled, text-judge agreement 61/4. The override columns fill as tagged traffic accrues; the
+question §4DG could not ask of the record is now a script, not a promise.
+
+**Also: §4DG's "written down rather than fixed" list is annotated as a period record** — every item
+on it has since been closed (banner and scoped-root in §4DH's rounds, shell-`rm` and sweep-race
+here), and the note says so, so nobody re-fixes fixed items from reading history.
+
+**State at close: 80 single-edit mutants, 78 killed, two survivors the documented redundancy pair
+proven by killed multi-edit mutants; suite 17,724 green.**
+
+## §4DH close-out — round 10 and convergence (2026-08-27)
+
+**The convergence check returned the same split verdict as §4DG's: safe to restart, not yet
+converged — eight contradictions, all edit-only.** All eight are fixed: the docs' mutation counts
+and reach numbers re-derived under the CURRENT code (the prose arm fires on 64 records now, not 28
+— 23 plain prose + the 41 restored route claims, and the growth IS the restored coverage); the
+deployment section now leads with the §4DH replay instead of presenting §4DG's; the deleted
+claim-deeper arm's DISPROVEN justification is replaced at both sites by the honest version (deleted
+as the certification hole, compensated by pair-alt resolution); the banner limit moved from "known
+limits" to "fixed"; and two harness mutants were repaired — one whose label promised a hard-list
+promotion its edit never performed, and one that killed by AttributeError instead of manifesting
+the refute its label names. The kill-by-crash class §4DG round 7 declared fixed recurred within
+three rounds: **a mutant that kills by crashing verifies nothing about the property it names**, and
+apparently needs re-checking every time the battery grows.
+
+**The verification lens found the drain to be the sibling one revision behind — twice in one
+finding.** The streamed drain's snapshot pid was a raw global read (no heal), and its tag-mismatch
+branch fell back to a LIVE post-semaphore global read: the §4DG cross-project race, re-opened on
+one branch of the fix that closed it. Both fixed: the fallback is now a PURE function
+(`_drain_scope_pid` — testable precisely because the drain itself is not) that prefers the
+request-tagged snapshot and otherwise uses the value the closure captured during the request; and
+the capture heal, which had grown FOUR inline copies in a single round, is consolidated into
+`_captured_project_id` — one heal, four call sites, its own pins. Four copies of the same ten
+lines in one round is the drift mechanism this whole feature history documents, happening in real
+time.
+
+**Also from the same lens, both fixed with pins:** the pair-alt path derived its directory rule
+from the ALT spelling (a prose-claimed FILE could be satisfied by a directory at the pair's
+rel_str); a could-not-check on one alt stopped the next alt from resolving; and the soft arm never
+consulted pair alts at all, so a retired pair-write re-created empty at its rel_str escaped the one
+check the soft arm keeps. The could-not-check pin initially could not distinguish success from
+surrender — both return None — and asserts through `report["resolved"]` instead.
+
+**Final state at close: 75 single-edit mutants, 73 killed, two survivors both documented
+redundancies proven by killed multi-edit mutants; suite 17,717 green; docs and journal re-derived
+against the shipped code.** Ten review rounds, twenty-five lenses. The pattern held to the end —
+every round's criticals were inside the previous round's fixes — and the exit was the same as
+§4DG's: not a round that found nothing, but a round whose findings no longer touched behaviour.
+
+## §4DH addendum — the review rounds on the demotion (2026-08-27)
+
+**The corpus replay validated the demotion outright**: on 1,857 records, 16 refuting records become
+clean — 15 verified-false refutes, 1 indeterminate, **0 real refutes lost** — 0 records newly
+refute, and 5 more false "missing" paths vanish from surviving refutes' issue lists.
+
+**And the adversarial lenses found the same pattern as every round before them: the criticals were
+inside my fixes.** Three findings, all fixed and pinned:
+
+**1. The race fix covered one caller of five.** I threaded the spawn-captured `project_id` through
+the gated front door — while the STREAMED drain (the production-common path: the web UI always
+streams), the in-loop repair spawn, the sync await, and both timeout attaches kept reading the
+process-global. Worse, inside the verdict itself only FILE-ARTIFACT used the captured id: WEB-EXEC
+and VISUAL scoped by live global reads in the same detached task, so one verdict could scope its
+three ground-truth arms to three different projects. An executed repro showed a correct turn
+false-refuted against the wrong project's empty namesake, then filing its follow-ups against the
+RIGHT project. All five callers and all three arms now thread one captured id through
+`_scoped_sandbox_for`; a tripwire test requires every `_compute_verifier_verdict(` call site to
+pass a captured id (the sentinel spelled explicitly does not count — the first tripwire draft was
+gameable exactly that way) and forbids live `project_scoped_sandbox(self.context)` reads in the
+verdict arms. The capture also HEALS through `_conversation_bound_project` at spawn time — a
+stomped global used to be healed at resolve time, and committing a captured None straight to the
+root would have regressed that.
+
+**2. The claim-deeper deletion's justification was provably wrong.** "The fallback root the caller
+always supplies" — the caller supplies it only when SCOPED, and the fallback's exact-path hit
+covers the OPPOSITE direction. Executed repro: a pair-write whose model spelling ran deeper than
+the file's real location read a PRESENT file as missing. The deletion stands — the arm was still
+the shallow-namesake certification hole — but resolution now consults the pair-write's own
+`rel_str` (the tool's statement of where the file landed, via `_fs_wrote_pair_alts`) before
+declaring a written file absent.
+
+**3. The soft arm could false-refute through a namesake.** A bare prose `config.json` claim
+resolved via the basename search to an unrelated EMPTY `vendor/config.json`. Soft resolution is
+exact-path-only now: emptiness testimony must be about the file at the claimed path, or nothing.
+
+**Two regressions of my own during the round, both caught by the machinery.** A `..`-escaping claim
+walked OUT of the sandbox on the exact-path probe (an empty host file one level up refuted a turn
+that never touched it) — found by my own pre-review probe of the reviewer's attack line, guarded
+and pinned. And the repair-path capture sat inside the async branch while the sync branch
+referenced it — the UnboundLocalError was swallowed by the defensive except *exactly as designed*,
+and surfaced only because eight tests count verifier passes and two became one. The capture now
+sits above the whole chain, and the comment says why.
+
+**The extractor's `~`/`$HOME` handling was fixture-picked in the docs' favour**: `~/notes.md`
+captured as `/notes.md` — a legitimate-looking sandbox-root spelling for a file in the operator's
+home. The capture now takes the fragment whole and rejects it; the route strip is case-insensitive
+(IGNORECASE capture, case-sensitive strip — the uppercase spelling silently lost its coverage).
+
+**Final state: 71 single-edit mutants, 69 killed; both survivors documented redundancies proven by
+multi-edit mutants; suite 17,708 green.**
+
+## §4DH — Prose is not absence-grade evidence (2026-08-27)
+
+**The deferred fixes from §4DG's close-out, plus the housekeeping, taken as one change.** The
+operator asked for all of them; the design centre is a single sentence: **only a tool confirmation
+may refute on absence.**
+
+**1. The prose arm is demoted to emptiness-only.** Every false FILE-ARTIFACT refute attested in the
+record was a prose capture — a host-path echo, a download link, another tool's output quoted back —
+refuting a turn on the ABSENCE of a file it never really produced, often with no file tool run at
+all. Prose contributed a file the ledger lacked on 7 of 1,855 records. So prose claims now ride the
+`soft` arm: a claimed-but-absent file is not evidence of anything, a claimed file that exists at
+**0 bytes still refutes** (the defect class prose actually catches), and a ledger-written file that
+is gone still refutes. The interleave built to stop prose starving the ledger arm was deleted the
+same hour — with one source for the hard list there is nothing to interleave, and starvation is
+impossible by construction rather than defended against.
+
+**2. The host-path denylist became an allowlist.** `_sandbox_shaped` enumerates what IS inside the
+sandbox — relative, `/workspace/…`, or a single-segment root spelling like `/probe.py` — instead of
+listing what isn't. The denylist leaked by construction: `~/x.json`, `$HOME/a.txt`, `/Volumes/…`,
+and the redaction artifact `/Data/AI/…` (born when `/Users/<user>` is redacted and the capture
+restarts mid-path) all walked past it. The case-sensitivity hole closes structurally — there is no
+tuple to spell `/System` in.
+
+**3. Download routes are stripped, not dropped.** `/api/download/<rel>` becomes `<rel>`: the link
+is a URL, but it names a real `image_generation`/`report_pdf` artifact that no other arm covers
+(the ledger parses only `file_system`), and 41 recorded turns had lost that coverage when the route
+was filtered. Under the demotion the restored coverage is emptiness-only — right for artifacts
+another tool produced.
+
+**4. Scoping is race-free.** The verdict runs in a detached task up to ~60s after the turn;
+`current_project_id` is process-global and a concurrent conversation's reconcile can repoint it
+mid-flight ([[the-sibling-one-revision-behind]]: `_attach_late_verdict_handler` had captured at
+spawn since 08-13, the verdict itself had not). The gated front door captures once and passes down;
+a captured `None` means UNSCOPED — the raw sandbox root via `stateful=True` — never "read the
+mutable global again later". The end-to-end pin drifts the global to a poison value and asserts the
+spy sees the captured one.
+
+**5. Pruned: the claim-deeper suffix arm and `_root_consumed`.** With the fallback root the caller
+always supplies, the arm was an exact substitute (0 of 142 replayed verdicts changed with it
+disabled) that doubled as the shallow-namesake certification hole two adversarial lenses attacked,
+and had a constraint bolted on to re-narrow it. A mechanism that cannot fire, defending a shape its
+sibling covers, priced at a wrong-file certification class: deletion is the fix. Its test had
+pinned it only because the fixture omitted the fallback root the caller always passes — the fixture
+now mirrors the caller, and the pin's docstring says why a future version must not resurrect the
+arm by testing a configuration that never runs. The follow-up task filer's unsliced `issues` read —
+the one consumer nobody hardened — is bounded to the merge cap.
+
+**One regression caught during the work, same family as ever:** the test agents' MagicMock context
+made `current_project_id` truthy, so the new explicit-id path handed a kwarg to stubs that took two
+positionals — TypeError, swallowed by the blanket except, checks silently off, tests green. The
+same shape as the `soft=` incident one round earlier; the stubs now take `*a, **k` and say why.
+
+**State: 63 single-edit mutants, 61 killed; both survivors documented redundancies proven by
+multi-edit mutants; suite 17,696 green.** Mutants for the deleted mechanisms were deleted with
+them, and one mutant became near-equivalent under the demotion (raw-spelling union dedup — the
+eviction it guarded is structurally impossible now) and was removed rather than left surviving:
+a harness that reports an unkillable mutant as SURVIVED is claiming coverage is missing when the
+property is gone.
+
 ## §4DG — The verifier refuted a turn for a file the agent tidied up (2026-08-26)
 
 **The report.** The operator asked for a functional web OS, got one, looked at it, liked it — and
@@ -26487,7 +26796,9 @@ while the check keeps reporting "clean" — nothing else fails. `TestProducerPar
 tripwire ([[the-sibling-one-revision-behind]]) — **and its first version did not trip**, which is
 the subject of the next round.
 
-**Written down rather than fixed** (each real, each needing its own design): a file removed by a
+**Written down rather than fixed** *(period record — every item in this list was later closed:
+the banner and scoped-root items in §4DH's rounds, the shell-`rm` and sweep-race items in §4DI)*:
+a file removed by a
 shell `rm` through `execute` reproduces the false refute by a route with no confirmation message; a
 `[FAILURE BANNER]` prefix — added whenever a tool result contains the literal "Traceback", which an
 echoed source block can supply — fails the SUCCESS gate and drops the record whole; the DONE-task

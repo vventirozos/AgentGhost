@@ -9,6 +9,9 @@
 <body>
 <aside class="sidebar">
   <h1>Ghost Agent</h1>
+
+  <p><strong>Removal marks (§4DI, 2026-08-27).</strong> Every real deletion here — a DONE-flip sweep, a tidy, and the project store's hard delete — stamps <code>store.recent_workspace_removals</code> via <code>_mark_removal</code>: a per-project capped dict of <code>(timestamp, deleted-file list)</code> (<code>None</code> = the whole tree went). The <a href="verifier.html">verifier</a>'s FILE-ARTIFACT check consults it, recency-gated, so a missing ledger-written file that a removal just explained reports could-not-check instead of refuting. Dry-runs never arm the mark; pids are casefolded because <code>_project_dir</code> lowercases.</p>
+
   <nav>
     <h3>Guide</h3>
     <a href="../index.html">&larr; Back to the guide</a>

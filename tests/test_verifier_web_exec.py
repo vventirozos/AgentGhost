@@ -639,9 +639,14 @@ def _fs(content):
 
 
 def _scope_to(monkeypatch, host_dir):
+    # ⚠ *a/**k, deliberately: this stands in for a real signature, and when
+    # that signature grew a keyword the positional-only stub raised
+    # TypeError INSIDE the block's blanket except — the check silently
+    # stopped running while every test stayed green. Same lesson as the
+    # test_verdict_fact_recording stubs.
     monkeypatch.setattr(
         "ghost_agent.tools.file_system.project_scoped_sandbox",
-        lambda ctx, stateful=False: (str(host_dir), "/workspace"))
+        lambda ctx, *a, **k: (str(host_dir), "/workspace"))
 
 
 async def _verdict_with(agent, tools, reply="Done."):
@@ -656,12 +661,12 @@ async def _verdict_with(agent, tools, reply="Done."):
 
 async def test_a_second_spelling_does_not_evict_a_real_deliverable(
         tmp_path, monkeypatch):
-    """⚠ The union deduped on the RAW spelling while the ledger keys are
-    normalised, so `/workspace/a.js` and `a.js` each burned one of the eight
-    slots. That eviction would silence the 2026-07-19 corrupted-
-    index.html guard (it differs on 0 of 1,855 recorded turns — the right
-    key for a shape the record has not yet produced, not a measured save) — the exact thing the mutated ∪ claimed union exists
-    for. Here index.html is empty and must still be caught."""
+    """The ledger-written empty index.html must refute no matter how the
+    other writes are spelled. (Historically this pinned an eight-slot
+    eviction through raw-spelling dedup in the claimed ∪ mutated union; the
+    §4DH demotion removed prose from the hard list and the union with it,
+    so the eviction is impossible by construction — the fixture survives as
+    a plain corrupted-write pin.)"""
     from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
     _scope_to(monkeypatch, tmp_path)
     for n in ("a.js", "b.js", "c.js", "d.js"):
@@ -719,8 +724,9 @@ async def test_a_file_artifact_refute_does_not_discard_an_execution_refute(
         return_value=("index.html", "SyntaxError: Unexpected token"))
     v_result, _ = await _verdict_with(
         agent,
-        [_fs("SUCCESS: Wrote 10 chars to 'index.html'.")],
-        reply="Done. I also saved the summary to notes.md.")
+        [_fs("SUCCESS: Wrote 10 chars to 'index.html'."),
+         _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")],   # never landed
+        reply="Done.")
     assert v_result.verdict == VerifyVerdict.REFUTED
     joined = "; ".join(v_result.issues or [])
     assert "uncaught JS exception" in joined      # execution evidence kept
@@ -729,12 +735,14 @@ async def test_a_file_artifact_refute_does_not_discard_an_execution_refute(
 
 async def test_prose_claims_cannot_starve_the_mutated_file_guard(
         tmp_path, monkeypatch):
-    """⚠ `_claimed` was concatenated before `_mutated` and the union then cut
-    to 8 — and the prose extractor alone returns up to 8. So a chatty answer
-    that named eight present files pushed the ledger arm out entirely, and a
-    file this turn CORRUPTED went unchecked because the model had talked
-    about other things. LLM prose must not outrank hard tool facts for a
-    scarce slot."""
+    """⚠ Prose must not outrank hard tool facts for a scarce slot. Two
+    designs failed here before the structural one: concatenating claims
+    first let 8 prose claims evict the ledger arm entirely, and an
+    interleave fixed the eviction while leaving prose in the hard list.
+    Prose now rides the soft (emptiness-only) arm, so the hard list is
+    ledger-only and starvation is impossible by construction — this pins
+    that a corrupted ledger-written file refutes REGARDLESS of how chatty
+    the answer is."""
     from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
     _scope_to(monkeypatch, tmp_path)
     names = [f"n{i}.md" for i in range(8)]
@@ -768,8 +776,9 @@ async def test_the_merged_issue_survives_every_consumers_slice(
     agent._execute_web_artifact = AsyncMock(
         return_value=("index.html", "SyntaxError: Unexpected token"))
     v_result, _ = await _verdict_with(
-        agent, [_fs("SUCCESS: Wrote 10 chars to 'index.html'.")],
-        reply="Done. I also saved the summary to notes.md.")
+        agent, [_fs("SUCCESS: Wrote 10 chars to 'index.html'."),
+                _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")],
+        reply="Done.")
     # what the repair directive and the backfill reason actually read
     assert "notes.md" in "; ".join(v_result.issues[:2])
     assert "uncaught JS exception" in "; ".join(v_result.issues[:2])
@@ -787,8 +796,9 @@ async def test_merging_the_same_refute_twice_is_idempotent(
         verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
     agent._execute_web_artifact = AsyncMock(
         return_value=("index.html", "SyntaxError: Unexpected token"))
-    tools = [_fs("SUCCESS: Wrote 10 chars to 'index.html'.")]
-    reply = "Done. I also saved the summary to notes.md."
+    tools = [_fs("SUCCESS: Wrote 10 chars to 'index.html'."),
+             _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")]
+    reply = "Done."
     first, _ = await _verdict_with(agent, tools, reply=reply)
     n_issues, n_also = len(first.issues), (first.reasoning or "").count("ALSO:")
     agent.context.verifier.verify_claim = AsyncMock(return_value=first)
@@ -815,8 +825,10 @@ async def test_a_sub_threshold_refute_is_replaced_not_promoted(
     agent = _refuting_agent(0.55, ["a weak textual objection"])
     agent._execute_web_artifact = AsyncMock(return_value=None)
     (tmp_path / "ok.md").write_text("present")
-    v, _ = await _verdict_with(agent, [_fs("SUCCESS: Wrote 7 chars to 'ok.md'.")],
-                               reply="Done. I saved notes.md.")
+    v, _ = await _verdict_with(
+        agent, [_fs("SUCCESS: Wrote 7 chars to 'ok.md'."),
+                _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")],
+        reply="Done.")
     joined = "; ".join(v.issues or [])
     assert "notes.md" in joined
     assert "weak textual objection" not in joined
@@ -832,8 +844,10 @@ async def test_the_grounded_issue_lands_inside_the_backfill_slice(
                                    "no evidence for C"])
     agent._execute_web_artifact = AsyncMock(return_value=None)
     (tmp_path / "ok.md").write_text("present")
-    v, _ = await _verdict_with(agent, [_fs("SUCCESS: Wrote 7 chars to 'ok.md'.")],
-                               reply="Done. I saved notes.md.")
+    v, _ = await _verdict_with(
+        agent, [_fs("SUCCESS: Wrote 7 chars to 'ok.md'."),
+                _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")],
+        reply="Done.")
     assert "notes.md" in "; ".join((v.issues or [])[:2])
 
 
@@ -846,8 +860,9 @@ async def test_merging_into_the_same_object_twice_changes_nothing(
     agent = _refuting_agent(0.85, ["claim A unsupported"])
     agent._execute_web_artifact = AsyncMock(return_value=None)
     (tmp_path / "ok.md").write_text("present")
-    tools = [_fs("SUCCESS: Wrote 7 chars to 'ok.md'.")]
-    reply = "Done. I saved notes.md."
+    tools = [_fs("SUCCESS: Wrote 7 chars to 'ok.md'."),
+             _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")]   # never landed
+    reply = "Done."
     first, _ = await _verdict_with(agent, tools, reply=reply)
     n_issues = len(first.issues or [])
     n_also = (first.reasoning or "").count("ALSO:")
@@ -868,7 +883,282 @@ async def test_both_grounded_issues_reach_the_repair_directive(
     agent = _refuting_agent(0.85, ["claim A unsupported", "claim B hedged"])
     agent._execute_web_artifact = AsyncMock(return_value=None)
     v, _ = await _verdict_with(
-        agent, [_fs("SUCCESS: Wrote 0 chars to 'hollow.md'.")],
-        reply="Done. I saved notes.md and wrote hollow.md.")
+        agent, [_fs("SUCCESS: Wrote 0 chars to 'hollow.md'."),
+                _fs("SUCCESS: Wrote 20 chars to 'notes.md'.")],
+        reply="Done.")
     directive = "; ".join((v.issues or [])[:3])
     assert "notes.md" in directive and "hollow.md" in directive
+
+
+# ── round 8: prose demoted to emptiness-only; race-free scoping ───────
+async def test_a_prose_only_claim_never_refutes_on_absence(
+        tmp_path, monkeypatch):
+    """⚠ THE HEADLINE CHANGE. Every false FILE-ARTIFACT refute attested in
+    the record was a prose capture refuting on the ABSENCE of a file the
+    answer never really produced — on turns that often ran no file tool at
+    all. Prose now rides the soft arm: a claimed-but-absent file is not
+    evidence of anything, and the text verdict stands."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    _scope_to(monkeypatch, tmp_path)
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    v, _ = await _verdict_with(
+        agent, [{"role": "tool", "name": "web_search",
+                 "content": "RESULTS: ..."}],
+        reply="As agreed, I saved the board to game_state.json earlier.")
+    assert v.verdict == VerifyVerdict.CONFIRMED
+    assert v.confidence == 0.95
+
+
+async def test_a_prose_claimed_EMPTY_file_still_refutes(
+        tmp_path, monkeypatch):
+    """Prose keeps its teeth for emptiness: a claimed file that exists at 0
+    bytes is a real defect the old parse caught, and still is."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    _scope_to(monkeypatch, tmp_path)
+    (tmp_path / "summary.md").write_text("")
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    v, _ = await _verdict_with(
+        agent, [{"role": "tool", "name": "web_search",
+                 "content": "RESULTS: ..."}],
+        reply="Done — I saved the summary to summary.md.")
+    assert v.verdict == VerifyVerdict.REFUTED
+    assert "summary.md" in "; ".join(v.issues or [])
+
+
+async def test_a_ledger_written_file_still_refutes_on_absence(
+        tmp_path, monkeypatch):
+    """The demotion must not defang the ledger arm: a tool confirmation IS
+    absence-grade evidence, and a written file that is gone still refutes."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    _scope_to(monkeypatch, tmp_path)
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    v, _ = await _verdict_with(
+        agent, [_fs("SUCCESS: Wrote 20 chars to 'report.md'.")],
+        reply="Done.")
+    assert v.verdict == VerifyVerdict.REFUTED
+    assert "report.md" in "; ".join(v.issues or [])
+
+
+async def test_the_verdict_scopes_to_the_project_captured_at_spawn(
+        tmp_path, monkeypatch):
+    """⚠ RACE-FREE SCOPING. The verdict runs in a detached task up to ~60s
+    after the turn, and `current_project_id` is process-global — a
+    concurrent conversation's reconcile can repoint it mid-flight, resolving
+    this turn's deliverables against the WRONG project's directory. The
+    gated front door captures the id at spawn; the verdict must use the
+    captured value, not re-read the global."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    seen = {}
+
+    def _spy(ctx, *a, **k):
+        seen.update(k)
+        seen["stateful"] = k.get("stateful", a[0] if a else False)
+        return (str(tmp_path), "/workspace")
+
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox", _spy)
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    (tmp_path / "a.md").write_text("x")
+    # the global says one thing; the captured value says another
+    agent.context.current_project_id = "GLOBAL-DRIFTED"
+    await agent._compute_verifier_verdict(
+        tools_run_this_turn=[_fs("SUCCESS: Wrote 1 chars to 'a.md'.")],
+        messages=[{"role": "user", "content": "x"}],
+        final_ai_content="Done.", last_user_content="x", lc="x",
+        project_id="captured-at-spawn")
+    assert seen.get("explicit_project_id") == "captured-at-spawn"
+
+
+async def test_a_captured_None_project_means_unscoped_not_reread(
+        tmp_path, monkeypatch):
+    """'No project at capture' must mean UNSCOPED — passing None through to
+    `project_scoped_sandbox` would fall back to the mutable global, which by
+    verdict time may point at a project this turn never ran under."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    seen = {}
+
+    def _spy(ctx, *a, **k):
+        seen.update(k)
+        if a:
+            seen["stateful"] = a[0]
+        return (str(tmp_path), "/workspace")
+
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox", _spy)
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    (tmp_path / "a.md").write_text("x")
+    agent.context.current_project_id = "GLOBAL-DRIFTED"
+    await agent._compute_verifier_verdict(
+        tools_run_this_turn=[_fs("SUCCESS: Wrote 1 chars to 'a.md'.")],
+        messages=[{"role": "user", "content": "x"}],
+        final_ai_content="Done.", last_user_content="x", lc="x",
+        project_id=None)
+    assert seen.get("stateful") is True
+    assert "explicit_project_id" not in seen
+
+
+# ── round 9: every front door threads the captured scope ──────────────
+def test_every_verdict_entry_point_threads_a_captured_project_id():
+    """⚠ TRIPWIRE, because this exact miss happened three times in one
+    round: the captured id was threaded to ONE consumer while the streamed
+    spawn (the production-common path), the in-loop repair spawn and both
+    timeout attaches kept reading the process-global — one verdict could
+    scope its arms to different projects. Every direct call to
+    `_compute_verifier_verdict(` must pass `project_id=`, and the verdict
+    flow must contain no live `project_scoped_sandbox(self.context)` read.
+    A new caller that forgets is exactly the next instance of the bug."""
+    import inspect
+    import re as _re
+    from pathlib import Path as _P
+    src = (_P(inspect.getfile(GhostAgent))).read_text(encoding="utf-8")
+    # every direct call passes project_id= within its argument block
+    for m in _re.finditer(r"self\._compute_verifier_verdict\(", src):
+        window = src[m.end():m.end() + 800]
+        args_block = window[: window.find(")\n") + 2 if ")\n" in window
+                            else len(window)]
+        assert ("project_id=" in args_block
+                and "project_id=_PROJECT_ID_UNCAPTURED" not in args_block
+                # ⚠ the live-global SPELLING is not a capture — an audit
+                # showed `project_id=self.context.current_project_id` passed
+                # this scan while being exactly the race it forbids.
+                and "current_project_id" not in args_block), (
+            "a _compute_verifier_verdict call site does not thread a "
+            "CAPTURED project_id — passing nothing (or the sentinel, which "
+            "is the same thing spelled louder) re-reads the process-global "
+            "inside a detached task:\n"
+            + src[max(0, m.start() - 200): m.end() + 300])
+    # a REFERENCE to the method (aliasing, functools.partial) would evade
+    # the call-site scan above entirely — forbid taking one at all: every
+    # occurrence of the attribute must be an immediate call.
+    for m in _re.finditer(
+            r"self\._compute_verifier_verdict\b(?!\()"
+            r"|type\(self\)\._compute_verifier_verdict"
+            r"|['\"]_compute_verifier_verdict['\"]", src):
+        raise AssertionError(
+            "a bare reference to _compute_verifier_verdict (alias/partial?) "
+            "evades the project-id tripwire — call it directly:\n"
+            + src[max(0, m.start() - 200): m.end() + 200])
+    # and the verdict arms themselves never read the global directly
+    for fn in (GhostAgent._compute_verifier_verdict,
+               GhostAgent._execute_web_artifact):
+        body = inspect.getsource(fn)
+        assert "project_scoped_sandbox(self.context)" not in body, (
+            f"{fn.__name__} scopes through a live global read — use "
+            f"_scoped_sandbox_for(project_id)")
+
+
+async def test_the_gated_front_door_captures_and_threads_the_global(
+        tmp_path, monkeypatch):
+    """Behavioral half of the tripwire: drive the GATED door and assert the
+    value it captured reaches the sandbox scoping as explicit_project_id."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    seen = {}
+
+    def _spy(ctx, *a, **k):
+        seen.update(k)
+        return (str(tmp_path), "/workspace")
+
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox", _spy)
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    agent._critic_gate_timeout = lambda: float("inf")
+    agent._critic_async_enabled = lambda: False
+    agent.context.current_project_id = "pid-at-spawn"
+    agent.context.args = None
+    (tmp_path / "a.md").write_text("x")
+    await agent._compute_verifier_verdict_gated(
+        tools_run_this_turn=[_fs("SUCCESS: Wrote 1 chars to 'a.md'.")],
+        messages=[{"role": "user", "content": "x"}],
+        final_ai_content="Done.", last_user_content="x", lc="x",
+        trajectory_id="")
+    assert seen.get("explicit_project_id") == "pid-at-spawn"
+
+
+async def test_a_stomped_global_is_healed_from_the_conversation_binding(
+        tmp_path, monkeypatch):
+    """⚠ A global cleared mid-request by a concurrent reconcile used to be
+    healed inside project_scoped_sandbox at resolve time; committing a
+    captured None straight to the raw root would regress that. The capture
+    heals through `_conversation_bound_project` while conversation_key is
+    still this turn's own."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    seen = {}
+
+    def _spy(ctx, *a, **k):
+        seen.update(k)
+        return (str(tmp_path), "/workspace")
+
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox", _spy)
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system._conversation_bound_project",
+        lambda ctx: "healed-pid")
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    agent._critic_gate_timeout = lambda: float("inf")
+    agent._critic_async_enabled = lambda: False
+    agent.context.current_project_id = None       # stomped
+    agent.context.args = None
+    (tmp_path / "a.md").write_text("x")
+    await agent._compute_verifier_verdict_gated(
+        tools_run_this_turn=[_fs("SUCCESS: Wrote 1 chars to 'a.md'.")],
+        messages=[{"role": "user", "content": "x"}],
+        final_ai_content="Done.", last_user_content="x", lc="x",
+        trajectory_id="")
+    assert seen.get("explicit_project_id") == "healed-pid"
+
+
+async def test_web_exec_scopes_by_the_captured_id_not_the_global(
+        tmp_path, monkeypatch):
+    """⚠ The structural pin alone was gameable: routing through the helper
+    with the SENTINEL still reads the global. Drive the real
+    `_execute_web_artifact` and assert the sandbox scoping received the
+    captured id."""
+    seen = {}
+
+    def _spy(ctx, *a, **k):
+        seen.update(k)
+        return (str(tmp_path), "/workspace")
+
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox", _spy)
+    agent = GhostAgent.__new__(GhostAgent)
+    agent.context = MagicMock()
+    agent.available_tools = {"browser": AsyncMock()}
+    await agent._execute_web_artifact(["index.html"],
+                                      project_id="captured-web")
+    assert seen.get("explicit_project_id") == "captured-web"
+
+
+async def test_the_removal_downgrade_leaves_a_durable_trace(
+        tmp_path, monkeypatch):
+    """⚠ the downgrade decides verdicts; a mechanism whose firings live only
+    in a one-day log is the exact "no durable record" defect the override
+    provenance was built to close. The skip list rides the VerifyResult into
+    the sidecar."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    _scope_to(monkeypatch, tmp_path)
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    v, _ = await _verdict_with(
+        agent,
+        [_fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+         {"role": "tool", "name": "execute",
+          "content": "--- COMMAND RESULT ---\nEXIT CODE: 0"}],
+        reply="Done.")
+    assert v.verdict == VerifyVerdict.CONFIRMED
+    assert getattr(v, "skipped_removable", None) == ["probe.py"]

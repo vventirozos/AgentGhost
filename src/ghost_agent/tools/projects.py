@@ -635,6 +635,25 @@ def _set_current(context, project_id: Optional[str]):
     if sp is not None:
         try:
             if project_id is None:
+                # ⚠ record WHAT this conversation is closing, HERE — while
+                # the ownership sentinel is still readable, one line before
+                # it is deleted. This is the only point every genuine close
+                # route (exit, archive, hard delete) passes through; the
+                # first version stamped in `_park_current_project`, whose
+                # only callers are the request-start HYGIENE branches, where
+                # ownership is false by construction — the stamp was
+                # unreachable from every production path and the same-turn-
+                # close false-refute class it closed was silently back
+                # (round-14 convergence lens: "the fix severs what it
+                # feeds"). The verifier's scope heal reads
+                # (conversation_key, pid); only an owned binding stamps.
+                try:
+                    if prev and _conversation_bound_project_pid(
+                            context) == prev:
+                        context.last_closed_project = (
+                            getattr(context, "conversation_key", None), prev)
+                except Exception:
+                    pass
                 sp.delete(_CURRENT_SENTINEL)
                 sp.delete(_CURRENT_CONV_SENTINEL)
             else:
@@ -766,10 +785,28 @@ def _message_references_project(context, project_id: str) -> bool:
     return False
 
 
+def _conversation_bound_project_pid(context) -> str:
+    """The pid this conversation's sentinels bind, or "". Thin wrapper so
+    the park-stamp ownership gate and the verifier heal share one notion."""
+    try:
+        from .file_system import _conversation_bound_project
+        return _conversation_bound_project(context) or ""
+    except Exception:
+        return ""
+
+
 def _park_current_project(context, cur: str, why: str):
     """Deactivate the process-global active project for THIS request,
     snapshotting its scratchpad so the owning conversation can resume it."""
     saved = _snapshot_scratchpad(context, cur)
+    # (No close-stamp here, deliberately. This function's only callers are
+    # the request-start HYGIENE branches, where the conversation owns the
+    # parked project in NEITHER case — a stamp here is either wrong (the
+    # round-13 finding: healing to a project this conversation never
+    # touched) or unreachable (the round-14 finding: an ownership gate that
+    # its own call sites falsify by construction). The live stamp is in
+    # `_set_current(context, None)`, the one point every genuine close
+    # passes through.)
     context.current_project_id = None
     _wm = getattr(context, "workspace_model", None)
     if _wm is not None:

@@ -595,6 +595,18 @@ class ProjectStore:
                     except Exception:
                         pass
                     shutil.rmtree(ws_p, ignore_errors=True)
+                    # ⚠ the whole tree just went — stamp the removal mark
+                    # (deleted=None = "everything") so a verdict in flight
+                    # for this project reports could-not-check instead of
+                    # refuting files the delete removed. This was the one
+                    # removal route with no mark: `manage_projects` is
+                    # excluded from the verdict's removal-capable names ON
+                    # THE CLAIM that its removal paths stamp the store.
+                    try:
+                        from ..core.workspace_cleanup import _mark_removal
+                        _mark_removal(self, project_id, None)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.warning("Could not remove workspace for %s: %s", project_id, e)
         return deleted

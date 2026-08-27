@@ -185,8 +185,13 @@ class TestTheWriterActuallyRuns:
         monkeypatch.setattr(AG, "_claimed_deliverable_files",
                             lambda *x, **k: ["report.md"], raising=False)
         import ghost_agent.tools.file_system as fs
+        # ⚠ *a/**k: when the real signature grew keywords this positional
+        # stub raised TypeError inside the blanket except and the override
+        # silently stopped running — the THIRD stub in this feature to fail
+        # that way, one file over from the two that were already fixed.
         monkeypatch.setattr(fs, "project_scoped_sandbox",
-                            lambda c: (str(tmp_path), None), raising=False)
+                            lambda c, *a, **k: (str(tmp_path), None),
+                            raising=False)
 
         final = "Done — report.md is written."
         asyncio.run(a._compute_verifier_verdict(
@@ -269,8 +274,13 @@ class TestTheWriterActuallyRuns:
         monkeypatch.setattr(AG, "_claimed_deliverable_files",
                             lambda *x, **k: ["report.md"], raising=False)
         import ghost_agent.tools.file_system as fs
+        # ⚠ *a/**k: when the real signature grew keywords this positional
+        # stub raised TypeError inside the blanket except and the override
+        # silently stopped running — the THIRD stub in this feature to fail
+        # that way, one file over from the two that were already fixed.
         monkeypatch.setattr(fs, "project_scoped_sandbox",
-                            lambda c: (str(tmp_path), None), raising=False)
+                            lambda c, *a, **k: (str(tmp_path), None),
+                            raising=False)
 
         final = "Done — report.md is written."
         asyncio.run(a._compute_verifier_verdict(

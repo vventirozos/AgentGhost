@@ -43,7 +43,13 @@ import tempfile
 _argv = sys.argv
 REPO = (_argv[_argv.index("--tree") + 1] if "--tree" in _argv
         else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TARGET = os.path.join(REPO, "src/ghost_agent/core/agent.py")
+# A mutant tuple may carry a 4th element: the repo-relative file it edits
+# (default agent.py). ⚠ Added because `_mark_removal` lives in
+# workspace_cleanup.py and sat entirely OUTSIDE the battery — its dry-run
+# guard could be deleted with every test green and the harness none the
+# wiser.
+DEFAULT_TARGET_REL = "src/ghost_agent/core/agent.py"
+TARGET = os.path.join(REPO, DEFAULT_TARGET_REL)
 # ⚠ test_verdict_fact_recording.py is here because a signature change in
 # `_verify_file_artifacts` broke two stubs in THAT file — the resulting
 # TypeError was swallowed by the block's blanket `except`, both tests kept
@@ -85,19 +91,32 @@ MUTANTS = [
      "r\"^SUCCESS: (?:Downloaded|Copied) '.+?' to '(.+?)'\\.\")",
      "r\"^SUCCESS: (?:Downloaded|Copied) '(.+?)' to '.+?'\\.\")"),
     ("confirmation-line split removed",
-     '        head = content.split("\\n", 1)[0][:4000]',
-     "        head = content[:4000]"),
+     '        head = content.split("\\n", 1)[0][:4000]\n        # \u26a0 FOUR OVERLAPPING GUARDS keep an echoed confirmation inert: the',
+     "        head = content[:4000]\n        # \u26a0 FOUR OVERLAPPING GUARDS keep an echoed confirmation inert: the"),
     ("synthetic records accepted",
-     '        if not isinstance(t, dict) or t.get("_synthetic"):',
-     "        if not isinstance(t, dict):"),
+     '        if not isinstance(t, dict) or t.get("_synthetic"):\n'
+     '            continue\n'
+     "        # \u26a0 The canonical name ONLY.",
+     '        if not isinstance(t, dict):\n'
+     '            continue\n'
+     "        # \u26a0 The canonical name ONLY."),
     ("tool-name gate removed",
+     '        # lists that must agree are one list too many.\n'
      '        if str(t.get("name", "")) != "file_system":',
-     "        if False:"),
+     '        # lists that must agree are one list too many.\n'
+     '        if False:'),
     ("banner prefix no longer stripped",
-     '        if content.startswith("[FAILURE BANNER]"):', "        if False:"),
+     '        # fix for an observed incident.\n'
+     '        if content.startswith("[FAILURE BANNER]"):',
+     '        # fix for an observed incident.\n'
+     '        if False:'),
     ("soft paths refute on absence",
      "            if found is None or found is False or is_dir:",
-     "            if found is False or is_dir:"),
+     "            if found is False or is_dir:\n"
+     "                continue\n"
+     "            if found is None:\n"
+     "                missing.append(name)\n"
+     "                continue"),
     ("soft emptiness arm dropped",
      "            if _record(found, name) and _is_empty(found, name):",
      "            if False:"),
@@ -105,19 +124,20 @@ MUTANTS = [
      "            return (False, False) if unknown else (None, False)",
      "            return None, False"),
     ("directory answers a prose file claim",
-     "            dir_ok = _fs_norm(name) not in _file_claim_keys",
+     "            dir_ok = _fs_norm(dir_ok_name if dir_ok_name is not None\n"
+     "                              else name) not in _file_claim_keys",
      "            dir_ok = True"),
     ("foreign-project guard disabled",
      "                    and parts[1] not in own_ids)",
      "                    and False)"),
     ("basename search allowed on fallback roots",
-     "                if root != primary:\n"
-     "                    # A fallback root gets its exact path and nothing more:",
-     "                if False:\n"
-     "                    # A fallback root gets its exact path and nothing more:"),
+     "                if root != primary or exact_only:",
+     "                if exact_only:"),
     ("claim regex cannot capture a leading slash",
-     'r"[`\'\\"]?((?:[A-Za-z][A-Za-z0-9+.\\-]*://)?/?"',
-     'r"[`\'\\"]?("'),
+     '    r"[`\'\\"]?((?:~[A-Za-z0-9._/\\-]*|\\$\\{?[A-Za-z_0-9]+\\}?)?"\n'
+     '    r"(?:[A-Za-z][A-Za-z0-9+.\\-]*://)?/?"',
+     '    r"[`\'\\"]?((?:~[A-Za-z0-9._/\\-]*|\\$\\{?[A-Za-z_0-9]+\\}?)?"\n'
+     '    r"(?:[A-Za-z][A-Za-z0-9+.\\-]*://)?"'),
 
     ("shape: Wrote (produce pattern)",
      "    re.compile(r\"^SUCCESS: Wrote \\d+ chars to '(.+?)'\\.\"),",
@@ -151,11 +171,6 @@ MUTANTS = [
     ("foreign guard compares raw, unnormalised paths",
      '            return os.path.normpath(str(rel)).replace(os.sep, "/").casefold()',
      '            return str(rel)'),
-    ("claim-deeper arm unconstrained by the root's own path",
-     "                            if not _root_consumed(\n"
-     "                                    root, want[: -(len(hit) + 1)]):\n"
-     "                                continue",
-     "                            pass"),
     ("directory rule skips instead of stopping",
      "                        if not dir_ok:\n                            return None, False",
      "                        if not dir_ok:\n                            pass"),
@@ -169,21 +184,147 @@ MUTANTS = [
      "        _file_claim_keys = {str(c) for c in (file_claims or ())}"),
     ("resolved-path dedup back to claim strings",
      "            if key in seen_real:", "            if False:"),
-    ("sys-path filter back to bare prefixes",
-     "_SYS_PATH_SEGMENTS = tuple(p.lower() + \"/\" for p in _SYS_PATH_PREFIXES)",
-     "_SYS_PATH_SEGMENTS = tuple(p.lower() for p in _SYS_PATH_PREFIXES)"),
-    ("sys-path filter case-sensitive again",
-     "                or name.lower().startswith(_SYS_PATH_SEGMENTS)",
-     "                or name.startswith(_SYS_PATH_SEGMENTS)"),
-    ("route filter widened back to a bare api/",
-     '_HTTP_ROUTE_PREFIXES = ("/api/download/", "api/download/")',
-     '_HTTP_ROUTE_PREFIXES = ("/api/", "api/")'),
-    ("http-route claims no longer filtered",
-     "                or name.startswith(_HTTP_ROUTE_PREFIXES)):", "                ):"),
-    ("union no longer interleaved",
-     "            _to_check = [x for pair in zip_longest(_claim_q, _mut_q)\n"
-     "                         for x in pair if x is not None][:8]",
-     "            _to_check = (_claim_q + _mut_q)[:8]"),
+    ("prose claims promoted back to the hard list",
+     "            for _cand in _mutated:",
+     "            for _cand in list(_claimed) + list(_mutated):"),
+    ("prose claims dropped instead of soft-checked",
+     "            for _cand in list(_retired) + [c for c in _claimed]:",
+     "            for _cand in list(_retired) + [c for c in _claimed]:\n"
+     "                if _cand in _claimed:\n"
+     "                    continue"),
+    ("allowlist accepts any absolute path",
+     '    return "/" not in name[1:]          # "/probe.py" yes, "/etc/x.conf" no',
+     "    return True"),
+    ("allowlist rejects sandbox-root spellings",
+     '    return "/" not in name[1:]          # "/probe.py" yes, "/etc/x.conf" no',
+     "    return False"),
+    ("workspace prefix no longer allowlisted",
+     '    if name.startswith("/workspace/"):\n        return True',
+     "    if False:\n        return True"),
+    ("download route dropped instead of stripped",
+     "                name = name[len(_pfx):]     # the route -> the artifact",
+     '                name = ""'),
+    ("captured project id ignored — global re-read",
+     "        if project_id and project_id is not _PROJECT_ID_UNCAPTURED:",
+     "        if False:"),
+    ("captured None falls back to the mutable global",
+     "        return project_scoped_sandbox(self.context, stateful=True)[0]",
+     "        return project_scoped_sandbox(self.context)[0]"),
+    ("sentinel resolution removed — kwarg dead",
+     '        if project_id is _PROJECT_ID_UNCAPTURED:\n'
+     '            project_id = getattr(self.context, "current_project_id", None)',
+     "        project_id = getattr(self.context, \"current_project_id\", None)"),
+    ("streamed drain stops threading the captured id",
+     "                                project_id=_drain_pid,",
+     "                                project_id=_PROJECT_ID_UNCAPTURED,"),
+    ("web-exec back to a live global read",
+     "        sbx = Path(self._scoped_sandbox_for(project_id))",
+     "        sbx = Path(self._scoped_sandbox_for(_PROJECT_ID_UNCAPTURED))"),
+    ("pair alternates not consulted before missing",
+     "                _saw_unknown = False\n"
+     "                for _alt in (alt_spellings or {}).get(str(name), ()):",
+     "                _saw_unknown = False\n"
+     "                for _alt in ():"),
+    ("soft arm resolves by basename again",
+     "            found, is_dir = _resolve(name, exact_only=True)",
+     "            found, is_dir = _resolve(name)"),
+    ("home fragments accepted again",
+     '        if name[:1] in ("~", "$"):', "        if False:"),
+    ("route strip case-sensitive again",
+     "            if name[:len(_pfx)].lower() == _pfx:",
+     "            if name[:len(_pfx)] == _pfx:"),
+    ("drain fallback back to a live global read",
+     "        return captured",
+     "        return None  # (a live global read stood here)"),
+    ("the one scope heal disabled — stomped globals commit raw",
+     "        pid = getattr(self.context, \"current_project_id\", None)\n"
+     "        if pid:\n"
+     "            return pid",
+     "        pid = getattr(self.context, \"current_project_id\", None)\n"
+     "        if True:\n"
+     "            return pid"),
+    ("alt dir_ok derived from the alt spelling again",
+     "            dir_ok = _fs_norm(dir_ok_name if dir_ok_name is not None\n"
+     "                              else name) not in _file_claim_keys",
+     "            dir_ok = _fs_norm(name) not in _file_claim_keys"),
+    ("could-not-check alt stops the search again",
+     "                    if _f2 is False:\n"
+     "                        _saw_unknown = True\n"
+     "                        continue",
+     "                    if _f2 is False:\n"
+     "                        _saw_unknown = True\n"
+     "                        break"),
+    ("soft arm no longer consults pair alts",
+     "            if found is None:\n"
+     "                for _alt in (alt_spellings or {}).get(str(name), ()):\n"
+     "                    _f2, _d2 = _resolve(_alt, exact_only=True,",
+     "            if False:\n"
+     "                for _alt in (alt_spellings or {}).get(str(name), ()):\n"
+     "                    _f2, _d2 = _resolve(_alt, exact_only=True,"),
+    ("keys re-decided on every produce — rewrites downgrade again",
+     "            if not k or k in decided:",
+     "            if not k:"),
+    ("removal-after-write ordering ignored — any exec disarms the check",
+     "            decided.add(k)\n"
+     "            if exec_seen:",
+     "            decided.add(k)\n"
+     "            if True:"),
+    ("removal-capable downgrade dropped — the GlassOS-adjacent refute returns",
+     '                if _k in (removable_keys or ()):',
+     "                if False:"),
+    ("sweep mark: the deleted list no longer has to NAME the file",
+     "                                        and _krel in _del):",
+     "                                        and True):"),
+    ("brace-form env fragments split again",
+     'r"[`\'\\"]?((?:~[A-Za-z0-9._/\\-]*|\\$\\{?[A-Za-z_0-9]+\\}?)?"',
+     'r"[`\'\\"]?((?:~[A-Za-z0-9._/\\-]*|\\$[A-Za-z_]+)?"'),
+    ("close-time heal record ignored — closed projects unscope",
+     "            _lc = getattr(self.context, \"last_closed_project\", None)",
+     "            _lc = None"),
+    ("shell-evidence markers ignored — composed skills walk past again",
+     "    return bool(_SHELL_EVIDENCE_RE.search(content[:4000]))",
+     "    return False"),
+    ("read-only tools disarm the absence check again",
+     '_REMOVAL_CAPABLE_NAMES = ("execute",)',
+     '_REMOVAL_CAPABLE_NAMES = ("execute", "workspace", "system_utility")'),
+    ("pair spellings decided separately again",
+     "            k = rep.get(k, k)",
+     "            pass"),
+    ("removal downgrade loses its durable trace",
+     "                            v_result.skipped_removable = list(",
+     "                            _ignored = list("),
+    ("dry-run arms the removal mark",
+     "    if dry_run:\n        return",
+     "    if False:\n        return",
+     "src/ghost_agent/core/workspace_cleanup.py"),
+    ("removal mark stamps the raw mixed-case pid",
+     '        key = str(project_id or "").strip().casefold()',
+     '        key = str(project_id or "").strip()',
+     "src/ghost_agent/core/workspace_cleanup.py"),
+    ("the genuine-close stamp stops firing",
+     "                    if prev and _conversation_bound_project_pid(",
+     "                    if False and _conversation_bound_project_pid(",
+     "src/ghost_agent/tools/projects.py"),
+    ("sweep match back to basename equality",
+     "                    if _del is None or (_del != \"ABSENT\"\n"
+     "                                        and _krel in _del):",
+     "                    if _del is None or (_del != \"ABSENT\"\n"
+     "                                        and any(_krel.rsplit(\"/\", 1)[-1]\n"
+     "                                                == d.rsplit(\"/\", 1)[-1]\n"
+     "                                                for d in _del)):"),
+    ("shell marker un-anchored again",
+     'r"^--- (?:COMMAND|EXECUTION) RESULT ---"',
+     'r"--- (?:COMMAND|EXECUTION) RESULT ---"'),
+    ("retrieval surfaces disarm again",
+     "    if name in _RETRIEVAL_SURFACE_NAMES:\n        return False",
+     "    if name in _RETRIEVAL_SURFACE_NAMES:\n        pass"),
+    ("second sweep overwrites the fresh earlier mark",
+     "        prev = marks.get(key)",
+     "        prev = None",
+     "src/ghost_agent/core/workspace_cleanup.py"),
+    ("escaping dot-dot claims resolve again",
+     '            if _norm_rel(rel).split("/", 1)[0] == "..":',
+     "            if False:"),
     ("merge has no confidence floor",
      "                            and getattr(v_result, \"confidence\", 0.0) >= 0.7):",
      "                            ):"),
@@ -195,23 +336,12 @@ MUTANTS = [
     ("merge is not idempotent",
      "                        if _fa_issues:      # idempotent: re-running adds nothing",
      "                        if True:"),
-    ("suffix rule: claim-deeper arm removed",
-     '                        elif want.endswith("/" + hit):', "                        elif False:"),
     ("suffix rule: hit-deeper arm removed",
-     '                        elif hit.endswith("/" + want):', "                        elif False:"),
+     '                        if not (hit == want or hit.endswith("/" + want)):',
+     "                        if not (hit == want):"),
     ("suffix rule: separators dropped",
-     '                        elif hit.endswith("/" + want):\n'
-     '                            pass\n'
-     '                        elif want.endswith("/" + hit):',
-     '                        elif hit.endswith(want):\n'
-     '                            pass\n'
-     '                        elif want.endswith(hit):'),
-    ("suffix rule: separator dropped on the claim-deeper arm only",
-     '                        elif want.endswith("/" + hit):',
-     "                        elif want.endswith(hit):"),
-    ("suffix rule: separator dropped on the hit-deeper arm only",
-     '                        elif hit.endswith("/" + want):',
-     "                        elif hit.endswith(want):"),
+     '                        if not (hit == want or hit.endswith("/" + want)):',
+     "                        if not (hit == want or hit.endswith(want)):"),
     ("empty-by-design allowlist removed",
      "            if (_P(str(name)).name in _EMPTY_BY_DESIGN",
      "            if (False"),
@@ -219,8 +349,9 @@ MUTANTS = [
      "            issues=[i for i in (",
      "            issues=[(\"claimed-but-missing deliverable\" if missing\n"
      "                     else \"claimed-but-empty deliverable\")] or [i for i in ("),
-    ("union dedup back to raw spelling",
-     "                _k = _fs_norm(_cand)", "                _k = _cand"),
+    # (a raw-spelling union-dedup mutant lived here; with prose out of the
+    #  hard list the eviction it guarded is structurally impossible and the
+    #  mutant became near-equivalent — deleted rather than left surviving)
     ("host dir no longer un-scoped",
      '                _extra = ([str(_sbx.parent.parent)]\n'
      '                          if _sbx.parent.name == "projects" else [])',
@@ -254,21 +385,12 @@ MULTI = [
     ("BOTH fallback-root guards removed", [
         ("                    and parts[1] not in own_ids)",
          "                    and False)"),
-        ("                if root != primary:\n"
-         "                    # A fallback root gets its exact path and nothing more:",
-         "                if False:\n"
-         "                    # A fallback root gets its exact path and nothing more:"),
-    ]),
-    ("BOTH claim-deeper constraints removed", [
-        ('                        elif want.endswith("/" + hit):',
-         "                        elif want.endswith(hit):"),
-        ("                            if not _root_consumed(\n"
-         "                                    root, want[: -(len(hit) + 1)]):\n"
-         "                                continue",
-         "                            pass"),
+        ("                if root != primary or exact_only:",
+         "                if exact_only:"),
     ]),
     ("ALL THREE echoed-confirmation guards removed", [
-        ('        head = content.split("\\n", 1)[0][:4000]', "        head = content[:4000]"),
+        ('        head = content.split("\\n", 1)[0][:4000]\n        # \u26a0 FOUR OVERLAPPING GUARDS keep an echoed confirmation inert: the',
+         "        head = content[:4000]\n        # \u26a0 FOUR OVERLAPPING GUARDS keep an echoed confirmation inert: the"),
         ("        m = _FS_RETIRE_RE.match(head)", "        m = _FS_RETIRE_RE.search(head)"),
         ("""_FS_RETIRE_RE = re.compile(r"^SUCCESS: Deleted '(.+?)'\\.")""",
          """_FS_RETIRE_RE = re.compile(r"SUCCESS: Deleted '(.+?)'\\.")"""),
@@ -309,8 +431,21 @@ def main():
     # still work, and the previous version's `finally` raised FileNotFound
     # and printed no `restored:` line at all — leaving a mutant installed
     # with the absence of a line as the only signal.
-    pristine_bytes = io.open(TARGET, "rb").read()
-    want = hashlib.sha256(pristine_bytes).hexdigest()
+    targets = {DEFAULT_TARGET_REL}
+    for mtuple in MUTANTS:
+        if len(mtuple) == 4:
+            targets.add(mtuple[3])
+    for group in MULTI:
+        for edit in group[1]:
+            if len(edit) == 3:
+                targets.add(edit[2])
+    paths = {rel: os.path.join(REPO, rel) for rel in targets}
+    pristine_map = {rel: io.open(pth, "rb").read()
+                    for rel, pth in paths.items()}
+    want_map = {rel: hashlib.sha256(b).hexdigest()
+                for rel, b in pristine_map.items()}
+    pristine_bytes = pristine_map[DEFAULT_TARGET_REL]
+    want = want_map[DEFAULT_TARGET_REL]
     tmpdir = tempfile.mkdtemp()
     pristine = os.path.join(tmpdir, "agent.py")
     io.open(pristine, "wb").write(pristine_bytes)
@@ -328,17 +463,27 @@ def main():
               f"before running again.")
         sys.exit(2)
 
+    skip_restore = set()
+
     def _restore(where):
-        try:
-            with open(TARGET, "wb") as fh:
-                fh.write(pristine_bytes)
-            ok = hashlib.sha256(io.open(TARGET, "rb").read()).hexdigest() == want
-            print(f"restored ({where}):", "matches this run's start state"
-                  if ok else "!! MISMATCH — the tree may hold a mutant")
-        except Exception as exc:            # never leave with no signal
-            print(f"!! RESTORE FAILED ({where}): {type(exc).__name__}: {exc}\n"
-                  f"!! {TARGET} MAY HOLD A MUTANT — restore it from "
-                  f"{pristine}")
+        ok = True
+        for rel, pth in paths.items():
+            if rel in skip_restore:
+                print(f"!! {rel} NOT restored ({where}): an editor raced this "
+                      f"run — inspect it by hand")
+                ok = False
+                continue
+            try:
+                with open(pth, "wb") as fh:
+                    fh.write(pristine_map[rel])
+                ok &= (hashlib.sha256(io.open(pth, "rb").read()).hexdigest()
+                       == want_map[rel])
+            except Exception as exc:        # never leave with no signal
+                ok = False
+                print(f"!! RESTORE FAILED ({where}) for {rel}: "
+                      f"{type(exc).__name__}: {exc}")
+        print(f"restored ({where}):", "matches this run's start state"
+              if ok else "!! MISMATCH — the tree may hold a mutant")
 
     def _on_signal(*_a):
         _restore("signal")
@@ -352,8 +497,11 @@ def main():
         signal.signal(sig, _on_signal)
 
     if "--list" in sys.argv:
-        for label, old, _ in MUTANTS:
-            print(f"  [{pristine_bytes.decode('utf-8').count(old)}] {label}")
+        for mtuple in MUTANTS:
+            label, old = mtuple[0], mtuple[1]
+            rel = mtuple[3] if len(mtuple) == 4 else DEFAULT_TARGET_REL
+            src_ = pristine_map[rel].decode("utf-8")
+            print(f"  [{src_.count(old)}] {label}")
         shutil.rmtree(tmpdir, ignore_errors=True)
         return
     # ⚠ NEVER against a live agent. This rewrites the production source ~65
@@ -382,20 +530,29 @@ def main():
         src0 = pristine_bytes.decode("utf-8")
         cur_expected = src0
         killed = survived = missing = invalid = 0
-        for label, old, new in MUTANTS:
-            if src0.count(old) != 1:
-                print(f"  MISSING  {label}  (anchor matches {src0.count(old)}x — "
+        # files an editor-race abort has quarantined: exit-restore skips them
+        # (restoring would clobber the concurrent edits the abort protects)
+        for mtuple in MUTANTS:
+            label, old, new = mtuple[0], mtuple[1], mtuple[2]
+            rel = mtuple[3] if len(mtuple) == 4 else DEFAULT_TARGET_REL
+            tgt = paths[rel]
+            base = pristine_map[rel].decode("utf-8")
+            if base.count(old) != 1:
+                print(f"  MISSING  {label}  (anchor matches {base.count(old)}x — "
                       f"mutant did NOT run, proves nothing)")
                 missing += 1
                 continue
-            cur_expected = src0.replace(old, new, 1)
-            with open(TARGET, "w", encoding="utf-8") as fh:
+            cur_expected = base.replace(old, new, 1)
+            with open(tgt, "w", encoding="utf-8") as fh:
                 fh.write(cur_expected)
-            if io.open(TARGET, encoding="utf-8").read() != cur_expected:
-                print(f"!! {TARGET} changed underneath this run — something "
-                      f"else is editing it. Aborting BEFORE the next restore, "
-                      f"so those edits are not clobbered. The lock stops a "
+            if io.open(tgt, encoding="utf-8").read() != cur_expected:
+                print(f"!! {tgt} changed underneath this run — something "
+                      f"else is editing it. Aborting; that file is LEFT AS "
+                      f"IS (an exit-restore would clobber the very edits "
+                      f"this abort protects — inspect it by hand: the last "
+                      f"mutant may still be mixed in). The lock stops a "
                       f"second harness; it cannot stop an editor.")
+                skip_restore.add(rel)
                 return
             status, n = run_tests()
             if status == "invalid":
@@ -407,30 +564,48 @@ def main():
             else:
                 print(f"  SURVIVED {label}")
                 survived += 1
-            with open(TARGET, "w", encoding="utf-8") as fh:
-                fh.write(src0)
+            with open(tgt, "w", encoding="utf-8") as fh:
+                fh.write(base)
             cur_expected = src0
         print(f"\n{killed} killed / {survived} survived / {missing} anchor-missing "
               f"/ {invalid} invalid   (of {len(MUTANTS)})")
         print("\nmulti-edit (redundant-guard) mutants:")
+        # ⚠ This loop was rewritten once and the rewrite MERGED with the old
+        # body instead of replacing it: the applied edit used the leftover
+        # `old`/`new` from the single-edit loop, so BOTH multi-edit groups
+        # installed the last single mutant and reported its kill count as
+        # their own. The redundancy proofs the journal cited were vacuous —
+        # true in substance (the intended mutants do die when applied
+        # properly) but unproven by the run. A convergence lens caught it by
+        # noticing both MULTI lines printed the same "(6 failing)" as the
+        # last shape mutant. Everything below is scoped to THIS loop's own
+        # names, and each write goes to the edit's own target file.
         for label, edits in MULTI:
-            cur, ok = src0, True
-            for old, new in edits:
-                if cur.count(old) != 1:
+            per_file = {}
+            ok = True
+            for edit in edits:
+                rel = edit[2] if len(edit) == 3 else DEFAULT_TARGET_REL
+                per_file.setdefault(rel, pristine_map[rel].decode("utf-8"))
+            for edit in edits:
+                o_, n_ = edit[0], edit[1]
+                rel = edit[2] if len(edit) == 3 else DEFAULT_TARGET_REL
+                if per_file[rel].count(o_) != 1:
                     print(f"  MISSING  {label}  (an anchor matches "
-                          f"{cur.count(old)}x — proves nothing)")
+                          f"{per_file[rel].count(o_)}x — proves nothing)")
                     ok = False
                     break
-                cur = cur.replace(old, new, 1)
+                per_file[rel] = per_file[rel].replace(o_, n_, 1)
             if not ok:
                 continue
-            with open(TARGET, "w", encoding="utf-8") as fh:
-                fh.write(cur)
+            for rel, text in per_file.items():
+                with open(paths[rel], "w", encoding="utf-8") as fh:
+                    fh.write(text)
             status, n = run_tests()
             print(f"  {'killed  ' if status == 'fail' else 'SURVIVED'} {label}"
                   f"  ({n} failing)")
-            with open(TARGET, "w", encoding="utf-8") as fh:
-                fh.write(src0)
+            for rel in per_file:
+                with open(paths[rel], "wb") as fh:
+                    fh.write(pristine_map[rel])
     finally:
         _restore("exit")
         for _p in (lock,):

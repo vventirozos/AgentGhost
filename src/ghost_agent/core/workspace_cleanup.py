@@ -462,6 +462,57 @@ def _keep_set(store, project_id: str) -> Optional[Set[str]]:
     return keep
 
 
+def _mark_removal(store, project_id, deleted=None, *, dry_run=False) -> None:
+    """Record that files under ``project_id`` were REALLY removed just now.
+
+    ⚠ Mark it where you catch it: the verifier's FILE-ARTIFACT re-read can
+    race a removal fired by ANOTHER request while the verdict is in flight —
+    a missing ledger-written file then reads as a failed delivery when the
+    truth is "this project was just swept/deleted". The verdict consults
+    this (recency-gated) and reports could-not-check instead of refuting.
+
+    The first version was a single raw tuple and an audit broke it four
+    ways at once: a DRY-RUN armed it (status stays "ok" and `deleted` lists
+    what WOULD go); a second sweep of any other project evicted the slot
+    inside the window, re-opening the race for the first; the mark carried
+    no file list, so a tidy that deleted one stale screenshot "explained"
+    the absence of `app.py` — a file tidy is structurally incapable of
+    deleting; and the pid was stamped raw while `_project_dir` lowercases,
+    so a mixed-case id missed in the false-refute direction. Hence: a
+    dry-run guard, a per-project DICT (capped), the deleted list itself
+    (``None`` = the whole tree went — hard delete), and casefolded keys.
+    """
+    if dry_run:
+        return
+    try:
+        import time as _t
+        marks = getattr(store, "recent_workspace_removals", None)
+        if not isinstance(marks, dict):
+            marks = {}
+        key = str(project_id or "").strip().casefold()
+        if not key:
+            return
+        rels = (None if deleted is None
+                else [str(d).replace("\\", "/").casefold()
+                      for d in list(deleted)[:64]])
+        # ⚠ UNION with a still-fresh earlier mark: a second sweep/tidy of
+        # the same project inside the window used to overwrite the first
+        # list, un-explaining files the first sweep really deleted.
+        prev = marks.get(key)
+        if (prev and rels is not None and prev[1] is not None
+                and _t.time() - prev[0] < 900):
+            rels = list(dict.fromkeys(list(prev[1]) + rels))[:128]
+        elif prev and prev[1] is None:
+            rels = None                       # whole-tree removal absorbs
+        marks[key] = (_t.time(), rels)
+        if len(marks) > 16:                    # cap; drop the oldest
+            for stale in sorted(marks, key=lambda k: marks[k][0])[:-16]:
+                marks.pop(stale, None)
+        setattr(store, "recent_workspace_removals", marks)
+    except Exception:
+        pass
+
+
 def sweep_project_workspace(store, project_id: str, *,
                             dry_run: bool = False) -> Dict[str, Any]:
     """Sweep a finished project's workspace: keep registered ``file``
@@ -623,6 +674,10 @@ def sweep_project_workspace(store, project_id: str, *,
             f"kept {len(kept)} deliverable(s), freed {freed:,} bytes",
             icon=Icons.CUT,
         )
+    if summary.get("status") == "ok" and (summary.get("deleted")
+                                          or summary.get("dirs_removed")):
+        _mark_removal(store, project_id, summary.get("deleted"),
+                      dry_run=dry_run)
     return summary
 
 
@@ -869,4 +924,8 @@ def tidy_project_workspace(store, project_id: str, *,
                 })
             except Exception:
                 logger.debug("workspace_tidy event skipped", exc_info=True)
+    if summary.get("status") == "ok" and (summary.get("deleted")
+                                          or summary.get("dirs_removed")):
+        _mark_removal(store, project_id, summary.get("deleted"),
+                      dry_run=dry_run)
     return summary

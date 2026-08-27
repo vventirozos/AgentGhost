@@ -34,7 +34,7 @@ class TestClaimExtraction:
         # code that could not have excluded anything.
         "Generated the docs at https://example.com/guide.md",   # URL
         "Wrote /etc/hosts.conf on the server.",                 # system path
-        "Created the report at /api/download/projects/x/r.pdf",  # HTTP route
+
         "Saved it to /Users/v/Data/AI/notes.md",                 # host path
         "Just a chat with no files at all.",
     ])
@@ -53,8 +53,8 @@ class TestClaimExtraction:
         ("wrote /tmp_notes.md", ["/tmp_notes.md"]),
         ("saved /rootcause.md", ["/rootcause.md"]),
         ("saved /variables.py", ["/variables.py"]),
-        # …while a real system path still goes, case-insensitively, because
-        # the claim regex is IGNORECASE and the tuple spells "/System".
+        # …while a real system path still goes — structurally, no tuple to
+        # spell "/System" in: a multi-segment absolute is not sandbox-shaped.
         ("Wrote /etc/hosts.conf on the server.", []),
         ("Wrote /USR/local/share/x.md", []),
         ("Saved it to /Users/v/Data/AI/notes.md", []),
@@ -64,20 +64,67 @@ class TestClaimExtraction:
         assert _claimed_deliverable_files(text) == expected
 
     @pytest.mark.parametrize("text,expected", [
-        # The tools instruct the model to emit this exact link form, so
-        # refuting on it is one subsystem mandating what another refutes.
-        ("Created ![generated image](/api/download/gen_d7f2a1b3.png)", []),
-        ("Generated the report at /api/download/projects/x/r.pdf", []),
-        # …but a genuine deliverable in a directory called `api/` must
-        # survive: the leading slash is what the capture now preserves, so
-        # every real route arrives slashed and a bare `api/` prefix would
-        # only ever drop real files.
+        # ⚠ The download route is STRIPPED, not dropped: the link is a URL
+        # but `<rel>` points at a real artifact (`image_generation` /
+        # `report_pdf` outputs) that no other arm covers — the ledger parses
+        # only `file_system` confirmations. 41 recorded turns carry such
+        # links; dropping them lost their only coverage, refuting on them
+        # verbatim was the original false-refute shape. The claim becomes
+        # the artifact the route serves, checked for emptiness only.
+        ("Created ![generated image](/api/download/gen_d7f2a1b3.png)",
+         ["gen_d7f2a1b3.png"]),
+        ("Generated the report at /api/download/projects/x/r.pdf",
+         ["projects/x/r.pdf"]),
+        # …and a genuine deliverable in a directory called `api/` survives:
+        # only the download route is special, never the bare segment.
         ("saved the handler to api/routes.py", ["api/routes.py"]),
         ("created api/schema.json", ["api/schema.json"]),
     ])
-    def test_http_routes_are_excluded_without_eating_an_api_directory(
+    def test_download_routes_become_the_artifact_they_serve(
             self, text, expected):
         assert _claimed_deliverable_files(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        # ⚠ Shapes the old host-path DENYLIST leaked, each becoming a claim
+        # about a file that cannot exist in the sandbox: `~` and `$HOME`
+        # fragments, `/Volumes`, and the redaction artifact born when
+        # `/Users/<user>` is redacted and the capture restarts mid-path.
+        # The allowlist ("relative, /workspace/, or a single-segment
+        # sandbox-root file") rejects them structurally.
+        "saved to ~/Data/AI/x.json",
+        "stored /Volumes/ext/z.csv",
+        "saved /Data/AI/Data/system/prm/checkpoint.json",
+    ])
+    def test_host_shapes_the_denylist_leaked_are_rejected(self, text):
+        assert _claimed_deliverable_files(text) == []
+
+    @pytest.mark.parametrize("text", [
+        # ⚠ single-segment forms: the capture used to restart mid-path, so
+        # `~/notes.md` yielded `/notes.md` — a legitimate-looking sandbox-
+        # root spelling for a file in the operator's home. The regex now
+        # captures the `~`/`$VAR` fragment and the filter rejects it.
+        "saved to ~/notes.md",
+        "wrote $HOME/a.txt",
+        "wrote ${HOME}/a.txt",     # the brace form fragmented to /a.txt
+    ])
+    def test_home_fragments_are_captured_and_rejected_whole(self, text):
+        assert _claimed_deliverable_files(text) == []
+
+    def test_the_route_strip_is_case_insensitive(self):
+        # the claim regex is IGNORECASE, so the capture can arrive as
+        # /API/DOWNLOAD/… — un-stripped it fell to the allowlist as a
+        # multi-segment absolute and silently lost its soft coverage.
+        assert _claimed_deliverable_files(
+            "Created ![i](/API/DOWNLOAD/gen_a.png)") == ["gen_a.png"]
+
+    def test_workspace_prefixed_claims_are_sandbox_shaped(self):
+        # ⚠ `/workspace/…` is the container mount's own spelling — the one
+        # absolute multi-segment form that IS inside the sandbox. Without
+        # this branch the allowlist's multi-segment rejection would silently
+        # drop the corpus's real `/workspace/.services/...` claims.
+        assert _claimed_deliverable_files(
+            "I saved /workspace/webos/index.html for you."
+        ) == ["/workspace/webos/index.html"]
 
     def test_capped_and_deduped(self):
         txt = " ".join(f"saved f{i}.md" for i in range(20)) + " saved f0.md"
@@ -625,20 +672,20 @@ class TestSoftAndDirectoryResolution:
         assert r is not None and r.verdict == VerifyVerdict.REFUTED
 
     def test_a_project_scoped_claim_resolves_against_the_project_root(self):
-        """⚠ THE DOMINANT REAL SHAPE, and it had no fixture at all.
+        """⚠ THE DOMINANT REAL SHAPE. `project_scoped_sandbox` hands this
+        check a host_dir that IS `<sandbox>/projects/<pid>`, while paths are
+        spelled from the sandbox root (`projects/<pid>/app.html`, often with
+        a `/workspace/` head) — so the claim carries a prefix the root has
+        already consumed.
 
-        `project_scoped_sandbox` hands this check a host_dir that IS
-        `<sandbox>/projects/<pid>`, while the model spells paths — in prose
-        AND in the confirmations the ledger parses — from the SANDBOX root
-        (`projects/<pid>/app.html`, often with a `/workspace/` head). So the
-        claim carries a prefix the root has already consumed. A one-sided
-        suffix rule made that unsatisfiable — rglob only yields
-        basename-matching hits, so demanding the on-disk path reproduce the
-        claim's whole parent chain turned the fallback into dead code and
-        refuted 39% of
-        the turns this check runs on (measured with the fallback root
-        disabled; with it supplied the two mechanisms are substitutes), every one of them a
-        file sitting right there on disk.
+        The fixture passes `extra_roots` BECAUSE THE CALLER ALWAYS DOES when
+        scoped — that fallback's exact-path hit is what resolves this shape.
+        An earlier version omitted it and thereby pinned a claim-deeper
+        suffix arm that was an exact substitute for the fallback (0 of 142
+        replayed verdicts changed with it disabled) and doubled as a
+        shallow-namesake certification hole; that arm is deleted, and a pin
+        must not resurrect it by testing a configuration the caller never
+        runs.
         """
         root = Path(tempfile.mkdtemp())
         proj = root / "projects" / "e4e240b630f6"
@@ -649,16 +696,14 @@ class TestSoftAndDirectoryResolution:
                       "workspace/projects/e4e240b630f6/app.html",
                       "app.html"):
             assert GhostAgent._verify_file_artifacts(
-                [claim], str(proj)) is None, claim
+                [claim], str(proj), extra_roots=[str(root)]) is None, claim
 
     def test_a_claim_whose_prefix_the_root_does_not_stand_for_refutes(self):
-        # ⚠ The symmetric rule's claim-deeper arm exists for ONE shape: a
-        # claim spelled from the sandbox root, resolved against a root that
-        # already IS the project directory. Unconstrained it said any deep
-        # claim may be answered by a shallow namesake — `<sbx>/index.html`
-        # answering `projects/webos/index.html`, on a turn that wrote
-        # nothing. The prefix the claim carries must be the prefix this root
-        # actually stands for.
+        # ⚠ The claim-deeper arm is DELETED: a deep claim is never answered
+        # by a shallow namesake — `<sbx>/index.html` cannot answer
+        # `projects/webos/index.html` on a turn that wrote nothing. (Ledger
+        # pair-writes get their rel_str consulted instead; prose claims are
+        # absence-ignored.) These fixtures pin the rejection.
         d = Path(tempfile.mkdtemp())
         (d / "index.html").write_text("an unrelated page at the root")
         for claim in ("projects/webos/index.html", "a/b/c/index.html"):
@@ -672,11 +717,12 @@ class TestSoftAndDirectoryResolution:
         assert r is not None and r.verdict == VerifyVerdict.REFUTED
 
     def test_the_fallback_respects_directory_boundaries(self):
-        # ⚠ Without the "/" in the suffix comparison, `ax/report.pdf`
-        # satisfies a claim of `x/report.pdf` — a wrong-file certification the
-        # disjoint-name fixture above cannot catch, since those two names
-        # share no suffix at all. Same bug class the ledger already pins with
-        # `tmpx` vs `tmp`.
+        # ⚠ Without the "/" in the hit-deeper comparison, `ax/report.pdf`
+        # would satisfy a claim of `x/report.pdf` — a wrong-file
+        # certification the disjoint-name fixture above cannot catch, since
+        # those two names share no suffix at all. Same bug class the ledger
+        # already pins with `tmpx` vs `tmp`. (The mirror-direction arm this
+        # class once also pinned was deleted outright.)
         d = self._dir()
         (d / "ax").mkdir()
         (d / "ax" / "report.pdf").write_text("a different file")
@@ -693,6 +739,32 @@ class TestSoftAndDirectoryResolution:
         (d / "deep" / "app.html").write_text("a different file")
         r = GhostAgent._verify_file_artifacts(["abcdeep/app.html"], str(d))
         assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_an_escaping_dotdot_claim_never_resolves(self):
+        # ⚠ `cand = root / rel` joins the RAW spelling, so a claim whose
+        # normalised form escapes the root walked OUT of the sandbox on the
+        # exact-path probe — an empty host file one level up produced a
+        # "claimed-but-empty" refute about a file no turn touched. Interior
+        # `..` that stays inside still resolves.
+        import os
+        d = Path(tempfile.mkdtemp())
+        outside = d.parent / f"escape_{os.getpid()}.md"
+        outside.write_text("")
+        try:
+            assert GhostAgent._verify_file_artifacts(
+                [], str(d), soft=[f"../{outside.name}"]) is None
+            r = GhostAgent._verify_file_artifacts(
+                [f"../{outside.name}"], str(d))
+            assert r is not None       # hard: absent, not the host file
+            joined = "; ".join(r.issues or [])
+            assert "claimed-but-missing" in joined
+            assert "claimed-but-empty" not in joined
+        finally:
+            outside.unlink()
+        (d / "sub").mkdir()
+        (d / "sub" / "x.md").write_text("real")
+        assert GhostAgent._verify_file_artifacts(
+            ["sub/../sub/x.md"], str(d)) is None
 
     def test_the_basename_fallback_still_finds_a_nested_match(self):
         d = self._dir()
@@ -1090,16 +1162,356 @@ class TestReportCountersAreArmSeparated:
             for base in (proj, sbx):
                 os.chmod(base / "locked", 0o700)
 
-    def test_one_file_claimed_and_retired_is_named_once(self):
-        # `sub/out.txt` claimed and `out.txt` retired are different strings
-        # and the same file; the string dedup could never fire.
+    def test_one_file_under_two_spellings_is_named_once(self):
+        # ⚠ Two claimed spellings can resolve to ONE file (`_fs_norm` does
+        # not collapse interior `..`), and a dedup keyed on the claim
+        # STRINGS can never fire for them — the empty file was named twice
+        # in the repair directive. Dedup is on the resolved path. (The
+        # original fixture used a soft bare-basename spelling, which the
+        # soft arm's exact-only rule now skips before the dedup is ever
+        # reached — this pair still reaches it.)
         d = Path(tempfile.mkdtemp())
         (d / "sub").mkdir()
         (d / "sub" / "out.txt").write_text("")
         r = GhostAgent._verify_file_artifacts(
-            ["sub/out.txt"], str(d), soft=["out.txt"])
+            ["sub/out.txt", "sub/../sub/out.txt"], str(d))
         assert r is not None
         assert "; ".join(r.issues).count("out.txt") == 1
+
+
+class TestRemovalAwareAbsence:
+    """⚠ Absence after a CONFIRMED write proves removal, not non-production.
+    The two removal routes that leave no file_system confirmation — a later
+    shell/script step, and a workspace sweep racing the re-read — downgrade
+    the missing-refute to a logged skip. Both are evidence-gated: ORDER for
+    the shell route, the sweep's own recency-stamped mark for the sweep."""
+
+    def _fs(self, c):
+        return {"role": "tool", "name": "file_system", "content": c}
+
+    def _exec(self):
+        return {"role": "tool", "name": "execute",
+                "content": "--- COMMAND RESULT ---\nEXIT CODE: 0\n..."}
+
+    def test_a_write_followed_by_execute_does_not_refute_on_absence(self):
+        from ghost_agent.core.agent import _keys_removable_after_write
+        d = Path(tempfile.mkdtemp())
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+                 self._exec()]
+        rep = {}
+        r = GhostAgent._verify_file_artifacts(
+            ["probe.py"], str(d), report=rep,
+            removable_keys=_keys_removable_after_write(tools))
+        assert r is None
+        assert rep["skipped_removable"] == ["probe.py"]
+
+    def test_an_execute_BEFORE_the_write_proves_nothing(self):
+        # ⚠ order is the evidence — without it every turn that ran any
+        # script would lose its absence check entirely.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        d = Path(tempfile.mkdtemp())
+        tools = [self._exec(),
+                 self._fs("SUCCESS: Wrote 9 chars to 'probe.py'.")]
+        r = GhostAgent._verify_file_artifacts(
+            ["probe.py"], str(d),
+            removable_keys=_keys_removable_after_write(tools))
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_read_only_tool_after_the_write_does_not_disarm(self):
+        # ⚠ the first gate was a NAME list that included `workspace` (a
+        # read-only reporting tool) and `system_utility` (diagnostics) —
+        # each silently neutralised real turns' absence checks. The gate is
+        # evidence now: the record must carry the execute tool's own result
+        # markers.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        d = Path(tempfile.mkdtemp())
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+                 {"role": "tool", "name": "workspace",
+                  "content": "WORKSPACE SUMMARY: 12 files, 3 changed"}]
+        assert _keys_removable_after_write(tools) == set()
+        r = GhostAgent._verify_file_artifacts(
+            ["probe.py"], str(d),
+            removable_keys=_keys_removable_after_write(tools))
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_composed_skill_with_a_shell_step_disarms_by_evidence(self):
+        # arbitrarily-named composed skills embed the execute tool's result
+        # header verbatim for their shell steps — that is the evidence.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+                 {"role": "tool", "name": "auto_cleanup_task",
+                  "content": "step 2 result:\n--- COMMAND RESULT ---\n"
+                             "EXIT CODE: 0"}]
+        assert _keys_removable_after_write(tools) == {"probe.py"}
+
+    def test_a_web_page_QUOTING_ci_output_does_not_disarm(self):
+        # ⚠ the marker is anchored at line start AND retrieval surfaces are
+        # excluded outright: browser PAGE TEXT embeds third-party text
+        # verbatim, and a page quoting CI output must not disarm the check —
+        # a browser cannot run a shell.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+                 {"role": "tool", "name": "browser",
+                  "content": "--- PAGE TEXT (capped preview) ---\n"
+                             "--- COMMAND RESULT ---\nEXIT CODE: 0"}]
+        assert _keys_removable_after_write(tools) == set()
+
+    def test_a_midline_quoted_marker_does_not_disarm(self):
+        from ghost_agent.core.agent import _keys_removable_after_write
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+                 {"role": "tool", "name": "some_summary_tool",
+                  "content": "the log said --- COMMAND RESULT --- earlier"}]
+        assert _keys_removable_after_write(tools) == set()
+
+    def test_pair_spellings_are_decided_as_ONE_file(self):
+        # ⚠ a pair-write's two spellings are one file: a post-exec rewrite
+        # under the rel_str spelling used to leave the model spelling
+        # "removable" for the same bytes.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'projects/p/x.md'. "
+                          "Script-side path (from sandbox cwd): 'x.md'."),
+                 self._exec(),
+                 self._fs("SUCCESS: Wrote 9 chars to 'x.md'.")]
+        assert _keys_removable_after_write(tools) == set()
+
+    class _SP:
+        """Dict-backed scratchpad honouring the REAL sentinel keys — these
+        pins must distinguish live wiring, not monkeypatched wiring: the
+        first stamp site was proven unreachable by its own call sites while
+        a monkeypatched pin stayed green (round 14)."""
+        def __init__(self):
+            self.d = {}
+        def get(self, k, default=None):
+            return self.d.get(k, default)
+        def set(self, k, v, **kw):
+            self.d[k] = v
+        def delete(self, k):
+            self.d.pop(k, None)
+
+    def _bound_ctx(self, conv, pid):
+        from unittest.mock import MagicMock
+        from ghost_agent.tools.file_system import (_PROJECT_BIND_PID,
+                                                   _PROJECT_BIND_CONV)
+        ctx = MagicMock()
+        ctx.conversation_key = conv
+        ctx.scratchpad = self._SP()
+        if pid:
+            ctx.scratchpad.d[_PROJECT_BIND_PID] = pid
+            ctx.scratchpad.d[_PROJECT_BIND_CONV] = conv
+        ctx.current_project_id = pid
+        ctx.last_closed_project = None
+        return ctx
+
+    def test_a_genuine_close_stamps_through_the_LIVE_route(self, monkeypatch):
+        """⚠ THE ROUND-14 FINDING. The first stamp lived in
+        `_park_current_project`, whose only callers are the hygiene
+        branches — where ownership is false BY CONSTRUCTION — so the stamp
+        was unreachable from every production path and the same-turn-close
+        false-refute class it closed was silently back. Every genuine close
+        (exit, archive, hard delete) passes through `_set_current(ctx,
+        None)`; the stamp now lives there, one line before the sentinel it
+        reads is deleted. This pin drives the REAL route with REAL sentinel
+        keys — no monkeypatched ownership."""
+        import ghost_agent.tools.projects as PJ
+        monkeypatch.setattr(PJ, "_snapshot_scratchpad",
+                            lambda ctx, pid: True)   # not under test
+        ctx = self._bound_ctx("conv-9", "pid-9")
+        PJ._set_current(ctx, None)
+        assert ctx.last_closed_project == ("conv-9", "pid-9")
+        from ghost_agent.tools.file_system import _PROJECT_BIND_PID
+        assert _PROJECT_BIND_PID not in ctx.scratchpad.d   # sentinel gone
+
+    def test_closing_a_binding_another_conversation_owns_stamps_nothing(
+            self, monkeypatch):
+        import ghost_agent.tools.projects as PJ
+        from ghost_agent.tools.file_system import _PROJECT_BIND_CONV
+        monkeypatch.setattr(PJ, "_snapshot_scratchpad",
+                            lambda ctx, pid: True)
+        ctx = self._bound_ctx("conv-9", "pid-9")
+        ctx.scratchpad.d[_PROJECT_BIND_CONV] = "conv-OTHER"   # theirs
+        PJ._set_current(ctx, None)
+        assert ctx.last_closed_project is None
+
+    def test_a_hygiene_park_stamps_nothing(self, monkeypatch):
+        import ghost_agent.tools.projects as PJ
+        monkeypatch.setattr(PJ, "_snapshot_scratchpad",
+                            lambda ctx, pid: True)
+        ctx = self._bound_ctx("conv-9", None)      # binds nothing
+        PJ._park_current_project(ctx, "someone-elses-pid", "hygiene")
+        assert ctx.last_closed_project is None
+
+    def test_a_REWRITE_after_the_exec_still_refutes_on_absence(self):
+        # ⚠ each key is decided exactly once, at its LAST produce. Deciding
+        # on every produce let an earlier write of a re-written file
+        # downgrade the check even though the last write postdated every
+        # exec — a script that ran before the final write cannot have
+        # removed it.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        d = Path(tempfile.mkdtemp())
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'a.py'."),
+                 self._exec(),
+                 self._fs("SUCCESS: Wrote 9 chars to 'a.py'.")]
+        assert _keys_removable_after_write(tools) == set()
+        r = GhostAgent._verify_file_artifacts(
+            ["a.py"], str(d),
+            removable_keys=_keys_removable_after_write(tools))
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_removable_EMPTY_file_still_refutes(self):
+        # the downgrade is for ABSENCE only: a file that is back on disk
+        # and empty is a real defect regardless of what ran after it.
+        from ghost_agent.core.agent import _keys_removable_after_write
+        d = Path(tempfile.mkdtemp())
+        (d / "probe.py").write_text("")
+        tools = [self._fs("SUCCESS: Wrote 9 chars to 'probe.py'."),
+                 self._exec()]
+        r = GhostAgent._verify_file_artifacts(
+            ["probe.py"], str(d),
+            removable_keys=_keys_removable_after_write(tools))
+        assert r is not None and "empty" in "; ".join(r.issues)
+
+    def _tree_pid(self):
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        return root, proj
+
+    def test_a_sweep_that_NAMED_the_file_explains_its_absence(self):
+        root, proj = self._tree_pid()
+        rep = {}
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/report.md"], str(proj), extra_roots=[str(root)],
+            report=rep, swept_removals={"pid": ["report.md"]})
+        assert r is None
+        assert rep["skipped_removable"]
+
+    def test_a_sweep_that_deleted_OTHER_debris_explains_nothing(self):
+        # ⚠ the first mark carried no file list, so a tidy that removed one
+        # stale screenshot "explained" the absence of app.py — a file tidy
+        # is structurally incapable of deleting. The mark carries the
+        # deleted list now, and it must actually NAME the file.
+        root, proj = self._tree_pid()
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/app.py"], str(proj), extra_roots=[str(root)],
+            swept_removals={"pid": ["debug_shot.png"]})
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_hard_delete_explains_everything_under_its_project(self):
+        root, proj = self._tree_pid()
+        rep = {}
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/app.py"], str(proj), extra_roots=[str(root)],
+            report=rep, swept_removals={"pid": None})
+        assert r is None and rep["skipped_removable"]
+
+    def test_a_sweep_of_ANOTHER_project_explains_nothing(self):
+        root, proj = self._tree_pid()
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/report.md"], str(proj), extra_roots=[str(root)],
+            swept_removals={"other": None})
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_mixed_case_pid_still_matches_its_mark(self):
+        # `_project_dir` lowercases; the mark used to stamp the raw id and
+        # the verdict missed in the FALSE-REFUTE direction.
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "myproj"
+        proj.mkdir(parents=True)
+        rep = {}
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/MyProj/report.md"], str(proj),
+            extra_roots=[str(root)], report=rep,
+            swept_removals={"myproj": ["report.md"]})
+        assert r is None and rep["skipped_removable"]
+
+    def test_a_deleted_nested_namesake_does_not_explain_a_top_level_file(self):
+        # ⚠ the first match accepted bare-basename equality: a deleted
+        # `vendor/x.md` "explained" a missing top-level `x.md`. Path-wise,
+        # project-relative equality only.
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/x.md"], str(proj), extra_roots=[str(root)],
+            swept_removals={"pid": ["vendor/x.md"]})
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_second_sweep_unions_with_a_fresh_earlier_mark(self):
+        from ghost_agent.core.workspace_cleanup import _mark_removal
+        class _Store: pass
+        st = _Store()
+        _mark_removal(st, "pid", ["a.md"])
+        _mark_removal(st, "pid", ["b.md"])
+        assert set(st.recent_workspace_removals["pid"][1]) == {"a.md", "b.md"}
+        _mark_removal(st, "pid", None)          # whole-tree absorbs
+        assert st.recent_workspace_removals["pid"][1] is None
+
+    def test_the_mark_itself_ignores_dry_runs_and_evicts_oldest(self):
+        from ghost_agent.core.workspace_cleanup import _mark_removal
+        class _Store: pass
+        st = _Store()
+        _mark_removal(st, "PidA", ["x.md"], dry_run=True)
+        assert not getattr(st, "recent_workspace_removals", None)
+        _mark_removal(st, "PidA", ["x.md"])
+        marks = st.recent_workspace_removals
+        assert "pida" in marks and marks["pida"][1] == ["x.md"]
+        for i in range(20):                      # cap at 16, oldest out
+            _mark_removal(st, f"p{i}", None)
+        assert len(st.recent_workspace_removals) <= 16
+
+
+class TestPairAltAndSoftExactness:
+    def test_a_pair_writes_tool_spelling_rescues_a_deeper_claim(self):
+        # ⚠ The claim-deeper suffix arm was deleted as "an exact substitute
+        # for the fallback root" — a justification an adversarial lens
+        # refuted: the fallback covers the OPPOSITE direction, so a
+        # pair-write whose model spelling ran deeper than the file's real
+        # location read a PRESENT file as missing. The tool's own rel_str
+        # is the statement of where the file landed; resolution consults it.
+        from ghost_agent.core.agent import _fs_wrote_pair_alts
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        (proj / "app.py").write_text("real content")
+        tools = [{"name": "file_system", "content":
+                  "SUCCESS: Wrote 12 chars to 'projects/pid/src/app.py'. "
+                  "Script-side path (from sandbox cwd): 'app.py'."}]
+        assert GhostAgent._verify_file_artifacts(
+            ["projects/pid/src/app.py"], str(proj),
+            extra_roots=[str(root)],
+            alt_spellings=_fs_wrote_pair_alts(tools)) is None
+
+    def test_a_genuinely_missing_pair_write_still_refutes(self):
+        from ghost_agent.core.agent import _fs_wrote_pair_alts
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        tools = [{"name": "file_system", "content":
+                  "SUCCESS: Wrote 12 chars to 'projects/pid/src/app.py'. "
+                  "Script-side path (from sandbox cwd): 'app.py'."}]
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/src/app.py"], str(proj),
+            extra_roots=[str(root)],
+            alt_spellings=_fs_wrote_pair_alts(tools))
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_the_soft_arm_never_resolves_by_basename(self):
+        # ⚠ Soft carries prose claims, whose spellings are sloppy by nature;
+        # a bare `config.json` claim resolved via rglob to an unrelated
+        # EMPTY `vendor/config.json` and refuted a turn on a file nobody
+        # meant. Emptiness testimony must be about the file at the claimed
+        # path, or nothing.
+        d = Path(tempfile.mkdtemp())
+        (d / "vendor").mkdir()
+        (d / "vendor" / "config.json").write_text("")
+        assert GhostAgent._verify_file_artifacts(
+            [], str(d), soft=["config.json"]) is None
+
+    def test_the_soft_arm_still_catches_an_exact_empty(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "report.md").write_text("")
+        r = GhostAgent._verify_file_artifacts([], str(d), soft=["report.md"])
+        assert r is not None and "report.md" in "; ".join(r.issues)
 
 
 class TestCheckabilityIsReported:
@@ -1437,3 +1849,147 @@ class TestProducerParserParity:
         assert _files_mutated_this_turn(
             [{"role": "tool", "name": "file_system",
               "content": message}]) == expected
+
+
+class TestCapturedProjectId:
+    """The ONE sanctioned scope capture — four sites grew four copies of
+    this heal in a single round before it was consolidated."""
+
+    def _agent(self):
+        from unittest.mock import MagicMock
+        a = GhostAgent.__new__(GhostAgent)
+        a.context = MagicMock()
+        return a
+
+    def test_a_live_global_wins(self):
+        a = self._agent()
+        a.context.current_project_id = "live-pid"
+        assert a._captured_project_id() == "live-pid"
+
+    def test_a_stomped_global_heals_from_the_conversation_binding(self, monkeypatch):
+        a = self._agent()
+        a.context.current_project_id = None
+        monkeypatch.setattr(
+            "ghost_agent.tools.file_system._conversation_bound_project",
+            lambda ctx: "healed-pid")
+        assert a._captured_project_id() == "healed-pid"
+
+    def test_a_closed_project_heals_from_the_close_time_record(self, monkeypatch):
+        # ⚠ a same-turn project close clears the global AND the conversation
+        # binding; the close path records (conversation_key, pid) at the
+        # moment it clears, so the heal names the project actually closed.
+        # (The first fallback used the shared `request_start_project_id`
+        # slot — a concurrent request overwrote it, and an A→B switch healed
+        # to A while the writes sat under B.)
+        a = self._agent()
+        a.context.current_project_id = None
+        a.context.conversation_key = "conv-1"
+        a.context.last_closed_project = ("conv-1", "closed-pid")
+        monkeypatch.setattr(
+            "ghost_agent.tools.file_system._conversation_bound_project",
+            lambda ctx: "")
+        assert a._captured_project_id() == "closed-pid"
+
+    def test_another_conversations_close_heals_nothing(self, monkeypatch):
+        a = self._agent()
+        a.context.current_project_id = None
+        a.context.conversation_key = "conv-1"
+        a.context.last_closed_project = ("conv-OTHER", "their-pid")
+        monkeypatch.setattr(
+            "ghost_agent.tools.file_system._conversation_bound_project",
+            lambda ctx: "")
+        assert a._captured_project_id() is None
+
+    def test_no_binding_anywhere_means_unscoped_None(self, monkeypatch):
+        a = self._agent()
+        a.context.current_project_id = None
+        a.context.conversation_key = "conv-1"
+        a.context.last_closed_project = None
+        monkeypatch.setattr(
+            "ghost_agent.tools.file_system._conversation_bound_project",
+            lambda ctx: "")
+        assert a._captured_project_id() is None
+
+
+class TestDrainScopeAndAltSemantics:
+    """Round-10 pins: the streamed drain's scope pid is a PURE function so it
+    is testable at all — the drain runs post-semaphore where nothing live is
+    race-free — and the pair-alt loop's edge semantics."""
+
+    def test_the_snapshot_wins_when_the_tag_matches(self):
+        snap = ("req-A", {"pid": "proj-A"})
+        assert GhostAgent._drain_scope_pid(snap, "req-A", "captured-X") == "proj-A"
+
+    def test_a_mismatched_tag_falls_back_to_the_CAPTURED_value(self):
+        # ⚠ the mismatch branch used to fall back to a live
+        # `current_project_id` read — at drain time that is whichever
+        # request is running, i.e. the §4DG cross-project race re-opened on
+        # the production-common path.
+        snap = ("req-B", {"pid": "proj-B"})
+        assert GhostAgent._drain_scope_pid(snap, "req-A", "captured-X") == "captured-X"
+
+    def test_a_missing_snapshot_falls_back_to_the_captured_value(self):
+        assert GhostAgent._drain_scope_pid(None, "req-A", "captured-X") == "captured-X"
+        assert GhostAgent._drain_scope_pid("garbage", "req-A", None) is None
+
+    def test_an_alt_directory_cannot_satisfy_a_prose_claim(self):
+        # ⚠ the alt path re-derived dir_ok from the ALT spelling, so a
+        # prose-claimed FILE was satisfied by a DIRECTORY sitting at the
+        # pair's rel_str spelling — masking a missing-deliverable refute.
+        from ghost_agent.core.agent import _fs_wrote_pair_alts
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        (proj / "app").mkdir()                    # a DIRECTORY at rel_str
+        tools = [{"name": "file_system", "content":
+                  "SUCCESS: Wrote 12 chars to 'projects/pid/deep/app'. "
+                  "Script-side path (from sandbox cwd): 'app'."}]
+        # the extension-less spelling is ledger-only; force the prose rule
+        r = GhostAgent._verify_file_artifacts(
+            ["projects/pid/deep/app"], str(proj), extra_roots=[str(root)],
+            file_claims={"projects/pid/deep/app"},
+            alt_spellings=_fs_wrote_pair_alts(tools))
+        assert r is not None and r.verdict == VerifyVerdict.REFUTED
+
+    def test_a_could_not_check_alt_does_not_stop_the_next_alt(self):
+        import os
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        locked = proj / "locked"
+        locked.mkdir()
+        (proj / "app.py").write_text("real")
+        os.chmod(locked, 0o000)
+        try:
+            rep = {}
+            r = GhostAgent._verify_file_artifacts(
+                ["projects/pid/src/app.py"], str(proj),
+                extra_roots=[str(root)],
+                alt_spellings={"projects/pid/src/app.py":
+                               ["locked/app.py", "app.py"]},
+                report=rep)
+            assert r is None
+            # ⚠ None alone cannot distinguish "the second alt resolved" from
+            # "gave up as could-not-check" — both skip the refute. The
+            # report can: a real hit counts as resolved.
+            assert rep["resolved"] == 1
+        finally:
+            os.chmod(locked, 0o700)
+
+    def test_a_retired_pair_write_recreated_empty_is_caught_via_its_alt(self):
+        # ⚠ the soft arm never consulted pair alts, so a retired pair-write
+        # re-created EMPTY at its rel_str spelling escaped the one check the
+        # soft arm exists to keep.
+        from ghost_agent.core.agent import _fs_wrote_pair_alts
+        root = Path(tempfile.mkdtemp())
+        proj = root / "projects" / "pid"
+        proj.mkdir(parents=True)
+        (proj / "probe.py").write_text("")        # back, and empty
+        tools = [{"name": "file_system", "content":
+                  "SUCCESS: Wrote 9 chars to 'projects/pid/deep/probe.py'. "
+                  "Script-side path (from sandbox cwd): 'probe.py'."}]
+        r = GhostAgent._verify_file_artifacts(
+            [], str(proj), soft=["projects/pid/deep/probe.py"],
+            extra_roots=[str(root)],
+            alt_spellings=_fs_wrote_pair_alts(tools))
+        assert r is not None and "probe.py" in "; ".join(r.issues)

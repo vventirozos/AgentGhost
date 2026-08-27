@@ -1630,6 +1630,151 @@ def _fs_norm(path) -> str:
     return p.lstrip("/").rstrip("/").casefold()
 
 
+# ⚠ Evidence over names. The first gate listed `workspace` (a READ-ONLY
+# reporting tool) and `system_utility` (weather/diagnostics) — each silently
+# neutralised real turns' absence checks — while an arbitrarily-named
+# composed skill embedding an `execute` step walked past it. A shell run is
+# recognised by the record itself: the execute tool's own result header,
+# which composed-skill records embed verbatim for their shell steps.
+# `manage_projects` is still NOT here — its removal paths (DONE-flip sweep,
+# hard delete) stamp the store instead (see workspace_cleanup._mark_removal
+# and ProjectStore.delete_project).
+_REMOVAL_CAPABLE_NAMES = ("execute",)
+# ⚠ ANCHORED at line start: the execute tool's own result header begins a
+# line; a web page or recalled document merely QUOTING CI output mid-text
+# must not disarm the absence check. Retrieval surfaces are excluded
+# outright — browser PAGE TEXT and knowledge/recall bodies embed third-
+# party text verbatim at line start, and none of them can run a shell.
+# Residual accepted limit (fail-OPEN only — a missed refute, never a false
+# one): a retrieval-free tool whose content carries an adversarial header
+# at line start.
+_SHELL_EVIDENCE_RE = re.compile(r"^--- (?:COMMAND|EXECUTION) RESULT ---",
+                                re.MULTILINE)
+_RETRIEVAL_SURFACE_NAMES = ("browser", "web_search", "knowledge_base",
+                            "recall", "vision_analysis", "introspect")
+
+
+def _is_removal_capable(name: str, content: str) -> bool:
+    if name in _REMOVAL_CAPABLE_NAMES or "execute" in name:
+        return True
+    if name in _RETRIEVAL_SURFACE_NAMES:
+        return False
+    return bool(_SHELL_EVIDENCE_RE.search(content[:4000]))
+
+
+def _keys_removable_after_write(tools_run: Optional[list]) -> set:
+    """Normalised keys of written files a LATER shell/script step could have
+    removed.
+
+    ⚠ Closes the ledger's oldest stated limit. A `SUCCESS: Wrote …`
+    confirmation proves the file WAS produced; a later absence proves only
+    that something removed it. When a removal-capable tool ran AFTER the
+    write, "deliberate tidy-up the ledger cannot see" is at least as likely
+    as "failed delivery" — the GlassOS incident, one tool over — so the
+    missing-refute is downgraded to a logged skip for exactly those keys.
+    ORDER is the evidence: an execute that ran before the write proves
+    nothing, and those keys still refute.
+    """
+    exec_after: set = set()
+    decided: set = set()
+    exec_seen = False
+    # ⚠ a pair-write's two spellings are ONE file: group them first, decide
+    # by representative — otherwise a post-exec rewrite under one spelling
+    # left the other spelling "removable" for the same bytes.
+    rep: dict = {}
+    for t in tools_run or []:
+        if not isinstance(t, dict) or str(t.get("name", "")) != "file_system":
+            continue
+        c = str(t.get("content", ""))
+        if c.startswith("[FAILURE BANNER]"):
+            c = c.split("\n", 1)[1] if "\n" in c else ""
+        m = _FS_WROTE_PAIR_RE.match(c.split("\n", 1)[0][:4000]) \
+            if c.startswith("SUCCESS") else None
+        if m:
+            k1, k2 = _fs_norm(m.group(1)), _fs_norm(m.group(2))
+            if k1 and k2 and k1 != k2:
+                canon = rep.get(k1, rep.get(k2, k1))
+                rep[k1] = rep[k2] = canon
+    for t in reversed(tools_run or []):
+        if not isinstance(t, dict) or t.get("_synthetic"):
+            continue
+        name = str(t.get("name", ""))
+        if name != "file_system":
+            if _is_removal_capable(name, str(t.get("content", ""))):
+                # success or not: a script that failed AFTER its `rm` still
+                # removed the file.
+                exec_seen = True
+            continue
+        content = str(t.get("content", ""))
+        if content.startswith("[FAILURE BANNER]"):
+            content = content.split("\n", 1)[1] if "\n" in content else ""
+        if not content.startswith("SUCCESS"):
+            continue
+        head = content.split("\n", 1)[0][:4000]
+        produced = []
+        m = _FS_WROTE_PAIR_RE.match(head)
+        if m:
+            produced = [m.group(1), m.group(2)]
+        else:
+            m = _FS_MOVED_RE.match(head) or _FS_DEST_RE.match(head)
+            if m:
+                produced = [m.group(m.lastindex)]
+            else:
+                for _rx in _FS_PRODUCE_RES:
+                    m = _rx.match(head)
+                    if m:
+                        produced = [m.group(1)]
+                        break
+        for p_ in produced:
+            k = _fs_norm(p_)
+            k = rep.get(k, k)
+            if not k or k in decided:
+                continue
+            # ⚠ decide each key exactly ONCE, at its LAST produce — which is
+            # the first time the reversed walk meets it. Deciding on every
+            # produce let an EARLIER write of a re-written file add the key
+            # even though the last write postdated every exec, silently
+            # widening the downgrade to files the script could not have
+            # removed.
+            decided.add(k)
+            if exec_seen:
+                exec_after.add(k)
+    # expand back to every spelling in each removable group
+    for k2, canon in rep.items():
+        if canon in exec_after:
+            exec_after.add(k2)
+    return exec_after
+
+
+def _fs_wrote_pair_alts(tools_run: Optional[list]) -> dict:
+    """{model spelling -> [tool-resolved spellings]} from Wrote-pair lines.
+
+    ⚠ For RESOLUTION, not just cancellation. The ledger keeps the model's
+    `filename` spelling; the tool's `rel_str` is where the file actually
+    landed relative to the scoped dir. When the two diverge beyond the
+    normalised prefixes, resolving only the model's spelling read a present
+    file as MISSING — the claim-deeper shape an adversarial lens reproduced
+    after the suffix arm covering it was deleted. The alternate spelling is
+    the tool's own statement of the real location; try it before declaring
+    a pair-written file absent.
+    """
+    out: dict = {}
+    for t in tools_run or []:
+        if not isinstance(t, dict) or t.get("_synthetic"):
+            continue
+        if str(t.get("name", "")) != "file_system":
+            continue
+        content = str(t.get("content", ""))
+        if content.startswith("[FAILURE BANNER]"):
+            content = content.split("\n", 1)[1] if "\n" in content else ""
+        if not content.startswith("SUCCESS"):
+            continue
+        m = _FS_WROTE_PAIR_RE.match(content.split("\n", 1)[0][:4000])
+        if m and _fs_norm(m.group(1)) != _fs_norm(m.group(2)):
+            out.setdefault(m.group(1), []).append(m.group(2))
+    return out
+
+
 def _fs_path_ledger(tools_run: Optional[list]) -> tuple:
     """-> (left_behind, retired) for this request's file_system calls.
 
@@ -1647,12 +1792,12 @@ def _fs_path_ledger(tools_run: Optional[list]) -> tuple:
     REPLACED BLOCK, a syntax-error excerpt), whose quoted strings are
     code, not paths.
 
-    Known limits, none of which this parse can see: a file removed by a
-    shell `rm` through the `execute` tool is invisible here (the same
-    false refute, via a route with no confirmation message); and the DONE-task workspace sweep can delete a file
-    between this parse and the on-disk re-read. (A `[FAILURE BANNER]` prefix
-    used to drop a record whole; that one is FIXED below, not a limit — the
-    parse reads past the banner.)
+    Former limits, all closed downstream (§4DI): a file removed by a shell
+    `rm` through `execute` is still invisible to THIS parse, but the
+    verdict's missing-refute is order-gated on it (`_keys_removable_after_
+    write`); a workspace sweep racing the re-read is explained by the
+    sweep's own store mark (`_mark_sweep`, recency-gated); and a `[FAILURE
+    BANNER]` prefix used to drop a record whole — the parse reads past it.
     """
     alive: dict = {}        # normalised key -> [original spelling, is_alive]
     alias: dict = {}        # a second spelling of one file -> its primary key
@@ -1857,41 +2002,107 @@ _CLAIMED_FILE_RE = re.compile(
     # the ground-truth check. Two of the three FILE-ARTIFACT refutes
     # recoverable from the record were exactly this, on turns that ran no
     # file tool at all.
-    r"[`'\"]?((?:[A-Za-z][A-Za-z0-9+.\-]*://)?/?"
+    # The optional leading `~` / `$VAR` group exists so those fragments are
+    # CAPTURED (and then rejected by `_sandbox_shaped`) instead of the
+    # capture restarting mid-path: `~/notes.md` used to yield `/notes.md` —
+    # a legitimate-looking sandbox-root spelling for a file that lives in
+    # the operator's home.
+    # ⚠ the `~` branch is GREEDY: `~/.config/app/x.json` used to fail the
+    # head char class at the dot, and the capture restarted mid-path as a
+    # legitimate-looking relative `config/app/x.json`. Consuming the whole
+    # home-relative form keeps it one rejectable token.
+    r"[`'\"]?((?:~[A-Za-z0-9._/\-]*|\$\{?[A-Za-z_0-9]+\}?)?"
+    r"(?:[A-Za-z][A-Za-z0-9+.\-]*://)?/?"
     r"[A-Za-z0-9][A-Za-z0-9._/\-]*\.(?:" + _DELIVERABLE_EXT + r"))\b",
     re.IGNORECASE,
 )
-_SYS_PATH_PREFIXES = ("/usr", "/etc", "/bin", "/sbin", "/lib", "/opt",
-                      "/var", "/System", "/Library", "/private", "/dev",
-                      "/proc", "/Users", "/home", "/root", "/tmp")
-# HTTP routes the tools themselves instruct the model to emit — `report_pdf`
-# and the image tools tell it to reply with `[title](/api/download/<rel>)`.
-# That is a URL, not a path, and refuting on it is the probe.py shape again:
-# one subsystem mandating the very text another subsystem refutes.
-# ⚠ `api/download/`, not a bare `api/`: the leading slash is exactly what the
-# capture group now preserves, so every real occurrence arrives slashed, and
-# a bare prefix would silently drop a genuine `api/routes.py` deliverable.
-_HTTP_ROUTE_PREFIXES = ("/api/download/", "api/download/")
-# ⚠ SEGMENT boundaries, not bare prefixes. `startswith` is a string test:
-# once the capture group could begin with "/", `/opt` swallowed
-# `/optimizer.md`, `/bin` swallowed `/binary.json`, `/root` swallowed
-# `/rootcause.md` — real sandbox-root deliverables, dropped SILENTLY and in
-# the direction no log line reports. Lower-cased because the claim regex is
-# IGNORECASE, so `/USR/x.md` reached a tuple that spells `/System` with a
-# capital S ([[guard-a-proxy-not-the-thing]]).
-_SYS_PATH_SEGMENTS = tuple(p.lower() + "/" for p in _SYS_PATH_PREFIXES)
+# The download route the tools themselves instruct the model to emit —
+# `report_pdf` and the image tools tell it to reply with
+# `[title](/api/download/<rel>)`. The link is a URL, but `<rel>` is a REAL
+# sandbox-relative path pointing at a real artifact that no other arm covers
+# (`_fs_path_ledger` parses only `file_system` confirmations, and these files
+# come from `image_generation` / `report_pdf`). So the route is STRIPPED, not
+# dropped: the claim becomes the artifact it serves. 41 of 1,855 recorded
+# turns carry such links; under the old drop they lost their only coverage.
+# Sentinel distinguishing "caller did not capture a project id" from a
+# captured None ("there WAS no project at spawn" — which must mean unscoped,
+# not "read the mutable global again later").
+# How long a workspace-removal mark explains a missing written file (same
+# recency philosophy as `_locate_entry_page`'s freshness window).
+_REMOVAL_MARK_FRESH_WINDOW_S = 900
+
+_PROJECT_ID_UNCAPTURED = object()
+
+_DOWNLOAD_ROUTE_PREFIXES = ("/api/download/", "api/download/")
+
+
+def _sandbox_shaped(name: str) -> bool:
+    """Can this claimed path plausibly live inside the sandbox?
+
+    ⚠ AN ALLOWLIST, deliberately. The previous filter was a denylist of
+    host-path segments (`/usr/`, `/Users/`, …), and a denylist of "outside
+    the sandbox" leaks by construction: `~/x.json`, `$HOME/a.txt`,
+    `/Volumes/ext/z.csv` and the redaction artifact `/Data/AI/…` (born when
+    `/Users/<user>` is redacted and the capture restarts mid-path) all
+    walked past it, each becoming a claim about a file that cannot exist in
+    the sandbox. The property is "inside the sandbox"; enumerate what IS,
+    not what isn't:
+
+      * a relative path (`report.md`, `webos/index.html`, `api/routes.py`);
+      * a `/workspace/`-prefixed path — the container mount's own spelling;
+      * a single-segment absolute (`/probe.py`) — the sandbox-ROOT spelling
+        `_get_safe_path` heals, which real turns produce.
+
+    A multi-segment absolute (`/etc/hosts.conf`, `/Users/v/notes.md`,
+    `/Data/AI/…/checkpoint.json`) is a host path: there is no healed
+    spelling that lands it in the sandbox. This also subsumes the old
+    case-sensitivity hole (`/USR/x.md`) structurally — no tuple to drift.
+    """
+    if not name.startswith("/"):
+        return True
+    if name.startswith("/workspace/"):
+        return True
+    return "/" not in name[1:]          # "/probe.py" yes, "/etc/x.conf" no
 
 
 def _claimed_deliverable_files(text) -> list:
-    """Filenames the answer presents as a CREATED/SAVED deliverable."""
+    """Filenames the answer presents as a CREATED/SAVED deliverable.
+
+    ⚠ These claims are checked for EMPTINESS ONLY, never absence (they ride
+    the `soft` arm of `_verify_file_artifacts`). Every false FILE-ARTIFACT
+    refute attested in the record came from this extractor — a host-path
+    echo, a download link, a fragment of another tool's output — refuting a
+    turn on the ABSENCE of a file the answer never really produced. The
+    ledger's tool confirmations are the only absence-grade evidence; prose
+    keeps the emptiness check (a claimed file that exists but is 0 bytes is
+    a real defect) and loses the power to refute on what is not there.
+    """
     if not text:
         return []
     out: list = []
     for m in _CLAIMED_FILE_RE.findall(str(text)):
         name = m.strip().strip("`'\"")
-        if (not name or "://" in name
-                or name.lower().startswith(_SYS_PATH_SEGMENTS)
-                or name.startswith(_HTTP_ROUTE_PREFIXES)):
+        if not name:
+            continue
+        if name.lower().startswith("file://"):
+            # a file:// URL over a sandbox path IS a sandbox claim — the
+            # browser tool itself teaches this spelling
+            # (file:///workspace/...). Strip the scheme; the allowlist
+            # judges what remains.
+            name = name[7:]
+        if not name or "://" in name:
+            continue
+        if name[:1] in ("~", "$"):
+            continue                        # a home/env fragment, never ours
+        for _pfx in _DOWNLOAD_ROUTE_PREFIXES:
+            # case-insensitively: the claim regex is IGNORECASE, so the
+            # capture can arrive as /API/DOWNLOAD/… — un-stripped, that
+            # spelling fell to the allowlist as a multi-segment absolute and
+            # silently lost its soft coverage.
+            if name[:len(_pfx)].lower() == _pfx:
+                name = name[len(_pfx):]     # the route -> the artifact
+                break
+        if not name or not _sandbox_shaped(name):
             continue
         if name not in out:
             out.append(name)
@@ -9932,7 +10143,96 @@ class GhostAgent:
         except Exception:
             return False
 
-    async def _execute_web_artifact(self, written: list):
+    def _captured_project_id(self):
+        """The turn's project binding, captured NOW and healed.
+
+        ⚠ THE ONLY sanctioned way to capture scope for anything that may
+        outlive the semaphore. Four sites grew four copies of the same
+        ten-line heal within one round — the drift risk this feature's
+        whole history warns about — so the heal lives once: the global,
+        else `_conversation_bound_project` (valid only while
+        conversation_key is still this turn's own), else None = unscoped.
+        """
+        pid = getattr(self.context, "current_project_id", None)
+        if pid:
+            return pid
+        try:
+            from ..tools.file_system import _conversation_bound_project
+            pid = _conversation_bound_project(self.context) or None
+        except Exception:
+            pid = None
+        if pid:
+            return pid
+        # ⚠ third fallback: the project this CONVERSATION most recently
+        # closed/parked. A same-turn close clears both the global and the
+        # conversation binding, and a captured None then resolved the
+        # turn's scoped writes against the raw root — bare-spelled files
+        # under the just-closed project read as missing (fail-closed, but
+        # false). The first version fell back to `request_start_project_id`
+        # and an audit broke it twice: it is one shared never-cleared slot
+        # (a CONCURRENT request's start overwrote it before this capture),
+        # and a turn that started under A, switched to B, wrote under B and
+        # closed B healed to A — refuting B's real files. The close path
+        # records (conversation_key, pid) at the moment it clears the
+        # binding, so the heal is conversation-scoped and names the project
+        # actually closed.
+        try:
+            _lc = getattr(self.context, "last_closed_project", None)
+            if (isinstance(_lc, tuple) and len(_lc) == 2 and _lc[0]
+                    and _lc[0] == getattr(self.context, "conversation_key",
+                                          None)):
+                return _lc[1] or None
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _drain_scope_pid(snapshot, req_id, captured):
+        """The project id a streamed drain may scope by. PURE, so it is
+        testable — the drain runs post-semaphore where nothing live is
+        race-free.
+
+        The request-tagged snapshot wins; on a tag mismatch (another
+        streamed request's finalize overwrote the single slot between our
+        finalize and our drain) the fallback is the value the closure
+        CAPTURED during the request — ⚠ never a live `current_project_id`
+        read, which at drain time belongs to whichever request is running
+        and re-opened the §4DG cross-project race on the mismatch branch.
+        """
+        try:
+            if (isinstance(snapshot, tuple) and len(snapshot) == 2
+                    and snapshot[0] == req_id):
+                return (snapshot[1] or {}).get("pid")
+        except Exception:
+            pass
+        return captured
+
+    def _scoped_sandbox_for(self, project_id):
+        """Host sandbox dir for a SPAWN-CAPTURED project binding.
+
+        ⚠ Every ground-truth arm of the verdict must scope through this,
+        with the id captured at its front door — never through a live
+        `project_scoped_sandbox(self.context)` read. The verdict runs in a
+        detached task up to ~60s late; the first fix threaded the captured
+        id to exactly ONE consumer (FILE-ARTIFACT) while WEB-EXEC, VISUAL,
+        the streamed spawn and both timeout attaches kept reading the
+        process-global — so one verdict could scope its three arms to
+        different projects, and the streamed path (the production-common
+        one) kept the §4DG cross-project race wholesale
+        ([[the-sibling-one-revision-behind]], cited by the fix it survived).
+        A captured None means UNSCOPED — the raw sandbox root — never
+        "read the mutable global again later".
+        """
+        from ..tools.file_system import project_scoped_sandbox
+        if project_id and project_id is not _PROJECT_ID_UNCAPTURED:
+            return project_scoped_sandbox(
+                self.context, explicit_project_id=project_id)[0]
+        if project_id is _PROJECT_ID_UNCAPTURED:
+            return project_scoped_sandbox(self.context)[0]
+        return project_scoped_sandbox(self.context, stateful=True)[0]
+
+    async def _execute_web_artifact(self, written: list,
+                                    project_id=_PROJECT_ID_UNCAPTURED):
         """Headless-load EVERY html page written/edited this turn (cap
         ``_WEB_EXEC_MAX_PAGES``), not just one entry page.
 
@@ -9951,8 +10251,8 @@ class GhostAgent:
         browser = (getattr(self, "available_tools", None) or {}).get("browser")
         if browser is None:
             return None
-        from ..tools.file_system import project_scoped_sandbox, _to_container_path
-        sbx = Path(project_scoped_sandbox(self.context)[0])
+        from ..tools.file_system import _to_container_path
+        sbx = Path(self._scoped_sandbox_for(project_id))
         # The bind mount sits at the sandbox ROOT even when file ops are
         # scoped to <root>/projects/<id>; un-scope so we can find (and build a
         # container URL for) files written under either layout.
@@ -10133,7 +10433,8 @@ class GhostAgent:
                                 sc_agree: Optional[int] = None,
                                 sc_drawn: Optional[int] = None,
                                 route: str = "",
-                                override: str = "") -> None:
+                                override: str = "",
+                                skipped_removable=None) -> None:
         """Append one verdict record beside the trajectory log.
 
         Deliberately NOT written into the trajectory's `extra`: the
@@ -10182,6 +10483,8 @@ class GhostAgent:
                     # recoverable by hand were all false. Measure the
                     # mechanism, not just its output.
                     **({"override": override} if override else {}),
+                    **({"skipped_removable": skipped_removable}
+                       if skipped_removable else {}),
                     # An auto-repaired turn verifies TWICE: once before the
                     # repair and once on the repaired answer. Both rows are
                     # kept (the pre-repair verdict is real signal about the
@@ -10214,6 +10517,7 @@ class GhostAgent:
     async def _compute_verifier_verdict(
         self, *, tools_run_this_turn, messages, final_ai_content,
         last_user_content, lc, req_id: str = "", trajectory_id: str = "",
+        project_id=_PROJECT_ID_UNCAPTURED,
     ):
         """Verifier verdict computation — no side effects on the TURN.
 
@@ -10243,6 +10547,15 @@ class GhostAgent:
         request is running then (the `core/turn_facts.py` lesson). Empty
         strings are fine; the ledger simply records no identity.
         """
+        # ⚠ Resolve the project binding ONCE, up front. `project_id` arrives
+        # captured-at-spawn from the gated front door (race-free); a direct
+        # caller that did not capture gets the global read here, at method
+        # start — still one read, never a mid-method re-read that a
+        # concurrent conversation's reconcile can flip between the ledger
+        # parse and the on-disk re-read.
+        if project_id is _PROJECT_ID_UNCAPTURED:
+            project_id = getattr(self.context, "current_project_id", None)
+
         from .verifier import VerifyVerdict
         verifier = getattr(self.context, "verifier", None)
         # §4BC split: the EVIDENCE view decides IF the verifier runs (a
@@ -10485,8 +10798,7 @@ class GhostAgent:
         # Visual ground-truth override (unchanged from the inline gate).
         try:
             if _is_visual_intent(last_user_content):
-                from ..tools.file_system import project_scoped_sandbox
-                _sbx = project_scoped_sandbox(self.context)[0]
+                _sbx = self._scoped_sandbox_for(project_id)
                 _before_img, _after_img = _select_visual_evidence(
                     messages, last_user_content or "", _sbx,
                 )
@@ -10561,7 +10873,8 @@ class GhostAgent:
                     icon=Icons.VERIFIER_LAB, level="WARNING",
                 )
             if written or _retired_pages:
-                check = await self._execute_web_artifact(written)
+                check = await self._execute_web_artifact(
+                    written, project_id=project_id)
                 if check is None:
                     _wx_inconclusive = True
                     pretty_log(
@@ -10643,68 +10956,96 @@ class GhostAgent:
             # list — parsing filenames out of it produced a false
             # FILE-ARTIFACT refute for files this reply never claimed.
             _claimed = _claimed_deliverable_files(_claim_src)
-            # Union with the files the turn ACTUALLY mutated (writes AND
-            # replaces, any extension) — claim-prose selection alone let an
-            # edited-but-unclaimed file skip the ground-truth re-read
-            # (2026-07-19 index.html corruption). Cap matches the claimed
-            # list's own [:8].
             _mutated, _retired = _fs_path_ledger(tools_run_this_turn)
-            # ⚠ Dedup on the ledger's own key, not the raw spelling:
-            # `/workspace/a.js` and `a.js` are one file, and letting both in
-            # burns two of the eight slots — an eviction that would silence the
-            # 2026-07-19 corrupted-index.html guard. (Not a measured
-            # save: normalised vs raw dedup differs on 0 of 1,855
-            # recorded turns, because the ledger already dedups
-            # internally. It is the right key for a shape the record
-            # has not yet produced.)
-            # ⚠ And INTERLEAVE. Concatenating prose-claims first let a chatty
-            # answer with 8 claims starve the ledger arm completely: the same
-            # corrupted index.html went unchecked because the model had
-            # talked about eight other files. LLM prose must not outrank hard
-            # tool facts for a scarce slot.
-            _seen_keys, _claim_q, _mut_q = set(), [], []
-            for _src_list, _dst in ((_claimed, _claim_q), (_mutated, _mut_q)):
-                for _cand in _src_list:
-                    _k = _fs_norm(_cand)
-                    if _k in _seen_keys:
-                        continue
+            # ⚠ THE LEDGER IS THE ONLY ABSENCE-GRADE EVIDENCE. The hard,
+            # missing-refuting list is built from tool confirmations alone;
+            # prose claims ride the `soft` (emptiness-only) arm alongside the
+            # retired paths. Every attested false FILE-ARTIFACT refute came
+            # from a prose capture on a turn that ran no file tool, while
+            # prose contributed a file the ledger lacked on 7 of 1,855
+            # recorded turns — a trade that buys the whole false-refute class
+            # for almost nothing. Prose keeps its teeth for emptiness: a
+            # claimed file that exists at 0 bytes still refutes. (This also
+            # retires the claim/mutated interleave — with one source for the
+            # hard list there is nothing to interleave.)
+            _seen_keys, _to_check = set(), []
+            for _cand in _mutated:
+                _k = _fs_norm(_cand)
+                if _k not in _seen_keys:
                     _seen_keys.add(_k)
-                    _dst.append(_cand)
-            # ⚠ Structurally terminating, deliberately. The first draft was
-            # a `while` whose exit depended on at least one of two optional
-            # branches firing each pass — disable either and it spins
-            # forever. A mutation run found that by hanging for 900s, which
-            # is the good outcome; in production it would have been a wedged
-            # turn. An interleave is a zip, so write it as one.
-            _to_check = [x for pair in zip_longest(_claim_q, _mut_q)
-                         for x in pair if x is not None][:8]
-            _n_claimed = sum(1 for _c in _to_check if _c in set(_claimed))
-            # Paths the request produced and then removed are checked for
-            # EMPTINESS only (see `_verify_file_artifacts`' `soft`): absence
-            # is what "removed" means, but a removed path that is back on
-            # disk and EMPTY was re-created badly by a route this parse
-            # cannot see, and that arm of the old check is worth keeping.
-            _soft = [p for p in _retired if _fs_norm(p) not in _seen_keys][:8]
+                    _to_check.append(_cand)
+            _to_check = _to_check[:8]
+            # Soft = written-then-removed paths (absence is what "removed"
+            # means, but a re-created-EMPTY one is a real defect) + the
+            # prose claims not already covered by the ledger. Retired first:
+            # they are ledger-grounded and rarer.
+            _soft, _soft_keys = [], set()
+            for _cand in list(_retired) + [c for c in _claimed]:
+                _k = _fs_norm(_cand)
+                if _k in _seen_keys or _k in _soft_keys:
+                    continue
+                _soft_keys.add(_k)
+                _soft.append(_cand)
+            _soft = _soft[:8]
             if _to_check or _soft:
-                from ..tools.file_system import project_scoped_sandbox
-                _host_dir = project_scoped_sandbox(self.context)[0]
+                # ⚠ RACE-FREE SCOPING — see _scoped_sandbox_for. All three
+                # ground-truth arms scope through the one spawn-captured id.
+                _host_dir = self._scoped_sandbox_for(project_id)
                 # ⚠ Its SIBLING already un-scopes: `_execute_web_artifact`
                 # uses `sbx.parent.parent if sbx.parent.name == "projects"`
                 # because a turn's writes can land at the sandbox ROOT while
-                # the binding still reads as scoped — the incident
-                # `project_scoped_sandbox`'s own docstring records. Passing
-                # it as a FALLBACK root (rather than looping and re-judging)
-                # keeps one verdict, and `_verify_file_artifacts` refuses a
-                # hit under another project so the wider search cannot
-                # certify a namesake — or rescue a genuinely corrupt local
-                # file by finding a healthy one next door.
+                # the binding still reads as scoped. Passing it as a FALLBACK
+                # root keeps one verdict, and `_verify_file_artifacts`
+                # refuses a hit under another project so the wider search
+                # cannot certify a namesake.
                 _sbx = Path(str(_host_dir))
                 _extra = ([str(_sbx.parent.parent)]
                           if _sbx.parent.name == "projects" else [])
                 _rep = {}
+                # removals of the SCOPE project's files within the last 15
+                # minutes (matching _locate_entry_page's recency-gate
+                # precedent) explain a missing written file without implying
+                # failure. Per-project dict, carrying the deleted list —
+                # see workspace_cleanup._mark_removal for the four ways the
+                # single-tuple version failed.
+                _swept = None
+                try:
+                    _marks = getattr(getattr(self.context, "project_store",
+                                             None),
+                                     "recent_workspace_removals", None)
+                    if isinstance(_marks, dict):
+                        _swept = {k: v[1] for k, v in _marks.items()
+                                  if (time.time() - float(v[0]))
+                                  < _REMOVAL_MARK_FRESH_WINDOW_S}
+                except Exception:
+                    _swept = None
                 _fa = self._verify_file_artifacts(
                     _to_check, _host_dir, soft=_soft, extra_roots=_extra,
-                    file_claims=set(_claimed), report=_rep)
+                    file_claims=set(_claimed), report=_rep,
+                    alt_spellings=_fs_wrote_pair_alts(tools_run_this_turn),
+                    removable_keys=_keys_removable_after_write(
+                        tools_run_this_turn),
+                    swept_removals=_swept)
+                if _rep.get("skipped_removable"):
+                    # ⚠ durable, not just a log line: the downgrade decides
+                    # verdicts, and a mechanism whose firings live only in a
+                    # one-day log is the exact "no durable record" defect
+                    # the override provenance was built to close.
+                    if v_result is not None:
+                        try:
+                            v_result.skipped_removable = list(
+                                _rep["skipped_removable"])[:8]
+                        except Exception:
+                            pass
+                    pretty_log(
+                        "Verifier",
+                        f"FILE-ARTIFACT: {len(_rep['skipped_removable'])} "
+                        f"written-then-missing path(s) NOT refuted — a later "
+                        f"shell/script step or a workspace sweep could have "
+                        f"removed them "
+                        f"({', '.join(_rep['skipped_removable'][:3])})",
+                        icon=Icons.VERIFIER_LAB, level="WARNING",
+                    )
                 if _fa is not None:
                     try:        # provenance for the sidecar (see below)
                         _prev = str(getattr(v_result, "override", "") or "")
@@ -10786,15 +11127,13 @@ class GhostAgent:
                     pretty_log(
                         "Verifier",
                         f"FILE-ARTIFACT clean: {_rep.get('resolved', 0)} of "
-                        f"{len(_to_check)} file(s) read "
-                        f"({_n_claimed} claimed + "
-                        f"{len(_to_check) - _n_claimed} written) present "
+                        f"{len(_to_check)} written file(s) read, present "
                         f"+ non-empty"
-                        + (f"; {len(_soft)} written-then-removed checked for "
-                           f"emptiness only" if _soft else "")
+                        + (f"; {len(_soft)} prose-claimed/removed checked "
+                           f"for emptiness only" if _soft else "")
                         + (f"; {len(_rep.get('unresolvable') or [])} could "
                            f"NOT be read" if _rep.get("unresolvable") else "")
-                        + (" — nothing claimed or left behind this turn"
+                        + (" — no files written this turn"
                            if not _to_check else ""),
                         icon=Icons.VERIFIER_LAB,
                     )
@@ -10902,6 +11241,8 @@ class GhostAgent:
                     self._record_verdict_sidecar(
                         str(trajectory_id), _vs, _vc,
                         override=str(getattr(v_result, "override", "") or ""),
+                        skipped_removable=list(getattr(
+                            v_result, "skipped_removable", None) or []) or None,
                         # §4BR: the vote counters ride the SIDECAR, for the
                         # same reason the verdict does. They are the
                         # instrument for the arm's mechanism gate ("if
@@ -10939,7 +11280,9 @@ class GhostAgent:
 
     @staticmethod
     def _verify_file_artifacts(claimed, host_dir, soft=None, *,
-                               extra_roots=(), file_claims=(), report=None):
+                               extra_roots=(), file_claims=(), report=None,
+                               alt_spellings=None, removable_keys=None,
+                               swept_removals=None):
         """Grounded check: re-read the claimed deliverable files under the
         sandbox host dir. Refute if any is MISSING or EMPTY — hard ground
         truth the text verifier can't see. Returns a REFUTED VerifyResult or
@@ -10984,6 +11327,7 @@ class GhostAgent:
         rep.setdefault("resolved", 0)
         rep.setdefault("resolved_soft", 0)
         rep.setdefault("unresolvable", [])
+        rep.setdefault("skipped_removable", [])
         if not host_dir or (not claimed and not soft):
             return None
         roots = []
@@ -11078,29 +11422,34 @@ class GhostAgent:
             return (len(parts) >= 2 and parts[0] == "projects"
                     and parts[1] not in own_ids)
 
-        def _root_consumed(root, consumed):
-            """True when `root`'s own path ends with the segments a claim
-            carries that the hit does not.
-
-            ⚠ The symmetric suffix rule's claim-deeper arm exists for one
-            shape: a claim spelled from the sandbox root resolved against a
-            root that already IS the project directory. Unconstrained it
-            says any deep claim may be answered by a shallow namesake —
-            `<sbx>/index.html` answering `projects/webos/index.html`. The
-            prefix the claim carries must be the prefix this root stands
-            for."""
-            if not consumed:
-                return True
-            r = str(root).replace(os.sep, "/").rstrip("/").casefold()
-            return r.endswith("/" + consumed) or r == consumed
-
-        def _resolve(name):
+        def _resolve(name, exact_only=False, dir_ok_name=None):
             """-> (path, is_dir), (None, False) if absent, or (False, False)
-            if the check could not be CARRIED OUT for this path."""
+            if the check could not be CARRIED OUT for this path.
+
+            ``exact_only`` skips the basename search. The soft (emptiness-
+            only) arm carries prose claims whose spellings are sloppy by
+            nature; letting a bare `config.json` claim resolve via rglob to
+            ANY same-named file found an unrelated empty
+            `vendor/config.json` and refuted a turn on a file nobody meant
+            — wrong-file evidence, the exact class the foreign-project
+            guard closes for the scoped case. Emptiness testimony must be
+            about the file at the claimed path, or nothing."""
             rel = _rel_of(name)
             if not rel:
                 return None, False
-            dir_ok = _fs_norm(name) not in _file_claim_keys
+            # ⚠ A `..` that escapes the root is not a sandbox path. `cand =
+            # root / rel` joins the RAW spelling, so an escaping claim walked
+            # OUT of the sandbox on the exact-path probe — an empty host file
+            # one level up produced a "claimed-but-empty" refute about a file
+            # no turn ever touched. (Interior `..` that stays inside is fine;
+            # normpath collapses it for this test.)
+            if _norm_rel(rel).split("/", 1)[0] == "..":
+                return None, False
+            # ⚠ from the ORIGINAL claim when resolving an ALT spelling: a
+            # prose-claimed file must not be satisfied by a DIRECTORY that
+            # happens to sit at the pair's rel_str spelling.
+            dir_ok = _fs_norm(dir_ok_name if dir_ok_name is not None
+                              else name) not in _file_claim_keys
             own_ids = _own_for(name)
             want = _norm_rel(rel)
             unknown = False
@@ -11126,10 +11475,11 @@ class GhostAgent:
                         f"{name} ({type(_rex).__name__})")
                     unknown = True
                     continue
-                if root != primary:
+                if root != primary or exact_only:
                     # A fallback root gets its exact path and nothing more:
                     # a basename search there is a licence to answer with
-                    # any same-named file anywhere in the sandbox.
+                    # any same-named file anywhere in the sandbox. Same for
+                    # the soft arm on ANY root — see the docstring.
                     continue
                 try:
                     for p in root.rglob(_P(rel).name):
@@ -11137,15 +11487,21 @@ class GhostAgent:
                             hit = _norm_rel(str(p.relative_to(root)))
                         except ValueError:
                             continue
-                        if hit == want:
-                            pass
-                        elif hit.endswith("/" + want):
-                            pass
-                        elif want.endswith("/" + hit):
-                            if not _root_consumed(
-                                    root, want[: -(len(hit) + 1)]):
-                                continue
-                        else:
+                        # ⚠ Two arms, not three. A claim-deeper arm
+                        # (`want.endswith("/" + hit)` — a deep claim answered
+                        # by a shallower on-disk hit) existed here and was
+                        # DELETED as the shallow-namesake certification hole
+                        # two adversarial lenses attacked. Its original
+                        # justification ("an exact substitute for the
+                        # fallback root the caller always supplies") was
+                        # later DISPROVED — the fallback exists only when
+                        # scoped, and covers the opposite direction — so the
+                        # deletion is compensated instead: resolution
+                        # consults a pair-write's own rel_str (see
+                        # `_fs_wrote_pair_alts`) before declaring a written
+                        # file missing. Prose claims spelled deeper than
+                        # disk are absence-ignored on the soft arm.
+                        if not (hit == want or hit.endswith("/" + want)):
                             continue
                         if _foreign(str(p.relative_to(root)), own_ids):
                             continue
@@ -11195,16 +11551,72 @@ class GhostAgent:
 
         for name in (claimed or []):
             found, is_dir = _resolve(name)
+            if found is None:
+                # A pair-write's tool-resolved spelling is the tool's own
+                # statement of where the file really landed; consult it
+                # before calling a written file missing. A could-not-check
+                # on one alt must not stop the NEXT alt from resolving —
+                # only a real hit ends the search.
+                _saw_unknown = False
+                for _alt in (alt_spellings or {}).get(str(name), ()):
+                    _f2, _d2 = _resolve(_alt, dir_ok_name=name)
+                    if _f2 is False:
+                        _saw_unknown = True
+                        continue
+                    if _f2 is not None:
+                        found, is_dir = _f2, _d2
+                        break
+                if found is None and _saw_unknown:
+                    found = False
             if found is False:
                 continue                    # could not check — never refute
             if found is None:
+                _k = _fs_norm(name)
+                # ⚠ absence after a CONFIRMED write proves removal, not
+                # non-production. Two removal routes leave no file_system
+                # confirmation to cancel the write: a later shell/script
+                # step (`rm` through execute — the GlassOS shape one tool
+                # over), and a workspace sweep racing this re-read from
+                # another request. Both are evidence-gated — ORDER for the
+                # first, the sweep's own recency-stamped mark for the
+                # second — and both downgrade to a logged skip, never to a
+                # refute the repair loop cannot win.
+                if _k in (removable_keys or ()):
+                    rep["skipped_removable"].append(name)
+                    continue
+                if swept_removals:
+                    # which project does this MISSING path belong to?
+                    _kp = (_k.split("/", 2)[1]
+                           if _k.startswith("projects/") else
+                           (own_project or "").casefold())
+                    _del = swept_removals.get((_kp or "").casefold(), "ABSENT")
+                    # None = the whole tree went (hard delete); a list must
+                    # actually NAME the file — path-wise, project-relative.
+                    # ⚠ The first match accepted bare-BASENAME equality, so a
+                    # deleted `vendor/x.md` "explained" a missing top-level
+                    # `x.md` and vice versa; a tidy that removed one stale
+                    # screenshot must not explain a missing app.py either.
+                    _krel = (_k.split("/", 2)[2]
+                             if _k.startswith("projects/") and _k.count("/") >= 2
+                             else _k)
+                    if _del is None or (_del != "ABSENT"
+                                        and _krel in _del):
+                        rep["skipped_removable"].append(name)
+                        continue
                 missing.append(name)
                 continue
             rep["resolved"] += 1
             if not is_dir and _record(found, name) and _is_empty(found, name):
                 empty.append(name)
         for name in (soft or []):
-            found, is_dir = _resolve(name)
+            found, is_dir = _resolve(name, exact_only=True)
+            if found is None:
+                for _alt in (alt_spellings or {}).get(str(name), ()):
+                    _f2, _d2 = _resolve(_alt, exact_only=True,
+                                        dir_ok_name=name)
+                    if _f2 is not None and _f2 is not False:
+                        found, is_dir = _f2, _d2
+                        break
             if found is None or found is False or is_dir:
                 continue            # absence is expected for a removed path
             # ⚠ counted separately: the caller's "nothing was readable" gate
@@ -11571,6 +11983,18 @@ class GhostAgent:
 
         gate = self._critic_gate_timeout()
 
+        # ⚠ Capture the project binding NOW, while this is still the turn's
+        # own execution. The spawned verdict task can run ~60s later, and
+        # `current_project_id` is process-global — a concurrent
+        # conversation's reconcile repointing it mid-flight made a late
+        # verdict resolve deliverables against the WRONG project's
+        # directory. `_attach_late_verdict_handler` has captured at spawn
+        # since 2026-08-13 for exactly this reason; the verdict itself
+        # did not.
+        # ⚠ captured AND healed here, while conversation_key is still this
+        # turn's own — see _captured_project_id.
+        _vp_project_id = self._captured_project_id()
+
         # §4BC scope guard (round-2 review MAJOR-3; widened to ALL
         # non-async configs in round 3): the informational-bookkeeping
         # widening is an ASYNC-CRITIC-ONLY feature — its verdict rides the
@@ -11596,6 +12020,7 @@ class GhostAgent:
                 lc=lc,
                 req_id=req_id,
                 trajectory_id=trajectory_id,
+                project_id=_vp_project_id,
             )
 
         task = _glog.spawn_task(self._compute_verifier_verdict(
@@ -11606,6 +12031,7 @@ class GhostAgent:
             lc=lc,
             req_id=req_id,
             trajectory_id=trajectory_id,
+            project_id=_vp_project_id,
         ))
 
         if gate > 0:
@@ -11633,7 +12059,10 @@ class GhostAgent:
             task, trajectory_id,
             conv_fp if conv_fp is not None
             else self._conversation_fingerprint(messages),
-            project_id=getattr(self.context, "current_project_id", None),
+            # the value captured above, NOT a fresh global read after the
+            # gate wait — follow-up tasks were filed on whichever project the
+            # global pointed at by timeout time.
+            project_id=_vp_project_id,
         )
         return None, last_tool
 
@@ -12231,8 +12660,13 @@ class GhostAgent:
         status = str(proj.get("status", "")).upper()
         if not proj or status in ("RELEASED", "ARCHIVED"):
             return
+        # ⚠ Bounded read, aligned with the merge cap: every other consumer
+        # of `issues` slices (`[:2]` backfill, `[:3]` repair directive and
+        # note) and this was the one that did not — the sole path on which a
+        # pathological upstream could file from an unbounded list into
+        # durable project state.
         issues = [str(i).strip() for i in (getattr(v_result, "issues", None)
-                                           or [])]
+                                           or [])[:4]]
         issues = [i for i in issues if len(i) >= self._REFUTE_TASK_MIN_CHARS]
         # Delivery/packaging artifacts are never project WORK: "truncated
         # response" describes the audit packer's own cut (req 56221fad filed
@@ -20769,8 +21203,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # B's project and wiping B's in-flight accumulation.
                         # Same req_id-tag guard the calibration stash uses.
                         try:
+                            # ⚠ healed at WRITE time, under the semaphore,
+                            # while conversation_key is still this turn's own
+                            # — the drain consumes this snapshot precisely
+                            # because nothing readable at drain time is
+                            # race-free, so a stomped global committed here
+                            # poisons both the work-log filing and the
+                            # streamed verdict's scope.
+                            _wl_snap_pid = self._captured_project_id()
                             self.context._project_work_pending = (req_id, {
-                                "pid": getattr(self.context, "current_project_id", None),
+                                "pid": _wl_snap_pid,
                                 "files": set(getattr(self.context, "_project_work_files", None) or set()),
                                 "tools": dict(getattr(self.context, "_project_work_tools", None) or {}),
                                 "failed": dict(getattr(self.context, "_project_work_failed_tools", None) or {}),
@@ -21911,6 +22353,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _crit = ""
                             _refuted = False
                             _unverified = False
+                            # ⚠ captured ABOVE the whole async/sync verdict
+                            # chain — every _compute_verifier_verdict call in
+                            # it threads this. (The first placement sat inside
+                            # the async branch alone; the sync branch raised
+                            # UnboundLocalError, which the defensive except
+                            # dutifully swallowed into "skip the repair" —
+                            # eight tests caught it because two verifier
+                            # passes became one.) On overrun the spawned task
+                            # runs post-semaphore, where the global belongs to
+                            # whoever runs next.
+                            _rv_pid = self._captured_project_id()
                             try:
                                 from .verifier import VerifyVerdict as _VV
                                 if self._critic_async_enabled():
@@ -21964,6 +22417,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     lc=lc,
                                                     req_id=req_id,
                                                     trajectory_id=current_trajectory_id,
+                                                    project_id=_rv_pid,
                                                 ))
                                             _vdone, _ = await asyncio.wait(
                                                 {_vtask}, timeout=_rbudget)
@@ -21993,10 +22447,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 self._attach_late_verdict_handler(
                                                     _vtask, current_trajectory_id,
                                                     _stable_conv_fp,
-                                                    project_id=getattr(
-                                                        self.context,
-                                                        "current_project_id",
-                                                        None),
+                                                    project_id=_rv_pid,
                                                 )
                                                 _verifier_verdict_cache = (
                                                     None, _lt,
@@ -22045,6 +22496,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     _verdict_is_fresh = True
                                 else:
                                     _vr, _lt = await self._compute_verifier_verdict(
+                                        project_id=_rv_pid,
                                         tools_run_this_turn=tools_run_this_turn,
                                         messages=messages,
                                         final_ai_content=final_ai_content,
@@ -23162,6 +23614,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         _turn_reg = ss._turn_reg
         pressure_lockdown = ss.pressure_lockdown
 
+        # ⚠ captured while this is still the turn's own execution (and
+        # healed) — the drain's fallback when the snapshot tag mismatches.
+        _stream_captured_pid = self._captured_project_id()
+
         async def stream_wrapper():
             full_content = ""
             # §4O B-MAJOR-1: the internal drain sets stream_errored on an
@@ -23945,15 +24401,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # filing below also runs in this drain (after semaphore
                 # release) and must file against THIS turn's project, not a
                 # concurrent turn's re-pointed current_project_id.
-                _drain_pid = None
-                try:
-                    _dp = getattr(self.context, "_project_work_pending", None)
-                    if isinstance(_dp, tuple) and len(_dp) == 2 and _dp[0] == req_id:
-                        _drain_pid = (_dp[1] or {}).get("pid")
-                    else:
-                        _drain_pid = getattr(self.context, "current_project_id", None)
-                except Exception:
-                    _drain_pid = getattr(self.context, "current_project_id", None)
+                _drain_pid = self._drain_scope_pid(
+                    getattr(self.context, "_project_work_pending", None),
+                    req_id, _stream_captured_pid)
 
                 # Streamed-turn trajectory + work_log (2026-07-20 H1).
                 # A streamed forced-final turn RETURNS the SSE
@@ -24167,6 +24617,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     else:
                         _sv_task = _glog.spawn_task(
                             self._compute_verifier_verdict(
+                                # ⚠ _drain_pid, NOT the sentinel: the drain
+                                # runs post-semaphore, where a method-start
+                                # global read is whoever runs next. This was
+                                # the production-common path the first
+                                # capture fix missed.
+                                project_id=_drain_pid,
                                 tools_run_this_turn=stream_tools_snapshot,
                                 messages=stream_verify_messages,
                                 final_ai_content=_sv_claim,
