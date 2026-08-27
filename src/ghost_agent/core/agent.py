@@ -19,6 +19,7 @@ import httpx
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
+from itertools import zip_longest
 
 from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 from .planning import TaskTree, TaskStatus
@@ -1536,66 +1537,293 @@ def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     return any(marker in content for marker in _FILE_MUTATION_MARKERS)
 
 
-# Quoted filenames with a web extension inside a file_system SUCCESS
-# message ("SUCCESS: Wrote 8214 chars to 'index.html'. ...").
-_WEB_ARTIFACT_RE = re.compile(r"'([^']+\.(?:html?|js|mjs|cjs))'")
+# ── file_system SUCCESS-message parsing ──────────────────────────────
+# Both ground-truth overrides below (WEB-EXEC entry page, FILE-ARTIFACT
+# re-read) learn what a request touched by parsing the file tool's own
+# SUCCESS confirmations — turn records carry (name, content), not the
+# original call arguments. So the parse mirrors the message shapes
+# `tools/file_system.py` emits, one anchored pattern per shape, and it
+# respects ORDER: a scratch file written and then deleted in the same
+# request is not a deliverable.
+#
+# ⚠ WHY (2026-08-26, the GlassOS webOS refute). The previous parse
+# matched any quoted token containing a dot, in EVERY file_system SUCCESS
+# message — including `SUCCESS: Deleted 'probe.py'.`. So a scratch probe
+# the agent wrote, ran, and then tidied up was collected as a produced
+# file, re-read, found missing, and REFUTED (0.9) a turn whose real
+# deliverable (webos/index.html, 25KB, rendered and clicked) was on disk
+# the whole time — overriding a text verdict of CONFIRMED 0.95. Three
+# properties made it worse than one bad verdict:
+#   • `tools_run_this_turn` accumulates across the whole REQUEST, so the
+#     poison survived into the auto-repair round AND the post-reply
+#     re-verify;
+#   • no repair round could ever clear it — the "missing deliverable" was
+#     a file the agent had deliberately removed;
+#   • `tools/execute.py`'s inline-`python -c` block message PRESCRIBES
+#     `file_system(write, path="probe.py")`, so the agent was refuted for
+#     obeying another subsystem's instruction.
+# Only the operator's human label (`_human_label_locked`) stopped the late
+# REFUTED from backfilling a correct turn into the corpus as a FAILURE.
+#
+# ⚠ THE KEY IS NORMALISED, NOT LITERAL. `_get_safe_path` resolves
+# `/workspace/x`, `./x` and `x` to the SAME file, and the write
+# confirmation prints two spellings while the delete prints one — so
+# string-equal bookkeeping lets the incident reproduce verbatim whenever
+# the model spells the delete differently from the write (8 of 135 write confirmations in the
+# trajectory corpus capture a `/workspace/…` filename). Keys are
+# normalised and case-folded (the sandbox is a bind mount on a
+# case-insensitive host FS), and a removed DIRECTORY retires everything
+# produced beneath it — a scratch *directory* is the same tidy-up idiom.
+
+_FS_PATH_PREFIXES = ("/workspace/", "workspace/", "./")
+
+# One anchored pattern per confirmation shape in tools/file_system.py.
+# `'(.+?)'\.`-style captures (rather than `'([^']+)'`) tolerate an
+# apostrophe in a filename and any trailing clause the tool appends.
+# ⚠ Reword a message there and its pattern here goes silently blind —
+# tests/test_grounded_file_verify.py::TestProducerParserParity is the
+# tripwire that makes such a reword fail loudly.
+_FS_RETIRE_RE = re.compile(r"^SUCCESS: Deleted '(.+?)'\.")
+_FS_MOVED_RE = re.compile(r"^SUCCESS: Renamed/Moved '(.+?)' to '(.+?)'\.")
+_FS_DEST_RE = re.compile(
+    r"^SUCCESS: (?:Downloaded|Copied) '.+?' to '(.+?)'\.")
+# ⚠ The `Wrote` confirmation prints TWO spellings of one file: the model's
+# `filename` and the resolved `rel_str`. Under a project-scoped sandbox those
+# differ by the whole `projects/<pid>/` head — `projects/abc/probe.py` and
+# `probe.py` — and the tool then advertises the SECOND one as "Script-side
+# path (from sandbox cwd)", which is the spelling the model uses to delete
+# it. Registering only the first left the delete uncancelled and reproduced
+# the GlassOS false refute verbatim. 53 of the 135 real write
+# confirmations in the corpus (39%) print a pair this did not collapse
+# — a different statistic from the resolver's 39%, which is a
+# coincidence of two unrelated measurements. Both slots name one entry.
+_FS_WROTE_PAIR_RE = re.compile(
+    r"^SUCCESS: Wrote \d+ chars to '(.+?)'\. "
+    r"Script-side path \(from sandbox cwd\): '(.+?)'\.")
+_FS_PRODUCE_RES = (
+    re.compile(r"^SUCCESS: Wrote \d+ chars to '(.+?)'\."),
+    re.compile(r"^SUCCESS: auto-promoted operation='replace' to 'write' "
+               r"for '(.+?)' because"),
+    re.compile(r"^SUCCESS: Streaming replace applied to '(.+?)' "
+               r"\(\d+ line\(s\) modified\)\."),
+    re.compile(r"^SUCCESS: Applied \d+ SEARCH/REPLACE blocks to '(.+?)'\."),
+    re.compile(r"^SUCCESS: (?:Exact|Flexible) match found and replaced "
+               r"in '(.+?)'\."),
+    re.compile(r"^SUCCESS: Fuzzy match \([^)]*\) found and replaced "
+               r"in '(.+?)'\."),
+    re.compile(r"^SUCCESS: Anchor match — replaced the block spanning "
+               r"lines .+? in '(.+?)' \("),
+)
+# The web subset the execution probe can load, and the entry-page subset
+# whose disappearance must not be certified in silence.
+_WEB_EXT_RE = re.compile(r"\.(?:html?|js|mjs|cjs)$", re.IGNORECASE)
+_HTML_EXT_RE = re.compile(r"\.html?$", re.IGNORECASE)
 
 
-def _web_artifacts_written(tools_run: Optional[list]) -> list:
-    """Filenames of web files (html/js) successfully written this turn.
+def _fs_norm(path) -> str:
+    """Bookkeeping key: the sandbox-relative, case-folded spelling."""
+    p = str(path).strip()
+    for pfx in _FS_PATH_PREFIXES:
+        if p.startswith(pfx):
+            p = p[len(pfx):]
+            break
+    return p.lstrip("/").rstrip("/").casefold()
 
-    Feeds the verifier's execution check: a turn that WROTE web files must
-    have its entry page actually loaded before a CONFIRMED is credible.
-    Parses the recorded tool SUCCESS messages because turn records carry
-    only (name, content), not the original call arguments."""
-    out: list = []
+
+def _fs_path_ledger(tools_run: Optional[list]) -> tuple:
+    """-> (left_behind, retired) for this request's file_system calls.
+
+    ``left_behind`` are the paths it produced and did not remove, in
+    first-production order, deduplicated by normalised key (the original
+    spelling is what comes back, since the consumers re-map prefixes
+    themselves). ``retired`` are the paths it produced and then deleted
+    or renamed away — kept, rather than discarded, so a consumer can tell
+    "this request produced no web page" apart from "this request produced
+    one and then removed it". A silent empty list is how a ground-truth
+    check goes inoperative without anyone noticing.
+
+    Only the confirmation LINE is parsed. Everything after the first
+    newline is the tool echoing the edited source back (POST-EDIT VIEW,
+    REPLACED BLOCK, a syntax-error excerpt), whose quoted strings are
+    code, not paths.
+
+    Known limits, none of which this parse can see: a file removed by a
+    shell `rm` through the `execute` tool is invisible here (the same
+    false refute, via a route with no confirmation message); and the DONE-task workspace sweep can delete a file
+    between this parse and the on-disk re-read. (A `[FAILURE BANNER]` prefix
+    used to drop a record whole; that one is FIXED below, not a limit — the
+    parse reads past the banner.)
+    """
+    alive: dict = {}        # normalised key -> [original spelling, is_alive]
+    alias: dict = {}        # a second spelling of one file -> its primary key
+
+    def _alias(secondary, primary_raw):
+        k2, k1 = _fs_norm(secondary), _fs_norm(primary_raw)
+        if k2 and k1 and k2 != k1:
+            # ⚠ A SET, not a single key. The script-side spelling is a bare
+            # relative path, so two projects writing `probe.py` map the same
+            # alias; last-write-wins retired whichever wrote last, which is a
+            # coin flip. Retiring every candidate is the safe direction: it
+            # can silence an absence check (the path moves to the
+            # emptiness-only arm) but can never manufacture the false REFUTE
+            # this whole change exists to remove.
+            alias.setdefault(k2, set()).add(k1)
+
+    def _produce(raw):
+        key = _fs_norm(raw)
+        if not key:
+            return
+        if key in alive:
+            alive[key][1] = True
+        else:
+            alive[key] = [raw, True]
+
+    def _retire(raw):
+        key = _fs_norm(raw)
+        if not key:
+            return
+        # Retire through the alias table: the spelling used to delete a file
+        # is routinely the one the write message advertised second.
+        # ⚠ A DIRECT hit wins over the alias table. The alias key is a bare
+        # spelling and can name a real file at the sandbox root: deleting
+        # `probe.py` when the request wrote BOTH `probe.py` and
+        # `projects/aaa/probe.py` retired the project's file too, though it
+        # is still on disk. If the deleted spelling names something this
+        # request produced under that very name, that is what was deleted.
+        direct = [k for k in alive if k == key or k.startswith(key + "/")]
+        if direct:
+            for k in direct:
+                alive[k][1] = False
+            return
+        targets = set()
+        for k2, k1s in alias.items():
+            if k2 == key or k2.startswith(key + "/"):
+                targets.update(k1s)
+        # (No subtree test here: `_alias` only ever maps FILE paths, so an
+        # alias target can never be a parent of another live key. The
+        # directory case is handled by `direct` above, which does test the
+        # subtree. A mutation survivor showed this arm was dead code.)
+        for k in alive:
+            if k in targets:
+                alive[k][1] = False
+
     for t in tools_run or []:
         if not isinstance(t, dict) or t.get("_synthetic"):
             continue
-        if str(t.get("name", "")).lower().replace("-", "_") not in (
-                "file_system", "filesystem", "file"):
+        # ⚠ The canonical name ONLY. `_canonicalise_tool_name` rewrites a
+        # hallucinated "filesystem"/"file" to "file_system" BEFORE dispatch,
+        # and the record is built from the rewritten name — so alias
+        # branches here were dead. Worse than dead: the Context Shield's
+        # edge-condense exemption (`fname not in ["file_system", …]`) lists
+        # only the canonical name, so a record that somehow arrived under an
+        # alias would be parsed here and condensed there, failing the SUCCESS
+        # gate and vanishing whole — the exact failure the banner strip above
+        # exists to prevent, through a channel no test could see. Two name
+        # lists that must agree are one list too many.
+        if str(t.get("name", "")) != "file_system":
             continue
         content = str(t.get("content", ""))
+        # ⚠ A `[FAILURE BANNER] <first error line>\n` prefix can be prepended
+        # to a tool result containing "Traceback"/"Error"/"SYSTEM ERROR" —
+        # the trigger is not gated on the tool, though it also requires the
+        # error line to have been truncated out of the head — and the
+        # banner-prefixed text is what gets recorded. A successful edit whose
+        # echoed POST-EDIT VIEW carries that word would then fail the SUCCESS
+        # gate and the whole record would be dropped, silencing FILE-ARTIFACT
+        # and WEB-EXEC on a turn that really did write files. The op still
+        # succeeded, so the confirmation underneath is still the truth; read
+        # past the banner. ⚠ No instance exists in 1,263 recorded file_system
+        # results — this is a cheap guard against a reachable shape, not a
+        # fix for an observed incident.
+        if content.startswith("[FAILURE BANNER]"):
+            content = content.split("\n", 1)[1] if "\n" in content else ""
         if not content.startswith("SUCCESS"):
             continue
-        for m in _WEB_ARTIFACT_RE.findall(content):
-            if m not in out:
-                out.append(m)
-    return out
+        head = content.split("\n", 1)[0][:4000]
+        # ⚠ FOUR OVERLAPPING GUARDS keep an echoed confirmation inert: the
+        # SUCCESS fast-path above, this confirmation-line split, `re.match`
+        # anchoring at offset 0, and the `^` every pattern carries. The split
+        # and the anchoring EACH suffice alone; the SUCCESS fast-path alone
+        # does NOT — with the others gone it lets `_FS_RETIRE_RE` find an
+        # echoed `SUCCESS: Deleted '…'` in the body and retire a live
+        # deliverable. So a single-edit mutant on the split or an anchor
+        # cannot fail a test, and that survival is redundancy, not missing
+        # coverage — proven by the multi-edit mutant in
+        # scripts/mutate_fs_ledger.py that strips every copy at once.
+        # The behaviour is pinned by
+        # `test_a_confirmation_echoed_inside_an_edited_file_is_inert`, whose
+        # failure world is CONSTRUCTED, not observed: the file tool is
+        # confined by `_get_safe_path` to <GHOST_HOME>/sandbox and cannot
+        # reach this repo, and no file in the live sandbox contains such a
+        # string. What is verified is the mechanism — a replace whose echoed
+        # REPLACED BLOCK carries a confirmation line does retire a live
+        # deliverable once the guards are gone. Do not read the comment as a
+        # report of something that happened.
+        m = _FS_RETIRE_RE.match(head)
+        if m:
+            _retire(m.group(1))
+            continue
+        m = _FS_MOVED_RE.match(head)
+        if m:
+            _retire(m.group(1))
+            _produce(m.group(2))
+            continue
+        m = _FS_DEST_RE.match(head)
+        if m:
+            # Destination only: a Downloaded source is a URL, and a Copied
+            # source was not produced by this request.
+            _produce(m.group(1))
+            continue
+        # ⚠ No URL filter in this branch, on purpose. `Downloaded 'url' to
+        # 'file'` is the only confirmation that ever quotes a URL, and it is
+        # dispatched above, so a `"://" not in …` guard here would be
+        # unreachable code that no test could exercise. An earlier draft had
+        # one; mutation showed it survived everything, and dead guard code
+        # reads as defence.
+        m = _FS_WROTE_PAIR_RE.match(head)
+        if m:
+            _produce(m.group(1))
+            _alias(m.group(2), m.group(1))
+            continue
+        for _rx in _FS_PRODUCE_RES:
+            m = _rx.match(head)
+            if m:
+                _produce(m.group(1))
+                break
+    return ([o for o, ok in alive.values() if ok],
+            [o for o, ok in alive.values() if not ok])
 
 
-# Any quoted filename in a file_system SUCCESS message — the all-extension
-# sibling of _WEB_ARTIFACT_RE. Extension capped at 7 chars so quoted prose
-# fragments don't match.
-_MUTATED_FILE_RE = re.compile(r"'([^']+\.[A-Za-z0-9]{1,7})'")
+def _web_artifacts_written(tools_run: Optional[list]) -> list:
+    """Web files (html/js) this request produced and did not remove.
+
+    Feeds the verifier's execution check: a turn that WROTE web files must
+    have its entry page actually loaded before a CONFIRMED is credible."""
+    return [p for p in _fs_path_ledger(tools_run)[0] if _WEB_EXT_RE.search(p)]
+
+
+def _retired_entry_pages(tools_run: Optional[list]) -> list:
+    """HTML pages this request produced and then removed.
+
+    The WEB-EXEC probe has no claim-prose leg — the written list is its
+    only input — so dropping a removed page from that list would also
+    disarm its inconclusive confidence cap, and a turn that renamed its
+    only page to `index.html.bak` would be certified at full confidence.
+    Deliberately narrow to `.html/.htm`: a retired `.js`/`.py` scratch
+    file must NOT cap a turn whose deliverable was never a web page."""
+    return [p for p in _fs_path_ledger(tools_run)[1] if _HTML_EXT_RE.search(p)]
 
 
 def _files_mutated_this_turn(tools_run: Optional[list]) -> list:
-    """Filenames of ALL files successfully written or replaced this turn.
+    """ALL files this request produced and did not remove, any extension.
 
     Feeds the FILE-ARTIFACT ground-truth check alongside the answer-text
     claims: `_claimed_deliverable_files` only sees files the prose says were
     *created* ("wrote/saved/generated ..."), so a file the turn EDITED but
     described as "updated"/"fixed" was never re-checked — the 2026-07-19
     index.html marker-leak corruption shipped behind a CONFIRMED (100%)
-    precisely because the corrupted file was an unclaimed edit. Parses the
-    recorded tool SUCCESS messages (same sourcing as
-    `_web_artifacts_written`) because turn records carry only
-    (name, content), not the original call arguments."""
-    out: list = []
-    for t in tools_run or []:
-        if not isinstance(t, dict) or t.get("_synthetic"):
-            continue
-        if str(t.get("name", "")).lower().replace("-", "_") not in (
-                "file_system", "filesystem", "file"):
-            continue
-        content = str(t.get("content", ""))
-        if not content.startswith("SUCCESS"):
-            continue
-        for m in _MUTATED_FILE_RE.findall(content[:400]):
-            if m not in out:
-                out.append(m)
-    return out
+    precisely because the corrupted file was an unclaimed edit."""
+    return _fs_path_ledger(tools_run)[0]
 
 
 # ── Deliverable-file ground-truth check ──────────────────────────────
@@ -1619,12 +1847,39 @@ _CLAIMED_FILE_RE = re.compile(
     r"\b(?:saved|wrote|written|created|generated|produced|exported|stored|"
     r"placed|dumped)\b"
     r"[^\n`'\"]{0,60}?"
-    r"[`'\"]?([A-Za-z0-9][A-Za-z0-9._/\-]*\.(?:" + _DELIVERABLE_EXT + r"))\b",
+    # ⚠ The capture MUST be able to include a leading "/" and a URL scheme.
+    # It used to start at `[A-Za-z0-9]`, so a captured name could never begin
+    # with "/" and the `://` was always eaten by the gap above — which made
+    # BOTH filters below unreachable code. `Wrote /etc/hosts.conf` yielded
+    # `etc/hosts.conf`, `Generated … https://example.com/guide.md` yielded
+    # `example.com/guide.md`, and a `/api/download/…` markdown link yielded
+    # `api/download/…`. Each then went into the hard, absence-refuting leg of
+    # the ground-truth check. Two of the three FILE-ARTIFACT refutes
+    # recoverable from the record were exactly this, on turns that ran no
+    # file tool at all.
+    r"[`'\"]?((?:[A-Za-z][A-Za-z0-9+.\-]*://)?/?"
+    r"[A-Za-z0-9][A-Za-z0-9._/\-]*\.(?:" + _DELIVERABLE_EXT + r"))\b",
     re.IGNORECASE,
 )
 _SYS_PATH_PREFIXES = ("/usr", "/etc", "/bin", "/sbin", "/lib", "/opt",
                       "/var", "/System", "/Library", "/private", "/dev",
                       "/proc", "/Users", "/home", "/root", "/tmp")
+# HTTP routes the tools themselves instruct the model to emit — `report_pdf`
+# and the image tools tell it to reply with `[title](/api/download/<rel>)`.
+# That is a URL, not a path, and refuting on it is the probe.py shape again:
+# one subsystem mandating the very text another subsystem refutes.
+# ⚠ `api/download/`, not a bare `api/`: the leading slash is exactly what the
+# capture group now preserves, so every real occurrence arrives slashed, and
+# a bare prefix would silently drop a genuine `api/routes.py` deliverable.
+_HTTP_ROUTE_PREFIXES = ("/api/download/", "api/download/")
+# ⚠ SEGMENT boundaries, not bare prefixes. `startswith` is a string test:
+# once the capture group could begin with "/", `/opt` swallowed
+# `/optimizer.md`, `/bin` swallowed `/binary.json`, `/root` swallowed
+# `/rootcause.md` — real sandbox-root deliverables, dropped SILENTLY and in
+# the direction no log line reports. Lower-cased because the claim regex is
+# IGNORECASE, so `/USR/x.md` reached a tuple that spells `/System` with a
+# capital S ([[guard-a-proxy-not-the-thing]]).
+_SYS_PATH_SEGMENTS = tuple(p.lower() + "/" for p in _SYS_PATH_PREFIXES)
 
 
 def _claimed_deliverable_files(text) -> list:
@@ -1635,7 +1890,8 @@ def _claimed_deliverable_files(text) -> list:
     for m in _CLAIMED_FILE_RE.findall(str(text)):
         name = m.strip().strip("`'\"")
         if (not name or "://" in name
-                or name.startswith(_SYS_PATH_PREFIXES)):
+                or name.lower().startswith(_SYS_PATH_SEGMENTS)
+                or name.startswith(_HTTP_ROUTE_PREFIXES)):
             continue
         if name not in out:
             out.append(name)
@@ -9876,7 +10132,8 @@ class GhostAgent:
                                 sc_n: Optional[int] = None,
                                 sc_agree: Optional[int] = None,
                                 sc_drawn: Optional[int] = None,
-                                route: str = "") -> None:
+                                route: str = "",
+                                override: str = "") -> None:
         """Append one verdict record beside the trajectory log.
 
         Deliberately NOT written into the trajectory's `extra`: the
@@ -9914,6 +10171,17 @@ class GhostAgent:
                     "verdict": verdict,
                     "confidence": confidence,
                     "at": get_utc_timestamp(),
+                    # ⚠ WHICH override produced this verdict. The grounded
+                    # file/exec checks have been overriding the text judge
+                    # since 2026-07-16 with NO durable trace: the sidecar
+                    # kept verdict+confidence, the trajectory kept neither,
+                    # and the only record was a pretty_log line in a file
+                    # that holds about a day. So the one question that
+                    # matters — how often is the override RIGHT — could not
+                    # be asked of the record at all, and the three refutes
+                    # recoverable by hand were all false. Measure the
+                    # mechanism, not just its output.
+                    **({"override": override} if override else {}),
                     # An auto-repaired turn verifies TWICE: once before the
                     # repair and once on the repaired answer. Both rows are
                     # kept (the pre-repair verdict is real signal about the
@@ -10271,7 +10539,28 @@ class GhostAgent:
         _wx_inconclusive = False
         try:
             written = _web_artifacts_written(tools_run_this_turn)
-            if written:
+            # A page this request produced and then REMOVED (renamed to
+            # index.html.bak, deleted in a retry) leaves `written` empty.
+            # WEB-EXEC has no claim-prose leg, so treating that as "no web
+            # work this turn" would skip the probe AND its inconclusive
+            # confidence cap — certifying, at full confidence, a build
+            # whose entry page is not on disk (lens B, 2026-08-26). Run the
+            # probe anyway: it returns None for an empty list, which is the
+            # existing inconclusive path and arms the 0.6 cap. Narrow to
+            # retired HTML pages on purpose — a tidied-up scratch .js must
+            # not cap a turn whose deliverable was never a web page.
+            _retired_pages = (_retired_entry_pages(tools_run_this_turn)
+                              if not written else [])
+            if _retired_pages:
+                pretty_log(
+                    "Verifier",
+                    f"WEB-EXEC: {len(_retired_pages)} entry page(s) written "
+                    f"then removed this request and none left "
+                    f"({', '.join(_retired_pages[:3])}) — probing anyway so "
+                    f"the inconclusive cap still arms",
+                    icon=Icons.VERIFIER_LAB, level="WARNING",
+                )
+            if written or _retired_pages:
                 check = await self._execute_web_artifact(written)
                 if check is None:
                     _wx_inconclusive = True
@@ -10295,6 +10584,10 @@ class GhostAgent:
                             ),
                             issues=[f"uncaught JS exception(s) on {page_rel}"],
                         )
+                        try:
+                            v_result.override = "web-exec"
+                        except Exception:
+                            pass
                         pretty_log(
                             "Verifier",
                             f"WEB-EXEC REFUTED: '{page_rel}' throws on load",
@@ -10355,30 +10648,154 @@ class GhostAgent:
             # edited-but-unclaimed file skip the ground-truth re-read
             # (2026-07-19 index.html corruption). Cap matches the claimed
             # list's own [:8].
-            _mutated = _files_mutated_this_turn(tools_run_this_turn)
-            _to_check = list(_claimed)
-            for _mf in _mutated:
-                if _mf not in _to_check:
-                    _to_check.append(_mf)
-            _to_check = _to_check[:8]
-            if _to_check:
+            _mutated, _retired = _fs_path_ledger(tools_run_this_turn)
+            # ⚠ Dedup on the ledger's own key, not the raw spelling:
+            # `/workspace/a.js` and `a.js` are one file, and letting both in
+            # burns two of the eight slots — an eviction that would silence the
+            # 2026-07-19 corrupted-index.html guard. (Not a measured
+            # save: normalised vs raw dedup differs on 0 of 1,855
+            # recorded turns, because the ledger already dedups
+            # internally. It is the right key for a shape the record
+            # has not yet produced.)
+            # ⚠ And INTERLEAVE. Concatenating prose-claims first let a chatty
+            # answer with 8 claims starve the ledger arm completely: the same
+            # corrupted index.html went unchecked because the model had
+            # talked about eight other files. LLM prose must not outrank hard
+            # tool facts for a scarce slot.
+            _seen_keys, _claim_q, _mut_q = set(), [], []
+            for _src_list, _dst in ((_claimed, _claim_q), (_mutated, _mut_q)):
+                for _cand in _src_list:
+                    _k = _fs_norm(_cand)
+                    if _k in _seen_keys:
+                        continue
+                    _seen_keys.add(_k)
+                    _dst.append(_cand)
+            # ⚠ Structurally terminating, deliberately. The first draft was
+            # a `while` whose exit depended on at least one of two optional
+            # branches firing each pass — disable either and it spins
+            # forever. A mutation run found that by hanging for 900s, which
+            # is the good outcome; in production it would have been a wedged
+            # turn. An interleave is a zip, so write it as one.
+            _to_check = [x for pair in zip_longest(_claim_q, _mut_q)
+                         for x in pair if x is not None][:8]
+            _n_claimed = sum(1 for _c in _to_check if _c in set(_claimed))
+            # Paths the request produced and then removed are checked for
+            # EMPTINESS only (see `_verify_file_artifacts`' `soft`): absence
+            # is what "removed" means, but a removed path that is back on
+            # disk and EMPTY was re-created badly by a route this parse
+            # cannot see, and that arm of the old check is worth keeping.
+            _soft = [p for p in _retired if _fs_norm(p) not in _seen_keys][:8]
+            if _to_check or _soft:
                 from ..tools.file_system import project_scoped_sandbox
                 _host_dir = project_scoped_sandbox(self.context)[0]
-                _fa = self._verify_file_artifacts(_to_check, _host_dir)
+                # ⚠ Its SIBLING already un-scopes: `_execute_web_artifact`
+                # uses `sbx.parent.parent if sbx.parent.name == "projects"`
+                # because a turn's writes can land at the sandbox ROOT while
+                # the binding still reads as scoped — the incident
+                # `project_scoped_sandbox`'s own docstring records. Passing
+                # it as a FALLBACK root (rather than looping and re-judging)
+                # keeps one verdict, and `_verify_file_artifacts` refuses a
+                # hit under another project so the wider search cannot
+                # certify a namesake — or rescue a genuinely corrupt local
+                # file by finding a healthy one next door.
+                _sbx = Path(str(_host_dir))
+                _extra = ([str(_sbx.parent.parent)]
+                          if _sbx.parent.name == "projects" else [])
+                _rep = {}
+                _fa = self._verify_file_artifacts(
+                    _to_check, _host_dir, soft=_soft, extra_roots=_extra,
+                    file_claims=set(_claimed), report=_rep)
                 if _fa is not None:
-                    v_result = _fa
+                    try:        # provenance for the sidecar (see below)
+                        _prev = str(getattr(v_result, "override", "") or "")
+                        v_result.override = (
+                            f"{_prev}+file-artifact" if _prev
+                            else "file-artifact")
+                    except Exception:
+                        pass
+                    # ⚠ Do not throw away a refute that already stands. An
+                    # earlier override (WEB-EXEC execution, VISUAL) may have
+                    # refuted with far more actionable evidence — "the page
+                    # throws a SyntaxError on load" — and the repair prompt is
+                    # built from `issues`. Replacing wholesale told the model
+                    # only "a deliverable is missing" and the JS bug shipped.
+                    # ⚠ Merge by RESERVING SLOTS, not by appending: every
+                    # consumer slices (`issues[:3]` for the repair directive
+                    # and the note, `[:2]` for the backfill reason), so an
+                    # appended issue on a refute that already had three was
+                    # dropped by all of them — strictly worse than replacing.
+                    # ⚠ …but only merge into a refute that ALREADY carries
+                    # weight. `max(conf)` on a 0.55 text refute would stamp it
+                    # 0.9 — pushing a verdict that no gate would have acted on
+                    # across the repair, backfill and lesson-scrub thresholds,
+                    # carrying its own issues while the grounded evidence is
+                    # what gets truncated away. Below the gate, replace.
+                    if (v_result is not None
+                            and getattr(v_result, "verdict", None)
+                            == VerifyVerdict.REFUTED
+                            and getattr(v_result, "confidence", 0.0) >= 0.7):
+                        _fa_issues = [i for i in (_fa.issues or [])
+                                      if i not in (v_result.issues or [])]
+                        if _fa_issues:      # idempotent: re-running adds nothing
+                            # ⚠ INTERLEAVED, grounded first. Reserving the
+                            # back half is not enough: the backfill reason
+                            # reads `issues[:2]`, so a standing refute with
+                            # two issues of its own still pushed the file
+                            # evidence out of it. The grounded check is the
+                            # harder fact — it leads, and the standing
+                            # refute's own reasons follow, so BOTH survive
+                            # every consumer's slice.
+                            v_result.issues = [
+                                x for pair in zip_longest(
+                                    _fa_issues[:2],
+                                    list(v_result.issues or [])[:2])
+                                for x in pair if x][:4]
+                            v_result.reasoning = ((v_result.reasoning or "")
+                                                  + " ALSO: "
+                                                  + (_fa.reasoning or "")).strip()
+                        v_result.confidence = max(v_result.confidence,
+                                                  _fa.confidence)
+                    else:
+                        v_result = _fa
                     pretty_log(
                         "Verifier",
-                        f"FILE-ARTIFACT REFUTED: {(_fa.reasoning or '')[:130]}",
+                        f"FILE-ARTIFACT REFUTED: {(_fa.reasoning or '')[:260]}",
                         icon=Icons.VERIFIER_LAB, level="WARNING",
+                    )
+                elif not _rep.get("checkable") or (
+                        not _rep.get("resolved") and _to_check):
+                    # ⚠ `resolved` counts CLAIMED paths only. Counting soft
+                    # hits too let one written-then-removed file that came
+                    # back satisfy this gate while every actual deliverable
+                    # sat behind an unreadable directory — and the operator
+                    # was told "clean … present + non-empty".
+                    # ⚠ `None` means "no override", which covers BOTH "every
+                    # path checked out" and "nothing could be opened". Logging
+                    # them alike turned an unmounted workspace — the
+                    # documented OrbStack boot race — into a positive claim
+                    # about files this check never read.
+                    pretty_log(
+                        "Verifier",
+                        "FILE-ARTIFACT could not run: no path was readable "
+                        f"({len(_to_check)} claimed/written"
+                        + (f", {len(_rep.get('unresolvable') or [])} errored"
+                           if _rep.get("unresolvable") else "") + ")",
+                        icon=Icons.WARN, level="WARNING",
                     )
                 else:
                     pretty_log(
                         "Verifier",
-                        f"FILE-ARTIFACT clean: {len(_to_check)} file(s) "
-                        f"({len(_claimed)} claimed + "
-                        f"{len(_to_check) - len(_claimed)} mutated) present "
-                        f"+ non-empty",
+                        f"FILE-ARTIFACT clean: {_rep.get('resolved', 0)} of "
+                        f"{len(_to_check)} file(s) read "
+                        f"({_n_claimed} claimed + "
+                        f"{len(_to_check) - _n_claimed} written) present "
+                        f"+ non-empty"
+                        + (f"; {len(_soft)} written-then-removed checked for "
+                           f"emptiness only" if _soft else "")
+                        + (f"; {len(_rep.get('unresolvable') or [])} could "
+                           f"NOT be read" if _rep.get("unresolvable") else "")
+                        + (" — nothing claimed or left behind this turn"
+                           if not _to_check else ""),
                         icon=Icons.VERIFIER_LAB,
                     )
         except Exception as _fa_exc:
@@ -10484,6 +10901,7 @@ class GhostAgent:
                 if trajectory_id:
                     self._record_verdict_sidecar(
                         str(trajectory_id), _vs, _vc,
+                        override=str(getattr(v_result, "override", "") or ""),
                         # §4BR: the vote counters ride the SIDECAR, for the
                         # same reason the verdict does. They are the
                         # instrument for the arm's mechanism gate ("if
@@ -10520,46 +10938,285 @@ class GhostAgent:
         return v_result, last_tool
 
     @staticmethod
-    def _verify_file_artifacts(claimed, host_dir):
+    def _verify_file_artifacts(claimed, host_dir, soft=None, *,
+                               extra_roots=(), file_claims=(), report=None):
         """Grounded check: re-read the claimed deliverable files under the
         sandbox host dir. Refute if any is MISSING or EMPTY — hard ground
         truth the text verifier can't see. Returns a REFUTED VerifyResult or
-        None (all present + non-empty, or nothing checkable)."""
+        None (all present + non-empty, or nothing checkable).
+
+        ``soft`` paths are checked for EMPTINESS ONLY, never absence. They
+        are the paths this request produced and then REMOVED: absence is
+        exactly what "removed" means and refuting on it is the 2026-08-26
+        GlassOS false refute. But a removed path that is back on disk was
+        re-created by some route this parse cannot see (a shell `rm` and
+        rewrite through `execute`), and a re-created deliverable that landed
+        EMPTY is a real defect the old parse used to catch — so that arm is
+        kept rather than dropped with the rest.
+
+        ``extra_roots`` are fallback workspaces, tried in order when a path
+        does not resolve under ``host_dir``. ⚠ They exist because a turn's
+        writes can land at the sandbox ROOT while the binding still reads as
+        project-scoped, and the sibling `_execute_web_artifact` already
+        un-scopes for that reason. They are NOT a free second search: a hit
+        under a DIFFERENT `projects/<id>/` is rejected, because a basename
+        collision with any other project would otherwise certify that
+        project's file as this one's deliverable — and, worse, rescue a
+        genuinely corrupt local file by finding a healthy namesake.
+
+        ``file_claims`` are the paths the ANSWER PROSE named. A prose claim
+        always names a file (the extractor requires a deliverable
+        extension), so a directory must never satisfy one; ledger entries,
+        by contrast, legitimately name directories (`Copied 'src' to
+        'backup.old'`). The same split governs the empty-by-design
+        exemption: an empty `__init__.py` nobody claimed is correct, but one
+        the answer describes as carrying content is a real defect.
+
+        ``report`` — if given, a dict filled with ``checkable`` (did any
+        root exist), ``resolved`` (paths actually opened) and
+        ``unresolvable``. "Could not check" and "checked and found fine" are
+        different states and the caller must be able to log them apart.
+        """
         from pathlib import Path as _P
         from .verifier import VerifyResult, VerifyVerdict
-        if not claimed or not host_dir:
+        rep = report if isinstance(report, dict) else {}
+        rep.setdefault("checkable", False)
+        rep.setdefault("resolved", 0)
+        rep.setdefault("resolved_soft", 0)
+        rep.setdefault("unresolvable", [])
+        if not host_dir or (not claimed and not soft):
             return None
-        root = _P(host_dir)
-        if not root.exists():
-            return None
-        missing, empty = [], []
-        for name in claimed:
-            rel = name
-            for pfx in ("/workspace/", "workspace/", "./"):
-                if rel.startswith(pfx):
-                    rel = rel[len(pfx):]
-            rel = rel.lstrip("/")
-            found = None
+        roots = []
+        for _r in [host_dir, *extra_roots]:
             try:
-                cand = root / rel
-                if cand.is_file():
-                    found = cand
-                else:
-                    base = _P(rel).name
-                    for p in root.rglob(base):  # path mismatch → basename search
-                        if p.is_file():
-                            found = p
-                            break
+                _rp = _P(str(_r))
+                if _rp.exists() and _rp not in roots:
+                    roots.append(_rp)
             except Exception:
                 continue
+        if not roots:
+            return None
+        rep["checkable"] = True
+        primary = _P(str(host_dir))
+        own_project = (primary.name if primary.parent.name == "projects"
+                       else None)
+        # Emptiness that is the normal, correct state for a file NOBODY
+        # claimed to have filled. Refuting on these opens a repair round
+        # whose only escapes are corrupting or deleting the file — the
+        # original bug's shape, in the arm that never had it.
+        _EMPTY_BY_DESIGN = {"__init__.py", ".gitkeep", "py.typed",
+                            ".keep", ".placeholder"}
+        # ⚠ Normalised keys. Everything else in this slice compares through
+        # `_fs_norm`; membership here was by exact string, so a prose claim
+        # spelled `/workspace/pkg/__init__.py` did not match the check
+        # running on `pkg/__init__.py` and the exemption fired on a file the
+        # answer said it had filled. The invariant that made that
+        # unreachable lived 300 lines away in the caller.
+        _file_claim_keys = {_fs_norm(c) for c in (file_claims or ())}
+
+        def _rel_of(name):
+            rel = str(name)
+            for pfx in _FS_PATH_PREFIXES:
+                if rel.startswith(pfx):
+                    rel = rel[len(pfx):]
+                    break
+            return rel.lstrip("/")
+
+        def _norm_rel(rel):
+            """Collapse `..`/`.` and case — the comparisons below decide
+            access, and the filesystem resolves what a raw string test
+            rejects. `projects/mine/../other/x.py` and `Projects/other/x.py`
+            both reach another project's file on this volume."""
+            return os.path.normpath(str(rel)).replace(os.sep, "/").casefold()
+
+        # ⚠ Which project(s) is THIS turn's? `own_project` alone is None on
+        # an unscoped turn — and the sandbox root is exactly where turns
+        # write into `projects/<pid>/`. Treating "no project bound" as "no
+        # project directory may answer" refuted a turn that wrote
+        # `projects/<pid>/app.py` and said "I wrote app.py", while the ledger
+        # entry for the SAME FILE resolved clean in the same call. The turn's
+        # own paths name its project; read it from them.
+        # ⚠ …and derived from the OTHER paths, never from the one being
+        # resolved. A claim that spells `projects/other/secret.py` would
+        # otherwise vouch for itself and the guard would evaporate exactly
+        # when the claim reaches furthest.
+        def _proj_of(path):
+            _cp = _norm_rel(_rel_of(path)).split("/")
+            return (_cp[1] if len(_cp) >= 2 and _cp[0] == "projects" and _cp[1]
+                    else None)
+
+        _claim_projects = [(str(c), _proj_of(c)) for c in
+                           list(claimed or []) + list(soft or [])
+                           + list(file_claims or ())]
+
+        def _own_for(name):
+            ids = {own_project.casefold()} if own_project else set()
+            for _n, _pid in _claim_projects:
+                # ⚠ compare through the ledger key. A raw-string test
+                # let TWO SPELLINGS of one claim vouch for each other
+                # — `projects/bbb/x.py` and its `/workspace/` variant
+                # in one answer — and the guard evaporated exactly
+                # where it reaches furthest. Everything else in this
+                # slice already compares this way.
+                if _pid and _fs_norm(_n) != _fs_norm(name):
+                    ids.add(_pid)
+            return ids
+
+        def _foreign(hit_rel, own_ids):
+            """A hit inside a DIFFERENT project is never this turn's
+            deliverable.
+
+            ⚠ This applies to every basename search, primary root included.
+            Gating it on `root != primary` made it dead code exactly where
+            it was needed: with no active project, `project_scoped_sandbox`
+            returns the sandbox ROOT as primary, so the search descends into
+            `projects/*` with nothing guarding it and another project's page
+            certifies a turn that wrote nothing. `own_project is None` means
+            no project directory may answer at all — the degenerate case
+            fails closed."""
+            parts = _norm_rel(hit_rel).split("/")
+            return (len(parts) >= 2 and parts[0] == "projects"
+                    and parts[1] not in own_ids)
+
+        def _root_consumed(root, consumed):
+            """True when `root`'s own path ends with the segments a claim
+            carries that the hit does not.
+
+            ⚠ The symmetric suffix rule's claim-deeper arm exists for one
+            shape: a claim spelled from the sandbox root resolved against a
+            root that already IS the project directory. Unconstrained it
+            says any deep claim may be answered by a shallow namesake —
+            `<sbx>/index.html` answering `projects/webos/index.html`. The
+            prefix the claim carries must be the prefix this root stands
+            for."""
+            if not consumed:
+                return True
+            r = str(root).replace(os.sep, "/").rstrip("/").casefold()
+            return r.endswith("/" + consumed) or r == consumed
+
+        def _resolve(name):
+            """-> (path, is_dir), (None, False) if absent, or (False, False)
+            if the check could not be CARRIED OUT for this path."""
+            rel = _rel_of(name)
+            if not rel:
+                return None, False
+            dir_ok = _fs_norm(name) not in _file_claim_keys
+            own_ids = _own_for(name)
+            want = _norm_rel(rel)
+            unknown = False
+            for root in roots:
+                try:
+                    cand = root / rel
+                    if cand.is_file() and not (root != primary
+                                               and _foreign(rel, own_ids)):
+                        return cand, False
+                    if cand.is_dir():
+                        # ⚠ A STOP, not a skip. Falling through to the
+                        # basename search let a prose claim whose exact path
+                        # is a directory be answered by an unrelated
+                        # same-named file elsewhere in the tree — the rule
+                        # said "a directory may not satisfy this claim" and
+                        # delivered "something else may".
+                        if not dir_ok:
+                            return None, False
+                        if not (root != primary and _foreign(rel, own_ids)):
+                            return cand, True
+                except Exception as _rex:
+                    rep["unresolvable"].append(
+                        f"{name} ({type(_rex).__name__})")
+                    unknown = True
+                    continue
+                if root != primary:
+                    # A fallback root gets its exact path and nothing more:
+                    # a basename search there is a licence to answer with
+                    # any same-named file anywhere in the sandbox.
+                    continue
+                try:
+                    for p in root.rglob(_P(rel).name):
+                        try:
+                            hit = _norm_rel(str(p.relative_to(root)))
+                        except ValueError:
+                            continue
+                        if hit == want:
+                            pass
+                        elif hit.endswith("/" + want):
+                            pass
+                        elif want.endswith("/" + hit):
+                            if not _root_consumed(
+                                    root, want[: -(len(hit) + 1)]):
+                                continue
+                        else:
+                            continue
+                        if _foreign(str(p.relative_to(root)), own_ids):
+                            continue
+                        if p.is_file():
+                            return p, False
+                        if p.is_dir() and dir_ok:
+                            return p, True
+                except Exception as _rex:
+                    # ⚠ NOT `None`: the caller reads None as MISSING, i.e. a
+                    # refute. An error here (the bind mount vanishing, an
+                    # unreadable parent — pathlib propagates EACCES) says
+                    # nothing about whether the file exists.
+                    rep["unresolvable"].append(
+                        f"{name} ({type(_rex).__name__})")
+                    unknown = True
+                    continue
+            return (False, False) if unknown else (None, False)
+
+        def _is_empty(found, name):
+            if (_P(str(name)).name in _EMPTY_BY_DESIGN
+                    and _fs_norm(name) not in _file_claim_keys):
+                return False
+            try:
+                return found.stat().st_size == 0
+            except OSError:
+                return False
+
+        missing, empty = [], []
+        seen_real = set()
+
+        def _record(found, name):
+            """-> True when this resolved path has not been counted yet.
+
+            ⚠ A file can arrive twice under two spellings — claimed as
+            `sub/out.txt`, retired as `out.txt` — and the dedup that was
+            supposed to stop that compared claim STRINGS, which are
+            different by construction, so it could never fire. Dedup on the
+            resolved path."""
+            try:
+                key = str(found.resolve())
+            except Exception:
+                key = str(found)
+            if key in seen_real:
+                return False
+            seen_real.add(key)
+            return True
+
+        for name in (claimed or []):
+            found, is_dir = _resolve(name)
+            if found is False:
+                continue                    # could not check — never refute
             if found is None:
                 missing.append(name)
-            else:
-                try:
-                    if found.stat().st_size == 0:
-                        empty.append(name)
-                except OSError:
-                    pass
+                continue
+            rep["resolved"] += 1
+            if not is_dir and _record(found, name) and _is_empty(found, name):
+                empty.append(name)
+        for name in (soft or []):
+            found, is_dir = _resolve(name)
+            if found is None or found is False or is_dir:
+                continue            # absence is expected for a removed path
+            # ⚠ counted separately: the caller's "nothing was readable" gate
+            # must not be satisfied by a path that is not in the checked
+            # list at all.
+            rep["resolved_soft"] += 1
+            if _record(found, name) and _is_empty(found, name):
+                empty.append(name)
+        # ⚠ One probe per (root x path) is not one unresolvable path: the
+        # same claim errored under two roots produced two entries and the
+        # caller reported "1 claimed/written, 2 errored".
+        rep["unresolvable"] = sorted(set(rep["unresolvable"]))
         if not missing and not empty:
             return None
         parts = []
@@ -10570,11 +11227,18 @@ class GhostAgent:
         return VerifyResult(
             verdict=VerifyVerdict.REFUTED,
             confidence=0.9,
-            reasoning=("File-artifact check: the answer claims deliverable "
-                       "file(s) that are not actually present/non-empty in the "
-                       "sandbox (" + "; ".join(parts) + "). The content was "
+            reasoning=("File-artifact check: deliverable file(s) this turn "
+                       "claimed or wrote are not actually present/non-empty in "
+                       "the sandbox (" + "; ".join(parts) + "). The content was "
                        "declared done but not produced."),
-            issues=[f"claimed-but-{'missing' if missing else 'empty'} deliverable"],
+            # ⚠ The repair directive is built from `issues`, not `reasoning`
+            # — an issue string with no filename tells the model a
+            # deliverable is missing and never which one.
+            issues=[i for i in (
+                ("claimed-but-missing deliverable: " + ", ".join(missing[:3]))
+                if missing else None,
+                ("claimed-but-empty deliverable: " + ", ".join(empty[:3]))
+                if empty else None) if i],
         )
 
     @staticmethod

@@ -172,9 +172,16 @@ class TestTheWriterActuallyRuns:
         # Force the FILE-ARTIFACT override to win — it builds a replacement
         # VerifyResult, which is what drops the counters when the carry is
         # missing.
-        a._verify_file_artifacts = lambda claimed, host_dir: VerifyResult(
-            verdict=VerifyVerdict.REFUTED, confidence=0.9,
-            reasoning="FILE-ARTIFACT", issues=["missing"])
+        # ⚠ **kwargs, deliberately: this stub stands in for a real
+        # signature, and when that signature gained a keyword the
+        # positional-only lambda raised TypeError INSIDE the block's
+        # blanket `except`, which logged a warning and moved on. Both
+        # tests kept passing while the override they exist to watch
+        # had stopped running.
+        a._verify_file_artifacts = (
+            lambda claimed, host_dir, *a_, **k_: VerifyResult(
+                verdict=VerifyVerdict.REFUTED, confidence=0.9,
+                reasoning="FILE-ARTIFACT", issues=["missing"]))
         monkeypatch.setattr(AG, "_claimed_deliverable_files",
                             lambda *x, **k: ["report.md"], raising=False)
         import ghost_agent.tools.file_system as fs
@@ -249,9 +256,16 @@ class TestTheWriterActuallyRuns:
         ex.enroll_request(ctx, "R", eligible=True, origin="user")
         ex.mark_trigger(ctx, "R", "verify_depth_fired", True)
 
-        a._verify_file_artifacts = lambda claimed, host_dir: VerifyResult(
-            verdict=VerifyVerdict.REFUTED, confidence=0.9,
-            reasoning="FILE-ARTIFACT", issues=["missing"])
+        # ⚠ **kwargs, deliberately: this stub stands in for a real
+        # signature, and when that signature gained a keyword the
+        # positional-only lambda raised TypeError INSIDE the block's
+        # blanket `except`, which logged a warning and moved on. Both
+        # tests kept passing while the override they exist to watch
+        # had stopped running.
+        a._verify_file_artifacts = (
+            lambda claimed, host_dir, *a_, **k_: VerifyResult(
+                verdict=VerifyVerdict.REFUTED, confidence=0.9,
+                reasoning="FILE-ARTIFACT", issues=["missing"]))
         monkeypatch.setattr(AG, "_claimed_deliverable_files",
                             lambda *x, **k: ["report.md"], raising=False)
         import ghost_agent.tools.file_system as fs

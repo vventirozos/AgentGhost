@@ -26338,6 +26338,376 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4DG — The verifier refuted a turn for a file the agent tidied up (2026-08-26)
+
+**The report.** The operator asked for a functional web OS, got one, looked at it, liked it — and
+the verifier refuted the turn. Their question was the entry: *"I verified that the webos was
+created and it was looking as I wanted, why did this happen?"*
+
+**It was not the judge.** The text verdict was `CONFIRMED` 0.95. The refute came entirely from the
+FILE-ARTIFACT ground-truth override, which overwrote it at 0.9. The "claimed-but-missing
+deliverable" was `probe.py` — a scratch script the agent wrote, ran `node --check` through, and
+then deliberately **deleted**, along with a temp `_chk.js`. The reply never mentioned either;
+`_claimed_deliverable_files` returns `[]` for that answer. The whole refute came from the *mutated*
+half of the claimed ∪ mutated union.
+
+**The mechanism was a lexical proxy standing in for a semantic property** ([[lexical-proxy-for-semantic-property]]).
+"Files this turn produced" was implemented as "any quoted token containing a dot, in any
+`file_system` SUCCESS message". `SUCCESS: Deleted 'probe.py'.` is such a message. The selector had
+no idea what the message *meant* — and the same blind spot silently held three more: the vanished
+source of `Renamed/Moved 'old' to 'new'`, the URL of `Downloaded 'url' to 'file'`, and any quoted
+`'./util.js'` sitting inside the POST-EDIT VIEW the replace tool echoes back.
+
+**Three properties turned one bad verdict into a trap.** `tools_run_this_turn` accumulates across
+the whole REQUEST, so a scratch write at tool call 5 of 16 poisoned the verdict at 16, the
+auto-repair round, and the post-reply async re-verify. The repair round was **unwinnable by
+construction** — nothing can make a deliberately-deleted file reappear, so the one bounded repair
+attempt was spent on an impossible target. And `tools/execute.py`'s inline-`python -c` block
+message *prescribes* `file_system(write, path="probe.py")` as the sanctioned workaround: the agent
+was refuted for obeying another subsystem. Two guards, pointed at each other.
+
+**What saved the corpus was the human, not the machine.** The late `REFUTED` (90%) would have
+backfilled a correct turn as FAILURE and scrubbed its lessons. It was withheld only because the
+operator's 👍 landed first and `_human_label_locked` outranks a late verdict. Given how thin the real-user supply is
+([[traffic-gated-clocks]]), silent label noise of this shape is expensive. **A reviewer challenged
+that rate and was wrong in an instructive way:** the trajectory store shows 1,658
+`task_kind=user_request` records over 49 days (33.8/day), which looks like a 10x contradiction —
+but those records carry **no origin field**, and self-play and bench replays enter through the same
+`handle_chat` path. That is the exact conflation §4AQ documents and fixed on the *mirror* line, not
+on the trajectory record. The store cannot separate them, so it cannot refute the figure; cite the
+constraint, not a rate derived from a denominator that does not distinguish.
+
+**The first fix was right and insufficient, and four fresh-eye lenses said so.** A shape-aware,
+order-aware parser closed the reported route and 13 mutants died against it. Four independent
+read-only reviewers — parser completeness, blast radius, test validity, adversarial — then took it
+apart. Three of their findings were defects the fix had *introduced*, which is the whole argument
+for [[review-your-own-changes]] on a change that looked finished:
+
+- **The bookkeeping key was literal, so the incident still reproduced.** `_get_safe_path` resolves
+  `/workspace/x`, `./x` and `x` to one file; the write confirmation prints TWO spellings and the
+  delete prints one. Write `probe.py`, delete `/workspace/probe.py`, and the cancellation misses —
+  the original refute, verbatim. 35 real writes in the trajectory corpus carry a `/workspace/…`
+  spelling, so this is the common case, not the corner. **And every fixture in my regression class
+  used write-spelling == delete-spelling — the one case where the bug does not fire.** The suite
+  was picked around the surviving hole ([[review-rounds-that-cannot-converge]]).
+- **A deleted *directory* did not retire what was written inside it.** `rmtree` emits the same
+  confirmation. "Write a scratch dir, run it, clean up" replayed the incident while the file case
+  was fixed.
+- **NEW regression: `Copied 'webos' to 'backup'` selected a bare directory name**, which the
+  checker — accepting only `is_file()` — always called missing. The old dotted-token parse could
+  never emit a dotless name, so the shape-aware branches *created* this one.
+
+**And two false CONFIRMS the simple fix would have introduced.** Selecting fewer paths is not free.
+WEB-EXEC has no claim-prose leg — the written list is its only input — so a turn that renamed its
+only page to `index.html.bak` would have skipped the probe **and its inconclusive 0.6 cap**, and
+been certified at full confidence with no page on disk. Separately, the old code checked a deleted
+path for *emptiness* too; drop it entirely and a deliverable re-created 0-byte by a shell rewrite
+goes clean. So suppression is now **visible rather than silent**: the parser returns
+`(left_behind, retired)`, a retired HTML entry page with none left still runs the probe (which
+returns `None` for an empty list — the existing inconclusive path), and retired paths are re-read
+for emptiness only, never absence. Narrow on purpose: a tidied `.js` must not cap a turn whose
+deliverable was never a web page.
+
+**A separate false CONFIRM, found and fixed on the way — and the fix for it was the worst bug of
+the whole exercise.** `_verify_file_artifacts`' basename `rglob` fallback took the first filesystem
+hit with no path check, so a claim of `webos/index.html` was reported clean by a stale
+`backup/index.html`. I required the hit to END WITH the normalised claim. That is half the rule,
+and the missing half was the common half.
+
+`rglob` only ever yields hits whose BASENAME matches, so demanding the on-disk path reproduce the
+claim's entire parent chain turned the fallback into dead code for every multi-segment claim. And
+the dominant real shape is exactly that: `project_scoped_sandbox` hands the check a `host_dir` that
+IS `<sandbox>/projects/<pid>`, while the model spells paths from the sandbox root — so the claim
+carries a prefix the root already consumed. **A fresh-eye replay of 181 real turns put it at 39% of
+every turn this check runs on flipping clean → REFUTE, on files sitting right there on disk.** It
+also silently disarmed the directory rule for project-scoped ops, and converted the claim
+extractor's harmless over-captures — a `/api/download/…` link tail (which `report_pdf` *instructs*
+the model to emit), a host-path echo — into refutes. It was live for about an hour.
+
+The rule is symmetric now: accept a hit that is a suffix of the claim OR has the claim as a suffix.
+A hit under a DIFFERENT parent still matches neither direction, so the stale-`backup/` fix holds.
+
+**Two lessons, and the second is the one that matters.** First: a containment rule between two
+paths needs both directions named before you write the `if` — I reasoned about "the hit is deeper"
+and never asked whether the claim could be. Second, and worse: **the entire test suite was green,
+67/67, with a 39% false-refute rate in it** — because no fixture anywhere set `host_dir` to a
+`projects/<id>` directory. The suite already contained the exact regressing string
+(`projects/e4e2/minesweeper.html`) but only ever fed it to the *selector*, never to the *resolver*
+with a scoped root. The mutation pass could not see it either: mutants probe the code you wrote
+against the fixtures you have, so a whole missing regime is invisible to them
+([[mutation-harness-corpus-validity]]). Fixture coverage of the deployment's real shapes is a
+different axis from mutation coverage, and I had confused the two.
+
+**The empirical replay is what settled it, and it also cleared the rest.** Two reviewers looked
+contradictory — one measured "39% of turns flip to refute", the other "the refute bit is unchanged"
+— until you notice they varied different functions: the corpus replay ran BOTH arms through the
+already-broken live resolver, so its selection deltas were clean while the resolver defect hid
+inside both. Reconstructing the original resolver by hand settled it in one run. That same replay,
+over 1,855 records / 49 days, is the strongest evidence the *selection* change is safe: 38 records
+differ, all one-directional, the great majority of the drops are a second quoted spelling of a file still being
+checked (92.7% counted by message token; 6.8% counted by normalised key — the gap is
+itself the finding that those two spellings were NOT being collapsed), the remainder are exactly the intended set (deleted scratch files, a download URL), and
+class (b) — anything newly selected — is **empty**, so the change cannot have created a false
+refute. Zero turns in 49 days newly arm the WEB-EXEC 0.6 cap. Its one measurable live effect is
+removing the GlassOS false refute, plus a reconstructed second one where the old parse had put a
+`https://…pdf` URL into the hard-checked list.
+
+**A dead guard, removed rather than pinned.** The first draft filtered `"://"` out of the
+write/replace branch. Mutation showed it survived every test — the only confirmation that ever
+quotes a URL is `Downloaded`, dispatched earlier and carrying no mutation marker. The branch was
+unreachable; a test for it would have described a world that cannot happen
+([[pin-must-fail-somewhere]]), so the filter is gone and a comment says why
+([[silent-inoperative-subsystems]]).
+
+**Mutation caught two pins the change had hollowed out — one of them someone else's.** 29
+single-edit mutants; the survivors told the story. Deleting the tool-NAME gate changed nothing,
+because the pre-existing "other tools are ignored" test used a payload with no mutation marker: my
+fix had turned a working pin into documentation without touching it
+([[vacuous-tests-and-lying-harnesses]]). And my own "one write, two spellings, one entry" test
+stopped exercising dedup the moment the anchored pattern captured a single token. Both repaired;
+23 of 29 mutants now die.
+
+**The six survivors are the interesting part: they are redundant, not uncovered.** An echoed
+confirmation is kept inert by three overlapping guards — the SUCCESS fast-path, the
+confirmation-line split, and positional anchoring (`re.match` at offset 0, with a redundant `^` in
+every pattern). **Two of them individually suffice**, so no single-edit mutant on those two can
+fail a test, and reading those survivals as missing coverage would be wrong. The claim as first
+written — "any one suffices" — was itself false and a later lens caught it: with only the SUCCESS
+fast-path standing, an echoed `SUCCESS: Deleted '…'` in the body is found and retires a live
+deliverable. A redundancy argument is a factual claim about the code and has to be measured like
+one. Two multi-edit mutants that strip *every* copy of one guarantee at once both die — which is
+the only honest way to show the pin is real rather than decorative. The redundancy is now stated in
+the code so the next reader does not "fix" it. Its failure world is CONSTRUCTED, not observed — the file tool
+is confined to the sandbox and cannot reach this repo, and no sandbox file contains such a
+string. What is verified is the mechanism, not an incident.
+
+**A tripwire, because the new parse is precise enough to go blind quietly.** One anchored pattern
+per shape means rewording a message in `tools/file_system.py` makes the parser stop seeing that op
+while the check keeps reporting "clean" — nothing else fails. `TestProducerParserParity` is that
+tripwire ([[the-sibling-one-revision-behind]]) — **and its first version did not trip**, which is
+the subject of the next round.
+
+**Written down rather than fixed** (each real, each needing its own design): a file removed by a
+shell `rm` through `execute` reproduces the false refute by a route with no confirmation message; a
+`[FAILURE BANNER]` prefix — added whenever a tool result contains the literal "Traceback", which an
+echoed source block can supply — fails the SUCCESS gate and drops the record whole; the DONE-task
+sweep can delete a file between the parse and the re-read; and a project-scoped write anchored to
+the outer sandbox root is checked against the scoped dir it never landed in. That last one's safe
+fix needs a recency gate like `_locate_entry_page`'s — widening the search root without one trades
+a false refute for a false confirm, which is the wrong direction.
+
+**Round 3: the tripwire did not trip, and the pin fixtures were picked.** The parity class compared
+the static PREFIX of each `SUCCESS:` literal — and a prefix stops at the first `{`, while every
+parser pattern depends on the text after it. Rewording `Wrote {n} chars to` into
+`Wrote {n} bytes into` — which blinds the ledger to EVERY write and takes both ground-truth
+overrides down with it — left the tripwire green along with 761 other tests. It compares BEHAVIOUR
+now: render each of the producer's own f-strings via `ast` and require the parser to match it and
+capture the right slot. Five real rewords that used to pass now all trip.
+
+The same round found the WEB-EXEC consumer branch with **zero** coverage (deleting it outright left
+137 tests green — the helper was tested, the branch that consumes it was not), and three pins whose
+fixtures sat in the one shape where their bug cannot fire: the echoed-confirmation test used a
+LINE-NUMBERED post-edit view, so the `  12 | ` prefix was doing the work and the guards it named
+were unreachable; the apostrophe test asserted `[]`, which is equally the all-blind result
+([[verify-cannot-distinguish]]); and the two-spellings test used spellings that normalise to one
+key, hiding the parse it was named for.
+
+**Round 4 found a regression inside the fix, and three defects older than it.** In my own new code:
+an internal error inside path resolution returned the same value as "not found", and the caller
+reads that as MISSING — so a bind mount vanishing mid-read, or a root-owned `0700` directory the
+host cannot traverse, produced the exact false refute this entry is about. The code it replaced
+skipped such a name entirely. It fails open now and **says so**, because "could not check" and
+"checked and fine" are different states and only one is evidence. Also: a directory named
+`report.pdf` satisfied "I generated report.pdf"; an empty `__init__.py`, whose emptiness is
+correct, drove a repair round whose only escapes are corrupting or deleting it; and the union
+deduplicated on the raw spelling while the ledger keys are normalised, so one file could hold two
+of the eight slots and evict a genuinely corrupted `index.html` — the 2026-07-19 guard, switched
+off by a spelling.
+
+Older, and each flagged by more than one lens: the check never un-scoped to the sandbox root though
+its sibling `_execute_web_artifact` already did ([[the-sibling-one-revision-behind]], again); a
+file-artifact refute REPLACED an execution refute that already stood, so the repair prompt — built
+from `issues`, not `reasoning` — heard "a deliverable is missing" and never "the page throws on
+load", and the JS bug shipped; and that issue string never named a file at all. A `[FAILURE BANNER]`
+prefix, prepended to any tool result containing the word "Traceback" (which an echoed source block
+supplies), dropped whole records and silenced both overrides on turns that really did write files.
+
+**The harness was the least trustworthy instrument in the room.** An audit of the *instruments*
+found that re-running the first mutation script would have restored `agent.py` from a snapshot 365
+lines stale — silently reverting live work — while its own restore check diffed the clobbered file
+against the very snapshot it had been clobbered with, printing `identical` in exactly the case
+where the tree was destroyed. It had no signal trap, scored a broken-collection run as a kill, and
+mis-parsed the failure count. Three of its mutants had also stopped applying: **the ⚠ comment I
+added to explain the redundancy was inserted between two lines one mutant anchored on**, so the
+mutant that would have proven the redundancy could no longer run ([[the-fix-severs-what-it-feeds]]).
+It is now `scripts/mutate_fs_ledger.py`, in the repo — snapshotting the live file at start-up,
+verifying the restore by hash, trapping signals, and reporting an unmatched anchor as MISSING rather
+than as a survivor, because a mutant that cannot apply proves nothing. 64 mutants, 61 killed; the three
+survivors are documented redundancies, each proven by a multi-edit mutant. It lives in the repo so the number can be re-derived —
+citing a measurement from a harness that is deleted with the job is an unverifiable claim.
+
+**Round 5 found the half nobody was looking at.** `_claimed_deliverable_files` carries two
+filters — a URL check and a system-path check — and **both were unreachable code**. The capture
+group began at `[A-Za-z0-9]`, so a captured name could never start with `/`, and the `://` was
+always eaten by the gap before it. `Wrote /etc/hosts.conf` yielded `etc/hosts.conf`;
+`Generated … https://example.com/guide.md` yielded `example.com/guide.md`; a `/api/download/…`
+markdown link — which `report_pdf` *instructs* the model to emit — yielded `api/download/…`. Each
+went straight into the hard, absence-refuting leg. **Two of the three FILE-ARTIFACT refutes
+recoverable from the record are exactly this**, on turns that ran no file tool at all. And the two
+tests naming those guards passed because their fixtures had no completion verb, so the claim regex
+never fired: two named guards, zero coverage, and tests certifying them
+([[guard-a-proxy-not-the-thing]]).
+
+That finding came from the lens told to ignore everything the other six had covered. Four rounds
+had reasoned carefully about dedup, caps, roots and soft paths — inside the ledger half of a union
+whose *other* half was ungated. **A review that is briefed on the change reviews the change**, and
+the defect was one call upstream of it.
+
+**A regression I caused, invisible to my own harness.** Adding `soft=` broke two positional-lambda
+stubs in `tests/test_verdict_fact_recording.py`; the TypeError was swallowed by the block's blanket
+`except`, both tests kept passing, and the override they exist to watch had stopped running. My
+harness ran two test files. That was a third. A mutation harness only measures the files it runs
+([[vacuous-tests-and-lying-harnesses]]).
+
+**Patching symptoms stopped working, so the resolver was rebuilt.** One call, one verdict, an
+explicit `report` for "could not check", a fallback root whose basename search is restricted to the
+primary root and which rejects hits under another project (12% of files in the live sandbox share a
+basename — enough for a sibling project to certify this turn's claim, or for a healthy namesake to
+*rescue a genuinely corrupt local file*), and directory-ness and empty-by-design keyed off whether
+the claim came from PROSE or from the ledger rather than off its spelling. The dot heuristic that
+preceded that split refuted every `Copied 'src' to 'backup.old'` — a directory whose name contains
+a dot — with no repair possible short of deleting the tree.
+
+**The instruments failed twice more, and the second time is the interesting one.** The harness's
+`restored: verified by hash` was a **tautology**: it hashed the snapshot *it* took at start-up, so a
+mutant already in the tree was snapshotted as pristine, faithfully restored, and certified — and
+the corrupted run's headline (`0 survived`) reads better than a clean one's. A reviewer caught my
+harness mid-sweep with a mutant installed in the live tree, which is the same
+[[reviewer-mutation-race]] with the roles swapped. The parity test deduped by message TEXT, and
+`Downloaded` has **two** emitter sites with identical text — so rewording either left every
+instrument green while every download through that route went invisible. It keys on sites now, and
+pins the per-site path-slot counts, because the capture assertion only ever validates the first
+slot and a path added *after* the pattern's terminator would be produced and never checked.
+
+**Mutation reached a state worth stating precisely: 64 single-edit mutants, 61 killed; the three
+survivors are redundant guard pairs, each proven by a multi-edit mutant that strips every copy at
+once — all killed.** That distinction is the whole discipline. A surviving single-edit mutant
+means the guarantee has more than one implementation, not that it is untested, and the only honest
+way to tell those apart is to remove them together. The survival analysis also earned its keep
+directly: three of my new tests could not distinguish their own mutants, and one survivor was a
+real hole — `_foreign` was checked on the directory and rglob branches but **not** on the plain
+file branch, so a claim naming another project's file still resolved. Two guards that only
+partially overlap are not two guards; they are one guard with a hole where they do not.
+
+**And one mutant hung the suite for fifteen minutes, which was the good outcome.** It exposed an
+interleave loop whose termination depended on one of two optional branches firing each pass.
+Disable either and it spins forever; in production that is a wedged turn. An interleave is a zip,
+so it is written as one now.
+
+**The mechanism finally has an instrument.** The verdict sidecar records WHICH override produced a
+verdict. This check has been overriding the text judge since 2026-07-16 with no durable trace —
+sidecar kept verdict and confidence, trajectory kept neither, the only record a log line in a file
+holding about a day. So the one question that matters, how often the override is RIGHT, could not
+be asked of the record at all ([[measure-the-mechanism]]).
+
+**Round 6 found the reported bug STILL LIVE, through the spelling I had not collapsed.** The
+`Wrote` confirmation prints two spellings of one file — the model's `filename` and the resolved
+`rel_str` — and under a project-scoped sandbox they differ by the whole `projects/<pid>/` head. The
+tool then advertises the second one as "Script-side path (from sandbox cwd)", which is the spelling
+the model uses to delete it. So `Wrote 'projects/abc/probe.py' … 'probe.py'` followed by
+`Deleted 'probe.py'` did not cancel, and the GlassOS refute reproduced verbatim on the current
+tree. **53 of 135 real write confirmations in the corpus print such a pair.** Five rounds had
+reasoned about spelling normalisation and normalised the WRONG PAIR — the comment even says "the
+write confirmation prints two spellings while the delete prints one" and then collapses the
+`/workspace/` variants instead. Both slots now name one entry through an alias table.
+
+**And the same round found that MY fix two hours earlier had created an 11-record false-refute
+regression.** Moving the foreign-project guard onto the primary root closed a real hole (13 of 88
+rglob resolutions in the corpus were answered by a file under someone else's project) — but with
+no project bound, `own_project` is None, and the sandbox root is exactly where turns write into
+`projects/<pid>/`. So "no project bound" became "no project directory may answer", and a turn that
+wrote `projects/<pid>/app.py` and said "I wrote app.py" was refuted at 0.9 **while the ledger entry
+for the same file resolved clean in the same call**. The turn's own paths name its project; the
+guard reads it from them now — and from the OTHER paths in the call, never from the one being
+resolved, or a claim spelling `projects/other/secret.py` would vouch for itself.
+
+**Several of my own confident numbers did not survive being run**, which is its own finding. The
+"39% of turns" figure attached to the one-sided suffix rule describes a configuration that no
+longer ships: with the fallback root supplied, the two mechanisms are exact substitutes and
+disabling the claim-deeper arm changes 0 of 142 verdicts. "92.7% of the drops are a duplicate
+spelling" is 6.8% counted by normalised key — and that gap is itself the finding above. "An
+eviction that, measured live, silenced the 2026-07-19 guard" differs on 0 of 1,855 records. The
+`[FAILURE BANNER]` narrative overstated its trigger and has no instance in 1,263 recorded results.
+And the echoed-confirmation comment named a failure world that cannot happen — the file tool is
+confined to the sandbox and cannot reach this repo. Every one is now corrected in place, marked as
+rationale rather than incident. **A wrong number repeated in code, docs and a journal entry is far
+more durable than the bug it was written about** ([[restated-is-not-checked]]).
+
+**What the machinery actually reaches, measured rather than argued.** Two arms carry the change:
+the ledger (123 of 1,855 records) and the retired list (1 — the incident). Seven mechanisms have
+NEVER been able to fire on real traffic: the WEB-EXEC retired-entry-page arm, the soft arm actually
+re-opening a re-created file, the directory prose-vs-ledger split, the empty-by-design allowlist,
+the tri-state could-not-check, the interleave changing the selected set, and the merge's confidence
+floor. The fix for the reported bug is about thirty lines; most of what surrounds it defends shapes
+the record has not produced. Each was a real hole a lens produced on demand — but the honest
+framing is design rationale, not incident report, and the two live defects this round both came out
+of that defensive layer rather than out of the fix.
+
+**Round 7 was the convergence check, and it did not converge.** Two lenses: one replayed the
+round-6 fixes over the corpus, one asked only "is this safe to deploy and is the tree
+self-consistent". The verdict was **safe to deploy, not converged** — and the two are separable.
+On 1,855 records the change is one-directional: 38 records select strictly fewer paths, **0 select
+anything new**, 41 false `/api/download/` refutes disappear, 3 records (0.16%) gain a bounded new
+claim, and every other mechanism differs on 0 records. Nothing makes the agent worse than the code
+it replaces.
+
+What blocked "converged" was integrity, not behaviour: **eleven contradictions between the code,
+its tests, the harness, the docs page and this entry** — a docstring still listing a limit the code
+now fixes; two numbers the previous round's sweep said were corrected and were not; mutation counts
+two rounds stale, with this entry contradicting itself (37/36 vs 45/43) about the same in-repo
+script whose entire reason for living in the repo is that the number can be re-derived; a test
+whose name described an induced error it never induced; and a harness mutant that killed **by
+crashing the extractor** rather than by reproducing the behaviour it named, so the property it
+claimed to verify never was. All fixed; the real number is **64 single-edit mutants, 61 killed,
+three documented-redundancy survivors, plus 3 multi-edit mutants all killed**.
+
+**Round 7 also found two genuine defects in round 6's alias table** — the alias key is a bare
+relative path, so two projects writing `probe.py` shared one key and last-write-wins retired a coin
+flip; and deleting `probe.py` when the request wrote BOTH `probe.py` and `projects/aaa/probe.py`
+retired the project's file, still on disk. A direct hit now wins over the alias table, and an
+ambiguous alias retires every candidate — the safe direction, since it can silence an absence check
+but never manufacture the false REFUTE this whole entry is about. Round 6's `_own_for` had the same
+raw-string-vs-`_fs_norm` bug the module's own comment warns about two screens away: two spellings
+of one claim vouched for each other.
+
+**And the harness clobbered a live edit — mine.** I told a reviewer to run it; it snapshotted the
+tree, I edited while it swept, and its restore wrote the older snapshot back over three of my
+fixes. The lock added the round before stops a second HARNESS; it cannot stop an EDITOR. Three
+guards followed: the sweep now refuses to start while the agent is running, exits non-zero when it
+refuses (a harness that declined to run was reporting success to its caller), and takes `--tree` to
+run against an rsync'd copy — which is the only configuration with no live-source hazard at all,
+and costs four seconds. It also aborts if the target changes underneath it, rather than restoring
+over whatever arrived.
+
+**Seven rounds, and the pattern held every single time**: each round's criticals were inside the
+previous round's fixes ([[web-console-review-4bu]]). What finally changed was not the defect rate
+but the framing — the last lens was asked "is this safe to deploy", not "what else is wrong", and
+that question has an answer while the other one does not.
+
+**Two lessons from the review rounds themselves.** First, every round's criticals were inside the
+previous round's fixes — the fourth time this pattern has shown up here ([[web-console-review-4bu]]).
+Second, and new: **a reviewer's finding is a claim, not a verdict.** One lens reported the traffic
+rate as contradicted, another reported "39% of turns flip" against another's "the bit is unchanged";
+in both cases the reviewers had measured different things, and only reconstructing the comparison by
+hand settled it. Taking either at face value would have produced a wrong fix and a wrong journal
+entry.
+
+**Two diagnosis fixes, both earned by how long this took to read.** The refute said "the answer
+*claims* deliverable file(s)" about paths the answer never mentioned — wording that sends you
+hunting through the reply for a claim that isn't there. And the log line truncated the reasoning at
+130 chars, mid-filename, so the stream showed `missing: probe.` — a fragment that reads like a
+parser bug in the *logger*. Wording corrected to "claimed or wrote"; truncation raised to 260.
+
 ## §4DF — GEPA autonomy Phase 3: the loop launches its own optimizer runs (2026-08-26)
 
 **The design, before the first line of code (the §4DC/§4DE day-one discipline).** With §4DE live,
