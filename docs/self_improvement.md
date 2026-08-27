@@ -904,7 +904,7 @@ and *"collect more evidence"* are different instructions.
 > 25%), then 0.65/day and ~29 days by counting 48 day-directories as 48 days
 > when the span is 50. Accrual is also bursty, so treat a month as a
 > **floor, not an estimate** (`traffic-gated-clocks` — every pending verdict
-> here is gated by ~3.5 turns/day of real traffic). The significance
+> here is gated by scarce real traffic). The significance
 > requirement is preventative for this signature, not a change to a run that
 > is currently happening.
 

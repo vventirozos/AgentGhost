@@ -53,8 +53,9 @@ DERIVED_MOOD_VOCAB = ("overloaded", "stuck", "satisfied", "curious", "idle")
 
 #: Prefix TTL — a mood older than this is dropped from the wake-up
 #: prefix (the introspection surfaces still show it, flagged stale).
-#: 48 h ≈ several real turns at live traffic rates (~3.5 turns/day),
-#: so a mood the updater keeps re-confirming never ages out, while an
+#: 48 h ≈ several real turns at organic traffic rates (window sized on
+#: the since-retracted §4AQ rate, §4DJ — higher real traffic only makes
+#: it more conservative), so a mood the updater keeps re-confirming never ages out, while an
 #: abandoned one disappears within two quiet days.
 MOOD_STALE_AFTER_HOURS = 48.0
 
@@ -69,9 +70,9 @@ STREAK_WINDOW = 5
 #: ...and only when they are at most this old. Without an age bound,
 #: the back-scan + heartbeat set_at refresh mint an eternally-"fresh"
 #: streak mood off verdicts from weeks back (probe-proven at a 21-day
-#: gap, review R3) — the eternal-label defect reborn. At live traffic
-#: (~3.5 turns/day, ~19% verdict-bearing ≈ 0.7 verdicts/day) a week
-#: admits roughly one full STREAK_WINDOW.
+#: gap, review R3) — the eternal-label defect reborn. At quiet-period
+#: traffic (~19% of turns verdict-bearing; sized on the since-retracted
+#: §4AQ rate, §4DJ) a week admits roughly one full STREAK_WINDOW.
 STREAK_MAX_AGE_DAYS = 7.0
 #: Streak rules need at least this many known verdicts to say anything.
 STREAK_MIN_KNOWN = 3

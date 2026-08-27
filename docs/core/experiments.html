@@ -124,7 +124,7 @@ $GHOST_HOME/system/experiments.json
     experiment n exceeds the flywheel's item count by design), and bench
     verdict computation honors <code>--no-bench</code> through the
     admissibility chokepoint. This is what unblocks the Track-2 flip queue at
-    bench speed (~6-11 graded solves/night vs ~3.5 real turns/day).
+    bench speed (~6-11 graded solves/night vs scarce real turns).
   </p>
 
   <h2>tts_bon — the first bench-scoped arm (§4BF Track 2 flip ii)</h2>
@@ -534,7 +534,7 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
     <code>paths</code> call because it had <em>one</em> whole-file read across 23 turns; the macro
     was never in a position to fire. Corpus-wide only <b>52 of 1,556 turns (3.3%)</b> offer this
     macro anything to collapse, so a readable uptake check needs roughly <b>598 enrolled turns</b> —
-    about 170 days at the observed rate of ~3.5 real user turns/day, and the outcome comparison needs
+    months of accrual at any realistic organic rate, and the outcome comparison needs
     far more still. <strong>The blocker is not turn count alone, it is that eligible turns are
     rare</strong>: any traffic bought for this arm has to be file-heavy work, not generic requests,
     which is ~30× cheaper than raising traffic in general.

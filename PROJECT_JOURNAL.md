@@ -455,7 +455,7 @@ as the last step, mutation-pin every fix red-on-revert, docs + journal + restart
    is now the PRIMARY metric of the live `verify_depth` arm and the only correctness signal
    §4BR's decision rule accepts. Shipped 08-13 (Track 1a) with open items (Slack scopes), and
    never had a converged review. Failure mode is the worst kind — silently lost or
-   double-counted labels — at ~0.77 qualifying turns/day, where each lost label costs days of
+   double-counted labels — at a scarce qualifying-label rate, where each lost label costs days of
    a 7-week clock. A bug here means discovering in October that Gate 0 was starved by code,
    not by traffic.
 2. **✅ CONVERGED 2026-08-17 (§4BU) — web workspace console / session bridge**. 3 rounds x 3
@@ -586,7 +586,7 @@ channel (§4BT), introspect/learning_health (§4BS), egress (§4P), selfhood/moo
    (~1-2 wk); foresight_note arm @ n≥30/arm; §4K live-ledger backtest ~08-12 (gates the
    MCTS/BoN consumer decision); tool-desc GEPA gate @ ~250 positives ~08-17.~~
    ⛔ **FALSE PREMISE — CORRECTED 2026-08-11 (§4AQ). THE CLOCKS ARE STOPPED, NOT SLOW.** Real user
-   traffic is **median 3.5 turns/day, zero on three of the last six days** (measured: 52 genuine
+   traffic is **scarce — zero on three of the last six days** (the week measured: 52 genuine
    requests against 165 self-play in a week). Every one of these reads is gated on real turns —
    self-play is excluded from the ledgers they consume BY DESIGN — so: §4K backtest = 64 rows,
    decisive buckets n=2 and n=0; `fs_batch` ~25/arm; `foresight_note` ~17/arm; `use_planning`
@@ -738,8 +738,8 @@ would inflate counts with internal maintenance passes and corrupt the very signa
 ### Tracks 1b / 1c / 2 / 3 = the QUEUED follow-ups, listed at the end of this section
 
 **Premise (operator-approved plan, 2026-08-13 session).** §4AQ/§4BC established the binding
-constraint: every pending verdict is gated on RESOLVED real-turn outcomes, traffic is ~3.5 real
-turns/day, and ~39% of steady-state turns stay `unknown` by design (evidence-free chat). The
+constraint: every pending verdict is gated on RESOLVED real-turn outcomes, real-turn traffic is
+scarce, and ~39% of steady-state turns stay `unknown` by design (evidence-free chat). The
 three-track answer: **(1) outcome supply** (labels + graded volume), **(2) flip
 measured-but-consuming-nothing instruments into actuators**, **(3) a research organ that runs
 tracks 1–2's protocol autonomously**. Track 1a — the cheapest resolver, the human who just read
@@ -1542,7 +1542,7 @@ Operator opened a fresh-eye review QUEUE (§4 above) and picked #1: the human-fe
 channel — `/api/feedback`, Slack 👍/👎, the web UI, the corrections overlay. It went first
 because §4BR made it **the primary metric of a live arm**: `verify_depth`'s decision rule
 accepts human feedback as the ONLY correctness signal and disowns the outcome label as
-circular. At ~0.77 qualifying turns/day a silently lost label costs days of a 7-week clock,
+circular. At a scarce qualifying-label rate a silently lost label costs days of a slow clock,
 so the severity model was set accordingly: a lost or mis-attributed label is a CRITICAL.
 
 **TWO CRITICALS IN ROUND 1.**
@@ -1782,9 +1782,10 @@ absolute 25s line fires unconditionally on the arm that changes nothing.
 **2. The trigger rate.** "~41% of turns" had no provenance anywhere. The corpus says
 58.1% (122/210).
 
-**3. Gate 0's timeline, by 3.7×.** "n=40 is ~2 weeks at 3.5 turns/day" used the RAW rate
-and ignored the three discounts stated in the same document. Qualifying turns are
-3.5 × 0.581 × 0.50 × 0.756 = **0.77/day** → n=40 is **52 days (7.4 weeks)**.
+**3. Gate 0's timeline, by 3.7×.** The two-week estimate used the RAW turn rate
+and ignored the three discounts stated in the same document — qualifying turns are the raw
+rate × 0.581 × 0.50 × 0.756, a 3.7× stretch on any clock. (The raw rate itself was later
+retracted as vacation-skewed — §4DJ.)
 
 ---
 
@@ -1819,7 +1820,7 @@ and ignored the three discounts stated in the same document. Qualifying turns ar
 Live turns have **no correctness oracle**, and the convenient metric —
 `resolve_turn_outcome`'s SUCCESS/FAILED — is **circular**: the verdict is an input to it,
 so a treatment that changes verdicts moves it mechanically. The honest metric is human
-feedback, which at ~0.77 qualifying turns/day may take months or never reach its floor.
+feedback, which at a scarce qualifying-label rate may take months or never reach its floor.
 Gate 0 therefore reads the MECHANISM first: too few non-unanimous votes means the judge
 does not vary here and the arm retires without waiting on outcomes.
 
@@ -2038,7 +2039,7 @@ carries `bench_train_n: 50` and accuracy **0.6607** — the 50 bench rows cost t
   function of the request text at all. That is the ceiling on this whole approach, and
   0.728 is 80% of it.
 * **"~9% real traffic" is an INFERENCE, not a measurement.** 1,482 turns / 38 days ≈ 39/day
-  against ~3.5 interactive turns/day. The corpus's own `task_kind` says 92.1%
+  against the (since-retracted) headline interactive-turn rate. The corpus's own `task_kind` says 92.1%
   `user_request` and contains zero self-play/bench rows. Both can be true (one interactive
   turn logs several trajectories) but only the arithmetic was checked, not the population.
 
@@ -4305,7 +4306,7 @@ denominator this whole section exists to grow.
 **Proposed follow-up (NOT done, needs operator sign-off):** an OFFLINE retro-grade of the 271
 historical payload-shaped rows — run the two-stage judge over stored (final_response, tool
 results), write `verifier_backfill_4bc` corrections to the sidecar. It is the only way the ARMS'
-resolved-n grows faster than ~3.5 real turns/day; labels would enter the corpus from a batch
+resolved-n grows faster than organic real-turn supply; labels would enter the corpus from a batch
 judge pass, so it deserves an explicit yes plus a small human-audited sample first.
 
 
@@ -6031,7 +6032,7 @@ literal re-inlined into the payload).
 FIX THIS ═══**
 
 **Instrument: `scripts/planner_nothink_bench.py` — a PAIRED replay of 30 REAL recorded planner
-payloads.** A live arm was never an option (3.5 turns/day, §4AQ), but the recordings hold every
+payloads.** A live arm was never an option (scarce real turns, §4AQ), but the recordings hold every
 payload the agent actually issued, so the same prompts run under both conditions today. Pairing is
 what makes n=30 readable — the §4V lesson. Stratified 15 originally-truncated / 15 completed:
 the first half is where the fix must WORK, the second where it must do no HARM. Cleared §4U
@@ -6184,8 +6185,9 @@ lesson extraction vs everything else):
 | self-play | 11 | 27 | 27 | 26 | 19 | 20 | 24 | 11 |
 | **REAL user** | **25** | **13** | **0** | **0** | **5** | **7** | **2** | **0** |
 
-**Median 3.5 real turns/day. Three of the last six days were ZERO.** 165 self-play requests against
-52 genuine ones in a week.
+**Real-turn supply was scarce that week — three of the last six days were ZERO; 165 self-play
+requests against 52 genuine ones. (The measuring week was later retracted as vacation-skewed —
+§4DJ.)**
 
 **EVERY PENDING VERDICT IS GATED ON THIS SUPPLY, AND EVERY ONE OF THEIR DATES ASSUMED TRAFFIC THAT
 DOES NOT EXIST:**
@@ -6257,7 +6259,7 @@ two-sided pin, because a check that can only ever say "not readable" is furnitur
 
 **AND IT QUANTIFIES THE REAL BLOCKER, which is not turn count.** Corpus-wide, only **52 of 1,556
 turns (3.3%)** offer this macro anything to collapse. A readable *uptake* check therefore needs
-~**598 enrolled turns** ≈ **170 days** at 3.5 real turns/day; the outcome comparison needs far more.
+~**598 enrolled turns** — months at any realistic organic rate; the outcome comparison needs far more.
 **So `fs_batch` cannot resolve on organic traffic — not the effect, not even the uptake.** Its
 eligibility is derived from `collapse_fs_batch`, the shipped macro's own rule, never a hand-written
 "≥2 reads" test (which would count `read_chunked` pagination the macro deliberately does not touch,
@@ -22314,7 +22316,7 @@ M10 skip-streak backoff (token pin walked through by the mutant — live demo of
 ### Deferred / documented (candidates for R2 lenses to re-check)
 - B-M7 ledger rotation (577KB/5wk, readers bounded, in-source acknowledged).
 - B-M8 `record_scheduled_result` classifies by exception-shape only (verifier verdict unconsulted; content rides the summary).
-- B-M9 shared ReadBudget window when a user turn and an idle advance overlap (~3.5 turns/day, opt-in flag).
+- B-M9 shared ReadBudget window when a user turn and an idle advance overlap (rare, opt-in flag).
 - Lens A documented-not-fixed: phase-2.9 unconditional finally, `/api/generate` counters, dead band (3600,7200], organic self-play/dream unbounded await, stale mid-tick `idle_secs`.
 - Test hygiene (lens C): `test_selfplay_bug_fixes.py:95` reseeds process-global RNG without restore; `challenge_templates._LAST_TEMPLATE_KEY` order-coupling; `test_bio_time_scale.py::_agent()` re-implements `__init__` flag parsing; selector blind spot — `test_bio_time_scale.py` escaped the name+symbol in-scope union.
 - Dream surface stamps at the freshness-skip and final-except sites degrade gracefully to the (now error-aware) string fallback if deleted — belt unpinned, suspenders pinned.
@@ -22802,7 +22804,7 @@ impossible on every arm — only a catastrophic harm could ever have been called
 "no difference detected yet" read as evidence the features don't help; it was the design
 having no power. Power confirmed by simulation under the report's own rule (α split 4 metrics
 × 2 arms, radii ADDED): detecting a HALVED failure rate (0.20→0.10) needs ~1,000 resolved
-turns/arm — at ~3.5 user turns/day, years. At the live n≈100/arm, power is **0.00**.
+turns/arm — far beyond organic supply. At the live n≈100/arm, power is **0.00**.
 
 **2. The confidence model was credited with beating the base rate on a 1e-6 tolerance.**
 `learning_health` scored WIN/LOSS by comparing two point estimates. Live: brier_cv 0.03889 vs
@@ -22887,7 +22889,7 @@ never as a survivor (the §4CD harness lesson, carried forward and used twice he
 ### Found-not-fixed (documented)
 - **The live arms cannot conclude on quality at this traffic**, and that is now visible rather
   than fixed. An improvement verdict on `failure_rate` needs ≥~230-260 resolved turns/arm
-  (have 67-76); `human_failure_rate` needs far more and collects at ~0.77 labelled turns/day.
+  (have 67-76); `human_failure_rate` needs far more and collects only at the scarce labelled-turn rate.
   The operator's real levers are fewer concurrent arms (the α split is 4 metrics × 2 arms), a
   richer metric, or accepting that these arms are safety nets rather than experiments.
 - `use_planning` treatment shows 8/22 human-graded failures vs 3/30 control (Fisher exact
@@ -23384,8 +23386,8 @@ housekeeping corrections before the work.
 §4CK were taken earlier the same day (release-block on missing deliverables; the repair-await
 budget). IDE therefore lands under **§4CL Imagine · §4CM Dream · §4CN Evolve**.
 
-**Rule 0 — the traffic premise, measured.** IDE.md's Phase-D thesis opens *"~3.5 real turns/day
-gate every verdict clock"*. Wrong by roughly an order of magnitude. Over the 46-day trajectory
+**Rule 0 — the traffic premise, measured.** IDE.md's Phase-D thesis opened with the §4AQ
+headline turn rate gating every verdict clock. Wrong by roughly an order of magnitude. Over the 46-day trajectory
 corpus (2026-07-07 → 2026-08-21, `system/trajectories/`, corrections overlay applied):
 
 <div class="scroll">
@@ -26338,6 +26340,30 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4DJ — the headline turn-rate metric is RETRACTED (2026-08-27)
+
+**Operator statement: the §4AQ turn-rate measurement (2026-08-11) was taken during a VACATION week
+and is not representative. The figure is erased from every reference — journal, memory, docs, and
+code comments — by instruction.** §4CL's "Rule 0" had already found the trajectory corpus running
+roughly an order of magnitude above it (with the origin-conflation caveat that the store cannot
+separate real turns from self-play/bench). What SURVIVES the retraction, unchanged:
+
+- **The structural lesson**: pending arm/ledger verdicts are gated on RESOLVED real-turn outcomes,
+  self-play is excluded from those ledgers by design, and any clock priced in calendar days must be
+  derived from a measured, origin-verified supply — never assumed ([[traffic-gated-clocks]], now
+  rate-free).
+- **The liveness fix**: `origin=user|sim` stamping on the mirror line (§4AQ's actual code change).
+- **The discount arithmetic** (§4BF Gate 0): qualifying labels ≈ raw rate × 0.581 × 0.50 × 0.756 —
+  the ×3.7 stretch applies at ANY raw rate.
+
+**Thresholds and clocks that were SIZED on the retracted rate, flagged for optional re-derivation**
+(all err in the safe direction if the true rate is higher — clocks shorten, caps get more headroom;
+none binds harder): mood prefix TTL 48h and `STREAK_MAX_AGE_DAYS=7` (selfhood/mood.py); Slack
+`_REPLY_INDEX_MAX` sizing rationale (slack bot); `_RECENT_COVERAGE_WINDOW=50` (core/experiments.py);
+the router's 200→500 escalate-all rationale (router/model.py); every "~N weeks to n=X" estimate in
+§4BF/§4BR/§4DF. A fresh origin-verified rate measurement (the §4AQ mirror-line counter, over a
+normal fortnight) is the prerequisite for re-deriving any of them.
+
 ## §4DI round 14 — the fix severed what it fed, and the stamp moved home (2026-08-27)
 
 **The final lens verified fixes 2–4 and rejected fix 1 with the cleanest severance yet.** The
@@ -26677,14 +26703,16 @@ was refuted for obeying another subsystem. Two guards, pointed at each other.
 
 **What saved the corpus was the human, not the machine.** The late `REFUTED` (90%) would have
 backfilled a correct turn as FAILURE and scrubbed its lessons. It was withheld only because the
-operator's 👍 landed first and `_human_label_locked` outranks a late verdict. Given how thin the real-user supply is
-([[traffic-gated-clocks]]), silent label noise of this shape is expensive. **A reviewer challenged
-that rate and was wrong in an instructive way:** the trajectory store shows 1,658
-`task_kind=user_request` records over 49 days (33.8/day), which looks like a 10x contradiction —
-but those records carry **no origin field**, and self-play and bench replays enter through the same
-`handle_chat` path. That is the exact conflation §4AQ documents and fixed on the *mirror* line, not
-on the trajectory record. The store cannot separate them, so it cannot refute the figure; cite the
-constraint, not a rate derived from a denominator that does not distinguish.
+operator's 👍 landed first and `_human_label_locked` outranks a late verdict. Given how thin the
+real-user label supply is ([[traffic-gated-clocks]]), silent label noise of this shape is
+expensive. **A reviewer challenged the then-current turn-rate figure, and the exchange cut both
+ways:** the trajectory store shows 1,658 `task_kind=user_request` records over 49 days, but those
+records carry **no origin field** — self-play and bench replays enter through the same
+`handle_chat` path — so the store could neither confirm nor refute the figure (the §4AQ
+conflation, fixed on the *mirror* line, not the trajectory record). The reviewer's METHOD was
+invalid; the figure itself was later retracted by the operator as a vacation-week sample (§4DJ).
+The durable rule: cite the constraint, not a rate derived from a denominator that does not
+distinguish.
 
 **The first fix was right and insufficient, and four fresh-eye lenses said so.** A shape-aware,
 order-aware parser closed the reported route and 13 mutants died against it. Four independent
@@ -27453,7 +27481,7 @@ promote, deploy, judge, revert — requires the operator to type a command.
    The structural blocker.
 3. **Trigger.** Nothing decides WHEN to run. Every precondition is already computable (supply gate,
    re-draw age, upstream health, idle main slot, §4U preflight); they need an orchestrator job.
-4. **The clock.** At ~3.5 turns/day a live verdict needs weeks (12/arm, era-scoped, halved by the
+4. **The clock.** At organic turn rates a live verdict needs weeks (12/arm, era-scoped, halved by the
    50/50 split). Autonomy does not fix traffic; the loop is a slow metabolism by design, and the
    7-day re-draw guard already paces it correctly.
 
@@ -27946,7 +27974,7 @@ in NEITHER. Driven, two consecutive promotions in one home: `run1 baseline_instr
 registry text (569 chars), `run2`'s is run 1's *optimized* text (599). §4CW exists for exactly this
 and measured the damage on the sibling gate (chain 0.393 vs hand-written 0.484) — and here both escape
 hatches are shut: `recheck_gepa_incumbent.py` exits 3 for every `tool_description.*` signature, so
-`gepa_live_check` at ~3.5 turns/day is the only judge and every re-promotion resets its era. The seed
+`gepa_live_check` under scarce real traffic is the only judge and every re-promotion resets its era. The seed
 arm is ported: one extra private-tier evaluation, paid only on a re-promotion whose main gate already
 passed, with the same exclusion and power treatment as the main arm (an underpowered seed arm refuses
 the run rather than promoting on a suppressed check), `--allow-seed-loss` recorded, and the whole arm
@@ -28155,8 +28183,8 @@ one can be judged turns one decision into many"*. This gate **wrote** `promoted_
 it: the computed-and-thrown-away shape, in the field §4DA itself added. It bites harder here — α=0.05
 promotes under the null 5% *per run*; `recheck_gepa_incumbent` exits 3 for every `tool_description.*`
 so it cannot re-score them, leaving `gepa_live_check` the only judge; and every re-promotion changes
-the text, changes the sha and **resets the era**, discarding every accrued turn as stale. At ~3.5
-turns/day an unguarded loop keeps the live check permanently INSUFFICIENT.
+the text, changes the sha and **resets the era**, discarding every accrued turn as stale. At organic
+turn rates an unguarded loop keeps the live check permanently INSUFFICIENT.
 
 Three more: the outage abort was inside `if args.smoke:`, so the expensive path fell through and paid
 for **1032 rollouts** against a dead upstream before refusing — a guard with an exemption exempting the

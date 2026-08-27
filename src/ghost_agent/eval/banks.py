@@ -1,7 +1,7 @@
 """Bench banks — externally-imported graded tasks for the idle flywheel.
 
 §4BF Track 1b (2026-08-13). The learning stack's binding constraint is
-RESOLVED-outcome supply (§4AQ/§4BC: ~3.5 real turns/day, most unknown).
+RESOLVED-outcome supply (§4AQ/§4BC: real turns are scarce, most unknown).
 Bench banks turn idle cycles into mechanically-graded outcomes: external
 task sets with objective oracles (unit tests, exact numeric answers) are
 normalized into the self-play machinery's (prompt, setup, validator)

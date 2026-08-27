@@ -528,8 +528,8 @@ class TestTheGateDoesNotRatchetAwayFromTheHandWrittenText:
     measured the damage on its own signature (chain 0.393 vs
     hand-written 0.484). Here both escape hatches are closed:
     `recheck_gepa_incumbent.py` exits 3 for every `tool_description.*`
-    signature, and every re-promotion resets `gepa_live_check`'s era at
-    ~3.5 turns/day.
+    signature, and every re-promotion resets `gepa_live_check`'s era, whose
+    clock runs on scarce live traffic.
     """
 
     def _promote_once(self, tmp_path, monkeypatch, capsys):

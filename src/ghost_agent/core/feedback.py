@@ -196,8 +196,8 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
             # Slack retries once; the web UI retried only on 404 (5xx —
             # e.g. the agent restarting, the window a deploy itself
             # creates — fell through to a transient chat bubble and
-            # nothing durable). With ~0.77 qualifying turns/day feeding
-            # §4BR's 7-week clock, a silently lost label costs days.
+            # nothing durable). With scarce qualifying labels feeding
+            # §4BR's slow clock, a silently lost label costs days.
             logger.warning(
                 "human feedback NOT RECORDED for req %s — no trajectory "
                 "matched (client may have raced the write). If this "

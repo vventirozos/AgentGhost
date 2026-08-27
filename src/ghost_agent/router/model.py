@@ -358,7 +358,7 @@ class ComplexityClassifier:
     #: demonstrate significance perfectly well.
     #:
     #: The raise would have cost a fresh box ~3 extra months of
-    #: escalate-all (at ~3.5 turns/day, first deploy 200 → 500 labelled
+    #: escalate-all (at organic turn rates, first deploy 200 → 500 labelled
     #: turns) and bought nothing: label-randomised corpora leak at the
     #: same rate under either floor. A held-out-size floor cannot lower a
     #: significance test's type-I rate; only the test can.

@@ -30,8 +30,8 @@ of them and NEVER passes an override flag (no `--allow-*`, no
 
 Design constraints, each from a recorded failure:
 
-* **Wall-clock cadence, persisted** (`traffic-gated-clocks`): at ~3.5
-  turns/day anything gated on turns starves. Due-ness is computed from a
+* **Wall-clock cadence, persisted** (`traffic-gated-clocks`): with real
+  turns scarce, anything gated on turns starves. Due-ness is computed from a
   state file that survives restarts.
 * **Notify on TRANSITIONS, not ticks** (`fire-once-notification`,
   `chat-noise-preference`): the parked->ready edge notifies once
@@ -86,7 +86,7 @@ from .gate_contract import (
 )
 
 #: Wall-clock cadences (seconds). Weekly mine, daily judgement — the
-#: 7-day re-draw guard and MIN_PER_ARM-at-3.5-turns/day both make faster
+#: 7-day re-draw guard and MIN_PER_ARM-at-scarce-traffic both make faster
 #: clocks pointless.
 SUPPLY_WATCH_INTERVAL_S = 7 * 86400
 LIVE_JUDGE_INTERVAL_S = 86400

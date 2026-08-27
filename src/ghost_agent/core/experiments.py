@@ -569,7 +569,7 @@ _RECENT_ARMS_MAX = 16
 
 #: How many of the most recently WALKED admitted records the coverage window
 #: spans. Sized so a stamp outage shows up within about a fortnight of live
-#: traffic (~3.5 user turns/day) rather than never — small enough to move,
+#: traffic rather than never — small enough to move,
 #: large enough that one quiet day cannot swing it.
 _RECENT_COVERAGE_WINDOW = 50
 
@@ -968,7 +968,7 @@ def context_was_mutated(traj) -> bool:
 #                  zero-fills: `human_label_rate` carries the denominator.
 #   human_label_rate — 1.0 on a human-labelled turn, 0.0 otherwise. Answers
 #                  "is the channel producing data on this arm at all", which
-#                  at ~0.77 qualifying turns/day is the question that decides
+#                  at the scarce qualifying-label rate is the question that decides
 #                  whether the arm can EVER conclude.
 _METRICS: Tuple[Tuple[str, bool], ...] = (
     ("failure_rate", True),

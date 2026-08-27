@@ -783,6 +783,6 @@ class TestTheReplyIndexBoundsAreReal:
         for i in range(60):
             bot.register_reply("C1", f"{i}.0", f"req{i}", REQUESTER)
         assert bot._REPLY_INDEX_MAX >= 100, (
-            "at ~3.5 turns/day over an 8-day TTL the cap must not bind")
+            "at organic turn rates over an 8-day TTL the cap must not bind")
         assert bot.lookup_reply("C1", "0.0") is not None, (
             "the oldest of 60 entries was evicted — capacity is too small")

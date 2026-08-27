@@ -387,7 +387,7 @@ def _apply_bench_mass_cap(samples):
     """§4BF Track 1c: blend populations under an EQUAL-MASS cap.
 
     Bench solves accumulate labeled rows ~an order of magnitude faster
-    than real turns (~6-11/night vs ~3.5 turns/day, most unknown). The
+    than real turns (~6-11/night vs scarce live turns, most unknown). The
     operator decision admits them to the fit — but the instrument being
     fitted scores REAL turns, so bench may contribute at most as many
     rows as the real population (the newest bench rows win; recency is

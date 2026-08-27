@@ -885,7 +885,7 @@ def main() -> int:
     # re-score them — so `gepa_live_check` is the ONLY post-promotion
     # judge, and it needs MIN_PER_ARM per arm scoped to one sha. Every
     # re-promotion changes the text, changes the sha, and resets the era,
-    # discarding every accrued turn as stale. At ~3.5 turns/day an
+    # discarding every accrued turn as stale. At organic turn rates an
     # unguarded loop keeps the live check permanently INSUFFICIENT.
     def _too_young(sig_path):
         if args.min_promotion_age_days <= 0 or not sig_path.exists():
@@ -1410,8 +1410,8 @@ def main() -> int:
     # damage on its own signature (chain 0.393 vs hand-written 0.484).
     # Here the escape hatch is closed on both sides:
     # `recheck_gepa_incumbent.py` exits 3 for every `tool_description.*`
-    # signature — it cannot re-score them — so `gepa_live_check` at ~3.5
-    # turns/day is the only judge, and every re-promotion resets its era.
+    # signature — it cannot re-score them — so `gepa_live_check`, fed by
+    # scarce live traffic, is the only judge, and every re-promotion resets its era.
     #
     # Cost: ONE extra private-tier evaluation, and only when an artifact
     # is live AND the main gate already passed. A first promotion (seed ==

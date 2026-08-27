@@ -1151,7 +1151,7 @@ class TestOneHumanOverturningAnotherIsNotSILENT:
 class TestTheLossPathsAreVISIBLE:
     """C3: every refusal returned a code and logged NOTHING. The live agent
     runs at INFO (the launcher passes no --debug), so a DEBUG diagnostic is
-    no diagnostic. At ~0.77 qualifying turns/day each lost label costs days
+    no diagnostic. At the scarce qualifying-label rate each lost label costs days
     of §4BR's clock."""
 
     def _agent(self, tmp_path, with_collector=True):

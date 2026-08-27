@@ -2,8 +2,8 @@
 """Does disabling the planner's <think> prelude fix truncation without
 breaking the plan? — a PAIRED replay of real recorded planner calls.
 
-WHY A REPLAY AND NOT A LIVE ARM (2026-08-11). Real user traffic runs at a
-median of 3.5 turns/day (§4AQ), so a live A/B on the planner would need
+WHY A REPLAY AND NOT A LIVE ARM (2026-08-11). Real user traffic is scarce
+(§4AQ), so a live A/B on the planner would need
 months. The recordings hold every planner payload the agent has actually
 issued, so the same prompts can be re-run under both conditions today. Paired
 on the identical input, which is what makes a 30-item sample worth reading —
