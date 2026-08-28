@@ -70,12 +70,14 @@ import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import NestedCompleter, PathCompleter
+from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
-from rich.console import Console, ConsoleOptions, Group, RenderResult
+from rich.console import Console, ConsoleOptions, RenderResult
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.prompt import Confirm
 from rich.segment import Segment
 from rich.table import Table
@@ -87,16 +89,62 @@ HISTORY_FILE = Path.home() / ".ghost_history"
 NOTIFY_CONSUMER = "ghost-cli"
 CODE_THEME = "monokai"
 
+#: Left gutter for everything the agent says. Replies used to print flush at
+#: column 0 while every notice, table and hint was indented two — so the most
+#: important text on screen was the one thing out of alignment.
+GUTTER = 2
+#: The prompt. Single-cell and light: a solid block (▌) smears into a
+#: continuous vertical bar in the prompt's redraw region, and ❯ is the
+#: ubiquitous shell-prompt cliché.
+PROMPT_GLYPH = "› "
+
+# --- palette ----------------------------------------------------------------
+# Deliberate truecolor values (the 256-colour codes this began with were
+# approximations of these). Named by ROLE, not by hue, so a re-theme is one
+# dict.
+PALETTE = {
+    "you":    "#5fd7ff",     # you — the prompt bar, your own words
+    "ghost":  "#a98eff",     # the agent
+    "notice": "#f0a35e",     # system notices
+    "err":    "#ff6b6b",
+    "ok":     "#7fd694",
+    "mute":   "#8a90a0",     # chrome, secondary text
+    "faint":  "#5f6675",     # rules, borders, separators — still legible as
+                             # TEXT (the session id and link URLs use it), so
+                             # it cannot go as dark as a pure border colour.
+}
+
 # One console for all output. Rich handles non-tty and NO_COLOR by itself;
-# highlight=False stops it from auto-colouring numbers inside plain notices
-# (Markdown code blocks still get full pygments highlighting).
+# highlight=False stops it from auto-colouring numbers inside plain notices.
+#
+# The markdown.* entries are the point of this block. rich ships stock
+# defaults for them — cyan-on-BLACK code spans, cyan table borders and
+# headers, magenta headings — which belonged to no palette at all and were
+# the loudest thing on screen in any reply containing a table or a code
+# span. The theme owns them now, so a reply looks like the rest of the app.
 console = Console(theme=Theme({
-    "you":    "bold color(81)",     # you / prompt
-    "ghost":  "color(141)",         # ghost
-    "notice": "color(215)",         # system notices
-    "err":    "color(203)",         # errors
-    "ok":     "color(114)",         # healthy / done
-    "mute":   "color(245)",         # dim chrome
+    **PALETTE,
+    "status.spinner":        PALETTE["ghost"],
+    "rule.line":             PALETTE["faint"],
+    "markdown.code":         f"bold {PALETTE['you']}",      # no black backing
+    "markdown.h1":           f"bold {PALETTE['ghost']}",
+    "markdown.h2":           f"bold {PALETTE['ghost']}",
+    "markdown.h3":           f"bold {PALETTE['you']}",
+    "markdown.h4":           f"bold {PALETTE['mute']}",
+    "markdown.h5":           f"italic {PALETTE['mute']}",
+    "markdown.h6":           f"italic {PALETTE['faint']}",
+    "markdown.hr":           PALETTE["faint"],
+    "markdown.item.bullet":  f"bold {PALETTE['ghost']}",
+    "markdown.item.number":  f"bold {PALETTE['ghost']}",
+    "markdown.list":         PALETTE["mute"],
+    # Both, and both readable: with terminal hyperlink support rich styles
+    # the anchor TEXT with link_url, so a "border grey" there makes every
+    # link in a reply nearly invisible.
+    "markdown.link":         f"underline {PALETTE['you']}",
+    "markdown.link_url":     f"underline {PALETTE['you']}",
+    "markdown.block_quote":  PALETTE["mute"],
+    "markdown.table.border": PALETTE["faint"],
+    "markdown.table.header": f"bold {PALETTE['mute']}",
 }), highlight=False)
 
 
@@ -116,7 +164,7 @@ def _default_key() -> str:
 
 DEFAULT_KEY = _default_key()
 
-PROMPT_STYLE = Style.from_dict({"p": "bold #5fd7ff"})
+PROMPT_STYLE = Style.from_dict({"p": PALETTE["you"]})
 
 bindings = KeyBindings()
 @bindings.add("c-d")
@@ -128,8 +176,9 @@ def _(event):                       # Alt+Enter → force submit (multi-line)
 
 
 COMPLETER = NestedCompleter.from_nested_dict({
-    "/help": None, "/exit": None, "/quit": None,
+    "/help": None, "/exit": None, "/quit": None, "/bye": None,
     "/clear": None, "/new": None,
+    "/good": None, "/bad": None, "/+1": None, "/-1": None,
     "/sessions": {"rm": None},
     "/resume": None,
     "/health": None, "/turns": None,
@@ -144,6 +193,54 @@ COMPLETER = NestedCompleter.from_nested_dict({
     "/project": {"info": None, "use": None, "resume": None,
                  "advance": None, "tasks": None, "new": None},
 })
+
+# --- human outcome labels (👍/👎) -------------------------------------------
+# The agent's /api/feedback turns "request_id + thumb" into a corrections
+# sidecar record, resolving a turn's outcome=unknown — which is what every
+# measurement clock in the learning stack is gated on. The CLI already mints
+# the request_id (chat_turn) and sends it as X-Request-ID, so a label is one
+# POST away; this is the same channel as the web UI's thumbs and Slack's
+# 👍/👎 reactions, distinguished only by `source`.
+FEEDBACK_SOURCE = "cli"
+#: Command word → wire signal. Parsed off the RAW line (before shlex), so a
+#: reason may contain apostrophes and quotes. Every alias here must also be
+#: in COMPLETER and HELP — see tests::TestCommandSurface.
+RATE_CMDS = {
+    "/good": "positive", "/+1": "positive",
+    "/bad": "negative", "/-1": "negative",
+}
+#: Retry schedule for a label. The agent records the trajectory AFTER the
+#: stream closes (post-semaphore), so a thumb typed the instant a reply
+#: lands can 404. The operator is sitting at the prompt, so retry
+#: synchronously and report the truth instead of firing and forgetting.
+RATE_RETRY_DELAYS = (0.5, 2.0, 4.0)
+#: Feedback is a tiny POST. It needs its OWN timeout because the retry
+#: multiplies it: with _json's default (10, 60) the four attempts could
+#: freeze the prompt for 4x70s + 6.5s ≈ 287s against a hung agent.
+RATE_TIMEOUT = (5, 10)
+#: How many turn refs to keep. Ratings target recent replies; this only
+#: bounds a long REPL session's memory.
+RATE_HISTORY = 50
+
+
+# --- untrusted text → terminal ---------------------------------------------
+# rich strips only BEL/BS/VT/FF/CR (rich.control.STRIP_CONTROL_CODES = [7, 8,
+# 11, 12, 13]). ESC is NOT in that set, so every CSI and ST-terminated OSC in
+# agent- or server-supplied text reached the terminal RAW — verified:
+# \x1b[2J (clear), \x1b[?1049h (alt screen) and \x1b]52;c;<b64>\x1b\\, which
+# WRITES THE OPERATOR'S CLIPBOARD. This agent summarizes Tor-fetched pages,
+# and the CLI is the only client that renders into a terminal instead of into
+# HTML (the web UI and Slack escape by construction), so strip at every point
+# where untrusted text becomes output: reply chunks, notices, table cells,
+# trimmed previews, titles.
+_UNSAFE_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _safe(text: Any) -> str:
+    """Untrusted text → printable. Keeps newline and tab; drops ESC, the C0
+    controls rich lets through, DEL, and the C1 range (U+009B is a one-byte
+    CSI, so half-stripping would leave a working escape introducer)."""
+    return _UNSAFE_CTRL_RE.sub("", str(text if text is not None else ""))
 
 
 # --- small formatting helpers ---------------------------------------------
@@ -176,13 +273,14 @@ def _dur(seconds: float | None) -> str:
 
 
 def _trim(text: Any, width: int) -> str:
-    text = " ".join(str(text or "").split())
+    text = " ".join(_safe(text).split())
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> None:
-    """Muted-header, borderless table. Cells are plain text (never parsed
-    as rich markup — titles/previews can contain anything)."""
+    """Muted-header, borderless table, aligned to the gutter. Cells are plain
+    text (never parsed as rich markup — titles/previews can contain
+    anything)."""
     if not rows:
         return
     t = Table(box=None, header_style="mute", pad_edge=False,
@@ -190,13 +288,46 @@ def _table(headers: list[str], rows: list[list[str]]) -> None:
     for h in headers:
         t.add_column(h)
     for r in rows:
-        t.add_row(*[Text(str(c)) for c in r])
-    console.print(t)
+        t.add_row(*[Text(_safe(c)) for c in r])
+    console.print(Padding(t, (0, 0, 0, GUTTER)))
 
 
-def _reply_renderable(text: str) -> Group:
-    """The ghost's reply as it renders in the transcript: label + Markdown."""
-    return Group(Text("👻", style="ghost"), Markdown(text, code_theme=CODE_THEME))
+def _fit_line(head: list, optional: list[list], tail: Text | None = None,
+              width: int | None = None) -> Text:
+    """``head`` + as many ``optional`` groups as fit + ``tail``, dropping
+    optional groups from the TAIL until the line fits the terminal.
+
+    Chrome that wraps is worse than chrome that says less: the old banner
+    assembled every segment unconditionally and spilled onto a second line
+    in any window narrower than its content. Both the banner and its hint
+    line go through this, so they cannot drift apart in how they degrade."""
+    w = console.width if width is None else width
+    groups = list(optional)
+    while True:
+        parts = list(head)
+        for group in groups:
+            parts.extend(group)
+        line = Text.assemble(*parts)
+        if tail is not None:
+            line.append_text(tail)
+        if line.cell_len <= w - 1:
+            return line
+        if not groups:
+            # Nothing optional left and it STILL doesn't fit (a very narrow
+            # window, or a long hostname). Truncating is the guarantee —
+            # without it the invariant held only while something remained
+            # to drop, which is exactly when it stops being tested.
+            line.truncate(max(1, w - 1), overflow="ellipsis")
+            return line
+        groups.pop()          # drop the least important survivor, retry
+
+
+def _rule(width: int | None = None) -> Text:
+    """A separator that spans the terminal. It used to be a hardcoded 52
+    characters, so it under-ran a wide window and the banner it belonged to
+    WRAPPED in a narrow one."""
+    w = max(8, (width if width is not None else console.width) - GUTTER * 2)
+    return Text(" " * GUTTER + "─" * w, style="faint")
 
 
 def _flush_point(text: str, start: int) -> int:
@@ -234,25 +365,23 @@ class _StreamPrinter:
     exceed the screen (so only the UNFINISHED block may live there —
     it is naturally small; _TailCrop guards the rare giant one)."""
 
-    def __init__(self, header: Text | None = None):
-        self.header = header
+    def __init__(self) -> None:
         self.text = ""
         self.upto = 0
         self.live: Live | None = None
 
-    def _print_header_once(self) -> None:
-        if self.header is not None:
-            console.print(self.header)
-            self.header = None
-
     def feed(self, chunk: str) -> None:
-        self.text += chunk
+        # THE choke point for the rendered path: everything the agent says
+        # becomes terminal output here, and self.text is what the caller
+        # keeps as history / hands to /save. Sanitizing at the call sites
+        # instead would leave the guard one refactor away from being
+        # bypassed by a new one.
+        self.text += _safe(chunk)
         fp = _flush_point(self.text, self.upto)
         if fp > self.upto:
-            self._print_header_once()
             segment = self.text[self.upto:fp]
             if segment.strip():
-                console.print(Markdown(segment, code_theme=CODE_THEME))
+                console.print(_reply_block(segment))
                 console.print()   # inter-block spacing rich would have added
             self.upto = fp
         pending = self.text[self.upto:]
@@ -261,8 +390,15 @@ class _StreamPrinter:
                 self.live = Live(console=console, refresh_per_second=12,
                                  transient=True)
                 self.live.start()
-            self.live.update(_TailCrop(Markdown(pending,
-                                                code_theme=CODE_THEME)))
+            # _LazyMarkdown, not Markdown: parsing here re-parsed the whole
+            # pending region on EVERY chunk, and when a reply has no blank
+            # line to flush on — a table, a long bullet list — the pending
+            # region IS the whole reply. Measured: a 400-row table cost
+            # 12.24s against 0.07s for the same volume of prose, with
+            # markdown_it.parse accounting for 14.6s of a 16.9s profile
+            # (1410 calls, one per chunk). Deferred, the parse runs on
+            # Live's refresh clock (12/s) instead of the token rate.
+            self.live.update(_TailCrop(_LazyMarkdown(pending)))
 
     def settle(self) -> None:
         """Stop the live tail and print whatever block was still open —
@@ -273,8 +409,38 @@ class _StreamPrinter:
         rest = self.text[self.upto:]
         self.upto = len(self.text)
         if rest.strip():
-            self._print_header_once()
-            console.print(Markdown(rest, code_theme=CODE_THEME))
+            console.print(_reply_block(rest))
+
+
+def _reply_block(markup: str) -> Padding:
+    """One block of the agent's reply, on the gutter. Every path that prints
+    reply text goes through here so the transcript keeps one left edge — the
+    settled blocks, the still-open tail, and the end-of-stream flush.
+
+    A plain indent, deliberately: a coloured left rail would mark every
+    reply line as the agent's, but it also prefixes every line the operator
+    copies out of the terminal. Copy-clean won."""
+    return Padding(Markdown(markup, code_theme=CODE_THEME),
+                   (0, 0, 0, GUTTER))
+
+
+class _LazyMarkdown:
+    """Markdown parsed at RENDER time rather than at update time.
+
+    ``Live.update()`` is called once per streamed chunk but rich only
+    RENDERS on its own refresh tick, so building the Markdown object in
+    ``feed()`` paid a full markdown_it parse per token for a document that
+    was thrown away unrendered ~90% of the time. Holding the markup and
+    parsing inside ``__rich_console__`` moves that cost onto the refresh
+    clock. Kept separate from _TailCrop so the crop stays a plain
+    renderable wrapper (and its own tests keep testing only cropping)."""
+
+    def __init__(self, markup: str):
+        self.markup = markup
+
+    def __rich_console__(self, console: Console,
+                         options: ConsoleOptions) -> RenderResult:
+        yield _reply_block(self.markup)
 
 
 class _TailCrop:
@@ -685,6 +851,11 @@ HELP = """[bold]conversation[/]
   [you]/resume[/] <id>           continue a session (id prefix is enough)
   [you]/save[/] \\[file.zip]       snapshot workspace (chat + sandbox) to a zip
   [you]/load[/] <file.zip>       restore a workspace zip [dim](replaces agent sandbox)[/]
+[bold]rating[/] [dim]— human outcome labels; this is what trains the verifier[/]
+  [you]/good[/] \\[note]           👍 the last reply
+  [you]/bad[/] \\[why…]            👎 the last reply [dim](the reason IS the payload)[/]
+  [dim]aliases /+1 /-1 · /good ^2 rates two replies back · switching thumbs
+  re-labels · cancelled or errored turns can't be rated[/]
 [bold]agent[/]
   [you]/health[/]                runtime health of the agent
   [you]/turns[/]                 in-flight + queued turns
@@ -700,11 +871,12 @@ HELP = """[bold]conversation[/]
   [you]/project[/] info|use|resume|advance|tasks <id>
   [you]/project new[/] "title" \\["goal"]
 [bold]misc[/]
-  [you]/help[/]   [you]/exit[/]  [dim](or Ctrl-D)[/]
+  [you]/help[/]   [you]/exit[/] [dim](or[/] [you]/quit[/] [you]/bye[/][dim], or Ctrl-D)[/]
 [dim]Enter submits · paste multi-line freely · Alt+Enter force-submits
 replies render as Markdown with highlighted code · images the reply
 references draw inline after it (GHOST_CLI_IMAGES=off|iterm|kitty|sixel|halfblock)
-Ctrl-C aborts a reply AND cancels the turn on the agent[/]"""
+Ctrl-C aborts a reply and cancels the turn on the agent; at an idle
+prompt it just clears the line — Ctrl-D exits[/]"""
 
 
 class GhostAPI:
@@ -713,11 +885,42 @@ class GhostAPI:
     def __init__(self, base_url: str, api_key: str):
         # Reduce to scheme://host:port — request paths are appended, so a
         # stray path/query on base_url would build a malformed URL (→ 405).
-        p = urlparse(base_url)
-        self.base_url = (f"{p.scheme}://{p.netloc}"
-                         if p.scheme and p.netloc else base_url.rstrip("/"))
+        raw = str(base_url or "").strip()
+        p = urlparse(raw)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            # GHOST_URL=eva:8000 parses as scheme='eva', netloc='' — it fell
+            # through to the raw string and every call then died with a bare
+            # MissingSchema instead of just working. Assume http.
+            p = urlparse("http://" + raw.split("://", 1)[-1])
+        self.base_url = (f"{p.scheme}://{p.netloc}" if p.netloc
+                         else raw.rstrip("/"))
         self.http = requests.Session()
         self.http.headers["X-Ghost-Key"] = api_key
+
+    @staticmethod
+    def _stream_to_file(resp: requests.Response, dest: Path) -> int:
+        """Stream a 200 body into ``dest`` via a sibling temp file and one
+        atomic rename. ``dest`` is not touched unless the WHOLE body
+        arrived, and the only thing ever unlinked is our own temp file.
+
+        Both halves were bugs. A transfer that died mid-stream left a
+        truncated file over the operator's original; and the callers
+        "cleaned up" a failure with dest.unlink(), which deleted a
+        PRE-EXISTING local file the CLI had never written — verified:
+        `/download report.pdf` against a 404 removed the operator's own
+        report.pdf."""
+        tmp = dest.with_name(f".{dest.name}.part-{uuid.uuid4().hex[:8]}")
+        written = 0
+        try:
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_content(65536):
+                    fh.write(chunk)
+                    written += len(chunk)
+            os.replace(tmp, dest)
+        except BaseException:      # KeyboardInterrupt included, deliberately
+            tmp.unlink(missing_ok=True)
+            raise
+        return written
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
@@ -780,6 +983,17 @@ class GhostAPI:
         return self._json("POST", "/api/turn/cancel",
                           body={"request_id": request_id, "hard": hard})
 
+    def feedback(self, request_id: str, signal: str, note: str = "",
+                 source: str = FEEDBACK_SOURCE) -> tuple[int, Any]:
+        """Human outcome label for one completed turn. ``signal`` is
+        'positive'|'negative'; ``note`` on a negative becomes the
+        trajectory's failure_reason (the agent caps it at 500 chars and
+        redacts it before logging — cap here too so the wire matches)."""
+        return self._json("POST", "/api/feedback",
+                          body={"request_id": request_id, "signal": signal,
+                                "note": note[:500], "source": source},
+                          timeout=RATE_TIMEOUT)
+
     def health(self, timeout: tuple = (10, 30)) -> tuple[int, Any]:
         return self._json("GET", "/api/health", timeout=timeout)
 
@@ -822,17 +1036,13 @@ class GhostAPI:
             return 200, bytes(buf)
 
     def download(self, name: str, dest: Path) -> tuple[int, int]:
-        """Stream a sandbox file to ``dest``. Returns (status, bytes_written)."""
+        """Stream a sandbox file to ``dest``. Returns (status, bytes_written).
+        A non-200 leaves ``dest`` untouched — see _stream_to_file."""
         with self.http.get(self._url(f"/api/download/{quote(name)}"),
                            stream=True, timeout=(10, 600)) as r:
             if r.status_code != 200:
                 return r.status_code, 0
-            written = 0
-            with dest.open("wb") as fh:
-                for chunk in r.iter_content(65536):
-                    fh.write(chunk)
-                    written += len(chunk)
-            return 200, written
+            return 200, self._stream_to_file(r, dest)
 
     def workspace_save(self, history: list[dict], dest: Path) -> tuple[int, int]:
         with self.http.post(self._url("/api/workspace/save"),
@@ -840,12 +1050,7 @@ class GhostAPI:
                             stream=True, timeout=(10, 600)) as r:
             if r.status_code != 200:
                 return r.status_code, 0
-            written = 0
-            with dest.open("wb") as fh:
-                for chunk in r.iter_content(65536):
-                    fh.write(chunk)
-                    written += len(chunk)
-            return 200, written
+            return 200, self._stream_to_file(r, dest)
 
     def workspace_load(self, path: Path) -> tuple[int, Any]:
         with path.open("rb") as fh:
@@ -890,22 +1095,50 @@ class GhostCLI:
         # Built lazily in chat(): constructing a PromptSession on a non-tty
         # stdin (e.g. `ghost --health` from a script) warns on stderr.
         self.prompt_session: PromptSession | None = None
+        # Rateable replies, oldest → newest — one ref per reply THIS client
+        # streamed. A /resume'd or /load'ed history carries no request ids,
+        # so it contributes none (see _reset_turn_refs).
+        self.turns: list[dict] = []
+        self._rate_hinted = False
+        # Set by stream_reply: "" | "cancelled" | "error". A turn the agent
+        # never finished is not rateable — see cmd_rate.
+        self._turn_interrupted = ""
 
     # -- presentation ----------------------------------------------------
     def banner(self) -> None:
-        rule = Text("─" * 52, style="mute")
+        """Identity, endpoint, session and liveness on ONE line that never
+        wraps, over a rule that spans the window.
+
+        The old banner hardcoded a 52-column rule and unconditionally
+        assembled the full URL, the session id and 'up 3h 20m' — so it
+        under-ran a wide terminal and WRAPPED in a narrow one, which is
+        what the operator saw first, every time."""
         console.print()
-        console.print(rule)
-        head = Text.assemble(
-            ("  👻 GHOST", "bold ghost"),
-            (f"   {self.api.base_url}  ·  {self.session_id[:8]}  ·  ", "mute"))
-        head.append_text(self._probe())
-        console.print(head)
-        console.print(Text.assemble(
-            ("  type ", "dim"), ("/help", "you"),
-            (" for commands · Tab completes · Ctrl-D to exit", "dim")))
-        console.print(rule)
+        console.print(self._banner_line(console.width))
+        console.print(_rule())
+        console.print(self._hint_line(console.width))
         console.print()
+
+    def _banner_line(self, width: int) -> Text:
+        """Identity and liveness are never what gets cut; the endpoint and
+        the session id are, in that order, as the window narrows."""
+        host = self.api.base_url.split("://", 1)[-1]
+        sep = ("  ·  ", "faint")
+        probe = Text("  ·  ", style="faint")
+        probe.append_text(self._probe())
+        return _fit_line(
+            head=[("  👻 ghost", "bold ghost")],
+            optional=[[sep, (host, "mute")],
+                      [sep, (self.session_id[:8], "faint")]],
+            tail=probe, width=width)
+
+    def _hint_line(self, width: int) -> Text:
+        return _fit_line(
+            head=[("  /help", "you")],
+            optional=[[("  ·  Tab completes", "faint")],
+                      [("  ·  ", "faint"), ("Ctrl-D", "mute"),
+                       (" exits", "faint")]],
+            width=width)
 
     def _probe(self) -> Text:
         """One cheap health ping for the banner: reachability + key check."""
@@ -914,8 +1147,10 @@ class GhostCLI:
         except requests.RequestException:
             return Text("○ unreachable", style="err")
         if status == 200:
-            return Text.assemble(("● online", "ok"),
-                                 (f" · up {_dur(data.get('uptime_s'))}", "mute"))
+            # Compact ("3h20m", not "up 3h 20m") — this is the segment the
+            # banner can least afford to spend width on.
+            up = _dur(data.get("uptime_s")).replace(" ", "")
+            return Text.assemble(("● online", "ok"), (f" {up}", "faint"))
         if status == 403:
             return Text("● key rejected", style="err")
         return Text(f"● HTTP {status}", style="notice")
@@ -924,7 +1159,11 @@ class GhostCLI:
     def notice(msg: str, style: str = "notice") -> None:
         # Text() keeps the message literal — never parsed as rich markup
         # (error details / titles can contain anything, including brackets).
-        console.print(Text(msg, style=style))
+        # _safe() additionally strips ESC/C1: server error prose reaches here
+        # verbatim, and rich does not strip escape introducers.
+        # Indented to the gutter so notices share the transcript's left edge
+        # with replies and tables.
+        console.print(Text(" " * GUTTER + _safe(msg), style=style))
 
     def fail(self, status: int, data: Any) -> None:
         self.notice(f"✖ HTTP {status}: {self.api.error_of(data)}", "err")
@@ -934,11 +1173,13 @@ class GhostCLI:
         """POST the history and render the streamed reply live as Markdown.
         Returns its text (possibly partial, if aborted) so the caller can
         keep context."""
-        status_spin = console.status(Text("thinking…", style="mute"),
+        status_spin = console.status(Text("thinking…", style="faint"),
                                      spinner="dots")
         status_spin.start()
         waiting = True                 # spinner up, no token yet
-        printer = _StreamPrinter(header=Text("👻", style="ghost"))
+        self._turn_interrupted = ""    # cleared per turn; set on every exit
+                                       # branch that leaves the reply partial
+        printer = _StreamPrinter()
 
         def _settle() -> None:
             """Idempotent screen hand-off: stop the spinner/live tail and
@@ -958,6 +1199,7 @@ class GhostCLI:
                                       request_id) as resp:
                 if resp.status_code != 200:
                     _settle()
+                    self._turn_interrupted = "error"
                     try:
                         detail = self.api.error_of(resp.json())
                     except ValueError:
@@ -979,8 +1221,12 @@ class GhostCLI:
                         continue
                     if obj.get("error"):
                         _settle()
+                        self._turn_interrupted = "error"
                         self.notice(f"✖ {self.api.error_of(obj)}", "err")
                         break
+                    # Control-char stripping lives in _StreamPrinter.feed —
+                    # the single point where reply text becomes output and
+                    # becomes self.text (→ history, → /save).
                     chunk = ((obj.get("choices") or [{}])[0]
                              .get("delta", {}).get("content", ""))
                     if not chunk:
@@ -991,12 +1237,15 @@ class GhostCLI:
                     printer.feed(chunk)
         except KeyboardInterrupt:
             _settle()
+            self._turn_interrupted = "cancelled"
             self._abort_turn(request_id)
         except requests.exceptions.ConnectionError:
             _settle()
+            self._turn_interrupted = "error"
             self.notice("✖ cannot reach the agent — is it running?", "err")
         except Exception as e:                     # noqa: BLE001 — surface anything
             _settle()
+            self._turn_interrupted = "error"
             self.notice(f"✖ {type(e).__name__}: {e}", "err")
         finally:
             _settle()
@@ -1015,6 +1264,13 @@ class GhostCLI:
         except requests.RequestException:
             self.notice("⛔ aborted locally — couldn't reach the agent "
                         "to cancel; /turns to check, /cancel to retry", "mute")
+        except KeyboardInterrupt:
+            # An impatient SECOND Ctrl-C, landing while we post the cancel.
+            # It used to escape here and unwind the whole REPL — the
+            # self-inflicted double-interrupt. The turn may still hold the
+            # global lock, so say so, but keep the session.
+            self.notice("⛔ cancel not confirmed — the turn may still be "
+                        "running; /turns to check, /cancel to retry", "mute")
 
     def chat_turn(self, line: str) -> None:
         self.history.append({"role": "user", "content": line})
@@ -1023,12 +1279,177 @@ class GhostCLI:
         reply = self.stream_reply(request_id)
         console.print()
         if reply:
-            render_reply_images(self.api, reply)
+            # BOOKKEEPING BEFORE RENDERING. Image fetches are up to 4 serial
+            # round-trips with 130s timeouts, and a Ctrl-C in that window used
+            # to escape chat_turn — costing the REPL, the assistant message,
+            # and the turn's rateability, for a reply the agent had already
+            # finished and the server had already stored.
             self.history.append({"role": "assistant", "content": reply})
+            # Keep the request_id — it is the ONLY handle a 👍/👎 has on
+            # this turn's trajectory (the agent stamps X-Request-ID as the
+            # trajectory's req_id, which /api/feedback resolves against).
+            self.turns.append({"req_id": request_id, "prompt": line[:60],
+                               "interrupted": self._turn_interrupted,
+                               "label": None})
+            del self.turns[:-RATE_HISTORY]
+            try:
+                render_reply_images(self.api, reply)
+            except KeyboardInterrupt:
+                self.notice("⛔ image rendering skipped", "mute")
+            if not self._rate_hinted and not self._turn_interrupted:
+                self._rate_hinted = True     # once per session, not per reply
+                console.print(Text.assemble(
+                    ("  👍 ", ""), ("/good", "mute"),
+                    ("   👎 ", ""), ("/bad <why>", "mute")))
+                console.print()
         else:
             # Nothing came back (error / abort before the first token):
             # drop the user message so a retry doesn't double it.
             self.history.pop()
+
+    # -- rating (human outcome labels) -------------------------------------
+    def _reset_turn_refs(self) -> None:
+        """Drop the rateable refs. Called wherever the conversation the
+        operator is looking at stops being the one those ids belong to
+        (/clear, /new, /resume, /load) — otherwise a /good would label a
+        turn from a conversation they have mentally left, which is exactly
+        the reused-bubble bug the web client carries a guard for."""
+        self.turns.clear()
+        self._rate_hinted = False
+
+    def _rateable(self, nth: int) -> dict | None:
+        """The Nth-newest rateable reply (1 = the last one), or None with a
+        notice explaining why there isn't one."""
+        if nth < 1:
+            self.notice("✖ ^N counts back from the last reply — ^1 is newest",
+                        "err")
+            return None
+        if len(self.turns) < nth:
+            if not self.turns:
+                self.notice(
+                    "nothing to rate yet — ratings attach to replies this "
+                    "client streamed, so a /resume'd or /load'ed history "
+                    "carries none until you ask something", "mute")
+            else:
+                n = len(self.turns)
+                self.notice(f"only {n} rateable "
+                            f"{'reply' if n == 1 else 'replies'} in this "
+                            f"session", "mute")
+            return None
+        return self.turns[-nth]
+
+    def _post_label(self, req_id: str, signal: str,
+                    note: str) -> tuple[int, Any]:
+        """POST the label, retrying the races that would otherwise lose it
+        silently. Labels are scarce and gate the learning stack's clocks, so
+        wait here (the operator is at the prompt anyway) and report what
+        actually happened rather than firing and forgetting.
+
+        Retried: 404 (the agent records the trajectory AFTER the stream
+        closes, so a thumb typed the instant a reply lands misses it), 429,
+        5xx, and — the one this loop was written for — TRANSPORT failures.
+        A restarting agent, the window a deploy creates, refuses the
+        connection: that is requests.ConnectionError, not HTTP 503. The
+        first version retried only the HTTP shapes, so it covered the less
+        likely manifestation of its own motivating scenario and dropped the
+        label on the more likely one (measured: 1 attempt vs 4).
+
+        A transport failure is reported as status 0 so the caller reports it
+        as a loss rather than as a code it can mistake for a server answer.
+        """
+        status, data = 0, {}
+        for attempt in range(1 + len(RATE_RETRY_DELAYS)):
+            if attempt:
+                time.sleep(RATE_RETRY_DELAYS[attempt - 1])
+            try:
+                status, data = self.api.feedback(req_id, signal, note)
+            except requests.RequestException as e:
+                status, data = 0, {"error": f"{type(e).__name__}: {e}"}
+            if not (status in (0, 404, 429) or status >= 500):
+                break
+        return status, data
+
+    def cmd_rate(self, signal: str, rest: str) -> None:
+        """/good | /bad — one human outcome label for a completed reply.
+
+        ``rest`` is the RAW remainder of the line: an optional leading ^N
+        (how many replies back) followed by a free-text note."""
+        nth = 1
+        if rest.startswith("^"):
+            tok, _, tail = rest.partition(" ")
+            try:
+                nth = int(tok[1:])
+            except ValueError:
+                return self.notice(f"✖ '{tok}' is not ^N (e.g. /bad ^2 …)",
+                                   "err")
+            rest = tail.strip()
+        ref = self._rateable(nth)
+        if ref is None:
+            return
+
+        # A turn the agent never finished is NOT evidence about the agent.
+        # Labeling a Ctrl-C'd turn FAILED teaches the verifier that a
+        # human's abort was a model failure; labeling a truncated one
+        # PASSED teaches it that stopping early is fine. Both are label
+        # noise in a corpus where labels are scarce enough to be load-
+        # bearing — refuse, and say which case it was.
+        if ref["interrupted"]:
+            why = ("you cancelled it" if ref["interrupted"] == "cancelled"
+                   else "it errored mid-stream")
+            return self.notice(
+                f"✖ that turn is not rateable — {why}, so the trajectory is "
+                f"truncated and a label would describe the interruption, not "
+                f"the agent. Ask again and rate the finished reply.", "err")
+
+        note = rest.strip()
+        if signal == "negative" and not note and sys.stdin.isatty():
+            # The reason is the part the distiller and verifier can train
+            # on — a bare thumb only resolves outcome=unknown.
+            try:
+                note = console.input(
+                    Text("  why? (enter to skip) ", style="mute")).strip()
+            except EOFError:              # Ctrl-D = end of input = skip it
+                console.print()
+                note = ""
+            except KeyboardInterrupt:
+                # Ctrl-C means CANCEL, not "skip the reason" — Enter already
+                # means skip. This used to record a bare 👎 anyway.
+                console.print()
+                return self.notice("rating cancelled — nothing recorded",
+                                   "mute")
+
+        icon = "👍" if signal == "positive" else "👎"
+        if ref["label"] and ref["label"] != signal:
+            self.notice(f"re-labeling (was "
+                        f"{'👍' if ref['label'] == 'positive' else '👎'}) — "
+                        f"last write wins", "mute")
+        with console.status(Text("recording…", style="mute"), spinner="dots"):
+            status, data = self._post_label(ref["req_id"], signal, note)
+
+        # Name the turn the operator actually rated, not just its id — with
+        # ^N in play "which one did that hit?" is a real question.
+        which = _trim(ref["prompt"], 40) or ref["req_id"][:8]
+        if status == 200 and isinstance(data, dict) and data.get("ok"):
+            ref["label"] = signal
+            if data.get("unchanged"):
+                return self.notice(f"{icon} already labeled — unchanged",
+                                   "mute")
+            return self.notice(
+                f"{icon} recorded · '{which}' → "
+                f"{data.get('outcome') or signal}", "ok")
+        tries = 1 + len(RATE_RETRY_DELAYS)
+        if status == 0:
+            return self.notice(
+                f"✖ label NOT recorded — couldn't reach the agent in {tries} "
+                f"tries: {self.api.error_of(data)}", "err")
+        if status == 404:
+            # After the retries this is a real miss, not a race — the label
+            # is LOST. Never let that look like success.
+            return self.notice(
+                "✖ label NOT recorded — no trajectory matched that turn "
+                "(is trajectory logging enabled on the agent?)", "err")
+        self.notice(f"✖ label NOT recorded — HTTP {status}: "
+                    f"{self.api.error_of(data)}", "err")
 
     # -- sessions ----------------------------------------------------------
     def cmd_sessions(self) -> None:
@@ -1071,6 +1492,7 @@ class GhostCLI:
         if status != 200:
             return self.fail(status, data)
         self.history = list(data.get("messages") or [])
+        self._reset_turn_refs()      # a stored history carries no req_ids
         self.session_id = sid
         title = data.get("title") or "(untitled)"
         self.notice(f"resumed {sid[:8]} · {title} · "
@@ -1083,6 +1505,7 @@ class GhostCLI:
 
     def cmd_new(self, title: str) -> None:
         self.history.clear()
+        self._reset_turn_refs()
         if title:
             try:
                 status, data = self.api.session_create(title)
@@ -1103,6 +1526,7 @@ class GhostCLI:
         # stays on the server, one /resume away.
         old = self.session_id[:8]
         self.history.clear()
+        self._reset_turn_refs()
         self.session_id = uuid.uuid4().hex
         self.notice(f"context cleared — new session {self.session_id[:8]} "
                     f"(/resume {old} brings the old one back)", "mute")
@@ -1114,7 +1538,10 @@ class GhostCLI:
             return self.fail(status, data)
         ok, bad = ("✓", "ok"), ("✗", "err")
         rss = data.get("rss_mb")
-        limit = data.get("rss_limit_mb") or 0
+        try:                       # a string here used to raise ValueError
+            limit = float(data.get("rss_limit_mb") or 0)
+        except (TypeError, ValueError):
+            limit = 0.0
         rss_s = f"{rss} MB" + (f" / {limit:.0f} MB" if limit else "")
         rows: list[tuple[str, Any]] = [
             ("status", data.get("status", "?")),
@@ -1132,7 +1559,7 @@ class GhostCLI:
         for key, val in rows:
             line = Text.assemble(("  "), (f"{key:<16}", "mute"))
             line.append_text(Text.assemble(val) if isinstance(val, tuple)
-                             else Text(str(val)))
+                             else Text(_safe(val)))
             console.print(line)
 
     def cmd_turns(self) -> None:
@@ -1178,7 +1605,7 @@ class GhostCLI:
             sev_style = "err" if sev in ("error", "critical") else "notice"
             console.print(Text.assemble(
                 "  ", (f"{_ago(r.get('ts')):>8}", "mute"), "  ",
-                (f"{r.get('phase', '?'):<14}", sev_style),
+                (f"{_safe(r.get('phase') or '?'):<14}", sev_style),
                 (_trim(r.get("summary"), 90), "")))
         # Ack AFTER displaying — a crash mid-print re-serves them next time.
         self.api.notifications_ack(NOTIFY_CONSUMER, watermark)
@@ -1228,8 +1655,11 @@ class GhostCLI:
                 except OSError:
                     pass
         else:
-            dest.unlink(missing_ok=True)
-            self.notice(f"✖ HTTP {status} — no such file in the sandbox?", "err")
+            # NO unlink here. The writer never opened dest on a non-200, so
+            # this "cleanup" deleted whatever local file happened to share
+            # the name — the operator's own report.pdf, verified.
+            self.notice(f"✖ HTTP {status} — no such file in the sandbox? "
+                        f"({dest} was left alone)", "err")
 
     def cmd_save(self, arg: str) -> None:
         dest = (Path(arg).expanduser() if arg
@@ -1240,8 +1670,10 @@ class GhostCLI:
         if status == 200:
             self.notice(f"✓ workspace saved → {dest} ({size:,} bytes)", "ok")
         else:
-            dest.unlink(missing_ok=True)
-            self.notice(f"✖ HTTP {status} — workspace save failed", "err")
+            # Same as /download: dest was never opened, so unlinking it here
+            # destroyed an unrelated pre-existing file of that name.
+            self.notice(f"✖ HTTP {status} — workspace save failed "
+                        f"({dest} was left alone)", "err")
 
     def cmd_load(self, arg: str) -> None:
         path = Path(arg).expanduser()
@@ -1258,6 +1690,7 @@ class GhostCLI:
             restored = data.get("chat_history") or []
             if restored:
                 self.history = list(restored)
+                self._reset_turn_refs()   # restored turns carry no req_ids
             self.notice(f"✓ workspace restored ({len(restored)} chat messages)", "ok")
         else:
             self.fail(status, data)
@@ -1336,7 +1769,7 @@ class GhostCLI:
             self.notice(f"✓ active project → {pid}", "ok")
             briefing = (data or {}).get("briefing")
             if briefing:
-                console.print(Text(str(briefing), style="mute"))
+                console.print(Text(_safe(briefing), style="mute"))
         elif sub == "advance":
             with console.status(Text(f"advancing {pid}…", style="mute"),
                                 spinner="dots"):
@@ -1362,7 +1795,7 @@ class GhostCLI:
                 st = str(t.get("status", "")).upper()
                 console.print(Text.assemble(
                     "  ", icons.get(st, ("·", "mute")), " ",
-                    (f"{str(t.get('id', ''))[:8]}", "mute"), " ",
+                    (f"{_safe(t.get('id'))[:8]}", "mute"), " ",
                     (_trim(t.get("description"), 76), "")))
         else:
             self.notice(f"unknown subcommand '/project {sub}' — see /help")
@@ -1378,13 +1811,26 @@ class GhostCLI:
             return True
 
         try:
-            parts = shlex.split(line)
-        except ValueError as e:
-            self.notice(f"✖ {e} — quote arguments like /memory fix \"a\" \"b\"", "err")
-            return True
-        cmd, args = parts[0].lower(), parts[1:]
+            # Rating is parsed off the RAW line, BEFORE shlex: a failure
+            # reason is free text and `/bad it didn't find the file` would
+            # die in shlex.split with "No closing quotation" — losing the
+            # label to a quoting rule the operator never opted into.
+            head, _, rest = line.partition(" ")
+            signal = RATE_CMDS.get(head.lower())
+            if signal:
+                self.cmd_rate(signal, rest.strip())
+                return True
 
-        try:
+            try:
+                parts = shlex.split(line)
+            except ValueError as e:
+                self.notice(f"✖ {e} — quote arguments like "
+                            f"/memory fix \"a\" \"b\"", "err")
+                return True
+            if not parts:
+                return True
+            cmd, args = parts[0].lower(), parts[1:]
+
             match cmd:
                 case "/help":
                     console.print(HELP)
@@ -1431,6 +1877,14 @@ class GhostCLI:
                                 f"see /help (plain text talks to the agent)")
         except requests.RequestException as e:
             self.notice(f"✖ {type(e).__name__}: cannot reach the agent", "err")
+        except Exception as e:      # noqa: BLE001 — one bad payload, not one
+            # dead session. This caught only RequestException, so a single
+            # unexpected response shape ended the REPL and took the local
+            # history and the rateable turn refs with it (verified: a
+            # session row missing "id" → KeyError; rss_limit_mb as a string
+            # → ValueError). A command may fail; the session may not.
+            self.notice(f"✖ {type(e).__name__}: {e} — command failed, "
+                        f"session intact", "err")
         return True
 
     # -- main loop -------------------------------------------------------
@@ -1441,20 +1895,43 @@ class GhostCLI:
             completer=COMPLETER,
             history=FileHistory(str(HISTORY_FILE)),
             auto_suggest=AutoSuggestFromHistory(),
+            # prompt_toolkit reserves EIGHT rows for the completion menu by
+            # default, for the whole session, whether or not a menu is
+            # showing. That is the permanent blank gap under the prompt —
+            # and because those rows are a scrolling redraw region, every
+            # frame leaves the prompt character behind in scrollback, which
+            # smears a block glyph into a continuous vertical bar down the
+            # left of the transcript (operator screenshot, 2026-08-27).
+            # Reserve nothing and complete like a shell instead: Tab lists,
+            # which is what the banner has always promised.
+            reserve_space_for_menu=0,
+            complete_style=CompleteStyle.READLINE_LIKE,
+            complete_while_typing=False,
         )
         self.banner()
         while True:
             try:
-                line = self.prompt_session.prompt([("class:p", "❯ ")])
-            except (EOFError, KeyboardInterrupt):
+                line = self.prompt_session.prompt([("class:p", PROMPT_GLYPH)])
+            except EOFError:
                 break
+            except KeyboardInterrupt:
+                # Ctrl-C clears the line; Ctrl-D exits. These shared a
+                # `break`, so the key /help advertises as "aborts a reply"
+                # also ended the session when used to drop a mistyped line.
+                continue
             if line is None:                        # Ctrl-D
                 break
             line = line.strip()
             if not line:
                 continue
-            if not self.dispatch(line):
-                break
+            try:
+                if not self.dispatch(line):
+                    break
+            except KeyboardInterrupt:
+                # Last line of defence for an interrupt raised somewhere a
+                # command didn't expect one. Individual paths handle their
+                # own (see _abort_turn, chat_turn's image render).
+                console.print(Text("⛔ interrupted", style="mute"))
         console.print(Text("👋 disconnected", style="dim"))
 
 
@@ -1470,7 +1947,10 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
     if session_id:
         body["session_id"] = session_id
     render = sys.stdout.isatty()
-    printer = _StreamPrinter(header=None)
+    printer = _StreamPrinter()
+    # Kept in a name (it used to be inlined into the header dict) so the
+    # Ctrl-C path below can cancel THIS turn server-side.
+    request_id = uuid.uuid4().hex[:16]
 
     def _finish() -> None:
         """Flush the still-open block. Reached from the normal path AND
@@ -1481,7 +1961,7 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
 
     try:
         with api.http.post(api._url("/v1/chat/completions"), json=body,
-                           headers={"X-Request-ID": uuid.uuid4().hex[:16]},
+                           headers={"X-Request-ID": request_id},
                            stream=True, timeout=(10, None)) as resp:
             if resp.status_code != 200:
                 try:
@@ -1508,8 +1988,11 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                     print(f"ghost: {api.error_of(obj)}", file=sys.stderr)
                     got_error = True
                     break
-                chunk = ((obj.get("choices") or [{}])[0]
-                         .get("delta", {}).get("content", ""))
+                # Sanitized HERE, not in feed(): the piped branch below
+                # bypasses the printer entirely, and `ghost -p q | less -R`
+                # is still a terminal on the other end.
+                chunk = _safe((obj.get("choices") or [{}])[0]
+                              .get("delta", {}).get("content", ""))
                 if not chunk:
                     continue
                 if render:
@@ -1523,6 +2006,24 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
             elif printer.text:
                 render_reply_images(api, printer.text)
             return 1 if got_error else 0
+    except KeyboardInterrupt:
+        # Turns are globally SERIALIZED on the agent: an abandoned one-shot
+        # keeps working and keeps the lock, wedging every other client. The
+        # REPL has always cancelled server-side; this path did not, so a
+        # Ctrl-C'd script blocked the agent until the turn finished on its
+        # own. Same cancel, same request id.
+        _finish()
+        try:
+            status, data = api.cancel_turn(request_id=request_id)
+            cancelled = (status == 200 and isinstance(data, dict)
+                         and data.get("cancelled"))
+            print("ghost: aborted — agent turn cancelled" if cancelled
+                  else "ghost: aborted (turn already finished)",
+                  file=sys.stderr)
+        except (requests.RequestException, KeyboardInterrupt):
+            print("ghost: aborted locally — could not reach the agent to "
+                  "cancel; the turn may still hold the lock", file=sys.stderr)
+        return 130
     except requests.RequestException as e:
         print(f"ghost: {type(e).__name__}: cannot reach the agent", file=sys.stderr)
         return 1

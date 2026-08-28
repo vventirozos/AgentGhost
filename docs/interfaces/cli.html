@@ -52,6 +52,7 @@
     <tbody>
       <tr><td>chat (plain text)</td><td><code>POST /v1/chat/completions</code> (SSE stream, rendered live as rich Markdown; <code>session_id</code> persists the conversation server-side)</td></tr>
       <tr><td><code>/sessions · /resume · /new · /clear</code></td><td><code>/api/sessions</code> CRUD — <code>/clear</code> rotates the session id (a local-only clear would lie: the server merges stored history back in)</td></tr>
+      <tr><td><code>/good · /bad [why…]</code> (aliases <code>/+1 · /-1</code>)</td><td><code>POST /api/feedback</code> — human outcome label on a completed reply; see <a href="#rating">Rating</a></td></tr>
       <tr><td><code>/health · /turns · /cancel [hard]</code></td><td><code>/api/health</code>, <code>/api/turns</code>, <code>/api/turn/cancel</code></td></tr>
       <tr><td><code>/notify</code></td><td><code>/api/notifications/pending</code> + ack, consumer <code>ghost-cli</code> (watermark acked AFTER display so a crash re-serves)</td></tr>
       <tr><td><code>/memory fix|rm</code></td><td><code>/api/memory/correct</code> · <code>/api/memory/delete</code></td></tr>
@@ -61,6 +62,227 @@
       <tr><td>one-shot: <code>ghost -p "q"</code> / pipe stdin</td><td>same chat stream; Markdown when stdout is a tty, raw text when piped</td></tr>
     </tbody>
   </table></div>
+
+  <h2 id="rating">Rating — human outcome labels (2026-08-27)</h2>
+  <p>The Slack bot (👍/👎 reaction) and the web UI (thumb buttons) can resolve a turn's
+  <code>outcome=unknown</code> by writing an explicit human label through
+  <code>POST /api/feedback</code>. The CLI now can too — it is the surface where typing a
+  <em>reason</em> is natural, and on a negative that reason becomes the trajectory's
+  <code>failure_reason</code>, which is worth considerably more to the verifier/distiller
+  than a bare thumb.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Form</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>/good [note]</code> · <code>/+1</code></td><td>👍 the last reply → <code>signal: positive</code>, outcome <code>passed</code></td></tr>
+      <tr><td><code>/bad [why…]</code> · <code>/-1</code></td><td>👎 the last reply → <code>signal: negative</code>, outcome <code>failed</code>; the free text is the <code>note</code> (agent caps it at 500 chars and redacts it before logging). A bare <code>/bad</code> on a tty prompts <em>why? (enter to skip)</em> once; off a tty it records the bare label rather than blocking. Enter skips the reason, Ctrl-D skips it, <strong>Ctrl-C cancels the rating entirely</strong> — it used to fall in with Ctrl-D and record a bare 👎 anyway.</td></tr>
+      <tr><td><code>/good ^2</code> · <code>/bad ^3 reason…</code></td><td>rate N replies back (<code>^1</code> = newest). The <code>^N</code> token can't collide with a reason.</td></tr>
+    </tbody>
+  </table></div>
+  <p>Labels ride <code>source: "cli"</code>, so operator-CLI labels stay distinguishable from
+  <code>web</code> and <code>slack:U…</code> in the corpus. Switching thumbs re-labels
+  (last-write-wins server-side); a repeat of the same thumb returns
+  <code>unchanged</code> and is reported as <em>already labeled</em> — it is still POSTed,
+  because the agent's repeat path re-heals the cache stamp and the diary row.</p>
+
+  <h3>Why the CLI is not a copy of the web client</h3>
+  <p>Three differences, each load-bearing:</p>
+  <ul>
+    <li><strong>Parsed before <code>shlex</code>.</strong> Every other slash command goes
+    through <code>shlex.split</code>; a reason is free text, and
+    <code>/bad it didn't find the file</code> dies there with <em>"No closing quotation"</em>.
+    Dispatch catches that and posts nothing — the label would be lost to a quoting rule the
+    operator never opted into. <code>/good</code>/<code>/bad</code> are therefore matched off
+    the raw line before the split.</li>
+    <li><strong>Synchronous retry, honest report.</strong> The agent records the trajectory
+    <em>after</em> the stream closes (post-semaphore), so a thumb typed the instant a reply
+    lands 404s. The web client must fire-and-forget with one blind retry; the CLI operator is
+    sitting at the prompt, so it retries in-line (<code>RATE_RETRY_DELAYS</code> = 0.5s / 2s /
+    4s) under a spinner and then reports what actually happened. A surviving 404 says
+    <em>label NOT recorded — no trajectory matched</em>, which is the "trajectory logging is
+    off" diagnosis, not a bare HTTP code. Nothing is ever reported as recorded without
+    <code>HTTP 200</code> <em>and</em> <code>ok: true</code>.
+    <br>⚠ The first version retried 404/429/5xx only, and justified the 5xx leg as <em>"the
+    agent restarting — the window a deploy creates."</em> A restarting agent <strong>refuses
+    the connection</strong>: that is <code>requests.ConnectionError</code>, not HTTP 503. So
+    the loop covered the less likely manifestation of its own motivating scenario and dropped
+    the label on the more likely one — measured, 1 attempt against 4. Transport failures are
+    now retried on the same schedule and surface as <code>status 0</code>. The label also
+    carries its own <code>RATE_TIMEOUT</code> of (5, 10): the retry <em>multiplies</em> the
+    timeout, and on <code>_json</code>'s (10, 60) default four attempts could freeze the
+    prompt for ~287s against a hung agent.</li>
+    <li><strong>Cancelled and errored turns are not rateable.</strong> A Ctrl-C'd turn is
+    truncated by the <em>human</em>: labeling it <code>failed</code> teaches the verifier that
+    an operator's abort was a model failure, and labeling it <code>passed</code> teaches it
+    that stopping early is fine. Both are label noise in a corpus where labels are scarce
+    enough to be load-bearing, so <code>stream_reply</code> stamps
+    <code>_turn_interrupted</code> (<code>cancelled</code>/<code>error</code>) and both thumbs
+    refuse, naming which case it was. The web client has no equivalent guard.</li>
+  </ul>
+  <p>Refs are also dropped by <code>/clear</code>, <code>/new</code>, <code>/resume</code> and
+  <code>/load</code>: after those, a <code>/good</code> would label a turn from a conversation
+  the operator has left (a stored or restored history carries no request ids at all). The
+  request id itself is the <code>X-Request-ID</code> the CLI already mints per turn — the agent
+  stamps it as the trajectory's <code>req_id</code>, which is what <code>/api/feedback</code>
+  resolves against, so this needed no server-side change.</p>
+  <p>Tests: <code>tests/test_ghost_cli.py::TestRating</code> — 14 single-guard mutants
+  (shlex routing, the interrupted guard and its per-turn reset, each ref-drop site, the retry
+  loop, the <code>ok</code> check, the 404 diagnosis, <code>source</code>, the note cap, the
+  <code>^N</code> parse, the isatty branch) all killed by the full file.</p>
+
+  <h2 id="hardening">Full-client review — 2026-08-27</h2>
+  <p>A multi-lens review of the whole script (state, protocol, terminal, security,
+  crash-resilience, performance), every finding reproduced by execution rather than by
+  reading. Eleven fixes; 25 further single-fix mutants all killed by the suite.</p>
+
+  <h3>Local files are never destroyed by a failed transfer</h3>
+  <p><code>cmd_download</code> and <code>cmd_save</code> "cleaned up" a failure with
+  <code>dest.unlink(missing_ok=True)</code> — but the writer only opens <code>dest</code> on
+  HTTP 200, so on a 404 the unlink deleted whatever local file happened to share the name.
+  Verified: a real <code>report.pdf</code> plus <code>/download report.pdf</code> against a
+  404 removed the operator's own file. The mirror case was equally wrong: a transfer that
+  died mid-stream left a truncated file over the original. Both writers now stream through a
+  sibling temp file and one <code>os.replace</code>, cleaning up on
+  <code>BaseException</code> (Ctrl-C included), and the callers unlink nothing.</p>
+
+  <h3>Control characters cannot reach the terminal</h3>
+  <p>rich strips only <code>[7, 8, 11, 12, 13]</code>. <strong>ESC is not in that set</strong>,
+  so every CSI and ST-terminated OSC in agent- or server-supplied text was written to the
+  terminal raw — confirmed for <code>\x1b[2J</code>, <code>\x1b[?1049h</code> and
+  <code>\x1b]52;c;…\x1b\\</code>, which <strong>writes the operator's clipboard</strong>. The
+  agent summarizes Tor-fetched pages, and this is the only client that renders into a terminal
+  instead of into HTML (the web UI and Slack escape by construction). <code>_safe()</code>
+  now strips ESC, the C0 controls rich lets through, DEL and the C1 range (U+009B is a
+  one-byte CSI) at every point untrusted text becomes output: <code>_StreamPrinter.feed</code>
+  (which also cleans the copy kept as history and written by <code>/save</code>),
+  <code>notice</code>, <code>_trim</code>, <code>_table</code>, the piped one-shot branch, and
+  the health/notification/briefing fields. Sequences are <em>defanged, not swallowed</em> —
+  the inert remainder stays visible so an attempt is legible in the transcript.</p>
+
+  <h3>One bad payload no longer ends the session</h3>
+  <p><code>dispatch</code> caught only <code>requests.RequestException</code> and
+  <code>chat()</code> guarded only the prompt, so a single unexpected response shape killed the
+  REPL and took the local history and the rateable turn refs with it (verified: a session row
+  missing <code>id</code> → <code>KeyError</code>; <code>rss_limit_mb</code> as a string →
+  <code>ValueError</code>). <code>dispatch</code> now catches <code>Exception</code>, reports,
+  and continues; <code>/health</code> additionally coerces the limit rather than relying on
+  that catch.</p>
+
+  <h3>Ctrl-C means one thing per context</h3>
+  <p>It meant three, and two of them ended the session. Now: <strong>during a reply</strong> it
+  aborts and cancels the turn server-side; <strong>at an idle prompt</strong> it clears the
+  line (it used to share a <code>break</code> with EOF, so the key <code>/help</code>
+  advertises as the abort key also quit the CLI); <strong>Ctrl-D</strong> exits. A second
+  Ctrl-C landing while <code>_abort_turn</code> posts the cancel is caught and reported instead
+  of unwinding the REPL, and a Ctrl-C during post-reply image fetching no longer costs the
+  reply — the history append and the turn ref now happen <em>before</em> rendering, so a reply
+  the agent already finished stays in context and stays rateable.</p>
+  <p>The same gap existed in <code>one_shot</code>, which never cancelled at all: turns are
+  globally serialized, so a Ctrl-C'd script left the agent working <em>and holding the lock</em>
+  for every other client. It now cancels the request id it actually sent and exits 130.</p>
+
+  <h3>Streaming cost no longer depends on reply shape</h3>
+  <p><code>feed()</code> built <code>Markdown(pending)</code> once per chunk and that
+  constructor runs a full markdown_it parse. <code>_flush_point</code> only advances on a blank
+  line, so for a reply that has none — a table, a long bullet list, which this agent emits
+  routinely — the pending region is the whole reply and was re-parsed on every token. Measured:
+  a 400-row table cost <strong>12.24s</strong> against 0.07s for the same volume of prose, with
+  <code>Markdown.__init__ → markdown_it.parse</code> accounting for 14.6s of a 16.9s profile
+  across 1410 calls. <code>_LazyMarkdown</code> holds the markup and parses inside
+  <code>__rich_console__</code>, so the parse runs on Live's refresh clock instead of the token
+  rate: the same table now costs <strong>0.14s</strong>, the list 0.12s. Pinned as the
+  mechanism (parse count), not as wall-clock.</p>
+
+  <h3>Smaller</h3>
+  <ul>
+    <li><code>GHOST_URL=eva:8000</code> parsed as <code>scheme='eva', netloc=''</code> and
+    fell through to a bare <code>MissingSchema</code> on every call; a missing scheme now
+    defaults to <code>http://</code> (https is never downgraded).</li>
+    <li>A rating confirmation names the turn it labeled, not just its id — with
+    <code>^N</code> in play, "which one did that hit?" is a real question.</li>
+    <li>Undocumented <code>/+</code> and <code>/-</code> aliases removed and <code>/bye</code>
+    added to both the completer and <code>/help</code>. A drift test now asserts that
+    dispatch, <code>COMPLETER</code> and <code>HELP</code> name the same command set —
+    when they diverge, Tab and <code>/help</code> lie.</li>
+  </ul>
+  <p>One candidate was <strong>retracted</strong> on inspection: the CLI replaying its full
+  local history every turn alongside the server's stored history looks like double-counting,
+  but <code>core/sessions.py::merge_history_detail</code> is built for exactly this fat-client
+  replay — stored is always a prefix, only the unmatched tail is appended, and client-side
+  assistant messages are stripped from that tail, so an aborted turn's partial reply cannot
+  poison the store either.</p>
+
+  <h2 id="chrome">The look — 2026-08-27</h2>
+  <p>Three structural problems, all visible in the first screenful:</p>
+  <ul>
+    <li><strong>The banner wrapped.</strong> Its rule was a hardcoded 52 columns and it
+    assembled the full URL, the session id and <code>up 3h 20m</code> unconditionally — so it
+    under-ran a wide window and spilled onto a second line in a narrow one.
+    <code>_fit_line()</code> now drops optional segments from the tail (endpoint, then session
+    id) and truncates as a last resort; identity and liveness are never what gets cut. The rule
+    spans the terminal. Pinned as <em>exactly three lines at every width from 16 to 140</em>,
+    including a 50-character hostname — measured by counting LINES, since a wrapped banner
+    shows up as extra short lines rather than as an over-long one.</li>
+    <li><strong>Replies were the one thing out of alignment.</strong> Markdown printed flush at
+    column 0 while every notice, table and hint was indented two. Everything now shares one
+    <code>GUTTER</code>; <code>_reply_block()</code> is the single place reply text is
+    rendered, so the settled blocks, the live tail and the end-of-stream flush cannot drift
+    apart.</li>
+    <li><strong>rich's stock colours leaked into every reply.</strong> Markdown tables rendered
+    with cyan borders and headers, code spans as bold cyan on a BLACK background, headings in
+    magenta — none of it from the palette, and the loudest thing on screen in any reply
+    containing a table. The theme now owns every <code>markdown.*</code> style rich ships with
+    a colour, and a test asserts that set is fully covered so a future rich release cannot
+    quietly add one back.</li>
+  </ul>
+  <p>The palette moved to deliberate truecolor values named by <strong>role</strong>
+  (<code>you</code>, <code>ghost</code>, <code>notice</code>, <code>err</code>,
+  <code>ok</code>, <code>mute</code>, <code>faint</code>), so a re-theme is one dict. Note that
+  <code>faint</code> is used for the session id and for link text, not only for rules — with
+  terminal hyperlink support rich styles the anchor TEXT with <code>markdown.link_url</code>,
+  so a true border-grey there makes every link in a reply nearly invisible.</p>
+  <h3>The prompt, and the gap under it</h3>
+  <p>The prompt is <code>›</code> (in <code>PROMPT_GLYPH</code>; a test pins that
+  <code>chat()</code> actually uses it — a constant nothing reads is decoration).
+  <code>❯</code> is the shell-prompt cliché, and the first replacement, <code>▌</code>, was
+  worse for a reason that had nothing to do with taste:</p>
+  <p><strong>prompt_toolkit reserves eight rows for the completion menu by default</strong>
+  (<code>reserve_space_for_menu=8</code>), for the whole session, menu showing or not. That is
+  a permanent blank gap under the prompt — and because those rows are a scrolling redraw
+  region, every frame leaves a copy of the prompt glyph behind in scrollback. With a solid
+  block that reads as one continuous vertical bar running down the left of the transcript,
+  which is what the operator saw. The session now reserves nothing and completes like a shell
+  (<code>CompleteStyle.READLINE_LIKE</code>, <code>complete_while_typing=False</code>): Tab
+  lists, which is what the banner has always promised. Pinned, along with a check that the
+  glyph is not a block- or heavy-line drawing character.</p>
+  <p>Replies get a plain indent rather than a coloured left rail. The rail was built and
+  rendered — it is the one thing that makes a reply read as the agent's on an ordinary prose
+  turn, since <code>markdown.text</code> carries no colour and a reply with no table, code
+  span or heading looks exactly as it did before the palette existed — but it also prefixes
+  every line the operator copies out of the terminal. Copy-clean won; the rail was removed
+  rather than left in the file unused.</p>
+  <p>Two of the fifteen visual mutants initially survived, and one is worth recording: the
+  gutter-alignment test built its expected indent out of <code>cli.GUTTER</code>, so setting
+  <code>GUTTER = 0</code> made it pass trivially. It now measures the rendered indent of the
+  reply, the notice and the table, asserts all three agree, and asserts the agreed value is at
+  least 2 — a literal, not the constant under test.</p>
+
+  <h2 id="mutation-safety">Mutation runs never touch the deployed client</h2>
+  <p><code>~/Data/AI/bin/ghost</code> is on PATH and symlinks to
+  <code>interface/externals/cli/ghost</code>. The mutation harnesses used to write each broken
+  variant into that file and restore it a couple of seconds later — so <strong>every mutant
+  was briefly the operator's live client</strong>. Launching <code>ghost</code> inside one of
+  those windows loaded the broken build: on 2026-08-27 a mutant that disables the rating
+  branch (<code>signal = None</code>) made <code>/good</code> and <code>/+1</code> answer
+  <em>"unknown or incomplete command"</em> in a real session, and the operator reasonably
+  reported it as a bug in the feature.</p>
+  <p>An EXIT/INT/TERM trap does not fix this — a trap restores <em>afterwards</em>, and the
+  window is the problem. The suite now honours <code>GHOST_CLI_PATH</code>, pointing itself at
+  a copy; harnesses write mutants there and the deployed file is never opened for writing. A
+  run is verified by checksumming the deployed file before and after. Two guards back it up:
+  the deploy-contract tests assert against the repo path rather than the override, and
+  <code>TestLocation::test_the_deployed_client_dispatches_its_rating_commands</code> loads the
+  file the symlink actually resolves to, so a leaked mutant fails the suite instead of
+  surfacing in the operator's next session.</p>
 
   <h2>Streaming render — tail-cropped live view (2026-07-26)</h2>
   <p>Replies stream into a rich <code>Live</code> region re-rendered as Markdown ~12×/s. The

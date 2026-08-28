@@ -129,8 +129,14 @@
 
   <h2>CLI</h2>
   <p>A small command for asking a question from a terminal or a shell script.</p>
-  <pre class="shell">interface/externals/cli/ghost "what's the disk usage on the server?"</pre>
-  <p>Useful in a pipeline, or when you want an answer without leaving the terminal.</p>
+  <pre class="shell">interface/externals/cli/ghost -p "what's the disk usage on the server?"</pre>
+  <p>Useful in a pipeline, or when you want an answer without leaving the terminal.
+  Run it with no arguments for an interactive session.</p>
+  <p>Inside that session you can rate a reply, the same way the 👍/👎 buttons work in the
+  web UI and the 👍/👎 reactions work in Slack: <code>/good</code> if the answer was right,
+  <code>/bad why it was wrong</code> if it wasn't. That is not a comment box — it is how
+  Ghost learns which of its answers were actually any good, and the reason you type on a
+  <code>/bad</code> is the most useful part.</p>
 
   <h2>The HTTP API</h2>
   <p>Everything above is a client of this. The API is Ollama-compatible, so tools that already speak Ollama can point at Ghost with no changes.</p>

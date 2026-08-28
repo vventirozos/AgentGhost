@@ -131,6 +131,17 @@
     reply's requester only).</li>
     <li><strong>Web UI</strong>: thumb buttons on agent bubbles
     (<a href="../interfaces/web_server.html">web_server</a>).</li>
+    <li><strong>CLI</strong> (<code>source: "cli"</code>, 2026-08-27):
+    <code>/good</code> · <code>/bad [why…]</code> on a streamed reply
+    (<a href="../interfaces/cli.html#rating">cli</a>). The only producer that
+    refuses to label a <em>cancelled or errored</em> turn, and the only one
+    that retries synchronously — including the TRANSPORT failure a
+    restarting agent actually produces, which is
+    <code>ConnectionError</code> and not the HTTP 503 a retry loop written
+    for "the deploy window" naturally reaches for — and then reports
+    whether the label landed. It is also the one where a negative's
+    <code>note</code> (→ <code>failure_reason</code>) is routinely filled
+    in.</li>
     <li>Anything else that can speak <code>POST /api/feedback</code>
     (<a href="../api/routes.html">api.routes</a>).</li>
   </ul>
