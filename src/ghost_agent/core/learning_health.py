@@ -211,6 +211,38 @@ def _lesson_hit_rate(lesson: dict) -> float:
     return (h + 1) / (r + 2)
 
 
+def usable_number(v, *, allow_negative: bool = False):
+    """A value off `calibration_params.json` we may print or compare, else None.
+
+    ⚠ ONE GUARD, BECAUSE SITE-BY-SITE GUARDING CANNOT CONVERGE. Six review
+    rounds each hardened the numeric reads the previous round had looked at
+    and missed a neighbour: the bool clause reached `_num` and not
+    `n_negative`; `math.isfinite` reached `_baseline_ok`, `_have_ci` and
+    `_show` and not `_num` or `_hdr_num`; the `>= 0` sentinel check reached
+    three of the four Brier sites. Every round was a real defect and every
+    round was the same defect, because the reviewer's attention defined the
+    boundary. This is the boundary instead, and
+    `test_every_numeric_read_goes_through_the_guard` walks the AST to prove
+    nothing bypasses it.
+
+    Rejected: non-numbers, `bool` (`isinstance(True, int)` is True), and
+    non-finite values. Also rejected by default: negatives — because `-1.0`
+    is this module's OWN "not recorded" sentinel, written by `fit()` for
+    `brier_raw`, `brier_base_rate` and `brier_cv`. It was recognised as such
+    at three of the four Brier sites, so a params file the agent certifies
+    as IN FORCE rendered "beats the base-rate predictor" off a number that
+    means "we never computed this".
+    """
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    f = float(v)
+    if not math.isfinite(f):
+        return None
+    if not allow_negative and f < 0.0:
+        return None
+    return f
+
+
 def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
     """Aggregate the learning stores under ``memory_dir`` (the
     system/memory directory). Returns a nested dict of sections; each is
@@ -338,6 +370,47 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
 
     # -- Calibration -------------------------------------------------------
     params = _load_json(calib_dir / "calibration_params.json", {}) or {}
+    # ⚠ TWO READERS, TWO POLICIES, ONE FILE. `calibration.load_params`
+    # refuses a params file whose `schema` does not match SCHEMA_VERSION and
+    # the agent then runs on hardcoded defaults — while this reader accepted
+    # it and rendered a full CALIBRATION section, base-rate licence included,
+    # for a fit that is IN FORCE NOWHERE. Flag it rather than blanking the
+    # section: the numbers are still the last fit's and worth seeing, but the
+    # report must not imply they are running.
+    # ⚠ ASK THE LOADER, DO NOT MIRROR ONE OF ITS FOUR REFUSALS. The first
+    # version compared `schema` only, while `load_params` also returns None
+    # on bad JSON, a non-dict, and any KeyError/TypeError/ValueError from the
+    # required numeric fields. Measured: `"threshold": "abc"` and a deleted
+    # `w_competence` each make the agent fall back to hardcoded defaults
+    # while this report still printed the fit AND its base-rate licence —
+    # the exact scenario the flag was added to catch. One authority.
+    # ⚠ NON-DICT, AND A LOADER THAT CAN RAISE. `params` is whatever the
+    # file held: `[1,2,3]` or `"hello"` made `params.get("schema")` six
+    # lines down raise AttributeError — while THIS flag's own comment
+    # enumerates "a non-dict" as one of the refusals it reports. And
+    # `load_params` does `int(d.get(...))`, which raises OverflowError (not
+    # covered by its KeyError/TypeError/ValueError catch) on a JSON
+    # `Infinity` or `1e400`. Calling it here therefore introduced a NEW way
+    # for one malformed field to blank the entire report — a file that
+    # rendered fine before this flag existed.
+    # ⚠ AND REMEMBER WHY IT IS EMPTY. `_load_json` returns {} for BAD JSON
+    # and this line empties a non-dict — after which `not params`
+    # short-circuits the check below to "in force". The notice's own sentence
+    # says it reports "bad JSON, a non-dict, and unusable required numerics";
+    # it could not fire for the first two, which are the two cases this
+    # normalisation creates.
+    _params_malformed = bool(params) and not isinstance(params, dict)
+    _raw_present = (calib_dir / "calibration_params.json").exists()
+    if not isinstance(params, dict):
+        params = {}
+    from .calibration import CalibrationTracker as _CalTracker
+    try:
+        _params_in_force = (
+            (not _raw_present)                      # no file at all: fine
+            and not _params_malformed
+        ) or (_CalTracker(calib_dir).load_params() is not None)
+    except Exception:       # noqa: BLE001 — a report must never break on data
+        _params_in_force = False
     all_samples = _load_jsonl(calib_dir / "calibration.jsonl")
     # Every count below is EPOCH-SCOPED, matching the fit. Pooling epochs is
     # what made this report contradict itself: 1709 rows on disk, of which
@@ -393,6 +466,8 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
         eff_rows = [s for s in samples if s.get("effort_observed")]
         eff_sigmas, _ = _live_separation(eff_rows, "effort_component")
         report["calibration"] = {
+            "params_in_force": _params_in_force,
+            "schema_on_disk": params.get("schema"),
             "samples_on_disk": len(all_samples),
             "samples_this_epoch": len(samples),
             "samples_other_epochs": n_other_epochs,
@@ -407,6 +482,39 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             # The interval the WIN/LOSS verdict is scored on (queue #8).
             "brier_cv_delta_lo": params.get("brier_cv_delta_lo"),
             "brier_cv_delta_hi": params.get("brier_cv_delta_hi"),
+            # ⚠ The COLLECTOR is the only path from the producer to the
+            # renderer. Adding the field to both ends and not to this list
+            # left the renderer's `cal.get("beats_base_rate")` permanently
+            # None, so it fell back to re-deriving from lo/hi — the "ask
+            # once" fix was inert. Migrate the whole reader set, not the two
+            # ends of it.
+            # ⚠ THE ABSENT-VS-NULL RULE WENT TO THE NEIGHBOUR, NOT TO THIS
+            # KEY. `map_status` got a helper, a guarded forward, a comment
+            # and a test; `beats_base_rate` — the field this whole change is
+            # about — kept a bare `.get()`, so absent and null collapsed and
+            # the renderer read null as "legacy file, please derive". That
+            # made an explicit null the MOST PERMISSIVE value the field
+            # accepts: a stored "unknown" withholds the licence, an outright
+            # typo withholds it, and `null` gets "beats the base-rate
+            # predictor" plus a DERIVED tag asserting the file predates a
+            # field it explicitly contains.
+            "beats_base_rate": params.get("beats_base_rate"),
+            "beats_base_rate_present": "beats_base_rate" in params,
+            # ⚠ THE RENDERER NEEDS THE CAUSE, NOT JUST THE REFUSAL. Its
+            # `unknown` branch used to state "the Platt map was rejected" as
+            # fact while having no field to check it against -- and `unknown`
+            # has a second source: a fit with no usable interval, which keeps
+            # `map_status="applied"`. Reproduced on a 9-row fit
+            # (`min_samples_for_fit` is a per-tracker argument): applied map,
+            # `unknown` verdict, no interval, and all three clauses of that
+            # sentence false. Carry the field and say what happened.
+            # ⚠ ABSENT -> "applied" (the loader's documented default for a
+            # file older than the field); an explicit null stays None and
+            # fails closed. Passing `.get()` through collapsed the two, so a
+            # `"map_status": null` read as APPLIED here while `load_params`
+            # (which stringifies it to "None") failed closed.
+            "map_status": (params["map_status"] if "map_status" in params
+                           else "applied"),
             "n_negative": params.get("n_negative"),
             "n_samples": params.get("n_samples"),
             "feature_contrib": params.get("feature_contrib"),
@@ -1484,8 +1592,29 @@ def activity_liveness(ledger_path: Path,
     # which would rebuild by hand exactly the blindness it exists to remove.
     silent_everywhere = sum(recent.values()) == 0
 
+    # The attempt heartbeat, read from beside the ledger. Failure here is
+    # not an alarm condition: `read_attempts` returns {} and every phase
+    # falls back to the outcome-only rule.
+    try:
+        from .autonomous_activity import (
+            attempt_suppresses_alarm as _suppresses,
+            read_attempts as _read_attempts)
+        attempts = _read_attempts(ledger_path) if ledger_path else {}
+    except Exception:  # noqa: BLE001
+        attempts = {}
+        def _suppresses(_e, _n, _w):  # noqa: E306
+            return False
+    now_ts = time.time()
+    alarm_window_s = float(alarm_window_hours) * 3600.0
+
     rows = []
-    for phase in sorted(set(PHASE_EXPECTATION) | set(context) | set(recent)):
+    # ⚠ `set(attempts)` is in the union. Without it a phase that has ONLY
+    # ever stamped a heartbeat — a new loop wired to the heartbeat before it
+    # ever produces an outcome — appears nowhere at all, which is the exact
+    # invisibility this registry exists to remove, re-entered through the new
+    # door.
+    for phase in sorted(set(PHASE_EXPECTATION) | set(context) | set(recent)
+                        | set(attempts)):
         exp = phase_expectation(phase)
         n24, n168 = recent.get(phase, 0), context.get(phase, 0)
         rows.append({
@@ -1495,8 +1624,39 @@ def activity_liveness(ledger_path: Path,
             "expectation": exp,
             # Only PERIODIC can alarm: the others are at zero by design, and
             # a monitor that cries on a benign zero gets ignored on a real one.
+            # ⚠ A RECENT ATTEMPT SUPPRESSES THE ALARM, and is reported.
+            #
+            # The ledger records OUTCOMES, so "produced nothing in 24h" and
+            # "did not run in 24h" were the same row. Measured 2026-08-30:
+            # this printed `✗ DEAD router_train 0/24h 0/7d` while the loop
+            # had run 30 minutes earlier and correctly declined an 89%
+            # unchanged corpus. An alarm that fires on a healthy loop is how
+            # the column gets learned-ignored — and then misses a real one.
+            #
+            # The heartbeat is a SEPARATE signal (`idle_attempts.json`), so
+            # this is not the ledger vouching for itself. Absent heartbeat →
+            # unchanged behaviour: an unreadable or never-written heartbeat
+            # must degrade to the old alarm, never to a false GREEN.
+            # ⚠ ASK THE PREDICATE, do not re-derive the comparison here.
+            # The first version inlined `(now - ts) <= window`, which is
+            # one-sided: any FUTURE timestamp — an NTP step back, a
+            # hand-edited file, a JSON `Infinity` (json.loads accepts the
+            # literal) — satisfied it forever and turned a real DEAD alarm
+            # permanently green. This file already hardens the LEDGER
+            # timestamps against exactly that ~100 lines above; the new
+            # signal, the only one that can SILENCE an alarm, did not
+            # inherit it. One predicate, one place.
+            "attempted_at": (attempts.get(phase) or {}).get("ts"),
+            "attempted_result": (attempts.get(phase) or {}).get("result"),
+            "attempted_age_s": (
+                None if not attempts.get(phase)
+                else now_ts - float(attempts[phase]["ts"])),
+            "attempted_recently": _suppresses(
+                attempts.get(phase), now_ts, alarm_window_s),
             "alarm": bool(exp == EXPECT_PERIODIC and n24 == 0
-                          and not silent_everywhere),
+                          and not silent_everywhere
+                          and not _suppresses(attempts.get(phase), now_ts,
+                                              alarm_window_s)),
             "registered": phase in PHASE_EXPECTATION,
         })
     # Zeros FIRST. The old renderer sorted by count descending and cut to the
@@ -1661,18 +1821,50 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
         # one (audit 2026-08-10). This is the line an operator actually reads;
         # leading it with a number the fit scored on its own rows is where the
         # optimism entered every downstream quote of it.
-        _cv_hdr = cal.get("brier_cv")
-        _hdr_brier = (f"Brier {_cv_hdr} (CV)"
-                      if isinstance(_cv_hdr, (int, float)) and _cv_hdr >= 0
-                      else f"Brier {cal['brier']} (in-sample)")
+        # ⚠ THE THIRD SITE READING THIS NUMBER, AND THE ONLY ONE IN THE
+        # HEADER. Same missing bool clause as the verdict block below had:
+        # `"brier_cv": true` rendered `Brier True (CV)` in the section
+        # title. Guarding one site and not its siblings is how the same
+        # defect keeps reappearing one line over.
+        def _show(v):
+            """Render a number, or say it is unreadable.
+
+            ⚠ THE THIRD VALUE IN A GUARDED F-STRING. `_hdr_num` covers
+            `brier_cv` and `brier` in the header line; `threshold` sits in
+            the SAME f-string unguarded, and `threshold: true` loads fine
+            (`float(True)` is 1.0), so the section printed `threshold True`
+            on a file certified in force. Same for the three weights on the
+            next line. Guarding the values that have bitten so far is how
+            the neighbour keeps biting.
+            """
+            n = usable_number(v)
+            return "UNREADABLE" if n is None else v
+
+        def _hdr_num(v):
+            return usable_number(v)
+
+        _cv_hdr = _hdr_num(cal.get("brier_cv"))
+        _b_hdr = _hdr_num(cal.get("brier"))
+        if _cv_hdr is not None and _cv_hdr >= 0:
+            _hdr_brier = f"Brier {_cv_hdr} (CV)"
+        elif _b_hdr is not None:
+            _hdr_brier = f"Brier {_b_hdr} (in-sample)"
+        else:
+            _hdr_brier = "Brier UNREADABLE"
         lines.append(
             f"\nCALIBRATION: {_n_epoch} samples, "
-            f"{_hdr_brier}, threshold {cal['threshold']}"
+            f"{_hdr_brier}, threshold {_show(cal.get('threshold'))}"
             + (f" · {_n_other} older-epoch rows excluded from the fit"
                if _n_other else ""))
+        # ⚠ ABSENT MAY BE OMITTED; PRESENT-BUT-UNUSABLE MUST BE NAMED.
+        # Dropping the clause for an unusable value is the silent-omission
+        # anti-pattern this same round fixed for the negative-class line.
+        _w_effort = (_show(cal["w_effort"]) if "w_effort" in cal else None)
         lines.append(
-            f"  weights: entropy {cal['w_entropy']}, competence {cal['w_competence']}"
-            + (f", effort {cal['w_effort']}" if cal.get("w_effort") is not None else "")
+            f"  weights: entropy {_show(cal.get('w_entropy'))}, "
+            f"competence {_show(cal.get('w_competence'))}"
+            + (f", effort {_show(_w_effort)}"
+               if _w_effort is not None else "")
             + f"; outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-"
             + (f" ({cal['outcome_verified_pos']}+/"
                f"{cal['outcome_verified_neg']}- verifier-checked)"
@@ -1745,8 +1937,55 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             f"({cal['entropy_observed_pos']}+/{cal['entropy_observed_neg']}- observed)"
             + (f", separation {_sep}σ" if _sep is not None else ""))
         lines.append(f"  → {_ent_note}")
-        _br, _bb = cal.get("brier_raw"), cal.get("brier_base_rate")
-        if isinstance(_br, (int, float)) and _br >= 0 and isinstance(_bb, (int, float)) and _bb >= 0:
+        # ⚠ FOUR NUMBERS IN ONE EXPRESSION, TWO OF THEM GUARDED. `_num` was
+        # applied to `brier` and `brier_cv` and not to these, so
+        # `"brier_base_rate": true` printed `the base-rate predictor (True)`
+        # AND drove the comparison against 1.0, manufacturing "beats" for a
+        # 0.9-Brier model. Guarding a name list is how the same defect keeps
+        # reappearing on the neighbour.
+        def _n(v):
+            return usable_number(v)
+
+        _br, _bb = _n(cal.get("brier_raw")), _n(cal.get("brier_base_rate"))
+        # ⚠ A WARNING NESTED INSIDE AN UNRELATED GUARD IS NOT A WARNING.
+        # This notice sat below the `_br`/`_bb` check, so a params file
+        # `load_params` REFUSES that also lacks `brier_raw` or
+        # `brier_base_rate` — or carries their -1.0 "not computed" sentinel —
+        # rendered a complete, confident section with no warning at all. The
+        # same nesting silently deleted the under-powered notice, the
+        # CONSUMER DEAD line and the whole ablation table: eight lines
+        # vanishing on one bad number, with the suite green because the pin
+        # only asserted the report still contained "LESSONS:".
+        if not cal.get("params_in_force", True):
+            lines.append(
+                f"  ⚠ NOT IN FORCE — `load_params` refuses this file "
+                f"(schema on disk {cal.get('schema_on_disk')!r}; it also "
+                f"refuses bad JSON, a non-dict, and unusable required "
+                f"numerics), so the agent is running on hardcoded "
+                f"defaults and NOTHING below describes the live scorer")
+        # ⚠ THESE TWO PREDICATES MUST BE COMPLEMENTS, AND WERE NOT. `NaN < 0`
+        # and `NaN >= 0` are BOTH False, so a NaN baseline fell through the
+        # announcement AND the block: no `NOT IN FORCE` (the file loads
+        # fine), no `NO USABLE BASELINE`, and the verdict line, the in-sample
+        # line, the negative-class line, the CONSUMER DEAD notice and the
+        # whole ablation table silently gone. That is the same eight-line
+        # amputation the announcement was added to abolish, surviving for the
+        # one value class `_base_rate_verdict` next door explicitly hardened
+        # with `math.isfinite`. One predicate now, used twice.
+        # ⚠ THE isfinite AND >= 0 CLAUSES USED TO LIVE HERE AND ARE NOW DEAD:
+        # `_br`/`_bb` come from `_n` -> `usable_number`, which already
+        # rejects bools, non-finite values and the `-1.0` "not recorded"
+        # sentinel. A mutation run flagged them as an equivalent mutant,
+        # which is the tell: a condition no input can falsify reads as
+        # protection and provides none. Deleted rather than left standing —
+        # the guarantee now has exactly one home, and it is `usable_number`.
+        _baseline_ok = _br is not None and _bb is not None
+        if not _baseline_ok:
+            lines.append(
+                f"  ⚠ NO USABLE BASELINE — brier_raw={cal.get('brier_raw')!r},"
+                f" brier_base_rate={cal.get('brier_base_rate')!r}. The verdict"
+                f" and the feature table below are omitted, not passed")
+        if _baseline_ok:
             # Equality is not a loss: when the map converges to predicting the
             # base rate (the honest outcome while no feature carries weight)
             # the two are identical, and calling that "LOSES TO" reads as a
@@ -1757,10 +1996,53 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             # `brier_base_rate` is a comparison only one side of which paid
             # for its parameters. Both are shown, labelled, and the WIN/LOSS
             # call is made on the honest number.
-            _cv = cal.get("brier_cv")
-            _honest = (_cv if isinstance(_cv, (int, float)) and _cv >= 0
-                       else None)
-            _score = _honest if _honest is not None else cal["brier"]
+            # ⚠ EVERY NUMBER OFF THIS FILE IS UNTRUSTED. `brier_cv` had an
+            # isinstance guard with no bool clause (`"brier_cv": true`
+            # rendered `Brier True (5-fold CV)`), and `cal["brier"]` had no
+            # guard at all — a missing key, a null, or a string reached the
+            # `_score < _bb` comparison and raised TypeError, which
+            # `introspect` turns into "Learning health unavailable",
+            # destroying lessons, episodes, PRM and router reporting over one
+            # malformed calibration field. That is the same blast radius the
+            # verdict coercion was added to prevent, one variable over.
+            def _num(v):
+                return usable_number(v)
+
+            _cv = _num(cal.get("brier_cv"))
+            _honest = _cv if _cv is not None and _cv >= 0 else None
+            _score = _honest if _honest is not None else _num(cal.get("brier"))
+            # ⚠ GUARD THE DISPLAY, NOT ONLY THE COMPARISON. `_score` was
+            # made safe while three lines below still formatted
+            # `cal['brier']` raw, so a bool printed as `Brier True (IN-SAMPLE
+            # ...)`. Computing a safe value and then not using it is the
+            # same defect as never computing it.
+            _brier_shown = (cal.get("brier") if _num(cal.get("brier")) is not None
+                            else "UNREADABLE")
+            # ⚠ ANNOUNCING THAT A VERDICT CANNOT BE COMPUTED, THEN COMPUTING
+            # ONE. Setting `_score = nan` fell through to the comparison
+            # chain, where `nan < x` and `nan > x` are both False, so it
+            # landed on `else: "matches"` — a MEASURED word, the fabricated
+            # neutral `fit()` explicitly refuses to record, printed directly
+            # under a notice saying the comparison is impossible. Identical
+            # shape to the `_baseline_ok` defect fixed 60 lines above, which
+            # is why this is a flag rather than a sentinel value: a sentinel
+            # that flows into arithmetic gets compared.
+            _score_unusable = _score is None
+            if _score_unusable:
+                lines.append(
+                    "  ⚠ NO USABLE BRIER on file (brier="
+                    f"{cal.get('brier')!r}, brier_cv={cal.get('brier_cv')!r})"
+                    " — the calibration verdict cannot be computed")
+                # ⚠ NO SENTINEL VALUE HERE, DELIBERATELY. This line used to
+                # be `_score = float("nan")`, which flowed into the
+                # comparison chain below: `nan < x` and `nan > x` are both
+                # False, so it fell to `else: "matches"` — a measured word
+                # printed under a notice saying the comparison is
+                # impossible. `_score_unusable` gates that chain now, so any
+                # assignment here is dead code; a mutation run confirmed it
+                # (no value is distinguishable), and dead code that looks
+                # like a fallback is what invites the next reader to compare
+                # it. `_score` stays None.
             # ⚠ THE VERDICT NEEDS THE INTERVAL, NOT THE POINT (queue #8,
             # 2026-08-21). A 1e-6 tolerance makes any wobble a victory: on
             # the live store the model beat the base rate by 0.00108 and this
@@ -1771,42 +2053,312 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             # stated without the power to support it. When no CI is recorded
             # (params written before this existed) fall back to the point
             # comparison, but SAY so rather than implying a tested claim.
-            _dlo, _dhi = cal.get("brier_cv_delta_lo"), cal.get(
-                "brier_cv_delta_hi")
+            # ⚠ ASK THE STORED VERDICT, do not re-derive it. This block used
+            # to recompute the comparison from the raw `lo`/`hi` fields at
+            # render time, so the producer's measurement and the consumer's
+            # rendering of it were two implementations of one decision and
+            # could drift. `beats_base_rate` is decided once by
+            # `calibration._base_rate_verdict` and stored on the params;
+            # older files predate the field, so the lo/hi path remains as a
+            # LABELLED fallback rather than a silent second opinion.
+            from .calibration import (BEATS_INDISTINGUISHABLE, BEATS_NO,
+                                      BEATS_UNKNOWN, BEATS_YES,
+                                      _base_rate_verdict, _known_verdict,
+                                      downgrade_for_map, map_applied,
+                                      map_applied_in_params)
+            # ⚠ CI BOUNDS ARE LEGITIMATELY NEGATIVE — that is what a WIN
+            # looks like — so this is the one numeric read besides the
+            # ablation deltas that allows them. Routed through the single
+            # guard rather than an inline copy: `_have_ci` had drifted from
+            # `_base_rate_verdict` on finiteness once already.
+            _dlo = usable_number(cal.get("brier_cv_delta_lo"),
+                                 allow_negative=True)
+            _dhi = usable_number(cal.get("brier_cv_delta_hi"),
+                                 allow_negative=True)
+            # ⚠ COERCE HERE TOO. This reader takes the RAW params dict
+            # (`_load_json`), not `load_params`, so the vocabulary check
+            # wired into the loader never ran on the live path. An
+            # unhashable value (`[]`, `{}`) then raised out of the
+            # membership test below and blanked the ENTIRE learning-health
+            # report — lessons, episodes, PRM, router — over one malformed
+            # advisory field.
+            # ⚠ ABSENCE IS OBSERVABLE HERE TOO, AND MEANS SOMETHING ELSE.
+            # `cal` is the COLLECTOR's dict, not the params file. A dict with
+            # no `map_status` key is output from a collector older than the
+            # field — it reads as applied, exactly as an old params file
+            # does. Only an explicit None (a null the collector passed
+            # through) fails closed. Reading `.get()` collapsed the two and
+            # made every pre-existing caller with a hand-rolled block render
+            # as a rejected map.
+            _map_in_force = map_applied_in_params(cal)
+            _ms = cal.get("map_status")
+            _stored_raw = cal.get("beats_base_rate")
+            # Absence is the ONLY licence to derive. A present-but-null value
+            # is a malformed verdict and fails closed like any other.
+            _verdict_present = cal.get("beats_base_rate_present",
+                                       _stored_raw is not None)
+            # ⚠ THE STORED VERDICT GOES THROUGH THE AUTHORITY TOO. The first
+            # version applied `downgrade_for_map` only where the renderer
+            # DERIVED a verdict, protecting files where the field is absent
+            # and trusting files where it is WRONG. A params file carrying
+            # `beats_base_rate="yes"` with `map_status="rejected_inverted"`
+            # printed "beats the base-rate predictor" one line above its own
+            # admission that the map was discarded — and that combination is
+            # not hypothetical: it is exactly what `fit()` wrote before this
+            # change, so any file from that build has it.
+            _stored = (None if not _verdict_present
+                       else (_known_verdict(_stored_raw) if _map_in_force
+                             else BEATS_UNKNOWN))
+            # ⚠ FOUR WORDS, NOT THREE. `_words` maps only the three
+            # PRINTABLE verdicts; quoting it as the vocabulary in an error
+            # message omitted `unknown`, which is a verdict.
+            _VERDICT_WORDS = (BEATS_YES, BEATS_NO, BEATS_INDISTINGUISHABLE,
+                              BEATS_UNKNOWN)
+            _words = {BEATS_YES: "beats",
+                      BEATS_NO: "LOSES TO",
+                      BEATS_INDISTINGUISHABLE: "is INDISTINGUISHABLE from"}
             _ci_note = ""
-            if isinstance(_dlo, (int, float)) and isinstance(_dhi, (int, float)):
-                if _dhi < 0:
-                    _verdict = "beats"
-                elif _dlo > 0:
-                    _verdict = "LOSES TO"
+            # ⚠ BOOLS ARE INTS. `"brier_cv_delta_lo": true` in a params file
+            # satisfied this and printed `[95% CI +1.00000..+1.00000]`. The
+            # verdict was safe (`_base_rate_verdict` rejects bools) but the
+            # interval beside it was fabricated.
+            # ⚠ TWO GUARDS, ONE QUESTION, AND THE LOOSER ONE DRIVES THE
+            # DISPLAY. `_base_rate_verdict` requires `math.isfinite` on
+            # exactly these two values; this display guard got the bool
+            # clause and not the finiteness one, so infinite bounds printed
+            # `[95% CI of the delta -inf..+inf]` beside a real stored
+            # verdict — a fabricated interval, word-for-word the defect the
+            # comment above claims the bool clause fixed.
+            _have_ci = _dlo is not None and _dhi is not None
+            # ⚠ ABSENT IS NOT THE SAME FACT AS WITHHELD, and conflating them
+            # let the consumer overturn the producer.
+            #
+            # This fallback exists for params files written BEFORE the field
+            # (key absent → `cal.get` returns None). The first version tested
+            # `_stored not in _words`, which is also true of a stored
+            # `"unknown"` — and a stored `"unknown"` has exactly one source:
+            # `fit()` downgrading the verdict because the map was rejected
+            # and the shipped predictor is the RAW composite, so the interval
+            # describes a model we refused. Legacy files have the key absent,
+            # and `fit()` refuses below 40 samples so `_cv_delta_ci` always
+            # returns an interval — meaning `not in _words` fired on the ONE
+            # population where re-deriving is provably wrong. Measured: a
+            # `discarded_worse` fit storing `unknown` rendered "beats the
+            # base-rate predictor", the exact licence the producer withheld.
+            _derived = False
+            if _stored is None and _have_ci:
+                # Pre-field params: derive with the SAME function the
+                # producer uses, never a private copy of its logic — AND
+                # apply the same rejection rule it applies afterwards.
+                #
+                # ⚠ THIS USED TO STOP AT `_base_rate_verdict`, WHICH SEES
+                # ONLY AN INTERVAL. The rule "a rejected map ships the raw
+                # composite, so this interval describes a predictor we
+                # refused" lived only in `fit()`. Every params file written
+                # before the field existed takes this path — the live one
+                # included — so on the anti-correlated corpus this module
+                # documents at length, the operator's keep/kill instrument
+                # printed "beats the base-rate predictor" for a scorer 3.5x
+                # WORSE than a constant. The producer refused the licence and
+                # the consumer granted it, one branch above the branch that
+                # had just been fixed to stop exactly that.
+                _stored = (_base_rate_verdict((None, _dlo, _dhi))
+                           if _map_in_force else BEATS_UNKNOWN)
+                _derived = True
+            if _stored == BEATS_UNKNOWN:
+                # The producer measured and REFUSED to answer. Say that;
+                # never substitute an answer of our own -- and state the
+                # cause we can actually SEE, not the one we assume.
+                if not _map_in_force:
+                    # ⚠ ONLY CLAIM THE INTERVAL WHEN THERE IS ONE. The first
+                    # wording said "while the interval measures the map we
+                    # discarded" unconditionally — a dangling reference on a
+                    # fit whose `brier_cv_delta_lo` is None (reachable: a
+                    # 9-row fit, since `min_samples_for_fit` is a per-tracker
+                    # argument). That is the same defect this very sentence
+                    # replaced, committed inside its replacement.
+                    _why = (" while the interval measures the map we "
+                            "discarded" if _have_ci else "")
+                    # A blank or non-string status must not render as an
+                    # empty gap in the sentence.
+                    _shown = _ms if isinstance(_ms, str) and _ms else repr(_ms)
+                    _verdict = (f"has NO base-rate comparison — the Platt map "
+                                f"was {_shown}, so the shipped predictor is "
+                                f"the raw composite{_why}. Not compared "
+                                f"against")
+                    if _have_ci:
+                        _ci_note = (
+                            f" [the discarded map's CI {_dlo:+.5f}"
+                            f"..{_dhi:+.5f} — does NOT describe what ships]")
+                elif (_stored_raw is not None
+                      and _stored_raw != BEATS_UNKNOWN):
+                    # ⚠ COERCED, NOT RECORDED. The params carried a value
+                    # outside the vocabulary — a typo, a hand edit, a verdict
+                    # from a future version. Saying only "no comparison" would
+                    # hide that the file is malformed, so name it. (The
+                    # separate "junk" branch that used to do this became dead
+                    # code the moment coercion moved ahead of it; a guard that
+                    # cannot run is worse than no guard.)
+                    _verdict = (f"has NO usable base-rate verdict — the "
+                                f"params record {_stored_raw!r}, which is not "
+                                f"one of {sorted(_VERDICT_WORDS)}. Not "
+                                f"compared "
+                                f"against")
+                elif _have_ci:
+                    # ⚠ THE THIRD ARM SAID "no usable interval was recorded"
+                    # AND THEN PRINTED THE INTERVAL. Arms 1 and 2 were both
+                    # fixed to claim only what they can observe; this one
+                    # kept a cause its own next clause refutes on the same
+                    # line. What is true here is narrower: there IS an
+                    # interval, and the fit declined to draw a verdict from
+                    # it.
+                    _verdict = ("has NO base-rate comparison — the fit "
+                                "recorded no verdict from its interval. Not "
+                                "compared against")
+                    # The interval IS the evidence here; keep showing it.
+                    _ci_note = (f" [interval on file {_dlo:+.5f}"
+                                f"..{_dhi:+.5f}, but the fit recorded no "
+                                f"verdict from it]")
                 else:
-                    _verdict = "is INDISTINGUISHABLE from"
-                _ci_note = (f" [95% CI of the delta {_dlo:+.5f}..{_dhi:+.5f}"
-                            f"{'' if _verdict != 'is INDISTINGUISHABLE from' else ' — straddles zero'}]")
+                    _verdict = ("has NO base-rate comparison — no usable "
+                                "cross-validated interval was recorded for "
+                                "this fit. Not compared against")
+                    if _have_ci:
+                        _ci_note = (f" [interval on file {_dlo:+.5f}"
+                                    f"..{_dhi:+.5f}, but the fit recorded no "
+                                    f"verdict from it]")
+            elif _stored in _words:
+                _verdict = _words[_stored]
+                if _have_ci:
+                    # ⚠ AND SAY WHEN IT WAS DERIVED. The comment here called
+                    # this a "LABELLED fallback rather than a silent second
+                    # opinion", and the docs repeated the claim — but the
+                    # output was BYTE-IDENTICAL to a stored verdict, so an
+                    # operator could not tell a measurement the fit recorded
+                    # from one this renderer invented at display time. That
+                    # is the live store's path today: its params file
+                    # predates the field entirely.
+                    _ci_note = (
+                        f" [95% CI of the delta {_dlo:+.5f}..{_dhi:+.5f}"
+                        f"{' — straddles zero' if _stored == BEATS_INDISTINGUISHABLE else ''}"
+                        f"{' — DERIVED at render time; this params file predates the stored verdict' if _derived else ''}]")
+                else:
+                    # Keep the honesty qualifier. A stored verdict with no
+                    # interval behind it is still a point comparison, and
+                    # dropping the caveat was this change's own thesis
+                    # running backwards.
+                    _verdict += " (point estimate only — no CI recorded)"
+            elif not _map_in_force:
+                # ⚠ THE ARMS THE RULE STOPPED ONE `elif` SHORT OF.
+                #
+                # `_map_in_force` gated the stored path, the derive path, the
+                # refusal wording and both in-sample lines — and not these
+                # three. So a params file with `map_status` present but no CI
+                # and no verdict (any build between 2026-07-29 and
+                # 2026-08-21) printed "beats the base-rate predictor" from a
+                # point comparison, for EVERY status, directly above the line
+                # explaining that the number behind it describes the map that
+                # was thrown away. Byte-identical output for `applied`,
+                # `rejected_inverted`, `rejected_step`, `discarded_worse` and
+                # `""`.
+                #
+                # Four review rounds each found the rule reaching every
+                # branch the reviewer was looking at and stopping just short
+                # of one more. Gating the arms individually is what kept
+                # producing that; this is the last arm, and the `elif` chain
+                # is now exhaustively covered.
+                _verdict = ("has NO base-rate comparison — the Platt map was "
+                            f"{cal.get('map_status')!r}, so the shipped "
+                            "predictor is the raw composite and this is a "
+                            "point comparison against the DISCARDED map. Not "
+                            "compared against")
+            elif _score_unusable:
+                _verdict = ("has NO base-rate comparison — the Brier on file "
+                            "is unusable, so nothing was compared against")
             elif _score < _bb - 1e-6:
                 _verdict = "beats (point estimate only — no CI recorded)"
             elif _score > _bb + 1e-6:
                 _verdict = "LOSES TO (point estimate only — no CI recorded)"
             else:
-                _verdict = "matches"
+                # ⚠ THE THIRD ARM HAD NO CAVEAT. `beats` and `LOSES TO` both
+                # carry "(point estimate only — no CI recorded)"; `matches`
+                # asserted a bare equivalence, which is a stronger claim than
+                # either of them and the one this block's own comment says
+                # must never be implied without a test behind it.
+                _verdict = "matches (point estimate only — no CI recorded)"
             if _honest is not None:
                 lines.append(
                     f"  Brier {_honest} (5-fold CV, out-of-sample) {_verdict} "
                     f"the base-rate predictor ({_bb}){_ci_note}")
-                lines.append(
-                    f"    in-sample {cal['brier']} · raw composite {_br} "
-                    f"— in-sample is NOT performance, it is the fit scored on "
-                    f"its own rows")
+                # ⚠ ON A REJECTION PATH THESE TWO ARE THE SAME NUMBER, and
+                # the CV figure above them describes a map that was thrown
+                # away. `fit()` sets `brier = brier_raw` and
+                # `calibrated = composites` on all three rejection paths, so
+                # "in-sample X · raw composite X" printed one value twice and
+                # read as two independent measurements agreeing. Meanwhile
+                # the shipped predictor -- the raw composite -- has no
+                # out-of-sample number anywhere on this line. Say which of
+                # these describes what actually runs.
+                # ⚠ A SECOND COPY OF THE RULE, IN THE SAME BLOCK, ALREADY
+                # DISAGREEING. This kept the pre-fix vocabulary
+                # (`not in ("", "applied")`), so for `map_status=""` the
+                # verdict line above said the map was rejected while this
+                # line said it was applied and dropped the "SAME number"
+                # qualification — on the exact value the shared helper was
+                # written for. Extracting an authority does nothing if the
+                # old expression survives beside it.
+                _rejected = not _map_in_force
+                if _rejected:
+                    lines.append(
+                        f"    in-sample {_brier_shown} · raw composite {_br} "
+                        f"— the map was {cal.get('map_status')!r}, so these "
+                        f"are the SAME "
+                        f"number and the CV figure above describes the "
+                        f"DISCARDED map, not what ships")
+                else:
+                    lines.append(
+                        f"    in-sample {_brier_shown} · raw composite {_br} "
+                        f"— in-sample is NOT performance, it is the fit "
+                        f"scored on its own rows")
             else:
+                # ⚠ THE OTHER HALF OF THE SAME LINE. `_ci_note` was silently
+                # dropped on this branch, and it never received the
+                # "these are the SAME number" qualification the CV branch got
+                # — so a rejected map with no CV recorded printed
+                # `in-sample X … raw composite X`, one value twice, exactly
+                # the shape that qualification exists to abolish. Fixing a
+                # line means fixing every branch that prints it.
+                _same = ("" if _map_in_force
+                         else f" — the map was {cal.get('map_status')!r}, so "
+                              f"these are the SAME number")
                 lines.append(
-                    f"  Brier {cal['brier']} (IN-SAMPLE — no CV recorded, "
+                    f"  Brier {_brier_shown} (IN-SAMPLE — no CV recorded, "
                     f"treat as optimistic) {_verdict} the base-rate predictor "
-                    f"({_bb}); raw composite {_br}")
+                    f"({_bb}); raw composite {_br}{_same}{_ci_note}")
             # THE NUMBER EVERY OTHER VERDICT RESTS ON. Every feature verdict,
             # weight and Brier comparison here is estimated from the negative
             # class, and the live store carries 18 of them in 694 rows.
             _nneg, _n = cal.get("n_negative"), cal.get("n_samples")
-            if isinstance(_nneg, int) and isinstance(_n, int) and _n:
+            # ⚠ `isinstance(True, int)` IS TRUE, and this is the line the
+            # comment above calls "THE NUMBER EVERY OTHER VERDICT RESTS ON".
+            # `_n`, `_num`, `_hdr_num` and the feature filter all reject
+            # bools; this one did not, so `n_negative: true` rendered
+            # `negative class: True/1258 (0.1%) ⚠ UNDER-POWERED` on a file
+            # certified in force, with no warning anywhere.
+            _counts_ok = (isinstance(_nneg, int) and not isinstance(_nneg, bool)
+                          and isinstance(_n, int) and not isinstance(_n, bool)
+                          and _n)
+            if not _counts_ok:
+                # ⚠ THE GUARD ADDED LAST ROUND DELETED THE LINE IN SILENCE —
+                # the line this block calls "THE NUMBER EVERY OTHER VERDICT
+                # RESTS ON". The sibling fix in the same commit counts and
+                # names what it drops; this one did not. Announcing an
+                # omission is the rule, not a courtesy.
+                lines.append(
+                    f"  ⚠ NEGATIVE-CLASS COUNT UNREADABLE (n_negative="
+                    f"{_nneg!r}, n_samples={_n!r}) — every verdict above is "
+                    f"estimated from a population this report cannot size")
+            if _counts_ok:
                 _pct = _nneg / _n
                 _warn = ("  ⚠ UNDER-POWERED" if _nneg < 50 else "")
                 lines.append(
@@ -1840,13 +2392,52 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                     "    the score is recorded and calibrated; NOTHING acts "
                     "on it. Treat these numbers as a measurement, not as a "
                     "behaviour.")
-            _fc = cal.get("feature_contrib") or {}
+            # ⚠ THE GUARD WENT ON A NAME LIST, NOT ON THE BOUNDARY. `brier`,
+            # `brier_cv` and `brier_base_rate` were each guarded by name
+            # while this dict raised three separate ways — a list has no
+            # `.items()`, and a string or None value dies in `-kv[1]` and in
+            # `_v > 1e-6`. Each one blanked the entire report through
+            # `introspect`. Anything read off this file is untrusted; filter
+            # to what is actually usable instead of naming the fields that
+            # have bitten so far.
+            _fc_raw = cal.get("feature_contrib")
+            _fc = {}
+            if isinstance(_fc_raw, dict):
+                # ⚠ SAME GUARD. This filter rejected bools and admitted
+                # `Infinity`, which sorts to the TOP of the table as the
+                # largest possible held-out delta — on the table the report
+                # itself tells the operator to believe over the σ-gate.
+                # Negatives ARE meaningful here (dropping the feature helps),
+                # so this is the one numeric read that allows them.
+                _fc = {k: v for k, v in _fc_raw.items()
+                       if usable_number(v, allow_negative=True) is not None}
+                _dropped = len(_fc_raw) - len(_fc)
+                if _dropped:
+                    lines.append(
+                        f"  ⚠ {_dropped} feature-ablation entr"
+                        f"{'y' if _dropped == 1 else 'ies'} unusable and "
+                        f"omitted (non-numeric values on file)")
+            elif _fc_raw is not None:
+                lines.append(
+                    f"  ⚠ feature_contrib is {type(_fc_raw).__name__}, not a "
+                    f"mapping — the ablation table is omitted")
             if _fc:
                 lines.append("  feature ABLATION (held-out Brier delta; "
                              ">0 = dropping it hurts, i.e. it helps):")
                 for _k, _v in sorted(_fc.items(), key=lambda kv: -kv[1]):
-                    _m = ("helps" if _v > 1e-6
-                          else "no measurable contribution")
+                    # ⚠ TWO WORDS FOR THREE OUTCOMES. A NEGATIVE delta means
+                    # dropping the feature IMPROVES held-out Brier — the
+                    # feature is actively hurting — and it rendered as "no
+                    # measurable contribution". The live params file carries
+                    # `competence_component: -4.3e-05` and reads exactly that
+                    # today, beside an `effort_component` 20x smaller in
+                    # magnitude labelled "helps".
+                    if _v > 1e-6:
+                        _m = "helps"
+                    elif _v < -1e-6:
+                        _m = "HURTS — dropping it IMPROVES held-out Brier"
+                    else:
+                        _m = "no measurable contribution"
                     lines.append(f"    {_k:<24} {_v:+.6f}  {_m}")
                 lines.append(
                     "    ⚠ where ABLATION and the σ-gate disagree, believe the "
@@ -1916,6 +2507,27 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                 f"{mark}{row['phase']:<24} {row['n_alarm_window']:>4} /{aw}h "
                 f"{row['n_context_window']:>5} /{cw}d   "
                 f"{row['expectation']}{note}")
+            # ⚠ SAY IT, don't just withhold the alarm. A zero with the alarm
+            # quietly suppressed is indistinguishable from a zero nobody
+            # looked at — the operator has no way to tell "ran and declined"
+            # from "we stopped checking". The heartbeat is positive evidence,
+            # so it gets a line.
+            from .autonomous_activity import (
+                EXPECT_PERIODIC as _EXPECT_PERIODIC_NAME)
+            # Only a row that COULD have alarmed needs the explanation, and
+            # the age comes from the row — a second `time.time()` here can
+            # print an age that contradicts the `attempted_recently` it is
+            # explaining.
+            if (row["expectation"] == _EXPECT_PERIODIC_NAME
+                    and row["n_alarm_window"] == 0
+                    and row.get("attempted_recently")):
+                _age_h = float(row["attempted_age_s"] or 0.0) / 3600.0
+                lines.append(
+                    f"        └ RAN {_age_h:.1f}h ago and produced nothing — "
+                    f"this loop records an OUTCOME, and declining (e.g. an "
+                    f"unchanged corpus) is a healthy outcome-free run. Not "
+                    f"dead; the heartbeat is a separate signal from the "
+                    f"ledger.")
         if lv.get("alarms"):
             lines.append(
                 f"  ✗ {len(lv['alarms'])} PERIODIC loop(s) silent for {aw}h: "

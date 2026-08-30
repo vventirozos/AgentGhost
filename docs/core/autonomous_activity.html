@@ -265,6 +265,85 @@
   (see <a href="../interfaces/slack_bot.html">the bot page</a>); this store-level guard covers
   every other consumer. Tests:
   <code>tests/test_autonomous_activity.py::test_save_consumer_offset_skips_noop_writes</code>.</p>
+
+  <h2>The idle-attempt heartbeat &mdash; <code>idle_attempts.json</code> (2026-08-30, &sect;4DY)</h2>
+
+  <p>The ledger on this page records <strong>outcomes</strong>: a phase writes a
+  row when it did something. That is the right contract for the digest, and it
+  leaves one question unanswerable &mdash; <em>did this loop run?</em> A loop
+  that ran and correctly declined looks exactly like one that never ran.</p>
+
+  <p>Measured 2026-08-30: the learning-health view printed
+  <code>&#10007; DEAD router_train 0/24h 0/7d</code> while the loop had run
+  thirty minutes earlier and logged <em>&ldquo;the labelled corpus is 89% the
+  same as the last look &hellip; not re-running the same test on the same
+  evidence&rdquo;</em>. Its last ledger row was its last real <em>retrain</em>
+  &mdash; exactly what the ledger promises. &ldquo;Produced nothing&rdquo; was
+  being rendered as &ldquo;is dead&rdquo;, and
+  <code>negative_controls</code> &mdash; genuinely stale &mdash; sat in the same
+  alarm list, which is how a column gets learned-ignored.</p>
+
+  <p>A second signal answers the other half. It lives beside the ledger at
+  <code>$GHOST_HOME/system/idle_attempts.json</code> and is deliberately
+  <strong>not</strong> more ledger rows: a skip per idle cycle would add ~30
+  rows/day to a file that never rotates, and would blur the outcome contract.</p>
+
+  <h3>Outcome classes &mdash; only <code>declined</code> suppresses</h3>
+  <div class="scroll"><table>
+    <tr><th>Value</th><th>Means</th><th>Suppresses the DEAD alarm?</th></tr>
+    <tr><td><code>entered</code></td><td>the phase started work; the outcome is unknown</td><td>No</td></tr>
+    <tr><td><code>declined</code></td><td>it ran and producing nothing was correct (skip-if-unchanged)</td><td><strong>Yes</strong></td></tr>
+    <tr><td><code>failed</code></td><td>it raised</td><td>No</td></tr>
+  </table></div>
+
+  <p class="warn">&#9888; The first version stored a bare timestamp stamped at
+  entry. A loop that <em>crashes on every cycle</em> was then byte-identical to
+  one that declined, and the view asserted &ldquo;a healthy outcome-free
+  run&rdquo; about a permanently broken loop &mdash; a false <em>green</em>,
+  which this subsystem treats as worse than the false alarm it replaced. The
+  stamp is written where the phase <em>enters</em> its work, so
+  <code>entered</code> is exactly what a crash leaves behind.</p>
+
+  <h3>File contract</h3>
+  <pre><code>{"router_train": {"ts": 1788068709.49, "result": "declined"}}</code></pre>
+  <p>A <strong>bare float</strong> is the pre-outcome-class format written by
+  the first generation. It cannot prove a run declined, so it is read as
+  <code>entered</code> and never suppresses. Rows with a non-finite, boolean,
+  or unparseable <code>ts</code> are dropped individually &mdash; one bad row
+  must not discard the others.</p>
+
+  <h3>Recency is bounded on BOTH sides</h3>
+  <p><code>attempt_suppresses_alarm()</code> requires
+  <code>-60s &le; (now &minus; ts) &le; alarm_window</code>. The lower bound is
+  the point: a one-sided test let any <em>future</em> stamp &mdash; an NTP step
+  back, a hand-edited file, a JSON <code>Infinity</code> literal &mdash;
+  suppress the alarm forever. The 60&nbsp;s of slack absorbs the fact that the
+  consumer captures <code>now</code> and <em>then</em> reads the file.</p>
+
+  <h3>Writing</h3>
+  <p><code>record_attempt()</code> holds a module lock, writes through a
+  <code>pid+uuid</code> temp with <code>write_text_nofollow</code>, and
+  <code>os.replace</code>s it in. A pid-only temp name collides between
+  <em>threads</em> of one process (8&times;30 stamps recovered 0 of 240 and left
+  the file unparseable) &mdash; the same &sect;4BW shape
+  <code>sandbox/services.py</code> and <code>sandbox/jobs.py</code> already fix.
+  An unreadable file is <strong>refused</strong>, never overwritten: falling
+  back to <code>{}</code> would destroy every other phase&rsquo;s stamp.</p>
+
+  <h3>What the operator sees</h3>
+  <p>A suppressed row is stated, not silently dropped &mdash; a zero with the
+  alarm withheld is indistinguishable from a zero nobody looked at:</p>
+  <pre><code>    router_train    0 /24h    0 /7d   periodic
+        &#9492; RAN 0.5h ago and produced nothing &mdash; this loop records an
+          OUTCOME, and declining is a healthy outcome-free run.</code></pre>
+
+  <p><code>negative_controls</code> was reclassified
+  <code>EXPECT_PERIODIC &rarr; EXPECT_ON_OUTPUT</code> in the same change: it
+  runs on a <strong>seven-day</strong> interval judged against a 24&nbsp;h alarm
+  window, so a healthy weekly loop alarmed six days in seven. Its real liveness
+  signal is its own state file, which
+  <code>core/liveness.py::_negative_controls_probe</code> already reads.</p>
+
 </main>
 </body>
 </html>

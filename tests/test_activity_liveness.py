@@ -68,9 +68,14 @@ def test_EVERY_phase_written_in_source_is_registered():
     Measured at the time of writing: 15 phase literals in src/, of which 8 had
     produced ZERO ledger records in seven days.
     """
+    # ⚠ `_record_idle_attempt` is a SECOND door into the liveness view
+    # (§4DY, the attempt heartbeat). It was added without being added here,
+    # so a phase reachable only through it was invisible to this guard — the
+    # exact blind spot this test exists to close, re-entered through the new
+    # entry point. Any future recorder must be listed here too.
     pat = re.compile(
-        r'(?:_record_autonomous_activity|log\.record|_alog\.record'
-        r'|activity_log\.record)\(\s*\n?\s*["\']([a-z_]+)["\']', re.M)
+        r'(?:_record_autonomous_activity|_record_idle_attempt|log\.record'
+        r'|_alog\.record|activity_log\.record)\(\s*\n?\s*["\']([a-z_]+)["\']', re.M)
     found = set()
     for f in (REPO / "src").rglob("*.py"):
         found |= set(pat.findall(f.read_text()))

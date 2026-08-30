@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import uuid
 import threading
 import time
 from dataclasses import dataclass, field
@@ -121,6 +122,25 @@ PHASE_EXPECTATION = {
     "dream": EXPECT_PERIODIC,
     "skills_auto": EXPECT_PERIODIC,
     "router_train": EXPECT_PERIODIC,
+    # ⚠ NOT periodic-on-a-24h-window. `negative_controls` runs on a SEVEN
+    # DAY interval (evolve/negative_controls.py: INTERVAL_S = 7*24*3600),
+    # so EXPECT_PERIODIC against a 24h alarm window brands a healthy weekly
+    # loop DEAD six days in seven.
+    #
+    # ⚠ CORRECTION (an earlier version of this comment said it "writes no
+    # ledger row at all"). The agent's idle phase DOES record on all three
+    # paths — cannot-run, success and exception (agent.py ~7645/7683/7695).
+    # What is measured is narrower and still decisive: the live ledger holds
+    # 0 negative_controls rows across 4,405 rows and ~45 days, while the
+    # phase's own state file shows a successful run 6.4 days ago. So the
+    # runs that happen are not reaching those row-writing paths, and the
+    # LEDGER is not a usable liveness signal for this phase either way.
+    # Its real signal
+    # is its own state file's timestamp, which `core/liveness.py`'s
+    # `_negative_controls_probe` already reads; the sibling `gepa_autonomy`
+    # was reclassified for exactly this reason and this one was missed.
+    # Live check 2026-08-30: last run 6.4 days ago, all 3 controls held —
+    # i.e. not yet due, and reported as dead.
     # records only when there was an outcome to record
     "reflection": EXPECT_ON_OUTPUT,          # skips unchanged-corpus ticks
     "selfplay_selftest_skip": EXPECT_ON_OUTPUT,   # a SKIP is the event
@@ -178,7 +198,7 @@ PHASE_EXPECTATION = {
     # built, so a zero means the phase stopped running rather than that it
     # had nothing to say. `GHOST_NEGCTRL=0` disables it, and that is the
     # only state in which a zero is benign.
-    "negative_controls": EXPECT_PERIODIC,
+    "negative_controls": EXPECT_ON_OUTPUT,
     # §4CN E2 stage 4: a proposal packet reaching an operator. GATED, and
     # a zero here is the EXPECTED reading twice over — `GHOST_EVOLVE` is
     # off by default, and even with it on a candidate must clear static,
@@ -241,6 +261,193 @@ class ActivityRecord:
             ),
             meta=dict(meta) if isinstance(meta, dict) else {},
         )
+
+
+# ── idle-phase ATTEMPT heartbeat ──────────────────────────────────────────
+#
+# The activity ledger records OUTCOMES: a phase writes a row when it did
+# something. That is the right contract for a digest, and it makes one
+# question unanswerable — "did this loop RUN?" — because a loop that ran and
+# correctly declined looks identical to one that never ran at all.
+#
+# Measured 2026-08-30: the liveness view reported
+#     ✗ DEAD router_train 0/24h 0/7d
+# while the loop had run 30 minutes earlier and logged
+#     "router train: the labelled corpus is 89% the same as the last look …
+#      not re-running the same test on the same evidence"
+# Its last ledger row (2026-08-16) is its last real RETRAIN, which is
+# exactly what the ledger promises. The alarm was reading "produced nothing"
+# as "is dead", and the operator was being pointed at a healthy loop.
+#
+# This heartbeat answers the other half. It is deliberately NOT more ledger
+# rows: a skip-per-idle-cycle would add ~30 rows/day to a file that never
+# rotates, and would blur the ledger's outcome contract. One tiny JSON map,
+# phase -> last attempt timestamp, bounded by the number of phases.
+
+from ..tools.file_system import (  # noqa: E402
+    write_text_nofollow as _write_text_nofollow,
+)
+
+_ATTEMPTS_FILENAME = "idle_attempts.json"
+
+# An attempt's OUTCOME CLASS, not just its timestamp.
+#
+# ⚠ THE FIRST VERSION STORED A BARE TIMESTAMP AND WAS A FALSE GREEN.
+# The stamp is written where a phase ENTERS its work, before the try block
+# that does it. With only a timestamp, a loop that crashes on every single
+# cycle is byte-identical to one that ran and correctly declined — and the
+# renderer then positively asserts "RAN 0.0h ago … a healthy outcome-free
+# run" about a permanently broken loop. That is the false GREEN this
+# module's own comments call worse than the false alarm it replaced.
+#
+# So only an explicit DECLINED suppresses the alarm. ENTERED (started,
+# outcome unknown — the state a crash leaves behind) and FAILED do not.
+ATTEMPT_ENTERED = "entered"
+ATTEMPT_DECLINED = "declined"
+ATTEMPT_FAILED = "failed"
+
+#: Slack for clock granularity, NOT for clock faults.
+#:
+#: The consumer captures `now_ts` and then reads the file, so a stamp
+#: written microseconds later is legitimately "in the future" by a hair. A
+#: strict `0 <= age` rejected exactly that and refused to suppress a genuine
+#: DECLINED run. One minute absorbs scheduling jitter and NTP slew while
+#: still rejecting the failure this bound exists for — a stamp hours or days
+#: ahead, which would otherwise suppress the alarm forever.
+_FUTURE_TOLERANCE_S = 60.0
+
+#: Only this outcome means "ran, and producing nothing was correct".
+_SUPPRESSING_RESULTS = frozenset({ATTEMPT_DECLINED})
+
+# Guards the read-modify-write below. `ActivityLog` next door has always had
+# one; the first version of this store had none, and 8 threads x 30 phases
+# recovered 0 of 240 keys AND left the file unparseable.
+_ATTEMPTS_LOCK = threading.Lock()
+
+
+def attempts_path(ledger_path) -> Path:
+    """The heartbeat lives beside the ledger it complements."""
+    return Path(ledger_path).parent / _ATTEMPTS_FILENAME
+
+
+def record_attempt(ledger_path, phase: str,
+                   result: str = ATTEMPT_ENTERED) -> bool:
+    """Stamp `phase` as having run now, with the outcome class it reached.
+
+    Never raises — a heartbeat that can break an idle phase is worse than no
+    heartbeat.
+    """
+    if result not in (ATTEMPT_ENTERED, ATTEMPT_DECLINED, ATTEMPT_FAILED):
+        result = ATTEMPT_ENTERED
+    tmp = None
+    try:
+        p = attempts_path(ledger_path)
+        with _ATTEMPTS_LOCK:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            raw = None
+            try:
+                raw = p.read_text()
+            except FileNotFoundError:
+                raw = ""
+            except OSError:
+                # ⚠ DO NOT RESET. The first version fell back to `data = {}`
+                # on ANY read failure and then COMMITTED that reset —
+                # destroying every other phase's heartbeat, permanently, with
+                # a True return and no log line. One transient EIO or an
+                # unreadable file wiped the instrument. Refuse instead.
+                logger.warning(
+                    "idle-attempt heartbeat: %s unreadable — refusing to "
+                    "overwrite it (other phases' stamps would be lost)", p)
+                return False
+            try:
+                data = json.loads(raw or "{}")
+            except Exception:  # noqa: BLE001 — corrupt file, safe to replace
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data[str(phase)] = {"ts": time.time(), "result": result}
+            # pid + uuid, like `sandbox/services.py::_save` and
+            # `sandbox/jobs.py`. A pid-only suffix collides between THREADS
+            # of one process: B truncates the tmp A is mid-write on, A
+            # renames it into place, and B's remaining bytes land in the live
+            # file. That is §4BW, which both siblings already fixed.
+            tmp = p.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+            _write_text_nofollow(tmp, json.dumps(data, indent=2))
+            os.replace(tmp, p)
+            tmp = None
+            return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("idle-attempt heartbeat write failed: %s", e)
+        return False
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def read_attempts(ledger_path) -> Dict[str, dict]:
+    """`{phase: {"ts": float, "result": str}}`.
+
+    Empty on any failure — an unreadable heartbeat must degrade to
+    "unknown", which the consumer treats as the OLD alarm, never to a green.
+    A single bad row is dropped on its own; it must not discard the others
+    (one un-floatable value used to empty the whole map).
+    """
+    out: Dict[str, dict] = {}
+    try:
+        data = json.loads(attempts_path(ledger_path).read_text() or "{}")
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    for k, v in data.items():
+        try:
+            if isinstance(v, dict):
+                ts, result = v.get("ts"), v.get("result")
+            else:
+                # A bare timestamp is the pre-outcome-class format. It cannot
+                # prove the run DECLINED, so it is read as ENTERED and does
+                # not suppress.
+                ts, result = v, ATTEMPT_ENTERED
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                continue
+            ts = float(ts)
+            if ts != ts or ts in (float("inf"), float("-inf")):
+                continue          # NaN / +-inf are instrument faults
+            out[str(k)] = {"ts": ts,
+                           "result": (str(result) if result else
+                                      ATTEMPT_ENTERED)}
+        except Exception:  # noqa: BLE001 — one bad row, not the whole map
+            continue
+    return out
+
+
+def attempt_suppresses_alarm(entry, now_ts: float,
+                             window_s: float) -> bool:
+    """Does this heartbeat license withholding a DEAD alarm?
+
+    Three conditions, all required:
+      * the run DECLINED — entered-but-unfinished is what a crash leaves;
+      * it was recent;
+      * it is not in the FUTURE. The first version tested only
+        `now - ts <= window`, so a future-dated stamp (an NTP step back, a
+        hand-edited file) suppressed the alarm forever. This file already
+        documents that exact hazard for ledger timestamps 100 lines above —
+        "a single garbage-ts row would keep a dead PERIODIC phase looking
+        alive in the liveness table forever" — and the first version did not
+        inherit it.
+    """
+    try:
+        if not isinstance(entry, dict):
+            return False
+        if str(entry.get("result")) not in _SUPPRESSING_RESULTS:
+            return False
+        age = float(now_ts) - float(entry.get("ts"))
+        return -_FUTURE_TOLERANCE_S <= age <= float(window_s)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class ActivityLog:

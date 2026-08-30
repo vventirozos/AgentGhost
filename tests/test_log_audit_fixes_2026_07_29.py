@@ -300,9 +300,83 @@ class TestCalibMapStatus:
             assert loaded is not None
             assert loaded.map_status == "applied"
 
-    def test_refit_emit_is_conditional_on_map_status(self):
-        assert 'refit=("ok" if _map_status == "applied"' in AGENT_SRC
-        assert 'f"map_{_map_status}"' in AGENT_SRC
+    @pytest.mark.asyncio
+    async def test_refit_emit_is_conditional_on_map_status(self, tmp_path,
+                                                           monkeypatch):
+        """A REJECTED map must not read as `refit=ok` in the operator's
+        stream — the 2026-07-29 finding this class exists for.
+
+        ⚠ UPGRADED FROM A SOURCE-TEXT GREP (2026-08-30). It asserted the
+        literal `'refit=("ok" if _map_status == "applied"'` appeared in
+        `agent.py`, so it broke the moment that expression was assigned to a
+        variable before being passed — while the behaviour was unchanged.
+        A grep cannot tell a refactor from a regression. The property is
+        pinned by executing the phase instead, which is strictly stronger:
+        the old form could also be satisfied by the text sitting in dead
+        code.
+        """
+        import datetime
+        import random as _random
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from ghost_agent.core import metacog_log
+        from ghost_agent.core.agent import GhostAgent
+        from ghost_agent.core.calibration import CalibrationTracker
+
+        monkeypatch.setenv("GHOST_HOME", str(tmp_path))
+        calib_dir = tmp_path / "system" / "calibration"
+        calib_dir.mkdir(parents=True, exist_ok=True)
+        tracker = CalibrationTracker(calib_dir)
+        rng = _random.Random(7)
+        for _ in range(400):                    # anti-correlated -> rejected
+            y = rng.random() < 0.75
+            c = rng.uniform(0.05, 0.4) if y else rng.uniform(0.6, 0.95)
+            tracker.record(composite=c, outcome=1.0 if y else 0.0,
+                           entropy_component=0.5, competence_component=c)
+
+        emitted = []
+        monkeypatch.setattr(metacog_log, "emit",
+                            lambda sub, **kw: emitted.append((sub, kw)))
+
+        ctx = MagicMock()
+        ctx.calibration_tracker = tracker
+        ctx.memory_system = MagicMock()
+        ctx.memory_system.collection.get = MagicMock(return_value={"ids": []})
+        ctx.llm_client = SimpleNamespace(foreground_tasks=0)
+        for attr in ("journal", "frontier_tracker", "reflector", "prm_scorer",
+                     "postmortem_engine", "trajectory_collector",
+                     "complexity_dispatcher"):
+            setattr(ctx, attr, None)
+        ctx.last_activity_time = (datetime.datetime.now()
+                                  - datetime.timedelta(seconds=1200))
+        ctx.args = MagicMock()
+        ctx.args.model = "test-model"
+        for k in ("prm_train_cooldown", "router_train_cooldown",
+                  "self_narrative_cooldown", "calib_refit_cooldown"):
+            setattr(ctx.args, k, None)
+
+        agent = GhostAgent.__new__(GhostAgent)
+        agent.context = ctx
+        agent._last_calib_refit_at = (datetime.datetime.now()
+                                      - datetime.timedelta(days=10))
+        try:
+            await agent._biological_tick()
+        except Exception:
+            pass
+
+        calib = [kw for sub, kw in emitted
+                 if getattr(sub, "name", str(sub)).upper().endswith("CALIB")]
+        assert calib, "the calibration phase emitted no CALIB line"
+        refit = str(calib[-1].get("refit", ""))
+        params = tracker.load_params()
+        assert params.map_status != "applied", (
+            f"fixture drifted: map was {params.map_status!r}, so no rejection "
+            "was reported and this pin proves nothing")
+        assert refit.startswith(f"map_{params.map_status}"), (
+            f"a {params.map_status!r} map reported refit={refit!r} — the "
+            "2026-07-29 defect: a rejected calibration reading as healthy")
+        assert not refit.startswith("ok"), refit
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -580,6 +580,195 @@ def _cv_brier(pairs, *, k: int = 5, seed: int = 7) -> Optional[float]:
     return total / n
 
 
+#: The four answers to "is this model better than predicting the base rate?"
+BEATS_YES = "yes"
+BEATS_NO = "no"
+BEATS_INDISTINGUISHABLE = "indistinguishable"
+BEATS_UNKNOWN = "unknown"
+
+#: Verdicts that do NOT license treating the score as informative.
+NOT_INFORMATIVE = frozenset({BEATS_NO, BEATS_INDISTINGUISHABLE, BEATS_UNKNOWN})
+# The whole vocabulary — anything outside it is not a verdict.
+_VERDICTS = frozenset({BEATS_YES}) | NOT_INFORMATIVE
+
+
+def map_applied(map_status) -> bool:
+    """Is the Platt map in force, so a CV interval describes what ships?
+
+    ⚠ ONE ANSWER FOR ONE QUESTION. `""` was read three different ways: the
+    renderer treated it as APPLIED, `agent.py` emitted `refit=map_` (i.e.
+    rejected), and `load_params` defaulted only an ABSENT key to "applied".
+    ⚠ ABSENT IS NOT THE SAME AS NULL. "Written before `map_status` existed"
+    is a fact about a file's AGE and reads as applied; an explicit
+    `"map_status": null` is a malformed value and fails closed. This
+    function only ever sees a VALUE, so `None` is the null case — use
+    `map_applied_in_params` when you hold the dict and can tell the two
+    apart. `load_params` already made that distinction by accident:
+    `str(d.get("map_status", "applied"))` yields `"applied"` for an absent
+    key and the string `"None"` for a null. That left the loader failing
+    closed on a null while the learning-health collector passed `None`
+    through, which read as APPLIED — two readers, two policies, one file.
+    """
+    return map_status == "applied"
+
+
+def map_applied_in_params(params: dict) -> bool:
+    """`map_applied` for a raw params dict, where absence is observable."""
+    if "map_status" not in params:
+        return True          # older than the field itself
+    return map_applied(params["map_status"])
+
+
+def downgrade_for_map(verdict: str, map_status) -> str:
+    """Withhold a verdict that does not describe the shipped predictor.
+
+    ⚠ THE RULE HAD ONE HOME AND TWO CALLERS (2026-08-30). `_cv_brier` and
+    `_cv_delta_ci` fit a Platt map per fold, so the interval measures the
+    CALIBRATED model; on every rejection path `fit()` ships the RAW
+    composite instead. `fit()` applied that rule. `learning_health`, which
+    DERIVES a verdict for any params file written before the field existed,
+    did not — it called `_base_rate_verdict`, which sees only an interval.
+
+    That is not a corner: every params file written before this change has
+    the field absent, including the live one, so the derive path is the live
+    path. Measured on a real anti-correlated fit with the field stripped —
+    exactly what the previous producer wrote — the renderer printed "beats
+    the base-rate predictor" for a shipped scorer whose Brier was 3.5x worse
+    than a constant. The producer's refusal was correct and the consumer
+    re-granted the licence one branch above the branch that had just been
+    fixed to stop it.
+
+    So the rule lives here, and both callers ask it.
+    """
+    return verdict if map_applied(map_status) else BEATS_UNKNOWN
+
+
+def _verdict_from_params(d: dict) -> str:
+    """The stored verdict, or the one its own interval implies.
+
+    ⚠ THE DERIVE RULE HAD TWO OF ITS THREE READERS. `learning_health`
+    derives a verdict from `brier_cv_delta_lo/hi` when the field is absent —
+    every params file written before 2026-08-30 is on that path, INCLUDING
+    THE LIVE ONE — and this loader, holding the same two fields, did not. So
+    one file told two operator surfaces different stories:
+
+        load_params / stats / calib_startup_fields : "unknown"
+        agent idle CALIB                           : refit=ok/no_signal:unknown
+        activity ledger                            : ", NO base-rate licence"
+        introspect learning                        : "beats the base-rate predictor"
+
+    Today's live file straddles zero so both land in NOT_INFORMATIVE and the
+    disagreement is invisible; one refit whose interval clears zero puts them
+    in open contradiction.
+
+    Absence is the only licence to derive. A present-but-null verdict is
+    malformed and fails closed, exactly as a typo does — collapsing those two
+    made `null` the most permissive value the field accepts.
+    """
+    status = str(d.get("map_status", "applied"))
+    if "beats_base_rate" in d:
+        return downgrade_for_map(_known_verdict(d.get("beats_base_rate")),
+                                 status)
+    lo, hi = d.get("brier_cv_delta_lo"), d.get("brier_cv_delta_hi")
+    if lo is None or hi is None:
+        return BEATS_UNKNOWN
+    return downgrade_for_map(_base_rate_verdict((None, lo, hi)), status)
+
+
+def _known_verdict(value) -> str:
+    """Coerce a persisted verdict to the vocabulary, or to `unknown`.
+
+    ⚠ `str(d.get(...))` accepted anything. A params file carrying a typo, a
+    value from a future version, or a hand edit loaded as that raw string and
+    then flowed into consumers that test `in NOT_INFORMATIVE` — which is
+    false for an unrecognised word, so it read as LICENSED. A verdict we
+    cannot recognise is a verdict we do not have.
+    """
+    # ⚠ TOTAL, INCLUDING UNHASHABLE. `value in _VERDICTS` RAISES on a list
+    # or dict — and this helper's own docstring names "a hand edit" as the
+    # threat. The raise propagated: `load_params` discarded the entire fit,
+    # and the renderer (which does its own membership test) aborted the WHOLE
+    # learning-health report with `TypeError: unhashable type: 'list'`, so one
+    # malformed advisory field destroyed lessons, episodes, PRM and router
+    # reporting too.
+    try:
+        return value if value in _VERDICTS else BEATS_UNKNOWN
+    except TypeError:
+        return BEATS_UNKNOWN
+
+
+def _base_rate_verdict(delta_ci) -> str:
+    """Decide ONCE whether the model beats a constant, from the INTERVAL.
+
+    ⚠ ASKED ONCE, STORED, AND READ — never re-derived. `learning_health`
+    used to recompute this from the raw `lo`/`hi` fields at its own render
+    site, which is how a producer's honest measurement and a consumer's
+    rendering of it can drift apart. One function, one answer, one field on
+    the params.
+
+    The SIGN OF THE INTERVAL licenses the claim, not the point estimate:
+    an interval straddling zero means the two predictors are
+    indistinguishable at this sample size, however favourable the midpoint
+    looks. `unknown` when no interval could be computed (too few rows, or a
+    params file written before the CI existed) — and `unknown` is in
+    `NOT_INFORMATIVE`, so an absent measurement never reads as a licence.
+
+    ⚠ INTERVAL-ONLY, DELIBERATELY (2026-08-30). This took `brier_cv` and
+    `brier_base` too, and fell back to a point comparison when no interval
+    existed. Two problems. First, from `fit()` that arm is unreachable
+    (`_cv_delta_ci` returns None only below `2*k` = 10 rows, and the default
+    fit floor is 40), so its two arguments were dead there — and a mutant
+    swapping them survived every test that could ever be written, because no
+    reachable world observes the difference. A pin guarding "that arm is
+    unreachable" read a DEFAULT-constructed tracker, while the floor is a
+    per-tracker constructor argument: setting it to 8 made the arm live
+    again with the suite green, and the swap then inverts a real verdict.
+    Second, the arm returned BEATS_NO from a point estimate — a measured
+    word from exactly the comparison this whole change says does not license
+    one.
+
+    So: no usable interval, no verdict. `unknown` now means precisely "no
+    interval I could read", at every caller, and there is no argument left
+    to get wrong. The renderer keeps its own clearly-labelled point-estimate
+    line for legacy params, which is where that fallback belongs.
+    """
+    try:
+        # ⚠ EXACTLY THREE. `_cv_delta_ci` returns `(delta, lo, hi)`; anything
+        # else is a producer whose shape changed under us. Accepting a longer
+        # tuple means a future reorder keeps returning YES from whatever now
+        # sits at indices 1 and 2.
+        if delta_ci is not None and len(delta_ci) != 3:
+            return BEATS_UNKNOWN
+        if delta_ci:
+            lo_raw, hi_raw = delta_ci[1], delta_ci[2]
+            # ⚠ REAL, FINITE, ORDERED — or we have no interval at all.
+            # `float()` accepts strings and `isinstance(True, int)` is True,
+            # so without these `("-0.01", "-0.002")`, `(nan, -0.001)`,
+            # `(inf, -inf)` and an INVERTED `(0.01, -0.01)` all returned
+            # YES — the single answer that licenses trusting the score.
+            # A NaN bound is a broken measurement, not a tested tie, so it
+            # lands on `unknown` rather than `indistinguishable`.
+            if (isinstance(lo_raw, bool) or isinstance(hi_raw, bool)
+                    or not isinstance(lo_raw, (int, float))
+                    or not isinstance(hi_raw, (int, float))):
+                return BEATS_UNKNOWN
+            lo, hi = float(lo_raw), float(hi_raw)
+            if not (math.isfinite(lo) and math.isfinite(hi)) or lo > hi:
+                return BEATS_UNKNOWN
+            if hi < 0.0:
+                return BEATS_YES          # entirely better than the base rate
+            if lo > 0.0:
+                return BEATS_NO           # entirely worse
+            return BEATS_INDISTINGUISHABLE
+        # No interval, no verdict. See the docstring: the point-estimate
+        # fallback that used to live here was unreachable from `fit()`,
+        # carried two arguments nothing could observe, and answered with a
+        # measured word.
+        return BEATS_UNKNOWN
+    except Exception:  # noqa: BLE001 — a verdict must never break the fit
+        return BEATS_UNKNOWN
+
+
 def _cv_delta_ci(pairs, *, k: int = 5, seed: int = 7, boots: int = 2000,
                  alpha: float = 0.05):
     """Paired bootstrap CI for (cross-validated model loss − base-rate loss).
@@ -811,6 +1000,15 @@ class FittedParams:
     # the map was rejected reads as a healthy calibration when the score
     # is in fact predicting nothing (2026-07-29 log audit).
     map_status: str = "applied"
+    #: Does the model beat always-predicting-the-base-rate? Decided ONCE by
+    #: `_base_rate_verdict` from the CROSS-VALIDATED delta INTERVAL, not the
+    #: point estimate. Distinct from `map_status`, which answers a different
+    #: question — whether the Platt MAP was applied (it can be correctly
+    #: applied, because it beats the raw composite, while the underlying
+    #: model is indistinguishable from a constant; that is the live state).
+    #: Anything in `NOT_INFORMATIVE` means no consumer may treat the score
+    #: or its threshold as carrying information.
+    beats_base_rate: str = BEATS_UNKNOWN
     # Which corpus epoch produced this fit, and how many rows were excluded
     # as belonging to older ones. Without both numbers an operator reading
     # `n_samples=541` against a 1709-row file has no way to tell a healthy
@@ -1520,6 +1718,23 @@ class CalibrationTracker:
         # Slope also cannot be judged without the composite's spread: a = 3.0
         # over a 0.02-wide range moves probabilities less than a = 0.3 over
         # the full unit interval.
+        # ⚠ THE EVIDENCE IS COMPUTED BEFORE THE DECISION THAT USES IT.
+        #
+        # `brier_cv` and the delta CI used to be computed ~45 lines BELOW
+        # this block, so the map decision — and the base-rate warning under
+        # it — could only ever consult the IN-SAMPLE point estimate. The
+        # decision literally happened before its evidence existed. Measured
+        # 2026-08-30 on the live store: in-sample 0.046703 vs base rate
+        # 0.047776 reads as a win by 0.0011, `map_status` lands on
+        # "applied", and no warning fires — while the cross-validated
+        # interval is [-0.00207, +0.00021], which STRADDLES ZERO. This
+        # module's own `_cv_delta_ci` docstring says the sign of the
+        # INTERVAL, not of the point estimate, is what licenses a "beats the
+        # base rate" claim (queue #8); the licence was never asked for here.
+        brier_cv = _cv_brier(composites)
+        _delta_ci = _cv_delta_ci(composites)
+        beats_base_rate = _base_rate_verdict(_delta_ci)
+
         map_status = "applied"
         if platt_a <= 0.0:
             logger.warning(
@@ -1553,23 +1768,68 @@ class CalibrationTracker:
             calibrated = composites
             brier = brier_raw
             map_status = "discarded_worse"
-        if brier > brier_base:
+        # ⚠ THE VERDICT MUST DESCRIBE THE PREDICTOR WE ACTUALLY SHIP.
+        #
+        # `_cv_brier` and `_cv_delta_ci` fit a Platt map PER FOLD, so they
+        # measure the CALIBRATED model. On the three rejection paths above
+        # the map is thrown away and the RAW composite is shipped
+        # (`platt_a, platt_b = 1.0, 0.0`) — so the interval describes a
+        # predictor that was explicitly refused. Measured: an anti-correlated
+        # composite (the live "AUC 0.473" state) yields `rejected_inverted`
+        # AND `beats_base_rate="yes"`, about a shipped scorer whose Brier is
+        # 0.724 against a base rate of 0.250 — three times WORSE than a
+        # constant, carrying the one answer that licenses trusting it.
+        #
+        # A fold-wise refit of the WEIGHTS would give a cross-validated
+        # measurement of the raw composite, so this is conservatism, not
+        # impossibility — say which it is. We decline to invent one from the
+        # calibrated fit, because that is how the wrong licence was granted
+        # in the first place. So: not measured, therefore `unknown`.
+        #
+        # It must be exactly `BEATS_UNKNOWN`, never `BEATS_NO` or
+        # `BEATS_INDISTINGUISHABLE`. Those two are MEASURED words — "we ran
+        # the comparison and the model lost" / "…and it was a tie" — and we
+        # ran no comparison. Recording either would be a fabricated neutral.
+        if not map_applied(map_status):
             logger.warning(
-                "calibration: fitted model (Brier %.4f) is WORSE than always "
-                "predicting the base rate %.3f (Brier %.4f) — the confidence "
-                "score is not adding information as a probability",
-                brier, base, brier_base)
+                "calibration: map %s, so the shipped predictor is the RAW "
+                "composite — the cross-validated interval describes the "
+                "CALIBRATED model and does not apply to it. Recording "
+                "beats_base_rate=%s rather than a licence we did not measure.",
+                map_status, BEATS_UNKNOWN)
+            beats_base_rate = downgrade_for_map(beats_base_rate, map_status)
+
+        # ⚠ DRIVEN BY THE INTERVAL. The point comparison `brier > brier_base`
+        # is silent for the case that actually matters — a model whose point
+        # estimate edges the base rate while its CI says the two are
+        # indistinguishable. That is "a margin is not a result" (§4CY), and
+        # it is the live state of this store.
+        if beats_base_rate == BEATS_NO:
+            logger.warning(
+                "calibration: fitted model (CV Brier %.4f) is WORSE than "
+                "always predicting the base rate %.3f (Brier %.4f) — the "
+                "confidence score is not adding information as a probability",
+                brier_cv, base, brier_base)
+        elif beats_base_rate == BEATS_INDISTINGUISHABLE:
+            logger.warning(
+                "calibration: fitted model (CV Brier %.4f) is INDISTINGUISHABLE "
+                "from always predicting the base rate %.3f (Brier %.4f) — the "
+                "95%% CI of the delta [%+.5f, %+.5f] straddles zero. The map "
+                "is still applied (it beats the RAW composite, a different "
+                "question), but nothing may treat this score as informative: "
+                "see `beats_base_rate` on the stored params.",
+                brier_cv, base, brier_base,
+                _delta_ci[1] if _delta_ci else float("nan"),
+                _delta_ci[2] if _delta_ci else float("nan"))
 
         # ── HONEST PERFORMANCE (audit 2026-08-10) ────────────────────────
         # `brier` above is IN-SAMPLE and was the headline. Cross-validate so
         # the reported gain is one the model did not buy with its own
         # parameters; both are stored and the renderer labels which is which.
         # `composites` is already a list of (composite, outcome) PAIRS.
-        brier_cv = _cv_brier(composites)
-        # ...and the UNCERTAINTY on the only comparison that matters. The
-        # point estimate alone let a 0.001 delta render as "beats the
-        # base-rate predictor" (queue #8).
-        _delta_ci = _cv_delta_ci(composites)
+        # (`brier_cv` and `_delta_ci` are computed ABOVE, before the map
+        # decision that must consult them. They used to be computed here,
+        # which is why that decision could not.)
         n_negative = sum(1 for _c, y in composites if y < 0.5)
 
         # Per-feature ABLATION. `_separation_sigmas` is a difference-of-means
@@ -1619,6 +1879,7 @@ class CalibrationTracker:
             w_effort=round(w_eff, 4),
             n_effort_observed=len(eff_observed),
             map_status=map_status,
+            beats_base_rate=beats_base_rate,
             epoch=CURRENT_EPOCH,
             n_excluded_other_epochs=n_excluded,
             brier_cv=round(brier_cv, 6) if brier_cv is not None else -1.0,
@@ -1664,7 +1925,37 @@ class CalibrationTracker:
                 brier_base_rate=float(d.get("brier_base_rate", -1.0)),
                 w_effort=float(d.get("w_effort", 0.0)),
                 n_effort_observed=int(d.get("n_effort_observed", 0)),
+                # ⚠ `.get(key, default)` NOT `.get(key) or default`. The
+                # second turns an explicit `null` and `""` into "applied" —
+                # a malformed value reading as a map in force. With the
+                # default form a null stringifies to "None", which
+                # `map_applied` rejects, so the file fails closed.
                 map_status=str(d.get("map_status", "applied")),
+                # ⚠ THE READER SET AGAIN. `_save_params` WRITES this field and
+                # for one commit this loader did not reconstruct it, so every
+                # RELOADED fit carried the default forever. Identical to the
+                # collector omission this same change had already fixed once,
+                # one reader along.
+                #
+                # ⚠ AND THE FIRST VERSION OF THIS COMMENT WAS FALSE. It named
+                # two consequences that do not exist: `apply_fitted`
+                # (confidence.py) reads only the weights, threshold, lambda
+                # and Platt pair and never touches this field, and `stats()`
+                # has no production caller at all. The live path from producer
+                # to operator is `_save_params` → params.json →
+                # `learning_health._load_json` (raw dict, NOT this loader) →
+                # collector → renderer. This loader is on the path that feeds
+                # the metacog CALIB line, and that is the reason to keep it
+                # correct — a justification has to be checked like a claim.
+                # ⚠ THE THIRD READER, AND IT DID NOT ASK. `fit()` and the
+                # learning-health renderer both route the verdict through
+                # `downgrade_for_map`; this loader did not, so ONE file
+                # produced opposite answers on two operator surfaces — the
+                # startup CALIB line emitted
+                # `{map: rejected_inverted, beats_base_rate: yes}` while
+                # `introspect learning` said no comparison applied. A params
+                # file from the previous build carries exactly that pair.
+                beats_base_rate=_verdict_from_params(d),
                 epoch=str(d.get("epoch", "")),
                 n_excluded_other_epochs=int(d.get("n_excluded_other_epochs", 0)),
                 # Defaults keep a pre-audit params file loading unchanged;
@@ -1685,7 +1976,16 @@ class CalibrationTracker:
                                  if isinstance(d.get("feature_contrib"), dict)
                                  else None),
             )
-        except (KeyError, TypeError, ValueError) as exc:
+        # ⚠ `OverflowError` IS AN `ArithmeticError`, NOT A `ValueError`.
+        # `int(float('inf'))` raises out of this function for five fields
+        # (n_samples, n_entropy_observed, n_effort_observed,
+        # n_excluded_other_epochs, n_negative), against this module's own
+        # documented contract: "returns None on ANY problem so a corrupt file
+        # degrades to the hardcoded defaults, never a crash." A caller had
+        # already diagnosed this gap and worked around it with a broad
+        # `except Exception` on its own side, leaving `stats()` and the
+        # startup path exposed. Fix the contract where it is stated.
+        except Exception as exc:  # noqa: BLE001 — the contract is "never raise"
             logger.debug("calibration params malformed: %s", exc)
             return None
 
@@ -1701,7 +2001,17 @@ class CalibrationTracker:
     # ----------------------------------------------------------- summary
 
     def stats(self) -> Dict[str, object]:
-        """Introspection summary (for ``introspect`` / the calib log)."""
+        """Introspection summary.
+
+        ⚠ NO PRODUCTION CALLER TODAY. The docstring used to claim "for
+        ``introspect`` / the calib log"; neither is true. `introspect
+        learning` renders through `learning_health.render_learning_health`,
+        which reads the params JSON directly, and the metacog CALIB lines
+        read a `FittedParams` from `fit()` / `load_params()`. This is a
+        test-and-debug surface. Said plainly so the next reader does not
+        assume, as this change's author did, that adding a key here reaches
+        an operator.
+        """
         all_samples = self._load_samples(limit=self.max_history)
         # §4BF 1c (R1 review): the SAME resolution + origin cap as the fit.
         # The raw-epoch version reported a brier over superseded duplicates
@@ -1739,6 +2049,12 @@ class CalibrationTracker:
             "lambda_uncertainty": params.lambda_uncertainty if params else None,
             "map_status": (getattr(params, "map_status", "applied")
                            if params else None),
+            # The keep/kill instrument must see the LICENCE, not just whether
+            # the Platt map was applied — they answer different questions,
+            # and the live store is "applied" AND "indistinguishable".
+            "beats_base_rate": (getattr(params, "beats_base_rate",
+                                        BEATS_UNKNOWN)
+                                if params else None),
         }
 
 
@@ -1828,4 +2144,15 @@ __all__ = [
     "SCHEMA_VERSION",
     "CURRENT_EPOCH",
     "epoch_for_ts",
+    # The base-rate verdict vocabulary. `NOT_INFORMATIVE` is the guard a
+    # consumer is meant to test against ("may I treat this score as
+    # carrying information?"), so it belongs on the declared surface.
+    "BEATS_YES",
+    "BEATS_NO",
+    "BEATS_INDISTINGUISHABLE",
+    "BEATS_UNKNOWN",
+    "NOT_INFORMATIVE",
+    "map_applied",
+    "map_applied_in_params",
+    "downgrade_for_map",
 ]

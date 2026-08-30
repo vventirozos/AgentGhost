@@ -32568,3 +32568,419 @@ aborted `reap()`'s per-row loop and every background job silently stopped landin
 itself runs, so `cat "$0"` reveals it — a forgery defence one line from being defeated.
 It is an integrity issue inside the container, not a host escape, and the fix is a
 redesign rather than a patch. Round five's fixes have not had fresh eyes.
+
+## §4DY — A dead-loop alarm firing on a healthy loop (2026-08-30)
+
+Auditing the agent's numeric producers and consumers turned up an instrument bug
+rather than an arithmetic one. The learning-health view reported
+
+    ✗ DEAD router_train    0 /24h     0 /7d   periodic
+
+while the loop had run thirty minutes earlier and logged
+
+    router train: the labelled corpus is 89% the same as the last look and nothing
+    about the gate changed — not re-running the same test on the same evidence;
+    the deployed model stays
+
+Both statements are true. The activity ledger records OUTCOMES — a phase writes a
+row when it did something — so `router_train`'s last row (2026-08-16, matching the
+checkpoint mtime exactly) is its last real RETRAIN, which is precisely what the
+ledger promises. The alarm rule was `expectation == PERIODIC and n24 == 0`, and for
+a skip-if-unchanged loop on a stabilised corpus, "produced nothing" IS the healthy
+steady state. The alarm was reading "produced nothing" as "is dead" and pointing the
+operator at a working loop.
+
+That is worse than it sounds, because `negative_controls` was in the same alarm list
+and is genuinely dead (last fired 152h ago). A column that cries on a healthy loop is
+one the operator learns to scroll past — rebuilding by hand the blindness the section
+exists to remove.
+
+**Two hypotheses were wrong before the right one.** First: the retrain's idle window
+(900s < idle ≤ 3600s) is never hit. Measured the real inter-turn gap distribution —
+20.1% of 537 gaps fall in-band, so the window is reachable. Second: the corpus
+fingerprint gate blocks it silently. Also wrong: `_idle_ran.append("router")` sits
+BEFORE that gate, so a skipped run still reports itself in the idle-cycle log — which
+is exactly how the discrepancy was visible at all. The actual answer was in the log
+the whole time.
+
+**The fix is a second, separate signal**, not a change to what the ledger means: an
+attempt heartbeat at `system/idle_attempts.json`, phase → last-run timestamp, stamped
+where the phase STARTS work and before its skip gate. Stamping it after the gate would
+have reproduced the exact bug it exists to fix — only successful retrains would
+register — so that ordering has its own pin.
+
+Three deliberate choices:
+
+* **Not more ledger rows.** A skip-per-idle-cycle would add ~30 rows/day to a file
+  that never rotates, and would blur the ledger's outcome contract. One small map,
+  bounded by the number of phases.
+* **Failure degrades toward alarming.** An absent, corrupt, empty or stale heartbeat
+  falls back to the old rule. The module's own comment says a false GREEN is worse
+  than a false alarm; a heartbeat that silences an alarm by failing would be exactly
+  that.
+* **The suppression is stated, not silent.** A zero with the alarm quietly withheld is
+  indistinguishable from a zero nobody looked at, so a healthy skip now renders
+  `└ RAN 0.5h ago and produced nothing — this loop records an OUTCOME, and declining
+  is a healthy outcome-free run.`
+
+`router_train` stays classified `EXPECT_PERIODIC`. Reclassifying it to `ON_OUTPUT`
+(like `reflection`, whose comment already says "skips unchanged-corpus ticks") would
+have silenced the false alarm in one line — and made a genuinely dead router
+invisible. The heartbeat clears the false alarm and keeps the real one.
+
+Verified discrimination: no heartbeat → alarms; fresh heartbeat → suppressed and
+reported; 48h-old → alarms; corrupt → alarms; `negative_controls` → still alarms.
+
+**Two defects in the new tests, caught by the suite.** The call-site ordering
+assertion used `src.index()` on a skip message the PRM phase carries IDENTICALLY
+earlier in the file, so it compared against the wrong gate and was vacuous — it now
+searches forward from the stamp. And the renderer test passed the wrong directory, so
+it exercised nothing. Both were the tests being wrong, not the code.
+
+### The fix was a false green, and the pins could not see it
+
+Three fresh-eye lenses on a ~120-line change. They did not confirm it.
+
+**The first fix replaced a false alarm with a false green.** The stamp is written
+where the phase ENTERS its work, before the `try` that does it — so with a bare
+timestamp, a loop that CRASHES on every cycle was byte-identical to one that
+correctly declined, and the renderer positively asserted "RAN 0.0h ago … a healthy
+outcome-free run" about a permanently broken loop. That is the trade this
+subsystem's own comments call the worse one, made by the change written to avoid
+it. Fixed with outcome classes: only an explicit `declined` suppresses.
+
+**The recency test was one-sided.** `(now - ts) <= window` is true for EVERY future
+timestamp, so an NTP step back, a hand-edited file, or a JSON `Infinity` literal
+bought silence forever. This same file already hardens LEDGER timestamps against
+exactly that, ~100 lines above the new code — "a single garbage-ts row would keep a
+dead PERIODIC phase looking alive in the liveness table forever". The fix did not
+inherit a lesson written where it was being written.
+
+**And it repeated §4BW verbatim.** An unlocked read-modify-write with a pid-ONLY
+temp name: two THREADS share a pid, so one truncates the tmp the other is mid-write
+on. Measured — 8×30 stamps recovered **0 of 240** keys and left the file
+unparseable. `sandbox/services.py` and `sandbox/jobs.py` both already carry
+`pid+uuid` with a comment naming a fixed temp name as unsafe.
+
+**`MagicMock` implements `__fspath__`.** `Path(mock.activity_log.path)` therefore
+does not raise, the guard's `try/except` never fired, and the method wrote
+`./MagicMock/mock.activity_log.path/idle_attempts.json` into the repo root and
+returned success. `conftest`'s GHOST_HOME isolation gives no protection: the
+destination came from an attribute, not an env var. Now `isinstance(log, ActivityLog)`.
+
+**A second false alarm was sitting beside the first.** `negative_controls` runs on a
+SEVEN-DAY interval judged against a 24h window, so a healthy weekly loop alarmed six
+days in seven — and an earlier version of the new test file **pinned that false alarm
+as correct behaviour**. Reclassified to `EXPECT_ON_OUTPUT`; its real signal is the
+state-file probe `core/liveness.py` already has.
+
+### Three generations of vacuous pins, in one file
+
+Round one's tests asserted an **absence** (a Mock writes nothing), which
+`if isinstance(...) and False:` — the method made dead code entirely — satisfies
+perfectly. The ordering test used `src.index(needle, start)`, which returns an index
+`>= start` **by language guarantee**, so the assertion could never fail; its sibling
+had no offset at all and anchored on the PRM phase's IDENTICAL skip message 7,132
+characters earlier, making `src[gate:]` span 19,707 lines. The file's own header
+listed both vacuities as removed while both were still present ninety lines below it.
+
+Replaced with AST assertions — and the first AST attempt was wrong the same way,
+selecting the PRM block because it is SMALLER (66 lines vs 79) than the router's.
+The identical-string trap caught three successive versions of these tests.
+
+**But the AST tests are still satisfiable by dead code**: a reviewer deleted all
+three real stamps, added one never-called decoy method and three `if False:` blocks,
+and every assertion passed while the router phase wrote no heartbeat at all. Nothing
+in the tree drove the router idle phase. There is now a runtime test that does — real
+`ActivityLog`, real `TrajectoryCollector`, real `ComplexityDispatcher`, idle inside
+the 900–3600 s band — and it is the only thing binding the fix to code that executes.
+
+Three more pins could not distinguish their mutants because the mutants failed safe
+**by accident**: a boolean `ts` is epoch 1.0 and therefore 56 years stale; a non-finite
+`ts` fails the lower bound anyway. Rewritten to assert the property that actually
+differs — the reader DROPS the row, and the liveness payload stays valid strict JSON.
+
+**Mutation: 13/13** on round two's survivors, including the decoy. **Suite: 18,676
+passed, 0 failed.** Docs updated (`docs/core/autonomous_activity.html`), and
+`docs/evolve/negative_controls.html` corrected where it now contradicted the code.
+
+⚠ One correction to the record: an earlier version of this entry said
+`negative_controls` "writes no ledger row at all". The code has row-writing paths on
+all three branches. What is measured is narrower — 0 rows across 4,405 ledger rows
+and ~45 days, while its state file shows a run 6.4 days ago — so the runs that happen
+are not reaching those paths, and the ledger is not a usable liveness signal for it
+either way. The reclassification stands; the justification was overstated.
+
+## §4DZ — A confidence score that could not beat a constant, and the eight rounds that were needed to see it (2026-08-30)
+
+**Scope (retrofitted; §R.R0 now requires this BEFORE round 1).** Property under review: the
+confidence calibration must not report that its score carries information unless the evidence
+supports it, and every surface that reports it must tell the same story. Threat model: the params
+file is written only by this agent, but partial writes, version skew and its own "not recorded"
+sentinels are in scope. Out of scope: making the verdict GATE behaviour (see Open, below).
+
+### The defect
+
+`map_status` was decided ~45 lines ABOVE the only evidence that could inform it. `brier_cv` and
+`_cv_delta_ci` were computed below it, so the decision — and the base-rate warning under it —
+could only ever consult the IN-SAMPLE point estimate. Measured on the live store: in-sample
+0.046703 against a base rate of 0.047776 reads as a win by 0.0011, `map_status` lands on
+"applied", no warning fires — while the cross-validated 95% CI of that delta is
+[-0.00207, +0.00021], which **straddles zero**. The module's own `_cv_delta_ci` docstring says the
+sign of the INTERVAL licenses the claim. The licence was never asked for.
+
+Two questions had been conflated. *Was the Platt map applied?* compares the calibrated score to
+the RAW COMPOSITE. *Does the score carry information?* compares it to a CONSTANT. The live store
+answers "yes" to the first and "indistinguishable" to the second, at the same time.
+
+### The fix
+
+`FittedParams.beats_base_rate` — `yes | no | indistinguishable | unknown`, the last three grouped
+as `NOT_INFORMATIVE` — decided by `_base_rate_verdict(delta_ci)` from the interval alone, before
+the map decision that consumes it. On any non-applied map the shipped predictor is the raw
+composite, so the interval measures something we refused and the verdict is withheld as exactly
+`unknown` — never `no` or `indistinguishable`, which are MEASURED words for a comparison never run.
+
+`downgrade_for_map(verdict, map_status)` over `map_applied()` is the single authority, and it has
+three callers: `fit()`, `load_params()`, and the learning-health renderer on both its stored and
+derived paths. Each was added a round after the previous shipped alone.
+
+### What eight rounds actually found
+
+Rounds 3-8 each found real defects inside the previous round's fixes. That is the headline.
+
+- **The rule had one home and two callers.** `fit()` withheld the licence on a rejected map; the
+  renderer's DERIVE path — taken by every params file written before the field existed, the live
+  one included — called `_base_rate_verdict`, which sees only an interval. Measured on a real
+  anti-correlated fit with the field stripped to its pre-change shape: producer `unknown`,
+  renderer *"beats the base-rate predictor"*, for a shipped scorer whose Brier was 3.5x worse than
+  a constant.
+- **Then the same defect one branch up**: the authority reached DERIVED verdicts and not STORED
+  ones, so files where the field is absent were protected and files where it is WRONG were
+  trusted — and `fit()` wrote `rejected_inverted` with `beats_base_rate="yes"` before this change,
+  so every file from that build has exactly that shape.
+- **Then the old expression alive beside the new authority.** Extracting `map_applied` did nothing
+  while `not in ("", "applied")` survived twenty lines below. For `map_status=""` the two
+  disagreed inside one block: the verdict line said rejected, the next said applied.
+- **Then the three point-estimate arms**, the only verdict arms `_map_in_force` did not gate — so
+  any file from between 2026-07-29 and 2026-08-21 printed the licence for EVERY status.
+- **Then `load_params`**, a third reader that never asked, so one file told the startup CALIB line
+  and `introspect learning` different stories.
+- **Then the neighbours of every numeric guard**: the bool clause reached `_num` and not
+  `n_negative` (the line the code itself calls "THE NUMBER EVERY OTHER VERDICT RESTS ON");
+  `math.isfinite` reached three of six guards; the `>= 0` sentinel check reached three of four
+  Brier sites, so `"brier": -1.0` — this module's OWN "not recorded" value — rendered "beats the
+  base-rate predictor".
+- **Absent, null and withheld are three facts, not one.** A missing `beats_base_rate` was never
+  measured; a stored `unknown` was measured and REFUSED; `null` is malformed. Collapsing them made
+  `null` the single most permissive value the field accepted — more permissive than a typo.
+- **One malformed field could blank the whole report.** `beats_base_rate: []` raised out of a
+  membership test and `introspect` turned it into "Learning health unavailable", losing lessons,
+  episodes, PRM and router reporting. Fixed, then found again one variable over, then again on the
+  display after the comparison was guarded — and the fix for it introduced a NEW path
+  (`load_params` raising `OverflowError` on a JSON `Infinity`, uncovered by its
+  `except (KeyError, TypeError, ValueError)`, against its own documented "never a crash").
+- **Warnings nested inside unrelated guards.** `⚠ NOT IN FORCE` sat inside an `isinstance` check,
+  so a params file the agent refuses that also lacked its baseline rendered a complete, confident
+  section with no warning — and the same nesting silently deleted eight other lines.
+
+### Why site-by-site review could not finish, and what replaced it
+
+Every fix above patched the site a reviewer demonstrated, which guarantees an inconsistent sibling,
+which guarantees the next round finds it. Six rounds of "the neighbour" is the arithmetic of
+instance-level fixes, not bad luck. The method changed in round 8:
+
+1. **One guard.** `usable_number(v, *, allow_negative=False)` — rejects non-numbers, bools,
+   non-finite values, and negatives (the `-1.0` sentinel). Every numeric read delegates to it.
+2. **`test_every_numeric_read_goes_through_the_guard`** walks the AST and fails if any numeric key
+   reaches an f-string or comparison without it. It found three bypasses the moment it was written,
+   with no reviewer involved.
+3. **`test_no_hostile_value_in_any_key_breaks_or_fabricates`** — every params key x 13 hostile
+   values, asserting the report never raises, never renders an unusable value as a number anywhere
+   in the calibration section, and never drops a section silently.
+4. **`test_every_surface_tells_one_story_about_one_file`** — a table over
+   `load_params` / `stats` / `calib_startup_fields` / the rendered report.
+
+All three were verified to FIRE by introducing the defect and watching them red (§R.R7.2). The
+fuzz property did NOT fire on the first attempt — it scanned only the verdict line, so a bool on
+the detail line went unseen. That is the rule earning its place.
+
+### Pins: four generations of vacuity, all mine
+
+Source-text pins (a mutant deleting the code and leaving the text in a comment survived, and I
+committed the same failure AGAIN for the agent.py CALIB line); properties true in every world
+(`assert "INDISTINGUISHABLE" in src` cannot fail — the constant is in that module); AST proxies
+defeated by a decoy assignment; fixtures where both worlds agree (a bool interval caught by the
+ORDERING guard so the bool clause was never exercised; a `brier` guard tested only where `brier` is
+never read; the downgrade pinned on the one status the seed produces); a harness grading its own
+copy (the startup pin REBUILT the emit call); wrong-line selectors (`"in-sample"` matches the
+section header, `"raw composite"` matches the refusal sentence); success signals too weak to see
+the damage (`assert "LESSONS:" in out` passed through an eight-line amputation); and three tests
+that pinned the DEFECT, so fixing the bug would have reddened them.
+
+Two things are deliberately NOT pinned, and say so in the code: `map_applied(x)` IS
+`x == "applied"`, so the delegation is a provably equivalent mutant bought for drift-resistance;
+and the point-estimate arm of `_base_rate_verdict` was REMOVED rather than pinned, because from
+`fit()` it was unreachable and its two arguments were therefore unkillable. An earlier pin claimed
+to guard that unreachability by reading a DEFAULT-constructed tracker — but the fit floor is a
+constructor argument, so setting it to 8 made the arm live with the suite green.
+
+### Harness defects found the hard way
+
+- **A "tree verified" check that compares against its own backup certifies its own contamination.**
+  A mutant (`n13`) sat live in the working tree across a full-suite run and two batch re-runs, each
+  reporting clean, because each run backed up the already-mutated file and restored to it. Caught
+  by one of this change's own pins failing in the full suite. The harness now diffs against an
+  IMMUTABLE reference and ABORTS.
+- **A trap cannot cover a SIGKILL.** A batch hit the 10-minute tool cap and left a live mutant in
+  `main.py`. The harness is now sliceable so every run finishes inside the cap.
+- **A mutation test set narrower than the suite manufactures FALSE SURVIVORS** — one mutant
+  "survived" only because the test that kills it was in an omitted file.
+- **Copied trees lie**: `__pycache__` embeds `co_filename` pointing at the original path, so
+  `inspect.getsource` in a copy reads the unmutated source.
+
+### Numbers
+
+Suite 18,292 -> **18,826** passing, 0 failed, run twice (fixed and random order). Pins on this
+change: 30 -> **~150**. Mutation batches: 13/13, 24/24, 20/20, 22/23 (one equivalent), 28/28,
+20/20, 24/24, **20/20 on a verified-clean tree**. Eight review rounds; rounds 3-8 each found
+MAJORs inside the prior round's fixes — roughly half of all findings were in this review's own
+work, which is the honest measure of it (§R.R8).
+
+### Open, NOT closed
+
+`beats_base_rate` is a REPORTING licence with no enforcing consumer. `metacog` still gates on
+`below_threshold` computed from a threshold the fit installs regardless of the verdict, so a score
+the system has just declared indistinguishable from a constant still gates turns — which is the
+live state. Making it gate arbitration is a live behaviour change and is the operator's call.
+
+**And the reason §R exists:** convergence had been measured by reviewer silence, which measures
+the reviewer. Of the 14 prior sections declaring CONVERGED, only 7 quote a mutation score; the
+remaining five review sections — §4BY, §4BZ, §4CA (the three turn-loop slices), §4CP and §4DE —
+asserted it without one. Those are the sections whose convergence is unverified, and the turn
+loop is the most behaviourally critical code in the project.
+
+## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
+
+**This section is binding. When the operator says "review <feature/subsystem>", this is the
+process. It is not advisory and it is not to be shortened because a round looks clean.**
+
+It exists because the previous method could not converge, and said so with confidence: this
+journal contains **14** prior sections declaring CONVERGED — all mention mutation testing, but
+only **7** quote an actual score; the rest asserted it from reviewer silence. (An earlier draft of
+this section said "57". That was a count of LINES containing the word, not sections — a false
+number written into a binding protocol as its own justification, which is precisely the unchecked
+claim R8 below exists to forbid. It was quoted to the operator twice before anyone counted.) Three memory
+files — `review-rounds-that-cannot-converge`, `fix-is-the-least-reviewed-code`,
+`pin-inherits-the-fix-blind-spot` — describe this exact failure and were written BEFORE it
+happened again. Documented lessons did not prevent a repeat. A protocol with a mechanical
+stopping rule is the only thing that does.
+
+### R0 — Before round 1: write the scope down
+
+State, in the journal entry, before any reviewer is briefed:
+- **the property under review** — what must be TRUE when this is done, in one sentence;
+- **the threat model** — which inputs are trusted and which are not;
+- **out of scope** — explicitly.
+
+Without this, no finding can ever be out of scope, so no round can ever be the last one. The
+§4DZ review ran three unnecessary rounds because "review this change" over a renderer reading a
+20-key JSON file is unbounded by construction: 20 keys × a dozen hostile values is 240 findings
+available on demand.
+
+### R1 — Fix CLASSES, never instances
+
+A fix that changes one site is not a fix, it is a sample. Every fix must be accompanied by an
+enumeration that closes the class:
+- one guard/rule/decision with **one** implementation, and
+- a test that walks the **AST** (or fuzzes the whole input space) and FAILS if any site bypasses
+  it.
+
+If you cannot write that enumeration, you have not found the class yet — keep looking. §4DZ ran
+six rounds of "the neighbour": the bool clause reached `_num` and not `n_negative`;
+`math.isfinite` reached three of six guards; the `>= 0` sentinel check reached three of four
+Brier sites. Every round was a real defect and every round was the same defect. The AST pin found
+three more bypasses the instant it was written, with no reviewer involved.
+
+### R2 — Mutation testing is the gate, not the reviewer
+
+**Convergence is a mutation score, never an absence of findings.** A reviewer who reports nothing
+has told you about the reviewer.
+
+- whole-file mutants, ONE per run;
+- **never name the expected killer to the harness** — run the full relevant test set;
+- `py_compile` each mutant before believing its verdict;
+- trap EXIT/INT/TERM/HUP **and** diff the tree afterwards; slice the batch so every run finishes
+  inside the tool's hard timeout (a trap cannot cover a SIGKILL — one run was killed at the cap
+  and left a live mutant in `main.py`);
+- the test set must be **the full set of files that touch the change**. A narrower set
+  manufactures FALSE SURVIVORS;
+- purge `__pycache__` before mutating a copied tree — `.pyc` embeds the original path in
+  `co_filename`, so `inspect.getsource` silently reads the unmutated original;
+- run a **no-op control mutant** and confirm it SURVIVES, and a known-bad control and confirm it
+  DIES, before trusting any result.
+
+**A fix with no killing mutant is not a fix.** A survivor is either a missing pin or a proven
+equivalent mutant — and an equivalent mutant means DEAD CODE: delete it, do not leave an
+unfalsifiable guard standing.
+
+### R3 — The fix is the least-reviewed code in the tree
+
+Every round after the first must mutate the PREVIOUS round's fixes **first**. In §4DZ, rounds 3
+through 8 each found their criticals inside the last round's fix. Brief every reviewer on this
+explicitly and give them the previous round's diff as the primary target.
+
+### R4 — Pin quality bar (each is a hard reject)
+
+For every pin, name the concrete world in which it FAILS. If you cannot, it is documentation.
+Reject:
+- **source-text assertions** (`inspect.getsource`, `in src`, `.index`) — a mutant that deletes the
+  code and leaves the text in a comment survives them;
+- properties **true by language guarantee** (`assert "INDISTINGUISHABLE" in src` cannot fail when
+  the constant is defined in that module);
+- **AST proxies for behaviour** — a decoy assignment to the same name satisfies a line-ordering
+  pin;
+- **fixtures where the fixed and broken worlds agree** — the single most common failure. A bool
+  interval `(True, False)` is caught by the ORDERING guard, so it never tests the bool clause;
+  a `brier` guard tested only on paths where `brier` is never read; a rejection rule pinned on the
+  one status the seed happens to produce;
+- **tests that rebuild the code under test** and assert on their own copy;
+- **weak success signals** — `assert "LESSONS:" in out` passed while eight lines were silently
+  amputated from the report;
+- **wrong-line selection** — `"in-sample"` also matches the section header, `"raw composite"` also
+  matches the refusal sentence;
+- **tests that pin the DEFECT** — three did in §4DZ, so fixing the bug would have reddened them.
+
+### R5 — Cross-surface consistency is a first-class property
+
+Every producer/consumer pair must tell ONE story about ONE input. Pin it as a table over the
+cartesian product, not per-surface. §4DZ shipped a loader and a renderer that disagreed about the
+live params file for six rounds because each was pinned in isolation.
+
+### R6 — Verify the instruments before the code
+
+`measure-the-mechanism`: broken signals are dead mechanisms AND broken instruments. Confirm the
+harness can fail before trusting that it passed. Every number a review quotes must be
+independently re-derived, not copied from the system's own reporter.
+
+### R7 — The stopping rule (all four, or keep going)
+
+1. A mutation batch containing **every fix from every round** scores 100%, with each survivor
+   PROVEN equivalent and the dead code behind it deleted.
+2. The class-level enumerations from R1 exist, and each has been shown to FIRE (introduce the
+   defect, watch it red).
+3. The full suite is green, run twice: once before the final fixes and once after.
+4. A round produces only findings that R0 declared out of scope.
+
+**Never stop on "the reviewer found nothing."** Never write CONVERGED without quoting the
+mutation score beside it.
+
+### R8 — Honesty rules for the write-up
+
+- Report the mutation score, the survivor count, and which survivors were equivalent.
+- Name the defects that were found INSIDE this review's own fixes. That number is the honest
+  measure of the review's quality; §4DZ's was roughly half of all findings.
+- If a claim in a comment or docstring justifies a fix ("this breaks X"), verify X exists.
+  §4DZ shipped a comment naming two consumers that do not exist and a docstring claiming an
+  audience that never calls it.
+- State what was NOT done and why.

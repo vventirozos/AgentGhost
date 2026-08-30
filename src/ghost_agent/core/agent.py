@@ -6159,6 +6159,34 @@ class GhostAgent:
             return rng.random()
         return random.random()
 
+    def _record_idle_attempt(self, phase: str,
+                             result: str = "entered") -> None:
+        """Stamp an idle phase as having RUN, separately from whether it
+        produced an outcome.
+
+        The activity ledger records OUTCOMES, so a loop that ran and
+        correctly declined (skip-if-unchanged) is indistinguishable there
+        from one that never ran — which is how the liveness view came to
+        report `✗ DEAD router_train` about a loop that had run 30 minutes
+        earlier. Fail-safe by contract, like the ledger itself.
+        """
+        try:
+            from .autonomous_activity import ActivityLog, record_attempt
+            log = getattr(self.context, "activity_log", None)
+            # ⚠ isinstance, NOT `path is not None`. `MagicMock` implements
+            # `__fspath__`, so `Path(mock.activity_log.path)` does not raise
+            # and the try/except never fires — it silently created
+            # `./MagicMock/mock.activity_log.path/idle_attempts.json` under
+            # the repo root and returned success. Every prior consumer called
+            # `log.record(...)` ON the object, which a Mock absorbs; this is
+            # the first to take `.path` as a VALUE and hand it to mkdir.
+            # `conftest`'s GHOST_HOME isolation gives no protection here:
+            # the destination comes from an attribute, not an env var.
+            if isinstance(log, ActivityLog):
+                record_attempt(log.path, phase, result)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("idle-attempt heartbeat skipped: %s", e)
+
     def _record_autonomous_activity(self, phase, summary,
                                     severity: str = "info", **meta) -> None:
         """Best-effort sink of an idle-phase outcome into the
@@ -7310,6 +7338,11 @@ class GhostAgent:
                         and isinstance(dispatcher, _ComplexityDispatcher)):
                     self._last_router_train_at = datetime.datetime.now()
                     _idle_ran.append("router")   # §4CB R1 A-F4
+                    # ⚠ BEFORE the skip-if-unchanged gate below. The point of
+                    # the heartbeat is that a DECLINED run still counts as a
+                    # run; stamping it after the gate would reproduce the bug
+                    # it exists to fix.
+                    self._record_idle_attempt("router_train", "entered")
                     # Skip-if-unchanged gate — same rationale as the PRM
                     # phase above: identical corpus ⇒ identical classifier.
                     _rt_corpus_fp = None
@@ -7335,6 +7368,15 @@ class GhostAgent:
                             "skipped — trajectory corpus unchanged since last refit",
                             icon=Icons.SKIP,
                         )
+                        # ⚠ DECLINED, not merely entered. Only an explicit
+                        # decline licenses withholding the DEAD alarm: a
+                        # loop that CRASHES every cycle also leaves an
+                        # `entered` stamp, and with a bare timestamp the two
+                        # were byte-identical — the renderer then asserted
+                        # "a healthy outcome-free run" about a permanently
+                        # broken loop. That is the false GREEN this whole
+                        # mechanism exists to avoid.
+                        self._record_idle_attempt("router_train", "declined")
                     else:
                         try:
                             from ..router import RouterTrainer
@@ -7391,6 +7433,11 @@ class GhostAgent:
                                 logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")
                         except Exception as e:
                             logger.warning(f"Router retrain phase failed: {e}")
+                            # An exception IS an outcome. Without this the
+                            # phase keeps its `entered` stamp, which does not
+                            # suppress — correct — but `failed` is the honest
+                            # record and lets the view say WHY it is silent.
+                            self._record_idle_attempt("router_train", "failed")
                         finally:
                             self._last_router_train_at = datetime.datetime.now()
 
@@ -7454,10 +7501,41 @@ class GhostAgent:
                         # REJECTED as anti-correlated (2026-07-29 log audit).
                         # Surface the map verdict in the summary line.
                         _map_status = getattr(params, "map_status", "applied")
+                        # ⚠ THE SAME ARGUMENT, ONE QUESTION OVER. Surfacing
+                        # `map_status` here was mandatory because `refit=ok`
+                        # over a REJECTED map reads as a healthy calibration.
+                        # `map=applied` over a model that is statistically
+                        # INDISTINGUISHABLE FROM A CONSTANT reads exactly the
+                        # same way — and that is the live store today
+                        # (CI [-0.00187, +0.000354], straddling zero). "Was
+                        # the map applied?" and "does the score carry any
+                        # information?" are different questions; the line the
+                        # operator actually watches answered only the first.
+                        from .calibration import BEATS_YES, map_applied
+                        # ⚠ TEST FOR THE LICENCE, NOT FOR ITS ABSENCE.
+                        # `if _beats in NOT_INFORMATIVE` fails OPEN: any value
+                        # outside the four-word vocabulary -- a typo, a future
+                        # verdict, a params file hand-edited -- is not in the
+                        # set, so it reads as licensed and the operator sees a
+                        # clean `refit=ok`. `!= BEATS_YES` fails closed on
+                        # everything that is not an affirmative licence, which
+                        # is the only value that should ever suppress the
+                        # warning.
+                        _beats = getattr(params, "beats_base_rate", None)
+                        # ⚠ THE THIRD PRIVATE COPY OF "is the map in force?".
+                        # Harmless today only because `load_params` stringifies
+                        # `map_status`, so `None` cannot reach here — but that
+                        # is a coincidence of another module's coercion, and
+                        # the two other copies of this expression each
+                        # disagreed with the shared helper on some value.
+                        _refit = ("ok" if map_applied(_map_status)
+                                  else f"map_{_map_status}")
+                        if _beats != BEATS_YES:
+                            _refit = f"{_refit}/no_signal:{_beats}"
                         _mc_emit(
                             _mc_ss.CALIB,
-                            refit=("ok" if _map_status == "applied"
-                                   else f"map_{_map_status}"),
+                            refit=_refit,
+                            beats_base_rate=_beats,
                             threshold=params.threshold,
                             w_entropy=params.w_entropy,
                             lam=params.lambda_uncertainty,
@@ -7469,8 +7547,18 @@ class GhostAgent:
                             excluded=getattr(
                                 params, "n_excluded_other_epochs", 0),
                         )
-                        _map_note = ("" if _map_status == "applied"
+                        _map_note = ("" if map_applied(_map_status)
                                      else f", map {_map_status}")
+                        # The activity ledger is the operator's OTHER read of
+                        # this phase (`introspect activity`). It carried the
+                        # map and not the licence, so a refit that produced a
+                        # score indistinguishable from a constant was recorded
+                        # as an unqualified "confidence recalibrated".
+                        if _beats == BEATS_YES:
+                            _map_note += ", beats base rate"
+                        else:
+                            _map_note += (f", NO base-rate licence "
+                                          f"({_beats})")
                         self._record_autonomous_activity(
                             "calibration",
                             f"confidence recalibrated "

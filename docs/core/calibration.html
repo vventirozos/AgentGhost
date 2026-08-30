@@ -68,7 +68,101 @@
   </ul>
 
   <h2>Observability</h2>
-  <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier, the sample count <code>n</code> (current epoch) and <code>excluded</code> (older-epoch rows skipped). <code>tracker.stats()</code> exposes <code>{samples, samples_all_epochs, epoch, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty, map_status}</code> for introspection.</p>
+  <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier, the sample count <code>n</code> (current epoch) and <code>excluded</code> (older-epoch rows skipped). <code>tracker.stats()</code> exposes <code>{samples, samples_all_epochs, epoch, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty, map_status, beats_base_rate}</code> — a debug/test surface with no production caller, despite what its docstring claimed until 2026-08-30.</p>
+
+  <h3 id="beats-base-rate"><code>beats_base_rate</code> — the licence (2026-08-30)</h3>
+  <p><code>FittedParams.beats_base_rate</code> answers <em>&ldquo;may anything treat this score as
+  informative?&rdquo;</em> and takes one of four values: <code>yes</code>, <code>no</code>,
+  <code>indistinguishable</code>, <code>unknown</code>. The last three are grouped as
+  <code>NOT_INFORMATIVE</code>.</p>
+  <p><strong>Consumers test <code>!=&nbsp;BEATS_YES</code>, not
+  <code>in&nbsp;NOT_INFORMATIVE</code>.</strong> The membership form fails <em>open</em>: a value
+  outside the vocabulary — a typo, a hand edit, a verdict from a future version — is not in the
+  set, so it reads as licensed. <code>NOT_INFORMATIVE</code> remains as the grouping the
+  vocabulary is defined by; the guard consumers use is the affirmative one.</p>
+  <p>It is decided <strong>from the 95% paired-bootstrap CI of the cross-validated Brier delta,
+  not from the point estimate</strong>: <code>hi&nbsp;&lt;&nbsp;0</code> ⇒ <code>yes</code>,
+  <code>lo&nbsp;&gt;&nbsp;0</code> ⇒ <code>no</code>, straddling zero ⇒
+  <code>indistinguishable</code>. Malformed intervals (wrong arity, non-finite, inverted,
+  booleans, strings) all yield <code>unknown</code> — <code>yes</code> is unreachable from
+  anything but a well-formed interval strictly below zero. Until this landed, the decision sat
+  ~45 lines <em>above</em> the only evidence that could inform it and could consult only the
+  in-sample point estimate, which read the live store's 0.00108 wobble as a win.</p>
+  <p><strong>A rejected map withholds the licence — at every caller, for stored and derived
+  verdicts alike.</strong> The rule lives in
+  <code>calibration.downgrade_for_map(verdict,&nbsp;map_status)</code>, and it has
+  <strong>three</strong> callers: <code>fit()</code>, <code>load_params()</code>, and the
+  learning-health renderer — the last on <em>both</em> its paths, the verdict it derives for a
+  legacy file and the verdict it reads from a file that already has one. Each was added a round
+  after the previous one shipped alone; the loader was the third reader, and while it did not
+  ask, one params file told the startup <code>📐 CALIB</code> line and
+  <code>introspect learning</code> different stories. The second was added
+  2026-08-30 after the first shipped alone — protecting files where the field is <em>absent</em>
+  while trusting files where it is <em>wrong</em>, which is exactly the shape every params file
+  written by the previous build carries (<code>rejected_inverted</code> together with
+  <code>beats_base_rate:&nbsp;"yes"</code>). It lived only in <code>fit()</code> until
+  2026-08-30, so a params file written before the field existed — every one of them, the live one
+  included — was re-granted the licence at render time even when its map had been rejected.
+  <code>map_applied()</code> is the single answer to "is the map in force?":
+  absent means a file older than <code>map_status</code> and reads as applied; anything else
+  unrecognised (including <code>""</code>, which was previously read three different ways) fails
+  closed.</p>
+  <p>On all three rejection paths the
+  shipped predictor is the raw composite, while the CV interval measures the <em>calibrated</em>
+  model — so the verdict is downgraded to <code>unknown</code>, never to <code>no</code> or
+  <code>indistinguishable</code>, which are measured words for a comparison that was never run.
+  The learning-health renderer reports that refusal verbatim, naming the cause it can
+  actually observe — a rejected map, or a fit with no usable interval, which are different
+  situations that both produce <code>unknown</code>. Only a params file with the key genuinely
+  <em>absent</em> (written before this existed) falls back to deriving a verdict from the stored
+  interval, and the rendered line is then tagged <code>DERIVED at render time</code>. That tag
+  was claimed here before it existed: until 2026-08-30 a derived verdict rendered
+  byte-identically to a stored one.</p>
+  <h3 id="not-in-force">&ldquo;NOT IN FORCE&rdquo; (2026-08-30)</h3>
+  <p>The learning-health report reads <code>calibration_params.json</code> directly, so it could
+  render a full CALIBRATION section — base-rate licence included — for a fit
+  <code>load_params</code> <em>refuses</em>, while the agent ran on hardcoded defaults. It now
+  asks <code>load_params</code> itself rather than re-implementing one clause of its policy: the
+  loader returns <code>None</code> on bad JSON, a non-dict, a <code>schema</code> mismatch,
+  <em>and</em> any unusable required numeric, and a first version of this flag checked only the
+  schema. When the loader refuses, the section is prefixed <code>⚠ NOT IN FORCE</code> rather than
+  blanked — the numbers are still the last fit's and worth seeing, they simply are not running.</p>
+  <p><strong>Absent is not null.</strong> A params file with no <code>map_status</code> predates
+  the field and reads as applied; an explicit <code>"map_status": null</code> is a malformed value
+  and fails closed. <code>map_applied()</code> takes a value and so treats <code>None</code> as
+  the null case; <code>map_applied_in_params()</code> takes the dict, where absence is
+  observable. Every number read off this file is guarded the same way — a bool, a string or a
+  missing key in <code>brier</code> or <code>brier_cv</code> used to raise out of the renderer,
+  and <code>introspect</code> turned that into <code>Learning health unavailable</code>, losing
+  lessons, episodes, PRM and router reporting to one malformed calibration field.</p>
+  <h3 id="reading-the-file">Nothing read off the file is trusted</h3>
+  <p>Every value in <code>calibration_params.json</code> is attacker-shaped as far as this code is
+  concerned — a partial write, a hand edit, a future producer. The rules, all learned the hard
+  way, each after a guard was applied to one site and not its neighbour:</p>
+  <ul>
+    <li><strong>Absent is not null.</strong> A missing key means a file older than the field and
+      may be derived from; an explicit <code>null</code> is malformed and fails closed. This holds
+      for <code>map_status</code> (<code>map_applied_in_params</code>) and for
+      <code>beats_base_rate</code> (<code>beats_base_rate_present</code>) — the second got the
+      rule a round later, during which <code>null</code> was the single most permissive value the
+      field accepted, more permissive than a typo.</li>
+    <li><strong>Bools are ints, and NaN is neither positive nor negative.</strong> Every numeric
+      read goes through a guard rejecting <code>bool</code> and non-finite values. A pair of
+      predicates that were not complements (<code>&lt;&nbsp;0</code> / <code>&gt;=&nbsp;0</code>)
+      let <code>NaN</code> vanish eight lines of the report with no notice.</li>
+    <li><strong>Omissions are announced.</strong> <code>⚠ NOT IN FORCE</code> when
+      <code>load_params</code> refuses the file, <code>⚠ NO USABLE BASELINE</code> when the
+      verdict and ablation table are dropped, a counted warning when feature-ablation entries are
+      unusable. A section that disappears silently is worse than one that reports a problem.</li>
+    <li><strong>The report never raises.</strong> <code>introspect</code> turns any exception into
+      <em>Learning health unavailable</em>, so one malformed calibration field would cost the
+      lesson, episode, PRM and router sections too.</li>
+  </ul>
+  <p>An unrecognised value — a typo, a hand-edited file, a verdict from a future version — is not
+  a verdict. <code>load_params</code> coerces anything outside the four words to
+  <code>unknown</code>, because consumers testing <code>in NOT_INFORMATIVE</code> fail
+  <em>open</em> on a word they do not know; the log lines now test
+  <code>!=&nbsp;BEATS_YES</code> instead, which fails closed.</p>
   <p><strong>Reading <code>n</code>:</strong> it counts the current epoch only. When epochs landed it dropped 1709&nbsp;→&nbsp;541 in one refit; <code>excluded</code> sits beside it precisely so that reads as a filter rather than as data loss.</p>
 
   <h2 id="epochs">Corpus epochs (2026-08-02)</h2>
@@ -279,9 +373,18 @@
   <code>a ≈ −0.08</code>: a negative slope that would INVERT the agent's confidence ordering, and
   a near-flat one that would collapse every turn onto the base rate, leaving
   <code>below_threshold</code> permanently inert. Calibrating noise is not an improvement, so the
-  guard refuses any fit with slope below 0.5 and logs why. The machinery engages the moment a
-  predictive feature exists — pinned by a test using an informative-but-compressed corpus, where
-  it is adopted and beats the base rate.</p>
+  guard rejects a map whose slope is ≤&nbsp;0 (anti-correlated) or above the
+  <code>_MAX_SLOPE</code>&nbsp;=&nbsp;50 step backstop, and logs why. The machinery engages the
+  moment a predictive feature exists — pinned by a test using an informative-but-compressed
+  corpus, where the map is adopted.</p>
+  <p><strong>&ldquo;Adopted&rdquo; is not &ldquo;beats the base rate&rdquo; (2026-08-30).</strong>
+  This page used to run the two together. They are different questions with different evidence:
+  <em>was the Platt map applied?</em> compares the calibrated score to the <strong>raw
+  composite</strong>, while <em>does the score carry any information?</em> compares it to a
+  <strong>constant</strong>. A map can legitimately improve on the raw composite while the result
+  is still statistically indistinguishable from always predicting the base rate — which is the
+  live store today (<code>map_status: applied</code>, 95% CI of the Brier delta
+  [−0.00187, +0.000354], straddling zero).</p>
   <p><strong>The rejection is now visible in every status surface (2026-07-29):</strong>
   <code>FittedParams.map_status</code> records what happened to the map —
   <code>applied&nbsp;|&nbsp;rejected_inverted</code> (slope ≤ 0) <code>|&nbsp;rejected_step</code>

@@ -1267,6 +1267,43 @@ async def _announce_ready_when_warm(warmup_task, timeout: float = 120.0):
                icon=Icons.SYSTEM_READY)
 
 
+def calib_startup_fields(cp) -> dict:
+    """The payload of the startup 📐 CALIB line.
+
+    ⚠ EXTRACTED SO IT CAN BE EXECUTED (2026-08-30). This was an inline
+    `_mc_emit(...)` call inside `lifespan`, which no test can invoke, so its
+    only pin was a grep for `"beats_base_rate" in getsource(main)`. Two
+    mutants survived that: commenting the kwarg out (the literal stays in
+    the source) and hardcoding `beats_base_rate="yes"` (the line then
+    reports a licence for params that say `indistinguishable`). A test that
+    rebuilds the call itself is no better — it grades its own copy. This is
+    the one the process actually emits.
+
+    `map` and `beats_base_rate` answer DIFFERENT questions — "was the Platt
+    map applied?" versus "does the score beat a constant?" — and the line
+    carried only the first, so a model indistinguishable from a constant
+    read as a healthy startup.
+    """
+    # ⚠ ORDER MATTERS: THE LINE IS TRUNCATED. `pretty_log` cuts the rendered
+    # line at a fixed width with an ellipsis, and these two started at the
+    # END of the payload — so the verdict this change exists to surface was
+    # cut off the live log every time. Verified against the real
+    # `ghost-agent.log`: `loaded=startup threshold=0.84 w_entropy=0.00
+    # lam=0.00…`. Putting a field in a log line is not the same as putting
+    # it where the operator can read it. The two answers go first; the
+    # numeric detail is what may be dropped.
+    return {
+        "loaded": "startup",
+        "map": getattr(cp, "map_status", "applied"),
+        "beats_base_rate": getattr(cp, "beats_base_rate", None),
+        "threshold": cp.threshold,
+        "w_entropy": cp.w_entropy,
+        "lam": cp.lambda_uncertainty,
+        "brier": cp.brier,
+        "n": cp.n_samples,
+    }
+
+
 @asynccontextmanager
 async def lifespan(app):
     args = app.state.args
@@ -2987,13 +3024,7 @@ async def lifespan(app):
                 if _cp is not None and getattr(context.metacog, "confidence", None) is not None:
                     context.metacog.confidence.apply_fitted(_cp)
                     from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss
-                    _mc_emit(
-                        _mc_ss.CALIB, loaded="startup",
-                        threshold=_cp.threshold, w_entropy=_cp.w_entropy,
-                        lam=_cp.lambda_uncertainty, brier=_cp.brier,
-                        n=_cp.n_samples,
-                        map=getattr(_cp, "map_status", "applied"),
-                    )
+                    _mc_emit(_mc_ss.CALIB, **calib_startup_fields(_cp))
             except Exception as _capx:  # pragma: no cover — defensive
                 logger.debug("calibration params apply failed: %s", _capx)
             # Bridge HostSignals to TriggerBus.resource events so the
