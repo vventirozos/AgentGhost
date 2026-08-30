@@ -153,7 +153,7 @@ _DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # recorded result is truncated to 4000 chars, so a marker past that
 # horizon is invisible offline — approximation, not equality.
 _DISPATCH_ERROR_PREFIXES = ("Error:", "ERROR", "SYSTEM ERROR",
-                            "Critical Tool Error")
+                            "CRITICAL ERROR", "Critical Tool Error")
 
 # Guard/parse REJECTION messages the dispatch pipeline mints WITHOUT
 # executing the tool (pre-flight blocks, idempotency dedupe, metacog
@@ -167,7 +167,15 @@ _DISPATCH_ERROR_PREFIXES = ("Error:", "ERROR", "SYSTEM ERROR",
 # match that population. Fresh-eye review finding #2, 2026-08-05.
 _SYNTHETIC_RESULT_PREFIXES = (
     "SYSTEM BLOCK", "SYSTEM IDEMPOTENCY:", "SYSTEM PAUSE",
-    "SYSTEM ERROR:", "SYSTEM ESCAPE HATCH", "Error invoking tool",
+    # ⚠ Kept in step with `describe_invocation_error`'s fallback, which a
+    # later change reworded from "Error invoking tool" to "Error: invoking
+    # tool" so the turn loop would book it as a failure at all. That reword
+    # silently disarmed this guard for the LARGEST population it covers —
+    # every non-argument exception from every tool — and the test pinned the
+    # old string as a literal, so the suite reported it working while it was
+    # inoperative. `test_foresight` now calls the producer instead.
+    "SYSTEM ERROR:", "SYSTEM ESCAPE HATCH",
+    "Error invoking tool", "Error: invoking tool",
     "Error: Invalid JSON arguments", "Error: Unknown tool",
     # §4CL I1: the Imagine pre-flight steer DEFERS a call rather than
     # running it. Its message pairs with a tool_call in the reconstructed
@@ -219,8 +227,31 @@ def offline_call_failed(tc) -> bool:
             return True
     except Exception:  # noqa: BLE001
         pass
-    return str(getattr(tc, "result", "") or "").startswith(
-        _DISPATCH_ERROR_PREFIXES)
+    _res = str(getattr(tc, "result", "") or "")
+    # A REFUSAL is a failure here. This module kept a PRIVATE, diverging copy
+    # of the failure vocabulary and no rejection vocabulary at all, so
+    # `SYSTEM INSTRUCTION: …`, `REPLACE REJECTED`, a bare `REJECTED` and
+    # `PARTIAL:` were all seeded into the shadow world model as SUCCESSES:
+    # measured, 39 of the 82 corpus refusals. The index is re-seeded from a
+    # rolling window on every boot, so it recurs — and the LIVE grade is
+    # status-aware, so the seed and the live resolver disagreed inside one
+    # subsystem. Use the shared predicate rather than a second list.
+    try:
+        from ..distill.outcome_heuristics import is_unresolved_tool_result
+        from ..tools.tool_failure import result_is_rejection
+        # ⚠ NOT for an UNRESOLVED call. `result_is_rejection`'s vocabulary
+        # includes `PARTIAL:`, which is the literal head of swarm's
+        # still-running branch — the one every other reader exempts. Without
+        # this the offline seed labels FAILED exactly what the live resolver
+        # refuses to grade, inside one subsystem.
+        if (not is_unresolved_tool_result(getattr(tc, "result", ""))
+                and result_is_rejection(_res)):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # `.lstrip()`: the private copy had no leading-whitespace tolerance while
+    # the shared one does.
+    return _res.lstrip().startswith(_DISPATCH_ERROR_PREFIXES)
 
 
 def call_target(tool: str, op: str, args: Any) -> str:

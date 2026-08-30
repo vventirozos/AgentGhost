@@ -569,10 +569,50 @@ class TestRestoreMocksPurge_S4:
         # `solution.py` survives.
         pre_validator_block = src[src.index("Restore mocks one more time"):]
         next_call = pre_validator_block[:pre_validator_block.index("sandbox_manager.execute")]
-        # The pre-validator call must NOT pass `True` as the purge flag.
-        assert "True,  # purge_stragglers" not in next_call, (
-            "pre-validator _restore_mocks must use purge=False or it deletes solution.py"
-        )
+        # ⚠ PARSE the call, do not grep one spelling of it. The old
+        # assertion was `"True,  # purge_stragglers" not in next_call`, which
+        # a keyword argument (`purge_stragglers=True`) walks straight past —
+        # and `_restore_mocks` calls `p.unlink()`, so every overnight
+        # self-play attempt would run with the solver's own `solution.py`
+        # deleted.
+        import ast as _ast
+        import textwrap as _tw
+        # It is dispatched via `asyncio.to_thread(_restore_mocks, …)`, so the
+        # Call's func is `to_thread` and `_restore_mocks` is argument 0 —
+        # handle BOTH shapes, and read the purge flag positionally or by
+        # keyword.
+        def _purge_arg(call):
+            u = _ast.unparse(call.func)
+            if u.endswith("_restore_mocks"):
+                pos = call.args[2:3]
+            elif call.args and _ast.unparse(call.args[0]).endswith(
+                    "_restore_mocks"):
+                pos = call.args[3:4]
+            else:
+                return None
+            for k in call.keywords:
+                if k.arg == "purge_stragglers":
+                    return _ast.unparse(k.value)
+            return _ast.unparse(pos[0]) if pos else "False"
+
+        _ded = _tw.dedent(src)
+        _tree = _ast.parse(_ded)
+        # LINE numbers, not `src.find` on unparsed text — `ast.unparse`
+        # normalises the source, so a substring search lands on the wrong
+        # call (it flagged the between-attempts one, which may purge).
+        _anchor = next(i for i, l in enumerate(_ded.split("\n"), 1)
+                       if "Restore mocks one more time" in l)
+        _calls = [(n, _purge_arg(n)) for n in _ast.walk(_tree)
+                  if isinstance(n, _ast.Call)]
+        _calls = [(n, v) for n, v in _calls if v is not None]
+        assert _calls, "the _restore_mocks calls moved"
+        _after = [(c, v) for c, v in _calls if c.lineno > _anchor]
+        assert _after, "no _restore_mocks call after the pre-validator anchor"
+        for c, purge in _after:
+            assert purge != "True", (
+                "the pre-validator _restore_mocks purges stragglers — it "
+                f"unlinks the solver's own solution.py: "
+                f"{_ast.unparse(c)[:80]}")
 
     def test_restore_mocks_behavior_purge_vs_preserve(self, tmp_path):
         """Functional check on the REAL helper's two modes: purge=True

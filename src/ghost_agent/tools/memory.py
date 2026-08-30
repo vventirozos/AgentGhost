@@ -2,11 +2,14 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import List
+from .file_system import _get_safe_path
 from ..utils.logging import Icons, pretty_log, spawn_bg
 from ..utils.helpers import get_utc_timestamp, helper_fetch_url_content, recursive_split_text, semantic_split_text
 from ..memory.scratchpad import Scratchpad
+from .outcome import ToolOutcome
 
 logger = logging.getLogger("GhostAgent")
 
@@ -110,11 +113,58 @@ def _bus_write_failures(report) -> list:
         f"{k}: {v}" for k, v in report.items()
         if isinstance(v, str) and v.startswith("error"))
 
+
+#: Legs whose failure means the write did NOT happen. The vector and graph
+#: indexes are best-effort secondary writes; these are the canonical stores.
+#: Which bus leg is the CANONICAL store — per operation, because it differs.
+#:
+#: `MemoryBus.publish_fact` can emit exactly four keys: vector | graph |
+#: profile | skill. An earlier flat tuple listed `fact`, `memory` and
+#: `episodic`, none of which the bus can emit — three dead entries that made
+#: the rule look broader than it was — and it omitted `vector`, which IS the
+#: canonical store for `insert_fact`. So a fact that was never stored emitted
+#: PARTIAL, and the verifier's bookkeeping gate exempts PARTIAL on purpose:
+#: the write vanished AND the gate was disarmed.
+#:
+#: Making it flat the other way is equally wrong: for `update_profile` the
+#: canonical store is the profile JSON and `vector` is a retrieval index
+#: whose failure genuinely is partial. `graph` is never canonical.
+_CANONICAL_BUS_LEGS = {
+    "insert_fact": ("vector",),
+    "update_profile": ("profile",),
+    "learn_skill": ("skill",),
+}
+
+
+def _bus_canonical_failed(report, kind: str = "") -> bool:
+    """Did a CANONICAL leg fail, as opposed to a secondary index?
+
+    PARTIAL means "part of it landed" and is deliberately exempted from the
+    verifier's bookkeeping gate, because `update_profile` returns it when the
+    canonical write succeeded and only an index lagged. On the bus path the
+    same PARTIAL was emitted when the canonical leg itself errored — so a
+    TOTAL write failure disarmed the unverified-mutation guard and skipped
+    the verifier entirely. A canonical failure is a FAILURE.
+    """
+    if not isinstance(report, dict):
+        return False
+    legs = _CANONICAL_BUS_LEGS.get(kind)
+    if legs is None:
+        # unknown operation: every named canonical leg counts
+        legs = tuple({l for v in _CANONICAL_BUS_LEGS.values() for l in v})
+    return any(
+        isinstance(v, str) and v.startswith("error")
+        and str(k).lower() in legs
+        for k, v in report.items())
+
 async def tool_remember(text: str = None, memory_system=None, graph_memory=None, llm_client=None, model_name="default", memory_bus=None):
     """Insert a new fact. When a `memory_bus` is supplied the commit is
     dispatched through `publish_fact("insert_fact", ...)` so the tool stays
     ignorant of which subsystems exist; otherwise the legacy direct path
     runs (kept for backward compatibility with existing tests/callers)."""
+    # Same contract as tool_unified_forget: 'text' is THIS function's
+    # parameter name and is not a name the knowledge_base schema accepts.
+    # The dispatcher guards insert_fact before reaching here.
     if not text:
         return "SYSTEM ERROR: The 'text' parameter is MANDATORY. You must specify it."
     pretty_log("Memory Store", text, icon=Icons.MEM_SAVE)
@@ -162,8 +212,12 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
             })
             _fails = _bus_write_failures(_report)
             if _fails:
-                return (f"PARTIAL: memory write had failures — "
-                        f"{'; '.join(_fails)}. The fact may not be retrievable.")
+                _canon = _bus_canonical_failed(_report, "insert_fact")
+                _mk = ToolOutcome.failed if _canon else ToolOutcome.partial
+                _head = "FAILED" if _canon else "PARTIAL"
+                return _mk((f"{_head}: memory write had failures — "
+                        f"{'; '.join(_fails)}. The fact may not be retrievable."),
+                        reason_code="memory_write_partial")
 
             graph = getattr(memory_bus, "graph", None) or graph_memory
             if llm_client is not None and graph is not None:
@@ -279,7 +333,13 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     # Strip parenthetical info (e.g., "file.pdf (1234 bytes)")
     raw_name = re.sub(r'\s*\([\d\s\w,]+\).*$', '', raw_name, flags=re.IGNORECASE)
     
-    filename = raw_name.strip()
+    # ⚠ COERCE ONCE, AT ENTRY. `filename` is read with `.lower()` /
+    # `.startswith()` at ten sites below; arguments arrive via json.loads, so
+    # a list or int crashes the first of them with AttributeError, which the
+    # loop renders as "did you forget a required argument?". Fixing the ten
+    # READERS would be the wrong shape — one coercion at the source covers
+    # every present and future reader.
+    filename = str(raw_name).strip()
 
     # --- QWEN HALLUCINATION GUARD ---
     # If the filename starts with '#', 'Title:', or has no extension and spaces, reject it.
@@ -311,10 +371,40 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
             if full_text.startswith("Error"): return full_text 
         except Exception as e: return f"Web Error: {str(e)}"
     else:
+        # ⚠ CONTAINMENT. This used to be a bare
+        #     clean_name = str(filename).lstrip("/")
+        #     file_path = sandbox_dir / clean_name
+        # which contains an ABSOLUTE path (`/etc/passwd` -> `<sandbox>/etc/
+        # passwd`, harmless) but NOT a relative one. `../../.ghost_api_key`
+        # resolved straight out of the sandbox, and this branch then READ the
+        # file and embedded its contents into durable vector memory — where
+        # it is retrievable by `recall` forever — while returning "SUCCESS".
+        # Verified end-to-end through the real tool, 2026-08-30 (§4DX).
+        #
+        # It is reachable from prompt injection: fetched web or darkweb
+        # content enters the model's context, and the model's next tool call
+        # is the payload. `knowledge_base` is on the low-risk list, so
+        # nothing else in the stack was going to stop it.
+        #
+        # `_get_safe_path` is the project's containment helper (0 escapes on
+        # a 15-payload fuzz, including `..`, encoded `..`, absolute paths and
+        # a NUL byte) and raises ValueError on an escape.
+        #
+        # The `sandbox/` strip is kept and applied FIRST so the existing
+        # healing still works. Order matters: `sandbox/../../etc/passwd`
+        # becomes `../../etc/passwd` and is then REFUSED, rather than healed
+        # into an escape.
         clean_name = str(filename).lstrip("/")
         if clean_name.startswith("sandbox/"):
             clean_name = clean_name[8:]
-        file_path = sandbox_dir / clean_name
+        try:
+            file_path = _get_safe_path(sandbox_dir, clean_name)
+        except ValueError as _ve:
+            # Bare, NOT f"Error: {_ve}". The ~10 `file_system` sites return
+            # `str(ve)` and classify REJECTED; prefixing "Error:" made this
+            # match the FAILURE regex first, so one event had two statuses
+            # depending on which tool raised it.
+            return str(_ve)
         
         # --- ROBUST FILE RESOLUTION ---
         if not file_path.exists():
@@ -348,8 +438,38 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
 
                 resolved_file_path = await asyncio.to_thread(_resolve_file)
                 if resolved_file_path:
-                    file_path = resolved_file_path
-                    filename = str(file_path.relative_to(sandbox_dir))
+                    # ⚠ ASK THE GUARD AGAIN. The primary path above goes
+                    # through `_get_safe_path`; this fallback re-derives a
+                    # path for itself and used to return `matches[0]` raw.
+                    # `os.walk` stays inside the sandbox, but a FILE it
+                    # finds can be a SYMLINK pointing out of it — and the
+                    # model plants that with one in-container `ln -s`.
+                    #
+                    # The result was that `ingest('notes.txt')` was refused
+                    # while `ingest('notes')` — the same file, reached by
+                    # stem match — read the host target and embedded it in
+                    # durable memory. Demonstrated §4DX round 2, against a
+                    # fix shipped hours earlier: the guard was correct and
+                    # a second code path walked around it.
+                    _resolved = resolved_file_path.resolve()
+                    if not _is_within_root(_resolved, Path(sandbox_dir).resolve()):
+                        return (f"Error: Security Error: '{filename}' resolves "
+                                f"outside the sandbox (symbolic link). Refused.")
+                    # ⚠ USE THE RESOLVED PATH. Checking `_resolved` and
+                    # then reading `resolved_file_path` is a TOCTOU race:
+                    # everything downstream re-follows the link at read
+                    # time, and the model can run a swap loop concurrently
+                    # (`execute` promotes long commands to detached jobs).
+                    # Reading the already-resolved path closes the window.
+                    file_path = _resolved
+                    # `_resolved` is guaranteed inside the sandbox by the
+                    # check above, so `relative_to` cannot raise here. It
+                    # could before that check existed, and the bare `except`
+                    # below then reported a containment refusal as "File not
+                    # found" — the exact misdirection the refusal-message
+                    # pin forbids.
+                    filename = str(file_path.relative_to(
+                        Path(sandbox_dir).resolve()))
                     pretty_log("KB Auto-Resolve", filename, icon=Icons.OK)
                     # Re-check the library under the RESOLVED name: the
                     # pre-check above ran on the raw argument, so
@@ -624,9 +744,13 @@ async def tool_query_document(filename: str = None, question: str = None,
     can iterate (search → read → refine → search again).
     """
     if not filename or not question:
+        # Placeholders are marked so nothing in the example can be read as a
+        # parameter name — the same discipline `_kb_target_or_error` enforces
+        # for the branches it owns.
         return ("SYSTEM ERROR: both 'filename' and 'question' are MANDATORY "
-                "for action='query'. Example: knowledge_base(action='query', "
-                "filename='postgresql.pdf', question='how does wal_level work?')")
+                "for action='query'. Worked call: knowledge_base("
+                "action='query', filename='<an ingested document>', "
+                "question='<your question about it>')")
     if not memory_system:
         return "Error: Memory system is disabled."
 
@@ -723,7 +847,7 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
             
     if graph_memory:
         import re as _re
-        words = [w.strip('.,?!;"\'()[]') for w in query.split() if len(w.strip('.,?!;"\'()[]')) > 3]
+        words = [w.strip('.,?!;"\'()[]') for w in str(query).split() if len(w.strip('.,?!;"\'()[]')) > 3]
         if words:
             try:
                 edges = await asyncio.to_thread(graph_memory.get_neighborhood, words, 15)
@@ -761,7 +885,9 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
     memory-store counterpart of tool_query_document's iterative loop."""
     if not ref:
         return ("SYSTEM ERROR: The 'ref' parameter is MANDATORY — pass an "
-                "evidence handle like 'ep:12' (episode) or 'session:<id>'.")
+                "evidence handle from a recall hit's EVIDENCE REFS line. "
+                "Worked call: knowledge_base(action='expand', "
+                "ref='<ep:12, or session:the-id>').")
     ref = str(ref).strip()
     pretty_log("Evidence Expand", ref, icon=Icons.MEM_READ)
 
@@ -771,7 +897,8 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
         try:
             ep_id = int(ref.split(":", 1)[1])
         except (ValueError, IndexError):
-            return f"Error: malformed episode ref '{ref}' — expected 'ep:<number>'."
+            return (f"Error: malformed episode ref '{ref}' — expected the "
+                    f"form '<ep:12>'.")
         ep = await asyncio.to_thread(episodic_memory.get_episode, ep_id)
         if not ep:
             return (f"Error: episode {ep_id} no longer exists (episodes are "
@@ -808,11 +935,18 @@ async def tool_expand_evidence(ref=None, episodic_memory=None,
         lines += [f"{m.get('role', '?')}: {str(m.get('content', ''))[:200]}" for m in tail]
         return "\n".join(lines)
 
-    return (f"Error: unknown ref scheme '{ref}' — supported: 'ep:<id>' "
-            f"(episode from EVIDENCE REFS) and 'session:<id>'.")
+    return (f"Error: unknown ref scheme '{ref}' — supported: '<ep:12>' "
+            f"(episode from EVIDENCE REFS) and '<session:the-id>'.")
 
 
 async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None):
+    # NOTE: this message names THIS function's parameter and is meant for a
+    # DIRECT caller. A model reaching this tool goes through
+    # `tool_knowledge_base`, which guards the argument itself and builds its
+    # error from `_KB_TARGET_ALIASES` — do not route this string to a model,
+    # and do not "helpfully" copy its wording into the dispatcher. The
+    # dispatcher used to surface it verbatim, telling models to pass a
+    # parameter the dispatcher dropped; the retry was byte-identical forever.
     if not target:
         return "SYSTEM ERROR: The 'target' parameter is MANDATORY. You must specify it."
     # Reject ultra-short targets that would match nearly everything.
@@ -822,10 +956,41 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     if not memory_system: return "Report: Memory disabled."
     report = []
 
-    clean_target = str(target).lstrip("/")
+    # ⚠ ORDER. The `sandbox/` strip below removes a component, and the disk
+    # sweep decides "did the caller name a PATH?" from the presence of a
+    # separator — so a two-component `sandbox/index.html` lost its only
+    # separator here and fell back to the basename tier, deleting every
+    # index.html in the tree. That is the exact defect the path rule was
+    # added to close, reachable by adding four characters, and
+    # `file_system.py` documents `sandbox/` as an observed live model shape.
+    # Decide the shape FIRST, from the raw string.
+    _raw_target = str(target).strip()
+    _probe = _raw_target.rstrip("/" + os.sep)
+    target_names_a_path = ("/" in _probe.lstrip("/")
+                           or os.sep in _probe.lstrip(os.sep))
+    # Computed here, used by BOTH sweeps. They were written separately and
+    # disagreed: one call printed "Nothing on disk is deleted for a partial
+    # name match" two lines above "Vector: Wiped document 'notes.txt'" — the
+    # same two names, opposite policies, and the irreversible half was the
+    # one ignoring the rule. Against the live library `forget('postgresql-
+    # 19-A4.md')` destroyed the 7k-chunk manual: the exact incident the
+    # vector rule was written for, through the extension case it lacked.
+    _tgt_name = Path(_raw_target).name
+    target_names_a_file = bool(Path(_tgt_name).suffix) or _tgt_name.startswith(".")
+
+    # `removeprefix`, not `lstrip`: lstrip takes a CHARACTER SET, so
+    # `.config/x.md` became `config/x.md` (a different, unnamed file) and
+    # `../../etc/passwd` became `etc/passwd`.
+    # A trailing separator is not part of the name: `forget('notes/')` kept
+    # the slash in `clean_target`, so the disk half matched `notes` as a bare
+    # topic and deleted five files while the profile and graph halves matched
+    # nothing at all — one call, two different targets.
+    clean_target = _raw_target.rstrip("/" + os.sep) or _raw_target
+    while clean_target.startswith("./"):
+        clean_target = clean_target[2:]
+    clean_target = clean_target.lstrip("/")
     if clean_target.startswith("sandbox/"):
         clean_target = clean_target[8:]
-    clean_target_lc = clean_target.lower()
 
     # --- ENTITY-AWARE EXPANSION ---
     # Pull the target's direct graph neighbours so the wipe also reaches
@@ -838,7 +1003,14 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     expanded_targets: list = []
     if graph_memory is not None:
         try:
-            expanded_targets = await asyncio.to_thread(graph_memory.get_connected_entities, target)
+            # `clean_target`, like every other sweep. This is the AMPLIFIER
+            # of a forget — it is what reaches the alias tombstone
+            # ('mortimer' -> 'iguana') — and leaving it raw made it dead for
+            # exactly the two spellings the normalisation was added for:
+            # `./mortimer` and `sandbox/mortimer` cleared one edge instead
+            # of two and left the profile row untouched.
+            expanded_targets = await asyncio.to_thread(
+                graph_memory.get_connected_entities, clean_target)
         except Exception:
             expanded_targets = []
     if not isinstance(expanded_targets, list):
@@ -855,6 +1027,22 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             sandbox_root = Path(sandbox_dir).resolve()
             target_basename = Path(clean_target).name.lower()
             target_stem = Path(clean_target).stem.lower()
+            # A target carrying a separator NAMES ONE FILE. Matching it on
+            # the basename alone deleted every file in the tree sharing that
+            # name — and the kept-report prints candidates as
+            # sandbox-relative paths and tells the caller to re-issue with
+            # one, so its own instruction was the trigger:
+            # `forget('projects/alpha/report_atlas.md')` removed the beta and
+            # archive copies too, and on the live sandbox
+            # `forget('projects/<id>/index.html')` removed five index.html
+            # files across five projects. A path means a path.
+            target_relpath = clean_target.lower() if target_names_a_path else None
+            # A target with an EXTENSION also names one file, so it must not
+            # fall through to the stem tier: with `notes.md` absent,
+            # `forget('notes.md')` deleted notes.txt, notes.xlsx and
+            # notes.pdf — the very files the report calls "partial matches"
+            # and promises not to touch when `notes.md` happens to exist.
+            target_is_filename = target_names_a_file
 
             exact_hits: list[Path] = []
             stem_hits: list[Path] = []
@@ -864,14 +1052,139 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                 dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', 'venv', '__pycache__', 'env', 'acquired_skills')]
                 for fname in files:
                     fname_lc = fname.lower()
+                    _abs = Path(root) / fname
+                    if target_relpath is not None:
+                        # Path-qualified: only that exact path is a hit, and
+                        # nothing weaker is offered — the caller was precise.
+                        try:
+                            if str(_abs.relative_to(sandbox_root)).lower() == target_relpath:
+                                exact_hits.append(_abs)
+                        except ValueError:
+                            pass
+                        continue
                     if fname_lc == target_basename:
-                        exact_hits.append(Path(root) / fname)
+                        exact_hits.append(_abs)
                     elif Path(fname).stem.lower() == target_stem:
-                        stem_hits.append(Path(root) / fname)
+                        (substr_hits if target_is_filename else stem_hits).append(_abs)
                     elif len(target_stem) >= 3 and target_stem in fname_lc:
-                        substr_hits.append(Path(root) / fname)
+                        substr_hits.append(_abs)
 
-            chosen: list[Path] = exact_hits or stem_hits or substr_hits
+            # REDUNDANT PREFIX HEALING. `knowledge_base` receives the
+            # PROJECT workspace as its root when a project is active, so a
+            # model reading a listing produces `projects/<id>/index.html`
+            # while the root already IS `.../projects/<id>`. Without this the
+            # path rule turned a working call into a silent total no-op —
+            # and, because a path-qualified miss short-circuits, it emitted
+            # no candidate report either: the caller was told the file does
+            # not exist. `file_system` does the same healing.
+            if target_relpath and not exact_hits:
+                _root_parts = [q.lower() for q in sandbox_root.parts]
+                _t_parts = target_relpath.split("/")
+                for _drop in range(1, len(_t_parts)):
+                    if _t_parts[:_drop] != _root_parts[-_drop:]:
+                        continue
+                    _healed = "/".join(_t_parts[_drop:])
+                    _cand = sandbox_root / _healed
+                    if _cand.is_file():
+                        exact_hits.append(_cand)
+                        break
+
+            # Substring matches are REPORTED, NOT DELETED.
+            #
+            # The tier existed to catch near-misses, and it deletes every
+            # file whose name merely CONTAINS the target: measured,
+            # `forget('atlas')` unlinked `atlas_migration_plan.py`,
+            # `notes_about_atlas.md` and `sub/deep_atlas_notes.txt`.
+            # Irreversible, model-reachable, no dry-run — and the `target`
+            # parameter is now described to the model in the vocabulary that
+            # feeds this branch hardest ("a topic, an entity, a person's
+            # name"), so the input is a bare word far more often than a
+            # filename.
+            #
+            # Forgetting a TOPIC does not mean deleting every file whose
+            # name shares a token with it; the vector, profile and graph
+            # sweeps below remove the knowledge either way. So a substring
+            # hit now surfaces as a candidate the caller can name
+            # explicitly — at which point it is an exact match and is
+            # deleted. Exact and stem matches are unchanged.
+            # AMBIGUITY GATE. A bare basename matches every file with that
+            # name anywhere in the tree, and the tier that DELETES had no
+            # such check while the tier that only reports did: measured on
+            # the live sandbox, `forget('index.html')` removed five files
+            # across five projects and `forget('app.py')` two, silently and
+            # irreversibly. The conservatism had landed entirely on the tier
+            # that does not delete. More than one match means the caller has
+            # not said which — so say so, and take the path.
+            # ...over whichever tier is about to DELETE. Gating `exact_hits`
+            # alone meant `forget('index.html')` refused three files while
+            # `forget('index')` — five characters shorter — unlinked five,
+            # through the stem tier the gate never looked at.
+            # Ambiguity is about LOCATION, not count. `forget('notes')`
+            # taking `notes.md` and `notes.txt` from one directory is the
+            # stem tier doing its job — the caller named that thing and
+            # there is one of it. `forget('index')` taking `index.js` from
+            # the root and four `index.html` files from four different
+            # projects is five different things wearing one name, and the
+            # caller cannot have meant all of them. So the gate fires when
+            # the matches span more than one directory.
+            # ⚠ CLEAR BOTH TIERS. Emptying `exact_hits` alone handed the
+            # very next line (`chosen = exact_hits or stem_hits`) the weaker
+            # tier that had LOST to them: with `p/a/index`, `p/b/index` and
+            # `index.html`, `forget('index')` refused the two the caller may
+            # have meant and irreversibly deleted the third — a fresh
+            # instance of the contradiction-in-one-report this gate exists
+            # to remove. If the caller has not said which, nothing goes.
+            _ambiguous: list[Path] = []
+            if not target_names_a_path:
+                _tier = exact_hits or stem_hits
+                if len({h.parent for h in _tier}) > 1:
+                    _ambiguous = list(_tier)
+                    exact_hits = []
+                    stem_hits = []
+            chosen: list[Path] = exact_hits or stem_hits
+            # Everything the sweep matched but did NOT delete — the weaker
+            # tiers the `or` chain shadowed, not just the substring one.
+            # This report is the entire mitigation for no longer deleting
+            # them, and the first version only emitted it when NOTHING was
+            # deleted: `forget('atlas')` with an `atlas.md` present deleted
+            # that one file and said nothing about the three others it had
+            # matched. `forget('notes.md')` likewise kept `notes.txt`
+            # silently. The caller has to be told what survived, whether or
+            # not something else went.
+            # Symlinks are refused at the unlink below, so listing one as
+            # something to "forget by its exact name" is a permanent dead
+            # end. Name them separately.
+            kept = [h for h in (_ambiguous + stem_hits + substr_hits)
+                    if h not in chosen and not h.is_symlink()]
+            if kept:
+                # Print `./name` for a root-level candidate whose basename
+                # also occurs deeper in the tree: re-issuing a bare name
+                # matches EVERY file with it, so the report's own
+                # instruction would delete siblings the caller never saw.
+                # `./` makes the re-issue path-qualified, and hence exact.
+                _all_names = [h.name.lower() for h in (exact_hits + kept)]
+                _rel = []
+                for h in kept:
+                    _r = str(h.relative_to(sandbox_root))
+                    if "/" not in _r and _all_names.count(h.name.lower()) > 1:
+                        _r = "./" + _r
+                    _rel.append(_r)
+                _rel = sorted(_rel)
+                _shown = _rel[:10]
+                _more = (f" (+{len(_rel) - len(_shown)} more; narrow the "
+                         f"target to see them)" if len(_rel) > len(_shown) else "")
+                report.append(
+                    "ℹ️ Disk: kept "
+                    + str(len(_rel))
+                    + (" file(s) matching " if _ambiguous
+                       else " file(s) whose NAME only partly matches ")
+                    + repr(clean_target)
+                    + " — "
+                    + ", ".join(repr(n) for n in _shown)
+                    + _more
+                    + ". Nothing on disk is deleted for a partial name match;"
+                    " to delete one, forget it by the exact name shown here."
+                )
             for victim in chosen:
                 try:
                     # Never delete THROUGH a symlink: victim.resolve()
@@ -911,19 +1224,97 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         # direction was nonsensical. Match the disk sweep's discipline —
         # require >=3 chars for substring matching (against the basename),
         # and for a shorter stem only an EXACT filename-stem match.
-        target_stem = Path(target).stem.lower()
-        if len(target_stem) >= 3:
-            fuzzy_matches = [s for s in all_sources if target_stem in Path(s).name.lower()]
+        # SAME DISCIPLINE AS THE DISK SWEEP. A substring match on a
+        # document's filename used to DELETE the whole document: against the
+        # live library (one entry — the ~7k-chunk PostgreSQL manual),
+        # `forget('pdf')` / `forget('sql')` / `forget('postgres')` each
+        # destroyed it. Three characters, no candidate list, irreversible.
+        # And since §4DL the disk half of this very call prints "Nothing on
+        # disk is deleted for a partial name match" while this half did
+        # exactly that to the knowledge. Exact name or exact stem deletes;
+        # anything looser is reported so the caller can name it.
+        target_name = Path(clean_target).name.lower()
+        target_stem = Path(clean_target).stem.lower()
+        # Documents are keyed by SOURCE NAME, so a path-qualified target
+        # identifies one by its basename — and only exactly. And a target
+        # carrying an extension names ONE document, exactly as on disk:
+        # matching its stem too wiped `notes.pdf` and `notes.txt` for
+        # `forget('notes.md')`, each of which is an entire ingested document
+        # plus its library row.
+        if target_names_a_path:
+            # A source may itself carry a path. Prefer the whole-string
+            # match; if the named path is not in the library, basename
+            # matches are candidates to REPORT, not documents to delete —
+            # the caller was precise and the library disagrees.
+            _tl = clean_target.lower()
+
+            def _norm_source(src: str) -> str:
+                out = src.lower()
+                while out.startswith("./"):
+                    out = out[2:]
+                return out.lstrip("/")
+
+            # `removeprefix`-style, NOT `lstrip("./")` — the character-set
+            # bug this function documents 40 lines above. It collapsed
+            # `notes.md`, `.notes.md`, `..notes.md` and `./notes.md` onto one
+            # key, so one call wiped four distinct documents.
+            doc_exact = [s for s in all_sources if _norm_source(s) == _tl]
+        elif target_names_a_file:
+            doc_exact = [s for s in all_sources
+                         if Path(s).name.lower() == target_name]
         else:
-            fuzzy_matches = [s for s in all_sources if Path(s).stem.lower() == target_stem]
-        for match in fuzzy_matches:
+            doc_exact = [s for s in all_sources
+                         if Path(s).name.lower() == target_name
+                         or Path(s).stem.lower() == target_stem]
+        doc_exact = sorted(doc_exact)
+        doc_partial = [s for s in all_sources
+                       if s not in doc_exact
+                       and len(target_stem) >= 3
+                       and (target_stem in Path(s).name.lower()
+                            or (target_names_a_path
+                                and Path(s).name.lower() == target_name))]
+        # The ambiguity gate, on this half too. It was disk-only, so one
+        # report printed "kept 3 file(s) … Nothing on disk is deleted for a
+        # partial name match" above three "✅ Vector: Wiped document" lines
+        # naming the SAME three files — and the irreversible half was again
+        # the one ignoring the rule. Sources sharing a basename across
+        # different directories are different documents.
+        if not target_names_a_path and len(doc_exact) > 1:
+            if len({str(Path(_s).parent) for _s in doc_exact}) > 1:
+                doc_partial = sorted(set(doc_partial) | set(doc_exact))
+                doc_exact = []
+        for match in doc_exact:
             await asyncio.to_thread(memory_system.delete_document_by_name, match)
             report.append(f"✅ Vector: Wiped document '{match}'.")
+        if doc_partial:
+            # `+N more`, like the disk half. Naming 10 of N while telling the
+            # caller to re-issue with one of the names shown leaves the rest
+            # unreachable — the same defect the disk report was fixed for,
+            # repeated here because this report was written from it.
+            _shown_docs = sorted(doc_partial)[:10]
+            _more_docs = (f" (+{len(doc_partial) - len(_shown_docs)} more; "
+                          f"narrow the target to see them)"
+                          if len(doc_partial) > len(_shown_docs) else "")
+            report.append(
+                "ℹ️ Vector: kept " + str(len(doc_partial)) + " ingested "
+                "document(s) whose NAME only partly matches "
+                + repr(target) + " — "
+                + ", ".join(repr(m) for m in _shown_docs)
+                + _more_docs
+                + ". Re-issue with one of these exact names to remove it."
+            )
 
         # --- SEMANTIC SWEEP (For loose facts and smart_memory "auto" facts) ---
         # Run query + delete UNDER the vector lock so we don't race with
         # background ingest / smart_memory writes.
-        sweep_target_lc = str(target).strip().lower()
+        # `clean_target`, not the raw string. The disk and document halves
+        # normalise `./`, a leading `/` and a `sandbox/` prefix; these three
+        # did not, so `forget('./notes.md')` and `forget('sandbox/notes.md')`
+        # removed the file and the document and left every fact, profile row
+        # and graph edge in place — while the report said nothing about the
+        # half that had not run. `sandbox/` is documented in file_system.py
+        # as an observed live model shape.
+        sweep_target_lc = clean_target.strip().lower()
 
         def _semantic_sweep():
             with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
@@ -935,7 +1326,9 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                 # index still listed it; dedup then refused re-ingest), and
                 # episode/skill twins deleted here orphan their JSON side.
                 cand = memory_system.collection.query(
-                    query_texts=[target], n_results=20,
+                    # normalised, like every other sweep — the raw string
+                    # embedded `./` / `sandbox/` into the query vector
+                    query_texts=[sweep_target_lc], n_results=20,
                     where={"type": {"$nin": _FORGET_PROTECTED_TYPES}})
                 deleted_local = 0
                 hits = []
@@ -980,7 +1373,7 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     if profile_memory:
         try:
             data = profile_memory.load()
-            target_lc = target.lower().strip()
+            target_lc = clean_target.lower().strip()
             found_key = False
             exact_hits: list[tuple[str, str]] = []
             substr_hits: list[tuple[str, str]] = []
@@ -1032,7 +1425,11 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         continue
                     if isinstance(v, list):
                         if any(_value_mentions_target(item, target_lc) for item in v):
-                            res = profile_memory.prune_value(cat, k, target)
+                            # `target_lc`, the same string the guard above
+                            # matched on. Normalising the guard and leaving
+                            # the argument raw made every value prune a
+                            # no-op that still reported a green tick.
+                            res = profile_memory.prune_value(cat, k, target_lc)
                             report.append(f"✅ Profile: {res}")
                             handled.add((cat, k))
                             found_key = True
@@ -1050,9 +1447,12 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
     # 4. Knowledge Graph Cleanup
     if graph_memory:
         try:
-            deleted_edges = await asyncio.to_thread(graph_memory.delete_by_target, target)
+            # `clean_target`, like every other sweep — the raw string
+            # carried `./` / `sandbox/` / a trailing slash straight
+            # into the graph, where it matched nothing.
+            deleted_edges = await asyncio.to_thread(graph_memory.delete_by_target, clean_target)
             if deleted_edges > 0:
-                report.append(f"✅ Graph: Severed {deleted_edges} topological edges related to '{target}'.")
+                report.append(f"✅ Graph: Severed {deleted_edges} topological edges related to '{clean_target}'.")
         except Exception as e: report.append(f"⚠️ Graph Error: {e}")
 
     # 5. Entity-aware secondary sweep over the target's graph neighbours.
@@ -1136,7 +1536,7 @@ async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     icon = Icons.MEM_SCRATCH
-    log_title = f"Scratch {action.upper()}"
+    log_title = f"Scratch {str(action).upper()}"
     log_content = f"{key} = {value}" if value else key
     pretty_log(log_title, log_content, icon=icon)
     if not scratchpad:
@@ -1265,8 +1665,12 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         })
         _fails = _bus_write_failures(_report)
         if _fails:
-            return (f"PARTIAL: Profile update had failures — "
-                    f"{'; '.join(_fails)}. Retrieval may not reflect the change.")
+            _canon = _bus_canonical_failed(_report, "update_profile")
+            _mk = ToolOutcome.failed if _canon else ToolOutcome.partial
+            _head = "FAILED" if _canon else "PARTIAL"
+            return _mk((f"{_head}: Profile update had failures — "
+                    f"{'; '.join(_fails)}. Retrieval may not reflect the change."),
+                    reason_code="profile_write_partial")
         return f"SUCCESS: Profile updated."
 
     # --- LEGACY DIRECT PATH ---
@@ -1311,9 +1715,9 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
 
     if partial_failures:
         return (
-            f"PARTIAL: Profile updated (canonical JSON), but "
+            ToolOutcome.partial(f"PARTIAL: Profile updated (canonical JSON), but "
             f"{', '.join(partial_failures)} index(es) lagged. "
-            f"Semantic / graph retrieval may not yet reflect this change."
+            f"Semantic / graph retrieval may not yet reflect this change.", reason_code="profile_graph_lag")
         )
     return f"SUCCESS: Profile updated."
 
@@ -1351,8 +1755,12 @@ async def tool_learn_skill(task: str = None, mistake: str = None, solution: str 
         })
         _fails = _bus_write_failures(_report)
         if _fails:
-            return (f"PARTIAL: lesson write had failures — "
-                    f"{'; '.join(_fails)}. It may not be in the playbook.")
+            _canon = _bus_canonical_failed(_report, "learn_skill")
+            _mk = ToolOutcome.failed if _canon else ToolOutcome.partial
+            _head = "FAILED" if _canon else "PARTIAL"
+            return _mk((f"{_head}: lesson write had failures — "
+                    f"{'; '.join(_fails)}. It may not be in the playbook."),
+                    reason_code="lesson_write_partial")
         return "SUCCESS: Lesson learned and saved to the Skill Playbook and Vector Memory."
 
     # --- LEGACY DIRECT PATH ---
@@ -1360,9 +1768,155 @@ async def tool_learn_skill(task: str = None, mistake: str = None, solution: str 
     skill_memory.learn_lesson(task, mistake, solution, memory_system=memory_system)
     return "SUCCESS: Lesson learned and saved to the Skill Playbook and Vector Memory."
 
+#: Every kwarg name the `knowledge_base` dispatcher accepts as the SUBJECT of
+#: an action — the fact to store, the file to ingest, the topic to forget.
+#: The tuple is the FALLBACK order; `_kb_tried_names` hoists the action's own
+#: schema name in front of it, so the effective order differs per action.
+#:
+#: ⚠ Appending a name here is NOT automatically safe. `target` was appended
+#: last and still changed how 63 existing `forget` calls resolve, because it
+#: is also that action's `primary`. And a name added here becomes a name the
+#: generic resolution below can hand to `query` / `expand` / `update_profile`.
+#: Add one only after checking both.
+#:
+#: Anything that tells a model "parameter X is MANDATORY" must derive X from
+#: this tuple — see `_kb_target_or_error`, the only place in this module that
+#: builds such a message. Hand-writing one is how this bug happened: the inner
+#: `tool_unified_forget` demanded a 'target' parameter that was neither
+#: advertised in the schema NOR accepted here, so a model that complied
+#: exactly got a byte-identical error back. Seen live 2026-08-28 on "forget
+#: everything about X": every retry was the same call, the same error, until
+#: the strike budget ran out. An error that names a parameter the tool then
+#: drops is not a bad message — it is an unbreakable loop.
+_KB_TARGET_ALIASES = (
+    "filename", "fact", "content", "source", "path", "topic", "target",
+)
+
+#: The actions the schema advertises, in schema order. One home: the registry
+#: enum is pinned against this tuple, and the "unknown action" error is
+#: generated from it. (`update_profile` is dispatched but deliberately not
+#: advertised; see the branch at the end of `tool_knowledge_base`.)
+_KB_ACTIONS = (
+    "transcribe", "ingest_document", "query", "insert_fact", "expand",
+    "forget", "list_docs", "reset_all",
+)
+
+
+#: Characters that turn a prose hint into something that reads like a call.
+#: Stripped from every hint before it reaches a model. Includes the
+#: typographic forms — a curly apostrophe is what you get from pasting prose
+#: out of a document, and `subject=‘project atlas’` renders a
+#: perfectly copyable call while an ASCII-only class waves it through.
+_KB_HINT_SHAPE = re.compile("[=＝\"'`‘’“”]+")
+
+
+def _kb_tried_names(primary: str) -> tuple:
+    """Every kwarg name a subject lookup for `primary` consults, in order.
+
+    The action's own schema name goes first so a caller that passes both its
+    advertised name and a legacy alias gets what it asked for.
+    """
+    return (primary,) + tuple(n for n in _KB_TARGET_ALIASES if n != primary)
+
+
+def _kb_target_or_error(kwargs: dict, action: str, primary: str,
+                        hint: str, example: str):
+    """Resolve an action's subject from `kwargs`; on failure build the error.
+
+    Returns ``(value, None)`` or ``(None, error_string)``.
+
+    Lookup and message are one function because they must agree: the only
+    parameter the message names is `primary`, which the lookup tries first,
+    and the worked call is generated from it. `hint` and `example` are PROSE
+    AND A VALUE — neither may contain a parameter name.
+
+    ⚠ That last sentence is a constraint, not a guarantee. An earlier version
+    let each call site write its own worked example inside `hint`, and a
+    review showed the whole live bug reproducing byte-for-byte after changing
+    one hint's ``target=`` to ``subject=`` — with every regression test
+    green, because the pins scraped only quoted lowercase tokens and a hint's
+    parameter appears as bare ``name='value'``. The example is generated here
+    now, and `test_kb_missing_param_names_accepted_param.py` scans the
+    rendered message for any identifier that is neither the action nor a
+    tried name.
+
+    ⚠ It also used to LIST the other accepted aliases, so a model reading
+    ``insert_fact``'s error was told it "also accepts 'filename'" — and
+    obeying that stores the literal filename as a permanent fact and returns
+    SUCCESS. Excluding the other actions' names fixed the example and not the
+    property: ``source`` and ``path`` are just as filename-shaped, and were
+    still advertised. The alternatives are gone entirely. They were never
+    what ended the loop — the required name and the worked call are — and a
+    caller already passing a legacy alias never sees this message at all.
+    The aliases stay ACCEPTED for back-compat; they are simply not advice.
+    """
+    for name in _kb_tried_names(primary):
+        val = kwargs.get(name)
+        if not val:
+            continue
+        if isinstance(val, str):
+            # STRIP, don't merely test. An earlier version computed
+            # `val.strip()` to decide the subject was present and then
+            # returned the padded original — and `tool_unified_forget`
+            # strips in only 3 of its 6 uses, so `target=' atlas '` (the
+            # normal XML shape: the argument parser strips CR/LF, not
+            # spaces) skipped the disk and document sweeps while reporting
+            # every stage with a ✅. Normalise once, at the boundary.
+            val = val.strip()
+            if not val:
+                continue          # whitespace is not a subject
+            return val, None
+        # A non-string subject is not a subject. `target=['a','b']` is a
+        # plausible native-JSON shape for "forget X and Y", and it used to
+        # sail through: the vector and profile sweeps raised and were
+        # caught, the graph sweep "succeeded" against the repr, NOTHING was
+        # deleted, and the turn was booked as a clean success because the
+        # report never starts with an error prefix. The schema says string.
+        return None, (
+            f"SYSTEM ERROR: The '{primary}' parameter is MANDATORY for "
+            f"knowledge_base(action='{action}') and must be a single "
+            f"string, not {type(val).__name__}. Worked call: "
+            f"knowledge_base(action='{action}', {primary}={example!r}). "
+            f"For several subjects, make one call each."
+        )
+    # A hint may not carry a parameter name. This is the channel that
+    # reproduced the whole live loop under review: hints are free text, and
+    # one reading "...or subject='project atlas'" is a call shape a model
+    # will copy and have dropped. `=` and quotes are what make a fragment
+    # look callable, so they are removed here rather than trusted to review.
+    # (Prose that merely NAMES a field in passing is not reachable by this
+    # rule — see the module docstring of the regression test.)
+    hint = _KB_HINT_SHAPE.sub(" ", str(hint or "")).strip()
+    return None, (
+        f"SYSTEM ERROR: The '{primary}' parameter is MANDATORY for "
+        f"knowledge_base(action='{action}') — {hint}. Worked call: "
+        f"knowledge_base(action='{action}', {primary}={example!r})."
+    )
+
+
+def _kb_unknown_action_error(action: str) -> str:
+    """Same contract as `_kb_target_or_error`, for the ACTION slot.
+
+    "Unknown action 'delete'" named nothing the caller could switch to, and
+    `delete`/`erase`/`remove` are not in the alias map — so the model's next
+    guess was another guess. The valid set is generated from `_KB_ACTIONS`.
+    "Unknown action" is kept verbatim because an existing pin asserts on it
+    (test_transcribe_discoverability). Note it was never FATAL-classified on
+    its own — the FATAL class comes from the `MANDATORY` token this wording
+    adds, which is deliberate: an unknown action is a caller error, and the
+    caller now has the list it needs to fix it.
+    """
+    valid = ", ".join(repr(a) for a in _KB_ACTIONS)
+    if not action:
+        return (f"SYSTEM ERROR: The 'action' parameter is MANDATORY — it "
+                f"must be one of: {valid}.")
+    return (f"SYSTEM ERROR: Unknown action '{action}'. The 'action' "
+            f"parameter is MANDATORY and must be one of: {valid}.")
+
+
 async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memory_system=None, memory_bus=None, **kwargs):
     if not action:
-        return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
+        return _kb_unknown_action_error("")
     # --- ACTION ALIASES ---------------------------------------------------
     # `transcribe` is a FIRST-CLASS name for `ingest_document`, not a typo
     # heal. The tool is named for what it STORES while a model searching for
@@ -1374,6 +1928,11 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
     # openai-whisper anyway. Presence was never the problem; findability BY
     # NEED was. So the tool now answers to the word the model is looking for.
     action = str(action).strip().lower()
+    # The name the CALLER reached for, kept for the error messages. §4AW made
+    # `transcribe` a first-class verb because a model holding it could not
+    # find this tool; rendering the canonical name back at that model in the
+    # one worked call it is given renames its verb to the un-findable one.
+    action_as_called = action
     action = {
         "transcribe": "ingest_document",
         "transcribe_document": "ingest_document",
@@ -1382,29 +1941,51 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         "ingest_file": "ingest_document",
     }.get(action, action)
     # --- FLEXIBLE PARAMETER MAPPING ---
-    # Schema advertises 'filename' (ingest_document/forget) and 'fact'
-    # (insert_fact); legacy 'content'/'source'/'path'/'topic' kept for
-    # back-compat with older callers and Qwen variants that aliased.
-    target = (
-        kwargs.get("filename")
-        or kwargs.get("fact")
-        or kwargs.get("content")
-        or kwargs.get("source")
-        or kwargs.get("path")
-        or kwargs.get("topic")
-    )
-    key = kwargs.get("key")
-    value = kwargs.get("value")
-    category = kwargs.get("category")
+    # Schema advertises 'filename' (ingest_document/query), 'fact'
+    # (insert_fact) and 'target' (forget); legacy 'content'/'source'/'path'/
+    # 'topic' kept for back-compat with older callers and Qwen variants that
+    # aliased. Derived from _KB_TARGET_ALIASES so the accepted set is stated
+    # exactly once. This is the GENERIC resolution, used by the branches that
+    # only fall back to it; the subject-taking actions below re-resolve with
+    # their own schema name first via _kb_target_or_error.
+    target = next((kwargs[n] for n in _KB_TARGET_ALIASES if kwargs.get(n)), None)
 
+    # The three subject-taking actions resolve (and, when empty, complain)
+    # through _kb_target_or_error so the error a model reads always names a
+    # parameter this dispatcher accepts. The inner tools keep their own
+    # guards for DIRECT callers, but their messages name THEIR OWN parameter
+    # ('text' for tool_remember, 'target' for tool_unified_forget), which is
+    # not necessarily a name a model may pass — so they must never be the
+    # message a tool call surfaces.
     if action == "insert_fact":
-        return await tool_remember(target, memory_system, kwargs.get("graph_memory"), kwargs.get("llm_client"), kwargs.get("model_name", "default"), memory_bus=memory_bus)
+        fact, err = _kb_target_or_error(
+            kwargs, action_as_called, "fact",
+            "pass the single discrete fact to memorise",
+            "<the fact to remember>")
+        if err:
+            return err
+        return await tool_remember(fact, memory_system, kwargs.get("graph_memory"), kwargs.get("llm_client"), kwargs.get("model_name", "default"), memory_bus=memory_bus)
 
     elif action == "ingest_document":
-        return await tool_gain_knowledge(target, sandbox_dir, memory_system)
+        _is_media_verb = action_as_called != "ingest_document"
+        filename, err = _kb_target_or_error(
+            kwargs, action_as_called, "filename",
+            ("pass the name of an EXISTING audio or video file in your sandbox"
+             if _is_media_verb else
+             "pass the name of an EXISTING file in your sandbox, or a web URL"),
+            "<your-recording.mp4>" if _is_media_verb else "<your-file.pdf>")
+        if err:
+            return err
+        return await tool_gain_knowledge(filename, sandbox_dir, memory_system)
 
     elif action == "forget":
-        return await tool_unified_forget(target, sandbox_dir, memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"))
+        subject, err = _kb_target_or_error(
+            kwargs, action_as_called, "target",
+            "pass the topic, entity or filename to erase",
+            "<the topic to erase>")
+        if err:
+            return err
+        return await tool_unified_forget(subject, sandbox_dir, memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"))
 
     elif action == "query":
         return await tool_query_document(
@@ -1430,22 +2011,99 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         if not memory_system: return "Error: Memory system is disabled."
         deleted = 0
         failed_batches = 0
+        # OFF THE EVENT LOOP, and without materialising the store.
+        # `collection.get()` with no `include` returns every document body
+        # and metadata blob — live, ~8k rows including 7k manual chunks —
+        # to use nothing but the ids. It and every delete batch ran
+        # synchronously on the loop, stalling every concurrent request,
+        # stream and heartbeat for the duration, while the CHEAP graph wipe
+        # below was already offloaded.
+        _lock = (memory_system._get_lock()
+                 if hasattr(memory_system, "_get_lock") else _NullCM())
+
+        def _enumerate():
+            # ids AND metadatas in ONE scan. `include=["metadatas"]` returns
+            # both (chroma always sends ids), so the orphan count below
+            # describes exactly the rows this call is about to delete. Two
+            # separate `get()`s meant the count came from a different
+            # snapshot than the delete — rows landing between them produced
+            # a note about documents that were never removed.
+            try:
+                with _lock:
+                    return memory_system.collection.get(include=["metadatas"])
+            except TypeError:
+                # Older chroma clients reject the kwarg.
+                with _lock:
+                    return memory_system.collection.get()
+
         try:
-            all_ids = memory_system.collection.get().get("ids", []) or []
+            _snapshot = await asyncio.to_thread(_enumerate)
         except Exception as e:
             return f"Error: failed to enumerate vector store: {e}"
+        all_ids = _snapshot.get("ids", []) or []
+
+        # What this wipe ORPHANS, counted from the SAME snapshot.
+        # `reset_all` deletes the `document` / `episode` / `skill` /
+        # `acquired_skill` rows `_FORGET_PROTECTED_TYPES` protects, because
+        # each has a record in ANOTHER store this does not touch. `forget`
+        # refuses to create that asymmetry; `reset_all` creates it by
+        # design, so it has to say so — but only about rows that actually
+        # went (see the delete loop, which drops the count for a failed
+        # batch).
+        # Types positionally aligned with `all_ids`. Defensive because the
+        # shape is the client's: a metadatas list shorter than ids, a None
+        # entry, or a non-dict entry (which raised AttributeError straight
+        # out of the tool, deleting nothing and returning no error string).
+        _metas = _snapshot.get("metadatas") or []
+        _types: list = []
+        for _i in range(len(all_ids)):
+            _m = _metas[_i] if _i < len(_metas) else None
+            _types.append(_m.get("type") if isinstance(_m, dict) else None)
+        if len(_metas) < len(all_ids):
+            report_note_incomplete = True
+        else:
+            report_note_incomplete = False
+
+        def _delete(batch):
+            # UNDER THE VECTOR LOCK, like every other writer in vector.py and
+            # like both forget sweeps. Without it a concurrent ingest that
+            # started after the snapshot survived the wipe while the
+            # unlocked library reset erased its catalogue entry — the row
+            # lived, its index line did not, and the tool reported a clean
+            # "Wiped clean".
+            with _lock:
+                memory_system.collection.delete(ids=batch)
+
+        orphaned: dict = {}
         for i in range(0, len(all_ids), 500):
             batch = all_ids[i:i + 500]
             try:
-                memory_system.collection.delete(ids=batch)
+                await asyncio.to_thread(_delete, batch)
                 deleted += len(batch)
+                # Count orphans only for rows that actually went. The first
+                # version emitted the note from a pre-scan regardless of
+                # outcome: with every batch failing it reported "this
+                # removed the vector rows for 600 document…" having removed
+                # nothing.
+                for t in _types[i:i + 500]:
+                    if t in _FORGET_PROTECTED_TYPES:
+                        orphaned[t] = orphaned.get(t, 0) + 1
             except Exception as e:
                 failed_batches += 1
                 __import__("logging").getLogger("GhostAgent").warning(
                     f"reset_all batch {i // 500} failed: {e}"
                 )
         # Atomic library reset using the same pattern as the index helper.
-        if hasattr(memory_system, "library_file"):
+        # NOT when every batch failed: emptying the index while 8k rows
+        # survive leaves the store and its catalogue disagreeing, and the
+        # message says the entries were "left in place".
+        # ANY failed batch, not just total failure. With one batch of two
+        # failing, 500 rows survived and the catalogue was still emptied —
+        # exactly the disagreement this guard exists to prevent, and the
+        # message says the entries were "left in place". Ingest dedups on
+        # the library, so an un-listed surviving document can neither be
+        # queried nor re-ingested without duplicating.
+        if hasattr(memory_system, "library_file") and not failed_batches:
             try:
                 tmp = memory_system.library_file.with_suffix(memory_system.library_file.suffix + ".tmp")
                 tmp.write_text("[]")
@@ -1457,16 +2115,49 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
                 await asyncio.to_thread(kwargs.get("graph_memory").wipe_all)
             except Exception as e:
                 __import__("logging").getLogger("GhostAgent").warning(f"reset_all graph wipe failed: {e}")
+        note = ""
+        if report_note_incomplete:
+            note = (" NOTE: the store returned fewer metadata rows than ids,"
+                    " so the list of orphaned records below is incomplete.")
+        if orphaned:
+            note += (
+                " NOTE: this removed the vector rows for "
+                + ", ".join(f"{n} {t}" for t, n in sorted(orphaned.items()))
+                + ". Their records in the episodic / skill stores are NOT"
+                " deleted by this action and now have no searchable twin —"
+                " they remain on disk and will not surface in recall."
+            )
         if failed_batches:
-            return f"Partial: Wiped {deleted} entries; {failed_batches} batch(es) failed and were left in place."
-        return f"Success: Wiped clean ({deleted} entries removed)."
+            return ToolOutcome.partial(
+                f"PARTIAL: Wiped {deleted} entries; {failed_batches} "
+                f"batch(es) failed and were left in place.{note}",
+                world_changed=True, reason_code="wipe_partial")
+        return f"Success: Wiped clean ({deleted} entries removed).{note}"
 
     elif action == "update_profile":
+        # NOT a knowledge_base action. `update_profile` is advertised as its
+        # OWN tool (registry.py), and this branch was an unadvertised
+        # duplicate of it: absent from the action enum, reading
+        # key/value/category — none of which the knowledge_base schema
+        # carries — and returning "Error: 'key' is a required argument",
+        # which classifies UNKNOWN rather than FATAL. Worse, `is_mutating`
+        # (agent.py) counts it while `is_idempotent_setter` does not, so it
+        # was the one route that bypassed the repeat-write guard written for
+        # exactly this call. And `cat = category or target` let the generic
+        # alias chain file a fact under a category named after a PDF.
+        # Reviewed 2026-08-28: it was the last branch still violating the
+        # invariant the rest of this dispatcher now holds — an action the
+        # schema does not describe cannot be called correctly by a model
+        # that reads the schema. Redirect instead of dispatching.
+        # Deliberately does NOT say "call update_profile instead": that tool
+        # is in `disabled_tools` for subagents, self-play and dream, where
+        # the redirect would bounce the model between two errors with
+        # different signatures — so the same-failure loop breaker never fires
+        # and the 6-strike budget drains. Naming the actions THIS tool has is
+        # advice that is true in every context.
+        return _kb_unknown_action_error("update_profile")
 
-        cat = category or target
-        return await tool_update_profile(cat, key, value, kwargs.get("profile_memory"), memory_system, kwargs.get("graph_memory"), memory_bus=memory_bus)
-
-    return f"Error: Unknown action '{action}'"
+    return _kb_unknown_action_error(action)
 
 async def tool_dream_mode(context):
     """
@@ -1475,7 +2166,8 @@ async def tool_dream_mode(context):
     from ..core.dream import Dreamer
     dreamer = Dreamer(context)
     result = await dreamer.dream()
-    return f"{result}\n\nSYSTEM: SESSION FINISHED. STAND BY."
+    from .outcome import append_note
+    return append_note(result, "\n\nSYSTEM: SESSION FINISHED. STAND BY.")
 
 #: Per-cycle wall-clock budget for `self_play`. Covers challenge
 #: generation + all worker attempts end-to-end. A stuck worker with a
@@ -1592,12 +2284,19 @@ async def tool_self_play(context):
             f"Cycle exceeded {SELF_PLAY_CYCLE_TIMEOUT_S:.0f}s wall-clock budget. Aborting.",
             level="WARNING", icon=Icons.STOP,
         )
-        return (
+        from .outcome import ToolOutcome
+        # An abort is a failure, and `SYSTEM: SELF PLAY ABORTED` matches no
+        # failure or rejection predicate in the tree.
+        return ToolOutcome.failed(
             f"SYSTEM: SELF PLAY ABORTED — exceeded {SELF_PLAY_CYCLE_TIMEOUT_S:.0f}s cycle budget. "
             "A generation-loop or stuck upstream request burned the budget. "
-            "Retry or investigate the upstream model's decoder state."
-        )
-    return f"{result}\n\nSYSTEM: SELF PLAY DONE."
+            "Retry or investigate the upstream model's decoder state.",
+            world_changed=False, reason_code="selfplay_cycle_timeout")
+    from .outcome import append_note
+    # NOT an f-string: `ToolOutcome` is a `str` subclass, so interpolating it
+    # returns a plain `str` and every status `dream.py` declares — six
+    # failure sites migrated in the previous round — died right here.
+    return append_note(result, "\n\nSYSTEM: SELF PLAY DONE.")
 
 
 # ---------------------------------------------------------------------------

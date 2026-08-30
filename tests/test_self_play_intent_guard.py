@@ -270,7 +270,22 @@ async def test_biological_self_play_does_not_go_through_tool_guard():
     src = inspect.getsource(agent_mod)
     # The phase-3 self-play tick must call synthetic_self_play directly,
     # not via tool_self_play.
-    assert "tool_self_play" not in src.split("_biological_tick")[1].split("async def ")[0] if "_biological_tick" in src else True
+    # ⚠ This used to be `src.split("_biological_tick")[1]`, which lands on
+    # the watchdog's CALL site, not the method definition — the window ended
+    # 60 lines BEFORE `async def _biological_tick` began, so it inspected the
+    # wrong 13,567 characters and could not fail from anything in the method.
+    # Ask for the method.
+    import ast as _ast
+    import textwrap as _tw
+    _fn = next((n for n in _ast.walk(_ast.parse(src))
+                if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                and n.name == "_biological_tick"), None)
+    assert _fn is not None, "_biological_tick moved"
+    _body = _ast.unparse(_fn)
+    assert "tool_self_play" not in _body, (
+        "the biological tick calls the TOOL wrapper — it must call the "
+        "dreamer directly, or the intent guard sees a self-play request "
+        "the user never made")
 
 
 # ---------------------------------------------------------------------------

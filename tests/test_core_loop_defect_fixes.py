@@ -19,6 +19,7 @@ helper is tested behaviourally.
 
 import inspect
 import time
+import textwrap
 import types
 from pathlib import Path
 
@@ -45,8 +46,41 @@ def test_turn_loop_uses_ledger_for_failures():
 
 
 def test_decay_gated_on_ledger_freeze_flag():
-    # the execution_failure_count decay is gated on the (reversible) flag
-    assert "if execution_failure_count > 0 and not strikes.decay_frozen:" in SRC
+    """The decay must be gated on the REVERSIBLE ledger flag.
+
+    ⚠ This was a source-substring assertion on the exact `if` line, which a
+    later change broke by adding a second condition on a continuation line —
+    with the property fully intact. Parsed now, so the pin survives
+    reformatting and additional guards while still failing if the decay
+    stops consulting `decay_frozen` (or starts consulting something
+    permanent instead).
+    """
+    import ast
+
+    tree = ast.parse(SRC.lstrip()) if SRC.lstrip().startswith(("def", "async def")) \
+        else ast.parse(textwrap.dedent(SRC))
+    guards = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        assigns = [n for n in ast.walk(node)
+                   if isinstance(n, ast.Assign) and len(n.targets) == 1
+                   and isinstance(n.targets[0], ast.Name)
+                   and n.targets[0].id == "execution_failure_count"
+                   and "max(" in ast.unparse(n.value)]
+        if assigns:
+            guards.append(ast.unparse(node.test))
+    assert guards, "the execution_failure_count decay was removed or renamed"
+    assert any("decay_frozen" in g for g in guards), (
+        f"the decay is no longer gated on the reversible ledger flag: {guards}"
+    )
+    # ...and it must not decay a turn whose failure never reached the
+    # classifier — a binding failure paired with any trivial read used to
+    # end the turn on zero strikes.
+    assert any("binding_failure_count" in g for g in guards), (
+        f"the decay hands back the strike from a call that could not even be "
+        f"entered: {guards}"
+    )
 
 
 # --- 2. no silent tool-arg parse failures (source contract) ---------------

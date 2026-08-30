@@ -953,7 +953,13 @@ class TestRegistrySaveIsConcurrencySafe:
         sup._save({"a": {"pid": 1}})           # seed a good registry
         import ghost_agent.sandbox.services as svc
         import unittest.mock as m
-        with m.patch.object(type(svc.Path(tmp_path)), "write_text",
+        # ⚠ The INJECTION POINT moved, not the property. §4DX r5 routed this
+        # write through `_write_text_nofollow` (O_NOFOLLOW — the temp file is
+        # a fixed name in a model-writable directory), so patching
+        # `Path.write_text` no longer intercepts it. What is asserted below
+        # is unchanged: a failed save leaves no stray temp and does not
+        # corrupt the registry that was already there.
+        with m.patch.object(svc, "_write_text_nofollow",
                             side_effect=OSError("disk full")):
             with pytest.raises(OSError):
                 sup._save({"b": {"pid": 2}})

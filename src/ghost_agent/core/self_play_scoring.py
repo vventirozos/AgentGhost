@@ -86,13 +86,32 @@ def count_tool_errors(messages: Iterable[dict]) -> int:
         if m.get("role") != "tool":
             continue
 
+        _raw = m.get("content")
+        # TIER 0 — the STATUS, before the tool-name exclusion. The exclusion
+        # exists so a `file_system` READ of a log containing "ERROR:" is not
+        # counted; a REFUSED `file_system` write is a different thing, and
+        # only the status can tell them apart. Measured: 287 of 408 failures
+        # and 83 of 83 refusals were missed here, 125 of them `file_system`
+        # alone. UNRESOLVED is SKIPPED, per the third-state contract — it was
+        # being counted as an error on all 9 occurrences.
+        _st = getattr(_raw, "status", None)
+        if _st is not None:
+            _sv = str(getattr(_st, "value", _st))
+            if _sv not in ("ok", "unresolved"):
+                n += 1
+                continue
+            # UNRESOLVED deliberately falls through to tier 2, which counts
+            # it: for a REWARD, an unfinished run must not score as a clean
+            # one. That is the opposite of what a LABELLER should do, and it
+            # is intentional.
+
         name = str(m.get("name") or "").lower()
         if name in _DATA_TOOL_NAMES:
             # Retrieved data: content is the payload, not a failure
             # signal. Skip unconditionally.
             continue
 
-        content = str(m.get("content") or "")
+        content = str(_raw or "")
         if not content:
             continue
 

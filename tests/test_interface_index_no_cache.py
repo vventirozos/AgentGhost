@@ -37,11 +37,27 @@ from interface.server import get  # noqa: E402
 # but reading it dynamically is what makes this file's assertion state what
 # it means: the proxy forwards THE SERVER'S key, whatever it is.
 
+def _fake_request(cookies=None, scheme="http", headers=None):
+    """Minimal Request for calling the `/` handler directly.
+
+    §4DW gave the handler a `request` parameter: `?key=` is how the key
+    ARRIVES, but a cookie is how it PERSISTS, so the URL can be scrubbed
+    without making the page a one-shot (a reload used to land on 401).
+    """
+    from starlette.requests import Request
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    if cookies:
+        raw.append((b"cookie", "; ".join(
+            f"{k}={v}" for k, v in cookies.items()).encode()))
+    return Request({"type": "http", "method": "GET", "path": "/",
+                    "scheme": scheme, "headers": raw, "query_string": b"",
+                    "server": ("testserver", 80), "client": ("1.2.3.4", 1)})
+
 
 
 @pytest.mark.asyncio
 async def test_root_html_sets_no_cache():
-    resp = await get(key=server.GHOST_API_KEY)
+    resp = await get(_fake_request(), key=server.GHOST_API_KEY)
     assert resp.status_code == 200
     cc = resp.headers.get("cache-control", "")
     assert "no-cache" in cc
@@ -53,7 +69,7 @@ async def test_root_html_sets_no_cache():
 async def test_root_html_injects_key_and_serves_fresh_from_disk():
     """Body is read from disk per request (no restart needed) and carries
     the injected key global the front-end reads."""
-    resp = await get(key=server.GHOST_API_KEY)
+    resp = await get(_fake_request(), key=server.GHOST_API_KEY)
     body = resp.body.decode("utf-8")
     assert "window.GHOST_API_KEY=" in body
     # Served body reflects the current on-disk index.html (proves the
@@ -65,5 +81,5 @@ async def test_root_html_injects_key_and_serves_fresh_from_disk():
 
 @pytest.mark.asyncio
 async def test_root_unauthorized_without_key():
-    resp = await get(key=None)
+    resp = await get(_fake_request(), key=None)
     assert resp.status_code == 401

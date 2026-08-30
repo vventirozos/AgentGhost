@@ -174,7 +174,17 @@ class TestSourcePins:
 
     def test_competence_detector_uses_nonzero_exit_regex(self):
         # Carried finding #1: any non-zero exit code is a failure.
-        assert "int(_mc_exit.group(1)) != 0" in self.src
+        # ⚠ Was the literal inlined expression. The competence detector
+        # reads `ToolOutcome.shell_failed` now — one reading of "did the
+        # shell command fail", shared with the pre-flight and exit-code
+        # branches, which each had their own. Assert the property.
+        assert "_outcome.shell_failed" in self.src, (
+            "the competence detector stopped treating a non-zero exit as a "
+            "failure, so a crashing command teaches the profile it worked"
+        )
+        from ghost_agent.tools.outcome import ToolOutcome
+        assert ToolOutcome.ok("EXIT CODE: 127").shell_failed is True
+        assert ToolOutcome.ok("EXIT CODE: 0").shell_failed is False
         # The old 1/2-only substring predicate must be gone everywhere.
         assert '"EXIT CODE: 1" in str_res' not in self.src
         assert '"EXIT CODE: 2" in str_res' not in self.src

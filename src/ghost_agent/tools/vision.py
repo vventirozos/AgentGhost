@@ -393,12 +393,13 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         # NOTICE the emptiness itself before retrying (57s lost). Name the
         # failure so the retry decision has signal.
         if not analysis.strip():
-            return (
+            from .outcome import ToolOutcome
+            return ToolOutcome.failed(
                 "Vision API Error: the vision node returned an EMPTY result "
                 "(node contention or truncation — the image itself was "
                 "readable). Retry the same call once; if it stays empty, "
-                "the node is unhealthy."
-            )
+                "the node is unhealthy.",
+                world_changed=False, reason_code="vision_empty_result")
         # Truncation must never be silent (same policy as file listings): a
         # 50-page PDF analysed as if complete misleads every downstream step.
         page_note = ""
@@ -431,4 +432,11 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
 
     except Exception as e:
         pretty_log("Vision Error", str(e), level="ERROR", icon=Icons.FAIL)
-        return f"Vision API Error: {e}"
+        from .outcome import ToolOutcome
+        # The head is `Vision API Error:`, so `result_is_failure`'s anchored
+        # `Error\b` never matches — 4 live hard failures reached the loop as
+        # clean successes: no strike, no guard record, a competence SUCCESS
+        # and world-changed credit.
+        return ToolOutcome.failed(f"Vision API Error: {e}",
+                                  world_changed=False,
+                                  reason_code="vision_call_failed")

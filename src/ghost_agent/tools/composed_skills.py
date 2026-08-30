@@ -169,6 +169,11 @@ def _step_result_ok(result_str: str) -> bool:
     all-failed run as a success (inflating success_rate and telling the LLM the
     macro worked). Mirror the acquired-skill result gate: inspect the string.
     """
+    # A migrated tool ANSWERS this. ADD-only: `ok` falls through to the
+    # prose rules, so the exit-code banner keeps its authority.
+    _st = getattr(result_str, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) != "ok":
+        return False
     s = str(result_str or "").lstrip()
     if not s:
         return True  # empty output is not an error
@@ -190,9 +195,12 @@ def _step_result_ok(result_str: str) -> bool:
     # success_rate. Prefix-only checks: a SUCCESS message that merely
     # *contains* "SYSTEM INSTRUCTION" mid-text (e.g. a partial aider-block
     # report) still counts as ok.
+    # `CRITICAL ERROR:` is search.py's hard-failure head (3 producers). It
+    # was added to `_FAILURE_PREFIX_RE` and to none of the other prefix
+    # banks, so a `deep_research` that never ran scored a step SUCCESS here.
     return not s.startswith(
-        ("[error]", "Error", "ERROR", "SYSTEM ERROR", "Traceback",
-         "SYSTEM INSTRUCTION", "REJECTED")
+        ("[error]", "Error", "ERROR", "SYSTEM ERROR", "CRITICAL ERROR",
+         "Traceback", "SYSTEM INSTRUCTION", "REJECTED")
     )
 
 
@@ -1179,8 +1187,14 @@ class ComposedSkillRegistry:
             try:
                 result = await executor(step.tool_name, resolved_args)
                 result_str = str(result)
-                # Classify from the RESULT (tools return error strings, not raises).
-                step_ok = _step_result_ok(result_str)
+                # Classify from the RESULT (tools return error strings, not
+                # raises). Pass the OBJECT, not `result_str`: stringifying it
+                # one line earlier discarded the status and made
+                # `_step_result_ok`'s status arm unreachable from here —
+                # browser FAILED, memory PARTIAL, swarm UNRESOLVED and
+                # file_system PARTIAL all counted as successful steps and
+                # inflated the macro success_rate the model is shown.
+                step_ok = _step_result_ok(result)
                 # Bind BEFORE the failure branch so an `optional` step that
                 # failed still exposes its (error) output to later steps that
                 # deliberately reference it — and a downstream step gets ""
@@ -1302,7 +1316,9 @@ class ComposedSkillRegistry:
                 "step": step.description,
                 "tool": step.tool_name,
                 "result": _cap_step_result(result_str),
-                "success": _step_result_ok(result_str),
+                # the OBJECT, not `result_str` — stringifying it discards the
+                # status and makes `_step_result_ok`'s status arm unreachable
+                "success": _step_result_ok(result),
                 "optional": step.optional,
             }
         except Exception as exc:

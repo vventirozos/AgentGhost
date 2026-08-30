@@ -117,7 +117,7 @@ async def tool_self_state(
 
     Never raises — a self-state failure must not break a user turn.
     """
-    action = (action or "").strip().lower()
+    action = str(action or "").strip().lower()
     if action not in _VALID_ACTIONS:
         return (
             "SYSTEM ERROR: 'action' is mandatory and must be one of "

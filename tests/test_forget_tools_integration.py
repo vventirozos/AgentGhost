@@ -16,7 +16,16 @@ def mock_memory_system():
         'documents': [['Target document', 'Irrelevant document']],
         'metadatas': [[{'type': 'auto'}, {'type': 'auto'}]]
     }
-    mem_sys.get_library.return_value = ["test_file.txt", "target_doc.pdf"]
+    # ⚠ `target.pdf` ADDED 2026-08-28. The library was
+    # ["test_file.txt", "target_doc.pdf"] and forget("target") deleted
+    # `target_doc.pdf` on a SUBSTRING match — the same over-deletion the disk
+    # sweep stopped doing, and the reason `forget('pdf')` destroyed the
+    # PostgreSQL manual. Documents now go on an exact name or stem match and
+    # are otherwise reported. `target.pdf` is that exact-stem match, so the
+    # "vector swept" assertion below still checks what it was written to
+    # check; `target_doc.pdf` stays to prove the partial match is kept.
+    mem_sys.get_library.return_value = [
+        "test_file.txt", "target.pdf", "target_doc.pdf"]
     return mem_sys
 
 @pytest.fixture
@@ -43,7 +52,20 @@ async def test_tool_unified_forget_integration(tmp_path, mock_memory_system, moc
     """Test that all Memory subsystems (Vector, Profile, Disk, Graph) are targeted securely by unified_forget."""
     
     # 1. Setup mock disk
-    (tmp_path / "target_file.txt").write_text("dummy")
+    #
+    # ⚠ FIXTURE CHANGED 2026-08-28, deliberately. This was
+    # `target_file.txt`, which forget('target') reached through the
+    # SUBSTRING tier — and that tier no longer deletes: measured,
+    # forget('atlas') unlinked `atlas_migration_plan.py`,
+    # `notes_about_atlas.md` and `sub/deep_atlas_notes.txt`, none of which
+    # the caller named. Substring hits are reported now, not removed.
+    #
+    # This test's subject is "all four stores are swept", not "partial name
+    # matches are deleted", so the file is named to match exactly and the
+    # assertion below still checks what it was written to check. The new
+    # contract has its own coverage in
+    # tests/test_forget_disk_sweep_scope.py.
+    (tmp_path / "target.txt").write_text("dummy")
     
     # Needs a patch for asyncio.to_thread to execute synchronously for AsyncMock testing
     with patch("ghost_agent.tools.memory.asyncio.to_thread") as mock_to_thread:
@@ -64,10 +86,13 @@ async def test_tool_unified_forget_integration(tmp_path, mock_memory_system, moc
         
         # Verify 1: Disk swept
         assert "Disk: Deleted" in report
-        assert not (tmp_path / "target_file.txt").exists()
+        assert not (tmp_path / "target.txt").exists()
         
         # Verify 2: Vector swept
         assert mock_memory_system.delete_document_by_name.call_count == 1
+        assert mock_memory_system.delete_document_by_name.call_args[0][0] == "target.pdf"
+        assert "Vector: kept 1 ingested document(s)" in report
+        assert "target_doc.pdf" in report
         assert mock_memory_system.collection.delete.call_count == 1 # Found semantic chunk
         # The fixture doc literally contains "target", so it now trips the
         # literal-mention override (more accurate than the old distance-only

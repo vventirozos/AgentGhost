@@ -137,6 +137,170 @@ _SQL_UNGUARDED_UPDATE = re.compile(
 _SQL_DROP = re.compile(r"\bdrop\s+(?:table|schema|database|view|index)\b",
                        re.IGNORECASE)
 _SQL_TRUNCATE = re.compile(r"\btruncate\b", re.IGNORECASE)
+
+# Postgres built-ins that reach outside the database: server-side file I/O,
+# large-object import/export, and `COPY … TO/FROM PROGRAM` (command
+# execution). Matched on the MASKED statement, so a table or column merely
+# NAMED like one of these inside a string literal cannot trip it.
+#
+# `copy` is matched only in its dangerous forms — `COPY … TO/FROM PROGRAM`
+# and `COPY … FROM '/path'` — so ordinary `COPY t FROM STDIN` (the bulk-load
+# path a normal task uses) still validates.
+_SQL_FS_PRIMITIVE = re.compile(
+    r"\b(?:"
+    r"pg_read_file|pg_read_binary_file|pg_stat_file|pg_ls_dir|"
+    r"pg_ls_logdir|pg_ls_waldir|pg_ls_archive_statusdir|pg_ls_tmpdir|"
+    r"pg_ls_logicalsnapdir|pg_ls_logicalmapdir|pg_ls_replslotdir|"
+    r"pg_ls_summariesdir|"
+    r"lo_import|lo_export"
+    r")\b",
+    re.IGNORECASE)
+
+# Postgres features that grant code execution or host I/O outright. These
+# are not "dangerous if misused" — each is a complete escape on its own, and
+# none has a legitimate use from an agent tool:
+#
+#   * an UNTRUSTED procedural language (the `u` suffix) runs arbitrary code
+#     as the server's OS user. `CREATE EXTENSION plperlu` plus a one-line
+#     function is host RCE — and on this box `ghost` is a SUPERUSER with
+#     `trust` on loopback, so nothing else is in the way;
+#   * `ALTER SYSTEM` writes postgresql.auto.conf, and
+#     `session_preload_libraries` then loads an attacker .so on the next
+#     connection;
+#   * `dblink` / the FDWs open outbound connections FROM the database —
+#     egress the process-wide socket guard cannot see, because libpq
+#     bypasses it;
+#   * `pg_file_write` / `pg_file_unlink` / `pg_logdir_ls` (adminpack) are
+#     host filesystem writes.
+#
+# `CREATE EXTENSION` is refused wholesale rather than allow-listed: whether
+# an extension is trusted is a property of the installed catalogue, not of
+# the statement text, so it cannot be decided here. An operator installs
+# extensions by hand.
+_SQL_SERVER_ESCAPE = re.compile(
+    # Extensions and untrusted procedural languages. `["\s]*` after LANGUAGE
+    # because Postgres accepts the quoted identifier `LANGUAGE "plperlu"`,
+    # which the unquoted pattern could not see.
+    r"\bcreate\s+(?:or\s+replace\s+)?(?:trusted\s+)?extension\b"
+    r"|\blanguage\s+[\"\s]*(?:pl)?(?:perl|python|tcl|r|java|sh|v8)\w*u\b"
+    # ⚠ `LANGUAGE C` / `LANGUAGE internal` — the reason a NAME deny-list
+    # cannot work on its own. `CREATE FUNCTION f(...) AS 'evil.so','f'
+    # LANGUAGE C` loads an arbitrary shared object, and
+    # `... AS 'pg_read_file_off_len' LANGUAGE internal` RENAMES the exact
+    # primitive `_SQL_FS_PRIMITIVE` blocks — after which `SELECT myread(...)`
+    # scans clean. Any deny-list of names is one `CREATE FUNCTION` away from
+    # irrelevant, so the renaming mechanism itself is refused.
+    r"|\blanguage\s+[\"\s]*(?:c|internal)\b"
+    # `LOAD '/tmp/evil.so'` is a one-statement shared-object load. Matched
+    # as a leading STATEMENT keyword: `_mask_sql` has already blanked the
+    # path literal by the time this runs, so there is no quote left to
+    # anchor on, and a bare `\bload\b` would refuse a column named `load`.
+    r"|\A\s*load\b|;\s*load\b"
+    # ALTER SYSTEM writes postgresql.auto.conf; ALTER ROLE/DATABASE ... SET
+    # reaches the SAME GUCs (session_preload_libraries) per-role.
+    r"|\balter\s+system\b"
+    # ⚠ NARROWED to the GUCs that load code. The first version matched any
+    # `ALTER ROLE|DATABASE … SET`, which refused every routine migration:
+    # `ALTER ROLE app SET search_path = …`, `SET statement_timeout = …`,
+    # `ALTER DATABASE db SET timezone = …`. Standard DDL, killed with a
+    # security banner that `confirm=true` could not open.
+    r"|\balter\s+(?:role|user|database)\b[^;]*\bset\b[^;]*"
+    r"(?:preload_libraries|dynamic_library_path)\b"
+    # Privilege escalation.
+    r"|\b(?:alter|create)\s+(?:role|user)\b[^;]*\bsuperuser\b"
+    # The predefined roles are durable capability grants that never say
+    # "superuser": `pg_execute_server_program` is command execution,
+    # `pg_read_server_files` / `pg_write_server_files` are host file I/O.
+    r"|\bpg_(?:execute_server_program|read_server_files|write_server_files)\b"
+    # Outbound connections FROM the database — egress the process-wide
+    # socket guard cannot see, because libpq bypasses it. Matched as a
+    # function CALL, so a table named `dblink_cache` is not an escape.
+    r"|\bdblink(?:_connect|_connect_u|_exec|_open|_fetch|_close|"
+    r"_send_query|_get_result|_cancel_query)?\s*\("
+    r"|\b(?:postgres_fdw|file_fdw)\b"
+    # ⚠ SHAPES, NOT NAMES. The docstring above names this class — outbound
+    # connections the socket guard cannot see because libpq bypasses it —
+    # and the first version blocked `dblink(` plus two wrapper NAMES while
+    # leaving the statements that do it open. `CREATE SUBSCRIPTION` is the
+    # cleanest: one superuser statement that dials an attacker host at
+    # execution time. `dblink_fdw` slipped the function-call anchor, and
+    # `CREATE FOREIGN TABLE … OPTIONS (program …)` is host RCE.
+    r"|\b(?:create|alter)\s+subscription\b"
+    r"|\b(?:create|alter|drop)\s+server\b"
+    # ALTER/DROP too: the twins that REPOINT an existing foreign
+    # server at an attacker host, or swap its credentials.
+    r"|\b(?:create|alter|drop)\s+user\s+mapping\b"
+    r"|\bimport\s+foreign\s+schema\b"
+    r"|\bforeign\s+data\s+wrapper\b"
+    r"|\b(?:create|alter)\s+foreign\s+table\b"
+    # adminpack host filesystem writes.
+    r"|\bpg_file_write\b|\bpg_file_unlink\b|\bpg_file_rename\b"
+    r"|\bpg_logdir_ls\b|\bpg_reload_conf\b",
+    re.IGNORECASE)
+
+# Dynamic SQL inside a function body defeats every static scan:
+#   DO $$ BEGIN EXECUTE 'pg_read' || '_file(''/etc/passwd'')'; END $$
+# The string is assembled at run time, so no pattern above can see it. A
+# deny-list cannot win that argument; the construction is refused instead.
+_SQL_DYNAMIC_IN_BODY = re.compile(r"\bexecute\s+(?!immediate\b)", re.IGNORECASE)
+
+# ⚠ ANCHORED. Matching `\bcopy\b` anywhere refused
+# `CREATE TABLE audit (id serial, copy text)` and
+# `SELECT copy FROM ledger` — a column legitimately named `copy`. COPY is a
+# STATEMENT, so it can only lead one.
+_SQL_COPY = re.compile(r"\A\s*copy\b", re.IGNORECASE)
+_SQL_COPY_PROGRAM = re.compile(r"\bprogram\b", re.IGNORECASE)
+# `COPY … TO PROGRAM` / `… FROM PROGRAM`, wherever it appears.
+_SQL_COPY_PROGRAM_FORM = re.compile(
+    # `COPY` must START a statement or a plpgsql body clause — otherwise
+    # `SELECT copy FROM program` matched, which is the same false positive
+    # the `\A\s*copy` anchor was added to fix, one rule over.
+    r"(?:\A|;|\$\$|\$[A-Za-z_]\w*\$|\bbegin\b|\bthen\b|\bloop\b|\belse\b)\s*"
+    r"copy\b[^;]*?\b(?:to|from)\s+program\b",
+    re.IGNORECASE | re.DOTALL)
+# The only two endpoints of COPY that stay inside the client connection.
+_SQL_COPY_SAFE_ENDPOINT = re.compile(r"\b(?:stdin|stdout)\b", re.IGNORECASE)
+
+
+def _copy_reaches_the_host(masked: str) -> bool:
+    """True when a COPY statement's endpoint is a host file or a command.
+
+    ⚠ AN ALLOW-LIST, NOT A DENY-LIST, and it has to be. `_mask_sql` blanks
+    string literals before any guard runs, so `COPY t FROM '/etc/passwd'`
+    arrives here as `COPY t FROM` plus spaces — there is no path left to
+    pattern-match against, and the first attempt at this rule (matching
+    `from\s+'`) passed it clean. What survives masking is the SAFE spelling:
+    `STDIN` / `STDOUT` are bare keywords. So a COPY is refused unless it
+    names one of those, which also catches every file path without needing
+    to see it.
+
+    Checked at statement level rather than on the `TO`/`FROM` keyword,
+    because `COPY (SELECT x FROM t) TO STDOUT` has an inner FROM that a
+    keyword-anchored rule reads as the endpoint.
+    """
+    # ⚠ TWO RULES, because the two dangerous forms need different anchors.
+    #
+    # `COPY … TO/FROM PROGRAM` is unambiguous ANYWHERE: no column named
+    # `copy` is ever followed by `TO PROGRAM`. It must not be anchored to a
+    # statement head, because anchoring it is exactly what re-opened
+    # `DO $$ COPY t TO PROGRAM 'id'; $$` when the head-anchor was added to
+    # fix the `SELECT copy FROM ledger` false positive.
+    if _SQL_COPY_PROGRAM_FORM.search(masked):
+        return True
+    # The file form (`COPY t FROM '/etc/passwd'`) survives masking as
+    # `COPY t FROM` plus spaces — indistinguishable from `SELECT copy FROM
+    # t` unless COPY leads the statement, which as a STATEMENT it always
+    # does. (Inside a plpgsql body a bare COPY is not valid anyway; it would
+    # have to go through EXECUTE, which is refused as dynamic SQL.)
+    if not any(_SQL_COPY.match(part.strip())
+               for part in masked.split(";")):
+        return False
+    # (A `\bprogram\b` search anywhere in a COPY statement used to live
+    # here. It was redundant — `_SQL_COPY_PROGRAM_FORM` and the
+    # STDIN/STDOUT allow-list cover every real form — and it refused
+    # `COPY courses (id, program) FROM STDIN`, a column legitimately named
+    # `program`. Mutation-tested: neutering it changed no test result.)
+    return not _SQL_COPY_SAFE_ENDPOINT.search(masked)
 # Lightweight statement-shape checks — catch unbalanced quotes/parens.
 _SQL_SINGLE_QUOTE = "'"
 _SQL_INNER_PARENS = re.compile(r"\([^()]*\)")
@@ -155,7 +319,7 @@ def _strip_sql_parens(s: str) -> str:
     return s
 
 
-def _mask_sql(s: str) -> Tuple[str, dict]:
+def _mask_sql(s: str, *, keep_dollar: bool = False) -> Tuple[str, dict]:
     """Blank out everything that is DATA rather than statement structure —
     single-quoted literals, ``--`` line comments, ``/* */`` block comments
     (PostgreSQL nests them) and dollar-quoted bodies — replacing each with
@@ -164,6 +328,16 @@ def _mask_sql(s: str) -> Tuple[str, dict]:
     Returns ``(masked, flags)``. Structural checks (paren balance, statement
     splitting, destructive-verb detection) run on the MASKED text so neither
     a keyword inside a string nor a semicolon inside a comment can fool them.
+
+    ``keep_dollar=True`` leaves dollar-quoted bodies VERBATIM while still
+    masking literals and comments. A dollar body is executable CODE, not
+    data, so blanking it hides exactly what the host-primitive guards need
+    to see: ``DO $$ BEGIN PERFORM pg_read_file('/etc/passwd'); END $$``
+    masks down to ``DO`` plus whitespace and validated clean under
+    ``confirm=true``. Scanning the RAW statement instead would over-refuse
+    on any literal containing a keyword (``'create extension is just
+    text'``), so the guards get this middle form: literals masked, code
+    visible. §4DX round 2.
     """
     out = []
     flags = {"unterminated_quote": False, "unterminated_comment": False,
@@ -218,11 +392,32 @@ def _mask_sql(s: str) -> Tuple[str, dict]:
                 flags["has_dollar_body"] = True
                 if end < 0:
                     flags["unterminated_dollar"] = True
-                    out.append(" " * (n - i))
+                    out.append(s[i:n] if keep_dollar else " " * (n - i))
                     i = n
                     continue
                 j = end + len(tag)
-                out.append(" " * (j - i))
+                if keep_dollar:
+                    # ⚠ MASK THE BODY'S OWN LITERALS AND COMMENTS.
+                    #
+                    # Copying the body verbatim made the probe commit the
+                    # very sin `keep_dollar` exists to avoid, one nesting
+                    # level down: a plpgsql function whose body merely
+                    # MENTIONS `copy`, `create extension`, `dblink` or a
+                    # `pg_*` name in a comment or a RAISE NOTICE string was
+                    # refused unconditionally, and `confirm=true` could not
+                    # open it. The top-level pin missed it because the
+                    # top-level literal is still masked correctly.
+                    #
+                    # Recursing keeps the body's CODE visible (so a real
+                    # `pg_read_file` call inside a DO block is still seen)
+                    # while blanking its data. `_mask_sql` preserves
+                    # character offsets, so the recursion cannot shift them.
+                    _body = s[m.end():end]
+                    out.append(tag)
+                    out.append(_mask_sql(_body, keep_dollar=True)[0])
+                    out.append(tag)
+                else:
+                    out.append(" " * (j - i))
                 i = j
                 continue
         out.append(c)
@@ -342,6 +537,68 @@ def validate_sql(stmt: str, confirm: bool = False) -> Tuple[bool, str]:
             return False, "DROP statement requires confirm=true"
         if _SQL_TRUNCATE.search(masked):
             return False, "TRUNCATE statement requires confirm=true"
+
+    # ⚠ SANDBOX ESCAPE — NEVER GATED BY `confirm`.
+    #
+    # `postgres_admin` runs IN THE AGENT PROCESS, on the host, outside the
+    # Docker sandbox and outside every `_get_safe_path` root. The `ghost`
+    # role is a Postgres SUPERUSER and `pg_hba.conf` grants `trust` on
+    # loopback TCP, so these built-ins are the whole filesystem and a shell:
+    #
+    #   SELECT pg_read_file('~/Data/AI/.ghost_api_key')  -> the 0600 master key
+    #   COPY (SELECT 1) TO PROGRAM 'sh -c ...'           -> host RCE as the user
+    #
+    # Both were demonstrated end-to-end through the real tool on 2026-08-29.
+    # Every one of these validated CLEAN before this block existed: the guard
+    # above stops `DROP TABLE` — the clumsy destructive thing — and passed
+    # the complete escape.
+    #
+    # Unlike DROP/TRUNCATE this is NOT a confirmable operation. `confirm` is
+    # the model's own flag; it exists so a deliberate destructive DDL can
+    # proceed, not so file reads and command execution can be opted into. A
+    # legitimate schema task never needs any of these.
+    #
+    # ⚠ THIS IS THE SECOND LAYER, NOT THE FIX. It closes the agent's own tool
+    # path. It does NOT stop a compromised sandbox container connecting
+    # straight to `host.docker.internal:5432`, which `trust` + superuser
+    # accepts with no validator in the way. That needs the role dropped from
+    # superuser and `trust` replaced with `scram-sha-256` — host config, and
+    # the operator's call.
+    # ⚠ SCANNED ON THE DOLLAR-VISIBLE PROBE TOO. See `_mask_sql`'s
+    # `keep_dollar`: a DO block or function body is executable code the
+    # normal mask blanks, so a host primitive hidden inside one validated
+    # clean whenever the model set `confirm=true` — a flag the MODEL sets.
+    _probe, _ = _mask_sql(s, keep_dollar=True)
+    _m = _SQL_FS_PRIMITIVE.search(masked) or _SQL_FS_PRIMITIVE.search(_probe)
+    if _m:
+        return False, (
+            f"'{_m.group(0)}' reads or writes the HOST filesystem through the "
+            "database server, outside every sandbox. Refused unconditionally "
+            "(confirm=true does not enable it)."
+        )
+    if _copy_reaches_the_host(masked) or _copy_reaches_the_host(_probe):
+        return False, (
+            "COPY to/from a host FILE or PROGRAM runs outside every sandbox. "
+            "Only COPY ... FROM STDIN / TO STDOUT is allowed. Refused "
+            "unconditionally (confirm=true does not enable it)."
+        )
+    if flags["has_dollar_body"] and _SQL_DYNAMIC_IN_BODY.search(_probe):
+        return False, (
+            "dynamic SQL (EXECUTE) inside a function or DO body cannot be "
+            "checked statically — the statement is assembled at run time, so "
+            "`EXECUTE 'pg_read' || '_file(...)'` defeats every guard here. "
+            "Refused unconditionally. Write the statement literally instead."
+        )
+    _esc = (_SQL_SERVER_ESCAPE.search(masked)
+            or _SQL_SERVER_ESCAPE.search(_probe))
+    if _esc:
+        return False, (
+            f"'{_esc.group(0)}' grants code execution or host I/O through the "
+            "database server (untrusted procedural language, ALTER SYSTEM, "
+            "dblink/FDW outbound connection, or adminpack file write). "
+            "Refused unconditionally — confirm=true does not enable it. Ask "
+            "the operator if an extension is genuinely needed."
+        )
 
     return True, ""
 

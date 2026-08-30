@@ -11,6 +11,7 @@ Fix: tool runners for autoadvance are built from ``pinned_project_context``
 — a proxy that pins ``current_project_id`` to the target project while
 delegating everything else (reads AND writes) to the real context.
 """
+import ast
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,15 +76,56 @@ class TestCallersArePinned:
     """Pin the wiring by source inspection: both autoadvance tool-runner
     construction sites must build tools from the pinned context."""
 
+    # ⚠ Both of these were SUBSTRING pins and both were proven vacuous.
+    #
+    #  * the interactive one asserted `"pinned_project_context(context,
+    #    project_id)" in src` over the whole module — satisfied by
+    #    `_pinned = pinned_project_context(context, project_id)` followed by
+    #    `get_available_tools(context)`. The literal survives; the value
+    #    never reaches the consumer. It passed 1,515 tests.
+    #  * the idle one sliced a 1,400-char window and asserted
+    #    `"get_available_tools(_pin_ctx(ctx, pid))" in window` — and
+    #    `inspect.getsource` returns COMMENTS, so commenting the call out and
+    #    writing `get_available_tools(ctx)` beneath it satisfied both
+    #    assertions. Also 1,515 tests.
+    #
+    # Parse the call instead. A comment is not in the AST, and an unused
+    # assignment is not the call's argument.
+    @staticmethod
+    def _pinned_arg(mod, fn_name=None):
+        """The argument `get_available_tools` is actually called with."""
+        tree = ast.parse(inspect.getsource(mod))
+        scope = tree
+        if fn_name:
+            scope = next((n for n in ast.walk(tree)
+                          if isinstance(n, (ast.FunctionDef,
+                                            ast.AsyncFunctionDef))
+                          and n.name == fn_name), None)
+            assert scope is not None, f"{fn_name} moved"
+        calls = [n for n in ast.walk(scope)
+                 if isinstance(n, ast.Call)
+                 and ast.unparse(n.func).endswith("get_available_tools")]
+        assert calls, f"no get_available_tools call in {fn_name or mod}"
+        return [ast.unparse(c.args[0]) if c.args else "" for c in calls]
+
     def test_idle_tick_pins_target_project(self):
         import ghost_agent.core.agent as agent_mod
-        src = inspect.getsource(agent_mod)
-        idx = src.index("_aa_tool_runner")
-        window = src[idx - 500:idx + 900]
-        assert "pinned_project_context" in window or "_pin_ctx" in window
-        assert "get_available_tools(_pin_ctx(ctx, pid))" in window
+
+        args = self._pinned_arg(agent_mod, "_aa_tool_runner")
+        assert args, "the idle tick's tool runner moved"
+        for a in args:
+            assert "_pin_ctx" in a or "pinned_project_context" in a, (
+                "the idle autoadvancer builds its tool map from an UNPINNED "
+                f"context ({a!r}) — idle ticks carry no conversation, so the "
+                "process-global project id is parked at None and every file "
+                "write lands at the sandbox ROOT")
 
     def test_interactive_autoadvance_pins_target_project(self):
         import ghost_agent.tools.projects as projects_mod
-        src = inspect.getsource(projects_mod)
-        assert "pinned_project_context(context, project_id)" in src
+
+        args = self._pinned_arg(projects_mod)
+        assert any("pinned_project_context" in a for a in args), (
+            "the interactive autoadvance batch builds its tool map from an "
+            f"unpinned context ({args!r}) — a concurrent conversation's "
+            "reconcile can point the process-global id at a DIFFERENT "
+            "project, and the batch then writes into its workspace")

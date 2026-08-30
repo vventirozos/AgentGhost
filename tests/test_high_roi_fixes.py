@@ -38,14 +38,19 @@ def test_api_app_cors_credentials_disabled():
 
 
 def test_interface_server_cors_credentials_disabled():
+    # ⚠ This used to slice `src.split("CORSMiddleware")[1].split(")")[0]`.
+    # The FIRST occurrence of `CORSMiddleware` is the import, so the window
+    # was ~6 lines of imports and never reached the real config hundreds of
+    # lines below: adding a second `add_middleware(CORSMiddleware,
+    # allow_origins=["*"], allow_credentials=True, …)` passed. Its twin
+    # above, in the same file and with the same intent, was written
+    # correctly — strip comments and scan the whole file.
     src = Path("interface/server.py").read_text()
-    # The CORS middleware must use credentials=False alongside the wildcard.
-    assert "allow_credentials=False" in src
-    # The only `allow_credentials=True` allowed in the file would be in a
-    # comment talking about why we don't use it — assert there's no actual
-    # middleware config still using it.
-    middleware_block = src.split("CORSMiddleware")[1].split(")")[0] if "CORSMiddleware" in src else ""
-    assert "allow_credentials=True" not in middleware_block
+    code_only = "\n".join(
+        line for line in src.splitlines() if not line.strip().startswith("#")
+    )
+    assert "allow_credentials=False" in code_only
+    assert "allow_credentials=True" not in code_only
 
 
 # =====================================================================

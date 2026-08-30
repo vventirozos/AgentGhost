@@ -504,6 +504,9 @@ ESCALATION_OVERTURN_MEASURED = "42 of 50 (84%) on the recorded corpus"
 # evidence` emits `"\n\n".join(f"[{tool_name}] {content}")`, so this
 # recovers the per-tool-output boundaries.
 _EVIDENCE_SEGMENT_RE = re.compile(r"(?:\A|\n\n)(\[[^\]\n]{1,80}\] )")
+#: The `[tool] ` label a segment leads with, so an ANCHORED predicate can see
+#: the body underneath it.
+_EVIDENCE_LABEL_RE = re.compile(r"\A\[[^\]\n]{1,80}\]\s*")
 
 
 def _evidence_segments(evidence: str) -> List[str]:
@@ -538,6 +541,14 @@ def derive_high_stakes(evidence: str) -> bool:
     mined pool is a biased subset of that (production-REFUTED turns are
     excluded by construction), so the two rates are not expected to match
     and neither validates the other.
+
+    ⚠ SECOND HONEST BOUND: production's predicate is now STATUS-aware
+    (`_turn_had_tool_failure` reads `ToolOutcome.status` before sniffing),
+    and a packed digest carries no status — only text. Without the rejection
+    vocabulary below, 61 of the corpus's 82 refusals and 15 turns (7.7% of
+    the 195 production high-stakes turns) were invisible to the instrument
+    that calibrates the CONFIRM escalation. The shared rejection predicate
+    recovers what a string can still express.
     """
     try:
         from ..distill.outcome_heuristics import looks_like_tool_error
@@ -545,7 +556,19 @@ def derive_high_stakes(evidence: str) -> bool:
         logger.debug("verify_bench: outcome_heuristics unavailable; "
                      "high_stakes derivation off")
         return False
-    return any(looks_like_tool_error(seg)
+    try:
+        from ..tools.tool_failure import result_is_rejection
+    except Exception:  # noqa: BLE001
+        def result_is_rejection(_s):  # pragma: no cover - import guard
+            return False
+    # `result_is_rejection` is ANCHORED (a refusal head must lead), while a
+    # segment leads with its `[tool] ` label — so the label has to come off
+    # first. `looks_like_tool_error` is unaffected: it substring-scans the
+    # first 120 chars.
+    def _body(seg: str) -> str:
+        return _EVIDENCE_LABEL_RE.sub("", seg, count=1).lstrip()
+
+    return any(looks_like_tool_error(seg) or result_is_rejection(_body(seg))
                for seg in _evidence_segments(evidence or ""))
 
 # Literal segments of the live claim template, split around its

@@ -643,7 +643,7 @@ def _reformulate_query(query: str) -> List[str]:
     # of the session was an 11-word query whose reformulations both kept
     # every rare term). Hard-trim the broadened form to its first 5 words
     # instead; the question form only helps short queries.
-    words = query.strip().split()
+    words = str(query).strip().split()
     if len(words) > 6:
         trimmed = " ".join((broader or query).split()[:5])
         if trimmed and len(trimmed) > 5 and trimmed not in reformulations:
@@ -657,7 +657,7 @@ def _reformulate_query(query: str) -> List[str]:
         # labeled "[Reformulated]" burned a full wave on a lie (found
         # 2026-07-15) — fall through to the tutorial/guide fallback instead.
         simplified = " ".join(words[:5])
-        if simplified != query.strip():
+        if simplified != str(query).strip():
             reformulations.append(simplified)
 
     # Ensure we have exactly 2 reformulations
@@ -1336,13 +1336,22 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
     except Exception as exc:
         # The research itself succeeded — hand the evidence back instead of
         # dropping the whole result on a verify-call hiccup.
-        return (f"FACT CHECK PARTIAL: the verification call failed ({exc}); "
-                f"judge the claim from the raw research results below.\n"
-                f"[RESEARCH RESULTS]:\n{dr_result}")
+        # The research landed, the verification did not. `FACT CHECK
+        # PARTIAL:` is not a head any predicate in this tree recognises —
+        # `result_is_failure`, `result_is_rejection` and `coerce` all said
+        # OK — so a half-answer was booked as a clean success. The status
+        # says what the prose could not.
+        from .outcome import ToolOutcome
+        return ToolOutcome.partial(
+            f"FACT CHECK PARTIAL: the verification call failed ({exc}); "
+            f"judge the claim from the raw research results below.\n"
+            f"[RESEARCH RESULTS]:\n{dr_result}",
+            world_changed=False, reason_code="factcheck_verify_call_failed")
     if not verdict:
-        return (f"FACT CHECK PARTIAL: the verifier returned no text; judge the "
-                f"claim from the raw research results below.\n"
-                f"[RESEARCH RESULTS]:\n{dr_result}")
+        from .outcome import ToolOutcome
+        return ToolOutcome.partial(
+            f"FACT CHECK PARTIAL: the verifier returned no text; judge the "
+            f"claim from the raw research results below.\n"
+            f"[RESEARCH RESULTS]:\n{dr_result}",
+            world_changed=False, reason_code="factcheck_verifier_empty")
     return f"FACT CHECK COMPLETE:\n{verdict}"
-
-    return "SYSTEM ERROR: You failed to use the required `deep_research` tool. You must retry your action AND USE THE TOOL to fact check this claim."

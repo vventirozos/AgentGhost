@@ -151,6 +151,39 @@ class TestAgentWiringPins:
     def test_finalize_fallback_consumes_stash_not_hardcoded_neutral(self):
         assert "normalised_entropy=_norm_e" in SRC
         assert "normalised_entropy=0.5" not in SRC
+        # ⚠ The line above forbids a SPELLING. Assert the VALUE: whatever
+        # `_norm_e` is bound from must be able to be None (NOT OBSERVED,
+        # excluded from the fit) and must never be a constant. Injecting
+        # `_norm_e = float(1) / 2` passed the literal check and re-created
+        # the defect this file exists for — 1179 of 1180 samples pinned at
+        # neutral, recorded as real measurements.
+        import ast as _ast
+        _binds = [_ast.unparse(n.value) for n in _ast.walk(_ast.parse(SRC))
+                  if isinstance(n, _ast.Assign) and len(n.targets) == 1
+                  and getattr(n.targets[0], "id", None) == "_norm_e"]
+        assert _binds, "the entropy stash binding moved"
+        # `None` is CORRECT — it means NOT OBSERVED and is excluded from the
+        # fit. What must never appear is a numeric constant, however spelled:
+        # `0.5`, `float(1) / 2`, `1 / 2`. At least one binding must be a real
+        # observation.
+        _observed = []
+        for b in _binds:
+            _tree = _ast.parse(b, mode="eval").body
+            if isinstance(_tree, _ast.Constant) and _tree.value is None:
+                continue
+            try:
+                _val = eval(compile(_ast.Expression(_tree), "<x>", "eval"), {})
+            except Exception:
+                _val = None
+                _observed.append(b)
+            else:
+                raise AssertionError(
+                    f"the normalised entropy is a CONSTANT ({_val!r}), not an "
+                    f"observation — 0.5 is recorded as a real measurement "
+                    f"while None is excluded from the fit: _norm_e = {b}")
+        assert _observed, (
+            "every `_norm_e` binding is None or constant — nothing observes "
+            "the turn's entropy at all")
 
     def test_stash_is_reset_at_turn_start(self):
         assert "self.context._entropy_norm_pending = None" in SRC

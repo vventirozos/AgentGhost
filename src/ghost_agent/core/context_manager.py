@@ -194,10 +194,8 @@ class ContextManager:
             # L3 + the downstream tail-cap still bound total context).
             if "<tool_call>" in content or "</tool_call>" in content:
                 return msg
-            return {
-                **msg,
-                "content": self._truncate_with_summary(content, max_len=800),
-            }
+            return self._keep_outcome(
+                msg, self._truncate_with_summary(content, max_len=800))
 
         # L3: Compress user messages too (keep first 500 chars)
         if level >= 3 and role == "user" and len(content) > 1000:
@@ -207,6 +205,34 @@ class ContextManager:
             }
 
         return msg
+
+    @staticmethod
+    def _keep_outcome(msg: dict, new_text: str) -> dict:
+        """Rewrite a message's content while KEEPING what the tool said.
+
+        Two defects in one line of `{**msg, "content": <str>}`:
+
+        1. `ToolOutcome` is a `str` subclass, so the rewrite returns a plain
+           `str` and the status is destroyed.
+        2. The keyword line-filter below HOISTS an `[error]`/`exception` line
+           up into the first 120 characters, which is exactly the window the
+           shared failure sniffer reads — so a SUCCESSFUL call acquired an
+           error-looking head it never had.
+
+        Together those flipped **67 corpus labels on 42 turns, 64 of them
+        SUCCESS -> FAILED**, and the compressed list is what
+        `_record_turn_trajectory` writes. `context_compressed` marks the text
+        as no longer being the tool's own output, so the corpus stops
+        re-deriving a label from it.
+        """
+        old = msg.get("content")
+        st = getattr(old, "status", None)
+        if st is None:
+            return {**msg, "content": new_text}
+        from ..tools.outcome import ToolOutcome
+        return {**msg, "content": ToolOutcome(
+            new_text, status=old.status, world_changed=old.world_changed,
+            reason_code="context_compressed", declared=old.declared)}
 
     def _summarize_tool_output(self, msg: dict) -> dict:
         """Compress a tool output message to its essential information."""
@@ -223,7 +249,7 @@ class ContextManager:
         cache_key = f"{tool_name}:{hash(content)}"
         if cache_key in self._summaries_cache:
             self._summaries_cache.move_to_end(cache_key)  # LRU bump
-            return {**msg, "content": self._summaries_cache[cache_key]}
+            return self._keep_outcome(msg, self._summaries_cache[cache_key])
 
         # Heuristic compression: keep first and last lines, error lines
         lines = content.split("\n")
@@ -249,7 +275,7 @@ class ContextManager:
             self._summaries_cache.move_to_end(cache_key)
             while len(self._summaries_cache) > self._summaries_cache_max:
                 self._summaries_cache.popitem(last=False)  # evict oldest
-            return {**msg, "content": summary}
+            return self._keep_outcome(msg, summary)
         return msg
 
     @staticmethod
@@ -285,7 +311,8 @@ class ContextManager:
             # Truncate tool output in emergency
             content = last_tool.get("content", "")
             if isinstance(content, str) and len(content) > 1000:
-                last_tool = {**last_tool, "content": content[:1000] + "\n[EMERGENCY TRUNCATED]"}
+                last_tool = ContextManager._keep_outcome(
+                    last_tool, content[:1000] + "\n[EMERGENCY TRUNCATED]")
             result.append(last_tool)
         return result
 

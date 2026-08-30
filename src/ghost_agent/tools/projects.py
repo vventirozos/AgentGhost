@@ -72,8 +72,17 @@ _ACTIONS = {
 }
 
 
-def _err(msg: str) -> str:
-    return f"ERROR: {msg}"
+def _err(msg: str):
+    """A manage_projects refusal — and it says so.
+
+    Its sibling `_ok` declares; this returned a bare `f"ERROR: {msg}"` that
+    coerced to FAILED, so 15 live argument/lookup refusals (one of which
+    literally reads "NOTHING was deleted") armed the pre-flight guard against
+    a corrected re-issue that keys identically on tool+target+op.
+    """
+    from .outcome import ToolOutcome
+    return ToolOutcome.rejected(f"ERROR: {msg}",
+                                reason_code="manage_projects_refused")
 
 
 # Cap on what the constraint judgment gate reads per task (it is one blocking
@@ -252,13 +261,39 @@ async def _recheck_stale_parse_failure(store, project_id: str, task_id: str,
                   f"stale and has been superseded")
 
 
-def _ok(payload: Any) -> str:
+def _ok(payload: Any) -> "ToolOutcome":
+    """A manage_projects SUCCESS — and it says so.
+
+    The text is unchanged; the status is what is new. These payloads embed
+    the project ledger, and a stored `autoadvance_failed` event quotes the
+    failing tool's `--- EXECUTION RESULT --- EXIT CODE: 1` verbatim. The
+    dispatch loop's banner rule found that quote and booked the READ as a
+    failed shell command: 4 live rows, all successes, reported to the model
+    under the AUTHORITATIVE multi-step banner and recorded as metacog
+    incompetence. Position cannot tell a quoted banner from an envelope
+    (JSON is one line), so the producer says it instead.
+    """
+    from .outcome import ToolOutcome
+    # ⚠ A payload that reports its OWN refusal is not a success. `task_update`
+    # returns `updated: []` with `gated_constraints` when a constraint holds
+    # every task at non-DONE — nothing landed, and a declared ok silences the
+    # sniffer that would otherwise have caught it.
+    if isinstance(payload, dict):
+        _held = payload.get("gated_constraints") or payload.get(
+            "agent_instruction_constraints")
+        _nothing = (payload.get("updated") == []
+                    or payload.get("count") == 0)
+        if _held and _nothing:
+            import json as _j
+            return ToolOutcome.rejected(
+                _j.dumps(payload, default=str),
+                reason_code="task_update_held_by_constraint")
     if isinstance(payload, str):
-        return payload
+        return ToolOutcome.ok(payload)
     try:
-        return json.dumps(payload, default=str)
+        return ToolOutcome.ok(json.dumps(payload, default=str))
     except Exception:
-        return str(payload)
+        return ToolOutcome.ok(str(payload))
 
 
 async def _not_found_with_recall(context, term) -> str:
@@ -1833,7 +1868,7 @@ async def tool_manage_projects(
     context_summary: str = "",
     **_unused,
 ) -> str:
-    act = (action or "").strip().lower()
+    act = str(action or "").strip().lower()
     if act not in _ACTIONS:
         return _err(
             f"unknown action '{action}'. valid: {', '.join(sorted(_ACTIONS))}"
@@ -1991,7 +2026,10 @@ async def tool_manage_projects(
                            f"captured {len(req_constraints)} on create: "
                            f"{req_constraints[0][:70]}…",
                            icon=Icons.CONSTRAINT)
-            normalized = title.strip().lower()
+            # str(): a dict/list/int `title` arrives straight from
+            # json.loads and `.strip()` on it raises AttributeError, which
+            # the loop reports as a missing argument (§4DX round 3).
+            normalized = str(title).strip().lower()
             now = time.time()
             for existing in store.list_projects():
                 # Only reuse a same-title project that is still IN-FLIGHT.
@@ -2595,7 +2633,7 @@ async def tool_manage_projects(
             if not description:
                 return _err("description is required for action=task_add")
             try:
-                dep = DependencyType[dependency_type.upper()]
+                dep = DependencyType[str(dependency_type).upper()]
             except KeyError:
                 return _err(f"bad dependency_type: {dependency_type}")
             # Sibling duplicate guard: the 2026-04-19 trace 94 showed
@@ -2663,7 +2701,7 @@ async def tool_manage_projects(
 
             if status:
                 try:
-                    st_enum = TaskStatus[status.upper()]
+                    st_enum = TaskStatus[str(status).upper()]
                 except KeyError:
                     return _err(f"bad status: {status}")
             else:
@@ -4005,6 +4043,24 @@ async def tool_manage_projects(
                 except Exception:
                     logger.debug("failed-task enrichment skipped",
                                  exc_info=True)
+                # ⚠ NOT `_ok`. A failure-shaped stop DECLARES a success
+                # otherwise, and a declared ok now settles the corpus label —
+                # so 5 live rows reporting FAILED tasks were exempted from
+                # the sniffer while `_turn_had_tool_failure` still flagged
+                # them, a fresh three-reader split. PARTIAL is the honest
+                # status: the batch really did advance `count` tasks, and it
+                # really did stop on a failure.
+                from .outcome import ToolOutcome as _TO
+                import json as _json
+                # PARTIAL only when something ACTUALLY advanced — a batch
+                # that stopped on a failed project with `advanced == []`
+                # landed nothing, and PARTIAL would tell the model "PART OF
+                # THIS LANDED" over an empty list.
+                _mk = _TO.partial if batch.count else _TO.failed
+                return _mk(
+                    _json.dumps(_adv_payload, default=str),
+                    world_changed=bool(batch.count),
+                    reason_code=f"autoadvance_{batch.stop_reason}")
             return _ok(_adv_payload)
 
         # ---- auto-research ----------------------------------------------
@@ -4015,8 +4071,8 @@ async def tool_manage_projects(
             from ..core.project_research import (
                 research_topic, research_project,
             )
-            if topic and topic.strip():
-                rr = await research_topic(context, project_id, topic.strip())
+            if topic and str(topic).strip():
+                rr = await research_topic(context, project_id, str(topic).strip())
                 if not rr.ok:
                     return _err(f"research failed: {rr.error}")
                 return _ok({

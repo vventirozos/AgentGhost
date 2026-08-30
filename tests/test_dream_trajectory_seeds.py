@@ -150,6 +150,11 @@ async def test_trajectory_idempotency_guard():
 def test_watchdog_gate_consults_trajectories():
     from ghost_agent.core.agent import GhostAgent
     src = inspect.getsource(GhostAgent)
+    # ⚠ The token alone is not the gate. Renaming `_dream_eligible` leaves
+    # the fallback probe running and its verdict discarded — the agent
+    # silently stops dreaming forever with every dedicated pin green.
+    assert "_dream_eligible = await" in src, (
+        "the dream-eligibility fallback no longer assigns the gate variable")
     assert "trajectory_seed_available" in src, (
         "watchdog dream-eligibility gate lost its trajectory fallback — "
         "dream()'s own fallback would be dead code")

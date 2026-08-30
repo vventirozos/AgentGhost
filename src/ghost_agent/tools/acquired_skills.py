@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 
 from ..utils.logging import pretty_log, Icons
+from .file_system import write_text_nofollow as _fs_write_nofollow
+from .outcome import ToolOutcome
 
 logger = logging.getLogger("GhostAgent")
 
@@ -753,9 +755,9 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         from .registry import TOOL_DEFINITIONS as _BUILTIN_DEFS
         _builtin = {d.get("function", {}).get("name") for d in _BUILTIN_DEFS}
         if name in _builtin:
-            return (f"Skill creation failed: '{name}' is a BUILT-IN tool name. "
+            return ToolOutcome.rejected((f"Skill creation failed: '{name}' is a BUILT-IN tool name. "
                     f"A skill with this name would never be advertised or "
-                    f"dispatched. Pick a distinct name.")
+                    f"dispatched. Pick a distinct name."), reason_code="skill_creation_refused")
         from .composed_skills import _registry_from_context as _creg
         class _Ctx:  # minimal context shim for the registry cache helper
             pass
@@ -764,23 +766,23 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         _c.sandbox_dir = sandbox_dir
         _reg = _creg(_c)
         if _reg is not None and name in getattr(_reg, "skills", {}):
-            return (f"Skill creation failed: '{name}' is an existing COMPOSED "
+            return ToolOutcome.rejected((f"Skill creation failed: '{name}' is an existing COMPOSED "
                     f"skill (macro). Creating an acquired skill with the same "
                     f"name would advertise one tool and execute another. Pick "
-                    f"a distinct name or delete the macro first.")
+                    f"a distinct name or delete the macro first."), reason_code="skill_creation_refused")
     except Exception as _shadow_err:
         logger.debug("skill shadow check skipped: %s", _shadow_err)
     
     try:
         schema_dict = json.loads(parameters_schema)
     except json.JSONDecodeError as e:
-        return f"Skill creation failed: invalid parameters_schema JSON -> {e}. Fix the schema and try again."
+        return ToolOutcome.failed(f"Skill creation failed: invalid parameters_schema JSON -> {e}. Fix the schema and try again.", world_changed=False, reason_code="skill_creation_failed")
         
     try:
         # Just to validate it's proper JSON
         json.loads(test_payload)
     except json.JSONDecodeError as e:
-        return f"Skill creation failed: invalid test_payload JSON -> {e}. Fix the test payload and try again."
+        return ToolOutcome.failed(f"Skill creation failed: invalid test_payload JSON -> {e}. Fix the test payload and try again.", world_changed=False, reason_code="skill_creation_failed")
 
     # Normalize the incoming python_code at the earliest possible
     # point — BEFORE writing test_skill.py. This is defense-in-depth:
@@ -797,21 +799,32 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     from ..utils.sanitizer import sanitize_code
     normalized_code, syntax_error = sanitize_code(python_code, "test_skill.py")
     if syntax_error:
-        return (
+        return ToolOutcome.rejected((
             f"Skill creation failed: python_code didn't parse as valid Python "
             f"even after normalization ({syntax_error}). Common causes: XML/CDATA "
             f"wrapper that didn't strip (remove `<![CDATA[` / `]]>`), HTML entities "
             f"(`&quot;`, `&amp;`) that should be literal characters, truncated stream, "
             f"or escaped-newline confusion (pass real newlines in the JSON, not `\\\\n`). "
             f"Send the raw Python source verbatim — no wrappers."
-        )
+        ), reason_code="skill_creation_refused")
 
     test_file = sandbox_dir / "test_skill.py"
 
     try:
-        test_file.write_text(normalized_code, encoding="utf-8")
+        # ⚠ O_NOFOLLOW, not `write_text`. `test_skill.py` is a FIXED name in
+        # the sandbox root, which the container bind-mounts at /workspace —
+        # so the model plants `ln -s <any host file> /workspace/test_skill.py`
+        # with one `execute` call and this write lands on the target with
+        # fully model-authored bytes. Demonstrated end to end against the
+        # agent's own source tree (§4DX round 2); the TDD failure path then
+        # unlinks the symlink, so the sandbox looks untouched afterwards.
+        _fs_write_nofollow(test_file, normalized_code)
+    except ValueError as e:
+        return ToolOutcome.rejected(
+            f"Skill creation refused: {e}", world_changed=False,
+            reason_code="skill_test_path_unsafe")
     except Exception as e:
-        return f"Skill creation failed: Could not write test file -> {e}"
+        return ToolOutcome.failed(f"Skill creation failed: Could not write test file -> {e}", world_changed=False, reason_code="skill_creation_failed")
         
     logger.info(f"Starting TDD test for new skill '{name}'")
     pretty_log("TESTING SKILL", f"Running sandbox test for new skill: {name}", icon=Icons.TOOL_CODE)
@@ -859,8 +872,8 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         )
         
         if "(Process executed successfully, but no output was printed to stdout" in execution_result:
-            return f"Skill creation failed: The script executed successfully but printed absolutely NOTHING to stdout. You MUST print the final result so the system can read it, and ensure you actually parse sys.argv[1] and call your function inside an 'if __name__ == \"__main__\":' block."
-        return f"Skill creation failed: {execution_result}. Fix the code and try again."
+            return ToolOutcome.failed(f"Skill creation failed: The script executed successfully but printed absolutely NOTHING to stdout. You MUST print the final result so the system can read it, and ensure you actually parse sys.argv[1] and call your function inside an 'if __name__ == \"__main__\":' block.", world_changed=False, reason_code="skill_creation_failed")
+        return ToolOutcome.failed(f"Skill creation failed: {execution_result}. Fix the code and try again.", world_changed=False, reason_code="skill_creation_failed")
         
     try:
         test_file.unlink()

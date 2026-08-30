@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from .outcome import ToolOutcome
 import threading
 from typing import Optional
 from ..utils.logging import Icons, pretty_log
@@ -252,10 +253,10 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
                 except Exception:
                     pass
             return (
-                f"SYSTEM BLOCK: SQL statement rejected by pre-execution "
+                ToolOutcome.rejected(f"SYSTEM BLOCK: SQL statement rejected by pre-execution "
                 f"validator: {reason}. The query was not run. Re-emit with a "
                 f"WHERE clause, or pass confirm=true if you genuinely need to "
-                f"DROP/TRUNCATE."
+                f"DROP/TRUNCATE.")
             )
 
     # Default timeout: 15s, but allow override for complex queries.

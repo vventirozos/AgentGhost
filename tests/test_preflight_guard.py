@@ -343,6 +343,31 @@ def test_wiring_check_and_record_share_signature_key():
     assert "guard_key_target(ptarget, a_hash)" in src      # record site
 
 
+def _region(src: str, idx: int) -> str:
+    """The branch chain following a marker, bounded by CODE rather than by a
+    fixed character count.
+
+    Both pins here used `src[idx:idx + 2600]`, so adding a COMMENT to the
+    code they guard pushed the assertion target out of the window and turned
+    them red with no behaviour change. Walk to the end of the enclosing
+    branch chain instead: the next line at or below the marker's indent that
+    is not part of it.
+    """
+    lines = src[idx:].splitlines(keepends=True)
+    base = len(lines[0]) - len(lines[0].lstrip())
+    out = [lines[0]]
+    for ln in lines[1:]:
+        stripped = ln.strip()
+        if stripped and not stripped.startswith("#"):
+            ind = len(ln) - len(ln.lstrip())
+            if ind < base:
+                break
+        out.append(ln)
+        if len("".join(out)) > 8000:
+            break
+    return "".join(out)
+
+
 def test_wiring_world_changed_fires_only_on_success():
     """The world-changed reset lives on the SUCCESS branch of the result
     processing (elif of the record-on-failure branch) and is driven by the
@@ -351,7 +376,7 @@ def test_wiring_world_changed_fires_only_on_success():
     # The gate gained a third condition on 2026-08-12 (`not _pf_promoted`),
     # so it is now a continuation line — match the stable prefix.
     idx = src.index("elif _pf_world_mut and not _pf_exec_failed")
-    assert "note_world_changed()" in src[idx:idx + 2600]
+    assert "note_world_changed()" in _region(src, idx)
     # The hint must never treat blanket-is_mutating `execute` as a world
     # mutation — only heuristic-matched commands (probes stay inert).
     assert "looks_mutating_command(" in src
@@ -369,16 +394,43 @@ def test_wiring_failed_execute_never_clears_guard():
     caught exactly that when recording was tried)."""
     src = _agent_src()
     idx = src.index("_pf_exec_failed = False")
-    region = src[idx:idx + 2600]
+    region = _region(src, idx)
     assert 'fname == "execute"' in region
-    assert r"EXIT CODE:\s*(\d+)" in region
+    # ⚠ The exit-code regex used to be INLINED here, and this asserted its
+    # literal text. It is `ToolOutcome.shell_failed` now — the same reading,
+    # shared with the exit-code branch 700 lines below, which had its own
+    # copy with a different marker set. Assert the PROPERTY instead: the
+    # verdict is exit-code aware, and it comes from the outcome.
+    assert "_outcome.shell_failed" in region, (
+        "the pre-flight verdict stopped consulting the shell exit code; a "
+        "failed remediation (kill on a stale pid -> exit 1) would count as a "
+        "successful mutation and CLEAR the guard"
+    )
+    from ghost_agent.tools.outcome import ToolOutcome
+    assert ToolOutcome.ok("done\nEXIT CODE: 1").shell_failed is True
+    assert ToolOutcome.ok("done\nEXIT CODE: 0").shell_failed is False
     # Multi-line since 2026-08-12: the reset is additionally gated on
     # `_pf_promoted`, so a DETACHED command — which has not changed the world
     # yet — cannot clear the guard (sandbox/jobs.py).
     assert "elif _pf_world_mut and not _pf_exec_failed" in region
     assert "not _pf_promoted" in region
-    # record() stays keyed to Error:-prefixed results only.
-    assert "if _res_is_error:" in region
+    # record() stays keyed to genuine FAILURES — never to a refusal.
+    # ⚠ Was `assert "if _res_is_error:" in region`. A refusal is now a
+    # failure to the loop, and recording one armed the guard against the
+    # model's own CORRECTED re-issue: the guard keys on (tool, target, op)
+    # and ignores the args, so `replace` without `replace_with` followed by
+    # `replace` WITH it is the same key. Measured on the live corpus, a
+    # `file_system replace` that really succeeded would have been blocked,
+    # under a message telling the model it had re-run something unchanged.
+    assert "_res_is_error and not _outcome.is_rejection" in region, (
+        "the pre-flight guard records refusals again; the corrected retry "
+        "will be blocked"
+    )
+    assert "not _outcome.changed_the_world" in region, (
+        "the guard records a call that DID mutate; its premise is "
+        "'re-running this unchanged will fail the same way', which is false "
+        "for a half-applied write"
+    )
 
 
 def test_wiring_per_request_reset_exists():

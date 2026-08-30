@@ -45,6 +45,9 @@ import shutil
 import threading
 import time
 from pathlib import Path
+
+# A service/job registry is a few KB; anything larger is an attack.
+_REGISTRY_MAX_BYTES = 8 * 1024 * 1024
 from typing import Dict, FrozenSet, Optional
 
 logger = logging.getLogger("GhostAgent")
@@ -76,7 +79,12 @@ REMOTE_UNSERVE_SCRIPT = os.environ.get(
     "/Users/vasilis/Data/AI/bin/unserve-remote.sh")
 
 MAX_SERVICES = 5
-_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+# ⚠ `--` IS ILLEGAL IN A BARE NAME. `_file_stem` maps `project:service` to
+# `project--service`, so a bare name containing `--` collides with a scoped
+# key: `acme:api` and `acme--api` both validate and both derive the stem
+# `acme--api`. Demonstrated 2026-08-30: `purge_state('acme--api')` deleted
+# `acme:api`'s saved state and `logs('acme--api')` returned its log.
+_NAME_RE = re.compile(r"^[A-Za-z](?!.*--)[A-Za-z0-9_-]{0,31}$")
 _FORBIDDEN_CMD_RE = re.compile(
     r"(?:127\.0\.0\.1|localhost|0\.0\.0\.0)\s*:\s*(?:8000|8088)\b")
 _MAX_CMD_CHARS = 4000
@@ -223,10 +231,60 @@ def split_key(key) -> tuple:
     return None, key
 
 
+# A project id, as `tools/file_system.py::_safe_project_id` defines one.
+# Re-stated here rather than imported: `sandbox/` must not depend on
+# `tools/`, and this guard has to hold even if that helper moves.
+_SAFE_PROJECT_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,63}\Z")
+
+
+# Anything outside this set cannot appear in a derived filename. `/` and
+# `\` are the traversal characters; everything else is defence in depth.
+_UNSAFE_STEM_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+from ..tools.file_system import (  # noqa: E402
+    read_bytes_nofollow as _read_bytes_nofollow,
+    write_text_nofollow as _write_text_nofollow,
+)
+
+
 def _file_stem(key) -> str:
     """Per-service filename stem (cmd.sh / log / pid). ':' is shell-hostile
-    inside the container, so scoped keys map to ``<project>--<name>``."""
-    return str(key).replace(":", "--")
+    inside the container, so scoped keys map to ``<project>--<name>``.
+
+    ⚠ SANITISED AT THE CHOKE POINT. This used to be a bare
+    ``str(key).replace(":", "--")``, so every ``/`` and ``..`` in a key
+    survived into a filename — and the derived path is then written,
+    tailed, unlinked and **rmtree'd**:
+
+        start()       <host_dir>/<stem>.cmd.sh        (model-authored shell)
+        logs()        <host_dir>/<stem>.log           (read back to the model)
+        stop()        <host_dir>/<stem>.{log,pid}     (unlink)
+        purge_state() <host_dir>/state/<stem>         (shutil.rmtree)
+
+    Validating the KEY at `start()` was not enough: `stop`, `restart`,
+    `logs` and `purge_state` accept a key straight out of
+    `.services/registry.json`, which lives INSIDE the bind mount at
+    `/workspace/.services` — so the sandboxed model rewrites it with one
+    `execute` call. `purge_state` had no validation of any kind and is
+    reached by `manage_projects(action='delete')`; a registry entry named
+    `../../../HOST_TREE/src` deleted a host directory outside the sandbox
+    (demonstrated 2026-08-30).
+
+    Sanitising HERE rather than at each entry point is deliberate: this is
+    the single function every filename derivation goes through, so a future
+    fifth caller inherits the guard instead of re-opening the hole.
+    """
+    stem = _UNSAFE_STEM_CHARS.sub("_", str(key).replace(":", "--"))
+    # A stem of "." or ".." (or one containing "..") still walks up even
+    # with every separator gone, because it is joined onto a directory.
+    stem = stem.replace("..", "_")
+    # "." is not traversal but it IS the parent directory itself — a stem of
+    # "." makes `purge_state` rmtree `<host_dir>/state`, every service's
+    # saved state at once.
+    if stem in (".", ""):
+        stem = "_service"
+    return stem
 
 
 def extract_command_port(command) -> Optional[int]:
@@ -250,6 +308,9 @@ def substitute_command_port(command, old_port, new_port) -> str:
                   str(command or ""))
 
 
+from ..tools.outcome import ToolOutcome
+
+
 class ServiceSupervisor:
     """Manage named detached processes in the sandbox container.
 
@@ -270,7 +331,32 @@ class ServiceSupervisor:
 
     @property
     def host_dir(self) -> Path:
-        return Path(self.sandbox.host_workspace) / SERVICES_DIRNAME
+        """``<host_workspace>/.services`` — verified to be a REAL directory
+        inside the sandbox, not a symlink out of it.
+
+        ⚠ THE OTHER HALF OF THE FILE GUARDS. `jobs.py` has had this check
+        since its own audit ("`ln -s /somewhere/else /workspace/.jobs` made
+        the host side write the runner script into — and delete files from —
+        an arbitrary directory at the agent's uid, with no race needed") and
+        its comment names services.py as the unsafe twin. It was never
+        applied here: §4DX r4 hardened the individual FILES in this
+        directory against symlinks and left the directory itself open, which
+        is the same defect one level up.
+        """
+        root = Path(self.sandbox.host_workspace)
+        path = root / SERVICES_DIRNAME
+        try:
+            if path.is_symlink() or (
+                    path.exists()
+                    and path.resolve().parent != root.resolve()):
+                raise RuntimeError(
+                    f"sandbox services dir {path} is not a real directory "
+                    f"inside {root} (symlink or redirected) — refusing")
+        except RuntimeError:
+            raise
+        except OSError:
+            pass
+        return path
 
     @property
     def _registry_path(self) -> Path:
@@ -278,8 +364,26 @@ class ServiceSupervisor:
 
     def _load(self) -> Dict[str, dict]:
         try:
-            data = json.loads(self._registry_path.read_text())
+            # ⚠ O_NOFOLLOW + bounded. `registry.json` is a FIXED name in a
+            # model-writable directory: a symlink there made this read any
+            # host file, and an unbounded read of an attacker-sized file is
+            # a host-OOM lever from one poll tick. Found by the AST
+            # enumeration in tests/test_model_writable_root_ops.py, not by a
+            # sixth review round.
+            data = json.loads(_read_bytes_nofollow(
+                self._registry_path,
+                max_bytes=_REGISTRY_MAX_BYTES).decode("utf-8", "replace"))
             return data if isinstance(data, dict) else {}
+        except RuntimeError:
+            # ⚠ NOT SWALLOWED. `host_dir` raises RuntimeError only when the
+            # services directory has been REPLACED BY A SYMLINK — a security
+            # condition, not the "absent or corrupt registry" this broad
+            # except exists for. Folding it into `return {}` reported "No
+            # services registered" to the operator while the directory was
+            # hijacked: the guard fires, nothing is written through the
+            # link, and nobody is told. Let it out so the tool layer can
+            # render it.
+            raise
         except Exception:  # noqa: BLE001 — absent/corrupt → empty
             return {}
 
@@ -297,7 +401,10 @@ class ServiceSupervisor:
         tmp = self._registry_path.with_suffix(
             f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
-            tmp.write_text(json.dumps(reg, indent=2))
+            # ⚠ O_NOFOLLOW. The temp file sits in the same
+            # model-writable directory; a symlink there redirects the
+            # registry write onto an arbitrary host file.
+            _write_text_nofollow(tmp, json.dumps(reg, indent=2))
             os.replace(tmp, self._registry_path)
         except Exception:
             try:
@@ -513,13 +620,36 @@ class ServiceSupervisor:
 
     def _log_tail(self, name: str, lines: int = 25) -> str:
         try:
-            raw = (self.host_dir / f"{name}.log").read_bytes()
-            text = raw[-_LOG_TAIL_BYTES:].decode("utf-8", "replace")
+            # ⚠ O_NOFOLLOW. `host_dir` is bind-mounted into the container
+            # as `/workspace/.services`, so the model plants
+            # `ln -s /Users/…/.ghost_api_key /workspace/.services/leak.log`
+            # and `manage_services(action='logs', name='leak')` returned the
+            # master key straight into its own context. A plain
+            # `read_bytes()` follows the link; the name check above cannot
+            # see it, because the NAME is perfectly valid.
+            raw = _read_bytes_nofollow(self.host_dir / f"{name}.log",
+                                       max_bytes=_LOG_TAIL_BYTES)
+            text = raw.decode("utf-8", "replace")
             return "\n".join(text.splitlines()[-max(1, int(lines)):])
         except Exception:  # noqa: BLE001
             return "(no log output)"
 
     # -- validation ----------------------------------------------------------
+
+    def _validate_key(self, key) -> Optional[str]:
+        """Validate a bare service name OR a `project:service` key — BOTH
+        halves. The project half becomes a path component in every derived
+        filename, so it gets `_SAFE_PROJECT_ID_RE`; the service half gets
+        the existing name rule."""
+        raw = str(key or "")
+        if ":" in raw:
+            _kp, _kn = split_key(raw)
+            if _kp and not _SAFE_PROJECT_ID_RE.match(str(_kp)):
+                return ("Error: invalid project in service key — a project id "
+                        "is lowercase letters/digits/dash/underscore, 1-64 "
+                        f"chars (got {_kp!r}).")
+            return self._validate_name(_kn)
+        return self._validate_name(raw)
 
     @staticmethod
     def _validate_name(name) -> Optional[str]:
@@ -674,6 +804,21 @@ class ServiceSupervisor:
         # full key must not be silently re-scoped).
         if ":" in str(name or ""):
             _kp, _kn = split_key(name)
+            # ⚠ VALIDATE BOTH HALVES. `_validate_name` below only ever saw
+            # the RIGHT half, and `_file_stem` merely swaps ':' for '--', so
+            # every `../` in the project half survived into the filename
+            # stem — and `mkdir(parents=True)`, the `.cmd.sh` write and the
+            # `.log`/`.pid` unlinks all followed it out of the sandbox.
+            # Demonstrated §4DX round 2:
+            #   name='../../victim/pwn:svc'
+            #   -> wrote <sandbox>/.services/../../victim/pwn--svc.cmd.sh
+            # i.e. arbitrary host directory creation plus a file containing
+            # model-authored shell.
+            if _kp and not _SAFE_PROJECT_ID_RE.match(str(_kp)):
+                return ("Error: invalid project in service key — a project id "
+                        "is lowercase letters/digits/dash/underscore, 1-64 "
+                        "chars (got %r). Use 'project:service' with a real "
+                        "project id, or just 'service'." % (_kp,))
             project_id = _kp or project_id
             name = _kn
         # port=0 (or 'none') opts out of the port lease entirely — the rare
@@ -912,21 +1057,60 @@ class ServiceSupervisor:
             # purged only with the owning project's hard delete. Observed
             # live: the released chess coach 500'd on every move because it
             # wrote game_state.json into its now-immutable workspace.
-            (self.host_dir / "state" / stem).mkdir(parents=True,
-                                                   exist_ok=True)
+            # A symlinked `state/` (or `state/<stem>`) would take this
+            # mkdir — and everything the service then writes — out of the
+            # sandbox. `_file_stem` guarantees a direct child, so resolving
+            # and containing is enough.
+            _state_dir = self.host_dir / "state" / stem
+            _state_root = (self.host_dir / "state")
+            try:
+                # ⚠ The PARENT too: `mkdir(parents=True)` follows a
+                # symlinked `state/` and creates the service's writable
+                # directory outside the sandbox — the enabling half of the
+                # purge_state escape.
+                if _state_root.is_symlink():
+                    return ("Error: services state dir is a symbolic link; "
+                            "refusing to launch.")
+                _state_root.mkdir(parents=True, exist_ok=True)
+                if _state_root.resolve().parent != self.host_dir.resolve():
+                    return ("Error: services state dir resolves outside the "
+                            "services directory; refusing to launch.")
+                if _state_dir.exists() and _state_dir.is_symlink():
+                    return (f"Error: service state path {stem!r} is a symbolic "
+                            "link; refusing to launch.")
+                _state_dir.mkdir(parents=True, exist_ok=True)
+                if not str(_state_dir.resolve()).startswith(
+                        str(_state_root.resolve()) + os.sep):
+                    return (f"Error: service state path {stem!r} resolves "
+                            "outside the services directory; refusing.")
+            except OSError as _e:
+                return f"Error: could not prepare service state dir: {_e}"
             _state_dir_in = f"{CONTAINER_SERVICES_DIR}/state/{stem}"
-            (self.host_dir / f"{stem}.cmd.sh").write_text(
-                "#!/bin/sh\n" + _env_prefix
-                + f"export GHOST_SERVICE_TOKEN={_svc_token}\n"
-                + f"export GHOST_SERVICE_STATE_DIR={_state_dir_in}\n"
-                + f"export GHOST_SERVICE_NAME={shlex.quote(name)}\n"
-                # Record THIS shell's pid. Under `setsid` it is the session/
-                # group leader, so `kill -- -<pid>` reaps the whole tree. With
-                # the exec above, $$ IS the service process — the registry
-                # tracks the REAL pid, not the transient `$!` launcher that
-                # stop() used to miss, orphaning the service (2026-07-12).
-                + f"echo $$ > {_pidfile_in}\n"
-                + _run_line + "\n")
+            # ⚠ O_NOFOLLOW — the fourth instance of the fixed-name write
+            # that §4DX fixed three of, in the file that change set was also
+            # editing. A symlink planted at `<stem>.cmd.sh` redirected this
+            # model-authored shell script onto any host file.
+            try:
+                _write_text_nofollow(
+                    self.host_dir / f"{stem}.cmd.sh",
+                    "#!/bin/sh\n" + _env_prefix
+                    + f"export GHOST_SERVICE_TOKEN={_svc_token}\n"
+                    + f"export GHOST_SERVICE_STATE_DIR={_state_dir_in}\n"
+                    + f"export GHOST_SERVICE_NAME={shlex.quote(name)}\n"
+                    # Record THIS shell's pid. Under `setsid` it is the
+                    # session/group leader, so `kill -- -<pid>` reaps the
+                    # whole tree. With the exec below, $$ IS the service
+                    # process — the registry tracks the REAL pid, not the
+                    # transient `$!` launcher that stop() used to miss,
+                    # orphaning the service (2026-07-12).
+                    + f"echo $$ > {_pidfile_in}\n"
+                    + _run_line + "\n")
+            except ValueError as _ve:
+                # A refusal must come back as a tool RESULT, not an
+                # exception: an exception is rendered to the model as "did
+                # you forget a required argument?" and it retries the same
+                # call until it burns its strikes.
+                return f"Error: {_ve}"
             for _stale in (f"{stem}.log", f"{stem}.pid"):
                 try:
                     (self.host_dir / _stale).unlink()
@@ -963,8 +1147,15 @@ class ServiceSupervisor:
             if code != 0:
                 reg.pop(key, None)
                 self._save(reg)
-                return (f"Error: failed to launch '{name}' "
-                        f"(exit {code}): {out.strip()[:400]}")
+                # DECLARED failure: a process WAS spawned. Every other
+                # `Error:` return in this class is a validation refusal that
+                # launched nothing, so the wrapper can treat the rest as
+                # rejections — which is what stops them arming the pre-flight
+                # guard against the model's corrected re-issue.
+                return ToolOutcome.failed(
+                    f"Error: failed to launch '{name}' "
+                    f"(exit {code}): {out.strip()[:400]}",
+                    world_changed=True, reason_code="service_launch_failed")
             # Prefer the pid the script recorded (the real session leader,
             # written to <name>.pid as its first action). Poll briefly for the
             # bind-mounted file to appear.
@@ -972,11 +1163,18 @@ class ServiceSupervisor:
             pid_path = self.host_dir / f"{stem}.pid"
             for _ in range(20):        # ~2s
                 try:
-                    _txt = pid_path.read_text().strip()
+                    # ⚠ O_NOFOLLOW + O_NONBLOCK. `read_text()` follows a
+                    # symlink AND blocks forever on a FIFO — and this runs
+                    # under `asyncio.to_thread`, so each hit permanently
+                    # consumes an executor thread. `write_text_nofollow` 200
+                    # lines up carries a comment about exactly this hazard;
+                    # the read never got it.
+                    _txt = _read_bytes_nofollow(pid_path).decode(
+                        "utf-8", "replace").strip()
                     if _txt.isdigit():
                         pid = int(_txt)
                         break
-                except OSError:
+                except (OSError, ValueError):
                     pass
                 time.sleep(0.1)
             if pid is None:
@@ -988,16 +1186,30 @@ class ServiceSupervisor:
             if pid is None:
                 reg.pop(key, None)
                 self._save(reg)
-                return (f"Error: could not determine '{name}' pid "
-                        f"from launcher output: {out.strip()[:200]!r}")
+                # DECLARED failure: a process WAS spawned. Every other
+                # `Error:` return in this class is a validation refusal that
+                # launched nothing, so the wrapper can treat the rest as
+                # rejections — which is what stops them arming the pre-flight
+                # guard against the model's corrected re-issue.
+                return ToolOutcome.failed(
+                    f"Error: could not determine '{name}' pid "
+                    f"from launcher output: {out.strip()[:200]!r}",
+                    world_changed=True, reason_code="service_pid_unknown")
 
             time.sleep(1.2)
             if not self._pid_alive(pid):
                 reg.pop(key, None)
                 self._save(reg)
                 tail = self._log_tail(stem)
-                return (f"Error: service '{name}' exited immediately.\n"
-                        f"--- log tail ---\n{tail}")
+                # DECLARED failure: a process WAS spawned. Every other
+                # `Error:` return in this class is a validation refusal that
+                # launched nothing, so the wrapper can treat the rest as
+                # rejections — which is what stops them arming the pre-flight
+                # guard against the model's corrected re-issue.
+                return ToolOutcome.failed(
+                    f"Error: service '{name}' exited immediately.\n"
+                    f"--- log tail ---\n{tail}",
+                    world_changed=True, reason_code="service_exited_immediately")
 
             listening = None
             if port is not None:
@@ -1060,27 +1272,28 @@ class ServiceSupervisor:
         # WRONG process via the browser (review 2026-07-22).
         if port is not None and foreign_holder is not None:
             tail = self._log_tail(stem)
-            return (
+            return ToolOutcome.failed(
                 f"Service '{name}' started (pid {pid}) BUT port {port} is "
                 f"answered by a DIFFERENT process (pid {foreign_holder}), not "
                 f"'{name}' — it most likely failed to bind (address already "
                 f"in use). What answers on http://127.0.0.1:{port} is NOT "
                 f"this service. Stop whatever holds the port (action='status' "
                 f"to check registered services) or restart '{name}' on "
-                f"another port.\n--- {name} log tail ---\n{tail}"
-            )
+                f"another port.\n--- {name} log tail ---\n{tail}",
+                # the process exists, so something DID change
+                world_changed=True, reason_code="service_port_hijacked")
 
         if port is not None and listening is False:
             tail = self._log_tail(stem)
-            return (
+            return ToolOutcome.failed(
                 f"Service '{name}' started (pid {pid}) but nothing is "
                 f"listening on port {port} after ~6s — it likely FAILED to "
                 f"bind (missing dependency, a crash on import, or the app "
                 f"binds a different port). Check the log below BEFORE trying "
                 f"to reach it:\n--- {name} log tail ---\n{tail}\n"
                 f"Fix the cause (e.g. pip install the missing module, or point "
-                f"the app at port {port}), then action='restart' name='{name}'."
-            )
+                f"the app at port {port}), then action='restart' name='{name}'.",
+                world_changed=True, reason_code="service_failed_to_bind")
 
         lines = [f"Service '{name}' RUNNING (pid {pid})"
                  + (f" — project {project_id}" if project_id else "")
@@ -1270,10 +1483,16 @@ class ServiceSupervisor:
         return None
 
     def stop(self, name: str, project_id=None) -> str:
-        if ":" not in str(name or ""):
-            err = self._validate_name(name)
-            if err:
-                return err
+        # ⚠ VALIDATE BOTH HALVES. `":" not in name` skipped validation
+        # ENTIRELY for a scoped key — the same escape hatch `start()` was
+        # patched for, still open in stop/restart/logs. `logs()` then tailed
+        # `<host_dir>/<stem>.log` derived from it. `_file_stem` now
+        # sanitises the stem so a traversing key cannot reach the
+        # filesystem either way; this refuses it up front instead of
+        # silently rewriting it into a name that matches nothing.
+        err = self._validate_key(name)
+        if err:
+            return err
         with self._lock:
             reg = self._load()
             key, _err = self._resolve_or_error(reg, name, project_id)
@@ -1314,10 +1533,16 @@ class ServiceSupervisor:
         return " ".join(parts)
 
     def restart(self, name: str, project_id=None) -> str:
-        if ":" not in str(name or ""):
-            err = self._validate_name(name)
-            if err:
-                return err
+        # ⚠ VALIDATE BOTH HALVES. `":" not in name` skipped validation
+        # ENTIRELY for a scoped key — the same escape hatch `start()` was
+        # patched for, still open in stop/restart/logs. `logs()` then tailed
+        # `<host_dir>/<stem>.log` derived from it. `_file_stem` now
+        # sanitises the stem so a traversing key cannot reach the
+        # filesystem either way; this refuses it up front instead of
+        # silently rewriting it into a name that matches nothing.
+        err = self._validate_key(name)
+        if err:
+            return err
         # Hold the (reentrant) lock across the whole stop→start pair: no
         # concurrent start of the same name can slip into the window, and a
         # failed relaunch can restore the registration atomically (review
@@ -1353,9 +1578,11 @@ class ServiceSupervisor:
                 if key not in reg2:
                     reg2[key] = entry     # old pid/stamp → reads DEAD, truthfully
                     self._save(reg2)
-                    out += (f"\n(The registration for '{key}' was preserved — "
-                            f"fix the cause, then action='restart' "
-                            f"name='{key}' again.)")
+                    from ..tools.outcome import append_note
+                    out = append_note(out, (
+                        f"\n(The registration for '{key}' was preserved — "
+                        f"fix the cause, then action='restart' "
+                        f"name='{key}' again.)"))
             return out
 
     def status(self, name: Optional[str] = None, project_id=None) -> str:
@@ -1418,10 +1645,16 @@ class ServiceSupervisor:
         return out
 
     def logs(self, name: str, lines: int = 60, project_id=None) -> str:
-        if ":" not in str(name or ""):
-            err = self._validate_name(name)
-            if err:
-                return err
+        # ⚠ VALIDATE BOTH HALVES. `":" not in name` skipped validation
+        # ENTIRELY for a scoped key — the same escape hatch `start()` was
+        # patched for, still open in stop/restart/logs. `logs()` then tailed
+        # `<host_dir>/<stem>.log` derived from it. `_file_stem` now
+        # sanitises the stem so a traversing key cannot reach the
+        # filesystem either way; this refuses it up front instead of
+        # silently rewriting it into a name that matches nothing.
+        err = self._validate_key(name)
+        if err:
+            return err
         _reg = self._load()
         key, _err = self._resolve_or_error(_reg, name, project_id)
         if key is not None:
@@ -1448,11 +1681,54 @@ class ServiceSupervisor:
         archive keeps state exactly like it keeps the workspace. Accepts a
         registry key or display name; also works for already-deregistered
         services (stem derived from the raw key)."""
+        # ⚠ VALIDATE. This is the one entry point that never did, and it is
+        # the one that calls `rmtree` — on a key taken straight from the
+        # model-writable registry.
+        err = self._validate_key(name_or_key)
+        if err:
+            logger.warning("purge_state: %s", err)
+            return False
         with self._lock:
             reg = self._load()
             key = self._resolve_name(reg, str(name_or_key), project_id) \
                 or str(name_or_key)
         p = self.host_dir / "state" / _file_stem(key)
+        # Defence in depth behind the sanitised stem: this call is an
+        # `rmtree`, so it re-checks containment against the real root rather
+        # than trusting the derivation. Belt and braces on the one operation
+        # in this file that destroys data.
+        # ⚠ THE ROOT MUST NOT BE RESOLVED THROUGH THE ATTACKER'S LINK.
+        #
+        # This read `_root = (host_dir / "state").resolve()`, which follows a
+        # symlinked `state/` — so the containment test compared the victim
+        # directory against ITSELF and passed unconditionally. `state ->
+        # <HOST_TREE>` then let `purge_state("Agent")` rmtree
+        # `<HOST_TREE>/Agent`, reachable from
+        # `manage_projects(action='delete', hard=True)`. A guard that
+        # derives its own boundary from attacker-controlled state is not a
+        # guard.
+        #
+        # `host_dir` is already verified to be a real directory (it raises
+        # otherwise), so the boundary is anchored THERE and `state` itself is
+        # required to be a real subdirectory of it.
+        try:
+            _base = self.host_dir.resolve()
+            _state = self.host_dir / "state"
+            if _state.is_symlink():
+                logger.warning("purge_state: refusing symlinked state dir %s",
+                               _state)
+                return False
+            _root = _state.resolve()
+            if _root.parent != _base:
+                logger.warning("purge_state: state dir %s is outside %s",
+                               _root, _base)
+                return False
+            if p.is_symlink() or not str(p.resolve()).startswith(
+                    str(_root) + os.sep):
+                logger.warning("purge_state: refusing out-of-root path %s", p)
+                return False
+        except (OSError, ValueError):
+            return False
         try:
             if p.exists():
                 shutil.rmtree(p, ignore_errors=True)

@@ -202,6 +202,13 @@ async def test_starved_everything_still_bails(tmp_path):
 def test_watchdog_gate_consults_selfplay():
     from ghost_agent.core.agent import GhostAgent
     src = inspect.getsource(GhostAgent)
+    # ⚠ The token alone is not the gate. Renaming `_dream_eligible` leaves
+    # the fallback probe running and its verdict discarded — the agent
+    # silently stops dreaming forever and every dedicated pin stays green.
+    # The auto-memory pool is documented as organically unsatisfiable, so
+    # these fallbacks are the ONLY path to eligibility.
+    assert "_dream_eligible = await" in src, (
+        "the dream-eligibility fallback no longer assigns the gate variable")
     assert "selfplay_dream_fragments" in src, (
         "watchdog dream-eligibility gate lost its self-play fallback — "
         "dream()'s self-play seeding would be dead code overnight")

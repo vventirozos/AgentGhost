@@ -9,11 +9,18 @@ You MUST pass the FILENAME." — burning a strike on every conversational
 prose request that grazed the tool description.
 
 Fix: advertise per-action parameter names (`filename` for
-ingest_document/forget, `fact` for insert_fact) and strengthen the
+ingest_document, `fact` for insert_fact) and strengthen the
 description so the model can't read "Unified memory manager. ALWAYS use
 this to ingest_document" as an invitation to ingest prose. The handler
 keeps the old aliases (`content`, `source`, `path`, `topic`) so legacy
 trajectories and Qwen variants that aliased differently still work.
+
+⚠ SUPERSEDED IN PART (2026-08-28): `filename` was ALSO this rename's answer
+for `forget`, and that half was itself the foot-gun — a parameter named for
+files is not where a model looks for "the topic to forget", and the schema
+offered nothing else, so the model called `forget` bare and hit an
+unbreakable error loop. `forget` now advertises its own `target`.
+See `tests/test_kb_missing_param_names_accepted_param.py`.
 """
 
 import json
@@ -41,9 +48,9 @@ def test_schema_advertises_filename_and_fact():
     fn = _knowledge_base_def()
     props = fn["parameters"]["properties"]
     assert "filename" in props, (
-        "Schema must advertise 'filename' for ingest_document/forget — the "
+        "Schema must advertise 'filename' for ingest_document/query — the "
         "old 'content' name was the foot-gun that pulled models toward "
-        "passing prose."
+        "passing prose. ('forget' has its own 'target' since 2026-08-28.)"
     )
     assert "fact" in props, (
         "Schema must advertise 'fact' for insert_fact so prose-bearing "

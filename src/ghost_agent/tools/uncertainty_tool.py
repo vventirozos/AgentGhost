@@ -56,7 +56,7 @@ async def tool_flag_uncertainty(
     **kwargs,
 ) -> str:
     """Record an unknown or an assumption with the metacognitive tracker."""
-    action = (action or "").strip().lower()
+    action = str(action or "").strip().lower()
     if action not in _VALID_ACTIONS:
         return (
             "SYSTEM ERROR: 'action' is mandatory and must be one of "

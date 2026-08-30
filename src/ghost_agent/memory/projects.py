@@ -22,6 +22,8 @@ import time
 import uuid
 from enum import Enum
 from pathlib import Path
+
+from ..tools.file_system import write_text_nofollow as _fs_write_nofollow
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("GhostAgent")
@@ -179,6 +181,30 @@ def _constraint_list(value: Any) -> List[str]:
     if isinstance(value, (list, tuple)):
         return [str(c) for c in value if str(c).strip()]
     return [str(value)]
+
+
+def _contained_workspace(store, ws):
+    """Resolve a project workspace and refuse one that escapes the sandbox.
+
+    Returns the resolved Path, or None when it leaves `sandbox_root` (which
+    a symlinked project directory does). `delete_project` already resolves
+    and contains its workspace 1300 lines below; these writers did not.
+    """
+    from pathlib import Path as _P
+    try:
+        resolved = _P(ws).resolve()
+    except (OSError, ValueError):
+        return None
+    root = getattr(store, "sandbox_root", None)
+    if not root:
+        return resolved          # unscoped store (tests) — nothing to contain
+    try:
+        root_r = _P(root).resolve()
+    except (OSError, ValueError):
+        return None
+    if resolved != root_r and root_r not in resolved.parents:
+        return None
+    return resolved
 
 
 class ProjectStore:
@@ -1618,11 +1644,27 @@ class ProjectStore:
             lines.append("- (no deliverables registered yet)")
         text = "\n".join(lines) + "\n"
         try:
-            ws_path = Path(ws)
+            # ⚠ RESOLVE THE PARENT, not just the final component.
+            # `write_text_nofollow` refuses a symlink at the FILE, and its
+            # docstring says intermediate directories are the caller's
+            # problem — which both callers then ignored. The default
+            # workspace is `<sandbox_root>/projects/<id>`, a directory the
+            # container can `rm -rf` and replace with a symlink to anywhere
+            # on the host; `mkdir(parents=True, exist_ok=True)` follows it
+            # happily and the write lands outside. Demonstrated 2026-08-30:
+            # PROJECT_MAP.md written into the agent's own source tree.
+            ws_path = _contained_workspace(self, ws)
+            if ws_path is None:
+                return None
             ws_path.mkdir(parents=True, exist_ok=True)
             target = ws_path / "PROJECT_MAP.md"
             tmp = target.with_suffix(".md.tmp")
-            tmp.write_text(text, encoding="utf-8")
+            # ⚠ O_NOFOLLOW: a fixed `.tmp` name inside a directory the
+            # model can write to. `os.replace` below does not follow a
+            # link, but this write did — a symlink planted at
+            # `PROJECT_MAP.md.tmp` redirected model-authored text onto an
+            # arbitrary host file. Demonstrated §4DX round 2.
+            _fs_write_nofollow(tmp, text)
             os.replace(tmp, target)
             return str(target)
         except Exception as e:
@@ -1869,11 +1911,27 @@ class ProjectStore:
                       "Changes go to a new version: "
                       "`manage_projects action=create_version`._", ""]
         try:
-            ws_path = Path(ws)
+            # ⚠ RESOLVE THE PARENT, not just the final component.
+            # `write_text_nofollow` refuses a symlink at the FILE, and its
+            # docstring says intermediate directories are the caller's
+            # problem — which both callers then ignored. The default
+            # workspace is `<sandbox_root>/projects/<id>`, a directory the
+            # container can `rm -rf` and replace with a symlink to anywhere
+            # on the host; `mkdir(parents=True, exist_ok=True)` follows it
+            # happily and the write lands outside. Demonstrated 2026-08-30:
+            # PROJECT_MAP.md written into the agent's own source tree.
+            ws_path = _contained_workspace(self, ws)
+            if ws_path is None:
+                return None
             ws_path.mkdir(parents=True, exist_ok=True)
             target = ws_path / "RELEASE.md"
             tmp = target.with_suffix(".md.tmp")
-            tmp.write_text("\n".join(lines), encoding="utf-8")
+            # ⚠ O_NOFOLLOW: a fixed `.tmp` name inside a directory the
+            # model can write to. `os.replace` below does not follow a
+            # link, but this write did — a symlink planted at
+            # `RELEASE.md.tmp` redirected model-authored text onto an
+            # arbitrary host file. Demonstrated §4DX round 2.
+            _fs_write_nofollow(tmp, "\n".join(lines))
             os.replace(tmp, target)
             return str(target)
         except Exception as e:

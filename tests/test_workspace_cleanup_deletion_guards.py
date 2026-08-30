@@ -109,12 +109,86 @@ def test_protection_matching_ignores_CASE():
 def test_every_protection_membership_test_is_case_folded():
     """⚠ HALF-APPLIED IS THE FAILURE MODE. Fixing the keep-set while leaving
     the sibling `referenced`-media check exact-case still deletes the asset.
-    Pins that no protection site compares raw case."""
+
+    ⚠⚠ This test USED to be two greps — `"rel in keep" not in src` and
+    `"in referenced" not in src or "_ref_low" in src`. Both are satisfied by
+    any *other* spelling of an exact-case compare, and the second disjunct is
+    unconditionally true because `_ref_low` is assigned whether or not the
+    guard uses it. An audit proved three surviving mutants — one per
+    protection site — each of which unlinks a registered deliverable, and one
+    of the three sites (`_referenced_media`) was not even in the inspection
+    set. Nothing in 18,000+ tests noticed.
+
+    The greps are kept below as a cheap tripwire, but the real pins are the
+    three DRIVEN tests that follow: they put a real file on disk under a
+    different case and assert it survives.
+    """
     import inspect
     for fn in (WC.sweep_project_workspace, WC.tidy_project_workspace):
         src = inspect.getsource(fn)
         assert "rel in keep" not in src, fn.__name__
-        assert "in referenced" not in src or "_ref_low" in src, fn.__name__
+        # (The old second clause — `"in referenced" not in src or "_ref_low"
+        # in src` — was unconditionally TRUE: `_ref_low` is assigned whether
+        # or not the guard uses it, so it forbade nothing. The driven tests
+        # below are what actually protects the referenced-media site.)
+
+
+# ── 2b. the three case-fold sites, DRIVEN ───────────────────────────────
+#
+# Each writes `assets/Hero.png` to disk while the protection set names
+# `assets/hero.png`, then runs the real function and asserts the file is
+# still there. A mutant that restores an exact-case compare at any one site
+# deletes it.
+
+def _case_fixture(tmp_path, register=True, referenced=False):
+    from ghost_agent.core.planning import ProjectPlan
+    from ghost_agent.memory.projects import ProjectStore
+
+    store = ProjectStore(tmp_path / "mem", sandbox_root=tmp_path / "sb")
+    pid = store.create_project("CaseP")
+    pdir = store.sandbox_root / "projects" / pid
+    (pdir / "assets").mkdir(parents=True, exist_ok=True)
+    # on DISK: capital H
+    asset = pdir / "assets" / "Hero.png"
+    asset.write_bytes(b"\x89PNG deliverable")
+    if register:
+        plan = ProjectPlan(store, pid)
+        tid = plan.add_task("t")
+        # REGISTERED: lower-case h
+        store.register_file_artifact(tid, "assets/hero.png")
+    if referenced:
+        (pdir / "index.html").write_text(
+            '<img src="assets/hero.png">', encoding="utf-8")
+    return store, pid, asset
+
+
+def test_the_DONE_sweep_keeps_a_registered_file_whose_case_differs(tmp_path):
+    store, pid, asset = _case_fixture(tmp_path)
+    WC.sweep_project_workspace(store, pid)
+    assert asset.exists(), (
+        "the DONE sweep unlinked a REGISTERED deliverable because the disk "
+        "case differs from the registered case — irreversible, and the "
+        "module's own contract says source/document files are never deleted")
+
+
+def test_the_idle_tidy_keeps_a_registered_file_whose_case_differs(tmp_path):
+    store, pid, asset = _case_fixture(tmp_path)
+    # min_age_hours=0 so the grace period does not mask the guard
+    WC.tidy_project_workspace(store, pid, min_age_hours=0)
+    assert asset.exists(), (
+        "the IDLE tidy unlinked a registered deliverable on a case "
+        "difference — this one runs unattended, on ACTIVE projects")
+
+
+def test_a_REFERENCED_asset_survives_a_case_difference(tmp_path):
+    """The third site, `_referenced_media`, was not in the grep's inspection
+    set at all: an unregistered sprite that `index.html` points at."""
+    store, pid, asset = _case_fixture(tmp_path, register=False,
+                                      referenced=True)
+    WC.tidy_project_workspace(store, pid, min_age_hours=0)
+    assert asset.exists(), (
+        "an asset the build references was unlinked because the reference "
+        "and the file differ in case")
 
 
 # ── 3. the two normalizers ──────────────────────────────────────────────

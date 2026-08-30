@@ -1441,6 +1441,19 @@ def _looks_like_failure(output: str) -> bool:
     """
     if output is None:
         return True
+    # A migrated tool ANSWERS this question — read it before sniffing its
+    # prose. Measured on the 4,391-call corpus, 82 of 82 refusals reached
+    # this function as clean successes, and this is the UNATTENDED path: a
+    # refused edit let the idle autoadvancer mark its task DONE with nothing
+    # done. UNRESOLVED counts as a failure here for the same reason the
+    # promoted-job check below does — see that comment.
+    #
+    # ADD-only: an `ok` status falls through to the prose rules, so the
+    # non-zero `EXIT CODE:` banner and the `[SYSTEM ERROR]` sentinel keep
+    # all the authority they had.
+    _st = getattr(output, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) != "ok":
+        return True
     s = str(output).strip()
     if not s:
         return True
@@ -1506,6 +1519,14 @@ def classify_verify_result(output) -> str:
     All three are "inconclusive": the verify neither passed nor demonstrably
     failed, and the task must NOT be marked DONE on them.
     """
+    # A migrated tool ANSWERS this, and this gate is what marks a task DONE.
+    # A non-OK status can never be a PASS: a refusal verified nothing, and
+    # an unfinished job has no verdict — both are "inconclusive", which is
+    # this function's word for "do NOT mark it done".
+    _st = getattr(output, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) != "ok":
+        return "fail" if str(getattr(_st, "value", _st)) == "failed" \
+            else "inconclusive"
     s = str(output or "").strip()
     if not s:
         return "inconclusive"

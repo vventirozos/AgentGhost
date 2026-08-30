@@ -136,6 +136,19 @@ def _op_ok(out: str) -> bool:
     file (common in web deliverables) and counted the un-applied edit as
     applied — closing the leaf DONE with the file unchanged. Mirrors the
     anchored discipline of the sibling ``_looks_like_write_error``."""
+    # A migrated tool ANSWERS this. Its sibling below was the FIFTH reader
+    # of the same question and the only one this round's sweep missed — four
+    # were migrated and it was not, which is the round-over-round pattern
+    # this work keeps reproducing. PARTIAL still counts as written: a file
+    # that landed but does not parse HAS changed, and the syntax diagnostic
+    # is what reports that.
+    _st = getattr(out, "status", None)
+    if _st is not None:
+        _sv = str(getattr(_st, "value", _st))
+        if _sv in ("rejected", "failed"):
+            return False
+        if _sv == "partial":
+            return True
     head = (out or "").strip()[:80].lower()
     return head.startswith("success")
 
@@ -144,7 +157,19 @@ def _looks_like_write_error(out: str) -> bool:
     """Conservative write-failure check (writes rarely fail; don't abort a good
     build on a chatty success message). ``SYSTEM INSTRUCTION:`` heads are
     file_system REFUSALS (e.g. the empty-content write refusal) — missing them
-    closed tasks DONE with the file never written (2026-07-20 review)."""
+    closed tasks DONE with the file never written (2026-07-20 review).
+
+    Reads the STATUS first. It matched three lowercase heads and ignored the
+    status entirely, so on the typed path 36 live refusals still slipped
+    through — 14 ``REJECTED: that replace would introduce a syntax error``,
+    11 pre-flight guard blocks, 5 empty-write blocks, 4 rejected SQL. The
+    caller then does ``touched.add(path)`` and advances the task with the
+    file never written, unattended. ADD-only: an ``ok`` status falls through
+    to the prose rules below."""
+    _st = getattr(out, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) in ("rejected",
+                                                              "failed"):
+        return True
     head = (out or "").strip()[:80].lower()
     return (
         not out

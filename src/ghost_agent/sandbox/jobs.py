@@ -73,6 +73,16 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
+# A service/job registry is a few KB; anything larger is an attack.
+_REGISTRY_MAX_BYTES = 8 * 1024 * 1024
+# A pid/exit sentinel is a few bytes; anything larger is an attack.
+_SENTINEL_MAX_BYTES = 4096
+
+from ..tools.file_system import (
+    read_bytes_nofollow as _read_bytes_nofollow,
+    write_text_nofollow as _write_text_nofollow,
+)
 from typing import Dict, List, Optional, Tuple
 
 from ..utils.logging import Icons, pretty_log
@@ -368,7 +378,21 @@ class SandboxJobSupervisor:
           sweep, which is a fail-DANGEROUS default for a missing field.
         """
         try:
-            data = json.loads(self._registry_path.read_text())
+            # ⚠ O_NOFOLLOW + bounded. `registry.json` is a FIXED name in a
+            # model-writable directory: a symlink there made this read any
+            # host file, and an unbounded read of an attacker-sized file is
+            # a host-OOM lever from one poll tick. Found by the AST
+            # enumeration in tests/test_model_writable_root_ops.py, not by a
+            # sixth review round.
+            data = json.loads(_read_bytes_nofollow(
+                self._registry_path,
+                max_bytes=_REGISTRY_MAX_BYTES).decode("utf-8", "replace"))
+        except RuntimeError:
+            # ⚠ NOT SWALLOWED — mirrors services.py. `host_dir` raises only
+            # when `.jobs` has been replaced by a symlink; folding that into
+            # `return {}` reports "No background jobs" while the directory is
+            # hijacked. A guard that fires and tells nobody.
+            raise
         except Exception:  # noqa: BLE001 — absent/corrupt → empty
             return {}
         if not isinstance(data, dict):
@@ -422,7 +446,10 @@ class SandboxJobSupervisor:
         tmp = self._registry_path.with_suffix(
             f".{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
-            tmp.write_text(json.dumps(reg, indent=2))
+            # ⚠ O_NOFOLLOW. The temp file sits in the same
+            # model-writable directory; a symlink there redirects the
+            # registry write onto an arbitrary host file.
+            _write_text_nofollow(tmp, json.dumps(reg, indent=2))
             os.replace(tmp, self._registry_path)
         except Exception:
             try:
@@ -676,12 +703,19 @@ class SandboxJobSupervisor:
             path = self._paths(jid)["log"]
             size = path.stat().st_size
             if size <= _LOG_READ_CAP:
-                return path.read_bytes()
+                # ⚠ O_NOFOLLOW: this log is returned TO THE MODEL, and a
+                # symlink planted at `<jid>.log` inside the (guarded)
+                # .jobs dir made it any host file. The DIRECTORY check
+                # above does not cover the files in it — the same split
+                # services.py had in mirror image.
+                return _read_bytes_nofollow(path)
+            # ⚠ THE OTHER BRANCH OF THE SAME FUNCTION. Round 4 fixed the
+            # small-file path; a symlink to a file OVER the cap routed here
+            # and was read with a plain `open()`. `path.stat()` above also
+            # follows the link, which is how it got here.
             half = _LOG_READ_CAP // 2
-            with open(path, "rb") as fh:
-                head = fh.read(half)
-                fh.seek(size - half)
-                tail = fh.read(half)
+            _all = _read_bytes_nofollow(path)
+            head, tail = _all[:half], _all[-half:]
             return (head
                     + f"\n\n[... {size - _LOG_READ_CAP} bytes of job output "
                       f"omitted — read {self.log_rel_path(jid)} ...]\n\n"
@@ -691,12 +725,14 @@ class SandboxJobSupervisor:
             return b""
 
     def log_tail(self, jid: str, lines: int = 40) -> str:
+        # ⚠ THE SIBLING OF `_read_log`, DIRECTLY BELOW IT, AND IT WAS MISSED.
+        # Round 4 hardened `_read_log` and left this one on a plain `open()`
+        # — and THIS is the one whose output reaches the model's SYSTEM
+        # prompt (`main.py`) and a delegate job result. Same file, same
+        # class, ten lines apart.
         try:
-            path = self._paths(jid)["log"]
-            with open(path, "rb") as fh:
-                size = path.stat().st_size
-                fh.seek(max(0, size - _LOG_TAIL_BYTES))
-                raw = fh.read()
+            raw = _read_bytes_nofollow(self._paths(jid)["log"],
+                                       max_bytes=_LOG_TAIL_BYTES)
         except (OSError, ValueError):
             return "(no output)"
         if not raw:
@@ -721,7 +757,17 @@ class SandboxJobSupervisor:
         writes into `.jobs/` produced the same result. The nonce is minted
         host-side per job and only the runner script quotes it back."""
         try:
-            txt = self._paths(jid)["exit"].read_text().strip()
+            # ⚠ CAPPED. An unbounded read of a model-writable file is a
+            # host-OOM lever: a 300 MB sentinel took peak RSS from 357 MB to
+            # 992 MB, repeatable every poll tick. A pid or exit code is a
+            # handful of bytes.
+            txt = _read_bytes_nofollow(
+                self._paths(jid)["exit"],
+                max_bytes=_SENTINEL_MAX_BYTES).decode("utf-8", "replace").strip()
+            # ⚠ The int() below used to sit OUTSIDE this try. One poisoned
+            # sentinel (4301 digits — Python's int-parse limit) raised
+            # ValueError out of here, aborted `reap()`'s per-row loop, and
+            # EVERY background job stopped landing, logged only at debug.
         except (OSError, ValueError):
             return None
         nonce = self._nonces.get(jid)
@@ -742,11 +788,30 @@ class SandboxJobSupervisor:
                         level="WARNING", icon=Icons.SHIELD)
                 return None
             txt = txt[len(prefix):].strip()
-        return int(txt) if txt.lstrip("-").isdigit() else None
+        # ⚠ LENGTH-CAPPED. `int()` on a 4301-digit string raises ValueError
+        # (Python's int-parse limit), and this used to sit outside the try:
+        # one poisoned sentinel file aborted `reap()`'s per-row loop and
+        # EVERY background job stopped landing, logged only at debug.
+        if len(txt) > 32 or not txt.lstrip("-").isdigit():
+            return None
+        try:
+            return int(txt)
+        except ValueError:
+            return None
 
     def _read_pid(self, jid: str) -> Optional[int]:
         try:
-            txt = self._paths(jid)["pid"].read_text().strip()
+            # ⚠ CAPPED. An unbounded read of a model-writable file is a
+            # host-OOM lever: a 300 MB sentinel took peak RSS from 357 MB to
+            # 992 MB, repeatable every poll tick. A pid or exit code is a
+            # handful of bytes.
+            txt = _read_bytes_nofollow(
+                self._paths(jid)["pid"],
+                max_bytes=_SENTINEL_MAX_BYTES).decode("utf-8", "replace").strip()
+            # ⚠ The int() below used to sit OUTSIDE this try. One poisoned
+            # sentinel (4301 digits — Python's int-parse limit) raised
+            # ValueError out of here, aborted `reap()`'s per-row loop, and
+            # EVERY background job stopped landing, logged only at debug.
         except (OSError, ValueError):
             return None
         return int(txt) if txt.isdigit() else None
@@ -919,7 +984,9 @@ class SandboxJobSupervisor:
         ceiling = int(max(60.0, float(hard_ceiling_s)) + _CEILING_MARGIN_S)
         nonce = secrets.token_hex(8)
         self._nonces[jid] = nonce
-        paths["script"].write_text(
+        # ⚠ The un-migrated sibling of the `.cmd.sh` fix. Random jid plus a
+        # preceding unlink narrows it; the kernel closes it.
+        _write_text_nofollow(paths["script"],
             "#!/bin/sh\n"
             # $$ under setsid is the session/group leader, so `kill -- -$$`
             # reaps the whole tree (the command may fork children).

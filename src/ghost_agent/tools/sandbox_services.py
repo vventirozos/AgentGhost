@@ -25,6 +25,7 @@ async def tool_manage_services(action: str = None, name: str = None,
                                lines=None, workdir: str = None,
                                sandbox_manager=None, project_id=None,
                                **kwargs):
+
     # --- PARAMETER HALLUCINATION HEALING (matches execute.py style) ---
     action = (action or kwargs.get("operation") or kwargs.get("op") or "")
     action = str(action).strip().lower()
@@ -61,28 +62,69 @@ async def tool_manage_services(action: str = None, name: str = None,
             _detail += f" · project {project_id}"
         pretty_log("Service", _detail, icon=Icons.SANDBOX_BOX)
 
+    def _declare(res):
+        """Say what happened, so nobody has to guess from the prose.
+
+        This tool's own output legitimately QUOTES crashes: `logs` returns a
+        service's log tail, and a failed `start` embeds one. The dispatch
+        loop's traceback rule is an unanchored whole-body substring, so 13
+        live successful reads were booked as failures by it — and the rule
+        defers to a DECLARED status precisely so a tool that quotes a crash
+        can say "that crash is not mine". The supervisor signals its own
+        failures with an `Error:` head (services.py: exited immediately,
+        workdir missing, port reserved, already running, launch failed).
+        """
+        from .outcome import ToolOutcome
+        # If the supervisor already SAID, keep its answer. Classifying by an
+        # `Error:` head alone declared a service that started and then failed
+        # to bind as a clean success — and a declared ok short-circuits every
+        # other rule, so nothing downstream could recover it.
+        if isinstance(res, ToolOutcome):
+            return res
+        _t = str(res)
+        if _t.lstrip().startswith(("Error:", "ERROR:")):
+            # REJECTED, not FAILED. Every remaining `Error:` return in the
+            # supervisor is a VALIDATION refusal that launched nothing —
+            # "no service named X", "port is reserved", "already running",
+            # "workdir does not exist … Nothing was launched". The three
+            # paths that actually spawned a process, and the two bind
+            # failures, all declare `ToolOutcome.failed` themselves and are
+            # passed through above. Booking a refusal FAILED armed the
+            # pre-flight guard against the model's corrected re-issue (the
+            # guard keys on tool+target+op and ignores the args) — the exact
+            # pathology `browser._reject` was introduced for, on 13 live
+            # rows, and the guard then emitted 4 `SYSTEM BLOCK` blocks
+            # across 3 sessions.
+            return ToolOutcome.rejected(
+                _t, reason_code=f"manage_services_{action}_refused")
+        return ToolOutcome.ok(_t)
+
     try:
         if action == "start":
-            return await asyncio.to_thread(
+            return _declare(await asyncio.to_thread(
                 sup.start, name, command, port=port, workdir=workdir,
-                project_id=project_id)
+                project_id=project_id))
         if action == "stop":
-            return await asyncio.to_thread(sup.stop, name, project_id)
+            return _declare(await asyncio.to_thread(sup.stop, name, project_id))
         if action == "restart":
-            return await asyncio.to_thread(sup.restart, name, project_id)
+            return _declare(await asyncio.to_thread(
+                sup.restart, name, project_id))
         if action == "stop-all":
-            return await asyncio.to_thread(sup.stop_all)
+            return _declare(await asyncio.to_thread(sup.stop_all))
         if action == "adopt":
-            return await asyncio.to_thread(
-                lambda: sup.adopt(name, port, project_id=project_id))
+            return _declare(await asyncio.to_thread(
+                lambda: sup.adopt(name, port, project_id=project_id)))
         if action == "logs":
-            return await asyncio.to_thread(
+            return _declare(await asyncio.to_thread(
                 sup.logs, name, lines if lines is not None else 60,
-                project_id)
-        return await asyncio.to_thread(sup.status, name, project_id)
+                project_id))
+        return _declare(await asyncio.to_thread(sup.status, name, project_id))
     except Exception as e:  # noqa: BLE001 — tool contract: return, don't raise
         logger.warning("manage_services %s failed: %s", action, e)
-        return f"Error: manage_services {action} failed: {type(e).__name__}: {e}"
+        from .outcome import ToolOutcome
+        return ToolOutcome.failed(
+            f"Error: manage_services {action} failed: {type(e).__name__}: {e}",
+            world_changed=False, reason_code="manage_services_exception")
 
 
 MANAGE_SERVICES_TOOL_DEFINITION = {

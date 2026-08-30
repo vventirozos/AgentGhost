@@ -160,7 +160,10 @@ def test_metacog_skips_a_promoted_result():
     src = inspect.getsource(agent_mod)
     idx = src.index('_mc = getattr(self.context, "metacog", None)')
     window = src[idx:idx + 900]
-    assert "_mc_promoted(str_res)" in window, (
+    # The question, not the old symbol. It used to name `_mc_promoted`, an
+    # `execute`-ONLY text marker — blind to the second UNRESOLVED producer,
+    # so a still-running `swarm` await recorded a competence SUCCESS.
+    assert "_res_unresolved" in window, (
         "a detached command is neither a competence success nor a failure")
 
 
@@ -236,13 +239,27 @@ def test_the_preflight_world_changed_reset_is_gated_in_agent_py():
     from ghost_agent.core import agent as agent_mod
     src = inspect.getsource(agent_mod)
     idx = src.index("_pf_world_mut and not _pf_exec_failed")
-    assert "_pf_promoted" in src[idx:idx + 120], (
+    _gate = src[idx:idx + 200]
+    assert "_pf_promoted" in _gate, (
         "an unfinished mutation must not clear the pre-flight failure guard")
+    assert "_res_is_error" in _gate, (
+        "a demonstrably FAILED mutating call must not clear it either — the "
+        "branch's own comment says 'a SUCCESSFUL state-mutating call'. It "
+        "fired on 9 live calls another reader books as failures.")
     # …and the flag must be bound OUTSIDE the execute-only branch, or the
     # first non-execute tool call raises NameError.
-    bind = src.index("_pf_promoted = _sbx_promoted(str_res)")
-    gate = src.index('if fname == "execute" and not _res_is_error:')
+    bind = src.index("_pf_promoted = _res_unresolved")
+    # Anchor on the branch BODY: `if fname == "execute":` alone is not
+    # unique in this module (it was, only because of the `and not
+    # _res_is_error` this round removed).
+    gate = src.index("_pf_exec_failed = _outcome.shell_failed")
     assert bind < gate, "_pf_promoted must be bound unconditionally"
+    # ⚠ The execute-only branch is NO LONGER gated on `not _res_is_error`.
+    # It was, and that made it self-defeating: a crashed command set
+    # `_res_is_error`, so `_pf_exec_failed` stayed False and the reset above
+    # then cleared every recorded failure on the strength of the crash.
+    assert 'if fname == "execute" and not _res_is_error:' not in src, (
+        "the shell-failure flag is gated on the verdict again")
 
 
 # ------------------------------------------------------ the workspace ledger

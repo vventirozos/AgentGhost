@@ -419,7 +419,28 @@ async def tool_delegate(task=None, tasks=None, tools=None, wait: bool = False,
 
 
 async def tool_jobs(action: str = None, job_id=None, context=None, **kwargs):
-    """Status surface for background work (delegated sub-agents, swarm)."""
+    """Status surface for background work (delegated sub-agents, swarm).
+
+    Declares its own outcome. Its reports QUOTE the jobs they describe —
+    including a finished job's `EXIT CODE: 1` and `[FAILED]` lines — and the
+    dispatch loop's banner rule read those as the `jobs` call itself failing,
+    drawing a strike every time the model re-read the same failed job. A
+    successful READ of a failed job is a success.
+    """
+    from .outcome import ToolOutcome
+    _res = await _tool_jobs_impl(action=action, job_id=job_id,
+                                 context=context, **kwargs)
+    if isinstance(_res, ToolOutcome):
+        return _res
+    _t = str(_res)
+    if _t.lstrip().startswith(("Error:", "ERROR:")):
+        return ToolOutcome.failed(_t, world_changed=False,
+                                  reason_code="jobs_error")
+    return ToolOutcome.ok(_t)
+
+
+async def _tool_jobs_impl(action: str = None, job_id=None, context=None,
+                          **kwargs):
     action = str(action or kwargs.get("operation") or "status").strip().lower()
     job_id = job_id or kwargs.get("id") or kwargs.get("job")
     if action in ("list", ""):

@@ -317,8 +317,14 @@ class TestReconcileAndAdopt:
         sb.occupy(8102, 636)
         n_calls = len(sb.calls)
         sup.reconcile()
-        assert not any("kill" in c.lower() and "-TERM" in c
-                       for c in sb.calls[n_calls:])
+        # ANY kill, not just -TERM. The old assertion required BOTH tokens,
+        # so a `kill -9 {pid}` added to reconcile() was recorded by the fake
+        # sandbox, looked at by this assertion, and passed.
+        _killers = [c for c in sb.calls[n_calls:]
+                    if "kill" in c.lower() or "pkill" in c.lower()]
+        assert not _killers, (
+            f"reconcile() is not read-only — it signals a port holder: "
+            f"{_killers}")
         assert sup._load() == {}                 # registry untouched
 
     def test_registered_running_service_is_not_an_orphan(self, tmp_path):

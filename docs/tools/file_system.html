@@ -95,7 +95,7 @@
   <h2>PDF handling</h2>
   <ul>
     <li><code>read</code> blocks PDFs with a hint to use <code>read_chunked</code>.</li>
-    <li><code>read_chunked</code> uses PyMuPDF; max 1000 pages.</li>
+    <li><code>read_chunked</code> uses PyMuPDF; no page cap (the 1000 nearby is a chunk-size floor, not a page limit).</li>
     <li>For ingestion via <code>knowledge_base</code>, the PDF is chunked into the vector store.</li>
   </ul>
 

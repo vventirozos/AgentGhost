@@ -20968,7 +20968,13 @@ Without it, budget/deadline mutations degraded into indefinite CI hangs
 test; a deliberate-hang demo now fails in 5s. The rationale is recorded in
 pytest.ini itself.
 
-## §4BW — Sandbox / execute review (queue #4, 2026-08-19) — REVIEW COMPLETE, FIXES PENDING
+## §4BW — Sandbox / execute review (queue #4, 2026-08-19) — REVIEW COMPLETE, FIXES LANDED
+
+> ⚠ This header read **"FIXES PENDING"** until 2026-08-29. The fixes landed the SAME DAY —
+> see "§4BW FIXES APPLIED", "§4BW ROUND 2" and "§4BW R2 — three deferred MAJORs landed"
+> below — and §4CS later found that even the tail's "C LANDED" claim was false in the other
+> direction. A status line that outlives its own truth is the same claim-vs-fact defect this
+> journal records elsewhere; the index carried a phantom open item for ten days.
 
 ⚠ PROCESS NOTE. A PARALLEL #4 review session (agents named "#4 lens A/B",
 NOT the three "Sandbox lens A/B/C" this session launched) ran concurrently
@@ -26340,6 +26346,489 @@ parent before the child starts), builds one forged row per id and renames over t
 Closing it needs the child under the sandbox.
 
 
+## §4DL — The follow-on list, taken (2026-08-28)
+
+§4DK's review left seven things reported-not-fixed. Operator said proceed. All seven, ranked as they
+were reported.
+
+**`forget` deleted files the caller never named.** The disk sweep ranked candidates exact -> stem ->
+SUBSTRING and deleted every member of the first non-empty tier. Measured: `forget('atlas')` unlinked
+`atlas_migration_plan.py`, `notes_about_atlas.md` and `sub/deep_atlas_notes.txt`. Irreversible,
+model-reachable in one call, no dry-run — and §4DK made the pressure worse by describing `target` in
+the vocabulary that feeds this branch hardest ("a topic, an entity, a person's name"), because a
+bare word matches far more filenames than a filename does. Forgetting a TOPIC is not a licence to
+delete every file whose name shares a token with it; the vector, profile and graph sweeps remove the
+knowledge either way. Substring hits are now REPORTED as candidates and left alone; naming one makes
+it an exact match and it is deleted. ⚠ This broke `test_tool_unified_forget_integration`, whose
+fixture (`target` -> `target_file.txt`) reached the substring tier. Its subject is "all four stores
+are swept", so the fixture is now an exact match and the new contract has its own file
+(`test_forget_disk_sweep_scope.py`) — an existing test changed to fit new code, stated plainly
+rather than buried.
+
+**`reset_all` stalled the loop and lied about what it orphaned.** `collection.get()` with no
+`include` pulled every document BODY back (live: ~8k rows, 7k of them manual chunks) to use nothing
+but the ids, and it and every delete batch ran synchronously on the event loop — while the CHEAP
+graph wipe was already offloaded. Both are in threads now, and the enumeration asks for ids only. It
+also deletes the `document`/`episode`/`skill` rows `_FORGET_PROTECTED_TYPES` protects, because each
+has a record in another store this does not touch: `forget` refuses to create that asymmetry,
+`reset_all` creates it by design, and it now says so instead of returning a clean "Wiped clean".
+
+**Three of eight name-keyed decisions were healed; five were not.** §4DK fixed `is_mutating`,
+`is_idempotent_setter` and the wipe flag to read the canonical tool name. Still raw, in the same
+block: `is_sandbox_mutation` (an `fs` write left the workspace cache stale), the empty-`content`
+write block (bypassed by `fs` outright), the dedup hash (`kb` and `knowledge_base` with identical
+args never matched each other), `disabled_tools`, and the skill-store guards. The name is resolved
+ONCE at the top of the block now and the dispatch reuses that value, so the name every guard is
+keyed on is provably the one that executes. The general pin is an AST scan: no comparison of the raw
+name against a real tool may appear before the rebind.
+
+**"Did you forget a required argument?" told models to ADD when they had to REMOVE.** Model args are
+splatted unfiltered into a lambda that already supplies the tool's context, so
+`knowledge_base(action='forget', model_name='x')` returns "got multiple values for keyword argument
+'model_name'" under that banner. Same class as §4DK's loop — advice that cannot work — at every
+tool, not just this one. `describe_invocation_error` names the offending argument and says to drop
+it; the message classifies FATAL and gets the re-issue framing.
+
+Plus: the mixed-turn failure preview (140 chars) amputated the worked call mid-word, so argument
+errors get 300 and nothing else does; and the PDF page cap said 1000 in the docs and its own module
+docstring while the constant is 6000.
+
+**One item on the list was wrong and is NOT fixed.** I removed `update_profile` from `is_mutating`'s
+knowledge_base actions on the grounds that the branch stopped dispatching. The suite caught it:
+`test_kb_update_profile_action_not_collapsed` pins that a byte-identical repeat must not be
+collapsed. Its stated reason ("pass-through to tool_update_profile, a write") is indeed dead — but
+it protects a second, live one: collapsing replaces the result with a "no new information" note,
+which would swallow the redirect telling the model which actions this tool has. A corrective error
+is worth repeating. Reverted; the stale rationale corrected in place. The finding was reported as
+"harmless, but a lie in a list people read" — it was neither.
+
+**Measured.** 22 mutants over the new code, 4 survived the first pass — and one of the four was my
+own vacuous test: it recomputed the preview budget (`300 if is_argument_error(err) else 140`) and
+asserted against its own arithmetic, so a mutant that cut the budget to a flat 140 AND one that
+widened every preview to 300 both passed it. The budget is read out of the source now. The other
+three were unwired-helper gaps: `describe_invocation_error` correct but not called, the
+disabled-tools gate still raw. Pins added for each.
+
+### The review of the follow-on list, and what it cost
+
+**A second vacuous test, in the file written to prove the disk fix.**
+`test_a_topic_does_not_delete_files_that_merely_mention_it` PASSED ON THE PRE-FIX CODE. Its fixture
+created `atlas.md` — a STEM hit — so `exact or stem or substr` short-circuited and the substring
+tier it was written to exercise was never reached. The old code kept those same three files for the
+same reason. One of four disk tests discriminated. The fixture is split now: one case with no better
+match (the discriminating one), one with an exact match alongside.
+
+**And the report the whole mitigation rests on was off in the common case.** `if not chosen and
+substr_hits` — it only fired when NOTHING was deleted. `forget('atlas')` with an `atlas.md` present
+deleted that file and said nothing about the three it had matched and kept. It also ignored the
+STEM tier the `or` chain shadows, so `forget('notes.md')` kept `notes.txt` silently, and it named 10
+of N candidates while telling the caller to name one exactly.
+
+**`reset_all`'s orphan note was computed from a different snapshot than the delete** — two `get()`s,
+and the note emitted regardless of outcome: with every batch failing it reported "this removed the
+vector rows for N document…" having removed nothing, and reset the library index anyway while the
+message said the entries were "left in place". One scan now (`include=["metadatas"]` returns ids
+too), counted per successful batch.
+
+**`is_sandbox_mutation` was missing `copy`** while `is_mutating` had it — and the comment on the
+second says to keep them in sync, naming `copy` as the F2b fix. The fix had landed on one of the two
+lists, so a copy created a file and left the workspace cache valid. Both lists are pinned equal now.
+
+**Two more of my own assertions were satisfied by the wrong half of a string:** "names the offending
+argument" was true of the appended `TypeError` text rather than the message's own wording, and
+"the worked call fits the preview" held for any budget ≥145 when the call starts at index 133 of a
+209-char message — a mutant at 160 survived. And the `_cname` hoist opened a narrower defect going
+the other way: the alias table was consulted BEFORE the exact-name match, so an acquired skill
+legitimately named `fs` or `kb` resolved to the built-in and one of the newly-keyed guards blocked
+it outright. Real names win now — which also surfaced that `profile_update` had been a dead alias
+key since the day it was written, because lookups are normalised and that key is not.
+
+One item on the list was **wrong and is not fixed** (see below). One was a **mis-edit**: the PDF
+docstring's "MAX_PDF_PAGES = 1000" was a HISTORICAL statement about the old path in a paragraph
+about the PostgreSQL manual, not a stale restatement of the constant — "corrected" to 6000 it became
+nonsense. Restored, and the actually-wrong claim (`docs/tools/file_system.html`: "read_chunked …
+max 1000 pages", a cap that does not exist) fixed instead.
+
+
+## §4DO — Round three: briefed on the unit, not the half (2026-08-29)
+
+§4DN's reviewer diagnosed why six rounds had each found their criticals in the previous round's
+fixes — *"every round scoped itself to the half it changed"* — and named the brief for the next one.
+This is that round: the error vocabularies as a CROSS-PRODUCT, the forget sweeps DIFFED against each
+other, and the test harnesses audited for state the real loop shares.
+
+**There are ten error vocabularies, not the five the brief named.** A reviewer AST-parsed every
+`return`/`raise` in the 34 tool modules — **1,026 result heads** — ran all classifiers over each,
+then over **4,391 recorded live tool calls**. `tool_failure.py` claims "ONE HOME — the turn loop, the
+foresight seeder and the tests all read it from here." False at nine sites, five of them inline in
+the dispatch loop, and **the inline ones own the load-bearing decisions**.
+
+Two live criticals fell out, neither of them mine, both fixed:
+
+- **A refusal was credited as changing the world.** `file_system` answers a malformed mutating call
+  with `SYSTEM INSTRUCTION: …forgot 'replace_with'` or `REPLACE REJECTED (byte-identical)`. No
+  predicate matched, so a call that changed NOTHING cleared every recorded pre-flight failure, wiped
+  the loop-breaker's memory, **decremented the strike count** (a run of rejected replaces *erases*
+  earlier strikes, so the cap can never fire), marked the file modified in the work log, and taught
+  the foresight model the call succeeds. **63 live occurrences across 36 requests.** Now
+  `result_is_rejection` — deliberately NOT folded into `result_is_failure`, because the skill
+  success-rate readers exempt steering SYSTEM INSTRUCTIONs on purpose.
+- **A non-zero exit was reported as SUCCEEDED under the one banner that claims authority.**
+  `op_outcomes.ok` used a predicate that does not know about `EXIT CODE:`, so the MULTI-STEP OUTCOME
+  line — *"the successful operations DID take effect… AUTHORITATIVE over any prior context"* — called
+  a command that exited 127 a success. **15 live turns.**
+
+**And the sweeps, diffed mechanically rather than read in turn, were five tools wearing one name.**
+A reviewer rebuilt byte-identical state per target and diffed disk / library / vector / profile /
+graph against the report string. `clean_target` normalisation reached the disk and document halves
+only, so `forget('./notes.md')` and `forget('sandbox/notes.md')` deleted the file and the document
+and **silently skipped the semantic, profile and graph sweeps entirely** — the report never said the
+knowledge half had not run. The ambiguity gate was disk-only, so one report printed "kept 3 file(s)…
+Nothing on disk is deleted for a partial name match" above three `✅ Vector: Wiped document` lines
+naming **the same three files**. The gate also covered `exact_hits` only: `forget('index.html')`
+refused three files while `forget('index')` — five characters shorter — unlinked five through the
+stem tier the gate never looked at. A trailing slash split the call in half. And `lstrip("./")`
+appeared AGAIN, in the vector path branch I had just written, collapsing four distinct documents
+onto one key — the exact character-set bug the same function documents forty lines above.
+
+All five sweeps read one normalised target and one ambiguity rule now, and the gate keys on **how
+many directories** the matches span, not how many files: `notes.md` + `notes.txt` in one directory is
+the stem tier doing its job; five `index.html` files in five projects are five different things.
+
+**Measured.** 16 mutants over the round-three fixes: 6 survived the first pass — including both
+world-changed sites and three of the five sweep normalisations, because my pins spied on one sweep
+and one ledger. 16/16 after.
+
+### …and the fix for round three introduced three more
+
+The reviewer re-ran its differ against the patch and found the sweep-alignment fix had created new
+defects, all mine:
+
+- **The ambiguity gate deleted the file it shadowed.** Clearing `exact_hits` alone handed the very
+  next line (`chosen = exact_hits or stem_hits`) the weaker tier that had LOST to them: with
+  `p/a/index`, `p/b/index` and `index.html`, `forget('index')` refused the two the caller may have
+  meant and irreversibly deleted the third. The contradiction-in-one-report shape the gate exists to
+  remove, recreated by the gate.
+- **The profile value prune became a no-op that still printed a green tick.** I normalised the
+  GUARD (`_value_mentions_target(item, target_lc)`) and left its ARGUMENT raw
+  (`prune_value(cat, k, target)`), so the guard said "this value mentions the target" and handed the
+  pruner a string that matched nothing. `✅ Profile: No matching value under assets.pets`, profile
+  byte-identical, pet still injected into the system prompt every turn.
+- **The entity expansion was the one consumer left a revision behind.** It is the AMPLIFIER of a
+  forget — what reaches the `mortimer` → `iguana` tombstone — and it still read the raw string, so it
+  was dead for exactly the two spellings the normalisation was written for.
+
+Two of the pins I wrote for these could not kill their own mutants: one because `ProfileMemory.update`
+STRINGIFIES a list literal, so the fixture never exercised `prune_value` at all and the scalar
+delete path answered instead. 5/5 after. Full suite 18,077.
+
+**Standing lesson, now six rounds deep:** the fix for a review finding is the least-reviewed code in
+the tree, and it is where the next round's criticals live. Every round here proved it, including the
+round that was briefed on exactly that.
+
+### Reported, not fixed
+
+The cross-product's remaining findings are pre-existing and larger than this change: 219 live calls
+where the loop books success and the trajectory corpus books failure (40 code sites); 12 live
+non-`execute` calls carrying an `EXIT CODE` banner that gets no rescue; the `PARTIAL:` family on
+idempotent setters; `classify_tool_failure` scanning RETRYABLE before FATAL, so a permanently
+unsatisfiable call that merely mentions a timeout never enters the strike ledger; and
+`is_argument_error` matching `MANDATORY` as a substring over free prose — **7 of its 8 live firings
+were false positives on retrieved page and lesson text**. The reviewer's recommendation, which I
+endorse: a `ToolOutcome(status ∈ {OK, FAILED, REJECTED, PARTIAL, UNRESOLVED})` staged behind the one
+predicate, migrating ~120 of the 1,026 return sites (12% of the surface, 100% of the measured live
+divergences), pinned at the PRODUCER by an AST walk that fails when someone adds return #1,027.
+**It was undertaken immediately after this entry was written — see §4DP.**
+
+The harness audit is its own piece of work: **ten mutants survived** because the pins that should
+catch them are inert — `tests/verify_sandbox_cache.py` is never collected at all (the filename does
+not match `test_*`, and it is broken besides), two context-governor pins pass `raw_tools_called=[]`
+as a **list** where the product calls `.add()`, so the dispatch raises on the first tool and the rest
+of the pipeline is unreachable, and `seen_tools` is written by the loop and read by nothing.
+
+**Process, twice.** A backgrounded suite run that overlapped my edits produced 73 phantom failures
+(all green on the settled tree — `inspect.getsource` reads from disk). And I edited `agent.py` while
+a reviewer was measuring it, having told it the tree was stable; it caught the drift itself and
+re-verified its anchors. Both are my errors, not the tooling's.
+
+
+## §4DN — Round two: the halves that were fixed separately still disagreed (2026-08-28)
+
+Two lenses on §4DM's own fixes. Verdict: **no, do not ship** — two criticals and a major, all three
+inside the fixes from an hour earlier. The standing pattern held for the sixth consecutive round.
+
+**The colon fix repaired one producer and not the consumer.** §4DM made
+`describe_invocation_error` say `"Error:"` because the turn loop books failures on
+`startswith(("Error:", …))`. But **nine live tool returns say "Error " with a SPACE** —
+`tool_remember`'s "Error storing memory: …", `file_system`'s "Error 404 - Failed to download …",
+and seven more — and every one of them was still booked as a **clean success**. Driven: a failed
+`insert_fact` scored zero strikes AND had its hash written to `executed_idempotent`, so the model's
+identical retry was refused with "the intended state is already applied" and the fact was never
+stored. A failing `file_system` download went further: booked ok, it took the world-changed branch
+and **cleared every recorded failure**, disarming the pre-flight repeat guard it should have fed.
+The contract is one exported predicate now — `result_is_failure` — matching `Error` as a WORD
+(my own new test caught the first version calling "Errors were avoided" a failure).
+
+**The vector half never got the disk half's rules, and one report printed both policies.** Two lines
+apart, the same two filenames: *"Nothing on disk is deleted for a partial name match"* above
+*"✅ Vector: Wiped document 'notes.txt'"* — and the irreversible half was the one ignoring the rule.
+`forget('postgresql-19-A4.md')` destroyed the 7k-chunk manual: the exact incident the vector rule was
+written for, through the extension case it lacked. Both halves read one `target_names_a_file` /
+`target_names_a_path` now, computed once.
+
+**And the conservatism had landed entirely on the tier that does not delete.** `chosen = exact_hits or
+stem_hits` had no ambiguity check, so on the live sandbox `forget('index.html')` removed **five**
+files across five projects and `forget('app.py')` two — silently, irreversibly — while a single
+unambiguous substring match was refused and cost a second call. The line was inverted. An ambiguous
+bare name now reports its candidates as re-issuable paths (`./index.html`) instead of deleting them.
+
+Also, all measured: the `sandbox/` strip ran BEFORE the path test, so `forget('sandbox/index.html')`
+lost its only separator and reopened the §4DM critical with four characters; `str.lstrip("./")`
+strips a CHARACTER SET, so `.config/x.md` deleted `config/x.md`, a file nobody named; a dotfile has
+no `suffix`, so `forget('.env')` took `.env.local` and `.env.production`; and under a project-scoped
+sandbox the path rule turned a working call into a **silent total no-op** with no candidate report
+at all — the caller was told the file does not exist.
+
+**The reword disarmed a guard in another subsystem.** `foresight._SYNTHETIC_RESULT_PREFIXES` still
+listed `"Error invoking tool"`, so rejections the live hook never resolves were about to be seeded
+into the trajectory corpus as real FAILED transitions. Its test pinned the old string as a literal —
+green, and blind. It calls `describe_invocation_error` now instead of copying its output.
+
+### And another of my tests could not fail
+
+`test_a_crashed_setter_is_not_recorded_as_applied` — written to pin the consequence that makes the
+prefix load-bearing — used `_ts()`, which builds a **fresh `executed_idempotent` per dispatch**, so
+the cross-call guard could never fire. Reverting the product left it green. That is the third
+vacuous test in this body of work, and the second found by a reviewer rather than by me. Verified
+the repair with a two-edit mutant (product reverted × harness reverted): the shared set is what makes
+that test fail. `_KB_PRIMARY_NAMES` was also deleted — a reviewer proved it had no product consumer
+and its only test asserted one hand-written constant equals another.
+
+**Measured.** 17 mutants over the round-two fixes: 16 killed, 1 an equivalent (a harness-only revert,
+validated by the two-edit check above). Full suite 18,048.
+
+
+## §4DM — Four lenses on the follow-on list (2026-08-28)
+
+Four fresh-eye lenses on §4DL. Two CRITICALs, both **introduced by §4DL itself**, both live-reachable.
+
+**The report told the caller to do the thing that deletes their files.** The disk sweep matched on
+BASENAME while the kept-report printed candidates as sandbox-relative PATHS and instructed
+"forget it by the exact name shown here". Following that instruction deleted every file in the tree
+with that basename — including candidates the report had listed separately and files it never
+mentioned. Measured against the real sandbox layout (623 files):
+`forget('projects/<id>/index.html')` removed **five** index.html files across five projects;
+`forget('PROJECT_MAP.md')` removed every project's map. A target carrying a separator now means that
+path and nothing else, and a target carrying an EXTENSION no longer falls through to the stem tier
+(with `notes.md` absent, `forget('notes.md')` had deleted notes.txt, notes.xlsx and notes.pdf — the
+files the report calls partial matches and promises not to touch when `notes.md` happens to exist).
+
+**Every crashing tool became a clean success.** `describe_invocation_error`'s fallback returned
+`"Error invoking tool …"`, and the turn loop books failures on
+`startswith(("Error:", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))` — **`Error:` with a colon**.
+The comment right above it claimed it "keeps the 'Error' prefix the turn loop books failures by". It
+did not. Measured old-vs-new on one crashing call: strikes 1→**0**, `last_was_failure` True→**False**,
+the clean-success streak **advanced**, the foresight model was taught the call shape succeeds — and
+`executed_idempotent` recorded a CRASHED setter as applied, so the model's legitimate retry was
+refused with "the intended state is already applied", the tool having run zero times. That is the
+2026-07-05 live bug re-opened through the exception path, by a comment that was wrong about a colon.
+
+**And the fix for one hijack opened the mirror image.** §4DL made the exact normalised match beat the
+alias table so a skill named `fs` stopped resolving to `file_system`. But `norm_to_real` is last-wins
+and skills are appended AFTER built-ins, so a skill legally named `filesystem` then won the key of
+`file_system`: the empty-write block fired on a skill, a real write left the sandbox cache valid, and
+a skill named `knowledgebase` left `forget_was_called` False while the wipe ran — §4DK's tombstone
+resurrection, restored from the other side. An exact name is now canonical before any normalisation,
+which also keeps `_cname == fname` for every dispatchable call and so keeps the request-scoped
+idempotency hash stable when the tool map changes mid-request.
+
+Also: the vector half still substring-deleted whole documents while the disk half printed "Nothing on
+disk is deleted for a partial name match" — against the live library `forget('pdf')`, `forget('sql')`
+and `forget('postgres')` each destroyed the ~7k-chunk PostgreSQL manual. Same discipline now.
+`reset_all` took no vector lock (a concurrent ingest survived the wipe while the unlocked library
+reset erased its catalogue entry), and emptied the catalogue on PARTIAL failure — my guard covered
+total failure only, and the helper I wrote could not even express the partial case. The 300-char
+preview widening was dead: `summarize_multi_op_outcomes` re-cut to a flat 140.
+
+### The pins were the weak half, again
+
+A mutation audit ran 30 mutants against the five test files: **8 survived**, and the two most
+important were the fixes for the two CRITICALs above — found, fixed within the hour, and **neither
+could fail a test**. `pin-must-fail-somewhere`, twice, in the same hour.
+
+Worse, one behavioural test I wrote to close the gap **passed for the wrong reason**: an aliased
+ingest is not collapsed whether or not `is_mutating` reads the healed name, because the collapse
+gate gives up on any name outside `_COLLAPSE_READSAFE`. And the AST pins were evaded by spelling the
+same raw read differently — `tool["function"]["name"] in [...]` instead of `fname in [...]` — so the
+guards now forbid a subscript read outright, not just the token. `test_a_shadowed_STEM_match_is_
+reported_too` had stopped killing its own mutation because a LATER product edit emptied `stem_hits`
+for its fixture: a test written 30 minutes earlier, silently disarmed by the next change, exactly
+the class documented in that file's own header.
+
+**Measured.** 18 mutants over the reworked code and the audit's eight survivors: 18/18 killed, no
+anchor misses. Full suite 18,015.
+
+**Process note.** A backgrounded full-suite run that overlapped my edits produced **73 phantom
+failures** across 12 unrelated files — this repo pins a lot of behaviour with `inspect.getsource`
+and `ast.parse`, which read from disk at call time. All 59 re-ran green against the settled tree.
+Do not start the suite until the tree stops moving.
+
+
+## §4DK — An error that names a parameter the tool drops (2026-08-28)
+
+**Operator report: "I got this error twice, why?"** The user had asked the agent to forget a topic.
+The model called `knowledge_base(action='forget')` with no subject, was told *"SYSTEM ERROR: The
+'target' parameter is MANDATORY"*, retried with `target='…'`, and got the identical string back.
+`target` was a local variable inside the dispatcher and a parameter of the inner
+`tool_unified_forget`. It was in neither the advertised schema nor the dispatcher's alias chain
+(`filename|fact|content|source|path|topic`), so the kwarg fell into `**kwargs` and was discarded
+before the guard that demanded it ever ran. **Obeying the error could not work.** Every retry was
+byte-identical until the strike budget ran out. `insert_fact` carried the same trap through
+`'text'`.
+
+The first call was unwinnable too. The only legal slot for a topic was `filename`, a name for
+files, whose description is about `.mp4`/`.pdf` ingestion with "REQUIRED for forget (the topic name
+to forget)" tacked on the end. The live log has the model working it out and giving up: *"The
+parameters are: action, fact, question, ref, filename. None is obviously 'topic'."*
+
+**The fix, and why it is not one alias.** Adding `target` to the tuple would have closed this
+instance and left the class. `_KB_TARGET_ALIASES` is now the single statement of what the
+dispatcher accepts, and `_kb_target_or_error` does the lookup AND builds the message from the same
+list it just tried. `forget` advertises `target` in the schema; `filename`'s description opens by
+handing off to it. `'text'` was deliberately NOT added — widening the accepted set to match
+whatever an error happens to say is how a guard becomes a list of exemptions.
+
+### The claim was false, and a reviewer proved it
+
+The first version's comment said the loop *"cannot be reintroduced by an edit to either half,
+because there are no longer two halves."* There was a third half. Each call site passed a free-text
+`hint` that carried the **worked example** — the part a model actually copies. Changing one hint's
+`target=` to `subject=` reproduced the entire live loop **with all 19 pins green**: the pins scraped
+quoted lowercase tokens, and a hint's parameter appears as bare `name='value'`. A lexical proxy for
+a semantic property, in the pin written to prevent exactly this. The example is generated from the
+required parameter now; hints are prose; the pins recompute the message from
+`_kb_tried_names(primary)` and assert the rendered string contains it, plus a negative scan that
+fails on any identifier-shaped token that is not a name the lookup tried.
+
+### Four more, from four lenses
+
+- **The message steered models into a silent wrong write.** It enumerated the whole alias tuple, so
+  `insert_fact`'s error offered `'filename'` — and obeying it gives `tool_remember('notes.pdf')`,
+  the literal filename stored as a permanent fact, **returning SUCCESS**. Trading a loud loop for a
+  silent wrong write is not a fix. Alternatives are the legacy aliases only.
+- **The turn loop was telling the model not to obey the error.** `MANDATORY` classifies FATAL, and
+  FATAL appends *"PERMANENT ERROR — do NOT retry this tool call"* — appended to a message whose
+  whole point is "re-issue with this argument". That advice was accidentally right while these
+  errors named unusable parameters. FATAL still holds (a missing argument must not spend the
+  transient budget); the wording now permits the corrected re-issue and still forbids the identical
+  one.
+- **The action slot had the same defect.** *"Unknown action 'delete'"* named nothing to switch to,
+  and delete/erase/remove are not in the alias map, so the next guess was another guess. Both action
+  errors enumerate the valid set now, generated from `_KB_ACTIONS`, which the schema enum is pinned
+  against.
+- **`action='update_profile'` was dispatched but never advertised** — absent from the enum, reading
+  key/value/category which the schema does not carry, classified UNKNOWN rather than FATAL, and the
+  one route bypassing the repeat-write guard (`is_mutating` counts it, `is_idempotent_setter` does
+  not). It is a fully advertised tool in its own right; the branch redirects now.
+
+### The neighbour that failed open
+
+`forget_was_called` matched `args.get("action") == "forget"` on the RAW string over a `strict=True`
+parse — the un-healed twin of a check corrected 160 lines below it. The dispatcher normalises with
+`str(action).strip().lower()`, and the XML argument parser strips only CR/LF, so `" forget "` left
+the flag `False` **while the wipe ran**; so did any raw control character, because the dispatch site
+100 lines later parses with `strict=False`. That flag is what suppresses smart_memory, post_mortem
+and the episode write for the turn — so the content the user had just asked to delete was re-learned
+inside the same request. Now `call_runs_a_memory_wipe()`, extracted so it can be executed rather
+than asserted about, biased toward True, with a regex backstop for arguments that do not parse.
+
+**Its two mechanisms were redundant for every input the tests used** — mutation killed neither half.
+Two cases separate them now: a `\u0067`-escaped action only the parse recovers, and truncated JSON
+only the regex catches. Same lesson as §4CE: a verification that cannot distinguish the two worlds
+is not evidence about either.
+
+### Round two: the fixes were the new code
+
+A second pair of lenses reviewed round ONE's fixes rather than the original defect, on the standing
+assumption that each round's criticals live inside the previous round's work (§4BU, §4DG). They did.
+
+**The wipe predicate healed the ACTION and left the TOOL NAME raw.** It runs ~314 lines before
+`_canonicalise_tool_name`, whose alias table maps `kb` / `knowledgebase` / `knowledge-base` onto
+`knowledge_base` — its own comment cites `knowledgebase` as an observed Qwen 3.5 hallucination.
+Measured through `handle_chat` with byte-identical arguments and only the spelling varying: **the
+wipe ran in all five, the flag was False in four**, and each of those turns queued a smart_memory
+item carrying the request text and the wipe report straight back into the store just cleared. I had
+fixed three quarters of a fail-open guard and written a docs paragraph about closing it. It also did
+not cover `reset_all` — the LARGER wipe, which returns a SUCCESS string — so a predicate *named*
+`call_runs_a_memory_wipe` was answering False for the biggest wipe in the tool.
+
+**The exclusion set was a proxy.** Round one stopped `insert_fact`'s error advertising `'filename'`
+by excluding the other actions' schema names. `source` and `path` are exactly as filename-shaped as
+`filename`, were not excluded, and `insert_fact(source='meeting_notes.md')` still stores the literal
+filename as a permanent fact and returns SUCCESS. Same lesson as §4CI and `guard-a-proxy-not-the-thing`:
+I guarded "is another action's name" when the property is "suggests a value of the wrong type". The
+alternatives list is gone entirely — it was never what ended the loop (the required name and the
+worked call are), and a caller already passing a legacy alias never sees the message.
+
+**The worked call renamed the caller's verb.** `action` was interpolated after alias normalisation,
+so a model calling `action='transcribe'` — the verb §4AW added *because* the tool was un-findable
+without it — was handed `knowledge_base(action='ingest_document', filename='notes.pdf')`: its verb
+renamed back to the un-findable one, with a PDF example for an audio ask. **And the examples were
+live writes if copied:** `fact='The user lives in Athens'` stores a plausible fabricated profile
+fact and returns SUCCESS (it is even true of this operator, which makes it worse); `target='project
+atlas'` runs a real four-store destructive sweep.
+
+### Measured
+
+56 test functions / 128 cases across two files; full suite green. A 55-mutant whole-file run kills 54, covering every escape
+the reviewers demonstrated across all three rounds; the one survivor is the stated limit (a hint
+that names a field in bare prose, which is indistinguishable from English). Three review rounds,
+eight lenses. Every round's criticals were inside the previous round's fixes — R2's in R1's, R3's in
+R2's, and one of R3's in an edit I had made hours earlier the same session. What ended it was not a
+cleaner fix but the mutants: the run went 29/34 -> 43/49 -> 49/50 -> 54/55 as each survivor was
+either pinned or shown to be the documented limit. One reviewer swept all 41 dispatchable tools
+/ 160 (tool, action) pairs statically and by execution for the same class — a bare call, extract the
+names the error quotes, re-call with them, byte-compare — and found **no other instance**, with the
+detector validity-checked against a reconstructed pre-fix `memory.py`.
+
+### Round three: the second implementation of one decision
+
+Round two's tool-name fix was three quarters done. The predicate re-implemented the dispatcher's
+healing — alias table plus difflib at cutoff **0.85** — while `_canonicalise_tool_name` matches at
+**0.70** against the whole tool list, 314 lines later. Everything in `[0.70, 0.85)` healed at
+dispatch and not in the predicate: measured through the real batch dispatcher, `knowledge`,
+`knowledge_db`, `knowledgedb`, `knowledge_bank`, `knowledge_store`, `knowledge_base_query` and
+`know_base` all routed to `knowledge_base` and ran the wipe with the flag False. The comment
+justifying the tighter cutoff was measurably false. **Two implementations of one decision drift by
+construction** — the predicate asks the dispatcher's own question now, and a pin runs both over
+every name and asserts they agree. `is_mutating` and `is_idempotent_setter`, two lines away, had the
+same split (healed action, raw name): two identical `knowledgebase` ingests were classified
+read-safe and dedup-collapsed, **dropping a real ingest** — the defect their own comment claims to
+have fixed, reached through the other half of the identity.
+
+**And my newest edit had made its own bug.** The blank-subject check computed `val.strip()` to
+decide the subject was present and then passed the PADDED original on, while `tool_unified_forget`
+strips in only 3 of its 6 uses. `target=' atlas '` — the normal XML shape, since that parser strips
+CR/LF and not spaces — skipped the disk and document sweeps, left the files in place, and reported
+every stage with a ✅. Testing a normalised value and using the raw one is the same shape as the
+whole §4DK bug: two views of one identity, and the guard consults the other one.
+
+**Next, if this is picked up again** (a reviewer's brief, not this change's scope): the 0.85/0.70
+split was one instance of *two implementations of one decision* — look for the others in a 26k-line
+`agent.py`; the dispatch site splats `t_args` unfiltered into a lambda that already passes 9 context
+kwargs, so a model emitting `model_name=` gets "got multiple values for keyword argument" framed
+with "Did you forget a required argument?" (tells it to ADD when it must REMOVE); and the
+truncation chain (`[:140]`, `[:200]`, `[:500]`, `[:2000]`) silently cuts carefully built messages —
+the 140-char mixed-turn preview amputates the worked call mid-word.
+
+**Left open, reported not fixed:** `reset_all` materialises the whole vector store and runs its
+deletes on the event loop (while the cheap graph wipe IS offloaded), and drops the episode / skill /
+document rows `_FORGET_PROTECTED_TYPES` exists to protect; and `tool_unified_forget`'s disk sweep
+deletes every sandbox file whose name contains the target as a substring, so `forget('atlas')`
+unlinks `atlas_migration_plan.py` — irreversible, model-reachable, and the new `target` description
+invites exactly the short entity names that feed it.
+
+
 ## §4DJ — the headline turn-rate metric is RETRACTED (2026-08-27)
 
 **Operator statement: the §4AQ turn-rate measurement (2026-08-11) was taken during a VACATION week
@@ -31003,3 +31492,1079 @@ the entire scan while looking like a targeted fix for one false positive. It was
 because the test now asserts the stripper keeps a REAL call findable and a prose mention not, and
 confirmed by planting an actual `shutil.copytree` in the evaluator and watching the guard bite.
 Blanking the token spans in place, rather than re-joining tokens, is what preserves both.
+
+## §4DP — ToolOutcome: the status the loop could not sniff (2026-08-29)
+
+§4DO closed three measured harms by adding prefixes to predicates, and said the honest fix was a
+typed outcome. This is that fix, and three review rounds on it. The shape that survived is a **`str`
+subclass**: the first version was a dataclass with a hand-written proxy, and reviewers found the
+holes one at a time — `isinstance(x, str)` False, `json.dumps` raising, `"".join` raising, `re.search`
+raising, `+` raising, `os.path.join` raising. About a thousand call sites in this tree treat a tool
+result as a string; being one is the only version of "day 1 is behaviour-identical" that holds. The
+API payload is byte-identical because the status rides *inside* the content value — an extra dict key
+would be sent to the LLM.
+
+**The three harms are closed, measured on the same 4,391-call corpus §4DO used.** Refusals credited
+with a world change 66 → 0. Refusals scoring zero strikes 82 → 0. Turns reporting a non-zero exit as
+SUCCEEDED under the AUTHORITATIVE banner 15 → 0. Loop-vs-corpus disagreements **219 → 30**.
+
+### What each round got wrong
+
+**Round 1 and round 2 each removed a brake and called it a fix.** Round 1 exempted refusals from the
+pre-flight guard (right: the guard keys on tool+target+op, and a corrected re-issue keys identically).
+Round 2 then exempted them from the same-failure loop breaker (wrong). With both gone, nothing stopped
+a repeated refusal — and the System-3 pivot re-arms itself, because it fires at
+`execution_failure_count == 5` and then subtracts 2. Executed against the method's own arithmetic,
+lifted by AST rather than retyped: **11 pivots in 25 all-failing turns, the strike cap never reached,
+no final response forced, the task tree rewritten every other turn.** The repeat detector was never
+the problem — `note_failure` is also what freezes the success decay so the cap *can* fire. What was
+wrong was the ADVICE: "STOP repeating it — retrying will not change the result", against a message
+whose entire content is which argument to change. So only the steer branches now, and the second
+pivot no longer decays the counter.
+
+**Round 2's exemption also read the wrong result.** The strike block runs *after*
+`for i, result in enumerate(results)`, so `_outcome` there is the batch's LAST call. A refusal
+followed by a success took the hard-failure path; a hard failure followed by an unrelated refusal was
+exempted from the breaker *and* the decay freeze. Same two calls, opposite behaviour, decided by batch
+order. The flag is captured at the failing site now, beside `failed_fname`, which was moved there for
+exactly this reason in July.
+
+### The line that took three rounds to find: DECLARED vs DERIVED
+
+The recurring trap is that a status and a text sniffer disagree and there is no principle for who
+wins. Preferring the status once traded +61 refusals for **−198 `execute` failures**. ORing them
+leaves the sniffer's false positives: a `manage_projects` read whose JSON ledger quotes a stored
+`autoadvance_failed` event — traceback and `EXIT CODE: 1` verbatim — was booked a failed shell command.
+
+Position cannot separate those (a JSON payload is one line, so "the banner heads the result" is true
+for an envelope *and* for a quote). **The producer can.** `ToolOutcome` now records whether its status
+was *declared* by a producer or *derived* by `coerce` from the same prose the sniffer reads. A derived
+`ok` never overrules the sniffer; a declared `ok` settles it. This is safe for one structural reason,
+now pinned: **`execute` never declares.** Its results are bare strings, so `coerce` marks them derived
+and the shell keeps full authority over its own exit code — and `shell_failed` deliberately has no
+`declared` short-circuit at all, so a producer that declared OK while its envelope says 127 is still
+caught.
+
+Two dead fields (`retryable`, `meta`) went the other way: zero producers ever set either, and `meta`
+allocated a dict on every construction for a field nothing wrote. A reviewer proved the deletion
+lossless by making it.
+
+### The consumers were the whole second half
+
+Every round including the ones on this refactor was briefed on the files that changed, and each found
+its criticals inside the previous round's fixes. The round that broke the pattern did something else:
+it replayed all 4,391 calls through **each reader independently** and asked "how many of the 82
+refusals does *this* one still miss?" That found what no diff review had:
+
+- `_turn_had_tool_failure` — the verifier's high-stakes CONFIRM escalation — did
+  `str(tool.get("content"))`, discarding the status of a `ToolOutcome` handed to it, in the same file
+  and over the same list as a bug fixed a round earlier. **15 turns, 8% of the high-stakes population.**
+- `project_advancer._looks_like_failure` and `registry._acquired_skill_result_class` missed **82/82**
+  refusals. The first is what lets the idle autoadvancer mark a task DONE — unattended.
+- `browser` failures head `--- BROWSER RESULT ---\nSTATUS: ERROR`, which no anchored prefix rule can
+  reach: **42 live rows, 0/42 booked as failures.** Larger than the exit-code class §4DO closed, and
+  never in scope. One `_err` helper.
+- A write that LANDED on a file that does not parse headed its result `SUCCESS: Wrote …`. 11 live
+  rows, clean successes to every classifier — noticed only by an *eleventh* private sniffer in
+  `coding_executor`. Every gap had been getting a new local sniffer instead of a status.
+- `swarm`'s "N still running, they were NOT cancelled" branch was PARTIAL, which is a failure status,
+  so it drew a strike for work explicitly in flight. It is UNRESOLVED now — a status that until this
+  round had **no producer at all**, which made `_res_is_error` look more careful than it was.
+
+Then a fifth reader of the same question was missed while four were migrated —
+`coding_executor._looks_like_write_error`, **36 live refusals**, and its caller does `touched.add(path)`
+and advances the task with the file never written. That is the pattern in miniature, so the answer is
+not to remember the list: `test_every_result_classifier_reads_the_status` **enumerates** them from the
+AST and fails on the sixth.
+
+### Pins
+
+Every previous round's pin here guarded a reader, and the next defect arrived through a writer, so
+the contract pin is at the PRODUCER — an AST walk with **no allowlist**, failing when a
+refusal- or partial-shaped `return` appears anywhere that defines a `tool_*` entry point. Two things
+that had to be fixed about the pins themselves:
+
+- **The producer scanner had no positive control.** It was green because its result set was empty —
+  which is exactly what a broken scanner produces. A reviewer disabled each of its three arms in turn
+  and the whole suite stayed green. It now proves it can find a planted refusal in all four shapes
+  (literal, f-string, concatenation, module constant) before it is allowed to report none.
+- **Two pins asserted the fix instead of reading it.** The pivot simulation hardcoded
+  `if pivot_num == 1` rather than lifting the guard from source, and the browser pin asked "is
+  ToolOutcome mentioned in `_err`" — true either way, because `_err` imports it on its first line.
+  Both survived the exact mutants they exist to catch until a whole-file mutation run, one mutant per
+  run with the killer never named, exposed them. **30 mutants, 30 killed.**
+
+A third thing the mutation run taught: a foreground timeout killed the batch mid-mutant and left the
+scratch tree patched, which then reported the *next* run's mutant as an unmatched patch. The harness
+traps SIGTERM/SIGINT/SIGHUP and restores now.
+
+**Suite: 18,162 passed, 0 failed.** Not closed — the largest known remainder is the 30 residual
+loop-vs-corpus disagreements (`execute` 9, `deep_research` 7, `file_system` 6, `vision_analysis` 4,
+`manage_services` 3), and no downstream subsystem outside the readers listed here reads a status yet.
+
+## §4DQ — Round four: the fixes that round three's fixes needed (2026-08-29)
+
+Two lenses ran against the round-3 tree. One attacked round 3's own changes; one replayed the
+4,391-call corpus through every reader OUTSIDE the dispatch loop. Between them: **three CRITICALs
+inside round 3's fixes**, five unswept consumers, and one meta-finding that matters more than any
+of them — a reviewer applied three of the fixes it recommended and **1,009 tests passed with and
+without them**. Nothing was pinned.
+
+### Three CRITICALs in my own round-3 work
+
+**The loop was declaring on the producer's behalf.** §4DP's whole safety argument is that a
+*declared* status may settle the corpus label because the one producer whose body legitimately
+carries its own failure envelope — the shell — never declares. True, and pinned. But
+`ToolOutcome.__new__` defaults `declared=True`, and the tool-message construction at `agent.py:16086`
+forwarded `status`, `world_changed` and `reason_code` and **not `declared`**. Every derived ok — what
+`coerce` produces for `execute`, `jobs`, `manage_services` — was re-labelled a producer's
+declaration, and the sniffer became unreachable: **151 of 4,391 calls lost the structured
+`ToolCall.error` flag**, 116 of them `execute`. That is the −198 regression rebuilt from the other
+end, and the guard could not see it because the offending line is in the LOOP, in a file the
+"execute never declares" pin never opens. The pin is now "any construction that forwards a status
+must forward `declared`", across three files.
+
+**UNRESOLVED became a failed corpus row.** `"unresolved" != "ok"`, so giving the status a real
+producer in §4DP also gave every detached job a FAILED row — seeding the foresight world model with
+"this command shape fails" while the live grader explicitly refuses to grade the same row.
+
+**A `+` destroyed a status.** `ToolOutcome` is a `str` subclass, so
+`_promoted_result(...) + _probe_note` is `str.__add__` and returns a plain `str`. `execute(command=…)`
+promoted as UNRESOLVED and `execute(filename=…)` did not — the same event with two verdicts depending
+on which argument the model used. The pin called `_promoted_result` directly and could not see it.
+
+And the fourth reading of "is this a failure" (the strike branch) had no UNRESOLVED exemption while
+the other three did, which made the `swarm` PARTIAL → UNRESOLVED change **a no-op at the one site it
+was made for**. Its pin asserted `"ToolOutcome.unresolved" in source` — that the edit exists, not
+that the strike is gone.
+
+### PARTIAL needed its own steer
+
+Round 3 branched the repeat-steer for REJECTED and left PARTIAL on the hard-failure arm. A write that
+landed on a file that does not parse therefore got *"STOP repeating it — retrying will not change the
+result… if a file is missing, CREATE it"* — for a syntax error, where the correct move is exactly the
+retry it forbids. And `search.py` builds `partial(world_changed=False)` when the research succeeded
+and only the verification call hiccupped, so two identical hiccups armed the pre-flight guard against
+the third re-issue. A PARTIAL partly SUCCEEDED, so the guard's premise — *"re-running this unchanged
+will fail the same way"* — is simply false for it. Both fixed.
+
+### The consumers outside the loop
+
+Measured, then fixed:
+
+- **`[FAILURE BANNER]` — the last thing the model reads before deciding to retry or pivot.** Two
+  byte-identical copies of a text rule 17 lines apart, neither reading `_outcome`, which is in scope
+  on the same line. Wrong in both directions: **220 results the loop books as failures got no banner**
+  (file_system 67, execute 60, browser 42, manage_projects 15) and 9 clean results got one, through
+  the unanchored `"Traceback" in str_res` substring that `_res_is_error` already guards 140 lines
+  below. Now one shared `_failure_shaped`. **220 → 0 and 9 → 0.**
+- **The foresight seed, fully unattended.** A private, diverging copy of the failure vocabulary and
+  no rejection vocabulary at all: **39 of 82 refusals seeded into the shadow world model as
+  SUCCESSES**, re-seeded from a rolling window on every boot, while the live grade in the same
+  subsystem is status-aware. **39 → 0.**
+- **The verifier's run-gate.** `startswith(("Error", "SYSTEM BLOCK", "REJECTED"))`, case-SENSITIVE
+  and inlined at three sites, so `ERROR:` and `SYSTEM ERROR:` matched nothing: **15 of 22 failed
+  bookkeeping calls invisible**, 2 turns where the verifier never ran at all, 5 where the
+  unverified-mutation guard was disarmed. This is precisely the blind spot the 2026-07-25 error
+  carve-out was added to close, **reopened by letter case**. **7/22 → 21/21.**
+- `tool_failure_flags` `str()`'d the content — the third reader of that same list to have this exact
+  defect. `derive_high_stakes` had desynced from the production predicate it replicates, so the
+  instrument under-reported the thing it calibrates. A failure-shaped autoadvance stop declared OK.
+
+### On pins
+
+Round 3 shipped five pins that could not fail, and lens I found each by mutation: an expectation
+recomputed from the field the mutant changes; a `pickle` fixture whose `declared=True` matched
+`_rebuild_outcome`'s default; a `world_changed` assertion satisfied by the status table instead of
+the field; and a test that hand-built the envelope `execute` was supposed to build, so deleting
+execute's entire carry-through left it green. That last one is fixed by **extracting the real closure
+from source and running it** — the same "extract + run" discipline the pivot pin needed.
+
+Two more of my round-4 pins were caught the same way in the same session: the PARTIAL-steer pin
+asserted `"failure_was_partial" in source`, which survives rewriting the branch test to `if False:`;
+and the pivot pin's cap-latency assertion had to be added once the pivot COUNT made the decay guard
+non-load-bearing for termination — it still shortens time-to-cap from 8 turns to 7, and an unpinned
+guard reads as defence while doing nothing measurable.
+
+**49 mutants across both rounds' sets, 49 killed. Suite: 18,178 passed, 0 failed.**
+
+Not closed. Every round of this work has found its CRITICALs inside the previous round's fixes, and
+there is no reason to think this one is different.
+
+## §4DR — Round five: one verdict, and the fixes nobody had pinned (2026-08-29)
+
+Two lenses drove the REAL `_dispatch_and_process_tool_batch` over the 4,391-call corpus rather than
+testing predicates in isolation. That method change is what produced this round's findings, and one
+of them is about the previous four rounds rather than about the code.
+
+### The measurement that should have come first
+
+> A reviewer reverted `agent.py`'s world-changed reset — the **single** change behind §4DP's headline
+> "66 refusals credited with changing the world → 0" — to its pre-refactor predicate and ran the full
+> suite: **18,052 passed, 0 failed.**
+
+Three more of round 4's fixes revert just as silently. Every round measured its fixes on the corpus
+and then shipped them with a pin that asserts a *token* — `"UNRESOLVED" in <unparsed test>`,
+`"declared" in <gate>`, `"ToolOutcome.unresolved" in <source>`. A whole-file mutant keeps the token
+and changes the meaning, and 15 of 33 walked straight through. **Measuring a fix is not pinning it.**
+Every pin in this round either executes the code it guards or extracts the real expression and runs
+it; the mutants that used to survive now die.
+
+### One call, three verdicts
+
+The loop held three different answers to "did this call fail" inside a single iteration: a status-only
+one feeding `op_outcomes.ok` and the pre-flight guard, a wider rebind 660 lines down feeding metacog
+and the work log, and the strike branch, narrower than both. Driven through the real dispatch, seven
+consumers were **not unanimous on 56 calls**:
+
+- **18** where metacog, the corpus row and the work log said FAILED while `op_outcomes.ok`, the strike
+  ledger and `last_was_failure` said success.
+- **8** where `op_outcomes.ok` said FAILED and *no strike was drawn at all* — a non-`execute` tool whose
+  only signal is a non-zero `EXIT CODE:` never reached the strike branch. And because
+  `summarize_multi_op_outcomes` runs inside `if turn_has_failure:`, **6 turns never saw the MULTI-STEP
+  line at all**.
+
+There is one verdict now, computed once at the top of the iteration; `_tool_failed` *is* it and the
+strike branch reads it. In-loop non-unanimity: **56 → 7**, and the 7 are the banner's deliberately
+ADD-only text arms.
+
+Collapsing to the wider rule was only safe because of a producer migration in the same round.
+`manage_services` output legitimately QUOTES crashes — `logs` returns a service's log tail — and the
+traceback rule is an unanchored whole-body substring, so unifying on it would have made 13 successful
+reads *consistently* wrong instead of inconsistently wrong. The rule defers to a DECLARED status
+precisely so a tool that quotes a crash can say the crash is not its own, so `manage_services` now
+declares. Success-shaped results failed by the traceback substring: **13 → 1**, and that one is
+`execute`, where the shell predicate decides it anyway.
+
+### Two CRITICALs outside the loop, where no brief had looked
+
+- **The episode store booked 145 of 291 declared non-OK outcomes as `success=True`** — all 82 refusals,
+  all 42 browser failures, all 11 PARTIALs, all 9 UNRESOLVED. `str(t.get("content"))` and a five-prefix
+  bank. The *turn*-level success flag was made status-aware two rounds ago; this per-ACTION one was
+  never touched, and it builds the context chain, gates recovery search and feeds the playbook-lesson
+  model. `_ran_info` had the same shape and the same 145 rows, resolving unknowns and disarming the
+  clarifying-question gate.
+
+### Direction errors in round 4's own fixes
+
+- `failure_was_partial` was set in the `elif` and **not reset in the `execute` branch** — the exact
+  last-write-wins defect the sibling flag's comment documents. The PARTIAL steer is the *first* branch
+  of the chain, so a shell command that exited non-zero and did nothing was told *"PART OF THIS
+  LANDED — do NOT re-run the whole operation."*
+- `foresight`'s new rejection arm used `result_is_rejection`, whose vocabulary includes `PARTIAL:` —
+  the literal head of `swarm`'s **UNRESOLVED** "still running, NOT cancelled" branch that the same
+  round exempted everywhere else. The offline seed labelled FAILED exactly what the live resolver
+  refuses to grade.
+- `_bookkeeping_call_failed` treated PARTIAL as failed, and `update_profile` returns PARTIAL when the
+  canonical write LANDED and only a secondary index lagged — so a bookkeeping PARTIAL shadowed the
+  real action in the run gate, which its own docstring says "silently disables the untested-write
+  guard".
+- The System-3 `>=` trigger re-armed **every turn** when the pivot itself failed: `_run_system_3_pivot`
+  returns `{}` on any exception, including a 120 s timeout, so the counter never advanced. Three pivot
+  calls instead of one, on exactly the path where the pivot is broken. The count now advances on the
+  *attempt*.
+- `_pf_exec_failed` was set only `if not _res_is_error`, which is self-defeating under one verdict: a
+  crashed command left it False and the world-changed reset then cleared every recorded failure **on
+  the strength of the crash**. 9 live calls.
+
+### Producers that could not say they failed
+
+`Vision API Error:` (4 live) and `Synthetic challenge generation failed:` (6 sites) are invisible to
+the anchored failure regex — `Vision` and `Synthetic` shadow `Error\b` at position 0. Both now
+declare. `browser`'s argument refusals were FAILED rather than REJECTED, so they armed the pre-flight
+guard against the model's own corrected re-issue. `composed_skills` stringified the result **one line
+before** asking the status-aware question, so round 3's fix there was unreachable from both call
+sites. And `execute` had two more `result + note` concatenations — `ToolOutcome` is a `str` subclass,
+so `+` returns a plain `str` — found only by enumerating the shape rather than the site.
+
+### Corrections to §4DP and §4DQ
+
+A reviewer re-derived every published number. Three were wrong and are corrected here: the residual
+loop-vs-corpus set was **26, not 30** (my replay could not see `file_system`'s declared PARTIAL); the
+banner baseline was **191, not 220**, and that metric measured the *gate* rather than banner
+emission; and the bookkeeping figure was **5 → 22**, not 7/22 → 21/21. §4DP's claim that no producer
+constructs UNRESOLVED is stale — two do, both added by this work — and "`execute` never declares" is
+only true of a *success*, which is the load-bearing half.
+
+**22 mutants, 21 killed** (the 22nd is equivalent under the harness's own cwd; the pin it targets was
+demonstrated to fail off-root and pass with the absolute path). **Suite: 18,195 passed, 0 failed.**
+Loop-vs-corpus disagreements **26 → 23**.
+
+Still not converged. The honest summary after five rounds: the dispatch loop is consistent with
+itself now, and the remaining defects have all been *outside* it — in stores, gates and instruments
+that read a tool result without asking what it was.
+
+## §4DS — Round six: the instruments were the worst offenders (2026-08-29)
+
+Two lenses. One was briefed by the previous round's reviewer with an explicit instruction: *do not
+review the dispatch loop; enumerate by AST every site OUTSIDE it that reads a tool result, and do not
+filter by name — the last two CRITICALs had names no hint list would have matched.* That brief was
+right, and it found that the code most wrong about whether a tool call failed was the code
+**measuring** whether tool calls fail.
+
+### The measuring instrument was 2.6× off
+
+`eval/behavioral.py` counted a tool error as `"ERROR" in result.upper() or t["error"]` — a private,
+unanchored whole-body substring. Replayed over the corpus: **988 counted against 379 true failures,
+2.61×, with 654 fabricated error credits**, and that number is `mean_tool_errors` in the **frozen
+regression baseline**. The signal meant to say whether the agent got worse at using tools was more
+than half noise, and it moved whenever a fetched page happened to contain the word "error". Swapped
+for the tree's shared predicate ORed with the recorded flag: **365, 0.96×**, and one definition
+instead of two.
+
+The same shape ran through `self_play_scoring` (287 of 408 failures and 83 of 83 refusals missed,
+because the tool-name exclusion that protects a `file_system` log read also hid every refused
+`file_system` write), a `smoke_gate` that marks tasks DONE and passed 7 of 8 non-OK result shapes,
+and a reply banner that would have announced 148 of 408 failures — every refusal among them — as
+*"Process finished successfully."*
+
+### Two CRITICALs in round 5's fixes, and one of them hid failures
+
+- **`manage_services` declaring made things worse before better.** Round 5 had it declare by an
+  `Error:` head. The supervisor has two genuine failure returns that do not lead with `Error:` — a
+  service that started and then *failed to bind*. Because a DECLARED ok short-circuits both the
+  banner rule and the guard's `not _res_is_error`, nothing downstream could see them: **18 live rows
+  over 9 turns, 9.4% of all start/restart calls**, each also clearing the pre-flight guard as a
+  "successful mutation". Net of the round-5 change: 5 false positives removed, **8 genuine failures
+  newly hidden**. The supervisor declares now; the wrapper passes its verdict through.
+- **Six `self_play` declarations were destroyed one function later** by
+  ``return f"{result}\n\nSYSTEM: SELF PLAY DONE."`` — an f-string on a `str` subclass. The same defect
+  round 5 had just fixed at three `+` sites in `execute.py`, missed because the enumeration was
+  scoped to the module being migrated rather than to the shape. There is one `append_note` now, and
+  a pin that walks every module.
+
+### Collapsing three verdicts into one promoted a bad rule
+
+The round-5 collapse was right, but it carried the unanchored `"Traceback" in str_res` arm — which
+had lived in the wide rebind, feeding only the work log — up into the **strike ledger**. That is the
+"226 live successes booked as incompetence" family. Driven through the real dispatch, a successful
+`file_system` read of a log quoting a traceback drew a strike, failed the competence profile, set
+`last_was_failure`, injected an AUTO-DIAGNOSTIC flood, and handed the model
+*"The path doesn't exist. Run list_files…"* about the file it had just read. **4.2% of readable
+files in the live sandbox contain the word.** The arm is gone: the shell keeps its prose fallback
+through `shell_failed`, and every other tool gets the banner rule — which is what `outcome.py`
+prescribed all along.
+
+### One question, asked once
+
+The episode store's per-ACTION `success` flag was fixed twice and wrong twice: a five-prefix head
+bank booked 145 of 291 declared non-OK results as successes; replacing it with an `if/else` over the
+status then *shadowed* that bank, so 118 non-zero `execute` exits were still stored successful —
+neither half can see an `EXIT CODE:` banner under an `--- EXECUTION RESULT ---` head. Both attempts
+were private re-derivations of a question the loop already answers. There is now one
+`_action_failed(content, tool_name)`, and the episode store, the info-gathering gate and the pin all
+use it. **Loop-failed calls stored as successes: 234 → 0.**
+
+### On pins, again
+
+A reviewer proved **twelve** of round 5's pins could not fail. The common shape is a token check —
+`"ToolOutcome." in <expr>`, `"Error:" in <fn>`, `"status" in <src>` — that a mutant satisfies while
+inverting the meaning: `.failed(` → `.ok(` keeps every token. Six more of the round-6 pins failed the
+same way on first measurement. Everything here executes the code it guards or extracts the real
+expression and runs it. **68 mutants across three sets, 0 survivors** (one equivalent under the
+harness's own cwd, whose pin was separately demonstrated to fail off-root).
+
+Two findings are recorded as *declined*: a reviewer read the third-state contract ("callers must SKIP
+an unresolved call") as universal and asked that `self_play_scoring` stop counting detached runs. It
+is advice for a **labeller**, and a reward is not a label — `test_promoted_result_graders` pins the
+opposite with its reason: *"otherwise an unfinished run scores as a clean one and the reward is
+computed on work that never happened."* The prior decision stands, and the pin now records why.
+
+**Suite: 18,214 passed, 0 failed.**
+
+### A process failure of mine, on the record
+
+I told two reviewers the tree was frozen and then edited it while one was still measuring. Its first
+report arrived, I took it as final, and started the fix pass; the agent was still running and
+produced a second, better report — against a tree that had changed underneath it. It caught this
+itself, and its own verification had failed too: `find -newermt "-180 minutes"` is an invalid
+timestamp, `find` errors, and `2>/dev/null` swallowed it — so a check that could not distinguish
+"nothing changed" from "the check did not run" reported clean twice. Both halves are the same lesson
+this whole body of work keeps producing, and neither is the code's fault.
+
+## §4DT — Round seven: the defects live where two modules meet (2026-08-29)
+
+Two lenses. One attacked round 6's fixes. The other audited a surface no earlier round had touched —
+**every DECLARATION in the tree** — on a premise that had just been proved the hard way: because a
+declared `ok` short-circuits the banner rule, the corpus sniffer and several guards, **a wrong
+declaration is strictly worse than no declaration**. Rounds 3–6 quintupled the number of declaring
+producers and nobody had checked whether the declarations were right.
+
+Its closing observation is the organising idea of this entry, and it is the sharpest thing anyone has
+said about this work: **every defect sat at the EDGE of a migration** — the last `return` of a
+dispatcher, the wrapper one boundary out from the declared producer, the flag set one line after the
+awaited call it guards, the `+=` one function later. The migrations were scoped to the module being
+changed; the defects live between modules.
+
+### Three CRITICALs from the declaration audit
+
+- **A malformed `file_system` call reported SUCCESS.** Eight sibling argument refusals in that
+  dispatcher were migrated; the `return f"Unknown operation: {operation}"` at the bottom was not, so
+  it coerced to OK — the model told it SUCCEEDED under the AUTHORITATIVE banner, with a metacog
+  competence success, for a call that did nothing. **9 rows / 9 turns**, on the highest-traffic tool
+  in the corpus.
+- **`execute`'s policy blocks were invisible AS REFUSALS.** `_format_error` wraps
+  `SYSTEM BLOCK: … The command was not run` in an `--- EXECUTION RESULT ---` envelope, and
+  `result_is_rejection` is anchored — so the head was unreachable. The metacog exemption whose comment
+  names this exact case ("the action never RAN … skip the sample entirely") could not fire. **27 rows
+  / 20 turns**, while three sibling refusals in the same function declared correctly.
+- **A `rejected` over a truncated file.** `_wrote = True` was set one line *after* the awaited
+  `write_text`, which opens with `'w'` — truncate first, write second. An `OSError` from the write
+  therefore took the "nothing was touched" arm, and the `failed(world_changed=True)` arm written for
+  exactly that case was unreachable. The fix inherited the blind spot it was written to close.
+
+### Two CRITICALs inside round 6's own fixes
+
+- **The `context_compressed` branch turned real failures into corpus successes.** It suppressed the
+  sniffer entirely and fell back to status-only — but `execute` never declares, and its `EXIT CODE:`
+  banner *survives* compression by construction (the summariser always keeps the first three lines;
+  the banner is line 2 of its envelope). Measured: the branch removed 83 false positives and created
+  **32 false negatives, 31 of them `execute`** — the loop-vs-corpus split rebuilt sign-flipped inside
+  the fix meant to close it. It asks `_action_failed` now, which reads the banner and ignores the
+  prose the loop itself rewrote.
+- **The deterministic fast path `str()`s the status away** — and that path bypasses the dispatch loop
+  entirely, so no strike, no banner, no `op_outcomes`. `memory.py` had been migrated to `append_note`
+  in round 6 precisely so `dream.py`'s six declared failures survive; they died 90 lines away.
+
+### Round 6's banner fix was dead code
+
+It computed a fallback banner and then always declined to emit it: the de-duplication guard asks
+*"is this text already visible"*, which is trivially true of the head line it had just selected.
+**382 of 400 failures still reached the model unmarked.** When the fallback fires, the LABEL is the
+point, not the text.
+
+### And the same defect one boundary out, five more times
+
+A reviewer ran a real tree-wide AST sweep and found **five live sites** where a declared status is
+destroyed by `+=` or an f-string — including a write that landed *broken* being recorded as cleanly
+applied, which is the one thing `may_record_as_applied` exists to prevent. There is one
+`outcome.with_text()` now, `append_note` is expressed in terms of it, and the pin is the sweep.
+
+⚠ **§4DS claimed "there is one `append_note` now, and a pin that walks every module." That was
+false** — it walked one module and matched two literal phrases. Recorded here because a claim in a
+journal that the code does not support is its own defect, and this is the second time a reviewer has
+had to tell me so.
+
+### Everything else, measured
+
+`manage_services` booked every supervisor refusal as FAILED, so **29 of 29** armed the pre-flight
+guard against the model's own corrected re-issue — now **0**: the three paths that actually spawn a
+process declare `failed` themselves, and the wrapper treats the rest as refusals. `browser.interact`
+reported `STATUS: OK` whatever the per-action results were, and `_err` declared `world_changed=False`
+for failures that happen *after* the runner has navigated, clicked and filled. `manage_projects`
+declared success over `task_update`'s own refusal (`updated: []` with a held constraint) while its
+`_err` sibling returned a bare string — a split inside one tool. The bus's skill leg discarded
+`learn_lesson`'s return, which is `None` on every drop path, making the caller's failure branch **dead
+code that looked like coverage**. `_bus_canonical_failed` was wrong in both directions: it omitted
+`vector`, which *is* canonical for `insert_fact`, and a flat list would have made a retrieval-index
+lag on `update_profile` a total failure — canonicality is per-operation now. The smoke gate's
+round-6 status read was inert for the only tool it calls. The "STILL RUNNING" notice survived in 1 of
+5 shapes. The eval instrument was a third predicate and tool-name-blind.
+
+**Failures the loop can now see that it could not before: 174** (browser 143, manage_projects 18,
+file_system 9, vision_analysis 4). **Suite: 18,233 passed, 0 failed. 24 mutants, 24 killed** — four of
+them survivors on the first pass, every one a pin of mine that checked a token instead of the status.
+That specific mistake — accepting any `ToolOutcome.` where `.failed(` had been rewritten to `.ok(` —
+has now been caught in four separate rounds.
+
+### Process, again
+
+I told two reviewers the tree was frozen and then edited a test file inside one's start window. It
+caught that itself, having first run a **positive control** on its own `find` check before trusting
+it — the exact lesson from the previous round, applied by the reviewer rather than by me.
+
+## §4DU — Round eight: a live sandbox escape, and the pins that could not fail (2026-08-29)
+
+Two briefs, both new. One followed a single tool result across **every hop** it takes rather than
+auditing sites in isolation. The other asked a question nobody had asked: the unfalsifiable-pin
+pathology had been found 12, then 6, then 4, then 4 times — but **always in the six files I wrote and
+mutation-tested myself.** Nobody had checked the other ~950.
+
+### The security finding
+
+**`/api/upload?project_id=` escaped the sandbox.** `project_scoped_sandbox` normalised a
+client-supplied project id with `explicit_project_id.strip().lower()` and no path handling, and the
+scoped directory is built as `base / "projects" / pid` — so pathlib's join semantics meant an
+**absolute** id replaced the base outright and a `../..` id walked out. The upload route's
+`_is_within(sandbox_dir, file_path)` check then validated the file against the **already-escaped**
+`sandbox_dir`, so it always passed, and `mkdir(parents=True, exist_ok=True)` created the directory.
+Authenticated arbitrary-location directory creation and file write. Reproduced directly:
+
+```
+project_id='../../'       -> outside the sandbox
+project_id='/tmp/abs_pid' -> /tmp/abs_pid          (base replaced entirely)
+```
+
+The only test named for it asserted `"  ProjXYZ  " -> "projxyz"`. **Whitespace and case were the
+only payloads in the entire suite** — a test that cannot distinguish a sanitising normaliser from a
+concatenating one. Fixed at the source (an id is an opaque token; anything else refuses to scope and
+falls back to the sandbox root — fail closed) plus a second lock at the route, which now checks
+containment against the TRUE root rather than the scope it was handed. Pinned with 15 hostile
+payloads; the new pin fails 8 ways without the sanitiser while the old one passes throughout.
+
+### 38 pins that cannot fail, systemically
+
+The reviewer proved 38 by mutation across ~56 candidates. The footprint it measured: **729 assertions
+(2.3%) are over module source text, in 402 test functions across 167 files (17.5%)**, and 269 of
+those tests have no other kind of assertion. Load-bearing examples, each with a surviving mutant:
+
+- The **CORS** pin for the `0.0.0.0:8080` interface sliced on the first `CORSMiddleware` — which is
+  the *import* — so its window was six lines of imports and never reached the config. Its adjacent
+  twin, same file, same intent, strips comments and scans the whole file and **fails** on the
+  identical mutant.
+- The containment check on the irreversible `unlink()` path of `tool_unified_forget` could be
+  **deleted entirely** with 336 tests green: the test's input never reaches the guard.
+- The calibration pin forbids the literal `normalised_entropy=0.5`, not the value — `float(1) / 2`
+  passes, re-creating the exact defect it exists for (1179/1180 samples pinned at neutral, recorded
+  as real measurements on an unattended path).
+- The generic-knowledge safety filter can be made **log-only** — it prints "Discarded generic
+  knowledge" and stores the fact anyway — with 82 tests across 10 files green.
+- The self-play guard asserted the literal `"True,  # purge_stragglers"`; the **keyword** form sails
+  past, and the helper calls `p.unlink()` on the solver's own `solution.py`.
+- Two dream-watchdog gates are bare token asserts over a 14k-line class; renaming the gate variable
+  leaves the probes running with their verdicts discarded and **the agent silently stops dreaming
+  forever**, every dedicated pin green.
+- `reconcile()`'s "never kill a holder" law asserted `"kill" in c and "-TERM" in c`, so a recorded
+  `kill -9 {pid}` was looked at and passed.
+
+**The single recurring shape, in the reviewer's words:** *the pin was written at the same moment as
+the fix, in the fix's vocabulary, and inherited its blind spot.* Six are satisfied by a literal
+sitting in the very comment that explains the fix.
+
+Also: five `verify_*.py` files pytest never collects — one held two real tests, dead since creation —
+and a duplicate test name meant a pure-function check had never run. Both fixed; the dead file was
+replaced with an executed pin on the property it named, which turned out to be live and otherwise
+unguarded.
+
+### Following one value
+
+- **`is_promoted_result()` — an `execute`-only TEXT marker — was the tree's universal "not finished
+  yet" test at seven sites**, and there are two UNRESOLVED producers. `swarm`'s "still running, they
+  were NOT cancelled" carries no such marker, so foresight graded it `ok=True`, metacog recorded a
+  success, and **the user was told "Process finished successfully."** `_outcome.status` was in scope
+  at every one; one reads `.status` five lines later. There is one `_res_unresolved` now.
+- **Two of round 7's fixes stopped at the wrong level.** `_cap_oversized_tail` preserves the verdict
+  in 2 of its 4 write paths — the two `<tool_call>` branches still wrote a bare `str`, flipping
+  `_turn_had_tool_failure` True→False and disarming the verifier's escalation, reachable because nine
+  files in this repo's own `src/` contain `<tool_call` and exceed the threshold. And the "STILL
+  RUNNING" notice was fixed at its *filter* while remaining inside `if turn_has_failure:` — which
+  UNRESOLVED never sets, so it stayed unreachable for its own turn shape.
+- The work log gates on `not _res_is_error` while the line thirty above it was migrated to
+  `changed_the_world`, so a PARTIAL write that half-landed left `work_FILES=[]` — byte-identical
+  next-turn state to a refusal that touched nothing.
+
+**Suite: 18,267 passed, 0 failed.**
+
+Still open and recorded rather than fixed: a mid-batch `break` that sends a dangling `tool_call_id`
+upstream and records a tool that ran as an empty success; `_noprogress_trip` cleared inside a loop
+over concurrently-gathered results, so a hard abort depends on the model's emission order; and ~24 of
+the 38 vacuous pins below the CRITICAL line. The reviewer's own coverage note is worth keeping: it
+mutated ~56 of 402 source-text tests, and made no dent in the other 97.7% of assertions.
+
+## §4DV — Consolidation: two loop bugs, and the pins that guarded nothing (2026-08-29)
+
+Not a review round. Two pieces of work chosen deliberately after eight rounds: the loop bugs round 8
+recorded but did not fix, and the one audit that was measurably unfinished.
+
+### The two loop bugs
+
+**Two `break`s, not one, exited the results loop mid-batch.** `asyncio.gather` has already executed
+every call, and the tool message is appended EARLIER in the iteration than the decision chain — so
+breaking orphaned every later call: an assistant message went upstream carrying N `tool_calls` with
+fewer than N replies (a dangling `tool_call_id`), and a tool that really ran was recorded as an empty
+success. Both `continue` now. That needed a second change: with `continue`, a later result could
+overwrite the reason the turn stopped, so the first short-circuit wins.
+
+**`_noprogress_trip = None` sat inside that same loop**, so it erased only the trips EARLIER results
+had recorded. One identical multiset of calls hard-aborted the turn in one order and proceeded
+normally in three others — the chronology it depended on was the model's emission order, not
+execution order. It is decided once now, after the loop, from a per-batch flag.
+
+Three pins, each proven: reintroducing a `break` fails one, removing the clobber guard fails two,
+moving the reset back inside fails all three.
+
+### The targeted pin audit
+
+The top-priority target came back **healthy**: the GEPA promotion chain — 17 `test_4da_round*` files,
+125 source-text assertions — killed every mutant, because that chain had already self-corrected this
+exact class (round 8 of its own history records "SIX of round 8's own first pins were SOURCE GREPS").
+`tool_unified_forget` / `reset_all`, release immutability and skill graduation have **zero**
+source-text assertions at all — fully driven. That is a real negative result and worth recording.
+
+The findings were elsewhere, and all of them are **pin** defects: the code is correct, and nothing
+would notice if it regressed.
+
+- **The irreversible, unattended workspace deleter was guarded by two forbidden spellings.** Three
+  separate case-fold sites — the DONE sweep, the idle tidy, and `_referenced_media` (which was not
+  even in the pin's inspection set) — each had a surviving mutant that unlinks a registered
+  deliverable whose disk case differs from its registered case. One survived the FULL suite. This is
+  verbatim the live incident the module was written to close. Replaced with three DRIVEN tests: write
+  `assets/Hero.png` to disk, protect `assets/hero.png`, run the real function, assert the file is
+  still there. All three mutants now die.
+- **Both autoadvance project-pinning pins kept the words and lost the value.** One is satisfied by
+  `_pinned = pinned_project_context(...)` followed by `get_available_tools(context)` — literal
+  present, value discarded. The other slices a window and asserts a call string that a **comment**
+  satisfies, because `inspect.getsource` returns comments. Each survived 1,515 tests. Unpinned, the
+  idle autoadvancer's writes land at the sandbox ROOT (observed live, 2026-07-08) and a batch can
+  write into a concurrent conversation's project. Both now parse the call: a comment is not in the
+  AST, and an unused assignment is not the call's argument.
+- **`seg.count("try:") >= 2` cannot see nesting.** Moving the heal's `try` inside the reconcile's
+  keeps both tokens, both warnings and no debug line — and survived 1,420 tests. `reconcile_vector_
+  orphans` calls `_load_playbook`, which re-raises OSError by design, against a live root-owned-file
+  failure class: one unreadable playbook then silently skips the §4M heal for the process lifetime
+  (the audit that added it measured 36/50 lessons dark). The pin parses the phase now and asserts the
+  two `try` blocks are SIBLINGS.
+- Two smaller ones: a window sliced on the first `_biological_tick` landed on the watchdog's *call*,
+  ending 60 lines before the method it names — 13,567 characters of the wrong code; and a disjunct
+  (`"in referenced" not in src or "_ref_low" in src`) that was unconditionally true because `_ref_low`
+  is assigned whether or not the guard uses it.
+
+**Suite: 18,273 passed, 0 failed.** Cumulative pin-audit coverage: **69 of ~402 source-text tests
+(17%)**; ~333 remain, including 61 `count(...)` assertions and 114 windowed slices — the two shapes
+that produced every finding here.
+
+## §4DW — The HTTP surface: a leaked key, and a server with no doors (2026-08-29)
+
+The next system on the list was the HTTP surface — the two servers (the agent on `0.0.0.0:8000`,
+the interface behind it) and everything that authenticates to them. Five findings, all live.
+
+**The master key was in cleartext in four world-readable files.** 44 occurrences in
+`Logs/ghost-client.err`, 40 in `Logs/ghost-client.log`, 35 in
+`Data/sandbox/.services/48e0373aaab3--chess-coach-v3.log`, 1 in `Data/system/last_config.json`.
+All 0644, none rotated, while `.ghost_api_key` itself is correctly 0600. The sandbox one is the
+worst of the four: it sits **inside `sandbox_dir`**, which `/api/download` serves and containers
+read directly — a compromised sandbox service could read the key that authenticates the daemon
+that runs it.
+
+The cause is not one bug but a chain, and every link had to be closed separately:
+
+- **The redactor was running and did not cover the shape.** `redact_text` has 30-odd rules and is
+  called on the operator stream, the trajectory JSONL and the journal. Its
+  `form_secret_assignment` rule *deliberately* refuses a bare `key=` — in prose `key: value` is
+  almost never a secret. Inside a query string that reasoning inverts: `?key=` is exactly how this
+  system authenticates a browser page load, a PWA manifest and a WebSocket upgrade, because a
+  browser cannot set a header on a top-level navigation. New `url_query_secret` rule, anchored to
+  `[?&]` so it can only fire in a query string. `monkey=banana`, `key: value` and
+  `?q=onion+markets` are all still untouched.
+- **uvicorn never calls `pretty_log`.** The access logger writes the request line — query string
+  included — and `log_config=None` hands it root's handlers, which carry no redaction. That is
+  what wrote the 84 hits in the two client logs. A filter on `uvicorn.access` / `uvicorn.error`
+  now runs the records through `redact_text`. It is installed **at import**, not from `main()`:
+  a guarantee that holds only on one entry path is not a guarantee, and — the reason it matters
+  here — a test that calls the installer itself cannot tell whether production ever does. That
+  exact mutant survived the first version of the pin.
+- **The URL kept the key after it had been used.** The interface page took `?key=` and left it in
+  the address bar, so it was copy-pasted, bookmarked, and sent onward as a `Referer` — which is
+  how it reached a sandbox service's own access log. `URL_KEY_SCRUB_SCRIPT` now replaces the
+  history entry the instant the key is in `window.GHOST_API_KEY`, and the response carries
+  `Referrer-Policy: no-referrer` (plus `nosniff` and `X-Frame-Options: DENY`).
+- **The launcher tested readability, not content.** `[ -r "$GHOST_KEY_FILE" ]` is true for an
+  empty file, so an empty or whitespace-only key file exported an empty `GHOST_API_KEY` and the
+  daemon bound `0.0.0.0` **with authentication disabled**. It now reads the content and falls back
+  to loopback-only when there isn't any. `enforce_api_key_policy` makes the same call for a
+  whitespace-only value: HTTP strips whitespace from header values, so no client could ever have
+  authenticated with one.
+- The four files were scrubbed **length-preservingly** — the key replaced by a same-length marker,
+  written through `r+b` — because a daemon held two of them open in append mode and a
+  truncate-and-rewrite would have left a NUL hole at the open fd's offset. `last_config.json` went
+  to 0600, the two client logs to 0640.
+
+**Rotation was NOT performed.** It breaks the Slack bot, ghost-client, the `bin/` scripts and every
+tailnet client at once, and it is the operator's call.
+
+**A stored SSRF in the push subscriptions.** `add_subscription`'s only check was
+`endpoint.startswith("https://")`. The endpoint arrives from the client and is POSTed to later by
+the daemon, with the daemon's network position — so `https://100.93.181.31:8000/...` (the tailnet)
+or `https://web.push.apple.com@evil.tld/` were both accepted and both fetched. Now confined to the
+five real push-service host suffixes, rejecting userinfo, explicit ports and suffix confusion
+(`web.push.apple.com.evil.tld`). Enforced at **both** ends: the subscriptions file is plain JSON on
+disk that predates the ingest check, so an ingest-only guard would have left every stored endpoint
+unchecked. All 18 live subscriptions still pass.
+
+**Both servers published their own attack surface.** `/docs`, `/redoc` and `/openapi.json` were
+FastAPI defaults on each — a complete map of every route, method, path parameter and body model,
+including the ones that write files, execute code and reach the sandbox, served to anyone who could
+open the port. Auth on the endpoints is not a reason to hand out the map. The UIs are gone; the
+schema stays behind the same dependency as everything else. The first attempt at that registered
+the route **after** `include_router(router)`, and `router` ends in a `/{path:path}` catch-all — so
+every schema request went to the upstream proxy instead (502). Registration order is the fix.
+
+**The agent had no request-body cap at all.** The interface has had `BodySizeLimitMiddleware` for a
+while; the agent — the process holding every model, index and sandbox handle — had nothing. A single
+150 MB POST to `/api/upload` moved live RSS from 509 MB to 960 MB. A handler-level cap cannot fix
+that: Starlette parses the entire multipart body before the endpoint is entered, and
+`request.json()` reads the whole body first. New `src/ghost_agent/api/body_limit.py`, modelled on
+the interface's proven implementation rather than invented fresh — including the two non-obvious
+parts, that `BodyTooLarge` is a `BaseException` so it survives FastAPI's body-parsing
+`except Exception`, and that DELETE is capped because `/api/delete` reads a body.
+
+**Five of the first twenty mutants survived, and two of them were holes in the fix, not the pins.**
+The access-log install lived only inside `main()`. The URL scrub was a four-part implicit string
+concatenation, and a mutant that commented out only the first part left every token the test looked
+for — `history.replaceState`, `searchParams.delete("key")` — still rendered, inside a comment,
+doing nothing; it is one hoisted constant now. The other three were pins that could not
+distinguish: disabling the `Content-Length` branch still produced a 413 (the counting receive
+caught it), dropping DELETE from the capped methods was never exercised, and demoting
+`BodyTooLarge` to a plain `Exception` changed nothing any HTTP-level test could see. All three are
+now driven at the ASGI layer, where the difference is the thing asserted — including an inner app
+that deliberately swallows `Exception` to prove the overflow still escapes it. **22/22 on the
+re-run.**
+
+### Round two: four lenses, and the fixes that were themselves the bugs
+
+Four fresh-eye reviewers ran against a frozen, hash-manifested tree. They did not
+mostly confirm the work. They found a live bypass of the guard added hours earlier, a
+regression the fix itself caused, thirteen surviving mutants, and — from the lens
+briefed to ignore the brief — a host escape that had nothing to do with HTTP at all.
+
+**The allowlist I added was bypassable.** `urlsplit` and `requests` disagree about where
+the authority ends when it contains a backslash:
+`urlsplit("https://evil.tld\.web.push.apple.com/x").hostname` is
+`evil.tld\.web.push.apple.com`, which *ends with* `.web.push.apple.com` and passed the
+suffix check — while `requests` normalises the same URL to `https://evil.tld/%5C…` and
+POSTs to `evil.tld`. The guard validated a string that is not the host the request goes
+to. Any character DNS cannot carry means two parsers may disagree, so the host must now
+be a syntactically legal hostname before its suffix means anything.
+
+**And it could silence every push.** `urlsplit` is lazy: it does not parse the port
+until `.port` is read, and an out-of-range port raises `ValueError` *there* — outside
+the `try` I had wrapped only around `urlsplit()`. One stored row like
+`https://web.push.apple.com:99999/x` aborted the whole of `broadcast()` before any
+device was reached. The guard written to contain a poisoned row was the thing the
+poisoned row used.
+
+**`?%6bey=` authenticates.** Starlette percent-decodes parameter *names*, so that
+spelling is accepted exactly like `?key=` — while uvicorn logs the raw form, the JS
+scrub's `location.search.includes("key=")` guard is false for it, and both access-log
+redactors matched their names literally and missed it. A guard that reads the name
+differently from the router that honours it is not a guard. All three now decode the
+name; the scrub asks `URLSearchParams`, which decodes for free.
+
+**The scrub broke the page.** Taking `?key=` out of the address bar also removed the only
+thing that made the page re-openable: Cmd-R, session-restore, "reopen closed tab" and
+the service worker's `clients.openWindow("/")` all became 401 — and an installed iOS PWA
+has no address bar to fix it in. The page now sets an `HttpOnly; SameSite=Strict`
+cookie, which is strictly safer than the URL it replaces: JS cannot read it (unlike
+`window.GHOST_API_KEY`), it never rides a Referer, and it never appears in a log. That
+also let the master key come out of Web Push payloads entirely — they were
+`/?key=<master key>`, encrypted only to subscription keys the *client* supplies.
+
+**The whitespace-key fix never reached the caller.** It printed "treating it as an
+explicit --api-key '' (auth disabled)" and assigned to a **local**; the function returns
+`None` and the caller passes `args.api_key` unchanged. Auth stayed on with a credential
+no client can present, and the banner announced the opposite of what happened — while
+its pin asserted the banner. Plumbing the value through would have been *worse* than the
+bug: it really would disable auth on a public bind. A whitespace key is now refused
+outright on a non-loopback bind, like an absent one.
+
+**The redactor did not recognise the secret it exists to hide.** Every rule was
+name-anchored — `GHOST_API_KEY=`, `"api_key":`, `?key=`. The bare 64-character key, an
+`X-Ghost-Key:` header, a headers dict and a `curl -H` line all round-tripped it verbatim
+into every durable sink. Matching on the **value** is precise where a shape rule cannot
+be: the key is 64 hex characters, indistinguishable from every SHA-256 in these logs, so
+a `[0-9a-f]{64}` rule would redact file hashes and cache keys wholesale.
+
+**Outside the brief entirely: `postgres_admin` was a host escape.** The `ghost` Postgres
+role is a superuser and `pg_hba.conf` grants `trust` on loopback, and `validate_sql`
+passed `pg_read_file`, `pg_ls_dir`, `lo_import`, `COPY … FROM '<file>'` and
+`COPY … TO PROGRAM '<cmd>'`. The tool runs **in the agent process, on the host**, outside
+the Docker sandbox and outside every `_get_safe_path` root. The guard stopped
+`DROP TABLE` — the clumsy destructive thing — and passed reading the 0600 master key and
+executing arbitrary commands. Now refused unconditionally, not gated by `confirm`:
+`confirm` exists so a deliberate destructive DDL can proceed, not so file reads can be
+opted into. COPY had to become an **allow-list** (`STDIN`/`STDOUT` only) because
+`_mask_sql` blanks string literals before any guard runs — `COPY t FROM '/etc/passwd'`
+arrives as `COPY t FROM` and spaces, so there is no path left to match. The first
+attempt, a deny-list on `from\s+'`, passed the escape.
+
+⚠ **This is the second layer, not the fix.** It closes the agent's own tool path. It does
+not stop a compromised sandbox container connecting straight to
+`host.docker.internal:5432`, which `trust` + superuser accepts with no validator in the
+way. Dropping the role from superuser and replacing `trust` with `scram-sha-256` is host
+config and the operator's call.
+
+**On the pins.** Round one shipped 61 pins and a 22/22 mutation score. An independent
+lens ran 23 mutants of its own and **13 survived**: every mutant round one wrote *deleted*
+a line, and every pin was written to catch deletion. The survivors all lived in the other
+half of the space — a meaning changed while the tokens stay put. The scrub pin compared
+the constant to a page **built from that same constant**, so it could only detect "not
+injected", never "injected and inert". The redaction pin's `key not in out` plus
+`"<REDACTED>" in out` both hold when a lazy quantifier leaks 63 of 64 characters. The
+env-redaction pin asserted `"_is_secret_env" in body`, which survives swapping the
+ternary's arms and serving the key in cleartext.
+
+The harness was lying too, in three ways the same lens named: "killed" counted **any**
+nonzero exit, so a mutant that did not *compile* scored as a kill; it ran one of the five
+pin files; and its docstring claimed a post-run tree diff that did not exist. All three
+fixed — mutants are `py_compile`d first, all five files run, and the tree is hashed
+before and after.
+
+Round two: **38 of 39 valid mutants killed.** The one survivor is genuinely equivalent —
+removing the guard on a table whose literal is correct changes no behaviour for any
+possible input, and widening that literal is separately killed. Recorded as equivalent
+rather than papered over with a token assertion.
+
+**Suite: 18,431 passed, 0 failed** (18,292 → 18,431; +139 pins).
+
+**Still open, and the operator's call:** rotate the key (it breaks the Slack bot,
+ghost-client, `bin/` scripts and every tailnet client at once); drop the `ghost` Postgres
+role from superuser and replace `trust` with `scram-sha-256`; the sandbox has full
+clearnet egress, which defeats `--mandatory-tor`; `:8000` is plaintext on `0.0.0.0` with
+the host firewall off; `GHOST_LLM_RECORD=1` is still on with 685 MB of unrotated 0644
+recordings whose own comment says "REMOVE after ~1 week"; and the retired
+`ghost-secret-123` literal is still in `com.local.ghost-client.plist` (inert — the
+launcher overwrites it and fatally refuses that exact value).
+
+## §4DX — The tool layer: the guards were right, the callers weren't (2026-08-30)
+
+39 tools, ~30k lines, and the class had never been reviewed. Three prior sections
+touch it — §4BY reviewed how the loop PARSES tool calls, §4CI reviewed one file,
+§4DP–§4DV reviewed how the loop READS tool results — but nothing had audited what
+the tools do with their arguments. §4DW found `postgres_admin` was a host escape by
+accident, from a lens briefed to ignore its brief. That was the argument for looking
+here on purpose.
+
+**First pass: `knowledge_base` read arbitrary host files.** `ingest_document` /
+`transcribe` resolved its local-file argument as `sandbox_dir / filename.lstrip("/")`
+— which contains an ABSOLUTE path (`/etc/passwd` → `<sandbox>/etc/passwd`) but not a
+relative one. Driven end to end: `../../OUTSIDE.txt` read a file outside the sandbox,
+embedded its contents in durable vector memory where `recall` retrieves it forever,
+and returned `SUCCESS`. Reachable from prompt injection — the agent fetches web and
+darkweb content by design, and the model's next tool call is the payload.
+
+Everything else in the first pass came back clean: `_get_safe_path` refused all 15
+traversal payloads; `execute`, `browser`, `report_pdf`, `vision`, `file_system` all
+route through it; no shell injection anywhere (every `_exec` interpolation uses
+`shlex.quote` or `int()`).
+
+### Round two: four lenses, and the fix that was walked around within hours
+
+**The round-one fix was bypassed by a stem match.** The primary path went through
+`_get_safe_path`; the fuzzy fallback re-derived a path for itself and returned
+`matches[0]` raw. `os.walk` stays inside the sandbox, but a FILE it finds can be a
+symlink pointing out — and the model plants that with one in-container `ln -s`. So
+`ingest('notes.txt')` was refused while `ingest('notes')` — the same file, reached by
+STEM match — read the host target and stored it. A guard, correct, walked around by a
+second code path that re-derived the answer for itself.
+
+**Three more escapes, one root cause: a host write to a FIXED name.**
+`create_skill` wrote `<sandbox>/test_skill.py`; `manage_projects` wrote
+`RELEASE.md.tmp` and `PROJECT_MAP.md.tmp`. All three are CONSTANT names — there is no
+model-supplied path to validate, which is exactly why none called `_get_safe_path`.
+But the model does not need to supply a path: it plants a symlink at that constant
+name and the next write follows it. Demonstrated: the agent's own source file
+overwritten with model-authored Python, and the TDD cleanup path then unlinked the
+symlink so the sandbox looked untouched. Closed with one `write_text_nofollow`
+helper — `O_NOFOLLOW` is checked by the kernel at open time, so it is atomic, where
+an `is_symlink()` test followed by a write is a TOCTOU race the model can win because
+it controls the directory.
+
+**`manage_services` never validated the project half of a `name`.** `_validate_name`
+only ever saw the right half of `project:service`, and `_file_stem` merely swaps `:`
+for `--` — so every `../` survived into the filename stem, and `mkdir(parents=True)`,
+the `.cmd.sh` write and the `.log`/`.pid` unlinks all followed it out.
+
+**§4DW's SQL fix was re-opened by a flag the model sets.** `_mask_sql` blanks
+dollar-quoted bodies before any guard runs, so
+`DO $$ BEGIN PERFORM pg_read_file('/etc/passwd'); END $$` masks down to `DO` plus
+whitespace. An existing rule refuses dollar bodies — but only while `confirm` is
+false, and `confirm` is a MODEL-set boolean. The guards now scan a dollar-VISIBLE
+probe (`_mask_sql(keep_dollar=True)`): literals masked, code visible. Scanning the raw
+statement instead would have refused `'create extension is just text'`. Also added:
+untrusted procedural languages (`CREATE EXTENSION plperlu` plus a one-line function is
+host RCE, and `ghost` is a superuser with `trust` on loopback), `ALTER SYSTEM`,
+`dblink`/FDW, and the adminpack file-write functions — none gated by `confirm`.
+
+**And the one that matters most, in machinery hardened earlier the same session.**
+`_get_safe_path` raises `ValueError("Security Error: …")`, and twelve `file_system`
+handlers return the bare message as a plain `str`. `_FAILURE_PREFIX_RE` is anchored on
+`ERROR\b|Error\b`; this head starts with an **S**. It matched neither regex, so the
+loop booked every path-containment refusal as a WORLD-CHANGING SUCCESS: the pre-flight
+guard cleared, the loop-breaker's memory wiped, a strike decayed, and the project
+work_log recording a file that was never written — including the guard that stops an
+`rmtree` of the entire workspace. `core/coding_executor.py` already hand-rolled
+`head.startswith("security error")` for its own use: two implementations of one
+decision, and the canonical module — whose docstring says "ONE HOME" — did not have
+it. Eight more refusal heads had the same problem (`Skipped:`, `NOOP:`,
+`Nothing recorded`, `Unknown action`).
+
+Also fixed: six tools raised `AttributeError` on a non-string `action` (arguments
+arrive through `json.loads`, so an int or a list is an ordinary emission), which the
+loop rendered to the model as "did you forget a required argument?" — advice that
+cannot work, so it repeats the call and burns strikes on a type error nobody named.
+
+### The pins were wrong in the same way the code was
+
+The reviewer ran four mutants against the round-one pin file and **all four survived**.
+Every pin was written in the PRODUCER's vocabulary — it raises `ValueError`, the
+message starts with `Error:`, the message contains the path — and none asked the
+CONSUMER's question: *is this classified as a refusal, and does the loop credit it
+with changing the world?* Adding one assertion —
+`assert ToolOutcome.coerce(result).world_changed is False` — kills the message mutant
+and would have caught the `Security Error` defect outright.
+
+Then my own round-two batch had six survivors, all the same shape one level up: the
+pins asserted the GUARD (does `_get_safe_path` refuse a symlink, does the project-id
+regex reject `../`) while the mutants changed the CALL SITE (the tool stops calling
+the guard, the writer reverts to `write_text`). Rewritten to drive the real entry
+points. One of those pins was itself vacuous — a bare `except Exception: pass` around
+the driver meant it passed when the driver failed before reaching the write.
+
+**18/18 valid mutants killed** on the final run, including all four of the reviewer's.
+One earlier survivor was retired as genuinely equivalent: it mutated a Python <3.9
+`startswith` fallback that `is_relative_to` makes unreachable on 3.10 — re-aimed at
+the live branch, it dies.
+
+**Suite: 18,510 passed, 0 failed** (18,453 → 18,510).
+
+**Still open, and the operator's call:** drop the `ghost` Postgres role from superuser
+and replace loopback `trust` with `scram-sha-256` (the validator is the second layer;
+a compromised container still reaches `host.docker.internal:5432` with nothing in the
+way); six tools let injected text persist into future SYSTEM PROMPTS unescaped
+(`update_profile` → `{{PROFILE}}`, `self_state note_principle` → the wake-up prefix,
+`learn_skill` → the skill playbook, `knowledge_base insert_fact` → hydrated memory) and
+all of them sit on the verifier's bookkeeping SKIP list; `manage_tasks(create)` plants
+a full-toolset agent turn that runs later, unattended, across restarts; the tool-result
+channel is a `role:"user"` message with fetched page text concatenated raw, so a page
+containing `</tool_response>` breaks the wrapper; `url_ssrf_reason` resolves an octal
+IP differently from libcurl (`0177.0.0.1` reaches loopback under `--no-mandatory-tor`);
+`file_system(replace)` runs an unbounded synchronous scan on the event-loop thread with
+no per-call budget; and `workspace_track` is an uncontained host stat oracle.
+
+### Round three: the round-two fixes, reviewed — and one of them had re-opened a production loop
+
+Three lenses on the round-two diff. They did not confirm it.
+
+**I broke the idempotency ledger.** Round two added six heads to `_REJECTION_RE`, reasoning
+that a tool which wrote nothing must not be credited with a world change. True, and the
+wrong lever: REJECTED also sets `may_record_as_applied = False`, and the loop's durable
+idempotency ledger is gated on exactly that. The three idempotent setters —
+`update_profile`, `learn_skill`, `knowledge_base insert_fact` — are PRECISELY the three
+producers of `NOOP:`, whose reply means "the state you asked for is already there". Marked
+as a refusal, the ledger was never written, the guard never armed, and the model re-issued
+the identical call every turn: three dispatches, three strikes, and the loop-breaker firing
+with a steer telling the model to re-issue the same tool — the exact 9×-in-a-row
+`update_profile` loop the ledger was built to stop.
+
+`Nothing to diff` was worse. `workspace` is documented read-only and that string is its
+CORRECT answer for an empty watchlist — the live state of this box. It became a failure
+banner, a strike, and a `turn outcome: failed` label feeding the bench flywheel and the
+competence prior. Label noise manufactured from a correct read. All four heads reverted;
+`Security Error` and `Unknown action` — genuine refusals that changed nothing and are not
+idempotent setters — stay.
+
+**And I had blessed the regression in a pin.** `test_refusal_heads_never_credit_a_world_change`
+asserted all six heads were rejections, so the suite certified the breakage. Worse, when a
+later fix made one of its cases fail, I deleted the case instead of fixing the code — which
+is how `DO $$ COPY t TO PROGRAM 'id'; $$` was left validating clean for two hours. Anchoring
+`_SQL_COPY` to a statement head fixed a real false positive (`SELECT copy FROM ledger`) and
+simultaneously re-opened that. Both now hold: `… TO/FROM PROGRAM` is unambiguous anywhere and
+needs no anchor; the file form stays anchored.
+
+**Four criticals in code I had just written.**
+
+`purge_state` `rmtree`s an arbitrary host directory — no validation of any kind, and its key
+comes from `.services/registry.json`, which lives INSIDE the bind mount, so the model rewrites
+it with one `execute` call. Round two had validated `start()` only. `manage_projects(delete)`
+is the live caller. Fixed at `_file_stem`, the single choke point every derived filename flows
+through, so a future fifth caller inherits the guard.
+
+`O_NOFOLLOW` refuses a symlink and says nothing about a FIFO. Opening a reader-less FIFO for
+writing blocks forever, and both callers invoke the write synchronously from inside an
+`async def` — so `mkfifo /workspace/test_skill.py` freezes the entire event loop, with no
+exception for the caller's `try` to catch. Now `O_NONBLOCK` plus an `fstat`+`S_ISREG` check on
+the open fd.
+
+`O_NOFOLLOW` also covers only the final component. My own docstring said intermediate
+directories were the caller's problem — and then neither caller resolved its parent. The
+default workspace is a directory the container can replace with a symlink, and
+`mkdir(parents=True)` followed it happily: `PROJECT_MAP.md` written into the agent's own
+source tree. Both writers now resolve and contain the workspace.
+
+The KB fuzzy-resolver re-check was TOCTOU — it validated `_resolved` and then read through the
+unresolved path, which re-follows the link. One line: read the path you validated.
+
+**The SQL deny-list was one `CREATE FUNCTION` away from irrelevant.** `LANGUAGE C` loads an
+arbitrary shared object; `LANGUAGE internal` RENAMES the exact primitive the list blocks, after
+which `SELECT myread(...)` scans clean; `LOAD` needs no function at all; `ALTER ROLE … SET`
+reaches the same GUC as the `ALTER SYSTEM` already refused. A list of names cannot survive a
+rename, so the renaming MECHANISMS are refused now. Dynamic SQL inside a body is refused
+outright — `EXECUTE 'pg_read' || '_file(...)'` assembles the name at run time where no static
+scan can reach it. And the probe was over-refusing in the other direction: it copied the dollar
+body verbatim, so a plpgsql function merely MENTIONING `copy` in a comment was unusable; the
+mask now recurses so the body's code is visible and its data is not.
+
+**The pins were wrong in a third distinct way.** Generation 1 asserted the producer's
+vocabulary. Generation 2 asserted the guard instead of the call site. Generation 3 drove the
+right entry point and asserted a property true in BOTH worlds: `world_changed` (the raw
+override field) where the loop reads `changed_the_world` (the property); `hasattr(module,
+"_fs_write_nofollow")` — an import, not a call, proven vacuous by reverting both call sites
+while leaving the import; a refusal message checked with `"outside" in result` where the
+payload itself was `../OUTSIDE.txt`; a service fixture that died on a missing `execute` stub
+before reaching the sink, so the security assertion never ran at all. Nine of twelve wide
+survivors had that shape. The test that separates them is: **name a concrete world in which
+this assertion is false.**
+
+Two mutants were retired as genuinely equivalent rather than papered over: one mutated a
+Python <3.9 fallback `is_relative_to` makes unreachable, and one widened a language pattern in
+a direction no real language name occupies.
+
+**Suite: 18,567 passed, 0 failed.**
+
+### Rounds four and five: the class, finally enumerated
+
+**Round four found the same vulnerability class in the file round three was editing at
+the same hour.** `sandbox/services.py` had a fixed-name log READ (`ln -s
+~/.ghost_api_key .services/leak.log`, then `manage_services(logs)` returned the master
+key into the model's own context) and a fixed-name `.cmd.sh` WRITE that overwrote any
+host file with model-authored shell. Round three's docstring had enumerated "three
+host-side writers"; there were five, and two of them were in the file that change set
+also touched.
+
+The round-three pin for that class asserted `rglob("*pwn*")` was empty — that no NEW
+FILE appeared outside the sandbox. A symlink OVERWRITE never creates one. The pin
+inherited the fix's blind spot for the third round running.
+
+**Round five found three more, all inside round four's fixes.** `log_tail()` — the
+function DIRECTLY BELOW the one round four hardened, ten lines away, still on a plain
+`open()`, and the one whose output reaches the model's SYSTEM prompt. `_read_log`'s
+head+tail branch, the other half of a function whose small-file branch had just been
+fixed. And `purge_state`'s containment check computed its own boundary as
+`(host_dir / "state").resolve()` — which follows a symlinked `state/`, so it compared
+the victim directory against ITSELF and passed unconditionally. A guard that derives its
+boundary from attacker-controlled state is not a guard.
+
+**So the class was enumerated instead of patched.** An AST sweep of every host-side file
+operation whose path derives from a model-writable root found what a sixth round would
+have found next: `jobs.py` guards its DIRECTORY against symlink replacement but read its
+per-job FILES plainly; `services.py` had just gained the FILE guards while its DIRECTORY
+stayed open. Each file had exactly half the fix, and each file's own comment named the
+other as the unsafe twin.
+
+`tests/test_model_writable_root_ops.py` now enumerates the class from the AST at test
+time: every symlink-following content op in the two modules that work entirely inside
+the bind mount must go through `write_text_nofollow` / `read_bytes_nofollow`, or carry a
+written exemption. The first version of that test was itself a heuristic — it only
+flagged ops whose source segment mentioned `host_dir`, and it did NOT fire when round
+five's actual critical was re-introduced, because the path had been bound to a local one
+line earlier. A detector that cannot catch the bug it was written for is the defect it
+exists to prevent. Rewritten as a whitelist, it immediately found two more sites all five
+rounds had missed (both `registry.json` reads, symlink-following and unbounded), and it
+provably fails when round five's critical is put back.
+
+**Also closed:** the SQL rules blocked `dblink(` and two wrapper NAMES while leaving the
+statement SHAPES open — `CREATE SUBSCRIPTION` is one superuser statement that dials an
+attacker host, `GRANT pg_execute_server_program` is durable command execution that never
+says SUPERUSER, and `ALTER SERVER` / `ALTER USER MAPPING` repoint an existing foreign
+server. In the other direction the same rules were refusing every routine migration
+(`ALTER ROLE app SET search_path`), a column named `program`, and a table named
+`dblink_cache` — a false refusal kills the agent's real work as surely as a bypass lets
+an attacker through. An `int()` outside its `try` meant one 4301-digit sentinel file
+aborted `reap()`'s per-row loop and every background job silently stopped landing.
+
+**Suite: 18,622 passed, 0 failed** (18,453 → 18,622).
+
+**Left open deliberately:** the job exit-sentinel nonce is embedded in the script the job
+itself runs, so `cat "$0"` reveals it — a forgery defence one line from being defeated.
+It is an integrity issue inside the container, not a host escape, and the fix is a
+redesign rather than a patch. Round five's fixes have not had fresh eyes.

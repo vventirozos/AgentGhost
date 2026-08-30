@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -176,11 +177,121 @@ def subscription_count() -> int:
         return len(_load_subs_or_empty())
 
 
+# Hostnames the browser vendors actually terminate Web Push on. An endpoint
+# URL arrives from the CLIENT and is later POSTed to by this daemon, so an
+# unconstrained endpoint is a STORED SSRF: whoever can reach
+# `/api/push/subscribe` picks a URL, and every later broadcast makes the
+# host fetch it — with the daemon's network position, not the caller's.
+# `startswith("https://")` was the only check until §4DW (2026-08-29); it
+# accepts `https://100.93.181.31:8000/...` (the tailnet), `https://[::1]/`,
+# and `https://user:pw@evil/` alike.
+#
+# It also matters for the no-identity-egress rule: a push POST is keyed,
+# non-Tor traffic. Confining it to the four vendor services keeps that
+# exception enumerable instead of arbitrary.
+
+
+# ⚠ STRUCTURAL GUARD ON THE TABLE ITSELF. Every entry must be at least three
+# labels. Appending a single bare `"com"` to the tuple above silently turns
+# the allowlist into "any .com host" and restores the stored SSRF in full —
+# a one-word edit that no host-matching test would notice, because every
+# hostile fixture uses a made-up TLD. This fails the import instead.
+def _validate_suffix_table(suffixes):
+    """Return `suffixes` iff every entry is specific enough to be safe.
+
+    A FUNCTION rather than a bare `assert` so the guard can be executed by a
+    test: a bare assertion is unpinnable, because neutering it leaves the
+    real table valid and every host-matching test still passes.
+
+    ⚠ AND IT RETURNS THE TABLE, so the call cannot be dropped. Written first
+    as a separate statement below the tuple, it had the same problem one
+    level up: the guard was correct, the table was correct, and deleting the
+    CALL changed nothing observable — that mutant survived the whole suite.
+    Making the validated tuple the only way to obtain the table means
+    removing the call leaves `_PUSH_HOST_SUFFIXES` undefined and the module
+    unimportable. A guard nothing is forced to call is a comment.
+    """
+    for sfx in suffixes:
+        if len(sfx.split(".")) < 3:
+            raise ValueError(
+                f"push-host suffix {sfx!r} is too short: a suffix of fewer "
+                "than three labels allows an entire TLD, which restores the "
+                "stored SSRF this allowlist exists to close")
+    return tuple(suffixes)
+
+
+# ⚠ THE TUPLE IS INLINE INSIDE THE CALL, ON PURPOSE.
+#
+# Written as `_RAW = (...)` followed by `_PUSH_HOST_SUFFIXES =
+# _validate_suffix_table(_RAW)`, the guard was still bypassable in one edit:
+# assigning the raw tuple directly skips validation, and because the table
+# is currently correct NOTHING observable changes — that mutant survived the
+# whole suite. There is no name to bypass to now. Removing the call leaves
+# the table undefined; widening it trips the guard at import.
+_PUSH_HOST_SUFFIXES = _validate_suffix_table((
+    "push.services.mozilla.com",   # Firefox
+    "web.push.apple.com",          # Safari / iOS PWA — the one in use here
+    "notify.windows.com",          # Edge / WNS
+    "fcm.googleapis.com",          # Chrome
+    "android.googleapis.com",      # Chrome (legacy GCM path)
+))
+
+# A hostname, as DNS defines one: letters, digits, hyphens, dot-separated,
+# no label starting or ending with a hyphen.
+#
+# ⚠ THIS IS THE ANTI-BYPASS. `urlsplit` and `requests` disagree about where
+# the authority ends when it contains a backslash:
+#     urlsplit("https://evil.tld\\.web.push.apple.com/x").hostname
+#         -> 'evil.tld\\.web.push.apple.com'   (ends with the allowed suffix!)
+#     requests.prepare_url(same)
+#         -> 'https://evil.tld/%5C.web.push.apple.com/x'   (POSTs to evil.tld)
+# So the suffix check passed on a string that is not the host the request
+# actually goes to. Any character DNS cannot carry means the two parsers may
+# disagree, so the host must be a legal hostname before its suffix means
+# anything. Found by review, 2026-08-29, against the first version of this
+# very guard.
+_HOSTNAME_RE = re.compile(
+    r"\A[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\Z")
+
+
+def _push_endpoint_allowed(endpoint: str) -> bool:
+    """True only for an https URL on a known push-service host.
+
+    Rejects a userinfo component (`https://evil.tld@web.push.apple.com/` —
+    note the direction that actually needs this clause: the part before `@`
+    is NOT the host, so the reverse spelling is already caught by the host
+    check), an explicit port (a vendor never needs one, and it is how an
+    internal service gets addressed), any host that is not a syntactically
+    legal hostname, and any host that merely CONTAINS an allowed name
+    (`web.push.apple.com.evil.tld`, `xweb.push.apple.com`) by requiring a
+    dot-boundary suffix match.
+    """
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(endpoint)
+        # ⚠ INSIDE the try. `urlsplit` is lazy: it does not parse the port
+        # until `.port` is read, and an out-of-range port raises ValueError
+        # THERE. With this access outside the try, one stored row like
+        # `https://web.push.apple.com:99999/x` aborted the whole of
+        # `broadcast()` before any device was reached — the guard meant to
+        # contain a poisoned row instead let it silence every push.
+        if u.scheme != "https" or u.username or u.password or u.port:
+            return False
+        host = (u.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if not host or not _HOSTNAME_RE.match(host):
+        return False
+    return any(host == sfx or host.endswith("." + sfx)
+               for sfx in _PUSH_HOST_SUFFIXES)
+
+
 def add_subscription(subscription: Dict[str, Any]) -> bool:
     """Store (upsert by endpoint). Returns False on a malformed payload."""
     endpoint = subscription.get("endpoint")
     keys = subscription.get("keys") or {}
-    if (not isinstance(endpoint, str) or not endpoint.startswith("https://")
+    if (not isinstance(endpoint, str) or not _push_endpoint_allowed(endpoint)
             or not keys.get("p256dh") or not keys.get("auth")):
         return False
     with _lock:
@@ -248,6 +359,15 @@ def broadcast(title: str, body: str, *, url: str = "/", tag: str = "") -> int:
     sent = 0
     dead: List[str] = []
     for endpoint, sub in subs.items():
+        # The egress is the sink, so the allowlist is enforced HERE too, not
+        # only at `add_subscription`. The subscriptions file predates the
+        # ingest check (and is a plain JSON file on disk that anything with
+        # write access can edit), so an ingest-only guard would leave every
+        # already-stored endpoint — and every future hand-edit — unchecked.
+        if not _push_endpoint_allowed(endpoint):
+            logger.warning("webpush: refusing non-push-service endpoint %r",
+                           endpoint[:80])
+            continue
         try:
             webpush(
                 subscription_info=sub,

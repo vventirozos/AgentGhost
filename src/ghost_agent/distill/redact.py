@@ -140,6 +140,55 @@ def _redact_cc_if_luhn(m: "re.Match[str]") -> str:
     """
     return "<REDACTED_CC>" if _luhn_ok(re.sub(r"\D", "", m.group(0))) else m.group(0)
 
+# ── credential-bearing URL query parameters ───────────────────────────────
+# `form_secret_assignment` below deliberately refuses a bare `key=` — in
+# prose `key: value` is almost never a secret, and redacting it would eat
+# ordinary log lines. Inside a query string that reasoning inverts: `?key=`
+# is exactly how this system authenticates a browser page load, a PWA
+# manifest and a WebSocket upgrade (a browser cannot set a header on a
+# top-level navigation), so a bare `key` there IS the master credential.
+#
+# Found 2026-08-29 (§4DW): the master key stood in cleartext in four 0644
+# files — 44 hits in ghost-client.err, 40 in ghost-client.log, 35 in a
+# sandbox service's access log, 1 in last_config.json — every one written
+# through a path that had already called redact_text. The redactor was
+# running; this shape simply was not in its table.
+#
+# ⚠ MATCHED ON THE DECODED NAME. The first version of this rule spelled the
+# names literally in the pattern, and `?%6bey=<64 chars>` sailed straight
+# through it — while Starlette percent-DECODES parameter names, so that
+# spelling authenticates perfectly and uvicorn logs the raw form. A guard
+# that reads the name differently from the router that honours it is not a
+# guard. Decoding here means every encoding of the same name is covered.
+_QS_SECRET_NAMES = frozenset({
+    "key", "apikey", "api_key", "accesskey", "access_key",
+    "token", "accesstoken", "access_token", "auth", "authorization",
+    "secret", "password", "passwd", "pwd", "sig", "signature", "session",
+    "sessionid", "session_id", "credential", "credentials",
+})
+
+# One parameter of a query string: the leading `?`/`&`, the raw name, and the
+# value. The value class excludes `,` and `;` as well as whitespace and
+# quoting, so redacting a parameter cannot swallow the NEXT field of a
+# comma-separated or repr-style log line (it used to: `?key=SEC, status=200`
+# came back as `?key=<REDACTED> status=200`, losing the comma and the
+# structure around it).
+_QS_PARAM_RE = re.compile(r"([?&])([^=&\s\"'<>\]}]+)=([^&\s\"'<>\]},;]*)")
+
+
+def _redact_qs_if_secret(m: "re.Match[str]") -> str:
+    """Redact one query parameter iff its DECODED name is a credential."""
+    from urllib.parse import unquote_plus
+    raw_name = m.group(2)
+    try:
+        name = unquote_plus(raw_name).strip().lower().replace("-", "_")
+    except Exception:  # noqa: BLE001 — a redactor must never raise
+        name = raw_name.lower()
+    if name in _QS_SECRET_NAMES or name.replace("_", "") in _QS_SECRET_NAMES:
+        return f"{m.group(1)}{raw_name}=<REDACTED>"
+    return m.group(0)
+
+
 _BUILTIN_RULES: List[_BuiltinRule] = [
     # PEM private-key blocks (multi-line) — most specific, run first so the
     # whole block collapses before any sub-pattern nibbles at it.
@@ -239,10 +288,26 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # line ([ \t], not \s) so a name at end-of-line can't eat the next line.
     ("form_secret_assignment", re.compile(
         r"(?i)\b((?:[a-z0-9_\-]*"
-        r"(?:password|passwd|secret|token|api_key|apikey|access_key|private_key)"
+        r"(?:password|passwd|secret|token|api_key|apikey|access_key|private_key|ghost[_\-]?key)"
         r"|(?:[a-z0-9_\-]+[_\-])?(?:pwd|auth))"
         r"[\"']?[ \t]*[=:][ \t]*[\"']?)([^\s&\"',]+)"
     ), r"\1<REDACTED>"),
+
+    # Credential-bearing URL QUERY PARAMETERS. `form_secret_assignment`
+    # above deliberately refuses a bare `key=` — in prose `key: value` is
+    # almost never a secret, and redacting it would eat ordinary log lines.
+    # Inside a query string that reasoning inverts: `?key=` is exactly how
+    # this system authenticates a browser page load, a PWA manifest and a
+    # WebSocket upgrade (a browser cannot set a header on a top-level
+    # navigation), so a bare `key` there IS the master credential.
+    #
+    # Found 2026-08-29 (§4DW): the master key stood in cleartext in four
+    # 0644 files — 44 hits in ghost-client.err, 39 in ghost-client.log, 35
+    # in a sandbox service's access log, 1 in last_config.json — every one
+    # of them written through a path that had already called redact_text.
+    # The redactor was running; this shape simply wasn't in its table.
+    # Anchored to [?&] so it can only fire inside a query string.
+    ("url_query_secret", _QS_PARAM_RE, _redact_qs_if_secret),
 
     # .onion hostnames
     ("tor_onion", re.compile(r"\b[a-z2-7]{16,56}\.onion\b"), "<REDACTED_ONION>"),
@@ -386,12 +451,63 @@ class RedactionConfig:
     extra_rules: List[_BuiltinRule] = field(default_factory=list)
 
 
+# ── the master key, by VALUE ──────────────────────────────────────────────
+# Every other rule here is name-anchored: it recognises `GHOST_API_KEY=…`,
+# `"api_key": …`, `?key=…`. None of them recognises the SECRET ITSELF, so
+# these all round-tripped the live 64-char master key verbatim (verified
+# 2026-08-29):
+#     <the bare key>                 X-Ghost-Key: <key>
+#     curl -H 'X-Ghost-Key: <key>'   str(dict(request.headers))
+# — which is exactly how it reaches a durable sink that is not a URL or an
+# assignment: a tool result, a shell echo, an exception repr, a header dump.
+#
+# Matching on the VALUE is precise where a shape rule cannot be: the key is
+# 64 hex characters, indistinguishable from every SHA-256 in these logs, so
+# a `[0-9a-f]{64}` rule would redact file hashes, git objects and cache keys
+# wholesale. The value is already in this process's environment; reading it
+# adds no exposure, and a wrong/absent value simply yields no rule.
+#
+# Cached, and re-read when the source changes so a rotation takes effect
+# without a restart. Never raises: redaction failing open is bad, redaction
+# CRASHING is worse.
+_MASTER_KEY_CACHE: dict = {"source": None, "rule": None}
+_MIN_KEY_LEN = 16   # below this a "secret" is too generic to match safely
+
+
+def _master_key_rule():
+    """A rule redacting the configured API key wherever it appears, or None."""
+    try:
+        import os as _os
+        from pathlib import Path as _Path
+        val = (_os.environ.get("GHOST_API_KEY") or "").strip()
+        if not val:
+            try:
+                val = (_Path.home() / "Data/AI/.ghost_api_key").read_text().strip()
+            except Exception:
+                val = ""
+        if len(val) < _MIN_KEY_LEN:
+            return None
+        if _MASTER_KEY_CACHE["source"] != val:
+            _MASTER_KEY_CACHE["source"] = val
+            _MASTER_KEY_CACHE["rule"] = (
+                "ghost_master_key", re.compile(re.escape(val)),
+                "<REDACTED_API_KEY>")
+        return _MASTER_KEY_CACHE["rule"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def redact_text(text: str, config: RedactionConfig | None = None) -> str:
     if not text:
         return text
     cfg = config or RedactionConfig()
     disabled = set(cfg.disabled_rules or ())
     out = text
+    # FIRST: the literal secret, before any name-anchored rule can rewrite
+    # the context around it and stop it matching.
+    _mk = None if "ghost_master_key" in disabled else _master_key_rule()
+    if _mk is not None:
+        out = _mk[1].sub(_mk[2], out)
     for name, rx, repl in _BUILTIN_RULES:
         if name in disabled:
             continue

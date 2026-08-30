@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from .outcome import ToolOutcome
 import os
 import uuid
 from ..utils.logging import Icons, pretty_log
@@ -374,6 +375,7 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
         n_running = len(still_running)
         n_fail = dispatched - n_ok - n_running
         body = "\n".join(result_lines) if result_lines else "(no results)"
+        _all_ok = False
         if n_running:
             prefix = (
                 f"PARTIAL: overall await deadline ({deadline:g}s) reached — "
@@ -386,6 +388,7 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
                 f"jobs(action='status') later."
             )
         elif n_fail == 0 and skipped == 0:
+            _all_ok = True
             prefix = f"SUCCESS: {n_ok}/{len(tasks)} task(s) completed (await_results=True)."
         else:
             prefix = (
@@ -394,14 +397,32 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
                 + (f", {skipped} skipped ({', '.join(invalid)})" if skipped else "")
                 + "."
             )
-        return f"{prefix}\nTask IDs:\n{body}\nResults written to SCRAPBOOK at the requested output_key(s)."
+        # The STATUS follows the prefix. Wrapping this return
+        # unconditionally in `partial` swallowed the SUCCESS branch too, so
+        # a clean 2/2 swarm run was booked as a failure — `op_outcomes.ok`
+        # False under the "AUTHORITATIVE" banner, a competence failure
+        # recorded, and the idempotency record refused. As a bare string it
+        # had correctly coerced to OK; the wrap was the regression.
+        _text = (f"{prefix}\nTask IDs:\n{body}\nResults written to "
+                 f"SCRAPBOOK at the requested output_key(s).")
+        if _all_ok:
+            return ToolOutcome.ok(_text)
+        # NOTHING failed, some work is still in flight — that is UNRESOLVED,
+        # not PARTIAL. PARTIAL is a failure status, so it drew a strike and
+        # fed the same-failure breaker for tasks the message itself says
+        # "were NOT cancelled — do not re-dispatch them". Same defect as the
+        # unconditional `partial()` wrap above, one branch further in.
+        if n_running and not n_fail and not skipped:
+            return ToolOutcome.unresolved(
+                _text, reason_code="swarm_await_still_running")
+        return ToolOutcome.partial(_text, reason_code="swarm_await_partial")
 
     keys_str = ", ".join(dispatched_keys)
     if skipped > 0:
         return (
-            f"PARTIAL: {dispatched}/{len(tasks)} task(s) dispatched; {skipped} skipped "
+            ToolOutcome.partial(f"PARTIAL: {dispatched}/{len(tasks)} task(s) dispatched; {skipped} skipped "
             f"({', '.join(invalid)}). Task IDs: {keys_str}. Check SCRAPBOOK for the "
-            f"dispatched results; process the skipped items synchronously yourself."
+            f"dispatched results; process the skipped items synchronously yourself.")
         )
     return (
         f"SUCCESS: {dispatched} task(s) dispatched to the Swarm. Task IDs: {keys_str}. "

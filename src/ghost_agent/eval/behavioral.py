@@ -121,9 +121,28 @@ class EvalContext:
                     continue
                 if needle and needle in str(d.get("user_request", "")):
                     tcs = d.get("tool_calls") or []
+                    # `"ERROR" in result.upper()` was a PRIVATE rule, and an
+                    # unanchored whole-body substring at that: replayed over
+                    # the 4,391-call corpus it counted 987 errors against 387
+                    # true failures — 2.55x, 654 fabricated error credits —
+                    # and this number is `mean_tool_errors` in the FROZEN
+                    # regression baseline, i.e. the instrument that is
+                    # supposed to say whether the agent got WORSE at using
+                    # tools. The shared sniffer ORed with the recorded flag
+                    # measures 365 against 387 with 40 false: better on both
+                    # axes, and one definition instead of two.
+                    # THE shared question, with the tool name — `t["name"]`
+                    # is right here and was not being passed, so this used the
+                    # generic sniffer for `execute` too and missed 61 REJECTED
+                    # refusals (46 file_system "None of the SEARCH/REPLACE
+                    # blocks matched", 7 manage_services, 4 postgres_admin,
+                    # 4 manage_composed_skills SYSTEM BLOCK).
+                    from ..core.agent import _action_failed
                     errs = sum(1 for t in tcs
-                               if "ERROR" in str(t.get("result", "")).upper()
-                               or t.get("error"))
+                               if t.get("error")
+                               or _action_failed(t.get("result", "") or "",
+                                                 str(t.get("name")
+                                                     or t.get("tool") or "")))
                     return {"steps": int(d.get("n_steps") or len(tcs)),
                             "tool_calls": len(tcs), "tool_errors": errs}
         return out

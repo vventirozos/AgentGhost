@@ -171,6 +171,18 @@ def test_interface_download_rejects_path_traversal():
     dl_body = src[dl_idx:dl_end]
     assert '".." in filename' in dl_body
     assert "Invalid filename" in dl_body
+    # ⚠ Both halves, and the OR. Asserting the `..` token alone survived
+    # flipping `or` to `and`, which is not merely a weaker fail-fast: the
+    # handler pastes the parameter into a localhost URL and httpx normalises
+    # dot segments, so `/api/download/../introspect` reaches the agent's own
+    # `/api/introspect` CARRYING the injected `X-Ghost-Key`.
+    assert 'filename.startswith("/")' in dl_body
+    import ast as _ast
+    _guard = [ln for ln in dl_body.splitlines() if '".." in filename' in ln]
+    assert _guard, "the traversal guard moved"
+    assert " or " in _guard[0] and " and " not in _guard[0], (
+        f"the traversal guard is conjunctive — either half alone lets the "
+        f"other payload through: {_guard[0].strip()}")
 
 
 # =====================================================================

@@ -99,6 +99,36 @@ if not GHOST_API_KEY.strip():
 # Hard limit on inbound request body sizes for upload paths. Enforced at the
 # ASGI layer by BodySizeLimitMiddleware (see below) BEFORE the body is parsed,
 # plus a handler-level backstop in _read_capped_upload.
+# ⚠ SCRUB THE URL BAR. The key must ARRIVE as a query parameter — a browser
+# cannot set a header on a top-level navigation — but it must not STAY
+# there. On 2026-08-29 the master key was found 35 times in a sandbox
+# service's access log (`.services/…chess-coach-v3.log`, 0644, INSIDE
+# sandbox_dir, where /api/download serves it and containers read it
+# directly) because the URL carrying it travelled onward from this page.
+# Replacing the history entry the instant the key is in memory means it is
+# not copy-pasted, not bookmarked, and not in the next navigation's address
+# bar. Paired with `Referrer-Policy: no-referrer` on the same response.
+#
+# ⚠ A SINGLE CONSTANT ON PURPOSE. This started life as a four-part implicit
+# string concatenation inside the injection block, and a mutation that
+# commented out only the FIRST part left every token a test looked for
+# ("history.replaceState", 'searchParams.delete("key")') still present in
+# the rendered page — the pin passed against a scrub that did nothing. As
+# one unit, any edit to any part of it changes the string the test compares
+# against. (§4DW)
+URL_KEY_SCRUB_SCRIPT = (
+    '<script>try{const u=new URL(location.href);'
+    # ⚠ ASK URLSearchParams, do not string-match. The guard used to be
+    # `location.search.includes("key=")`, which is false for `?%6bey=` — a
+    # spelling Starlette DECODES and authenticates exactly like `?key=`. The
+    # scrub then did nothing and the key stayed in the address bar.
+    # `searchParams` decodes names, so `.has("key")` is true for every
+    # encoding of it, and `.delete("key")` removes them all.
+    'if(u.searchParams.has("key")){u.searchParams.delete("key");'
+    'history.replaceState(null,"",u.pathname+u.search+u.hash);}}'
+    'catch(e){}</script>\n'
+)
+
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # JSON bodies (chat, tts, workspace/save) are far smaller than file uploads,
@@ -154,6 +184,88 @@ def _proxy_timeout(total: float) -> "httpx.Timeout":
     """Timeout for the short-lived proxies (upload/download/save/load/voice):
     bounded total, fast connect failure."""
     return httpx.Timeout(total, connect=CHAT_CONNECT_TIMEOUT_S)
+
+
+# ── credential redaction in access logs ────────────────────────────────────
+# uvicorn's access logger records the full request line, INCLUDING the query
+# string. The interface authenticates the page load, the manifest and the
+# WebSocket upgrade by `?key=` (a browser cannot set a header on a top-level
+# navigation), so every one of those requests wrote the 64-char master key
+# into a logfile. Measured on 2026-08-29: 44 occurrences in
+# `~/Data/AI/Logs/ghost-client.err`, 39 in `.log`, both 0644 and neither
+# rotated — while `~/Data/AI/.ghost_api_key` is correctly 0600.
+#
+# Installed at import so it covers the uvicorn CLI path too (the launcher
+# starts this module with `uvicorn server:app`, which never reads a
+# log_config from here).
+import logging as _logging
+import re as _re
+from urllib.parse import unquote_plus as _unquote_plus
+
+# ⚠ KEPT IN STEP WITH `src/ghost_agent/distill/redact.py`'s `url_query_secret`
+# rule and `src/ghost_agent/main.py`'s `_RedactAccessLog`. This server runs
+# as a plain module with `cwd=interface/` and cannot import `ghost_agent`, so
+# the logic is duplicated — `tests/test_http_surface_hardening_4dw.py` pins
+# the three against one shared corpus so they cannot drift.
+#
+# The first version listed only `key|token|api_key|secret`, so `password`,
+# `apikey`, `access_token`, `auth` and `sig` were all written verbatim; and
+# it matched the name LITERALLY, so `?%6bey=` — which Starlette decodes and
+# happily authenticates — went straight through.
+_QS_SECRET_NAMES = frozenset({
+    "key", "apikey", "api_key", "accesskey", "access_key",
+    "token", "accesstoken", "access_token", "auth", "authorization",
+    "secret", "password", "passwd", "pwd", "sig", "signature", "session",
+    "sessionid", "session_id", "credential", "credentials",
+})
+_QS_PARAM_RE = _re.compile(r"([?&])([^=&\s\"'<>\]}]+)=([^&\s\"'<>\]},;]*)")
+
+
+def _redact_qs(text: str) -> str:
+    def _one(m):
+        raw_name = m.group(2)
+        try:
+            name = _unquote_plus(raw_name).strip().lower().replace("-", "_")
+        except Exception:  # noqa: BLE001
+            name = raw_name.lower()
+        if name in _QS_SECRET_NAMES or name.replace("_", "") in _QS_SECRET_NAMES:
+            return f"{m.group(1)}{raw_name}=<REDACTED>"
+        return m.group(0)
+    return _QS_PARAM_RE.sub(_one, text)
+
+
+class _RedactSecretsInAccessLog(_logging.Filter):
+    """Scrub credential-bearing query parameters from an access record.
+
+    ⚠ `record.args` may be a DICT — `logging` allows
+    `log("%(path)s", {"path": ...})` for named-field formatting. The first
+    version iterated `record.args` unconditionally, which yields the KEYS of
+    a dict and reassigned them as a tuple: the record then raised
+    `TypeError: format requires a mapping` at emit time and the line was
+    lost entirely. The `try/except` here cannot help with that — the
+    corruption happens before anything raises — so the type is checked.
+    """
+
+    def filter(self, record):
+        try:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    _redact_qs(a) if isinstance(a, str) else a
+                    for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: (_redact_qs(v) if isinstance(v, str) else v)
+                               for k, v in record.args.items()}
+            if isinstance(record.msg, str):
+                record.msg = _redact_qs(record.msg)
+        except Exception:  # noqa: BLE001 — logging must never raise
+            pass
+        return True
+
+
+for _ln in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+    _lg = _logging.getLogger(_ln)
+    if not any(isinstance(f, _RedactSecretsInAccessLog) for f in _lg.filters):
+        _lg.addFilter(_RedactSecretsInAccessLog())
 
 
 async def verify_interface_key(x_ghost_key: str | None = Header(default=None)) -> None:
@@ -390,7 +502,15 @@ async def _lifespan(_app: "FastAPI"):
                 pass
 
 
-app = FastAPI(lifespan=_lifespan)
+# ⚠ Interactive docs OFF, schema AUTHENTICATED. FastAPI publishes `/docs`,
+# `/redoc` and `/openapi.json` to anyone who can open the port by default —
+# a complete map of this server's routes, including the proxy allowlist,
+# the workspace endpoints and the push subscription surface. Auth on the
+# routes is not a reason to publish the map. The UIs are dropped rather
+# than gated because Swagger's own XHR for the schema carries no `?key=`,
+# so a gated UI could never load. (§4DW)
+app = FastAPI(lifespan=_lifespan, docs_url=None, redoc_url=None,
+              openapi_url=None)
 app.add_exception_handler(_JSONBodyError, _json_body_error_handler)
 
 # Shared module-level httpx client. Without this every chat request created
@@ -655,13 +775,59 @@ async def _log_streamer_once():
                 pass
             raise
 
+# Name of the cookie that carries page auth once `?key=` has been used.
+#
+# ⚠ THIS EXISTS BECAUSE THE URL SCRUB TOOK THE KEY OUT OF THE URL.
+# Before §4DW the key lived in the address bar, so a reload, a
+# session-restore, a bookmark and a notification click all re-sent it. The
+# scrub closed a real leak (the key reached a sandbox service's 0644 access
+# log by riding the URL) but it also removed the ONLY thing that made the
+# page re-openable — a Cmd-R would have landed the operator on the 401 page
+# with no way back, and an installed iOS PWA has no address bar to fix it
+# in. The cookie restores that, and is strictly safer than the URL it
+# replaces: HttpOnly (JS cannot read it, unlike `window.GHOST_API_KEY`),
+# SameSite=Strict, never in a Referer, and never in an access log.
+#
+# It gates ONLY this page. Every state-changing endpoint still requires the
+# `X-Ghost-Key` HEADER, so the cookie cannot be used for CSRF; and `/` is a
+# GET whose response a cross-origin page cannot read (CORS) or frame
+# (X-Frame-Options: DENY).
+_PAGE_COOKIE = "ghost_ui_key"
+_PAGE_COOKIE_MAX_AGE = 30 * 24 * 3600   # 30 days; rotation is the real revoke
+
+# ⚠ NO KEY IN A PUSH PAYLOAD. This used to be `/?key=<master key>` so the
+# notification click would land authenticated. A Web Push payload is
+# encrypted to the SUBSCRIPTION's p256dh/auth keys, which the client
+# supplies — so anyone who could plant a subscription could decrypt the
+# master key straight out of the notification. The page cookie above makes a
+# bare `/` open authenticated, so the key does not need to travel here.
+_PUSH_CLICK_URL = "/"
+
+
+def _request_is_https(request: "Request") -> bool:
+    """True when the browser's connection is TLS.
+
+    `Secure` cookies are dropped over plain HTTP, and this server is reached
+    BOTH ways: over the Tailscale cert from a phone, and over
+    http://127.0.0.1 locally. Setting `Secure` unconditionally would silently
+    break the local case; never setting it would leak the cookie over a
+    plaintext hop. So it follows the actual scheme, honouring a forwarding
+    proxy's header when there is one.
+    """
+    fwd = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    return (fwd or request.url.scheme).lower() == "https"
+
+
 @app.get("/")
-async def get(key: str | None = None):
+async def get(request: Request, key: str | None = None):
     # The page itself must be gated, otherwise we'd be handing out the
-    # injected API key to anyone who can reach the server. Accept the key
-    # via `?key=...` so a user can bookmark the URL once.
-    if not key or not secrets.compare_digest(
-        key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
+    # injected API key to anyone who can reach the server. `?key=...` is how
+    # the key ARRIVES (a browser cannot set a header on a top-level
+    # navigation); the cookie set below is how it PERSISTS, so the URL can be
+    # scrubbed without making the page a one-shot.
+    supplied = key or request.cookies.get(_PAGE_COOKIE)
+    if not supplied or not secrets.compare_digest(
+        supplied.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
     ):
         return HTMLResponse(
             content="<h1>401 Unauthorized</h1><p>Append <code>?key=YOUR_KEY</code> to the URL.</p>",
@@ -676,7 +842,11 @@ async def get(key: str | None = None):
     # unauthenticated /static mount.
     injected = (
         f'<script>window.GHOST_API_KEY={json.dumps(GHOST_API_KEY)};</script>\n'
-        f'<link rel="manifest" href="/manifest.webmanifest?key={quote(GHOST_API_KEY)}">\n'
+        # Order matters: the key is captured into `window.GHOST_API_KEY`
+        # FIRST, then the URL is scrubbed. Scrubbing before the capture
+        # would leave the page unauthenticated.
+        + URL_KEY_SCRUB_SCRIPT
+        + f'<link rel="manifest" href="/manifest.webmanifest?key={quote(GHOST_API_KEY)}">\n'
     )
     html = html.replace("</head>", f"{injected}</head>", 1)
     # `no-cache` forces the browser to revalidate the document with the
@@ -686,11 +856,33 @@ async def get(key: str | None = None):
     # refreshes, because the cached HTML still references the old `?v=`.
     # The document itself carries the injected API key, so we also mark it
     # `private` to keep shared proxies from caching it.
-    return HTMLResponse(
+    response = HTMLResponse(
         content=html,
         status_code=200,
-        headers={"Cache-Control": "no-cache, must-revalidate, private"},
+        headers={
+            "Cache-Control": "no-cache, must-revalidate, private",
+            # This document holds the master key in `window.GHOST_API_KEY`.
+            # A Referer carrying `?key=` to a sandbox-hosted service is the
+            # other half of the 2026-08-29 leak; `no-referrer` closes it for
+            # every outbound navigation and subresource.
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
     )
+    # Persist page auth so the scrubbed URL is still re-openable: reload,
+    # session-restore, "reopen closed tab", and the service worker's
+    # `clients.openWindow("/")` on a notification click all work again.
+    response.set_cookie(
+        _PAGE_COOKIE,
+        GHOST_API_KEY,
+        max_age=_PAGE_COOKIE_MAX_AGE,
+        path="/",
+        httponly=True,
+        samesite="strict",
+        secure=_request_is_https(request),
+    )
+    return response
 
 @app.get("/manifest.webmanifest")
 async def get_manifest(key: str | None = None):
@@ -932,7 +1124,7 @@ async def _push_if_unacked(task_id: str, user_text: str) -> None:
         body = (f"Failed: {task['error'][:200]}" if task.get("error")
                 else f"Reply ready — {preview}")
         await webpush_notify.broadcast_async(
-            "Ghost", body, url=f"/?key={quote(GHOST_API_KEY)}",
+            "Ghost", body, url=_PUSH_CLICK_URL,
             tag=f"ghost-turn-{task_id[:8]}")
     except asyncio.CancelledError:
         raise
@@ -982,7 +1174,7 @@ async def _notify_push_poller():
                 await webpush_notify.broadcast_async(
                     f"Ghost — {str(rec.get('phase', 'event')).upper()[:40]}",
                     str(rec.get("summary", ""))[:300],
-                    url=f"/?key={quote(GHOST_API_KEY)}", tag="ghost-notify")
+                    url=_PUSH_CLICK_URL, tag="ghost-notify")
             watermark = data.get("watermark", 0)
             if records or data.get("baseline") or watermark != last_acked:
                 resp = await client.post(
@@ -1287,6 +1479,14 @@ async def push_vapid_key():
     every send returned 0 (R2 lens A)."""
     key = webpush_notify.public_key()
     return {"enabled": bool(webpush_notify.can_send()), "key": key}
+
+@app.get("/openapi.json", include_in_schema=False,
+         dependencies=[Depends(verify_interface_key)])
+async def _authenticated_openapi():
+    """The built-in was turned off at construction; this is the same schema
+    behind the same key check every other endpoint uses."""
+    return JSONResponse(app.openapi())
+
 
 @app.post("/api/push/subscribe", dependencies=[Depends(verify_interface_key)])
 async def push_subscribe(request: Request):

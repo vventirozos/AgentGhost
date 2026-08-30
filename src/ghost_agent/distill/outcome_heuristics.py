@@ -204,21 +204,39 @@ def looks_like_tool_error(result: str) -> bool:
 def is_unresolved_tool_result(result) -> bool:
     """A tool call with NO OUTCOME YET — neither success nor failure.
 
-    Today that means exactly one thing: an ``execute`` command that outran
-    its budget while still working and was DETACHED as a background job
-    (:mod:`sandbox.jobs`). Its result is success-SHAPED on purpose, so that
-    the turn loop does not book a strike for a task that has not failed —
-    which means every consumer of the shared failure sniffer below would
-    otherwise read it as a clean SUCCESS and write that into the corpus.
+    It used to say "today that means exactly one thing" — an ``execute``
+    command that outran its budget while still working and was DETACHED as a
+    background job (:mod:`sandbox.jobs`). That stopped being true when
+    ``swarm``'s "N still running, they were NOT cancelled" branch started
+    minting UNRESOLVED: this predicate could not see it, so
+    `tool_failure_flags` emitted False (a clean SUCCESS) for a swarm await
+    still in flight.
+
+    A promoted result is success-SHAPED on purpose, so that the turn loop
+    does not book a strike for a task that has not failed — which means
+    every consumer of the shared failure sniffer below would otherwise read
+    it as a clean SUCCESS and write that into the corpus.
 
     Callers must SKIP an unresolved call rather than label it: a third state
     is the honest one, and a bool cannot carry it.
     """
+    # The STATUS is the general answer; the text check below stays for
+    # historical rows and for the paths that never build an outcome.
+    _st = getattr(result, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) == "unresolved":
+        return True
+    _t = str(result or "")
+    # swarm's still-running branch, by TEXT: the offline seeder reads rows
+    # from JSONL, where `ToolCall.result` is a plain `str` and no status
+    # survives — so a status-only rule is dead on the data it exists for.
+    if ("still running in the background" in _t
+            and "were NOT cancelled" in _t):
+        return True
     try:
         from ..sandbox.jobs import is_promoted_result
     except Exception:  # noqa: BLE001 — heuristics must never hard-fail
         return False
-    return is_promoted_result(result)
+    return is_promoted_result(_t)
 
 
 def _looks_like_tool_error(result: str) -> bool:
@@ -231,6 +249,15 @@ def _looks_like_tool_error(result: str) -> bool:
     can say. Any caller that treats False as SUCCESS must test for
     unresolved separately; :func:`tool_failure_flags` does.
     """
+    # A migrated tool ANSWERS this. ADD-only: an `ok` status falls straight
+    # through to the prose rules below, so the exit-code and traceback
+    # evidence keeps every bit of the authority it has — preferring the
+    # status here once cost -198 `execute` failures. UNRESOLVED is not a
+    # verdict, and this function's own docstring already says so.
+    _st = getattr(result, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) not in ("ok",
+                                                                  "unresolved"):
+        return True
     if not isinstance(result, str):
         return False
     # A NON-ZERO exit-code banner is a hard failure signal even without an
@@ -422,8 +449,18 @@ def tool_failure_flags(tools: Optional[Iterable[Any]]) -> List[bool]:
     for t in tools or ():
         if t is None:
             continue
-        content = (str(t.get("content", "") or "") if isinstance(t, dict)
-                   else str(getattr(t, "result", "") or ""))
+        # NOT `str(...)`: the dict path is the turn loop's
+        # `tools_run_this_turn`, whose `content` IS a `ToolOutcome`, and
+        # stringifying it kills the status check inside the shared sniffer
+        # before it runs — 61 of 82 refusals lost. Third reader of this same
+        # list to have had this exact defect. `or ""` still normalises None,
+        # and a `ToolOutcome` is a `str`, so every text rule downstream is
+        # unaffected.
+        _raw = t.get("content", "") if isinstance(t, dict) else getattr(
+            t, "result", "")
+        content = _raw if isinstance(_raw, str) else str(_raw or "")
+        if content is None:
+            content = ""
         # SKIP an unresolved call — never emit False for it. Emitting False
         # meant one detached command LAUNDERED a whole failed turn: three
         # genuinely failed tools give [T,T,T] and the shape rule fires, but

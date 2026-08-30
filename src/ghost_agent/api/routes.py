@@ -1630,6 +1630,17 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     if not file.filename or ".." in file.filename or file.filename.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid filename")
     file_path = (sandbox_dir / file.filename).resolve()
+    # ⚠ Containment is checked against the TRUE sandbox root, not against
+    # `sandbox_dir`. `sandbox_dir` is DERIVED from the client-supplied
+    # `?project_id=`, so checking the file against it validated an
+    # already-escaped base and always passed — an absolute project id
+    # replaced the root outright and `mkdir(parents=True)` then created the
+    # directory. `project_scoped_sandbox` now refuses an unsafe id; this is
+    # the second lock, because the caller of a scoping helper must never
+    # have to trust that the scope it got back is inside the sandbox.
+    _root = getattr(agent.context, "sandbox_dir", None)
+    if _root is not None and not _is_within(Path(_root), file_path):
+        raise HTTPException(status_code=400, detail="Invalid filename")
     if not _is_within(sandbox_dir, file_path):
         raise HTTPException(status_code=400, detail="Invalid filename")
 

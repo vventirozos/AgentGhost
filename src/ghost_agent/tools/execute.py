@@ -1,5 +1,6 @@
 import asyncio
 import os
+from .outcome import ToolOutcome
 import shlex
 import sys
 import re
@@ -122,13 +123,13 @@ def _released_shell_block(project_store, command: str):
             proj = project_store.get_project(pid)
             if proj and str(proj.get("status", "")).upper() == "RELEASED":
                 return (
-                    f"SYSTEM BLOCK: project {pid} is RELEASED (immutable) and "
+                    ToolOutcome.rejected(f"SYSTEM BLOCK: project {pid} is RELEASED (immutable) and "
                     f"this command contains a mutation (rm/mv/redirect/"
                     f"sed -i/…) targeting its workspace — NOT executed. Fork "
                     f"a development copy first: manage_projects "
                     f"action=create_version project_id={pid}, then work in "
                     f"the new version's workspace. Read-only commands "
-                    f"(cat/grep/ls) on released files are fine.")
+                    f"(cat/grep/ls) on released files are fine."))
     except Exception:
         return None
     return None
@@ -292,7 +293,19 @@ def _register_promoted_job(job_registry, job, label):
             "promoted-job registry mirror failed", exc_info=True)
 
 
-def _promoted_result(job: dict, ran_s: int, output: str) -> str:
+def _append_note(res, note: str):
+    """Append trailing text WITHOUT dropping a `ToolOutcome`'s status.
+
+    `ToolOutcome` is a `str` SUBCLASS, so `res + note` is `str.__add__` and
+    returns a plain `str` — silently discarding the status. Three sites in
+    this module did exactly that; one was found live and its two siblings
+    only by enumeration.
+    """
+    from .outcome import append_note as _shared
+    return _shared(res, note)
+
+
+def _promoted_result(job: dict, ran_s: int, output: str) -> "ToolOutcome":
     """Tool result for a promoted command. EXIT CODE 0 on purpose: the turn
     loop scores a non-zero `execute` exit as a FAILURE and a transient
     strike, and a legitimately-long task is not a failure — miscounting it
@@ -310,12 +323,19 @@ def _promoted_result(job: dict, ran_s: int, output: str) -> str:
     _state = ("ALREADY RUNNING as background job"
               if job.get("duplicate") else
               "STILL RUNNING — promoted to background job")
-    return (
+    # UNRESOLVED, not OK: this is THE unfinished-call case, and the status
+    # says so where the text cannot. The text is byte-identical to before
+    # (still `EXIT CODE: 0`), so every downstream reader that keys on the
+    # banner — the verify gate, the TDD skill gate, project_advancer — is
+    # unaffected; only the dispatch loop's status-aware predicates change,
+    # and they now correctly decline to give a running job a verdict.
+    return ToolOutcome.unresolved(
         f"--- COMMAND RESULT --- {PROMOTED_RESULT_MARKER}\n"
         f"EXIT CODE: 0 ({_state} "
         f"{job.get('id')}, NOT finished)\n"
         f"STDOUT/STDERR:\n{_promotion_banner(job, ran_s)}\n"
-        f"--- output so far ---\n{body or '(nothing printed yet)'}"
+        f"--- output so far ---\n{body or '(nothing printed yet)'}",
+        reason_code="promoted_to_background_job",
     )
 
 # SANDBOX EGRESS GUARD (agent's own ports). The sandbox container has its
@@ -578,7 +598,13 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             "the host) — returned ground-truth explanation instead",
             level="WARNING", icon=Icons.SHIELD,
         )
-        return _AGENT_PORT_PROBE_MSG
+        # A REFUSAL — its own text says "command NOT executed". Returned as
+        # a bare string it classified OK, so it booked competence success,
+        # `op_outcomes.ok=True`, a foresight `ok=True`, and on a mutating
+        # command it would have taken the world-changed branch and cleared
+        # the pre-flight guard for work that never ran.
+        return ToolOutcome.rejected(_AGENT_PORT_PROBE_MSG,
+                                    reason_code="sandbox_egress_blocked")
 
     # --- 🛡️ HIJACK LAYER: CODE SANITIZATION ---
     
@@ -604,6 +630,18 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                f"\nSTDOUT/STDERR:\n{msg}")
         if hint:
             out += f"\n\n--- 💡 DIAGNOSTIC HINT ---\n{hint}\n------------------------"
+        # CARRY THE STATUS THROUGH THE ENVELOPE. `msg` may itself be a
+        # `ToolOutcome` — three `execute` refusals are built as one and then
+        # passed here — and interpolating it into an f-string produced a
+        # plain `str`, so the status never reached the loop and the
+        # migration was inert. It survived only because the envelope happens
+        # to carry `EXIT CODE: 1`, which is the same accident that covered
+        # it before the refactor.
+        if isinstance(msg, ToolOutcome):
+            return ToolOutcome(out, status=msg.status,
+                               world_changed=msg.world_changed,
+                               reason_code=msg.reason_code,
+                               declared=msg.declared)
         return out
 
     if command:
@@ -856,7 +894,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                             f"wrapper script."
                         )
 
-                    return _format_error(
+                    return _format_error(ToolOutcome.rejected(
                         f"SYSTEM BLOCK: this inline `python -c '...'` / `bash -c "
                         f"'...'` form was rejected. Trigger: {reason_str}. Bash "
                         f"quote-escape corrupts f-strings and imported-symbol "
@@ -869,8 +907,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                         f"For TRUE one-liners (<120 chars, single statement, no "
                         f"imports) like `python3 -c \"import sys; print(sys.path)\"` "
                         f"the inline form is still allowed."
-                        f"{_skill_hint}"
-                    )
+                        f"{_skill_hint}",
+                        reason_code="inline_shell_form_rejected"))
 
         pretty_log("Shell Command", command, icon=Icons.TOOL_SHELL)
 
@@ -900,7 +938,12 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 # invisible port-holder the registry can't see or stop.
                 _db = _daemonized_server_block(command)
                 if _db:
-                    return _format_error(_db)
+                    # A refusal: the command is not run. Left as a string it
+                    # classified OK, so a blocked daemon start booked a
+                    # success and would have credited a world change.
+                    return ToolOutcome.rejected(
+                        _format_error(_db),
+                        reason_code="daemonized_server_blocked")
         except Exception as _vexc:
             logging.getLogger("GhostAgent").debug("shell validator crashed: %s", _vexc)
             _shell_ok, _shell_reason = True, ""
@@ -918,7 +961,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     _metacog.count(validator_block=True)
                 except Exception:
                     pass
-            return _format_error(
+            return _format_error(ToolOutcome.rejected(
                 f"SYSTEM BLOCK: shell command rejected by pre-execution "
                 f"validator: {_shell_reason}. The command was not run. "
                 f"IMPORTANT: retry the SAME verification intent in an allowed "
@@ -926,8 +969,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 f"write the command's output to a file first and inspect it "
                 f"(`curl … -o /tmp/out.json` then `python3 -m json.tool "
                 f"/tmp/out.json`), or put the logic in a script via "
-                f"file_system + execute (urllib for HTTP checks works well)."
-            )
+                f"file_system + execute (urllib for HTTP checks works well).",
+                reason_code="shell_command_rejected"))
 
         # Execute the command securely using the sandbox manager's built-in execute wrapper.
         # 600s (not 300s): real project work — training a small model, running a
@@ -1151,10 +1194,11 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             )
 
         if exit_code != 0:
-            return _format_error(
-                output or f"Process failed (Exit {exit_code}) with no output.",
-                exit_code=exit_code,
-            ) + _host_proc_note
+            return _append_note(
+                _format_error(
+                    output or f"Process failed (Exit {exit_code}) with no output.",
+                    exit_code=exit_code,
+                ), _host_proc_note)
 
         return (f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\n"
                 f"STDOUT/STDERR:\n{output}{_host_proc_note}")
@@ -1613,7 +1657,14 @@ if has_error:
                 _dt, promoted_job)
             _register_promoted_job(kwargs.get("job_registry"), promoted_job,
                                    f"{runner} {rel_path}".strip())
-            return _promoted_result(promoted_job, int(_dt), output) + _probe_note
+            # `ToolOutcome` is a `str` SUBCLASS, so `+` is `str.__add__` and
+            # returns a plain `str` — the UNRESOLVED status the line above
+            # just built was destroyed by concatenation. The command-mode
+            # promotion (`if command:`) kept its status and this one did not,
+            # so the same event had two different verdicts depending on which
+            # argument the model used.
+            return _append_note(
+                _promoted_result(promoted_job, int(_dt), output), _probe_note)
 
         diagnostic_info = ""
         if exit_code != 0:
@@ -1685,8 +1736,10 @@ if has_error:
                 pass
 
         if exit_code != 0:
-             return _format_error(output, hint=diagnostic_info,
-                                  exit_code=exit_code) + _probe_note + _proxyless_browser_note
+             return _append_note(
+                 _format_error(output, hint=diagnostic_info,
+                               exit_code=exit_code),
+                 _probe_note + _proxyless_browser_note)
 
         return (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\n"
                 f"STDOUT/STDERR:\n{output}{_probe_note}{_proxyless_browser_note}")

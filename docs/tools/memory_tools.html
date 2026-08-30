@@ -47,7 +47,7 @@
     <thead><tr><th>Tool</th><th>Backend</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>knowledge_base</code> (insert_fact)</td><td><a href="../memory/vector.html">vector</a> + optionally <a href="../memory/graph.html">graph</a></td><td>Insert fact with MD5 dedup; if <code>memory_bus</code> is present, asynchronously extracts <code>(subject, PREDICATE, object)</code> triplets via the worker LLM.</td></tr>
-      <tr><td><code>knowledge_base</code> (<code>transcribe</code> / <code>ingest_document</code> — the same action)</td><td>vector</td><td>Ingest URL or local file (PDF / text), <strong>or an audio/video file, which is transcribed LOCALLY</strong> and indexed passage-by-passage with timestamp ranges. Hard caps: 100 MB on disk, 5 MB extracted text, 1000 PDF pages. Chunked via <code>semantic_split_text</code> or <code>recursive_split_text</code>.</td></tr>
+      <tr><td><code>knowledge_base</code> (<code>transcribe</code> / <code>ingest_document</code> — the same action)</td><td>vector</td><td>Ingest URL or local file (PDF / text), <strong>or an audio/video file, which is transcribed LOCALLY</strong> and indexed passage-by-passage with timestamp ranges. Hard caps: 100 MB on disk, 5 MB extracted text for non-PDF sources, and <code>MAX_PDF_PAGES = 6000</code> for PDFs (which use their own text budget, not the 5 MB one). Chunked via <code>semantic_split_text</code> or <code>recursive_split_text</code>.</td></tr>
       <tr><td><code>knowledge_base</code> (forget / list_docs / reset_all)</td><td>vector</td><td>Library management.</td></tr>
       <tr><td><code>knowledge_base</code> (expand)</td><td><a href="../memory/episodes.html">episodes</a> / <a href="../core/sessions.html">sessions</a></td><td><strong>2026-07-14:</strong> drill down from an <code>EVIDENCE REF</code> surfaced by <code>recall</code> to the raw record — <code>ref="ep:12"</code> returns the full episode (trigger, context, outcome, per-action tool chain with FAILED markers), <code>ref="session:&lt;id&gt;"</code> the stored conversation's last 10 messages. The memory-store counterpart of <code>query</code>'s iterative loop. Tests: <code>tests/test_iterative_recall_expand.py</code>.</td></tr>
       <tr><td><code>recall</code></td><td>vector</td><td>Semantic search: <code>memory_system.collection.query(query_texts=[query], n_results=...)</code>. <strong>2026-07-14:</strong> hits carrying provenance render <code>EVIDENCE</code> lines plus a TIP pointing at <code>action='expand'</code>; a zero-hit reply now nudges ONE retry with different wording (iterative recall) instead of a bare failure.</td></tr>
@@ -154,6 +154,368 @@
 
   <p><strong><code>forget</code> is type-scoped:</strong> both sweeps (semantic + entity-expansion) queried the nearest-20 with NO type filter, and the literal-mention override deletes regardless of distance — with 96.6% of live rows being ingested document chunks, forgetting a word appearing in a manual silently gutted the document (library index still listed it; content-hash dedup then refused re-ingest), and episode/skill twins were fair game too. Both sweeps now scope <code>{"type": {"$nin": _FORGET_PROTECTED_TYPES}}</code> (document / episode / skill / acquired_skill) with a per-row belt check. <strong>Ingest dedup re-check after auto-resolution:</strong> the library pre-check ran on the RAW argument, so <code>ingest_document('postgresql-manual')</code> sailed past it, resolved to <code>…pdf</code>, and re-extracted + re-embedded the whole 3k-page manual (hours of CPU, zero effect). <strong>Bus reports honored:</strong> remember / update_profile / learn_skill no longer discard the publish report — subsystem failures return <code>PARTIAL:</code>. Bare excepts on the recall path no longer swallow <code>asyncio.CancelledError</code>. Tests: <code>tests/test_memory_audit_fixes_2026_07_26.py::TestForgetSweepScoping</code>, <code>::TestBusPartialReporting</code>.</p>
   <p><strong>Splitter corruption (utils/helpers.py, the audit's #1 finding):</strong> <code>recursive_split_text</code> dropped whitespace separators on rejoin (<code>found_sep.strip()</code> falsy for <code>\\n</code>/<code>\\n\\n</code>/space), fusing the last word of each line to the first word of the next in EVERY chunk it produced — live: all 7,131 postgresql-manual chunks ("DocumentationThe PostgreSQL…"), degrading embeddings, BM25 token matching, and the passage text the model reads. Separators are now re-attached to every fragment, and <code>chunk_overlap</code> finally applies on the separator path (it only ever worked on the no-separator hard split) — capped at <code>chunk_size//4</code>, because callers can arrive with the overlap clamped to <code>chunk_size-1</code> (semantic_split_text shrinks the effective chunk size below the overlap for long headers) and an uncapped carry advances one fragment per chunk: quadratic output blowup that spun the test suite for 36 CPU-minutes before the cap. Already-ingested documents remain corrupt until re-ingested — delete + re-ingest to repair. Tests: <code>::TestSplitterSeparatorPreservation</code>.</p>
+
+  <h2>An error may only name a parameter the tool accepts
+  <span class="tag">2026-08-28</span></h2>
+  <p>The user asked the agent to forget a topic. It never happened. The model
+  called <code>knowledge_base(action='forget')</code> with no subject, got back
+  <em>"SYSTEM ERROR: The 'target' parameter is MANDATORY"</em>, obediently
+  retried with <code>target='…'</code> — and got the identical error. Every
+  retry after that was byte-identical, until the strike budget ran out.</p>
+  <p class="warn"><strong>Obeying the error could not work.</strong>
+  <code>target</code> was the name of a local variable inside the dispatcher
+  and a parameter of the inner <code>tool_unified_forget</code>. It was
+  <em>not</em> in the schema, and it was <em>not</em> in the dispatcher's alias
+  chain (<code>filename|fact|content|source|path|topic</code>), so a
+  <code>target=</code> kwarg fell into <code>**kwargs</code> and was discarded
+  before the guard that demanded it ever ran.</p>
+  <p>Two defects, opposite sides of the same seam:</p>
+  <ul>
+    <li><strong>The error named a rejected parameter.</strong>
+    <code>_KB_TARGET_ALIASES</code> is now the single statement of what the
+    dispatcher accepts, and <code>_kb_target_or_error</code> performs the
+    lookup <em>and</em> builds the message from the same list it just tried —
+    including the worked call, which is generated from the required
+    parameter's name rather than typed at the call site.</li>
+    <li><strong>The first call was unwinnable too.</strong> The schema
+    advertised no parameter that reads as "the thing to forget" — the only
+    legal slot was <code>filename</code>, whose description is about
+    <code>.mp4</code>/<code>.pdf</code> ingestion. The live log shows the model
+    hunting for exactly this and giving up: <em>"The parameters are: action,
+    fact, question, ref, filename. None is obviously 'topic'."</em>
+    <code>forget</code> now advertises <code>target</code>, described in the
+    vocabulary of the job, and <code>filename</code>'s description opens by
+    handing off to it.</li>
+  </ul>
+  <p><code>insert_fact</code> carried the same trap through a different name
+  (its guard demanded <code>'text'</code>) and is fixed by the same helper.
+  <code>'text'</code> was deliberately <em>not</em> added to the alias tuple:
+  widening the accepted set to match whatever an error happens to say is how a
+  guard becomes a list of exemptions.</p>
+
+  <h3>What four review lenses changed, and what they falsified</h3>
+  <p class="warn">The first version of this fix claimed the loop
+  <em>"cannot be reintroduced by an edit to either half, because there are no
+  longer two halves."</em> <strong>That was false, and a reviewer demonstrated
+  it.</strong> There was a third half: each call site passed a free-text
+  <code>hint</code> that carried the worked example — the part a model copies.
+  Changing one hint's <code>target=</code> to <code>subject=</code> reproduced
+  the entire live loop <em>with all 19 regression tests green</em>, because the
+  pins scraped quoted lowercase tokens and a hint's parameter appears as bare
+  <code>name='value'</code>. The example is generated from the required
+  parameter now, and the pins no longer scrape: they recompute the message from
+  <code>_kb_tried_names(primary)</code> and assert the rendered string contains
+  it, plus a negative scan that fails on any identifier-shaped token that is
+  not a name the lookup tried.</p>
+  <p>Four more things the review changed:</p>
+  <ul>
+    <li><strong>The message was steering models into a silent wrong write.</strong>
+    It enumerated the whole alias tuple, so <code>insert_fact</code>'s error
+    offered <code>'filename'</code> — and a model that obeyed got
+    <code>tool_remember('meeting_notes.md')</code>, storing the literal filename
+    as a permanent fact and returning SUCCESS. Trading a loud loop for a silent
+    wrong write is not a fix. The first attempt excluded the other actions'
+    schema names — which fixed the example and not the property, because
+    <code>source</code> and <code>path</code> are exactly as filename-shaped as
+    the <code>filename</code> that was excluded for being filename-shaped, and
+    were still advertised. The alternatives are gone entirely. They were never
+    what ended the loop — the required name and the worked call are — and a
+    caller already passing a legacy alias never sees this message. The aliases
+    stay accepted; they are simply not advice.</li>
+    <li><strong>The turn loop was telling the model not to obey the error.</strong>
+    <code>MANDATORY</code> classifies FATAL, and FATAL appends <em>"PERMANENT
+    ERROR — do NOT retry this tool call"</em>. That advice was accidentally
+    right while these errors named unusable parameters; it is exactly wrong now
+    that the recovery is a corrected re-issue. FATAL still holds (a missing
+    argument must not spend the transient retry budget), but an argument error
+    now reads <em>"do NOT repeat it unchanged; re-issue the SAME tool with the
+    argument the error names"</em>.</li>
+    <li><strong>The action slot had the same defect.</strong>
+    <em>"Unknown action 'delete'"</em> named nothing to switch to, and
+    delete/erase/remove are not in the alias map — so the next guess was
+    another guess. Both action errors now enumerate the valid set, generated
+    from <code>_KB_ACTIONS</code>, which the schema enum is pinned against.</li>
+    <li><strong><code>action='update_profile'</code> was dispatched but never
+    advertised.</strong> Absent from the enum, reading key/value/category which
+    the schema does not carry, classified UNKNOWN rather than FATAL, and — since
+    <code>is_idempotent_setter</code> covers only insert_fact/forget — the one
+    route bypassing the repeat-write guard written for exactly that call. It is
+    a fully advertised tool in its own right, so the branch now redirects
+    instead of dispatching.</li>
+  </ul>
+
+  <h3>The forget flag that failed open</h3>
+  <p>Reviewing the neighbours turned up the twin of a check that had already
+  been healed 160 lines below it. <code>forget_was_called</code> matched
+  <code>args.get("action") == "forget"</code> on the RAW string, over a
+  <code>strict=True</code> parse, while the dispatcher normalises with
+  <code>str(action).strip().lower()</code> and the dispatch site parses with
+  <code>strict=False</code>. So <code>" forget "</code> (the XML argument parser
+  strips only CR/LF), or any raw control character in the arguments, left the
+  flag <code>False</code> <em>while the wipe ran</em> — and that flag is what
+  suppresses smart_memory, post_mortem and the episode write for the turn. The
+  content the user had just asked to delete was re-learned inside the same
+  request. It is now <code>call_runs_a_memory_wipe()</code>, extracted so it can
+  be executed rather than asserted about, biased toward True (a false positive
+  costs one turn of bookkeeping; a false negative undoes a deletion), with a
+  regex backstop for arguments that do not parse at all.</p>
+  <p class="warn">Its two mechanisms — the healed parse and the regex — were at
+  first <strong>redundant for every input the tests used</strong>, so deleting
+  either one left the suite green. Two cases now separate them: a
+  <code>\u0067</code>-escaped action that only the parse recovers, and
+  truncated JSON that only the regex catches.</p>
+  <h3>Round two: the fixes were the new code</h3>
+  <p>A second pair of lenses reviewed round one's fixes rather than the original
+  defect, on the standing assumption that each round's criticals live inside the
+  previous round's work. They did:</p>
+  <ul>
+    <li><strong>The wipe predicate healed the ACTION and left the TOOL NAME
+    raw.</strong> It runs ~314 lines before <code>_canonicalise_tool_name</code>,
+    whose alias table maps <code>kb</code> / <code>knowledgebase</code> /
+    <code>knowledge-base</code> onto <code>knowledge_base</code> — its own
+    comment cites <code>knowledgebase</code> as an observed Qwen 3.5
+    hallucination. Measured through <code>handle_chat</code> with byte-identical
+    arguments and only the spelling varying: <strong>the wipe ran in all five,
+    the flag was False in four</strong>, and each of those turns queued a
+    smart_memory item carrying the request text and the wipe report straight
+    back into the store just cleared. Three quarters of a fail-open guard.</li>
+    <li><strong>It also did not cover <code>reset_all</code></strong> — a
+    strictly larger wipe (every id in the collection, the library index, the
+    graph) that returns a SUCCESS string, so nothing else stopped the turn's
+    bookkeeping repopulating what it had just emptied. A predicate <em>named</em>
+    for wipes answering False there is a wrong answer in the direction its own
+    docstring calls unrecoverable.</li>
+    <li><strong>The worked call renamed the caller's verb.</strong>
+    <code>action</code> was interpolated after alias normalisation, so a model
+    calling <code>action='transcribe'</code> — the verb §4AW added precisely
+    because the tool was un-findable without it — was handed
+    <code>knowledge_base(action='ingest_document', filename='notes.pdf')</code>:
+    its verb renamed back to the un-findable one, with a PDF example for an
+    audio ask. The caller's action is preserved now, and the transcribe path
+    gets a media example.</li>
+    <li><strong>The examples were live writes if copied.</strong>
+    <code>fact='The user lives in Athens'</code> stores a plausible fabricated
+    profile fact and returns SUCCESS; <code>target='project atlas'</code> runs a
+    real four-store destructive sweep. Both are visibly placeholders now, and a
+    test asserts it.</li>
+    <li>Two thirds of the argument-error pattern were unreachable (only
+    <code>MANDATORY</code> classifies FATAL, and the split was consulted only
+    there) while its comment claimed otherwise — so the one live message it was
+    written for, <code>update_profile</code>'s "'key' is a required argument",
+    never got it. The split now covers every non-retryable class. And the
+    redirect no longer says "call update_profile instead": that tool is disabled
+    for subagents, self-play and dream, where the advice bounces the model
+    between two differently-signed errors so the same-failure breaker never
+    fires and the strike budget drains.</li>
+  </ul>
+
+  <h3>Round three: the second implementation of one decision</h3>
+  <p>Round two's tool-name fix was itself only three quarters done. The
+  predicate re-implemented the dispatcher's name healing — alias table plus a
+  difflib pass at cutoff <code>0.85</code> — while
+  <code>_canonicalise_tool_name</code> matches at <code>0.70</code> against the
+  whole tool list. Everything in the band <code>[0.70, 0.85)</code> therefore
+  healed at dispatch and not in the predicate: measured through the real batch
+  dispatcher, <code>knowledge</code>, <code>knowledge_db</code>,
+  <code>knowledgedb</code>, <code>knowledge_bank</code>,
+  <code>knowledge_store</code>, <code>knowledge_base_query</code> and
+  <code>know_base</code> all routed to <code>knowledge_base</code> and ran the
+  wipe with the flag False. The comment justifying the tighter cutoff ("keeps
+  this from swallowing other tools") was measurably false. Two implementations
+  of one decision drift by construction, so the predicate now asks the
+  dispatcher's own question — and a pin runs both over every advertised name
+  and every mangling and asserts they agree. <code>is_mutating</code> and
+  <code>is_idempotent_setter</code>, two lines away, had the same split: they
+  healed the ACTION and read the RAW name, so two identical
+  <code>knowledgebase</code> ingests were classified read-safe and
+  dedup-collapsed, dropping a real ingest — the exact defect their own comment
+  says was fixed, reached through the other half of the identity.</p>
+  <p class="warn">And the newest edit had made its own bug. The blank-subject
+  check computed <code>val.strip()</code> to decide the subject was present,
+  then passed the <strong>padded original</strong> on — and
+  <code>tool_unified_forget</code> strips in only three of its six uses. So
+  <code>target=' atlas '</code> (the normal XML shape: that parser strips CR/LF,
+  not spaces) skipped the disk and document sweeps, left
+  <code>atlas.md</code> and <code>atlas.pdf</code> in place, and reported every
+  stage with a ✅. The subject is normalised once, at the boundary, now. A
+  non-string subject — <code>target=['project atlas','mortimer']</code>, a
+  plausible shape for "forget X and Y" — was likewise waved through: the vector
+  and profile sweeps raised and were swallowed, the graph sweep "succeeded"
+  against the repr, nothing was deleted, and the turn was booked as a clean
+  success. It is refused with an obeyable error now.</p>
+
+  <p>Tests: <code>tests/test_kb_missing_param_names_accepted_param.py</code> and
+  <code>tests/test_forget_flag_and_argument_error_context.py</code> — 56 test
+  functions, 128 cases.
+  A 50-mutant whole-file run kills 49, covering every escape the reviewers
+  demonstrated: a parameter name smuggled into a hint, a camelCase alias the old
+  scan could not see, a retry-flavoured word in a hint flipping the message out
+  of FATAL, a live example value, the caller's verb overwritten, either half of
+  the wipe predicate deleted, the tool-name healing removed,
+  <code>reset_all</code> dropped from the wipe set, a whitespace subject stored.
+  The one survivor is the stated limit below.</p>
+  <p><strong>The stated limit.</strong> A hint that names a field in bare prose
+  — no <code>=</code>, no quote, no separator character, e.g. "…or use the
+  subject field" — is caught by nothing, because that is indistinguishable from
+  English. The message still carries the generated worked call, which dominates
+  bare prose as a copy target. Everything that renders as a callable fragment is
+  stripped at runtime and pinned.</p>
+  <p><strong>Left open, deliberately</strong> (pre-existing, out of this
+  change's scope, reported to the operator): <code>reset_all</code> materialises
+  the whole vector store and runs its deletes on the event loop, and drops
+  episode/skill/document rows that <code>_FORGET_PROTECTED_TYPES</code> exists to
+  protect; and <code>tool_unified_forget</code>'s disk sweep deletes every
+  sandbox file whose name contains the target as a substring, so
+  <code>forget('atlas')</code> unlinks <code>atlas_migration_plan.py</code>.</p>
+
+  <h2>The follow-on list, taken <span class="tag">2026-08-28</span></h2>
+  <p><strong><code>forget</code> deleted files the caller never named.</strong> The disk sweep ranked
+  candidates exact → stem → <em>substring</em> and deleted every member of the first non-empty tier.
+  Measured: <code>forget('atlas')</code> unlinked <code>atlas_migration_plan.py</code>,
+  <code>notes_about_atlas.md</code> and <code>sub/deep_atlas_notes.txt</code> — irreversible,
+  model-reachable in one call, no dry-run. The section above made the pressure worse by describing
+  <code>target</code> in the vocabulary that feeds this branch hardest ("a topic, an entity, a
+  person's name"), because a bare word matches far more filenames than a filename does. Forgetting a
+  TOPIC is not a licence to delete every file whose name shares a token with it; the vector, profile
+  and graph sweeps remove the knowledge either way. Substring hits are reported as candidates and
+  left alone — naming one makes it an exact match, and it is deleted.</p>
+  <p><strong><code>reset_all</code> stalled the loop and hid what it orphaned.</strong>
+  <code>collection.get()</code> with no <code>include</code> pulled every document body back (live:
+  ~8k rows, 7k of them manual chunks) to use nothing but the ids, and it and every delete batch ran
+  synchronously on the event loop — while the <em>cheap</em> graph wipe was already offloaded. Both
+  are in threads now, asking for ids only. It also deletes the <code>document</code> /
+  <code>episode</code> / <code>skill</code> rows <code>_FORGET_PROTECTED_TYPES</code> exists to
+  protect, because each has a record in another store it does not touch: it says so now instead of
+  returning a clean "Wiped clean".</p>
+  <p><strong>Three of eight name-keyed decisions had been healed; five had not.</strong> Still
+  reading the raw tool name in the same block: <code>is_sandbox_mutation</code> (an <code>fs</code>
+  write left the workspace cache stale), the empty-<code>content</code> write block (bypassed by
+  <code>fs</code>), the dedup hash (<code>kb</code> and <code>knowledge_base</code> with identical
+  arguments never matched each other), <code>disabled_tools</code>, and the skill-store guards. The
+  name is resolved once at the top of the block now and the dispatch reuses that value, so the name
+  every guard is keyed on is provably the one that executes. The general pin is an AST scan: no
+  comparison of the raw name against a real tool may appear before the rebind.</p>
+  <p><strong>"Did you forget a required argument?" told models to ADD when they had to REMOVE.</strong>
+  Model arguments are splatted unfiltered into a lambda that already supplies the tool's context, so
+  <code>knowledge_base(action='forget', model_name='x')</code> returned "got multiple values for
+  keyword argument" under that banner — the same class as the loop above, at every tool.
+  <code>describe_invocation_error</code> names the offending argument and says to drop it.</p>
+  <p class="warn"><strong>Two of these pins were vacuous when written.</strong> The mixed-turn
+  preview test recomputed the budget — <code>300 if is_argument_error(err) else 140</code> — and
+  asserted against its own arithmetic, so a mutant that cut the budget to a flat 140 <em>and</em>
+  one that widened every preview to 300 both passed it. Worse, the headline disk-sweep test
+  <strong>passed on the pre-fix code</strong>: its fixture created <code>atlas.md</code>, a STEM
+  hit, so the <code>or</code> chain short-circuited and the substring tier it was written to
+  exercise was never reached — the old code kept those same three files for the same reason. One of
+  four disk tests discriminated.</p>
+  <p>The review that caught those also found the mitigation itself half-wired. The "kept" report
+  only fired when <em>nothing</em> was deleted, so <code>forget('atlas')</code> with an
+  <code>atlas.md</code> present removed that file and said nothing about the three it had matched;
+  it ignored the stem tier the <code>or</code> chain shadows
+  (<code>forget('notes.md')</code> kept <code>notes.txt</code> in silence); and it named 10 of N
+  candidates while telling the caller to name one exactly. <code>reset_all</code>'s orphan note came
+  from a different snapshot than the delete and was emitted regardless of outcome — with every batch
+  failing it reported removing rows it had not touched, and reset the library index anyway while the
+  message said the entries were "left in place". <code>is_sandbox_mutation</code> was missing
+  <code>copy</code> while <code>is_mutating</code> had it, so a copy created a file and left the
+  workspace cache valid. And the <code>_cname</code> hoist opened a defect going the other way: the
+  alias table was consulted <em>before</em> the exact-name match, so an acquired skill legitimately
+  named <code>fs</code> resolved to <code>file_system</code> and one of the newly-keyed guards
+  blocked it — which in turn surfaced that <code>profile_update</code> had been a dead alias key
+  since the day it was written, because lookups are normalised and that key is not.</p>
+  <p>22 mutants, 22 killed, no anchor misses.</p>
+
+  <h2>The review of the follow-on list <span class="tag">2026-08-28</span></h2>
+  <p class="warn"><strong>The report told the caller to do the thing that deletes
+  their files.</strong> The disk sweep matched on BASENAME while the kept-report
+  printed candidates as sandbox-relative PATHS and said "forget it by the exact
+  name shown here". Following that instruction deleted every file in the tree
+  with that basename — including candidates the report had listed separately.
+  Measured against the real sandbox layout,
+  <code>forget('projects/&lt;id&gt;/index.html')</code> removed
+  <strong>five</strong> index.html files across five projects. A target carrying
+  a separator now means that path and nothing else, and a target carrying an
+  extension no longer falls through to the stem tier — with
+  <code>notes.md</code> absent, <code>forget('notes.md')</code> had deleted
+  <code>notes.txt</code>, <code>notes.xlsx</code> and <code>notes.pdf</code>,
+  the very files the report calls partial matches.</p>
+  <p class="warn"><strong>And every crashing tool became a clean success.</strong>
+  <code>describe_invocation_error</code>'s fallback returned "Error invoking
+  tool …", while the turn loop books failures on <code>"Error:"</code> —
+  <em>with a colon</em>. The comment above it claimed it kept that prefix. It did
+  not: a crashing call scored zero strikes, advanced the clean-success streak,
+  taught the foresight model that the shape works, and had its hash recorded in
+  <code>executed_idempotent</code>, so the model's legitimate retry was refused
+  with "the intended state is already applied" — the tool having run zero
+  times.</p>
+  <p>The rest: the vector half still substring-deleted whole documents while the
+  disk half printed "Nothing on disk is deleted for a partial name match"
+  (against the live library, <code>forget('pdf')</code> destroyed the ~7k-chunk
+  PostgreSQL manual); <code>reset_all</code> took no vector lock and emptied the
+  catalogue on <em>partial</em> failure, which the test helper could not even
+  express; the 300-char preview widening was dead because the summariser re-cut
+  to 140; and the fix that stopped a skill named <code>fs</code> resolving to
+  <code>file_system</code> opened the mirror image, letting a skill named
+  <code>filesystem</code> take the built-in's identity. An exact name is
+  canonical before any normalisation now.</p>
+  <p><strong>The pins were the weak half again.</strong> A mutation audit ran 30
+  mutants against the five test files and <strong>8 survived</strong> — the two
+  most important being the fixes for the two criticals above, found and fixed
+  within the hour, neither able to fail a test. One behavioural test written to
+  close that gap passed <em>for the wrong reason</em>; the AST pins were evaded
+  by spelling the same raw read as <code>tool["function"]["name"]</code>; and a
+  test written 30 minutes earlier had been silently disarmed by the next product
+  edit. 18/18 mutants killed after the rework, full suite 18,015.</p>
+
+  <h2>One target, five sweeps, one rule <span class="tag">2026-08-29</span></h2>
+  <p><code>forget</code> runs five sweeps — disk, ingested documents, semantic
+  vector, profile (keys and values) and graph. Diffed mechanically against each
+  other rather than read in turn, they were five tools wearing one name.</p>
+  <p class="warn"><code>clean_target</code> normalisation (stripping
+  <code>./</code>, a leading <code>/</code> and a <code>sandbox/</code> prefix)
+  reached the disk and document halves only. So
+  <code>forget('./notes.md')</code> and <code>forget('sandbox/notes.md')</code>
+  deleted the file and the document and <strong>silently skipped the semantic,
+  profile and graph sweeps entirely</strong> — and the report never said the
+  knowledge half had not run. <code>sandbox/</code> is documented elsewhere in
+  this codebase as an observed live model shape.</p>
+  <p>The ambiguity gate was disk-only too, so a single report printed
+  <em>"kept 3 file(s) … Nothing on disk is deleted for a partial name match"</em>
+  directly above three <em>"✅ Vector: Wiped document"</em> lines naming
+  <strong>the same three files</strong> — the irreversible half ignoring the
+  policy the other half had just printed. And the gate covered only the exact
+  tier: <code>forget('index.html')</code> refused three files while
+  <code>forget('index')</code> — five characters shorter — unlinked five,
+  through the stem tier the gate never inspected.</p>
+  <p>All five sweeps read one normalised target and one gate now. The gate keys
+  on <strong>how many directories</strong> the matches span, not how many files:
+  <code>notes.md</code> and <code>notes.txt</code> in one directory are the stem
+  tier doing its job; five <code>index.html</code> files in five projects are
+  five different things wearing one name, and the caller cannot have meant all
+  of them.</p>
+
+  <h2>A refusal is not a world change <span class="tag">2026-08-29</span></h2>
+  <p><code>file_system</code> answers a malformed mutating call with
+  <em>"SYSTEM INSTRUCTION: you used operation='replace' but forgot
+  'replace_with'"</em> or <em>"REPLACE REJECTED (byte-identical)"</em>. Neither
+  matched any failure predicate, so a call that changed <strong>nothing</strong>
+  was credited with changing the world: every recorded pre-flight failure
+  cleared, the loop-breaker's memory wiped, the strike count
+  <strong>decremented</strong> — a run of rejected replaces <em>erases</em> the
+  strikes earlier failures earned, so the cap can never fire — the file marked
+  modified in the work log, and the foresight model taught that the call
+  succeeds. <strong>63 live occurrences across 36 requests.</strong></p>
+  <p>Separately, <code>op_outcomes.ok</code> did not know about
+  <code>EXIT CODE:</code>, so the MULTI-STEP OUTCOME line — the one message in
+  the loop that tells the model <em>"this live outcome is AUTHORITATIVE over any
+  prior context"</em> — reported a command that exited 127 as SUCCEEDED, in 15
+  live turns.</p>
+  <p>Both are fixed behind <code>result_is_rejection</code>, deliberately kept
+  separate from <code>result_is_failure</code> because the skill success-rate
+  readers exempt steering instructions on purpose. A cross-product audit of
+  <strong>1,026 tool return sites against 4,391 recorded live calls</strong>
+  found ten distinct error vocabularies where the code claims one; the remaining
+  divergences are recorded in PROJECT_JOURNAL §4DO as work not undertaken here.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

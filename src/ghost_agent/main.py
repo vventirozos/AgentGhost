@@ -28,6 +28,7 @@ import importlib.util
 import sys
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -61,6 +62,102 @@ from .core.hypothesis import HypothesisTester
 print(" - Importing utilities and tools...", flush=True)
 from .sandbox.docker import DockerSandbox, register_lazy_sandbox
 from .utils.logging import setup_logging, pretty_log, Icons, set_log_redaction
+
+
+# ⚠ NARROW ON PURPOSE — do NOT swap this for the full `redact_text`.
+#
+# The first version of this filter ran uvicorn's access args through all 30
+# built-in rules. That redacts a credential, but it also redacts the CLIENT
+# ADDRESS: `100.93.181.31:54233 - "GET /x"` became
+# `<REDACTED_IP>:54233 - "GET /x"`. An access log whose whole job is to say
+# WHO reached a server that binds 0.0.0.0 is worthless without the address,
+# and the only records worth reading — the non-loopback ones — are exactly
+# the ones the `ipv4` rule rewrites (127.0.0.1 is exempt, so local traffic
+# looked fine and hid the problem).
+#
+# A query-string credential is the only thing an access line can leak, so
+# that is the only thing this touches. Same shape as the interface's filter
+# in `interface/server.py`, deliberately — the two servers should not
+# disagree about what an access log may contain.
+# Same table and the same DECODED-name matching as
+# `distill/redact.py::_redact_qs_if_secret` and `interface/server.py`.
+# Spelling the names literally in a pattern misses `?%6bey=` — which
+# Starlette decodes and authenticates exactly like `?key=`.
+_ACCESS_QS_PARAM_RE = re.compile(
+    r"([?&])([^=&\s\"'<>\]}]+)=([^&\s\"'<>\]},;]*)")
+
+
+class _RedactAccessLog(logging.Filter):
+    """Scrub credential-bearing query parameters from an access record.
+
+    Filters run BEFORE formatting, so `record.args` still holds the pieces
+    uvicorn will interpolate (client, method, path+query, version, status).
+    Rewriting the args — not the finished line — keeps the format string
+    intact while still scrubbing the only part a client controls.
+
+    `record.args` may be a DICT (logging allows `log(msg, {...})` for
+    named-field formatting), which is why the tuple case is checked
+    explicitly rather than assumed. Never raises: a redaction failure must
+    not take down logging.
+    """
+
+    def _scrub(self, s):
+        from .distill.redact import _redact_qs_if_secret
+        return _ACCESS_QS_PARAM_RE.sub(_redact_qs_if_secret, s)
+
+    def filter(self, record):
+        try:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    self._scrub(a) if isinstance(a, str) else a
+                    for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {
+                    k: (self._scrub(v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()}
+            if isinstance(record.msg, str) and (
+                    "?" in record.msg or "&" in record.msg):
+                record.msg = self._scrub(record.msg)
+        except Exception:
+            pass
+        return True
+
+
+def install_access_log_redaction() -> None:
+    for name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _RedactAccessLog) for f in lg.filters):
+            lg.addFilter(_RedactAccessLog())
+
+
+# ⚠ Called at IMPORT, not from `main()`.
+#
+# uvicorn's access logger writes the request line — query string included —
+# and `log_config=None` means it inherits root's handlers, which carry no
+# redaction of their own (pretty_log redacts, but uvicorn never calls
+# pretty_log). §4DW.
+#
+# ⚠ AND IT IS DORMANT UNDER THE CURRENT ENTRY POINT. `setup_logging` pins
+# `logging.getLogger("uvicorn")` to WARNING (utils/logging.py), and access
+# lines are emitted at INFO — so on the `main()` path no access record is
+# ever CREATED and this filter never runs. Verified against the live logs:
+# `Logs/ghost-agent.log` contains zero uvicorn access lines. It is kept
+# because the level pin is one line in an unrelated module and the leak it
+# guards is a 64-char master key: if anything ever lowers that level, or the
+# app is served by the uvicorn CLI (which configures `uvicorn.access` at
+# INFO itself), the guard is already in place. Do not read its presence as
+# evidence that access logging is currently being scrubbed here — the
+# 2026-08-29 leak was the INTERFACE, whose filter is live and load-bearing.
+#
+# It sits here rather than inside `main()` because `main()` is one of
+# several ways this module is loaded (`-m ghost_agent.main`, an embedded
+# import, a test harness, a future `uvicorn ghost_agent.main:app`), and a
+# guarantee that holds only on one path is not a guarantee. It is also what
+# makes the pin honest: a test that calls the installer itself proves
+# nothing about whether production ever does.
+#
+# Idempotent, so importing more than once cannot stack filters.
+install_access_log_redaction()
 from .utils.token_counter import load_tokenizer
 from .tools.registry import TOOL_DEFINITIONS
 
@@ -87,6 +184,46 @@ def enforce_api_key_policy(api_key, host) -> None:
     indistinguishable from a misconfiguration, so we refuse to start.
     Loopback binds with no key run with auth disabled."""
     loopback = host in ("127.0.0.1", "localhost", "::1")
+    # ⚠ WHITESPACE IS NOT A CHOICE. `~/.zshrc` exports GHOST_API_KEY=" ",
+    # and HTTP strips leading/trailing OWS from header values, so a
+    # whitespace key is UNMATCHABLE over the wire: every request 403s while
+    # the operator believes auth is configured. Normalise it to "explicitly
+    # disabled" so the warning below actually fires, instead of booting on a
+    # public interface with a credential nobody can present.
+    if isinstance(api_key, str) and api_key.strip() == "" and api_key != "":
+        # ⚠ THIS RETURNS OR RAISES — it does NOT "normalise and continue".
+        #
+        # The first version printed "treating it as an explicit --api-key ''
+        # (auth disabled)" and assigned `api_key = ""` to a LOCAL. The
+        # function returns None and the caller passes `args.api_key`
+        # unchanged, so nothing downstream ever saw the empty string:
+        # `verify_api_key` read `args.api_key == " "`, found it truthy, and
+        # enforced auth with a credential no client can present. The banner
+        # announced the opposite of what happened.
+        #
+        # Plumbing the empty value through would have been WORSE than the
+        # bug: it really would disable auth on a public bind. So a
+        # whitespace-only key is treated as what it is — a
+        # misconfiguration — and handled the way the interface already
+        # handles it (`interface/server.py` raises at import):
+        #   * non-loopback bind -> refuse to start, like an absent key;
+        #   * loopback          -> warn loudly and carry on unreachable.
+        if not loopback:
+            print(
+                f"❌ REFUSING TO START: GHOST_API_KEY is whitespace-only while "
+                f"binding to {host} (non-loopback). HTTP strips whitespace from "
+                "header values, so NO client could ever authenticate — the "
+                "agent would answer 403 to everything while appearing "
+                "configured. Set a real secret, pass --api-key '' to disable "
+                "auth explicitly, or bind to 127.0.0.1."
+            )
+            raise SystemExit(2)
+        print(
+            "⚠️  GHOST_API_KEY is whitespace-only. HTTP strips whitespace "
+            "from header values, so NO client can authenticate. On this "
+            "loopback bind the agent will answer 403 to every request."
+        )
+        return
     if api_key is None and not loopback:
         print(
             f"❌ REFUSING TO START: binding to {host} (non-loopback) with no "
@@ -849,6 +986,16 @@ def parse_args():
         args.upstream_url = args.upstream_url.replace("http:://", "http://").replace("https:://", "https://")
     return args
 
+#: Env var names whose VALUE is a secret. Matched case-insensitively on the
+#: substring, so a future `GHOST_SLACK_TOKEN` is covered without an edit.
+_SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
+                       "CREDENTIAL", "AUTH", "WEBHOOK", "PASSPHRASE")
+
+
+def _is_secret_env(name: str) -> bool:
+    return any(m in str(name).upper() for m in _SECRET_ENV_MARKERS)
+
+
 def _build_resolved_config(args, context) -> dict:
     """Collapse the 5 config sources into one flat, redacted dict.
 
@@ -866,7 +1013,14 @@ def _build_resolved_config(args, context) -> dict:
     # (2) GHOST_* env vars (only those present — the consumed surface).
     for k, v in sorted(os.environ.items()):
         if k.startswith("GHOST_"):
-            cfg[f"env.{k}"] = v
+            # ⚠ REDACT. This dict is served by `/api/health` and written to
+            # `~/Data/AI/Data/system/last_config.json` (0644). The `arg.`
+            # leg two lines up was redacted and this one was not, so the
+            # 64-char master key sat in cleartext in both — while
+            # `~/Data/AI/.ghost_api_key` is correctly 0600. The project's own
+            # `redact_text` already recognises this exact string; it simply
+            # was not applied here.
+            cfg[f"env.{k}"] = ("<REDACTED>" if _is_secret_env(k) else v)
     # (3) module-constant cognitive toggles — the ones no flag controls, so
     # the ONLY place their live value is visible.
     try:

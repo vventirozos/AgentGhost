@@ -348,7 +348,27 @@ async def smoke_gate(tool_runner, written: List[str]) -> Optional[str]:
     except Exception as e:  # noqa: BLE001 — gate must fail open
         logger.debug("smoke_gate execute failed (fail-open): %s", e)
         return None
+    # The STATUS first: a refused or failed run produced no verdict, and
+    # `if not m: return None` fails this gate OPEN — 7 of 8 non-OK result
+    # shapes PASSED it, and passing marks a task DONE unattended.
+    _st = getattr(out, "status", None)
+    if _st is not None:
+        _sv = str(getattr(_st, "value", _st))
+        if _sv == "unresolved":
+            return ("smoke test did not finish — it is still running as a "
+                    "background job; re-check with jobs(action='status') "
+                    "before treating this build as good")
+        if _sv != "ok":
+            return (f"smoke test could not run ({_sv}): "
+                    f"{str(out)[:200]}")
     text = str(out or "")
+    # ...and the EXIT CODE, which is the only thing that sees a real
+    # `execute` failure: `execute` never declares, so the status block above
+    # is inert for the one tool this gate calls, and `if not m: return None`
+    # below fails the gate OPEN. 7 of 8 non-OK result shapes PASSED.
+    from ..tools.outcome import ToolOutcome as _TO
+    if _TO.coerce(text).shell_failed:
+        return (f"smoke test did not run cleanly: {text.strip()[:200]}")
     # A smoke run DETACHED at its budget (sandbox/jobs.py) has not produced a
     # verdict yet — and unlike a mangled run, it is still going. Report it as
     # a real gate failure rather than failing open: "the smoke test has not

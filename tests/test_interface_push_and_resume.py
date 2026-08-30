@@ -71,12 +71,19 @@ def push_files(tmp_path, monkeypatch):
     webpush_notify._vapid_signer = None
 
 
-def _sub(endpoint="https://push.example/dev1"):
+# ⚠ Endpoints must be on a REAL push-service host. §4DW (2026-08-29) added
+# a host allowlist to `add_subscription` AND to `broadcast`, because an
+# unconstrained endpoint is a stored SSRF: the client picks the URL and the
+# daemon fetches it later, with the daemon's network position. These
+# fixtures used to say `https://push.example/...`, which the allowlist
+# correctly refuses. Using the host the live subscriptions actually carry
+# keeps the store tests testing the STORE.
+def _sub(endpoint="https://web.push.apple.com/dev1"):
     return {"endpoint": endpoint,
             "keys": {"p256dh": "AAA", "auth": "BBB"}}
 
 
-def _real_sub(endpoint="https://push.example/real"):
+def _real_sub(endpoint="https://web.push.apple.com/real"):
     """Subscription with cryptographically valid p256dh/auth so real
     pywebpush encryption succeeds."""
     import base64
@@ -231,13 +238,13 @@ class TestBroadcast:
         monkeypatch.setattr(real_pywebpush, "webpush", webpush_with_fake_session)
         sent = webpush_notify.broadcast("Ghost", "real crypto", url="/x")
         assert sent == 1
-        assert captured["url"].startswith("https://push.example/")
+        assert captured["url"].startswith("https://web.push.apple.com/")
         assert captured["auth"].startswith("vapid ")  # real VAPID JWT header
         assert captured["body_len"] > 0               # real encrypted payload
 
     def test_dead_subscriptions_pruned(self, push_files):
-        webpush_notify.add_subscription(_sub("https://push.example/dead"))
-        webpush_notify.add_subscription(_sub("https://push.example/alive"))
+        webpush_notify.add_subscription(_sub("https://web.push.apple.com/dead"))
+        webpush_notify.add_subscription(_sub("https://web.push.apple.com/alive"))
 
         class FakeWPE(Exception):
             def __init__(self, status):
@@ -305,18 +312,18 @@ class TestSubscriptionsAreNotDestroyedByABadRead:
     def test_a_truncated_file_is_not_overwritten_by_a_new_subscribe(
             self, monkeypatch, tmp_path):
         p = self._write_subs(monkeypatch, tmp_path,
-                             '{"https://push.example/a": {"endpoint": "a"')
+                             '{"https://web.push.apple.com/a": {"endpoint": "a"')
         ok = webpush_notify.add_subscription({
-            "endpoint": "https://push.example/new",
+            "endpoint": "https://web.push.apple.com/new",
             "keys": {"p256dh": "x", "auth": "y"}})
         assert ok is False, "a new device was stored over an unreadable file"
-        assert p.read_text().startswith('{"https://push.example/a"'), (
+        assert p.read_text().startswith('{"https://web.push.apple.com/a"'), (
             "the unrepaired file was clobbered — every other device lost")
 
     def test_a_json_LIST_is_refused_too(self, monkeypatch, tmp_path):
         p = self._write_subs(monkeypatch, tmp_path, '[{"endpoint": "a"}]')
         assert webpush_notify.add_subscription({
-            "endpoint": "https://push.example/new",
+            "endpoint": "https://web.push.apple.com/new",
             "keys": {"p256dh": "x", "auth": "y"}}) is False
         assert p.read_text() == '[{"endpoint": "a"}]'
 
@@ -325,7 +332,7 @@ class TestSubscriptionsAreNotDestroyedByABadRead:
                             tmp_path / "does-not-exist.json")
         assert webpush_notify.subscription_count() == 0
         assert webpush_notify.add_subscription({
-            "endpoint": "https://push.example/new",
+            "endpoint": "https://web.push.apple.com/new",
             "keys": {"p256dh": "x", "auth": "y"}}) is True
 
     def test_read_only_callers_never_raise(self, monkeypatch, tmp_path):
@@ -355,7 +362,7 @@ class TestEveryPushCarriesATimeout:
         monkeypatch.setattr(webpush_notify, "_vapid_key_object",
                             lambda: object())
         monkeypatch.setattr(webpush_notify, "_load_subs_or_empty", lambda: {
-            "https://push.example/a": {"endpoint": "https://push.example/a",
+            "https://web.push.apple.com/a": {"endpoint": "https://web.push.apple.com/a",
                                        "keys": {"p256dh": "x", "auth": "y"}}})
         assert webpush_notify.broadcast("t", "b") == 1
         assert "timeout" in seen, "the push has no timeout — it can hang forever"
@@ -369,10 +376,10 @@ class TestPushFailuresAreLegible:
     def test_a_corrupt_store_is_a_503_not_a_client_error(self, client,
                                                          monkeypatch, tmp_path):
         p = tmp_path / "push_subs.json"
-        p.write_text('{"https://push.example/a": {"endpoint": "a"')
+        p.write_text('{"https://web.push.apple.com/a": {"endpoint": "a"')
         monkeypatch.setattr(webpush_notify, "_SUBS_FILE", p)
         r = client.post("/api/push/subscribe", headers=AUTH, json={
-            "subscription": {"endpoint": "https://push.example/new",
+            "subscription": {"endpoint": "https://web.push.apple.com/new",
                              "keys": {"p256dh": "x", "auth": "y"}}})
         assert r.status_code == 503, (
             f"a server-side corrupt store is reported to the device as ITS "
@@ -395,7 +402,7 @@ class TestPushFailuresAreLegible:
         earlier (R3 lens A)."""
         import logging
         monkeypatch.setattr(webpush_notify, "_load_subs_or_empty", lambda: {
-            "https://push.example/a": {"endpoint": "https://push.example/a"}})
+            "https://web.push.apple.com/a": {"endpoint": "https://web.push.apple.com/a"}})
         monkeypatch.setattr(webpush_notify, "vapid_config", lambda: None)
         with caplog.at_level(logging.WARNING):
             assert webpush_notify.broadcast("t", "b") == 0
@@ -432,8 +439,17 @@ class TestReplyReadyPush:
         pushed.assert_awaited_once()
         args = pushed.await_args
         assert "summarize my inbox" in args.args[1]
+        # ⚠ INVERTED 2026-08-29 (§4DW). This used to assert the URL CARRIED
+        # the quoted key — i.e. it pinned a leak. A Web Push payload is
+        # encrypted to the SUBSCRIPTION's p256dh/auth keys, which the client
+        # supplies, so anyone who could plant a subscription could decrypt
+        # the master key straight out of a notification. The page cookie
+        # makes a bare `/` open authenticated, so the key does not need to
+        # travel here at all.
         from urllib.parse import quote as _q
-        assert _q(KEY) in args.kwargs["url"]  # url carries the QUOTED key
+        assert _q(KEY) not in args.kwargs["url"], (
+            "the master key is back in the push payload")
+        assert args.kwargs["url"] == "/"
 
     def test_cancelled_turn_never_pushes(self, monkeypatch):
         # User hit Stop: a "Reply ready" buzz 12s later is noise, not news.

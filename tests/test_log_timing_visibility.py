@@ -45,10 +45,14 @@ def test_later_system_lines_report_the_gap_since_the_previous_one():
     assert glog._delta_from(100.0, 142.0).strip() == "+42.0s"
 
 
-def test_the_delta_is_the_gap_between_lines_not_since_boot():
+def test_the_delta_helper_returns_the_gap_between_two_readings():
     """A daemon runs for weeks; "since process start" would be useless. Each
     line reports the duration of the step that just finished, so the values
-    do NOT grow monotonically."""
+    do NOT grow monotonically.
+
+    ⚠ Renamed: this shared a name with the formatter-level test 58 lines
+    below, so Python rebound the module attribute and pytest only ever ran
+    the second one — this pure-function check had never executed."""
     first = glog._delta_from(100.0, 100.5)
     second = glog._delta_from(100.5, 100.6)
     assert float(re.search(r"\+\s*([\d.]+)s", second).group(1)) < \

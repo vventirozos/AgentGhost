@@ -42,6 +42,7 @@ from urllib.parse import urlparse as _urlparse
 
 from ..utils.logging import Icons, pretty_log
 from .file_system import _get_safe_path, _to_container_path
+from .outcome import ToolOutcome
 
 logger = logging.getLogger("GhostAgent")
 
@@ -718,17 +719,46 @@ async def tool_browser(
     if max_chars is not None:
         max_chars = max(256, min(_safe_int(max_chars, _MAX_TEXT_CHARS), _MAX_TEXT_CHARS))
 
-    def _err(msg: str, hint: str = None) -> str:
+    def _err(msg: str, hint: str = None, ran: bool = False) -> "ToolOutcome":
+        """A browser failure — and it says so.
+
+        `--- BROWSER RESULT ---` heads the string, so the loop's anchored
+        failure-prefix rule never matched and NONE of these were failures to
+        the dispatch loop: measured, 42 live rows over 32 turns booked 0/42
+        as failures — no strike, no pre-flight guard record, no competence
+        signal, and `STATUS: ERROR` reported to the model as a SUCCEEDED
+        operation. That is the single largest remaining loop-vs-corpus
+        disagreement class, larger than the exit-code class §4DO closed.
+        Nothing here ran, so nothing changed.
+        """
+        from .outcome import ToolOutcome
         out = f"--- BROWSER RESULT ---\nSTATUS: ERROR\n{msg}"
         if hint:
             out += f"\n\n--- HINT ---\n{hint}\n-----------"
-        return out
+        # `world_changed` is a PARAMETER now: `_err` is called both before
+        # the runner starts and after it has already navigated, clicked and
+        # filled. Declaring "nothing changed" for the post-execution case
+        # lied to the pre-flight guard and to the loop-breaker's
+        # world-changed reset on 12 live rows.
+        return ToolOutcome.failed(out, world_changed=ran,
+                                  reason_code="browser_error")
+
+    def _reject(msg: str):
+        """An ARGUMENT refusal: nothing ran, and the message names what to
+        change. Booking these FAILED armed the pre-flight guard against the
+        corrected re-issue — the pathology the guard's own docstring
+        records."""
+        from .outcome import ToolOutcome
+        return ToolOutcome.rejected(
+            f"--- BROWSER RESULT ---\nSTATUS: ERROR\n{msg}",
+            reason_code="browser_bad_arguments")
 
     valid_list = ", ".join(sorted(_VALID_OPS))
     if not operation:
-        return _err(f"Missing 'operation'. Valid: {valid_list}.")
+        return _reject(f"Missing 'operation'. Valid: {valid_list}.")
+    operation = str(operation)
     if operation not in _VALID_OPS:
-        return _err(f"Unknown operation {operation!r}. Valid: {valid_list}.")
+        return _reject(f"Unknown operation {operation!r}. Valid: {valid_list}.")
     if not sandbox_dir or not sandbox_manager:
         return _err("Sandbox is not initialised — cannot run browser.")
 
@@ -764,7 +794,7 @@ async def tool_browser(
     _b = _browser_blocked_url(url, anonymous=_anon,
                               allowed_local_ports=_svc_ports)
     if _b:
-        return _err(f"Refused navigation: {_b}")
+        return _reject(f"Refused navigation: {_b}")
     # ("goto", "navigate"): the sanitiser below heals BOTH spellings'
     # file:// URLs, so the guard must inspect both — checking only "goto"
     # would let a future runner-side "navigate" alias skip the host-side
@@ -774,14 +804,14 @@ async def tool_browser(
             _b = _browser_blocked_url(_a.get("url"), anonymous=_anon,
                                       allowed_local_ports=_svc_ports)
             if _b:
-                return _err(f"Refused goto: {_b}")
+                return _reject(f"Refused goto: {_b}")
 
     # Write the runner once per call. Cheap (~10 KB) and avoids stale-
     # runner bugs if the file is edited mid-session.
     try:
         runner_host_path = _get_safe_path(sandbox_dir, _BROWSER_RUNNER_FILENAME)
     except ValueError as ve:
-        return _err(str(ve))
+        return _reject(str(ve))
     try:
         await asyncio.to_thread(runner_host_path.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(runner_host_path.write_text, _runner_script())
@@ -797,7 +827,7 @@ async def tool_browser(
             # `_get_safe_path` already rejects path escapes.
             host_out = _get_safe_path(sandbox_dir, target)
         except ValueError as ve:
-            return _err(str(ve))
+            return _reject(str(ve))
         await asyncio.to_thread(host_out.parent.mkdir, parents=True, exist_ok=True)
         # Translate host → container path. _to_container_path un-scopes a
         # project-scoped sandbox_dir to the root mount, so a scoped file at
@@ -818,7 +848,7 @@ async def tool_browser(
     _interact_shot_hosts: dict = {}
     if operation == "interact":
         if not isinstance(actions, list) or not actions:
-            return _err(
+            return _reject(
                 "interact requires a non-empty 'actions' list, e.g. "
                 "[{\"action\":\"click\",\"selector\":\"...\"}, "
                 "{\"action\":\"extract_text\",\"selector\":\"...\"}]."
@@ -832,7 +862,7 @@ async def tool_browser(
             if actions else False
         for idx, step in enumerate(actions):
             if not isinstance(step, dict):
-                return _err(
+                return _reject(
                     f"actions[{idx}] must be a dict, got {type(step).__name__}"
                 )
             new_step = dict(step)
@@ -845,7 +875,7 @@ async def tool_browser(
                 try:
                     host_sub = _get_safe_path(sandbox_dir, sub_target)
                 except ValueError as ve:
-                    return _err(f"actions[{idx}]: {ve}")
+                    return _reject(f"actions[{idx}]: {ve}")
                 await asyncio.to_thread(
                     host_sub.parent.mkdir, parents=True, exist_ok=True
                 )
@@ -953,7 +983,7 @@ async def tool_browser(
     except Exception as e:
         pretty_log("Browser Failed", f"{operation}: {type(e).__name__}: {e}",
                    icon=Icons.TOOL_BROWSER, level="ERROR")
-        return _err(f"sandbox execute failed: {e}")
+        return _err(f"sandbox execute failed: {e}", ran=True)
 
     ok, parsed = _parse_runner_output(output or "")
 
@@ -1097,10 +1127,11 @@ async def tool_browser(
             # action, not the generic browser advice below — "raise the
             # timeout / use interact" is wrong here and is what invited the
             # identical retry that produced this fix.
-            return _err(f"Runner failed (exit {exit_code}): {parsed}",
+            return _err(f"Runner failed (exit {exit_code}): {parsed}", ran=True,
                         hint=_onion_note)
         return _err(
             f"Runner failed (exit {exit_code}): {parsed}",
+            ran=True,
             hint=(
                 "If this is a navigation timeout, try wait_until='domcontentloaded' "
                 "or raise timeout_ms. If a CLICK timed out or its selector was "
@@ -1216,6 +1247,13 @@ async def tool_browser(
         action_results = parsed.get("actions") or []
         ok_count = sum(1 for r in action_results if r.get("ok"))
         err_count = len(action_results) - ok_count
+        # The header says `STATUS: OK` for every interact, whatever happened
+        # inside — 5 live rows where EVERY action failed were booked a clean
+        # success, and 24 more where some did. The per-action results are
+        # right here; the envelope just never used them.
+        _interact_status = (
+            "failed" if (err_count and not ok_count)
+            else "partial" if err_count else "ok")
         lines = [
             header,
             f"FINAL_URL: {parsed.get('final_url')}",
@@ -1310,6 +1348,14 @@ async def tool_browser(
                 lines.append(
                     f"  [{idx}] {status} {act}: {r.get('error')}"
                 )
-        return "\n".join(lines)
+        _txt = "\n".join(lines)
+        if _interact_status == "ok":
+            return _txt
+        # The runner already navigated, clicked and filled, so this DID
+        # change the world even when every action errored.
+        return (ToolOutcome.failed if _interact_status == "failed"
+                else ToolOutcome.partial)(
+            _txt, world_changed=True,
+            reason_code=f"browser_interact_{_interact_status}")
     # Defensive default — never hit because we validated above.
     return f"{header}\nRAW: {json.dumps(parsed)}"

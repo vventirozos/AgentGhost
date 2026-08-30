@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.outcome — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a class="current" href="outcome.html">outcome</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>tools / outcome.py</h1>
+  <p class="subtitle">What a tool call actually did &mdash; as data, not as a string to sniff.</p>
+
+  <h2>Why it exists</h2>
+  <p>Tools in this codebase <em>return</em> error strings rather than raising, so every consumer that
+  wanted to know "did this fail?" grew its own text rule. An audit AST-parsed every
+  <code>return</code>/<code>raise</code> in <code>ghost_agent/tools/</code> &mdash; 1,026 result heads &mdash;
+  ran all of those rules over each, then over 4,391 recorded live tool calls. It found <strong>ten
+  vocabularies</strong> where the code claimed one, and measured what the disagreement cost:</p>
+  <ul>
+    <li><strong>66 refusals credited with changing the world.</strong> A malformed mutating call that
+      touched <em>nothing</em> cleared recorded pre-flight failures, wiped the loop-breaker's memory and
+      <em>decremented</em> the strike count &mdash; so a run of rejected replaces erased earlier strikes
+      and the cap could never fire.</li>
+    <li><strong>15 turns reporting a non-zero exit as SUCCEEDED</strong> under the MULTI-STEP OUTCOME
+      banner, the one message that tells the model "this live outcome is AUTHORITATIVE".</li>
+    <li><strong>219 calls</strong> where the turn loop and the trajectory corpus disagreed about whether
+      the same call failed &mdash; and the corpus is what the learning loop trains on.</li>
+  </ul>
+  <p>Five review rounds had answered by adding prefixes to predicates, and each addition created the
+  next round's split. A string cannot say <em>"this REFUSED and touched nothing"</em> or <em>"this
+  half-landed"</em>, and those are exactly the two distinctions whose absence caused the harm.</p>
+
+  <h2>It IS a string</h2>
+  <p><code>ToolOutcome</code> is a <code>str</code> <strong>subclass</strong>. The first version was a
+  dataclass with a hand-written proxy, and reviewers found the holes one at a time:
+  <code>isinstance(x, str)</code> was False, <code>json.dumps</code> raised, <code>"".join([...])</code>
+  raised, <code>re.search</code> raised, <code>+</code> raised, <code>os.path.join</code> raised. Roughly
+  a thousand call sites treat a tool result as a string; being one is the only version of
+  "behaviour-identical on day 1" that actually holds.</p>
+  <p>The status rides <em>inside</em> the content value, so the LLM API payload is byte-identical &mdash;
+  an extra dict key on a message would be sent upstream. The cost is that equality and hashing are the
+  string's, so <code>ok("x") == rejected("x")</code>; nothing in the tree containerises results by value.</p>
+
+  <h2>Statuses</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Status</th><th>Means</th><th>Changed the world?</th><th>Typical producer</th></tr></thead>
+    <tbody>
+      <tr><td><strong>OK</strong></td><td>Did what was asked.</td><td>yes</td><td>any success path</td></tr>
+      <tr><td><strong>FAILED</strong></td><td>Tried and did not succeed.</td><td>no, unless <code>world_changed=True</code></td><td><code>browser</code> <code>STATUS: ERROR</code></td></tr>
+      <tr><td><strong>REJECTED</strong></td><td>Refused before running. Touched <em>nothing</em>.</td><td>no</td><td><code>file_system</code> refusals, the loop's pre-dispatch guards</td></tr>
+      <tr><td><strong>PARTIAL</strong></td><td>Half-landed.</td><td>yes</td><td>a write that landed on a file that does not parse; a multi-block replace where some blocks failed</td></tr>
+      <tr><td><strong>UNRESOLVED</strong></td><td><em>No verdict yet</em> &mdash; still running.</td><td>no</td><td><code>execute</code>'s promoted background job; <code>swarm</code>'s still-running branch</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>world_changed=True</code> exists for one measured case: a truncating write that then hit
+  ENOSPC. Reproduced under <code>RLIMIT_FSIZE</code> &mdash; 5,434 bytes in, 8,192 bytes of a different
+  file out, the original gone &mdash; and reported as a clean refusal that touched nothing.</p>
+
+  <h2>DECLARED vs DERIVED &mdash; the rule that took three rounds</h2>
+  <p>A status and a text sniffer will disagree, and the whole question is who wins. Preferring the
+  status once traded +61 refusals for <strong>&minus;198 <code>execute</code> failures</strong>, because
+  every result is wrapped, so the sniffer became dead code and took the exit-code rule with it. Simply
+  ORing them keeps the sniffer's false positives: a <code>manage_projects</code> read whose JSON ledger
+  quotes a stored <code>autoadvance_failed</code> event &mdash; traceback and <code>EXIT CODE: 1</code>
+  verbatim &mdash; was booked as a failed shell command.</p>
+  <p>Position cannot separate those two: a JSON payload is one line, so "the banner heads the result" is
+  true for a real envelope <em>and</em> for a quote. The <strong>producer</strong> can. So an outcome
+  records where its status came from:</p>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th>Built by</th><th>Against the sniffer</th></tr></thead>
+    <tbody>
+      <tr><td><strong>DERIVED</strong></td><td><code>ToolOutcome.coerce(text)</code> &mdash; a guess from the same prose the sniffer reads</td><td>ORs with it. Never overrules.</td></tr>
+      <tr><td><strong>DECLARED</strong></td><td>a producer calling <code>.ok()</code> / <code>.rejected()</code> / &hellip;</td><td>Settles it.</td></tr>
+    </tbody>
+  </table></div>
+  <p>This is safe for one structural reason, and it is pinned:
+  <strong><code>execute</code> never declares a SUCCESS.</strong> (It does declare
+  <code>REJECTED</code> and <code>UNRESOLVED</code> — the load-bearing half is that it never
+  declares <em>ok</em>, because that is the only status that could talk the sniffer out of its own
+  exit-code evidence.) Its results are bare strings, so
+  <code>coerce</code> marks them derived and the shell keeps full authority over its own exit code.
+  <code>shell_failed</code> additionally has <em>no</em> <code>declared</code> short-circuit at all, so a
+  producer that declared OK while its envelope says <code>127</code> is still caught.</p>
+
+  <h2>The two shell questions are different questions</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Property</th><th>Asks</th><th>Ask it of</th></tr></thead>
+    <tbody>
+      <tr><td><code>exit_code_failed</code></td><td>Does this carry a non-zero <code>EXIT CODE:</code> envelope? Banner only, and a declared status short-circuits it.</td><td>everything</td></tr>
+      <tr><td><code>shell_failed</code></td><td>Status, then the banner, then unanchored crash markers.</td><td><strong>only <code>execute</code></strong></td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>There is no unanchored traceback rule in the verdict.</strong> One lived in an earlier
+  wide re-derivation, where it fed only the work log; collapsing the loop's three verdicts into one
+  promoted it to the strike ledger, and a successful <code>file_system</code> read of a log quoting a
+  crash drew a strike, failed the competence profile and got a "the path doesn't exist" hint about
+  the file it had just read &mdash; 4.2% of readable files in the live sandbox contain the word.</p>
+  <p>The marker fallback is unanchored by necessity &mdash; a crashing script's traceback can be anywhere
+  in its stdout &mdash; and is therefore wrong for any tool that merely <em>quotes</em> code. Applied to
+  every tool it booked <strong>226 live successes as incompetence</strong>: a <code>file_system</code>
+  read of a script containing <code>except ValueError:</code>, a <code>recall</code> hit whose memory text
+  mentions <code>PermissionError</code>, a job log quoting <code>HTTP Error 429</code>.</p>
+  <p><code>UNRESOLVED</code> is tested <em>before</em> the general non-OK rule in both: an unfinished job
+  has no verdict, and answering True was how <code>exit_code_val = 1 if shell_failed</code> gave an
+  in-flight run a strike.</p>
+
+  <h2>Who reads it</h2>
+  <p>The status is minted in <code>tools/</code> and must not die at the dispatch loop. Every reader
+  below is <strong>ADD-only</strong>: an <code>ok</code> status falls through to that reader's existing
+  prose rules, so the exit-code and traceback evidence keeps all the authority it had.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Reader</th><th>Decides</th><th>Refusals it used to miss</th></tr></thead>
+    <tbody>
+      <tr><td><code>agent._turn_had_tool_failure</code></td><td>the verifier's high-stakes CONFIRM escalation</td><td>15 turns (8% of the population)</td></tr>
+      <tr><td><code>project_advancer._looks_like_failure</code></td><td>whether an <em>unattended</em> idle tick marks a task DONE</td><td>82 / 82</td></tr>
+      <tr><td><code>project_advancer.classify_verify_result</code></td><td>the fail-closed verify gate</td><td>&mdash; (now can never PASS on a non-OK status)</td></tr>
+      <tr><td><code>registry._acquired_skill_result_class</code></td><td>skill-graduation <code>success_rate</code></td><td>82 / 82</td></tr>
+      <tr><td><code>coding_executor._looks_like_write_error</code> / <code>_op_ok</code></td><td>whether a coding leaf records the file as written</td><td>36</td></tr>
+      <tr><td><code>file_system._batch_result_failed</code></td><td>per-path outcomes inside a batch envelope</td><td>22 / 82</td></tr>
+      <tr><td><code>composed_skills._step_result_ok</code></td><td>macro <code>success_rate</code></td><td>&mdash; (was missing <code>CRITICAL ERROR:</code>)</td></tr>
+      <tr><td><code>outcome_heuristics._looks_like_tool_error</code></td><td>the shared sniffer &mdash; the trajectory corpus label</td><td>61 / 82</td></tr>
+      <tr><td><code>outcome_heuristics.tool_failure_flags</code></td><td>the turn-level shape rule (lesson corpus, calibration, episode store)</td><td>61 / 82</td></tr>
+      <tr><td><code>agent._bookkeeping_call_failed</code></td><td>whether the verifier RUNS at all, and the unverified-mutation guard</td><td>15 / 22 failed bookkeeping calls</td></tr>
+      <tr><td><code>foresight.offline_call_failed</code></td><td>the shadow world model's seed label &mdash; <em>unattended</em></td><td>39 / 82</td></tr>
+      <tr><td><code>eval.verify_bench.derive_high_stakes</code></td><td>the bench instrument the CONFIRM escalation is calibrated against</td><td>61 / 82</td></tr>
+      <tr><td>the episode store's per-ACTION <code>success</code> flag</td><td>the context chain, recovery search, the playbook-lesson model</td><td>145 / 291 declared non-OK</td></tr>
+      <tr><td><code>_ran_info</code></td><td>resolving self-answered unknowns; the clarifying-question gate</td><td>145 / 291</td></tr>
+      <tr><td><code>eval.behavioral</code> · <code>self_play_scoring</code> · <code>build_gates.smoke_gate</code></td><td>the regression baseline, the self-play reward, and a gate that marks tasks DONE</td><td>2.61&times; over-count / 287 of 408 / 7 of 8</td></tr>
+    </tbody>
+  </table></div>
+  <p class="ref-banner">⚠ <strong>Ask the question once.</strong> Inside the loop that is
+  <code>_res_is_error</code>; for a row read back afterwards it is
+  <code>agent._action_failed(content, tool_name)</code>. Every private re-derivation of it has been
+  wrong — a five-prefix head bank booked 145 of 291 declared non-OK results as successes, and the
+  <code>if/else</code> that replaced it shadowed the bank so 118 non-zero <code>execute</code> exits
+  were still stored successful. Neither could see an <code>EXIT CODE:</code> banner under an
+  <code>--- EXECUTION RESULT ---</code> head.</p>
+  <p class="ref-banner">⚠ <strong>There is ONE verdict per call.</strong> The loop used to hold three
+  in a single iteration — a status-only one for <code>op_outcomes.ok</code> and the pre-flight guard, a
+  wider one 660 lines down for the competence profile and the work log, and the strike branch, narrower
+  than both. Seven consumers disagreed about the same call on 56 of 4,391 calls, including 8 where
+  <code>ok</code> was False and no strike was drawn at all. Compute it once; never recompute it.</p>
+  <p class="ref-banner">⚠ <strong>The loop must not declare on a producer's behalf.</strong> Any
+  construction that forwards a <code>status</code> must also forward <code>declared</code> &mdash;
+  <code>__new__</code> defaults it to <code>True</code>, so omitting it re-labels a derived status as
+  a producer's own answer and makes the sniffer unreachable. That mistake cost 151 of 4,391 calls
+  their <code>ToolCall.error</code> flag, 116 of them <code>execute</code>: the &minus;198 regression
+  rebuilt from the other end. It is pinned across <code>agent.py</code>, <code>execute.py</code> and
+  <code>file_system.py</code>.</p>
+  <p>That list is not maintained by memory. Four readers were migrated in one pass and a fifth was
+  missed &mdash; so <code>test_every_result_classifier_reads_the_status</code> <strong>enumerates</strong>
+  them from the AST and fails on the sixth.</p>
+
+  <h2>Decorating a result</h2>
+  <p><strong>Never touch the text directly.</strong> <code>ToolOutcome</code> is a <code>str</code>
+  subclass, so <code>res + note</code>, <code>f"{res}…"</code>, <code>str(res).strip()</code>, a slice
+  and <code>.replace</code> all go through <code>str</code> and return a plain <code>str</code>,
+  silently discarding the status. That defect has been found at <strong>nine sites in six modules
+  across four review rounds</strong> — three of them <em>after</em> the same thing had been fixed one
+  boundary away, because each sweep was scoped to the module being migrated.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Use</th><th>For</th></tr></thead>
+    <tbody>
+      <tr><td><code>outcome.with_text(res, new_text)</code></td><td>any rewrite of the text — truncation, compression, summarisation</td></tr>
+      <tr><td><code>outcome.append_note(res, note)</code></td><td>appending a hint or a verification note</td></tr>
+    </tbody>
+  </table></div>
+  <p>Both are no-ops on a plain <code>str</code>, so they are safe to apply anywhere a result might
+  or might not be an outcome. <code>test_outcome_consumers_r7</code> walks the whole package for the
+  raw forms.</p>
+
+  <h2>Where the defects actually are</h2>
+  <p>After seven rounds, the pattern is consistent enough to state as a rule: <strong>the defects live
+  where two modules meet.</strong> Every one found in the declaration audit sat at the edge of an
+  earlier migration &mdash; the last <code>return</code> of a dispatcher whose eight siblings were
+  migrated; the wrapper one boundary out from the producer that declares; the flag armed one line
+  after the <code>await</code> it guards; the <code>+=</code> one function later; the refusal wrapped
+  in an envelope that hides its own head from an anchored predicate. When you migrate a module, the
+  next thing to check is not the rest of that module &mdash; it is whoever calls it and whoever it
+  calls.</p>
+
+  <h2>How it is pinned</h2>
+  <ul>
+    <li><strong>At the producer, with no allowlist.</strong> An AST walk over every module defining a
+      <code>tool_*</code> entry point fails when a refusal- or partial-shaped <code>return</code> appears
+      as a bare string. Earlier rounds all pinned a <em>reader</em>, and each round's defect arrived
+      through a <em>writer</em>.</li>
+    <li><strong>With a positive control.</strong> The scanner was green because its result set was empty
+      &mdash; which is also what a broken scanner produces; all three of its arms could be disabled with
+      the suite green. It now has to find a planted refusal in four shapes (literal, f-string,
+      concatenation, module constant) before it is allowed to report none.</li>
+    <li><strong>By mutation, whole-file, one mutant per run, never naming the expected killer.</strong>
+      Two pins were found asserting the fix rather than reading it: the System-3 pivot simulation
+      hardcoded the guard it was supposed to lift from source, and the <code>browser</code> pin asked
+      "is <code>ToolOutcome</code> mentioned in <code>_err</code>" &mdash; true either way, since
+      <code>_err</code> imports it on its first line. 30 mutants, 30 killed.</li>
+  </ul>
+
+  <h2>Measured effect</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>On the 4,391-call corpus</th><th>Before</th><th>After</th></tr></thead>
+    <tbody>
+      <tr><td>refusals credited with a world change</td><td>66</td><td>0</td></tr>
+      <tr><td>refusals scoring zero strikes</td><td>82</td><td>0</td></tr>
+      <tr><td>turns reporting a non-zero exit as SUCCEEDED</td><td>15</td><td>0</td></tr>
+      <tr><td><code>browser</code> <code>STATUS: ERROR</code> rows the loop saw as failures</td><td>0 / 42</td><td>42 / 42</td></tr>
+      <tr><td>loop-vs-corpus disagreements</td><td>219</td><td>23</td></tr>
+      <tr><td>in-loop consumers not unanimous about one call</td><td>56</td><td>7</td></tr>
+      <tr><td>declared non-OK outcomes the episode store booked as successes</td><td>145 / 291</td><td>0</td></tr>
+      <tr><td>refusals seeded into the world model as successes</td><td>39 / 82</td><td>0 / 82</td></tr>
+      <tr><td>failed bookkeeping calls the verifier gate could see</td><td>5 / 22</td><td>22 / 22</td></tr>
+      <tr><td>loop-failures reaching the model with no <code>[FAILURE BANNER]</code></td><td>191</td><td>0</td></tr>
+      <tr><td>clean results given a spurious failure banner</td><td>9</td><td>0</td></tr>
+      <tr><td>loop-failed calls the episode store recorded as successful actions</td><td>234</td><td>0</td></tr>
+      <tr><td><code>mean_tool_errors</code> in the frozen regression baseline</td><td>2.61&times; truth</td><td>0.96&times;</td></tr>
+      <tr><td>services that failed to bind, invisible to every reader</td><td>18</td><td>0</td></tr>
+      <tr><td>supervisor refusals arming the guard against a corrected re-issue</td><td>29 / 29</td><td>0 / 29</td></tr>
+      <tr><td>failures the loop could not see at all (round 7 declarations)</td><td>174</td><td>0</td></tr>
+    </tbody>
+  </table></div>
+  <p>The remaining 30 are <code>execute</code> 9, <code>deep_research</code> 7, <code>file_system</code> 6,
+  <code>vision_analysis</code> 4, <code>manage_services</code> 3, <code>darkweb_research</code> 1 &mdash;
+  and no subsystem outside the readers listed above consults a status yet. See
+  <a href="tool_failure.html">tool_failure</a> for the retry/replan taxonomy that sits behind it.</p>
+</main>
+</body>
+</html>

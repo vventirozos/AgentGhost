@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 from typing import Any, Optional
 import httpx
+from .outcome import ToolOutcome, append_note
 try:
     from curl_cffi import requests as curl_requests
 except ImportError:
@@ -157,6 +158,143 @@ def _looks_like_binary(head: bytes) -> bool:
         return True
     suspicious = sum(1 for b in head if b < 0x20 and b not in _TEXT_CTRL_OK)
     return (suspicious / len(head)) > 0.05
+
+
+def _close_quietly(fd) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def read_bytes_nofollow(path: Path, *, max_bytes: int = 0) -> bytes:
+    """Read `path`, REFUSING to follow a symlink at the final component.
+
+    The read counterpart of `write_text_nofollow`, and needed for the same
+    reason: a FIXED filename inside a directory the model can write to. The
+    service log tail (`<host_dir>/<stem>.log`) is exactly that — `host_dir`
+    is bind-mounted into the container as `/workspace/.services`, so one
+    `ln -s /Users/…/.ghost_api_key /workspace/.services/leak.log` followed
+    by `manage_services(action='logs', name='leak')` returned the master key
+    straight into the model's context. Demonstrated 2026-08-30 (§4DX r4).
+
+    `max_bytes > 0` reads at most that many bytes from the END of the file.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as e:
+        raise ValueError(
+            f"Security Error: refusing to read '{path}' — it is a symbolic "
+            f"link or unreadable ({e.__class__.__name__}: {e})") from e
+    try:
+        import stat as _stat
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(
+                f"Security Error: refusing to read '{path}' — not a regular file.")
+        if max_bytes > 0:
+            size = os.fstat(fd).st_size
+            if size > max_bytes:
+                os.lseek(fd, size - max_bytes, os.SEEK_SET)
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def write_text_nofollow(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write `text` to `path`, REFUSING to follow a symlink at the final
+    component.
+
+    ⚠ WHY THIS EXISTS (§4DX round 2, 2026-08-30). Three host-side writers
+    used a FIXED filename inside a directory the model can write to:
+
+        acquired_skills.py   <sandbox>/test_skill.py     (create_skill)
+        memory/projects.py   <project>/RELEASE.md.tmp    (manage_projects)
+        memory/projects.py   <project>/PROJECT_MAP.md.tmp
+
+    None called `_get_safe_path`, because the name is a constant — there is
+    no model-supplied path to validate. But the model does not need to
+    supply a path: it plants a SYMLINK at that constant name with one
+    in-container call (`ln -s /Users/…/agent.py /workspace/test_skill.py`),
+    and the next write follows it. Demonstrated end to end: the agent's own
+    source file was overwritten with model-authored Python, and the
+    cleanup path then unlinked the symlink so the sandbox looked untouched.
+
+    `O_NOFOLLOW` is checked by the KERNEL at open time on the final
+    component, so this is atomic — an `is_symlink()` test followed by a
+    write is a TOCTOU race the model can win, because it controls the
+    directory. On a symlink the open fails with ELOOP and this raises.
+
+    Intermediate directories are NOT covered by O_NOFOLLOW; callers whose
+    parent directory is itself model-controlled must additionally resolve
+    the parent through `_get_safe_path`.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        # ⚠ 0o666, NOT 0o600 — the umask still applies, so this reproduces
+        # exactly what `write_text` produced. The security property here is
+        # O_NOFOLLOW, not the mode. Creating at 0o600 would also travel:
+        # `os.replace(tmp, target)` carries the tmp's inode onto an EXISTING
+        # artifact, so `PROJECT_MAP.md` silently went 0644 -> 0600 on its
+        # next render. Harmless on this box (the container runs as root and
+        # every daemon is the same user) and a latent breakage the moment
+        # anything is served by a different uid.
+        # ⚠ O_NONBLOCK. `O_NOFOLLOW` refuses a SYMLINK; it says nothing
+        # about a FIFO. Opening a reader-less FIFO for writing blocks
+        # FOREVER, and both callers invoke this synchronously from inside an
+        # `async def` — so `mkfifo /workspace/test_skill.py` freezes the
+        # asyncio event loop, i.e. the entire agent, with no exception for
+        # the caller's `try` to catch. O_NONBLOCK makes that open fail with
+        # ENXIO instead, and the `_refuse_non_regular` check below rejects
+        # every non-regular target explicitly.
+        fd = os.open(str(path), flags | getattr(os, "O_NONBLOCK", 0), 0o666)
+    except OSError as e:
+        # ELOOP (symlink) / ENOTDIR — refuse loudly rather than write through.
+        raise ValueError(
+            f"Security Error: refusing to write '{path}' — it is a symbolic "
+            f"link or an unwritable path ({e.__class__.__name__}: {e})"
+        ) from e
+    # ⚠ NO MANUAL os.close IN AN EXCEPT BRANCH. `os.fdopen` takes ownership
+    # of the fd, and the `with` closes it on the way out of BOTH the normal
+    # and the exception path. The first version added `os.close(fd)` to an
+    # `except BaseException`, which double-closed on any write error
+    # (ENOSPC, EIO, UnicodeEncodeError) — and this process runs
+    # `asyncio.to_thread` pools, so in the window between the two closes
+    # another thread can be handed the same fd number and have it closed
+    # underneath it. `except OSError: pass` made the victim silent.
+    #
+    # If `fdopen` itself raises (it can, on MemoryError) the fd leaks — one
+    # fd, once, on a path that is already failing, which is strictly better
+    # than closing a descriptor someone else now owns.
+    # The target must be a REGULAR file. A FIFO, socket or device node at
+    # this path is not something a text write should ever land on, and
+    # fstat-ing the OPEN fd (not the path) means there is no second lookup
+    # to race.
+    try:
+        import stat as _stat
+        _regular = _stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError as e:
+        _close_quietly(fd)
+        raise ValueError(f"Security Error: cannot stat '{path}': {e}") from e
+    if not _regular:
+        # ⚠ ONE close on this path. The first version closed inside the
+        # `try` AND again in `except OSError`, re-introducing the very
+        # double-close the write path had just been cleaned of.
+        _close_quietly(fd)
+        raise ValueError(
+            f"Security Error: refusing to write '{path}' — it is not a "
+            "regular file (FIFO, socket or device node).")
+    with os.fdopen(fd, "w", encoding=encoding) as fh:
+        fh.write(text)
 
 
 def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True) -> Path:
@@ -454,6 +592,42 @@ def _conversation_bound_project(context) -> str:
     return ""
 
 
+#: A project id is an opaque generated token (12 hex chars in practice). It
+#: is NOT a path fragment, and it reaches this function straight from a
+#: client query parameter on `/api/upload?project_id=`.
+_SAFE_PROJECT_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,63}\Z")
+
+
+def _safe_project_id(pid) -> str:
+    """Normalise a project id, or refuse to scope at all.
+
+    ⚠ SECURITY. This used to be `pid.strip().lower()` with no path handling,
+    and the value arrives from a client-supplied query parameter. Because the
+    scoped directory is built as ``base / "projects" / pid``, pathlib's join
+    semantics meant an ABSOLUTE id replaced the base outright and a
+    `../..` id walked out of the sandbox — and the upload route's
+    `_is_within(sandbox_dir, file_path)` check validated the file against the
+    ALREADY-ESCAPED `sandbox_dir`, so it always passed. `mkdir(parents=True)`
+    then created the directory. Verified: `project_id=/tmp/abs_pid` yielded
+    `/tmp/abs_pid`, and `project_id=../../` left the sandbox entirely.
+
+    Refusing (returning "") falls back to the unscoped sandbox root, which is
+    always inside the sandbox — fail CLOSED, and never silently onto a path
+    the caller chose.
+    """
+    if not isinstance(pid, str):
+        return ""
+    cleaned = pid.strip().lower()
+    if not cleaned:
+        return ""
+    if not _SAFE_PROJECT_ID_RE.match(cleaned):
+        import logging as _lg
+        _lg.getLogger("GhostAgent").warning(
+            "rejected unsafe project id %r — not scoping", pid[:80])
+        return ""
+    return cleaned
+
+
 def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=None):
     """Return ``(host_dir, container_workdir)`` scoped to the active project's
     workspace (``<sandbox>/projects/<id>/``), creating the dir on demand; or
@@ -484,10 +658,9 @@ def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=
     base = Path(sb) if sb is not None else None
     # An explicit caller-supplied project id wins over the racy global.
     if isinstance(explicit_project_id, str) and explicit_project_id.strip():
-        pid = explicit_project_id.strip().lower()
+        pid = _safe_project_id(explicit_project_id)
     else:
-        pid = getattr(context, "current_project_id", None)
-        pid = pid.strip().lower() if isinstance(pid, str) else ""
+        pid = _safe_project_id(getattr(context, "current_project_id", None))
     if not pid and not stateful and explicit_project_id is None:
         # ``current_project_id`` is process-global and can be cleared MID-REQUEST
         # by a concurrent conversation's reconcile (observed live: a 700s
@@ -495,7 +668,7 @@ def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=
         # writes landed in the sandbox ROOT and it thrashed for minutes). The
         # per-conversation binding is NOT stomped that way, so re-derive this
         # conversation's project from it.
-        pid = _conversation_bound_project(context)
+        pid = _safe_project_id(_conversation_bound_project(context))
     if pid and not stateful and base is not None:
         sub = base / "projects" / pid
         try:
@@ -867,10 +1040,16 @@ def _batch_result_failed(body: str) -> bool:
     only used to COUNT per-path outcomes inside the envelope; the envelope's
     own header is what those three classifiers actually read.
     """
+    # A migrated per-path body ANSWERS this; ADD-only, `ok` falls through.
+    _st = getattr(body, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) != "ok":
+        return True
     s = str(body or "").lstrip()
+    # "CRITICAL ERROR" does NOT start with "ERROR" — it was added to
+    # `_FAILURE_PREFIX_RE` alone and missed by every other prefix bank.
     return s.startswith(("Error", "ERROR", "[error]", "SYSTEM ERROR",
-                         "SYSTEM INSTRUCTION", "REJECTED", "Traceback",
-                         "Critical Tool Error"))
+                         "CRITICAL ERROR", "SYSTEM INSTRUCTION", "REJECTED",
+                         "Traceback", "Critical Tool Error"))
 
 
 # The PARTIAL header is load-bearing for outcome LABELS, not just for reading.
@@ -906,8 +1085,8 @@ async def tool_read_files(entries: "list[str]", sandbox_dir: Path, *,
     """
     requested = [e for e in (entries or []) if str(e).strip()]
     if not requested:
-        return ("SYSTEM INSTRUCTION: 'paths' was empty. Pass one path per "
-                "entry, e.g. paths=[\"model.py\", \"train.py\"].")
+        return (ToolOutcome.rejected("SYSTEM INSTRUCTION: 'paths' was empty. Pass one path per "
+                "entry, e.g. paths=[\"model.py\", \"train.py\"]."))
     used = requested[:_BATCH_MAX_PATHS]
     dropped = requested[_BATCH_MAX_PATHS:]
 
@@ -1279,7 +1458,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             icon=Icons.WARN,
         )
         return (
-            "SYSTEM INSTRUCTION: REPLACE REJECTED — your 'content' and "
+            ToolOutcome.rejected("SYSTEM INSTRUCTION: REPLACE REJECTED — your 'content' and "
             f"'replace_with' arguments arrived BYTE-IDENTICAL "
             f"({len(str(old_text))} chars). Replacing a block with itself is "
             "always a mistake; this usually means the tool-call transport "
@@ -1296,7 +1475,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             "<your NEW text>\n"
             ">>>>\n"
             "This single-argument form is immune to the argument-merge "
-            "corruption."
+            "corruption.")
         )
 
     if not has_aider_blocks and new_text is None:
@@ -1327,6 +1506,15 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                         str(old_text), filename=filename)
                 else:
                     clean_content = str(old_text)
+                # ⚠ armed BEFORE the call, not after. `Path.write_text`
+                # opens with 'w': it truncates first and writes second, so an
+                # OSError raised by the write itself (ENOSPC, EIO, EDQUOT,
+                # EFBIG) leaves a truncated file behind. Setting the flag
+                # afterwards meant that case took the "nothing was touched"
+                # arm — a DECLARED rejection over a half-written file, and
+                # the `failed(world_changed=True)` arm written for it was
+                # unreachable.
+                _wrote = True
                 await asyncio.to_thread(path.write_text, clean_content, encoding="utf-8")
                 pretty_log(
                     "File Replace Auto-Promote",
@@ -1334,20 +1522,47 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                     level="WARNING",
                     icon=Icons.WARN,
                 )
-                return (
+                _syn = await _syntax_feedback(path, filename)
+                _text = (
                     f"SUCCESS: auto-promoted operation='replace' to 'write' for "
                     f"'{filename}' because your 'content' was a complete Python "
                     f"module and 'replace_with' was missing. The file has been "
                     f"overwritten. Next time, use operation='write' directly "
                     f"when you intend to rewrite the whole file."
-                    + await _syntax_feedback(path, filename)
+                    + _syn
                 )
+                if _syn:
+                    return ToolOutcome.partial(
+                        _text, world_changed=True,
+                        reason_code="written_but_syntax_failed")
+                return _text
             except Exception as e:
-                return (
-                    f"SYSTEM INSTRUCTION: Attempted to auto-promote replace→write "
-                    f"but the write failed: {e}. Retry with operation='write'."
-                )
-        return "SYSTEM INSTRUCTION: You used operation='replace' but forgot to specify 'replace_with'. If you want to rewrite the entire file, use operation='write'. Otherwise, provide 'replace_with'."
+                # ⚠ NOT a rejection once the write has been attempted.
+                # `Path.write_text` opens with 'w': it TRUNCATES first and
+                # writes second, so an OSError here (ENOSPC, EIO, EDQUOT,
+                # EFBIG) leaves a truncated or half-written file. Reproduced
+                # under RLIMIT_FSIZE: 5,434 bytes in, 8,192 bytes of a
+                # different file out, original gone — and reported as
+                # "changed nothing", which would have let the pre-flight
+                # guard record it and the loop-breaker believe the file was
+                # untouched. This is the one site `world_changed` exists
+                # for. A failure BEFORE the write (markdown extraction) is
+                # still a true refusal.
+                _msg = (f"SYSTEM INSTRUCTION: Attempted to auto-promote "
+                        f"replace→write but the write failed: {e}. Retry "
+                        f"with operation='write'.")
+                if _wrote:
+                    _msg = (f"SYSTEM INSTRUCTION: auto-promoted "
+                            f"replace→write on '{filename}' and the write "
+                            f"LANDED, but a later step failed: {e}. The file "
+                            f"has been overwritten — re-read it before "
+                            f"acting on it.")
+                return ToolOutcome.failed(
+                    _msg, world_changed=True,
+                    reason_code="auto_promote_write_failed") if _wrote else \
+                    ToolOutcome.rejected(
+                        _msg, reason_code="auto_promote_failed_before_write")
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: You used operation='replace' but forgot to specify 'replace_with'. If you want to rewrite the entire file, use operation='write'. Otherwise, provide 'replace_with'.", reason_code="missing_replace_with")
         
     ext = str(filename).split('.')[-1].lower()
     if ext in ["py", "html", "css", "js", "ts", "json", "sh", "yaml", "yml", "csv", "xml"]:
@@ -1464,13 +1679,13 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                                 f"({leak}) — file left unchanged",
                                 icon=Icons.WARN, level="WARNING")
                             return (
-                                f"REJECTED: that replace would have written "
+                                ToolOutcome.rejected(f"REJECTED: that replace would have written "
                                 f"SEARCH/REPLACE marker line(s) ({leak}) into "
                                 f"'{filename}' as literal file content — "
                                 f"'{filename}' is unchanged on disk. Emit ONE "
                                 f"complete envelope per edit, or use "
                                 f"operation='write' if the file legitimately "
-                                f"needs such a line.")
+                                f"needs such a line."))
                         _g_ext = str(filename).split(".")[-1].lower()
                         if _g_ext in ("py", "json", "js", "mjs", "cjs", "html", "htm"):
                             # Syntax-checkable type: load both versions once
@@ -1491,11 +1706,11 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                                     f"syntax ({regression}) — file left unchanged",
                                     icon=Icons.WARN, level="WARNING")
                                 return (
-                                    f"REJECTED: that replace would introduce a "
+                                    ToolOutcome.rejected(f"REJECTED: that replace would introduce a "
                                     f"syntax error and was NOT applied — "
                                     f"'{filename}' is unchanged on disk: "
                                     f"{regression}. Re-read the file and emit a "
-                                    f"corrected surgical edit.")
+                                    f"corrected surgical edit."))
                         await asyncio.to_thread(os.replace, _tmp, path)
                         _committed = True
                     finally:
@@ -1584,7 +1799,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 ]
 
             if not blocks:
-                return "SYSTEM INSTRUCTION: Found SEARCH/REPLACE markers but failed to parse them. Ensure you use <<<< SEARCH, ====, and >>>> correctly."
+                return ToolOutcome.rejected("SYSTEM INSTRUCTION: Found SEARCH/REPLACE markers but failed to parse them. Ensure you use <<<< SEARCH, ====, and >>>> correctly.", reason_code="unparsable_blocks")
             
             success_count = 0
             errors = []
@@ -1689,9 +1904,25 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                             "VERIFY the result is what you intended.")
                 if errors:
                     msg += f" SYSTEM INSTRUCTION: {len(errors)} blocks failed:\n" + "\n".join(errors)
-                return await _write_replace_guarded(path, prev_content, file_content, filename, msg, post_edit=post_edit)
+                _res = await _write_replace_guarded(
+                    path, prev_content, file_content, filename, msg,
+                    post_edit=post_edit)
+                if errors and not getattr(_res, "is_rejection", False):
+                    # Some blocks landed and some did not: PARTIAL.
+                    # ⚠ Only when the write actually LANDED. The guard can
+                    # roll the whole edit back (marker leak, syntax
+                    # regression) and return REJECTED — relabelling that
+                    # PARTIAL with `world_changed=True` claimed a mutation
+                    # over a file that never changed, which fires
+                    # `strikes.note_world_changed()` and wipes the
+                    # loop-breaker's memory. Keep the guard's own verdict.
+                    return ToolOutcome.partial(
+                        str(_res),
+                        world_changed=getattr(_res, "changed_the_world", True),
+                        reason_code="some_replace_blocks_failed")
+                return _res
             else:
-                return f"SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '{filename}'.\n" + "\n".join(errors)
+                return ToolOutcome.rejected(f"SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '{filename}'.\n" + "\n".join(errors), reason_code="no_blocks_matched")
 
         # 1. Exact match attempt
         if old_text in file_content:
@@ -1720,7 +1951,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 f"SUCCESS: Flexible match found and replaced in '{filename}'.",
                 post_edit=post_edit)
         elif len(matches) > 1:
-            return "SYSTEM INSTRUCTION: Multiple instances of this text block found. Please provide a larger, more unique block of code in 'content' to ensure we replace the correct one."
+            return ToolOutcome.rejected("SYSTEM INSTRUCTION: Multiple instances of this text block found. Please provide a larger, more unique block of code in 'content' to ensure we replace the correct one.", reason_code="ambiguous_block")
 
         # 2.5 Fuzzy contiguous-block match. The flexible matcher above
         # only forgives whitespace; a single misremembered character or a
@@ -1749,8 +1980,9 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 f"near-identical block was unambiguous.",
                 post_edit=post_edit)
             if res.startswith("SUCCESS"):
-                res += (f" VERIFY the change is what you "
-                        f"intended:\n--- REPLACED BLOCK (was) ---\n{matched_text[:600]}")
+                res = append_note(res, f" VERIFY the change is what you "
+                                  f"intended:\n--- REPLACED BLOCK (was) ---\n"
+                                  f"{matched_text[:600]}")
             return res
 
         # 2.7 Anchor-block match. When the block's BOUNDARIES are stable but
@@ -1776,8 +2008,9 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 f"the middle differed from your old_text).",
                 post_edit=post_edit)
             if res.startswith("SUCCESS"):
-                res += (f" VERIFY the change:\n"
-                        f"--- REPLACED BLOCK (was) ---\n{matched_text[:600]}")
+                res = append_note(res, f" VERIFY the change:\n"
+                                  f"--- REPLACED BLOCK (was) ---\n"
+                                  f"{matched_text[:600]}")
             return res
 
         # 3. Neither exact nor flexible nor fuzzy nor anchor match. Return a
@@ -1827,7 +2060,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
                 "for the surgical edit.\n"
             )
         return (
-            "SYSTEM INSTRUCTION: The search block was NOT found in '"
+            ToolOutcome.rejected("SYSTEM INSTRUCTION: The search block was NOT found in '"
             + filename
             + "'. Your remembered `old_text` does NOT byte-match the "
             "current file — either (a) your SEARCH block has an off-by-"
@@ -1840,7 +2073,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str,
             "  3. If two replace attempts have already failed on this "
             "file, STOP retrying the SAME old_text — copy the exact text from "
             "the snippet below instead. Do not loop.\n"
-            "CLOSEST MATCH IN THE FILE (with line numbers):\n" + snippet
+            "CLOSEST MATCH IN THE FILE (with line numbers):\n" + snippet, reason_code="search_block_not_found")
         )
         
     except ValueError as ve: return str(ve)
@@ -2649,7 +2882,7 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
                    f"line(s) into the file ({leak}) — file left unchanged",
                    icon=Icons.WARN, level="WARNING")
         return (
-            f"REJECTED: that replace would have written SEARCH/REPLACE "
+            ToolOutcome.rejected(f"REJECTED: that replace would have written SEARCH/REPLACE "
             f"marker line(s) ({leak}) into '{filename}' as literal file "
             f"content — '{filename}' is unchanged on disk. This usually "
             f"means you packed more than one edit into a single "
@@ -2657,7 +2890,7 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
             f"(each with its own '<<<< SEARCH', '====' and '>>>>' lines); "
             f"multiple envelopes in one call are fine. If the file "
             f"legitimately needs a line of exactly '====', use "
-            f"operation='write' or an execute script instead."
+            f"operation='write' or an execute script instead.")
         )
     regression = _syntax_regression(prev_content, new_content, filename)
     if not regression:
@@ -2679,13 +2912,13 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
         # mistake self-evident.
         _snippet = _would_be_snippet(new_content, regression)
         return (
-            f"REJECTED: that replace would introduce a syntax error and was "
+            ToolOutcome.rejected(f"REJECTED: that replace would introduce a syntax error and was "
             f"NOT applied — '{filename}' is unchanged on disk: {regression}."
             + (f"\nThe REJECTED result around that line would have read:\n"
                f"{_snippet}\n" if _snippet else " ")
             + f"Your replacement block's indentation or structure is off. "
             f"Re-read the file, then emit a TIGHT single-line SEARCH/REPLACE "
-            f"for the surgical edit. Do NOT rewrite the whole file."
+            f"for the surgical edit. Do NOT rewrite the whole file.", reason_code="syntax_regression_rolled_back")
         )
     # errors="surrogateescape": new_content is the replace result, which splices
     # the LLM's (clean) replacement into the untouched file body — that body may
@@ -2696,10 +2929,15 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     # Whole-file defs diff: symbols defined in the previous content but not
     # in the new content were removed by this edit; surviving references to
     # them get named in the result (see _orphaned_symbol_warning).
-    return (success_msg
-            + _orphaned_symbol_warning(prev_content, new_content, new_content)
-            + await _syntax_feedback(path, filename)
-            + (post_edit_view(prev_content, new_content) if post_edit else ""))
+    _syn = await _syntax_feedback(path, filename)
+    _text = (success_msg
+             + _orphaned_symbol_warning(prev_content, new_content, new_content)
+             + _syn
+             + (post_edit_view(prev_content, new_content) if post_edit else ""))
+    if _syn:
+        return ToolOutcome.partial(_text, world_changed=True,
+                                   reason_code="written_but_syntax_failed")
+    return _text
 
 
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
@@ -2789,11 +3027,15 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
             rel_str = str(filename)
         summary = _fixture_summary(content, ext)
         syntax_note = await _syntax_feedback(path, filename)
-        return (
+        _text = (
             f"SUCCESS: Wrote {len(content)} chars to '{filename}'. "
             f"Script-side path (from sandbox cwd): '{rel_str}'."
             f"{summary}{syntax_note}"
         )
+        if syntax_note:
+            return ToolOutcome.partial(_text, world_changed=True,
+                                       reason_code="written_but_syntax_failed")
+        return _text
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
@@ -3440,7 +3682,7 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
             # served as page 1); declare nonlocal so that assignment doesn't
             # shadow the enclosing parameter and UnboundLocalError the reads.
             nonlocal page
-            if filename.lower().endswith(".pdf"):
+            if str(filename).lower().endswith(".pdf"):
                 try:
                     import fitz # PyMuPDF
                 except ImportError:
@@ -3586,13 +3828,13 @@ def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
         proj = project_store.get_project(pid)
         if proj and str(proj.get("status", "")).upper() == "RELEASED":
             return (
-                f"SYSTEM BLOCK: project {pid} is RELEASED (human-attested, "
+                ToolOutcome.rejected(f"SYSTEM BLOCK: project {pid} is RELEASED (human-attested, "
                 f"immutable) — this write was NOT applied. To change it, "
                 f"fork a development copy first: manage_projects "
                 f"action=create_version project_id={pid} "
                 f"description=\"<the requested change>\", then edit the new "
                 f"version's workspace. The released version keeps running "
-                f"untouched.")
+                f"untouched."))
     except Exception:
         return None
     return None
@@ -3600,7 +3842,7 @@ def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
 
 async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
     if not operation:
-        return "SYSTEM INSTRUCTION: The 'operation' parameter is MANDATORY. You must specify it (e.g., operation='read')."
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'operation' parameter is MANDATORY. You must specify it (e.g., operation='read').", reason_code="missing_operation")
     # Release immutability: block mutations into a RELEASED project's
     # workspace at the WRITE PATH (see _released_write_block).
     if str(operation or "").strip().lower() not in _READ_ONLY_OPS:
@@ -3677,7 +3919,7 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     # If the LLM put the content in 'path' but didn't provide 'content' (common for write)
     if operation == "write" and target_path and not final_content:
         # Check if the LLM accidentally sent the content as the only other parameter
-        return "SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY for write operations. You must provide the full text to write."
+        return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY for write operations. You must provide the full text to write.", reason_code="missing_content")
 
     sandbox_manager = kwargs.get("sandbox_manager")
 
@@ -3691,17 +3933,17 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     if operation == "search": 
         search_target = pattern or final_content
         if not search_target:
-            return "SYSTEM INSTRUCTION: The 'pattern' parameter is MANDATORY for search operations."
+            return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'pattern' parameter is MANDATORY for search operations.", reason_code="missing_pattern")
         return await tool_file_search(search_target, sandbox_dir, target_path, sandbox_manager)
     if operation == "find":
         search_target = pattern or final_content
         if not search_target:
-            return "SYSTEM INSTRUCTION: The 'pattern' parameter is MANDATORY for find operations (e.g. '*.py')."
+            return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'pattern' parameter is MANDATORY for find operations (e.g. '*.py').", reason_code="missing_pattern")
         return await tool_find_files(search_target, sandbox_manager, target_path or ".", sandbox_dir=sandbox_dir)
     
     if operation == "download":
         if not url:
-            return "SYSTEM INSTRUCTION: The 'url' parameter is MANDATORY for download operations."
+            return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'url' parameter is MANDATORY for download operations.", reason_code="missing_url")
             
         # Auto-heal missing or invalid target_path
         if not target_path or str(target_path).strip() == "" or str(target_path).startswith("http") or target_path == url:
@@ -3712,7 +3954,7 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         return await tool_download_file(url=str(url), sandbox_dir=sandbox_dir, tor_proxy=kwargs.get("tor_proxy"), filename=target_path)
 
     if not target_path: 
-        return f"SYSTEM INSTRUCTION: The 'path' (target filename) is missing for the '{operation}' operation. You MUST specify WHICH file to {operation}."
+        return ToolOutcome.rejected(f"SYSTEM INSTRUCTION: The 'path' (target filename) is missing for the '{operation}' operation. You MUST specify WHICH file to {operation}.", reason_code="missing_path")
     
     if operation == "read":
         # Optional line-range (#11). Accept the common aliases the model
@@ -3785,7 +4027,7 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         if rw and (not copy_target or copy_target == target_path):
             copy_target = rw
         if not copy_target:
-            return "SYSTEM INSTRUCTION: The 'destination' parameter is MANDATORY for copy operations (must contain the destination filename/path)."
+            return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'destination' parameter is MANDATORY for copy operations (must contain the destination filename/path).", reason_code="missing_destination")
         return await tool_copy_file(target_path, copy_target, sandbox_dir)
 
     if operation in ["rename", "move"]:
@@ -3796,10 +4038,13 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
             rename_target = rw
 
         if not rename_target:
-            return "SYSTEM INSTRUCTION: The 'destination' parameter is MANDATORY for rename/move operations (must contain the new filename/path)."
+            return ToolOutcome.rejected("SYSTEM INSTRUCTION: The 'destination' parameter is MANDATORY for rename/move operations (must contain the new filename/path).")
         return await tool_rename_file(target_path, rename_target, sandbox_dir)
         
     if operation == "delete":
         return await tool_delete_file(target_path, sandbox_dir)
     
-    return f"Unknown operation: {operation}"
+    return ToolOutcome.rejected(
+        f"Unknown operation: {operation}. Valid operations are: read, write, "
+        f"replace, list_files, delete, find, batch.",
+        reason_code="unknown_operation")

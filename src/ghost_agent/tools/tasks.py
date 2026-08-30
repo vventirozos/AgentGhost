@@ -263,7 +263,7 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
         return "Error: Proactive task runner not initialized."
         
     try:
-        job_id = f"task_{hashlib.md5(task_name.encode()).hexdigest()[:10]}"
+        job_id = f"task_{hashlib.md5(str(task_name).encode()).hexdigest()[:10]}"
 
         err = _add_job(scheduler, job_id, task_name, prompt, cron_expression)
         if err:
@@ -321,7 +321,7 @@ async def tool_watch_condition(task_name: str, check_command: str,
     except (TypeError, ValueError):
         return "Error: interval_secs must be an integer number of seconds (e.g. 60)."
     try:
-        job_id = f"watch_{hashlib.md5(task_name.encode()).hexdigest()[:10]}"
+        job_id = f"watch_{hashlib.md5(str(task_name).encode()).hexdigest()[:10]}"
         cron = f"interval:{secs}"
         err = _add_job(scheduler, job_id, task_name, reaction_prompt, cron,
                        kind="watch", check_command=check_command)
@@ -413,7 +413,7 @@ async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=No
     # Normalise like the sibling tools (self_state, introspect, uncertainty):
     # the dispatcher passes arg VALUES through raw, so "Create"/" list " would
     # otherwise fall through to "unknown action" and silently no-op.
-    action = action.strip().lower()
+    action = str(action or "").strip().lower()
     if not scheduler:
         return "Error: Background task scheduling is disabled or not available in this context."
 

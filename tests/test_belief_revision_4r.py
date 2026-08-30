@@ -266,8 +266,24 @@ def test_top_tier_gates_key_off_effective_threshold():
     # TEST passed on it because it only checked the source text. The filter is
     # now unconditional on score, which is what "a tuning knob must not disarm
     # a safety filter" actually requires.
-    assert "if not (is_personal or is_technical):" in src
     assert "_top_tier" not in src, "the no-op top-tier gate is back"
+    # ⚠ The filter must ABORT, not merely log. Deleting the single `return`
+    # in its branch leaves the log line and stores the fact anyway — junk
+    # into the durable profile store, with a message on the operator line
+    # saying it was discarded. Read the branch, not the condition.
+    import ast as _ast
+    import textwrap as _tw
+    _tree = _ast.parse(_tw.dedent(src))
+    _guards = [n for n in _ast.walk(_tree)
+               if isinstance(n, _ast.If)
+               and "is_personal or is_technical" in _ast.unparse(n.test)]
+    assert _guards, "the generic-knowledge filter moved"
+    for g in _guards:
+        assert any(isinstance(x, (_ast.Return, _ast.Continue, _ast.Raise))
+                   for x in g.body), (
+            "the generic-knowledge filter only LOGS — it prints "
+            "'Discarded generic knowledge' and stores the fact anyway: "
+            + _ast.unparse(g)[:120])
     assert "if score >= 0.9 and not (is_personal" not in src
 
 

@@ -4974,12 +4974,18 @@ Return ONLY a JSON object with:
                     level="WARNING", icon=Icons.WARN,
                 )
             else:
-                return (
+                from ..tools.outcome import ToolOutcome
+                # `Synthetic challenge generation failed:` is not a head any
+                # predicate in this tree recognises (the anchored failure
+                # regex needs `Error`/`ERROR` at position 0), so these
+                # reached the verifier's run gate and the corpus as clean
+                # successes.
+                return ToolOutcome.failed(
                     f"Synthetic challenge generation failed the quality gate after "
                     f"{gen_attempt_limit} attempts. Last rejection: {rejection_feedback}\n\n"
                     "SYSTEM INSTRUCTION: The self-play tool could not produce a "
-                    "winnable challenge. Do not retry automatically."
-                )
+                    "winnable challenge. Do not retry automatically.",
+                    world_changed=False, reason_code="selfplay_quality_gate")
 
         pretty_log("Synthetic Challenge", challenge[:80] + "...", icon=Icons.TOOL_CODE)
 
@@ -5228,20 +5234,26 @@ Return ONLY a JSON object with:
                     )
                     if syn_code != 0:
                         pretty_log("Self-Play Error", f"Setup script has syntax errors:\n{syn_out}", level="WARNING", icon=Icons.WARN)
-                        return (
+                        from ..tools.outcome import ToolOutcome
+                        return ToolOutcome.failed(
                             f"Synthetic challenge generation failed: setup script has syntax errors.\n"
                             f"Error:\n{syn_out}\n\n"
                             "SYSTEM INSTRUCTION: This setup script was tested in a temporary, isolated "
                             "sandbox that has now been destroyed. DO NOT try to fix `.setup.py` using "
                             "the file_system tool. DO NOT call the `self_play` tool again. Inform the "
-                            "user that generation failed."
-                        )
+                            "user that generation failed.",
+                            world_changed=False,
+                            reason_code="selfplay_setup_syntax")
 
                     pretty_log("Self-Play Setup", "Executing setup script to prepare sandbox...", icon=Icons.TOOL_CODE)
                     s_out, s_code = await asyncio.to_thread(isolated_context.sandbox_manager.execute, "python3 .setup.py", 60)
                     if s_code != 0:
                         pretty_log("Self-Play Error", f"Setup script failed: {s_out}", level="WARNING", icon=Icons.WARN)
-                        return f"Synthetic challenge generation failed during setup script execution:\n{s_out}\n\nSYSTEM INSTRUCTION: This setup script was executed in a temporary, isolated sandbox that has now been destroyed. DO NOT try to fix `.setup.py` using the file_system tool. DO NOT call the `self_play` tool again. Inform the user that generation failed."
+                        from ..tools.outcome import ToolOutcome
+                        return ToolOutcome.failed(
+                            f"Synthetic challenge generation failed during setup script execution:\n{s_out}\n\nSYSTEM INSTRUCTION: This setup script was executed in a temporary, isolated sandbox that has now been destroyed. DO NOT try to fix `.setup.py` using the file_system tool. DO NOT call the `self_play` tool again. Inform the user that generation failed.",
+                            world_changed=False,
+                            reason_code="selfplay_setup_failed")
 
                     # Snapshot the mock files the setup script produced
                     # (recursively — see module-level _snapshot_mocks), so
@@ -5310,15 +5322,17 @@ Return ONLY a JSON object with:
                         f"Validator script failed pre-flight:\n{v_out}",
                         level="WARNING", icon=Icons.WARN,
                     )
-                    return (
+                    from ..tools.outcome import ToolOutcome
+                    return ToolOutcome.failed(
                         "Synthetic challenge generation failed: the designated "
                         "validator script failed pre-flight (module-scope error).\n"
                         f"Error:\n{v_out}\n\nSYSTEM INSTRUCTION: This validator "
                         "script was tested in a temporary, isolated sandbox that "
                         "has now been destroyed. DO NOT try to fix `.validator.py` "
                         "using the file_system tool. DO NOT call the `self_play` "
-                        "tool again. Inform the user that generation failed."
-                    )
+                        "tool again. Inform the user that generation failed.",
+                        world_changed=False,
+                        reason_code="selfplay_generation_failed")
 
                 # --- Validator self-test gate -------------------------
                 # Catches "validator crashes on its own expected_output"
@@ -5478,7 +5492,8 @@ Return ONLY a JSON object with:
                                         pth.unlink()
                                     except Exception:
                                         pass
-                                return (
+                                from ..tools.outcome import ToolOutcome
+                                return ToolOutcome.failed(
                                     "Synthetic challenge generation failed: the "
                                     "validator crashes on, or rejects, its own "
                                     "expected_output — an internal contradiction "
@@ -5491,8 +5506,9 @@ Return ONLY a JSON object with:
                                     f"{(sv_out or '')[-400:]}\n\nSYSTEM INSTRUCTION: "
                                     "The challenge was tested in a temporary "
                                     "sandbox that has now been destroyed. DO NOT "
-                                    "call the self_play tool again automatically."
-                                )
+                                    "call the self_play tool again automatically.",
+                                    world_changed=False,
+                                    reason_code="selfplay_generation_failed")
                             # Clean up the probe solution.py before the
                             # real solver sees a clean sandbox.
                             try:
@@ -5598,7 +5614,8 @@ Return ONLY a JSON object with:
                             f"setup data — {_why}",
                             level="ERROR", icon=Icons.STOP,
                         )
-                        return (
+                        from ..tools.outcome import ToolOutcome
+                        return ToolOutcome.failed(
                             "Synthetic challenge generation failed: the challenge's "
                             "own reference solution does not pass its validator "
                             "against the data the setup script wrote — the challenge "
@@ -5606,8 +5623,9 @@ Return ONLY a JSON object with:
                             f"and has been discarded.\nDetail: {_why}\n\n"
                             "SYSTEM INSTRUCTION: The challenge was tested in a "
                             "temporary sandbox that has now been destroyed. DO NOT "
-                            "call the self_play tool again automatically."
-                        )
+                            "call the self_play tool again automatically.",
+                            world_changed=False,
+                            reason_code="selfplay_generation_failed")
 
                 temp_agent = GhostAgent(isolated_context)
                 # Any tool that writes to real, non-isolated state must

@@ -667,7 +667,79 @@ _BOOKKEEPING_TOOL_NAMES = frozenset({
 })
 
 
-def _bookkeeping_informational(content: str, *, id_linkage: bool = False) -> bool:
+def _action_failed(content, tool_name: str = "") -> bool:
+    """Did this recorded tool call fail? THE question, asked of a stored row.
+
+    The dispatch loop answers it once per call and every in-loop consumer
+    reads that one answer. Anything that re-derives it from a row AFTER the
+    turn — the episode store, the info-gathering gate, an eval harness —
+    must ask the same way, or the stored label contradicts the live one.
+    Three private prose banks did, and each was wrong in its own direction.
+
+    UNRESOLVED is not a failure: a detached job has no verdict yet.
+    """
+    from ..tools.outcome import OutcomeStatus, ToolOutcome
+    # `coerce` PASSES THROUGH an existing outcome — re-coercing `str(content)`
+    # would rebuild it as DERIVED and re-sniff a banner the producer already
+    # answered for (a `manage_projects` ledger quoting someone else's
+    # `EXIT CODE: 1`).
+    if isinstance(content, (list, tuple)):
+        # block-style content: any failing part fails the call
+        return any(_action_failed(_p, tool_name) for _p in content)
+    if isinstance(content, dict):
+        content = content.get("text") or content.get("content") or ""
+    _o = ToolOutcome.coerce(content if isinstance(content, ToolOutcome)
+                            else str(content or ""))
+    if _o.status is OutcomeStatus.UNRESOLVED:
+        return False
+    # ...and the TEXT form of the third state, for rows rehydrated from
+    # JSONL where no status survives (the offline seeder's whole diet).
+    try:
+        from ..distill.outcome_heuristics import is_unresolved_tool_result
+        if is_unresolved_tool_result(str(content or "")):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    # the same shell/banner split the loop uses
+    return bool(_o.is_failure
+                or (_o.shell_failed if tool_name == "execute"
+                    else _o.exit_code_failed))
+
+
+def _bookkeeping_call_failed(content) -> bool:
+    """Did this bookkeeping tool call FAIL?
+
+    Was `c.startswith(("Error", "SYSTEM BLOCK", "REJECTED"))`, inlined at
+    three sites. Case-SENSITIVE, so `ERROR:` and `SYSTEM ERROR:` — which
+    `manage_projects` and `knowledge_base` both emit — matched nothing:
+    measured, **15 of the 22 failed bookkeeping calls in the corpus (68%)
+    were invisible**. Consequences at turn level: 12 turns carry one, on 2 of
+    them the evidence run-gate returns `None` so the verifier never runs at
+    all, and on 5 the ACTION view returns `None`, disarming the
+    unverified-mutation guard and code-shape routing. That is exactly the
+    blind spot the 2026-07-25 error carve-out was added to close, reopened by
+    letter case.
+
+    Reads the STATUS first — the content is a `ToolOutcome` on the live path
+    — then the prefixes, case-insensitively.
+    """
+    _st = getattr(content, "status", None)
+    if _st is not None and str(getattr(_st, "value", _st)) not in (
+            "ok", "unresolved", "partial"):
+        # PARTIAL is excluded on purpose: `update_profile` returns it when
+        # the canonical write LANDED and only a secondary index lagged.
+        # Counting it a failure made a bookkeeping PARTIAL shadow the real
+        # action in `_find_substantive_tool_for_verifier`, which its own
+        # docstring says "silently disables the untested-write guard and
+        # demotes code-shaped audits to the weaker claim branch".
+        return True
+    c = str(content or "").lstrip().lower()
+    return c.startswith(("error", "system block", "system error", "rejected",
+                         "critical error", "system instruction",
+                         "[error]", "traceback", "security error"))
+
+
+def _bookkeeping_informational(content, *, id_linkage: bool = False) -> bool:
     """True when a BOOKKEEPING tool's output carries verifiable substance
     rather than a bare state-change confirmation.
 
@@ -689,9 +761,9 @@ def _bookkeeping_informational(content: str, *, id_linkage: bool = False) -> boo
       mutation confirmation is the 2026-04-19 guaranteed-REFUTED shape, so
       it must not summon the judge on its own.
     """
-    c = (content or "").strip()
-    if c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+    if _bookkeeping_call_failed(content):
         return True
+    c = str(content or "").strip()
     if len(c) >= 200:
         return True
     if id_linkage and re.search(r"\b[0-9a-f]{12}\b", c):
@@ -732,9 +804,10 @@ def _should_await_repair_verdict(budget: float, lt, unverified: bool) -> bool:
         return False
     if not _tool_is_bookkeeping(lt):
         return True
-    _c = str(lt.get("content", "")).lstrip()
-    if _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+    _raw = lt.get("content", "")
+    if _bookkeeping_call_failed(_raw):
         return True
+    _c = str(_raw).lstrip()
     _name = str(lt.get("name", "")).lower().strip()
     return (_name.replace("-", "_").replace(" ", "_") == "manage_projects"
             and '"stop_reason"' in _c)
@@ -791,7 +864,9 @@ def _find_substantive_tool_for_verifier(
         # "managetasks" → "manage_tasks" mapping elsewhere).
         collapsed = name.replace("-", "_").replace(" ", "_")
         if collapsed in _BOOKKEEPING_TOOL_NAMES:
-            _c = str(tool.get("content", "")).lstrip()
+            # NOT `str(...)`: that discards the status before the gate
+            # below can read it.
+            _c = tool.get("content", "")
             # Informational bookkeeping output IS a reason to run the
             # verifier (§4BC 2026-08-12). This covers the two prior
             # carve-outs and one new class, all via the shared predicate:
@@ -816,7 +891,7 @@ def _find_substantive_tool_for_verifier(
             if include_informational_bookkeeping:
                 if _bookkeeping_informational(_c):
                     return tool
-            elif _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+            elif _bookkeeping_call_failed(_c):
                 return tool
             # An autoadvance BATCH OUTCOME is a substantive completion/
             # failure claim, not a state-change confirmation (2026-08-01
@@ -1026,10 +1101,27 @@ def _turn_had_tool_failure(tools_run: Optional[list]) -> bool:
     if not tools_run:
         return False
     from ..distill.outcome_heuristics import looks_like_tool_error
+    from ..tools.outcome import OutcomeStatus
     for tool in tools_run:
         if not tool:
             continue
-        if looks_like_tool_error(str(tool.get("content", "") or "")):
+        content = tool.get("content", "") or ""
+        # Read the STATUS when the content carries one. `str(...)` threw it
+        # away — the same defect `_reconstruct_tool_calls` was fixed for, in
+        # this same file, over this same `tools_run_this_turn` list. The
+        # sniffer cannot see a refusal (`SYSTEM INSTRUCTION: …`, `SYSTEM
+        # BLOCK: …`), so a turn whose only failures were refused mutations
+        # looked clean and the CONFIRM escalation never fired: measured, 15
+        # turns, 8% of the true high-stakes population.
+        #
+        # OR, never override — exactly as the corpus reconstruction does. An
+        # OK status must not suppress the sniffer's own evidence (a non-zero
+        # `EXIT CODE:` banner), and UNRESOLVED is not a verdict at all.
+        _st = getattr(content, "status", None)
+        if _st is not None and _st not in (OutcomeStatus.OK,
+                                           OutcomeStatus.UNRESOLVED):
+            return True
+        if looks_like_tool_error(str(content)):
             return True
     return False
 
@@ -1236,7 +1328,7 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             # length bar, so it "compared" the task id against the PROJECT
             # id and called the mismatch an error), but a bare id
             # confirmation must not summon the judge on its own.
-            _c = str(tool.get("content", "")).strip()
+            _c = tool.get("content", "")
             if not _bookkeeping_informational(_c, id_linkage=True):
                 continue
         candidates.append(tool)  # newest-first
@@ -3478,6 +3570,142 @@ def _render_assistant_with_tool_calls(content: str, tool_calls: list,
     return ast_content.strip()
 from ..utils.token_counter import estimate_tokens
 from ..tools.registry import get_available_tools, TOOL_DEFINITIONS, get_active_tool_definitions
+from ..tools.outcome import ToolOutcome as _TO
+
+#: knowledge_base actions that clear stored memory. `reset_all` deletes every
+#: id in the vector collection, resets the library index to `[]` and wipes the
+#: graph — a strictly larger wipe than `forget`, and it returns a SUCCESS
+#: string, so without this the turn's smart_memory / post_mortem / episode
+#: write all run afterwards and repopulate the store that was just emptied.
+_WIPE_ACTIONS = frozenset({"forget", "reset_all"})
+
+_FORGET_ACTION_RE = re.compile(
+    r'"action"\s*:\s*"\s*(?:forget|reset_all)\s*"', re.IGNORECASE)
+
+
+#: The kwarg name in "got multiple values for keyword argument 'x'".
+_DUPLICATE_KWARG_RE = re.compile(
+    r"got multiple values for keyword argument '([^']+)'")
+
+
+#: A shell-style envelope reporting a non-zero exit. `execute` has its own
+#: rescue for this, gated on `fname == "execute"` — but 12 live calls from
+#: other tools (`manage_projects`, `manage_composed_skills`, `jobs`,
+#: `youtube_transcribe`, `create_skill`) carry the same banner and got none.
+# `0*[1-9]` — any number containing a non-zero digit. A negative
+# lookahead on a single `0` called "EXIT CODE: 00" a failure.
+_EXIT_CODE_FAIL_RE = re.compile(r"EXIT CODE:\s*0*[1-9]\d*")
+
+
+def describe_invocation_error(fname: str, exc: Exception) -> str:
+    """The tool result for a call that could not even be entered.
+
+    The blanket wording was "(Did you forget a required argument?)", which is
+    the wrong instruction for the most common way this fires. Model arguments
+    are splatted unfiltered into a dispatch lambda that already supplies the
+    tool's context (`memory_system`, `sandbox_dir`, `llm_client`, …), so a
+    model that passes one of those names by mistake gets
+
+        TypeError: tool_knowledge_base() got multiple values for keyword
+        argument 'model_name'
+
+    and is then told to ADD an argument when the fix is to REMOVE one. The
+    same class as the §4DK forget loop: an error whose advice cannot work.
+    Name the offending argument and say to drop it.
+    """
+    text = str(exc)
+    dup = _DUPLICATE_KWARG_RE.search(text)
+    if dup:
+        return (
+            f"SYSTEM ERROR: '{dup.group(1)}' is MANDATORY to REMOVE from this "
+            f"call — it is not a parameter you may pass to '{fname}'. The "
+            f"system supplies it. Re-issue the call without it, keeping your "
+            f"other arguments: {text}"
+        )
+    if isinstance(exc, TypeError) and "unexpected keyword argument" in text:
+        return (
+            f"SYSTEM ERROR: '{fname}' does not accept one of the arguments "
+            f"you passed. Re-read the tool schema and re-issue with only the "
+            f"parameters it advertises: {text}"
+        )
+    # A prefix `result_is_failure` recognises. "Error invoking tool …" matched
+    # none of the prefixes the turn loop booked failures by, so every non-argument
+    # exception from every tool was recorded as a CLEAN SUCCESS: no strike,
+    # no classifier, no diagnostic, the success-decay streak advanced, and a
+    # crashed idempotent setter had its hash stored as applied so the
+    # model's retry was blocked with "the intended state is already
+    # applied". The old awaited path was `f"Error: {result}"`, which matched.
+    return (f"Error: invoking tool '{fname}' failed (did you forget a "
+            f"required argument?): {text}")
+
+
+def call_runs_a_memory_wipe(fname: str, raw_arguments, available=None) -> bool:
+    """Will this tool call clear stored memory?
+
+    Sets `forget_was_called`, which suppresses smart_memory, post_mortem and
+    the episode write for the turn. Get it wrong in the False direction and
+    the content the user just asked to forget is re-learned inside the same
+    request — tombstone resurrection.
+
+    So it matches what the DISPATCHER will see, not the raw string. Three
+    ways the previous `args.get("action") == "forget"` missed a wipe that
+    then ran:
+
+    * `tool_knowledge_base` normalises with `str(action).strip().lower()`
+      because models emit "Forget"; the XML argument parser strips only
+      CR/LF, so `<parameter name="action"> forget </parameter>` arrives as
+      `" forget "`.
+    * `json.loads` defaults to `strict=True`, so one raw control character
+      anywhere in the arguments raised here — while the parse 100 lines
+      later, which passes `strict=False`, succeeded and the wipe went
+      through.
+    * If the JSON is unparseable for any other reason, a regex over the raw
+      text still catches the action.
+
+    Biased toward True on purpose. A false positive costs one turn of
+    background bookkeeping; a false negative undoes the user's deletion.
+    """
+    # Resolve the TOOL name with the DISPATCHER'S OWN matcher, not a second
+    # one. This predicate runs ~314 lines before `_canonicalise_tool_name`,
+    # so a name the dispatcher heals but this does not means the wipe RUNS
+    # with the flag False — the tombstone resurrection above.
+    #
+    # The first fix re-implemented the healing here (alias table + a difflib
+    # pass at cutoff 0.85) and a review measured the residue: the dispatcher
+    # matches at 0.70 against the whole tool list, so `knowledge` (ratio
+    # 0.818) and `know_base` healed there and not here. Two implementations
+    # of one decision drift by construction; the fix is to have one. Pass
+    # `available` from the call site and this asks the same question the
+    # dispatch will ask. Without it, the alias table alone still covers the
+    # spellings actually observed (kb / knowledgebase / knowledge-base).
+    name = None
+    if available:
+        try:
+            name = GhostAgent._canonicalise_tool_name(fname, list(available))
+        except Exception:  # noqa: BLE001 — never let name-healing break a turn
+            name = None
+    if name is None:
+        norm = re.sub(r"[^a-z0-9]", "", str(fname or "").lower())
+        try:
+            name = GhostAgent._TOOL_ALIAS_TABLE.get(norm, norm)
+        except Exception:  # noqa: BLE001
+            name = norm
+    if name == "forget":
+        return True
+    if name != "knowledge_base":
+        return False
+    text = raw_arguments if isinstance(raw_arguments, str) else ""
+    try:
+        args = (json.loads(raw_arguments, strict=False)
+                if isinstance(raw_arguments, str) else raw_arguments)
+        if isinstance(args, dict) \
+                and str(args.get("action") or "").strip().lower() in _WIPE_ACTIONS:
+            return True
+    except Exception:  # noqa: BLE001 — the regex below is the backstop
+        pass
+    return bool(_FORGET_ACTION_RE.search(text))
+
+
 from ..tools.tasks import tool_list_tasks
 from ..memory.skills import SkillMemory
 
@@ -5041,6 +5269,7 @@ class GhostAgent:
         _PASTE_NOTE = ("the pasted content exceeded the context window; ask "
                        "the user for the missing part if needed")
 
+        from ..tools.outcome import with_text as _keep
         def _cut_str(c, keep, note):
             half = max(1, keep // 2)
             return (c[:half]
@@ -5069,18 +5298,18 @@ class GhostAgent:
                         hi = c.find('</tool_call>', lo)
                         if hi == -1:
                             if len(c) - lo > 2000:
-                                m["content"] = (
+                                m["content"] = _keep(c, (
                                     c[:lo] + f"\n[unclosed tool_call "
                                     f"({len(c) - lo:,} chars) dropped by "
-                                    "context budget enforcement]\n")
+                                    "context budget enforcement]\n"))
                                 return True
                             break
                         hi += len('</tool_call>')
                         if hi - lo > 4000:
-                            m["content"] = (
+                            m["content"] = _keep(c, (
                                 c[:lo] + f"\n[tool_call block ({hi - lo:,} "
                                 "chars) dropped by context budget "
-                                "enforcement]\n" + c[hi:])
+                                "enforcement]\n" + c[hi:]))
                             return True
                         pos = hi
                     # no oversized block: center-cut the largest TAG-FREE
@@ -5102,12 +5331,14 @@ class GhostAgent:
                         return False
                     a, b = max(segs, key=lambda ab: ab[1] - ab[0])
                     seg = c[a:b]
-                    m["content"] = (c[:a]
-                                    + _cut_str(seg, max(1500, len(seg) // 3),
-                                               note)
-                                    + c[b:])
+                    m["content"] = _keep(c, (c[:a]
+                                             + _cut_str(seg,
+                                                        max(1500, len(seg) // 3),
+                                                        note)
+                                             + c[b:]))
                     return True
-                m["content"] = _cut_str(c, max(1500, len(c) // 3), note)
+                m["content"] = _keep(c, _cut_str(c, max(1500, len(c) // 3),
+                                                 note))
                 return True
             if isinstance(c, list):
                 # § context R4 parity: the token COUNTER str()-coerces ANY
@@ -5540,16 +5771,43 @@ class GhostAgent:
         so the model retries with a different shape."""
         if not name:
             return None
+        # AN EXACT NAME IS ALREADY CANONICAL. Without this, normalisation
+        # decides between two tools that share a normalised key — and
+        # acquired skills are appended AFTER the built-ins, so a skill
+        # legally named `filesystem` won the key of `file_system` and every
+        # guard keyed on the result asked about the wrong tool: the
+        # empty-write block fired on a skill, the sandbox cache went stale
+        # after a real write, and a skill named `knowledgebase` left
+        # `forget_was_called` False while the wipe ran. It also keeps
+        # `_cname == fname` for every dispatchable call, which is what makes
+        # the request-scoped idempotency hash stable when the tool map
+        # changes mid-request.
+        if name in available:
+            return name
         normalised = re.sub(r'[^a-z0-9]', '', str(name).lower())
-        if normalised in cls._TOOL_ALIAS_TABLE:
-            mapped = cls._TOOL_ALIAS_TABLE[normalised]
-            if mapped in available:
-                return mapped
-        # Build normalised → canonical map of the actually-available tools
-        # so the difflib fallback can match without dashes/case noise.
+        # Normalised → canonical map of the actually-available tools.
         norm_to_real = {re.sub(r'[^a-z0-9]', '', t.lower()): t for t in available}
+        # A REAL name wins over an alias. The alias table used to be
+        # consulted first, and twelve of its keys (`fs`, `kb`, `search`,
+        # `system`, `vision`, `profile_update`, …) are legal acquired-skill
+        # names that the shadow checks — which reject only EXACT built-in
+        # names — allow. A skill actually called `fs` therefore dispatched
+        # as itself while every name-keyed guard was told it was
+        # `file_system`; with the guards now keyed on this result, one of
+        # them blocks it outright. An alias only ever means the built-in
+        # when nothing real answers to the name.
         if normalised in norm_to_real:
             return norm_to_real[normalised]
+        # Look the alias up in a NORMALISED view of the table. The lookup
+        # key has had every non-alphanumeric stripped, so any table key
+        # containing one could never match: `profile_update` (and any other
+        # entry written with a separator) was dead the day it was added.
+        _alias = {re.sub(r'[^a-z0-9]', '', k.lower()): v
+                  for k, v in cls._TOOL_ALIAS_TABLE.items()}
+        if normalised in _alias:
+            mapped = _alias[normalised]
+            if mapped in available:
+                return mapped
         import difflib as _difflib
         close = _difflib.get_close_matches(normalised, list(norm_to_real.keys()), n=1, cutoff=0.7)
         if close:
@@ -14360,6 +14618,12 @@ class GhostAgent:
             # a write can be intentional.
             batch_seen_reads: dict = {}   # a_hash -> index of first dispatch
             batch_dup_of: dict = {}       # dup index -> source index
+            # Failures raised before a tool is even entered. They never
+            # reach the classifier that records a failure for the turn, so
+            # without this the per-result success decay handed the strike
+            # straight back and a model pairing an un-enterable call with
+            # any trivial read ended the turn on zero strikes.
+            binding_failure_count = 0
             for _tc_idx, tool in enumerate(tool_calls):
                 # Strike cap inside the per-tool loop. The outer cap
                 # at the top of the turn loop only runs at turn
@@ -14376,19 +14640,52 @@ class GhostAgent:
                 raw_tools_called.add(fname)
                 tool_usage[fname] = tool_usage.get(fname, 0) + 1
 
+                # RESOLVE THE TOOL NAME ONCE, HERE — every decision below is
+                # keyed on a name, and the dispatch canonicalisation used to
+                # run ~330 lines further down, so each of them silently asked
+                # about a DIFFERENT tool than the one that would execute.
+                # `_TOOL_ALIAS_TABLE` maps knowledgebase / knowledge-base /
+                # kb -> knowledge_base and filesystem / fs -> file_system;
+                # its own comment cites "knowledgebase" as an observed Qwen
+                # 3.5 hallucination, so these are names the model really
+                # emits. Measured consequences of the split, one per
+                # consumer: the memory-wipe flag stayed False while the wipe
+                # ran (the forgotten content was re-learned in the same
+                # turn); two identical `knowledgebase` ingests were
+                # classified read-safe and dedup-collapsed, dropping a real
+                # ingest; an `fs` write left the workspace cache stale; and
+                # the empty-`content` write block was bypassed outright.
+                #
+                # `_cname` is the name the dispatch WILL use. Use it for
+                # every classification; `fname` remains the raw string for
+                # anything the model should see quoted back at it.
+                # Refresh the map on a MISS before resolving — the same
+                # condition the dispatch uses, hoisted so both see the same
+                # tool list. `available_tools` is a cached dict on a
+                # lifespan singleton, so a skill created mid-session is
+                # absent until a rebuild; resolving against the stale map
+                # turned a brand-new `update_prices` into a difflib guess of
+                # `update_profile`, and every guard below would then have
+                # classified it as that tool. Conditional, so the common
+                # case costs nothing.
+                if fname not in self.available_tools:
+                    self._rebuild_available_tools()
+                _cname = self._canonicalise_tool_name(
+                    fname, list(self.available_tools.keys())) or fname
 
-
-                if fname == "forget":
+                if call_runs_a_memory_wipe(
+                        fname, tool["function"]["arguments"],
+                        available=list(self.available_tools.keys())):
                     forget_was_called = True
-                elif fname == "knowledge_base":
-                    try:
-                        args = json.loads(tool["function"]["arguments"])
-                        if args.get("action") == "forget":
-                            forget_was_called = True
-                    except: pass
 
+                # Raw name only, deliberately: `_canonicalise_tool_name`
+                # can only return a member of `available_tools`, and every
+                # containment site removes disabled names from that map, so
+                # `_cname in disabled_tools` is unreachable by construction.
+                # An alias of a disabled tool fails to resolve and falls
+                # through to the unknown-tool error.
                 if hasattr(self, 'disabled_tools') and fname in self.disabled_tools:
-                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM ERROR: Tool '{fname}' is explicitly disabled in this context."}
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.rejected(f"SYSTEM ERROR: Tool '{fname}' is explicitly disabled in this context.", reason_code="tool_disabled")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
@@ -14479,7 +14776,9 @@ class GhostAgent:
                         "role": "tool",
                         "tool_call_id": tool["id"],
                         "name": "system",
-                        "content": err_msg_content,
+                        "content": _TO.failed(err_msg_content,
+                                              world_changed=False,
+                                              reason_code="tool_call_parse_error"),
                     }
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
@@ -14490,8 +14789,16 @@ class GhostAgent:
                 try:
                     t_args = json.loads(tool["function"]["arguments"], strict=False)
 
-                    is_sandbox_mutation = fname in ["execute", "image_generation"] or \
-                                          (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone"])
+                    # `copy` CREATES A FILE. `is_mutating` below lists it —
+                    # its comment even says "`file_system` `copy` mutates
+                    # (creates a file) and was likewise missing (F2b)" — but
+                    # the fix landed on one of the two lists. Without it a
+                    # copy leaves `cached_sandbox_state` intact, so every
+                    # later turn in the request lists a workspace without
+                    # the new file. Keep the two op lists identical; the
+                    # test asserts it.
+                    is_sandbox_mutation = _cname in ["execute", "image_generation"] or \
+                                          (_cname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"])
 
                     if is_sandbox_mutation:
                         # Invalidate both the legacy global and the
@@ -14501,7 +14808,7 @@ class GhostAgent:
                         request_sandbox_state = None
                         request_state.invalidate_sandbox()
                     # Skill writes invalidate the playbook cache too.
-                    if fname == "learn_skill":
+                    if _cname == "learn_skill":
                         request_state.invalidate_skill_playbook()
                     # Acquired-skill registry mutations
                     # (create_skill / manage_skills delete) change
@@ -14511,18 +14818,29 @@ class GhostAgent:
                     # spent 11 min narrating "now invoking X" but
                     # never emitting a real tool_call because the
                     # cached schema didn't contain X yet.
-                    if fname == "create_skill" or (
-                        fname == "manage_skills"
-                        and (t_args.get("action") or "").lower() == "delete"
+                    # `.strip()` as well as `.lower()`. The tool itself does
+                    # `str(action).strip().lower()`, and `is_mutating` four
+                    # lines below does the same — this one only lowered, so
+                    # `action=" define "` registered the macro and left the
+                    # tool-definition cache STALE: the model then narrates
+                    # "now invoking X" against a schema that does not carry
+                    # X, which is the loop this invalidation exists to stop.
+                    if _cname == "create_skill" or (
+                        _cname == "manage_skills"
+                        and str(t_args.get("action") or "").strip().lower() == "delete"
                     ) or (
-                        fname == "manage_composed_skills"
-                        and (t_args.get("action") or "").lower() in ("define", "delete", "approve")
+                        _cname == "manage_composed_skills"
+                        and str(t_args.get("action") or "").strip().lower() in ("define", "delete", "approve")
                     ):
                         request_state.invalidate_tool_defs()
 
-                    a_hash = f"{fname}:{json.dumps(t_args, sort_keys=True)}"
+                    # Keyed on the HEALED name: `kb` and `knowledge_base`
+                    # carrying identical arguments are the same call, and
+                    # hashing the raw string let the dedup and idempotency
+                    # guards miss every cross-spelling repeat.
+                    a_hash = f"{_cname}:{json.dumps(t_args, sort_keys=True)}"
                 except Exception as e:
-                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Invalid JSON arguments - {str(e)}"}
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.failed(f"Error: Invalid JSON arguments - {str(e)}", world_changed=False, reason_code="bad_json_arguments")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
@@ -14544,10 +14862,12 @@ class GhostAgent:
                 # be classified read-safe → byte-identical duplicates collapsed,
                 # dropping a real ingest (§ turn-loop R3, F2a). `file_system`
                 # `copy` mutates (creates a file) and was likewise missing (F2b).
-                is_mutating = fname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
-                              (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
-                              (fname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
-                              (fname == "manage_composed_skills" and t_args.get("action") in ["define", "approve", "delete"])
+                # ...and on the HEALED TOOL NAME (`_cname`, resolved once at
+                # the top of this block), for the same reason.
+                is_mutating = _cname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
+                              (_cname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone", "copy"]) or \
+                              (_cname == "knowledge_base" and str(t_args.get("action") or "").strip().lower() in ["ingest_document", "forget", "reset_all", "insert_fact", "transcribe", "transcribe_document", "transcription", "ingest", "ingest_file", "update_profile"]) or \
+                              (_cname == "manage_composed_skills" and str(t_args.get("action") or "").strip().lower() in ["define", "approve", "delete"])
 
                 # --- IDEMPOTENCY GUARD (production loop fix) ---
                 # Pure setters with no value in repetition. Re-issuing
@@ -14556,9 +14876,10 @@ class GhostAgent:
                 # are intentionally NOT in this set: rerunning a script
                 # after an external fix is legitimate.
                 is_idempotent_setter = (
-                    fname in ("update_profile", "learn_skill")
-                    or (fname == "knowledge_base"
-                        and t_args.get("action") in ("insert_fact", "forget"))
+                    _cname in ("update_profile", "learn_skill")
+                    or (_cname == "knowledge_base"
+                        and str(t_args.get("action") or "").strip().lower()
+                        in ("insert_fact", "forget"))
                 )
                 if is_idempotent_setter and (
                         a_hash in executed_idempotent
@@ -14572,12 +14893,12 @@ class GhostAgent:
                         "role": "tool",
                         "tool_call_id": tool["id"],
                         "name": fname,
-                        "content": (
+                        "content": _TO.rejected(
                             f"SYSTEM IDEMPOTENCY: '{fname}' was already executed earlier in this "
                             f"request with these exact arguments. The intended state is already "
                             f"applied. DO NOT call it again — proceed to the next step or finalize "
-                            f"your response to the user."
-                        ),
+                            f"your response to the user.",
+                            reason_code="idempotency_guard"),
                     }
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
@@ -14591,7 +14912,7 @@ class GhostAgent:
 
                 seen_tools.add(a_hash)
 
-                if fname == "file_system":
+                if _cname == "file_system":
                     op = t_args.get("operation")
                     if op == "write":
                         content_val = t_args.get("content")
@@ -14629,7 +14950,7 @@ class GhostAgent:
                                     f"(path={_p_raw!r}, basename={_basename!r})",
                                     icon=Icons.STOP,
                                 )
-                                err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution."}
+                                err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.rejected(f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution.", reason_code="empty_write_blocked")}
                                 messages.append(err_msg)
                                 tools_run_this_turn.append({**err_msg, "_synthetic": True})
                                 execution_failure_count += 1
@@ -14678,7 +14999,7 @@ class GhostAgent:
                             err_msg = {"role": "tool",
                                        "tool_call_id": tool["id"],
                                        "name": fname,
-                                       "content": _pv_msg}
+                                       "content": _TO.rejected(_pv_msg, reason_code="constraint_violation")}
                             messages.append(err_msg)
                             tools_run_this_turn.append(
                                 {**err_msg, "_synthetic": True})
@@ -14688,8 +15009,8 @@ class GhostAgent:
 
                         target_path = str(t_args.get("path", "")).lower()
 
-                if fname not in self.available_tools:
-                    self._rebuild_available_tools()
+                # (the map was already refreshed at the top of this block,
+                # on the same condition, so `_cname` and the dispatch agree)
 
                 # --- TOOL NAME CANONICALIZATION ---
                 # Qwen 3.5 (and other models) hallucinates tool name
@@ -14698,10 +15019,12 @@ class GhostAgent:
                 # dispatcher silently 404s and the model wastes a
                 # whole turn before retrying.
                 if fname not in self.available_tools:
-                    canonical = self._canonicalise_tool_name(fname, list(self.available_tools.keys()))
-                    if canonical:
-                        pretty_log("Tool Alias", f"{fname} → {canonical}", icon=Icons.RETRY)
-                        fname = canonical
+                    # `_cname` was resolved at the top of this block with the
+                    # same call; reuse it so the name every guard above was
+                    # keyed on is provably the one that executes.
+                    if _cname != fname:
+                        pretty_log("Tool Alias", f"{fname} → {_cname}", icon=Icons.RETRY)
+                        fname = _cname
 
                 if fname in self.available_tools:
                     # Metacog mid-turn arbiter gate (roadmap phase 3,
@@ -14776,7 +15099,7 @@ class GhostAgent:
                                 "role": "tool",
                                 "tool_call_id": tool["id"],
                                 "name": fname,
-                                "content": _diag,
+                                "content": _TO.rejected(_diag, reason_code="preflight_block"),
                             }
                             messages.append(err_msg)
                             tools_run_this_turn.append(
@@ -14856,7 +15179,7 @@ class GhostAgent:
                                 "role": "tool",
                                 "tool_call_id": tool["id"],
                                 "name": fname,
-                                "content": _diag,
+                                "content": _TO.rejected(_diag, reason_code="preflight_block"),
                             }
                             messages.append(err_msg)
                             tools_run_this_turn.append(
@@ -14887,7 +15210,8 @@ class GhostAgent:
                     if _im_note:
                         _im_msg = {"role": "tool",
                                    "tool_call_id": tool["id"],
-                                   "name": fname, "content": _im_note}
+                                   "name": fname,
+                                   "content": _TO.rejected(_im_note, reason_code="idempotency_note")}
                         messages.append(_im_msg)
                         tools_run_this_turn.append(
                             {**_im_msg, "_synthetic": True})
@@ -14994,12 +15318,29 @@ class GhostAgent:
                             pending_idempotent.add(a_hash)
                     except Exception as e:
                         pretty_log("Tool Invocation Error", str(e), level="WARNING", icon=Icons.WARN)
-                        err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error invoking tool '{fname}' (Did you forget a required argument?): {str(e)}"}
+                        err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.failed(describe_invocation_error(fname, e), world_changed=False, reason_code="invocation_error")}
                         messages.append(err_msg)
                         tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                        # Arm the strike cap, as the unknown-tool branch
+                        # below does. This path exists BECAUSE a model
+                        # repeats a call it cannot enter; without the
+                        # increment the 6-strike backstop never fires on it.
+                        execution_failure_count += 1
                         last_was_failure = True
+                        # ...and tell the strike ledger, so the decay does
+                        # not hand the strike straight back. The decay only
+                        # fires on a turn with no recorded failure, and this
+                        # branch never reaches the classifier that records
+                        # one — so a model that paired its un-enterable call
+                        # with any trivial read ended the turn on zero
+                        # strikes, forever. Registering the signature also
+                        # gives the same-failure loop breaker something to
+                        # see, which it had no way to observe here.
+                        binding_failure_count += 1
+                        strikes.reset_clean_streak()
+                        strikes.note_failure(fname, describe_invocation_error(fname, e))
                 else:
-                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Unknown tool '{fname}'"}
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": _TO.failed(f"Error: Unknown tool '{fname}'", world_changed=False, reason_code="unknown_tool")}
                     messages.append(err_msg)
                     tools_run_this_turn.append({**err_msg, "_synthetic": True})
                     execution_failure_count += 1
@@ -15129,6 +15470,21 @@ class GhostAgent:
                 turn_has_failure = False
                 last_error_res = ""
                 last_error_preview = "Unknown Error"
+                # Was the FAILING call a refusal? Captured at the failure
+                # site for the same reason `failed_fname` is: the strike
+                # block below runs AFTER `for i, result in enumerate(...)`,
+                # so `_outcome` there is the batch's LAST result, not the
+                # one that failed. Reading `_outcome.is_rejection` there
+                # made the refusal branch last-result-wins — a refusal
+                # followed by a successful call took the hard-failure path,
+                # and a hard failure followed by an unrelated refusal was
+                # exempted from the breaker AND the decay freeze. Same two
+                # calls, opposite behaviour, decided by batch order.
+                failure_was_rejection = False
+                # PARTIAL is neither: part of the work LANDED, so "STOP
+                # repeating it" is wrong for a different reason than it is
+                # wrong for a refusal. It gets its own steer below.
+                failure_was_partial = False
                 # The tool name of the FAILING call (2026-07-20). `fname` is
                 # rebound per result, so after the loop it names the LAST
                 # tool in the batch — keying the strike signature / fallback
@@ -15149,6 +15505,20 @@ class GhostAgent:
                 # turn (the same SUCCEEDING action+target+result
                 # repeating), handled once after the results loop.
                 _noprogress_trip = None
+                # A short-circuit must not leave DISPATCHED calls without a
+                # reply: `asyncio.gather` has already run every one of them,
+                # and the tool message is appended EARLIER in the iteration
+                # than the decision chain that used to `break`. Breaking sent
+                # an assistant message carrying N tool_calls upstream with
+                # fewer than N tool replies — a dangling `tool_call_id` — and
+                # recorded a tool that really ran as an empty success.
+                _batch_short_circuit = False
+                # Cleared ONCE, after the loop. Clearing inside a loop over
+                # concurrently-gathered results erased only the trips EARLIER
+                # results had recorded, so whether a turn hard-aborted
+                # depended on the model's emission order rather than on what
+                # actually happened.
+                _batch_world_changed = False
 
                 # We reached the parallel-execution path, which means
                 # at least one tool call parsed cleanly this turn.
@@ -15157,25 +15527,153 @@ class GhostAgent:
                 consecutive_parse_errors = 0
                 for i, result in enumerate(results):
                     fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op, ptarget_raw, _pf_world_mut = tool_call_metadata[i]
-                    str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
+                    # An exception that surfaced from the AWAITED coroutine
+                    # gets the same treatment as one raised at binding time
+                    # (see `describe_invocation_error`): both reach the model
+                    # as the tool's result, and "Error: got multiple values
+                    # for keyword argument 'x'" is no more actionable here
+                    # than it was there.
+                    # ONE normalisation for the whole iteration. A tool may
+                    # return a `ToolOutcome` (status carried as DATA) or a
+                    # plain string (classified by the one legacy predicate,
+                    # so unmigrated tools behave exactly as before). An
+                    # audit of 1,026 return sites against 4,391 live calls
+                    # found TEN vocabularies asking this question, five of
+                    # them inlined right here — and the inline ones owned
+                    # the load-bearing decisions.
+                    from ..tools.outcome import (
+                        OutcomeStatus as _OutcomeStatus, ToolOutcome)
+                    if isinstance(result, Exception):
+                        _outcome = ToolOutcome.failed(
+                            describe_invocation_error(fname, result),
+                            reason_code="raised")
+                    else:
+                        # Strip BEFORE classifying, and never mutate the
+                        # object afterwards: `coerce` returns the same
+                        # instance for an outcome, the batch dedup aliases
+                        # one result across several indices, and the hash is
+                        # derived from the text — so an in-place edit made a
+                        # live object un-findable in a container it was
+                        # already in.
+                        if isinstance(result, ToolOutcome):
+                            _outcome = (result if "\r" not in result else
+                                        ToolOutcome(str(result).replace("\r", ""),
+                                                    status=result.status,
+                                                    world_changed=result.world_changed,
+                                                    reason_code=result.reason_code,
+                                                    declared=result.declared))
+                        else:
+                            _outcome = ToolOutcome.coerce(
+                                str(result).replace("\r", ""))
+                    str_res = _outcome.text
 
                     # Record this call's outcome uniformly (before the
                     # branch chain below) so a partial failure can be
                     # summarised as "N ok / M failed" rather than
                     # last-write-wins on last_error_*.
-                    _res_is_error = str_res.startswith((
-                        "Error:", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
+                    # UNRESOLVED is NOT a failure. It means the call has
+                    # not finished — a detached job — and the loop already
+                    # has a text-based path for that (`is_promoted_result`).
+                    # Giving it a verdict meant a strike, a guard record
+                    # ("re-running this unchanged will fail the same way")
+                    # and a competence failure for work still in flight.
+                    # ONE verdict for this row, computed ONCE and read by
+                    # every consumer below. There used to be three, inside a
+                    # single loop iteration: this one (status only), a WIDER
+                    # rebind 660 lines down that added the exit-code banner
+                    # and the traceback substring, and the strike branch,
+                    # which was narrower than both. Driven through the real
+                    # dispatch over the 4,391-call corpus, the seven
+                    # consumers were not unanimous on 56 calls — 18 where
+                    # metacog, the corpus row and the work log said FAILED
+                    # while `op_outcomes.ok`, the strike ledger and
+                    # `last_was_failure` said success, and 8 where
+                    # `op_outcomes.ok` said FAILED and no strike was drawn
+                    # at all (so `summarize_multi_op_outcomes`, which is
+                    # called inside `if turn_has_failure:`, never reached
+                    # the model on 6 turns).
+                    #
+                    # `shell_failed`'s prose fallback is right for shell
+                    # output and wrong for any tool that merely quotes code,
+                    # so it is asked only of the shell; everything else gets
+                    # the banner rule.
+                    _op_shell_failed = (_outcome.shell_failed
+                                        if fname == "execute"
+                                        else _outcome.exit_code_failed)
+                    # `Traceback` is an UNANCHORED whole-body substring — the
+                    # same shape as the marker fallback that booked 226
+                    # successes as incompetence — so a producer that DECLARED
+                    # its status is taken at its word: a project ledger
+                    # quoting a stored crash is not a crash.
+                    # THE "not finished yet" question, asked once. Seven
+                    # sites below asked `sandbox.jobs.is_promoted_result`,
+                    # which is an `execute`-ONLY TEXT marker — and there are
+                    # two UNRESOLVED producers. `swarm`'s "still running, they
+                    # were NOT cancelled" carries no such marker, so foresight
+                    # graded it ok=True, metacog recorded a success, and the
+                    # user was told "Process finished successfully." for work
+                    # that was still running. `_outcome.status` was in scope
+                    # at every one of them; one reads `.status` five lines
+                    # later.
+                    try:
+                        from ..distill.outcome_heuristics import (
+                            is_unresolved_tool_result as _is_unres)
+                        _res_unresolved = bool(
+                            _outcome.status is _OutcomeStatus.UNRESOLVED
+                            or _is_unres(str_res))
+                    except Exception:  # noqa: BLE001 — hot loop, never raise
+                        _res_unresolved = (
+                            _outcome.status is _OutcomeStatus.UNRESOLVED)
+                    _res_is_error = (
+                        _outcome.status is not _OutcomeStatus.UNRESOLVED
+                        and (_outcome.is_failure or _op_shell_failed))
+                    # ⚠ NO unanchored `"Traceback" in str_res` arm. It lived
+                    # in the old WIDE rebind, where it fed only the work log
+                    # and the no-progress ledger; collapsing the three
+                    # verdicts into one promoted it to the STRIKE LEDGER, and
+                    # it is the same whole-body marker that booked 226 live
+                    # successes as incompetence. `outcome.py` prescribes the
+                    # split it re-broke: the shell gets the prose fallback
+                    # (via `shell_failed` inside `_op_shell_failed`), and
+                    # every tool that merely QUOTES code gets the banner rule
+                    # — 4.2% of readable files in the live sandbox contain
+                    # the word, and a `file_system` read of one drew a strike.
 
                     # Idempotency hash lands only on SUCCESS: a failed
                     # setter was NOT applied, so an identical corrected
                     # retry must be allowed through the guard.
-                    if _is_idem_setter and not _res_is_error:
+                    if _is_idem_setter and _outcome.may_record_as_applied:
                         executed_idempotent.add(a_hash)
+                    from ..tools.tool_failure import is_argument_error
                     op_outcomes.append({
                         "tool": fname,
+                        # A refusal and a non-zero exit are not successes.
+                        # `op_outcomes` feeds the MULTI-STEP OUTCOME line,
+                        # which tells the model "the successful operations
+                        # DID take effect … this live outcome is
+                        # AUTHORITATIVE" — measured, that banner reported a
+                        # shell command that exited 127 as SUCCEEDED in 15
+                        # live turns, because the exit-code rescue lives in
+                        # a different predicate three hundred lines below.
+                        # `_res_is_error` already subsumes `_op_shell_failed`
+                        # (it is one of its disjuncts), so no second term.
                         "ok": not _res_is_error,
-                        "preview": (str_res.replace("Error:", "").strip()[:140]
-                                    if _res_is_error else None),
+                        # the third state, so the summary can say "still
+                        # running" instead of "SUCCEEDED"
+                        "unresolved": (_outcome.status
+                                       is _OutcomeStatus.UNRESOLVED),
+                        # 140 chars cut the useful half off an argument
+                        # error: the missing-parameter messages carry a
+                        # worked call at the END, and in any turn that mixed
+                        # a success with a failure the model read
+                        # "…filename to erase. Worked " and nothing more.
+                        # An error that has been built to be obeyable is
+                        # worth the extra ~160 characters; everything else
+                        # keeps the old budget.
+                        "preview": (
+                            str_res.replace("Error:", "").strip()[
+                                :300 if is_argument_error(str_res) else 140]
+                            if (_res_is_error or _op_shell_failed) else None),
                     })
 
                     # ── Foresight (SHADOW — §4K): grade the pre-dispatch
@@ -15187,8 +15685,7 @@ class GhostAgent:
                     # with a narrower rule here would make live rows and
                     # seeded rows disagree about what "failed" means.
                     try:
-                        from ..sandbox.jobs import (
-                            is_promoted_result as _fs_promoted)
+                        _fs_promoted = lambda _t: _res_unresolved  # noqa: E731
                         # A DETACHED command has no outcome yet. Grading it
                         # `ok=True` (its result is success-shaped so the turn
                         # loop won't strike it) would teach the world model
@@ -15241,20 +15738,30 @@ class GhostAgent:
                     # for every tool, so binding it conditionally would be a
                     # NameError on the first non-execute call.
                     try:
-                        from ..sandbox.jobs import (
-                            is_promoted_result as _sbx_promoted)
-                        _pf_promoted = _sbx_promoted(str_res)
+                        _pf_promoted = _res_unresolved
                     except Exception:  # noqa: BLE001 — hot loop, never raise
                         _pf_promoted = False
-                    if fname == "execute" and not _res_is_error:
-                        _pf_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                        if _pf_exit is not None:
-                            _pf_exec_failed = _pf_exit.group(1) != "0"
-                        else:
-                            _pf_exec_failed = ("Error" in str_res
-                                               or "Exception" in str_res
-                                               or "Traceback" in str_res)
-                    if _res_is_error:
+                    if fname == "execute":
+                        # one reading of "did the shell command fail",
+                        # shared with the exit-code branch below.
+                        # Unconditional: gating it on `not _res_is_error`
+                        # meant a crashed command left it False, and the
+                        # world-changed reset below then cleared every
+                        # recorded pre-flight failure on the strength of the
+                        # crash.
+                        _pf_exec_failed = _outcome.shell_failed
+                    if _res_is_error and not _outcome.is_rejection \
+                            and _outcome.status is not _OutcomeStatus.PARTIAL \
+                            and not _outcome.changed_the_world:
+                        # NOT a rejection. The guard's premise is "re-running
+                        # this unchanged will fail the same way" — but a
+                        # refusal names the argument to change, and the
+                        # corrected re-issue keys identically (the guard
+                        # keys on tool+target+op and ignores the args). This
+                        # is the pathology the guard's own docstring records
+                        # ("blocked the model's correct replace→write
+                        # recovery three times in a row"), reachable again
+                        # through the same-operation correction path.
                         try:
                             self._failure_guard.record(
                                 fname, guard_key_target(ptarget, a_hash),
@@ -15262,7 +15769,9 @@ class GhostAgent:
                         except Exception:
                             pass
                     elif _pf_world_mut and not _pf_exec_failed \
-                            and not _pf_promoted:
+                            and not _pf_promoted \
+                            and not _res_is_error \
+                            and _outcome.changed_the_world:
                         # …but NOT for a command that was detached at its
                         # budget and is still running (sandbox/jobs.py): it
                         # has not changed the world YET, so clearing every
@@ -15444,9 +15953,8 @@ class GhostAgent:
                     # and its `--- output so far ---` can carry a Traceback
                     # from a run that is still going, which the failure
                     # heuristic below would read as a hard failure.
-                    from ..sandbox.jobs import is_promoted_result as _mc_promoted
                     if _mc is not None and getattr(_mc, "enabled", False) \
-                            and fname and not _mc_promoted(str_res):
+                            and fname and not _res_unresolved:
                         _lstr = str_res.lstrip()
                         # Any NON-ZERO exit code is a failure, not just
                         # 1/2. The old substring check recorded codes
@@ -15454,12 +15962,30 @@ class GhostAgent:
                         # competence SUCCESS, poisoning the per-domain
                         # profile. Reuse the same regex the execute
                         # result-classification path below already uses.
-                        _mc_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                        _tool_failed = isinstance(result, Exception) or (
-                            _lstr.startswith(("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
-                            or "Traceback" in str_res
-                            or (_mc_exit is not None and int(_mc_exit.group(1)) != 0)
-                        )
+                        # The competence profile reads the SAME outcome as
+                        # everything else. This was its own predicate — no
+                        # word boundary, no notion of a refusal — so a
+                        # rejected mutating call taught the profile that the
+                        # tool had succeeded.
+                        # `exit_code_failed`, NOT `shell_failed`. The latter
+                        # falls back to unanchored crash markers over the
+                        # whole body, which is right for shell output and
+                        # wrong for every tool that merely QUOTES code:
+                        # measured, 226 live successes booked as
+                        # incompetence — a `file_system` read of a script
+                        # containing `except ValueError:`, a `recall` hit
+                        # whose memory text mentions `PermissionError`, a
+                        # job log quoting `HTTP Error 429`. 5.2% of every
+                        # competence sample, feeding the confidence
+                        # composite. (The `Traceback` arm this paragraph
+                        # used to describe was REMOVED in round 6: an
+                        # unanchored whole-body marker in the verdict is the
+                        # 226-successes family, and collapsing the three
+                        # verdicts into one had promoted it to the strike
+                        # ledger.) It was in the
+                        # original predicate and is a genuine crash marker.
+                        # the loop's one verdict, not a private copy
+                        _tool_failed = _res_is_error
                         _dur = tool_durations[i] if i < len(tool_durations) else None
                         _bus = getattr(_mc, "bus", None)
                         # Trigger publishes are best-effort and MUST NOT
@@ -15517,7 +16043,7 @@ class GhostAgent:
                             _is_sim = getattr(
                                 getattr(self.context, "skill_memory", None),
                                 "is_read_only", False) is True
-                            if not _lstr.startswith("SYSTEM BLOCK") and not _is_sim:
+                            if not _outcome.is_rejection and not _is_sim:
                                 _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
                         except Exception as _mcexc:
                             logger.debug("metacog outcome hook failed: %s", _mcexc)
@@ -15555,13 +16081,27 @@ class GhostAgent:
                                 _keep = ""
                                 try:
                                     from ..sandbox.jobs import (
-                                        PROMOTED_RESULT_BANNER as _prb,
-                                        is_promoted_result as _ipr2)
-                                    if _ipr2(str_res):
+                                        PROMOTED_RESULT_BANNER as _prb)
+                                    # BOTH producers: condensing destroyed
+                                    # swarm's markers while preserving
+                                    # execute's, so the disk row lost the one
+                                    # signal an offline reader has.
+                                    if _res_unresolved:
                                         _keep = _prb + "\n"
                                 except Exception:  # noqa: BLE001
                                     _keep = ""
                                 str_res = f"{_keep}[EDGE CONDENSED]: {summary_content}"
+                                # ⚠ The outcome deliberately KEEPS its
+                                # original text here. An earlier fix
+                                # assigned the condensed summary onto it —
+                                # which raised (the attribute is read-only)
+                                # and was swallowed by the enclosing
+                                # `except`, and would have been wrong if it
+                                # had worked: `exit_code_failed` and
+                                # `shell_failed` read that text, and the
+                                # summary does not carry the EXIT CODE
+                                # banner. The rebind below reads the status,
+                                # which condensation does not change.
                         except Exception as e:
                             logger.debug(f"Context-Shield edge summarisation failed: {type(e).__name__}: {e}")
 
@@ -15577,16 +16117,52 @@ class GhostAgent:
                         exit_match_full = re.search(r"EXIT CODE:\s*(\d+)", str_res)
                         if exit_match_full and "EXIT CODE:" not in safe_res:
                             safe_res = f"[FAILURE BANNER] EXIT CODE: {exit_match_full.group(1)}\n" + safe_res
-                    if (str_res.lstrip().startswith("Error")
-                            or "Traceback" in str_res
-                            or "SYSTEM ERROR" in str_res):
+                    # ONE reading, used by both this banner and the hint
+                    # scan 17 lines below — they were two byte-identical
+                    # copies of a text rule, and neither read `_outcome`,
+                    # which is in scope on this very line.
+                    #
+                    # Wrong in BOTH directions, measured on the 4,391-call
+                    # corpus: 220 results the loop books as failures got no
+                    # banner (file_system 67, execute 60, browser 42,
+                    # manage_projects 15) — every refusal among them — and 9
+                    # clean results got one, through the unanchored
+                    # `"Traceback" in str_res` substring that `_res_is_error`
+                    # already guards with `not _outcome.declared` 140 lines
+                    # below. This banner is the last thing the model reads
+                    # before deciding to retry or pivot.
+                    _failure_shaped = (
+                        _res_is_error
+                        or str_res.lstrip().startswith("Error")
+                        or "SYSTEM ERROR" in str_res)
+                    if _failure_shaped:
+                        from ..tools.tool_failure import result_is_failure as _rif
                         first_err_line = next(
                             (ln for ln in str_res.splitlines()
-                             if ln.strip().startswith(("Error", "SYSTEM ERROR"))
-                             or "Traceback" in ln),
+                             if _rif(ln) or "Traceback" in ln),
                             "",
                         )
-                        if first_err_line and first_err_line[:120] not in safe_res[:300]:
+                        _banner_is_label = False
+                        if not first_err_line:
+                            # The gate said this failed; the per-line
+                            # predicate is ANCHORED and cannot see a refusal
+                            # head, so 82 of 82 refusals entered this branch
+                            # and emitted no banner at all. Fall back to the
+                            # result's own first non-empty line.
+                            first_err_line = next(
+                                (ln.strip() for ln in str_res.splitlines()
+                                 if ln.strip()), "")
+                            # ...and EMIT it. The de-duplication guard below
+                            # asks "is this text already visible", which is
+                            # trivially true of a HEAD line — so the fallback
+                            # computed a value and then always declined to
+                            # use it: 382 of 400 failures still reached the
+                            # model unmarked. When the fallback fires, the
+                            # LABEL is the point, not the text.
+                            _banner_is_label = bool(first_err_line)
+                        if first_err_line and (
+                                _banner_is_label
+                                or first_err_line[:120] not in safe_res[:300]):
                             safe_res = f"[FAILURE BANNER] {first_err_line[:200]}\n" + safe_res
 
                     # Per-tool fallback hint injection — when a tool
@@ -15594,10 +16170,10 @@ class GhostAgent:
                     # concrete remediation hint so the LLM has an
                     # actionable next step instead of blindly retrying.
                     _hint_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                    if (str_res.lstrip().startswith("Error")
-                            or "Traceback" in str_res
-                            or "SYSTEM ERROR" in str_res
-                            or (_hint_exit is not None and int(_hint_exit.group(1)) != 0)):
+                    if ((_failure_shaped
+                         or (_hint_exit is not None
+                             and int(_hint_exit.group(1)) != 0))
+                            and not _outcome.is_rejection):
                         try:
                             from ..tools.tool_failure import get_fallback_hint
                             hint = get_fallback_hint(fname, str_res)
@@ -15677,7 +16253,42 @@ class GhostAgent:
                     except Exception as _fsn_e:  # noqa: BLE001
                         logger.debug(f"foresight note skipped: {_fsn_e}")
 
-                    tool_msg = {"role": "tool", "tool_call_id": tool_id, "name": fname, "content": safe_res}
+                    # The content CARRIES its status. `safe_res` is a
+                    # truncated plain string, so the status died here and
+                    # every downstream reader re-sniffed prose: measured, the
+                    # loop called five live refusal shapes failures while the
+                    # trajectory corpus, the verifier's high-stakes
+                    # escalation and skills graduation called them successes
+                    # — the 63-occurrence disagreement §4DO exists to close,
+                    # surviving in the half the dispatch rewrite did not
+                    # reach.
+                    #
+                    # A `ToolOutcome` IS a `str`, so this is invisible to
+                    # everything that treats the content as text — including
+                    # `json.dumps` and the LLM payload, which see exactly the
+                    # same characters as before. No extra dict key: an
+                    # unknown field on a message is sent to the API.
+                    tool_msg = {"role": "tool", "tool_call_id": tool_id,
+                                "name": fname,
+                                "content": ToolOutcome(
+                                    safe_res, status=_outcome.status,
+                                    world_changed=_outcome.world_changed,
+                                    reason_code=_outcome.reason_code,
+                                    # ⚠ `declared` MUST be forwarded.
+                                    # `__new__` defaults it True, so omitting
+                                    # it re-labelled every DERIVED ok — what
+                                    # `coerce` produces for execute, jobs,
+                                    # manage_services — as a producer's own
+                                    # declaration. `_reconstruct_tool_calls`
+                                    # then lets it settle the label and the
+                                    # sniffer becomes unreachable: measured,
+                                    # 151 of 4,391 calls lost the structured
+                                    # `ToolCall.error` flag, 116 of them
+                                    # `execute`. That is the -198 regression
+                                    # rebuilt from the other end — the LOOP
+                                    # declaring, in a file the "execute never
+                                    # declares" pin never opens.
+                                    declared=_outcome.declared)}
                     messages.append(tool_msg)
                     tools_run_this_turn.append(tool_msg)
 
@@ -15692,9 +16303,16 @@ class GhostAgent:
                     # selector, repeated screenshots returning the same
                     # view — is exactly the "succeeds but learns
                     # nothing" thrash from the Browser-OS run.
-                    _res_is_error = isinstance(result, Exception) or str_res.lstrip().startswith(
-                        ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
-                    ) or "Traceback" in str_res
+                    # Was a SIXTH definition of "did this fail", inline and
+                    # 550 lines from the first, disagreeing with it about
+                    # tracebacks and knowing nothing about refusals. It reads
+                    # the same outcome now, plus the traceback case the
+                    # no-progress ledger genuinely wants.
+                    # (`_res_is_error` is NOT recomputed here. It used to be
+                    # — a second, wider definition 660 lines from the first,
+                    # which is how seven consumers of one call came to
+                    # disagree. There is one verdict, at the top of the
+                    # iteration.)
                     # World-changed reset: a SUCCESSFUL file mutation
                     # invalidates every no-progress observation counted so
                     # far — re-observing after an edit is verification of
@@ -15708,11 +16326,26 @@ class GhostAgent:
                     # probe — resetting on probes would nullify the trip).
                     # See StrikeLedger.note_world_changed for the observed
                     # failure this closes.
+                    # ...and NOT for a refusal. `file_system` answers a
+                    # malformed mutating call with "SYSTEM INSTRUCTION: you
+                    # used operation='replace' but forgot 'replace_with'" or
+                    # "REPLACE REJECTED (byte-identical)" — neither of which
+                    # matched any failure predicate, so a call that changed
+                    # NOTHING wiped the loop-breaker's memory and cleared
+                    # every recorded pre-flight failure. 63 live
+                    # occurrences across 36 requests.
+                    # `changed_the_world`, not `not _res_is_error`: a write
+                    # that half-landed DID change the world, and the
+                    # no-progress ledger must know — otherwise the model
+                    # re-observing after a partial edit reads as thrash.
                     if (fname == "file_system" and is_mutating
-                            and not _res_is_error):
+                            and _outcome.changed_the_world
+                            and not _outcome.is_rejection):
                         strikes.note_world_changed()
                         repeated_action_steered.clear()
-                        _noprogress_trip = None
+                        # NOT `_noprogress_trip = None` here — see the
+                        # per-batch flag above.
+                        _batch_world_changed = True
                     # Work-log accumulation (2026-07-18): while a project is
                     # bound, record which files this request mutated and
                     # which work tools ran successfully. Read once by the
@@ -15735,7 +16368,13 @@ class GhostAgent:
                                 _wft[fname] = _wft.get(fname, 0) + 1
                         except Exception:
                             pass
-                    if not _res_is_error and fname and getattr(
+                    # `changed_the_world`, not `not _res_is_error` — the
+                    # no-progress reset thirty lines above was migrated for
+                    # exactly this reason and the work log was not. A PARTIAL
+                    # write that half-landed produced `work_FILES=[]`,
+                    # byte-identical next-turn state to a refusal that touched
+                    # nothing.
+                    if _outcome.changed_the_world and fname and getattr(
                             self.context, "current_project_id", None):
                         try:
                             if fname == "file_system" and is_mutating and ptarget:
@@ -15928,24 +16567,46 @@ class GhostAgent:
                             "Solver declared task unwinnable — exiting turn loop",
                             level="WARNING", icon=Icons.STOP,
                         )
-                        final_ai_content = str_res
-                        force_stop = True
-                        break
+                        if not _batch_short_circuit:
+                            final_ai_content = str_res
+                            force_stop = True
+                            _batch_short_circuit = True
+                        # `continue`, not `break` — every remaining dispatched
+                        # call still needs its reply recorded.
+                        continue
 
                     if fname == "execute":
                         code_match = re.search(r"EXIT CODE:\s*(\d+)", str_res)
                         if code_match:
                             exit_code_val = int(code_match.group(1))
                         else:
-                            if "Error" in str_res or "Exception" in str_res or "Traceback" in str_res:
-                                exit_code_val = 1
-                            else:
-                                exit_code_val = 0
+                            # the SAME predicate the pre-flight branch uses;
+                            # they had two different marker sets
+                            exit_code_val = 1 if _outcome.shell_failed else 0
 
                         if exit_code_val != 0:
                             turn_has_failure = True
                             last_error_res = str_res
                             failed_fname = fname
+                            # BOTH flags are re-derived here — resetting only
+                            # one left `failure_was_partial` stale from an
+                            # earlier result in the same batch, and the PARTIAL
+                            # steer is the FIRST branch of the chain, so a
+                            # crashed command was told "PART OF THIS LANDED".
+                            #
+                            # And NOT hard-coded False: `execute` has three
+                            # declared REJECTION sites whose envelope carries
+                            # `EXIT CODE: 1` (the egress guard, the
+                            # released-project block, the agent-port probe).
+                            # Assuming "a non-zero exit is never a refusal"
+                            # gave an `execute` refusal the "STOP repeating
+                            # it" steer while an identical `file_system`
+                            # refusal got "re-issue the SAME tool with that
+                            # correction" — same class of call, opposite
+                            # advice, decided by which tool it was.
+                            failure_was_rejection = _outcome.is_rejection
+                            failure_was_partial = (
+                                _outcome.status is _OutcomeStatus.PARTIAL)
                             if "STDOUT/STDERR:" in str_res:
                                 last_error_preview = str_res.split("STDOUT/STDERR:")[1].strip().replace("\n", " ")
                             elif "SYSTEM ERROR:" in str_res:
@@ -15998,8 +16659,7 @@ class GhostAgent:
                             # 0)" — a fabricated PASS written straight into
                             # the self-play corpus. Let the turn continue; the
                             # outer validator re-runs the solution itself.
-                            from ..sandbox.jobs import is_promoted_result
-                            if _is_sim and is_promoted_result(str_res):
+                            if _is_sim and _res_unresolved:
                                 _is_sim = False
                             if _is_sim:
                                 # Pull the command text from the
@@ -16054,22 +16714,36 @@ class GhostAgent:
                                             "(format mismatch?).",
                                             level="WARNING", icon=Icons.WARN,
                                         )
-                                if _ran_solution and len(_body) > 0 and _format_ok:
+                                if (_ran_solution and len(_body) > 0
+                                        and _format_ok
+                                        and not _batch_short_circuit):
                                     final_ai_content = (
                                         "solution.py executed successfully (exit 0)."
                                     )
                                     force_stop = True
+                                    _batch_short_circuit = True
                                     pretty_log(
                                         "Self-Play Short-Circuit",
                                         "Skipped confirmation turn — solution.py ran clean (sim mode).",
                                         icon=Icons.STOP,
                                     )
-                                    break  # exit the enumerate(results) loop
 
-                    elif str_res.startswith("Error:") or str_res.startswith("ERROR") or str_res.startswith("SYSTEM ERROR") or str_res.startswith("Critical Tool Error"):
+                    # the same outcome the top of the iteration built —
+                    # this was a seventh reading of the question
+                    elif _res_is_error:
+                        # UNRESOLVED is exempted at the other three readings
+                        # (the verdict, the competence profile and the
+                        # work-log rebind) and was not exempted here — so a
+                        # detached job still drew a strike and fed the
+                        # same-failure breaker, which made `swarm`'s
+                        # PARTIAL -> UNRESOLVED change a no-op at the one
+                        # site it was made for.
                         turn_has_failure = True
                         last_error_res = str_res
                         failed_fname = fname
+                        failure_was_rejection = _outcome.is_rejection
+                        failure_was_partial = (
+                            _outcome.status is _OutcomeStatus.PARTIAL)
                         last_error_preview = str_res.replace("Error:", "").strip()
                         pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")  # §LOG-5b
 
@@ -16096,6 +16770,11 @@ class GhostAgent:
                 # Independent of turn_has_failure — this path is for
                 # all-success thrash, which the strike machinery below
                 # never sees.
+                if _batch_world_changed:
+                    # A successful mutation anywhere in this batch invalidates
+                    # every no-progress observation in it, whatever order the
+                    # results arrived in.
+                    _noprogress_trip = None
                 if _noprogress_trip is not None and not force_stop and not force_final_response:
                     _asig, _acnt, _afname, _atarget = _noprogress_trip
                     _tgt_desc = f" on '{_atarget}'" if _atarget else ""
@@ -16190,6 +16869,22 @@ class GhostAgent:
                                 "you give them). Do NOT call this tool again."
                             )})
 
+                # An UNRESOLVED-only turn never sets `turn_has_failure`, so
+                # the "STILL RUNNING — do NOT re-dispatch, do NOT report
+                # these as done" summary was unreachable for exactly the turn
+                # shape it exists for. Surface it before the failure block.
+                if not turn_has_failure and any(
+                        o.get("unresolved") for o in op_outcomes):
+                    try:
+                        from ..tools.tool_failure import (
+                            summarize_multi_op_outcomes as _sm)
+                        _running_note = _sm(op_outcomes)
+                    except Exception:  # noqa: BLE001
+                        _running_note = ""
+                    if _running_note:
+                        messages.append({"role": "user",
+                                         "content": _running_note})
+
                 if turn_has_failure:
                     # Any failure (transient or structural) breaks the
                     # consecutive-clean-success streak that unfreezes decay.
@@ -16200,7 +16895,15 @@ class GhostAgent:
                     _fail_fname = failed_fname or fname
                     # Classify the failure to route to the right budget
                     from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
-                    failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
+                    # ONE expression, two uses. The class and the
+                    # diagnostic must describe the same text: the
+                    # preview can be a 60-char head (the execute
+                    # branch), so a class earned by a token past that
+                    # cut was being formatted against text no longer
+                    # containing it — and the argument-error split
+                    # could not see what it was splitting on.
+                    failure_text = last_error_res or last_error_preview
+                    failure_class, failure_match = classify_tool_failure(failure_text)
                     # Capture the failure head for harness-dimension
                     # attribution at finalize time (bounded: 6 per turn).
                     _ftexts = getattr(self.context, "_turn_failure_texts", None)
@@ -16219,39 +16922,79 @@ class GhostAgent:
                         # they only got the 60-char budget, which cut the
                         # error preview mid-clause (WARN+ gets 240).
                         pretty_log("Transient Fail", f"Transient strike {transient_failure_count}/4 ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN, level="WARNING")
-                        diagnostic_msg = format_failure_context(last_error_preview, failure_class)
+                        diagnostic_msg = format_failure_context(failure_text, failure_class)
                     else:
                         execution_failure_count += 1
                         pretty_log("Execution Fail", f"Strike {execution_failure_count}/6 ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL, level="WARNING")  # §LOG-5b
-                        diagnostic_msg = format_failure_context(last_error_preview, failure_class)
+                        diagnostic_msg = format_failure_context(failure_text, failure_class)
                         # Detect the SAME structural failure recurring.
                         # At ≥3 repeats: freeze the success-decay (so the
                         # cap can finally fire on this oscillating loop)
                         # and tell the model ONCE to stop retrying — the
                         # live tool result is authoritative over any stale
                         # context/system-state hint that says otherwise.
+                        # A REFUSAL goes through the repeat detector like
+                        # everything else. `note_failure` IS the brake: it
+                        # counts identical failures and freezes the
+                        # success-decay so the 6-strike cap can fire.
+                        # Skipping the call for refusals left them with NO
+                        # brake at all — round 1 had already exempted them
+                        # from the pre-flight guard, which is the other one —
+                        # and the System-3 pivot then fired every other turn
+                        # for ever. What was actually wrong was the ADVICE,
+                        # not the detection: "STOP repeating it — retrying
+                        # will not change the result" is the opposite of the
+                        # truth for a message whose whole content is which
+                        # argument to change. So only the steer branches.
                         _sig, _cnt, _persist, _first_warn = strikes.note_failure(
                             _fail_fname, last_error_preview
                         )
                         if _first_warn:
                             pretty_log(
                                 "Loop Breaker",
-                                f"Same failure ×{_cnt} "
+                                f"Same {'refusal' if failure_was_rejection else 'failure'} ×{_cnt} "
                                 f"({_fail_fname}) — freezing strike decay & redirecting.",
                                 level="WARNING", icon=Icons.STOP,
                             )
-                            messages.append({"role": "user", "content": (
-                                f"SYSTEM ALERT: This exact action has now failed "
-                                f"{_cnt} times with the SAME error: "
-                                f"{str(last_error_preview)[:160]}. STOP repeating it — "
-                                "retrying will not change the result. The live tool "
-                                "result and the current sandbox listing are AUTHORITATIVE "
-                                "over any prior context, memory, workspace narrative, or "
-                                "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
-                                "DIFFERENT action now: if a file is missing, CREATE it with "
-                                "file_system(operation='write', …) or choose an existing "
-                                "file from the listing; if an approach is wrong, change it."
-                            )})
+                            if failure_was_partial:
+                                _steer = (
+                                    f"SYSTEM ALERT: {_fail_fname} has now returned the "
+                                    f"same PARTIAL result {_cnt} times: "
+                                    f"{str(last_error_preview)[:160]}. PART OF THIS "
+                                    "LANDED — do NOT re-run the whole operation and do "
+                                    "NOT treat it as a clean failure. Read the result "
+                                    "to see which part succeeded and which did not, "
+                                    "then act ONLY on the part that did not: if a file "
+                                    "was written but does not parse, FIX the syntax in "
+                                    "that file; if some blocks of an edit applied and "
+                                    "others did not, re-issue only the ones that failed."
+                                )
+                            elif failure_was_rejection:
+                                _steer = (
+                                    f"SYSTEM ALERT: {_fail_fname} has now REFUSED the same "
+                                    f"call {_cnt} times with the SAME message: "
+                                    f"{str(last_error_preview)[:160]}. Nothing has run and "
+                                    "nothing has changed. This is a REFUSAL, not a broken "
+                                    "tool: the message above names exactly what is wrong "
+                                    "with the arguments. Re-issue the SAME tool with that "
+                                    "one thing corrected — read the message literally, use "
+                                    "the parameter name it asks for, and do NOT abandon the "
+                                    "task, switch tools, or rewrite the plan over it."
+                                )
+                            else:
+                                _steer = (
+                                    f"SYSTEM ALERT: This exact action has now failed "
+                                    f"{_cnt} times with the SAME error: "
+                                    f"{str(last_error_preview)[:160]}. STOP repeating it — "
+                                    "retrying will not change the result. The live tool "
+                                    "result and the current sandbox listing are AUTHORITATIVE "
+                                    "over any prior context, memory, workspace narrative, or "
+                                    "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
+                                    "DIFFERENT action now: if a file is missing, CREATE it with "
+                                    "file_system(operation='write', …) or choose an existing "
+                                    "file from the listing; if an approach is wrong, change it."
+                                )
+                            messages.append({"role": "user", "content": _steer})
 
                     # NO blanket `last_was_failure = True` here (2026-07-31):
                     # the per-result tracking inside the results loop already
@@ -16292,11 +17035,18 @@ class GhostAgent:
                     # OR total strike 6. Can fire a SECOND time at strike 5
                     # with results of the first pivot as extra context.
                     sys3_trigger = (
-                        (execution_failure_count == 4 and not _request_sys3_fired_once)
-                        or (execution_failure_count == 5 and _request_sys3_fired_once)
+                        (execution_failure_count >= 4 and not _request_sys3_fired_once)
+                        or (execution_failure_count >= 5
+                            and _request_sys3_fired_once == 1)
                     )
                     if sys3_trigger:
                         pivot_num = 2 if _request_sys3_fired_once else 1
+                        # Count the ATTEMPT, not the success. `_run_system_3_pivot`
+                        # returns {} on any exception — including a 120 s LLM
+                        # timeout — and on that path nothing below runs, so a
+                        # `>=` trigger re-armed every single turn.
+                        _request_sys3_fired_once = (
+                            int(_request_sys3_fired_once or 0) + 1)
                         pretty_log(f"System 3 Crisis Intervention #{pivot_num}", "Engaging meta-cognitive pivot...", icon=Icons.BRAIN_THINK)
 
                         # On second pivot, include first pivot's justification
@@ -16314,10 +17064,22 @@ class GhostAgent:
                         if sys3_result.get("tree_update"):
                             task_tree.load_from_json(sys3_result["tree_update"])
                             current_plan_json = task_tree.to_json()
-                            execution_failure_count = max(0, execution_failure_count - 2)
+                            # ONLY the first pivot decays the counter. The
+                            # second must not, or the trigger re-arms for
+                            # ever: 5 fires pivot #2, −2 leaves 3, two more
+                            # failures reach 5, and it fires again. Executed
+                            # against this method's own arithmetic, that is
+                            # 11 pivots in 25 all-failing turns with
+                            # `execution_failure_count >= 6` NEVER reached —
+                            # the task tree rewritten every other turn and no
+                            # force-final-response, for ever. Holding at 5
+                            # lets the next structural failure hit the cap,
+                            # which is what "at most two pivots" (see
+                            # `pivot_num`) always meant.
+                            if pivot_num == 1:
+                                execution_failure_count = max(0, execution_failure_count - 2)
                             transient_failure_count = 0
                             last_was_failure = False
-                            _request_sys3_fired_once = True
                             _request_sys3_prev_justification = sys3_result.get('justification', '')
                             messages.append({"role": "user", "content": f"SYSTEM 3 PIVOT #{pivot_num}: The previous approach failed. The strategy has been entirely rewritten. Justification: {sys3_result.get('justification')}. Follow the new plan."})
                             return False  # was `continue` — the region is the loop-body tail
@@ -16363,7 +17125,8 @@ class GhostAgent:
                             "Strike decay unfrozen after 3 consecutive clean successes.",
                             icon=Icons.OK,
                         )
-                    if execution_failure_count > 0 and not strikes.decay_frozen:
+                    if execution_failure_count > 0 and not strikes.decay_frozen \
+                            and not binding_failure_count:
                         execution_failure_count = max(0, execution_failure_count - 1)
 
                     # Terminal tools: `self_play` and `dream_mode`
@@ -16987,13 +17750,20 @@ class GhostAgent:
             # generation makes the biological watchdog think the
             # system is idle MID-REQUEST and wake the hippocampus.
             self.context.last_activity_time = datetime.datetime.now()
-            _pp_last = str(tools_run_this_turn[-1]['content'])
+            # NOT `str(...)` first: that destroys the status, and
+            # `is_promoted_result` is an `execute`-only TEXT marker blind to
+            # the second UNRESOLVED producer — so `swarm`'s "still running,
+            # they were NOT cancelled" was announced to the user as "Task
+            # completed successfully."
+            _pp_raw = tools_run_this_turn[-1]['content']
+            _pp_last = str(_pp_raw)
             try:
-                from ..sandbox.jobs import is_promoted_result as _pp_promoted
+                from ..distill.outcome_heuristics import (
+                    is_unresolved_tool_result as _pp_unres)
                 _pp_head = ("A command from this turn is STILL RUNNING in the "
                             "background (detached at its budget, not killed) — "
                             "its result is NOT in yet. Final tool output:"
-                            if _pp_promoted(_pp_last)
+                            if _pp_unres(_pp_raw)
                             else "Task completed successfully. Final tool output:")
             except Exception:  # noqa: BLE001
                 _pp_head = "Task completed successfully. Final tool output:"
@@ -17116,8 +17886,13 @@ class GhostAgent:
                     # and hands the same sentence to the verifier as its
                     # evidence.
                     try:
-                        from ..sandbox.jobs import is_promoted_result as _ipr
-                        _still_running = _ipr(str(fallback_tool.get("content", "")))
+                        # the OBJECT, and the predicate that knows both
+                        # UNRESOLVED producers — `is_promoted_result` is
+                        # execute-only text, so a still-running swarm await
+                        # was reported as "Process finished successfully."
+                        from ..distill.outcome_heuristics import (
+                            is_unresolved_tool_result as _ipr)
+                        _still_running = _ipr(fallback_tool.get("content", ""))
                     except Exception:  # noqa: BLE001
                         _still_running = False
                     # § finalize/stream R1 A-F1: the header must also check
@@ -17159,12 +17934,28 @@ class GhostAgent:
                                      _raw_out) is not None)
                     _m_exit = (re.search(r"EXIT CODE:\s*(\d+)", _raw_out)
                                if _exec_shaped else None)
+                    # A DECLARED failure is an OR, never an override: the
+                    # exit-code banner still DECIDES for exec-shaped output
+                    # (an explicit `EXIT CODE: 0` outranks an error-looking
+                    # first line of raw output). Without the status arm, 148
+                    # of 408 failures — including 83 of 83 refusals and 43 of
+                    # 44 browser failures — were announced to the user as
+                    # "Process finished successfully.", and that same string
+                    # is the verifier's evidence and the recorded reply.
+                    _fb_st = getattr(fallback_tool.get("content"), "status",
+                                     None)
+                    _fb_declared_bad = (
+                        _fb_st is not None
+                        and str(getattr(_fb_st, "value", _fb_st))
+                        not in ("ok", "unresolved"))
                     if _m_exit is not None:
-                        _looks_failed = _m_exit.group(1) != "0"
+                        _looks_failed = (_m_exit.group(1) != "0"
+                                         or _fb_declared_bad)
                     else:
-                        _looks_failed = _raw_out.lstrip().startswith(
-                            ("Error:", "ERROR:", "SYSTEM ERROR",
-                             "Critical Tool Error"))
+                        _looks_failed = _fb_declared_bad or \
+                            _raw_out.lstrip().startswith(
+                                ("Error:", "ERROR:", "SYSTEM ERROR",
+                                 "Critical Tool Error"))
                     if _still_running:
                         _head = ("The command is STILL RUNNING in the background "
                                  "(it outran its execution budget and was detached, "
@@ -17628,11 +18419,20 @@ class GhostAgent:
                     # dispatch classifier — "Critical Tool Error" was missing,
                     # so a failed search counted as successful info-gathering
                     # and falsely resolved an unknown.
+                    def _info_ok(t):
+                        # STATUS first — a refused or failed search is not
+                        # successful info-gathering, and the prefix bank
+                        # cannot see a refusal at all.
+                        # the same question the loop and the episode store
+                        # ask — a failed search is not successful
+                        # info-gathering, and a prose bank cannot see an
+                        # exit-code banner
+                        return not _action_failed(
+                            t.get("content", ""), str(t.get("name") or ""))
+
                     _ran_info = any(
                         isinstance(t, dict) and t.get("name") in _info_tools
-                        and not str(t.get("content", "")).lstrip().startswith(
-                            ("Error", "ERROR", "SYSTEM ERROR",
-                             "Critical Tool Error"))
+                        and _info_ok(t)
                         for t in (tools_run_this_turn or [])
                     )
                     if _ran_info:
@@ -19778,7 +20578,7 @@ class GhostAgent:
 
                 task_tree = TaskTree()
                 current_plan_json = {}
-                _request_sys3_fired_once = False
+                _request_sys3_fired_once = 0
                 _request_sys3_prev_justification = ""
                 force_final_response = False
 
@@ -20040,7 +20840,9 @@ class GhostAgent:
                             icon=Icons.STOP,
                         )
                         try:
-                            _det_raw = str(await self.available_tools[_det_tool]() or "").strip()
+                            from ..tools.outcome import with_text as _wt
+                            _det_res = await self.available_tools[_det_tool]() or ""
+                            _det_raw = _wt(_det_res, str(_det_res).strip())
                         except Exception as _det_exc:
                             logger.error(f"Deterministic {_det_tool} dispatch failed: {_det_exc}")
                             _det_raw = ""
@@ -24928,9 +25730,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             for t in (tools or []):
                 if not isinstance(t, dict):
                     continue
-                content = str(t.get("content", ""))
-                _ok = not content.lstrip().startswith(
-                    ("Error", "ERROR", "SYSTEM ERROR", "[SYSTEM ERROR]", "Traceback"))
+                _raw = t.get("content", "")
+                content = str(_raw)
+                # The STATUS first. `str(...)` then a five-prefix bank booked
+                # 145 of 291 declared non-OK results as successes — all 82
+                # refusals, all 42 browser failures, all 11 PARTIALs and all 9
+                # UNRESOLVED. The TURN-level success was made status-aware two
+                # rounds ago; this per-ACTION one was not, and it is the flag
+                # that builds `_chain` -> `context`, gates `search_recoveries`
+                # and feeds the playbook-lesson model.
+                # THE LOOP'S OWN QUESTION, not a third prose bank. Two
+                # earlier attempts here failed in opposite directions: a bare
+                # five-prefix bank booked 145 of 291 declared non-OK results
+                # as successes, and an `if/else` over the status then
+                # SHADOWED that bank so 118 non-zero `execute` exits were
+                # still stored successful — neither half can see an
+                # `EXIT CODE:` banner under an `--- EXECUTION RESULT ---`
+                # head. `_action_failed` is the same predicate the dispatch
+                # loop uses, asked of a stored row.
+                _ok = not _action_failed(_raw, str(t.get("name") or ""))
                 _name = t.get("name", "unknown")
                 actions.append({
                     "tool": _name,
@@ -25229,7 +26047,66 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         from ..distill.outcome_heuristics import (
                             _looks_like_tool_error, _normalize_tool_error,
                         )
-                        if _looks_like_tool_error(obj.result):
+                        # Prefer the STATUS the loop recorded over sniffing
+                        # the prose again. The sniffer stays as the fallback
+                        # for historical rows and for tools that still
+                        # return bare strings.
+                        from ..tools.outcome import ToolOutcome as _TO
+                        _raw = m.get("content") if isinstance(m, dict) else None
+                        _st = _raw.status.value if isinstance(_raw, _TO) else None
+                        # DECLARED means a producer answered; derived means
+                        # `coerce` guessed from the same prose the sniffer
+                        # reads. Only a producer's own "this succeeded" is
+                        # allowed to settle the question — a `manage_projects`
+                        # read whose JSON ledger quotes a stored crash is a
+                        # SUCCESS, and the sniffer cannot tell that quote from
+                        # a crash of its own.
+                        _decl = bool(getattr(_raw, "declared", False))
+                        # OR, never override. The recorded status ADDS the
+                        # refusals the sniffer cannot see (it has no rule for
+                        # "SYSTEM INSTRUCTION"); the sniffer owns the
+                        # exit-code and traceback evidence the status does
+                        # not carry. An earlier version preferred the status
+                        # and made the sniffer unreachable, because every
+                        # result is wrapped — measured on the 4,391-call
+                        # corpus that traded +61 refusals for −198 `execute`
+                        # failures, recreating the loop-vs-corpus split this
+                        # work exists to close, sign-flipped.
+                        # UNRESOLVED is NOT a verdict — `outcome_heuristics`
+                        # says so in its own contract ("callers must SKIP an
+                        # unresolved call rather than label it") and all four
+                        # readings in the dispatch loop exempt it. Giving a
+                        # detached job a FAILED corpus row seeds the foresight
+                        # world model with "this command shape fails" while
+                        # the live grader refuses to grade the same row.
+                        # Text the LOOP rewrote is not the tool's output, so
+                        # the sniffer has no business re-deriving a label from
+                        # it: context compression hoists error-keyword lines
+                        # into the sniffer's 120-char window and flipped 64
+                        # successes to FAILED on 42 turns.
+                        _compressed = (
+                            getattr(_raw, "reason_code", None)
+                            == "context_compressed")
+                        if _st == "unresolved":
+                            pass
+                        elif _compressed:
+                            # Status-ONLY here reached the corpus as a
+                            # SUCCESS for every derived failure: `execute`
+                            # never declares, and its `EXIT CODE:` banner
+                            # SURVIVES compression (the summariser always
+                            # keeps the first three lines; the banner is line
+                            # 2 of its envelope). Measured: this arm removed
+                            # 83 false positives and created 32 false
+                            # negatives, 31 of them `execute` — the
+                            # loop-vs-corpus split rebuilt sign-flipped
+                            # inside the fix meant to close it. Ask the
+                            # loop's own question: it reads the banner and
+                            # ignores the prose the loop rewrote.
+                            if _action_failed(_raw, _n):
+                                obj.error = _normalize_tool_error(obj.result)
+                        elif (_st is not None and _st != "ok") \
+                                or (_looks_like_tool_error(obj.result)
+                                    and not (_decl and _st == "ok")):
                             obj.error = _normalize_tool_error(obj.result)
                     except Exception:
                         pass

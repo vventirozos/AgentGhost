@@ -1361,14 +1361,23 @@ class MemoryBus:
                 results["skill"] = "skip"
                 return
             try:
-                await asyncio.to_thread(
+                _written = await asyncio.to_thread(
                     self.skill.learn_lesson,
                     lesson.get("task"),
                     lesson.get("mistake"),
                     lesson.get("solution"),
                     memory_system=self.vector,
                 )
-                results["skill"] = "ok"
+                # `learn_lesson` returns "written"/"reinforced" on a real
+                # write and None on every drop path (quality gate, dedup that
+                # neither wrote nor bumped, internal exception it swallows
+                # itself) — "so callers can tell a real write from a silent
+                # drop", per its own docstring. Discarding it made this leg
+                # report ok whenever nothing escaped, which made the caller's
+                # failure branch unreachable.
+                results["skill"] = ("ok" if _written
+                                    else "error: lesson was not written "
+                                         "(dropped by the playbook)")
             except Exception as e:
                 results["skill"] = f"error: {e}"
 
