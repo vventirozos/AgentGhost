@@ -174,3 +174,84 @@ def _detect_tool_call_loop(buf: str) -> bool:
     opens = len(re.findall(r'<tool_call\b', buf, re.IGNORECASE))
     closes = len(re.findall(r'</tool_call\b', buf, re.IGNORECASE))
     return (opens - closes) > TOOL_CALL_LOOP_THRESHOLD
+
+
+# --- native tool-call flood detector ----------------------------------------
+# Sibling of `_detect_tool_call_loop` for the OTHER tool-call channel.
+#
+# That probe reads the CONTENT buffer and counts unclosed `<tool_call>` tags,
+# so it is structurally blind whenever the upstream emits tool calls NATIVELY
+# (OpenAI-shape `delta.tool_calls`) — which is this agent's default
+# (`--native-tools`, main.py). In that mode a degenerate turn puts nothing in
+# either guarded buffer: `agent.handle_chat` computes
+# `guard_buf = reasoning_content if reasoning_content else full_content`, and
+# a native flood leaves BOTH frozen (measured: 264 chars of reasoning, 0 chars
+# of content) while the call list grows to the token cap. Every stream guard
+# therefore saw a healthy stream and none of them fired.
+#
+# Measured consequence — three production floods, one signature:
+#   2026-08-24 11:43  req 87e45af8   960 calls   294.8s of decode
+#   2026-08-31 09:55  req 97b2dc8e   817 calls   251.2s
+#   2026-08-31 13:12  req bench-ee   629 calls   237.7s
+# each a self-play turn whose reasoning stopped mid-quote of the literal rule
+# text ("emit EXACTLY ONE `") and then repeated one `execute` call until
+# max_tokens. In the 629 case every duplicate was DISPATCHED — `execute` is
+# blanket-mutating, so the batch dedup (read-safe allowlist) never collapses
+# it — spawning 629 real `python3` processes and 629 tool results into the
+# context window.
+#
+# TWO conditions, because a flood has two shapes:
+#   * a run of byte-identical COMPLETED calls — the observed decoder collapse.
+#     Fires in ~13 calls (~2-3s of decode) instead of ~5 minutes.
+#   * a hard ceiling on the batch — catches a flood whose arguments vary
+#     (e.g. the 144-identical-path `file_system` burst noted at the batch
+#     dedup site, had the paths differed).
+# Both are far above anything legitimate: the largest healthy batch in 27 days
+# of production log is FOUR calls, and `delegate` caps its own fan-out at 4.
+TOOL_CALL_BATCH_CEILING = 32     # calls in ONE assistant message = flood
+NATIVE_TOOL_CALL_REPEAT = 12     # byte-identical COMPLETED calls in a row
+
+
+def _native_call_identity(tc) -> tuple:
+    """(name, arguments) of one accumulated native tool-call entry.
+
+    Byte-level, deliberately: two calls that differ anywhere in their
+    arguments are different work, and only EXACT repetition is evidence of a
+    decoder collapse."""
+    if not isinstance(tc, dict):
+        return ("", "")
+    fn = tc.get("function")
+    if not isinstance(fn, dict):
+        return ("", "")
+    return (str(fn.get("name") or ""), str(fn.get("arguments") or ""))
+
+
+def _detect_native_tool_call_flood(tool_calls) -> bool:
+    """True when the natively-streamed tool-call list has collapsed.
+
+    ``tool_calls`` is the list being accumulated in place by the streaming
+    loop, so the LAST entry is still receiving argument fragments and can
+    look identical to its predecessor by mere prefix. Only COMPLETED
+    entries (everything before the last) are compared — the cost of one
+    extra call before firing, in exchange for never killing a live turn on
+    a half-streamed argument string.
+
+    O(NATIVE_TOOL_CALL_REPEAT) per call: the backwards scan stops at the
+    first difference or at the threshold, so it is safe to run on every
+    tool-call delta chunk."""
+    if not tool_calls:
+        return False
+    if len(tool_calls) > TOOL_CALL_BATCH_CEILING:
+        return True
+    completed = tool_calls[:-1]
+    if len(completed) < NATIVE_TOOL_CALL_REPEAT:
+        return False
+    run = 1
+    ident = _native_call_identity(completed[-1])
+    for tc in reversed(completed[:-1]):
+        if _native_call_identity(tc) != ident:
+            return False
+        run += 1
+        if run >= NATIVE_TOOL_CALL_REPEAT:
+            return True
+    return False

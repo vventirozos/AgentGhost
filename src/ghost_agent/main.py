@@ -1296,6 +1296,14 @@ def calib_startup_fields(cp) -> dict:
         "loaded": "startup",
         "map": getattr(cp, "map_status", "applied"),
         "beats_base_rate": getattr(cp, "beats_base_rate", None),
+        # ⚠ §4EB: THE SECOND VERDICT, AND IT GOES BEFORE THE NUMBERS FOR THE
+        # SAME REASON THE FIRST ONE DOES — this line is truncated at a fixed
+        # width. `beats_base_rate` answers "is this a good PROBABILITY";
+        # `ranks_outcomes` answers "does it ORDER turns", and on this corpus
+        # they have disagreed (indistinguishable / AUC 0.652). One without
+        # the other is how the operator reads "no signal" off a comparison
+        # that cannot support the phrase.
+        "ranks_outcomes": getattr(cp, "ranks_outcomes", None),
         "threshold": cp.threshold,
         "w_entropy": cp.w_entropy,
         "lam": cp.lambda_uncertainty,

@@ -32860,6 +32860,267 @@ remaining five review sections — §4BY, §4BZ, §4CA (the three turn-loop slic
 asserted it without one. Those are the sections whose convergence is unverified, and the turn
 loop is the most behaviourally critical code in the project.
 
+## §4EA — The channel no stream guard watched: three tool-call floods (2026-08-31)
+
+**Scope.** Property: a degenerate generation must not be able to run the upstream to its token
+cap, and must never reach the sandbox. Threat model: the model's own output, on every channel
+that can carry a tool call. Out of scope: why the decoder collapses (upstream), and the
+calibration warning the operator asked about in the same breath (separate, and NOT a defect —
+see Not done).
+
+### The defect
+
+The operator asked whether `tool call ⤷ repeated ×628` in the stream was normal. It was not.
+Three floods in the whole 27-day mirror log, one signature each time:
+
+| when | req | calls in one message | decode |
+|---|---|---|---|
+| 2026-08-24 11:43 | 87e45af8 | **960** | 294.8 s |
+| 2026-08-31 09:55 | 97b2dc8e | **817** | 251.2 s |
+| 2026-08-31 13:12 | bench-ee | **629** | 237.7 s |
+
+A self-play turn; reasoning stops mid-sentence exactly at the backtick in *"emit EXACTLY ONE `"*
+— the model quoting the self-play rule, which spelled out the literal `<tool_call>` tag and so
+put a real opening marker on its own reasoning stream; `content: 0 chars`; then the same
+`execute` call until max_tokens. Healthy batches in that log peak at **four** calls.
+
+**Nothing watched the channel.** Every stream guard reads
+`guard_buf = reasoning_content if reasoning_content else full_content`, and
+`_detect_tool_call_loop` — the probe built for exactly this shape — counts `<tool_call>` tags in
+the CONTENT buffer. With `--native-tools` (default ON) the calls arrive as `delta.tool_calls` and
+touch neither buffer: reasoning frozen at 264 chars, content at 0, while the list grew to the
+cap. The guard for this failure was blind in the mode the agent actually runs. Downstream the
+batch dedup did not help either — it collapses only byte-identical **read-safe** calls and
+`execute` is blanket-mutating — so in the 629 case every duplicate ran: **629 real `python3`
+processes** and 629 tool results into the window. Each turn self-recovered on one strike, which
+is why it stayed invisible for a week.
+
+### The fixes
+
+1. **`_detect_native_tool_call_flood`** (`core/stream_guards.py` — the seam module, per its own
+   rule that new guards land there). Two arms: `NATIVE_TOOL_CALL_REPEAT` (12) byte-identical
+   **completed** calls in a contiguous run, and a hard `TOOL_CALL_BATCH_CEILING` (32) for a flood
+   whose arguments vary. The entry still streaming is never judged — arguments accumulate by
+   `+=`, so a half-arrived string is a prefix of its predecessor and would fire on a legitimate
+   turn. Fires in ~13 calls (~2-3 s) and **aborts the stream**; nothing is dispatched.
+2. **A batch ceiling in `_dispatch_and_process_tool_batch`** — the one choke point every producer
+   passes (native stream, XML healer, client-SSE, non-stream). It cannot save the decode, so it
+   does the other job: keep the flood out of the sandbox and the window. **Trims**, before
+   `messages.append(msg)`, so the assistant message and its tool replies still agree exactly (an
+   orphaned `tool_call_id` is a 400 next turn). Trimmed two ways deliberately: in-place `del`
+   for the aliases, plus an explicit `msg["tool_calls"] = tool_calls` for a producer that hands
+   `msg` a copy — without which the trim would CREATE the orphans it exists to prevent. The
+   operator line distinguishes "every dropped call was byte-identical to one that ran" from
+   "SOME DROPPED CALLS WERE DISTINCT".
+3. **The self-play rule no longer names the tag** (`core/dream.py`): "Emit EXACTLY ONE tool call
+   per turn". Same constraint, no marker to quote. A **mitigation of the observed trigger, not
+   the fix** — the tag is still in the system prompt where it belongs, so the model can quote it
+   at any time; that is precisely why (1) is the fix.
+
+A flood takes the same discard/strike/retry path as a thinking loop but selects its own steer:
+the thinking-loop alert demands "ONE grounding tool call", the exact instruction a flood already
+over-obeyed. One append, two texts — branching the append would let a later edit fix one shape
+and leave the other behind.
+
+### Verification
+
+`tests/test_native_tool_call_flood.py` (19 pins). **Mutation: 14/14 killed**, noop control
+survived, known-bad control killed. Four of the fourteen killers were added *after* the first
+sweep — the first pass left four survivors, every one a real blind spot in my own pins, not an
+equivalent mutant:
+
+- the contiguity fixture had 20 identical calls but only ever 10 in a row, so "count them all"
+  still fell short of the threshold and survived;
+- `msg["tool_calls"]` sync survived because every fixture aliased the two lists — the world it
+  guards was untested;
+- removing the `break` survived because a one-chunk harness drains identically either way, so
+  "aborts the stream" — the entire point — was unpinned until a multi-chunk stream counted
+  consumed chunks;
+- the log line read the in-flight entry undetectably until the harness streamed arguments in two
+  pieces.
+
+An existing pin (`test_self_play_redesign.py`) asserted the old rule text and was updated to
+pin the property plus the tag's absence. Full suite **18,846 passed / 17 skipped / 0 failed**
+(the 17 are the documented steady state). Docs: `docs/core/agent.html`.
+
+### Not done
+
+- **The calibration warning asked about in the same message is NOT a defect.** 14 lines in 15.5 h
+  ≈ 1/hour = `--calib-refit-cooldown 3600`, one line per refit, no double-fire — the same answer
+  §4DZ's cadence question got. Whether the signal itself was dead was open when this was written;
+  it was **measured immediately after — see §4EB**.
+- The ceiling is a fixed 32, not adaptive; a legitimate fan-out above it would be trimmed with a
+  loud line but no model-visible note. 32 is 8× the largest healthy batch on record.
+
+## §4EB — The calibration signal is real, and nothing reads it (2026-08-31)
+
+**Scope.** Measurement, not a change: is the hourly `INDISTINGUISHABLE` verdict a corpus artifact
+(as on 2026-08-02) or a dead signal? Read-only probes against the live store, using the module's
+own loader / `_composite_for` / `_cv_delta_ci` so this measures the shipped mechanism rather than
+a re-derivation.
+
+**The instrument is sound.** Every number in the warning reproduces exactly from the live store —
+`platt_a` 1.759861, `brier_raw` 0.054386, `brier_base_rate` 0.047327, `brier_cv` 0.046503,
+CI [-0.001951, +0.000206]. The §4DZ epoch machinery is doing its job: 1274 rows, one epoch, 1168
+excluded.
+
+**The verdict is CORRECT, and not 2026-08-02 again.** It survives decontamination: refit on
+user-only rows (bench removed) still gives CI [-0.002400, +0.000356] — straddling zero. The score
+genuinely does not beat a constant *as a probability*.
+
+**But that question is not "is there signal".** Base rate 0.8553 with 71 negatives in 1274 (5.6%);
+R² of the fit is 1.7%. Brier against a base rate that skewed is a nearly powerless instrument for
+ranking, which the module's own comments already say ("ranked turns well (AUC 0.679) while scoring
+Brier 0.060 against 0.037"). Measured directly:
+
+| population | n | neg | AUC | 95% CI (boot) |
+|---|---|---|---|---|
+| pooled (what ships) | 1274 | 71 | 0.577 | [0.505, 0.658] |
+| `origin=user` | 1022 | 54 | **0.662** | [0.580, 0.738] |
+| `origin=bench` | 252 | 17 | **0.273** | [0.116, 0.460] |
+| `source=bench_validator` | 175 | 17 | 0.195 | [0.048, 0.370] |
+
+**Bench rows are anti-ranked, and the mass cap does not see it.** `_apply_bench_mass_cap` bounds
+how MANY bench rows enter (252 ≤ 1022, so all of them do) but nothing checks their DIRECTION. Fit
+alone they produce a Platt slope of **-12.8**. Pooling drags AUC 0.662 → 0.577; the epoch's most
+recent quarter reads 0.344 as they arrive. (The time-quarter split is exploratory; the origin
+split is not — the cap exists precisely because origin is a known-different population.)
+
+**The gate still separates.** `below_threshold` fires on 12.9% of rows (15.6% user-only) and
+flags turns with mean outcome 0.774 vs 0.867 unflagged (+0.094; user-only +0.082). A random gate
+at the same firing rate reaches +0.031 at the 95th percentile over 2000 draws — **p < 0.0001**.
+
+**…and nothing reads it.** Traced every consumer:
+
+- `metacog.maybe_arbitrate` — the ONLY behavioural consumer of `below_threshold`, and it returns
+  at `if not self.arbiter_enabled`. `_METACOG_ARBITER_ENABLED = False`, and §3 records it as
+  **"net-negative as built; superseded by #18"** — retired, not parked.
+- `metacog.count(confidence_below=…)` → `_ctr_confidence_below`, a telemetry counter.
+- `agent.py:19112` → the `Turn Outcome` log line ("confidence 0.71").
+- `agent.py:19434/19512` → writes the composite back into `calibration.jsonl`, i.e. into the
+  corpus the next refit reads.
+- `beats_base_rate` itself gates nothing anywhere: it appends `/no_signal:` to the operator's
+  `refit=` line and qualifies the activity note.
+
+So the loop is: score a turn → print it → store it → refit on it → print the refit. **No decision
+anywhere consumes the number.** The hourly warning is an honest report about a quantity with no
+consumer — which is why "is the signal dead?" is the less useful question. [[built-but-unwired-loops]]
+
+### (a) and (b) SHIPPED 2026-08-31; (c) DEFERRED with a trigger
+
+**Why not (c) first.** The binding constraint is not the missing consumer, it is the label
+supply: **1.59 labelled negatives/day** (54 in 34 days) against `_MIN_VERDICT_N = 30` per arm —
+**~38 days** for a failure-rate contrast, and that is if it were the only arm. It would not be:
+**7 live arms** are already enrolled at traffic=1.0, one of which (`verify_depth`, §4BR) is the
+identical "accurate but unconsumed signal → randomised arm" shape, shipped 2026-08-16 and still
+carrying nothing but its `DECISION_RULE.md`. An eighth arm buys another unreadable result and
+dilutes the seven. (c) would also have been built on the WORSE signal — pooled AUC 0.577 vs 0.662
+— so (a) is a precondition for it being a fair test. **Trigger: revisit (c) when `verify_depth`
+reads out.** Retiring the loop instead was considered and rejected: the defect is the missing
+consumer, not the number.
+
+**(a) `_apply_bench_direction_gate`.** The mass cap tests the VOLUME of the exchangeability
+assumption; nothing tested the assumption. Now the auxiliary population is scored with the
+PREVIOUSLY fitted weights — the instrument actually in production, which also keeps the decision
+independent of the fit it feeds — and excluded only on a **confident inversion** (whole CI below
+chance). Measured false-exclusion rate under a true null: **2.25–3.25% against a nominal 2.5%**,
+pinned as a test, because a gate that drops real data owes an error rate. On a cold start there
+are no params, so everything is admitted and the exclusion costs one refit — pinned too. Live
+effect on the first refit: **252 bench rows excluded, n 1274 → 1022, AUC 0.577 → 0.652.**
+
+**One builder.** `fit`, `_load_epoch` and `stats` each assembled the population chain by hand and
+this module already carries two bugs from that (§4L R2 NEW-4, §4BF 1c). All three now call
+`_fit_population`, with an AST enumeration that fails if a fourth filter reaches one caller only.
+
+**(b) `ranks_outcomes`.** AUC + bootstrap CI recorded beside the Brier verdict, **interval-driven
+by the same §4DZ discipline** and reusing the frozen four-word vocabulary (for a rank statistic
+`no` means *orders them backwards*). The warning now ends "Nothing may treat this score AS A
+PROBABILITY … It DOES still rank: AUC 0.652 [0.564, 0.732], so a RANKING use is supported where a
+probability claim is not." The operator line splits `no_signal:` into `no_prob:` / `no_rank:`.
+Two existing pins asserted the old token; they were repinned on the PROPERTY (the line is not a
+bare `ok` and names the verdict), which is what they were always for.
+
+**Verification.** `tests/test_calibration_rank_verdict.py` (22 pins) + 2 repinned.
+**Mutation 14/16 killed**, noop control survived, known-bad killed. Two survivors, both proven
+equivalent: the `params is None` fast path (the exception guard below catches it identically —
+kept anyway, because routing an expected cold start through an exception handler is how a real
+fault later gets mistaken for one), and `_auc_ci(composites)` vs `(calibrated)`. Full suite
+**18,868 passed / 17 skipped / 0 failed**. Docs: `docs/core/calibration.html`.
+
+⚠ **The first mutation run was INVALID and the noop control caught it** — the harness copied only
+`src/tests/`, so two `TestSourceWindowPins` in `test_admissibility_1c.py` (which read `scripts/`)
+failed constantly and "killed" every mutant including the no-op.
+
+⚠ **I committed the reader-set defect this module documents, against its own note.** The rank
+verdict went into `fit()` and the agent's CALIB line and NOT into `main.calib_startup_fields` or
+the `learning_health` collector — so one params file would have told the startup line, the idle
+line and `introspect learning` different stories. `calibration.py` carries a comment naming
+exactly this ("Migrate the whole reader set, not the two ends of it"). Caught by looking for the
+new string on the live log after deploying and not finding it. Now all FOUR surfaces carry both
+verdicts, enumerated from the AST rather than from a list, and the enumeration was verified to
+fail when either reader is removed.
+
+⚠ **A comment justifying one of these fixes was FALSE and is corrected in place.** It claimed
+measuring AUC on `calibrated` would report `1 - AUC` on the `rejected_inverted` branch. It would
+not: `fit` rebinds `calibrated = composites` on all three rejection paths, which is exactly why
+that mutant survives. The choice is clarity and independence, not correctness — and the test
+written to "distinguish" the two does not; its docstring now says so and pins the SIGN instead.
+
+### (c) SHIPPED 2026-08-31 — the confidence score's first consumer
+
+Operator overruled the deferral, correctly: my objection was to *proving* a consumer helps, not to
+having one. Restated: an eighth randomised arm cannot be read for ~38 days, so this ships as a
+**plain default behind a kill switch**, read through telemetry the deep path already records.
+
+**What it does.** A turn whose pre-penalty confidence is below the fitted threshold verifies at
+DEPTH (self-consistency n=3 on the cheap leg) instead of n=1. `verifier.deep_for_low_confidence`.
+
+**Two constraints that shaped it.**
+
+1. **A dependency cycle.** The full confidence score takes an `outcome_penalty` derived from
+   `verifier_backfill` — the verifier's own verdict. Routing the verifier on it is circular.
+   Broken by `_prepenalty_confidence`: the same `score()` call with `outcome_penalty=0.0`, from
+   inputs that all exist before the verdict, memoised per request so the later calibration record
+   cannot fork from it. That is also the column the store persists
+   (`raw_pre_penalty_composite`), so it is the one §4EB's AUC 0.652 describes.
+2. **A live experiment.** Router-hard turns are `verify_depth`'s population (§4BR) and half are
+   its control. `router_hard` therefore **EXCLUDES**: the two triggers are disjoint by
+   construction, enumerated over the whole input space. Membership is read as KEY PRESENCE in the
+   experiments ring — `mark_trigger` fires only on router-hard turns, so the key existing IS the
+   population — because reading the VALUE would treat every control-arm turn as outside the
+   experiment and deepen it, contaminating the arm in the one direction that looks like a null.
+
+**Verification.** `tests/test_verify_depth_low_confidence.py` (18 pins). **Mutation 14/14 killed**,
+noop control survived, known-bad killed. Full suite **18,889 passed / 17 skipped / 0 failed**.
+Docs: `docs/core/verifier.html`.
+
+⚠ **The mutation sweep caught the fix being dead.** `if False and _vconf_rule(...)` — the whole
+feature disabled — SURVIVED the first sweep, because the only wiring test asserted the AST
+*mentioned* the rule. `depth_for_turn`'s own docstring had already written the answer: "a
+predicate that can be CALLED is the difference between a pinned rule and a described one." The
+decision is now `_verify_depth_for_turn`, called and asserted, not read.
+
+⚠ **Four existing pins broke on the extraction while every property they assert still held** —
+they named `_compute_verifier_verdict` as a location. Repointed at a locator that finds the
+decision by WHAT IT DOES (reads `trigger_flags` for `verify_depth_fired`) and asserts it unique,
+so a second decision site fails there rather than splitting the rule silently. A fifth
+(`test_routing_can_never_fail_a_verdict`) was a 2200-CHARACTER WINDOW grepped for
+`except Exception`; it is now an AST check that every `_deep` decision sits inside a handler.
+
+⚠ **A FIFTH surface, found by reading the deployed report and not trusting it.** §4EB's
+direction gate went into the fit but not into `learning_health._live_epoch_filter` — a dict-level
+twin that re-derives the fit population from raw JSONL. It applied three of the fit's four
+filters, so the live report headline said **1275 samples where the fit consumed 1022**: "a
+population the agent never fits", which is the exact defect that twin exists to prevent,
+reintroduced by the change that fixed it one layer up. The twin now ASKS — it takes the fit's
+stored `bench_verdict` rather than re-measuring, because a twin free to re-derive is a twin free
+to disagree (`map_status` had three private copies; `beats_base_rate` had one file and four
+surfaces giving two answers). Pinned as an equality between the headline and `n_samples`.
+
+**Still open.** Whether it HELPS is unmeasured, by design — the telemetry (`sc_n`/`sc_agree`/
+`sc_drawn`) accrues per deep verdict and is the read when there is enough of it. Kill with
+`GHOST_VERIFY_DEPTH_CONF=0`, no restart needed.
+
 ## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
 
 **This section is binding. When the operator says "review <feature/subsystem>", this is the

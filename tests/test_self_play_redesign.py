@@ -177,8 +177,19 @@ class TestMaxTokensStillReasonable:
 
 class TestWorkerPromptConstraints:
     def test_prompt_mandates_one_tool_call_per_turn(self):
+        """The rule stays; the literal tag it used to spell out does not.
+
+        Updated 2026-08-31. Naming `<tool_call>` in a rule the model reads
+        invites it to QUOTE the rule inside <think> — which puts a real
+        opening marker on the reasoning stream, ends that channel
+        mid-sentence, and drops the decoder into a repeat loop (measured
+        three times: x960, x817, x629 calls, ~5 min of decode each). The
+        constraint is unchanged; only the tag is gone. See
+        tests/test_native_tool_call_flood.py.
+        """
         src = DREAM_SRC.read_text()
-        assert "EXACTLY ONE `<tool_call>` per turn" in src
+        assert "EXACTLY ONE tool call per turn" in src
+        assert "EXACTLY ONE `<tool_call>` per turn" not in src
 
     def test_prompt_bounds_script_length(self):
         src = DREAM_SRC.read_text()

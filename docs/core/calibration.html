@@ -69,6 +69,7 @@
 
   <h2>Observability</h2>
   <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier, the sample count <code>n</code> (current epoch) and <code>excluded</code> (older-epoch rows skipped). <code>tracker.stats()</code> exposes <code>{samples, samples_all_epochs, epoch, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty, map_status, beats_base_rate}</code> — a debug/test surface with no production caller, despite what its docstring claimed until 2026-08-30.</p>
+  <p><strong>Four surfaces report the verdicts, and they must agree</strong> (&sect;4EB): the startup 📐 line (<code>main.calib_startup_fields</code>), the idle-refit 📐 line (<code>core.agent._biological_tick</code>), the <code>logger.warning</code> from <code>fit</code> itself, and <code>introspect learning</code> (<code>learning_health</code> collector &rarr; renderer). Each carries <em>both</em> <code>beats_base_rate</code> and <code>ranks_outcomes</code>; the refit line reads <code>refit=ok/no_prob:&lt;v&gt;/no_rank:&lt;v&gt;</code>, and the report prints an <code>AUC … — the score RANKS outcomes</code> line under the Brier sentence. An AST enumeration in <code>tests/test_calibration_rank_verdict.py</code> fails if any function reports one verdict without the other — the first cut of &sect;4EB added the rank verdict to <code>fit</code> and the agent line only, which is the &ldquo;both ends but not the collector&rdquo; mistake this module already carries a warning about.</p>
 
   <h3 id="beats-base-rate"><code>beats_base_rate</code> — the licence (2026-08-30)</h3>
   <p><code>FittedParams.beats_base_rate</code> answers <em>&ldquo;may anything treat this score as
@@ -250,6 +251,28 @@
   "LEARNABLE" while the fit was pinning the weight to 0; keeping a local <code>abs(sep) &lt; 0.02</code>
   cut is how <code>feature_health</code> came to mark entropy <code>[live]</code> (0.0421 &gt; 0.02) in
   the same report where the fit pinned it (0.63σ &lt; 2.5σ). One function, one verdict.</p>
+
+  <h2 id="ranks-outcomes">Two questions, two verdicts (2026-08-31, §4EB)</h2>
+  <p>The hourly warning used to end on <em>&ldquo;nothing may treat this score as informative&rdquo;</em>. On this corpus a Brier comparison cannot support that sentence. With a base rate of 0.855 and 71 negatives in 1274 rows (5.6%), the achievable improvement over a constant is a fraction of a percent — measured R&sup2; 1.7% — so the test is nearly powerless for ordering. Measured on identical rows the same day:</p>
+  <div class="scroll"><table>
+    <tr><th>question</th><th>statistic</th><th>reading</th><th>verdict</th></tr>
+    <tr><td>Is it a good <em>probability</em>?</td><td>CV Brier vs base rate</td><td>delta CI [-0.00195, +0.00021]</td><td><code>beats_base_rate = indistinguishable</code></td></tr>
+    <tr><td>Does it <em>order</em> turns?</td><td>AUC vs chance</td><td>0.652 [0.564, 0.732] (user rows)</td><td><code>ranks_outcomes = yes</code></td></tr>
+  </table></div>
+  <p>Both are now measured, both are recorded, and both are <strong>interval-driven</strong> — <code>_rank_verdict</code> reads the bootstrap CI against 0.5 exactly as <code>_base_rate_verdict</code> reads the delta CI against zero, so this cannot become a second licence granted on a point estimate (the §4DZ defect). They reuse one frozen vocabulary; for a rank statistic <code>no</code> means <em>orders them backwards</em>. AUC is computed on the RAW composite deliberately: it is invariant to a strictly increasing Platt map, so raw and calibrated agree whenever the map is applied, and on the <code>rejected_inverted</code> branch the raw column is what actually ships.</p>
+  <p>Consequence for consumers: a <strong>ranking</strong> use — flagging the lowest-confidence turns — is supported by <code>ranks_outcomes</code>; a <strong>probability</strong> claim still needs <code>beats_base_rate</code>, and does not have it. The operator line reflects the split: <code>refit=ok/no_prob:indistinguishable</code> instead of the old undifferentiated <code>no_signal:</code>.</p>
+
+  <h2 id="aux-direction">Auxiliary rows must rank the same way (2026-08-31, §4EB)</h2>
+  <p><code>_apply_bench_mass_cap</code> admits bench-origin rows to the fit under an equal-mass cap, on the premise that they are exchangeable with real turns. It bounds how <em>many</em> enter; nothing tested the premise. Measured on the live store:</p>
+  <div class="scroll"><table>
+    <tr><th>population</th><th>n</th><th>AUC</th><th>95% CI</th></tr>
+    <tr><td>pooled (what shipped)</td><td>1274</td><td>0.577</td><td>[0.505, 0.658]</td></tr>
+    <tr><td><code>origin=user</code></td><td>1022</td><td>0.662</td><td>[0.580, 0.738]</td></tr>
+    <tr><td><code>origin=bench</code></td><td>252</td><td><strong>0.273</strong></td><td>[0.116, 0.460]</td></tr>
+  </table></div>
+  <p>Bench rows ranked outcomes <em>backwards</em> — fit alone they produce a Platt slope of &minus;12.8 — and being under the cap (252 &le; 1022) every one was admitted, dragging pooled AUC to 0.577. This is the same lesson <a href="#epochs">corpus epochs</a> encode one axis over: no fit beats a fit on incomparable rows.</p>
+  <p><code>_apply_bench_direction_gate</code> tests the premise. It is deliberately conservative — it excludes <strong>only</strong> on a confident inversion (the whole CI below chance); an auxiliary population that merely ranks weakly, or not at all, is still admitted, because dropping real data on noise is the worse error and the operator decision that admitted bench (&sect;4BF 1c) stands until there is evidence against its premise. Measured false-exclusion rate under a true null: 2.25&ndash;3.25% against a nominal 2.5%, pinned as a test. The auxiliary rows are scored with the <em>previously fitted</em> weights — the instrument actually in production, which also keeps the decision independent of the fit it feeds — so on a cold start there is no evidence and everything is admitted; the exclusion costs one refit. The decision is recorded as <code>bench_verdict</code> / <code>n_bench_misaligned</code>, so a corpus that oscillates is visible rather than silent.</p>
+  <p><strong>One builder.</strong> <code>fit</code>, <code>_load_epoch</code> and <code>stats</code> each assembled the population chain by hand, and this module already carries two bugs from that (&sect;4L R2 NEW-4 averaged superseded duplicates; &sect;4BF 1c reported over uncapped bench rows) — a metric describing a population the fit never consumed. All three now call <code>_fit_population</code>, and an AST enumeration fails if a fourth filter is added to one caller and not the others.</p>
 
   <h2>Known asymmetry</h2>
   <p>The <code>λ</code> (verbalised-uncertainty) grid is <em>not</em> gated by the separation test —

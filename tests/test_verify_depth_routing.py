@@ -343,16 +343,40 @@ class TestTheDecisionPoint:
                 f"{ast.dump(kw['deep'])}")
             assert kw["deep"].id == "_deep"
 
+    @staticmethod
+    def _depth_decision_fn(tree):
+        """The function that OWNS the depth read, located by WHAT IT DOES.
+
+        ⚠ These pins named `_compute_verifier_verdict` and broke when the
+        decision was extracted into a callable predicate (§4EC) — while every
+        property they assert still held. A pin bound to a location tests the
+        location. Found instead by "reads trigger_flags for
+        verify_depth_fired", and asserted unique so a second decision site
+        fails here rather than silently splitting the rule.
+        """
+        import ast
+        owners = [n for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and any(isinstance(c, ast.Call)
+                          and getattr(c.func, "attr", "") == "trigger_flags"
+                          for c in ast.walk(n))
+                  and "verify_depth_fired" in ast.dump(n)]
+        assert len(owners) == 1, (
+            f"the depth decision must live in exactly one function, found "
+            f"{[o.name for o in owners]}")
+        return owners[0]
+
     def test_the_deep_flag_is_READ_from_the_ledger_not_recomputed(self):
         """One definition. handle_chat decides (while the ring slot is live
         and before either delivery path writes its trajectory); this method
         only reads. Recomputing here is what put the stamp after the
         streamed drain — 2/169 rows, measured."""
+        import ast
         src = self._agent_src()
-        assert '_deep = bool(_flags.get("verify_depth_fired"))' in src
-        i = src.index("async def _compute_verifier_verdict")
-        j = src.index("async def _compute_verifier_verdict_gated")
-        assert "arm_for" not in src[i:j], (
+        fn = self._depth_decision_fn(ast.parse(src))
+        body = ast.dump(fn)
+        assert "verify_depth_fired" in body
+        assert "arm_for" not in body, (
             "the arm must not be consulted here — it is decided in handle_chat")
 
     def test_the_flag_is_read_from_the_ENROLLED_ONLY_ring(self):
@@ -503,11 +527,58 @@ class TestTheDecisionPoint:
             ast.dump(owner.test))
 
     def test_routing_can_never_fail_a_verdict(self):
-        src = self._agent_src()
-        i = src.index("_deep = False")
-        window = src[i:i + 2200]
-        assert "except Exception" in window
-        assert "never fail a verdict" in window
+        """A routing fault must degrade to control depth, never fail a turn.
+
+        ⚠ REPINNED 2026-08-31 (§4EC) FROM A CHARACTER WINDOW. This read the
+        2200 chars after `_deep = False` and grepped them for
+        `except Exception` — a selector that says nothing about structure
+        and breaks on any insertion, which is exactly what adding a second
+        trigger did. Structural now: every assignment that DECIDES `_deep`
+        must sit inside a `try` with an `except Exception` handler, located
+        by the AST. The one exception is the safe default `_deep = False`,
+        which is what a swallowed fault degrades TO.
+        """
+        import ast
+        tree = ast.parse(self._agent_src())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == "_compute_verifier_verdict")
+
+        guarded_lines = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Try) and any(
+                    isinstance(h.type, ast.Name) and h.type.id == "Exception"
+                    for h in node.handlers):
+                for inner in ast.walk(node):
+                    guarded_lines.add(getattr(inner, "lineno", -1))
+
+        decisions, safe_default = [], 0
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "_deep"
+                       for t in node.targets):
+                continue
+            if isinstance(node.value, ast.Constant) and node.value.value is False:
+                safe_default += 1
+                continue                      # the degrade-to target itself
+            if node.lineno not in guarded_lines:
+                decisions.append(node.lineno)
+
+        assert safe_default == 1, (
+            "the `_deep = False` safe default is missing or duplicated; a "
+            "swallowed routing fault has nothing well-defined to degrade to")
+        assert not decisions, (
+            f"`_deep` is decided outside a try/except at lines {decisions} — "
+            "a routing fault would fail the verdict instead of degrading "
+            "to control depth")
+        # ...and the guarded region must actually decide it, or the pin is
+        # satisfied by a function that never routes at all.
+        assert any(isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "_deep"
+                           for t in n.targets)
+                   and n.lineno in guarded_lines
+                   for n in ast.walk(fn)), "no guarded `_deep` decision at all"
 
     def test_the_router_verdict_is_READ_not_re_threaded(self):
         """Threading a new parameter through three call sites is the
@@ -524,9 +595,7 @@ class TestTheDecisionPoint:
         """
         import ast
         tree = ast.parse(self._agent_src())
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.AsyncFunctionDef)
-                  and n.name == "_compute_verifier_verdict")
+        fn = self._depth_decision_fn(tree)
         calls = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
                  and getattr(c.func, "attr", "") == "trigger_flags"]
         assert len(calls) == 1, f"expected one trigger_flags read, got {len(calls)}"
@@ -543,9 +612,7 @@ class TestTheDecisionPoint:
         import ast
         tree = ast.parse(self._agent_src())
 
-        def _key_of(fnname, attr, flag):
-            fn = next(n for n in ast.walk(tree)
-                      if isinstance(n, ast.AsyncFunctionDef) and n.name == fnname)
+        def _key_of(fn, attr, flag):
             call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
                         and getattr(c.func, "attr", "") == attr
                         and (flag is None or any(
@@ -553,8 +620,10 @@ class TestTheDecisionPoint:
                             for x in c.args)))
             return ast.dump(call.args[1])
 
-        write = _key_of("handle_chat", "mark_trigger", "verify_depth_fired")
-        read = _key_of("_compute_verifier_verdict", "trigger_flags", None)
+        _hc = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.AsyncFunctionDef) and n.name == "handle_chat")
+        write = _key_of(_hc, "mark_trigger", "verify_depth_fired")
+        read = _key_of(self._depth_decision_fn(tree), "trigger_flags", None)
         assert "req_id" in write and "req_id" in read, (write, read)
 
 

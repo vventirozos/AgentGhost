@@ -74,7 +74,7 @@ def _live_separation(rows: List[dict], attr: str):
         return 0.0, 0.0
 
 
-def _live_epoch_filter(samples: List[dict]):
+def _live_epoch_filter(samples: List[dict], bench_verdict: str = ""):
     """Scope raw JSONL rows to the epoch `calibration.fit` actually reads.
 
     Read from the owning module so this cannot drift from the fit — the whole
@@ -83,9 +83,17 @@ def _live_epoch_filter(samples: List[dict]):
     fit ever sees (which is how competence read as DEAD: its separation was
     measured across a label-scheme change). Returns
     ``(capped, n_other_epochs, n_superseded, precap)`` — ``capped`` is the
-    fit population (epoch + supersede + origin cap), ``precap`` the same
-    minus the cap (the bench-flood detector's population). Degrades to
-    "everything, nothing excluded" if the import fails.
+    fit population (epoch + supersede + origin cap + DIRECTION gate),
+    ``precap`` the same minus the cap (the bench-flood detector's
+    population). Degrades to "everything, nothing excluded" if the import
+    fails.
+
+    ⚠ `bench_verdict` (§4EC) is the fit's RECORDED direction verdict,
+    passed in rather than recomputed. Without it this twin applied THREE
+    of the fit's four filters, and the report headline said 1275 samples
+    where the fit consumed 1022 — "a population the agent never fits",
+    the exact defect this function exists to prevent, reintroduced by
+    adding a filter to the fit and not to its telemetry twin.
     """
     try:
         from .calibration import CURRENT_EPOCH, epoch_for_ts
@@ -121,6 +129,13 @@ def _live_epoch_filter(samples: List[dict]):
     try:
         from .calibration import apply_bench_mass_cap_rows
         scoped = apply_bench_mass_cap_rows(scoped)
+    except Exception:  # noqa: BLE001 — telemetry must never break on import
+        pass
+    # §4EC: and the DIRECTION gate — the fit's stored verdict, APPLIED, not
+    # re-derived. Last in the chain, mirroring `_fit_population`'s order.
+    try:
+        from .calibration import apply_bench_direction_rows
+        scoped = apply_bench_direction_rows(scoped, bench_verdict)
     except Exception:  # noqa: BLE001 — telemetry must never break on import
         pass
     return scoped, n_other, n_sup, precap
@@ -417,7 +432,8 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
     # only 541 were fittable, while the feature verdicts were computed over
     # all of them and so measured a label-scheme change rather than a signal.
     samples, n_other_epochs, n_superseded, precap_samples = \
-        _live_epoch_filter(all_samples)
+        _live_epoch_filter(all_samples,
+                           str(params.get("bench_verdict") or ""))
     # §4BF 1c (R2+R3 reviews): `label_origins` inside _label_health
     # describes the CAPPED population (correct — it must match the fit),
     # which saturates at 1:1 by construction. The PRE-CAP mix is the
@@ -500,6 +516,16 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             # field it explicitly contains.
             "beats_base_rate": params.get("beats_base_rate"),
             "beats_base_rate_present": "beats_base_rate" in params,
+            # ⚠ §4EB, AND THIS COMMENT BLOCK IS WHY. The rank verdict was
+            # added to `fit()` and to the agent's CALIB line and NOT here —
+            # the exact "both ends but not the collector" mistake the note
+            # above records, committed against the note. Absent-vs-null gets
+            # its own flag for the same reason `beats_base_rate` needed one.
+            "ranks_outcomes": params.get("ranks_outcomes"),
+            "ranks_outcomes_present": "ranks_outcomes" in params,
+            "auc": params.get("auc"),
+            "auc_ci_lo": params.get("auc_ci_lo"),
+            "auc_ci_hi": params.get("auc_ci_hi"),
             # ⚠ THE RENDERER NEEDS THE CAUSE, NOT JUST THE REFUSAL. Its
             # `unknown` branch used to state "the Platt map was rejected" as
             # fact while having no field to check it against -- and `unknown`
@@ -2290,6 +2316,35 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                 lines.append(
                     f"  Brier {_honest} (5-fold CV, out-of-sample) {_verdict} "
                     f"the base-rate predictor ({_bb}){_ci_note}")
+                # §4EB: the OTHER question, on its own line, so a reader
+                # cannot take the Brier sentence for the whole answer. Same
+                # absent-vs-null discipline, and the interval is printed
+                # beside the point estimate because the verdict is decided
+                # from it.
+                _rk_present = cal.get("ranks_outcomes_present",
+                                      cal.get("ranks_outcomes") is not None)
+                _rk = (_known_verdict(cal.get("ranks_outcomes"))
+                       if _rk_present else BEATS_UNKNOWN)
+                _auc, _alo, _ahi = (cal.get("auc"), cal.get("auc_ci_lo"),
+                                    cal.get("auc_ci_hi"))
+                _rk_words = {BEATS_YES: "RANKS outcomes",
+                             BEATS_NO: "ranks them BACKWARDS",
+                             BEATS_INDISTINGUISHABLE:
+                                 "does NOT rank outcomes (spans chance)"}
+                if _rk in _rk_words and isinstance(_auc, (int, float)) \
+                        and not isinstance(_auc, bool) and _auc >= 0:
+                    _auc_ci = ""
+                    if all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                           for v in (_alo, _ahi)):
+                        _auc_ci = f" [95% CI {_alo:.3f}..{_ahi:.3f}]"
+                    lines.append(
+                        f"  AUC {_auc:.3f}{_auc_ci} — the score "
+                        f"{_rk_words[_rk]}. A RANKING use is licensed by "
+                        f"THIS line; a probability claim needs the one above.")
+                else:
+                    lines.append(
+                        "  AUC not recorded — discrimination is UNKNOWN for "
+                        "this fit, not absent.")
                 # ⚠ ON A REJECTION PATH THESE TWO ARE THE SAME NUMBER, and
                 # the CV figure above them describes a map that was thrown
                 # away. `fit()` sets `brier = brier_raw` and

@@ -5780,8 +5780,21 @@ Return ONLY a JSON object with:
                     "messages": [{"role": "user", "content": (
                         _wrapper_opening +
                         "### RESPONSE SHAPE RULES (strict)\n"
-                        "1. Emit EXACTLY ONE `<tool_call>` per turn. Never "
-                        "two. If you want to do two things (read a file AND "
+                        # Deliberately does NOT name the `<tool_call>` tag.
+                        # This rule used to spell it out, and the model quoted
+                        # it back inside <think> — which puts a real opening
+                        # tag on the stream, ends the reasoning channel
+                        # mid-sentence, and (measured three times: 2026-08-24
+                        # x960, 2026-08-31 x817 and x629) drops the decoder
+                        # into a repeat loop that emits the same call until
+                        # max_tokens. The tag is still in the system prompt
+                        # where it belongs, so this is a mitigation of the
+                        # observed trigger, not the fix — the fix is the
+                        # native-flood stream guard. But a rule the model
+                        # cannot quote into a stop marker is strictly safer,
+                        # and it says exactly the same thing.
+                        "1. Emit EXACTLY ONE tool call per turn. Never two. "
+                        "If you want to do two things (read a file AND "
                         "write a script), do them in consecutive turns.\n"
                         "2. Keep any Python script under 60 lines. If the "
                         "natural solution is longer, split it across "

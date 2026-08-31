@@ -383,6 +383,29 @@ def apply_bench_mass_cap_rows(rows):
             or id(r) in keep]
 
 
+def apply_bench_direction_rows(rows, bench_verdict):
+    """Dict-level twin of `_apply_bench_direction_gate` for raw-JSONL
+    consumers — and it ASKS rather than re-derives.
+
+    ⚠ THE VERDICT IS ALREADY COMPUTED. `fit` decides whether the auxiliary
+    population ranks the same way and writes the answer to
+    `bench_verdict` on the params. A telemetry twin that re-ran the
+    measurement would be a second definition of one verdict, free to
+    disagree with the fit on the same rows — the failure this module has
+    now paid for on `map_status` (three private copies) and on
+    `beats_base_rate` (one file, four surfaces, two answers). So this takes
+    the STORED verdict as an argument and only applies it.
+
+    Anything other than a confident inversion keeps every row, so a params
+    file that predates the field (verdict absent → not `"no"`) behaves
+    exactly as before.
+    """
+    if str(bench_verdict or "") != BEATS_NO:
+        return list(rows or [])
+    return [r for r in rows or []
+            if str((r or {}).get("origin") or "user") != _AUX_ORIGIN]
+
+
 def _apply_bench_mass_cap(samples):
     """§4BF Track 1c: blend populations under an EQUAL-MASS cap.
 
@@ -653,7 +676,7 @@ def _verdict_from_params(d: dict) -> str:
     one file told two operator surfaces different stories:
 
         load_params / stats / calib_startup_fields : "unknown"
-        agent idle CALIB                           : refit=ok/no_signal:unknown
+        agent idle CALIB                           : refit=ok/no_prob:unknown
         activity ledger                            : ", NO base-rate licence"
         introspect learning                        : "beats the base-rate predictor"
 
@@ -824,6 +847,198 @@ def _cv_delta_ci(pairs, *, k: int = 5, seed: int = 7, boots: int = 2000,
     lo = means[int((alpha / 2.0) * len(means))]
     hi = means[min(len(means) - 1, int((1.0 - alpha / 2.0) * len(means)))]
     return delta, lo, hi
+
+
+#: Bootstrap replicates for the rank CI. Fewer than `_cv_delta_ci`'s 2000
+#: because AUC needs a re-sort per replicate; 800 is stable to ~0.005 here.
+_AUC_BOOTS = 800
+#: Below this many rows in a population, its rank direction is not evidence.
+_RANK_MIN_N = 40
+
+
+def _auc(pairs) -> Optional[float]:
+    """Tie-aware Mann-Whitney AUC of composite vs BINARISED outcome.
+
+    ⚠ A DIFFERENT QUESTION FROM `_cv_delta_ci`, and the reason both exist.
+    Brier-against-the-base-rate asks "is this score a good PROBABILITY"; at
+    the live base rate (0.855, 5.6% negatives) the achievable improvement is
+    a fraction of a percent and the comparison is nearly powerless. AUC asks
+    "does this score ORDER turns correctly", which is the question every
+    threshold consumer actually depends on. Measured 2026-08-31 they gave
+    opposite readings on the same rows: delta CI [-0.00195, +0.00021]
+    (indistinguishable) while user-origin AUC was 0.662 [0.580, 0.738].
+    Reporting only the first read as "no signal" when the truth was "no
+    probability calibration".
+
+    ``None`` when one class is absent — AUC is undefined then, and returning
+    0.5 would manufacture a measured tie out of no measurement at all.
+    """
+    rows = [(float(c), 1 if float(o) >= 0.5 else 0) for c, o in pairs]
+    n_pos = sum(y for _, y in rows)
+    n_neg = len(rows) - n_pos
+    if not n_pos or not n_neg:
+        return None
+    rows.sort(key=lambda r: r[0])
+    ranks = [0.0] * len(rows)
+    i = 0
+    while i < len(rows):
+        j = i
+        while j + 1 < len(rows) and rows[j + 1][0] == rows[i][0]:
+            j += 1
+        mid = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[k] = mid
+        i = j + 1
+    s_pos = sum(r for r, (_, y) in zip(ranks, rows) if y)
+    return (s_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _auc_ci(pairs, *, boots: int = _AUC_BOOTS, seed: int = 17,
+            alpha: float = 0.05):
+    """``(auc, lo, hi)`` by nonparametric bootstrap, or ``None``.
+
+    Deterministic (fixed seed), for the same reason `_cv_delta_ci` is: an
+    audit number that moves on its own is not one. Replicates that lose a
+    class are dropped rather than scored — with 71 negatives in 1274 rows
+    that is rare, but counting them as 0.5 would pull every interval toward
+    a tie, which is the direction that manufactures the "no signal" reading
+    this function exists to check.
+    """
+    point = _auc(pairs)
+    if point is None:
+        return None
+    rows = list(pairs)
+    n = len(rows)
+    if n < _RANK_MIN_N:
+        return None
+    rng = random.Random(seed)
+    vals = []
+    for _ in range(boots):
+        a = _auc([rows[rng.randrange(n)] for _ in range(n)])
+        if a is not None:
+            vals.append(a)
+    if len(vals) < boots // 2:
+        return None
+    vals.sort()
+    lo = vals[int((alpha / 2.0) * len(vals))]
+    hi = vals[min(len(vals) - 1, int((1.0 - alpha / 2.0) * len(vals)))]
+    return point, lo, hi
+
+
+def _rank_verdict(auc_ci) -> str:
+    """Does the score ORDER outcomes? Decided by the INTERVAL vs 0.5.
+
+    Same discipline §4DZ imposed on the base-rate verdict, and for the same
+    reason: a point estimate on the right side of chance is a margin, not a
+    result. Reuses the four-word verdict vocabulary — for a rank statistic
+    `BEATS_NO` means "orders them BACKWARDS", which is worse than chance in
+    exactly the sense that word already carries.
+    """
+    if not auc_ci:
+        return BEATS_UNKNOWN
+    _point, lo, hi = auc_ci
+    if lo > 0.5:
+        return BEATS_YES
+    if hi < 0.5:
+        return BEATS_NO
+    return BEATS_INDISTINGUISHABLE
+
+
+#: Origin of rows admitted to the fit only as auxiliary data.
+_AUX_ORIGIN = "bench"
+
+
+@dataclass
+class _Population:
+    """The rows a fit consumes, and why the rest were dropped.
+
+    ⚠ ONE BUILDER, THREE SURFACES. `fit`, `_load_epoch` and `stats` each
+    assembled this chain by hand. Every metric an operator reads must
+    describe the population the fit actually consumed — this module already
+    carries two bugs from that rule being broken one filter at a time (§4L
+    R2 NEW-4 averaged superseded duplicates; §4BF 1c reported over uncapped
+    bench rows). A shared builder makes the next filter reach all three by
+    construction instead of by remembering.
+    """
+    samples: List["CalibrationSample"]
+    n_superseded: int = 0
+    n_bench_capped: int = 0
+    n_bench_misaligned: int = 0
+    bench_rank: Optional[Tuple[float, float, float]] = None
+    bench_verdict: str = BEATS_UNKNOWN
+
+
+def _apply_bench_direction_gate(samples, params):
+    """Auxiliary rows may join the fit only while they RANK the same way.
+
+    ⚠ THE MASS CAP GUARDS THE WRONG HALF. `_apply_bench_mass_cap` bounds how
+    MANY bench rows enter, on the premise that they are otherwise
+    exchangeable with real turns. Measured 2026-08-31 on the live store they
+    are not: 252 bench rows scored AUC 0.273 [0.116, 0.460] — confidently
+    BACKWARDS — against 0.662 [0.580, 0.738] for the 1022 real ones, and fit
+    alone they produce a Platt slope of -12.8. They were under the cap
+    (252 <= 1022) so every one was admitted, dragging the pooled AUC to
+    0.577. This is the same lesson `CURRENT_EPOCH` encodes one axis over:
+    no fit beats a fit on incomparable rows. The cap tests the volume of the
+    assumption; this tests the assumption.
+
+    CONSERVATIVE — excludes ONLY on a confident inversion (`BEATS_NO`, i.e.
+    the whole interval below chance). An indistinguishable or merely weak
+    auxiliary population is still admitted: dropping real data on noise is
+    the worse error, and the operator decision that admitted bench at all
+    (§4BF 1c) stands until there is evidence against its premise.
+
+    Scored with the PREVIOUSLY fitted weights — the instrument currently in
+    production, which is exactly what the question is about, and which keeps
+    the decision independent of the fit it feeds. With no params yet (cold
+    start) there is no evidence, so the rows are admitted and the verdict is
+    `unknown`. The decision is recorded in the params, so a corpus that
+    oscillates across refits is visible rather than silent.
+    """
+    bench = [s for s in samples
+             if getattr(s, "origin", "user") == _AUX_ORIGIN]
+    # ⚠ NO SIZE CHECK HERE. `_auc_ci` owns the `_RANK_MIN_N` floor and
+    # returns None below it; a second copy was unobservable (a mutation
+    # sweep proved it equivalent) and would be the usual place for the two
+    # to drift apart. The `params is None` check IS also equivalent — the
+    # guard below catches the AttributeError — but a cold start is a NORMAL
+    # state, and routing an expected condition through an exception handler
+    # is how a real fault later gets mistaken for one.
+    if params is None:
+        return list(samples), BEATS_UNKNOWN, None
+    try:
+        pairs = [(_composite_for(s, params.w_entropy,
+                                 params.lambda_uncertainty, params.w_effort),
+                  s.outcome) for s in bench]
+    except Exception:  # noqa: BLE001 — a gate must never break the fit
+        return list(samples), BEATS_UNKNOWN, None
+    ci = _auc_ci(pairs)
+    verdict = _rank_verdict(ci)
+    if verdict != BEATS_NO:
+        return list(samples), verdict, ci
+    return ([s for s in samples
+             if getattr(s, "origin", "user") != _AUX_ORIGIN], verdict, ci)
+
+
+def _fit_population(epoch_samples, params=None) -> _Population:
+    """THE population — the single authority every surface must ask.
+
+    Order matters: supersession resolves duplicate labels for one request,
+    the mass cap bounds auxiliary volume, the direction gate tests whether
+    that auxiliary volume belongs at all, and the pressure migration makes
+    a mid-epoch feature-semantics change uniform.
+    """
+    resolved = _resolve_superseded(list(epoch_samples))
+    capped = _apply_bench_mass_cap(resolved)
+    gated, verdict, ci = _apply_bench_direction_gate(capped, params)
+    return _Population(
+        samples=_migrate_leaked_pressure(gated),
+        n_superseded=len(epoch_samples) - len(resolved),
+        n_bench_capped=len(resolved) - len(capped),
+        n_bench_misaligned=len(capped) - len(gated),
+        bench_rank=ci,
+        bench_verdict=verdict,
+    )
 
 
 def _feature_contribution(attr: str, composites, *, rebuild) -> Optional[float]:
@@ -1034,6 +1249,27 @@ class FittedParams:
     # DEAD at 0.05sigma while ablation says removing it costs 0.021 AUC;
     # this records the measurement that actually answers the question.
     feature_contrib: Optional[Dict[str, float]] = None
+    # ── DISCRIMINATION, the question Brier cannot ask (2026-08-31) ────────
+    # `beats_base_rate` answers "is this a good PROBABILITY". At a base rate
+    # of 0.855 with 5.6% negatives that comparison is nearly powerless, and
+    # reporting only it read as "no signal" when the truth was "no
+    # probability calibration": the same rows gave delta CI
+    # [-0.00195, +0.00021] (indistinguishable) and user-origin AUC 0.662
+    # [0.580, 0.738] (real ordering). A ranking use — flagging the lowest-
+    # confidence turns — is licensed by `ranks_outcomes`, never by
+    # `beats_base_rate`; a probability claim needs the latter. -1.0 / unknown
+    # = not recorded, never a measured value.
+    auc: float = -1.0
+    auc_ci_lo: Optional[float] = None
+    auc_ci_hi: Optional[float] = None
+    #: INTERVAL-driven, like `beats_base_rate` (§4DZ): `yes` = whole CI above
+    #: chance, `no` = whole CI BELOW it (ordered backwards), otherwise
+    #: indistinguishable. In `NOT_INFORMATIVE` ⇒ no ranking use either.
+    ranks_outcomes: str = BEATS_UNKNOWN
+    #: Did the auxiliary (bench) population rank the same way, and how many
+    #: rows the direction gate dropped when it did not.
+    bench_verdict: str = BEATS_UNKNOWN
+    n_bench_misaligned: int = 0
 
 
 @dataclass
@@ -1339,8 +1575,7 @@ class CalibrationTracker:
         # warns about, one filter deeper. Same ORIGIN CAP as the fit too
         # (§4BF 1c) — the metrics must describe the blended population
         # the fit consumes, not a bench-flooded superset.
-        return _migrate_leaked_pressure(
-            _apply_bench_mass_cap(_resolve_superseded(scoped)))
+        return _fit_population(scoped, self.load_params()).samples
 
     def _load_samples(self, limit: Optional[int] = None) -> List[CalibrationSample]:
         if not self.history_path.exists():
@@ -1497,15 +1732,25 @@ class CalibrationTracker:
         # (~1.8k rows vs 4k window); revisit if bench cadence grows.
         all_samples = self._load_samples(limit=self.max_history)
         epoch_samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
-        resolved = _resolve_superseded(epoch_samples)
-        samples = _migrate_leaked_pressure(_apply_bench_mass_cap(resolved))
-        # ⚠ THREE different exclusions, counted apart (§4L R2 NEW-5, one
-        # richer for 1c): epoch scope, source-rank supersession, and the
-        # bench mass cap. Folding cap-drops into "superseded" would make
-        # a bench-heavy night read as thousands of duplicate requests.
+        _pop = _fit_population(epoch_samples, self.load_params())
+        samples = _pop.samples
+        # ⚠ FOUR different exclusions, counted apart (§4L R2 NEW-5, one
+        # richer for 1c, one for the direction gate): epoch scope,
+        # source-rank supersession, the bench mass cap, and bench rows whose
+        # rank direction disqualifies them. Folding cap-drops into
+        # "superseded" would make a bench-heavy night read as thousands of
+        # duplicate requests.
         n_excluded = len(all_samples) - len(epoch_samples)
-        n_superseded = len(epoch_samples) - len(resolved)
-        n_bench_capped = len(resolved) - len(samples)
+        n_superseded = _pop.n_superseded
+        n_bench_capped = _pop.n_bench_capped
+        if _pop.n_bench_misaligned:
+            _br = _pop.bench_rank or (float("nan"),) * 3
+            logger.warning(
+                "calibration: %d bench row(s) EXCLUDED from the fit — they "
+                "rank outcomes backwards (AUC %.3f [%.3f, %.3f], whole "
+                "interval below chance), so pooling them with real turns "
+                "fits incomparable rows. See `bench_verdict` on the stored "
+                "params.", _pop.n_bench_misaligned, _br[0], _br[1], _br[2])
         if n_superseded:
             logger.debug(
                 "calibration: %d duplicate-request row(s) resolved by "
@@ -1790,6 +2035,22 @@ class CalibrationTracker:
         # `BEATS_INDISTINGUISHABLE`. Those two are MEASURED words — "we ran
         # the comparison and the model lost" / "…and it was a tie" — and we
         # ran no comparison. Recording either would be a fabricated neutral.
+        # The OTHER question, on the same rows.
+        #
+        # Measured on the RAW composite. `_auc_ci(calibrated)` would give the
+        # IDENTICAL number today — AUC is invariant to a strictly increasing
+        # transform, so the applied branch (a > 0) agrees by construction, and
+        # every rejection branch above reassigns `calibrated = composites`.
+        # A mutation sweep proved the two equivalent, so this is a clarity and
+        # independence choice, not a correctness fix: the raw column is what
+        # ships whenever the map is refused, and reading it directly means
+        # this line does not silently depend on those three reassignments
+        # staying in place. (An earlier version of this comment claimed the
+        # inverted branch would report `1 - AUC`. It would not — `calibrated`
+        # is rebound there. A justification has to be checked like a claim.)
+        _auc_res = _auc_ci(composites)
+        ranks_outcomes = _rank_verdict(_auc_res)
+
         if not map_applied(map_status):
             logger.warning(
                 "calibration: map %s, so the shipped predictor is the RAW "
@@ -1804,23 +2065,54 @@ class CalibrationTracker:
         # estimate edges the base rate while its CI says the two are
         # indistinguishable. That is "a margin is not a result" (§4CY), and
         # it is the live state of this store.
+        # ⚠ SAY WHICH KIND OF SIGNAL IS MISSING. Both warnings below used to
+        # end on "not adding information" / "nothing may treat this score as
+        # informative", which reads as "the score is noise". At this corpus's
+        # base rate that conclusion does not follow from a Brier comparison:
+        # measured 2026-08-31, the SAME rows were indistinguishable as a
+        # probability and ordered turns at AUC 0.662 [0.580, 0.738]. So each
+        # warning now carries the rank measurement beside the probability one
+        # — and it is interval-driven too, so this cannot become a second
+        # licence granted on a point estimate (the §4DZ defect).
+        if ranks_outcomes == BEATS_YES:
+            _rank_note = (
+                " It DOES still rank: AUC %.3f [%.3f, %.3f], so a RANKING use "
+                "(flagging the lowest-confidence turns) is supported where a "
+                "probability claim is not — see `ranks_outcomes`."
+                % (_auc_res[0], _auc_res[1], _auc_res[2]))
+        elif ranks_outcomes == BEATS_NO:
+            _rank_note = (
+                " And it orders turns BACKWARDS: AUC %.3f [%.3f, %.3f], whole "
+                "interval below chance. No use of this score is supported."
+                % (_auc_res[0], _auc_res[1], _auc_res[2]))
+        elif _auc_res:
+            _rank_note = (
+                " Nor does it rank: AUC %.3f [%.3f, %.3f] spans chance. No use "
+                "of this score is supported."
+                % (_auc_res[0], _auc_res[1], _auc_res[2]))
+        else:
+            _rank_note = (" Discrimination was NOT measured (too few rows or "
+                          "one outcome class), so it is unknown, not absent.")
+
         if beats_base_rate == BEATS_NO:
             logger.warning(
                 "calibration: fitted model (CV Brier %.4f) is WORSE than "
                 "always predicting the base rate %.3f (Brier %.4f) — the "
-                "confidence score is not adding information as a probability",
-                brier_cv, base, brier_base)
+                "confidence score is not adding information AS A PROBABILITY."
+                "%s",
+                brier_cv, base, brier_base, _rank_note)
         elif beats_base_rate == BEATS_INDISTINGUISHABLE:
             logger.warning(
                 "calibration: fitted model (CV Brier %.4f) is INDISTINGUISHABLE "
                 "from always predicting the base rate %.3f (Brier %.4f) — the "
                 "95%% CI of the delta [%+.5f, %+.5f] straddles zero. The map "
                 "is still applied (it beats the RAW composite, a different "
-                "question), but nothing may treat this score as informative: "
-                "see `beats_base_rate` on the stored params.",
+                "question). Nothing may treat this score AS A PROBABILITY: "
+                "see `beats_base_rate` on the stored params.%s",
                 brier_cv, base, brier_base,
                 _delta_ci[1] if _delta_ci else float("nan"),
-                _delta_ci[2] if _delta_ci else float("nan"))
+                _delta_ci[2] if _delta_ci else float("nan"),
+                _rank_note)
 
         # ── HONEST PERFORMANCE (audit 2026-08-10) ────────────────────────
         # `brier` above is IN-SAMPLE and was the headline. Cross-validate so
@@ -1889,6 +2181,12 @@ class CalibrationTracker:
                                if _delta_ci is not None else None),
             n_negative=n_negative,
             feature_contrib=feature_contrib or None,
+            auc=round(_auc_res[0], 4) if _auc_res else -1.0,
+            auc_ci_lo=round(_auc_res[1], 4) if _auc_res else None,
+            auc_ci_hi=round(_auc_res[2], 4) if _auc_res else None,
+            ranks_outcomes=ranks_outcomes,
+            bench_verdict=_pop.bench_verdict,
+            n_bench_misaligned=_pop.n_bench_misaligned,
         )
         self._save_params(params)
         return params
@@ -1975,6 +2273,23 @@ class CalibrationTracker:
                 feature_contrib=(d.get("feature_contrib")
                                  if isinstance(d.get("feature_contrib"), dict)
                                  else None),
+                # ⚠ THE READER SET, AGAIN. This file already records a field
+                # that `_save_params` wrote and this loader did not
+                # reconstruct, so every reloaded fit carried the default
+                # forever. Same defaults discipline: -1.0 / None / `unknown`
+                # each read as "not recorded", never as a measured value.
+                auc=float(d.get("auc", -1.0)),
+                auc_ci_lo=(float(d["auc_ci_lo"])
+                           if d.get("auc_ci_lo") is not None else None),
+                auc_ci_hi=(float(d["auc_ci_hi"])
+                           if d.get("auc_ci_hi") is not None else None),
+                # Coerced through the vocabulary for the same reason
+                # `beats_base_rate` is: an unrecognised word is not a verdict,
+                # and `in NOT_INFORMATIVE` is FALSE for one, so a typo would
+                # read as a licence.
+                ranks_outcomes=_known_verdict(d.get("ranks_outcomes")),
+                bench_verdict=_known_verdict(d.get("bench_verdict")),
+                n_bench_misaligned=int(d.get("n_bench_misaligned", 0)),
             )
         # ⚠ `OverflowError` IS AN `ArithmeticError`, NOT A `ValueError`.
         # `int(float('inf'))` raises out of this function for five fields
@@ -2019,8 +2334,7 @@ class CalibrationTracker:
         # (measured in review: 0.2614 over 7 raw rows vs 0.29 over the
         # fit's 2). The raw count stays visible as `samples_raw_epoch`.
         raw_epoch = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
-        samples = _migrate_leaked_pressure(
-            _apply_bench_mass_cap(_resolve_superseded(raw_epoch)))
+        samples = _fit_population(raw_epoch, self.load_params()).samples
         brier = (
             sum((s.composite - s.outcome) ** 2 for s in samples) / len(samples)
             if samples else None

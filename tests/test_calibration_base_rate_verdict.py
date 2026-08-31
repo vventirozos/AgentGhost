@@ -734,9 +734,26 @@ async def test_the_idle_refit_emits_the_licence_in_the_calib_line(tmp_path,
     assert payload.get("beats_base_rate") == BEATS_INDISTINGUISHABLE, (
         "the line the operator watches must carry the base-rate verdict, "
         f"not only the map. got {payload!r}")
-    assert "no_signal" in str(payload.get("refit", "")), (
+    _refit = str(payload.get("refit", ""))
+    # Property, not token: the qualifier's PREFIX changed 2026-08-31
+    # (`no_signal:` → `no_prob:` + `no_rank:`, because one Brier comparison
+    # cannot license the words "no signal"). What must hold either way is
+    # that the line is not a bare `ok` and names the verdict itself.
+    assert _refit != "ok" and BEATS_INDISTINGUISHABLE in _refit, (
         "a refit whose score is indistinguishable from a constant still "
-        f"reads as healthy: refit={payload.get('refit')!r}")
+        f"reads as healthy: refit={_refit!r}")
+    # §4EB: the SECOND verdict rides the same line. Without it the operator
+    # reads one statistic and takes it for "is there signal" — the two have
+    # disagreed on identical rows (probability indistinguishable, ordering
+    # AUC 0.652). Fails in the world where only the probability verdict is
+    # surfaced.
+    assert "ranks_outcomes" in payload, (
+        f"the CALIB line carries no rank verdict: {payload!r}")
+    _ranks = payload.get("ranks_outcomes")
+    if _ranks != BEATS_YES:
+        assert f"no_rank:{_ranks}" in _refit, (
+            "a score that does not rank still reads as ranking: "
+            f"refit={_refit!r}")
 
 
 def test_the_startup_calib_payload_carries_the_verdict():
@@ -896,7 +913,12 @@ async def test_an_unrecognised_verdict_does_not_silence_the_refit_warning(
              if getattr(sub, "name", str(sub)).upper().endswith("CALIB")]
     assert calib, "no CALIB line was emitted"
     refit = str(calib[-1].get("refit", ""))
-    assert "no_signal" in refit, (
+    # Property, not token — see the note on the sibling test above. The
+    # fixture sets the junk verdict on the returned object directly, so it
+    # reaches the line uncoerced BY DESIGN; what must hold is that the line
+    # is not a bare `ok` and shows the operator the word it could not
+    # recognise, rather than swallowing it.
+    assert refit != "ok" and "probably" in refit, (
         f"an unrecognised verdict read as licensed: refit={refit!r}")
 
 
@@ -2597,7 +2619,7 @@ def test_the_verdict_survives_the_log_line_truncation():
     `loaded=startup threshold=0.84 w_entropy=0.00 lam=0.00…`.
 
     The idle-refit line does not need this: it folds the verdict into the
-    FIRST field as `refit=ok/no_signal:<verdict>`.
+    FIRST field as `refit=ok/no_prob:<verdict>/no_rank:<verdict>`.
     """
     from ghost_agent.core.calibration import BEATS_INDISTINGUISHABLE, FittedParams
     from ghost_agent.main import calib_startup_fields

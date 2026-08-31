@@ -3494,9 +3494,11 @@ from .stream_guards import (  # noqa: E402
     THINKING_LOOP_PROBE_EVERY, THINKING_LOOP_WINDOW, THINKING_LOOP_THRESHOLD,
     TOOL_CALL_LOOP_THRESHOLD, TOOL_CALL_LOOP_PROBE_EVERY,
     PARAGRAPH_LOOP_MIN_LINE, PARAGRAPH_LOOP_THRESHOLD,
+    TOOL_CALL_BATCH_CEILING, NATIVE_TOOL_CALL_REPEAT,
     _STREAM_STOP_MARKERS,
     _detect_thinking_loop, _tail_has_stop_marker, _detect_tool_call_loop,
-    _detect_paragraph_loop,
+    _detect_paragraph_loop, _detect_native_tool_call_flood,
+    _native_call_identity,
 )
 
 
@@ -4787,6 +4789,52 @@ def _ends_with_action_promise(text) -> str:
     if _ACTION_PROMISE_RE.search(last_sentence):
         return last_sentence
     return ""
+
+
+def turn_confidence_inputs(tools_run):
+    """`(last_tool, domain, effort)` for a turn — the inputs BOTH confidence
+    call sites need.
+
+    Extracted 2026-08-31 (§4EC) because a second caller appeared. It was
+    inline in `_record_calibration_safe`; a copy in the verifier-depth path
+    would be a second definition of "which domain is this turn", and this
+    module has been bitten by exactly that (the `_TOOL_ALIAS_TABLE` split
+    where four guards each asked about a different tool than the one that
+    ran). One function, both callers.
+
+    Turn-EFFORT is the first confidence input that varies per TURN.
+    Competence is a per-domain historical average, so it was near-constant
+    within a domain and the composite had no discrimination at all
+    (leak-free AUC 0.473). Turn shape does: measured over 296 labelled
+    trajectories, passed turns averaged 2.4 tool calls / longest same-tool
+    run 1.4, failed turns 11.7 / 5.8 — AUC 0.670, separation +0.232.
+
+    `effort` is None (not 0.5) when the turn ran no tools: "no tools" is
+    absence of evidence about effort, not a measured value, and recording it
+    as observed would poison the weight fit the way fabricated entropy
+    neutrals did. Never raises — a labelling failure must not break either
+    a calibration record or a verdict.
+    """
+    last_tool = ""
+    for _t in reversed(tools_run or []):
+        if isinstance(_t, dict) and _t.get("name"):
+            last_tool = _t["name"]
+            break
+    try:
+        from .metacog import _domain_for_tool
+        domain = _domain_for_tool(last_tool or "")
+    except Exception:  # noqa: BLE001
+        domain = ""
+    effort = None
+    try:
+        from .confidence import effort_component as _effort_fn
+        _names = [t.get("name") for t in (tools_run or [])
+                  if isinstance(t, dict) and t.get("name")]
+        if _names:
+            effort = _effort_fn(_names)
+    except Exception:  # noqa: BLE001
+        effort = None
+    return last_tool, domain, effort
 
 
 #: Tools whose dropped-at-the-finish-line call means user-visible work was
@@ -7522,6 +7570,14 @@ class GhostAgent:
                         # is the only value that should ever suppress the
                         # warning.
                         _beats = getattr(params, "beats_base_rate", None)
+                        # The rank verdict rides the SAME line. `no_signal:`
+                        # on its own read as "the score is noise"; at this
+                        # base rate a Brier comparison cannot support that,
+                        # and the two verdicts have disagreed on identical
+                        # rows (probability indistinguishable, ordering
+                        # AUC 0.662). Same fail-closed test as above: only an
+                        # affirmative licence suppresses the qualifier.
+                        _ranks = getattr(params, "ranks_outcomes", None)
                         # ⚠ THE THIRD PRIVATE COPY OF "is the map in force?".
                         # Harmless today only because `load_params` stringifies
                         # `map_status`, so `None` cannot reach here — but that
@@ -7531,11 +7587,15 @@ class GhostAgent:
                         _refit = ("ok" if map_applied(_map_status)
                                   else f"map_{_map_status}")
                         if _beats != BEATS_YES:
-                            _refit = f"{_refit}/no_signal:{_beats}"
+                            _refit = f"{_refit}/no_prob:{_beats}"
+                        if _ranks != BEATS_YES:
+                            _refit = f"{_refit}/no_rank:{_ranks}"
                         _mc_emit(
                             _mc_ss.CALIB,
                             refit=_refit,
                             beats_base_rate=_beats,
+                            ranks_outcomes=_ranks,
+                            auc=getattr(params, "auc", -1.0),
                             threshold=params.threshold,
                             w_entropy=params.w_entropy,
                             lam=params.lambda_uncertainty,
@@ -7556,6 +7616,13 @@ class GhostAgent:
                         # as an unqualified "confidence recalibrated".
                         if _beats == BEATS_YES:
                             _map_note += ", beats base rate"
+                        # The ledger carried only the probability licence, so
+                        # a refit whose score RANKS but is not a calibrated
+                        # probability was recorded as flatly uninformative.
+                        if _ranks == BEATS_YES:
+                            _map_note += (
+                                f", ranks outcomes (AUC "
+                                f"{getattr(params, 'auc', -1.0):.3f})")
                         else:
                             _map_note += (f", NO base-rate licence "
                                           f"({_beats})")
@@ -11025,22 +11092,15 @@ class GhostAgent:
         # two-stage leg, so it is the only route the treatment can reach.
         _verify_route = "claim"
         try:
-            # Read the EXPERIMENTS ring, not turn-facts. Both carry the same
-            # boolean (`mark_trigger`'s value IS `_vd_deep`), but the rings
-            # have different eviction exposure: turn-facts is a 16-slot ring
-            # every request writes to — including sub-agent and dream turns,
-            # which run the same router block — while the experiments ring
-            # only ever holds ENROLLED requests. (Both rings refresh LRU
-            # position on write; MEMBERSHIP is the difference, not the
-            # eviction policy.) A 16-wide sub-agent fan-out therefore evicts the
-            # parent's turn-facts entry while leaving the experiments one
-            # intact, which would read as `_deep=False` on a turn whose
-            # trajectory still stamps `verify_depth_fired=True` — a control
-            # run filed as treatment, the exact inversion `depth_for_turn`'s
-            # docstring promises cannot happen.
-            _flags = _experiments_mod.trigger_flags(
-                self.context, str(req_id or "")) or {}
-            _deep = bool(_flags.get("verify_depth_fired"))
+            # ⚠ CALLABLE, NOT INLINE. This was ~30 lines here, and the only
+            # way to check it was to read it — a mutation that replaced the
+            # whole §4EC trigger with `if False and ...` survived the entire
+            # suite, because the one test on it asserted the AST MENTIONED
+            # the rule. `depth_for_turn`'s own docstring says it: "a
+            # predicate that can be CALLED is the difference between a
+            # pinned rule and a described one." The same lesson, one trigger
+            # later.
+            _deep = self._verify_depth_for_turn(req_id, tools_run_this_turn)
         except Exception as _vd_exc:   # never fail a verdict over routing
             # WARNING: the swallow is correct (a routing fault must never
             # fail a verdict) but its consequence is a SILENT control run on
@@ -14585,6 +14645,55 @@ class GhostAgent:
             # sees a Frankenstein reply.
             # Trace: 2026-05-01 dialog log turn 28.
             _pre_flush_final_len = len(final_ai_content)
+
+            # ── TOOL-CALL FLOOD BACKSTOP ────────────────────────────────
+            # Last line of defence, and the only one every producer passes
+            # through: the native streaming accumulator, the XML healer, the
+            # client-SSE path and the non-streaming path all converge HERE.
+            # The stream-side probe (`_detect_native_tool_call_flood`) kills a
+            # flood ~13 calls in and saves the decode; this one cannot save
+            # anything — by now the tokens are spent — so it does the other
+            # job: keep the flood out of the sandbox and out of the context.
+            #
+            # Why a cap is needed at all, given the batch dedup below: that
+            # dedup only collapses byte-identical READ-SAFE calls. `execute`
+            # is blanket-mutating, so on 2026-08-31 all 629 duplicates were
+            # dispatched — 629 real `python3` processes and 629 tool results
+            # into the window.
+            #
+            # TRIM, don't reject: the turn's first `TOOL_CALL_BATCH_CEILING`
+            # calls are almost certainly the work the model meant to do, and
+            # the trim happens BEFORE `messages.append(msg)`, so the assistant
+            # message and the tool results that follow it still agree exactly
+            # — no orphaned tool_call_id, which an upstream rejects with a 400.
+            #
+            # Trimmed TWO ways on purpose. In-place `del` (not a slice rebind)
+            # because `ts.tool_calls` and the caller's local are aliases of
+            # this same list — rebinding the local would leave both at full
+            # length. The explicit `msg["tool_calls"] = tool_calls` then covers
+            # the case the aliasing does NOT: handle_chat happens to point
+            # `msg` at the very same list today, but a producer that hands it
+            # a COPY would keep advertising every dropped call, and the trim
+            # would be what CREATED the orphaned ids it exists to prevent.
+            if len(tool_calls) > TOOL_CALL_BATCH_CEILING:
+                _flood_kept = tool_calls[:TOOL_CALL_BATCH_CEILING]
+                _flood_dropped = tool_calls[TOOL_CALL_BATCH_CEILING:]
+                _kept_idents = {_native_call_identity(t) for t in _flood_kept}
+                _all_dupes = all(_native_call_identity(t) in _kept_idents
+                                 for t in _flood_dropped)
+                del tool_calls[TOOL_CALL_BATCH_CEILING:]
+                msg["tool_calls"] = tool_calls
+                pretty_log(
+                    "Tool-Call Flood",
+                    f"{len(_flood_dropped)} call(s) over the "
+                    f"{TOOL_CALL_BATCH_CEILING}-per-message ceiling dropped "
+                    f"before dispatch — "
+                    + ("every dropped call was byte-identical to one that ran."
+                       if _all_dupes else
+                       "SOME DROPPED CALLS WERE DISTINCT: work the model asked "
+                       "for did not run."),
+                    level="WARNING", icon=Icons.STOP,
+                )
 
             if ui_content:
                 ui_content = ui_content.replace("\r", "")
@@ -19126,6 +19235,112 @@ class GhostAgent:
         return final_ai_content, created_time, req_id
 
 
+    def _verify_depth_for_turn(self, req_id, tools_run) -> bool:
+        """Should this turn's claim verification run at DEPTH? Both triggers.
+
+        ONE decision, in one callable place. A second decision site is how a
+        turn ends up recorded as control while behaving as treatment — the
+        inversion `verifier.depth_for_turn`'s docstring promises cannot
+        happen.
+
+        TRIGGER 1 (§4BR, a randomised arm): the complexity router called the
+        turn hard. Read from the EXPERIMENTS ring, not turn-facts. Both carry
+        the same boolean, but the rings have different eviction exposure:
+        turn-facts is a 16-slot ring every request writes to — including
+        sub-agent and dream turns, which run the same router block — while
+        the experiments ring only ever holds ENROLLED requests. A 16-wide
+        sub-agent fan-out therefore evicts the parent's turn-facts entry
+        while leaving the experiments one intact, which would read as
+        `_deep=False` on a turn whose trajectory still stamps
+        `verify_depth_fired=True`.
+
+        TRIGGER 2 (§4EC, a plain default): the agent's own pre-penalty
+        confidence in the turn is below the fitted threshold. PRESENCE, not
+        value, decides membership of trigger 1's population — `mark_trigger`
+        is called only when the router called the turn hard, so the KEY
+        existing is exactly "this turn is in the experiment". Reading the key
+        rather than stashing a second flag keeps the disjointness out of
+        reach of drift.
+        """
+        from .verifier import deep_for_low_confidence as _vconf_rule
+        _flags = _experiments_mod.trigger_flags(
+            self.context, str(req_id or "")) or {}
+        if bool(_flags.get("verify_depth_fired")):
+            return True
+        _cr = self._prepenalty_confidence(req_id, tools_run)
+        if _cr is None:
+            return False
+        if not _vconf_rule(
+                below_threshold=bool(getattr(_cr, "below_threshold", False)),
+                router_hard="verify_depth_fired" in _flags):
+            return False
+        pretty_log(
+            "Verify Depth",
+            f"low confidence (C={getattr(_cr, 'composite', -1):.2f} "
+            f"< threshold) — verifying at DEPTH",
+            icon=Icons.VERIFIER_LAB)
+        return True
+
+    def _prepenalty_confidence(self, req_id, tools_run):
+        """This turn's composite confidence WITHOUT the outcome penalty, or
+        ``None`` when metacog is off / not ready.
+
+        ⚠ PRE-PENALTY IS NOT AN APPROXIMATION — IT IS THE ONLY NON-CIRCULAR
+        READING. The full score takes an `outcome_penalty` derived from
+        `verifier_backfill`, i.e. from the verifier's own verdict. Routing
+        the VERIFIER on a number that consumes the verifier's answer is a
+        dependency cycle. The pre-penalty composite is computed from inputs
+        that all exist before the verdict — entropy, competence, verbalised
+        uncertainty pressure, effort — and it is ALSO the exact column the
+        calibration store records (`raw_pre_penalty_composite`), so it is
+        what the AUC 0.652 measurement describes. The full penalised reading
+        is still computed later, unchanged, for the calibration record.
+
+        MEMOISED PER REQUEST, because `_record_calibration_safe` runs later
+        in the same turn: two readings from the same inputs would be equal
+        today and a silent fork the moment one call site gains an input.
+        Never raises — a verdict must not fail over a routing signal.
+        """
+        try:
+            _memo = getattr(self.context, "_prepen_conf", None)
+            if isinstance(_memo, tuple) and len(_memo) == 2 and _memo[0] == req_id:
+                return _memo[1]
+            _mc = getattr(self.context, "metacog", None)
+            if (_mc is None or not getattr(_mc, "enabled", False)
+                    or getattr(_mc, "confidence", None) is None
+                    or getattr(_mc, "competence", None) is None):
+                return None
+            _last_tool, _dom, _effort = turn_confidence_inputs(tools_run)
+            _upress = 0.0
+            try:
+                _ut = getattr(self.context, "uncertainty_tracker", None)
+                if _ut is not None:
+                    _upress = _ut.pressure()
+            except Exception:  # noqa: BLE001
+                _upress = 0.0
+            _norm_e = None
+            _ep = getattr(self.context, "_entropy_norm_pending", None)
+            if isinstance(_ep, tuple) and len(_ep) == 2 and _ep[0] == req_id:
+                try:
+                    _norm_e = float(_ep[1])
+                except (TypeError, ValueError):
+                    _norm_e = None
+            reading = _mc.confidence.score(
+                normalised_entropy=_norm_e,
+                competence_p_success=_mc.competence.estimate(_dom, _last_tool or None),
+                n_observations=_mc.competence.observations(_dom, _last_tool or None),
+                uncertainty_pressure=_upress,
+                # THE POINT OF THIS METHOD. Zero, not omitted — the verdict
+                # this would penalise on has not been produced yet.
+                outcome_penalty=0.0,
+                effort=_effort,
+            )
+            self.context._prepen_conf = (req_id, reading)
+            return reading
+        except Exception as _pc_exc:  # noqa: BLE001
+            logger.debug("pre-penalty confidence unavailable: %s", _pc_exc)
+            return None
+
     async def _record_calibration_safe(self, *, req_id, tools_run,
                                        verifier_backfill,
                                        execution_failure_count,
@@ -19195,37 +19410,9 @@ class GhostAgent:
             # paths — the compute-now fallback below AND the streamed path,
             # where `_pending` arrives pre-built from the stash and none of
             # that block runs. It depends only on `tools_run`.
-            _last_tool = ""
-            for _t in reversed(tools_run or []):
-                if isinstance(_t, dict) and _t.get("name"):
-                    _last_tool = _t["name"]
-                    break
-            try:
-                from .metacog import _domain_for_tool
-                _dom = _domain_for_tool(_last_tool or "")
-            except Exception:  # noqa: BLE001 — labelling must never break the record
-                _dom = ""
-
-            # Turn-EFFORT feature: the first confidence input that varies per
-            # TURN. Competence is a per-domain historical average, so it was
-            # near-constant within a domain and the composite had no
-            # discrimination at all (leak-free AUC 0.473). Turn shape does:
-            # measured over 296 labelled trajectories, passed turns averaged
-            # 2.4 tool calls / longest same-tool run 1.4, failed turns 11.7 /
-            # 5.8 — AUC 0.670, separation +0.232.
-            _effort = None
-            try:
-                from .confidence import effort_component as _effort_fn
-                _names = [t.get("name") for t in (tools_run or [])
-                          if isinstance(t, dict) and t.get("name")]
-                # None (not 0.5) when the turn ran no tools: "no tools" is
-                # absence of evidence about effort, not a measured value, and
-                # recording it as observed would poison the weight fit the
-                # same way fabricated entropy neutrals did.
-                if _names:
-                    _effort = _effort_fn(_names)
-            except Exception:  # noqa: BLE001
-                _effort = None
+            # §4EC: shared with the verifier-depth path — see
+            # `turn_confidence_inputs`. Two callers, one definition.
+            _last_tool, _dom, _effort = turn_confidence_inputs(tools_run)
 
             if _pending is None and _ct is not None:
                 try:
@@ -22155,6 +22342,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # Ensure msg is always defined in this scope
                     msg = {"role": "assistant", "content": "", "tool_calls": []}
                     thinking_loop_detected = False
+                    # Which of the two collapse shapes killed the stream. Both
+                    # take the `thinking_loop_detected` recovery path (discard
+                    # + strike + retry), but they need DIFFERENT advice: the
+                    # thinking-loop alert tells the model to stop re-deriving
+                    # and emit one grounding tool call, which is precisely the
+                    # wrong instruction for a turn that just emitted 629 of
+                    # them.
+                    tool_call_flood_detected = False
                     try:
                         payload["stream"] = True
                         # Metacog entropy over the INTERNAL upstream stream
@@ -22498,6 +22693,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                         msg["tool_calls"][idx]["function"]["name"] += fn_chunk["name"]
                                                     if fn_chunk.get("arguments"):
                                                         msg["tool_calls"][idx]["function"]["arguments"] += fn_chunk["arguments"]
+
+                                            # NATIVE tool-call flood guard. The
+                                            # `_detect_tool_call_loop` probe above
+                                            # watches `full_content` for unclosed
+                                            # `<tool_call>` tags and is blind here:
+                                            # in native mode the calls never touch
+                                            # the content buffer, so a collapsed
+                                            # decoder ran to max_tokens with every
+                                            # stream guard reporting a healthy
+                                            # stream (three production floods —
+                                            # 960/817/629 calls, ~5 min each). This
+                                            # is the only probe on that channel;
+                                            # it runs where the list actually grows.
+                                            if _detect_native_tool_call_flood(msg["tool_calls"]):
+                                                thinking_loop_detected = True
+                                                tool_call_flood_detected = True
+                                                _flood_n = len(msg["tool_calls"])
+                                                # [-2:][0] = the newest COMPLETED
+                                                # entry (the last is still
+                                                # streaming its arguments), and
+                                                # total for any non-empty list —
+                                                # a log line must not be able to
+                                                # IndexError if a threshold moves.
+                                                _flood_id = _native_call_identity(
+                                                    msg["tool_calls"][-2:][0])
+                                                pretty_log(
+                                                    "Tool-Call Flood",
+                                                    f"Native decoder collapse: {_flood_n} "
+                                                    f"tool_call(s) in one message "
+                                                    f"(latest: {_flood_id[0] or '?'}"
+                                                    f"{' · ' + _flood_id[1][:60] if _flood_id[1] else ''}). "
+                                                    "Aborting stream before dispatch.",
+                                                    level="WARNING", icon=Icons.STOP,
+                                                )
+                                                break
                             except Exception as e:
                                 logger.debug(f"XML Tool parse text stream chunk error: {type(e).__name__}")
 
@@ -22686,7 +22916,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             msg["tool_calls"] = []
                             execution_failure_count += 1
                             thinking_cap_events += 1
-                            messages.append({"role": "assistant", "content": "[Internal thinking aborted: runaway loop detected.]"})
+                            messages.append({"role": "assistant", "content": (
+                                "[Tool-call generation aborted: a runaway burst of tool "
+                                "calls was discarded unrun.]" if tool_call_flood_detected
+                                else "[Internal thinking aborted: runaway loop detected.]")})
                             # Escalation: on the SECOND cap/loop event in
                             # the same attempt, stop retrying. The solver
                             # is stuck in a self-consistent but unwinnable
@@ -22710,7 +22943,26 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 )
                                 force_stop = True
                                 break
-                            messages.append({"role": "user", "content": "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."})
+                            # ONE append, TWO texts. The thinking-loop alert
+                            # tells the model to answer with ONE grounding tool
+                            # call — the exact instruction a flood already
+                            # over-obeyed, so a flood gets its own steer: the
+                            # problem was the REPEAT, not the tool. Selecting
+                            # the text (rather than branching the append and
+                            # the strike cap below) keeps both shapes on one
+                            # recovery path, so a later edit cannot fix one and
+                            # leave the other behind.
+                            _loop_steer = (
+                                "SYSTEM ALERT: Your previous turn emitted a runaway burst of "
+                                "tool calls and was killed before any of them ran. "
+                                "NOTHING executed and nothing changed — do not assume any of "
+                                "that work happened. Emit ONE tool call now, then STOP and "
+                                "wait for its result before deciding anything else. If you "
+                                "were quoting a rule about tool calls, do not quote the "
+                                "`<tool_call>` syntax — just make the call. Do not write a "
+                                "long <think> block."
+                            ) if tool_call_flood_detected else "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."
+                            messages.append({"role": "user", "content": _loop_steer})
                             if execution_failure_count >= 6:
                                 pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP, level="WARNING")
                                 force_final_response = True

@@ -323,6 +323,55 @@ def depth_for_turn(*, router_label: str, router_escalated: bool,
             and str(arm or "") == "treatment")
 
 
+def _conf_depth_enabled() -> bool:
+    """§4EC: may LOW CONFIDENCE raise verification depth?
+
+    Read per call, same idiom as `_depth_routing_enabled`, so it can be
+    killed without a restart. Kill switch: `GHOST_VERIFY_DEPTH_CONF=0`.
+    """
+    return os.getenv("GHOST_VERIFY_DEPTH_CONF", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
+def deep_for_low_confidence(*, below_threshold: bool,
+                            router_hard: bool) -> bool:
+    """§4EC: should THIS turn get depth-routed verification because the
+    agent's own confidence in it is low?
+
+    The composite confidence score had NO behavioural consumer at all. Its
+    only one — `metacog.maybe_arbitrate` — is hard-gated off by
+    `_METACOG_ARBITER_ENABLED`, retired in §3 as "net-negative as built", so
+    the loop scored a turn, logged it, stored it, refit on it, and logged the
+    refit, while no decision anywhere read the number. Measured 2026-08-31,
+    the score does not beat a constant as a PROBABILITY but it does ORDER
+    turns (AUC 0.652 [0.564, 0.732] on real turns), and the threshold gate
+    fires on 12.9% of them with mean outcome 0.774 against 0.867 unflagged —
+    a separation a random gate at the same rate reaches only 3% of the time
+    (p < 0.0001). Ordering is exactly what a "spend more verification here"
+    decision needs; a calibrated probability is not.
+
+    ⚠ `router_hard` EXCLUDES, it does not include. Turns the complexity
+    router calls hard are the `verify_depth` EXPERIMENT's population
+    (§4BR) — half of them are its control arm, and raising their depth from
+    here would make a control run behave as treatment while being recorded
+    as control, which is the precise inversion `depth_for_turn`'s docstring
+    promises cannot happen. So this trigger fires only OUTSIDE that
+    population: the two are disjoint by construction, the arm is
+    uncontaminated, and this reaches turns the experiment cannot.
+
+    ⚠ NOT AN ARM, DELIBERATELY. Labelled outcomes arrive at ~1.6 negatives
+    a day and seven arms already share them, so an eighth could not be read
+    for ~38 days. This ships as a plain default behind a kill switch, and is
+    read through the self-consistency telemetry the deep path already
+    records (`sc_n`/`sc_agree`/`sc_drawn` in the verdict sidecar) rather
+    than through a verdict that cannot arrive.
+    """
+    return (_conf_depth_enabled()
+            and _two_stage_enabled()
+            and bool(below_threshold)
+            and not bool(router_hard))
+
+
 def _escalate_refute_enabled() -> bool:
     """Re-adjudicate a CHEAP judge's REFUTED verdict on the main model
     before acting on it. Read per call so it can be flipped without a
