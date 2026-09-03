@@ -240,6 +240,11 @@ _DEGRADED_FLOOR = 0.15
 # Budget exhaustion: the reply is explicitly flagged working-state/PARTIAL,
 # i.e. the agent itself reports it did not finish.
 _BUDGET_EXHAUSTED_GRADE = 0.2
+#: §4EE R3 — a turn the SHAPE heuristics failed (selector thrash, repeated
+#: error, abort marker): unverified, and something demonstrably broke — the
+#: same currency as one unverified execution failure. Not 0.0: that is
+#: "checked and wrong", and a thrash is not a checked answer.
+_SHAPE_FAILURE_GRADE = 0.68
 # A user-reported failure ("it still doesn't work", a pasted traceback).
 # Strong — the human is telling you the delivered work is broken — but a
 # notch above an explicit correction's 0.0, because attribution is slightly
@@ -254,7 +259,8 @@ _TASK_REOPENED_GRADE = 0.15
 
 def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 0,
                        budget_exhausted: bool = False,
-                       unacked_total_failure: bool = False) -> float:
+                       unacked_total_failure: bool = False,
+                       shape_failed: bool = False) -> float:
     """Map a finished turn's observable signals onto a quality label in [0, 1].
 
     IMPORTANT — this is a PROXY, not ground truth. Only the verifier arms
@@ -284,6 +290,8 @@ def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 
         verdict = str(verifier_verdict or "").strip().lower()
         if verdict == "failed":
             return 0.0            # checked and WRONG — the one hard negative
+        if shape_failed:
+            return _SHAPE_FAILURE_GRADE   # rule 2: never upgraded, not even by a PASS
         if verdict == "passed" and not unacked_total_failure:
             return 1.0            # checked and RIGHT
         if budget_exhausted:
@@ -307,9 +315,24 @@ def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 
 # its own population, so it outranks every inferred tier; the human
 # stays on top (bench req_ids never collide with real ones, the order
 # is for principle, not traffic).
-_SOURCE_RANK = {"turn": 0, "verifier_late": 1, "task_reopened": 2,
-                "failure_report": 3, "bench_validator": 4,
-                "user_correction": 5}
+_SOURCE_RANK = {"turn": 0,
+                # §4EE R3: the shape heuristics' FAILED (selector thrash,
+                # repeated error, abort marker) re-labels the turn sample —
+                # it is written AFTER the sample, so without this tier a
+                # corpus FAILED graded as the prior or as 1.0. Below every
+                # verdict tier: a refute is stronger evidence, a late PASS
+                # never lands on a shape FAILED (rule 2 withholds it).
+                "shape_failure": 1,
+                "verifier_late": 2, "task_reopened": 3,
+                "failure_report": 4, "bench_validator": 5,
+                "user_correction": 6,
+                # §4EE F1: the explicit human thumb on THIS turn. It is the
+                # corpus's highest authority (`update_outcome` withholds every
+                # machine verdict behind it) and was the only corpus label
+                # source with no calibration rank at all — a 👎 corrected the
+                # learning corpus and left the confidence fit believing the
+                # turn's inline grade.
+                "human_feedback": 7}
 
 
 def resolve_superseded_rows(rows):
@@ -1554,6 +1577,104 @@ class CalibrationTracker:
             return False
 
     # ----------------------------------------------------------- reading
+
+    def record_shape_failure(self, req_id: str) -> bool:
+        """§4EE R3: re-label a turn's sample after the SHAPE heuristics marked
+        its corpus row FAILED. Joins the ``turn`` sample only (the tier sits
+        below every verdict tier), reuses its features untouched, writes
+        ``_SHAPE_FAILURE_GRADE`` at the ``shape_failure`` rank. Idempotent
+        per request. Never raises."""
+        try:
+            req_id = str(req_id or "")
+            if not req_id:
+                return False
+            with self._lock:
+                samples = self._load_samples()
+                base = None
+                for s in samples:
+                    if s.req_id != req_id:
+                        continue
+                    if s.source == "shape_failure":
+                        return False      # already re-labelled
+                    if s.source == "turn":
+                        base = s          # last write wins
+                if base is None:
+                    return False          # no join — skip, never default
+                if abs(base.outcome - _SHAPE_FAILURE_GRADE) < 1e-9:
+                    return False          # the inline grade already said so
+                return self.record(
+                    composite=base.composite,
+                    entropy_component=base.entropy_component,
+                    competence_component=base.competence_component,
+                    uncertainty_pressure=base.uncertainty_pressure,
+                    outcome=_SHAPE_FAILURE_GRADE,
+                    domain=base.domain,
+                    entropy_observed=base.entropy_observed,
+                    effort_component=base.effort_component,
+                    effort_observed=base.effort_observed,
+                    source="shape_failure",
+                    req_id=req_id,
+                    epoch=base.epoch,
+                    origin=base.origin,
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("record_shape_failure failed: %s", exc)
+            return False
+
+    def record_human_label(self, req_id: str, passed: bool) -> bool:
+        """§4EE F1: re-label a turn's calibration sample with an explicit
+        HUMAN verdict (the /api/feedback and Slack thumbs).
+
+        Same no-leakage contract as the other retro tiers: the stored
+        FEATURES of the turn's own sample are reused untouched, only the
+        label differs, and `_resolve_superseded` (rank human_feedback > all)
+        makes it a re-label, not a counter-weight. Joins the highest-ranked
+        existing sample for the request (turn / verifier_late / …) so a
+        late machine verdict that arrived first cannot block it — unlike
+        `record_late_verdict_correction`, which joins `turn` only.
+        Idempotent per (request, verdict): a repeated identical thumb
+        writes nothing; a CHANGED thumb writes again (last human wins,
+        as in the corpus sidecar). Never raises.
+        """
+        try:
+            req_id = str(req_id or "")
+            if not req_id:
+                return False
+            outcome = 1.0 if passed else 0.0
+            with self._lock:
+                samples = self._load_samples()
+                base, best_rank, standing = None, -1, None
+                for s in samples:
+                    if s.req_id != req_id:
+                        continue
+                    if s.source == "human_feedback":
+                        standing = s          # last write wins
+                        continue
+                    rank = _SOURCE_RANK.get(s.source or "turn", 0)
+                    if rank >= best_rank:
+                        base, best_rank = s, rank
+                if standing is not None and abs(standing.outcome - outcome) < 1e-9:
+                    return False          # same thumb again — nothing to do
+                if base is None:
+                    return False          # no join — skip, never default
+                return self.record(
+                    composite=base.composite,
+                    entropy_component=base.entropy_component,
+                    competence_component=base.competence_component,
+                    uncertainty_pressure=base.uncertainty_pressure,
+                    outcome=outcome,
+                    domain=base.domain,
+                    entropy_observed=base.entropy_observed,
+                    effort_component=base.effort_component,
+                    effort_observed=base.effort_observed,
+                    source="human_feedback",
+                    req_id=req_id,
+                    epoch=base.epoch,
+                    origin=base.origin,
+                )
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("record_human_label failed: %s", exc)
+            return False
 
     def _load_epoch(self, limit: Optional[int] = None,
                     epoch: Optional[str] = None) -> List[CalibrationSample]:

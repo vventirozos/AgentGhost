@@ -71,6 +71,16 @@
   <p>Synchronous; <code>llm_summarizer</code> can optionally be an async callable for L1 compression of tool outputs.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2>§4EC re-verification (2026-09-02)</h2>
+  <p>A whole-file mutation battery (323 mutants) found the compression levels, the per-role
+  rules, the summariser's shape and cache and the emergency prune without a single driven test;
+  212 of 233 tier-eligible mutants are now killed by <code>tests/test_4ec_context_pins.py</code>
+  (levels by ratio and the recovery reset, tool/assistant/user rules incl. the tool-call
+  exemption on either tag, head-3 + keyword lines + tail-3 summaries with the 20% saving rule and
+  a bounded LRU cache, short conversations untouched, the L4 prune keeping system + last user +
+  last tool truncated at 1,000 chars with its outcome kept). Full account: PROJECT_JOURNAL.md
+  §4EC addendum.</p>
 </main>
 </body>
 </html>

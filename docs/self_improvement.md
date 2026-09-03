@@ -2584,3 +2584,17 @@ loop — every validator-passing or user-correction-promoted trajectory
 becomes a labelled training example, and the model retrains every 3
 hours of idle time. Watch `pretty_log("PRM Retrain", …)` lines in the
 agent log for visible improvement over time.
+
+## §4EC re-verification of the epoch-pinned loader (2026-09-02)
+
+The §4DE loader was re-run through a whole-file mutation battery (337 mutants, 91.8% of the
+tier-eligible ones killed). Two cleanups: the `_snapshot` guards for a malformed or non-`.json`
+stamp entry were unreachable (the only producer, `_dir_stamp`, globs `*.json` into 3-tuples) and
+are deleted; the literal `if True:` scaffold left in `tuned_instruction` by the §4DE move is
+flattened. Eleven behaviours that were deletable-green are pinned in
+`tests/test_4ec_loader_pins.py` (bare import→first read, warn-once within one cache life, LRU
+touch on the orphaned-pin fallback, a no-change tick keeping its generation, `forget_request` on
+an orphan, PEP-562 `__getattr__` still raising, an emptied served slot leaving the ring, a file
+vanishing mid-glob, a bad artifact sorted before a good one, an empty-but-present epoch held
+unreadable, the unpinned-epoch sweep keeping exactly the current generation). Full account:
+PROJECT_JOURNAL.md §4EC.

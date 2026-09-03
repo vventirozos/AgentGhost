@@ -23,10 +23,12 @@ deferred background write and restart-proof, which the in-process stamp
 alone is not. Among HUMAN sources (feedback, user-correction promotion,
 operator scripts) last-write-wins stands.
 
-Deliberately NOT wired here (follow-ups, not oversights):
-  * calibration re-labels — ``record_late_verdict_correction`` is
-    source-ranked for the verifier; giving human labels their own rank is a
-    calibration-store schema decision, not a bolt-on.
+Calibration re-labels ARE wired since §4EE (2026-09-02): the label goes
+to ``CalibrationTracker.record_human_label`` at the ``human_feedback`` rank
+— the top of the ladder — right after the sidecar write, and the operator
+line says whether the fit took it.
+
+Deliberately NOT wired here (a follow-up, not an oversight):
   * reaction REMOVAL — labels only accrete; a changed mind posts a new
     (opposite) label and last-write-wins resolves it.
 """
@@ -227,6 +229,30 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                     "code": "unavailable"}
         unchanged = wrote == "unchanged"
 
+        # §4EE F1: the calibration corpus follows the label too. The fit
+        # maps confidence → correctness, and a human thumb is the one
+        # ground-truth source this project has for correctness; until now
+        # it re-labelled the learning corpus and left the fit believing the
+        # turn's inline grade (`human_feedback` was the only corpus label
+        # source with no calibration rank). Runs on every call — a
+        # re-click heals a missed write, like the diary below — and never
+        # raises: the sidecar write above is already committed.
+        _cal_note = ""
+        try:
+            _ct = getattr(ctx, "calibration_tracker", None)
+            if _ct is not None and hasattr(_ct, "record_human_label"):
+                # False means "no sample to join" (a thumb that raced the
+                # streamed drain's calibration write) or "same thumb again";
+                # the operator must be able to tell a relabelled fit from a
+                # skipped one (R3 review).
+                _cal_note = (" · calibration relabelled"
+                             if _ct.record_human_label(rid, positive)
+                             else " · calibration unchanged")
+        except Exception as _cte:  # noqa: BLE001 — label already committed
+            logger.debug("calibration human re-label skipped: %s: %s",
+                         type(_cte).__name__, _cte)
+            _cal_note = " · calibration write failed"
+
         # The label is COMMITTED from here — post-write side effects must
         # not convert success into a 503 (R2 review: a pretty_log failure
         # made the client retry, hit the dedupe as "unchanged", and the
@@ -283,7 +309,8 @@ def apply_human_label(agent: Any, request_id: str, signal: str,
                 pretty_log(
                     "Human Feedback",
                     f"{src} labeled req {rid[:8]} → {outcome}"
-                    + (f" · {log_reason}" if log_reason else ""),
+                    + (f" · {log_reason}" if log_reason else "")
+                    + _cal_note,
                     icon=(Icons.FEEDBACK_POS if positive
                           else Icons.FEEDBACK_NEG),
                 )

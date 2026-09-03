@@ -3982,6 +3982,110 @@ _THINK_UNCLOSED_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+def _head_insert_below_start_with(block: str, reply: str, sw_active_phrase) -> str:
+    """§4EC — the `_head_insert` closure of `_finalize_and_return`, extracted so
+    its fence walk is a PURE function with an input-space table
+    (tests/test_4ec_head_insert.py). Finalize-added material (verifier note,
+    clarify question, digests, deferred correction) goes at the head of the
+    reply — unless an active start-with constraint leads it (§4BZ R1 A-F2), in
+    which case it goes AFTER the phrase-led first segment, never inside a code
+    fence (§4BZ R2 M-1, R3 B-D3): the first paragraph break outside any fence;
+    else the first line break when the reply has no fences at all; else it is
+    appended below a `---` rule (a reply that is one fenced block, or ends
+    inside a fence, takes a plain prepend)."""
+    if not block:
+        return reply
+    if not sw_active_phrase:
+        return block + reply
+    if len(_FENCE_MARK_RE.findall(reply)) % 2 == 1:
+        return block + reply
+    _cut = reply.find("\n\n")
+    while _cut != -1 and len(
+            _FENCE_MARK_RE.findall(reply[:_cut])) % 2 == 1:
+        # an odd count before `_cut` with an even total means a closing
+        # mark ALWAYS exists after it — no `is None` arm (§4EC R2 review:
+        # the old closure's arm was unreachable)
+        _fm = _FENCE_MARK_RE.search(reply, _cut)
+        _cut = reply.find("\n\n", _fm.end())
+    if _cut != -1:
+        _cut += 2
+        return reply[:_cut] + block + reply[_cut:]
+    _cut = reply.find("\n")
+    if _cut != -1 and not _FENCE_MARK_RE.search(reply):
+        _cut += 1
+        return reply[:_cut] + "\n" + block + reply[_cut:]
+    _tail = block
+    if _tail.endswith("\n\n---\n\n"):
+        _tail = _tail[:-len("\n\n---\n\n")]
+    return reply.rstrip() + "\n\n---\n\n" + _tail
+
+
+_CDATA_RE = re.compile(r'<!\[CDATA\[(.*?)\]\]>', re.DOTALL)
+
+
+def _mask_cdata(text):
+    """§4EC F1/F2 — replace every `<![CDATA[body]]>` span with an opaque token.
+
+    The tool-call parser's structural regexes (the <tool_call> block split,
+    the truncation counters, Formats 1-5b, the bare-tag harvester) all run
+    over ONE working copy of the assistant text. CDATA bodies are opaque by
+    contract (prompts.py CDATA ESCAPE HATCH: "literal </parameter>, <, >,
+    JSON…"), so they leave that copy BEFORE any regex sees it and come back
+    into the extracted argument values at the parser's single exit
+    (`_unmask_cdata_calls`). Returns (masked_text, {token: body}). Tokens are
+    per-call random (a body cannot forge one) and contain no `<>{}"` or
+    whitespace, so no structural regex can match inside them.
+    """
+    if not text or "<![CDATA[" not in text:
+        return text, {}
+    salt = uuid.uuid4().hex[:8]
+    tokens = {}
+
+    def _sub(m):
+        tok = f"CDATA-{salt}-{len(tokens)}-ATADC"
+        tokens[tok] = m.group(1)
+        return tok
+
+    return _CDATA_RE.sub(_sub, text), tokens
+
+
+def _unmask_value(v, tokens):
+    if isinstance(v, str):
+        for tok, body in tokens.items():
+            if tok in v:
+                v = v.replace(tok, body)
+        return v
+    if isinstance(v, dict):
+        return {k: _unmask_value(x, tokens) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_unmask_value(x, tokens) for x in v]
+    return v
+
+
+def _unmask_cdata_calls(tool_calls, tokens):
+    """Restore CDATA bodies inside every parsed call's arguments (the JSON
+    string form the parser emits, or a dict). No-op without tokens."""
+    if not tokens:
+        return tool_calls
+    out = []
+    for tc in tool_calls:
+        fn = (tc or {}).get("function") or {}
+        args = fn.get("arguments")
+        # The parser's contract: `arguments` is ALWAYS a JSON string (every
+        # append site json.dumps it). A non-JSON string cannot carry a token
+        # (tokens are minted inside the JSON-bearing text), so the only work
+        # is parse → restore → dump. (§4EC fix battery: the former dict/list
+        # and raw-string arms were unreachable and are gone.)
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                fn = dict(fn, arguments=json.dumps(_unmask_value(parsed, tokens)))
+        out.append(dict(tc, function=fn))
+    return out
+
 
 def _strip_think_blocks(text: str) -> str:
     """Remove `<think>…</think>` reasoning, preferring the real close tag so a
@@ -13144,7 +13248,8 @@ class GhostAgent:
     @staticmethod
     def _turn_outcome_label(*, verifier_failed: bool, verifier_passed: bool,
                             budget_exhausted: bool, exec_terminal: bool,
-                            unacked_total_failure: bool = False) -> str:
+                            unacked_total_failure: bool = False,
+                            shape_failed: bool = False) -> str:
         """The operator-facing label for a finished turn.
 
         SHARED by the finalize line and the late-verdict correction so the
@@ -13154,9 +13259,11 @@ class GhostAgent:
         shape the 2026-07-31 outcome work kept finding).
 
         Mirrors ``distill.outcome_heuristics.resolve_turn_outcome``:
-        refute > budget-exhaustion > verifier PASS > terminal execution
-        failure. A verifier PASS outranking a broken tool is the
-        honest-failure rule — see that function's docstring.
+        refute > shape-heuristic FAILED > verifier PASS (unless withheld) >
+        terminal execution failure; budget exhaustion only colours a turn
+        the corpus leaves UNKNOWN (§4EE). A verifier PASS outranking a
+        broken tool is the honest-failure rule — see that function's
+        docstring.
 
         ``unacked_total_failure`` is that function's rule 2b
         (2026-08-04): when every tool call failed and the reply never said
@@ -13166,15 +13273,67 @@ class GhostAgent:
         announcing ``verified`` for a turn the corpus records as FAILED,
         which is the disagreement the shared helper exists to prevent.
         """
+        # §4EE: the ORDER is the corpus ladder's (`resolve_turn_outcome`):
+        # refute > shape-heuristic FAILED (rule 2, never upgraded) > verifier
+        # PASS unless withheld > terminal execution failure. Budget
+        # exhaustion is NOT a corpus signal, so it can only colour a turn
+        # the corpus leaves UNKNOWN — it used to outrank a verified PASS
+        # and a terminal failure here, so the line said "partial" for
+        # turns the corpus and the calibration grade called passed/failed
+        # (the three-mirror table caught it; §4EE F3). `shape_failed`
+        # (§4EE F2) is the recorded trajectory's verdict from the shape
+        # heuristics; without it a selector-thrash turn printed "ok" and a
+        # late PASS on one printed "CORRECTED failed → verified" while the
+        # corpus kept FAILED.
         if verifier_failed:
             return "failed"
-        if budget_exhausted:
-            return "partial (budget exhausted)"
+        if shape_failed:
+            return "failed"
         if verifier_passed and not unacked_total_failure:
             return "verified"
         if exec_terminal:
             return "failed"
+        if budget_exhausted:
+            return "partial (budget exhausted)"
         return "ok"
+
+    @staticmethod
+    def _row_shape_failed(row) -> bool:
+        """Did the SHAPE heuristics (or a refute) mark this corpus row FAILED?
+        A FAILED whose reason is not the structural stamp is one the corpus
+        will never upgrade (rule 2); a structural FAILED is upgradable and
+        reads False here."""
+        try:
+            from ..distill.outcome_heuristics import is_structural_reason
+            from ..distill.schema import Outcome as _Outcome
+            return (getattr(row, "outcome", None) == _Outcome.FAILED.value
+                    and not is_structural_reason(
+                        getattr(row, "failure_reason", "") or ""))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _recorded_shape_failed(self, trajectory_id) -> bool:
+        """Did the SHAPE heuristics mark this turn's corpus row FAILED?
+
+        Reads the row `_record_turn_trajectory` just stashed in the
+        correction cache. A FAILED whose reason is not the structural
+        stamp came from `classify_chat_outcome` (selector thrash, repeated
+        error, abort marker) or from a refute — either way the corpus will
+        never upgrade it (rule 2), so neither may the operator line
+        (§4EE F2). Structural FAILED is upgradable and stays False here.
+        Never raises; unknown/uncached → False.
+        """
+        try:
+            if not trajectory_id:
+                return False
+            cache = getattr(
+                self.context, "_recent_trajectories_for_correction", None)
+            for t in list((cache or {}).values()):
+                if getattr(t, "id", None) == trajectory_id:
+                    return self._row_shape_failed(t)
+            return False
+        except Exception:  # noqa: BLE001 — a logging aid must not break finalize
+            return False
 
     def _emit_late_outcome_correction(self, trajectory_id, verdict_tag):
         """Re-emit the Turn Outcome line when a LATE verdict changes the
@@ -13206,6 +13365,7 @@ class GhostAgent:
                 # are gone by the time a late verdict lands.
                 unacked_total_failure=bool(
                     snap.get("unacked_total_failure")),
+                shape_failed=bool(snap.get("shape_failed")),
             )
             old_state = str(snap.get("state") or "")
             # Emit only on a VALENCE FLIP — the label going from
@@ -13226,6 +13386,8 @@ class GhostAgent:
                         else f" · recovered {_fails} strike(s)")
             else:
                 note = ""
+            if snap.get("budget_exhausted"):
+                note += " · budget exhausted"
             _conf = snap.get("confidence")
             _tnames = list(snap.get("tools") or [])
             pretty_log(
@@ -13621,6 +13783,8 @@ class GhostAgent:
         # ---------------------------------------------------------
         # Isolate actual output from <think> blocks FIRST
         parse_target = _strip_think_blocks(content)
+        # §4EC F1/F2: CDATA bodies are opaque to EVERY structural regex below.
+        parse_target, _cdata_tokens = _mask_cdata(parse_target)
 
         # --- XML TAG NORMALIZATION ---
         # Heal prompt-induced hallucinations (<tool> instead of <tool_call>)
@@ -13881,22 +14045,10 @@ class GhostAgent:
                 block_content = re.split(r'</tool_call.*?>', block, flags=re.IGNORECASE)[0]
 
                 try:
-                    # Fallback: if it's pure JSON wrapped in <tool_call> without <function>
-                    t_data = None
-                    if '<function' not in block_content.lower():
-                        try:
-                            t_data = extract_json_from_text(block_content)
-                            if t_data and "name" in t_data:
-                                func_match = None  # skip XML path, use t_data directly
-                            else:
-                                t_data = None
-                        except Exception:
-                            t_data = None
-
-                    if t_data is None:
-                        func_match = re.search(r'<function(?:\s+name=|=)(.*?)>', block_content, re.IGNORECASE)
-                    else:
-                        func_match = None
+                    # §4EC F5: the old "pure JSON wrapped in <tool_call>" pre-pass here was
+                    # dead — it only ever set func_match=None, and the `else` branch below
+                    # recomputes the identical extract_json_from_text() value.
+                    func_match = re.search(r'<function(?:\s+name=|=)(.*?)>', block_content, re.IGNORECASE)
                     if func_match:
                         func_name_raw = func_match.group(1).strip()
                         func_name = func_name_raw.strip('"').strip("'").split()[0].strip('"').strip("'")
@@ -13908,21 +14060,9 @@ class GhostAgent:
                             if a.group(1).lower() not in ['name', 'function', 'tool_call']:
                                 args_val[a.group(1)] = a.group(2)
 
-                        # Format 0a: CDATA envelope — `<parameter name="x"><![CDATA[ANYTHING]]></parameter>`
-                        # The model can wrap content with `<![CDATA[...]]>` to embed
-                        # literal `</parameter>`, `<`, `>`, JSON, code, etc. without
-                        # the regex-based parser truncating early. Match these FIRST
-                        # and remove from the working block so subsequent regexes
-                        # don't double-parse the inner body. Strict — only fires when
-                        # the model actually emitted `<![CDATA[...]]>`, so it can never
-                        # corrupt non-CDATA tool calls.
-                        cdata_pattern = re.compile(
-                            r'<parameter(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_-]+)["\']?\s*>\s*<!\[CDATA\[(.*?)\]\]>\s*</parameter>',
-                            re.DOTALL | re.IGNORECASE,
-                        )
-                        cdata_hits = list(cdata_pattern.finditer(block_content))
-                        for cm in cdata_hits:
-                            args_val[cm.group(1).strip()] = cm.group(2)
+                        # Format 0a (CDATA envelope) retired in §4EC: bodies are masked
+                        # before ANY structural regex (see _mask_cdata) and restored at
+                        # the parser exit, so Formats 1-5b see an opaque token instead.
 
                         # Format 1: <parameter name="x">y</parameter> (Handles missing closing tags)
                         # The lookahead also breaks on a stray *opening* `<function`
@@ -14004,11 +14144,6 @@ class GhostAgent:
                             end_pos = end_func.start() if end_func else len(block_content)
                             for i, op in enumerate(openings):
                                 p_name = op.group(1).strip().strip('"').strip("'")
-                                # Skip if the opening is inside a CDATA-wrapped body we
-                                # already consumed — would double-parse the inner text.
-                                in_cdata = any(cm.start() <= op.start() < cm.end() for cm in cdata_hits)
-                                if in_cdata:
-                                    continue
                                 # Self-closing `<parameter .../>` has no body — skip.
                                 if block_content[op.end() - 2:op.end()] == "/>":
                                     continue
@@ -14029,9 +14164,11 @@ class GhostAgent:
                                 # Only REPLACE when the repair is strictly longer AND
                                 # the existing value looks truncated (Format 1 stopped
                                 # at a literal `</parameter>` inside the body).
+                                # §4EC F4: the former `elif existing is None` arm was reachable
+                                # only through the Format-1 vs repair name-derivation mismatch
+                                # (name="a.b" → spurious key "a"); Format 1 always sets a
+                                # value for every opener this regex can match. Removed.
                                 if isinstance(existing, str) and len(repaired) > len(existing):
-                                    args_val[p_name] = repaired
-                                elif existing is None:
                                     args_val[p_name] = repaired
                         except Exception:
                             # Repair pass is best-effort. Never let it crash the
@@ -14157,7 +14294,9 @@ class GhostAgent:
                                 "type": "function",
                                 "function": {
                                     "name": t_data["name"],
-                                    "arguments": json.dumps(args_val) if isinstance(args_val, dict) else (args_val if isinstance(args_val, str) else json.dumps(args_val))
+                                    # §4EC F8: `args_val` is always the dict Fallback 1
+                                    # built above — the str/other arms were dead.
+                                    "arguments": json.dumps(args_val)
                                 }
                             })
                         else:
@@ -14292,31 +14431,22 @@ class GhostAgent:
                                 }
                             })
                 except Exception as e:
+                    # §4EC F11: an exception inside the extractor (e.g. an EMPTY function
+                    # name → IndexError) used to drop the block SILENTLY — no call, no
+                    # strike, no reason, and the turn ended as an empty reply. It is a
+                    # malformed block: same strike, same recovery hint as the others.
                     logger.debug(f"XML execution metadata parsing error: {type(e).__name__}")
+                    if not parse_failure_reason:
+                        parse_failure_reason = "malformed"
+                    tool_calls.append({
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {"name": "system_parse_error", "arguments": "{}"},
+                    })
 
-            # Scrub from the human-facing UI string. Three shapes
-            # can leak into the reply: `<tool_call>...</tool_call>`,
-            # `<tool>...</tool>`, and a bare `<function
-            # name="...">...</function>` (emitted without the outer
-            # wrapper — has_tool_tag still True via the `<function`
-            # branch, but the earlier regex only caught `<tool_call`
-            # / `<tool>` and left the bare function shape in the
-            # user-facing text). Backreference `\1` forces the close
-            # tag to match the same type as the open — otherwise a
-            # nested `</function>` inside `<tool_call>...</tool_call>`
-            # would terminate the outer match early and leave an
-            # orphan `</tool_call>` behind.
-            ui_content = re.sub(
-                # `\Z` (absolute EOS) instead of `$` — see the
-                # stream-wrapper pattern for the full rationale.
-                # The short version: `$` in non-MULTILINE mode
-                # matches before a trailing `\n`, letting the
-                # newline after `<tool_call>` escape the scrub.
-                r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
-                '',
-                ui_content,
-                flags=re.DOTALL | re.IGNORECASE,
-            ).strip()
+            # §4EC F10: the UI scrub for this path is the shared one at the
+            # end of the parser — `has_tool_tag` gates both, so the copy that
+            # lived here was redundant (mutation-proven; its rationale moved).
         else:
             # Fallback: honour native tool_calls if the model didn't use XML format
             tool_calls = list(msg.get("tool_calls") or [])
@@ -14415,20 +14545,40 @@ class GhostAgent:
                 except Exception:
                     pass
 
-        # Native-precedence leak scrub (2026-08-19 review). When native
-        # `tool_calls` won the routing over content that ALSO carried
-        # `<function`/`<tool_call>` tokens, the XML-path scrub above never ran,
-        # so those tokens would leak into the user-facing reply. Strip them
-        # here. Guarded on `has_tool_tag` so it is a no-op for pure-text turns;
-        # idempotent on the XML path (already scrubbed → nothing left to match).
+        # THE UI scrub (2026-08-19 review; sole implementation since §4EC F10).
+        # Three shapes can leak into the human-facing reply: `<tool_call>...
+        # </tool_call>`, `<tool>...</tool>`, and a bare `<function name="...">
+        # ...</function>` emitted without the outer wrapper. Backreference `\1`
+        # forces the close tag to match the open — otherwise a nested
+        # `</function>` inside `<tool_call>...</tool_call>` ends the outer match
+        # early and leaves an orphan `</tool_call>`. `\Z` (absolute EOS) rather
+        # than `$`, which in non-MULTILINE mode matches before a trailing `\n`
+        # and let the newline after `<tool_call>` escape. Runs for BOTH routes:
+        # when native `tool_calls` won over content that also carried tool
+        # tokens, and on the XML path. Guarded on `has_tool_tag` so it is a
+        # no-op for pure-text turns.
+        # ⚠ TO A FIXED POINT. `re.sub` scans the ORIGINAL string, so removing
+        # one block can splice its neighbours into a brand-new tag
+        # (`<t<tool_call>x</tool_call>ool_call>y</tool_call>` → one pass
+        # leaves `<tool_call>y</tool_call>`). The deleted XML-path copy of
+        # this scrub was an accidental second pass that hid one splice level;
+        # a review of that deletion (§4EC) found the leak, and the property
+        # is "nothing left to match", not "two passes".
         if has_tool_tag:
-            ui_content = re.sub(
-                r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
-                '',
-                ui_content,
-                flags=re.DOTALL | re.IGNORECASE,
-            ).strip()
+            for _ in range(8):
+                _scrubbed = re.sub(
+                    r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+                    '',
+                    ui_content,
+                    flags=re.DOTALL | re.IGNORECASE,
+                )
+                if _scrubbed == ui_content:
+                    break
+                ui_content = _scrubbed
+            ui_content = ui_content.strip()
 
+        if _cdata_tokens:
+            tool_calls = _unmask_cdata_calls(tool_calls, _cdata_tokens)
         return tool_calls, ui_content, parse_failure_reason
 
     # ── §4CL I1: the Imagine PRE-FLIGHT STEER ───────────────────────────
@@ -15434,7 +15584,13 @@ class GhostAgent:
                         # collapse-unsafe. Dropping a real call is far worse
                         # than a redundant read, so unknown/dynamic → unsafe.
                         _collapse_unsafe = is_mutating or fname not in _COLLAPSE_READSAFE
-                        _dup_src_idx = None if _collapse_unsafe else batch_seen_reads.get(a_hash)
+                        # §4EC F9: ONE gate. Registration below admits only
+                        # collapse-safe calls and `a_hash` carries the healed
+                        # tool name, so a hit here is necessarily a read-safe
+                        # twin of a read-safe call; gating the lookup as well
+                        # was equivalent (mutation-proven) and hid which gate
+                        # was the real one.
+                        _dup_src_idx = batch_seen_reads.get(a_hash)
                         if _dup_src_idx is not None:
                             # Duplicate read-only call in the SAME batch —
                             # register a placeholder task; the result is
@@ -17863,44 +18019,9 @@ class GhostAgent:
             logger.debug("start-with enforcement skipped: %s", _sw_exc)
 
         def _head_insert(block: str, reply: str) -> str:
-            """Insert finalize-added material at the head of the reply —
-            unless an active start-with constraint leads it (§ R1 A-F2), in
-            which case the block goes AFTER the phrase-led first segment so
-            the mandated opening stays first."""
-            if not block:
-                return reply
-            if not _sw_active_phrase:
-                return block + reply
-            # § R3 B-D3: a reply that ENDS inside an open fence (odd total
-            # marker count) cannot take an insert or an append without
-            # corrupting the fence — the constraint yields to content
-            # integrity: plain prepend, as before R1.
-            if len(_FENCE_MARK_RE.findall(reply)) % 2 == 1:
-                return block + reply
-            _cut = reply.find("\n\n")
-            # § R2 M-1 (+ R3 B-D3): never land inside an OPEN code fence —
-            # counted line-anchored and in BOTH dialects (``` and ~~~); the
-            # R2 walk counted bare ``` substrings, so a ~~~markdown fence
-            # took the digest INSIDE it. With an odd count before the cut,
-            # advance past the closing fence's paragraph break.
-            while _cut != -1 and len(
-                    _FENCE_MARK_RE.findall(reply[:_cut])) % 2 == 1:
-                _fm = _FENCE_MARK_RE.search(reply, _cut)
-                if _fm is None:
-                    _cut = -1
-                    break
-                _cut = reply.find("\n\n", _fm.end())
-            if _cut != -1:
-                _cut += 2
-                return reply[:_cut] + block + reply[_cut:]
-            _cut = reply.find("\n")
-            if _cut != -1 and not _FENCE_MARK_RE.search(reply):
-                _cut += 1
-                return reply[:_cut] + "\n" + block + reply[_cut:]
-            _tail = block
-            if _tail.endswith("\n\n---\n\n"):
-                _tail = _tail[:-len("\n\n---\n\n")]
-            return reply.rstrip() + "\n\n---\n\n" + _tail
+            # §4EC: the fence walk lives in the pure module-level function so it
+            # can be pinned over its input space (tests/test_4ec_head_insert.py).
+            return _head_insert_below_start_with(block, reply, _sw_active_phrase)
 
         # --- THE "PERFECT IT" PROTOCOL INJECTION ---
         # Only trigger proactive optimization for heavy engineering/research tasks
@@ -19031,8 +19152,9 @@ class GhostAgent:
         # to the distill log. No-op when the collector isn't
         # wired. Deliberately non-fatal — trajectory logging
         # must never break a user turn.
+        _rec_row = None
         try:
-            self._record_turn_trajectory(
+            _rec_row = self._record_turn_trajectory(
                 messages=messages,
                 final_content=final_ai_content,
                 req_id=req_id,
@@ -19144,17 +19266,42 @@ class GhostAgent:
             # Priority lives in _turn_outcome_label — SHARED with the
             # late-verdict correction so the printed line and its correction
             # can never disagree. It mirrors resolve_turn_outcome: refute >
-            # budget-exhaustion > verifier PASS > terminal execution failure.
+            # shape FAILED > verifier PASS > terminal execution failure
+            # (budget exhaustion is a note, not a valence — §4EE).
             # `_exec_terminal` and `_unacked` were both computed above, before
             # the deferred-correction prepend; never re-derived here.
             _budget_exhausted = bool(getattr(fs, "turn_budget_exhausted", False))
             _unacked = _unacked_turn
+            # §4EE F2: the corpus row for this turn was written just above.
+            # Its verdict is what the operator line must mirror, including
+            # the shape heuristics (rule 2) the line's own inputs cannot see.
+            # The ROW is used when the recorder returned it (bench rows are
+            # never stashed in the correction cache, and a same-fingerprint
+            # neighbour can evict a stashed one — R3 review); the cache is
+            # the fallback for callers that recorded elsewhere.
+            _shape_failed = (self._row_shape_failed(_rec_row)
+                             if _rec_row is not None
+                             else self._recorded_shape_failed(current_trajectory_id))
+            # §4EE R3 — the THIRD mirror. The calibration sample was written
+            # before the row existed, so a shape-heuristic FAILED graded as
+            # the unverified prior (0.83) or, with an inline PASS, as 1.0
+            # while the corpus recorded FAILED. Re-label it at the
+            # `shape_failure` rank; the tier joins the turn sample and reuses
+            # its features (no leakage), like every other retro tier.
+            if _shape_failed:
+                try:
+                    _ct_sh = getattr(self.context, "calibration_tracker", None)
+                    if _ct_sh is not None and hasattr(_ct_sh, "record_shape_failure"):
+                        _ct_sh.record_shape_failure(str(req_id or ""))
+                except Exception:  # noqa: BLE001 — labelling must not break finalize
+                    pass
             _state = self._turn_outcome_label(
                 verifier_failed=_verifier_failed,
                 verifier_passed=_verifier_passed,
                 budget_exhausted=_budget_exhausted,
                 exec_terminal=_exec_terminal,
                 unacked_total_failure=_unacked,
+                shape_failed=_shape_failed,
             )
             # Name what actually happened. "recovered" is only true when a
             # later call succeeded; when the LAST call failed and the answer
@@ -19167,6 +19314,12 @@ class GhostAgent:
                     else f" · recovered {execution_failure_count} strike(s)")
             else:
                 _recovered_note = ""
+            # §4EE R3: budget exhaustion no longer decides the valence (the
+            # corpus and the grade never let it), but a 40/40-turn
+            # working-state reply must still not READ as a clean success —
+            # the note and the WARNING level carry that (§4O's promise).
+            if _budget_exhausted and not _state.startswith("partial"):
+                _recovered_note += " · budget exhausted"
             _conf = getattr(getattr(self.context, "last_confidence", None), "composite", None)
             _tnames = [t.get("name") for t in (tools_run_this_turn or [])
                        if isinstance(t, dict) and t.get("name")]
@@ -19180,7 +19333,8 @@ class GhostAgent:
                 icon=(Icons.FAIL if _state == "failed"
                       else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
                 level=("WARNING" if (_state == "failed"
-                                     or _state.startswith("partial")) else "INFO"))
+                                     or _state.startswith("partial")
+                                     or _budget_exhausted) else "INFO"))
             # §LOG-3 (2026-08-20): the turn's single most important artifact
             # never reached the log — the operator watched minutes of
             # reasoning and never saw what was SAID, and the durable
@@ -19214,6 +19368,7 @@ class GhostAgent:
                         # gone by then) and re-deriving it differently is the
                         # drift this ring exists to avoid.
                         "unacked_total_failure": _unacked,
+                        "shape_failed": _shape_failed,
                     }
                     while len(_ring) > 32:
                         _ring.popitem(last=False)
@@ -19935,18 +20090,13 @@ class GhostAgent:
                 # Context-pressure lockdown: set after the SECOND overflow in
                 # one request (read budget drops to zero for its remainder).
                 self.context._ctx_pressure_lockdown = False
-                # § context R1 B1: the BUDGET OBJECT needs the same disarm as
-                # the flag. It is armed per tool batch (dispatch pipeline) but
-                # was never cleared at request end — and the registry resolves
-                # it AT CALL TIME, so a leftover ReadBudget(0) from a request
-                # that ended under lockdown governed every OUT-OF-BAND tool
-                # call (project-advancer idle ticks, project research,
-                # composed skills, the projects API) until the next
-                # interactive batch: one lockdown on the day's last turn
-                # poisoned a whole night of autonomous work with a
-                # "conversation near the context ceiling" refusal in contexts
-                # with no conversation. The arm-without-disarm class, again.
-                self.context._read_budget = None
+                # § context R1 B1 put a ReadBudget disarm HERE (request start). §4EC
+                # retired it: the budget is armed only inside
+                # `_dispatch_and_process_tool_batch`, whose only caller is this
+                # method's turn loop, so every arm sits inside the outer
+                # try/finally whose disarm (§ context R3) is the universal one.
+                # Removing this line survived 2,607 tests; the enumeration is
+                # pinned in tests/test_4ec_read_budget_enumeration.py.
                 # Snapshot the project that was active when THIS user message
                 # arrived — the delete-eligibility gate in tools.projects
                 # only honours a bare "delete it" against this project. A
@@ -26464,8 +26614,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         verifier: Optional[str] = None,
         execution_failed: bool = False,
         pressure_lockdown: Optional[bool] = None,
-    ) -> None:
+    ) -> Optional["Trajectory"]:
         """Build and persist a Trajectory for the turn that just finished.
+        Returns the row it wrote (None when the collector is not wired), so
+        the Turn Outcome line can mirror the corpus verdict from the row
+        itself rather than re-finding it through a cache (§4EE R3).
 
         ``pressure_lockdown`` feeds the derived-mood hook at the bottom.
         None means "caller runs INSIDE this request's semaphore — read the
@@ -27024,6 +27177,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "derived-mood update skipped: %s: %s",
                 type(e).__name__, e,
             )
+        return traj
 
     async def _run_system_3_pivot(self, task_context: str, error_context: str, sandbox_state: str, model: str) -> dict:
         """System 3 Crisis Pivot: generate 3 alternative strategies and pick the safest one."""

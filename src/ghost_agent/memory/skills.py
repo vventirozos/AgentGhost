@@ -78,11 +78,44 @@ def _explicit_query_cluster(query: str):
         return "python_general"
     return None
 
-# Hard cap on playbook size. When a new lesson is written and the cap
-# is exceeded, we drop by utility (verified pinned, lowest-utility
-# unverified first) rather than plain FIFO — the old FIFO rule could
-# evict a verified high-utility lesson purely because it was old.
-PLAYBOOK_MAX = 50
+# §4EG — ACE (Agentic Context Engineering) retrofit: grow-and-refine.
+# The playbook cap is FREE on prompt budget — injection is a top-k retrieval
+# under the bus governor, so store size never reaches the prompt. A low cap
+# therefore only SHEDS knowledge: measured 2026-09-03, the store sat at 50/50
+# and cap-trim had dropped 664 lessons, 50 of them with positive net outcome
+# credit (one at 28 retrievals, 7 succ / 4 fail). Grow-and-refine raises the
+# cap and PINS proven-useful lessons (positive net credit) alongside verified
+# ones, so the cap can only ever evict UNPROVEN or proven-HARMFUL lessons.
+# `GHOST_ACE_PLAYBOOK=0` restores the old cap=50 + drop-lowest-utility rule.
+_ACE_PLAYBOOK = os.environ.get(
+    "GHOST_ACE_PLAYBOOK", "1").strip().lower() in ("1", "true", "yes", "on")
+# When a new lesson is written and the cap is exceeded, we drop by utility
+# (protected lessons pinned, lowest-utility unprotected first) rather than
+# plain FIFO — the old FIFO rule could evict a high-utility lesson purely
+# because it was old.
+PLAYBOOK_MAX = (int(os.environ.get("GHOST_PLAYBOOK_MAX", "300") or 300)
+                if _ACE_PLAYBOOK else 50)
+
+
+def _lesson_is_protected(lesson: dict) -> bool:
+    """A lesson the cap must NEVER evict (grow-and-refine, §4EG).
+
+    Verified always; and, under ACE, any lesson with positive NET outcome
+    credit — more verified-passes than -fails while it was present. Eviction
+    may then only target unproven lessons (no decisive outcome yet) or
+    proven-HARMFUL ones (more fails than passes), which also sink in
+    retrieval ranking and are simply never injected. `verified` alone
+    reproduces the legacy pin set when ACE is off.
+    """
+    if not isinstance(lesson, dict):
+        return False
+    if lesson.get("verified"):
+        return True
+    if _ACE_PLAYBOOK:
+        s = int(lesson.get("succeeded_retrievals") or 0)
+        f = int(lesson.get("failed_retrievals") or 0)
+        return s > f and s > 0
+    return False
 
 # Fields that signal a lesson is using the new schema. If any of these
 # keys is present we treat the entry as structured; absence means the
@@ -597,22 +630,29 @@ def _trim_playbook_by_utility(playbook: list, max_entries: int) -> list:
 
     head = playbook[0]
     rest = list(playbook[1:])
-    verified = [p for p in rest if _normalize_lesson(p).get("verified")]
-    unverified = [p for p in rest if not _normalize_lesson(p).get("verified")]
-    unverified.sort(
+    # §4EG: protected = verified + (under ACE) positive-net-credit. The cap
+    # fills its remaining slots with the highest-utility UNPROTECTED lessons;
+    # a protected lesson is never chosen for eviction.
+    protected = [p for p in rest if _lesson_is_protected(p)]
+    unprotected = [p for p in rest if not _lesson_is_protected(p)]
+    unprotected.sort(
         key=lambda p: compute_lesson_utility(_normalize_lesson(p)),
         reverse=True,
     )
 
-    kept = [head] + verified
+    kept = [head] + protected
     slots_left = max_entries - len(kept)
     if slots_left > 0:
-        kept.extend(unverified[:slots_left])
+        kept.extend(unprotected[:slots_left])
 
-    if len(kept) > max_entries:
-        # Overflow from too many verified lessons — keep the head and
-        # then the highest-utility rest (verified first by tie-break
-        # via `compute_lesson_utility`'s +0.3 verified bonus).
+    # §4EG: under ACE a protected lesson is NEVER evicted by the cap — if the
+    # protected set alone exceeds the cap the store is kept OVERSIZED (the same
+    # fail-open the archive path takes; redundancy is bounded by dedup-merge on
+    # write, not count eviction). Only the legacy path (ACE off) trims an
+    # overflow, keeping the head then the highest-utility rest. Folding the ACE
+    # guard into the condition keeps the oversized-return as the function's one
+    # exit and leaves no dead branch for a `True` mutant to hide in.
+    if not _ACE_PLAYBOOK and len(kept) > max_entries:
         head_keep = kept[0]
         tail = sorted(
             kept[1:],
@@ -1888,7 +1928,10 @@ class SkillMemory:
                 if (
                     score <= cutoff
                     and int(lesson.get("retrievals") or 0) >= min_retrievals
-                    and not lesson.get("verified")
+                    # §4EG: never prune a PROTECTED lesson (verified, or
+                    # positive net outcome credit under ACE). Subsumes the
+                    # old `not verified` and adds the proven-useful pin.
+                    and not _lesson_is_protected(lesson)
                     # A quarantined row is *deliberately* held on disk for the
                     # operator to review or reinstate, and it is excluded from
                     # prompt injection — so its retrievals stop accruing and

@@ -306,6 +306,15 @@ SyntaxError: Unexpected identifier 't'</pre>
   <p>Tests: <code>tests/test_fs_batch_macro.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2>§4EC re-verification of the read budget (2026-09-02)</h2>
+  <p>The §4CA read-budget mechanics are pinned as behaviour in
+  <code>tests/test_4ec_read_budget_pins.py</code>: <code>read_byte_budget</code>'s 150 KB floor
+  bounded by 80% of the window, <code>ReadBudget</code>'s clamps, the three whole-file refusal
+  wordings (fresh-but-small, exhausted, lockdown), the ranged-read exemption, the generated-file
+  sample's 4,096-byte charge with and without a budget, and chunked reads charged on success only.
+  The battery covered the 115 high-value mutants near those sites; the dispatcher's write/replace/
+  move arms were out of that review's scope. Full account: PROJECT_JOURNAL.md §4EC addendum.</p>
 </main>
 </body>
 </html>

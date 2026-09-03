@@ -446,8 +446,12 @@ def test_the_cascade_ABORTS_when_the_harness_moves(tmp_path, monkeypatch):
         # ⚠ MOVE IT ONLY ON THE FINAL CHECK. Tampering early aborts
         # before `passed` is ever set, so the assertion below would hold
         # for the wrong reason and the veto would be untested. The count
-        # is: before, pre-stage0, post-stage0, post-stage1.
-        if calls["n"] >= 4:              # someone edited a test mid-run
+        # is: before, pre-stage0, post-stage0, post-stage1, FINAL.
+        # ⚠ §4EC: when the post-stage-1 check was added (§4CP) this index
+        # stayed at 4, so the tamper fired BEFORE `passed` was assigned
+        # and the veto line survived deletion — the exact regression the
+        # comment below warns about. The count is asserted at the end.
+        if calls["n"] >= 5:              # someone edited a test mid-run
             d["tests/test_planted.py"] = "deadbeef"
         return d
     monkeypatch.setattr(EV.fence, "harness_digest", _moving)
@@ -465,6 +469,7 @@ def test_the_cascade_ABORTS_when_the_harness_moves(tmp_path, monkeypatch):
     assert [st.stage for st in out.stages] == [EV.STAGE_STATIC,
                                                EV.STAGE_PINS], out.stages
     assert all(st.passed for st in out.stages), out.stages
+    assert calls["n"] == 5, "the tamper must land on the FINAL check"
 
 
 @pytest.mark.slow

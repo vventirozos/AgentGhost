@@ -149,10 +149,10 @@ def _tail_has_stop_marker(buf: str, new_token: str) -> bool:
     for m in _STREAM_STOP_MARKERS:
         idx = tail.find(m)
         while idx != -1:
-            if idx == 0 and len(buf) > len(tail):
-                # Marker starts before the look-behind char — predecessor
-                # unknown. Conservative: treat as a real transition.
-                return True
+            # A marker at the very front of the window (idx == 0) has an
+            # UNKNOWN predecessor; `prev` is "" there, which is not a quote,
+            # so the check below returns True — the conservative verdict.
+            # (§4EC F13: an explicit idx-0 arm saying the same was redundant.)
             prev = tail[idx - 1] if idx > 0 else ""
             if prev not in ("`", '"', "'"):
                 return True

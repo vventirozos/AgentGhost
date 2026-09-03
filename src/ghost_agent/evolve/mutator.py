@@ -1143,7 +1143,8 @@ def _read_anchor_source(root: Path, target: str):
             return None                       # escapes the repo
         st = cand.lstat()
         if not stat.S_ISREG(st.st_mode):
-            return None                       # device, FIFO, socket, symlink
+            return None                       # device, FIFO, socket (a symlink was
+            # already FOLLOWED by resolve() above, so containment is what refuses it)
         if st.st_size > MAX_ANCHOR_SOURCE_BYTES:
             return None
         return cand.read_text(encoding="utf-8",

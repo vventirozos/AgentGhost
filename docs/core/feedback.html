@@ -116,10 +116,14 @@
 
   <h2>Deliberately not wired (follow-ups, not oversights)</h2>
   <ul>
-    <li><strong>Calibration re-labels</strong> —
-    <code>record_late_verdict_correction</code> is source-ranked for the
-    verifier; human labels need their own source rank in the calibration
-    store, a schema decision, not a bolt-on.</li>
+    <li><strong>Calibration re-labels &mdash; WIRED since &sect;4EE (2026-09-02).</strong>
+    The label also goes to <code>CalibrationTracker.record_human_label</code> at the
+    <code>human_feedback</code> rank, the top of the ladder, right after the sidecar
+    write; the Human Feedback line says <em>calibration relabelled</em> or
+    <em>calibration unchanged</em> (no sample to join &mdash; a thumb that raced the
+    streamed drain &mdash; or the same thumb again). Before this the one ground-truth
+    source the fit is documented to need corrected the learning corpus and left the
+    fit believing the turn's inline grade.</li>
     <li><strong>Reaction removal</strong> — labels only accrete; a changed
     mind posts the opposite signal and last-write-wins resolves it.</li>
   </ul>

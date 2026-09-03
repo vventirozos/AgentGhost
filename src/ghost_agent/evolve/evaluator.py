@@ -156,10 +156,10 @@ HOLDOUT_PCT = 25
 #: not merely "not promoted".
 PAIRED_ALPHA = 0.05
 
-#: Stage 2 defaults. The item count is the spec's 100–200; the budget is
-#: a DEADLINE, not a duration — a stage that can overrun by "just one
-#: more item" spends a night.
-BENCH_ITEMS = 120
+#: Stage 2 default budget — a DEADLINE, not a duration: a stage that can
+#: overrun by "just one more item" spends a night. The item count is the
+#: caller's (`sample_items(banks, n)`); the module-level default it once
+#: carried had no reader (§4EC).
 BENCH_BUDGET_S = 3600.0
 
 #: The share of REQUESTED items that must actually be graded before a
@@ -204,6 +204,8 @@ class StageResult:
 @dataclass
 class CascadeResult:
     node_id: str
+    #: False until `run_cascade`'s final assignment — so every early return
+    #: on the way there is a failure WITHOUT an explicit assignment.
     passed: bool = False
     stages: List[StageResult] = field(default_factory=list)
     #: Set when the harness moved. This is not a stage failure — it
@@ -370,8 +372,7 @@ def _import_index(canonical_root: Path) -> Dict[str, set]:
         try:
             tree = ast.parse(t.read_text(encoding="utf-8", errors="replace"))
         except (SyntaxError, OSError, ValueError):
-            idx[str(t.relative_to(canonical_root))] = names
-            continue
+            continue        # an unparsable pin imports nothing; absent reads as empty
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names.update(a.name for a in node.names)
@@ -531,12 +532,9 @@ def _reads_canonical_files(text: str) -> bool:
         if isinstance(f, ast.Name) and f.id == "open" and node.args:
             if _tainted(node.args[0]):
                 return True
-        if (isinstance(f, ast.Attribute) and f.attr == "read"
-                and isinstance(f.value, ast.Call)
-                and isinstance(f.value.func, ast.Name)
-                and f.value.func.id == "open"
-                and f.value.args and _tainted(f.value.args[0])):
-            return True
+        # `open(p).read()` needs no arm of its own: `ast.walk` reaches the
+        # inner `open(p)` call, which the arm above decides (§4EC: the
+        # explicit `.read` arm was mutation-equivalent, so it is gone).
     return False
 
 
@@ -820,9 +818,8 @@ def stage1_pins(candidate_root: Path, canonical_root: Path,
     # ⚠ NOT UNDER THE CANDIDATE. `cand / "_stage1_home"` put the
     # graded process's home INSIDE the tree being graded — and, when the
     # candidate was the repo itself, inside the tree the fence protects.
-    env["GHOST_HOME"] = str(stage_home)
+    env["GHOST_HOME"] = str(stage_home)          # created above
     env["TMPDIR"] = str(run_tmp)
-    Path(env["GHOST_HOME"]).mkdir(parents=True, exist_ok=True)
     # ⚠ AND NO BYTECODE. `fence.harness_digest` hashes source and skips
     # `__pycache__`, so a `.pyc` written during a graded run is imported
     # in preference to the source it no longer matches and the digest
@@ -1177,6 +1174,8 @@ def _run_items(tree: Path, canon: Path, items: List[dict], home: Path,
                     f"deliberately not idempotent over the same home.")
     inbox = home / f"{tag}_items.jsonl"
     outbox = home / f"{tag}_results.jsonl"
+    # Reachable only by a race with the `mkdir(exist_ok=False)` above (the
+    # directory is empty by construction); kept as a belt, never as evidence.
     for pre in (inbox, outbox):
         if pre.exists() or pre.is_symlink():
             return [], (f"{pre.name} exists before the {tag} child ran")
@@ -1729,9 +1728,12 @@ def stage4_packet(node_id: str, diff: str, brief: str,
     path = out / f"{node_id}.json"
     already = path.exists()
 
-    paired = next((st for st in cascade.stages
-                   if st.stage == STAGE_PAIRED), None)
-    stats = dict(paired.detail) if paired else {}
+    # `promotable` (refused above) guarantees a passed stage-3 result is
+    # present; a StopIteration here would mean that invariant broke, and
+    # loudly is the right way for it to break (§4EC: the `else {}` arm was
+    # unreachable).
+    paired = next(st for st in cascade.stages if st.stage == STAGE_PAIRED)
+    stats = dict(paired.detail)
     import json as _json
     packet = {
         "node_id": node_id,
@@ -1877,8 +1879,7 @@ def run_cascade(node_id: str, diff: str, candidate_root: Path,
                 f"{len(overlap)} item(s) are in BOTH the stage-2 pool and "
                 f"the held-out slice — a candidate judged on what it was "
                 f"tuned against", {"overlap": sorted(overlap)[:8]}))
-            res.passed = False
-            return res
+            return res                      # `passed` is still its default, False
     if s1.passed and bench_items and home:
         s2 = res.add(stage2_bench(
             Path(candidate_root), canon, items=bench_items,
@@ -1909,10 +1910,9 @@ def run_cascade(node_id: str, diff: str, candidate_root: Path,
                                   budget_s=budget_s, python=python))
             if _harness_moved():
                 return res
-        elif not s2.passed:
-            res.passed = False
-            _harness_moved()
-            return res
+        # A failed stage 2 falls through: `passed` becomes False below, the
+        # harness is checked once, and `promotable` is False — the explicit
+        # early return that used to sit here was equivalent (§4EC).
     # ⚠ RECORD THE PASS FIRST, THEN LET THE HARNESS CHECK VETO IT.
     # Checking before assigning made `_harness_moved`'s `passed = False`
     # unreachable — `passed` was still its default at every point the

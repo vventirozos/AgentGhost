@@ -745,6 +745,16 @@
   <pre><code>turn outcome  CORRECTED failed → verified (late verdict) · confidence 0.93 · tools: file_system · 4 chars · 1 tool failure(s), honestly reported</code></pre>
   <p>Two properties keep it signal, not noise. <strong>(1) Valence gate:</strong> it fires only when the label crosses the failure boundary. A turn that printed <code>ok</code> and is later CONFIRMED becomes <code>verified</code> — strictly more information, but not a mislabel, and announcing it would put a correction line on <em>every</em> successful async turn, training the eye to skip the one line that matters. <strong>(2) Once per turn:</strong> the snapshot is popped on emit, so an escalation backfill cannot re-announce. The priority ladder itself lives in the shared <code>_turn_outcome_label</code> helper used by BOTH the finalize line and the correction — two copies would drift the first time either side was edited, which is the defect shape this whole cluster kept surfacing. The snapshot ring is a logging aid and is never read as state.</p>
 
+  <h3>&#9888; The three mirrors, reviewed as ONE unit (&sect;4EE, 2026-09-02/03)</h3>
+  <p>The label producers &mdash; the corpus ladder (<code>resolve_turn_outcome</code>), the <code>Turn Outcome</code> line (<code>_turn_outcome_label</code> and its late correction) and the calibration grade (<code>grade_turn_outcome</code> under <code>_SOURCE_RANK</code>) &mdash; had each been fixed in isolation and had never been asked ONE question: over the product of their shared inputs, do they tell one story about one turn? Asked as a table (<code>tests/test_4ee_label_class_pins.py</code>), three cells disagreed on the first run, and a read-only review of the fix found a fourth:</p>
+  <ul>
+    <li><strong>The line ranked budget exhaustion above a verified PASS and above a terminal failure.</strong> Neither the corpus nor the grade does; the helper's docstring described an order the corpus ladder never had. The line's order is now the ladder's (refute &gt; shape FAILED &gt; PASS unless withheld &gt; terminal failure); budget exhaustion colours only an UNKNOWN turn as <code>partial</code>, and otherwise survives as a <code>&middot; budget exhausted</code> note that keeps the line at WARNING (&sect;4O's promise).</li>
+    <li><strong>The line could not see the shape heuristics.</strong> A selector-thrash or repeated-error turn the corpus marks FAILED printed <code>ok</code> on a clean strike ledger, and a late PASS on one announced <code>CORRECTED failed &rarr; verified</code> while the corpus kept FAILED (rule 2). <code>_record_turn_trajectory</code> now returns its row; the line derives <code>shape_failed</code> from that row (not from the fingerprint cache, which never holds a bench row), the correction ring snapshots it, and the late emitter stays silent.</li>
+    <li><strong>The grade was recorded before the row existed.</strong> A shape-FAILED turn graded as the unverified prior, or as 1.0 with an inline PASS. A <code>shape_failure</code> tier (rank just above <code>turn</code>, grade 0.68 &mdash; the currency of one unverified execution failure, not the 0.0 of "checked and wrong") re-labels the sample once the row is written; <code>grade_turn_outcome(shape_failed=)</code> states the same rule for the pure table.</li>
+    <li><strong>A human thumb never reached the fit.</strong> <code>human_feedback</code> was the only corpus label source with no calibration rank; it now sits at the top of the ladder (<a href="calibration.html">calibration</a>, <a href="feedback.html">feedback</a>).</li>
+  </ul>
+  <p>Two cells the table cannot produce are pinned by driving finalize instead: <code>unacked</code> is derived as <code>exec_terminal and sniffer(&hellip;)</code>, and the structural stamp is written only under rule 4 &mdash; so a sniffer that flags every tool result against a clean ledger leaves the line at <code>ok</code> and the corpus UNKNOWN. The class-level enumerations that came with the review walk the source tree: every <code>update_outcome</code> writer carries the authority flag its source requires, no module but the collector reads the day files, and every writer's source has a calibration rank.</p>
+
   <h2>Probe-log fix cluster (2026-07-31)</h2>
   <p>Live functional probes of the verification-tooling deploy (journal §6 2026-07-31) surfaced four pre-existing turn-loop defects, all fixed the same day:</p>
   <ul>
@@ -939,6 +949,54 @@
     catches. <b>The durable record is best-effort; the end-of-stream contract is not.</b>
   </p>
   <p>Tests: <code>tests/test_stream_done_sentinel_ordering.py</code> — 4 AST-based pins (scope, ordering, last-yield, total-guard).</p>
+
+  <h2>§4EC re-verification of the turn-loop slices (2026-09-02)</h2>
+  <p>The §R protocol was applied to the three turn-loop review sections (§4BY parse+dispatch,
+  §4BZ finalize+stream, §4CA context) plus §4CP and §4DE, with a whole-function AST mutation
+  battery instead of one hand-picked mutant per fix. What it changed in this module:</p>
+  <ul>
+    <li><strong>CDATA is now opaque to every structural regex.</strong> <code>_mask_cdata</code>
+      replaces each <code>&lt;![CDATA[…]]&gt;</code> span with a per-call random token at the
+      point the parser's working copy is born (right after <code>_strip_think_blocks</code>), and
+      <code>_unmask_cdata_calls</code> restores the bodies into the extracted argument values at
+      the parser's single exit. Before this, the body was extracted at "Format 0a" but never
+      removed from the working copy, so a literal <code>&lt;tool_call&gt;</code> inside a CDATA
+      body split the write in half (plus a <code>system_parse_error</code> strike) and Formats 3/5
+      harvested tags inside the body as arguments (<code>&lt;b&gt;</code> became
+      <code>args["b"]</code>). Format 0a and its <code>in_cdata</code> skip are gone.</li>
+    <li><strong>An empty function name is a malformed strike, not silence.</strong>
+      <code>&lt;function name=&gt;</code> raised <code>IndexError</code> inside the extractor and
+      the block-level handler only logged at DEBUG: no call, no strike, no reason, and the turn
+      ended as an empty reply. The handler now emits the same <code>system_parse_error</code> as
+      every other failure with <code>parse_failure_reason = "malformed"</code>.</li>
+    <li><strong>Dead code deleted after surviving the battery as equivalent mutants:</strong> the
+      "pure JSON in <code>&lt;tool_call&gt;</code>" pre-pass (its only effect was recomputed by the
+      else branch, with a duplicate WARNING on garbage); the repair pass's
+      <code>elif existing is None</code> arm (reachable only via a name-derivation mismatch that
+      produced a spurious key); the Fallback-1 append's non-dict arms; one of two redundant
+      batch-collapse guards; the XML-path ui scrub (the native-precedence scrub is the single
+      implementation); the per-block "truncated" classification (the whole-reply pre-check
+      subsumes it); and §4CA R1's request-start <code>ReadBudget</code> disarm (the dispatch has
+      exactly one caller, inside the outer <code>try/finally</code>; the ownership rule is
+      enumerated from the AST in <code>tests/test_4ec_read_budget_enumeration.py</code>).</li>
+    <li><strong>The fence walk is a pure function.</strong> <code>_head_insert_below_start_with</code>
+      holds §4BZ's placement rule (below an active start-with head, never inside a code fence);
+      the closure inside <code>_finalize_and_return</code> is a one-line delegate. Pinned over its
+      input space in <code>tests/test_4ec_head_insert.py</code>.</li>
+  </ul>
+  <p>Pins added for this module: <code>tests/test_4ec_parser_dialects.py</code> (every
+  argument-extraction dialect dispatches like the canonical form, parse-reason table, sink-count
+  drift guard), <code>tests/test_4ec_native_usable_gate.py</code> (the usable-native gate over
+  13 argument shapes × 4 tool kinds), <code>tests/test_4ec_dispatch_pins.py</code> (the dispatch
+  loop's invalidations, synthetic-error branches, world-change resets, churn and project tallies),
+  <code>tests/test_4ec_finalize_pins.py</code> (finalize call sites: content scrubs, fallback
+  header and preview, banner framing, verdict-cache reuse, clarify/risk/digest insertions),
+  <code>tests/test_4ec_stream_pins.py</code>. Full account: PROJECT_JOURNAL.md §4EC.</p>
+
+<h3>The deletion pass (2026-09-02, 22:30)</h3>
+<p>The four parser/dispatch arms &sect;4EC had recorded as mutation-equivalent were revisited with <code>agent.py</code> unfrozen. <strong>Deleted:</strong> F8, the non-dict arms of the Fallback-1 append (its arguments are always the dict Fallback 1 builds); F9, the second of two batch-collapse gates &mdash; the lookup is now ungated, registration into <code>batch_seen_reads</code> stays gated, and because the batch hash carries the healed tool name a hit is necessarily a read-safe twin (pinned: identical arguments on a read-safe and an unsafe tool in one batch both execute; a name-blind hash kills that pin, and so does removing the remaining gate &mdash; which is the point of having one gate instead of two); F10, the XML-path copy of the UI scrub (<code>has_tool_tag</code> gates both, so the shared scrub always ran after it); and, in <code>stream_guards.py</code>, F13, the explicit idx-0 arm of the stop-marker check (at idx 0 the predecessor is <code>""</code>, which is not a quote, so the next arm already returns True).</p>
+<p><strong>Two corrections to the record.</strong> F12, the per-block &ldquo;truncated&rdquo; classification, is <em>reachable</em> after all: a closed <code>&lt;tool_call&gt;</code> block ending in an unclosed <code>&lt;function name="x</code> tag (no <code>&gt;</code>) passes the whole-reply pre-check and lands on that arm. It was kept; the deciding world is named as a gap rather than pinned, because whether that garbage shape should read as <em>truncated</em> or <em>malformed</em> is a label decision, not a dead-code one. And F10 was <strong>broken by the read-only review of the deletion</strong>: <code>re.sub</code> scans the original string, so removing one block can splice its neighbours into a brand-new tag (<code>&lt;t&lt;tool_call&gt;x&lt;/tool_call&gt;ool_call&gt;y&lt;/tool_call&gt;</code> leaves <code>&lt;tool_call&gt;y&lt;/tool_call&gt;</code> after one pass); the deleted copy had been an accidental second pass hiding one splice level, and three levels leaked even before. The one remaining scrub now runs to a fixed point (bounded at 8 passes), pinned on one-, two- and function-splice inputs; single-pass and break-immediately mutants of the loop are killed.</p>
+<p>The lesson is general enough to keep: <em>mutation-equivalent is relative to the test corpus, not to behaviour.</em> A deletion that every test is blind to still needs someone trying to construct the input that distinguishes the two programs &mdash; the reviewer found F10&rsquo;s in minutes, from the diff alone.</p>
 </main>
 </body>
 </html>

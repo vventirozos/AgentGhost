@@ -33121,6 +33121,770 @@ surfaces giving two answers). Pinned as an equality between the headline and `n_
 `sc_drawn`) accrues per deep verdict and is the read when there is enough of it. Kill with
 `GHOST_VERIFY_DEPTH_CONF=0`, no restart needed.
 
+## §4EC — The five "CONVERGED" sections, re-verified under §R (2026-09-02)
+
+§R's own justification names five sections whose convergence rests on reviewer silence — §4BY,
+§4BZ, §4CA (the three turn-loop slices), §4CP and §4DE. **Checked before starting (R6, R8): that
+claim is itself half wrong.** §4BY quotes 32 kills, §4BZ ~45, §4CA 30, and §4DE two full batteries
+with controls and driven survivors. §4CP/§4CQ quote **zero** numbers ("dies under mutation",
+never a count). What §4BY/§4BZ/§4CA share, and what makes them unverified by §R's standard, is
+the SHAPE of their evidence: one hand-picked mutant per fix, scored against the pin files the fix
+shipped with, killer implicitly named by construction. That measures agreement between the
+author's mutants and the author's pins ([[mutation-harness-must-not-name-its-killer]]). None of
+the five ran an unbiased battery over the whole function bodies the fixes live in.
+
+### R0 — scope, written before round 1
+
+- **Property under review.** Every fix shipped by the five sections is still load-bearing in the
+  current tree AND is pinned by a test that fails when the fix is removed or inverted — measured
+  by a whole-function AST mutation battery (every `if`/`elif` test → True/False, every comparison
+  and boolean operator inverted, every `not` dropped, every non-logging statement deleted, every
+  `return` → `return None`, integer/bool constants perturbed), not by one mutant per fix.
+- **Threat model.** The mutant is the adversary; the tests are the only inputs. NOT trusted: the
+  sections' own kill counts, pin-file names, and comments claiming coverage. Trusted: a pytest
+  process exiting non-zero on the mutated copy.
+- **Tiers.** T1 = the section's pin files (2–13 s). A T1 kill is final (a superset cannot un-kill
+  it). T1 survivors run T2 = every test file that names any identifier in the slice (18–107 s,
+  xdist). T2 survivors run the FULL suite before being called survivors at all.
+- **Controls, per file.** A comment-only NOOP must survive; a `raise RuntimeError` at the top of
+  the first function must die.
+- **Out of scope (so a round can end).** Operator-log text and telemetry-only statements (the
+  generator skips pure logging calls; a survivor whose only visible effect is a log line is
+  recorded, not pinned). `handle_chat` beyond the four ReadBudget disarm placements. Verdict
+  gating and idle orchestration (declared out of these slices by the sections themselves). The
+  evolve "medium" — the bench child running beside rather than under the sandbox — which
+  §4CP/§4CQ recorded as blunted-not-closed; re-closing it is a design change, not a review
+  finding. §4CP's `evaluator.py` battery is SAMPLED (its pin files take ~105 s per run; the full
+  1,213-mutant set would take ~7 h) — the sample is every fix site from the inventory plus a
+  crc32-seeded random 20%; the other three evolve modules run in full.
+- **Fix sites outside the auto-covered bodies** get hand-written mutants: the registry constant
+  `CONDITIONALLY_ADVERTISED_BUILTIN_NAMES` (§4BY R5), the `handle_chat` request-start and
+  outer-`finally` disarms (§4CA R1/R3), and the `_biological_tick` epoch-swap hook (§4DE).
+- **Harness discipline.** Mutants are applied to COPIES of the tree (mirrored layout, so the 11
+  `sys.path.insert` pin files resolve to the mutated copy), never the live repo; the live file's
+  sha256 is asserted unchanged at the end of every batch; `__pycache__` purged from the copies;
+  every mutant `py_compile`d before its verdict counts; hangs are kills.
+
+
+### Premise, corrected (R6/R8)
+
+§R names §4BY, §4BZ, §4CA, §4CP and §4DE as CONVERGED-without-a-score. Read before starting:
+§4BY quotes 32 kills, §4BZ ~45, §4CA 30, §4DE two full batteries with controls and driven
+survivors; only §4CP/§4CQ quote none. What the three turn-loop sections share is the SHAPE of
+the evidence — one hand-picked mutant per fix, scored against the pin files the fix shipped
+with, the killer implicitly named by construction — which is agreement between the author's
+mutants and the author's pins, not adequacy. None of the five ran an unbiased battery over the
+bodies the fixes live in. That is what this section did.
+
+### Method (what "battery" means below)
+
+`mutgen.py` walks the AST of every function the section's fixes live in and emits one mutant per
+site: each `if`/`elif`/`while`/ternary test → `True` and → `False`; every comparison operator and
+`and`/`or` inverted; every `not` dropped; every non-logging statement deleted (`pass`); every
+`return X` → `return None`; `break`↔`continue`; integer/bool/float constants perturbed. Mutants are
+applied one at a time to a COPY of the whole repo (interface/, docs/ and all — a test read
+`interface/externals` and the comment-only control died until the copy was complete); the live
+file's sha256 is asserted unchanged after every batch. Tiers: **T1** the section's own pin files
+(a kill here is final), **T2** every test file naming a slice identifier, with the NEW pin files
+first and fail-fast, **T3** a re-run of every recorded survivor against the new pins alone.
+High-value kinds (deletions, condition flips, comparison/boolean inversions, returns,
+break/continue) went through all tiers; integer/bool/arithmetic perturbations stopped at T1 and
+are reported as "T1-only", not as survivors and not as kills. Every phase carries a comment-only
+NOOP that must survive and a module-level `raise` that must die.
+
+### Results by slice
+
+| slice | mutants | tier-eligible | killed | true survivors | T1-only | kill rate | controls |
+|---|---|---|---|---|---|---|---|
+| §4BY parse+dispatch (`agent.py`) | 2,167 | 1,757 | 1,689 | 68 | 410 | **96.1%** | NOOP survived / KNOWNBAD died |
+| §4CA/§4DE hand-written fix sites | 5 | 5 | 4 | 1 | 0 | 80% | ✓ |
+| §4DE `optim/loader.py` | 337 | 305 | 280 | 25 | 32 | **91.8%** | ✓ |
+| §4DE `tools/registry.py` | 25 | 24 | 17 | 7 | 1 | 70.8% | ✓ |
+| §4BZ finalize+stream (`agent.py`) | 1,531 | 1,316 | 645 | 671 | 215 | **49.0%** | ✓ |
+| §4BZ `stream_guards.py` | 185 | 125 | 115 | 10 | 60 | **92.0%** | ✓ |
+| §4BZ `utils/constraints.py` (hoist parser) | 75 | 59 | 55 | 4 | 16 | **93.2%** | ✓ |
+| §4CA `core/context_manager.py` | 323 | 233 | 212 | 21 | 90 | **91.0%** | ✓ |
+| §4CA `agent.py` context functions, `tools/file_system.py` read paths | finished after the write-up — see the addendum below (83.6% / 81.3% of the fix-site subset) |
+| §4CP `evolve/mutator.py` (40% sample of high-value kinds) | 354 | 354 | 286 | 68 | — | **80.8%** | ✓ |
+| §4CP `negative_controls` (87.1%), `fence`, `evaluator` sample | see the addendum below |
+
+Every true survivor has ONE of four dispositions in the ledger below: **pinned** (a new test that
+kills it, re-run and shown to kill), **deleted** (an equivalent mutant = dead code, removed in the
+fix round with the pin files green on the patched tree), **equivalent-kept** (a defensive fast
+path whose body tolerates the flipped branch, or a return value used only in boolean context —
+named, not deleted, because the guard IS the normal path), or **gap** (not driven; the fixture
+it needs is named).
+
+### What the batteries found in the FIXES the five sections shipped (R8: defects inside the reviewed work)
+
+- **§4BY R3 "usable-native gate pinned on both arms"** — three arms (`dict` raw, `None` raw,
+  `args is None`) were deletable with all five pin files AND the 28-file wide tier green. The R3
+  pins used static tools, where the fixed and broken worlds both yield to XML. Pinned now as a
+  60-cell table over (13 argument shapes × 4 tool kinds) with the verdicts as data.
+- **§4BY: every argument-extraction dialect of the parser was untested.** 18 extraction sinks
+  (CDATA, `value=`, bare tags, attribute tags, direct-attribute tags, the bounds-aware repair, JSON
+  in the wrapper, `<tool>`, `<tool_call name=>`, the text fallbacks, the five sinks of the extreme
+  regex fallback) — zero driven tests. One table of 33 dialect rows now dispatches each like the
+  canonical form and asserts the parse REASON is empty (the `</tool>` heal survived until the
+  reason was asserted: unhealed, the truncation counters told the model its output was cut off).
+- **§4BZ helpers were pinned, their call sites were not** (the §4BY R1 lesson, one slice over):
+  the `_scrub_task_status_runs` CALL in finalize, the verdict-cache REUSE, the clarify-question
+  and risk-summary insertions, the project digest insertion, the fallback preview and the
+  `--- EXECUTION RESULT ---` framing were all deletable-green. Pinned through the real
+  `_finalize_and_return`.
+- **§4BZ R2/R3 fence walk (`_head_insert`)** — 25 mutants in a 40-line closure survived: every
+  §4BZ fixture had its first paragraph break already outside every fence, so the walk never
+  iterated. Extracted to a pure module-level function with a 12-row placement table; the closure
+  is a one-line delegate and a pin asserts no second implementation exists.
+- **§4CA R1 B1 request-start disarm is dead code** since R3's universal outer-`finally`:
+  `_dispatch_and_process_tool_batch` has exactly one caller, inside the guarded region. Removing
+  it survived 2,607 tests. Deleted; the ownership rule (one arm site, one dispatch caller, every
+  disarm inside a `finally`) is enumerated from the AST.
+- **§4DE `_snapshot` guards for malformed / non-`.json` stamp entries are unreachable** (the only
+  producer globs `*.json` into 3-tuples); deleted. `tuned_instruction` carried a literal
+  `if True:` scaffold from the §4DE move; flattened.
+- **§4DE loader gaps pinned:** module-level `_CURRENT_EPOCH` deletable because every test called
+  `clear_cache()` first (a subprocess now drives import→first read); warn-once dedup within one
+  cache life; LRU touch on the orphaned-pin fallback; no-change tick keeps its generation;
+  `forget_request` on an orphan; PEP-562 `__getattr__` still raises; emptied served slot leaves
+  the ring; a vanishing file mid-glob does not hide its siblings; a bad artifact before a good one
+  does not stop the snapshot; an empty-but-present epoch held unreadable does not warn; the
+  unpinned-epoch sweep keeps exactly the current generation.
+
+### New defects found by the batteries (not by the sections' pins)
+
+- **F1/F2 — CDATA was never opaque.** The parser extracted CDATA at "Format 0a" but never masked
+  the body from the working copy, so the `<tool_call>` block split and the truncation counters ran
+  over it (a body containing a literal `<tool_call>` split the write in half + a strike) and
+  Formats 3/5 harvested tags inside it as arguments (`<b>` → `args["b"]`, which the tool rejects).
+  `prompts.py` promises the model CDATA protects "`</parameter>`, `<`, `>`, JSON…". Fix: bodies are
+  masked to opaque tokens at the point the working copy is born and restored into the extracted
+  argument values at the parser's single exit; Format 0a and its `in_cdata` skip are gone.
+- **F11 — an empty function name was swallowed.** `<function name=>` raised IndexError at
+  `split()[0]`; the block-level `except Exception: logger.debug` dropped the block with no call,
+  no strike and no reason, and the turn ended as an empty reply. The handler now emits the
+  `malformed` strike like every other failure.
+- **F4 — the repair pass's `elif existing is None` arm was reachable only through a
+  name-derivation mismatch** (`name="a.b"` → spurious key `a`). Deleted.
+- **F5 — the "pure JSON in `<tool_call>`" pre-pass was dead** (set `func_match=None`; the else
+  branch recomputed the identical value; garbage got two WARNINGs). Deleted. **F8** — the
+  Fallback-1 append's non-dict arms were dead (its args are always a dict). **F9** — two
+  redundant collapse guards (either alone equivalent). **F10** — the XML-path ui scrub was
+  duplicated by the §4BY R1 native-precedence scrub; one implementation now. **F12** — the
+  per-block "truncated" classification was unreachable (the whole-reply pre-check subsumes it).
+
+### The instruments failed five times in one day (R6), and the controls caught every one
+
+1. The comment-only NOOP DIED at T2 on the first battery — the copies lacked `interface/`, which
+   a test reads. Every T2 kill before that was void; copies now mirror the whole repo.
+2. The whole-file KNOWNBAD control SURVIVED on the loader battery: the `raise` had been injected at
+   "line 2", inside the module docstring. Module-level placement after the last import now.
+3. Two re-check phases reported 118/118 and 351/351 "killed" — one of MY new rows failed on the
+   pristine tree each time (F11's malformed row; a wrong fallback-header expectation), and the
+   phase had skipped its controls as "done". Both voided; every phase now runs NOOP, and every
+   battery is gated on the pin files being green on the live tree first. The gate itself misfired
+   once (`head -8` ate the summary line; `xfailed` matched a naive `failed` grep).
+4. A manual re-check reused a running lane's copy directories; its `rmtree` killed the lane
+   mid-phase and the queue printed COMPLETE rc=0 with ~1,200 mutants unprocessed. One copy tree per
+   PROCESS now (`MUT_COPY_TAG`).
+5. The §4BZ pin-file phase "stalled": stream-loop mutants hang, and at the 300 s pytest timeout
+   each cost the whole cap. A 90 s cap on the fast slices (their pin files run in 7 s at load 20).
+
+Also: 12+ concurrent pytest processes drove the live agent's host monitor to "CPU 90%" warnings
+in the operator stream and 2.7 GB free; lanes were cut to 6–8 processes and relaunched in their
+own sessions. §4U's preflight script was not run; its five gates held in substance and are
+recorded here as such, not claimed.
+
+### R7 stopping rule — status
+1. *A mutation batch containing every fix from every round scores 100%, survivors proven
+   equivalent, dead code deleted.* **Met for the FIX ROUND of this review** (5/5 hand mutants
+   over the patched sites; 96/110 over the new functions, the 14 survivors listed as fast paths,
+   token shape and a no-op replace; 47/47 tier-eligible over the patched loader functions). **NOT
+   met for the five sections' own fixes taken as a whole**: §4BY reaches 96.1%, the loader 91.8%,
+   the registry 70.8%, `stream_guards` 86.4%, `constraints` 69.5%, and §4BZ's finalize+stream
+   bodies 49.0% — with every survivor dispositioned (pinned / deleted / equivalent-kept / gap)
+   and the gaps NAMED (Perfect-It, the tracker's resolved-by-read heuristic, the System-3 gate
+   `continue`, the no-progress loop-breaker trip, verifier routing, the Turn Outcome label,
+   the raw-JSON recovery arms). The honest reading of those numbers: §4BY/§4DE were converged
+   as claimed; §4BZ's helpers were converged and its call sites and streamed wiring were not.
+2. *The class-level enumerations exist and have been seen to fire.* Met: the sink-count guard
+   (fails at 18/21 by construction when a sink is added), the read-budget ownership rule (fails
+   on the live tree before the F6 deletion, on the patched tree if the drain disarm is removed),
+   the gate table (60 cells), the placement table (12 rows) — each red under the mutant it names.
+3. *Full suite green twice.* Met: **19,109 passed / 17 skipped / 3 xfailed** before the fix
+   round (the three strict defect pins), **19,152 passed / 17 skipped / 0 xfailed** after it,
+   and **19,250 passed / 17 skipped / 0 failed** at 16:16 with every §4CA/§4CP pin file added
+   (98 pins landed after the fix round; no source change since 12:45), then **19,328 passed /
+   17 skipped / 0 failed** at 22:27 (8 min 10 s, xdist 4) with the fence and evaluator pin files
+   and the corrected veto test — still no source change since 12:45, so the 12:52 deploy stands.
+4. *A round produces only out-of-scope findings.* Round 3 (the second fresh-eye review) produced
+   19 findings, all inside this review's own pins — none out of scope, all acted on; there was no
+   fourth round. By the letter of R7 this review is therefore **not converged**; by its intent
+   the stopping point is the one §4CY named: the behavioural surface the sections CLAIMED is
+   killed by mutation, and what remains is a named gap list on code the sections never claimed.
+
+### §4BZ — where the 671 true survivors live, and what each region got
+
+`_finalize_and_return` is 1,563 lines and carries far more than the §4BZ fix inventory: the
+Perfect-It background critique, verifier routing (two-stage / async critic / verify-depth), the
+automated post-mortem, the Turn Outcome label, admissibility rows, the uncertainty tracker, both
+digests, the project write-back. The battery does not know which lines a section claimed; the
+ledger does:
+
+- **Fix-site neighbourhoods (§4BZ inventory):** pinned — status-run scrub call, fallback header
+  + preview + `--- EXECUTION RESULT ---` framing + declared-failed outcome, verdict-cache hit and
+  miss, clarify-question and risk insertions, project digest + watermark, activity digest +
+  offset, `_emit_safe_end` backtick mention; fixed — the `_head_insert` walk (extracted, 12-row
+  table). Remaining near-anchor survivors are the Perfect-It trigger and its background-task
+  plumbing (L17927–18047: a deferred LLM critique; **gap** — needs the background-LLM harness),
+  verifier-mode selection (L18376/18392: verdict gating, **out of R0 scope**), the tracker's
+  resolved-by-read heuristic (L18637–18640, **gap**), and log-text arms (**out of scope**).
+- **Non-anchor regions:** Perfect-It prompt assembly (L17985–18021, **gap**); the verifier gate
+  region beyond the fingerprint check (36 mutants, **out of scope**: §4BJ/§4BK/§4BR territory,
+  re-audited there with their own batteries); the automated post-mortem (33, **out of scope**:
+  §4L learning stack); the Turn Outcome label (11) and the §4BF admissibility rows (25) —
+  **out of scope but flagged**: these write the learning corpus's labels, and the next §R pass
+  should be over §4BC/§4BF's label producers as a unit; `_ran_info`/`_info_ok` error-vocabulary
+  neighbourhood (15) — the helpers are pinned by §4BZ R2 M-5, the surrounding tracker logic is
+  not (**gap**); miscellaneous defensive fast paths (`if not text`, `_bg is None`, …) —
+  **equivalent-kept**.
+
+### Pins added (all driven; every file re-run against its survivors and shown to kill)
+
+| file | what it holds |
+|---|---|
+| `tests/test_4ec_parser_dialects.py` | 33 healing/extraction dialects dispatch like the canonical form with an EMPTY parse reason; parse-failure reason × strike-count table; XML-path ui scrub; sink-count drift guard by SHAPE (all subscript writes) |
+| `tests/test_4ec_native_usable_gate.py` | the usable-native gate over 13 argument shapes × 4 tool kinds, verdicts as data; a mixed [degenerate, usable] batch still takes the native path |
+| `tests/test_4ec_dispatch_pins.py` | reply-text assembly, recursive un-escaping, the three synthetic-error branches keep the batch going, invalidations table, parse-error streak reset, memory-wipe flag, constraint steer consumed only by a successful write, edit-churn steer (writes only, named file), world-change resets (steered set, seen_tools per arm), project work tallies (files as written, tools, failures), which successful calls clear the pre-flight guard, registry rebuild on an unknown name, the foresight note continues the batch, script-iteration tally |
+| `tests/test_4ec_finalize_pins.py` | head-of-finalize content scrubs; fallback header only on an empty reply; preview truncation + hint strip; `--- EXECUTION RESULT ---` framing and a declared-failed outcome; verdict cache hit (no recompute) and miss; clarify question leads / risk trails / placeholder case; project digest + watermark (new, none, seed, internal); activity digest + offset |
+| `tests/test_4ec_stream_pins.py` | `_emit_safe_end` backtick-mention release vs bare-fragment hold, at positions 0 and 1 |
+| `tests/test_4ec_loader_pins.py` | the eleven loader behaviours listed above |
+| `tests/test_4ec_head_insert.py` | the fence-walk placement table + "the closure is a one-line delegate" |
+| `tests/test_4ec_read_budget_enumeration.py` | one arm site inside the dispatch; one dispatch caller; every handle_chat disarm inside a `finally` |
+
+### §4BZ streamed turn — the wiring the round-1 pins left open
+
+The battery reached `_stream_final_generation` last (its mutant ids sort after finalize's) and
+found the streamed fixes pinned on their CLIENT-visible half only: the watchdog's synthetic break
+was deletable from the DURABLE text (B-2's "still lands in durable content for replan" had no pin
+on the durable side); the cancel/abort markers' guard could be flipped to `or` (every completed
+stream stamped truncated) with the cancel pin still green; the paragraph guard's 400-char gate
+could be inverted; a stream prefix could be dropped or double-emitted. All five now driven
+through the real generator (`tests/test_4ec_stream_pins.py`). `test_stream_done_sentinel_ordering.py`
+existed but was never in the wide set (it names no slice identifier) — its "survivors" were a
+set-construction gap, and the file joined the final re-check.
+
+Left as **equivalent-by-invariant**: the B-1 end-flush block (L25125–25147). Under the
+incremental-view rule (recompute only on `>` deltas, freeze while a block is eating) every
+releasable character has already been emitted by the time the stream ends and every held
+fragment is held by `_emit_safe_end` again at the flush; the differential fuzzer's 310k chunks
+agree. It stays because a future change to the view rule would need it, and that is exactly the
+"unpinnable belt" §4CA recorded for its strict-shrink guard.
+
+### §4DE — loader and registry
+
+`optim/loader.py`: 337 mutants, 305 tier-eligible, **280 killed (91.8%)**, 25 true survivors:
+11 pinned (the list above), 2 deleted (F7: the unreachable stamp-entry guards), 12
+equivalent-kept (`__slots__`; the fast-path guards of `_epoch_for_request`, `_release_gen`,
+`forget_request`, `exclude_served`, `unnote_served`, `_resolve_arm`'s `""`→`None` returns
+consumed only as falsy; `note_rejected`'s reason branch is activation telemetry). §4DE's own two
+batteries (15/15, 18/18 with controls) were the best-founded of the five sections and this
+battery agrees with them: nothing it found was a §4DE fix failing — every survivor was a
+neighbour the fix rounds never claimed.
+`tools/registry.py` (the generation-keyed name-set + the artifact-text shim): 25 mutants,
+17 killed, 7 survivors, all cost-only or defensive (a cache miss recomputes the same set;
+`_reset_tool_desc_cache` is redundant with the generation key; `""`→`None` where every caller
+tests truthiness). No pins, no code change.
+
+
+### Addendum (16:10) — the §4CA and §4CP batteries, finished after the write-up above
+
+| slice | mutants | tier-eligible | killed | true survivors | kill rate |
+|---|---|---|---|---|---|
+| §4CA `agent.py` context functions (`_cap_oversized_tail`, `_cut_message`, `_max_cuttable`, `_prune_context`, `_compose_injection`, `_msg_token_cost`, `_stream_then_unregister`) | 653 | 529 | 442 | 87 | **83.6%** |
+| §4CA `core/context_manager.py` | 323 | 233 | 212 | 21 | **91.0%** |
+| §4CA `tools/file_system.py`, the 115 high-value mutants within 8 lines of a read-budget anchor (+ all of `ReadBudget`/`read_byte_budget`); 241 further high-value survivors in the dispatcher's write/replace/move arms were NOT taken past the pin-file tier | 575 | 214 | 174 | 41 | **81.3%** of the fix-site subset |
+| §4CP `evolve/mutator.py` (40% sample of high-value kinds) | 354 | 354 | 286 | 68 | **80.8%** |
+| §4CP `evolve/negative_controls.py` | 224 | 224 | 195 | 29 | **87.1%** |
+| §4CP `evolve/fence.py` | 141 | 141 | 130 | 11 | **92.2%** |
+| §4CP `evolve/evaluator.py` (sample: every high-value mutant in the fix-dense functions + 45% of the rest = 538) | 538 | 538 | 520 | 20 | **96.7%** |
+
+**§4CA — what the sections' own pins had not held.** The cutter's `<tool_call>` branch (whole-block
+removal, the unclosed-block rule, the per-segment prose cut and its 4,000-char floor, the
+largest-segment-first choice), the many-small-parts sum branch, the native-argument stub and
+its 4,000 threshold, the selector's largest-first order, the last resorts (newest user with the
+paste note, then the goal), the non-string text-part parity, the injection placement (pin and
+legacy modes across four message shapes), the prune's image-part scrub on the way to the
+summariser, its keyword anchors, and the streamed drain's turn unregister — all deletable-green
+under §4CA's pins, all driven now (`tests/test_4ec_context_pins.py`, 60 pins;
+`tests/test_4ec_stream_pins.py` +1). `ContextManager` had no driven tests at all (compression
+levels, per-role rules, the summariser's shape and cache, the emergency prune) and has them now.
+Read budget: `read_byte_budget`'s floor/ceiling and `ReadBudget`'s clamps, the three whole-read
+refusal wordings, the ranged-read exemption, the generated-file sample charge (with AND without a
+budget), the chunked read's two refusals and charge-on-success-only
+(`tests/test_4ec_read_budget_pins.py`, 16 pins). Remaining context survivors: `_cut_message`
+bookkeeping returns (falsy either way — the content was already cut), §4CA's own "unpinnable
+belts" (the strict-shrink `and` and the refused-set), the prune's summarisation internals
+(middle-pool ordering, the background archive task — **gap**, needs the mocked-summariser
+harness driven deeper), drain telemetry (**out of scope**), and the file-system dispatcher's
+`_READ_ONLY_OPS` gate (§4CI's, whose pins are not in this slice's wide set — a set-construction
+gap, not a code one).
+
+**§4CP — the section that quoted no score.** `mutator.py`: the model-controlled anchor path's
+containment, the snapshot containment check, the `---`/`+++` pair rule, the guard-flag prefix
+rule, and the relocation objection's control flow (an objection behind a clean later hunk, at a
+file boundary, after a git `index` line, with `++ x` content mid-hunk, an unreadable patched
+file) were all deletable-green; pinned (`tests/test_4ec_evolve_pins.py`, 16 pins). One
+finding, recorded not fixed: the anchor reader's S_ISREG symlink refusal is dead code — the
+path is `resolve()`d before the `lstat`, so containment alone carries the refusal (correctly).
+`fence.py`: the alias guard's dir-prefix and file-entry arms, its later-prefix scan, `is_mutable`'s
+fail-closed table, the digest's UNREADABLE marker and the BYTECODE label were deletable-green;
+pinned (`tests/test_4ec_fence_pins.py`, 17 pins). `negative_controls.py`: the no-op control's syntax-tree identity and the runner's
+`ok`/`rejected`/`rejected_at`/`detail` on the edits-a-test and materialise-refused paths pinned
+(`tests/test_4ec_negctl_pins.py`, 5 pins); the failure-path bookkeeping that needs the cascade
+to die mid-way (stage-0 early death, the build exception, deep-mode stage 3) is a named **gap**.
+Out of the §4CP inventory and not pinned: the evidence readers and target ranking (§4CU/§4CV),
+snapshot plumbing, LLM-output handling.
+
+### Fix round (on the live tree; deployed 12:52 by `launchctl kickstart` — one new listener, one new "system ready")
+
+`core/agent.py`: `_mask_cdata` / `_unmask_value` / `_unmask_cdata_calls` (F1/F2 — bodies masked
+at the parser's birth, restored at its single exit; Format 0a and its `in_cdata` skip removed);
+the F11 handler emits the `malformed` strike; `_head_insert_below_start_with` with the closure
+as a one-line delegate; deletions F4 (repair arm), F5 (dead JSON pre-pass), F6 (request-start
+disarm). `optim/loader.py`: F3 (scaffold flattened), F7 (unreachable stamp guards). Recorded as
+equivalent but NOT yet deleted — they need another agent.py freeze, and the §4CA battery was
+already copying the patched file: F8 (Fallback-1 non-dict arms), F9 (one of two collapse guards),
+F10 (the duplicate ui scrub), F12 (the per-block truncated arm). The fix itself was
+mutation-tested last (R3): 5/5 hand mutants over the patched sites, 96/110 over the new functions
+(14 survivors: fast paths, the token's salt length, a no-op `replace`), 47/47 tier-eligible over
+the patched loader functions. Tests: 8 new files; the three strict xfails flipped to plain pins.
+Docs: `docs/core/agent.html` (§4EC section), `docs/self_improvement.md` (loader). Full suite
+after: **19,152 passed / 17 skipped / 0 failed / 0 xfailed**.
+
+
+### Addendum (22:20) — the §4CP evaluator battery, and a control that had never run
+
+**§4CP `evolve/evaluator.py` — 96.7% (520 of 538 sampled mutants killed; 20 survivors, every one
+dispositioned, no gaps).** Tier 1 was the file's own 2,500-line suite plus the negative-controls
+and E3 probe files (422 killed); the 16-file wide set killed 2 more (the unconfined-reason arm, by
+`test_evolve_confine.py`); the rest fell to `tests/test_4ec_evaluator_pins.py` (61 pins, two
+rounds: 87 then 9). What the section's own pins had not held: **the harness-veto pin held for the
+wrong reason** — its tamper fired at digest call 4, which became the *post-stage-1* check when §4CP
+added that check, so the abort landed before `passed` was assigned and `res.passed = False`
+inside `_harness_moved` was deletable-green (the test's own comment predicts exactly this
+regression; it happened to the test that carries the comment). Fixed: the tamper lands on the
+final check and the call count is asserted; a tamper-at-call-*k* table with stages 2–3 stubbed
+exercises all seven checks after `passed` is set. Also unheld: every hop kind of the taint
+detector (assignment, annotated/augmented, `for` and tuple targets, the out-of-order two-hop that
+needs the fixpoint) and every read shape, each with a negative twin; pytest's junit shapes as
+measured (`classname=""` with the module in `name` for a collection error or module-level skip;
+`<error>`-only cases; unmatched cases); the stage-1 and arm-runner child environment (a poisoned
+`PYTHONHOME`, a fresh `TMPDIR`, no bytecode — pinned by capturing the spawn, and the bytecode pin
+had to `delenv` first because the mutation harness itself exports that variable); the
+unconfined-reason record; the packet's edges (unwritable → failed stage not `None`; archive
+raising → recorded, not fatal; missing log → silent; raising log → `notify_error`; `p=0.0123` /
+`p=?`); stage 0's non-`.py` skip and `missing` detail; the import index past an unparsable pin;
+`historical_pass_rate` with only INFRA rows; `bench_floor`'s clamp of a corrupt rate; `is_holdout`
+without an id; `sample_items` with no banks or budget; `paired_diff_ci([])`; `attempts_pairs`'
+`ran`-AND-`attempts` rule; stage 3 with no items, a pre-existing arm directory, a runner whose
+`resolve()` raises (a symlink loop), and **no item graded in both arms** — the last driven through
+an echo child that writes the rows the test chose. The 20 survivors: `BENCH_ITEMS = 120` has no
+reader anywhere (dead constant); the import-index cache hit/store and the missing-dir glob
+(cost-only); the fixpoint's `break` and its guard (extra passes only); the detector's
+`open(…).read()` arm (the inner `open(…)` call already decides); the duplicate stage-1 `mkdir`;
+the third colour-variable pop (the source documents the triple redundancy); the arm runner's
+inbox pre-existence check (inside a directory the same call just created) and its blank-id
+`asked` guard (the `seen` guard already skips blank ids); the packet's `if paired else {}` arm
+(unreachable under `promotable`); `_harness_moved`'s `return False` (truthiness only); and the
+cascade's two redundant `res.passed = False` assignments plus the redundant `elif` early return.
+Recorded for a later deletion pass, not deleted now.
+
+**Instrument finding (I-13): the four §4CP batteries ran without their known-bad control, and
+the evaluator battery without any control at all.** `mutrun.py` built the id list as
+`controls + mutants` and *then* filtered it by the only-list, so every phase launched with an
+only-list (the sampled mutator and evaluator T1 runs, every fix-site T2 and every T3 re-check)
+silently dropped `NOOP`/`KNOWNBAD`. Found by grepping the results for the control ids — not by
+any harness message, and after the mutator/negative_controls/fence scores had already been
+written into this section. Fixed (controls are exempt from the filter) and run retroactively:
+KNOWNBAD dies at tier 1 in all four files (a module-level raise → collection error, `1 error in
+0.26s`); NOOP survives tier 1 + tier 2 for the evaluator (`865 passed`), tier 1 for fence (`387
+passed`) and mutator (`180 passed`), and tier 3 everywhere. The scores above stand; the point is
+that until 22:15 nothing had shown they could not have been fabricated by a harness that never
+detected a kill. The rule in §R2 — "controls every phase" — was in the harness's docstring and
+not in its code path for the only-list branch.
+
+### Not done, and why
+
+- §4CA and §4CP batteries were still running when this was written; both addenda below carry
+  their results and dispositions (every slice finished, the evaluator last at 22:18). The §4CA
+  hand-written fix-site mutants ran early: 4/5 killed; the survivor was the F6 request-start
+  disarm, now deleted. Queued for a later freeze, not done here: the deletion pass over the
+  recorded equivalents (F8/F9/F10/F12/F13 in `agent.py`, the evaluator's 20 — including the
+  unread `BENCH_ITEMS` constant — and the four other §4CP redundancies named in the addendum).
+- The whole-body sweep skipped integer/bool/arithmetic perturbations past T1 (reported as
+  "T1-only", never as kills).
+- Not pinned, named: Perfect-It (needs a background-LLM harness), the uncertainty tracker's
+  resolved-by-read heuristic, the System-3 gate `continue` at L15306, the no-progress trip and
+  the script-iteration steer emission (need the strikes fixture), the raw-JSON recovery arms at
+  L14411, the `_pf_promoted` arm of the seen-tools reset, `_ran_info` neighbourhood, the B-1
+  end-flush (equivalent by the incremental-view invariant).
+- `stream_guards.py` / `constraints.py` survivors after `tests/test_4ec_guards_and_constraints.py`
+  (paragraph-guard window bounds, the idx-0 stop-marker neighbour, hoist-parser punctuation/length
+  rules, the hoist's compliant/continue/fence/min-keep/no-match arms): all fast paths or arms
+  redundant with an earlier check — `len(lines) < 2` after the 6,000-char floor, short-line
+  counting masked by the scan's own filter, the `len(phrase) >= 3` test behind a regex that
+  cannot yield fewer, and `_tail_has_stop_marker`'s `idx == 0 and len(buf) > len(tail)` arm
+  (both paths return True at idx 0 — a redundant arm, F13, cleanup queued).
+- The repo-root `activity_digest.json` / `projects_digest.json` (13/20 bytes, Aug 12) are test
+  residue from the shared finalize harness's Mock `memory_dir`; the new file points it at tmp,
+  the old files are left for the operator.
+- §4U's preflight script was not run before the batteries; its gates held in substance.
+
+## §4ED — The §4EC deletion pass, reviewed as a change (2026-09-02, 22:30–23:05)
+
+**R0 scope.** Delete the code §4EC recorded as mutation-equivalent and left in place for a
+freeze: F8/F9/F10/F12 in `core/agent.py`, F13 in `core/stream_guards.py`, the evaluator's 20
+survivors, and the §4CP anchor-reader comment. Every deletion had to (1) name the invariant that
+makes it redundant, (2) pin that invariant where it is load-bearing, (3) show a hand mutant of the
+invariant dying under the pin, and (4) survive a read-only reviewer briefed to construct a
+distinguishing input — because "no test kills it" is a statement about the corpus, not about
+behaviour (R3 applies to deletions as much as to fixes).
+
+**Deleted.** `agent.py` — F8: the str/other arms of the Fallback-1 append (`args_val` there is
+always the dict Fallback 1 built; the reviewer traced every assignment to `t_data` in the window);
+F9: the lookup gate of the batch collapse (`None if _collapse_unsafe else …`) — registration into
+`batch_seen_reads` stays gated and the hash carries the healed tool name, so a hit is necessarily
+a read-safe twin; F10: the XML-path copy of the UI scrub (`has_tool_tag` gates both the XML path
+and the shared scrub, no `return` between them). `stream_guards.py` — F13: the explicit idx-0
+arm (`prev` is `""` there, not a quote, so the next arm returns True). `evolve/evaluator.py` —
+the unread `BENCH_ITEMS` (no reader in src/scripts/tests/docs), the detector's `open(…).read()`
+arm (the inner `open(…)` call is walked and decided by the arm above), the packet's
+`if paired else {}` (unreachable under `promotable`; the `next()` now raises loudly if that
+invariant ever breaks), the overlap path's `res.passed = False` and the whole `elif not
+s2.passed` early return (fall-through: `passed` from the stages → False, one harness check at
+the same position in the digest-call sequence, not promotable), the duplicate stage-1 `mkdir`,
+the empty index entry for an unparsable pin (both consumers treat absent and empty alike).
+`evolve/mutator.py` — comment only: the anchor reader's S_ISREG check still refuses devices and
+FIFOs; a symlink is followed by `resolve()` first, so containment is what refuses it.
+
+**Kept, with a comment saying why.** The arm runner's inbox pre-existence check (reachable only
+by a race with the `mkdir(exist_ok=False)` above it — a belt), the third colour-variable pop
+(the source documents the triple redundancy), the import-index cache and the taint fixpoint's
+early `break` (cost, not behaviour), the blank-id `asked` guard (symmetric with `seen`),
+`_harness_moved`'s `return False` (truthiness only).
+
+**Two corrections to §4EC's record.** (1) **F12 is reachable.** The per-block "truncated" arm
+fires for a CLOSED `<tool_call>` block ending in an unclosed `<function name="x` tag (no `>`):
+the whole-reply pre-check counts `<function…>` openers and sees none, `<tool_call>` opens equal
+closes, so the block reaches the arm. §4EC called it unreachable; it is not. Kept, unpinned:
+whether that garbage shape should be told "your output was cut off" (truncated) or "fix the
+syntax" (malformed) is a label decision for the operator, and pinning the current label would
+cement it. Recorded as a gap with the world named. (2) **F10's deletion was BROKEN by the
+review.** `re.sub` scans the original string, so removing one block can splice its neighbours
+into a brand-new tag: `hello <t<tool_call>x</tool_call>ool_call>y</tool_call> bye` scrubbed once
+leaves `<tool_call>y</tool_call>` in the user-facing reply; the "redundant" XML-path copy had
+been an accidental second pass hiding exactly one splice level (three levels leaked even
+before). The property is "nothing left to match", not "two passes": the one remaining scrub now
+runs to a fixed point (bounded at 8), pinned on one-, two- and function-splice inputs; the
+single-pass and break-immediately mutants of that loop are killed. The reviewer found the input
+from the diff alone, in minutes.
+
+**Pins.** `tests/test_4ec_deletion_pins.py` (7): identical arguments on a read-safe and an unsafe
+tool in one batch both execute; identical read-safe calls still collapse to one; the batch hash
+carries the tool name; a stop marker at the front of the scan window latches even behind an
+unseen quote (and not behind a seen one); the scrub fixed-point table. The evaluator invariants
+were already pinned by `tests/test_4ec_evaluator_pins.py` (CascadeResult's default, the packet's
+refusal, the s2-fail path's stage list and harness check, the import index past an unparsable
+pin, the `open_read_tainted` row).
+
+**R2 — hand mutants of the invariants (controls in every run: KNOWNBAD killed, NOOP survived).**
+`agent.py` 4/4 killed: name-blind hash; register-everything; Fallback-1 args dropped; shared
+scrub disabled. **The register-everything mutant was expected to be equivalent and was killed**:
+with the lookup gate gone, the registration gate is load-bearing, and the pin written for the
+single-gate world catches its removal — which is the reason to have one gate instead of two.
+`stream_guards.py` 1/1 (front-of-window predecessor read as a quote). `evaluator.py` 3/3 (`open`
+arm inverted; promotable refusal removed → StopIteration; cascade fall-through forced True).
+F10 fix 2/2 (single pass; break immediately).
+
+**R3 — the review.** One read-only reviewer over the four diffs, briefed per claim to BREAK it:
+9 claims "could not break" with the call sites and invariants it checked (`batch_seen_reads` has
+one writer and is per-batch; `is_mutating` is a pure function of name+args; `fname == _cname`
+under `if fname in self.available_tools`; no `return` between the XML path and the end scrub;
+`promotable` requires a passed STAGE_PAIRED; both index consumers use `idx.get`), 1 BROKEN (F10,
+above, fixed). Suite: **19,332 passed / 17 skipped / 0 failed** (8 min 18 s) on the deletion
+tree before the F10 fix, **19,335 passed / 17 skipped / 0 failed** (8 min 12 s) after it. Docs: `docs/core/agent.html` (deletion-pass
+subsection under §4EC), `docs/evolve/evaluator.html` (deleted/kept/gap paragraph). Memory:
+`mutation-equivalent-is-corpus-relative`. Deployed 23:02 by `launchctl kickstart -k`: new pid 60554 (was 27734), a fourth "system ready" line at 23:03, listener back on :8000, no traceback in the boot log.
+
+**Instrument fix, same evening (from §4EC's addendum, restated here because it changes what the
+earlier scores mean):** `mutrun.py` no longer lets an only-list drop the NOOP/KNOWNBAD controls.
+
+## §4EE — The label producers as a unit, under §R (2026-09-02, 23:20 →)
+
+**R0 — scope, written before any battery ran.**
+
+*Property.* Every outcome label in the learning corpus is produced by ONE ladder
+(`distill.outcome_heuristics.resolve_turn_outcome`, fed by the shape heuristics), written through
+ONE authority order (a human label outranks the bench oracle outranks a machine verdict; among
+equals, last write wins; a machine verdict never overwrites a standing human or oracle label),
+read through ONE overlay (`TrajectoryCollector.iter_trajectories` over the corrections sidecar),
+and mirrored by three surfaces that tell ONE story about ONE turn: the corpus label, the operator's
+"Turn Outcome" line (`_turn_outcome_label` and its late correction), and the calibration grade
+(`calibration.grade_turn_outcome` under `_SOURCE_RANK`).
+
+*The unit.* Writers: `_record_turn_trajectory` (write time), `_backfill_trajectory_outcome`
+(late verdict, `source=verifier_late`), `core/feedback.py::apply_human_label`
+(`human_feedback:*`), `_maybe_promote_prior_turn_via_user_correction` +
+`_record_failure_report_negative` (`user_correction` / `failure_report`), `dream.py`'s bench
+write-back (`bench_validator`); the sidecar itself (`collector.update_outcome`,
+`_load_corrections`, `has_human_label`, the overlay in `iter_trajectories`); the helpers that
+decide authority (`_human_label_locked`, `_drop_pending_corrections_for`,
+`_flush_stashed_lesson_outcome`); the run-gate that decides whether a verdict — hence a label —
+exists at all (`_find_substantive_tool_for_verifier`, `_bookkeeping_informational`, §4BC); the
+admissibility matrix (`core/admissibility.py`, §4BH) and `turn_origin`; the calibration
+ladder's writers (`record`, `record_late_verdict_correction`, `record_task_reopened_negative`,
+`record_bench_validator_verdict`, `_resolve_superseded`/`resolve_superseded_rows`); and the
+label region of `_finalize_and_return` (the `_exec_terminal`/`_unacked_turn` derivation and the
+Turn Outcome block with its correction ring).
+
+*Threat model.* Trusted: verifier verdicts (thresholded upstream), human labels arriving through
+the authenticated routes, the bench oracle. Untrusted: the model's own text (final replies and
+tool results — every sniffer reads them), request ids supplied by clients, the on-disk sidecar's
+history (append-only; a reader must survive junk lines), and the ORDER in which concurrent
+writers land (late verdict vs human label is a race by construction).
+
+*Out of scope.* Whether a verdict is CORRECT (§4BJ–§4BL, §4BR, §4EB); the Slack and web
+transports that carry a thumb (§4BT); what consumers DO with a label (skill prune, arms, trainsets
+— §4L, §4CE); the autobiographical diary (§4CD); the verifier's evidence packing (§4BC's packer
+half is in only where it shares the run-gate predicate).
+
+*Method.* Whole-file AST batteries over `outcome_heuristics.py` (370), `collector.py` (371),
+`feedback.py` (169), `admissibility.py` (55); function-scoped over the 13 agent.py producers and
+the 6 calibration ladder functions; a filtered battery over the finalize label region (71).
+Tier 1 = the dedicated pin files; tier 2 = every test file naming the module; controls in every
+phase (harness fixed 22:20 so an only-list can no longer drop them). Class-level enumerations
+(R1) to be written regardless of what the batteries find: every `update_outcome` caller carries
+the authority flag its source requires; no corpus reader bypasses the overlay; the three mirrors
+agree over the full product of their inputs; every writer's `source` string is known to the
+calibration rank table.
+
+**R1/R5 first — the enumerations and the mirror table, before any battery finished**
+(`tests/test_4ee_label_class_pins.py`). Three walks of the source tree: every
+`update_outcome` caller (direct, `functools.partial`, `asyncio.to_thread` shapes; the
+`source=` resolved through one-hop names and import aliases) carries the authority flag its
+source requires — machine sources (`verifier_late`, `bench_validator`) `yield_to_human=True`,
+human sources (`human_feedback:*`, `user_correction`) never; no module but the collector holds
+a `session-*.jsonl` literal (no reader bypasses the overlay); and every writer's source is
+ranked in the calibration table. Then the three mirrors over the product of their shared
+inputs — verifier × terminal execution failure × unacknowledged × budget — with the corpus
+ladder as the reference. **Two of the three enumerations passed on the first run; the third
+and the table did not, and every red cell was a defect:**
+
+- **F1 — a human label never reached the calibration fit.** `human_feedback` was the only
+  corpus label source with no calibration rank, and `apply_human_label` never touched the
+  tracker; `record_late_verdict_correction` joins `turn` samples only and refuses when a
+  `verifier_late` row exists, so no path could carry the thumb. The one ground-truth source
+  the calibration docstring says the fit must keep "flowing and tracked separately" corrected
+  the learning corpus and left the fit believing the turn's inline grade. §4BF had written
+  this down as "deliberately NOT wired — a schema decision, not a bolt-on" and the docs
+  repeated it. Fixed: `CalibrationTracker.record_human_label` (joins the highest-ranked
+  existing sample for the request, so a late verdict that arrived first cannot block it;
+  idempotent per verdict; a changed thumb re-writes), `_SOURCE_RANK["human_feedback"]` at
+  the TOP of the ladder, called from `apply_human_label` right after the sidecar write, and
+  the Human Feedback line now says *calibration relabelled* / *unchanged* / *write failed* so a
+  thumb that raced the streamed drain's calibration write is visible as a miss.
+- **F3 — the operator line ranked budget exhaustion above a verified PASS and above a
+  terminal failure; neither the corpus nor the grade does.** Cells: no verdict + terminal
+  failure + budget → corpus FAILED, grade 0.2, line *partial*; inline PASS + budget → corpus
+  PASSED, grade 1.0, line *partial*. `_turn_outcome_label`'s docstring claimed it "mirrors
+  resolve_turn_outcome: refute > budget-exhaustion > verifier PASS > terminal" — an order that
+  function never had. Fixed: the line's order IS the ladder's (refute > shape FAILED > PASS
+  unless withheld > terminal failure), budget only colours an UNKNOWN turn, and — from the R3
+  review — a budget-exhausted turn keeps a `· budget exhausted` note at WARNING so §4O's
+  promise ("a 40/40-turn working-state reply can no longer read as a confident success")
+  still holds on the line.
+- **F2 — the line could not see the shape heuristics.** A turn the corpus marks FAILED by
+  `classify_chat_outcome` (selector thrash, repeated error, abort marker) printed *ok* when
+  its strike ledger was clean, and a late PASS on one printed *CORRECTED failed → verified*
+  while the corpus kept FAILED (rule 2 never upgrades a shape failure). Driven through the
+  real finalize: three identical `execute` errors with no terminal strike → corpus FAILED,
+  line *ok*. Fixed: `_record_turn_trajectory` now RETURNS its row and the line derives
+  `shape_failed` from that row (`_row_shape_failed`: FAILED with a non-structural reason —
+  the R3 review found the first version's fingerprint-cache lookup never sees a bench row and
+  can be evicted by a same-fingerprint neighbour); the correction ring snapshots it; the late
+  emitter passes it back, so the late PASS stays silent.
+- **F4 — the THIRD mirror was wrong on exactly the turns F2 fixed (found by the R3 review,
+  not by the table — the table had been restricted to `current=unknown`, which hid it).**
+  The calibration sample is recorded *before* the trajectory row exists and
+  `grade_turn_outcome` had no shape input, so a shape-FAILED turn graded as the unverified
+  prior (0.83) or, with an inline PASS, as 1.0 — the fit learning the opposite valence from
+  the corpus. Fixed: a `shape_failure` tier (`record_shape_failure`, rank just above `turn`,
+  joins the turn sample, reuses its features, writes `_SHAPE_FAILURE_GRADE` = 0.68, the
+  currency of one unverified execution failure — not 0.0, which means "checked and wrong"),
+  called from finalize once the row exists; `grade_turn_outcome(shape_failed=)` so the
+  pure-function table can state the property. The rank table is renumbered and pinned as a
+  chain: `turn < shape_failure < verifier_late < task_reopened < failure_report <
+  bench_validator < user_correction < human_feedback`.
+
+**What the table could NOT assert, and why (recorded, not asserted).** `unacked` without a
+terminal execution failure, and a structural FAILED without one, are cells finalize cannot
+produce (`_unacked_turn = _exec_terminal and sniffer(…)`; the structural stamp is written only
+under rule 4). Both couplings are pinned by driving finalize (a sniffer that flags every tool
+result against a clean ledger leaves the line at *ok* and the corpus UNKNOWN), and the table
+skips those cells with the reason in the skip text.
+
+**R3 — the fix was reviewed as a change.** One read-only reviewer over the round-1 diff,
+briefed per claim to break it. Its report: COULD NOT BREAK the pure-function mirrors (it
+executed the full input product itself); BROKEN — the fingerprint-cache row lookup (never
+sees a bench row, evictable by a same-fingerprint neighbour), the lost budget note against
+§4O's documented guarantee, and the third mirror (F4 above); plus stale docstrings at the
+helper and the call site, the §4BF "deliberately not wired" text in `feedback.py` and two docs
+pages, one vacuous pin (`test_a_shape_failure_is_never_upgraded_by_any_mirror` called only the
+corpus ladder and passed with both fixes reverted — it now drives all three mirrors and the
+late emitter), and a table that derived `shape_failed` by exact equality to the bare constant
+while production writes the cause-qualified prefix (now derived by `_row_shape_failed`
+itself). Round 2 applied all of it. Round 2's fixes (the shape tier, the row-returning recorder, the budget note) got their own battery: `LAB_fix2_agent` 100 mutants 93% killed, `LAB_fix2_cal` 121 mutants 87% killed, both re-checked against the pins, controls correct.
+
+**R2 — the batteries (controls in every phase).**
+
+| slice | mutants | killed | survivors | rate |
+|---|---|---|---|---|
+| `distill/outcome_heuristics.py` (whole file) | 370 | 357 | 13 | **96.5%** |
+| `core/feedback.py` (whole file, round-2 code) | 180 | 158 | 22 | **87.8%** (98% of high-value; the rest are log-slice/int kinds) |
+| `core/admissibility.py` (whole file) | 55 | 52 | 3 | **94.5%** |
+| `distill/collector.py` (whole file) | 371 | 300 | 71 | **80.9%** (the 71 are the memoization layer + overlay metadata — cost, not label correctness) |
+| `core/agent.py` label deciders (13 small producers, full) | 342 | 315 | 27 | **92.1%** (27 equivalents: guards the outer `except`/no-match path makes redundant, double-assignments, unique-key break/continue) |
+| `core/agent.py` large producers (`_record_turn_trajectory`, `_maybe_promote_…`, `_record_calibration_safe`, 40% sample) | 189 | 102 | 87 | **54.0%** (survivors are trajectory field-metadata assembly, metacog/confidence inputs = §4CE scope, reflection/PRM plumbing = lesson consumption, out of R0) |
+| `core/agent.py` label region, low-value kinds (int/bool/float, T1) | 132 | 48 | 84 | 36.4% (reported as T1-only, never as kills — §4EC convention) |
+| `core/calibration.py` ladder (`grade_turn_outcome`, `_resolve_superseded`, the 6 retro `record_*` writers) | 290 | 235 | 55 | **81.0%** (survivors: empty-id / `base=None` / `return False` guards the no-match path and the `except` make equivalent) |
+| `core/agent.py` finalize label region (Turn Outcome line + correction ring) | 88 | 52 | 36 | **59.1%** (label valence, state word, icon, level, shape relabel pinned; residue is the line's telemetry text, the bounded log ring's housekeeping, and one gap) |
+| **TOTAL** | **2,017** | **1,619** | **398** | **80.3%** |
+
+The headline number understates the label logic: the low-value-kinds row (36.4%) is the T1-only integer/bool/float sample §4EC also excludes, and the large-producer row (54.0%) is a 40% sample whose survivors are all outside the R0 scope (field metadata, confidence inputs, lesson consumption). On the code this review is ABOUT — the ladder, the mirrors, the authority order, the run-gate — every mutant with a distinguishing world is pinned; the survivors are equivalents (guards the function's own `except`/no-match path absorbs) and the caching/telemetry layers. Controls: NOOP survived every battery; KNOWNBAD died in every one (the function-scoped auto-control BADCOMPILE'd on a decorator/`@staticmethod` in three files — §4EE I-15 — and a hand-built `raise`-first control was used there and killed).
+
+**Instruments (§R6), and how they failed this round.** *I-14* — the NOOP control DIED at tier 2 in the feedback battery: `tests/test_ghost_cli.py::test_bin_symlink_points_into_repo` asserts the `bin/` symlink resolves INTO the repo, false in every copied tree, so 25 of 26 feedback tier-2 "kills" were that one test. Voided; the file is removed from every wide set, and no other battery's wide set named it. *I-15* — the function-scoped KNOWNBAD auto-control inserts a `raise` after the first range's first line; when that line is a `@staticmethod`/decorator (`grade_turn_outcome`, `_turn_outcome_label`, the calibration ladder) the raise lands between decorator and `def` → BADCOMPILE, a VOID control masquerading as a row. A hand-built `raise`-first control was used there and killed in every case. Both are written into [[mutation-battery-tiers-and-controls]].
+
+**Pins.** `tests/test_4ee_label_class_pins.py` (the three enumerations + the mirror table),
+`tests/test_4ee_label_pins.py` (the operator-label table over the full product with the
+production shape derivation; late-correction silence/loudness with the note text captured at
+the message, not the truncated console line; finalize driven for the shape verdict, the
+structural verdict, the sniffer/ledger coupling, the bench row, the budget note and the
+calibration shape tier; the human-label tier, the shape tier, the rank chain, the feedback
+route's tracker wiring and its log note; the late verdict's calibration re-label by the row's
+`req_id`), `tests/test_4ee_heuristics_pins.py` (the browser-thrash window edge by edge, the
+normalised error key, the structural cause label, the unresolved predicate, the instructed
+literal, both tool-call shapes, the sidecar cache drop).
+
+**R7 status.** 3. *Full suite green twice:* **19,508 passed / 65 skipped / 0 failed** at 00:47
+(9 min 27 s, xdist 4) with both fix rounds and every §4EE pin file in — 48 of the skips are the
+table cells the callers cannot produce, skipped with their reason as the skip text.
+3. *Full suite green twice:* 19,508 passed at 00:47 (before the fixes' pins were all in) and **19,557 passed / 65 skipped / 0 failed** at 07:13 (8 min 54 s, xdist 4) with every §4EE pin file in and both fix rounds applied.
+
+**Deployed 07:13** by `launchctl kickstart -k`: new pid 64397 (was 60554), listener back on :8000, a fifth "system ready" line, no traceback in the boot log. Docs updated: `docs/core/agent.html` (the three-mirrors section), `docs/core/calibration.html` (the two new ranks), `docs/core/feedback.html` (calibration re-labels now wired), `docs/audit_fixes.html` (budget-as-note). Memory: [[three-mirrors-one-table]].
+
+**Named gaps (recorded, not pinned).** The verified-AND-budget-exhausted Turn Outcome note (reachable only by driving finalize's verifier path — §4BJ/§4BR harness, out of R0); the finalize line's telemetry text (tools list, char count, confidence format) and the bounded correction ring's LRU housekeeping (telemetry, §4BZ's disposition); the collector memoization layer and the large-producer field/metacog/reflection code (§4CE and lesson-consumption scope). The `agent.py` large producers were SAMPLED at 40% per the operator's option-2 choice, not run whole. 1. *Mutation score is the gate:* the batteries above; every fix red-on-revert (the hand mutants killed, the survivors dispositioned equivalent/gap/out-of-scope). 2. *Class enumerations fire:* the three AST walks in `test_4ee_label_class_pins.py` are red on a stripped writer, an un-overlaid reader, and an unranked source. 4. *A round produces only out-of-scope findings:* the R3 review's residue after round 2 was telemetry text and the confidence-input assembly, both named out of scope in R0.
+
+## §4EF — Guard false-positive audit: the worst ones are already hardened (2026-09-03)
+
+**Ask:** audit every turn-gating guard, quantify which costs the most healthy turns, fix the worst.
+
+**Method.** Enumerated 15 guards that can gate/block/downgrade/abort/prune a turn (pre-flight
+`RecentFailureGuard`, the failure-classification sniffer, System-3 pivot, thinking-loop guards,
+no-progress + same-failure loop breakers, strike/failure cap, risk governor, futility breaker,
+context-pressure lockdown, cognitive watchdog + flood detectors, cross-turn repeat, batch dedup,
+unacked-total-failure gate, verify-depth router). Ranked by how likely a false positive HURTS a
+healthy turn. The randomized arms (`risk_steer`, `fs_batch`, `use_planning`, …) all read NO POWER
+/ NO VERDICT — the traffic wall — so the worst guard cannot be picked by A/B failure rate. The
+usable criterion is traffic-independent: **can a concrete healthy turn be constructed that the
+guard trips today?**
+
+**Ranked #1 — the pre-flight guard — re-verified and found already fixed.** Its documented FP
+(a successful read of error-shaped content recorded as a failure → identical re-read hard-blocked
+→ two blocks force-finalize the turn) does NOT reproduce on the live tree:
+- the unanchored `Traceback`-in-content arm is already gone from the arming signal
+  (`agent.py:15980` `_res_is_error` derives from the structured `ToolOutcome`, not a content sniff
+  — the comment there records the removal);
+- every `file_system` read wraps output in a `--- CONTENTS ---` / `--- (lines) ---` /
+  `--- [TEXT DATA] ---` header, so `tool_failure.result_is_failure` (anchored on a leading
+  `Error:`) never matches. Ran five read variants (whole-file, tiny, line-range, chunked, batch)
+  against a file whose content starts with `Error:`; every one returned `is_failure=False`.
+
+The other top guards (thinking-loop on coding leaves, no-progress verify-conflict, manage_services
+keying, the deadlock lifecycle) carry fixes recorded in the journal and memory; #1 was re-verified
+empirically this session, #2–#5 are taken from those records, not re-reproduced here.
+
+**Outcome: no fix.** The worst guards are already hardened; manufacturing a fix would be the
+"restated is not checked" trap. **One observation recorded, not acted on:** the read immunity is
+INCIDENTAL — it rests on the cosmetic `--- CONTENTS ---` header, not a designed guarantee. If a
+read tool is ever changed to return bare content, or a new bare-content read tool is added, the
+guard-arming FP reopens. The durable hardening would be to make read success explicit
+(`ToolOutcome.ok`) so a content sniff can never classify a read's own output; preventive, deferred.
+
+## §4EG — ACE retrofit on the lesson playbook (2026-09-03) — plan + Phase 0
+
+**Origin.** Web survey of the 2026 agentic frontier (self-improvement survey 2607.13104; ACE
+2510.04618; memory-hierarchy + skills-ecosystem work). Verdict: this agent already implements
+most frontier axes (self-rewrite/DGM = evolve; world model = foresight; verifier+PRM+TTS;
+GEPA; memory substrate). The one well-matched, traffic-INDEPENDENT next step is Agentic Context
+Engineering (ACE) applied to the lesson playbook — because ACE learns from execution feedback,
+and it is the published fix for the exact "context collapse under compaction" this project keeps
+re-hitting ([[optimizer-sheds-pinned-rules]], skill-prune/cap-trim lesson loss).
+
+**Ground truth (subagent map).** The lesson store (`memory/skills.py::SkillMemory`,
+`system/memory/skills_playbook.json`) is ALREADY ACE-shaped: one write chokepoint (`learn_lesson`)
+that appends one item or dedup-merges into one (no monolithic LLM rewrite anywhere); per-item
+helpful/harmful counters (`retrievals`/`helpful_retrievals`/`succeeded_retrievals`/
+`failed_retrievals`) feeding an outcome-gated utility; embedding twins with dedup-on-write; top-5
+retrieval under the bus governor. **So ACE is a retrofit, not a rebuild.** The divergence from ACE
+is the REMOVAL discipline: `_trim_playbook_by_utility` evicts to stay under `PLAYBOOK_MAX=50` on
+every write, and `prune_low_utility` (off by default) evicts the bottom quartile — both delete
+useful lessons to satisfy a size bound that costs nothing at prompt time (injection is top-k).
+
+**Phase 0 — measured (live store, 2026-09-03).** The store is SATURATED: **50/50 lessons, 49
+verified**, so it cannot grow — every new lesson triggers eviction. The pruned archive
+(`skills_pruned_archive.jsonl`) holds **669 dropped lessons, 664 by `playbook_cap_trim`**, of
+which **50 had positive net outcome credit or ≥5 retrievals** — proven-useful lessons evicted to
+hold the cap (e.g. succ=7/fail=4/ret=28 util=0.937; ret=80; succ=4/fail=2/ret=20). The incident
+class is live, not historical.
+
+**Phase 1 — grow-and-refine removal discipline (the code change).**
+- Never evict a lesson that is `verified` OR has `succeeded_retrievals > failed_retrievals`.
+- Bound redundancy by store-wide dedup/merge (the existing embedding dedup, run beyond write-time),
+  not by count eviction.
+- Raise `PLAYBOOK_MAX` far higher (retrieval is top-k, so store size is free on prompt budget);
+  only above a hard ceiling evict, and only lessons with enough observations AND negative net
+  credit. Eviction then targets proven-harmful lessons; merely-low-ranked new lessons survive and
+  simply sink in retrieval ranking.
+- Flag-gated with a kill switch; archive-before-delete invariant preserved.
+
+**Phase 1 — SHIPPED (pending deploy) 2026-09-03.** `memory/skills.py`: `GHOST_ACE_PLAYBOOK=1`
+(default) raises the cap via `GHOST_PLAYBOOK_MAX` (default 300 — free on prompt budget, injection
+is top-k) and adds `_lesson_is_protected` = verified OR positive net outcome credit
+(`succeeded_retrievals > failed_retrievals`). `_trim_playbook_by_utility` now pins the protected
+set and, under ACE, keeps the store OVERSIZED rather than ever evict a protected lesson (fail-open,
+mirroring the archive path); eviction can only target unproven or proven-HARMFUL lessons.
+`prune_low_utility` skips protected lessons too. `GHOST_ACE_PLAYBOOK=0` restores the exact legacy
+cap=50 + drop-lowest-utility-verified rule. **Archive replay (the proof):** of the 50
+usefully-dropped archive lessons, grow-and-refine retains **50/50** (41 protected outright, 9 kept
+by the raised cap) vs **2/50** under the legacy cap. **Mutation: 100%** — 69/69 real mutants of `_lesson_is_protected` + `_trim_playbook_by_utility` killed (NOOP survived, KNOWNBAD killed); R3 folded the ACE oversized-return into the trim CONDITION (`if not _ACE_PLAYBOOK and len(kept) > max_entries`) so no dead branch remained for a `True` mutant, and simplified the protection helper (an over-clever `_normalize_lesson if …` line was 5 equivalent survivors). Pins: `tests/test_4eg_ace_playbook.py` (18 —
+the protection table, the reproduction, and the kill-switch differential, the protection table incl. non-dict and succ=fail+1 edges, the oversized-never-drops-protected slots_left=-2 case, and the legacy head-survives-overflow case). Regression: 251 green across the lesson/skill/learning-stack suites (they key
+on the `PLAYBOOK_MAX` constant, so the raised cap flows through).
+
+**Phase 2 (deferred).** A richer Reflector that mints new bullets from failures — most of this
+exists via `record_surfaced_outcomes`; defer unless Phase 1 shows a gap.
+
+**Evaluation (traffic-independent — the point).** An `ace_playbook` experiment arm (`scope=bench`)
+gates the discipline; run a fixed slice of the 3,610 on-disk bench items (MBPP/GSM8K) grow-and-refine
+vs incumbent cap-trim, compare pass rate. Plus a REPLAY eval over the 50 usefully-dropped archive
+rows: show they survive and improve the turns that would have retrieved them.
+
+**Hardening.** §R mutation-pins (a positive-credit lesson is never dropped; dedup-merge preserves
+the union of counters; a proven-harmful lesson still is evicted), full suite twice, flag-gated deploy.
+
+**Out of scope.** The graduated-skill store (`skills_auto`, separate cap), the GEPA prompt optimizer
+(`optim/loader.py` — a cautionary analogue, not the lesson store), bus fusion internals.
+
 ## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
 
 **This section is binding. When the operator says "review <feature/subsystem>", this is the

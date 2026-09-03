@@ -224,6 +224,23 @@
   <div class="note"><strong>⚠ Bias is not the same as variance, and only one of them matters here.</strong> The first version of this audit de-attenuated each lesson's observed rate to its noise-corrected truth and found the same victims — and concluded label noise was exonerated. That was an artifact: <code>(observed − FCR)/(1 − FRR − FCR)</code> is <em>monotone</em>, so removing the label's systematic bias cannot reorder a rank-based prune. A bottom-quartile cutoff is structurally immune to bias; what corrupts it is variance. An audit built the first way can only ever exonerate.</div>
   <div class="note"><strong>⚠ A rank cutoff is decided only by the lessons adjacent to the boundary.</strong> Population-level separation is irrelevant — the boundary has to fall in a <em>gap</em>. Identical lessons tie exactly and the cutoff slices arbitrarily through the tie; lessons spaced closer than the standard error of their own counts are ordered by noise. Both are pinned in <code>tests/test_label_noise_audit.py</code>, whose load-bearing pair is two-sided: the counterfactual must <em>convict</em> where noise decides the victims and <em>exonerate</em> where the evidence is ample.</div>
   <p><strong>What would have to change.</strong> Re-centring the multiplier on the playbook's own pooled rate, and replacing the relative-quartile cutoff with an absolute one, are both necessary and neither is sufficient — at a median of 3 decisive outcomes per lesson no cutoff ranks lessons rather than noise. Note that <code>compute_lesson_utility</code> also drives the <em>live</em> cap-trim (<code>_trim_playbook_by_utility</code>, which fires on every write once the playbook is full), so re-centring it is an operator-visible retention decision, not a silent fix.</p>
+  <h2>&sect;4EG &mdash; ACE grow-and-refine: the cap no longer sheds proven lessons (2026-09-03)</h2>
+  <p>The playbook cap is <strong>free on prompt budget</strong> &mdash; injection is a top-k
+  retrieval under the bus governor, so store size never reaches the prompt. A low cap therefore
+  only shed knowledge: measured 2026-09-03 the store sat at 50/50 and cap-trim had dropped 664
+  lessons, <strong>50 of them with positive net outcome credit</strong> (one at 28 retrievals,
+  7&nbsp;succ&nbsp;/&nbsp;4&nbsp;fail). Retrofitting <a href="https://arxiv.org/abs/2510.04618">ACE</a>'s
+  grow-and-refine discipline: <code>GHOST_ACE_PLAYBOOK=1</code> (default) raises the cap
+  (<code>GHOST_PLAYBOOK_MAX</code>, default 300) and pins a lesson that is <em>verified OR has
+  positive net outcome credit</em> (<code>succeeded_retrievals &gt; failed_retrievals</code>).
+  <code>_trim_playbook_by_utility</code> then keeps the store oversized rather than ever evict a
+  protected lesson (fail-open, like the archive path); the cap can only target unproven or
+  proven-harmful lessons, which also sink in retrieval ranking and are never injected.
+  <code>prune_low_utility</code> skips protected lessons too. Kill switch
+  <code>GHOST_ACE_PLAYBOOK=0</code> restores the exact legacy cap=50 + drop-lowest-utility rule.
+  <strong>Archive replay:</strong> of the 50 usefully-dropped lessons, grow-and-refine retains
+  50/50 vs 2/50 under the legacy cap. Pinned in <code>tests/test_4eg_ace_playbook.py</code>
+  including the kill-switch differential.</p>
 </main>
 </body>
 </html>

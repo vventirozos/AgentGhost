@@ -136,12 +136,10 @@ def _snapshot(gen: int, stamp: tuple) -> _Epoch:
     cache: Dict[str, str] = {}
     shas: Dict[str, str] = {}
     for entry in (stamp or ()):
-        try:
-            name = entry[0]
-        except Exception:  # noqa: BLE001 — a malformed entry is skipped,
-            continue       # never a crash out of "Never raises" callers
-        if not isinstance(name, str) or not name.endswith(".json"):
-            continue
+        # §4EC F7: `stamp` only ever comes from `_dir_stamp` (3-tuples of
+        # `*.json` names), so the former malformed-entry / non-.json guards
+        # were unreachable — deleted rather than left as unfalsifiable code.
+        name = entry[0]
         sig = name[:-len(".json")]
         try:
             data = json.loads((_optim_dir() / name).read_text())
@@ -651,44 +649,44 @@ def tuned_instruction(signature_name: str, default: str = "", *,
     _arm = _resolve_arm(signature_name, context, req_id)
 
     _ep = _epoch_for_request(req_id)
-    if True:
-        cached = _ep.cache.get(signature_name)
-        # ⚠ A CONTROL TURN IS A FALLBACK, NOT AN APPLICATION. The counter
-        # ran before the arm check, so ten deliberately-withheld turns
-        # reported `applied: 10` — corrupting the project's own
-        # `silent-inoperative-subsystems` instrument, whose whole job is to
-        # say whether a read site USED the artifact.
-        if _arm == "control":
-            _FALLBACK_COUNTS[signature_name] = (
-                _FALLBACK_COUNTS.get(signature_name, 0) + 1)
-            # Stamped only when there is something to withhold: with no
-            # artifact on disk (today's live state) treatment stamps
-            # nothing, and a control-only corpus looks like accruing data
-            # while being uncomparable forever.
-            if cached:
-                # ⚠ STAMP THE ERA ON THE CONTROL TURN TOO. A control turn
-                # is served the baseline, so it has no artifact of its
-                # own — but it belongs to the era of the artifact it was
-                # WITHHELD, and that is what makes the two arms
-                # comparable. §4DA round 8 scoped only the TREATMENT arm
-                # by sha, which turned it into a time window while
-                # control stayed all of history: measured, a
-                # contemporaneous 10/20 vs 10/20 (KEEP, p=0.6238) became
-                # 10/20 vs 40/50 (REVERT, p=0.0148) — a healthy artifact
-                # retired on control turns belonging to the artifact it
-                # replaced.
-                _note_served(req_id, signature_name,
-                             _ep.shas.get(signature_name, ""),
-                             "control")
-            return default
+    # §4EC F3: the `if True:` scaffold left by the §4DE move was flattened.
+    cached = _ep.cache.get(signature_name)
+    # ⚠ A CONTROL TURN IS A FALLBACK, NOT AN APPLICATION. The counter
+    # ran before the arm check, so ten deliberately-withheld turns
+    # reported `applied: 10` — corrupting the project's own
+    # `silent-inoperative-subsystems` instrument, whose whole job is to
+    # say whether a read site USED the artifact.
+    if _arm == "control":
+        _FALLBACK_COUNTS[signature_name] = (
+            _FALLBACK_COUNTS.get(signature_name, 0) + 1)
+        # Stamped only when there is something to withhold: with no
+        # artifact on disk (today's live state) treatment stamps
+        # nothing, and a control-only corpus looks like accruing data
+        # while being uncomparable forever.
         if cached:
-            _APPLIED_COUNTS[signature_name] = _APPLIED_COUNTS.get(signature_name, 0) + 1
+            # ⚠ STAMP THE ERA ON THE CONTROL TURN TOO. A control turn
+            # is served the baseline, so it has no artifact of its
+            # own — but it belongs to the era of the artifact it was
+            # WITHHELD, and that is what makes the two arms
+            # comparable. §4DA round 8 scoped only the TREATMENT arm
+            # by sha, which turned it into a time window while
+            # control stayed all of history: measured, a
+            # contemporaneous 10/20 vs 10/20 (KEEP, p=0.6238) became
+            # 10/20 vs 40/50 (REVERT, p=0.0148) — a healthy artifact
+            # retired on control turns belonging to the artifact it
+            # replaced.
             _note_served(req_id, signature_name,
                          _ep.shas.get(signature_name, ""),
-                         _arm or "unenrolled")
-        else:
-            _FALLBACK_COUNTS[signature_name] = _FALLBACK_COUNTS.get(signature_name, 0) + 1
-        return cached if cached else default
+                         "control")
+        return default
+    if cached:
+        _APPLIED_COUNTS[signature_name] = _APPLIED_COUNTS.get(signature_name, 0) + 1
+        _note_served(req_id, signature_name,
+                     _ep.shas.get(signature_name, ""),
+                     _arm or "unenrolled")
+    else:
+        _FALLBACK_COUNTS[signature_name] = _FALLBACK_COUNTS.get(signature_name, 0) + 1
+    return cached if cached else default
 
     # §4DE: the lazy per-read disk load that used to live here moved into
     # `_snapshot` — an epoch's content is bound at snapshot time, so a

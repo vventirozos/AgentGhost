@@ -516,6 +516,18 @@
   <code>user_correction</code> for ground truth. This landed BEFORE any new signal tier on purpose: without it,
   mixing tiers is irreversible, because you can never audit which tier is noisy nor drop one without discarding
   the whole corpus. Legacy rows default to <code>turn</code>, which is what they were.</p>
+  <p><strong>&sect;4EE (2026-09-02) &mdash; two ranks the mirror question found missing.</strong>
+  <code>human_feedback</code> (the explicit thumb on this turn, via <code>record_human_label</code>)
+  is now the TOP of the ladder &mdash; it was the only corpus label source with no calibration
+  rank at all, so a 👎 corrected the learning corpus and left the fit believing the inline grade.
+  <code>shape_failure</code> (via <code>record_shape_failure</code>, rank just above
+  <code>turn</code>) re-labels a turn the SHAPE heuristics marked FAILED at
+  <code>_SHAPE_FAILURE_GRADE</code> (0.68, the currency of one unverified execution failure):
+  the sample is written before the corpus row exists, so without this tier a selector-thrash
+  turn graded as the prior or, with an inline PASS, as 1.0 while the corpus said FAILED. The
+  full order is <code>turn &lt; shape_failure &lt; verifier_late &lt; task_reopened &lt;
+  failure_report &lt; bench_validator &lt; user_correction &lt; human_feedback</code>, pinned as a
+  chain in <code>tests/test_4ee_label_pins.py</code>.</p>
 
   <h3>§4BF 1c — bench population (origin, oracle re-label, equal-mass cap)</h3>
   <p>Samples additionally carry <code>origin</code> (<code>"user"</code> | <code>"bench"</code>;
