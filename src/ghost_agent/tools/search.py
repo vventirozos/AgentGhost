@@ -9,6 +9,8 @@ import time
 from typing import List, Dict, Any, Callable, Optional, Tuple
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import helper_fetch_url_content
+
+logger = logging.getLogger("GhostAgent")
 from ..core.node_throughput import (
     CHARS_PER_TOKEN, MIN_CHARS as _MIN_DISTILL_CHARS, env_float,
     log_plan as log_distill_plan)
@@ -776,7 +778,30 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         "unavailable, rather than looping on more searches."
     )
 
-async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, **kwargs):
+def _record_project_findings(context, query: str, output: str) -> Optional[str]:
+    """Main-loop research write-back (2026-09-03, §4EK): a live conversation
+    searching about its active project leaves the results in the project's
+    research/ dir, where coding leaves read them. Autonomous leaves (pinned
+    project contexts) are excluded — their research is already saved as a
+    brief. Never raises; returns the project-relative path when written."""
+    try:
+        if context is None or getattr(context, "is_pinned_project_context", False):
+            return None
+        pid = getattr(context, "current_project_id", None)
+        store = getattr(context, "project_store", None)
+        if not pid or store is None:
+            return None
+        from ..core.project_research import record_main_loop_findings
+        rel = record_main_loop_findings(store, pid, query, output)
+        if rel:
+            logger.info("web_search: results written back to project %s (%s)", pid, rel)
+        return rel
+    except Exception:  # noqa: BLE001 — never let a record fail a search
+        logger.debug("web_search: project findings write-back skipped", exc_info=True)
+        return None
+
+
+async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, context=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
     # Stylometric egress scrubbing: under anonymous mode, normalise the
@@ -804,7 +829,13 @@ async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_
             except Exception:
                 pass
     # Tavily support removed. Always using DDGS.
-    return await tool_search_ddgs(query, tor_proxy)
+    out = await tool_search_ddgs(query, tor_proxy)
+    rel = _record_project_findings(context, query, out)
+    if rel and isinstance(out, str):
+        # Tell the model where the results now live, so it can point a
+        # build at them instead of re-searching.
+        out = out.rstrip() + f"\n\n(saved to {rel} in the active project — coding leaves read it)"
+    return out
 
 async def tool_deep_research(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, **kwargs):
     if not query:
@@ -1122,7 +1153,7 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
                 _sized = plan.describe()
             except Exception:                                   # noqa: BLE001
                 _sized = "sizing unavailable"
-            pretty_log("Worker Compute",
+            pretty_log("Research Compute",
                        f"Distilled facts from {short_url} — {_sized}",
                        icon=Icons.TOOL_DEEP)
             try:

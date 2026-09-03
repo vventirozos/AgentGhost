@@ -3211,7 +3211,7 @@ Return ONLY valid JSON:
                     "Macro Proposed",
                     f"macro mining FAILED after {result['proposed']} "
                     f"proposal(s): {type(e).__name__}: {e}",
-                    level="ERROR", icon=Icons.WARN,
+                    level="ERROR", icon=Icons.FAIL,
                 )
             except Exception:                     # noqa: BLE001
                 logger.error("Macro proposal mining failed AND its own "
@@ -5483,7 +5483,7 @@ Return ONLY a JSON object with:
                                     f"Validator {_mode} on its OWN expected_output "
                                     f"(internal contradiction). Rejecting challenge.\n"
                                     f"Validator output tail:\n{(sv_out or '')[-400:]}",
-                                    level="ERROR", icon=Icons.STOP,
+                                    level="ERROR", icon=Icons.FAIL,
                                 )
                                 # Clean up probe artefacts so nothing
                                 # leaks into the next gen attempt.
@@ -5612,7 +5612,7 @@ Return ONLY a JSON object with:
                             "Self-Play Consistency",
                             "Challenge discarded: validator disagrees with its own "
                             f"setup data — {_why}",
-                            level="ERROR", icon=Icons.STOP,
+                            level="ERROR", icon=Icons.FAIL,
                         )
                         from ..tools.outcome import ToolOutcome
                         return ToolOutcome.failed(
@@ -6098,7 +6098,7 @@ Return ONLY a JSON object with:
                                     "answer.txt missing — the harness seam "
                                     "did not run (infra, not charged to "
                                     "the agent)",
-                                    level="ERROR", icon=Icons.STOP,
+                                    level="ERROR", icon=Icons.FAIL,
                                 )
                                 break
                             is_validator_crash = False
@@ -6125,7 +6125,7 @@ Return ONLY a JSON object with:
                             if is_validator_crash:
                                 validator_infra_crash = True
                                 _infra_this_attempt = True
-                                pretty_log("Self-Play Abort", f"Validator script crashed or has syntax errors. Aborting (infra — not charged to the agent). Feedback:\n{feedback[:250]}", level="ERROR", icon=Icons.STOP)
+                                pretty_log("Self-Play Abort", f"Validator script crashed or has syntax errors. Aborting (infra — not charged to the agent). Feedback:\n{feedback[:250]}", level="ERROR", icon=Icons.FAIL)
                                 break
 
                             # Broken line-split backstop (2026-07-29): when the
@@ -6144,7 +6144,7 @@ Return ONLY a JSON object with:
                                     "un-split element equal to the joined expected "
                                     "lines. The solution is correct; aborting (infra "
                                     f"— not charged to the agent). Feedback:\n{feedback[:250]}",
-                                    level="ERROR", icon=Icons.STOP,
+                                    level="ERROR", icon=Icons.FAIL,
                                 )
                                 break
 

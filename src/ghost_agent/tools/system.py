@@ -132,7 +132,7 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                 await asyncio.sleep(5)
                 continue
             
-    pretty_log("Weather Warn", f"Open-Meteo failed: {last_error}", level="WARN", icon=Icons.WARN)
+    pretty_log("Weather Warn", f"Open-Meteo failed: {last_error}", level="WARNING", icon=Icons.WARN)
 
     for attempt in range(3):
         try:

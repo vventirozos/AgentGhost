@@ -33885,6 +33885,287 @@ the union of counters; a proven-harmful lesson still is evicted), full suite twi
 **Out of scope.** The graduated-skill store (`skills_auto`, separate cap), the GEPA prompt optimizer
 (`optim/loader.py` — a cautionary analogue, not the lesson store), bus fusion internals.
 
+## §4EH — Log coverage + icon representation pass (2026-09-03)
+
+**Ask (operator uses the log stream as the monitoring tool):** log all events, keep it readable,
+make every icon make contextual sense. Audited all **770** `pretty_log`/`_safe_pretty_log` call
+sites and the **91**-icon `Icons` enum (full inventory in the session record). Architecture fact
+that frames everything: only `pretty_log` and stdlib WARNING+ reach the LIVE stream —
+`logger.info`/`logger.debug` go to the file only, so every meaningful `logger.debug` event is a
+live-stream blind spot.
+
+**Phase 1 — icons that LIED about severity (shipped).** 17 ERROR-level lines rendered a non-failure
+glyph (a soft amber WARN 🔶, a STOP halt 🛑, or a cheerful tool glyph like the browser globe 🌎),
+so a failure was visually indistinguishable from routine activity — one even carried a "FAIL LOUD"
+comment while rendering soft. All → FAIL ❌. The one ERROR line kept as-is is `sandbox/jobs.py:604`
+"Job Kill Refused" (SHIELD 🔒 — a deliberate fail-closed security refusal). Enforced by a lint,
+`tests/test_4eh_log_icons.py`: an AST scan asserting every ERROR/CRITICAL `pretty_log` uses FAIL
+or SHIELD (fires on WARN/STOP/tool-glyph). Applied byte-safe (ast col-offsets are byte offsets;
+dream.py lines carry unicode, so char-slicing corrupted the first attempt — caught by an assert).
+
+**Phase 2 — consistency (shipped).** `tools/system.py` `level="WARN"` → `"WARNING"` (the only
+`'WARN'` in the tree); the dark-web breaker-cleared line used the CLEARNET globe 🌐 → onion 🧅
+(the enum comment exists precisely to keep them distinct); "Verifier Gate" thought-bubble 💭 →
+verifier flask 🧪 (class-correct); "PRM Boot Warnings" retitled "PRM Boot Failed" (it emits at
+ERROR).
+
+**Phase 3 — coverage, the "log all events" core (shipped).** Two primary silent signals put on the
+stream: the **per-turn router decision** (label · confidence · escalation · reason — it gates MCTS
+and the planner every turn, was only stashed to `body` + `turn_facts`) via BRAIN_ROUTE 🧭; and the
+**memory hydration verdict** ("N/M recalled memories used" — the operator's primary "is memory
+paying off?" signal, was `logger.info` → file only) via MEM_READ 🔎. Foresight's predict/resolve
+exception swallows promoted from `logger.debug` to WARNING so the instrument going dark is visible.
+(The dark-web breaker-OPEN transition was already logged; only the per-skip debug stays quiet, by
+design.)
+
+**Phase 4 — dedicated tool-dispatch icon + title collisions (shipped).** New `Icons.TOOL_DISPATCH`
+🧰 (single-codepoint, wide-base) so a tool being INVOKED no longer borrows the clapperboard 🎬 that
+means "request started" — added to the enum AND both hand-synced client maps
+(`interface/static/app.js` ICON_CLASS and `clockwork_ghost/turnstatus.py`), with
+`tests/test_web_icon_map_drift.py` green. Title collisions where two DIFFERENT events shared a
+rendered title, disambiguated: "Service" → "Sandbox Service" (sandbox register) vs "Project
+Service" (project stop); "Worker Compute" → "Research Compute" for the darkweb/search summarizer
+paths (the LLM worker-node keeps "Worker Compute", which the worker-warmup tests assert); boot
+"Memory Bus" → "Memory Bus Init" (distinct from the per-turn "Memory Bus").
+
+**Deferred as coherent-enough / lower-value.** The "verifier" title spans ~50 calls but they are
+all verifier events under the flask 🧪 — a coherent stream, not a collision; the "workspace"
+five-icon spread and the "self-state" icon variety carry sub-event meaning and renaming risks
+`test_workspace_changelog_and_nav`; the PRM-skip 18-char truncation triplet is a readability wart
+(same prefix, distinct messages/level), not misleading, and renaming churns recent §4EE pins;
+graph-write success lines and the constraint-gate/autoadvance debug swallows are low-value coverage.
+
+**Superseded plan note (Phase 4, needs client-map work).** Title-collision disambiguation: the
+lowercased-and-18-char-truncated titles mean "workspace" renders with 5 icons across 4 files,
+"verifier" spans ~50 calls as one stream, and "service" means both stopped 🛑 and registered 📦.
+A dedicated tool-dispatch icon (so 🎬 stops doubling for REQ_START and every Tool Call) requires
+updating the three client icon maps (`interface/static/app.js`, `slack_bot/main.py`,
+`clockwork_ghost/turnstatus.py`) with `tests/test_web_icon_map_drift.py` as the gate. Lower-value
+coverage still open: graph-write success lines, and the constraint-gate/autoadvance `logger.debug`
+swallows.
+
+## §4EI — Coding-leaf postmortem: request 463111ad (2026-09-03) — think policy, kept rejections, append rollback, pre-write guards
+
+**Trigger.** Operator: "see the agent's log, task 463111ad, what went wrong?" then "fix it, verify your
+changes." The request ("proceed with all tasks" on a 7-leaf Elden Ring tracker) ran **49 min inside
+one `autoadvance count=all` call**, closed 3 DONE / 3 FAILED, and the page it produced was mostly
+unreachable. The batch stopped on the Talismans leaf after 4 attempts; the main loop then spent 5 more
+minutes trying to repair line 387 by hand.
+
+**What the log showed (ranked by cost).**
+1. **Every thinking attempt hit the 30K reasoning ceiling with zero content** — 6 of 6 across 4
+   leaves, ~115 s each. The model (Ornith-1.5-35B-A3B, live since 2026-08-26, switch never
+   journaled) drafts the whole file inside `<think>`; the ceiling was designed for "3–15K planning".
+   llama-server confirms each cancel at 10–12.5K tokens. Only the no-think retry ever produced specs.
+2. **4 of 5 no-think retries were rejected by the parser although complete** — server-side
+   `truncated = 0`, tails `"ledger":"…"}` + closing fence — and the log labelled them "TRUNCATED
+   JSON … cut off at max_tokens". Four live reproductions through the executor's own prompt builder
+   (raw HTTP, no-think) all parsed strictly, so the trigger is still unknown; the log kept 400+200
+   chars and `GHOST_LLM_RECORD=0`. Log-side `<REDACTED>` in a preview was checked and ruled out
+   (redaction runs only in the logging formatter).
+3. **Appended sections were unreachable.** `.panel{display:none}` unless `.is-active`; the Somberstone
+   and Miner leaves each appended a second `<section data-section="bearings">` with no nav entry;
+   `querySelector` matches the first. Both closed DONE; one had no verify at all, the other's verify
+   was three greps for strings it had just written.
+4. **A syntax-failed append stayed on disk and poisoned every retry.** The Talismans spec carried
+   literal `...` elision lines; feedback said "fix with edits", the model appended again, the file grew
+   18K→22K with the same line-387 error four times.
+5. **Main loop dithered 3 min** (six web searches never written to the research file; the executor
+   only reads that file) and the decomposer invented "8 bearings".
+Comparison from the ledger: 2026-08-15 coding leaves averaged 76 s with zero warnings; today 291 s.
+
+**Fixes (core/coding_executor.py, core/agent.py).**
+- **Think policy** — `GHOST_CODING_THINK_SKIP_AFTER` (default 2): after N consecutive aborted think
+  phases (ceiling / n-gram loop / budget eaten with no content) the spec call starts with thinking
+  disabled (`_spec_nothink_call`, the retry's recipe); a clean think phase resets; state is **per LLM
+  client** (weak-keyed) so the production client adapts once per process and test doubles never
+  share it. 0 = never think; negative = never adapt. System hint tells the model not to draft file
+  contents in its thinking. A no-think first call that returns reasoning-only is not retried with
+  the same recipe.
+- **Kept rejections** — `_keep_unparsed_spec_output` writes content+reasoning verbatim to
+  `$GHOST_HOME/system/coding_executor_failures/` (newest `UNPARSED_SPEC_KEEP`=30), named in the
+  warning. `_usable` no longer accepts path-only `files` entries (the truncation repair salvages
+  `[{"path":…}]`; accepting it skipped retry AND dump). `_generate_build_spec` now returns `{}` on
+  failure as its docstring always claimed. `extract_json_from_text` reports **UNBALANCED** (not
+  "TRUNCATED") when the text ends with `}`.
+- **Append rollback** — a syntax-failed append is written back to the pre-append content
+  (`_restore_file`), the snapshot is marked authoritative, feedback says REVERTED and asks for the
+  whole block; a failed restore keeps the old taint→edits flow. Content rewrites/new files unchanged.
+- **Pre-write guards** (append + content) — `_placeholder_elision_reason` (a line that is only
+  `...`/`…`, bare or commented, in HTML/JS/TS/CSS; Python exempt) and `_html_duplicate_key_reason`
+  (top-level element re-using an `id`/`data-*` key the file already has, or used twice in the
+  fragment; nested duplicates allowed; HTML only).
+
+**Verification.** Pins: `tests/test_coding_executor_think_policy_and_append_guards.py` (24 tests;
+15 failed on the pre-fix code, the 7 "must stay allowed" guards passed by construction, 2 added
+during the work). Mutation: 18 single-point mutants over every mechanism (streak increment, threshold
+off-by-one, reset, rotation, dump, closed-json helper, rollback, both placeholder sites, dup-key,
+`_usable`, retry gate, `enable_thinking`, prompt nudge, top-level-only, restore error path, `{}`
+contract, policy consulted) run on a scratchpad copy with a no-mutant control → **18/18 killed**.
+Full suite: first run 19599 pass / 1 fail — `test_outcome_consumers_r3` read
+`_dump_rejected_spec(content, …)` as a result classifier (hint word + `content` arg); renamed to what
+it is, not exempted. Second run **19601 passed / 65 skipped / 4:55**. Deployed by killing the
+supervised listener: pid 20895 → 80854, one process, `/api/health` ok, "system ready" +1.
+
+**Addendum (same day, "verify your changes and prove it worked").** Planning the live proof exposed
+a blind spot in the rollback: an append onto a file that was ALREADY broken would have been "reverted"
+with feedback blaming the new block, leaving the real fault untouched. `_syntax_error_before_block`
+now reads the line number out of the reason `_syntax_fail_reason` produced and compares it with the
+block's start line (`_appended_block_start_line`: the `</body>` line for HTML, two past the last
+non-blank line otherwise). A line BEFORE the block → keep the taint→edits flow and say "line N is in
+the EXISTING file"; a line inside or after the block → revert (an unterminated construct is reported
+at the next token, i.e. in the tail the append pushed down). Pins: 2 (base-broken, tail-is-block);
+mutants: 3 more (always-base, always-block, anchor ignored) → **21/21 killed**, control green (26
+pins). Full suite **19603 passed / 65 skipped / 5:00**. The first draft took `out` and tripped the
+same AST classifier scan as the dump helper; it now takes the classified `reason` — honest
+delegation, not a rename. Live proof: the operator had deleted the Elden Ring project at 13:14, so
+the proof runs on a scratch CODING project driven through `POST /api/projects/{pid}/advance` (one
+leaf per call, the real executor in the deployed process); results below.
+
+**Live proof (14:04–14:28) and the rejection cause, PROVEN.** Scratch CODING project `2fbc9a7a09ea`
+(tip calculator, 3 leaves) driven through `POST /api/projects/{pid}/advance` on the deployed process:
+leaf 1 DONE 114 s, leaf 2 DONE 156 s (both with clean think phases — Ornith thinks within budget on
+small tasks; the streak entered leaf 3 at 0). Leaf 3: attempt 1 ceiling abort → no-think retry
+rejected; attempt 2 n-gram loop abort → **policy flip line** → retry rejected; attempts 3–4 **"spec call
+starts with thinking disabled"** (7–15 s each) → rejected → FAILED. Four rejected outputs were KEPT,
+and they finally showed the cause — not quote escaping but **structural slips at the `files` array
+boundary in no-think mode**: (i) `…"},"path":…` — the `{` opening the next file entry dropped; (ii)
+`…"}` then `,"verify":…` with the files array still open — the `]` dropped. Braces balance either
+way, so the brace scan said "malformed" and every salvage failed. Four raw-HTTP reproductions earlier
+in the day had parsed because the slip is intermittent (0/4 vs 4/4 in one leaf).
+Fix: `_repair_spec_structure` — at the parser's own error offset, when the misplaced token is a known
+spec key and the string-aware container stack matches, insert exactly the dropped character (`{`
+inside the array before an entry key; `]` before a top-level key while `{[` is open); result must
+strictly `json.loads` to a dict and be `_usable`, and an unchanged text is never returned as a repair.
+Wired into `_parse_spec_channels`, the one extraction chain both the streamed call and the retry now
+share. Pinned on the real files (tests/fixtures/spec_structure_4ei/rejected_1-4.txt): each repairs
+with exactly one inserted character. Re-run of the failed leaf after deploy: DONE in 247 s — via a
+clean think on attempt 2, while attempt 1's retry was rejected AGAIN with a **third shape** (two
+dropped `{` AND the closing `]}` never emitted; finish_reason stop). Rule 3 added: at end-of-input with
+containers open, close them innermost-first; pinned on rejected_5.txt (3 fixes, 4 characters). Built
+page checked on disk: one history section, no placeholder lines, no duplicate keys; project
+hard-deleted (204, workspace gone). Final battery: 34 pins, **27/27 mutants killed** (control green),
+full suite **19611 passed / 65 skipped / 4:50**, deployed pid 82477 (one listener, "system ready"
+stable). Not exercised live (pinned only): append rollback, both pre-write guards, the already-broken
+base discriminator — no leaf in the proof produced those shapes.
+
+**Addendum — JSON grammar on the no-think call (operator: "add the json grammar").** The client
+posts the payload dict as-is (`json=payload`), so no passthrough was needed. `_spec_nothink_call` now
+sends `response_format` = `json_schema` "build_spec" from `SPEC_JSON_SCHEMA` — deliberately loose:
+requires only `files` as an array of objects with a `path`, allows extra keys and any edits item
+shape. llama-server compiles it to GBNF, so the dropped `{`/`]`/`]}` and the ```` ```json ```` fence
+are impossible at the sampler. Thinking calls never carry it; the main turn loop is untouched.
+`GHOST_CODING_SPEC_JSON_GRAMMAR`: unset/1 schema, `object` = json_object, `0` off. One retry without
+the grammar if the call errors while it is on (a backend that rejects `response_format` cannot fail a
+leaf); with it off, a failing call is not retried. Live server check first: both `json_schema` and
+`json_object` accepted on a no-think call (2 s, strict JSON, no fence). Proof through the executor's
+real prompt builder (`GHOST_CODING_THINK_SKIP_AFTER=0`, raw HTTP forwarding the real payload): **4 of 4
+usable specs, one call each, 12–22 s, no repair fired** — three of them the history task that had been
+rejected 5 of 5 times without the grammar. Pins +5 (schema on the no-think payload and absent from the
+streamed call, kill switch, object mode, one-shot fallback, no retry without a grammar); mutants +5
+(grammar never attached, kill switch ignored, fallback removed, object mode broken, schema requires
+nothing) → **32/32 killed**, control green (39 pins); one earlier mutant's anchor had gone stale after
+the refactor and was re-anchored (unapplied ≠ survived). Full suite **19616 passed / 65 skipped / 4:52**.
+Deployed pid 50022, one listener, "system ready" stable. The structure repair stays as the second line
+for backends without grammar support — and for the THINK path, which the grammar cannot cover: the
+post-deploy sanity leaf (scratch project, DONE 170 s on attempt 2) had its attempt-1 THINKING output
+rejected with a fourth shape, the `}` closing the last file entry dropped before `]`
+(`…"append":"…"],"verify"`; kept file, `think_off=False`). Rule 4 added (insert `}` before `]` only
+when the stack is `…[{`), fixture rejected_6.txt, one mutant; the new "UNBALANCED JSON" diagnosis
+fired on it correctly. Final battery for the whole section: 40 pins, **33/33 mutants killed** (control
+green), full suite **19617 passed / 65 skipped / 4:51**, deployed pid 29768 (one listener, "system
+ready" stable 30 s), scratch project hard-deleted.
+
+**Not done / open.** (a) The repair covers the three shapes in the corpus; with the grammar on it
+should not be needed on llama-server — if "spec structure repaired" ever appears again, the grammar
+was not applied (check the kill switch and the backend). (b) Verify gates for UI leaves are
+still tautological (string greps) or absent — a leaf can close DONE with an invisible deliverable; the
+dup-key guard removes one route to that, not the class. (c) Main-loop research is not persisted to the
+research file. (d) The 2026-08-26 model switch to Ornith-1.5 has no journal entry. (e) The skip count
+is 65, not the 17 recorded in the run-and-test memory — pre-existing, unexamined here.
+
+## §4EJ — Sandbox services: unpublished ports now say so (2026-09-03)
+
+**Trigger.** Operator: "the agent starts a service (port 8899) but I can't reach it by using
+serve-remote.sh 8899, why?" Facts: the container publishes only `127.0.0.1:8100-8104` (docker ps);
+host listeners on 8899: zero; the agent had started `elden-tracker` with `python3 -m http.server 8899`
+via manage_services — a command-named port is honoured as the preference even outside the range —
+and the report said "listening ✓" (true INSIDE the sandbox: browser tool, verifier and execute all
+reach it there). The start report adds the remote-access recipe only for published ports and said
+nothing otherwise, so neither the model nor the operator was told the port is host-unreachable;
+`serve-remote.sh` warns "nothing is listening" but serves anyway.
+
+**Fix (sandbox/services.py, tools/sandbox_services.py).** `unpublished_port_warning(port,
+published_ports)`: in bridge mode, when the port is not in the set docker actually published, the
+start report appends "⚠ NOT reachable from the host: port N is not published by the sandbox
+(published: …), so http://127.0.0.1:N exists only INSIDE the sandbox — the user's browser cannot open
+it and `serve-remote.sh N` would map the tailnet onto an empty port" plus the way out (omit the port
+so a published one is leased and exported as $PORT, or name one in the range). Status marks the same
+service "⚠ in-sandbox only". Host network mode never warns (`_binds_host_netns`: the port is on the
+host loopback already). A second instance that published nothing reports "published: none", not the
+configured range. The tool schema's `port` description now states the boundary so the model stops
+picking out-of-range ports for things the user must open.
+
+**Verification.** Pins: `TestUnpublishedPortWarning` (6: warn+steer, published→hint not warn, host
+netns never warns, empty published set says none, start/status one story, schema carries the boundary
+— read from the schema object, not source text). Mutants +4 (warning removed, host-netns guard
+dropped, status warning removed, empty set reported as the range) → **37/37 killed** on the combined
+battery, control green (129 pins). Full suite **19623 passed / 65 skipped / 4:54**. Deployed pid 7796.
+**Live:** `manage_services action=restart name=elden-tracker` through the deployed agent returned the
+report with the warning verbatim, naming the real published set 8100–8104 and the serve-script trap;
+host listeners on 8899 still zero, as the warning says.
+
+**Found on the way — every deploy kills every sandbox service.** The status probe showed all 6
+registered services DEAD, including the operator's `elden-tracker` that was RUNNING at 17:17.
+`docker inspect`: the container was created 2026-08-23 and last STARTED at 17:38:54 — my deploy. An
+agent restart stops/starts the container, so every `setsid nohup` service inside dies; the registry
+labels it "DEAD (exited or container recreated)" and keeps the entry for `action=restart`. Restored
+the operator's service via that restart (it is the live proof above). Not changed: whether the
+supervisor should auto-restart RUNNING services after a boot is a design decision for the operator
+(it would re-run user commands unattended). Also: the sandbox-remote-hosting memory now says so.
+
+## §4EK — Main-loop research write-back (2026-09-03)
+
+**Trigger.** Operator picked item 4 of the "what's next" list ("proceed with 4"; declined auto-restart
+of services: "I might end up having more services than ports"). Root: in 463111ad the main loop ran
+six web searches about the project and threw the results away — only the conversation saw them,
+while coding leaves read `research/*.md` and nothing else; they built from a 3 KB brief that said
+"talismans and stat allocation are not covered" and shipped wrong facts.
+
+**Fix.** `core/project_research.py`: `record_main_loop_findings(store, pid, query, output)` writes
+`research/main-loop-findings.md` — newest first, top 5 results per search with a 200-char snippet +
+URL, a repeated query replaces its own entry, newest 8 searches survive, atomic write, research index
++ INDEX.md kept in step; `parse_search_results` reads the tool's `### N. title / body / [Source: url]`
+blocks and drops link-less rows; error/empty outputs are never recorded. Zero LLM calls. Hook:
+`tools/search.py::tool_search(context=…)` (the registry now passes the live context) calls the
+recorder after the search and appends "(saved to research/main-loop-findings.md in the active
+project — coding leaves read it)" to the tool output. Excluded: `context is None` and pinned project
+contexts — `_PinnedProjectContext.is_pinned_project_context = True` (class attribute, so normal lookup
+beats the proxy's `__getattr__`) — because autonomous leaves already save briefs. **One authority for
+relevance:** the work-log gate's token-overlap body moved from `agent.py` into
+`project_research.request_relevant_to_project`; `GhostAgent._request_relevant_to_project` now
+delegates (it only supplies the live command accumulator), and the recorder uses the same verdict — a
+"get me the news" interlude is neither journaled nor filed. `_gather_research_briefs` needed no
+change: the file sorts before `research-*.md` and its head is the newest search.
+
+**Verification.** 15 pins (`tests/test_main_loop_research_writeback.py`): parsing, newest-first +
+sources + index on both surfaces, off-topic/error/empty not recorded, repeat replaces, eviction, the
+real gatherer picks it up, EXECUTED delegation (flip the authority → the agent's answer flips),
+project-dir-in-commands, the tool hook for live/pinned/no context, and an EXECUTED registry wiring
+pin (build the real tool map from a MagicMock context, monkeypatch `tool_search`, assert the context
+arrives — a substring pin over the registry source was proven vacuous in §4AT). Mutants +7 (gate
+removed, newest-first inverted, eviction removed, repeat not replaced, pinned leaves write back, agent
+gate stops delegating, link-less rows kept) → **44/44 killed** on the combined battery, control green
+(142 pins). Full suite **19636 passed / 65 skipped / 4:50**. Deployed pid 82496. **Live:** scratch
+project, `switch`, one bounded chat request asking for a project-related `web_search` → the tool output
+carried the trailer, `research/main-loop-findings.md` (1,980 B) + INDEX.md appeared in the workspace,
+log line "results written back to project …"; project hard-deleted. Side observation, not this
+change: the search engines answered an Elden Ring query with chiropractic-billing pages — Tor-exit /
+engine quality, see [[onion-engine-survey]] territory.
+
+**Not done.** The write-back records raw results, not a synthesis; a leaf that needs a brief still
+runs the research leaf. Auto-restart of sandbox services after a deploy: declined by the operator.
+
 ## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
 
 **This section is binding. When the operator says "review <feature/subsystem>", this is the

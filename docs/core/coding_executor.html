@@ -321,6 +321,117 @@
     budget-exhaustion branch; the <em>per-file</em> truncation fires first and far more often, and
     only a producer-side pin caught it (mutation-testing showed removing the marker reddened nothing).
   </p>
+
+  <h2 id="think-policy">Think policy, kept rejections, append rollback, two pre-write guards <span class="tag">2026-09-03 · §4EI</span></h2>
+  <p>
+    Request <code>463111ad</code> (an Elden Ring tracker, 7 leaves, <code>autoadvance count=all</code>) ran
+    49 minutes and closed 3 DONE / 3 FAILED with a page that was mostly unreachable. Every mechanism
+    below is a fix for one thing that run did, and each has a pin in
+    <code>tests/test_coding_executor_think_policy_and_append_guards.py</code> that fails on the old code.
+  </p>
+  <p>
+    <b>Think policy.</b> The coding model drafted the <em>whole file</em> inside its think block, so every
+    leaf hit the 30K reasoning ceiling with zero content (6 of 6 thinking attempts, ~115&nbsp;s each), and
+    only the no-think retry ever produced a spec. Thinking still earns its cost on a model that plans in
+    3–15K, so the executor now adapts instead of switching: after
+    <code>GHOST_CODING_THINK_SKIP_AFTER</code> (default 2) <em>consecutive</em> aborted think phases —
+    ceiling, exact n-gram loop, or the whole budget eaten with no content — the spec call starts with
+    thinking disabled (<code>_spec_nothink_call</code>: the same <code>/no_think</code> +
+    <code>enable_thinking=False</code> recipe the retry used). One clean think phase resets the streak; a
+    restart resets it too. The streak is kept <b>per LLM client</b> (weak-keyed), so the one production
+    client adapts once per process while test doubles never see each other. <code>0</code> = never think on
+    spec calls; a negative value = never adapt. The system hint also tells the model not to draft file
+    contents in its thinking. A no-think first call that comes back reasoning-only is <em>not</em> retried
+    with the same recipe.
+  </p>
+  <p>
+    <b>Rejected output is kept.</b> Four of the run's five no-think retries returned complete specs
+    (server-side <code>truncated&nbsp;=&nbsp;0</code>, tail <code>"ledger":"…"}</code>) that the parser
+    rejected, and neither the 400-char log preview nor four live reproductions could say why. When no
+    usable spec is parsed, the raw content and reasoning channels are now written verbatim to
+    <code>$GHOST_HOME/system/coding_executor_failures/</code> (newest <code>UNPARSED_SPEC_KEEP</code>
+    = 30 files survive; nothing is written when <code>GHOST_HOME</code> is unset or the upstream reply was
+    empty), and the warning names the file. Two related tightenings: <code>_usable</code> no longer accepts
+    a <code>files</code> entry with no <code>content</code>/<code>append</code>/<code>edits</code> (the
+    truncation repair salvages <code>[{"path": …}]</code> out of a broken spec, and accepting that skipped
+    the retry and the dump), and <code>_generate_build_spec</code> honours its own contract by returning
+    <code>{}</code> on every failure. In <code>extract_json_from_text</code>, a brace-unbalanced text
+    that <em>ends</em> with <code>}</code> is now reported as <b>UNBALANCED</b> (a quote or escape inside
+    a string desynced the scan) instead of "TRUNCATED … cut off at max_tokens" — the old message sent the
+    reader to the token budget when the defect was inside a string.
+  </p>
+  <p>
+    <b>Append rollback.</b> A syntax-failed <code>append</code> used to stay on disk with feedback "fix it
+    with <code>edits</code>"; the model answered with another append, the file grew 18K→22K, and the same
+    line failed four times. An append is a pure addition, so the pre-append content is a complete known
+    state: the executor now writes it back (<code>_restore_file</code>), marks the snapshot authoritative,
+    and the feedback says the append was <b>reverted</b> and asks for the whole block again. If the restore
+    write itself fails, the old taint→edits flow applies unchanged. New files and <code>content</code>
+    rewrites keep the taint flow (there is no prior state to restore).
+    <b>Already-broken base:</b> if the diagnostic's line number lies <em>before</em> the appended
+    block's start line (<code>_syntax_error_before_block</code> / <code>_appended_block_start_line</code>:
+    the <code>&lt;/body&gt;</code> line for HTML, two past the last non-blank line otherwise), the file was
+    broken before this append — no revert, and the feedback says "line N is in the EXISTING file".
+    A line inside or <em>after</em> the block is the block's fault (an unterminated construct is reported
+    at the next token, in the tail the append pushed down) and reverts. The helper reads the reason
+    <code>_syntax_fail_reason</code> already produced, not the raw tool result.
+  </p>
+  <p>
+    <b>Two pre-write guards</b> (append and content). (1) <em>Placeholder elision</em>: a line that is only
+    <code>...</code>/<code>…</code>, bare or in a <code>//</code>, <code>/* */</code> or
+    <code>&lt;!-- --&gt;</code> comment, in an HTML/JS/TS/CSS file is refused before the write, naming the
+    line — the Talismans leaf shipped two such lines and failed its own syntax check on every retry.
+    Python is exempt: <code>...</code> is a valid statement there; an inline prose ellipsis
+    (<code>Loading...</code>) is not a whole line and passes. (2) <em>Duplicate routing key</em>: an HTML
+    append whose <b>top-level</b> element carries an <code>id</code> or <code>data-*</code> key the file
+    already has (or that the fragment uses twice) is refused, because selectors and routers match the
+    first element — two leaves appended a second <code>&lt;section data-section="bearings"&gt;</code>
+    that the SPA could never show, and both closed DONE. Nested duplicates (a <code>data-item</code> inside
+    a new section) are allowed, and the guard is HTML-only.
+  </p>
+  <p>
+    <b>Spec structure repair (the rejection cause, proven by the kept files).</b> The live proof's
+    kept outputs showed why complete-looking no-think specs failed: not quote escaping but three
+    structural slips at the <code>files</code> boundary — (i) <code>…"},"path":…</code>, the
+    <code>{</code> opening the next entry dropped; (ii) a top-level key (<code>"verify"</code>…) emitted
+    while the files array is still open, the <code>]</code> dropped; (iii) the output simply ending with
+    <code>files</code> and the top object open, <code>]}</code> never emitted (finish reason
+    <em>stop</em>). Braces balance in (i) and (ii), so the scan said "malformed" and every salvage
+    failed. <code>_repair_spec_structure</code> re-parses, and at the parser's own error offset — only
+    when the misplaced token is a known spec key and the string-aware container stack matches — inserts
+    exactly the dropped character(s), then requires a strict <code>json.loads</code> to a dict; an
+    unchanged text is never returned as a repair. It runs last in <code>_parse_spec_channels</code>,
+    the one extraction chain the streamed call and the retry now share. Pinned on the six real files
+    in <code>tests/fixtures/spec_structure_4ei/</code> (one inserted character each for 1–4 and 6; two
+    <code>{</code> plus <code>]}</code> for 5). The sixth shape — the <code>}</code> closing the last
+    file entry dropped before <code>]</code> — came from a post-deploy sanity leaf on the
+    <em>thinking</em> path, which the grammar below cannot cover; the repair is what keeps that path
+    honest.
+  </p>
+  <p>
+    <b>JSON grammar on the no-think call.</b> The repair handles three known shapes; the grammar
+    removes the class. <code>_spec_nothink_call</code> now sends llama-server's OpenAI-compatible
+    <code>response_format</code> (the client posts the payload dict as-is, so no passthrough was
+    needed): by default a <code>json_schema</code> named <code>build_spec</code> built from
+    <code>SPEC_JSON_SCHEMA</code>, which is deliberately loose — it requires only the shape that
+    failed (a <code>files</code> <em>array of objects</em>, each with a <code>path</code>) and allows
+    extra keys and any edits item shape, so it cannot starve a legitimate spec. The server compiles
+    it to GBNF and constrains every sampled token, so a dropped <code>{</code>/<code>]</code> and the
+    <code>```json</code> fence become impossible. Thinking calls never carry it (a think block is not
+    JSON), and the main turn loop is untouched. <code>GHOST_CODING_SPEC_JSON_GRAMMAR</code>:
+    unset/<code>1</code> = schema, <code>object</code> = shape-free <code>json_object</code>,
+    <code>0</code> = off. A backend that errors while the grammar is on gets exactly one retry without
+    it, so the grammar can never fail a leaf by itself; with the grammar off a failing call is not
+    retried. Proven against the live server through the executor's real prompt builder: 4 of 4
+    usable specs in 12–22&nbsp;s, no repair needed, including three runs of the history task that had
+    been rejected 5 of 5 times without it.
+  </p>
+  <p>
+    ⚠ The first draft's dump helper was named <code>_dump_rejected_spec(content, …)</code>, which the
+    <code>test_outcome_consumers_r3</code> AST enumeration reads as a result classifier (a hint word in the
+    name plus a <code>content</code> parameter). It is not one; it was renamed to what it is
+    (<code>_keep_unparsed_spec_output</code>) rather than added to an exempt list.
+  </p>
 </main>
 </body>
 </html>

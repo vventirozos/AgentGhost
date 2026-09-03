@@ -311,6 +311,79 @@ class TestIsPublishedPort:
         assert is_published_port(8100, published_ports=sup._published_ports()) is False
 
 
+class TestUnpublishedPortWarning:
+    """2026-09-03 (§4EJ): a service on a port docker did not publish is
+    reachable only inside the sandbox. The start report used to say only
+    "listening ✓" and omit the remote hint — silence that read as
+    "reachable" to the model and the operator (live: `python3 -m http.server
+    8899`, then `serve-remote.sh 8899` mapped the tailnet onto an empty host
+    port). Both surfaces — start report and status — now say so."""
+
+    def _sup(self, tmp_path, host_netns=False, published=None):
+        from ghost_agent.sandbox.services import ServiceSupervisor
+        sb = FakeSandbox(tmp_path, happy_handler())
+        if host_netns:
+            sb.binds_host_netns = lambda: True
+        if published is not None:
+            sb.published_service_ports = lambda: published
+        return ServiceSupervisor(sb)
+
+    def test_start_on_unpublished_port_warns_and_steers(self, tmp_path):
+        from ghost_agent.sandbox.services import (REMOTE_SERVE_SCRIPT,
+                                                  SUGGESTED_PORTS)
+        out = self._sup(tmp_path).start("dash", "python3 app.py", port=9099)
+        assert "RUNNING" in out
+        assert "NOT reachable from the host" in out
+        assert "9099" in out and SUGGESTED_PORTS in out
+        assert f"{REMOTE_SERVE_SCRIPT} 9099" in out      # names the trap
+        assert "$PORT" in out                             # the way out
+        assert "Remote access" not in out
+
+    def test_start_on_published_port_hints_and_does_not_warn(self, tmp_path):
+        out = self._sup(tmp_path).start("dash", "python3 app.py", port=8100)
+        assert "Remote access" in out
+        assert "NOT reachable from the host" not in out
+
+    def test_host_network_mode_never_warns(self, tmp_path):
+        # Host netns: the port IS on the host loopback; "not published" means
+        # nothing there and the warning would be false.
+        out = self._sup(tmp_path, host_netns=True).start(
+            "dash", "python3 app.py", port=9099)
+        assert "RUNNING" in out
+        assert "NOT reachable" not in out and "in-sandbox only" not in out
+
+    def test_second_instance_published_nothing_says_none(self, tmp_path):
+        # Configured-range port, but the manager published NOTHING (2nd
+        # instance): warn, and say the published set is empty rather than
+        # quoting the configured range.
+        out = self._sup(tmp_path, published=set()).start(
+            "dash", "python3 app.py", port=8100)
+        assert "NOT reachable from the host" in out
+        assert "published: none" in out
+        assert "Remote access" not in out
+
+    def test_status_tells_the_same_story_as_the_start_report(self, tmp_path):
+        from ghost_agent.sandbox.services import REMOTE_SERVE_SCRIPT
+        sup = self._sup(tmp_path)
+        sup.start("inside", "python3 app.py", port=9099)
+        sup.start("shared", "python3 app.py", port=8100)
+        listing = sup.status()
+        inside = next(l for l in listing.splitlines() if "- inside" in l)
+        shared = next(l for l in listing.splitlines() if "- shared" in l)
+        assert "in-sandbox only" in inside and "remote:" not in inside
+        assert "remote:" in shared and REMOTE_SERVE_SCRIPT in shared
+        assert "in-sandbox only" not in shared
+
+    def test_tool_schema_tells_the_model_the_range_boundary(self):
+        # The schema the model actually receives, not the source text.
+        from ghost_agent.tools.sandbox_services import (
+            MANAGE_SERVICES_TOOL_DEFINITION, SUGGESTED_PORTS)
+        desc = (MANAGE_SERVICES_TOOL_DEFINITION["function"]["parameters"]
+                ["properties"]["port"]["description"])
+        assert "OUTSIDE that range are reachable only inside the sandbox" in desc
+        assert SUGGESTED_PORTS in desc
+
+
 class TestRemoteAccessHint:
     def test_hint_names_the_serve_script_and_url_and_bind(self):
         h = remote_access_hint(8100)

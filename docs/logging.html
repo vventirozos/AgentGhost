@@ -281,6 +281,24 @@
   </ul>
   <p>Tests: <code>tests/test_logging_stream_fixes.py</code>.</p>
 
+  <h2>&sect;4EH &mdash; coverage + icon-sense pass (2026-09-03)</h2>
+  <p>The stream is a monitoring tool, so severity must read at a glance and meaningful events must
+  appear at all. <strong>Icon severity:</strong> an ERROR/CRITICAL line now always renders the
+  failure glyph &#10060; (or &#128274; SHIELD for a deliberate fail-closed security refusal) &mdash;
+  17 lines that used a soft amber &#128310;, a halt &#128721;, or a cheerful tool glyph on an ERROR
+  were corrected, and <code>tests/test_4eh_log_icons.py</code> lints the invariant over the AST.
+  <strong>Coverage:</strong> the per-turn router decision (label/confidence/escalation, gates MCTS
+  and the planner) and the memory hydration verdict ("N/M recalled memories used") now reach the
+  live stream instead of only the file mirror; foresight predict/resolve failures surface at
+  WARNING. <strong>Consistency:</strong> <code>level="WARN"</code>&rarr;<code>"WARNING"</code>, the
+  dark-web breaker line uses the onion &#129445; not the clearnet globe &#127760;, and the Verifier
+  Gate line uses the flask &#129514; not a thought bubble. <strong>Phase 4:</strong> a dedicated
+  tool-dispatch glyph &#129520; (so a tool call no longer borrows the &#127916; "request started"
+  clapperboard; added to both client icon maps), and the title collisions where two different
+  events shared one rendered name &mdash; "Service" split into Sandbox/Project, the research
+  summarizer's "Worker Compute" &rarr; "Research Compute", boot "Memory Bus" &rarr; "Memory Bus
+  Init". The "verifier" stream (one coherent flask-iconed class) and a few sub-event icon varieties
+  were left as-is.</p>
 </main>
 </body>
 </html>

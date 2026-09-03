@@ -543,6 +543,16 @@ class MemoryBus:
                      for i in sorted(used_idx)]
             logger.info("hydration-judge: %d/%d surfaced memor(ies) used -> %s",
                         len(used_idx), len(survivors), "; ".join(_used))
+            # §4EH: this is the operator's primary "is recalled memory paying
+            # off?" signal — put it on the live stream, not just the file.
+            try:
+                from ..utils.logging import pretty_log, Icons
+                pretty_log("Memory Used",
+                           f"{len(used_idx)}/{len(survivors)} recalled "
+                           f"memor(ies) used: " + "; ".join(_used),
+                           icon=Icons.MEM_READ)
+            except Exception:  # noqa: BLE001
+                pass
         return len(used_idx)
 
     def _credit_surfaced(self, survivors: List[Dict[str, Any]]) -> None:

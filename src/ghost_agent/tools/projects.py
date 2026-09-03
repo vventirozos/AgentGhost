@@ -1525,7 +1525,7 @@ def _stop_project_services(context, project_id: str,
             except Exception:
                 continue
         if stopped:
-            pretty_log("Service", f"stopped {stopped} service(s) of project "
+            pretty_log("Project Service", f"stopped {stopped} service(s) of project "
                                   f"{project_id} (lifecycle)", icon=Icons.STOP)
     except Exception:
         return stopped

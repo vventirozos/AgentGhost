@@ -397,7 +397,7 @@ def log_prm_boot_warnings(context):
             + ". Every value read here would be a pre-wiring default. NO "
             "PRM warning is emitted this boot, so their absence means "
             "nothing. This is a boot-ordering defect, not a config one.",
-            level="ERROR", icon=Icons.WARN,
+            level="ERROR", icon=Icons.FAIL,
         )
         return {"unread": None, "online_update": None,
                 "inert_flag": None, "wiring_error": _unwired}
@@ -429,7 +429,7 @@ def log_prm_boot_warnings(context):
             "handed a placeholder. NO PRM warning is emitted this boot, "
             "so their absence means nothing. This is a wiring defect, "
             "not a config one.",
-            level="ERROR", icon=Icons.WARN,
+            level="ERROR", icon=Icons.FAIL,
         )
         return {"unread": None, "online_update": None,
                 "inert_flag": None, "wiring_error": _missing}
@@ -559,7 +559,7 @@ def audit_prm_boot_warnings_ran(context):
            "silence about PRM inertness means nothing. Either the boot "
            "hop was removed/disabled/short-circuited, or it ran and "
            "bailed on the wiring defect logged above.")
-    pretty_log("PRM Boot Warnings", msg, level="ERROR", icon=Icons.WARN)
+    pretty_log("PRM Boot Warnings", msg, level="ERROR", icon=Icons.FAIL)
     return msg
 
 
@@ -2002,7 +2002,7 @@ async def lifespan(app):
             if getattr(context, "memory_dir", None) is not None else None
         ),
     )
-    pretty_log("Memory Bus", "Cognitive event bus initialized", icon=Icons.EVENT_BUS)
+    pretty_log("Memory Bus Init", "Cognitive event bus initialized", icon=Icons.EVENT_BUS)
 
     # Self-evaluation gate. Verifier owns no persistent state; it just
     # holds a reference to the LLM so it can run claim/output checks.

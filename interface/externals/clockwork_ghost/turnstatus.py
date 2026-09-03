@@ -79,6 +79,7 @@ ICON_CLASS = {
     "🔬": "tool",
     "🐍": "tool",
     "🐚": "tool",
+    "🧰": "tool",
     "📥": "tool",
     "🎨": "tool",
     "📄": "tool",

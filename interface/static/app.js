@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=10.5';
+import * as matrixGraphFace from './matrix_graph.js?v=10.6';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -123,6 +123,7 @@ const ICON_CLASS = {
     '🔬': 'tool',     // TOOL_DEEP
     '🐍': 'tool',     // TOOL_CODE
     '🐚': 'tool',     // TOOL_SHELL
+    '🧰': 'tool',     // TOOL_DISPATCH
     '📥': 'tool',     // TOOL_DOWN / Docker pull
     '🎨': 'tool',     // IMAGE_GEN
     '📄': 'tool',     // REPORT_PDF

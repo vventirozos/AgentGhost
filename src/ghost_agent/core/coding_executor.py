@@ -29,8 +29,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import logging
+import os
 import re
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -58,6 +61,26 @@ MAX_CONTENT_CHARS = 400_000
 # verify failure on attempt 3-4; the old hard stop at 2 converted a recoverable
 # build into a batch-halting FAILURE. Each retry is fed the exact failure reason.
 MAX_ATTEMPTS = 4
+# Think policy (2026-09-03, §4EI). Live: a coding model that drafts the WHOLE
+# file inside its think block hits the ceiling above on every leaf — 6 of 6
+# thinking attempts in request 463111ad, ~115 s each, zero content — and only
+# the no-think retry ever produced a spec. Thinking still earns its cost on a
+# model that plans in 3-15K, so the policy is adaptive rather than a switch:
+# after this many CONSECUTIVE aborted think phases (ceiling, n-gram loop, or
+# the whole budget eaten with no content) the spec call starts with thinking
+# disabled; one clean think phase (content produced) resets the streak. The
+# streak is kept PER LLM CLIENT (weak-keyed), so the one long-lived production
+# client adapts once per process while test doubles never see each other.
+#   GHOST_CODING_THINK_SKIP_AFTER=<n>   default 2
+#   0 = never think on spec calls;  negative = never adapt (legacy behaviour).
+# A process restart (deploy) or a clean think phase resets the streak.
+THINK_SKIP_AFTER_ABORTS_DEFAULT = 2
+# Rejected spec outputs are kept VERBATIM under
+# $GHOST_HOME/system/coding_executor_failures/ (newest UNPARSED_SPEC_KEEP
+# files). The 400-char log preview could not say WHY four complete-looking
+# retry outputs failed to parse in 463111ad — and GHOST_LLM_RECORD is off in
+# production — so the next rejection must leave the whole text behind.
+UNPARSED_SPEC_KEEP = 30
 # A COMPLETELY empty upstream response (content=0 reasoning=0) is contention/
 # infra, not the model failing — feedback retries can't fix it, so cap them
 # separately (with a small backoff) rather than burning all MAX_ATTEMPTS
@@ -684,6 +707,491 @@ def _recover_spec_escaping_newlines(channels, extract, usable) -> dict:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Think policy — see THINK_SKIP_AFTER_ABORTS_DEFAULT
+# ---------------------------------------------------------------------------
+
+_THINK_STATE: "weakref.WeakKeyDictionary[Any, Dict[str, int]]" = weakref.WeakKeyDictionary()
+_THINK_STATE_FALLBACK: Dict[int, Dict[str, int]] = {}
+
+
+def _think_skip_after() -> int:
+    raw = (os.getenv("GHOST_CODING_THINK_SKIP_AFTER") or "").strip()
+    if not raw:
+        return THINK_SKIP_AFTER_ABORTS_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return THINK_SKIP_AFTER_ABORTS_DEFAULT
+
+
+def _think_state(llm) -> Dict[str, int]:
+    """Per-client streak record: ``{"aborts": n, "skipping": 0|1}``."""
+    try:
+        st = _THINK_STATE.get(llm)
+        if st is None:
+            st = {"aborts": 0, "skipping": 0}
+            _THINK_STATE[llm] = st
+        return st
+    except TypeError:  # not weak-referenceable / unhashable double
+        return _THINK_STATE_FALLBACK.setdefault(
+            id(llm), {"aborts": 0, "skipping": 0})
+
+
+def _think_disabled_now(llm) -> bool:
+    """Should this spec call skip the think phase entirely?"""
+    n = _think_skip_after()
+    if n < 0:
+        return False
+    if n == 0:
+        return True
+    return _think_state(llm)["aborts"] >= n
+
+
+def _note_think_outcome(llm, *, aborted: bool) -> None:
+    """Record one streamed think phase: aborted (zero content) or clean."""
+    n = _think_skip_after()
+    st = _think_state(llm)
+    if not aborted:
+        if st["aborts"]:
+            logger.info("coding_executor: think phase produced content — "
+                        "abort streak reset (was %d)", st["aborts"])
+        st["aborts"] = 0
+        st["skipping"] = 0
+        return
+    st["aborts"] += 1
+    if n > 0 and st["aborts"] >= n and not st["skipping"]:
+        st["skipping"] = 1
+        logger.warning(
+            "coding_executor: %d consecutive think phases aborted with no "
+            "content — spec calls now start with thinking DISABLED "
+            "(GHOST_CODING_THINK_SKIP_AFTER=%d; a clean think phase or a "
+            "restart resets)", st["aborts"], n)
+
+
+# JSON grammar for the no-think spec call (2026-09-03, §4EI follow-up).
+# The five kept rejections were all STRUCTURAL slips (a dropped `{`, `]` or
+# `]}` at the files boundary). A grammar makes those impossible at the
+# sampler: llama-server's OpenAI-compatible `response_format` compiles the
+# schema to GBNF and constrains every generated token. The schema is
+# deliberately loose — only the shape that failed (an ARRAY of OBJECTS with
+# a path) is required; extra keys and any edits item shape are allowed, so
+# it cannot starve a legitimate spec. Thinking calls never get it: a think
+# block is not JSON. Never applied to the main turn loop (different path).
+#   GHOST_CODING_SPEC_JSON_GRAMMAR   unset/1 = json_schema (default),
+#                                    object  = json_object (shape-free),
+#                                    0/off   = no grammar.
+SPEC_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "files": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"path": {"type": "string"},
+                           "content": {"type": "string"},
+                           "append": {"type": "string"},
+                           "edits": {"type": "array",
+                                     "items": {"type": "object"}}},
+            "required": ["path"]}},
+        "verify": {"type": "string"},
+        "summary": {"type": "string"},
+        "ledger": {"type": "string"},
+    },
+    "required": ["files"],
+}
+
+
+def _spec_response_format() -> Optional[Dict[str, Any]]:
+    mode = (os.getenv("GHOST_CODING_SPEC_JSON_GRAMMAR") or "1").strip().lower()
+    if mode in ("0", "off", "false", "no", "none"):
+        return None
+    if mode == "object":
+        return {"type": "json_object"}
+    return {"type": "json_schema",
+            "json_schema": {"name": "build_spec", "schema": SPEC_JSON_SCHEMA}}
+
+
+async def _spec_nothink_call(llm, model: str, sys_hint: str, user: str,
+                             is_background: bool) -> Tuple[str, str]:
+    """The thinking-disabled spec call: ``/no_think`` soft-switch +
+    ``enable_thinking=False`` hard-switch + a system nudge — the same recipe
+    as project_research._llm_call and dream.py — plus the JSON grammar
+    (see SPEC_JSON_SCHEMA). Returns (content, reasoning). Used both as the
+    retry after an aborted think phase and, once the think policy has
+    flipped, as the FIRST call. A backend that rejects `response_format`
+    (or any error while the grammar is on) gets ONE retry without it, so a
+    grammar can never make the leaf fail on its own."""
+    def _payload(grammar: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        p: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_hint +
+                 "\nDo NOT emit a <think> block — output the JSON object directly."},
+                {"role": "user", "content": user + "\n\n/no_think"},
+            ],
+            "temperature": 0.3, "max_tokens": 16384, "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if grammar:
+            p["response_format"] = grammar
+        return p
+
+    grammar = _spec_response_format()
+    try:
+        resp = await llm.chat_completion(_payload(grammar), is_background=is_background)
+    except Exception as e:  # noqa: BLE001 — see docstring
+        if not grammar:
+            raise
+        logger.warning("coding_executor: no-think spec call with the JSON "
+                       "grammar failed (%s: %s) — retrying once without it",
+                       type(e).__name__, _short(str(e), 160))
+        resp = await llm.chat_completion(_payload(None), is_background=is_background)
+    msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
+    return msg.get("content") or "", msg.get("reasoning_content") or ""
+
+
+def _unparsed_spec_dir():
+    home = (os.getenv("GHOST_HOME") or "").strip()
+    if not home:
+        return None
+    from pathlib import Path
+    return Path(home) / "system" / "coding_executor_failures"
+
+
+def _keep_unparsed_spec_output(content: str, reasoning: str,
+                        note: str = "") -> Optional[str]:
+    """Keep the raw channels of a rejected spec call on disk (never raises).
+    Returns the file path, or None when GHOST_HOME is unset or the write
+    failed. Newest ``UNPARSED_SPEC_KEEP`` files survive."""
+    d = _unparsed_spec_dir()
+    if d is None:
+        return None
+    try:
+        import time as _time
+        d.mkdir(parents=True, exist_ok=True)
+        stamp = _time.strftime("%Y%m%dT%H%M%S", _time.gmtime())
+        fn = d / f"{stamp}_{os.getpid()}_{_time.time_ns() % 1_000_000:06d}.txt"
+        fn.write_text(
+            f"# coding_executor rejected spec output\n# {note}\n"
+            f"# content_chars={len(content)} reasoning_chars={len(reasoning)}\n"
+            f"===== CONTENT =====\n{content}\n"
+            f"===== REASONING =====\n{reasoning}\n", encoding="utf-8")
+        files = sorted(d.glob("*.txt"))   # names sort by time
+        for old in files[:max(0, len(files) - UNPARSED_SPEC_KEEP)]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(fn)
+    except Exception:  # noqa: BLE001 — a diagnostic must never fail the leaf
+        logger.debug("coding_executor: rejected-spec dump failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Spec structure repair (2026-09-03, §4EI live proof)
+# ---------------------------------------------------------------------------
+# The rejected-output dump finally showed WHY complete-looking no-think specs
+# failed to parse: not quote escaping but two structural slips at the
+# `files` array boundary — corpus tests/fixtures/spec_structure_4ei, 4 of 4
+# rejections in one leaf:
+#   * `…"}]` never emitted: a top-level key ("verify"/"summary"/"ledger")
+#     arrives while the files array is still open  → the `]` was dropped;
+#   * `…"},"path":…`: an entry key arrives directly inside the files array
+#     → the `{` opening the next file object was dropped.
+# Braces balance either way, so the brace scan says "malformed" and every
+# salvage path fails. The repair inserts exactly the one character the
+# parser's own error offset and the open-container stack call for, and
+# nothing else; the result must strictly json.loads to a dict.
+
+_SPEC_TOP_KEYS = frozenset({"files", "verify", "summary", "ledger"})
+_SPEC_ENTRY_KEYS = frozenset({"path", "content", "append", "edits", "find",
+                              "replace", "after", "before", "insert"})
+
+
+def _container_stack(t: str, upto: int) -> str:
+    """Open containers (`{`/`[`) at offset ``upto``, string-aware."""
+    st: List[str] = []
+    in_str = esc = False
+    for ch in t[:upto]:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            st.append(ch)
+        elif ch in "}]":
+            if st:
+                st.pop()
+    return "".join(st)
+
+
+def _strip_fences(t: str) -> str:
+    t = (t or "").strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def _repair_spec_structure(text: str, max_fixes: int = 4
+                           ) -> Optional[Tuple[str, List[str]]]:
+    """Repair the two boundary slips described above. Each fix is applied
+    at the parser's error offset ONLY when the misplaced token is a known
+    spec key and the container stack matches; anything else returns None.
+    Returns ``(fixed_text, fixes)`` — never an unrepaired or unchanged
+    text, so a caller cannot mistake a plain parse for a repair."""
+    body = _strip_fences(text)
+    start = body.find("{")
+    if start < 0:
+        return None
+    body = body[start:]
+    fixes: List[str] = []
+    for _ in range(max_fixes):
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError as e:
+            pos = e.pos
+        else:
+            return (body, fixes) if fixes and isinstance(obj, dict) else None
+        if pos >= len(body):
+            # Third slip (live proof, 5th kept output): the output simply
+            # ENDS with `files` and the top object still open — the model
+            # dropped the closing `]}` (finish_reason was stop, not a cut).
+            # Close what is open, innermost first; an EOF inside a string
+            # makes the next parse fail elsewhere and returns None.
+            stack = _container_stack(body, len(body))
+            if not stack:
+                return None
+            body += "".join("]" if c == "[" else "}" for c in reversed(stack))
+            fixes.append(f"closed {len(stack)} open container(s) at end of output")
+            continue
+        if body[pos] == "]":
+            # Fourth slip (post-deploy sanity leaf, think path): the `}`
+            # closing the last file entry dropped — `…"append":"…"],"verify"`.
+            # Only when the parser is inside an object that sits directly in
+            # an array; the `]` then belongs to that array.
+            stack = _container_stack(body, pos)
+            if stack.endswith("[{"):
+                body = body[:pos] + "}" + body[pos:]
+                fixes.append("closed an entry object before `]`")
+                continue
+            return None
+        if body[pos] != ":":
+            return None
+        # The string just before `pos` is a key that landed in the wrong
+        # container: `"key":` where the parser expected `,` or `]`.
+        q_end = body.rfind('"', 0, pos)
+        q_start = body.rfind('"', 0, q_end) if q_end > 0 else -1
+        if q_start < 0:
+            return None
+        key = body[q_start + 1:q_end]
+        before = body[:q_start].rstrip()
+        if not before.endswith(","):
+            return None
+        comma = len(before) - 1
+        stack = _container_stack(body, q_start)
+        if key in _SPEC_TOP_KEYS and stack == "{[":
+            body = body[:comma] + "]" + body[comma:]
+            fixes.append(f'closed `files` before "{key}"')
+        elif key in _SPEC_ENTRY_KEYS and stack.endswith("["):
+            body = body[:q_start] + "{" + body[q_start:]
+            fixes.append(f'opened an entry object before "{key}"')
+        else:
+            return None
+    return None
+
+
+def _parse_spec_channels(content: str, reasoning: str, extract, usable) -> dict:
+    """The full spec-extraction chain over both model channels: content,
+    reasoning, both joined, raw-newline recovery, then the structural
+    repair. Returns the first USABLE spec, else whatever the chain last
+    produced (the caller treats non-usable as a rejection)."""
+    spec = extract(content, repair_truncated=True) or {}
+    if not usable(spec) and reasoning:
+        spec = extract(reasoning, repair_truncated=True) or {}
+        if not usable(spec):
+            # A spec split across the closing </think> boundary.
+            spec = extract(f"{reasoning}\n{content}", repair_truncated=True) or spec
+    if not usable(spec):
+        spec = _recover_spec_escaping_newlines(
+            (content, reasoning), extract, usable) or spec
+    if not usable(spec):
+        for channel in (content, reasoning):
+            if not (channel or "").strip():
+                continue
+            rep = _repair_spec_structure(channel)
+            if not rep:
+                continue
+            cand = extract(rep[0]) or {}
+            if usable(cand):
+                logger.warning("coding_executor: spec structure repaired — %s",
+                               "; ".join(rep[1]))
+                return cand
+    return spec
+
+
+# ---------------------------------------------------------------------------
+# Pre-write guards shared by append and content (2026-09-03, §4EI)
+# ---------------------------------------------------------------------------
+
+_WEB_SUFFIXES = (".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".jsx", ".tsx",
+                 ".css", ".scss", ".vue", ".svelte")
+# A line that is ONLY an elision marker — `...` / `…`, optionally inside a
+# comment (`// ...`, `/* ... */`, `<!-- ... -->`). In JS/CSS such a line never
+# parses; in HTML it is a text node that reads as "rest omitted". Python is
+# deliberately NOT covered: `...` is a valid statement there.
+_ELISION_LINE_RE = re.compile(
+    r"^\s*(?:<!--\s*|/\*\s*|//\s*)?(?:\.\.\.|…)\s*(?:\*/\s*|-->\s*)?$")
+
+
+def _placeholder_elision_reason(text: str, path: str) -> Optional[str]:
+    """Why ``text`` must not be written to ``path``: it elides code with
+    placeholder lines. Live 2026-09-03: the Talismans leaf appended a block
+    with `...` in both its markup and its script; the file then failed the
+    syntax check on that line for every retry."""
+    if not path.lower().endswith(_WEB_SUFFIXES):
+        return None
+    hits = [i for i, line in enumerate((text or "").split("\n"), 1)
+            if _ELISION_LINE_RE.match(line)]
+    if not hits:
+        return None
+    where = ", ".join(f"line {h}" for h in hits[:4])
+    return (f"{path} refused BEFORE writing: the spec contains {len(hits)} "
+            f"placeholder line(s) ('...' at {where}) — elided code is not "
+            f"code and does not parse. Emit the COMPLETE block; if it is too "
+            f"long, put the feature in a separate file or split the task.")
+
+
+def _html_keys(text: str, top_level_only: bool) -> List[Tuple[str, str]]:
+    """``(attr, value)`` pairs for ``id`` and ``data-*`` attributes — on every
+    element, or only on the DEPTH-0 elements of a fragment."""
+    from html.parser import HTMLParser
+    void = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+            "meta", "param", "source", "track", "wbr"}
+    out: List[Tuple[str, str]] = []
+
+    class _P(HTMLParser):
+        depth = 0
+
+        def _take(self, attrs):
+            for k, v in attrs:
+                if v is not None and (k == "id" or k.startswith("data-")):
+                    out.append((k, v))
+
+        def handle_starttag(self, tag, attrs):
+            if not top_level_only or self.depth == 0:
+                self._take(attrs)
+            if tag not in void:
+                self.depth += 1
+
+        def handle_startendtag(self, tag, attrs):
+            if not top_level_only or self.depth == 0:
+                self._take(attrs)
+
+        def handle_endtag(self, tag):
+            if tag not in void and self.depth > 0:
+                self.depth -= 1
+
+    p = _P()
+    p.feed(text or "")
+    return out
+
+
+def _html_duplicate_key_reason(base: str, fragment: str,
+                               path: str) -> Optional[str]:
+    """Why an HTML ``fragment`` must not be appended to ``base``: one of its
+    TOP-LEVEL elements carries an ``id``/``data-*`` key the file already has
+    (or the fragment uses twice). Live 2026-09-03: two leaves each appended a
+    second ``<section data-section="bearings">``; the SPA's
+    ``querySelector('[data-section=…]')`` matches the first element, so both
+    deliverables were unreachable — and both tasks closed DONE."""
+    if not path.lower().endswith((".html", ".htm")):
+        return None
+    try:
+        top = _html_keys(fragment, top_level_only=True)
+        have = set(_html_keys(base, top_level_only=False)) if base else set()
+    except Exception:  # noqa: BLE001 — a guard must never raise
+        return None
+    seen: set = set()
+    for k, v in top:
+        if (k, v) in have or (k, v) in seen:
+            return (f"append to {path} refused BEFORE writing: its top-level "
+                    f"element carries {k}=\"{v}\", which the file already has "
+                    f"(or the fragment uses twice). A second element with the "
+                    f"same key is unreachable — selectors and routers match "
+                    f"the FIRST one — so this is not an addition. Use `edits` "
+                    f"to fill or change the existing {k}=\"{v}\" element, or "
+                    f"give the new element a NEW key.")
+        seen.add((k, v))
+    return None
+
+
+async def _restore_file(tool_runner: ToolRunner, path: str, content: str) -> bool:
+    """Write ``content`` back to ``path`` after a syntax-failed append. True
+    when the write went through (the file is the pre-append state again)."""
+    try:
+        out = await tool_runner(
+            "file_system", {"operation": "write", "path": path, "content": content})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("coding_executor: restore of %s after a syntax-failed "
+                       "append errored: %s", path, e)
+        return False
+    if _looks_like_write_error(out):
+        logger.warning("coding_executor: restore of %s after a syntax-failed "
+                       "append was rejected: %s", path, _short(out))
+        return False
+    return True
+
+
+_DIAG_LINE_RE = re.compile(r"\bline\s+(\d+)")
+
+
+def _appended_block_start_line(base: str, path: str) -> int:
+    """1-based line where ``_smart_append`` places the new block in ``base``:
+    the line holding the last ``</body>`` (else ``</html>``) for HTML, two
+    lines past the last non-blank line otherwise."""
+    base = base or ""
+    if path.lower().endswith((".html", ".htm")):
+        low = base.lower()
+        for anchor in ("</body>", "</html>"):
+            idx = low.rfind(anchor)
+            if idx != -1:
+                return base[:idx].count("\n") + 1
+    return base.rstrip().count("\n") + 3
+
+
+def _syntax_error_before_block(base: str, path: str, reason: str) -> Optional[int]:
+    """Given the reason ``_syntax_fail_reason`` produced (it carries the
+    sandbox diagnostic), the reported line number when it points BEFORE the
+    appended block — the file was already broken before this append; None
+    when the line is inside or after the block, or no line is reported.
+    Lines AFTER the block still count as the block's: an unterminated
+    construct is reported at the next token or EOF — the tail the append
+    pushed down."""
+    text = str(reason or "")
+    idx = text.find("SYNTAX CHECK FAILED")
+    m = _DIAG_LINE_RE.search(text[idx:] if idx >= 0 else text)
+    if not m:
+        return None
+    line = int(m.group(1))
+    return line if line < _appended_block_start_line(base, path) else None
+
+
+def _reverted_append_reason(path: str, out: str) -> str:
+    text = str(out or "")
+    idx = text.find("SYNTAX CHECK FAILED")
+    diag = " ".join(text[idx:].split())[:400] if idx >= 0 else ""
+    return (f"the block appended to {path} does NOT parse — {diag} The append "
+            f"was REVERTED: {path} is back to its previous state, so there is "
+            f"nothing to fix in place. Re-emit the WHOLE block as a corrected "
+            f"`append` (complete code, no '...' elisions, no re-declared "
+            f"identifiers).")
+
+
 async def _stream_spec_completion(llm, payload: Dict[str, Any],
                                   is_background: bool):
     """Stream the build-spec generation, accumulating the content and
@@ -823,7 +1331,13 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         "with a verify that proves it — never re-implement working code. "
         "The verify must NOT kill or restart processes/services (no fuser -k, "
         "pkill, kill) — if a service is involved, probe the one already "
-        "running (e.g. curl its port)."
+        "running (e.g. curl its port).\n"
+        "Think briefly (a short plan), then answer. Do NOT draft file contents "
+        "inside your thinking — code belongs in the JSON output only; a think "
+        "phase that outgrows the planning budget is aborted and the attempt "
+        "is lost. Never append a second copy of a section/container the file "
+        "already has (same id or data-* key): fill the existing one with "
+        "`edits`, or give the new one a new key."
     )
     user = f"TASK: {description}\n"
     if constraints:
@@ -858,12 +1372,28 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     # mid-string yields invalid JSON and a truncated file, and a reasoning
     # model spends part of the budget in `reasoning_content` before the
     # JSON even starts.
-    content, reasoning, loop_aborted = await _stream_spec_completion(llm, {
-        "model": model,
-        "messages": [{"role": "system", "content": sys_hint},
-                     {"role": "user", "content": user}],
-        "temperature": 0.3, "max_tokens": 16384,
-    }, is_background)
+    think_off = _think_disabled_now(llm)
+    if think_off:
+        # Think policy (§4EI): the streak of aborted think phases has hit the
+        # threshold (or the operator set the knob to 0) — skip the ~2-minute
+        # think phase that has been producing nothing and go straight to the
+        # call that has been producing specs.
+        logger.info("coding_executor: spec call starts with thinking disabled "
+                    "(GHOST_CODING_THINK_SKIP_AFTER=%d, abort streak %d)",
+                    _think_skip_after(), _think_state(llm)["aborts"])
+        content, reasoning = await _spec_nothink_call(
+            llm, model, sys_hint, user, is_background)
+        loop_aborted = None
+    else:
+        content, reasoning, loop_aborted = await _stream_spec_completion(llm, {
+            "model": model,
+            "messages": [{"role": "system", "content": sys_hint},
+                         {"role": "user", "content": user}],
+            "temperature": 0.3, "max_tokens": 16384,
+        }, is_background)
+        _note_think_outcome(
+            llm, aborted=bool(loop_aborted)
+            or (not content.strip() and bool(reasoning.strip())))
     # Reasoning models (Qwen via llama.cpp) emit their chain-of-thought in a
     # separate `reasoning_content` field. When the think block consumes the
     # whole token budget without closing, the parser routes EVERYTHING there
@@ -879,7 +1409,17 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
             return False
         files = s.get("files")
         if isinstance(files, list) and files:
-            return True
+            # An entry must carry a payload (§4EI): the truncation repair can
+            # salvage `[{"path": "app.js"}]` from a broken spec, and a
+            # path-only entry is not a spec — accepting it skipped the
+            # no-think retry AND the rejected-output dump, then failed the
+            # attempt as "no writable files".
+            if any(isinstance(f, dict) and (
+                    str(f.get("content") or "").strip()
+                    or str(f.get("append") or "").strip()
+                    or (isinstance(f.get("edits"), list) and f.get("edits")))
+                   for f in files):
+                return True
         # A VERIFY-ONLY spec ("the deliverable already exists — just prove
         # it works") is a first-class answer (2026-08-01): the caller's
         # no-files path honours the verify and closes the task without
@@ -889,19 +1429,9 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         # re-implementing files that already worked.
         return bool(str(s.get("verify") or "").strip())
 
-    spec = extract_json_from_text(content, repair_truncated=True) or {}
-    if not _usable(spec) and reasoning:
-        spec = extract_json_from_text(reasoning, repair_truncated=True) or {}
-        if not _usable(spec):
-            # Last resort: scan reasoning + content together (a spec split
-            # across the closing </think> boundary).
-            spec = extract_json_from_text(
-                f"{reasoning}\n{content}", repair_truncated=True) or spec
-    if not _usable(spec):
-        # Raw-newline-in-string repair (see _repair_json_string_newlines).
-        spec = _recover_spec_escaping_newlines(
-            (content, reasoning), extract_json_from_text, _usable) or spec
-    if not _usable(spec) and not content.strip() and reasoning.strip():
+    spec = _parse_spec_channels(content, reasoning, extract_json_from_text, _usable)
+    if (not _usable(spec) and not content.strip() and reasoning.strip()
+            and not think_off):
         # The think phase produced no JSON: the stream guard aborted it
         # (exact n-gram loop or the 30K reasoning ceiling — the reason is
         # named in the log so live tuning has data), or the think block
@@ -928,25 +1458,9 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
                 "coding_executor: think block consumed the whole budget "
                 "(content=0, reasoning=%d chars) — retrying once with "
                 "thinking disabled", len(reasoning.strip()))
-        resp = await llm.chat_completion({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": sys_hint +
-                 "\nDo NOT emit a <think> block — output the JSON object directly."},
-                {"role": "user", "content": user + "\n\n/no_think"},
-            ],
-            "temperature": 0.3, "max_tokens": 16384, "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }, is_background=is_background)
-        msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
-        content = msg.get("content") or ""
-        reasoning = msg.get("reasoning_content") or ""
-        spec = extract_json_from_text(content, repair_truncated=True) or {}
-        if not _usable(spec) and reasoning:
-            spec = extract_json_from_text(reasoning, repair_truncated=True) or spec
-        if not _usable(spec):
-            spec = _recover_spec_escaping_newlines(
-                (content, reasoning), extract_json_from_text, _usable) or spec
+        content, reasoning = await _spec_nothink_call(
+            llm, model, sys_hint, user, is_background)
+        spec = _parse_spec_channels(content, reasoning, extract_json_from_text, _usable)
     was_empty = not content.strip() and not reasoning.strip()
     if not _usable(spec):
         # Diagnostic: the model returned no usable file spec. Log a window of
@@ -954,12 +1468,22 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         # JSON-escaped code? truncated mid-think? — or a fully EMPTY upstream
         # response, content=0 reasoning=0, which is contention, not the model).
         raw = (content or reasoning).strip()
+        # Keep the WHOLE output (§4EI): the head/tail window below could not
+        # explain four complete-looking rejections in one request.
+        kept = None if was_empty else _keep_unparsed_spec_output(
+            content, reasoning, note=f"think_off={think_off}")
         logger.warning(
             "coding_executor: no file spec parsed (content=%d reasoning=%d%s). "
-            "RAW head: %s ||| tail: %s",
+            "RAW head: %s ||| tail: %s%s",
             len(content.strip()), len(reasoning.strip()),
             " — EMPTY upstream response" if was_empty else "",
-            raw[:400].replace("\n", "\\n"), raw[-200:].replace("\n", "\\n"))
+            raw[:400].replace("\n", "\\n"), raw[-200:].replace("\n", "\\n"),
+            (f" ||| full output kept at {kept}" if kept else
+             ("" if was_empty else
+              " ||| (set GHOST_HOME to keep the full output on disk)")))
+        # Contract (docstring): {} on every failure. A salvaged-but-unusable
+        # dict (path-only entries) must not leak to the caller as a spec.
+        spec = {}
     return spec, was_empty
 
 
@@ -1124,6 +1648,14 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         pyguard = _py_append_guard(base, append, path)
         if pyguard:
             return (None, pyguard)
+        # §4EI pre-write guards: elided code never parses, and a top-level
+        # element that re-uses an existing id/data-* key is unreachable.
+        placeholder = _placeholder_elision_reason(append, path)
+        if placeholder:
+            return (None, placeholder)
+        dupkey = _html_duplicate_key_reason(base, append, path)
+        if dupkey:
+            return (None, dupkey)
         new = _smart_append(base, append.strip(), path)
         if len(new) > MAX_CONTENT_CHARS:
             # Never truncate (it would cut off closing tags and break the
@@ -1141,6 +1673,25 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         touched.add(path)
         sfail = _syntax_fail_reason(path, out)
         if sfail:
+            # Revert (2026-09-03, §4EI). An append is a pure addition, so the
+            # pre-append content is a complete, known state — put it back.
+            # Left on disk, the broken block poisoned every retry: the model
+            # answered "line 387 does not parse" with ANOTHER append, the
+            # file grew 18K→22K, and the same line failed four times.
+            pre = _syntax_error_before_block(base, path, sfail)
+            if pre is not None:
+                # The reported line precedes the appended block: the file was
+                # broken BEFORE this append. Reverting would hide that and
+                # blame the new block — keep the taint flow and say where the
+                # fault really is.
+                return (None, f"{sfail} NOTE: line {pre} is in the EXISTING "
+                              f"file, before the block you appended — the "
+                              f"file was already broken; fix that line with "
+                              f"`edits`.")
+            if base.strip() and await _restore_file(tool_runner, path, base):
+                snap[path] = base
+                fresh.add(path)
+                return (None, _reverted_append_reason(path, out))
             return (None, sfail)
         # Record the just-written content so a SECOND append to the same path
         # in this spec builds on it instead of the pre-write state — two
@@ -1199,6 +1750,9 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         return (None, f"{path} content is {len(content)} chars (> "
                       f"{MAX_CONTENT_CHARS}) — split it across multiple files "
                       f"instead of emitting one oversized file")
+    placeholder = _placeholder_elision_reason(content, path)
+    if placeholder:
+        return (None, placeholder)
 
     # Truncation guard: an HTML file written via full `content` that has no
     # closing </html> was almost certainly cut off at the token cap (observed:

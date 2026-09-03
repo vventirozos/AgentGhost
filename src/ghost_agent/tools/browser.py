@@ -982,7 +982,7 @@ async def tool_browser(
             )
     except Exception as e:
         pretty_log("Browser Failed", f"{operation}: {type(e).__name__}: {e}",
-                   icon=Icons.TOOL_BROWSER, level="ERROR")
+                   icon=Icons.FAIL, level="ERROR")
         return _err(f"sandbox execute failed: {e}", ran=True)
 
     ok, parsed = _parse_runner_output(output or "")

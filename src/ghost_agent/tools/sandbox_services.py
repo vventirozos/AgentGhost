@@ -60,7 +60,7 @@ async def tool_manage_services(action: str = None, name: str = None,
             _detail += f" · {command}" + (f" :{port}" if port else "")
         if project_id and action in ("start", "adopt"):
             _detail += f" · project {project_id}"
-        pretty_log("Service", _detail, icon=Icons.SANDBOX_BOX)
+        pretty_log("Sandbox Service", _detail, icon=Icons.SANDBOX_BOX)
 
     def _declare(res):
         """Say what happened, so nobody has to guess from the prose.
@@ -191,7 +191,11 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "the preference) and a free port from "
                         f"{SUGGESTED_PORTS} is assigned automatically; if "
                         "the preferred port is taken the service starts on "
-                        "the next free one and the report says so. The "
+                        "the next free one and the report says so. Ports "
+                        "OUTSIDE that range are reachable only inside the "
+                        "sandbox (the user's browser and serve-remote cannot "
+                        "reach them) — never name one for something the user "
+                        "must open. The "
                         "granted port is exported as the PORT env var — "
                         "bind that (`port=int(os.environ.get('PORT', "
                         "<default>))`). Pass 0 ONLY for a service that "

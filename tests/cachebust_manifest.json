@@ -1,11 +1,11 @@
 {
   "app.js": {
-    "sha": "5180cf657f6737fc",
-    "version": "10.5"
+    "sha": "c61b3bb81102fa13",
+    "version": "10.6"
   },
   "matrix_graph.js": {
     "sha": "3718a2f10ec95dab",
-    "version": "10.5"
+    "version": "10.6"
   },
   "notifications.js": {
     "sha": "d285f64c8a82f93d",

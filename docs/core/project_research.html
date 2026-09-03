@@ -114,6 +114,41 @@
   the fix. Test: <code>test_project_research_offmain.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+
+  <h2 id="main-loop-writeback">Main-loop research write-back <span class="tag">2026-09-03 · §4EK</span></h2>
+  <p>
+    Live (request <code>463111ad</code>): the main loop ran six web searches about the active project and
+    threw the results away — only the conversation saw them, while the coding leaves read the
+    project's <code>research/</code> files and nothing else. They built from a 3&nbsp;KB brief that said
+    "talismans and stat allocation are not covered" and shipped wrong facts.
+  </p>
+  <p>
+    Every <em>relevant</em> main-loop <code>web_search</code> now lands in
+    <code>research/main-loop-findings.md</code> — newest first, the top 5 results of each search with a
+    200-char snippet and the source URL, a repeated query replaces its own entry, and only the newest
+    <code>MAIN_LOOP_FINDINGS_MAX_SEARCHES</code> (8) survive. Zero LLM calls: the raw results with their
+    URLs are the record. The research index (metadata + <code>INDEX.md</code>) carries a
+    <code>main-loop-findings</code> entry, and <code>_gather_research_briefs</code> — what the coding
+    executor reads — picks the file up unchanged (it sorts before <code>research-*.md</code> and its head
+    is the newest search). The tool output tells the model where the results now live.
+  </p>
+  <p>
+    <b>Who writes, who does not.</b> The hook sits in <code>tool_search</code>, which the registry now
+    calls with the live context; it writes only when <code>current_project_id</code> is set and the
+    context is not a pinned one — autonomous leaves (autoadvance, the <code>/advance</code> route, the
+    research leaf itself) build tools from <code>_PinnedProjectContext</code>, whose
+    <code>is_pinned_project_context</code> marker excludes them, since their research is already saved as
+    a brief. Error outputs and empty result sets are never recorded.
+  </p>
+  <p>
+    <b>One authority for "is this about the project".</b> The work-log gate's token-overlap check
+    (request vs. project title/description/task text, or a command naming the project dir) moved out
+    of <code>agent.py</code> into <code>request_relevant_to_project</code> here; the agent method now
+    delegates, and the recorder uses the same verdict — so "get me the news" in a project conversation
+    is neither journaled nor filed as research. Pins:
+    <code>tests/test_main_loop_research_writeback.py</code> (executed delegation, executed registry
+    wiring, the gatherer integration).
+  </p>
 </main>
 </body>
 </html>

@@ -364,6 +364,7 @@ class Icons:
     TOOL_DEEP    = "🔬"
     TOOL_CODE    = "🐍"
     TOOL_SHELL   = "🐚"
+    TOOL_DISPATCH = "🧰"  # a tool being INVOKED (distinct from REQ_START 🎬)
     TOOL_FILE_W  = "💾"
     TOOL_FILE_R  = "📖"
     TOOL_FILE_M  = "📙"   # MULTI-path batch read (distinct from the single 📖)

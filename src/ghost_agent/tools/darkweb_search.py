@@ -402,7 +402,7 @@ def _breaker_record(name: str, won: bool) -> None:
         if name in _ENGINE_BREAKER:
             _ENGINE_BREAKER.pop(name, None)
             pretty_log("Darkweb Engine", f"{name}: recovered — breaker cleared",
-                       icon=Icons.TOOL_SEARCH)
+                       icon=Icons.TOOL_DARKWEB)
         return
     fails, opened = _ENGINE_BREAKER.get(name, (0, 0.0))
     fails += 1
@@ -1544,7 +1544,7 @@ async def tool_darkweb_research(
                 _sized = plan.describe()
             except Exception:                                   # noqa: BLE001
                 _sized = "sizing unavailable"
-            pretty_log("Worker Compute",
+            pretty_log("Research Compute",
                        f"Distilled facts from {short_url} — {_sized}",
                        icon=Icons.TOOL_DEEP)
             try:

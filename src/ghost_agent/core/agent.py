@@ -4334,8 +4334,21 @@ def _scan_json_braces(t: str) -> int:
 
 
 def _unclosed_braces(t: str) -> int:
-    """How many `{` were never closed. >0 means the text was CUT OFF."""
+    """How many `{` were never closed by a string-aware scan. >0 means the
+    text was cut off — OR that a stray quote inside a string desynced the
+    scan; ``_ends_like_closed_json`` tells the two apart."""
     return max(0, _scan_json_braces(t))
+
+
+_CLOSING_FENCE_RE = re.compile(r"\s*```\s*$")
+
+
+def _ends_like_closed_json(t: str) -> bool:
+    """True when the text's last non-blank character (ignoring a trailing
+    code fence) is `}` or `]` — the shape of an object that was finished,
+    whatever the brace scan says about it."""
+    tail = _CLOSING_FENCE_RE.sub("", (t or "").rstrip())
+    return tail.rstrip().endswith(("}", "]"))
 
 
 _INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
@@ -4598,6 +4611,24 @@ def extract_json_from_text(text: str, repair_truncated: bool = False) -> dict:
                 logger.debug("extract_json_from_text: braces appear only "
                              "inside inline code spans — prose, not JSON. "
                              f"Preview: {preview}")
+            elif _unclosed_braces(text) > 0 and _ends_like_closed_json(text):
+                # (3) UNBALANCED IS NOT TRUNCATED EITHER (2026-09-03, §4EI).
+                #     Four retry outputs in request 463111ad ended with
+                #     `"ledger":"…"}` + a closing fence, the server reported
+                #     truncated=0, and this branch still printed "cut off at
+                #     max_tokens" — sending the reader to the token budget
+                #     when the defect was inside a string. A text that ENDS
+                #     with `}` was not cut; its brace count is off because a
+                #     quote/escape inside a string desynced the scan.
+                logger.warning(
+                    "extract_json_from_text: UNBALANCED JSON — "
+                    f"{_unclosed_braces(text)} unclosed brace(s) by a "
+                    f"string-aware scan of {len(text)} chars that END with a "
+                    f"closing brace: a quote or escape inside a string most "
+                    f"likely desynced the scan. This is NOT a max_tokens cut — "
+                    f"inspect the raw output (coding_executor keeps rejected "
+                    f"specs under $GHOST_HOME/system/coding_executor_failures/). "
+                    f"Preview: {preview}")
             elif _unclosed_braces(text) > 0:
                 logger.warning(
                     "extract_json_from_text: TRUNCATED JSON — "
@@ -7852,7 +7883,7 @@ class GhostAgent:
                            "package location" if _nc_root is None
                            else "GHOST_HOME is unset")
                         + ". The cascade's refusals are UNVERIFIED.",
-                        level="ERROR", icon=Icons.WARN,
+                        level="ERROR", icon=Icons.FAIL,
                     )
                     self._record_autonomous_activity(
                         "negative_controls",
@@ -7890,7 +7921,7 @@ class GhostAgent:
                                 + f". The cascade may have stopped refusing. "
                                   f"{_detail}")
                             pretty_log("Negative Controls", _ncmsg,
-                                       level="ERROR", icon=Icons.WARN)
+                                       level="ERROR", icon=Icons.FAIL)
                         self._record_autonomous_activity(
                             "negative_controls", _ncmsg)
                     except Exception as _nce:  # noqa: BLE001
@@ -7902,7 +7933,7 @@ class GhostAgent:
                             f"RUN FAILED ({type(_nce).__name__}: {_nce}) — "
                             f"the cascade's refusals are UNVERIFIED this "
                             f"cycle.",
-                            level="ERROR", icon=Icons.WARN)
+                            level="ERROR", icon=Icons.FAIL)
                         self._record_autonomous_activity(
                             "negative_controls",
                             f"run FAILED: {type(_nce).__name__}")
@@ -7985,7 +8016,7 @@ class GhostAgent:
                         "GEPA Autonomy",
                         "a job HUNG past its outer watchdog — the child "
                         "may still be running; investigate before the "
-                        "next window", level="ERROR", icon=Icons.WARN)
+                        "next window", level="ERROR", icon=Icons.FAIL)
                     self._record_autonomous_activity(
                         "gepa_autonomy", "job hung past the watchdog",
                         severity="notify")
@@ -7995,7 +8026,7 @@ class GhostAgent:
                     self._safe_pretty_log(
                         "GEPA Autonomy",
                         f"phase FAILED: {type(_gae).__name__}: {_gae}",
-                        level="ERROR", icon=Icons.WARN)
+                        level="ERROR", icon=Icons.FAIL)
                 finally:
                     self._last_gepa_autonomy_at = datetime.datetime.now()
 
@@ -9226,7 +9257,7 @@ class GhostAgent:
                         "the optimizer launch HUNG past the outer "
                         "watchdog — the child may still be running; "
                         "investigate before the next window",
-                        level="ERROR", icon=Icons.WARN)
+                        level="ERROR", icon=Icons.FAIL)
                     self._record_autonomous_activity(
                         "gepa_autonomy",
                         "optimizer hung past the watchdog",
@@ -9238,7 +9269,7 @@ class GhostAgent:
                         "GEPA Autonomy",
                         f"optimizer phase FAILED: "
                         f"{type(_goe).__name__}: {_goe}",
-                        level="ERROR", icon=Icons.WARN)
+                        level="ERROR", icon=Icons.FAIL)
                 finally:
                     self._last_gepa_optimizer_at = datetime.datetime.now()
 
@@ -15624,7 +15655,7 @@ class GhostAgent:
                                     "Tool Call",
                                     fname + (f" · {' · '.join(_disp_bits)}"
                                              if _disp_bits else ""),
-                                    icon=Icons.REQ_START)
+                                    icon=Icons.TOOL_DISPATCH)
                             except Exception:
                                 pass
                             _coro = self.available_tools[fname](**t_args)
@@ -17801,30 +17832,14 @@ class GhostAgent:
         ``cmds``: the command list to check; the streamed drain passes its
         request-tagged snapshot rather than the (possibly-reassigned) live
         self.context accumulator."""
-        try:
-            req_tokens = {
-                t for t in re.findall(
-                    r"[a-z0-9]+", str(request or "").lower())
-                if len(t) > 3}
-            if not req_tokens:
-                return False
-            _cmds = cmds if cmds is not None else (
-                getattr(self.context, "_project_work_cmds", None) or [])
-            for _cmd in _cmds:
-                if project_id and str(project_id) in str(_cmd):
-                    return True
-            proj = store.get_project(project_id) or {}
-            hay = str(proj.get("title") or "") + " " + str(proj.get("description") or "")
-            try:
-                for t in store.list_tasks(project_id) or []:
-                    hay += " " + str(t.get("description") or "")
-            except Exception:
-                pass
-            hay_tokens = {
-                t for t in re.findall(r"[a-z0-9]+", hay.lower()) if len(t) > 3}
-            return bool(req_tokens & hay_tokens)
-        except Exception:
-            return True
+        # One authority (2026-09-03, §4EK): the same verdict now gates the
+        # main-loop research write-back, so the logic lives in
+        # project_research.request_relevant_to_project and this method only
+        # supplies the live command accumulator.
+        from .project_research import request_relevant_to_project
+        _cmds = cmds if cmds is not None else (
+            getattr(self.context, "_project_work_cmds", None) or [])
+        return request_relevant_to_project(store, project_id, request, cmds=_cmds)
 
     async def _finalize_and_return(self, fs: "FinalizeState"):
         """The post-turn-loop finalization chain — output scrubbers,
@@ -20286,6 +20301,25 @@ class GhostAgent:
                             router_escalation_kind=str(
                                 getattr(decision, "escalation_kind", "") or ""),
                         )
+                        # §4EH: surface the per-turn routing decision on the
+                        # operator stream — it gates MCTS + the planner every
+                        # turn and was previously only stashed + turn_facts'd.
+                        try:
+                            _rc = decision.confidence
+                            pretty_log(
+                                "Router Decision",
+                                f"{decision.label}"
+                                + (f" · conf {_rc:.2f}"
+                                   if isinstance(_rc, (int, float)) else "")
+                                + (f" · ESCALATED "
+                                   f"({getattr(decision, 'escalation_kind', '') or '?'})"
+                                   if decision.escalated else "")
+                                + (f" · {decision.reason}"
+                                   if getattr(decision, "reason", "") else ""),
+                                icon=Icons.BRAIN_ROUTE,
+                            )
+                        except Exception:  # noqa: BLE001 — a log must not break routing
+                            pass
                         # §4BR — the router's FIRST consumer, decided HERE
                         # and not where it is used.
                         #
@@ -23967,7 +24001,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     f"{'REFUTED' if _refuted else 'UNVERIFIED'} → "
                                     f"auto-repair round {repair_round}/"
                                     f"{self._MAX_VERIFIER_REPAIRS}: {_crit[:100]}",
-                                    icon=Icons.BRAIN_THINK, level="WARNING",
+                                    icon=Icons.VERIFIER_LAB, level="WARNING",
                                 )
                                 continue
 

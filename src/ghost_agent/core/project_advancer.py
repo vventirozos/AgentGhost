@@ -233,6 +233,10 @@ class _PinnedProjectContext:
     """
 
     __slots__ = ("_base", "_pinned_pid")
+    # Class attribute (normal lookup wins over __getattr__): lets tools tell
+    # an autonomous leaf's calls (research briefs already saved) from a live
+    # conversation's — the main-loop research write-back keys on it (§4EK).
+    is_pinned_project_context = True
 
     def __init__(self, base, project_id: str):
         object.__setattr__(self, "_base", base)

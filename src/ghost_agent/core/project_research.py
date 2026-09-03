@@ -271,6 +271,150 @@ def _write_index_md(store, project_id: str, rdir: Path) -> None:
         logger.debug("research INDEX.md write skipped", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Main-loop research write-back (2026-09-03, §4EK)
+# ---------------------------------------------------------------------------
+# Live 2026-09-03 (request 463111ad): the main loop ran six web searches
+# about the project and threw the results away — only the conversation saw
+# them, and the coding leaves read the project's research/ files, nothing
+# else. The leaves then built from a 3 KB brief that said "talismans and
+# stat allocation are not covered", and shipped wrong facts. Every relevant
+# main-loop search is now appended (newest first, bounded) to
+# research/main-loop-findings.md, which _gather_research_briefs already
+# picks up. Zero LLM calls: the raw results with their URLs are the record.
+
+MAIN_LOOP_FINDINGS_FILE = "main-loop-findings.md"
+MAIN_LOOP_FINDINGS_SLUG = "main-loop-findings"
+MAIN_LOOP_FINDINGS_TOPIC = "Main-loop search findings (auto)"
+MAIN_LOOP_FINDINGS_MAX_SEARCHES = 8
+MAIN_LOOP_FINDINGS_MAX_RESULTS = 5
+MAIN_LOOP_FINDINGS_SNIPPET_CHARS = 200
+_FINDINGS_HEADER = (
+    "# Main-loop search findings (auto)\n\n"
+    "_Raw web-search results the agent found while working on this project "
+    "in conversation — newest first, bounded. Not a brief: cite the URLs and "
+    "verify claims before building on them._\n"
+)
+_SEARCH_BLOCK_RE = re.compile(
+    r"###\s*\d+\.\s*(?P<title>.*?)\n(?P<body>.*?)\n\[Source:\s*(?P<url>[^\]]+)\]",
+    re.DOTALL)
+
+
+def request_relevant_to_project(store, project_id, request, cmds=None) -> bool:
+    """True when ``request`` plausibly concerns ``project_id``: shares a
+    significant token with the project title/description or its task
+    descriptions, or a command in ``cmds`` names the project's directory.
+    Fail-OPEN (True) on any store error — the gate exists to drop obvious
+    off-topic interludes, never to lose real work records. This is THE
+    authority: Agent._request_relevant_to_project delegates here and the
+    findings recorder uses the same verdict (one input, one story)."""
+    try:
+        req_tokens = {
+            t for t in re.findall(r"[a-z0-9]+", str(request or "").lower())
+            if len(t) > 3}
+        if not req_tokens:
+            return False
+        for _cmd in (cmds or []):
+            if project_id and str(project_id) in str(_cmd):
+                return True
+        proj = store.get_project(project_id) or {}
+        hay = str(proj.get("title") or "") + " " + str(proj.get("description") or "")
+        try:
+            for t in store.list_tasks(project_id) or []:
+                hay += " " + str(t.get("description") or "")
+        except Exception:
+            pass
+        hay_tokens = {
+            t for t in re.findall(r"[a-z0-9]+", hay.lower()) if len(t) > 3}
+        return bool(req_tokens & hay_tokens)
+    except Exception:
+        return True
+
+
+def parse_search_results(output: str) -> List[Dict[str, str]]:
+    """The search tool's ``### N. title / body / [Source: url]`` blocks as
+    dicts. Anything else (error strings, empty output) parses to []."""
+    out: List[Dict[str, str]] = []
+    for m in _SEARCH_BLOCK_RE.finditer(output or ""):
+        url = m.group("url").strip()
+        if not url or url == "#":
+            continue
+        out.append({"title": " ".join(m.group("title").split()),
+                    "body": " ".join(m.group("body").split()),
+                    "url": url})
+    return out
+
+
+def _render_finding(query: str, results: List[Dict[str, str]], ts: float) -> str:
+    iso = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    lines = [f"## {iso} — {query.strip()}"]
+    for r in results[:MAIN_LOOP_FINDINGS_MAX_RESULTS]:
+        snip = r["body"][:MAIN_LOOP_FINDINGS_SNIPPET_CHARS].rstrip()
+        if len(r["body"]) > MAIN_LOOP_FINDINGS_SNIPPET_CHARS:
+            snip += "…"
+        lines.append(f"- **{r['title']}** — {snip}\n  {r['url']}")
+    return "\n".join(lines) + "\n"
+
+
+def _split_findings(text: str) -> List[str]:
+    """Existing entries (each starting with '## '), header dropped."""
+    body = text.split("\n## ", 1)
+    if len(body) < 2:
+        return []
+    return ["## " + part.strip() + "\n" for part in body[1].split("\n## ") if part.strip()]
+
+
+def _entry_query(entry: str) -> str:
+    first = entry.split("\n", 1)[0]
+    return first.split(" — ", 1)[1].strip().lower() if " — " in first else first.lower()
+
+
+def record_main_loop_findings(store, project_id: str, query: str, output: str,
+                              *, ts: Optional[float] = None) -> Optional[str]:
+    """Append a relevant main-loop search to the project's
+    ``research/main-loop-findings.md`` (newest first; a repeated query
+    replaces its own entry; the newest ``MAIN_LOOP_FINDINGS_MAX_SEARCHES``
+    survive) and keep the research index in step. Returns the project-
+    relative path when written, else None. Never raises."""
+    try:
+        query = " ".join(str(query or "").split())
+        if not query or not project_id:
+            return None
+        if not request_relevant_to_project(store, project_id, query):
+            return None
+        results = parse_search_results(output)
+        if not results:
+            return None
+        rdir = _research_dir(store, project_id)
+        if rdir is None:
+            return None
+        ts = time.time() if ts is None else float(ts)
+        path = rdir / MAIN_LOOP_FINDINGS_FILE
+        existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        entries = [e for e in _split_findings(existing)
+                   if _entry_query(e) != query.lower()]
+        entries.insert(0, _render_finding(query, results, ts))
+        entries = entries[:MAIN_LOOP_FINDINGS_MAX_SEARCHES]
+        text = _FINDINGS_HEADER + "\n" + "\n".join(entries)
+        import os as _os
+        tmp = path.with_suffix(".md.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        _os.replace(tmp, path)
+        rel = f"{RESEARCH_SUBDIR}/{MAIN_LOOP_FINDINGS_FILE}"
+        _upsert_index(store, project_id, {
+            "slug": MAIN_LOOP_FINDINGS_SLUG,
+            "topic": MAIN_LOOP_FINDINGS_TOPIC,
+            "path": rel,
+            "summary_preview": f"latest: {query[:80]} ({len(entries)} searches kept)",
+            "ts": ts,
+        })
+        _write_index_md(store, project_id, rdir)
+        return rel
+    except Exception:  # noqa: BLE001 — a record must never fail the search
+        logger.debug("main-loop findings write-back skipped", exc_info=True)
+        return None
+
+
 def _fallback_summary(topic: str, search_output: str) -> str:
     """Heuristic brief when no LLM is available: list the result titles."""
     if not search_output:

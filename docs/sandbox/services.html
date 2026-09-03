@@ -234,6 +234,25 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   network exposure itself. The <code>manage_services</code> report surfaces the
   exact <code>serve-remote.sh</code> command + URL whenever a service comes up
   on a published port, so the operator never has to remember the recipe.</p>
+  <p class="note"><strong>Unpublished ports say so (2026-09-03, §4EJ).</strong>
+  When a command names its own port (<code>python3 -m http.server 8899</code>)
+  the supervisor honours it as the preference — even outside the published
+  range. The service then really is up and "listening ✓" <em>inside</em> the
+  sandbox (the browser tool, the verifier and <code>execute</code> all reach it
+  there), but nothing listens on the host, and <code>serve-remote.sh 8899</code>
+  maps the tailnet onto an empty port. The report used to omit the remote hint
+  and say nothing else — silence that read as "reachable". In bridge mode the
+  start report now appends <code>⚠ NOT reachable from the host: port 8899 is
+  not published by the sandbox (published: …)</code>, names the serve-script
+  trap, and steers the next start back to the range (omit the port so a
+  published one is leased and exported as <code>$PORT</code>); the status
+  listing marks the same service <code>⚠ in-sandbox only</code>. Host network
+  mode never warns — there the port is on the host loopback already. A second
+  instance that published nothing reports <code>published: none</code>. The
+  tool schema's <code>port</code> description carries the same boundary so the
+  model stops choosing out-of-range ports for things the user must open.
+  Pins: <code>TestUnpublishedPortWarning</code> in
+  <code>tests/test_sandbox_services.py</code>.</p>
 
   <h2>Case-insensitive name resolution (2026-07-17)</h2>
   <p>Lookups (<code>stop</code> / <code>restart</code> / <code>status</code> / <code>logs</code>,

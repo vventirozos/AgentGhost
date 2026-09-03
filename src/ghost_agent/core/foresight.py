@@ -462,7 +462,10 @@ class Foresight:
                               p_fail=None, basis="none", support=0,
                               simulation=bool(simulation))
         except Exception as exc:  # noqa: BLE001
-            logger.debug("foresight predict skipped: %s", exc)
+            # §4EH: foresight is a steering INSTRUMENT — if it stops
+            # predicting the operator must see it, not just the debug file.
+            pretty_log("Foresight", f"predict skipped: {type(exc).__name__}: {exc}",
+                       level="WARNING", icon=Icons.WARN)
             return None
 
     # -- resolve ----------------------------------------------------------
@@ -501,7 +504,8 @@ class Foresight:
             return self._write_ledger(pred, ok=ok, error_head=error_head,
                                       req_id=req_id, step=step)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("foresight resolve skipped: %s", exc)
+            pretty_log("Foresight", f"resolve skipped: {type(exc).__name__}: {exc}",
+                       level="WARNING", icon=Icons.WARN)
             return False
 
     def _write_ledger(self, pred: Prediction, *, ok: bool,

@@ -163,6 +163,33 @@ def remote_access_hint(port: int) -> str:
     )
 
 
+def unpublished_port_warning(port: int, published_ports: Optional[set] = None,
+                             spec: Optional[str] = None) -> str:
+    """The other half of ``remote_access_hint`` (2026-09-03). A service on a
+    port docker did NOT publish is reachable ONLY inside the sandbox: the
+    in-sandbox browser and execute see it, the operator's browser does not,
+    and ``serve-remote.sh <port>`` maps the tailnet onto an empty host port.
+    Live: the model started ``python3 -m http.server 8899`` (a port it chose
+    itself), the report said only "listening ✓", and the operator spent the
+    afternoon wondering why the serve script gave nothing. Says so, and steers
+    the next start back to the published range."""
+    if published_ports:
+        span = ",".join(str(p) for p in sorted(published_ports))
+    elif published_ports is None:
+        span = spec or os.environ.get("GHOST_SANDBOX_SERVICE_PORTS", SUGGESTED_PORTS)
+    else:
+        span = "none"
+    return (
+        f"⚠ NOT reachable from the host: port {port} is not published by the "
+        f"sandbox (published: {span}), so http://127.0.0.1:{port} exists only "
+        f"INSIDE the sandbox — the user's browser cannot open it and "
+        f"`{REMOTE_SERVE_SCRIPT} {port}` would map the tailnet onto an empty "
+        f"port. For user/remote access restart it on a published port: omit "
+        f"the port from the command (a free one from {SUGGESTED_PORTS} is "
+        f"leased and exported as $PORT) or name one in that range."
+    )
+
+
 def default_service_ports(spec: Optional[str] = None) -> list:
     """Parse a ports spec like ``"8100-8104"`` or ``"8100,8101"`` into a
     bounded list of ints. Empty/invalid → []. Shared by docker.py's
@@ -432,6 +459,15 @@ class ServiceSupervisor:
             return self.sandbox.published_service_ports()
         except Exception:
             return None
+
+    def _binds_host_netns(self) -> bool:
+        """True in host network mode (Linux default): every service port is
+        then on the host loopback already, so "not published" does not mean
+        "not reachable from the host". Stub/older managers → bridge."""
+        try:
+            return bool(self.sandbox.binds_host_netns())
+        except Exception:  # noqa: BLE001
+            return False
 
     def _exec(self, cmd: str, timeout: int = 30):
         out, code = self.sandbox.execute(cmd, timeout=timeout)
@@ -1305,8 +1341,13 @@ class ServiceSupervisor:
                 f"In-sandbox URL: http://127.0.0.1:{port} — the browser and "
                 f"execute tools reach it there (listening ✓). The port is "
                 f"exported to the app as $PORT.")
-            if is_published_port(port, published_ports=self._published_ports()):
+            _pub = self._published_ports()
+            if is_published_port(port, published_ports=_pub):
                 lines.append(remote_access_hint(port))
+            elif not self._binds_host_netns():
+                # Bridge mode and an unpublished port: say so — silence here
+                # read as "reachable" to the model AND the operator (2026-09-03).
+                lines.append(unpublished_port_warning(port, published_ports=_pub))
         lines.append(
             f"Logs: action='logs' name='{name}' · stop: action='stop'. "
             f"It survives across turns until stopped (or the sandbox "
@@ -1621,6 +1662,11 @@ class ServiceSupervisor:
                             e['port'], published_ports=self._published_ports()):
                         part += (f" · remote: {REMOTE_SERVE_SCRIPT} "
                                  f"{e['port']}")
+                    elif _lp and not self._binds_host_netns():
+                        # Same story as the start report (2026-09-03).
+                        part += (" · ⚠ in-sandbox only: port not published "
+                                 "to the host (restart on one of "
+                                 f"{SUGGESTED_PORTS} for user/remote access)")
                 else:
                     part += f", port {e['port']} (kept for restart)"
             up = time.time() - float(e.get("started_at") or 0)
