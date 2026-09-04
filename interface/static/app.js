@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=10.6';
+import * as matrixGraphFace from './matrix_graph.js?v=10.7';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -270,10 +270,18 @@ function toggleSendButtonUI(isProcessing, stoppable = true) {
             sendBtn.innerHTML = stoppable ? CANCEL_SVG : SEND_SVG;
             sendBtn.classList.toggle('send-btn-cancel', !!stoppable);
             sendBtn.disabled = !stoppable;
+            // The accessible name has to move with the state. This button
+            // is icon-only in all three of them, so a static label would
+            // announce "Send message" while the control is a Stop — worse
+            // than the no-name-at-all it replaced, because it is confidently
+            // wrong. The markup's aria-label is the idle value.
+            sendBtn.setAttribute('aria-label',
+                stoppable ? 'Stop the current turn' : 'Working — please wait');
         } else {
             sendBtn.innerHTML = SEND_SVG;
             sendBtn.classList.remove('send-btn-cancel');
             sendBtn.disabled = false;
+            sendBtn.setAttribute('aria-label', 'Send message');
         }
     }
 }
@@ -821,12 +829,54 @@ const RENDERABLE_LANGS = new Set([
     'language-mermaid', 'language-csv'
 ]);
 
+// Wrap rendered markdown tables in a horizontal scroller (2026-09-04).
+//
+// A table wider than the bubble used to be SQUEEZED into it: the browser
+// shrinks columns until the text wraps, and a four-column comparison came
+// out as ragged prose whose columns could not be told apart. `.table-scroll`
+// + `width: max-content` on the table (style.css) lets it keep its natural
+// column widths and scroll instead.
+//
+// Called from decorateCodeBlocks rather than from decorateCodeBlocks' three
+// callers: every path that renders agent markdown already reaches that one
+// function, and a second call to remember at each site is a call the next
+// site forgets.
+//
+// Idempotence (streaming reassigns innerHTML on every chunk, so this runs
+// per token) comes from the DOM itself — "is my parent already a wrapper?"
+// — not from a `data-` marker. The first version carried both; mutation
+// testing showed deleting the marker changed no behaviour, because the
+// derived check already covered every case. A marker can also go STALE in
+// a way the derived check cannot: move a wrapped table out of its wrapper
+// and the marker still claims it is wrapped, so the table silently loses
+// its scroller forever.
+function decorateTables(root) {
+    if (!root) return;
+    root.querySelectorAll('table').forEach(table => {
+        if (table.parentElement
+            && table.parentElement.classList.contains('table-scroll')) {
+            return;
+        }
+        const wrap = document.createElement('div');
+        wrap.className = 'table-scroll';
+        // A scrollable region must be reachable by keyboard, or a table
+        // wider than the bubble is unreadable without a pointer.
+        wrap.tabIndex = 0;
+        wrap.setAttribute('role', 'region');
+        wrap.setAttribute('aria-label', 'Table');
+        table.parentNode.insertBefore(wrap, table);
+        wrap.appendChild(table);
+    });
+}
+
 // Decorate <pre><code> blocks inside a rendered message with a small
 // language pill + copy button. Runs on each marked.parse() reassignment;
 // the `data-decorated` marker makes it idempotent so repeated streaming
-// updates don't stack buttons.
+// updates don't stack buttons. Also the single entry point for the other
+// per-message markdown decorations (see decorateTables).
 function decorateCodeBlocks(root) {
     if (!root) return;
+    decorateTables(root);
     const pres = root.querySelectorAll('pre');
     pres.forEach(pre => {
         if (pre.dataset.decorated === '1') return;
@@ -2723,10 +2773,15 @@ const workspaceUploadInput = document.getElementById('workspace-upload-input');
 
 function updateWorkspaceBtnState() {
     if (!workspaceBtn) return;
+    // One glyph, two actions. The title already flipped; the accessible
+    // name did not, so screen-reader users got the same word for both
+    // branches of the click handler.
     if (chatHistory.length === 0) {
         workspaceBtn.title = "Load Workspace";
+        workspaceBtn.setAttribute('aria-label', 'Load workspace');
     } else {
         workspaceBtn.title = "Save Workspace";
+        workspaceBtn.setAttribute('aria-label', 'Save workspace');
     }
     workspaceBtn.innerHTML = `
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -4339,6 +4394,7 @@ window.GhostCore = {
     renderMarkdown,
     renderHistoryToLog,
     decorateCodeBlocks,
+    decorateTables,
     decorateMessageActions,
     attachRenderButtons,
     stripInternalTags: _stripInternalTags,
@@ -4384,7 +4440,7 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=7.6').catch(e => {
+import('./workspace.js?v=7.7').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,

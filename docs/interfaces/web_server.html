@@ -670,6 +670,103 @@
   the <code>BaseException</code> escape hatch <code>_BodyTooLarge</code> exists for was never
   exercised.</p>
 
+  <h2>2026-09-04 UI/UX audit fixes</h2>
+  <p>Found by auditing the live server headlessly (Playwright at six viewports, 1512×945 down
+  to 375×667 plus an 844×390 landscape phone) and measuring contrast ratios, touch-target
+  sizes and layout geometry in-page, rather than by reading the source. Every fix is
+  mutation-pinned; the suites are <code>tests/test_interface_markdown_render.py</code>,
+  <code>tests/test_interface_rail_dismiss.py</code>,
+  <code>tests/test_interface_contrast.py</code> and
+  <code>tests/test_interface_a11y.py</code>.</p>
+  <ul>
+    <li><strong>Agent markdown had nowhere to land (HIGH, closed).</strong> <code>style.css</code>
+    styled <code>pre</code>, <code>code</code>, <code>ul</code>/<code>ol</code>,
+    <code>blockquote</code>, <code>a</code> and <code>img</code> inside <code>.message</code> —
+    and nothing else. <code>table</code>, <code>th</code>, <code>td</code>,
+    <code>h1</code>–<code>h6</code> and <code>hr</code> took the UA defaults inside a bubble
+    designed for none of it. Measured on a live reply: <code>th</code> padding was the UA's
+    <code>1px</code> with <code>border-collapse: separate</code>, so a four-column comparison
+    rendered as ragged text whose columns could not be told apart — the table was <em>worse</em>
+    than the list it replaced; <code>hr</code> came out as the UA's
+    <code>rgb(128,128,128)</code> groove, the brightest element in the bubble, reading as a
+    heading underline rather than a section break; <code>h2</code> landed at 2em UA bold beside
+    0.95rem/300 body text. Tables now collapse their borders with 7×10px cells and a mono
+    eyebrow header row; headings differentiate by weight and the mono/sans axis rather than by
+    scale (h3 and below become mono eyebrows — at these sizes a half-step of scale is invisible
+    but a family switch is not); <code>hr</code> is a fading hairline matching
+    <code>.empty-hero-rule</code>. A table wider than the bubble now SCROLLS instead of being
+    crushed: <code>decorateTables()</code> in <code>app.js</code> wraps each one in a focusable
+    <code>.table-scroll</code> region and the table takes <code>width: max-content</code>.
+    Idempotence comes from the DOM (<em>is my parent already a wrapper?</em>) rather than a
+    <code>data-</code> marker — streaming re-runs the decorators on every chunk, and mutation
+    testing showed the marker the first version carried was fully redundant with the derived
+    check, as well as being able to go stale in a way the derived check cannot.</li>
+
+    <li><strong>The sessions drawer never closed after you picked a session (HIGH, closed).</strong>
+    <code>workspace.js</code> had passed <code>isDocked</code> and <code>setRailOpen</code> into
+    the sessions context since the rail was built, and <code>sessions.js</code> destructured
+    neither — a capability plumbed all the way in and never consumed, which nothing failed on
+    because nothing looked. On a phone you tapped a conversation and the rail stayed over it:
+    the one action the drawer exists for gave no sign it worked. <code>switchTo</code> and
+    <code>newChat</code> now dismiss the drawer on success (and on re-tapping the session
+    already open, which is still a navigation gesture), while deliberately NOT dismissing on
+    the mid-turn refusal or a failed load — closing the rail under an error toast reads as
+    success for something that did not happen. Docked rails never close: there the rail is the
+    navigation, not an overlay. The dismissal passes <code>persist=false</code>, which is
+    load-bearing — <code>setRailOpen</code>'s default writes <code>ghost_rail_open</code>, which
+    <code>initRail</code> and the docked-media-query handler both read, so persisting would mean
+    that picking a session on a portrait tablet and then rotating to landscape (crossing the
+    900×500 docked threshold) brought the docked rail back CLOSED.</li>
+
+    <li><strong>Three text styles failed WCAG AA (MED, closed).</strong> Measured in-page:
+    <code>.session-meta</code> ("1h ago · 48 msgs", the line you navigate the rail by) at
+    ~3.1:1 and 9.9px, <code>.msg-time</code> at ~3.2:1, both
+    <code>rgba(158,170,192,0.55)</code> → <code>0.75</code>. <code>#planner-monologue</code> was
+    <code>#c22745</code>, which is <code>--error-color</code> verbatim: ordinary planner
+    narration was painted in the colour reserved for failure, and measured 3.6:1 besides — now
+    the <code>#b894ff</code> accent already used by <code>.notif-phase</code>. The pin
+    RECOMPUTES the ratio from the shipped value; a text assertion cannot tell 0.55 from 0.75,
+    only that somebody wrote <em>an</em> rgba. Note the model composites over the DECLARED
+    surfaces, which is the optimistic bound — these sit on translucent panels with a
+    <code>backdrop-filter</code> over the animated face, so the real backdrop varies frame to
+    frame and a brighter face lowers the true ratio further.</li>
+
+    <li><strong>Sixteen controls had no accessible name, including the send button (MED,
+    closed).</strong> <code>#send-btn</code> — the most-used control in the app — carried no
+    <code>title</code>, no <code>aria-label</code> and only an inline SVG, so assistive tech
+    announced it as "button"; fifteen other icon-only controls had a <code>title</code> and
+    nothing else, and <code>title</code> is not surfaced by touch at all. Names that CHANGE with
+    state are set in JS rather than markup: <code>#send-btn</code> flips Send / Stop the current
+    turn / Working, and <code>#workspace-btn</code> flips Load / Save with its title. A static
+    name on a control whose meaning changes is worse than none, because it is confidently
+    wrong.</li>
+
+    <li><strong>The focus ring was a hand-kept list, and the primary actions were not on it
+    (MED, closed).</strong> <code>:focus-visible</code> enumerated ten selectors;
+    <code>#send-btn</code>, <code>#mic-btn</code>, <code>#palette-input</code>,
+    <code>.face-form-item</code> and <code>#delete-all-sessions-btn</code> were missing, so a
+    keyboard user tabbing to the primary action saw nothing. Replaced with a rule over the
+    interactive element types, wrapped in <code>:where()</code> to keep specificity at 0-1-0 so
+    components can still override it. <strong>The first version of this fix had the same bug it
+    fixed:</strong> at 0-1-0 it was outranked by four <code>outline: none</code> declarations on
+    IDs (<code>#chat-input</code>, <code>#session-search</code>, <code>#palette-input</code>,
+    <code>#memory-match</code>/<code>#memory-replacement</code>), and a real browser computed
+    <code>outline-style: none</code> on all four while every selector-coverage test passed —
+    asking "does a rule match?" is a proxy for "is a ring visible". Three of those suppressions
+    are gone; <code>#chat-input</code> keeps its as the one DECLARED exemption, because
+    <code>#input-area:focus-within</code> restyles the whole composer pill (border, fill, glow
+    and a 2px lift), which is a stronger indicator than a ring around a borderless textarea
+    inside it. That exemption is asserted, not just commented: the test fails if the
+    focus-within rule is ever removed while the suppression stays.</li>
+  </ul>
+  <p><strong>Not fixed, recorded here as known.</strong> The live-log console
+  (<code>position: fixed; bottom: 0; height: min(44dvh,440px)</code>) covers the composer on
+  both desktop and phone, so you cannot type while watching the stream; desktop bubbles are
+  capped at <code>max-width: 35%</code> (461px of a 1235px column at 1512px wide); mobile chrome
+  takes 26% of the viewport before a word is shown; there is no scroll-to-bottom control; the
+  command palette is ⌘K-only and so unreachable on a phone; <code>.msg-menu-btn</code> is
+  34×34px against a 44px touch-target floor.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

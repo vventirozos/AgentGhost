@@ -799,8 +799,18 @@ class TestBusyStateIsVISIBLE:
         and workspace paths have no `currentChatController`, so the Stop
         button it revealed was a live-looking control wired to nothing."""
         fn = extract_js_function(app_js, "toggleSendButtonUI")
+        # `setAttribute` was added to the stub on 2026-09-04, when
+        # toggleSendButtonUI started moving the button's accessible name
+        # with its state (the icon-only control announced "Send message"
+        # while showing a Stop icon). A real button has it; the stub did
+        # not, so the product change surfaced here as a TypeError. The
+        # names themselves are asserted in tests/test_interface_a11y.py.
         preamble = """
-const sendBtn = {classList: {add(){}, remove(){}, toggle(k, v){ this[k] = v; }}};
+const sendBtn = {
+  attrs: {},
+  setAttribute(k, v) { this.attrs[k] = v; },
+  classList: {add(){}, remove(){}, toggle(k, v){ this[k] = v; }},
+};
 const CANCEL_SVG = 'CANCEL', SEND_SVG = 'SEND';
 function stopTurnTicker() {}
 """

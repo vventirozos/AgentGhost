@@ -39,7 +39,7 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=5.3">
+    <link rel="stylesheet" href="/static/style.css?v=5.4">
 </head>
 
 <body>
@@ -77,12 +77,12 @@
             <div id="render-header">
                 <span id="render-title">VISUALIZER</span>
                 <div id="render-controls">
-                    <button id="render-download" class="render-btn" title="Download">
+                    <button id="render-download" class="render-btn" title="Download" aria-label="Download rendered output">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                     </button>
-                    <button id="render-zoom-out" class="render-btn">-</button>
-                    <button id="render-zoom-in" class="render-btn">+</button>
-                    <button id="render-close" class="render-btn">✕</button>
+                    <button id="render-zoom-out" class="render-btn" aria-label="Zoom out">-</button>
+                    <button id="render-zoom-in" class="render-btn" aria-label="Zoom in">+</button>
+                    <button id="render-close" class="render-btn" aria-label="Close visualizer">✕</button>
                 </div>
             </div>
             <div id="render-content-wrapper">
@@ -110,8 +110,8 @@
             <div id="log-console-header">
                 <span id="log-console-title">LIVE LOG</span>
                 <div id="log-console-controls">
-                    <button id="log-clear" class="render-btn" title="Clear">⌫</button>
-                    <button id="log-close" class="render-btn" title="Close">✕</button>
+                    <button id="log-clear" class="render-btn" title="Clear" aria-label="Clear the live log">⌫</button>
+                    <button id="log-close" class="render-btn" title="Close" aria-label="Close the live log">✕</button>
                 </div>
             </div>
             <div id="log-console-body"></div>
@@ -141,14 +141,14 @@
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
                     <span id="notif-badge" class="hidden">0</span>
                 </button>
-                <button id="logs-btn" class="icon-btn" title="Live Log">
+                <button id="logs-btn" class="icon-btn" title="Live Log" aria-label="Live log">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="4 17 10 11 4 5"></polyline>
                         <line x1="12" y1="19" x2="20" y2="19"></line>
                     </svg>
                 </button>
                 <input type="file" id="workspace-upload-input" style="display: none;" accept=".zip" />
-                <button id="workspace-btn" class="icon-btn" title="Load Workspace">
+                <button id="workspace-btn" class="icon-btn" title="Load Workspace" aria-label="Load workspace">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
                         <polyline points="17 21 17 13 7 13 7 21"></polyline>
@@ -156,14 +156,14 @@
                     </svg>
                 </button>
                 <input type="file" id="file-upload-input" style="display: none;" />
-                <button id="upload-btn" class="icon-btn" title="Upload to Sandbox">
+                <button id="upload-btn" class="icon-btn" title="Upload to Sandbox" aria-label="Upload a file to the sandbox">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                         <polyline points="17 8 12 3 7 8"></polyline>
                         <line x1="12" y1="3" x2="12" y2="15"></line>
                     </svg>
                 </button>
-                <button id="download-btn" class="icon-btn" title="Download from Sandbox">
+                <button id="download-btn" class="icon-btn" title="Download from Sandbox" aria-label="Download a file from the sandbox">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                         <polyline points="7 10 12 15 17 10"></polyline>
@@ -178,7 +178,7 @@
                         aria-label="Cycle face form">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="9" r="5.5"></circle><path d="M14 10.5a5.5 5.5 0 1 1-3.5 9.9"></path><path d="M12 3.5 13.2 6l2.6.4-1.9 1.9.5 2.6-2.4-1.3"></path></svg>
                 </button>
-                <button id="fullscreen-btn" class="icon-btn" title="Toggle Zen Mode">
+                <button id="fullscreen-btn" class="icon-btn" title="Toggle Zen Mode" aria-label="Toggle zen mode">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
                         <path
@@ -230,7 +230,7 @@
                         <line x1="8" y1="23" x2="16" y2="23"></line>
                     </svg>
                 </button>
-                <button id="send-btn">
+                <button id="send-btn" aria-label="Send message">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
                         <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -245,8 +245,8 @@
     <div id="notif-panel" class="hidden" aria-label="Notifications">
         <div class="panel-header">
             <span class="panel-title">NOTIFICATIONS</span>
-            <button id="notif-clear" class="render-btn" title="Clear all">⌫</button>
-            <button id="notif-close" class="render-btn" title="Close">✕</button>
+            <button id="notif-clear" class="render-btn" title="Clear all" aria-label="Clear all notifications">⌫</button>
+            <button id="notif-close" class="render-btn" title="Close" aria-label="Close notifications">✕</button>
         </div>
         <div id="notif-list"></div>
     </div>
@@ -254,7 +254,7 @@
     <div id="status-panel" class="hidden" aria-label="Agent status">
         <div class="panel-header">
             <span class="panel-title">AGENT STATUS</span>
-            <button id="status-close" class="render-btn" title="Close">✕</button>
+            <button id="status-close" class="render-btn" title="Close" aria-label="Close agent status">✕</button>
         </div>
         <div id="status-body"></div>
     </div>
@@ -273,7 +273,7 @@
         <div id="memory-modal-box">
             <div class="panel-header">
                 <span class="panel-title" id="memory-modal-title">CORRECT MEMORY</span>
-                <button id="memory-modal-close" class="render-btn" title="Close">✕</button>
+                <button id="memory-modal-close" class="render-btn" title="Close" aria-label="Close memory correction">✕</button>
             </div>
             <p id="memory-modal-hint">Finds one stored memory fragment containing this exact text and rewrites
                 it. Trim the match down to the false part before applying.</p>
@@ -290,7 +290,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=10.6"></script>
+    <script type="module" src="/static/app.js?v=10.7"></script>
 </body>
 
 </html>

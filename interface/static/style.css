@@ -387,6 +387,14 @@ footer#input-area-wrapper {
     font-size: max(1.05rem, 16px);
     padding: 14px 0;
     resize: none;
+    /* ⚠ The ONE deliberate `outline: none`. The composer's focus
+       indicator is `#input-area:focus-within` (border colour, fill,
+       glow and a 2px lift on the whole pill) — a stronger and more
+       legible signal than a ring drawn around a borderless textarea
+       inside it. This exemption is asserted in
+       tests/test_interface_a11y.py, which fails if the focus-within
+       rule is ever removed while this line stays: an exemption nobody
+       checks is just a hole with a comment on it. */
     outline: none;
     max-height: 150px;
     line-height: 1.5;
@@ -582,7 +590,13 @@ body.zen-mode .icon-btn:hover {
 #planner-monologue {
     font-family: var(--font-mono);
     font-size: 0.8rem;
-    color: #c22745;
+    /* Was #c22745 — which IS --error-color. Ordinary planner narration
+       ("considering X…") was painted in the app's error colour, so the
+       one signal reserved for something being wrong fired on every
+       healthy turn, and it measured 3.64:1 (AA failure) besides. This
+       violet is the accent already used by .notif-phase and measures
+       8.72:1. Errors keep --error-color to themselves. */
+    color: #b894ff;
     text-shadow: 0 0 8px rgba(75, 26, 122, 0.8);
     max-width: 600px;
     line-height: 1.4;
@@ -686,6 +700,135 @@ body.zen-mode .icon-btn:hover {
     padding-left: 12px;
     color: rgba(255, 255, 255, 0.7);
     font-style: italic;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Markdown block elements the agent actually emits (2026-09-04)
+
+   These had NO rules at all, so `table`/`th`/`td`, `h1`-`h6` and `hr`
+   fell through to the UA defaults inside a bubble styled for nothing
+   else. Measured on a live reply before this block: `th` padding was
+   the UA's `1px` with `border-collapse: separate` and no rules, so a
+   four-column comparison rendered as ragged text whose columns could
+   not be told apart; `hr` came out as the UA's `rgb(128,128,128)`
+   groove — the BRIGHTEST element in the bubble, reading as a heading
+   underline rather than a section break; and `h2` landed at 2em UA
+   bold beside 0.95rem/300 body text, which is the wrong voice as well
+   as the wrong size.
+
+   The agent writes plans, comparisons and headed sections constantly,
+   so this is load-bearing formatting, not polish.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Tables. `collapse` is required, not cosmetic: with `separate` the
+   cell borders below never join into rules and the grid reads as
+   floating dashes. The horizontal scroller is applied by app.js
+   (`decorateTables`) — a table wider than the bubble must SCROLL, not
+   crush its columns, which is the defect this replaces. */
+.message table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 0.88em;
+}
+
+.message th,
+.message td {
+    padding: 7px 10px;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* The header takes the mono eyebrow treatment used by every other
+   label in this UI (#rail-title, .panel-title, .notif-phase) so a
+   table header reads as one of ours rather than as browser chrome. */
+.message th {
+    font-family: var(--font-mono);
+    font-size: 0.74em;
+    font-weight: 500;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.58);
+    white-space: nowrap;
+}
+
+.message tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* Scroller wrapper (built by app.js). `max-width: 100%` on the wrapper
+   plus `width: max-content` on the table is what lets a wide table
+   keep its column widths and scroll, instead of being squeezed to the
+   bubble width. */
+.message .table-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    margin: 12px 0;
+}
+
+.message .table-scroll > table {
+    width: max-content;
+    min-width: 100%;
+    margin: 0;
+}
+
+/* Headings. Kept close to body size — a reply is a paragraph with
+   structure, not a document — and differentiated by WEIGHT and the
+   mono/sans axis rather than by scale, which is how the rest of the
+   interface separates levels. */
+.message h1,
+.message h2,
+.message h3,
+.message h4,
+.message h5,
+.message h6 {
+    font-weight: 500;
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+    margin: 18px 0 8px;
+    color: #fff;
+}
+
+.message h1:first-child,
+.message h2:first-child,
+.message h3:first-child,
+.message h4:first-child,
+.message h5:first-child,
+.message h6:first-child {
+    margin-top: 0;
+}
+
+.message h1 { font-size: 1.25em; }
+.message h2 { font-size: 1.12em; }
+
+/* h3 and below become mono eyebrows: at these sizes another half-step
+   of scale is invisible, but the family switch is not. */
+.message h3,
+.message h4,
+.message h5,
+.message h6 {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.62);
+}
+
+/* Section break, not a heading underline: a hairline that fades at
+   both ends, matching .empty-hero-rule. `border: none` is the load-
+   bearing half — without it the UA groove stays visible under the
+   gradient. */
+.message hr {
+    border: none;
+    height: 1px;
+    margin: 18px 0;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        rgba(123, 98, 196, 0.35) 50%,
+        transparent 100%);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1548,7 +1691,13 @@ body.zen-mode #rail-scrim {
     color: var(--text-color);
     font-family: var(--font-mono);
     font-size: 0.75rem;
-    outline: none;
+    /* No `outline: none` here. It used to suppress the ring at ID
+       specificity, which outranks the :focus-visible rule below, and the
+       only remaining indicator was #session-search:focus nudging the
+       border from rgba(123,98,196,.14) to .32 — a 1px hairline moving
+       between two nearly identical alphas. Keyboard users had nothing to
+       see. The border nudge stays as the pointer-focus treatment; the
+       ring rides on top for keyboard focus. */
     -webkit-appearance: none;
 }
 #session-search:focus {
@@ -1612,7 +1761,12 @@ body.zen-mode #rail-scrim {
     font-family: var(--font-mono);
     font-size: 0.62rem;
     letter-spacing: 0.5px;
-    color: rgba(158, 170, 192, 0.55);
+    /* 0.55 alpha measured 3.09:1 against the near-black rail — a WCAG AA
+       failure on the line you navigate the rail BY ("1h ago · 48 msgs"),
+       at 9.9px. 0.75 measures 5.17:1 and is still visibly secondary to the
+       title above it. Pinned in tests/test_interface_contrast.py, which
+       recomputes the ratio from this value rather than matching the text. */
+    color: rgba(158, 170, 192, 0.75);
 }
 .session-delete {
     align-self: center;
@@ -2045,7 +2199,15 @@ body.zen-mode #rail-scrim {
     color: var(--text-color);
     font-family: var(--font-main);
     font-size: max(1rem, 16px);
-    outline: none;
+    /* This one had `outline: none` AND no :focus rule of any kind, so
+       it was the only control in the app with no focus indicator at
+       all — invisible after arrowing down into #palette-results and
+       back up. The ring is now its indicator; `outline-offset: -2px`
+       keeps it inside the rounded palette box instead of straddling
+       the edge. */
+}
+#palette-input:focus-visible {
+    outline-offset: -2px;
 }
 #palette-results {
     max-height: min(46dvh, 420px);
@@ -2094,7 +2256,9 @@ body.zen-mode #rail-scrim {
     font-family: var(--font-mono);
     font-size: 0.6rem;
     letter-spacing: 1px;
-    color: rgba(158, 170, 192, 0.55);
+    /* Same measurement as .session-meta: 3.09:1 -> 5.17:1. See the note
+       there; both are pinned by the same recomputation test. */
+    color: rgba(158, 170, 192, 0.75);
     user-select: none;
     -webkit-user-select: none;
 }
@@ -2307,7 +2471,9 @@ body.zen-mode #rail-scrim {
     line-height: 1.5;
     padding: 10px 12px;
     resize: vertical;
-    outline: none;
+    /* `outline: none` removed for the same reason as #session-search:
+       the :focus border-color nudge below is the pointer treatment, not
+       a keyboard focus indicator. */
 }
 #memory-match:focus, #memory-replacement:focus { border-color: var(--surface-highlight); }
 #memory-replacement.hidden { display: none; }
@@ -2350,12 +2516,23 @@ body.compact .session-title { font-size: 0.78rem; }
 /* ── Restore/re-render without replaying entrances ─────────────── */
 body.restoring .message { animation: none !important; }
 
-/* ── Keyboard focus (visible, theme-consistent) ────────────────── */
-.icon-btn:focus-visible, .session-main:focus-visible,
-.msg-menu-btn:focus-visible, .msg-menu-item:focus-visible,
-.session-delete:focus-visible, .status-turn-stop:focus-visible,
-#status-indicator:focus-visible, #memory-modal-apply:focus-visible,
-#memory-modal-cancel:focus-visible, .render-btn:focus-visible {
+/* ── Keyboard focus (visible, theme-consistent) ────────────────────
+   This was an ENUMERATION of ten selectors, and the two controls a
+   keyboard user reaches first — #send-btn and #mic-btn, the primary
+   actions — were not on it, along with #palette-input, .face-form-item
+   and #delete-all-sessions-btn. That is the failure mode of a hand-kept
+   list: every control added after it was written starts with no focus
+   ring, and nothing says so.
+
+   Replaced with a rule over the interactive elements themselves, so a
+   new control is covered on the day it is added. `:where()` keeps the
+   specificity at 0-1-0 (the :focus-visible pseudo-class alone), so any
+   component that wants a different ring can still override with a plain
+   class selector. Enumerated and pinned in tests/test_interface_a11y.py
+   — the test walks index.html and fails on a focusable element this
+   rule cannot match. */
+:where(button, [role="button"], [role="menuitem"], a[href],
+       input, textarea, select, [tabindex]:not([tabindex="-1"])):focus-visible {
     outline: 2px solid var(--accent-color);
     outline-offset: 2px;
 }

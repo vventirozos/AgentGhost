@@ -13,7 +13,33 @@
 // ═══════════════════════════════════════════════════════════════
 
 export function initSessions(ctx) {
-    const { Core, el, toast, jewelHue, relTime } = ctx;
+    const { Core, el, toast, jewelHue, relTime, isDocked, setRailOpen } = ctx;
+
+    // Drawer mode only: picking a session must dismiss the rail (2026-09-04).
+    //
+    // workspace.js has passed `isDocked`/`setRailOpen` into this context
+    // since the rail was built, and nothing here ever destructured them —
+    // the capability was plumbed in and never consumed. The visible effect
+    // on a phone: you tap a conversation and the rail stays over it, so the
+    // one action the drawer exists for gives no sign it worked and you have
+    // to find the scrim to see the result. Docked rails must NOT close;
+    // there the rail is the navigation, not an overlay.
+    //
+    // Guarded on the callables so a stale/partial ctx degrades to the old
+    // behaviour instead of throwing inside a session switch.
+    function dismissDrawer() {
+        if (typeof isDocked !== 'function' || typeof setRailOpen !== 'function') return;
+        if (isDocked()) return;
+        // persist=false is load-bearing. `setRailOpen`'s default writes
+        // ghost_rail_open='0', and initRail / the docked-media-query change
+        // handler both read that key to decide whether a DOCKED rail starts
+        // open. Persisting here would mean: pick a session on a portrait
+        // tablet, rotate to landscape (820x1180 -> 1180x820 crosses the
+        // 900x500 docked threshold), and the docked rail comes back CLOSED
+        // — a transient drawer dismissal silently rewritten as a standing
+        // preference for a mode the user was not even in.
+        setRailOpen(false, false);
+    }
 
     const listEl = document.getElementById('session-list');
     const noteEl = document.getElementById('rail-note');
@@ -219,8 +245,13 @@ export function initSessions(ctx) {
     }
 
     async function switchTo(id) {
-        if (id === currentId) return;
+        // Tapping the session already open is still a navigation gesture on
+        // a phone: the user asked for that conversation and it is behind the
+        // drawer, so dismiss even though there is nothing to load.
+        if (id === currentId) { dismissDrawer(); return; }
         if (Core.isProcessing()) {
+            // Deliberately NOT dismissed: the toast explains why nothing
+            // happened, and closing the rail under it would read as success.
             toast('Wait for the current turn to finish first', 'error');
             return;
         }
@@ -230,6 +261,7 @@ export function initSessions(ctx) {
             // paint (R6); a superseded load returns null having bound
             // nothing.
             await load(id);
+            dismissDrawer();
         } catch (e) {
             toast(`Could not open session: ${e.message}`, 'error');
         }
@@ -243,6 +275,9 @@ export function initSessions(ctx) {
         Core.stopTTS();
         Core.clearConversation();
         setCurrent(mintId());
+        // Same reasoning as switchTo: the empty composer is the result of
+        // this action and it is behind the drawer.
+        dismissDrawer();
     }
 
     async function deleteSession(s) {
