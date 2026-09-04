@@ -929,8 +929,41 @@ class VectorMemory:
                 return ""
 
     @staticmethod
+    def _age_gloss(ts: str) -> str:
+        """``· 59d ago`` for a recall stamp, or "" when unparseable.
+
+        An absolute ISO stamp is a poor staleness cue: the model has to
+        find CURRENT TIME elsewhere in the prompt and subtract, which is
+        exactly the step it skips (a fact stated 2026-07-07 was recalled
+        verbatim as current on 2026-09-04). The elapsed time is the thing
+        it actually needs, so compute it here rather than hope."""
+        try:
+            import datetime as _dt
+            from ..utils.helpers import parse_utc_timestamp
+            then = parse_utc_timestamp(ts)
+            if then.tzinfo is not None:
+                then = then.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            # Same idiom as the recency-decay path below (line ~1130):
+            # an aware-UTC now, flattened to naive, so both sides of the
+            # subtraction are naive UTC.
+            now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+            days = (now - then).days
+            if days < 0:
+                return ""
+            if days == 0:
+                return " · today"
+            if days < 60:
+                return f" · {days}d ago"
+            if days < 730:
+                return f" · {days // 30}mo ago"
+            return f" · {days // 365}y ago"
+        except Exception:
+            return ""
+
+    @staticmethod
     def _render_item(item: dict) -> str:
         ts = item['meta'].get('timestamp', '?')
+        ts = f"{ts}{VectorMemory._age_gloss(ts)}"
         m_type = item['meta'].get('type', 'auto').upper()
         doc_text = item['doc']
 

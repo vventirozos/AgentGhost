@@ -9557,6 +9557,20 @@ class GhostAgent:
                 # raises "'str' object has no attribute 'get'".
                 if not isinstance(profile_up, dict):
                     profile_up = None
+                # TEMPORAL ANCHORING of the extracted fact. The synthesizer
+                # copies the user's phrasing, so a stated age arrives here
+                # as a snapshot ("…two sons, Thodoris 9 and Leonidas 4mo")
+                # and lands in BOTH the vector store and the profile. Both
+                # legs are anchored from the same string so the stores
+                # cannot disagree. said_at defaults to now: consolidation
+                # runs at most a journal-drain behind the episode, and an
+                # error of hours is nothing against the months of drift
+                # this removes.
+                from ..memory.temporal import anchor as _anchor_temporal
+                if fact:
+                    fact = _anchor_temporal(fact)
+                if profile_up is not None and profile_up.get("value"):
+                    profile_up["value"] = _anchor_temporal(profile_up["value"])
 
                 # --- UNCONDITIONAL KNOWLEDGE GRAPH INGESTION ---
                 from ..utils.helpers import is_removal_or_negation_text, is_removal_triplet

@@ -18,6 +18,7 @@
     <a href="vector.html">vector</a>
     <a href="graph.html">graph</a>
     <a class="current" href="profile.html">profile</a>
+    <a href="temporal.html">temporal</a>
     <a href="skills.html">skills</a>
     <a href="journal.html">journal</a>
     <a href="scratchpad.html">scratchpad</a>
@@ -39,11 +40,16 @@
 
   <h2>Schema</h2>
   <pre><code>{
-  "root":          { "name": str },
-  "relationships": { "wife|husband|son|daughter": str | list[str] },
-  "interests":     { "science|general|...": str | list[str] },
-  "assets":        { "car|...": str | list[str] }
-}</code></pre>
+  "root":          { "name": Value },
+  "relationships": { "wife|husband|son|daughter": Value },
+  "interests":     { "science|general|...": Value },
+  "assets":        { "car|...": Value }
+}
+
+Value := str                      # LEGACY — as_of unknown
+       | {"v": str, "as_of": ISO} # stamped
+       | list[Value]              # multi-valued (merge keys)</code></pre>
+  <p>Both shapes coexist for ever: a legacy bare value is never back-filled with a fabricated date. See <a href="#provenance">provenance</a> below.</p>
 
   <h2>Canonicalisation</h2>
   <p>Common synonyms remap at write time: <code>wife → relationships.wife</code>, <code>vehicle → assets.car</code>, etc. The caller receives the rewritten key in the return message so the agent can keep its mental model synced.</p>
@@ -78,14 +84,45 @@
   <div class="scroll"><table>
     <thead><tr><th>Method</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><td><code>load() / save(data)</code></td><td>Whole-file read / write.</td></tr>
-      <tr><td><code>update(category, key, value) -&gt; str</code></td><td>Merge-semantic update; returns sync message describing canonical mapping.</td></tr>
+      <tr><td><code>load() / save(data)</code></td><td>Whole-file read / write. <code>load()</code> UNWRAPS to the legacy shape; <code>save()</code> preserves the stamps of unchanged values.</td></tr>
+      <tr><td><code>load_raw() -&gt; dict</code></td><td>The on-disk shape, stamps included. Used by update / delete / prune_value / get_context_string — going through <code>load()</code> there would strip provenance on the next save.</td></tr>
+      <tr><td><code>as_of(category, key) -&gt; str | None</code></td><td>When this store learned the value (newest stamp for a multi-valued key). None when unknown — never a guess.</td></tr>
+      <tr><td><code>stamp(category, key, as_of) -&gt; int</code></td><td>Attach provenance to UNSTAMPED items only. Cannot change a value; refuses a falsy date. Returns how many it stamped.</td></tr>
+      <tr><td><code>update(category, key, value, as_of=None) -&gt; str</code></td><td>Merge-semantic update; returns sync message describing canonical mapping.</td></tr>
       <tr><td><code>delete(category, key) -&gt; str</code></td><td>Remove a whole key; status string.</td></tr>
       <tr><td><code>prune_value(category, key, target) -&gt; str</code></td><td>Remove list items / a scalar that <em>mention</em> <code>target</code> (token-boundary match); drops the key/category when emptied. Lets <code>forget</code> reach entities stored as values.</td></tr>
       <tr><td><code>get_context_string() -&gt; str</code></td><td>Format for LLM injection.</td></tr>
     </tbody>
   </table></div>
 
+
+  <h2 id="provenance">Per-value provenance — <code>as_of</code> (2026-09-04)</h2>
+  <p>Anchoring (below) fixes decaying facts that have a <strong>derivable invariant</strong>: an age has a birth date behind it, so the current value can be recomputed. Plenty of facts decay with no invariant — an employer, a location, "currently learning X". For those the only truthful thing the store can say is <em>when it learned them</em>, and a bare string could not say even that.</p>
+  <p>That gap was not hypothetical. The corpus-repair script could not ask this store when <code>relationships.sons</code> was recorded; it had to infer the date from the <em>contradiction log</em>, a different store — which is why it carries a <code>--said-at</code> flag and a refuse-to-guess rule.</p>
+
+  <h3>Stamps are per VALUE, not per key</h3>
+  <p>A merging key accumulates its items at different times, so one stamp for the key would be a lie about every item but the last. A scalar becomes <code>{"v": …, "as_of": …}</code>; a list becomes a list of those. Promotion from scalar to list carries the existing item over untouched, so its own date survives.</p>
+
+  <h3>The reader contract is what makes this cheap</h3>
+  <p><code>load()</code> returns the <strong>legacy shape</strong> — every value unwrapped to a plain string or list — so all twelve production readers (enumerated from the AST, not from a hand-written list) are untouched by the migration. Only code that wants provenance calls <code>load_raw()</code> or <code>as_of()</code>. <code>save()</code> re-attaches the stamp of any value handed back unchanged, which closes the <code>save(load())</code> footgun structurally: once unwrapped the two shapes are indistinguishable, so no convention could.</p>
+
+  <h3>Quiet by default</h3>
+  <p>A marker only appears where it changes how the fact should be read. A <strong>durable</strong> key (<code>_DURABLE_KEYS</code>: name, birthday, pronouns, wife, sons, …) is never marked — a name is not more doubtful for being a year old. A perishable value younger than <code>_STALE_AFTER_DAYS = 90</code> renders exactly as before. Past that it reads <code>(as of 2026-04-01)</code>, and past <code>_VERY_STALE_AFTER_DAYS = 365</code>, <code>(as of 2024-02-01, may be stale)</code>. An unstamped legacy value is never marked either: absent provenance is not evidence of age. The marker is a fixed date string, so it does not churn the byte-stable <code>{{PROFILE}}</code> prefix.</p>
+  <p><strong>A restatement refreshes the stamp</strong>, on both the scalar and the list path — the user saying a fact again is evidence it is still true, and "last confirmed" is what the marker reports.</p>
+
+  <h3>Recovering provenance for the existing corpus</h3>
+  <p><code>scripts/repair_temporal_anchors.py --targets profile-stamps</code>. Dates are <em>recovered</em>, never invented, and only from stores that record a fact WRITE: the minted vector fact (<code>User &lt;key&gt; is &lt;value&gt;</code>) and the contradiction log, which preserves superseded ones verbatim. A document that happens to contain the words records nothing about the profile — the first version matched any corpus mention and dated <code>name = Vasilis</code> from a chess prompt and <code>debugging_tool_macos = dtrace</code> from a PostgreSQL manual. Values shorter than 12 characters are not attributable by text match at all. Anything undatable is reported UNRECOVERED rather than stamped with today, which would date every legacy fact to the day of the upgrade and make the marker lie for a year.</p>
+  <p><code>ProfileMemory.stamp()</code> is the write path, deliberately surgical: routing the backfill through <code>update()</code> would re-anchor, canonicalise and cap the values — a migration able to rewrite what it was only supposed to date. It cannot change a value, never overwrites an existing stamp, and refuses a falsy date.</p>
+  <p class="warn"><strong>⚠ Deploy order: code, then data.</strong> New code reads legacy bare values fine (unwrapping is identity on a string), but an agent still running the older <code>ProfileMemory</code> renders a stamped value as a raw dict — <code>{'v': 'Athens, Greece', 'as_of': …}</code> — straight into every system prompt, and hands the same dict to <code>tool_check_location</code>. The script prints this before applying.</p>
+
+  <h2>Temporal anchoring — a stated age is not a fact (2026-09-04)</h2>
+  <p>This store renders bare, <strong>unstamped</strong> <code>- key: value</code> lines into <code>### USER PROFILE ###</code> on every turn, so anything time-dependent written into it reads as present tense for ever. Live: <code>relationships.sons = "Thodoris (9 years old) and Leonidas (4 months old)"</code>, stated 2026-07-07, was still being recalled verbatim two months later.</p>
+  <p>Two changes, both in this file:</p>
+  <ul>
+    <li><code>update()</code> anchors at the store BOUNDARY — <code>"Leonidas (4 months old)"</code> is stored as <code>"Leonidas (born ~2026-02-20)"</code>. Placed here rather than per-caller because every writer funnels through <code>update()</code>: the <code>update_profile</code> tool (both paths), the bus's <code>_profile</code> leg, and smart-memory consolidation. Nothing can bypass it.</li>
+    <li><code>get_context_string()</code> DERIVES the current value at render time: <code>- sons: Thodoris (born ~2017-01 → ~9 years old) and Leonidas (born ~2026-02-20 → ~6 months old)</code>. The disk keeps constants; the prompt gets what is true today, and the model is never asked to subtract a timestamp it will not notice. The gloss is a rounded age, not a date, so the block still changes only when the age changes — <code>{{PROFILE}}</code> is inside the byte-stable system prefix and must not churn daily.</li>
+  </ul>
+  <p><strong><code>_same_fact()</code> is the dedup change this forced.</strong> Anchoring makes two statements of the same fact differ in bytes ("4 months old" in July, "6 months old" in September), so the exact-string merge dedup would have kept BOTH and injected two contradictory birth dates into every prompt. Values carrying an anchor now compare on <code>temporal.signature()</code> — anchor-blind — so the newer statement refines in place. The exemption is deliberately scoped to anchored values: everything else keeps byte-exact semantics, so this cannot silently collapse distinct interests (<code>python</code> and <code>Python</code> still both persist). See <a href="temporal.html">memory / temporal.py</a> for the full design, the known limitations, and the corpus-repair script. Tests: <code>tests/test_temporal_anchoring.py</code>.</p>
 
   <h2>Audit fixes (2026-07-26)</h2>
   <p><strong>Fail-closed on transient read errors.</strong> ProfileMemory was the only small store without the <code>_degraded</code> discipline its siblings have: an EIO/EACCES read was treated as corruption — the INTACT profile was shunted to a <code>.corrupt-*</code> sidecar, identity reverted to <code>{"name": "User"}</code>, and the next <code>save()</code> overwrote the real file. Now: OSError (≠ FileNotFoundError) serves the default in-memory, leaves the on-disk file untouched, and BLOCKS writes until a read succeeds; parse corruption keeps the sidecar path. <code>save()</code> also fsyncs before the rename (torn-write window). The bus's profile leg and the smart-memory consolidation both now REQUIRE category+key on a profile_update — the old "info"/"notes" defaults minted permanent junk keys like <code>cli_tools.info</code> outside the notes ring (no rotation, no value cap, injected into every prompt). Tests: <code>::TestProfileFailClosed</code>.</p>

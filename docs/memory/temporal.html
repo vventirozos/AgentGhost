@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.temporal — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a class="current" href="temporal.html">temporal</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>memory / temporal.py — anchoring</h1>
+  <p class="subtitle">Store the invariant, derive the quantity. Facts that decay are rewritten at write time into facts that don't.</p>
+
+  <h2>The defect it fixes (live, 2026-09-04)</h2>
+  <p>On 2026-07-07 the user stated that his son Leonidas was 4 months old. Two months later the agent still answered <em>"Leonidas is 4 months old"</em>. Nothing was corrupted — the store had faithfully kept what it was told. The problem is that <strong>a stated age is a measurement, not a fact</strong>: it is true only on the day it is said.</p>
+  <p>Why nothing downstream caught it:</p>
+  <ul>
+    <li><strong>The profile block carries no timestamp at all.</strong> <code>ProfileMemory.get_context_string()</code> renders bare <code>- key: value</code> lines into <code>### USER PROFILE ###</code> on every turn. An unstamped line reads as present tense, for ever, with maximum authority.</li>
+    <li><strong>The vector store's stamp was not enough.</strong> Rows <em>are</em> stamped and the prompt <em>does</em> carry <code>CURRENT TIME</code>, so the arithmetic was possible — but it required the model to notice an ISO stamp, subtract, and then overrule an unstamped profile line asserting otherwise. It never did.</li>
+  </ul>
+  <p>The invariant behind an age is a <strong>birth date</strong>, which is constant. So the store keeps the birth date, and the current age is computed on the way into the prompt. The model is never asked to do the subtraction it demonstrably skips.</p>
+
+  <h2>The two halves</h2>
+  <div class="scroll"><table>
+    <thead><tr><th></th><th>Runs</th><th>Does</th><th>Called from</th></tr></thead>
+    <tbody>
+      <tr><td><code>anchor(text, said_at)</code></td><td>WRITE time</td><td>"Leonidas is 4 months old" &rarr; "Leonidas born ~2026-02-20"</td><td><code>ProfileMemory.update</code> (the boundary), <code>tool_update_profile</code>, <code>tool_remember</code>, smart-memory consolidation</td></tr>
+      <tr><td><code>derive(text, now)</code></td><td>RENDER time</td><td>"born ~2026-02-20" &rarr; "born ~2026-02-20 &rarr; ~6 months old"</td><td><code>ProfileMemory.get_context_string</code></td></tr>
+    </tbody>
+  </table></div>
+  <p>What is on disk is therefore always a constant; what the model reads is always current. A derived value is <strong>never persisted</strong> — if it were, tomorrow's read would compound onto a frozen number and the bug would return through the store.</p>
+
+  <h2>Why the anchor is placed in <code>ProfileMemory.update()</code></h2>
+  <p>Every writer funnels through it — the <code>update_profile</code> tool (both its bus and legacy paths), the memory bus's <code>_profile</code> leg, and smart-memory consolidation — so nothing can bypass the rewrite. <code>tool_update_profile</code> anchors <em>additionally</em>, up front, because it also mints a vector fact (<code>"User &lt;key&gt; is &lt;value&gt;"</code>) and a graph triplet from the same value: anchoring only inside the profile store would leave those two siblings holding the decaying snapshot, which is the three-stores-disagree shape §4M MAJOR-4 already had to fix once. <code>anchor()</code> is idempotent, so the second application is a no-op.</p>
+
+  <h2>Design decisions</h2>
+
+  <h3>Midpoint anchoring</h3>
+  <p>"9 years old" means the true age is in [9, 10), so the best estimate of the birth date is <code>said_at − 9.5y</code>, not <code>said_at − 9y</code>. Naive subtraction biases every later derivation one unit <em>high</em> — the exact error class the module exists to remove. The residual uncertainty is why every derived age renders with a <code>~</code>.</p>
+
+  <h3>Precision survives the round trip</h3>
+  <p>An anchor is written at the granularity its statement supports: an age in years anchors to the <strong>month</strong> (<code>born ~2017-01</code>, ±6 months), an age in months or finer to the <strong>day</strong> (<code>born ~2026-02-20</code>). <code>derive()</code> reads that granularity back and renders a coarse anchor in years only. Without it, "my son is 1 year old" came back as <em>"~18 months old"</em> — more precise than anything known, and not what the user said. This was caught by a round-trip pin, after an earlier pin written against the arithmetic helpers passed while the pair that actually runs disagreed.</p>
+
+  <h3>One anchor shape, two spellings read</h3>
+  <p>People type <code>born March 12, 2026</code>, not ISO. <code>anchor()</code> canonicalises the month-name form (<code>March 12, 2026</code>, <code>12 March 2026</code>, <code>Mar 12, 2026</code>, <code>in March 2026</code>) to ISO so there is one shape to read, and <code>derive()</code> reads the named form too, for rows written before that existed. Found live: the operator stated both children's exact birth dates in a chat turn, the pre-change code stored them verbatim, and they carried <em>no derived age at all</em> — an exact date the model still has to subtract from by hand is the original defect one step further along.</p>
+
+  <h3>Coarseness is the estimate marker, not the granularity</h3>
+  <p><code>born ~2017-01</code> came from "9 years old" and is good to ±6 months, so rendering it in months would be false precision — it renders in years. <code>born 2026-03</code> came from someone <em>saying</em> "born in March 2026" and is good to ±15 days. Keying coarseness on month-granularity alone rendered that five-month-old infant as <em>"~0 years old"</em>; it keys on the <code>~</code>.</p>
+
+  <h3>Unit follows magnitude</h3>
+  <p>An infant anchored in months ages into years by itself: <code>~3 weeks old</code> &rarr; <code>~6 months old</code> &rarr; <code>~2 years old</code>. A stored snapshot can never do this — "4 months old" stays "4 months old" through the child's third birthday.</p>
+
+  <h3>KV-cache stability</h3>
+  <p>The gloss is a <em>rounded</em> age, never a date or a day count, so the rendered profile block changes only when the derived age changes — about monthly for an infant, yearly for a child. <code>{{PROFILE}}</code> sits inside the byte-stable system prefix <code>core/agent.py</code> deliberately keeps identical across turns for upstream prefix-cache hits; rendering "today" here would have invalidated that prefix every single day.</p>
+
+  <h3>Conservative matching</h3>
+  <p>A rewrite requires an explicit age <em>cue</em> — "old", "age", "aged", "yo", "mo". A bare "4 months" is left alone: it is far more often a duration ("4 months of runway") than an age, and a wrong rewrite is worse than a miss. Implausible counts (<code>aged 900 years</code>) are left alone too.</p>
+
+  <h3>Protected spans — quoted records and derived glosses</h3>
+  <p>Two kinds of span are never rewritten, for the same reason: neither is a claim the store owns.</p>
+  <ul>
+    <li>A <strong>quoted string</strong> is a record — a search query the agent ran, a command, a code literal. Live proof: a stored skill lesson held <code>web_search(query="Thodoris basketball Panellinios age 9")</code>, and an unguarded pass rewrote the query text itself.</li>
+    <li>A <strong>derived gloss</strong> is render output. If one flows back into a writer, anchoring it would freeze a rendered value into the store — reintroducing the snapshot the module exists to eliminate.</li>
+  </ul>
+
+  <h3>Predicative vs attributive position</h3>
+  <p>A predicative or parenthetical age is <em>replaced</em>: <code>Thodoris (9 years old)</code> &rarr; <code>Thodoris (born ~2017-01)</code>. A fully-hyphenated <strong>attributive</strong> compound fills an adjective/noun slot, and replacing it produces garbage — <em>"equipment for a born ~2017-02-20 named Thodoris"</em> was the live result on a real stored fact. That one form is <em>annotated</em> instead: <code>a 9-year-old (born ~2017-01) named Thodoris</code>, which <code>derive()</code> renders as <code>a 9-year-old (born ~2017-01 &rarr; ~9 years old) named Thodoris</code>. The trade is deliberate: the stale token survives in the only position where removing it costs grammaticality, and the authoritative value sits immediately after it. The syntactic rule is mechanical — hyphenated compound &rArr; attributive &rArr; annotate; spaced &rArr; predicative &rArr; replace.</p>
+
+  <h3>Restatement refines, it does not accumulate</h3>
+  <p>Anchoring makes two statements of the same fact differ in bytes ("4 months old" in July and "6 months old" in September anchor to different dates), so the profile's exact-string dedup would have kept <strong>both</strong> and injected two contradictory birth dates into every prompt. <code>ProfileMemory._same_fact()</code> compares <code>signature()</code> — an anchor-blind form — so the newer statement refines the anchor in place. The exemption is scoped to values that actually carry an anchor; everything else keeps byte-exact dedup semantics, so this cannot silently collapse distinct interests.</p>
+
+  <h2>Relative dates</h2>
+  <p>"3 years ago" is the same defect class — it silently re-anchors to whenever it is next read — so it is absolutised to <code>in ~2023-07-07</code> at write time. No gloss is derived for it: the value is already a constant and the prompt carries <code>CURRENT TIME</code>. Fuzzier forms ("last March", "next week") are deliberately <em>not</em> handled: ambiguous, low value, and a high false-rewrite risk.</p>
+
+  <h2>Recall stamps</h2>
+  <p><code>VectorMemory._render_item</code> now prints elapsed time next to the ISO stamp — <code>[2026-07-07T21:29:05Z · 59d ago]</code>. An absolute stamp makes the model find <code>CURRENT TIME</code> elsewhere in the prompt and subtract; the elapsed value is what it actually needs. A malformed stamp degrades to the old rendering rather than raising — this runs for every retrieved row.</p>
+
+  <h2>Known limitations</h2>
+  <ul>
+    <li><strong>"born" reads oddly for a non-person</strong> ("the release born ~2026-02-20"). Accepted: profile facts carrying ages are overwhelmingly about people and pets, and the marker's legibility to both a regex and an LLM is worth more than the rare awkward phrasing.</li>
+    <li><strong>An age used as a category is still annotated.</strong> "a ball best for a 9-year-old" is a product attribute that does not decay, but the attributive branch will annotate it. Noisy, not corrupting — the original token survives. The <em>repair</em> script does distinguish the two cases (see below); the write path does not, because the distinction is semantic and a regex that pretended to have semantics would be worse.</li>
+    <li><strong>Perishable-but-underivable facts</strong> — a job, a location, "currently learning X" — have no invariant to derive, so anchoring cannot help them. They are covered by the companion mechanism: per-value <code>as_of</code> provenance and a staleness marker, in <a href="profile.html#provenance">memory / profile.py</a>.</li>
+  </ul>
+
+  <h2>Repairing an existing corpus</h2>
+  <p><code>scripts/repair_temporal_anchors.py</code>. The module stops new snapshots but is dead code against what is already stored, so the live corpus needed a one-time pass. Dry run by default; <code>--apply</code> writes; every target is backed up first.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Target</th><th>said_at from</th><th>Applied 2026-09-04</th></tr></thead>
+    <tbody>
+      <tr><td><code>profile</code></td><td>none stored — <code>--said-at</code>, else inferred from the earliest age-bearing <code>contradiction_log</code> entry (both inference and its source are printed for review)</td><td>1 row: <code>relationships.sons</code></td></tr>
+      <tr><td><code>vector</code></td><td>the row's own <code>timestamp</code></td><td>1 row, via <code>POST /api/memory/correct</code></td></tr>
+      <tr><td><code>graph</code></td><td>the edge's own <code>timestamp</code></td><td>2 of 3 candidates (1 rewritten, 1 retired as a duplicate)</td></tr>
+    </tbody>
+  </table></div>
+  <p>Three things the script refuses to do. It will not <strong>guess a said_at</strong> — a rewrite anchored to the wrong date is worse than the snapshot because it looks authoritative, so an undated row is reported as unrepaired rather than silently skipped. It will not <strong>open Chroma directly</strong> — a second <code>PersistentClient</code> against the live dir risks HNSW corruption, so vector rewrites go through the owning process via <code>correct_fragment</code>. And it will not <strong>sweep blindly</strong>: in the graph, an age is only a decaying claim when the predicate says it is about the subject. <code>thodoris IS_AGE "9 years old"</code> was repaired to <code>thodoris BORN "~2017-02"</code> (rewriting the object alone would have left <code>IS_AGE</code> pointing at a birth date — a worse record than the one it replaced); <code>wilson evolution youth IS_BEST_FOR "9-year-old"</code> was skipped, because a ball stays suitable for nine-year-olds.</p>
+  <p>Vector <code>document</code>, <code>episode</code> and <code>skill</code> rows are excluded outright: a document's ages belong to the document's own timeline, and a skill lesson is a record of what was done.</p>
+
+  <p>Two behaviours the script has that <code>anchor()</code> deliberately does not. <strong>The predicate can supply the cue.</strong> <code>thodoris IS_AGE "9 years"</code> survived the first pass — the object alone reads as a duration, which <code>anchor()</code> correctly refuses to rewrite. Under an age-ish predicate the cue is already established, so <code>_with_predicate_cue()</code> supplies it (and a bare number means years). This stays in the script: loosening <code>anchor()</code> would reintroduce "4 months of runway". <strong>A repaired form that already exists means the row is a duplicate.</strong> <code>triplets</code> is <code>UNIQUE(subject, predicate, object)</code>, so such a row cannot be updated into place and must not be — it gets the store's own supersession mark (<code>valid_until</code>, which every graph read path filters on) instead. Both were found by <em>running</em> the repair on the live graph, not by reading it; the collision raised <code>IntegrityError</code> and rolled the batch back without changing anything.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_temporal_anchoring.py</code> — 25 pins, each written to fail when its mechanism is removed, with the mutants it answers to named in its docstring. The time-dependent pins assert the rendered value <em>changes</em> as the clock moves rather than matching a fixed string (a string pin would pass with the whole feature deleted), and the arithmetic pins recompute the expected date instead of hardcoding it. Two defects were found by pins during development (the year/month precision loss, and the missing "weeks" case in the gloss-stripping regex); two more by sweeping the live corpus before shipping, and two by running the repair. The mutation battery scores <strong>32/32 killed</strong> — its first run scored 19/22, and all three survivors were weak pins, not weak code: an unreachable guard removed as dead code, and two pins asserting on tokens rather than executing the consumer.</p>
+
+  <h2>API</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>anchor(text, said_at=None) -&gt; str</code></td><td>Rewrite ages / relative dates into absolute anchors. Idempotent. Non-string input, protected spans and implausible ages pass through untouched — it runs on every profile write and must never be able to destroy a value.</td></tr>
+      <tr><td><code>derive(text, now=None) -&gt; str</code></td><td>Append the value true at <code>now</code> to every anchor. Strips any previous gloss first, so it is idempotent and self-correcting. A future-dated anchor renders no age.</td></tr>
+      <tr><td><code>signature(text) -&gt; str</code></td><td>Anchor-blind form, for equality checks that must treat two statements of the same fact as identical.</td></tr>
+      <tr><td><code>has_anchor(text) -&gt; bool</code></td><td>Whether the text carries at least one absolute anchor.</td></tr>
+    </tbody>
+  </table></div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

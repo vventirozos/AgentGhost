@@ -9,6 +9,7 @@ from .file_system import _get_safe_path
 from ..utils.logging import Icons, pretty_log, spawn_bg
 from ..utils.helpers import get_utc_timestamp, helper_fetch_url_content, recursive_split_text, semantic_split_text
 from ..memory.scratchpad import Scratchpad
+from ..memory.temporal import anchor as _anchor_temporal
 from .outcome import ToolOutcome
 
 logger = logging.getLogger("GhostAgent")
@@ -167,6 +168,13 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
     # The dispatcher guards insert_fact before reaching here.
     if not text:
         return "SYSTEM ERROR: The 'text' parameter is MANDATORY. You must specify it."
+    # Anchor BEFORE the dedup hash and before any store sees it: "remember
+    # that Leonidas is 4 months old" is the single most direct route a
+    # decaying snapshot takes into memory. Anchoring here (rather than
+    # inside VectorMemory.add) is deliberate — add() also ingests DOCUMENT
+    # chunks, whose "4 months old" belongs to the document's own timeline,
+    # not to the ingest date, and must not be rewritten.
+    text = _anchor_temporal(text)
     pretty_log("Memory Store", text, icon=Icons.MEM_SAVE)
 
     # --- DEDUP: check whether the same text has already been embedded.
@@ -1621,6 +1629,17 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
         return msg
 
     pretty_log("Profile Update", f"{category}.{key}={value}", icon=Icons.USER_ID)
+
+    # TEMPORAL ANCHORING, done ONCE and up front. ProfileMemory.update()
+    # anchors at its own boundary regardless (nothing can bypass it), but
+    # this function ALSO mints a vector fact ("User <key> is <value>") and
+    # a graph triplet from the raw value. Anchoring only inside the profile
+    # store would leave those two siblings holding the decaying snapshot
+    # while the profile held the anchor — the exact three-stores-disagree
+    # shape §4M MAJOR-4 already had to fix once for the canonical key.
+    # anchor() is idempotent, so the second application downstream is a
+    # no-op.
+    value = _anchor_temporal(value)
 
     # --- DEDUP: short-circuit when the stored value already equals the new
     # value. This is the second-line defence against the production loop bug

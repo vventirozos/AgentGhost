@@ -34166,6 +34166,181 @@ engine quality, see [[onion-engine-survey]] territory.
 **Not done.** The write-back records raw results, not a synthesis; a leaf that needs a brief still
 runs the research leaf. Auto-restart of sandbox services after a deploy: declined by the operator.
 
+## §4EL — Temporal anchoring: a stated age is a measurement, not a fact (2026-09-04)
+
+**Trigger.** Operator: *"i told the agent 2 months ago that leonidas is 4 years old … now, 2 months
+later the agent recalls the memory verbatim, without the concept of time."* Live transcript: **"Leonidas
+is 4 months old (Thodoris is 9 years old) per my records."** The fact was stated **2026-07-07**
+(recovered independently from `contradiction_log.json`) and was still being served verbatim on
+**2026-09-04**.
+
+**Diagnosis.** Nothing was corrupted — the store faithfully kept what it was told. The defect is that a
+stated age is a MEASUREMENT, true only on the day it is said, and it was stored as a fact.
+`user_profile.json` held `relationships.sons = "Thodoris (9 years old) and Leonidas (4 months old)"`,
+and `ProfileMemory.get_context_string` renders bare, **unstamped** `- key: value` lines into
+`### USER PROFILE ###` on every turn — maximum authority, present tense, for ever. The vector store
+*does* stamp rows and the prompt *does* carry `CURRENT TIME`, so the arithmetic was possible; it
+required the model to notice an ISO stamp, subtract, and then overrule an unstamped profile line
+asserting otherwise. It never did. `memory/graph.py` already had the right instinct (bitemporal
+`valid_from` / `valid_until`); the profile and vector fact paths never got it.
+
+**Fix — store the invariant, derive the quantity.** New `memory/temporal.py`. `anchor(text, said_at)`
+runs at WRITE time and rewrites an age into the constant behind it (`"Leonidas is 4 months old"` →
+`"Leonidas born ~2026-02-20"`); `derive(text, now)` runs at RENDER time and appends the value true
+today (`→ ~6 months old`). The disk holds a constant, the prompt holds the current value, and the
+model is never asked to do the subtraction it demonstrably skips. **Anchoring sits in
+`ProfileMemory.update()`** — the boundary every writer funnels through (update_profile tool both
+paths, bus `_profile`, smart-memory) so nothing can bypass it; `tool_update_profile` and
+`tool_remember` anchor additionally and up front because they also mint a vector fact and a graph
+triplet from the same value, and anchoring only in the profile would have recreated the
+three-stores-disagree shape of §4M MAJOR-4. Idempotent, so the second pass is a no-op. Also:
+`SMART_MEMORY_PROMPT` gained a TEMPORAL RULE (the prompt is the hint, the regex is the mechanism), and
+`VectorMemory._render_item` now prints elapsed time beside the stamp (`[… · 59d ago]`).
+
+**Five design points that are load-bearing.** (1) **Midpoint anchoring** — "9 years old" means [9,10),
+so the estimate is `said_at − 9.5y`; naive subtraction biases every later derivation one unit high,
+the exact error class being removed. (2) **Precision survives the round trip** — a year-stated age
+anchors to the MONTH (±6mo), a month-stated age to the DAY, and `derive` renders a coarse anchor in
+years only; without it "1 year old" came back as "~18 months old", inventing precision. (3) **KV-cache
+stability** — the gloss is a rounded age, never a date, so `{{PROFILE}}` (inside the byte-stable system
+prefix) changes about monthly for an infant, not daily. (4) **Protected spans** — quoted strings and
+derived glosses are never rewritten: a quoted string is a record, a gloss is render output. (5)
+**`_same_fact`** — anchoring makes a restatement differ in bytes, so exact-string dedup would have kept
+two contradictory birth dates; anchored values now compare on `temporal.signature()` and refine in
+place, with the exemption scoped so unanchored dedup stays byte-exact.
+
+**Two defects the LIVE CORPUS found that no unit test would have.** Sweeping all 8,682 chroma rows and
+every graph edge through `anchor()` before shipping: (a) attributive position mangled a real stored
+fact — `"equipment for a 9-year-old named Thodoris"` → `"for a born ~2017-02-20 named Thodoris"`; the
+fully-hyphenated compound now ANNOTATES (`9-year-old (born ~2017-02)`) instead of replacing, a
+mechanical syntactic rule (hyphenated = attributive = annotate; spaced = predicative = replace). (b) A
+stored skill lesson held `web_search(query="Thodoris basketball Panellinios age 9")` and the pass
+rewrote the query text — falsifying a record of what was executed. Hence protected spans.
+
+**Corpus repair.** `scripts/repair_temporal_anchors.py`, dry-run by default, backs up each target.
+Applied: profile 1 row (`relationships.sons`, said_at 2026-07-07), vector 1 row (via
+`POST /api/memory/correct` — a second PersistentClient against live Chroma risks HNSW corruption),
+graph 2 rows (1 rewritten, 1 retired as a duplicate) of 3 candidates. It refuses to guess a said_at (an undated row is reported UNREPAIRED, never silently
+skipped) and refuses to sweep blindly: `thodoris IS_AGE "9 years old"` → `thodoris BORN "~2017-02"`
+(rewriting the object alone would leave `IS_AGE` pointing at a birth date), while
+`wilson evolution youth IS_BEST_FOR "9-year-old"` was SKIPPED — a ball stays suitable for
+nine-year-olds. Its own first run printed **"profile (0 candidates)"** for the very row this change
+exists to fix: detection ran on a `json.dumps()`, where every value is quoted and therefore
+protected. A tool that cannot see the defect reports success — detection now walks string leaves.
+
+**Two more, found by RUNNING the repair rather than reading it.** (c) `thodoris IS_AGE "9 years"`
+survived the first pass: the age cue lives in the PREDICATE and the object alone reads as a duration,
+which `anchor()` correctly refuses. Fixed in the script only (`_with_predicate_cue`) — loosening
+`anchor()` itself would reintroduce "4 months of runway"; a bare number under an age predicate means
+years. (d) Applying that repair raised `IntegrityError: UNIQUE(subject, predicate, object)` — the
+repaired form already existed from the earlier pass, so that row IS the duplicate. It now gets the
+store's own supersession mark (`valid_until`, which every graph read path filters on) instead of being
+updated into a collision. The failed run rolled back cleanly and changed nothing.
+
+**Two more, found by the post-restart LIVE probe.** Restarted (pid 44104) and asked the original
+failing question: **"Leonidas is about 6 months old"** — fixed. The same turn also revealed (e) the
+operator had told the agent both children's EXACT birth dates in a chat turn, stored verbatim by the
+pre-change code as `born March 12, 2026` — a form `derive()` could not read, so they carried no
+derived age at all (an exact date the model must subtract from by hand is the original defect one
+step on). `anchor()` now canonicalises the month-name form to ISO and `derive()` reads it, for legacy
+rows. (f) That exposed the precision bug AGAIN in a new place: coarseness was keyed on
+month-granularity, so `born 2026-03` ("born in March 2026", ±15 days) rendered a five-month-old as
+"~0 years old". Coarseness keys on the `~` estimate marker, not the granularity. Live profile
+consolidated: `relationships.sons` now carries the exact dates and derives
+`Thodoris (born 2016-11-25 → 9 years old) and Leonidas (born 2026-03-12 → 5 months old)`; the two
+duplicate per-child keys the turn created (one with a typo'd key) removed. Estimate calibration: the
+anchors were off by 20 and 51 days, both inside their stated uncertainty.
+
+**Verification.** 25 pins (`tests/test_temporal_anchoring.py`), each naming the mutants it answers to.
+Time-dependent pins assert the rendered value CHANGES as the clock moves (a fixed-string pin passes
+with the feature deleted); arithmetic pins recompute rather than hardcode. Two defects were caught by
+pins mid-development (year/month precision loss; `_GLOSS_RE` missing "weeks"). First battery run:
+**19/22**, three survivors, all pin weakness — a `born > now` pre-check that `_months_between` already
+made unreachable (removed as dead code rather than pinned around it), and two repair pins written as
+token/helper assertions instead of executing the consumer (rewritten against real JSON and SQLite
+fixtures, with a row per guard so redundant guards cannot hide each other — with one fixture the two
+graph guards were redundant and a mutation of either survived). Final: **32/32 killed**, control
+green, mutants applied to an isolated copy tree — `src/` is what the live agent executes. Full suite
+**19,661 passed / 65 skipped / 5:43**.
+
+**Not done — the third layer.** Perishable facts with no invariant to derive (job, location,
+"currently learning X") still need per-value `as_of` stamping and a staleness class; the profile
+schema is still bare strings. Ages used as a CATEGORY ("a ball best for a 9-year-old") are still
+annotated by the write path — noisy, not corrupting; only the repair script distinguishes them, because
+the distinction is semantic and a regex that pretended to have semantics would be worse. **Needs a
+restart to take effect**: the running agent has the pre-change code, so until it is redeployed the
+repaired profile renders as bare anchors (a date the model can subtract from `CURRENT TIME`) with no
+derived age.
+
+## §4EM — Layer 3: per-value provenance on the profile (2026-09-04)
+
+**Trigger.** Operator, on §4EL's "not done" line: *"what do you mean the profile schema is still bare
+strings?"* → *"yes, build layer 3."*
+
+**The gap.** Anchoring (§4EL) fixes decaying facts that have a DERIVABLE invariant — an age has a birth
+date behind it. An employer, a location, "currently learning X" have none, so nothing can be
+recomputed and the only truthful thing the store can say is WHEN it learned them. A bare string could
+not say even that. Live evidence, from the operator's own profile: `root.project_codename =
+zephyrineehbjb` and `projects.codename = zephyrineceehh` — two codenames in two places with nothing
+able to say which is current; `projects.home_lab_worker_node = ["nova", "nova (runs Gemma)"]`, same
+shape. And the cost was already paid in §4EL: the repair script could not ask this store when
+`relationships.sons` was written and had to infer the date from the contradiction log, which is why it
+carries a `--said-at` flag and a refuse-to-guess rule.
+
+**Shape.** A value is `str` (LEGACY, as_of unknown), `{"v": str, "as_of": ISO}`, or a list of those.
+Stamps are PER VALUE, not per key: a merging key accumulates its items at different times, so one
+stamp for the key would be a lie about every item but the last. Scalar→list promotion carries the
+existing item over untouched so its own date survives.
+
+**What made the migration cheap: the reader contract.** Every profile reader was enumerated FROM THE
+AST (12 production call sites) rather than from a grep or a memory — all of them go through `load()`.
+So `load()` keeps returning the LEGACY unwrapped shape and not one of them changed; `load_raw()` /
+`as_of()` are the opt-in for provenance. `update`/`delete`/`prune_value`/`get_context_string` moved to
+`load_raw()` — going through `load()` there would have stripped every OTHER key's stamp on the next
+save. `save()` re-attaches the stamp of any value handed back unchanged, which closes the
+`save(load())` footgun structurally: once unwrapped the two shapes are indistinguishable, so no
+convention could.
+
+**Quiet by default.** A marker appears only where it changes how the fact should be read: never for a
+`_DURABLE_KEYS` key (a name is not more doubtful for being a year old), never below
+`_STALE_AFTER_DAYS = 90`, `(as of 2026-04-01)` past that, `(as of …, may be stale)` past
+`_VERY_STALE_AFTER_DAYS = 365`, and never for an unstamped legacy value — absent provenance is not
+evidence of age. It is a fixed date string, so the byte-stable `{{PROFILE}}` prefix does not churn. A
+restatement refreshes the stamp on BOTH the scalar and list paths (they diverged in the first draft;
+"last confirmed" is exactly what the marker reports).
+
+**Backfill: recover, never invent.** `--targets profile-stamps`. Admissible evidence is only a store
+that records a fact WRITE — the minted vector fact (`User <key> is <value>`) and the contradiction
+log, which preserves superseded ones verbatim. The first version matched any corpus mention and the
+dry run showed the bill: `name = Vasilis` dated from a chess-coaching prompt, `debugging_tool_macos =
+dtrace` and `home_lab_worker_node = nova` from a **PostgreSQL manual**. Structural match + a
+12-character minimum + document/episode/skill rows excluded. On the live corpus: **7 of 17 values
+recovered**, 6 by the strong minted-fact form, all clustered in the 2026-07-07 seeding window — and
+that immediately resolved the codename conflict (`zephyrineehbjb` 23:16 is newer than `zephyrineceehh`
+16:31, a question nothing could answer before). The other 10 are reported UNRECOVERED, not stamped
+with today. `ProfileMemory.stamp()` is the write path and is deliberately surgical — routing the
+backfill through `update()` would re-anchor, canonicalise and cap the values, i.e. a migration able to
+rewrite what it was only supposed to date.
+
+**⚠ Deploy order, code THEN data.** New code reads legacy bare values fine (unwrapping is identity on
+a string), but an agent still on the older `ProfileMemory` renders a stamped value as a raw dict —
+`{'v': 'Athens, Greece', 'as_of': …}` — straight into every system prompt and hands the same dict to
+`tool_check_location`. The script prints this before applying. **The live backfill is therefore NOT
+applied yet**: pid 44104 is running §4EL code.
+
+**Verification.** 41 pins. First battery: **40/46**, six survivors, all the same pin weakness — every
+layer-3 pin wrote ONE value per key, so it never reached the list branch, and a mutant deleting the
+list-path stamp refresh / overwriting list stamps / flipping `max` to `min` in `as_of()` all survived;
+the backfill had no pin at all. One more survivor was `_wrap`'s "unknown date" branch, proved
+unreachable and deleted rather than pinned around (same call as §4EL's `born > now`), with the guard
+moved to the reachable edge in `stamp()`. Final: **47/47 killed**, control green, isolated copy tree.
+Full suite **19,677 passed / 65 skipped / 5:17**.
+
+**Not done.** Perishability is a key-name allowlist (`_DURABLE_KEYS`), not a learned property. The
+thresholds (90 / 365 days) are unmeasured defaults. And because every recovered date is inside the
+last 60 days, no marker renders on the live profile today — the mechanism is live but invisible until
+facts age.
+
 ## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
 
 **This section is binding. When the operator says "review <feature/subsystem>", this is the

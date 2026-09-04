@@ -962,8 +962,14 @@ You are the Subconscious Synthesizer. Extract high-signal data from this task ep
 - 0.2 : TRACKED-PROJECT STATE — anything about a MANAGED PROJECT's files, architecture, tasks, testing, or release status (episodes mentioning a 12-hex project id or a project the agent manages). The project store already records these; saving them here creates stale duplicates ("user is working on X" read weeks later as current truth). -> DISCARD. NEVER put project state in profile_update. A durable USER preference learned during project work ("user prefers dark UIs") is still 0.9.
 - 0.1 : EPHEMERAL CHIT-CHAT -> DISCARD.
 
+### TEMPORAL RULE
+Facts decay. NEVER write an age, a duration, or a relative date into a `fact` or a `profile_update` — they are measurements, true only on the day they were said, and they are read back months later as if current. Write the ABSOLUTE date they imply, computed from the CURRENT TIME you were given:
+- "Leonidas is 4 months old" -> "Leonidas born ~<date 4 months before today>"
+- "started at the company 3 years ago" -> "started in ~<date 3 years before today>"
+An absolute date already in the statement ("born in March 2026") is already correct — keep it as is.
+
 ### OUTPUT FORMAT
-Return ONLY a JSON object. 
+Return ONLY a JSON object.
 1. For `score` and `fact`: If the episode contains NEW implicit context to remember semantically, score it >= 0.8 and provide a 1-sentence "fact". If the agent already explicitly saved the fact using a tool, score it < 0.5 to avoid duplicates.
 2. For `graph_triplets`: ALWAYS extract explicit entity relationships into this array as objects with "subject", "predicate", and "object" keys, REGARDLESS of the semantic score. Predicates MUST be uppercase verbs (e.g., OWNS, LIKES, USES, WORKS_AT). Use broad, normalized entities.
 
