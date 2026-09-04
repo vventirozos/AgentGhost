@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 # ---------- Signal A: correction phrases ----------------------------
@@ -101,6 +101,23 @@ _CORRECTION_RE = re.compile(
     r"^\s*(?:" + "|".join(_CORRECTION_PHRASES) + r")",
     re.IGNORECASE,
 )
+
+
+def has_correction_phrase(text) -> bool:
+    """Signal A on its own — does this message OPEN like a correction?
+
+    Exposed because it is the CHEAP GATE for the adjudicated second signal:
+    the caller must be able to ask "is this even a candidate?" without paying
+    for a judge, and it must ask with the SAME regex this module promotes on.
+    Measured on 1601 consecutive live turn pairs it fires 14 times (0.9%), so
+    an LLM adjudication behind it costs about one call per 114 turns.
+
+    A second private copy of this test in the caller is how the gate and the
+    promotion come to disagree about what a candidate is — the one-authority
+    rule this module already applies to `_content_tokens`.
+    """
+    head = (text if isinstance(text, str) else "").lstrip()[:240]
+    return bool(head and _CORRECTION_RE.search(head))
 
 
 # ---------- Affirmation veto (Signal A+B false-positive guard) -------
@@ -231,11 +248,88 @@ this many content tokens. A bare 'no' or 'wrong' has zero content
 tokens and would trivially overlap with anything otherwise."""
 
 
+#: Bounded budget for the adjudication call. It runs on the ~0.9% of turns
+#: that clear Signal A, and it blocks the user's turn while it does — so it
+#: gets a small ceiling and a hard failure mode (see `classify_user_correction`
+#: on `contradicts=None`: every timeout falls back to today's behaviour).
+ADJUDICATION_MAX_TOKENS = 200
+
+
+def adjudication_prompt(*, prev_user_request: str,
+                        prev_assistant_response: str,
+                        current_user_text: str) -> str:
+    """The Signal-B question, asked of the ASSISTANT'S ANSWER.
+
+    ⚠ THE DISTINCTIONS THIS PROMPT EXISTS TO DRAW were all found in live
+    traffic (§4EP, the 12 blocked candidates):
+
+      * "no let's change topic, do you think covid vaccines…" — a topic
+        change that opens with "no". NOT a correction.
+      * "no go ahead, i give you the permission" — a permission grant.
+      * "nope, nothing for now, mark the project as done" — an ANSWER to a
+        question the assistant asked. Promoting it stamps a correct turn
+        FAILED.
+      * "Actually, you remember now — Chess Coach v3 was just a stepping
+        stone…" — a message asserting a FALSE PREMISE about the assistant's
+        own history (a live continuity-probe). Promoting it would teach the
+        agent that its correct memory was the error. Called out explicitly
+        because it is correction-SHAPED and the most damaging false positive
+        available.
+
+    Against genuine ones: "No, that's wrong. You made a mistake there. The
+    correct answer is Canberra"; "no I was asking about the mysql problem";
+    "that's not true. you have many mechanisms that work when i'm not
+    around".
+    """
+    return (
+        "You judge whether a user's message CORRECTS the assistant's "
+        "previous answer.\n\n"
+        "It is a CORRECTION only if the user asserts that something the "
+        "assistant SAID is wrong, inaccurate, or answered the wrong "
+        "question.\n\n"
+        "It is NOT a correction if the user is:\n"
+        "- changing the subject (even if the message starts with \"no\")\n"
+        "- answering a question the assistant asked (\"no, nothing for "
+        "now\")\n"
+        "- granting permission or agreeing to proceed\n"
+        "- adding new information without contradicting anything\n"
+        "- asserting a premise about the assistant's own past that the "
+        "assistant did not claim\n\n"
+        "PREVIOUS USER REQUEST:\n" + (prev_user_request or "")[:800] +
+        "\n\nASSISTANT'S ANSWER:\n" + (prev_assistant_response or "")[:2000] +
+        "\n\nUSER'S NEXT MESSAGE:\n" + (current_user_text or "")[:800] +
+        "\n\nAnswer with JSON only: {\"corrects\": true|false}"
+    )
+
+
+def parse_adjudication(text) -> Optional[bool]:
+    """Read the judge's answer, or ``None`` when it did not give one.
+
+    ⚠ FAILS CLOSED, and `None` is not `False`. `False` means "a judge looked
+    and said no", which SUPPRESSES a promotion the lexical test might have
+    made; `None` means "no judge ruled" and restores that test. Collapsing
+    the two would let an unparseable reply silently veto real corrections —
+    the absent-is-not-withheld rule, one module over.
+    """
+    import json as _json
+    import re as _re
+    raw = text if isinstance(text, str) else ""
+    m = _re.search(r"\{[^{}]*\}", raw, _re.DOTALL)
+    if not m:
+        return None
+    try:
+        val = _json.loads(m.group(0)).get("corrects")
+    except Exception:  # noqa: BLE001 — a judge that malforms has not ruled
+        return None
+    return bool(val) if isinstance(val, bool) else None
+
+
 def classify_user_correction(
     *,
     prev_user_request: str,
     prev_assistant_response: str,
     current_user_text: str,
+    contradicts: Optional[bool] = None,
 ) -> CorrectionVerdict:
     """Decide whether ``current_user_text`` is a correction of the
     assistant turn that produced ``prev_assistant_response``.
@@ -246,9 +340,39 @@ def classify_user_correction(
       B. Token-overlap rephrase: Jaccard(prev_user, current_user)
          over content tokens (stopwords stripped) ≥ threshold.
 
-    Promotion requires BOTH. ``prev_assistant_response`` is accepted
-    by the API for forward compatibility (a future LLM-judge variant
-    will use it) but the heuristic version doesn't read it.
+    Promotion requires Signal A **and** a corroborating second signal.
+
+    ⚠ SIGNAL B WAS A LEXICAL PROXY FOR A SEMANTIC PROPERTY (§4EP,
+    2026-09-04). "Did the user re-ask the same question in similar words?"
+    is not the question; "does this message assert that my previous answer
+    was wrong?" is. Measured over 1601 consecutive live turn pairs, the
+    conjunction promoted **2**, while 12 more fired Signal A and were
+    blocked — and hand-labelling those 12 found **6 genuine corrections**
+    ("No, that's wrong. The correct answer is Canberra", "no I was asking
+    about the mysql problem") against 6 non-corrections that merely open
+    with "no" (a topic change, a permission grant, an answer to a yes/no
+    question). So Signal A alone is ~50% precise: dropping the conjunction
+    would have poisoned the corpus, and keeping it costs ~70% of the
+    strongest negative label the system can get.
+
+    Neither cheap replacement separates the two classes. Measured on those
+    12: Jaccard(current, prior ASSISTANT REPLY) is 0.000-0.167 for real
+    corrections and 0.000-0.108 for the others, fully overlapping; "did the
+    reply end with a question?" is 4/6 in BOTH classes — exactly zero
+    information. Stop patching a proxy and ask the question.
+
+    ``contradicts`` is that answer, supplied by the caller (this function
+    stays pure and does no I/O — see `adjudication_prompt`):
+
+      * ``True``/``False`` — a judge ruled; **it decides**, because a
+        semantic read of the actual reply outranks a token-overlap guess.
+      * ``None`` — no judge ran (offline, no client, timeout, unparseable).
+        Falls back to the lexical rephrase test, i.e. **exactly today's
+        behaviour**. Every failure path lands here, so the judge can only
+        ever ADD promotions, never silently remove the old ones.
+
+    ``prev_assistant_response`` is still not read here — it is the judge's
+    subject, and the judge lives at the call site.
 
     Pure: never raises, never mutates inputs, no I/O.
     """
@@ -289,9 +413,16 @@ def classify_user_correction(
     if confidence > 1.0:
         confidence = 1.0
 
-    is_correction = ("phrase" in signals) and any(
-        s.startswith("rephrase") for s in signals
-    )
+    # ⚠ ASK THE VERDICT ONCE. When a judge ruled, the lexical test is not
+    # consulted at all — two authorities on one question is how a promotion
+    # gets granted by whichever signal happened to fire.
+    _rephrased = any(s.startswith("rephrase") for s in signals)
+    if contradicts is None:
+        _corroborated = _rephrased
+    else:
+        _corroborated = bool(contradicts)
+        signals.append(f"adjudicated({'yes' if contradicts else 'no'})")
+    is_correction = ("phrase" in signals) and _corroborated
 
     # Affirmation veto — only consulted when both signals fired, so the
     # common paths pay nothing. A clear affirmation with no negative

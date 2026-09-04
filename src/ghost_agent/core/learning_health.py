@@ -526,6 +526,19 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             "auc": params.get("auc"),
             "auc_ci_lo": params.get("auc_ci_lo"),
             "auc_ci_hi": params.get("auc_ci_hi"),
+            # ⚠ §4EO, AND THE SAME COMMENT BLOCK IS WHY, AGAIN. Both verdicts
+            # above are measured on the rows carrying a VERDICT, not on
+            # `n_fitted` — 402 of 1074 live. Forwarded here so the renderer
+            # states the population it is reporting on rather than letting
+            # `n_fitted` be read as the evidence behind the verdict, and so
+            # `indistinguishable` can be told apart from "cannot measure"
+            # (`delta_halfwidth` is the smallest resolvable difference).
+            "n_verdict_rows": params.get("n_verdict_rows"),
+            "n_unverified_prior": params.get("n_unverified_prior"),
+            "delta_halfwidth": params.get("delta_halfwidth"),
+            # The rank measurement per feature — the statistic with power at
+            # this base rate, beside `feature_contrib`'s Brier deltas.
+            "component_auc": params.get("component_auc"),
             # ⚠ THE RENDERER NEEDS THE CAUSE, NOT JUST THE REFUSAL. Its
             # `unknown` branch used to state "the Platt map was rejected" as
             # fact while having no field to check it against -- and `unknown`
@@ -2390,6 +2403,36 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                     f"  Brier {_brier_shown} (IN-SAMPLE — no CV recorded, "
                     f"treat as optimistic) {_verdict} the base-rate predictor "
                     f"({_bb}); raw composite {_br}{_same}{_ci_note}")
+            # ⚠ AND WHICH ROWS THEY REST ON (§4EO). The verdicts above are
+            # measured on rows carrying a VERDICT, not on `n_fitted` — 402 of
+            # 1074 live. Printing only the fitted count invites reading
+            # `n=1074` as the evidence behind an `indistinguishable`, when
+            # two thirds of those rows are the unverified prior whose value
+            # IS the base-rate comparand. `delta_halfwidth` then separates the
+            # two states the word covers: a measured tie, and a comparison
+            # that never had the resolution to find one.
+            _nvr = usable_number(cal.get("n_verdict_rows"))
+            _nup = usable_number(cal.get("n_unverified_prior"))
+            _hw = usable_number(cal.get("delta_halfwidth"))
+            if _nvr is not None and _nup is not None:
+                lines.append(
+                    f"  verdict population: {int(_nvr)} row(s) carrying a "
+                    f"verdict; {int(_nup)} placeholder row(s) (unverified "
+                    f"prior) fitted but NOT judged on")
+            if _hw is not None:
+                _dlo2 = usable_number(cal.get("brier_cv_delta_lo"),
+                                      allow_negative=True)
+                _dhi2 = usable_number(cal.get("brier_cv_delta_hi"),
+                                      allow_negative=True)
+                _obs = (abs((_dlo2 + _dhi2) / 2.0)
+                        if _dlo2 is not None and _dhi2 is not None else None)
+                lines.append(
+                    f"  resolution: this corpus cannot resolve a Brier "
+                    f"difference smaller than {_hw:+.5f}"
+                    + (f" — the observed effect is {_obs:.5f}, "
+                       f"{_hw / _obs:.1f}x smaller, so `indistinguishable` "
+                       f"here means CANNOT MEASURE, not measured-equal"
+                       if _obs else ""))
             # THE NUMBER EVERY OTHER VERDICT RESTS ON. Every feature verdict,
             # weight and Brier comparison here is estimated from the negative
             # class, and the live store carries 18 of them in 694 rows.
@@ -2420,6 +2463,34 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                     f"  negative class: {_nneg}/{_n} ({_pct:.1%}){_warn}"
                     + (" — every verdict on this screen is estimated from "
                        f"those {_nneg} rows" if _warn else ""))
+            # ⚠ THE ONE THING THIS SCORE IS LICENSED TO DO (§4ER). Everything
+            # above says what it may NOT be read as; this is the use it MAY
+            # be put to, and until 2026-09-04 it had none at all — confidence
+            # computed 865 times, `below_threshold` 118 times, arbitrations 0.
+            # Gated on the licence itself, so if the score stops ranking the
+            # list goes silent instead of quietly becoming decoration.
+            try:
+                from .calibration import CalibrationTracker as _CT
+                _cal_dir = Path(str(memory_dir)).parent / "calibration"
+                _lows, _why = _CT(_cal_dir).lowest_confidence_turns(
+                    limit=5, days=7)
+                if _lows:
+                    lines.append(
+                        "  LOWEST-CONFIDENCE turns this week (the ranking use "
+                        "`ranks_outcomes` licenses — NOT probabilities):")
+                    for _s in _lows:
+                        _tag = ("" if _s.outcome >= 0.5
+                                else "  ← and it did go wrong")
+                        lines.append(
+                            f"    {_s.ts[:16]}  score {_s.composite:.3f}  "
+                            f"{_s.domain or '—'}  req {(_s.req_id or '?')[:12]}"
+                            f"{_tag}")
+                elif _why:
+                    # Absent is not withheld: say which.
+                    lines.append(f"  lowest-confidence ranking withheld: {_why}")
+            except Exception as _lcx:  # noqa: BLE001 — a report must not die
+                logger.debug("lowest-confidence list skipped: %s", _lcx)
+
             # ⚠⚠ WHO ACTS ON THIS (audit 2026-08-10). The threshold's ONLY
             # consumer is metacog arbitration, and that call site is hard-
             # gated by `_METACOG_ARBITER_ENABLED` in core/agent.py — a module
@@ -2498,6 +2569,38 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
                     "    ⚠ where ABLATION and the σ-gate disagree, believe the "
                     "ablation: the gate is a difference-of-means test and at "
                     "this negative count it cannot resolve what it judges")
+            # ⚠ THE SAME TABLE ON THE STATISTIC THAT HAS POWER (§4EO). Every
+            # ablation delta above is under 0.001 at this base rate — a table
+            # nobody can act on, which is how a feature sat at the largest
+            # weight for a month with no reading on whether it works. Same
+            # untrusted-input discipline: filter to what is usable and SAY
+            # what was dropped.
+            _ca_raw = cal.get("component_auc")
+            _ca = {}
+            if isinstance(_ca_raw, dict):
+                _ca = {k: v for k, v in _ca_raw.items()
+                       if usable_number(v) is not None}
+                _ca_dropped = len(_ca_raw) - len(_ca)
+                if _ca_dropped:
+                    lines.append(
+                        f"  ⚠ {_ca_dropped} component-rank entr"
+                        f"{'y' if _ca_dropped == 1 else 'ies'} unusable and "
+                        f"omitted (non-numeric values on file)")
+            elif _ca_raw is not None:
+                lines.append(
+                    f"  ⚠ component_auc is {type(_ca_raw).__name__}, not a "
+                    f"mapping — the component-rank table is omitted")
+            if _ca:
+                lines.append("  component RANK (AUC on the verdict rows; "
+                             "0.5 = chance):")
+                for _k, _v in sorted(_ca.items(), key=lambda kv: -kv[1]):
+                    if _v > 0.55:
+                        _m = "orders outcomes"
+                    elif _v < 0.45:
+                        _m = "orders outcomes BACKWARDS"
+                    else:
+                        _m = "chance — no ordering"
+                    lines.append(f"    {_k:<24} {_v:.4f}  {_m}")
         fh = cal.get("feature_health") or {}
         if fh:
             live = cal.get("live_features") or []
@@ -2875,17 +2978,29 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
         _en = ig.get("enabled_count", 0)
         lines.append("\nIMAGINE GATE (§4CL — the allow-list every steer "
                      "is gated on):")
+        # ⚠ AN OPEN GATE ON A DISARMED PROCESS STEERS NOTHING. These are two
+        # questions and this line answered only one: on 2026-09-04 six buckets
+        # read as DISCRIMINATE here while `GHOST_IMAGINE` was unset, so every
+        # deferral was dropped at the first line of the consumer. Say which.
+        _armed = ig.get("steer_armed")
         if _en:
             lines.append(
                 f"  {_en}/{ig.get('buckets', 0)} (tool, tclass) buckets "
                 f"DISCRIMINATE: {', '.join(ig.get('enabled') or [])}")
+            if _armed is False:
+                lines.append(
+                    "  ⚠ but the steer is DISARMED (GHOST_IMAGINE unset) — "
+                    "the gate is open and NOTHING acts on it")
+            elif _armed is True:
+                lines.append("  steer ARMED — these buckets defer live calls")
         else:
             _why = "; ".join(f"{n}× {r}" for r, n
                              in (ig.get("closed_reasons") or {}).items())
             lines.append(
                 f"  CLOSED — 0/{ig.get('buckets', 0)} buckets enabled over "
                 f"{ig.get('ledger_rows', 0)} ledger rows"
-                + (f" ({_why})" if _why else ""))
+                + (f" ({_why})" if _why else "")
+                + ("" if _armed is not False else "; steer also disarmed"))
         _p = ig.get("params") or {}
         lines.append(
             f"  built {ig.get('built', '?')}; bar: n≥{_p.get('min_bucket_n')}, "

@@ -28,17 +28,33 @@ def _agent(verifier=None):
 
 
 class TestLateVerdictEmptyDifferentiation:
-    def _capture(self, agent, last_tool):
+    def _capture(self, agent, last_tool, n_tools=None):
         with patch("ghost_agent.core.agent.pretty_log") as log:
-            agent._record_late_verdict(None, "traj-1", "", last_tool=last_tool)
+            agent._record_late_verdict(None, "traj-1", "", last_tool=last_tool,
+                                       n_tools=n_tools)
         assert log.call_count == 1
         call = log.call_args
         return call.args[1], call.kwargs.get("level", "INFO")
 
     def test_no_evidence_tool_is_a_quiet_by_design_skip(self):
-        msg, level = self._capture(_agent(), last_tool=None)
-        assert "no verifiable evidence" in msg
+        """§4EP: this used to assert the text "no verifiable evidence
+        (bookkeeping-only tools)" — which named the wrong cause for 97% of
+        the turns it fired on. The skip is still quiet and still by design;
+        it now has to say WHICH evidence-free shape it saw."""
+        msg, level = self._capture(_agent(), last_tool=None, n_tools=0)
+        assert "ran NO tools" in msg
         assert "by design" in msg
+        assert level == "INFO"
+
+    def test_bookkeeping_only_is_a_DIFFERENT_quiet_skip(self):
+        msg, level = self._capture(_agent(), last_tool=None, n_tools=4)
+        assert "ran 4 tool(s) but none carried" in msg
+        assert level == "INFO"
+
+    def test_an_uncaptured_count_says_so_rather_than_guessing(self):
+        msg, level = self._capture(_agent(), last_tool=None, n_tools=None)
+        assert "not captured" in msg
+        assert "ran NO tools" not in msg
         assert level == "INFO"
 
     def test_missing_verifier_is_a_quiet_by_design_skip(self):

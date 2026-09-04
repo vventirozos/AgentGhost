@@ -145,7 +145,10 @@ class TestLateVerdictHandlerPublishesTask:
         assert agent._deferred_verdict_task is None
         agent._record_late_verdict.assert_called_once_with(
             "vr", "traj-1", "conv-1", last_tool="lt",
-            force_correction=False, project_id=None)
+            # §4EP threads the turn's tool COUNT to the skip message so it can
+            # name the cause it observed; the handler forwards whatever the
+            # spawn site captured (None = not captured).
+            force_correction=False, project_id=None, n_tools=None)
 
     async def test_cancelled_verdict_still_clears_handle(self):
         agent = GhostAgent.__new__(GhostAgent)

@@ -39,6 +39,28 @@
   <p><code>build_gate</code> now emits a <code>discrimination</code> block carrying the pooled numbers and this verdict, surfaced on the idle-phase summary and in the <a href="../tools/introspect.html#loop-yield">LOOP YIELD</a> row. It is DERIVED, so it flips on its own the moment predicted-fail rows start failing more than predicted-ok ones. Tests: <code>tests/test_4cs_foresight_gate_parked.py</code> (10 tests, 10 mutants, 10 killed).</p>
   </div>
 
+  <h2 id="armed">An open gate is not a running steer (2026-09-04, &sect;4ER)</h2>
+  <p>The allow-list opens itself from measured data; <code>GHOST_IMAGINE</code> decides whether the
+  consumer looks at it at all. These are independent, and for days they disagreed: <strong>six of 145
+  buckets were open</strong> &mdash; <code>file_system|ext:py</code> (n=1896, Brier skill +0.41),
+  <code>manage_services|</code> (n=2475), <code>execute|cmd:cd</code> (n=603) and three more, 16% of
+  predicted calls &mdash; while the flag was unset, so every deferral was discarded at the first line of
+  <code>_imagine_preflight_note</code>. <code>introspect learning</code> reported "6/145 buckets
+  DISCRIMINATE" and nothing said the steer was dead; the module docstring meanwhile asserted the gate
+  was <em>closed on every bucket</em>, which had stopped being true.</p>
+  <p><code>steer_armed()</code> now rides <code>gate_stats</code> and the report says
+  <strong>ARMED</strong> or <strong>DISARMED</strong> beside the bucket count. It is read from the
+  environment on every call, never cached &mdash; the screen must describe the running process, not a
+  launcher edit that process never saw. A comment asserting a path is dead is how a live path stops
+  being reviewed: the gate's status is a measurement.</p>
+  <p><strong>Armed 2026-09-04, on replayed evidence.</strong> Over the 11.4k-row ledger, gates 3+4
+  together admit <strong>~100 deferrals per 6 days (~17/day), of which 66% were calls that really
+  failed</strong> &mdash; just above the gate's own 0.6 precision bar. The other 34% cost one extra
+  round trip, not a wrong answer: the model may re-issue the call unchanged with a justification and it
+  is dispatched (once per args, max two deferrals per request). It is a randomised A/B, so CONTROL still
+  dispatches and the arms stay comparable. Kill switches: <code>GHOST_IMAGINE=0</code> (all imagination)
+  or <code>GHOST_IMAGINE_PREFLIGHT=0</code> (this steer only).</p>
+
   <h2>Why the gate comes first</h2>
   <p>Two negative results from the literature are load-bearing for the whole Imagine phase: an agent <em>offered</em> a simulation tool uses it under 1% of the time and gets worse, and a planner gated on a model's <em>self-reported</em> confidence is gated on nothing. So imagination has to be forced into the loop rather than offered &mdash; and gated on measured historical accuracy rather than on a model saying it feels sure.</p>
   <p>This project's own history says the same thing more sharply. <a href="mcts.html">MCTS turn-start</a> was disabled precisely because its value function scored the model's self-prediction of un-executed actions. Foresight was built to be the grounded replacement, and its verdict on the live ledger has been "underpowered-promising" for weeks &mdash; never "measured usable". The gate is what turns that sentence into a per-bucket boolean that code can read.</p>

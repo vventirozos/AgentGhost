@@ -1309,6 +1309,14 @@ def calib_startup_fields(cp) -> dict:
         "lam": cp.lambda_uncertainty,
         "brier": cp.brier,
         "n": cp.n_samples,
+        # ⚠ §4EO: `n` IS NOT THE EVIDENCE BEHIND THE VERDICT. It counts the
+        # rows the WEIGHTS were fitted on; both verdicts above are measured
+        # on the rows carrying one — 402 of 1074 live, the rest being the
+        # unverified prior whose value IS the base-rate comparand. Printing
+        # only `n` beside `beats_base_rate` is how 1074 gets read as the
+        # power behind an `indistinguishable`. 0 on a params file older than
+        # the field, which reads as "not recorded", not as "no evidence".
+        "n_verdict": getattr(cp, "n_verdict_rows", 0),
     }
 
 

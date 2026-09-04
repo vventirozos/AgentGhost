@@ -306,6 +306,57 @@ def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 
         return _UNVERIFIED_PRIOR
 
 
+def label_is_verdict(outcome) -> bool:
+    """Did this row's label come from CHECKING the turn, or from the prior?
+
+    ⚠ A PLACEHOLDER IS NOT A LABEL. `grade_turn_outcome` returns
+    `_UNVERIFIED_PRIOR` for "nothing was checked and nothing visibly broke" —
+    a stand-in for a measurement that never happened, exactly as the neutral
+    0.5 is for unobserved entropy. This module already refuses to let that
+    entropy stand-in vote (`entropy_observed` gates `w_entropy`); the outcome
+    stand-in had no such gate, and on the live store it is **63% of the fit
+    population** (672 of 1074 rows, 2026-09-04).
+
+    What that does to the two verdicts:
+
+    * `beats_base_rate` compares the model against always predicting the base
+      rate — and the base rate IS the placeholder (0.838 vs a constant 0.83),
+      so two thirds of the rows are asking the model to reproduce the
+      comparand. The Platt map obliges: it maps the whole corpus onto
+      [0.700, 0.867], and the fitted slope 1.958/intercept 0.013 return
+      0.837 at the placeholder. `indistinguishable from a constant` was not a
+      finding about the score. It was the corpus describing itself.
+    * `ranks_outcomes` binarises at 0.5, so every placeholder enters the AUC
+      as a POSITIVE — 672 of 1017 (66%) of the "successes" the score is
+      credited with ordering are turns nobody checked.
+
+    Exact equality on the constant, not a tolerance: `_UNVERIFIED_PRIOR` is
+    this module's own value, every other grade path produces a different one
+    (the degraded path subtracts at least `_EXEC_FAILURE_PENALTY`), and a
+    tolerance would swallow a genuine neighbouring grade. Measured on the
+    live corpus: 672 rows match exactly, zero near-misses.
+
+    Total: never raises, so a malformed row is treated as carrying no verdict
+    rather than aborting a fit.
+    """
+    try:
+        return float(outcome) != _UNVERIFIED_PRIOR
+    except (TypeError, ValueError):
+        return False
+
+
+def verdict_pairs(pairs):
+    """The `(score, outcome)` rows that carry a verdict — the population every
+    "is this score any good" measurement is entitled to use.
+
+    One implementation, asked by all three (Brier delta, rank, per-component
+    rank), for the same reason `resolve_superseded_rows` has exactly one
+    ladder per shape: three private filters are three chances to disagree
+    about what the fit was measured on.
+    """
+    return [(c, y) for c, y in pairs or [] if label_is_verdict(y)]
+
+
 # Source precedence for per-request label resolution (§4L Lens-A/B,
 # 2026-08-07). Higher rank = stronger evidence, mirroring the outcome
 # ladder: a user correction outranks a late verifier verdict outranks
@@ -494,6 +545,25 @@ def _outcome_variance(samples) -> float:
     vals = [s.outcome for s in samples]
     mean = sum(vals) / len(vals)
     return sum((v - mean) ** 2 for v in vals) / len(vals)
+
+
+def base_rate_brier(pairs):
+    """``(base rate, Brier of always predicting it)`` for these rows, or
+    ``(None, None)`` when there are none.
+
+    ⚠ A HELPER SO THE EMPTY CASE IS REACHABLE. Written inline in `fit`, the
+    "no rows" branch was dead code: a corpus with zero verdict rows has a
+    constant outcome column, so `_outcome_variance` bails the fit long before
+    the division. A guard nothing can reach reads as protection and provides
+    none — and this one guards a ZeroDivisionError, so deleting it is not an
+    option either. Extracted instead, where a caller can hand it an empty list
+    and see it answer.
+    """
+    rows = list(pairs or [])
+    if not rows:
+        return None, None
+    base = sum(y for _, y in rows) / len(rows)
+    return base, sum((base - y) ** 2 for _, y in rows) / len(rows)
 
 
 def _sigmoid(z: float) -> float:
@@ -687,6 +757,46 @@ def downgrade_for_map(verdict: str, map_status) -> str:
     So the rule lives here, and both callers ask it.
     """
     return verdict if map_applied(map_status) else BEATS_UNKNOWN
+
+
+def announce_level(previous: object, current: object) -> int:
+    """WARNING the first time a fit verdict is seen or when it CHANGES,
+    DEBUG while it merely persists.
+
+    ⚠ A STANDING CONDITION IS NOT AN EVENT. Every warning in `fit` described
+    a property of the CORPUS — "bench rows rank backwards", "the map is not
+    in force", "indistinguishable from the base rate" — and was re-emitted
+    at WARNING on every refit. The refit is hourly and the corpus is
+    append-only, so the same rows produced the same verdict ~11x a day:
+    measured on the live log, 99 INDISTINGUISHABLE lines and 80 bench-
+    EXCLUDED lines over five days, identical but for the fourth decimal.
+    That is the operator's alarm channel spent on a fact that has not moved
+    since 2026-08-30, and it trains exactly the habit these warnings exist
+    to defeat — scrolling past them.
+
+    The steady state does NOT go dark. It is a field on the params
+    (`beats_base_rate`, `bench_verdict`, `map_status`), rides the per-refit
+    metacog CALIB line at INFO (`no_prob:…`/`no_rank:…`, agent.py phase
+    2.7c) and the activity ledger, and is queryable via
+    `introspect learning`. The verdict is already ASKED ONCE and published;
+    this only stops the log from re-announcing the answer. The TRANSITION is
+    the event, and it is the thing an operator can act on.
+
+    Compares against the last SUCCESSFULLY FITTED params — the value on
+    disk, not a value remembered in this process. A restart therefore does
+    not re-announce a standing condition, and there is no second copy of
+    "what did we last say" to drift from the file every consumer reads.
+    ⚠ Consequence, stated because it is a real one: a fit that BAILS writes
+    no params, so a verdict that changes and then bails re-announces until
+    a fit succeeds and records it. That is the honest direction — the change
+    is genuinely still unrecorded — and a bail is itself a fault worth
+    hearing about.
+
+    `previous` is `None` at cold start (no params file, or one too corrupt
+    to load). No verdict in the vocabulary is `None`, so an unrecorded
+    condition always announces: this fails toward saying too much.
+    """
+    return logging.WARNING if previous != current else logging.DEBUG
 
 
 def _verdict_from_params(d: dict) -> str:
@@ -989,6 +1099,9 @@ class _Population:
     n_bench_misaligned: int = 0
     bench_rank: Optional[Tuple[float, float, float]] = None
     bench_verdict: str = BEATS_UNKNOWN
+    #: Per-component AUC of the EXCLUDED auxiliary rows — which input drove
+    #: the inversion. `None` unless rows were actually excluded.
+    bench_component_rank: Optional[Dict[str, float]] = None
 
 
 def _apply_bench_direction_gate(samples, params):
@@ -1028,19 +1141,37 @@ def _apply_bench_direction_gate(samples, params):
     # state, and routing an expected condition through an exception handler
     # is how a real fault later gets mistaken for one.
     if params is None:
-        return list(samples), BEATS_UNKNOWN, None
+        return list(samples), BEATS_UNKNOWN, None, None
     try:
         pairs = [(_composite_for(s, params.w_entropy,
                                  params.lambda_uncertainty, params.w_effort),
                   s.outcome) for s in bench]
     except Exception:  # noqa: BLE001 — a gate must never break the fit
-        return list(samples), BEATS_UNKNOWN, None
+        return list(samples), BEATS_UNKNOWN, None, None
     ci = _auc_ci(pairs)
     verdict = _rank_verdict(ci)
     if verdict != BEATS_NO:
-        return list(samples), verdict, ci
+        return list(samples), verdict, ci, None
+    # ⚠ AN EXCLUSION THAT CANNOT EXPLAIN ITSELF GETS RE-DIAGNOSED BY HAND.
+    # This gate has been throwing rows away since 2026-08-31 saying only
+    # "they rank backwards", so the question it raises — WHY do these rows
+    # invert? — took a bespoke script to answer, and the answer was worth
+    # having: measured 2026-09-04 the driver is `competence_component`
+    # (AUC 0.189 on the excluded rows) against `effort_component` at 0.755.
+    # Competence is a per-DOMAIN prior, so on a population whose domain mix
+    # is degenerate it is a near-constant that cannot track per-turn
+    # outcomes — and it carries the largest weight (0.5). Naming the
+    # component turns the message into a diagnosis; the same measurement on
+    # the kept rows rides `component_auc`.
+    diag = {}
+    for _attr in ("entropy_component", "competence_component",
+                  "effort_component"):
+        _a = _auc([(getattr(s, _attr), s.outcome) for s in bench])
+        if _a is not None:
+            diag[_attr] = round(_a, 3)
     return ([s for s in samples
-             if getattr(s, "origin", "user") != _AUX_ORIGIN], verdict, ci)
+             if getattr(s, "origin", "user") != _AUX_ORIGIN],
+            verdict, ci, diag or None)
 
 
 def _fit_population(epoch_samples, params=None) -> _Population:
@@ -1053,7 +1184,7 @@ def _fit_population(epoch_samples, params=None) -> _Population:
     """
     resolved = _resolve_superseded(list(epoch_samples))
     capped = _apply_bench_mass_cap(resolved)
-    gated, verdict, ci = _apply_bench_direction_gate(capped, params)
+    gated, verdict, ci, diag = _apply_bench_direction_gate(capped, params)
     return _Population(
         samples=_migrate_leaked_pressure(gated),
         n_superseded=len(epoch_samples) - len(resolved),
@@ -1061,6 +1192,7 @@ def _fit_population(epoch_samples, params=None) -> _Population:
         n_bench_misaligned=len(capped) - len(gated),
         bench_rank=ci,
         bench_verdict=verdict,
+        bench_component_rank=diag,
     )
 
 
@@ -1293,6 +1425,49 @@ class FittedParams:
     #: rows the direction gate dropped when it did not.
     bench_verdict: str = BEATS_UNKNOWN
     n_bench_misaligned: int = 0
+    # ── WHAT THE VERDICTS WERE MEASURED ON (2026-09-04, §4EO) ────────────
+    #: `beats_base_rate`, `ranks_outcomes`, `brier_cv`, `brier_base_rate`,
+    #: the delta CI and `component_auc` all describe the rows that carry a
+    #: VERDICT — see `label_is_verdict`. `n_samples` counts the rows the
+    #: WEIGHTS were fitted on, which is a different and much larger number
+    #: (1074 vs 402 live), and reading one as the other is reading power that
+    #: does not exist. Both are recorded so neither can be inferred wrongly.
+    n_verdict_rows: int = 0
+    n_unverified_prior: int = 0
+    #: Half-width of the cross-validated delta CI: the SMALLEST difference
+    #: this corpus can resolve. Without it `indistinguishable` conflates two
+    #: opposite states — "we measured a tie" and "we cannot measure" — and
+    #: the live store is the second (delta -0.0037, resolution ±0.0061).
+    #: None = no interval was computed.
+    delta_halfwidth: Optional[float] = None
+    #: Per-component AUC on the verdict rows. `feature_contrib` answers the
+    #: same shape of question on the Brier scale, which at this base rate is
+    #: nearly powerless — every entry there is under 0.001. This is the
+    #: statistic that HAS power, and it is how the live finding became
+    #: visible: `competence_component` carries the largest weight (0.5) and
+    #: ranks at 0.482 [0.404, 0.568], i.e. chance.
+    component_auc: Optional[Dict[str, float]] = None
+
+
+#: The baseline when NOTHING has been recorded yet — a cold start, or a params
+#: file too corrupt to load. Every verdict on it is ``None``, which belongs to
+#: no vocabulary, so `announce_level` reads each condition as news.
+#:
+#: ⚠ ONE SENTINEL, NOT THREE `if prev is not None` GUARDS. Written per site,
+#: the cold-start branch is a separate chance to write `else current` at each
+#: one — and a mutation battery proved that unpinnable: at cold start
+#: `_apply_bench_direction_gate` has no instrument, so it excludes nothing and
+#: the bench warning never runs. That site's cold-start branch is UNREACHABLE,
+#: so the mutant `else _pop.bench_verdict` is EQUIVALENT today and survives
+#: every pin — while sitting one gate change away from silently swallowing the
+#: first announcement of a backwards auxiliary population. Sharing one baseline
+#: moves the decision onto a line the base-rate pins do reach, and makes a
+#: mistyped field an AttributeError instead of a quieter log.
+NOTHING_RECORDED = FittedParams(
+    w_entropy=0.0, w_competence=0.0, threshold=0.0, lambda_uncertainty=0.0,
+    brier=-1.0, n_samples=0, fitted_at="",
+    map_status=None, beats_base_rate=None, bench_verdict=None,
+)
 
 
 @dataclass
@@ -1853,7 +2028,16 @@ class CalibrationTracker:
         # (~1.8k rows vs 4k window); revisit if bench cadence grows.
         all_samples = self._load_samples(limit=self.max_history)
         epoch_samples = [s for s in all_samples if s.epoch == CURRENT_EPOCH]
-        _pop = _fit_population(epoch_samples, self.load_params())
+        # ONE read, TWO consumers. The direction gate scores bench rows with
+        # the weights currently in production, and `announce_level` asks the
+        # same file what verdicts it already recorded — so a re-read here
+        # could hand the two halves of one fit different baselines.
+        _prev = self.load_params()
+        # THE baseline every warning below compares against. `NOTHING_RECORDED`
+        # stands in for "no params yet", so no site carries its own cold-start
+        # branch — see that sentinel for why per-site guards cannot be pinned.
+        _rec = _prev if _prev is not None else NOTHING_RECORDED
+        _pop = _fit_population(epoch_samples, _prev)
         samples = _pop.samples
         # ⚠ FOUR different exclusions, counted apart (§4L R2 NEW-5, one
         # richer for 1c, one for the direction gate): epoch scope,
@@ -1866,12 +2050,23 @@ class CalibrationTracker:
         n_bench_capped = _pop.n_bench_capped
         if _pop.n_bench_misaligned:
             _br = _pop.bench_rank or (float("nan"),) * 3
-            logger.warning(
+            # ⚠ THE VERDICT IS THE TRIGGER, NOT THE COUNT. The excluded count
+            # climbs with every nightly bench solve (253 -> 309 over five
+            # days), so gating on it would re-announce a standing exclusion
+            # under a different number — the noise this is fixing, wearing a
+            # disguise. `bench_verdict` flipping is the event.
+            logger.log(
+                announce_level(_rec.bench_verdict, _pop.bench_verdict),
                 "calibration: %d bench row(s) EXCLUDED from the fit — they "
                 "rank outcomes backwards (AUC %.3f [%.3f, %.3f], whole "
                 "interval below chance), so pooling them with real turns "
-                "fits incomparable rows. See `bench_verdict` on the stored "
-                "params.", _pop.n_bench_misaligned, _br[0], _br[1], _br[2])
+                "fits incomparable rows. Driven by%s. See `bench_verdict` on "
+                "the stored params.",
+                _pop.n_bench_misaligned, _br[0], _br[1], _br[2],
+                ("".join(" %s %.3f;" % (k, v) for k, v in sorted(
+                    (_pop.bench_component_rank or {}).items(),
+                    key=lambda kv: kv[1])).rstrip(";")
+                 or " an unmeasured component mix"))
         if n_superseded:
             logger.debug(
                 "calibration: %d duplicate-request row(s) resolved by "
@@ -2097,9 +2292,32 @@ class CalibrationTracker:
         # module's own `_cv_delta_ci` docstring says the sign of the
         # INTERVAL, not of the point estimate, is what licenses a "beats the
         # base rate" claim (queue #8); the licence was never asked for here.
-        brier_cv = _cv_brier(composites)
-        _delta_ci = _cv_delta_ci(composites)
+        # ⚠ AND THE EVIDENCE MUST COME FROM ROWS THAT SAW SOMETHING (§4EO,
+        # 2026-09-04). Every row above is fitted on; only the ones carrying a
+        # VERDICT may judge the result. 63% of this corpus is the
+        # `_UNVERIFIED_PRIOR` placeholder, whose value IS the base rate, so
+        # the comparison was largely the corpus checking whether the model
+        # could reproduce its own filler — see `label_is_verdict`. The
+        # weights and the map are unchanged: this narrows what MEASURES the
+        # scorer, never what the scorer is.
+        _verdict = verdict_pairs(composites)
+        n_verdict_rows = len(_verdict)
+        n_unverified_prior = len(composites) - n_verdict_rows
+        brier_cv = _cv_brier(_verdict)
+        _delta_ci = _cv_delta_ci(_verdict)
         beats_base_rate = _base_rate_verdict(_delta_ci)
+        # ⚠ THE PAIR IS ATOMIC. `brier_base_rate` is the comparand of
+        # `brier_cv` and must describe the SAME rows. Written independently,
+        # a corpus too thin to cross-validate stored `brier_cv = -1.0` beside
+        # a usable baseline, and the learning-health renderer's documented
+        # fallback ("no CV Brier, use the in-sample one") then compared a
+        # full-population in-sample number against a verdict-population
+        # baseline — 0.041 vs 0.113, which reads as a crushing win. Both or
+        # neither.
+        base_verdict, brier_base_verdict = base_rate_brier(_verdict)
+        _delta_halfwidth = (
+            (_delta_ci[2] - _delta_ci[1]) / 2.0 if _delta_ci is not None
+            else None)
 
         map_status = "applied"
         if platt_a <= 0.0:
@@ -2169,11 +2387,15 @@ class CalibrationTracker:
         # staying in place. (An earlier version of this comment claimed the
         # inverted branch would report `1 - AUC`. It would not — `calibrated`
         # is rebound there. A justification has to be checked like a claim.)
-        _auc_res = _auc_ci(composites)
+        # Same population, same reason: binarising at 0.5 turns every
+        # placeholder into a POSITIVE, so 66% of the "successes" this score
+        # was credited with ordering were turns nobody checked.
+        _auc_res = _auc_ci(_verdict)
         ranks_outcomes = _rank_verdict(_auc_res)
 
         if not map_applied(map_status):
-            logger.warning(
+            logger.log(
+                announce_level(_rec.map_status, map_status),
                 "calibration: map %s, so the shipped predictor is the RAW "
                 "composite — the cross-validated interval describes the "
                 "CALIBRATED model and does not apply to it. Recording "
@@ -2215,25 +2437,51 @@ class CalibrationTracker:
             _rank_note = (" Discrimination was NOT measured (too few rows or "
                           "one outcome class), so it is unknown, not absent.")
 
+        # ⚠ ONE DECISION FOR BOTH BRANCHES. `no` and `indistinguishable` are
+        # two values of ONE verdict; deciding the level separately per branch
+        # would let a `no` -> `indistinguishable` flip — a real change in what
+        # the score may be used for — read as steady state in whichever
+        # branch it landed in.
+        _bbr_level = announce_level(_rec.beats_base_rate, beats_base_rate)
+        # ⚠ SAY WHAT THE COMPARISON WAS RUN ON, AND WHAT IT COULD HAVE SEEN.
+        # `indistinguishable` reads as "we measured a tie". At this corpus it
+        # means "we cannot measure": the interval's half-width IS the
+        # smallest difference these rows can resolve, and live it is 5x the
+        # observed effect. Without that number the same word covers a
+        # measured tie and a measurement that never had a chance, which is
+        # the `unknown`-vs-measured distinction this module already refuses
+        # to blur one field over.
+        _pop_note = (
+            " Measured on the %d row(s) carrying a VERDICT; %d placeholder "
+            "row(s) (the unverified prior, whose value IS the base rate) were "
+            "excluded from the comparison but not from the fit."
+            % (n_verdict_rows, n_unverified_prior))
+        _res_note = ("" if _delta_halfwidth is None else
+                     " This corpus resolves differences no smaller than "
+                     "%+.5f." % _delta_halfwidth)
+        _cv_txt = "n/a" if brier_cv is None else "%.4f" % brier_cv
         if beats_base_rate == BEATS_NO:
-            logger.warning(
-                "calibration: fitted model (CV Brier %.4f) is WORSE than "
+            logger.log(
+                _bbr_level,
+                "calibration: fitted model (CV Brier %s) is WORSE than "
                 "always predicting the base rate %.3f (Brier %.4f) — the "
                 "confidence score is not adding information AS A PROBABILITY."
-                "%s",
-                brier_cv, base, brier_base, _rank_note)
+                "%s%s%s",
+                _cv_txt, base_verdict, brier_base_verdict,
+                _pop_note, _res_note, _rank_note)
         elif beats_base_rate == BEATS_INDISTINGUISHABLE:
-            logger.warning(
-                "calibration: fitted model (CV Brier %.4f) is INDISTINGUISHABLE "
+            logger.log(
+                _bbr_level,
+                "calibration: fitted model (CV Brier %s) is INDISTINGUISHABLE "
                 "from always predicting the base rate %.3f (Brier %.4f) — the "
                 "95%% CI of the delta [%+.5f, %+.5f] straddles zero. The map "
                 "is still applied (it beats the RAW composite, a different "
                 "question). Nothing may treat this score AS A PROBABILITY: "
-                "see `beats_base_rate` on the stored params.%s",
-                brier_cv, base, brier_base,
+                "see `beats_base_rate` on the stored params.%s%s%s",
+                _cv_txt, base_verdict, brier_base_verdict,
                 _delta_ci[1] if _delta_ci else float("nan"),
                 _delta_ci[2] if _delta_ci else float("nan"),
-                _rank_note)
+                _pop_note, _res_note, _rank_note)
 
         # ── HONEST PERFORMANCE (audit 2026-08-10) ────────────────────────
         # `brier` above is IN-SAMPLE and was the headline. Cross-validate so
@@ -2270,6 +2518,26 @@ class CalibrationTracker:
             if _d is not None:
                 feature_contrib[_attr] = _d
 
+        # ⚠ THE SAME QUESTION ON THE STATISTIC THAT HAS POWER (§4EO).
+        # `feature_contrib` is a held-out BRIER delta per feature, and at this
+        # base rate every entry is under 0.001 — a table of numbers too small
+        # to act on, which is how a feature can sit at the largest weight for
+        # a month without anyone able to say whether it works. AUC asks the
+        # ranking question instead, on the rows entitled to answer it.
+        # Measured live: effort 0.622 [0.549, 0.699] (ranks), entropy 0.582
+        # (spans chance), and `competence_component` — carrying w=0.5, the
+        # LARGEST weight — 0.482 [0.404, 0.568], i.e. chance. Recorded rather
+        # than acted on: a grid over the weights moves AUC by 0.014 against a
+        # CI 0.15 wide, so "reweight it" is not a conclusion this corpus
+        # supports. It is a number that must be VISIBLE while it accumulates.
+        component_auc = {}
+        for _attr in ("entropy_component", "competence_component",
+                      "effort_component"):
+            _a = _auc(verdict_pairs(
+                [(getattr(s, _attr), s.outcome) for s in samples]))
+            if _a is not None:
+                component_auc[_attr] = round(_a, 4)
+
         # Threshold is picked on the CALIBRATED scores (Youden's J on the
         # "predict success when p ≥ τ" decision) — it must live on the same
         # scale `below_threshold` will compare against, or the gate fires at
@@ -2288,7 +2556,15 @@ class CalibrationTracker:
             platt_a=round(platt_a, 6),
             platt_b=round(platt_b, 6),
             brier_raw=round(brier_raw, 6),
-            brier_base_rate=round(brier_base, 6),
+            # ⚠ THE VERDICT POPULATION'S baseline, not the fit's — it is the
+            # direct comparand of `brier_cv` and the two must describe the
+            # same rows. -1.0 ("not recorded") whenever the CV Brier could
+            # not be computed, so the renderer's documented fallback cannot
+            # compare a full-population in-sample number against it.
+            brier_base_rate=(round(brier_base_verdict, 6)
+                             if (brier_cv is not None
+                                 and brier_base_verdict is not None)
+                             else -1.0),
             w_effort=round(w_eff, 4),
             n_effort_observed=len(eff_observed),
             map_status=map_status,
@@ -2308,11 +2584,67 @@ class CalibrationTracker:
             ranks_outcomes=ranks_outcomes,
             bench_verdict=_pop.bench_verdict,
             n_bench_misaligned=_pop.n_bench_misaligned,
+            n_verdict_rows=n_verdict_rows,
+            n_unverified_prior=n_unverified_prior,
+            delta_halfwidth=(round(_delta_halfwidth, 6)
+                             if _delta_halfwidth is not None else None),
+            component_auc=component_auc or None,
         )
         self._save_params(params)
         return params
 
     # ----------------------------------------------------------- params io
+
+    def lowest_confidence_turns(self, *, limit: int = 5, days: int = 7):
+        """The turns this score ranks LOWEST — its one licensed use.
+
+        ⚠ THE LICENCE GATES THE USE (§4ER). `beats_base_rate` is
+        `indistinguishable` and always will be at this corpus (§4EO/§4EP), so
+        the score may never be read as "I am 42% sure". `ranks_outcomes` is
+        `yes` (AUC 0.634 [0.564, 0.712]) — it ORDERS turns, and ordering is
+        what "show me the shakiest answers of the week" needs. That is the
+        only thing this number has ever been entitled to do, and until now it
+        did nothing at all: measured over 209 metacog summaries, confidence
+        was computed 865 times, `below_threshold` fired 118 times, and
+        arbitrations — its sole consumer, hard-gated off by
+        `_METACOG_ARBITER_ENABLED` — happened **zero** times.
+
+        Returns ``(rows, refusal)``. Exactly one is meaningful:
+
+          * ``refusal`` is a string when the ranking may NOT be shown — no
+            params, or `ranks_outcomes` is anything but an affirmative
+            licence. Absent is not withheld: a caller must be able to say
+            WHY the list is missing instead of printing an empty one, which
+            reads as "no shaky turns this week".
+          * otherwise ``rows`` is up to `limit` samples, lowest composite
+            first.
+
+        Ranked on the RAW stored composite — one stable scale across refits,
+        the same column the reliability table uses. Applying the Platt map
+        here would rank identically (it is monotone) while implying the
+        probability reading the licence refuses.
+        """
+        params = self.load_params()
+        if params is None:
+            return [], "no fitted params yet — the score has no measured licence"
+        # ⚠ TEST FOR THE LICENCE, NOT FOR ITS ABSENCE. `in NOT_INFORMATIVE`
+        # fails OPEN on a typo or a future verdict word; only an affirmative
+        # `yes` may unlock a use of this score.
+        if _known_verdict(params.ranks_outcomes) != BEATS_YES:
+            return [], (f"ranks_outcomes={params.ranks_outcomes!r} — the score "
+                        f"is not licensed to order turns, so this list is "
+                        f"withheld rather than shown")
+        try:
+            cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                      - datetime.timedelta(days=max(1, int(days)))).isoformat()
+        except Exception:  # noqa: BLE001
+            return [], "could not compute the window"
+        rows = [s for s in self._load_epoch()
+                if getattr(s, "origin", "user") != "bench" and s.ts >= cutoff]
+        if not rows:
+            return [], f"no rows in the last {days} day(s)"
+        rows.sort(key=lambda s: s.composite)
+        return rows[:max(1, int(limit))], ""
 
     def load_params(self) -> Optional[FittedParams]:
         """Read the persisted fitted params, or ``None`` if absent /
@@ -2411,6 +2743,21 @@ class CalibrationTracker:
                 ranks_outcomes=_known_verdict(d.get("ranks_outcomes")),
                 bench_verdict=_known_verdict(d.get("bench_verdict")),
                 n_bench_misaligned=int(d.get("n_bench_misaligned", 0)),
+                # ⚠ THE READER SET, FOR THE FOURTH TIME. Three fields in this
+                # loader's history were WRITTEN by `_save_params` and not
+                # reconstructed here, so every reloaded fit carried the
+                # default forever. Same defaults discipline: 0 / None each
+                # read as "not recorded", never as a measured zero — a
+                # `n_verdict_rows` of 0 that meant "old file" would say the
+                # verdicts rest on no evidence at all.
+                n_verdict_rows=int(d.get("n_verdict_rows", 0)),
+                n_unverified_prior=int(d.get("n_unverified_prior", 0)),
+                delta_halfwidth=(float(d["delta_halfwidth"])
+                                 if d.get("delta_halfwidth") is not None
+                                 else None),
+                component_auc=(d.get("component_auc")
+                               if isinstance(d.get("component_auc"), dict)
+                               else None),
             )
         # ⚠ `OverflowError` IS AN `ArithmeticError`, NOT A `ValueError`.
         # `int(float('inf'))` raises out of this function for five fields
@@ -2590,4 +2937,13 @@ __all__ = [
     "map_applied",
     "map_applied_in_params",
     "downgrade_for_map",
+    # A placeholder is not a label. Declared because every future consumer
+    # asking "how good is this score" has to know which rows may answer.
+    "label_is_verdict",
+    "verdict_pairs",
+    "base_rate_brier",
+    # The steady-state rule. Declared because it is a POLICY every future
+    # per-refit warning in this module has to obey, not a private detail of
+    # the three that obey it today.
+    "announce_level",
 ]

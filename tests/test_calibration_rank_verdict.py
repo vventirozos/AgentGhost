@@ -153,7 +153,7 @@ def _aligned(n, *, origin, seed, invert=False):
 def test_backwards_ranking_bench_rows_are_excluded():
     real = _aligned(200, origin="user", seed=1)
     bench = _aligned(120, origin="bench", seed=2, invert=True)
-    kept, verdict, ci = C._apply_bench_direction_gate(real + bench, _params())
+    kept, verdict, ci, _dg = C._apply_bench_direction_gate(real + bench, _params())
     assert verdict == BEATS_NO
     assert ci is not None and ci[2] < 0.5
     assert all(s.origin != "bench" for s in kept)
@@ -165,7 +165,7 @@ def test_aligned_bench_rows_are_kept():
     unconditionally, which is a different (and worse) change."""
     real = _aligned(200, origin="user", seed=1)
     bench = _aligned(120, origin="bench", seed=7)
-    kept, verdict, _ci = C._apply_bench_direction_gate(real + bench, _params())
+    kept, verdict, _ci, _dg = C._apply_bench_direction_gate(real + bench, _params())
     assert verdict == BEATS_YES
     assert len(kept) == len(real) + len(bench)
 
@@ -190,7 +190,7 @@ def test_the_gate_excludes_only_on_a_CONFIDENT_inversion():
     verdicts = []
     for seed in range(20, 32):
         noise = _noise_bench(120, seed)
-        kept, verdict, _ = C._apply_bench_direction_gate(real + noise,
+        kept, verdict, _, _dg = C._apply_bench_direction_gate(real + noise,
                                                          _params())
         verdicts.append(verdict)
         if verdict != BEATS_NO:
@@ -226,11 +226,11 @@ def test_the_gate_has_no_opinion_without_evidence():
     real = _aligned(200, origin="user", seed=1)
     bench = _aligned(120, origin="bench", seed=2, invert=True)
     # No previous fit → no instrument to test the population against.
-    kept, verdict, ci = C._apply_bench_direction_gate(real + bench, None)
+    kept, verdict, ci, _dg = C._apply_bench_direction_gate(real + bench, None)
     assert (verdict, ci) == (BEATS_UNKNOWN, None) and len(kept) == 320
     # Too few auxiliary rows → not evidence either, however they rank.
     few = _aligned(C._RANK_MIN_N - 1, origin="bench", seed=2, invert=True)
-    kept2, verdict2, _ = C._apply_bench_direction_gate(real + few, _params())
+    kept2, verdict2, _, _dg2 = C._apply_bench_direction_gate(real + few, _params())
     assert verdict2 == BEATS_UNKNOWN and len(kept2) == len(real) + len(few)
 
 
@@ -239,7 +239,7 @@ def test_the_gate_never_breaks_the_fit():
     bench = _aligned(120, origin="bench", seed=2, invert=True)
     broken = MagicMock()
     broken.w_entropy = "not a number"
-    kept, verdict, _ = C._apply_bench_direction_gate(real + bench, broken)
+    kept, verdict, _, _dg = C._apply_bench_direction_gate(real + bench, broken)
     assert verdict == BEATS_UNKNOWN and len(kept) == 320
 
 

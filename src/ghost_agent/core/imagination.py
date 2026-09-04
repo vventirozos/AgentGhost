@@ -650,12 +650,40 @@ def enabled_buckets(home: str = None) -> Dict[str, dict]:
             if isinstance(v, dict) and v.get("enabled") is True}
 
 
+def steer_armed() -> bool:
+    """Is the pre-flight steer switched ON for this process?
+
+    ⚠ THE GATE OPENING IS NOT THE STEER RUNNING. The allow-list opens
+    itself from data — six buckets did — while `GHOST_IMAGINE` stayed unset,
+    so every deferral was still discarded at the first line of
+    `_imagine_preflight_note`. `gate_stats` reported "6 buckets
+    DISCRIMINATE" and a reader (this one, 2026-09-04) took that to mean the
+    steer was acting. Two different questions, and the report answered only
+    one; the module docstring meanwhile asserted the gate was closed on
+    every bucket, which had stopped being true.
+
+    Read from the environment on every call, deliberately: the flag is what
+    the running process actually has, and caching it would let the report
+    describe a launcher edit that this process never saw.
+    """
+    if os.getenv("GHOST_IMAGINE", "0").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return False
+    return os.getenv("GHOST_IMAGINE_PREFLIGHT", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def gate_stats(home: str = None) -> Dict[str, Any]:
     """The learning-health read surface. Reports the closed case as
     loudly as the open one, and names the most common reason buckets are
     closed — "waiting for data" and "measured flat" are different
-    project states."""
-    out: Dict[str, Any] = {"present": False}
+    project states.
+
+    Carries `steer_armed` beside the bucket counts: an open gate on a
+    disarmed process steers nothing, and the two were indistinguishable on
+    this surface until 2026-09-04.
+    """
+    out: Dict[str, Any] = {"present": False, "steer_armed": steer_armed()}
     doc = load_gate(home)
     if not doc:
         p = _gate_path(home)
@@ -670,6 +698,7 @@ def gate_stats(home: str = None) -> Dict[str, Any]:
             reasons[str(e.get("why", "")).split(":")[0] or "unknown"] += 1
     out.update({
         "present": True,
+        "steer_armed": steer_armed(),
         "built": doc.get("built"),
         "params": doc.get("params"),
         "ledger_rows": doc.get("ledger_rows"),
@@ -720,5 +749,6 @@ __all__ = [
     "gate_params", "bucket_key", "claims_failure",
     "is_steerable_row", "STEERABLE_BASES", "STEERABLE_MIN_SUPPORT",
     "STEERABLE_MIN_FAILS", "build_gate", "load_gate", "gate_allows",
-    "enabled_buckets", "gate_stats", "reset_gate_cache_for_tests",
+    "enabled_buckets", "gate_stats", "steer_armed",
+    "reset_gate_cache_for_tests",
 ]

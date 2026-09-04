@@ -30,6 +30,38 @@
   <h1>core / confidence.py — CompositeConfidence</h1>
   <p class="subtitle">Fuses token-level entropy (one-shot generation signal) and per-domain competence (long-term capability prior) into one tunable confidence score.</p>
 
+  <h2 id="licensed-use">The one thing this score is licensed to do (2026-09-04, &sect;4ER)</h2>
+  <p>Measured over 209 metacog summaries: confidence computed <strong>865</strong> times,
+  <code>below_threshold</code> fired <strong>118</strong> times, arbitrations &mdash; its only consumer,
+  hard-gated off by <code>_METACOG_ARBITER_ENABLED</code> &mdash; <strong>zero</strong>. The number was
+  computed, recorded, calibrated and acted on by nothing.</p>
+  <p><a href="calibration.html#verdict-population">&sect;4EO</a>/<a
+  href="verifier.html#coverage">&sect;4EP</a> settled what it may be read as. It is <strong>not a
+  probability</strong> (<code>beats_base_rate=indistinguishable</code>, and confirm-carrying coverage
+  cannot make that resolvable at this corpus). It <strong>does order turns</strong>
+  (<code>ranks_outcomes=yes</code>, AUC 0.634 [0.564, 0.712]). So it gets exactly one use:
+  <code>CalibrationTracker.lowest_confidence_turns()</code> &mdash; "the shakiest answers of the week",
+  rendered on <code>introspect learning</code>.</p>
+  <ul>
+    <li><strong>The licence gates the use.</strong> Only an affirmative <code>yes</code> unlocks it —
+    <code>in NOT_INFORMATIVE</code> would fail OPEN on a typo or a future verdict word.</li>
+    <li><strong>Absent is not withheld.</strong> It returns <code>(rows, refusal)</code>: a refusal
+    string when the ranking may not be shown, so the report can say <em>why</em> instead of printing an
+    empty list that reads as "no shaky turns this week".</li>
+    <li>Ranked on the RAW stored composite — one stable scale across refits. The Platt map would rank
+    identically (it is monotone) while implying the probability reading the licence refuses.</li>
+  </ul>
+
+  <h2 id="asking">Asking where the corpus is blind</h2>
+  <p>The human channel was never the bottleneck: the web console carries 👍/👎 on every reply, the
+  <code>ghost</code> CLI has <code>/good</code>/<code>/bad</code> with retries, Slack has thumbs. Thirty-nine
+  days produced <strong>7 labels</strong>, because nobody is ever asked.</p>
+  <p>So the agent asks — on a turn that ranks in the bottom quintile, <strong>has no verdict</strong>,
+  and has not been asked about in 20 hours. The middle condition is the point: a verified turn already
+  has a label, so asking there buys a duplicate, while an unverified low-ranked turn is exactly a row
+  that would otherwise enter the corpus as the <code>_UNVERIFIED_PRIOR</code> placeholder. The wording
+  never quotes the number (<code>GHOST_LABEL_ASK_HOURS=0</code> disables it).</p>
+
   <h2>Formula</h2>
   <p>
     <code>C = w_e · (1 - e) + w_c · p</code>, with <code>w_e + w_c = 1</code> enforced and both clamped to [0, 1].

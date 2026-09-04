@@ -27,6 +27,7 @@ These tests pin:
 
 import asyncio
 import inspect
+import re
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -183,7 +184,7 @@ def _agent_source():
 def test_stream_gate_block_is_wired():
     src = _agent_source()
     assert "VERIFIER GATE (STREAM)" in src
-    gate = src.split("VERIFIER GATE (STREAM)")[1][:6000]
+    gate = _gate_block(src)
     # Late-only: spawns the pure computation, never the gated/inline form.
     assert "_compute_verifier_verdict(" in gate
     assert "_compute_verifier_verdict_gated" not in gate
@@ -213,9 +214,23 @@ def test_stream_gate_captures_are_eager():
 
 def test_stream_gate_strips_think_from_claim():
     src = _agent_source()
-    gate = src.split("VERIFIER GATE (STREAM)")[1][:6000]
+    gate = _gate_block(src)
     assert "<think>" in gate
     assert "final_ai_content=_sv_claim" in gate
+
+
+def _gate_block(src: str) -> str:
+    """The stream-gate source, sliced to the end of the BLOCK.
+
+    ⚠ This was a magic `[:6000]` in three places while the assertions that
+    read it live at offset ~6100 — so any edit inside the gate silently
+    truncated the thing under test, and the pin was measuring its own slice.
+    §4EP added ~120 characters and all three went red at once. One helper,
+    bounded by the next section marker instead of a hand-picked length.
+    """
+    block = src.split("VERIFIER GATE (STREAM)")[1]
+    end = re.search(r"# ─+ [A-Z]", block[500:])
+    return block[:(end.start() + 500) if end else 12000]
 
 
 def test_stream_gate_every_branch_is_loud():
@@ -224,7 +239,7 @@ def test_stream_gate_every_branch_is_loud():
     invisible cannot be distinguished from a gate that never ran. Every
     skip branch and the exception path must log at a visible level."""
     src = _agent_source()
-    gate = src.split("VERIFIER GATE (STREAM)")[1][:6000]
+    gate = _gate_block(src)
     assert gate.count("stream gate:") >= 4  # 3 skips + deferred + failed
     assert "stream gate spawn failed" in gate
     assert 'level="WARNING"' in gate

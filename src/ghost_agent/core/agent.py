@@ -658,6 +658,12 @@ def _has_meta_task_directive(text: str) -> bool:
     return bool(_META_TASK_DIRECTIVE_RE.search(text or ""))
 
 
+#: Ceiling on the user-correction adjudication (§4EP). It blocks the user's
+#: turn, and it fires on ~0.9% of them; a judge that is slow has not ruled,
+#: and `None` restores the pre-§4EP lexical test rather than losing the turn.
+_CORRECTION_JUDGE_TIMEOUT_S = float(
+    os.getenv("GHOST_CORRECTION_JUDGE_TIMEOUT", "20") or 20)
+
 _BOOKKEEPING_TOOL_NAMES = frozenset({
     "manage_projects", "manage_tasks", "manage_skills",
     "scratchpad", "learn_skill", "update_profile",
@@ -665,6 +671,57 @@ _BOOKKEEPING_TOOL_NAMES = frozenset({
     "self_play_loop", "stop_self_play", "list_lessons",
     "knowledge_base",  # insert_fact / forget return confirmations only
 })
+
+
+def prm_skip_level(previous_reason, reason) -> str:
+    """`pretty_log` level for a PRM-retrain skip: news, or steady state.
+
+    ⚠ EXTRACTED SO IT CAN BE MUTATED AND KILLED. Written inline inside
+    `_biological_tick` — a very large async method — the only way to pin it
+    was a source-text assertion, which the review protocol rejects and which
+    would pass over a `level=` that had quietly become a constant.
+
+    Two decisions live here, and they are different questions:
+
+      * **Is this news?** Answered by `announce_level`, the SHARED rule
+        (§4EN). A second private `if reason != last` here is how the two
+        drift — the failure this codebase has paid for on `map_status`
+        (three copies) and `beats_base_rate` (four surfaces).
+      * **How loud is news?** INFO. A deliberately parked subsystem is not a
+        fault, and passing the shared rule's WARNING through verbatim would
+        have a months-long intentional no-op paging the operator.
+    """
+    from .calibration import announce_level
+    return ("INFO" if announce_level(previous_reason, reason) == logging.WARNING
+            else "DEBUG")
+
+
+def verdict_is_consumable(v_result, last_tool) -> bool:
+    """May this verdict drive the note / backfill / retraction?
+
+    ⚠ EXTRACTED SO IT CAN BE MUTATED AND KILLED. Written inline, the clause
+    was `last_tool is not None` — "a substantive tool ran" — which is FALSE
+    for every verdict the §4EQ memory-claim route can ever produce, because
+    that route exists precisely for tool-free turns. The verdict would have
+    been computed, logged, and consumed by nothing: a verifier that runs and
+    changes nothing, which is this codebase's most-repeated defect class.
+
+    The question the guard actually asks is "was the verifier applicable to
+    this turn". Tool evidence answers yes. So does a produced REFUTED, which
+    can only exist here because a mechanical check found a contradiction —
+    and a contradiction the agent can PROVE is the last thing that should be
+    dropped for want of a tool call.
+
+    A produced CONFIRMED/UNCERTAIN with no tool is deliberately NOT
+    consumable: the memory route never emits one (§4EP — confirm-carrying
+    coverage makes calibration worse), so such a value would be a verdict
+    from somewhere unaccounted for, and this fails closed on it.
+    """
+    if last_tool is not None:
+        return True
+    from .verifier import VerifyVerdict
+    return (v_result is not None
+            and getattr(v_result, "verdict", None) == VerifyVerdict.REFUTED)
 
 
 def _action_failed(content, tool_name: str = "") -> bool:
@@ -7389,15 +7446,35 @@ class GhostAgent:
                     # below appends. R2 B-MIN-1: _safe_pretty_log — this
                     # skip-line sits outside the phase try, so a raising
                     # log (OSError 28) escaped the whole tick.
+                    # ⚠ A STANDING CONDITION, NOT AN EVENT (§4ES, the §4EN
+                    # rule one subsystem over). This reason is derived from a
+                    # module CONSTANT and a CLI flag, so it cannot change
+                    # inside a process — yet it was narrated on every idle
+                    # tick, ~10x a day for months (409 lines in the live log,
+                    # every dated one a skip). Announce it when it CHANGES,
+                    # which for a per-process constant means once per boot.
+                    #
+                    # ⚠ AND THE BASELINE IS IN-PROCESS HERE, DELIBERATELY —
+                    # the opposite of §4EN's. There the baseline is the
+                    # params FILE, because a standing fact about the CORPUS
+                    # must not be replayed by a restart. Here the fact is
+                    # about THIS process's configuration, so a restart SHOULD
+                    # re-announce it: the operator may have just changed the
+                    # flag, and that is exactly when they need to see it.
+                    _prm_why = prm_consumer_why_no_reader(ctx)
+                    _prm_lvl = prm_skip_level(
+                        getattr(self, "_prm_skip_reason", None), _prm_why)
+                    self._prm_skip_reason = _prm_why
                     self._safe_pretty_log(
                         "PRM Retrain",
                         "skipped — both value-reading consumers are off ("
-                        + prm_consumer_why_no_reader(ctx)
+                        + _prm_why
                         + "). Training would produce a checkpoint neither "
                         "reads; enable either to resume. "
                         "(--prm-online-update is a PRODUCER, not a "
                         "consumer — correctly not counted here; see §4BN.)",
                         icon=Icons.SKIP,
+                        level=_prm_lvl,
                     )
                 elif (
                     traj_collector is not None
@@ -7741,6 +7818,11 @@ class GhostAgent:
                             # tell a healthy filter from a truncated read.
                             excluded=getattr(
                                 params, "n_excluded_other_epochs", 0),
+                            # ⚠ §4EO: the SAME line, the same misread. `n`
+                            # counts what the weights were fitted on; the
+                            # verdicts beside it are measured on the rows
+                            # carrying a verdict (402 of 1074 live).
+                            n_verdict=getattr(params, "n_verdict_rows", 0),
                         )
                         _map_note = ("" if map_applied(_map_status)
                                      else f", map {_map_status}")
@@ -11148,6 +11230,23 @@ class GhostAgent:
                 or evidence_tool is None
                 or not final_ai_content
                 or self._is_strict_trivial_chat(lc)):
+            # §4EQ: before giving up on a TOOL-FREE turn, ask the arithmetic.
+            # 46% of user turns land here and become the unverified
+            # placeholder; an age claim that contradicts an anchored birth
+            # date is checkable without any tool and without any model.
+            #
+            # ⚠ NARROWED TO "no evidence tool WAS THE ONLY REASON". This
+            # branch also covers sim/ablation (no verifier attached) and
+            # `--no-verifier`; running a check there would put verdicts into
+            # an ablation that exists to have none.
+            if (verifier is not None
+                    and getattr(verifier, "llm_client", None) is not None
+                    and evidence_tool is None
+                    and final_ai_content
+                    and not self._is_strict_trivial_chat(lc)):
+                _mem = self._memory_claim_refutation(final_ai_content)
+                if _mem is not None:
+                    return _mem, last_tool
             return None, last_tool
         # Replay the active project's explicit user constraints into the
         # verifier's view of the request. The current message is often just
@@ -12614,6 +12713,7 @@ class GhostAgent:
             task, trajectory_id,
             conv_fp if conv_fp is not None
             else self._conversation_fingerprint(messages),
+            n_tools=len(tools_run_this_turn or []),
             # the value captured above, NOT a fresh global read after the
             # gate wait — follow-up tasks were filed on whichever project the
             # global pointed at by timeout time.
@@ -12651,7 +12751,7 @@ class GhostAgent:
             return ""
 
     def _attach_late_verdict_handler(self, task, trajectory_id, conv_fp="",
-                                     force_correction=False,
+                                     force_correction=False, n_tools=None,
                                      project_id=None):
         """Apply the safety-critical side effects of a verdict that lands
         AFTER its response already shipped.
@@ -12698,7 +12798,8 @@ class GhostAgent:
             self._record_late_verdict(v_result, trajectory_id, conv_fp,
                                       last_tool=_lt,
                                       force_correction=force_correction,
-                                      project_id=project_id)
+                                      project_id=project_id,
+                                      n_tools=n_tools)
 
         # Published so _judge_hydration_safe can serialise the finalize
         # burst behind the in-flight verdict (both used to hit the single
@@ -13550,7 +13651,7 @@ class GhostAgent:
 
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
                              last_tool=None, force_correction=False,
-                             project_id=None):
+                             project_id=None, n_tools=None):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
         unit-testable. On a high-confidence REFUTED: log it, scrub any
@@ -13565,12 +13666,33 @@ class GhostAgent:
             # sim turn, drowning the case it exists for — a genuinely dead
             # verifier path).
             if last_tool is None:
-                # No substantive evidence tool this turn — skipped by
-                # design (no evidence, no verdict). Routine; log quietly.
+                # ⚠ THE MESSAGE NAMED THE WRONG CAUSE (§4EP, 2026-09-04).
+                # It said "bookkeeping-only tools" for EVERY evidence-free
+                # turn. Measured on the live log: of 73 user turns skipped
+                # here, **71 ran no tools at all** and 2 were bookkeeping —
+                # so the one line an operator has for the largest coverage
+                # gap in the corpus (46% of user turns) described a cause
+                # that accounted for 3% of it. Diagnosing the gap took log
+                # archaeology precisely because the log said something else.
+                # Two causes, two messages, and the count says which.
+                # ⚠ `None` = NOT CAPTURED, and it must not read as zero.
+                # A call site that forgets to pass the count would otherwise
+                # report "ran NO tools" about a turn it never counted — the
+                # same confident-wrong-cause defect one revision later.
+                if n_tools is None:
+                    _why = ("no evidence tool this turn (tool count not "
+                            "captured at this call site)")
+                elif not int(n_tools):
+                    _why = ("turn ran NO tools — a conversational or "
+                            "knowledge answer with no tool evidence to "
+                            "check against")
+                else:
+                    _why = (f"turn ran {int(n_tools)} tool(s) but none carried "
+                            f"verifiable evidence (bookkeeping "
+                            f"confirmations / synthetic error rows)")
                 pretty_log(
                     "Verifier",
-                    "no verdict — turn carried no verifiable evidence "
-                    "(bookkeeping-only tools); skipped by design",
+                    f"no verdict — {_why}; skipped by design",
                     icon=Icons.VERIFIER_LAB,
                 )
             elif getattr(getattr(self.context, "verifier", None),
@@ -14664,9 +14786,17 @@ class GhostAgent:
           2. the per-request cap and the once-per-args guard, so a
              deferral can never become a loop;
           3. `imagination.gate_allows(tool, tclass)` — the measured
-             allow-list. It is CLOSED on every bucket today, which makes
-             this whole path inert by construction; that is the design,
-             not an oversight (see §4CL I0);
+             allow-list. ⚠ THIS COMMENT SAID "CLOSED on every bucket
+             today … inert by construction" and that has been FALSE since
+             the gate rebuilt on a larger ledger: as of 2026-09-04 SIX
+             buckets are open (`file_system|ext:py` n=1896 skill +0.41,
+             `execute|cmd:cd` n=603 +0.15, `manage_services|` n=2475
+             +0.16, plus three more), covering 16% of predicted calls. A
+             comment asserting a path is dead is how a live path stops
+             being reviewed — the gate opens itself from data, so its
+             status is a MEASUREMENT, never a constant in a docstring.
+             Replayed over the ledger, gates 3+4 together admit ~100 calls
+             per 6 days, 66% of which really did fail (§4ER);
           4. the precedent itself must be strong: exact/class basis,
              support ≥ 3, ≥ 2 real precedent failures, p(fail) ≥ 0.5, and
              a non-empty error head to actually tell the model;
@@ -18411,10 +18541,20 @@ class GhostAgent:
             # not strict trivial chat). `_compute_verifier_verdict`
             # returns `last_tool` even when it produces no verdict, so
             # the unverified-mutation branch below still fires.
+            #
+            # ⚠ AND `last_tool is not None` WOULD HAVE MADE §4EQ DEAD CODE.
+            # The memory-claim route exists precisely for turns with NO tool,
+            # so `last_tool` is None on every verdict it can ever produce:
+            # the verdict would have been computed, logged, and consumed by
+            # nothing — a verifier that runs and changes nothing, which is
+            # this codebase's most-repeated defect. The clause the guard
+            # actually wants is "was the verifier applicable", and for a
+            # tool-free turn a produced verdict IS the applicability.
+            _v_applicable = verdict_is_consumable(v_result, last_tool)
             if (
                 verifier is not None
                 and verifier.llm_client is not None
-                and last_tool is not None
+                and _v_applicable
                 and final_ai_content
                 and not self._is_strict_trivial_chat(lc)
             ):
@@ -18809,6 +18949,20 @@ class GhostAgent:
                 risk = tracker.get_risk_summary()
                 if risk and final_ai_content and risk[:60] not in final_ai_content:
                     final_ai_content = f"{final_ai_content}\n\n---\n{risk}"
+                # §4ER: ask for a human label on a turn nothing checked and
+                # the score ranks lowest. Uses the MEMOISED pre-penalty
+                # reading — the same column the AUC measurement describes and
+                # the one the calibration record stores — so this costs no
+                # extra compute and cannot disagree with the recorded row.
+                try:
+                    _ask = self._label_request_note(
+                        self._prepenalty_confidence(req_id,
+                                                    tools_run_this_turn),
+                        verifier_backfill)
+                    if _ask and final_ai_content and _ask[:40] not in final_ai_content:
+                        final_ai_content = f"{final_ai_content}{_ask}"
+                except Exception as _lrx:  # noqa: BLE001
+                    logger.debug("label request skipped: %s", _lrx)
                 # Verify-side of the lifecycle: if the turn completed
                 # cleanly (a response, no error/failure markers), treat
                 # the assumptions the agent proceeded on as borne out
@@ -20240,8 +20394,11 @@ class GhostAgent:
                 # the backstop to trigger. Non-fatal: a failure here
                 # must never break the user turn.
                 try:
+                    _contradicts = await self._adjudicate_correction(
+                        messages, last_user_content)
                     self._maybe_promote_prior_turn_via_user_correction(
-                        messages, last_user_content
+                        messages, last_user_content,
+                        contradicts=_contradicts,
                     )
                 except Exception as e:
                     logger.debug(
@@ -23788,6 +23945,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     _vtask, current_trajectory_id,
                                                     _stable_conv_fp,
                                                     project_id=_rv_pid,
+                                                    n_tools=len(
+                                                        tools_run_this_turn or []),
                                                 )
                                                 _verifier_verdict_cache = (
                                                     None, _lt,
@@ -24507,10 +24666,199 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             logger.debug("failure-report negative skipped: %s", e)
             return False
 
+    #: How rarely the agent may ASK for a label. The channel is not the
+    #: bottleneck — the console, the CLI and Slack all take one click — but
+    #: 39 days produced 7 labels because nobody is ever asked. One ask a day
+    #: at most; a second one the same day is worth less than the goodwill it
+    #: spends. Override with GHOST_LABEL_ASK_HOURS, disable with 0.
+    _LABEL_ASK_MIN_HOURS = 20.0
+
+    def _label_request_note(self, reading, verifier_backfill) -> str:
+        """One short line asking for a thumb, or "".
+
+        ⚠ ASK WHERE THE CORPUS IS BLIND, NOT WHERE THE SCORE IS LOW. Three
+        conditions, and the middle one is the point:
+
+          1. the turn scored in the bottom band — the `ranks_outcomes`
+             licence is exactly "this score ORDERS turns" (§4ER), and the
+             lowest-ranked turn is where a human label is most informative;
+          2. **no verdict was produced** for it. A verified turn already has
+             a label; spending the operator's attention there buys a
+             duplicate. An unverified low-ranked turn is a row that would
+             otherwise enter the corpus as the `_UNVERIFIED_PRIOR`
+             placeholder (§4EO) — 63% of the fit population and unfittable;
+          3. it has not asked recently.
+
+        Deliberately NOT a probability claim. The score may not say "I am 42%
+        sure" (`beats_base_rate=indistinguishable`, and §4EP measured that it
+        cannot become resolvable at this corpus); it may only rank. The
+        wording says "one of the shakier answers", never a number.
+
+        Never raises: a solicitation that breaks a turn is not worth a label.
+        """
+        try:
+            hours = float(os.getenv("GHOST_LABEL_ASK_HOURS",
+                                    self._LABEL_ASK_MIN_HOURS) or 0)
+            if hours <= 0:
+                return ""
+            if verifier_backfill is not None:
+                return ""                 # already labelled by a verdict
+            composite = getattr(reading, "raw_pre_penalty_composite", None)
+            if composite is None:
+                composite = getattr(reading, "composite", None)
+            if composite is None:
+                return ""
+            tracker = getattr(self.context, "calibration_tracker", None)
+            if tracker is None:
+                return ""
+            # ⚠ ASK THE VERDICT ONCE. The licence gates the ask too — a score
+            # that no longer orders turns has no business picking which turn
+            # to spend the operator's attention on — but this used to re-check
+            # it here, and `lowest_confidence_turns` already refuses without
+            # an affirmative `ranks_outcomes` (returning no rows). A mutation
+            # sweep proved the second copy unkillable: removing it changed
+            # nothing, because the refusal arrives as an empty list either
+            # way. A guard no input can falsify reads as protection and
+            # provides none — one authority, and it is the one below.
+            lows, _why = tracker.lowest_confidence_turns(limit=20, days=14)
+            if len(lows) < 10:
+                return ""                 # too thin to know what "low" is
+            # Bottom quintile of the recent window, computed from the rows
+            # themselves rather than a hardcoded threshold — the composite's
+            # scale moves with every refit.
+            cutoff = lows[max(0, len(lows) // 5 - 1)].composite
+            if float(composite) > cutoff:
+                return ""
+            now = datetime.datetime.now()
+            last = getattr(self, "_last_label_ask_at", None)
+            if last is not None and (now - last).total_seconds() < hours * 3600:
+                return ""
+            self._last_label_ask_at = now
+            return ("\n\n---\n*This was one of the shakier answers I've given "
+                    "this week and nothing checked it. Was it right? A 👍/👎 "
+                    "here teaches me more than a hundred I score myself.*")
+        except Exception as exc:  # noqa: BLE001 — never break a turn for this
+            logger.debug("label request skipped: %s", exc)
+            return ""
+
+    def _memory_claim_refutation(self, final_ai_content: str):
+        """A REFUTED verdict when the reply contradicts anchored memory, or
+        `None`. Never CONFIRMS (§4EQ — see `core/memory_claim_check`).
+
+        This is the only route that produces a verdict for a tool-free turn,
+        and it produces ONLY negatives on purpose: §4EP measured that
+        confirm-carrying coverage shrinks the very Brier delta it was meant
+        to make measurable (2-16x across seeds), so a route that could
+        confirm here would make calibration worse while the coverage number
+        improved.
+
+        Arithmetic, not a judge: no model call, no prompt to be argued out
+        of, and it cannot invent a contradiction it did not compute.
+        """
+        try:
+            store = getattr(self.context, "profile_memory", None)
+            if store is None:
+                return None
+            from .memory_claim_check import refute_age_claims
+            from .reply_smoothing import strip_system_notes
+            # The MODEL's own words. Finalize appends system notes (⚠
+            # Unverified, correction banners) and judging those produced a
+            # self-refute once already — the claim under audit is the reply
+            # the model wrote, not the disclaimer we stapled to it.
+            claim = strip_system_notes(final_ai_content or "")
+            issues = refute_age_claims(reply=claim, profile=store.load())
+            if not issues:
+                return None       # ⚠ NOT a pass — nothing to say
+            from .verifier import VerifyResult, VerifyVerdict
+            return VerifyResult(
+                verdict=VerifyVerdict.REFUTED,
+                # Above the 0.7 consumption bar because the contradiction is
+                # COMPUTED, not judged. Not 1.0: the binding of a claim to a
+                # subject is a proximity heuristic, and that is the part that
+                # can be wrong.
+                confidence=0.9,
+                reasoning=("arithmetic check against anchored memory "
+                           "(no tool evidence this turn)"),
+                issues=list(issues),
+            )
+        except Exception as exc:  # noqa: BLE001 — a checker must not break a turn
+            logger.debug("memory claim check skipped: %s: %s",
+                         type(exc).__name__, exc)
+            return None
+
+    async def _adjudicate_correction(self, messages,
+                                     current_user_text: str):
+        """Signal B, asked of the assistant's ANSWER instead of guessed from
+        token overlap (§4EP). Returns True / False / None.
+
+        ⚠ NONE IS THE SAFE ANSWER AND EVERY FAILURE PATH RETURNS IT — no
+        verifier, no client, the phrase gate not firing, no prior assistant
+        message, a timeout, an unparseable reply. `None` restores the lexical
+        test, so this can only ever ADD promotions to the pre-§4EP set; it
+        can never silently remove one. `False` (a judge looked and said no)
+        is a different, stronger answer and does suppress.
+
+        Gated on the cheap phrase regex FIRST — measured at 0.9% of live
+        turns — so 99% of turns pay nothing and never wait on a judge. The
+        call blocks the user's turn, hence the small token ceiling.
+        """
+        from ..distill.user_correction import (
+            ADJUDICATION_MAX_TOKENS, adjudication_prompt,
+            has_correction_phrase, parse_adjudication,
+        )
+        if not has_correction_phrase(current_user_text):
+            return None
+        verifier = getattr(self.context, "verifier", None)
+        if verifier is None or getattr(verifier, "llm_client", None) is None:
+            return None
+        # The immediately-prior assistant message and the user request before
+        # it. Walked from the end rather than indexed: the tail of `messages`
+        # is not a fixed shape (tool rows, system notes), and an index that
+        # is right today is the kind of thing that silently starts reading a
+        # tool result as "the answer".
+        prev_assistant = prev_user = ""
+        for m in reversed(messages or []):
+            if not isinstance(m, dict):
+                continue
+            role, content = m.get("role"), m.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if role == "assistant" and not prev_assistant:
+                prev_assistant = content
+            elif role == "user" and prev_assistant and not prev_user:
+                prev_user = content
+                break
+        if not prev_assistant:
+            return None
+        try:
+            result = await asyncio.wait_for(
+                verifier._call_llm(
+                    adjudication_prompt(
+                        prev_user_request=prev_user,
+                        prev_assistant_response=prev_assistant,
+                        current_user_text=current_user_text or ""),
+                    temperature=0.0,
+                    max_tokens=ADJUDICATION_MAX_TOKENS,
+                    json_only=True,
+                ),
+                timeout=_CORRECTION_JUDGE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — a judge must not break a turn
+            logger.debug("correction adjudication skipped: %s: %s",
+                         type(exc).__name__, exc)
+            return None
+        try:
+            text = (result or {}).get("choices", [{}])[0].get(
+                "message", {}).get("content", "")
+        except Exception:  # noqa: BLE001
+            return None
+        return parse_adjudication(text)
+
     def _maybe_promote_prior_turn_via_user_correction(
         self,
         messages,
         current_user_text: str,
+        contradicts=None,
     ) -> None:
         """Stage-1 self-improvement: promote the immediately-prior
         assistant trajectory to FAILED when the current user message
@@ -24591,10 +24939,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception:
             return
 
+        # `contradicts` is the adjudicated Signal B (§4EP). None = no judge
+        # ruled, and the classifier then falls back to the lexical rephrase
+        # test — i.e. exactly the pre-§4EP behaviour. Computed by the CALLER
+        # because it costs an LLM round trip and this helper is sync and pure
+        # of I/O by contract.
         verdict = classify_user_correction(
             prev_user_request=prev_user,
             prev_assistant_response=prev_assistant,
             current_user_text=current_user_text or "",
+            contradicts=contradicts,
         )
         # The TRAJECTORY lookup is deliberately AFTER the classification and
         # after the Tier-2 branch below. It used to sit above both, so a turn
@@ -25981,7 +26335,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _sv_task, current_trajectory_id,
                             stream_conv_fp,
                             force_correction=True,
-                            project_id=_drain_pid)
+                            project_id=_drain_pid,
+                            # The STREAMED spawn site — the one an AST
+                            # enumeration caught after two were migrated by
+                            # hand. Same snapshot the verdict itself judges.
+                            n_tools=len(stream_tools_snapshot or []))
                         pretty_log(
                             "Verifier",
                             "stream gate: verdict deferred — "

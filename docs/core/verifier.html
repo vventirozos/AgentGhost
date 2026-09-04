@@ -40,6 +40,120 @@
     </tbody>
   </table></div>
 
+  <h2 id="coverage">Coverage: what it is, and what it has to carry (2026-09-04, &sect;4EP)</h2>
+  <p>63% of the calibration corpus is the unverified-prior placeholder
+  (<a href="calibration.html#verdict-population">&sect;4EO</a>) because most turns never get a
+  verdict. Measured on the live log, of 160 finished <code>origin=user</code> turns
+  <strong>73 (46%) were skipped</strong> by this gate &mdash; and <strong>71 of those 73 ran no tools
+  at all</strong>. They are conversational or knowledge answers with no tool output to judge
+  against; this verifier is evidence-grounded, so it genuinely cannot rule on them.</p>
+
+  <h3 id="coverage-target">Coverage alone is the wrong target</h3>
+  <p>The obvious response &mdash; extend the verifier to tool-free turns &mdash; was measured before
+  it was built, and it does not work. On the live verdict population (n=402, 57 negatives), growing
+  the corpus with <strong>CONFIRM-only</strong> labels shrinks the observed Brier delta by
+  <strong>2&ndash;16&times; across six seeds</strong>, because every added row is one the base-rate
+  predictor already gets right: the effect collapses as fast as the interval does, and the comparison
+  stays unresolvable at every size. Growth at the <em>existing</em> class mix leaves the effect
+  intact (0.16&ndash;1.22&times;).</p>
+  <p>So the requirement is not coverage, it is <strong>negative-carrying coverage</strong>. A route
+  that can only confirm buys a better-looking percentage and nothing else &mdash; and a route that
+  refutes on <em>absence</em> of supporting memory is the false-negative trap this module already
+  carries a truncation guard for. Pinned in
+  <code>tests/test_correction_adjudication.py</code>.</p>
+  <p><em>Correction to an earlier reading:</em> a single bootstrap of the live corpus suggested that
+  same-mix growth at 2&times; would become resolvable. Across seeds that replicates about one time in
+  three and is <strong>not</strong> a finding; only the confirm-only collapse is robust.</p>
+
+  <h3 id="corrections">The tier that was nearly dead</h3>
+  <p><code>user_correction</code> is ground truth &mdash; the human said the answer was wrong &mdash;
+  and it is the strongest NEGATIVE the system can obtain. It produced <strong>zero</strong> rows in
+  the whole epoch. Over 1601 consecutive live turn pairs the promotion rule fired <strong>twice</strong>;
+  12 more cleared Signal&nbsp;A (the correction-opener regex) and were blocked by Signal&nbsp;B, a
+  Jaccard overlap between the current message and the <em>previous user request</em>.</p>
+  <p>Hand-labelling those 12 found <strong>6 genuine corrections</strong> ("No, that's wrong &hellip;
+  the correct answer is Canberra", "no I was asking about the mysql problem") against 6 that merely
+  open with "no": a topic change, a permission grant, an answer to a yes/no question, and one
+  message asserting a false premise about the agent's own history. So Signal&nbsp;A alone is ~50%
+  precise &mdash; dropping the conjunction would have poisoned the corpus, and keeping it costs ~70%
+  of the tier.</p>
+  <p><strong>No lexical signal separates the two classes.</strong> Measured on those 12:
+  Jaccard(current, prior <em>reply</em>) is 0.000&ndash;0.167 for real corrections and
+  0.000&ndash;0.108 for the rest, fully overlapping; "did the reply end with a question?" is 4/6 in
+  <em>both</em> classes &mdash; exactly zero information. The property is semantic, so Signal&nbsp;B
+  is now a judge: <em>does this message assert that the assistant's previous answer was wrong?</em>
+  asked of the <strong>reply</strong>, which is the parameter
+  <code>classify_user_correction</code> had reserved for it since it was written.</p>
+  <ul>
+    <li><strong>Signal A remains the cost gate.</strong> It fires on 0.9% of live turns, so the judge
+    costs about one call per 114 turns. <code>has_correction_phrase</code> is the single authority
+    both the gate and the promotion read.</li>
+    <li><strong>The judge decides when it rules.</strong> A semantic read of the actual reply
+    outranks a token-overlap guess; the lexical test is not consulted alongside it.</li>
+    <li><strong><code>None</code> is not <code>False</code>.</strong> Every failure path &mdash; no
+    verifier, no client, timeout, unparseable reply &mdash; returns <code>None</code> and restores the
+    pre-&sect;4EP lexical behaviour. The change can only ADD promotions, never silently remove one.
+    <code>False</code> (a judge looked and said no) is a stronger answer and does suppress.</li>
+    <li>The affirmation veto still wins over a <code>yes</code>: praise that opens like a correction
+    is never promoted, whatever the judge said.</li>
+  </ul>
+
+  <h3 id="memory-claim">Refute-capable coverage for tool-free turns (&sect;4EQ)</h3>
+  <p>The 46% gap above is closed the only way the measurement allows: a route that can
+  <strong>refute</strong>. <code>core/memory_claim_check.py</code> checks age claims in a tool-free
+  reply against the birth dates <a href="../memory.html">&sect;4EL</a> anchored in the profile
+  &mdash; and it is <strong>refute-only by construction</strong>, not by policy:</p>
+  <ul>
+    <li>A contradiction returns an issue. <strong>A match returns nothing</strong> &mdash; not
+    CONFIRMED, not UNCERTAIN. The turn stays a placeholder exactly as it is today, so every label this
+    route can ever add is a NEGATIVE, the scarce class (57 of 402 verdict rows). The module exports no
+    way to express a pass.</li>
+    <li><strong>Absence returns nothing either.</strong> The check fires only where BOTH a claimed
+    value and a stored comparand exist, so "the store does not mention it" can never become "the
+    answer is wrong". The refute-on-absence trap is made structurally impossible rather than guarded
+    after the fact.</li>
+    <li><strong>Arithmetic, not a judge.</strong> An age against a stored birth date is a computation:
+    no model call, no prompt to be argued out of, and it cannot hallucinate a contradiction. &sect;4EL
+    anchored those dates so the value could be recomputed; this is the first consumer that recomputes
+    one in order to CHECK something.</li>
+  </ul>
+  <p><strong>The tolerance is deliberately generous.</strong> A claim of <em>N</em> units admits a true
+  age from one unit below to two above. The live case it exists for: a child of 5 months 23 days, where
+  the store's own <code>_age_phrase</code> renders "5 months" and the user called it "about 6 months"
+  &mdash; both right, and a pedantic check would have written a 0.0 on one of them. It still refutes
+  what it is for: "9 years old" against a true 5.9 months is off by a factor of 18.</p>
+  <p><strong>Binding is confined to one line, and a tie says nothing.</strong> Distance alone was run
+  over the 1977 replies in the trajectory store and produced three hits &mdash; <em>all three
+  false</em>, every one a markdown list or table where subjects and ages interleave and the nearest
+  name by character count belongs to the previous row ("<code>| Vasilis | 1980-01-29 | 44 years
+  |</code>" bound Vasilis's age to Thodoris). A line is the unit these replies are organised in. The
+  live reply "Your sons are 9 (Thodoris) and 5 months old (Leonidas)" puts both names exactly 14
+  characters from the age phrase; first-wins bound the infant's age to the nine-year-old and refuted a
+  correct answer, so an equidistant tie is skipped. After both rules: <strong>zero refutations across
+  the same 1977 replies</strong>, while the contradictions still fire.</p>
+  <p><strong>The consumption guard had to widen, or this was dead code.</strong> It read
+  <code>last_tool is not None</code> &mdash; false for every verdict this route can produce, since the
+  route exists for tool-free turns. The verdict would have been computed, logged and consumed by
+  nothing. <code>verdict_is_consumable</code> now asks the question the guard meant: tool evidence
+  answers "applicable", and so does a produced REFUTED. A tool-free CONFIRMED/UNCERTAIN is
+  <em>not</em> consumable &mdash; the memory route never emits one, so such a value would be a verdict
+  from somewhere unaccounted for, and it fails closed.</p>
+  <p><strong>Expected yield, stated honestly.</strong> Against the whole historical corpus this route
+  refutes <strong>nothing</strong>, because the agent's age arithmetic has so far been right. It is a
+  guard that fires when that stops being true, not a source of label volume. What it changes is that a
+  tool-free turn is no longer <em>unfalsifiable</em>. Pins:
+  <code>tests/test_memory_claim_check.py</code> (24); mutation battery 16/16 killed.</p>
+
+  <h3 id="skip-cause">The skip message named the wrong cause</h3>
+  <p>One line covered every evidence-free turn: <em>"no verdict &mdash; turn carried no verifiable
+  evidence (bookkeeping-only tools)"</em>. Measured live, <strong>71 of 73</strong> such user turns ran
+  <em>no tools at all</em> and 2 were bookkeeping &mdash; so the operator's only view of the largest
+  coverage gap in the corpus described a cause accounting for 3% of it, and diagnosing the gap took
+  log archaeology precisely because the log said something else. Two causes now, two messages, with
+  the tool count deciding which. A count that was never captured says so (<code>None</code> is not
+  zero), and an AST enumeration fails if any spawn site omits it &mdash; it found a third site after
+  two had been migrated by hand.</p>
+
   <h2>Routing</h2>
   <p>Tries <code>llm_client.route(task="VERIFY", max_tokens=2048, ...)</code> against the worker pool first — both cheaper and a different "perspective" than the foreground model. Falls back to a direct foreground call if the worker pool is empty or its circuit is open. When a dedicated critic pool is configured (<code>--critic-nodes</code>) it takes precedence over both, with its own budget (<code>GHOST_CRITIC_CALL_TIMEOUT</code>, default 120&nbsp;s).</p>
   <p><strong>Verify-sized worker budget (2026-07-16).</strong> The worker-route call used to inherit <code>route()</code>'s default <code>_ROUTE_TIMEOUT_S</code> (12&nbsp;s — sized for sub-second routing chores). A verdict takes 7–11&nbsp;s <em>uncontended</em> on the live worker (Gemma&nbsp;4 E4B), so any contention on the node pushed it past the ceiling: <code>Nova: ReadTimeout</code> → no gate verdict → a hallucinated answer shipped unchecked (req 738c/35, the "Everest pizza" turn), caught only by the late async verdict a full turn later. <code>_call_llm</code> now passes its own budget — <code>_VERIFY_WORKER_TIMEOUT_S</code>, default 45&nbsp;s, env <code>GHOST_VERIFY_WORKER_TIMEOUT</code> — through <code>route(timeout=…)</code>. The loop-exit repair budget (25&nbsp;s) and the late-verdict handler already tolerate a verdict that lands after the reply, so the longer ceiling costs the user nothing; a genuinely sick node still fails bounded. Covered by <code>tests/test_verify_worker_timeout.py</code>.</p>

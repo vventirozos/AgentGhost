@@ -69,7 +69,147 @@
 
   <h2>Observability</h2>
   <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier, the sample count <code>n</code> (current epoch) and <code>excluded</code> (older-epoch rows skipped). <code>tracker.stats()</code> exposes <code>{samples, samples_all_epochs, epoch, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty, map_status, beats_base_rate}</code> — a debug/test surface with no production caller, despite what its docstring claimed until 2026-08-30.</p>
-  <p><strong>Four surfaces report the verdicts, and they must agree</strong> (&sect;4EB): the startup 📐 line (<code>main.calib_startup_fields</code>), the idle-refit 📐 line (<code>core.agent._biological_tick</code>), the <code>logger.warning</code> from <code>fit</code> itself, and <code>introspect learning</code> (<code>learning_health</code> collector &rarr; renderer). Each carries <em>both</em> <code>beats_base_rate</code> and <code>ranks_outcomes</code>; the refit line reads <code>refit=ok/no_prob:&lt;v&gt;/no_rank:&lt;v&gt;</code>, and the report prints an <code>AUC … — the score RANKS outcomes</code> line under the Brier sentence. An AST enumeration in <code>tests/test_calibration_rank_verdict.py</code> fails if any function reports one verdict without the other — the first cut of &sect;4EB added the rank verdict to <code>fit</code> and the agent line only, which is the &ldquo;both ends but not the collector&rdquo; mistake this module already carries a warning about.</p>
+  <p><strong>Four surfaces report the verdicts, and they must agree</strong> (&sect;4EB): the startup 📐 line (<code>main.calib_startup_fields</code>), the idle-refit 📐 line (<code>core.agent._biological_tick</code>), the warning from <code>fit</code> itself (since 2026-09-04 at WARNING only when the verdict <a href="#log-on-change">changes</a>, at DEBUG while it persists), and <code>introspect learning</code> (<code>learning_health</code> collector &rarr; renderer). Each carries <em>both</em> <code>beats_base_rate</code> and <code>ranks_outcomes</code>; the refit line reads <code>refit=ok/no_prob:&lt;v&gt;/no_rank:&lt;v&gt;</code>, and the report prints an <code>AUC … — the score RANKS outcomes</code> line under the Brier sentence. An AST enumeration in <code>tests/test_calibration_rank_verdict.py</code> fails if any function reports one verdict without the other — the first cut of &sect;4EB added the rank verdict to <code>fit</code> and the agent line only, which is the &ldquo;both ends but not the collector&rdquo; mistake this module already carries a warning about.</p>
+
+  <h3 id="verdict-population">A placeholder is not a label (2026-09-04, &sect;4EO)</h3>
+  <p><code>grade_turn_outcome</code> returns <code>_UNVERIFIED_PRIOR</code> (0.83) for &ldquo;nothing
+  was checked and nothing visibly broke&rdquo; &mdash; a stand-in for a measurement that never
+  happened, exactly as the neutral 0.5 is for unobserved entropy. This module already refuses to let
+  the entropy stand-in vote (<code>entropy_observed</code> gates <code>w_entropy</code>); the outcome
+  stand-in had no such gate, and on the live store it is <strong>63% of the fit population</strong>
+  (672 of 1074, measured 2026-09-04). Both verdicts were computed over it:</p>
+  <ul>
+    <li><code>beats_base_rate</code> compares the model against always predicting the base rate
+    &mdash; and <strong>the base rate IS the placeholder</strong> (0.838 against a constant 0.83), so
+    two thirds of the rows were asking the model to reproduce the comparand. The fitted map obliges:
+    slope 1.958 / intercept 0.013 returns 0.837 at the placeholder, and the whole corpus maps onto
+    <code>[0.700, 0.867]</code>. &ldquo;Indistinguishable from a constant&rdquo; was not a finding
+    about the score; it was the corpus describing itself.</li>
+    <li><code>ranks_outcomes</code> binarises at 0.5, so every placeholder entered the AUC as a
+    <strong>positive</strong> &mdash; 672 of 1017 (66%) of the &ldquo;successes&rdquo; the score was
+    credited with ordering were turns nobody checked.</li>
+  </ul>
+  <p><code>label_is_verdict</code> is now the single authority on which rows may judge a fit, and
+  <code>verdict_pairs</code> the single filter (one implementation per shape, as with the
+  supersession and cap twins). <strong>Placeholders are still fitted on</strong> &mdash; this narrows
+  what <em>measures</em> the scorer, never what the scorer is. The weights, the Platt map and the
+  threshold are untouched.</p>
+  <div class="scroll">
+  <table>
+    <tr><th></th><th>All rows (reported until 2026-09-04)</th><th>Verdict rows (reported now)</th></tr>
+    <tr><td>n</td><td>1074</td><td>402 (+672 placeholders)</td></tr>
+    <tr><td>base rate</td><td>0.838</td><td>0.851</td></tr>
+    <tr><td>base-rate Brier</td><td>0.0423</td><td>0.1127</td></tr>
+    <tr><td>CV Brier</td><td>0.0416</td><td>0.1090</td></tr>
+    <tr><td>delta CI</td><td>[-0.00180, +0.00046]</td><td>[-0.01011, +0.00204]</td></tr>
+    <tr><td>AUC</td><td>0.653 [0.570, 0.725]</td><td>0.634 [0.564, 0.712]</td></tr>
+  </table>
+  </div>
+  <p>Both verdicts are unchanged on today's corpus (<code>indistinguishable</code> /
+  <code>yes</code>) &mdash; the point is that they now rest on rows that saw something. New fields:
+  <code>n_verdict_rows</code>, <code>n_unverified_prior</code>, <code>delta_halfwidth</code>,
+  <code>component_auc</code>. <code>brier_base_rate</code> is now the <em>verdict</em> population's
+  baseline, because it is the direct comparand of <code>brier_cv</code>; the two are written
+  <strong>atomically</strong> (both, or both <code>-1.0</code>), since a usable baseline beside an
+  unusable CV Brier sends the learning-health renderer down its documented in-sample fallback and
+  makes it compare 0.041 against 0.113.</p>
+
+  <h4 id="resolution">&ldquo;Indistinguishable&rdquo; hides two opposite states</h4>
+  <p>The word covers <em>&ldquo;we measured a tie&rdquo;</em> and <em>&ldquo;we cannot
+  measure&rdquo;</em>, and the live store is the second. <code>delta_halfwidth</code> &mdash; the
+  half-width of the cross-validated delta CI &mdash; is the smallest difference these rows can
+  resolve: <strong>&plusmn;0.00607 against an observed effect of 0.00369</strong>, so the comparison
+  is 1.6&times; too coarse to find what is there. The warning and <code>introspect learning</code>
+  both state it. This is the same <code>unknown</code>-versus-measured distinction the module already
+  refuses to blur on <code>beats_base_rate</code>, one field over. Scaling estimate: roughly double
+  the verdict rows (~6 weeks at ~10/day) before the comparison could resolve either way.</p>
+
+  <h4 id="component-rank">Component RANK, beside the ablation table</h4>
+  <p><code>feature_contrib</code> is a held-out <em>Brier</em> delta per feature, and at this base
+  rate every entry is under 0.001 &mdash; a table nobody can act on, which is how a feature sat at the
+  largest weight for a month with no reading on whether it works. <code>component_auc</code> asks the
+  ranking question instead, on the verdict rows. Measured 2026-09-04:</p>
+  <div class="scroll">
+  <table>
+    <tr><th>component</th><th>weight</th><th>AUC on verdict rows</th><th></th></tr>
+    <tr><td><code>effort_component</code></td><td>0.4</td><td>0.622 [0.549, 0.699]</td><td>orders outcomes</td></tr>
+    <tr><td><code>entropy_component</code></td><td>0.1</td><td>0.582 [0.498, 0.664]</td><td>spans chance</td></tr>
+    <tr><td><code>competence_component</code></td><td><strong>0.5</strong></td><td>0.482 [0.404, 0.568]</td><td>chance</td></tr>
+  </table>
+  </div>
+  <p><strong>The largest weight sits on the only component that does not rank.</strong> Recorded, not
+  acted on: a grid over the weights moves AUC by 0.014 against a CI 0.15 wide, and the best grid point
+  differs between the full and verdict populations &mdash; that is a search fitting noise, so
+  &ldquo;reweight it&rdquo; is not a conclusion this corpus supports. It is a number that must be
+  <em>visible</em> while it accumulates. Note what competence is: a per-<em>domain</em> historical
+  success rate, the only input that does not vary per turn.</p>
+
+  <h4 id="bench-driver">The bench exclusion now explains itself</h4>
+  <p>The <a href="#aux-direction">direction gate</a> had been dropping rows since 2026-08-31 saying
+  only &ldquo;they rank backwards&rdquo;, so the question it raises &mdash; <em>why</em> do these rows
+  invert? &mdash; took a bespoke script to answer. The answer was worth having: on the 309 excluded
+  rows <code>competence_component</code> ranks at <strong>0.189</strong> against
+  <code>effort_component</code> at <strong>0.755</strong>. Competence is a per-domain prior, so on a
+  population whose domain mix is degenerate it is a near-constant that cannot track per-turn outcomes
+  &mdash; and it carries the largest weight. The gate now returns that per-component measurement and
+  the message names it (<code>Driven by competence_component 0.189; …</code>), so an exclusion is a
+  diagnosis rather than a verdict.</p>
+  <p><strong>What this is not.</strong> The bench population also showed 7 of its 19 failures with no
+  per-turn component observed at all &mdash; composite collapses to the domain prior (0.88&ndash;0.92)
+  and reports it with the authority of a measurement. That looked like the finding, and it does
+  <em>not</em> replicate on real turns: P(bad | effort unobserved) is 0.024 against 0.066 when
+  observed, i.e. the opposite direction. It is a bench-harness pattern, and nothing was changed on the
+  strength of it.</p>
+  <p>Pins: <code>tests/test_calibration_verdict_population.py</code> (22). Mutation battery 17/17
+  killed, no-op control survived, known-bad control died.</p>
+
+  <h3 id="log-on-change">Warnings fire on CHANGE, not per refit (2026-09-04)</h3>
+  <p>The three per-refit warnings in <code>fit</code> — the backwards auxiliary
+  population, the map not in force, and the base-rate verdict — each describe a property of the
+  <strong>corpus</strong>, not an event. The refit runs hourly (<code>_CALIB_REFIT_COOLDOWN</code>,
+  agent idle phase 2.7c) over an append-only store, so the same rows re-announced the same verdict
+  about eleven times a day. Measured on the live operator log: <strong>99</strong>
+  <code>INDISTINGUISHABLE</code> lines and <strong>80</strong> bench-<code>EXCLUDED</code> lines over
+  five days, identical but for the fourth decimal. That is the alarm channel spent on a fact that has
+  not moved, which trains exactly the habit these warnings exist to defeat.</p>
+  <p>Each site now picks its level through <code>announce_level(previous, current)</code>:
+  <strong>WARNING</strong> when the verdict is new or has changed, <strong>DEBUG</strong> while it
+  merely persists. The message text is untouched, so a log grep still finds the state; only the
+  severity moves. <em>The transition is the event.</em></p>
+  <ul>
+    <li><strong>The verdict is the trigger, never the count.</strong> <code>n_bench_misaligned</code>
+    climbs with every nightly bench solve (253 &rarr; 309 over five days), so gating on it would
+    re-announce a standing exclusion under a new number — the same noise in disguise.</li>
+    <li><strong>One decision serves both base-rate branches.</strong> <code>no</code> and
+    <code>indistinguishable</code> are two values of one verdict logged from two branches; deciding
+    per branch would let a <code>no</code>&nbsp;&rarr;&nbsp;<code>indistinguishable</code> flip — a real
+    change in what the score may be used for — read as steady state.</li>
+    <li><strong>The baseline is the params file, not process memory.</strong> A restart therefore
+    does not replay every standing warning, and there is no second record of &ldquo;what did we last
+    say&rdquo; to drift from the file every other consumer reads. Consequence, stated because it is
+    real: a fit that <em>bails</em> writes no params, so a verdict that changes and then bails
+    re-announces until a fit succeeds and records it — the honest direction, since the change is
+    genuinely still unrecorded.</li>
+    <li><strong>One cold-start baseline, shared.</strong> <code>NOTHING_RECORDED</code> is a
+    <code>FittedParams</code> whose verdicts are <code>None</code> — in no vocabulary, so an
+    unrecorded condition always announces. It replaced three per-site
+    <code>if prev is not None</code> guards after a mutation battery proved one of them
+    <em>unpinnable</em>: at cold start <code>_apply_bench_direction_gate</code> has no instrument, so
+    it excludes nothing and the bench warning never runs, making that site&rsquo;s cold-start branch
+    unreachable and its mutant equivalent — one gate change away from silently swallowing the first
+    announcement. <code>test_the_bench_line_cannot_fire_before_a_first_fit</code> pins the
+    reachability that argument rests on.</li>
+  </ul>
+  <p>The steady state does <strong>not</strong> go dark: it stays a field on the stored params
+  (<code>beats_base_rate</code>, <code>bench_verdict</code>, <code>map_status</code>), rides the
+  per-refit 📐 CALIB line at INFO as <code>no_prob:&lt;v&gt;</code>/<code>no_rank:&lt;v&gt;</code>, is
+  written to the activity ledger, and is queryable via <code>introspect learning</code>. The verdict
+  is asked once and published; this only stops the log from re-announcing the answer.</p>
+  <p>Pins: <code>tests/test_calibration_log_on_change.py</code> (17). Mutation battery 10/10 killed
+  — always-WARNING, always-DEBUG, inverted comparison, count-as-trigger, wrong field, per-branch
+  decision, per-site cold start, a sentinel carrying a vocabulary word, an instance-memoised
+  baseline, and the map line deciding from itself — with a no-op control that survived and a
+  known-bad control that died.</p>
 
   <h3 id="beats-base-rate"><code>beats_base_rate</code> — the licence (2026-08-30)</h3>
   <p><code>FittedParams.beats_base_rate</code> answers <em>&ldquo;may anything treat this score as

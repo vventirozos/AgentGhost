@@ -34341,6 +34341,484 @@ thresholds (90 / 365 days) are unmeasured defaults. And because every recovered 
 last 60 days, no marker renders on the live profile today — the mechanism is live but invisible until
 facts age.
 
+## §4EN — Calibration warnings fire on CHANGE, not per refit (2026-09-04)
+
+**Trigger.** Operator, pasting two 🔶 lines from the stream: *"this is always the same with only the
+numbers slightly changing, what's the deal with this?"* → *"do the log-on-change fix."*
+
+**The diagnosis first, because the noise was hiding two different facts.** Reproduced the live fit
+against `~/Data/AI/Data/system/calibration/` (n=1073, base 0.8377, 309 misaligned — matches the stored
+params exactly).
+
+- **`INDISTINGUISHABLE` is a LABEL problem, not a model problem.** The outcome histogram of the fit
+  population: **673 of 1073 rows (63%) carry the literal constant `_UNVERIFIED_PRIOR = 0.83`** — "no
+  verifier verdict, nothing visibly broke". 327 are 1.0, 42 are 0.0, 31 everything else; 57 rows below
+  0.5. The base rate (0.8377) *is* that constant, so "always predict 0.838" scores Brier 0.0423 and
+  there is nothing left for a model to win. Verified share is flat across the epoch: 61% prior in
+  July, 65% in August. **This warning cannot clear on its own.** Fitting on verified-only rows (n=400)
+  moves the delta point estimate 4.7× (0.0041 vs 0.00086) and holds AUC at 0.635 [0.565, 0.711], but
+  the CI still straddles zero — roughly double the verified mass (~6 weeks at ~10/day) before the
+  comparison can resolve either way.
+- **The bench exclusion has a real signal inside it.** After supersession the auxiliary population is
+  309 rows with **19 negatives**, all from the bench oracle. Mean composite is **0.866 on the failures
+  vs 0.831 on the passes** — the agent is *more* confident on the bench items it gets wrong, hence AUC
+  0.288 [0.149, 0.443]. The gate is doing its job; the overconfidence it exposes is logged and
+  discarded. **Open, not closed.**
+- **And the truncated tail of the line already said the useful thing:** `It DOES still rank: AUC 0.654
+  [0.572, 0.726]`. The score orders turns; it just is not a better *probability* than a constant.
+
+**The defect being fixed.** All three warnings in `fit` describe properties of the CORPUS, not events.
+The refit is hourly over an append-only store, so the same rows re-announced the same verdict ~11×/day:
+**99 `INDISTINGUISHABLE` lines and 80 bench-`EXCLUDED` lines over five days**, identical but for the
+fourth decimal. The alarm channel spent on a fact that has not moved since 2026-08-30.
+
+**The fix.** `announce_level(previous, current)` → WARNING when new or changed, DEBUG while it
+persists. Message text untouched (greps still work); only severity moves.
+
+- The **verdict** is the trigger, never the count — `n_bench_misaligned` climbed 253 → 309 in five
+  days, so gating on it would re-announce the same exclusion under a new number.
+- **One decision for both base-rate branches.** `no` and `indistinguishable` are two values of one
+  verdict logged from two branches; per-branch decisions would let a `no` → `indistinguishable` flip
+  read as steady state.
+- **Baseline is the params FILE**, not process memory: a restart does not replay standing warnings,
+  and there is no second record of "what did we last say". Accepted consequence: a fit that *bails*
+  writes no params, so a changed-then-bailed verdict re-announces until a fit succeeds — the honest
+  direction.
+- The steady state does not go dark: still a params field, still on the per-refit 📐 CALIB line at
+  INFO (`no_prob:…`), the activity ledger, and `introspect learning`.
+
+**What the mutation battery found in the fix itself (R3/R8).** Round 1 scored 9/10 with one survivor:
+the bench site's cold-start branch, mutated to `else _pop.bench_verdict`. It is **equivalent — but
+only by a coupling two functions away**: with no params `_apply_bench_direction_gate` has no
+instrument, so it excludes nothing and the bench warning never runs, making that branch unreachable
+and unpinnable. One gate change away from silently swallowing the first announcement of a backwards
+auxiliary population. Fixed as a CLASS, not an instance: three per-site `if prev is not None` guards
+collapsed into one shared `NOTHING_RECORDED` sentinel (a `FittedParams` whose verdicts are `None`),
+which moves the decision onto a line the base-rate pins DO reach and makes a mistyped field an
+`AttributeError` instead of a quieter log. `test_the_bench_line_cannot_fire_before_a_first_fit` pins
+the reachability the equivalence argument rests on. Round 2 also caught **M10** — the `map_status`
+line, which has never fired on this log and had no pin at all: the sibling one revision behind. Three
+map pins added.
+
+**Verification.** `tests/test_calibration_log_on_change.py` — 17 pins. **Mutation battery 10/10
+killed** (always-WARNING, always-DEBUG, inverted comparison, count-as-trigger, wrong field,
+per-branch decision, per-site cold start, sentinel carrying a vocabulary word, instance-memoised
+baseline, map line deciding from itself), no-op control SURVIVED and known-bad control KILLED, whole
+tree copied to scratchpad so no mutant touched the deployed source. Full suite green.
+
+**Files.** `src/ghost_agent/core/calibration.py` (`announce_level`, `NOTHING_RECORDED`, three sites in
+`fit`), `tests/test_calibration_log_on_change.py`, `docs/core/calibration.html#log-on-change`.
+
+**Still open (deliberately not in this change):** the bench overconfidence above, and the 63%
+unverified-prior mass that makes the base-rate comparison nearly powerless. Quieting the log did not
+fix either; it stopped them from being announced hourly as if they were new.
+
+## §4EO — A placeholder is not a label: the verdicts move onto rows that saw something (2026-09-04)
+
+**Trigger.** Operator, on §4EN's two "still open" items: *"proceed with these 2 items."*
+
+### Item 2 — the 63% unverified-prior mass. It was not "not enough data".
+
+`grade_turn_outcome` returns `_UNVERIFIED_PRIOR` (0.83) for "nothing was checked and nothing visibly
+broke". Live: **672 of 1074 fit rows (63%)**, exact equality, zero near-misses. Both verdicts were
+computed over it, and both were largely the corpus talking to itself:
+
+- `beats_base_rate` compares the model against always predicting the base rate — and **the base rate
+  IS the placeholder** (0.838 vs a constant 0.83). Two thirds of the rows asked the model to
+  reproduce the comparand, and the Platt map obliged: slope 1.958 / intercept 0.013 returns 0.837 at
+  the placeholder, and the entire corpus maps onto `[0.700, 0.867]`. "Indistinguishable from a
+  constant" was never a finding about the score.
+- `ranks_outcomes` binarises at 0.5, so **every placeholder entered the AUC as a POSITIVE** — 672 of
+  1017 (66%) of the "successes" the score was credited with ordering were turns nobody checked.
+
+This is the module's own rule, one field over: the neutral 0.5 stand-in is excluded from the entropy
+fit by `entropy_observed`; the outcome stand-in had no gate at all.
+
+`label_is_verdict` is now the single authority, `verdict_pairs` the single filter. **Placeholders are
+still fitted on** — this narrows what MEASURES the scorer, never what the scorer is. Weights, Platt
+map and threshold untouched.
+
+| | all rows (until today) | verdict rows (now) |
+|---|---|---|
+| n | 1074 | 402 (+672 placeholders) |
+| base rate | 0.838 | 0.851 |
+| base-rate Brier | 0.0423 | 0.1127 |
+| CV Brier | 0.0416 | 0.1090 |
+| delta CI | [-0.00180, +0.00046] | [-0.01011, +0.00204] |
+| AUC | 0.653 [0.570, 0.725] | 0.634 [0.564, 0.712] |
+
+Both verdicts are UNCHANGED on today's corpus (`indistinguishable` / `yes`) — the point is that they
+now rest on rows that saw something.
+
+**"Indistinguishable" hid two opposite states.** It covers "we measured a tie" and "we cannot
+measure", and the live store is the second: `delta_halfwidth` (new) is **±0.00607 against an observed
+effect of 0.00369** — the comparison is 1.6× too coarse to find what is there. Stated in the warning
+and in `introspect learning`.
+
+**`brier_base_rate` is now the verdict population's baseline** (it is the direct comparand of
+`brier_cv`) and the two are written **atomically** — both, or both -1.0. Written independently, a
+corpus too thin to cross-validate left a usable baseline beside `brier_cv = -1.0`, and the
+learning-health renderer's documented in-sample fallback then compared 0.041 against 0.113.
+
+### Item 1 — bench overconfidence. The first answer was wrong; the second is recorded.
+
+The 309 excluded bench rows carry 19 oracle-graded failures whose mean composite (0.866) exceeds the
+290 passes (0.831). **Mechanism: `competence_component`** — AUC **0.189** on those rows against
+`effort_component` at **0.755**. Competence is a per-DOMAIN historical success rate, the only input
+that does not vary per turn, so on a degenerate domain mix it is a near-constant — and it carries the
+largest weight (0.5).
+
+⚠ **The finding I nearly shipped was a bench artifact.** 7 of the 19 failures had NO per-turn
+component observed, so the composite collapsed to the domain prior (0.88–0.92) and reported it with
+the authority of a measurement — P(bad | effort unobserved) = 0.80 on bench. It does **not** replicate
+on real turns: 0.024 unobserved vs 0.066 observed, the opposite direction. Nothing was changed on the
+strength of it.
+
+**What replicates, and is now visible.** `component_auc` (new) records the per-component rank on the
+verdict rows, beside `feature_contrib`'s Brier deltas — which are all under 0.001 at this base rate, a
+table nobody can act on:
+
+| component | weight | AUC on verdict rows |
+|---|---|---|
+| `effort_component` | 0.4 | 0.622 [0.549, 0.699] — orders outcomes |
+| `entropy_component` | 0.1 | 0.582 [0.498, 0.664] — spans chance |
+| `competence_component` | **0.5** | 0.482 [0.404, 0.568] — chance |
+
+**The largest weight sits on the only component that does not rank.** Recorded, NOT acted on: a grid
+over the weights moves AUC by 0.014 against a CI 0.15 wide, and the best grid point differs between
+the full and verdict populations — a search fitting noise. "Reweight it" is not a conclusion this
+corpus supports.
+
+**The exclusion now explains itself.** `_apply_bench_direction_gate` returns the per-component
+measurement and the message names it (`Driven by competence_component 0.189; …`). An exclusion that
+cannot say why gets re-diagnosed by hand — which is exactly what this session did.
+
+### What the pins caught in my own work
+
+- The grade-path enumeration (run against `grade_turn_outcome`, not a hand list of constants) found a
+  **second route to 0.83**: `unacked_total_failure` withholds a verifier PASS and, with zero counted
+  failures, lands exactly on the prior. Classified as a non-verdict, which is correct — the rule's own
+  words are "unverified and something broke". Verified **unreachable** from the live caller
+  (`_calib_unacked` requires `execution_failure_count > 0`), and that reachability is itself pinned.
+- The empty-verdict branch in `fit` was **dead code**: zero verdict rows ⇒ constant outcome column ⇒
+  the variance bail fires first. Extracted to `base_rate_brier`, where the empty case is reachable and
+  testable, instead of leaving a ZeroDivisionError guard nothing could exercise.
+- A skipped test asserts nothing — the all-placeholder case now pins the bail AND the helper.
+
+**Verification.** `tests/test_calibration_verdict_population.py` — 24 pins. **Mutation battery 17/17
+killed** across `calibration.py` and `learning_health.py` (verdicts on all rows, rank-only revert,
+predicate inverted / tolerant / failing open, baseline reverted, non-atomic baseline, half-width as
+full width, component AUC on all rows, counts swapped, fields written-but-not-reloaded, empty-input
+guard neutered, collector drop, renderer drop, diagnosis blaming a fixed component, diagnosis
+manufactured with no exclusion, diagnosis dropped from the message), no-op control SURVIVED, known-bad
+control KILLED. Full suite green.
+
+**Cross-surface (R5).** Three surfaces printed a row count beside the verdict, and it was
+`n_samples` — 2.7x the evidence the verdict rests on. All three now carry the verdict count:
+`introspect learning` (`verdict population: N row(s)`), the startup 📐 line
+(`main.calib_startup_fields` → `n_verdict`) and the idle-refit 📐 line (`agent` phase 2.7c). Pinned as
+a table, not per surface.
+
+**Files.** `src/ghost_agent/core/calibration.py`, `src/ghost_agent/core/learning_health.py`
+(collector + renderer), `src/ghost_agent/main.py`, `src/ghost_agent/core/agent.py` (the two 📐
+lines), `tests/test_calibration_verdict_population.py`,
+`docs/core/calibration.html#verdict-population`.
+
+**Still open.** Verifier coverage itself: 63% of turns produce no checkable verdict, flat across the
+epoch (61% July, 65% August). §4EO stops that from corrupting the verdicts; it does not raise
+coverage. That is the only thing that moves `beats_base_rate`.
+
+## §4EP — Verifier coverage: the target was wrong, and the tier that carries negatives was dead (2026-09-04)
+
+**Trigger.** Operator, on §4EO's last open item: *"fix the last open lever left, verifier coverage
+itself."*
+
+### Where the gap actually is
+
+Measured on the live log, 160 finished `origin=user` turns: **73 (46%) skipped** by the verifier gate,
+and **71 of those 73 ran NO TOOLS AT ALL**. They are conversational/knowledge answers with no tool
+output; an evidence-grounded verifier genuinely cannot rule on them.
+
+⚠ **Two false leads, both killed by checking the authoritative field.** (a) 1018 log lines read
+"verifier not attached in this context (sim/ablation)" and 857 looked like real request ids by their
+SHAPE — an id-shape proxy for a semantic property. Against the `origin=` field on the finish line:
+**262 sim, 87 bench, and ZERO user turns**. The message is accurate. (b) `shell`-domain rows are 82%
+unverified, which looked like a filter bug; it is not — those are the same tool-free population once
+the domain is attributed.
+
+### The finding: coverage alone is the WRONG TARGET
+
+The obvious fix — extend the verifier to tool-free turns — was simulated before it was built. On the
+live verdict population (n=402, 57 negatives), growing the corpus with **CONFIRM-only** labels shrinks
+the observed Brier delta by **2–16× across six seeds**: every added row is one the base-rate predictor
+already gets right, so the effect collapses as fast as the interval and the comparison stays
+unresolvable at every size. Same-mix growth leaves it intact (0.16–1.22×).
+
+**So the requirement is negative-carrying coverage, not coverage.** A confirm-only route buys a better
+percentage and nothing else; a route that refutes on ABSENCE of supporting memory is the false-negative
+trap this module already carries a truncation guard for.
+
+⚠ **Correction to my own earlier reading.** A single bootstrap of the live corpus suggested same-mix
+growth at 2× becomes resolvable, and I reported that. Across seeds it replicates ~1 time in 3 and is
+NOT a finding. Only the confirm-only collapse is robust; that is what is pinned.
+
+### What shipped: the tier that was nearly dead
+
+`user_correction` is ground truth (the human said the answer was wrong) and the strongest NEGATIVE
+available. **Zero rows in the whole epoch.** Over 1601 consecutive live turn pairs the rule fired
+**twice**; 12 more cleared Signal A and were blocked by Signal B — a Jaccard overlap against the
+previous USER REQUEST.
+
+Hand-labelling those 12: **6 genuine corrections** vs 6 that merely open with "no" (topic change,
+permission grant, an answer to a yes/no question, and one asserting a false premise about the agent's
+own history). Signal A alone is ~50% precise — dropping the conjunction would have poisoned the
+corpus; keeping it costs ~70% of the tier.
+
+**No lexical signal separates them.** Jaccard(current, prior REPLY) is 0.000–0.167 for real
+corrections and 0.000–0.108 for the rest — fully overlapping. "Reply ended with a question?" is 4/6 in
+BOTH classes: exactly zero information. Stop patching a proxy and ask the question.
+
+Signal B is now a judge — *does this message assert the assistant's previous answer was wrong?* — asked
+of the REPLY, the parameter `classify_user_correction` had reserved for it since it was written.
+
+- **Signal A stays the cost gate**: fires on 0.9% of turns → ~1 judge call per 114 turns.
+  `has_correction_phrase` is the single authority the gate and the promotion both read.
+- **The judge decides when it rules**; the lexical test is not consulted alongside it.
+- **`None` is not `False`**: every failure path (no verifier, no client, timeout, unparseable) returns
+  `None` and restores pre-§4EP behaviour, so this can only ADD promotions, never silently remove one.
+- The affirmation veto still wins over a `yes`.
+
+### The skip message named the wrong cause
+
+One line covered every evidence-free turn: *"bookkeeping-only tools"*. **71 of 73 ran no tools at
+all**; bookkeeping accounted for 3% of what the message described. That is why diagnosing this gap took
+log archaeology. Two causes, two messages, the tool count decides; a count never captured says so
+(`None` ≠ zero). An **AST enumeration** fails if any spawn site omits the count — **it found a third
+site** after two had been migrated by hand.
+
+**Verification.** `tests/test_correction_adjudication.py` — 15 pins. **Mutation battery 10/11 killed**
+(judge ignored, None→False, OR instead of ask-once, phrase gate dropped, veto skipped, parser treating
+a non-answer as False, parser accepting a truthy non-bool, prompt losing its false-positive classes,
+skip message reverted, uncaptured count read as zero), no-op control SURVIVED, known-bad control
+KILLED. The one survivor (deleting the `[:240]` head slice) is **proven equivalent** — the regex is
+`^`-anchored without MULTILINE, verified directly, and the PROPERTY is pinned instead of the slice.
+Full suite green.
+
+**Files.** `src/ghost_agent/distill/user_correction.py`, `src/ghost_agent/core/agent.py`,
+`tests/test_correction_adjudication.py`, `docs/core/verifier.html#coverage`.
+
+**Still open, honestly.** This raises the strongest negative tier from ~2 per 1600 turns to an expected
+~6-8 — real ground-truth negatives, but a small absolute number. The 46% tool-free population remains
+unverified BY DESIGN, and §4EP's own measurement says filling it with confirms would make the
+calibration comparison worse, not better. Closing it properly needs a refute-capable check on
+memory-grounded claims (the §4EL anchoring machinery can arithmetically refute a wrong age or date);
+that is a real route and it is not built.
+
+## §4EQ — Refute-capable coverage for tool-free turns (2026-09-04)
+
+**Trigger.** Operator, on §4EP's open item: *"implement this refute-capable check on
+memory-grounded claims. let's close this."*
+
+**The constraint §4EP bought.** 46% of user turns run no tools and become the unverified
+placeholder. §4EP measured that filling that gap with CONFIRM-carrying labels shrinks the observed
+Brier delta 2–16× across seeds — coverage that cannot refute is worse than no coverage. So the route
+had to be refute-capable or not exist.
+
+**Refute-only BY CONSTRUCTION, not by policy.** `core/memory_claim_check.py` checks age claims
+against the birth dates §4EL anchored in the profile:
+- A contradiction returns an issue; **a match returns nothing** — not CONFIRMED, not UNCERTAIN. Every
+  label it can add is a NEGATIVE, the scarce class (57 of 402). The module exports no way to express
+  a pass.
+- **Absence returns nothing either**: the check fires only where BOTH a claimed value and a stored
+  comparand exist, so refute-on-absence is structurally impossible rather than guarded after the fact.
+- **Arithmetic, not a judge**: no model call, no prompt to be argued out of, cannot hallucinate a
+  contradiction. §4EL anchored the dates so a value could be recomputed; this is the first consumer
+  that recomputes one in order to CHECK something.
+
+**Two defects found by measuring against real traffic, not by review.**
+
+1. ⚠ **Three FALSE refutes across the 1977 stored replies — every hit was wrong.** Proximity binding
+   breaks on markdown lists and tables, where subjects and ages interleave and the nearest name by
+   character count belongs to the previous row: `| Vasilis | 1980-01-29 | 44 years |` bound Vasilis's
+   age to Thodoris. Binding is now confined to **one line** — the unit these replies are actually
+   organised in. **After the fix: zero refutations across the same 1977 replies**, contradictions
+   still firing.
+2. ⚠ **A tie must not refute.** The live reply "Your sons are 9 (Thodoris) and 5 months old
+   (Leonidas)" puts BOTH names exactly 14 characters from the age phrase; first-wins bound the
+   infant's age to the nine-year-old and refuted a correct answer.
+
+**The tolerance is generous on purpose.** A claim of N units admits a true age from one below to two
+above. The case it exists for: 5 months 23 days, where the store's own `_age_phrase` renders "5
+months" and the user said "about 6 months" — both right, and a pedantic check writes a 0.0 on one of
+them. It still catches what it is for (9 years vs 5.9 months is off by 18×).
+
+**The consumption guard would have made this dead code.** It read `last_tool is not None` — false for
+every verdict this route can produce. Computed, logged, consumed by nothing: the most-repeated defect
+class in this codebase. `verdict_is_consumable` was extracted so it could be mutated and killed; it
+asks the question the guard meant, and fails closed on a tool-free CONFIRMED/UNCERTAIN (a value the
+memory route never emits).
+
+**And a vacuous totality pin.** `test_the_checker_is_total` passed `None`/`42`/`object()` — all
+rejected by type checks BEFORE any guard — so mutants replacing both `except` blocks with `raise`
+survived the whole suite. Rewritten with inputs that genuinely raise (a dict whose `values()` throws;
+a non-date `now`).
+
+**Verification.** `tests/test_memory_claim_check.py` — 24 pins. **Mutation battery 16/16 killed**
+(match confirms, tie takes first, tolerance removed / made infinite, window unbounded, binding crosses
+lines, line span is the whole reply, patterns double-count, unattributable date yields a subject, both
+totality guards, consumption guard reverted / admitting anything, gate un-narrowed into sim/ablation,
+confidence below the bar, route never called), no-op control SURVIVED, known-bad control KILLED. Full
+suite green.
+
+**Files.** `src/ghost_agent/core/memory_claim_check.py` (new), `src/ghost_agent/core/agent.py`
+(`verdict_is_consumable`, `_memory_claim_refutation`, gate + consumption guard),
+`tests/test_memory_claim_check.py`, `docs/core/verifier.html#memory-claim`.
+
+**Expected yield, stated honestly.** Against the whole historical corpus this route refutes
+**nothing** — the agent's age arithmetic has so far been right. It is a guard that fires when that
+stops being true, not a source of label volume. What changed is that a tool-free turn is no longer
+*unfalsifiable*: the class of claim it covers (anchored, dated facts) can now be contradicted without
+a tool. Extending it to other anchored value types is the natural next step and is not built.
+
+## §4ER — Three loops closed: the steer, the score's licensed use, and asking for a label (2026-09-04)
+
+**Trigger.** Operator: *"this is a personal AI, with not many requests. so the data will be sparse … I am
+looking into improving this agent regardless of the data starvation. what can we do?"* → *"do 1, 3, 4."*
+
+**The reframe, measured.** The agent is NOT data-starved; the layer being watched is. Same five weeks:
+
+| level | volume | negatives |
+|---|---|---|
+| turn (calibration, confidence) | 402 verdict rows | 57 (14%) |
+| step: PRM value model | 2,019 samples | **1,352 (67%)** — skipped 414× ("no live consumer") |
+| step: foresight world model | **34,777 observations** | 372 tool errors |
+
+A turn yields one label; the 1,162 tool-using turns made **4,560 tool calls**, each with its own
+pass/fail. Two dense, balanced, working signals were wired to nothing.
+
+### 1. The pre-flight steer: built, open, and disarmed
+
+`_imagine_preflight_note` defers a call the precedent index says will fail and hands the model the
+precedent. Its allow-list **opens itself from data and was already open on 6 of 145 buckets**
+(`file_system|ext:py` n=1896 Brier-skill +0.41, `manage_services|` n=2475, `execute|cmd:cd` n=603,
++3) = 16% of predicted calls — while `GHOST_IMAGINE` was unset, so every deferral was dropped at the
+consumer's first line.
+
+⚠ **The docstring asserted the opposite**: "CLOSED on every bucket today … inert by construction; that
+is the design, not an oversight". That had stopped being true. A comment claiming a path is dead is how
+a live path stops being reviewed — the gate's status is a MEASUREMENT, never a constant in prose.
+
+Replayed over the 11.4k-row ledger: **~100 deferrals per 6 days (~17/day), 66% of them calls that
+really did fail** — just above the gate's own 0.6 precision bar. The 34% cost one extra round trip, not
+a wrong answer (the model may re-issue unchanged with a justification). It is a randomised A/B, so
+CONTROL still dispatches. **Armed** in the launcher with those numbers recorded.
+
+`steer_armed()` + the report now distinguish **"the gate opened"** from **"the steer is acting"** —
+`introspect learning` said "6/145 buckets DISCRIMINATE" and nothing said nothing acts on it.
+
+### 3. The score's one licensed use
+
+Confidence: computed 865 times, `below_threshold` fired 118 times, arbitrations **0** — its only
+consumer is hard-gated off. §4EO/§4EP settled what it may be read as: not a probability
+(`indistinguishable`, provably unresolvable here), but it DOES order turns (`ranks_outcomes=yes`,
+AUC 0.634). `lowest_confidence_turns()` gives it that one use, **gated on the licence itself**, and
+returns `(rows, refusal)` — absent is not withheld, so the report can say *why* a list is missing
+instead of printing an empty one that reads as "no shaky turns this week". Live, the 4th-ranked turn
+had actually failed.
+
+### 4. Asking where the corpus is blind
+
+The channel was never the bottleneck: the web console has 👍/👎 per reply, the `ghost` CLI has
+`/good`/`/bad` with retries, Slack has thumbs. 39 days produced **7 labels** because **nobody is ever
+asked**. So the agent now asks — on a turn that (a) ranks in the bottom quintile, (b) **has no verdict**
+(a verified turn already has a label; an unverified low-ranked one is exactly a row that would enter the
+corpus as the `_UNVERIFIED_PRIOR` placeholder), and (c) has not asked in 20h. The wording never quotes a
+number — the licence forbids the probability reading.
+
+### What the mutation sweep found in my own work
+
+- **A redundant licence check in the ask** that no input could falsify (the ranking helper already
+  refuses). Deleted — one authority.
+- **Two vacuous pins of my own**: the thin-corpus test wrapped its assertion in `if len(rows) < 10`, so a
+  fixture that was not thin asserted nothing; and its replacement stubbed rows as `object()`, which made
+  the helper raise into its own catch-all and return "" for the wrong reason. Both mutants survived until
+  the fixtures were real.
+- **A no-op mutant of my own writing** (`"" or X` ≡ `X`) that I had mistaken for a live test.
+- An unreachable-window assertion: the fixture stamps rows with `now`, so `days=1` still contains them.
+
+**Verification.** `tests/test_confidence_ranking_use.py` (13) + `tests/test_steer_armed_reporting.py` (5),
+alongside the 23 existing pre-flight pins. **Mutation battery 14/14 killed**, no-op control SURVIVED,
+known-bad control KILLED. Full suite green.
+
+**Files.** `src/ghost_agent/core/imagination.py` (`steer_armed`), `core/calibration.py`
+(`lowest_confidence_turns`), `core/agent.py` (`_label_request_note`, wiring, the corrected gate
+comment), `core/learning_health.py` (ARMED/DISARMED + the ranking), `~/Data/AI/bin/start-ghost-agent.sh`
+(armed).
+
+**Still open.** The PRM (option 2) was NOT done: it trains on 2,019 balanced samples every idle cycle and
+both consumers are gated off, so it is cost with no benefit. Either wire a consumer or delete it — that
+decision is the operator's.
+
+## §4ES — PRM: parked on the record, and the record made readable (2026-09-04)
+
+**Trigger.** Operator: *"we need a decision for PRM, previously it was proven that it's not
+beneficial and that we shouldn't use it, correct?"* → *"proceed."*
+
+**The premise was half right, and checking it mattered.**
+
+* ✅ **§4BM (2026-08-14) killed ONE USE, not the PRM.** Flip (iii) "early-kill" is REMOVED: the state
+  vector is pinned to turn-start constants, so it is identical for every step in a trajectory, and
+  prefix-score AUC vs outcome is 0.656 / 0.593 / 0.581 / 0.598 / 0.590 — below the gate's own 0.65 bar
+  and FLAT in prefix length. **It is a request-difficulty classifier, not a doomed-run detector.** At a
+  10% operating point: catches 14.2% of failed runs, destroys 8.5% of successful ones, precision 0.371.
+  The pre-registered gate technically PASSED (AUC 0.7157) and was recorded **VOID BECAUSE
+  MIS-SPECIFIED**.
+* ❌ **"Not beneficial, proven" is stronger than the record.** #27b left keep/delete **INCONCLUSIVE**
+  and states twice that *"delete PRM is still not triggered"*. §4BM itself measured a real stacked gain
+  over the live depth prior: **+0.0291 AUC, CI [+0.0111, +0.0454], excluding zero** — "statistically
+  real, economically trivial, and not what kills it". Disposition on record: **"stays parked"**, with
+  explicit reopen conditions.
+
+⚠ **And I had overstated the cost one message earlier.** I reported the PRM "trains on 2,019 balanced
+samples every idle cycle — cost with no benefit". Wrong: **every dated retrain line from 2026-08-24 to
+today is `skipped`**; the training lines I counted came from an earlier, undated log era. There is also
+**no live checkpoint at all**. Today's cost is a gate check, ~10×/day.
+
+### Decision: parked. Not deleted, no consumer wired.
+
+Wiring one is ruled out on §4BM's evidence. Deleting saves nothing (the cost is already ≈ zero) and
+discards an option the record deliberately kept open. **The defect was never the PRM — it was that its
+state was misreported**, which is exactly what produced my own overstatement.
+
+### What was fixed
+
+1. **The skip is a standing condition** (the §4EN rule, one subsystem over). The reason derives from a
+   module CONSTANT and a CLI flag, so it cannot change inside a process — yet it was narrated every
+   idle tick, **409 lines in the live log**. Now announced when it CHANGES, i.e. once per boot.
+   ⚠ **The baseline is IN-PROCESS here, deliberately the opposite of §4EN's**: there the baseline is
+   the params FILE so a restart cannot replay a standing CORPUS fact; here the fact is about THIS
+   process's configuration, so a boot SHOULD re-announce it — that is exactly when a flag change would
+   have taken effect.
+   News is **INFO, never WARNING**: a deliberately parked subsystem is not a fault.
+2. **The artefact that caused the misread is retired.** `checkpoint.json.pre-1c-schema` sitting alone
+   in `prm/` reads as "there is a model here"; there is not, and its 25-feature schema cannot load
+   against today's 26. Renamed to `RETIRED-2026-07-27-…-SCHEMA-DRIFTED.json.bak` (nothing reads it —
+   the loader resolves the exact name `checkpoint.json`), with a `README.md` stating the disposition
+   and the evidence.
+
+**Review note.** Three of my first pins were SOURCE-TEXT assertions, which §R R4 rejects — the level
+decision lived inline in `_biological_tick`, a very large async method. Extracted as `prm_skip_level`
+so every pin is behavioural; the "uses the shared rule" pin now proves it by BENDING
+`announce_level` and requiring the level to bend with it, rather than grepping for the call.
+
+**Verification.** `tests/test_prm_skip_on_change.py` — 6 pins. **Mutation battery 6/6 killed** (always
+INFO, always DEBUG, private comparison instead of the shared rule, comparison inverted, news escalated
+to WARNING, cold start reading as unchanged), no-op control SURVIVED, known-bad control KILLED. Full
+suite green.
+
+**Files.** `src/ghost_agent/core/agent.py` (`prm_skip_level` + the idle site),
+`tests/test_prm_skip_on_change.py`, `$GHOST_HOME/system/prm/README.md` (+ the retired artefact).
+
 ## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
 
 **This section is binding. When the operator says "review <feature/subsystem>", this is the
