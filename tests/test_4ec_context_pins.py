@@ -311,11 +311,22 @@ class TestInjectionPlacement:
         assert out[-1]["role"] == "user" and out[-1]["content"].startswith("<system_state_update>") and len(out) == 3
 
     def test_pin_mode_last_message_is_a_later_user(self):
+        """2026-09-04: the volatile block is APPENDED here too, where it used
+        to be prefixed onto the later user message. `req_messages` is rebuilt
+        clean each turn, so a folded block vanishes next turn and re-prefills
+        the message it rode on — and tool results are translated to role
+        "user", so this branch was the common agentic case. Placement pins
+        with mutation coverage live in tests/test_prefix_cache_placement.py."""
         msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "first"},
                 {"role": "assistant", "content": "a"}, {"role": "user", "content": "latest"}]
         out = GhostAgent._compose_injection(msgs, self.STABLE, self.DYN, True)
-        assert out[1]["content"].startswith("<session_context>") and len(out) == 4
-        assert out[3]["content"].startswith("<system_state_update>") and out[3]["content"].endswith("latest")
+        assert out[1]["content"].startswith("<session_context>") and len(out) == 5
+        # The later user message passes through UNTOUCHED...
+        assert out[3] == {"role": "user", "content": "latest"}
+        # ...and the volatile block rides its own trailing message.
+        assert out[4]["role"] == "user"
+        assert out[4]["content"].startswith("<system_state_update>")
+        assert self.DYN in out[4]["content"]
 
     def test_pin_mode_last_message_is_a_tool_result(self):
         msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "first"},

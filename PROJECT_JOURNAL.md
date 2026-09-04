@@ -34819,6 +34819,144 @@ suite green.
 **Files.** `src/ghost_agent/core/agent.py` (`prm_skip_level` + the idle site),
 `tests/test_prm_skip_on_change.py`, `$GHOST_HOME/system/prm/README.md` (+ the retired artefact).
 
+## §4ET — Prefill, not throughput: two placement defects and a launcher that ate its own flags (2026-09-04)
+
+**Trigger.** Operator: *"this agent has reached enough maturity to care about performance … do a
+thorough review on the performance aspect"* → *"do 1-3"*.
+
+### The frame was wrong, and measuring it first changed every priority
+
+Seven days of live llama-server telemetry: **2.96 h prefill + 5.54 h decode over 168 h ≈ 5% GPU
+utilisation**, prompt-cache hit rate already **77.5%** (`prompt_tokens_cached_total` 24.1M vs
+`prompt_tokens_total` 6.98M), prefill 885–1,860 tok/s, decode 63–82 tok/s. Meanwhile **p50
+time-to-first-token was 52.6 s and TTFT was 72% of a request's wall clock** (n=80 streams).
+
+The box is idle. **This is a latency problem wearing a throughput problem's clothes**, and every
+"make it faster" instinct that starts with batching, slot counts or decode speed is aimed at the
+95% that was never busy. A single traced request (`5d15ffb9`, the greeting *"hello ghost, how's
+things today?"*, 54.4 s end to end) spent **36.5 s — 67% — in avoidable prefill**.
+
+Corollary worth keeping: several tuned budgets are calibrated on a machine 2–4× slower than this
+one (`main.py` "~450 tok/s", `search.py` "~300 tok/s prefill: 41 s before the first output token" —
+actually ~11 s). `capacity-change-retunes-thresholds`, again.
+
+### Fix 1 — the final-generation turn dropped `payload["tools"]`
+
+The Ornith/Qwen template renders `# Tools` **before** the system text. Dropping the `tools` key
+therefore leaves a common prefix of **19 characters** (`<|im_start|>system\n`): the entire prompt,
+at its largest of the whole request, re-prefills from token 3 — on exactly the turn the user is
+waiting for. Live arithmetic: turn 1 = 27,152 prompt tokens with tools; turn 2 = 6,568 tokens fully
+re-prefilled in 5.8 s; 6,568 + ~21,400 tokens of schemas reconstructs 27,152. **The drop was the
+whole cost.** The comment justifying it ("wasted bytes") had the sign backwards.
+
+Keeping them is free. `tool_choice:"none"` renders a byte-identical prompt to `"auto"`, **verified
+on `/v1/chat/completions`, not just `/apply-template`**:
+
+| request | `prompt_tokens` | `cached_tokens` |
+|---|---|---|
+| tools + `tool_choice:"auto"` | 7,529 | 0 (cold) |
+| tools + `tool_choice:"none"` | 7,529 | **7,525** |
+| no `tools` key | 36 | 0 |
+
+That second row is the fix. The third is the defect. **Checking the real endpoint mattered**: had
+llama.cpp cleared `tools` before templating when `tool_choice` is `none` — a plausible
+implementation — `/apply-template` would still have shown identical prompts and the fix would have
+achieved nothing.
+
+This is the same defect the `_pin_stable` guard (§4N, 2026-07-22) exists to prevent for
+`tool_header_block`. It reached the prompt through the native `tools` channel instead —
+`guard-a-proxy-not-the-thing`.
+
+### Fix 2 — `_compose_injection` folded the volatile block into an existing message
+
+Three branches; turn 1 and "last message is not a user message" appended the
+`<system_state_update>` block as its own message, but "last message **is** a later user message"
+prefixed it onto that message. That third branch is the common agentic case — the request builder
+translates every `role:"tool"` result into a `role:"user"` `<tool_response>` message. Since
+`req_messages` is rebuilt clean from `messages` every turn, the folded block is gone from that same
+message next turn: the cache diverges *there* instead of at the new content and re-evaluates a tool
+result it already paid for. Measured through the real template on an 8-turn request at live median
+block sizes: **9,232 → 5,721 re-prefilled tokens per turn (−38%)**.
+
+**Two of three branches were already right.** The fix was to stop making an exception.
+
+### Fix 3 — the launcher had eaten four flags, silently
+
+`bin/start-llama-server.sh` carried a bare `#` comment line inside a backslash continuation. Bash
+strips `\`+newline *before* tokenising, so the `#` opened a comment and the `\` ending that comment
+line was itself inside the comment: **the command terminated there**. `-np 1`, `-t 10`, `--jinja`
+and `"$@"` never reached the process. `--jinja` and `-t 10` happened to match this build's defaults
+and hid it; `-np 1` did not — the server auto-selected **4 slots**
+(`srv load_model: initializing, n_slots = 4, kv_unified = 'true'`), **81% of slot selections fell to
+`selected slot by LRU`** instead of LCP-similarity, and the ~25.5k-token static head was evicted
+constantly. That is what turned a greeting into a 30.7 s / 27,152-token cold prefill, and it is
+traceable to a cause: idle self-play ran at 14:57 with a deliberately different system slot
+(`profile_memory=None`), spread 4 tasks across all 4 slots, and the user spoke at 15:01.
+
+Losing `"$@"` also made the script's documented "extra args are appended as overrides" false.
+The launcher now builds argv as an **array** and echoes it before `exec`, so the flags actually used
+land in `Logs/llama-server.log` and can be diffed against `ps` without trusting the file.
+
+### The defect inside the fix
+
+`fix-is-the-least-reviewed-code`, on schedule. Keeping the schemas attached means a final-generation
+turn now *sees* the tools it is told not to call, and `tool_choice:"none"` suppresses only the
+PARSED call — measured: llama.cpp returns `tool_calls: []` and leaves the `<tool_call>` XML in
+`content`, which this agent's own XML parser then turns back into calls. The stream scrubber was
+already gated on `is_final_generation`, but the **dispatch** drop guard tested only
+`force_final_response`. Those differ (`is_final_generation` is `force_final_response OR
+required_tool == "none"`), so the two halves of one promise disagreed. Aligned on the wider
+predicate.
+
+### Pins, and the vacuous one
+
+`tests/test_prefix_cache_placement.py`, 16 tests. The tools pin **executes** the production `if`
+statement, extracted from `handle_chat` by AST — `tests/test_native_tools_flag.py` contains a
+hand-written miniature of the same payload block, which passes with or without the fix and is why
+this survived so long (`harness-grades-own-homework`).
+
+⚠ **The first placement pin was vacuous and a mutant proved it.** It asserted "the volatile block
+sits on `out[-1]`" — true of a *folded* block too, so reverting Fix 2 left all 13 tests green.
+Rewritten in the consumer's vocabulary: **cache loss must not scale with the size of the preceding
+tool result** (1 KB vs 100 KB tool result, loss must be identical), plus "composition rewrites
+exactly one existing message and appends exactly one". `pin-inherits-the-fix-blind-spot`, caught
+only because the mutation battery ran.
+
+**Mutation score 12/12.** Revert either fix; invert `tool_choice`; re-`pop` the tools; fold onto the
+pinned message; empty the volatile block; drop it; copy the tail into it; narrow either half of the
+suppression predicate; disable the drop guard. Every mutant killed; source hash re-verified after each.
+
+**The suite named the one test that mattered.** `test_context_compaction.py::
+test_final_generation_turn_drops_native_tools_too` asserted `"tools" not in main_payload` — the
+only place that drove the REAL payload block end to end, and it pinned the defect as the contract.
+Its stated rationale ("sending tools tempts the model to call one instead of answering") was a real
+concern, so it was not simply inverted: the intent moved to a BEHAVIOURAL pin
+(`test_final_generation_drops_a_tool_call_instead_of_dispatching_it` — the model emits a tool call
+on a text-only turn and the guard must drop it), which is a stronger guarantee than hiding the
+schema ever was. The module docstring carried the same claim and was corrected too; note that
+optimisation #1 (the XML/prompt-side schema skip) is untouched and still correct — that block sits
+mid-prompt, not ahead of the system slot.
+
+⚠ **Also worth recording as a near-miss:** the first full-suite run reported "25 failed, 69 errors"
+and the 69 were all `GHOST_API_KEY is set but EMPTY` — this session's shell had the variable set to
+a single space. And an earlier run reported **exit 0 having never executed**: `timeout` does not
+exist on macOS (`harness-that-cannot-run-reports-success`, on the record and stepped on anyway).
+A third run was killed because it overlapped later edits — the new pins read the module from disk
+via `inspect.getfile`, so its verdict would have been phantom (`suite-runs-must-not-overlap-edits`).
+
+### Not done, and why
+
+Recommendations 4–10 from the review are untouched — they need a restart window or a bench:
+`--ctx-size 262144` is 2.9× the largest prompt ever seen (91,881) and the box is oversubscribed
+(17.3 + 0.9 + KV 11.7 + cache-ram 6.0 = **35.9 GB on 36 GB**; the previous process died of
+`kIOGPUCommandBufferCallbackErrorOutOfMemory` after 519 `Compute error … ret = -3`); `id_slot`
+routing is verified available (`selected slot by id (2)`) and is strictly better than `-np 1`;
+`--cache-reuse` is 0; tool schemas are ~21.4k tokens (~490/tool) = 79% of the static head, the only
+lever that lowers the floor rather than raising the hit rate. `--max-context 240000` also means
+`ContextManager` compression (arms at 60% = 144k) has effectively **never fired**.
+
+**Fix 3 has no effect until llama-server restarts; Fixes 1–2 none until the agent restarts.**
+
 ## §R — MANDATORY REVIEW PROTOCOL (2026-08-30)
 
 **This section is binding. When the operator says "review <feature/subsystem>", this is the

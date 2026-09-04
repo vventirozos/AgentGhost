@@ -12383,22 +12383,36 @@ class GhostAgent:
                 req_messages[first_user_idx]["content"],
                 f"{stable_block}\n\n[USER INSTRUCTION]",
             )
-        last_idx = len(req_messages) - 1
-        if last_idx == first_user_idx:
-            # Turn 1 (the query is the only message). Do NOT fold volatile into
-            # the pinned message — that would make turn 1's first message differ
-            # from the clean [stable + instruction + query] that every later turn
-            # presents, so turn 2 couldn't reuse the cached prefix. Emit volatile
-            # as its own trailing message instead, keeping the pinned message
-            # byte-identical from turn 1 onward.
-            req_messages.append({"role": "user", "content": volatile_block})
-        elif req_messages[last_idx]["role"] == "user":
-            req_messages[last_idx]["content"] = _prefix_content(
-                req_messages[last_idx]["content"],
-                f"{volatile_block}\n",
-            )
-        else:
-            req_messages.append({"role": "user", "content": volatile_block})
+        # The volatile block ALWAYS rides its own trailing message — it is
+        # never folded into an existing one.
+        #
+        # ⚠ MEASURED, 2026-09-04. This used to have three branches: turn 1 and
+        # "last message is not a user message" appended (correct), while
+        # "last message IS a later user message" PREFIXED the block onto it.
+        # That third branch is the COMMON agentic case, because the request
+        # builder above translates every `role:"tool"` result into a
+        # `role:"user"` `<tool_response>` message — so on nearly every turn >=2
+        # the volatile block was folded into the newest tool result.
+        #
+        # Why folding costs a re-prefill: `req_messages` is rebuilt CLEAN from
+        # `messages` at the top of every turn, so the block folded into turn
+        # N's last message is absent from that same message on turn N+1. The
+        # upstream prefix cache therefore diverges at that message and must
+        # re-evaluate it AND everything after it, even though its own content
+        # never changed. Appending instead puts the divergence exactly at the
+        # boundary of the genuinely-new content, which is the floor.
+        #
+        # Measured over an 8-turn request at live median block sizes (stable
+        # 15,256 ch, volatile 3,598 ch, tool responses ~1.8k tok), rendered
+        # through the real chat template:
+        #     fold   (old): 9,232 re-prefilled tokens/turn, 61,109 over 2..8
+        #     append (new): 5,721 re-prefilled tokens/turn, 40,047 over 2..8
+        # i.e. -38% of per-turn prefill for a placement change.
+        #
+        # Turn 1 still gets its own trailing message for the original reason:
+        # folding there would make turn 1's pinned first message differ from
+        # every later turn's, so turn 2 could not reuse the pinned prefix.
+        req_messages.append({"role": "user", "content": volatile_block})
         return req_messages
 
     def _critic_async_enabled(self) -> bool:
@@ -22491,19 +22505,40 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # every turn.
                     #
                     # On final-generation turns (force_final_response or
-                    # required_tool=='none') we ALSO suppress the native
-                    # schema: the model is being told to answer in plain
-                    # text, and `force_final_response` already drops any
-                    # tool_calls the model attempts. Sending tools on
-                    # those turns is wasted bytes AND tempts the model
-                    # to call something instead of answering.
-                    if (
-                        getattr(self.context.args, "native_tools", False)
-                        and not is_final_generation
-                    ):
+                    # required_tool=='none') the model is being told to answer
+                    # in plain text, so no tool may be called — but the schemas
+                    # MUST STAY ATTACHED. `tool_choice` suppresses the call;
+                    # DROPPING `tools` destroys the prompt cache.
+                    #
+                    # ⚠ MEASURED, 2026-09-04. This branch used to read
+                    # `and not is_final_generation`, i.e. it removed
+                    # `payload["tools"]` entirely. The Ornith/Qwen chat
+                    # template renders the `# Tools` block BEFORE the system
+                    # text, so removing it leaves a common prefix of NINETEEN
+                    # CHARACTERS (`<|im_start|>system\n`) — the entire prompt,
+                    # at its largest of the whole request, re-prefills from
+                    # token 3, right when the user is waiting for the answer.
+                    # Live proof (req 5d15ffb9): turn 1 = 27,152 prompt tokens
+                    # WITH tools; turn 2 = 6,568 tokens fully re-prefilled in
+                    # 5.8s, and 6,568 + ~21,400 tokens of tools = turn 1's
+                    # 27,152 — the drop was the whole cost.
+                    #
+                    # Keeping them is FREE: `tool_choice:"none"` renders a
+                    # BYTE-IDENTICAL prompt to `"auto"` on this template
+                    # (verified against the live server via /apply-template:
+                    # both 14,955 chars, common prefix 14,955), because the
+                    # template branches on `tools` alone. So the cached prefix
+                    # survives intact and the call is still suppressed —
+                    # `force_final_response` continues to drop any tool_calls
+                    # a non-conforming server might still emit.
+                    # This is the same defect the `_pin_stable` guard above
+                    # exists to prevent for `tool_header_block`; it reached
+                    # the prompt through the native channel instead.
+                    if getattr(self.context.args, "native_tools", False):
                         try:
                             payload["tools"] = all_tools
-                            payload["tool_choice"] = "auto"
+                            payload["tool_choice"] = (
+                                "none" if is_final_generation else "auto")
                             # Qwen 3.6 + vLLM default to single-tool-per-reply
                             # when `tools` is attached, silently defeating the
                             # "emit multiple tool_calls in one turn" prompt
@@ -23332,7 +23367,29 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             pretty_log("Context Overflow", "Emergency pruning triggered...", icon=Icons.WARN)
                             # Emergency Prune: Keep System + Last User + 1 Last Tool Result (Truncated)
                             system_msgs = [m for m in req_messages if m.get("role") == "system"]
-                            last_user = next((m for m in reversed(req_messages) if m.get("role") == "user"), None)
+
+                            def _is_volatile_block(m) -> bool:
+                                """The synthetic per-turn `<system_state_update>`
+                                message `_compose_injection` appends. It is
+                                timestamp/plan bookkeeping, never the thing the
+                                model was working on, so recovery must not
+                                mistake it for the last real user message."""
+                                c = m.get("content")
+                                return (isinstance(c, str)
+                                        and c.lstrip().startswith("<system_state_update>"))
+
+                            # Prefer the last SUBSTANTIVE user message. Under the
+                            # pin the trailing message is always the volatile
+                            # block (2026-09-04: it is now appended on every
+                            # branch, where it previously rode the tool result on
+                            # one of three), and recovering with only that block
+                            # would retry against bookkeeping instead of evidence.
+                            # Fall back to it if there is genuinely nothing else.
+                            _users = [m for m in reversed(req_messages)
+                                      if m.get("role") == "user"]
+                            last_user = next(
+                                (m for m in _users if not _is_volatile_block(m)),
+                                next(iter(_users), None))
 
                             recovery_msgs = list(system_msgs)
                             if last_user:
@@ -23489,10 +23546,26 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # `<tool_response>` block and loses to the strong
                     # system-prompt directive above it. Drop those
                     # hallucinated tool_calls so the loop converges.
-                    if force_final_response and tool_calls:
+                    # ⚠ GATED ON `is_final_generation`, NOT `force_final_response`
+                    # (2026-09-04). Those differ: `is_final_generation` is
+                    # `force_final_response OR required_tool == "none"`, so a
+                    # planner that signalled only through `required_tool` reached
+                    # here with the flag unset and its tool_calls were dispatched
+                    # on a turn declared text-only. The STREAM side already used
+                    # the wider predicate (`_stream_scrub_active =
+                    # bool(is_final_generation)`), so the two halves of the same
+                    # promise disagreed. That gap became reachable the moment the
+                    # schemas stayed attached on final-generation turns (see the
+                    # payload block): the model can now see the tools it is being
+                    # told not to call, and `tool_choice:"none"` suppresses the
+                    # PARSED call but not the model emitting the XML in content
+                    # (measured: llama.cpp returns tool_calls=[] and leaves the
+                    # `<tool_call>` text in `content`, which this agent's own XML
+                    # parser then picks up). One predicate, both halves.
+                    if is_final_generation and tool_calls:
                         dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
                         logger.warning(
-                            "Dropping %d tool_call(s) — force_final_response is set (names=%s)",
+                            "Dropping %d tool_call(s) — final-generation turn (names=%s)",
                             len(tool_calls), dropped,
                         )
                         # HONESTY NOTE ON DROPPED MUTATIONS (2026-07-14). When

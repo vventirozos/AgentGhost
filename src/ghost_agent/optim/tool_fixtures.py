@@ -203,11 +203,18 @@ def _result_previews_from_messages(messages: List[Any],
     """Extract tool-result previews from a follow-up record's messages.
 
     Only user-role messages AFTER the last assistant message are
-    considered, and only from the ``<tool_response`` marker onward — the
-    volatile ``<system_state_update>`` block is PREPENDED to the same
-    message on the live path and must never leak into fixtures. A message
-    without the marker (e.g. a same-request summarizer prompt) yields
-    nothing.
+    considered, and only from the ``<tool_response`` marker onward, so the
+    volatile ``<system_state_update>`` block never leaks into fixtures.
+
+    ⚠ That block used to be PREPENDED to the tool-result message itself,
+    which is what the marker-onward slice was written to strip. Since
+    2026-09-04 it rides its own trailing user message instead (a folded
+    block vanishes on the next turn and re-prefills the message it rode on
+    — see ``GhostAgent._compose_injection``), so it now arrives as a
+    SEPARATE message carrying no marker and is skipped by the same rule.
+    Both shapes are handled; do not "simplify" the marker slice away on the
+    strength of the new placement — recorded day-files from before the
+    change still carry the old one.
     """
     if not isinstance(messages, list):
         return []

@@ -469,12 +469,102 @@
   is prepended to <code>dynamic_state</code> (it is genuinely per-turn-relevant,
   so it belongs there), and the final-gen turn keeps the byte-stable header while
   the "answer directly, no <code>&lt;tool_call&gt;</code>" directive moves to
-  <code>dynamic_state</code> (native/legacy <code>tools</code> are suppressed
-  downstream regardless, so the model still cannot call a tool). The UNPINNED
+  <code>dynamic_state</code> (the call is suppressed downstream regardless, so
+  the model still cannot call a tool — but see the 2026-09-04 entry below: it is
+  suppressed via <code>tool_choice</code>, <em>not</em> by removing the schemas).
+  The UNPINNED
   path is byte-for-byte unchanged (the slim header + inline playbook), so the
   existing layout tests are untouched. Verify live via the <code>Prefill Cache
   h=</code> line — the hash is now stable across a planned request's turns
   including its final answer. Covered by <code>tests/test_kv_pin_stable_prefix.py</code>.</p>
+
+  <h3>Two placement defects closed <span class="tag">2026-09-04</span></h3>
+  <p>A measurement pass over seven days of live traffic found the stack was
+  <strong>prefill-latency bound, not throughput bound</strong>: the GPU was busy
+  ~5% of the time (2.96&nbsp;h prefill + 5.54&nbsp;h decode over 168&nbsp;h) while
+  median time-to-first-token was <strong>52.6&nbsp;s</strong> — 72% of a request's
+  wall clock. Prompt-cache hit rate was already 77.5%
+  (<code>prompt_tokens_cached_total</code> 24.1M vs <code>prompt_tokens_total</code>
+  6.98M), so the remaining loss was concentrated in a few structural misses. Two
+  were placement defects, both invisible to behavioural tests because the model
+  received identical information either way — it simply had to be re-prefilled.</p>
+
+  <p><strong>(1) The final-generation turn dropped <code>payload["tools"]</code>.</strong>
+  The Ornith/Qwen chat template renders the <code># Tools</code> block
+  <em>before</em> the system text, so removing the <code>tools</code> key leaves a
+  common prefix of <strong>nineteen characters</strong>
+  (<code>&lt;|im_start|&gt;system\n</code>) — the entire prompt, at its largest of
+  the whole request, re-prefills from token 3 on exactly the turn the user is
+  waiting for. Live proof (req <code>5d15ffb9</code>, a two-turn greeting): turn 1
+  = 27,152 prompt tokens with tools; turn 2 = 6,568 tokens fully re-prefilled in
+  5.8&nbsp;s, and 6,568 + ~21,400 tokens of tool schemas reconstructs turn 1's
+  27,152 — the drop <em>was</em> the whole cost. The schemas now stay attached and
+  suppression rides <code>tool_choice: "none"</code>, which renders a
+  <strong>byte-identical</strong> prompt to <code>"auto"</code> (verified against
+  the live template through <code>/apply-template</code>: both 14,955 characters,
+  common prefix 14,955), because the template branches on the presence of
+  <code>tools</code> alone. <code>force_final_response</code> continues to drop any
+  <code>tool_calls</code> a non-conforming server might still emit, so behaviour is
+  unchanged and the re-prefill goes to zero. This is the same defect the pin above
+  closed for <code>tool_header_block</code>; it reached the prompt through the
+  native <code>tools</code> channel instead.</p>
+
+  <p><strong>(2) <code>_compose_injection</code> folded the volatile block into an
+  existing message.</strong> Of its three branches, turn&nbsp;1 and "last message is
+  not a user message" appended the <code>&lt;system_state_update&gt;</code> block as
+  its own trailing message, but "last message is a later user message" <em>prefixed</em>
+  it onto that message. That third branch is the common agentic case, because the
+  request builder translates every <code>role:"tool"</code> result into a
+  <code>role:"user"</code> <code>&lt;tool_response&gt;</code> message — so on nearly
+  every turn&nbsp;&ge;&nbsp;2 the block was folded into the newest tool result. Since
+  <code>req_messages</code> is rebuilt clean from <code>messages</code> at the top of
+  every turn, the folded block is absent from that same message next turn: the cache
+  diverges <em>there</em> rather than at the genuinely-new content, and re-evaluates
+  the tool result it had already paid for. Measured over an 8-turn request at live
+  median block sizes, rendered through the real chat template:
+  <strong>9,232&nbsp;&rarr;&nbsp;5,721 re-prefilled tokens per turn (&minus;38%)</strong>.
+  The block is now appended on every branch. The emergency context-overflow recovery
+  was hardened alongside it: it picks the last <em>substantive</em> user message, so
+  it retries against evidence rather than against timestamp bookkeeping.</p>
+
+  <p><strong>A defect inside the fix.</strong> Keeping the schemas attached
+  means a final-generation turn now <em>sees</em> the tools it is told not to
+  call, and <code>tool_choice: "none"</code> suppresses only the <em>parsed</em>
+  call — measured against the live server, llama.cpp returns
+  <code>tool_calls: []</code> and leaves the <code>&lt;tool_call&gt;</code> XML in
+  <code>content</code>, which this agent's own XML parser then turns back into
+  calls. The streaming scrubber was already gated on
+  <code>is_final_generation</code>, but the <em>dispatch</em> drop guard tested
+  only <code>force_final_response</code>. Those differ —
+  <code>is_final_generation</code> is <code>force_final_response OR required_tool
+  == "none"</code> — so the two halves of one promise disagreed and a planner
+  signalling through <code>required_tool</code> alone could dispatch a tool on a
+  turn declared text-only. Both halves now use the wider predicate.</p>
+
+  <p>Both are pinned by <code>tests/test_prefix_cache_placement.py</code>, whose
+  assertions are written in the cache's own vocabulary rather than the fix's. The
+  tools pin <em>executes</em> the production <code>if</code> statement, extracted
+  from <code>handle_chat</code> by AST — a hand-written miniature of the payload
+  block (as in <code>tests/test_native_tools_flag.py</code>) passes with or without
+  the fix, which is why the defect survived so long. The placement pin asserts that
+  <strong>cache loss does not scale with the size of the preceding tool result</strong>;
+  an earlier draft asserting "the volatile block sits on the last message" was
+  <em>vacuous</em> — a folded block also sits on the last message, and the mutant
+  survived. Ten mutants (revert either fix, invert <code>tool_choice</code>, re-pop
+  <code>tools</code>, fold onto the pinned message, empty or drop the volatile block,
+  copy the tail into it, narrow either half of the suppression predicate) are all
+  killed &mdash; mutation score 10/10.</p>
+
+  <p>Not fixed here, and worth knowing when reading latency numbers: the
+  <code>llama-server</code> launcher had a bare <code>#</code> comment line inside its
+  backslash continuation, which silently terminated the command and dropped
+  <code>-np&nbsp;1</code>, <code>-t&nbsp;10</code>, <code>--jinja</code> and
+  <code>"$@"</code>. The server therefore auto-selected <strong>four slots</strong>,
+  81% of slot selections fell to <code>selected slot by LRU</code> instead of
+  LCP-similarity, and the ~25.5k-token static head was evicted constantly — which is
+  what turned a greeting into a 30.7&nbsp;s cold prefill. The launcher now builds its
+  argv as an array and echoes it before <code>exec</code>, so the flags actually used
+  are on the record in <code>Logs/llama-server.log</code>.</p>
 
   <h2>Self-play control hooks</h2>
   <p><code>handle_chat</code> carries two small but load-bearing hooks that coordinate with the self-play subsystem:</p>

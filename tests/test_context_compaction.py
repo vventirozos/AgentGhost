@@ -20,10 +20,22 @@ Two related savings on the per-turn payload:
       as a fallback for models that emit the legacy shape; only the
       `<tool_def>...</tool_def>` block is suppressed.
 
-Cross-cutting invariant: on a final-generation turn the native
-schema is also dropped from `payload["tools"]` — the model is told
-to answer, sending tools tempts it to call something instead.
+Cross-cutting invariant (⚠ REVISED 2026-09-04, §4ET): on a
+final-generation turn the native schema STAYS in `payload["tools"]`
+and the call is suppressed with `tool_choice: "none"` instead. The
+old rule dropped the key, which cost a full re-prefill: this
+template renders `# Tools` BEFORE the system text, so an absent key
+leaves a 19-character common prefix and the whole prompt — at its
+largest of the request, on the turn the user is waiting for —
+re-evaluates from token 3 (measured live: 6,568 tokens / 5.8 s on a
+two-turn greeting). `tool_choice: "none"` renders byte-identical
+bytes, so the temptation is removed for free, and the text-only
+promise is kept by the drop guard rather than by hiding the schema.
+NOTE #1 above (the XML/prompt-side schema skip) is unaffected — that
+block sits mid-prompt, not ahead of the system slot.
 """
+
+import logging
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -269,10 +281,28 @@ async def test_final_generation_turn_via_planner_drops_schema():
 
 
 @pytest.mark.asyncio
-async def test_final_generation_turn_drops_native_tools_too():
-    """Cross-cutting: on a final-generation turn the native `tools`
-    array must also be suppressed. Sending tools tempts the model to
-    call one instead of answering."""
+async def test_final_generation_turn_suppresses_the_call_not_the_schema():
+    """Cross-cutting: on a final-generation turn the model must not call a
+    tool — but the native `tools` array must STAY ATTACHED.
+
+    ⚠ REVERSED 2026-09-04 (§4ET). This used to assert `"tools" not in
+    main_payload`, on the rationale that "sending tools tempts the model to
+    call one instead of answering". The intent was right; the mechanism was
+    catastrophic for latency. The Ornith/Qwen chat template renders the
+    `# Tools` block BEFORE the system text, so removing the key leaves a
+    19-character common prefix and the WHOLE prompt — at its largest of the
+    request, on the turn the user is waiting for — re-prefills from token 3.
+    Measured live (req 5d15ffb9): 6,568 tokens / 5.8s thrown away on a
+    two-turn greeting.
+
+    Suppression moved to `tool_choice: "none"`, which renders a
+    byte-identical prompt (verified on /v1/chat/completions: 7,529
+    prompt_tokens either way, 7,525 of them cached) so the temptation is
+    removed without the re-prefill. The original intent is now pinned
+    BEHAVIOURALLY below — a tool call emitted on such a turn is dropped
+    rather than dispatched — which is a stronger guarantee than hiding the
+    schema ever was.
+    """
     agent = _make_agent(native_tools=True, use_planning=True, llm_response="answer")
     planner_response = {
         "choices": [{"message": {"content": (
@@ -295,10 +325,62 @@ async def test_final_generation_turn_drops_native_tools_too():
 
     assert len(captured) >= 2
     main_payload = captured[1]
-    assert "tools" not in main_payload, (
-        "Final-generation turn must NOT attach native tools, even when "
-        "native_tools=True. Sending tools tempts the model to call one."
+    assert "tools" in main_payload, (
+        "Final-generation turn dropped payload['tools'] — the template renders "
+        "# Tools before the system text, so an absent key re-prefills the "
+        "entire prompt from token 3 (§4ET)."
     )
+    assert main_payload["tool_choice"] == "none", (
+        "the call must be suppressed via tool_choice — the one channel that "
+        "changes no rendered bytes"
+    )
+    # The prompt still tells the model to answer in prose.
+    assert "DO NOT emit any <tool_call>" in _all_content(main_payload)
+
+
+@pytest.mark.asyncio
+async def test_final_generation_drops_a_tool_call_instead_of_dispatching_it(caplog):
+    """The behavioural half of the guarantee above.
+
+    Hiding the schema was never what kept a final-generation turn text-only —
+    the drop guard was. Pin the guard directly, because the schema is now
+    visible to the model on exactly these turns: `tool_choice:"none"` stops
+    llama.cpp PARSING a call, but the model can still emit `<tool_call>` XML
+    into `content` (measured against the live server), which this agent's own
+    XML parser turns back into calls.
+    """
+    agent = _make_agent(native_tools=True, use_planning=True, llm_response="answer")
+    planner_response = {
+        "choices": [{"message": {"content": (
+            '{"thought": "explain conceptually",'
+            ' "tree_update": {"id": "root", "description": "x", "status": "DONE", "children": []},'
+            ' "next_action_id": "none",'
+            ' "required_tool": "none"}'
+        ), "tool_calls": []}}]
+    }
+    # The model disobeys and calls a tool on the text-only turn.
+    main_response = {"choices": [{"message": {
+        "content": "Let me check.",
+        "tool_calls": [{"id": "c1", "type": "function",
+                        "function": {"name": "execute",
+                                     "arguments": '{"command": "rm -rf /tmp/x"}'}}],
+    }}]}
+    captured = []
+
+    async def mock_chat_capture(payload, *a, **kw):
+        captured.append(payload)
+        return planner_response if len(captured) == 1 else main_response
+
+    agent.context.llm_client.chat_completion = mock_chat_capture
+    body = {"messages": [{"role": "user", "content": "Run a quick lookup"}], "model": "test"}
+    with caplog.at_level(logging.WARNING, logger="GhostAgent"):
+        await agent.handle_chat(body, MagicMock())
+
+    assert any("Dropping" in r.message and "tool_call" in r.message
+               for r in caplog.records), (
+        "a tool_call emitted on a final-generation turn was NOT dropped — with "
+        "the schema now attached on these turns, this guard is what keeps the "
+        "promise that the schema's absence used to keep")
 
 
 @pytest.mark.asyncio
