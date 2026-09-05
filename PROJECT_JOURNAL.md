@@ -35081,3 +35081,102 @@ mutation score beside it.
   §4DZ shipped a comment naming two consumers that do not exist and a docstring claiming an
   audience that never calls it.
 - State what was NOT done and why.
+
+
+## §4EU — introspect: routing, the answer gist, briefs, and a one-call overview (2026-09-05)
+
+**Trigger.** Operator: *"review introspect, how can we improve it?"* → six findings → *"fix them."*
+
+**R0 scope.** Property: every introspective question reaches the tool, and the tool returns
+something a 35B model can answer from in ONE call, with every number it prints traceable to the
+store it came from. Threat model: trusted — the on-disk selfhood store, the activity ledger and
+the trajectory corpus (this process writes them); untrusted — tool arguments from the model
+(type-corrupted, coerced, never trusted). Out of scope: the instrument arithmetic (hardened
+2026-07-27, re-verified here only by the R5 label/verdict table), the wake-up prefix's OFF decision
+(§3), the narrative summariser.
+
+**Measured (two months of trajectories, 380 session files).** 98 introspect calls in 53 turns —
+summary 39, recent 28, activity 12, learning 10, narrative 5, stats 2, recall 1, experiments 1.
+48 user prompts matched introspective phrasings: **9 reached the tool, 28 got no tool at all, 9
+went to `system_utility`** (the machine); "how are you feeling today" was asked 7× and never
+reached selfhood. With `_SELFHOOD_PREFIX_ENABLED = False` those 28 answers were composed from
+nothing — and the tool's own docstring and docs page still claimed the prefix was spliced into
+every prompt. Live store: 2,382 rows = 1,780 experiences + 602 boots (25%); 926 (39%) with
+outcome unknown; 68 same-request-same-minute pairs; `values.json` holds 2 principles in 5 weeks,
+one a fact about RAM. Reports: learning 20,029 chars / 215 lines / 4.6 s per call (was 2.55 s at
+the July review — corpus growth); experiments 16,424 / 117. No general tool-result cap exists, so
+"how are your lessons doing?" injected ~5k tokens of operator dashboard.
+
+**Fixes.**
+1. *Routing* — `core/prompts.py` SELF SURFACE rule (sibling of LESSONS SURFACE: names the phrases,
+   picks the action, says `system_utility` is the MACHINE); `tools/registry.py` description
+   rewritten, `overview` first in the enum, `verbose` / `section` params, `hours` for `recent`;
+   the stale prefix claim corrected in the module docstring and `docs/tools/introspect.html`.
+2. *Answer gist* — `Experience.answer_gist` (`selfhood/schema.py`): ≤160 chars, `<think>` blocks
+   dropped, PII redacted BEFORE the clip (`autobiographical.answer_gist`), written by
+   `SelfModel.capture_turn`, in the recall haystack, rendered as an `→ my answer:` line. Old rows
+   load with "". Live recall for "Leonidas age" had returned five records of the question and none
+   of the birth date.
+3. *Noise* — `AutobiographicalMemory.recent(include_boots=, hours=)` (over-scans ×8, floor 64;
+   substrate default unchanged because the narrative reads boots on purpose; the tool opts out);
+   `search_my_past` never returns boots; `NO_VERDICT_CLAUSE` + `strip_no_verdict_clause` strips the
+   clause at render ONLY when it is the tail (kept on disk for `_swap_verdict_clause`);
+   `_collapse_repeats` → "(×N)", newest member kept on chronological surfaces, best-ranked on
+   recall; `hours` window on `recent` (an unparseable timestamp is KEPT — unknown age is not old
+   age). The "[passed] beside it didn't land" contradiction was already fixed 2026-08-21; the three
+   live rows predate it.
+4. *Briefs* — `_brief_view` (STRUCTURAL: the report's unindented headlines + its own "⚠" lines —
+   nothing matches on words), `_section_block`, `_apply_report_view`; `_learning_report_cached`
+   (TTL 600 s, trailer states the age); `core/experiments.MetricComparison._verdict_parts` →
+   `verdict` (byte-identical to before) + `verdict_label` + `decided`; `render_brief_report`
+   (same `■ name  (n=N)` header as the full report, the same two zero-row shapes), `render_headline`,
+   `report_from_trajectories(brief=)`, `headline_from_trajectories`, ONE shared corpus walk.
+5. *Activity* — `render_activity_brief`: notify-severity records first ("What changed"), then one
+   line per kind with count and newest entry; the tool default; `verbose=true` is the ledger.
+6. *`overview`* — six surfaces (selfhood with mood EVIDENCE + open-question text + 3 real recent
+   rows; 24h activity brief; learning headline lines; experiments headline; pending post-mortem
+   defects; workspace event counts), each NAMING its absence; capped at 3,200 chars with a marker.
+   Plus: `stats` exports `last_mood_evidence`; `summary` renders open questions / unfinished
+   threads as text and principles with their age.
+
+**Live probe (copy of the store).** overview 2,572 chars, 3.65 s cold / 0.11 s cached; learning
+brief 2,657 chars (23 of 196 lines); experiments brief 3,576; activity brief 1,264 (12 lines).
+
+**Tests.** `tests/test_introspect_routing_and_briefs.py` — 48 pins, each naming the world where it
+fails; two existing pins moved to the class they pin (both activity renderers in
+`test_selfhood_introspect_tool.py`; the wiring rows on `verbose=true` in `test_learning_health.py`).
+Docs: `docs/tools/introspect.html` (actions, parameters, failure semantics, dated section),
+`docs/tools.html`, `docs/algorithms/selfhood.html`. Full suite **19,892 → 19,894 passed / 65
+skipped** (~4:50), run twice — before and after the second batch of pins.
+
+**Mutation (R2/R7).** Copied tree (never the working tree; live hashes verified unchanged
+after), 16 test files, whole-file mutants, `py_compile` before every verdict, no killer named.
+**44/44 killed (100%)** across `introspect.py`, `autobiographical.py`, `model.py`,
+`experiments.py`, `autonomous_activity.py`, `prompts.py`, `registry.py`; no-op control
+SURVIVED, known-bad control KILLED (52 failing). First pass 32/34: the two survivors were missing
+PINS, not dead code — `recent(limit)` no longer bound under a filter (the tool re-trims, so the
+substrate contract was unpinned), and the brief's omission of descriptive metrics was unfalsifiable
+because the fixture never added the metric (the season's seventh cannot-distinguish assertion).
+Harness in `scratchpad/mutate_introspect.py` (session-local; the battery is reproducible from
+this entry's file list).
+
+**R8 — defects found inside this review's OWN fixes: 7.** (1) the brief's zero-row header diverged
+from the full report's `■ name  (n=0)` — two existing pins caught it; (2) on an EMPTY corpus the
+brief rendered ■ rows where the full report renders prose ("Enabled and waiting for traffic") — the
+DENY pin read it as a bench-name leak, which it was, by format; (3) the experiments trailer listed
+section names, bench-scoped ones included; (4) `render_headline` dropped its "Experiments:" label
+when only unstamped names existed — an absence rendered unlabeled, the exact class R3 of the
+July review named; (5) the harness's INVALID heuristic matched pytest's `-x` "Interrupted" banner
+and reported 10/10 INVALID — an instrument that cannot fail its own way; (6) the copied tree lacked
+`interface/`, so one unrelated test failed at baseline (the harness would have scored every mutant
+KILLED on it — caught by running the set unmutated first); (7) two of my own pins carried wrong
+expectations (`_age_str(60)` renders "just now"; an undated row is kept inside an `hours` window
+by design). And an eighth outside the code: this entry was first drafted as §4ES, an id two
+sections stale — the section grep used `###` where the journal uses `## §`.
+
+**Deploy / follow-ups.** The live agent runs from source under launchd — one restart
+(`sudo launchctl kickstart -k system/com.local.ghost-agent`) loads this; not done in this
+session. After-measurement in ~2 weeks: re-run the routing query (user turns matching the SELF
+SURFACE phrasings × tools used) — the baseline is 9/48 reaching the tool, 9 to `system_utility`.
+If the rule alone does not move the `system_utility` habit, check the lesson playbook for a
+lesson that teaches it.

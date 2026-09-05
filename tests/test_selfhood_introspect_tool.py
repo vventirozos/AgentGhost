@@ -341,10 +341,18 @@ async def test_activity_never_raises_even_when_render_blows_up(tmp_path: Path,
     def _boom(*a, **k):
         raise RuntimeError("render exploded")
 
+    # Both renderers are in the class: the brief is the default path
+    # (2026-09-05), the report is the verbose one. A guard that covers one
+    # and not the other is the "sibling one revision behind" defect.
     monkeypatch.setattr(aa, "render_activity_report", _boom)
+    monkeypatch.setattr(aa, "render_activity_brief", _boom)
     out = await tool_introspect(action="activity", context=ctx)
     assert "Activity report failed" in out
     assert "RuntimeError" in out
+    out_v = await tool_introspect(action="activity", context=ctx,
+                                  verbose=True)
+    assert "Activity report failed" in out_v
+    assert "RuntimeError" in out_v
 
 
 async def test_activity_read_failure_is_not_reported_as_quiet(tmp_path: Path,

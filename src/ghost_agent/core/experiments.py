@@ -1376,59 +1376,39 @@ class MetricComparison:
         c = float(self.control_mean)
         return c if self.lower_is_better else 1.0 - c
 
-    @property
-    def verdict(self) -> str:
-        # A metric that CANNOT decide must say so at every stage, not only
-        # once its interval happens to exclude zero (review R4 observation).
-        # The three early returns below fire first, so a circular or
-        # descriptive metric read as a plain "no difference detected yet" —
-        # and `_render_block` renders only the verdict, never the confound,
-        # so the caveat was invisible for exactly as long as the numbers
-        # were inconclusive. That is the whole window in which a reader
-        # forms an expectation.
+    def _verdict_parts(self) -> Tuple[str, str]:
+        """``(label, detail)`` — the ONE place the verdict class is decided.
+
+        ``verdict`` renders ``label — detail`` (the full report, byte-for-
+        byte what it rendered before 2026-09-05); ``verdict_label`` renders
+        the class alone for the brief surfaces. The split lives here rather
+        than in a parser over the rendered string so the two surfaces
+        cannot drift (§R R5: one input, one story)."""
         if self.metric in _DESCRIPTIVE_METRICS or self.confound.startswith(
                 "CIRCULAR"):
-            return f"NO VERDICT — ⚠ {self.confound}"
+            return "NO VERDICT", f"⚠ {self.confound}"
         if self.diff is None or self.diff_lo is None or self.diff_hi is None:
-            return "insufficient data"
+            return "insufficient data", ""
         if min(self.control_n, self.treatment_n) < _MIN_VERDICT_N:
-            # The CS is asymptotic; below this it is not trustworthy enough to
-            # call. Reporting the interval but withholding the verdict is the
-            # honest middle — the numbers stay visible, the conclusion waits.
-            return f"insufficient data (n<{_MIN_VERDICT_N}/arm)"
+            return f"insufficient data (n<{_MIN_VERDICT_N}/arm)", ""
         if self.diff_lo <= 0.0 <= self.diff_hi:
             # ⚠ "no difference detected yet" and "this design cannot detect a
-            # difference" render identically, and on the live board they were
-            # ALL the second one: measured 2026-08-21, every live arm and both
-            # quality metrics had a half-width 2-6x LARGER than the biggest
-            # improvement the metric can physically show (e.g. failure_rate
-            # control 0.203, half-width 0.367 — the rate would have to fall
-            # below zero to be called). Five arms x two metrics of "no
-            # difference detected yet" reads as evidence the features do not
-            # help; it was the instrument having no power, which is the
-            # queue-#8 failure mode exactly ("a wrong verdict looks like a
-            # verdict"). Absence of evidence is only evidence of absence when
-            # the design could have found something.
+            # difference" are different sentences. When the CS is wider than
+            # the whole improvement range the metric has, the test could not
+            # have called an improvement at ANY true effect — say so, and say
+            # roughly how many turns per arm it would take.
             _mp = self.max_possible_improvement
             _hw = self.half_width
             if _mp is not None and _hw is not None and _hw >= _mp:
                 _floor = "0" if self.lower_is_better else "1"
                 if _mp <= 0.0:
-                    # Not an instrument failure — the good case. The control
-                    # arm is already at the metric's best value, so there is
-                    # nothing left to improve, and "an improvement verdict
-                    # needs N/arm" would be false at every N.
-                    return (f"no improvement is POSSIBLE — the control arm is "
-                            f"already at {_floor} on this metric; only a harm "
-                            f"verdict remains available")
+                    return ("no improvement is POSSIBLE",
+                            f"the control arm is already at {_floor} on this "
+                            "metric; only a harm verdict remains available")
                 if self.arm_alpha > 0.0:
                     _need = n_for_detectable(
                         _mp, float(self.control_mean or 0.0),
                         alpha=self.arm_alpha)
-                    # THREE cases, not two. "No alpha was supplied" is not
-                    # "no n can reach it", and collapsing them let a missing
-                    # field print a false impossibility claim — the exact
-                    # shape this whole pass is about.
                     _needs = (
                         f"; an improvement verdict needs at most "
                         f"~{_need}/arm (have "
@@ -1437,16 +1417,33 @@ class MetricComparison:
                         f"; unreachable within {_POWER_SEARCH_MAX_N:,}/arm")
                 else:
                     _needs = ""
-                return (f"NO POWER for an improvement — the interval "
-                        f"(±{_hw:.3f}) is wider than the largest improvement "
-                        f"this metric can show ({_mp:.3f}, i.e. "
+                return ("NO POWER for an improvement",
+                        f"the interval (±{_hw:.3f}) is wider than the "
+                        f"largest improvement this metric can show "
+                        f"({_mp:.3f}, i.e. "
                         f"{float(self.control_mean or 0.0):.3f} → {_floor}), "
                         f"so 'no difference' here is the DESIGN, not "
                         f"evidence{_needs}")
-            return "no difference detected yet"
+            return "no difference detected yet", ""
         better = (self.diff < 0) if self.lower_is_better else (self.diff > 0)
         base = "TREATMENT BETTER" if better else "TREATMENT WORSE"
-        return f"{base} — ⚠ {self.confound}" if self.confound else base
+        return base, (f"⚠ {self.confound}" if self.confound else "")
+
+    @property
+    def verdict(self) -> str:
+        label, detail = self._verdict_parts()
+        return f"{label} — {detail}" if detail else label
+
+    @property
+    def verdict_label(self) -> str:
+        """The verdict CLASS without its explanation — what the brief
+        report and the overview headline print."""
+        return self._verdict_parts()[0]
+
+    @property
+    def decided(self) -> bool:
+        """True only for the two verdicts that call a direction."""
+        return self.verdict_label in ("TREATMENT BETTER", "TREATMENT WORSE")
 
 
 # §4I Phase 3 — pre-treatment covariates usable for variance reduction.
@@ -1904,6 +1901,144 @@ def _render_block(arms: Dict[str, ArmStats], *, alpha: float,
     return lines
 
 
+def _brief_metric_lines(arms: Dict[str, ArmStats], *, alpha: float,
+                        experiment: str = "",
+                        only: Optional[Iterable[str]] = None) -> List[str]:
+    """One ``metric n=c/t diff=… → LABEL`` line per tested metric —
+    descriptive metrics (a denominator, never a hypothesis) are omitted
+    from the brief because their only honest verdict is "NO VERDICT"."""
+    out: List[str] = []
+    wanted = set(only) if only else None
+    for cmp_ in compare_arms(arms, alpha=alpha, experiment=experiment):
+        if cmp_.metric in _DESCRIPTIVE_METRICS:
+            continue
+        if wanted is not None and cmp_.metric not in wanted:
+            continue
+        if cmp_.control_mean is None and cmp_.treatment_mean is None:
+            continue
+        d = "—" if cmp_.diff is None else f"{cmp_.diff:+.3f}"
+        out.append(f"    {cmp_.metric:<14} n={cmp_.control_n}/{cmp_.treatment_n} "
+                   f"diff={d} → {cmp_.verdict_label}")
+    return out
+
+
+def render_brief_report(summary: Dict[str, Dict[str, ArmStats]], *,
+                        alpha: float = 0.05,
+                        triggered: Optional[Dict[str, Dict[str, ArmStats]]] = None,
+                        coverage: Optional[Dict[str, int]] = None,
+                        population: str = SCOPE_LIVE,
+                        expected_names: Optional[Iterable[str]] = None,
+                        ) -> str:
+    """The introspect DEFAULT rendering (2026-09-05): one header per
+    experiment and one verdict LABEL per tested metric — no intervals, no
+    prose. The full ``render_report`` (16 KB live) stays the operator/CLI
+    surface and is what ``verbose=true`` returns.
+
+    Every experiment the full report would show appears here too,
+    including the enabled-but-unstamped zero rows: a silent row is how
+    ``verify_depth`` sat inert for three days (2026-08 review, R1)."""
+    _bench = population == SCOPE_BENCH
+    lines: List[str] = [
+        f"EXPERIMENTS — {'bench' if _bench else 'live'} randomized arms "
+        "(brief: verdict labels only; verbose=true for intervals and "
+        "confounds, section='<experiment>' for one block)"]
+    if not summary:
+        # Mirror the full report's empty-corpus shape: with nothing
+        # stamped, enabled specs are named in prose ("waiting for
+        # traffic"), not as ■ rows — the DENY test greps "■ <name>" to
+        # prove a bench-scoped spec's stale live stamps did not render.
+        _exp_missing = sorted(set(expected_names or ()))
+        if _exp_missing and _kill_switch_on():
+            lines.append(f"Enabled but unstamped: {', '.join(_exp_missing)} "
+                         f"— expected: {ENV_KILL}=0 is set, so no turn "
+                         "enrolls in anything.")
+        elif _exp_missing:
+            lines.append("Enabled and waiting for traffic: "
+                         f"{', '.join(_exp_missing)}.")
+        else:
+            lines.append("no experiment has stamped a turn yet")
+        return "\n".join(lines)
+    if coverage:
+        _rec_n = int(coverage.get("recent_admitted", 0))
+        _rec_st = int(coverage.get("recent_stamped", 0))
+        if _rec_n:
+            _pct = 100.0 * _rec_st / _rec_n
+            lines.append(f"recent stamp coverage: {_rec_st}/{_rec_n} "
+                         f"({_pct:.0f}%)"
+                         + ("  ⚠ below 90% — the stamp is regressing NOW"
+                            if _pct < 90.0 else ""))
+    for name in sorted(summary):
+        arms = summary[name]
+        total = sum(s.n for s in arms.values())
+        c_s, t_s = arms.get(CONTROL), arms.get(TREATMENT)
+        # Same header shape as the full report ("■ name  (n=N)") so a
+        # reader — or a pin — that greps one surface finds the other.
+        lines.append(f"■ {name}  (n={total})  control {c_s.n if c_s else 0} / "
+                     f"treatment {t_s.n if t_s else 0}")
+        lines.extend(_brief_metric_lines(arms, alpha=alpha, experiment=name))
+        trig = (triggered or {}).get(name) or {}
+        if trig:
+            trig_total = sum(s.n for s in trig.values())
+            share = (100.0 * trig_total / total) if total else 0.0
+            on_trig = _brief_metric_lines(trig, alpha=alpha, experiment=name,
+                                          only=("failure_rate",))
+            lines.append(f"    trigger fired on {trig_total}/{total} "
+                         f"({share:.1f}%)"
+                         + (f"; on those turns: {on_trig[0].strip()}"
+                            if on_trig else ""))
+        elif name in TRIGGER_KEYS:
+            lines.append("    trigger has not fired on any recorded turn yet")
+    _missing = sorted(set(expected_names or ()) - set(summary))
+    if _missing and _kill_switch_on():
+        lines.append(f"⚠ {len(_missing)} enabled spec(s) with no stamps "
+                     f"({', '.join(_missing)}) — expected: {ENV_KILL}=0 is "
+                     "set in this process, so no turn enrolls in anything")
+        _missing = []
+    for name in _missing:
+        lines.append(f"■ {name}  (n=0)")
+        lines.append("    ⚠ enabled in the registry but NO enrolled turn "
+                     "carries it — no eligible traffic yet, or "
+                     "enrollment/stamping is broken")
+    return "\n".join(lines)
+
+
+def render_headline(summary: Dict[str, Dict[str, ArmStats]], *,
+                    alpha: float = 0.05,
+                    triggered: Optional[Dict[str, Dict[str, ArmStats]]] = None,
+                    expected_names: Optional[Iterable[str]] = None) -> str:
+    """Two or three lines for the introspect ``overview``: how many
+    experiments are enrolled, which (if any) have a DECIDED verdict, and
+    which enabled specs have never stamped a turn."""
+    names = sorted(summary)
+    decided: List[str] = []
+    for name in names:
+        for scope, arms in (("all turns", summary[name]),
+                            ("triggered turns",
+                             (triggered or {}).get(name) or {})):
+            if not arms:
+                continue
+            for cmp_ in compare_arms(arms, alpha=alpha, experiment=name):
+                if cmp_.metric in _DESCRIPTIVE_METRICS:
+                    continue
+                if cmp_.decided:
+                    decided.append(f"{name}/{cmp_.metric} ({scope}): "
+                                   f"{cmp_.verdict_label}")
+    missing = sorted(set(expected_names or ()) - set(summary))
+    parts: List[str] = []
+    if names:
+        parts.append(f"Experiments: {len(names)} live arm(s) enrolled — "
+                     + ", ".join(f"{n} n={sum(s.n for s in summary[n].values())}"
+                                 for n in names))
+        parts.append("  DECIDED: " + "; ".join(decided) if decided else
+                     "  no decided verdict yet (every metric reads "
+                     "insufficient data / no power / no difference)")
+    else:
+        parts.append("Experiments: no live experiment has stamped a turn yet.")
+    if missing:
+        parts.append(f"  ⚠ enabled but unstamped: {', '.join(missing)}")
+    return "\n".join(parts)
+
+
 def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
                   alpha: float = 0.05,
                   triggered: Optional[Dict[str, Dict[str, ArmStats]]] = None,
@@ -2256,8 +2391,10 @@ def report_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
                              deny_names: Optional[Iterable[str]] = None,
                              population: str = SCOPE_LIVE,
                              expected_names: Optional[Iterable[str]] = None,
+                             brief: bool = False,
                              ) -> str:
     """Load the corpus and render. Used by introspect + the CLI script.
+    ``brief=True`` renders ``render_brief_report`` (verdict labels only).
 
     Streams: both views and the coverage counters come from ONE walk, so a
     grown corpus is never materialised in memory. ``admit_task_kinds``
@@ -2267,17 +2404,43 @@ def report_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
     this one). The bench surfaces build their own summarize+render with
     the bench population label rather than calling this helper.
     """
+    all_stats, trig_stats, coverage = _summaries_from_trajectories(
+        trajectory_root, day=day, admit_task_kinds=admit_task_kinds,
+        admit_names=admit_names, deny_names=deny_names)
+    _render = render_brief_report if brief else render_report
+    return _render(all_stats, alpha=alpha, triggered=trig_stats,
+                   coverage=coverage, population=population,
+                   expected_names=expected_names)
+
+
+def _summaries_from_trajectories(trajectory_root: Any, *,
+                                 day: Optional[str] = None,
+                                 admit_task_kinds: Tuple[str, ...] = ("user_request",),
+                                 admit_names: Optional[Iterable[str]] = None,
+                                 deny_names: Optional[Iterable[str]] = None):
+    """The ONE corpus walk behind the report, the brief and the headline."""
     from ..distill.collector import TrajectoryCollector
     collector = TrajectoryCollector(root=Path(str(trajectory_root)),
                                     session_id="reader")
-    all_stats, trig_stats, coverage = summarize_streaming(
+    return summarize_streaming(
         collector.iter_trajectories(day=day),
         admit_task_kinds=admit_task_kinds,
         admit_names=admit_names,
         deny_names=deny_names)
-    return render_report(all_stats, alpha=alpha, triggered=trig_stats,
-                         coverage=coverage, population=population,
-                         expected_names=expected_names)
+
+
+def headline_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,
+                               admit_task_kinds: Tuple[str, ...] = ("user_request",),
+                               deny_names: Optional[Iterable[str]] = None,
+                               expected_names: Optional[Iterable[str]] = None,
+                               ) -> str:
+    """Load the corpus and render the overview headline (same walk and
+    the same scope arguments as ``report_from_trajectories``)."""
+    all_stats, trig_stats, _coverage = _summaries_from_trajectories(
+        trajectory_root, admit_task_kinds=admit_task_kinds,
+        deny_names=deny_names)
+    return render_headline(all_stats, alpha=alpha, triggered=trig_stats,
+                           expected_names=expected_names)
 
 
 # ──────────────────────────────────────────────────────────────────────

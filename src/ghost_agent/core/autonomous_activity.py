@@ -792,6 +792,63 @@ def record_scheduled_result(log: Optional[ActivityLog], *, job_id: str,
         logger.debug("record_scheduled_result failed: %s", e)
 
 
+def _clip_summary(s: str, n: int = 140) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def render_activity_brief(records: List[ActivityRecord], *,
+                          hours: float = 24.0,
+                          now: Optional[float] = None,
+                          max_notify: int = 8,
+                          max_phases: int = 10) -> str:
+    """Kind-grouped view of a ledger window — the introspect DEFAULT for
+    ``action='activity'`` (2026-09-05).
+
+    The line-by-line ``render_activity_report`` led with nine identical
+    calibration refits and twelve self-play lines; a reader asking "what
+    did you do while I was away?" wants what CHANGED first. So: every
+    notify-severity record (experiment verdicts, defects filed, scheduled
+    task conclusions) on its own line, newest first — then ONE line per
+    routine kind with its count and newest entry. Same window and
+    ``now`` injection as the report; ``verbose=true`` on the tool still
+    returns the full ledger."""
+    now_ts = now if now is not None else time.time()
+    cutoff = now_ts - float(hours) * 3600.0
+    items = [r for r in (records or []) if r.summary and r.ts >= cutoff]
+    if not items:
+        return (f"No background activity recorded in the last "
+                f"{hours:g}h.")
+    items.sort(key=lambda r: r.ts, reverse=True)
+    kinds = {r.phase for r in items}
+    lines = [f"Background activity (last {hours:g}h): {len(items)} "
+             f"record(s) across {len(kinds)} kind(s)"]
+    notify = [r for r in items if r.severity == SEVERITY_NOTIFY]
+    if notify:
+        lines.append("  What changed (notify-severity, newest first):")
+        for r in notify[:max_notify]:
+            lines.append(f"    ! [{_PHASE_LABELS.get(r.phase, r.phase)}] "
+                         f"{_age_str(r.ts, now_ts)} — "
+                         f"{_clip_summary(r.summary)}")
+        if len(notify) > max_notify:
+            lines.append(f"    …and {len(notify) - max_notify} more")
+    routine: Dict[str, List[ActivityRecord]] = {}
+    for r in items:
+        if r.severity == SEVERITY_NOTIFY:
+            continue
+        routine.setdefault(r.phase, []).append(r)   # newest first
+    if routine:
+        ranked = sorted(routine.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        lines.append("  Routine, by kind (count, newest entry):")
+        for phase, rs in ranked[:max_phases]:
+            newest = rs[0]
+            lines.append(f"    · [{_PHASE_LABELS.get(phase, phase)}] "
+                         f"×{len(rs)}, newest {_age_str(newest.ts, now_ts)} "
+                         f"— {_clip_summary(newest.summary)}")
+        if len(ranked) > max_phases:
+            lines.append(f"    …and {len(ranked) - max_phases} more kind(s)")
+    return "\n".join(lines)
+
+
 def get_activity_log(context) -> Optional[ActivityLog]:
     """The context-attached ledger, or None. Accessor so call sites don't
     need to know the attribute name (and tests can monkeypatch one spot)."""
@@ -806,6 +863,7 @@ __all__ = [
     "load_offset", "save_offset",
     "load_consumer_offset", "save_consumer_offset",
     "render_activity_digest", "render_activity_report",
+    "render_activity_brief",
     "summarize_turn_content", "record_scheduled_result",
     "get_activity_log",
 ]

@@ -49,6 +49,14 @@ class Experience:
     tools_used: List[str] = field(default_factory=list)
     outcome: str = "unknown"  # passed | failed | unknown
     cluster: Optional[str] = None
+    # What I actually ANSWERED — a short, redacted, single-line excerpt of
+    # the final reply (2026-09-05). The template summary records how the
+    # turn went ("reached for X and the answer landed"), never what was
+    # said, so recall could surface the question and never the answer:
+    # live, "Leonidas age" returned five records of the question and none
+    # of the birth date. Empty on rows written before the field existed
+    # (`from_dict` fills the default) and on turns with no reply text.
+    answer_gist: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

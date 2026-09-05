@@ -45,20 +45,23 @@
   <p class="subtitle">Read-only handle the agent reaches for when asked to describe itself, recall what it has been working on, or surface specific past turns.</p>
 
   <h2>Why this tool exists</h2>
-  <p>The selfhood wake-up prefix is already spliced into every system prompt (see <a href="../algorithms/selfhood.html">Selfhood</a>), so a casual <em>"tell me about yourself"</em> is already grounded in the running diary. <code>introspect</code> is the explicit handle for cases where the agent wants a <strong>deterministic snapshot</strong> rather than relying on whatever the prefix happened to surface — answering specific recall questions, producing a structured self-report, or letting evaluation scripts pull a known shape.</p>
+  <p>The selfhood wake-up prefix is <strong>off on the request path</strong> (<code>_SELFHOOD_PREFIX_ENABLED = False</code> in <code>core/agent.py</code>, journal §3 — it added tokens and steered nothing). So nothing about mood, diary, principles or open questions reaches the model except through this tool, and routing is load-bearing: the system prompt's <strong>SELF SURFACE</strong> rule sends every "how are you / how's things / what did you do while I was away / tell me about yourself" question here, and <code>overview</code> is the one-call answer. (This page claimed the prefix was live until 2026-09-05; measured over two months of trajectories, 48 such questions were asked, 9 reached the tool, 28 were answered with no tool at all and 9 went to <code>system_utility</code> — the machine's CPU and RAM, not the self.)</p>
+  <p><code>introspect</code> is also the deterministic handle for specific recall ("what do you remember about X" — matched against the request <em>and</em> the answer since 2026-09-05), for a structured self-report, and for evaluation scripts that need a known shape.</p>
   <p>Counterpart to <code>self_state</code>: <em>introspect</em> reads, <em>self_state</em> writes. The two are deliberately split so a single tool description does not conflate "introspect myself" with "author my forward-looking continuity slot".</p>
 
   <h2>Tool: <code>introspect</code></h2>
   <div class="scroll"><table>
     <thead><tr><th>Action</th><th>Returns</th><th>Backed by</th></tr></thead>
     <tbody>
-      <tr><td><code>summary</code> (default)</td><td><code>stats()</code> + the running first-person diary + operating principles + the most recent 5 experiences, rendered as one first-person block — the natural answer to "tell me about yourself".</td><td><code>SelfModel.stats()</code>, <code>NarrativeSummariser.latest()</code>, <code>SelfModel.principles_text()</code>, <code>AutobiographicalMemory.recent()</code></td></tr>
-      <tr><td><code>stats</code></td><td>Counts (experiences, open questions, unfinished threads, operating principles), last noted mood, last-active timestamp, narrative-present flag, top-5 topic cluster mix.</td><td><code>SelfModel.stats()</code></td></tr>
+      <tr><td><code>overview</code></td><td>The one-call "how are you" briefing (2026-09-05): mood <em>with its evidence</em>, open questions and unfinished threads as text, the last 3 real experiences, the last 24h of background work led by notify-severity changes, the learning headline lines, the experiments headline (enrolled arms, any DECIDED verdict, enabled-but-unstamped specs), pending post-mortem defects, workspace event counts. Every surface that cannot render says so by name; bounded to ~3.2 KB with a truncation marker.</td><td>all of the below; <code>core/experiments.render_headline()</code>; <code>context.defect_queue</code>; <code>context.workspace_model</code></td></tr>
+      <tr><td><code>summary</code> (default)</td><td><code>stats()</code> + open questions / unfinished threads as text + the running first-person diary + operating principles (each with its age) + the most recent 5 real experiences (session boots excluded, repeats collapsed), rendered as one first-person block — the natural answer to "tell me about yourself".</td><td><code>SelfModel.stats()</code>, <code>SelfStateThread.open_questions()</code>, <code>NarrativeSummariser.latest()</code>, <code>SelfModel.principles()</code>, <code>AutobiographicalMemory.recent(include_boots=False)</code></td></tr>
+      <tr><td><code>stats</code></td><td>Counts (experiences, open questions, unfinished threads, operating principles), last noted mood <em>with its evidence and provenance</em>, last-active timestamp, narrative-present flag, top-5 topic cluster mix.</td><td><code>SelfModel.stats()</code></td></tr>
       <tr><td><code>narrative</code></td><td>The most recently consolidated first-person diary, or "No narrative on file yet."</td><td><code>NarrativeSummariser.latest()</code></td></tr>
-      <tr><td><code>recent</code></td><td>The last N first-person experiences (newest last), with outcome flags when known and a compact age ("3.2h ago"). <code>limit</code> defaults to 5; capped at 25.</td><td><code>AutobiographicalMemory.recent()</code></td></tr>
-      <tr><td><code>recall</code></td><td>IDF-weighted, dependency-free search over the autobiographical log; returns best-match-first, each line age-stamped. Requires <code>query</code>.</td><td><code>SelfModel.recall_relevant()</code> → <code>AutobiographicalMemory.search_my_past()</code></td></tr>
-      <tr><td><code>activity</code></td><td>The background-activity ledger over a bounded recent window (ALL severities — the on-demand home of the routine maintenance the finalize banner stopped auto-surfacing 2026-07-17). Newest first, ×N-collapsed, age-stamped; annotates when the tail scan could not cover the requested window.</td><td><code>core/autonomous_activity.py</code> ledger (not the SelfModel — works with selfhood disabled)</td></tr>
-      <tr><td><code>learning</code></td><td>The LEARNING-HEALTH report (lessons, competence, episodes, calibration, <b>MECHANISM LIVENESS</b>, background-phase counts, cognitive wiring).</td><td><code>core/learning_health.py</code> (not the SelfModel — works with selfhood disabled)</td></tr>
+      <tr><td><code>recent</code></td><td>The last N real first-person experiences (newest last) — session boots excluded, identical requests collapsed into one "(×N)" line, the "without a verdict either way" clause dropped, an <code>→ my answer:</code> line when the row carries a gist — with outcome flags when known and a compact age ("3.2h ago"). <code>limit</code> defaults to 5; capped at 25. Optional <code>hours</code> window (rows whose timestamp does not parse are kept — unknown age is not old age).</td><td><code>AutobiographicalMemory.recent(include_boots=False, hours=…)</code></td></tr>
+      <tr><td><code>recall</code></td><td>IDF-weighted, dependency-free search over the autobiographical log — over the request, the cluster <em>and the answer gist</em>, so a memory is reachable by what was answered, never over boot markers; best-match-first, repeats collapsed, each line age-stamped. Requires <code>query</code>.</td><td><code>SelfModel.recall_relevant()</code> → <code>AutobiographicalMemory.search_my_past()</code></td></tr>
+      <tr><td><code>activity</code></td><td>The background-activity ledger over a bounded recent window (ALL severities — the on-demand home of the routine maintenance the finalize banner stopped auto-surfacing 2026-07-17). Default (2026-09-05) is a kind-grouped brief: every notify-severity record on its own line first ("What changed"), then one line per routine kind with its count and newest entry. <code>verbose=true</code> is the line-by-line ledger (newest first, ×N-collapsed, age-stamped). Both annotate when the tail scan could not cover the requested window.</td><td><code>core/autonomous_activity.render_activity_brief()</code> / <code>render_activity_report()</code> (not the SelfModel — works with selfhood disabled)</td></tr>
+      <tr><td><code>learning</code></td><td>The LEARNING-HEALTH report (lessons, competence, episodes, calibration, <b>MECHANISM LIVENESS</b>, background-phase counts, cognitive wiring). Default (2026-09-05) is the <em>brief</em>: the report's unindented headline lines plus every "⚠" warning line, and a trailer naming the sections; <code>section="calibration"</code> returns one block with its detail; <code>verbose=true</code> the full 200-line report. One corpus walk (4.6 s live) is cached for 10 minutes; the trailer states the age of cached numbers.</td><td><code>core/learning_health.py</code> (not the SelfModel — works with selfhood disabled)</td></tr>
+      <tr><td><code>experiments</code></td><td>Live randomized arms. Default (2026-09-05) is the <em>brief</em>: per experiment the same <code>■ name  (n=N)</code> header as the full report and one verdict <em>label</em> per tested metric (descriptive metrics omitted), the triggered-turns failure_rate label, enabled-but-unstamped zero rows, and the bench-scoped section under its own banner; <code>section="&lt;experiment&gt;"</code> returns that experiment's full block with intervals and confounds; <code>verbose=true</code> the whole report. The label and the full verdict text come from ONE method (<code>MetricComparison._verdict_parts</code>) so the two surfaces cannot drift.</td><td><code>core/experiments.report_from_trajectories(brief=…)</code>, <code>render_brief_report()</code></td></tr>
     </tbody>
   </table></div>
 
@@ -66,10 +69,12 @@
   <div class="scroll"><table>
     <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
     <tbody>
-      <tr><td><code>action</code></td><td>enum</td><td>One of <code>summary</code>, <code>stats</code>, <code>narrative</code>, <code>recent</code>, <code>recall</code>, <code>activity</code>, <code>learning</code>. Defaults to <code>summary</code>. Every action is described in the tool description — <code>learning</code> was enum-only until 2026-07-27, i.e. undiscoverable by the model.</td></tr>
-      <tr><td><code>query</code></td><td>string</td><td>Required for <code>action="recall"</code>. The phrase to search the autobiographical log for.</td></tr>
-      <tr><td><code>limit</code></td><td>int</td><td>Optional for <code>recent</code> / <code>recall</code>. Defaults to 5; clamped to <code>[1, 25]</code>. For <code>activity</code>: ledger lines, default 30, cap 100.</td></tr>
-      <tr><td><code>hours</code></td><td>number</td><td>For <code>activity</code>: look-back window. Default 24; clamped to <code>[0.25, 336]</code>.</td></tr>
+      <tr><td><code>action</code></td><td>enum</td><td>One of <code>overview</code>, <code>summary</code>, <code>stats</code>, <code>narrative</code>, <code>recent</code>, <code>recall</code>, <code>activity</code>, <code>learning</code>, <code>experiments</code>. Defaults to <code>summary</code>. Every action is described in the tool description — <code>learning</code> was enum-only until 2026-07-27, i.e. undiscoverable by the model.</td></tr>
+      <tr><td><code>query</code></td><td>string</td><td>Required for <code>action="recall"</code>. The phrase to search the autobiographical log for; matched against the request and the answer gist.</td></tr>
+      <tr><td><code>limit</code></td><td>int</td><td>Optional for <code>recent</code> / <code>recall</code>. Defaults to 5; clamped to <code>[1, 25]</code>. For <code>activity</code> with <code>verbose=true</code>: ledger lines, default 30, cap 100.</td></tr>
+      <tr><td><code>hours</code></td><td>number</td><td>For <code>activity</code>: look-back window. Default 24; clamped to <code>[0.25, 336]</code>. For <code>recent</code>: keep only experiences younger than this (same cap; non-positive or unparseable values mean no window).</td></tr>
+      <tr><td><code>verbose</code></td><td>boolean</td><td>For <code>activity</code> / <code>learning</code> / <code>experiments</code>: <code>true</code> = the full untrimmed report. Default <code>false</code> = the brief. String forms ("true", "1", "yes") coerce.</td></tr>
+      <tr><td><code>section</code></td><td>string</td><td>For <code>learning</code> / <code>experiments</code>: expand ONE block of the <em>full</em> report by a case-insensitive substring of its headline ("calibration", "lessons", an experiment name). An unknown name returns the list of available names.</td></tr>
     </tbody>
   </table></div>
 
@@ -81,6 +86,7 @@
     <li><strong>Internal exception</strong> in the SelfModel read path: caught at the tool boundary, logged at WARNING, returned as a short failure string. Introspection must never break a user turn.</li>
     <li><strong><code>activity</code> exceptions</strong>: the branch returns before the SelfModel try-block, so it carries its own guard (added 2026-07-27 — it previously escaped the never-raises contract). A <em>failed ledger read</em> returns an explicit read-error message, never the calm "No background activity recorded" a genuinely quiet window produces.</li>
     <li><strong><code>learning</code> exceptions</strong>: caught in-branch; degrades to "Learning health unavailable: …".</li>
+    <li><strong><code>overview</code></strong>: every surface degrades on its own and <em>names</em> its absence ("ledger is not attached", "Learning: unavailable (RuntimeError: …)", "queue not attached") — a missing block is a report of a missing subsystem, never silence. The branch carries its own guard like <code>activity</code>.</li>
   </ul>
 
   <h2>Wiring</h2>
@@ -366,7 +372,9 @@
     the top "topic cluster" was restart noise rendered as introspection.
     <code>count()</code>/<code>cluster_counts()</code> exclude <code>outcome=="boot"</code>;
     stats render "Session boots (excluded from the counts above): N". <code>recent</code>
-    still shows boots (labeled) — they are real chronology.</li>
+    still showed boots (labeled) at the time — superseded 2026-09-05: the tool's <code>recent</code>
+    excludes them; the substrate's <code>recent()</code> keeps its default so the narrative
+    summariser, which reads boots on purpose, is unchanged.</li>
     <li><strong>The learning report asserted a stale direction</strong> ("all-lessons …
     OVERSTATES") that live data had reversed; the direction is now computed from the two
     numbers it prints.</li>
@@ -378,6 +386,44 @@
   <p>Review lesson recorded: two of the round-1 fix tests were themselves vacuous (one ran
   against a context whose early return skipped the code under test; one mutation was
   semantically equivalent) — both caught by mutation-testing the tests, not by reading them.</p>
+
+  <h2 id="review-2026-09-05">2026-09-05 — routing, answer gist, briefs, overview (journal §4EU)</h2>
+  <p>Operator: "review introspect, how can we improve it?" then "fix them". The instrument side had been
+  hardened by the 2026-07-27 review; this pass measured the tool from the outside — who calls it, what it
+  returns, and what the model has to do with the result.</p>
+  <ul>
+    <li><strong>Routing was the largest gap.</strong> Over two months of trajectories, 48 user turns matched
+    introspective phrasings; 9 reached the tool, 28 were answered with no tool, 9 went to
+    <code>system_utility</code>. With the wake-up prefix off there was nothing to answer from. Fix: the
+    <strong>SELF SURFACE</strong> rule in <code>core/prompts.SYSTEM_PROMPT</code> (a sibling of LESSONS
+    SURFACE), a rewritten tool description that owns "how are you feeling", and this page's own stale
+    prefix claim corrected. The same trajectory query is the after-measurement.</li>
+    <li><strong>Experiences carried no answer.</strong> <code>capture_turn</code> received the final reply
+    and discarded it; recall for "Leonidas age" returned five records of the question. Fix:
+    <code>Experience.answer_gist</code> (≤160 chars, think-blocks dropped, PII redacted before the clip),
+    written at capture, in the recall haystack, rendered as an <code>→ my answer:</code> line. Old rows
+    load with an empty gist.</li>
+    <li><strong>Noise.</strong> Boots were 25% of the log and reached <code>recent</code>; 39% of rows
+    rendered "without a verdict either way"; identical requests rendered twice. Fixes:
+    <code>recent(include_boots=False)</code> for the tool only, boots never match in search, the clause
+    stripped at render only when it is the TAIL of the summary (kept on disk for the late-verdict
+    backfill), repeats collapsed to "(×N)" with the newest kept for chronological lists and the
+    best-ranked for recall, and an <code>hours</code> window on <code>recent</code>. The
+    "[passed] next to it didn't land" contradiction was already fixed on 2026-08-21
+    (<code>_swap_verdict_clause</code>); the three rows on the live box predate it.</li>
+    <li><strong>Reports sized for the operator.</strong> learning 20 KB / experiments 16 KB per call,
+    no tool-result cap. Fixes: brief-by-default views (structural for learning — headlines + ⚠ lines;
+    label-only for experiments via <code>render_brief_report</code>), <code>section=</code> and
+    <code>verbose=</code>, a 10-minute cache on the learning walk. <code>MetricComparison</code> now
+    computes <code>(label, detail)</code> once; <code>verdict</code> is byte-identical to before.</li>
+    <li><strong>Activity read as a maintenance log.</strong> Default is now
+    <code>render_activity_brief</code>: notify-severity changes first, then one line per kind.</li>
+    <li><strong><code>overview</code></strong>: the one-call briefing "full briefing" prompts used to
+    fan out over five tools for.</li>
+  </ul>
+  <p>Pins live in <code>tests/test_introspect_routing_and_briefs.py</code> (each names the world where
+  it fails); two existing tests moved to the class they pin (both activity renderers; the wiring rows on
+  <code>verbose=true</code>). The journal entry carries the mutation score.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

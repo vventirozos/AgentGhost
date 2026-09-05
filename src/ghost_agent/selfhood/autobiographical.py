@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import datetime
 import re
 import threading
 from pathlib import Path
@@ -202,9 +203,43 @@ def redact_pii(text: str) -> str:
     return out
 
 
+#: `recent()` over-scan when a filter is active (see its docstring).
+_RECENT_FILTER_OVERSCAN = 8
+_RECENT_FILTER_MIN_TAIL = 64
+
+
 def _tokenize(text: str) -> List[str]:
     """Lowercase word tokens — shared by the recall scorer and clustering."""
     return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+#: Length cap for `answer_gist`. 160 chars is one or two sentences — enough
+#: to carry a fact ("born 12 March 2026", "the table is 41 GB with toast")
+#: without turning the diary into a transcript. Sized against the 1.1 MB
+#: live log: ~1,800 rows × 160 B adds under 300 KB before compaction.
+ANSWER_GIST_MAX_CHARS = 160
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def answer_gist(final_response: str, *,
+                max_chars: int = ANSWER_GIST_MAX_CHARS) -> str:
+    """The "what I said" half of an experience: a short, single-line,
+    redacted excerpt of the agent's own final reply.
+
+    Reasoning blocks are dropped first (a gist of the think-trace is not an
+    answer), whitespace is collapsed, and PII is redacted BEFORE the clip —
+    clipping first can cut a secret in half and leave the pattern
+    unmatchable (the same rule `_outcome_phrase` documents for failure
+    reasons). Empty in → empty out; callers store "" rather than a
+    placeholder so a missing gist never reads as an answer."""
+    text = _THINK_BLOCK_RE.sub(" ", str(final_response or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    text = redact_pii(text)
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
 
 
 def _derive_cluster(text: str) -> Optional[str]:
@@ -262,6 +297,36 @@ _VERDICT_CLAUSE_STARTS = (
     "and the answer landed",
     "and it didn't land",
 )
+
+#: The unknown-outcome clause, by name — the ONE authority for the phrase
+#: the read surfaces strip (`strip_no_verdict_clause`). It stays in the
+#: STORED summary on purpose: the late-verdict backfill
+#: (`_swap_verdict_clause`) finds and replaces it there, and 39% of live
+#: rows are waiting for exactly that. Only rendering drops it.
+NO_VERDICT_CLAUSE = _VERDICT_CLAUSE_STARTS[0]
+
+
+def strip_no_verdict_clause(summary: str) -> str:
+    """Render-side twin of `_swap_verdict_clause`: drop a TRAILING
+    "without a verdict either way" (a reader gains nothing from it — the
+    missing `[outcome]` tag already says the turn was never judged).
+
+    Only the tail is eligible: the clause must run to the end of the
+    string (modulo the final period). A decoy inside the quoted user
+    request ("…without a verdict either way, what do you think?") is
+    therefore left alone — the truncation hazard `_swap_verdict_clause`
+    documents cannot arise here, because a non-tail match is not a
+    match. A summary without the clause is returned unchanged."""
+    s = summary or ""
+    i = s.rfind(NO_VERDICT_CLAUSE)
+    if i < 0:
+        return s
+    if s[i:].rstrip().rstrip(".").strip() != NO_VERDICT_CLAUSE:
+        return s
+    head = s[:i].rstrip()
+    if s.rstrip().endswith(".") and not head.endswith("."):
+        head += "."
+    return head
 
 
 def _swap_verdict_clause(summary: str, new_clause: str) -> str:
@@ -547,7 +612,8 @@ class AutobiographicalMemory:
         except OSError as e:
             logger.warning("cannot read autobiographical log %s: %s", self.path, e)
 
-    def recent(self, limit: int = 5) -> List[Experience]:
+    def recent(self, limit: int = 5, *, include_boots: bool = True,
+               hours: Optional[float] = None) -> List[Experience]:
         """Return the most recent N experiences, newest last so the
         natural caller can do ``for e in mem.recent(3): print(e)`` and
         read in chronological order.
@@ -555,28 +621,54 @@ class AutobiographicalMemory:
         Reads only the tail of the file (a bounded deque over the lines)
         instead of materialising the whole log — `recent()` is on the
         per-turn hot path (wake-up prefix, reference-note), and a full
-        O(n) parse per call was quadratic over the log's monotonic growth."""
+        O(n) parse per call was quadratic over the log's monotonic growth.
+
+        ``include_boots=False`` drops session-boot markers (2026-09-05):
+        they are 25% of the live log and one of five "recent experiences"
+        rendered by introspect was "Session resumed". The default stays
+        True because the narrative summariser reads boots on purpose —
+        they structure its "after a few hours off…" diary voice.
+        ``hours`` keeps only rows younger than the window; a row whose
+        timestamp does not parse is KEPT (unknown age is not old age).
+        With either filter the tail over-scan is ``limit × 8`` lines
+        (floor 64) — a boot-heavy tail can therefore return fewer than
+        ``limit`` rows rather than reading the whole file."""
         if limit <= 0:
             return []
         if not self.path.exists():
             return []
         from collections import deque
+        filtering = (not include_boots) or (hours is not None)
+        scan = (max(limit * _RECENT_FILTER_OVERSCAN, _RECENT_FILTER_MIN_TAIL)
+                if filtering else limit)
         try:
             with self.path.open("r", encoding="utf-8") as f:
-                tail_lines = deque(f, maxlen=limit)
+                tail_lines = deque(f, maxlen=scan)
         except OSError as e:
             logger.warning("cannot read autobiographical log %s: %s", self.path, e)
             return []
+        cutoff = None
+        if hours is not None:
+            cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                      - datetime.timedelta(hours=float(hours)))
         items: List[Experience] = []
         for line in tail_lines:
             line = line.strip()
             if not line:
                 continue
             try:
-                items.append(Experience.from_dict(json.loads(line)))
+                exp = Experience.from_dict(json.loads(line))
             except Exception:
                 continue
-        return items
+            if not include_boots and exp.outcome == "boot":
+                continue
+            if cutoff is not None:
+                from .mood import parse_iso_utc
+                ts = parse_iso_utc(exp.timestamp)
+                if ts is not None and ts < cutoff:
+                    continue
+            items.append(exp)
+        return items[-limit:] if filtering else items
 
     def recent_verdicts(
         self,
@@ -692,6 +784,10 @@ class AutobiographicalMemory:
         # dict loaded once.
         scored: List[tuple] = []
         for exp, hs_tokens in zip(experiences, haystacks):
+            # A boot marker is not an experience: "session"/"boot" match
+            # 600 identical rows on the live log and bury real recall.
+            if exp.outcome == "boot":
+                continue
             score = sum(idf[t] for t in q_tokens if t in hs_tokens)
             if score > 0:
                 refs = self.reference_count(exp.id)
@@ -720,8 +816,11 @@ class AutobiographicalMemory:
         haystacks: List[set] = []
         df: Dict[str, int] = {}
         for exp in experiences:
+            # The gist is in the haystack so recall reaches a memory by
+            # what was ANSWERED, not only by how the question was phrased.
             hs = (exp.summary + " " + exp.user_first_words + " "
-                  + (exp.cluster or "")).lower()
+                  + (exp.cluster or "") + " "
+                  + (getattr(exp, "answer_gist", "") or "")).lower()
             # Store the TOKEN SET (not the raw string). Scoring tests
             # membership token-wise to match how df is built — a query
             # token must EQUAL a document token, not merely appear as a

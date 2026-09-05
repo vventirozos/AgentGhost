@@ -21,6 +21,7 @@ from typing import Awaitable, Callable, Iterable, Optional
 from .autobiographical import (
     AutobiographicalMemory,
     _derive_cluster,
+    answer_gist,
     detect_referenced_experiences,
     redact_pii,
     summarise_turn_first_person,
@@ -283,6 +284,9 @@ class SelfModel:
                 tools_used=tool_list[:10],
                 outcome=str(outcome or "unknown"),
                 cluster=resolved_cluster,
+                # The reply itself, clipped and redacted — recall's
+                # answer-side vocabulary (schema.Experience.answer_gist).
+                answer_gist=answer_gist(final_response),
             )
             self.autobio.append(exp)
             if self.state is not None:
@@ -719,6 +723,10 @@ class SelfModel:
             "last_mood_source": (getattr(_mood, "source", "self")
                                  if _mood else ""),
             "last_mood_set_at": (_mood.set_at if _mood else ""),
+            # The falsifiable half of a derived mood ("my last 5
+            # verdict-bearing turns all passed") — the label alone is an
+            # unfalsifiable vibe, which is the defect derive_mood replaced.
+            "last_mood_evidence": (_mood.evidence if _mood else ""),
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),

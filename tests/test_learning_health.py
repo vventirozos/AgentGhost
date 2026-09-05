@@ -586,7 +586,11 @@ async def test_introspect_learning_delivers_real_flag_states_end_to_end(
         args=types.SimpleNamespace(frontier_selfplay=True,
                                    no_trajectories=False,
                                    prm_online_update=False))
-    out = await tool_introspect(action="learning", context=context)
+    # verbose=True: the wiring rows are indented detail, which the
+    # 2026-09-05 brief (the tool's default view) folds away by design —
+    # this pin is about the end-to-end flag plumbing, not the view.
+    out = await tool_introspect(action="learning", context=context,
+                                verbose=True)
     # Flags handed in must appear as STATES, not as unchecked prose.
     assert ".uncertainty() ON" in out, out[:400]
     # §4BN: the row moved to the PRODUCER side (online_update refines a
