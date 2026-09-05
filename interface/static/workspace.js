@@ -6,7 +6,7 @@
 //  core and is only touched at the bridge seam. Sub-modules:
 //    sessions.js       — durable server-side conversations (left rail)
 //    notifications.js  — notify-severity autonomous activity (bell)
-//    status.js         — /api/health + /api/turns strip and panel
+//    status.js         — /api/health poll → DEGRADED tag on the ONLINE chip
 //    palette.js        — ⌘K command palette
 //  This module owns the shared chrome: rail open/close, density,
 //  toasts, the per-message action menu, and the memory-correction
@@ -14,8 +14,8 @@
 // ═══════════════════════════════════════════════════════════════
 import { initSessions } from './sessions.js?v=7.7';
 import { initNotifications } from './notifications.js?v=6.9';
-import { initStatus } from './status.js?v=7.0';
-import { initPalette } from './palette.js?v=6.8';
+import { initStatus } from './status.js?v=7.2';
+import { initPalette } from './palette.js?v=7.0';
 
 const Core = window.GhostCore;
 
@@ -275,7 +275,7 @@ initMemoryModal();
 const sessions = initSessions(ctx);
 const notifications = initNotifications(ctx);
 const status = initStatus(ctx);
-initPalette({ ...ctx, sessions, notifications, status });
+initPalette({ ...ctx, sessions, notifications });
 
 // Decorate whatever history app.js already restored before we loaded.
 Core.decorateMessageActions();

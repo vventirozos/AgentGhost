@@ -54,6 +54,63 @@ def _mark_foreground(agent, delta: int) -> None:
         pass
 
 
+def _restamp_sse_request_id(chunk, req_id: str):
+    """Rewrite the ``id`` of every JSON ``data:`` frame in ``chunk`` to
+    ``chatcmpl-<req_id>`` — the agent's OWN request id.
+
+    ⚠ WHY (2026-09-05). On the streamed-final-generation path the agent
+    forwards the upstream llama-server's SSE frames verbatim, and those
+    carry llama's completion id (``chatcmpl-`` + 32 random characters).
+    Every client that labels a turn (web UI thumbs, CLI) reads the request
+    id off the frames — the contract `core/feedback.normalize_request_id`
+    documents — so it POSTed llama's id, while the trajectory was filed
+    under the agent's ``req_id`` (``4f6dc15d``). ``/api/feedback`` then
+    answered "no trajectory found" for EVERY streamed turn, and the
+    operator's labels — the scarcest signal the learning stack has — were
+    lost silently. Slack was immune only because it mints its own
+    ``X-Request-ID``. This is the one choke point every client-bound
+    streaming frame passes through, so it is the place to fix the id.
+
+    Bytes in, bytes out; ``[DONE]``, SSE comments, ``event:`` lines and
+    anything unparseable pass through untouched. A chunk may carry several
+    frames (split on the blank line); each JSON object frame gets the id,
+    including ones that had none — the client captures the first ``id`` it
+    sees, and an id-less first frame would leave it holding llama's from
+    the second."""
+    if not req_id:
+        return chunk
+    try:
+        raw = chunk.decode("utf-8") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+    except Exception:  # noqa: BLE001 — undecodable bytes: not ours to touch
+        return chunk
+    if '"id"' not in raw and "data:" not in raw:
+        return chunk
+    stamped = f"chatcmpl-{req_id}"
+    out = []
+    changed = False
+    for frame in raw.split("\n\n"):
+        stripped = frame.strip()
+        if stripped.startswith("data:"):
+            payload = stripped[len("data:"):].strip()
+            # Only JSON OBJECTS are candidates: `[DONE]`, arrays and prose
+            # fail the `{` gate (a separate `[DONE]` test was dead code —
+            # the mutation batch proved it equivalent, §4EX).
+            if payload.startswith("{"):
+                try:
+                    d = json.loads(payload)
+                except ValueError:
+                    d = None
+                if isinstance(d, dict) and d.get("id") != stamped:
+                    d["id"] = stamped
+                    frame = "data: " + json.dumps(d, ensure_ascii=False)
+                    changed = True
+        out.append(frame)
+    if not changed:
+        return chunk
+    result = "\n\n".join(out)
+    return result.encode("utf-8") if isinstance(chunk, (bytes, bytearray)) else result
+
+
 def _sse_delta_text(chunk) -> str:
     """Extract the assistant text from one SSE chunk the agent's streamer
     emitted (``data: {"choices":[{"delta":{"content": "..."}}]}``).
@@ -686,11 +743,21 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     async for chunk in content:
                         content_started = True
                         _acc.append(_sse_delta_text(chunk))
-                        yield chunk
+                        # The frames are llama-server's, with llama's id;
+                        # the feedback contract is OUR id (see the helper).
+                        yield _restamp_sse_request_id(chunk, req_id)
                     _persist_session("".join(_acc))
                 else:
                     _persist_session(content)
-                    async for chunk in agent.context.llm_client.stream_openai(model, content, created_time, req_id):
+                    # A trivial-fast-path reply has NO trajectory (by
+                    # design), so no label can ever land on it: say so on
+                    # the wire and the UI renders no thumbs (§4EX). `is
+                    # True` — a MagicMock agent answers truthy to anything.
+                    _unlabelable = (getattr(agent, "is_trivial_reply", None) is not None
+                                    and agent.is_trivial_reply(req_id) is True)
+                    async for chunk in agent.context.llm_client.stream_openai(
+                            model, content, created_time, req_id,
+                            extra={"ghost": {"labelable": False}} if _unlabelable else None):
                         content_started = True
                         yield chunk
             except Exception as e:

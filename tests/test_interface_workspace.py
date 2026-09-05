@@ -39,9 +39,14 @@ def test_workspace_markup_present():
     html = _read("index.html")
     for el_id in (
         "session-rail", "session-list", "session-search", "new-chat-btn",
+        # 2026-09-05: workspace load/save moved into the rail beside "+".
+        "rail-actions", "workspace-load-btn", "workspace-save-btn",
         "rail-toggle", "rail-scrim", "notif-btn", "notif-badge",
-        "notif-panel", "notif-list", "status-panel", "status-body",
-        "model-pill", "cmd-palette", "palette-input", "palette-results",
+        # status-panel / status-body / model-pill left this list 2026-09-05:
+        # removed at the operator's request (their ABSENCE is pinned in
+        # tests/test_interface_face_prefs_and_status_chip.py).
+        "notif-panel", "notif-list",
+        "cmd-palette", "palette-input", "palette-results",
         "msg-menu", "memory-modal", "memory-match", "memory-replacement",
         "toast-stack",
     ):
@@ -248,18 +253,20 @@ def test_notifications_watermark_contract():
 # ---------------------------------------------------------------------------
 
 def test_status_module_contract():
+    """2026-09-05: status.js is the health TAG only — the model pill, the
+    panel, the turn queue and its per-turn cancel went with the operator's
+    removal. The chip's behaviour is EXECUTED under node in
+    tests/test_interface_face_prefs_and_status_chip.py; this keeps the
+    surface contract."""
     js = _read("status.js")
     assert "/api/health" in js
-    assert "/api/turns" in js
-    assert "/api/turn/cancel" in js
-    assert "hard" in js, "hard cancel (guaranteed lock release) must be reachable"
     # The two silent-failure detectors must be surfaced, not dropped.
     assert "memory_system_loaded" in js
     assert "biological_watchdog_alive" in js
-    # ActiveTurn.to_dict() emits request_id (NOT req_id/id) — a review
-    # found the per-turn cancel buttons dead on this exact mismatch.
-    assert "t.request_id" in js
-    assert "arg.model" in js, "live health config flattens args as arg.model"
+    # The removed surfaces must not creep back in under the old names.
+    for gone in ("/api/turns", "/api/turn/cancel", "t.request_id",
+                 "arg.model", "status-panel", "model-pill"):
+        assert gone not in js, f"{gone} is back in status.js"
 
 
 # ---------------------------------------------------------------------------

@@ -239,14 +239,38 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex',
     'lattice', 'stack', 'embedding', 'descent', 'cube', 'empty'];
 // Default form: VORTEX (operator pick, 2026-07-28 — superseded horizon
-// after the black-hole iteration). An explicit button choice still
-// overrides via localStorage below.
+// after the black-hole iteration). The form the operator last picked
+// overrides it — resolved by `resolveInitialForm` below.
 let formIndex = FORMS.indexOf('vortex');
+
+// Which form to boot into (2026-09-05). Precedence, highest first:
+//   1. the SERVER's record of the last form picked ANYWHERE — server.py
+//      injects it as <meta name="ghost-face-form"> once a pick has been
+//      saved (POST /api/ui/prefs, app.js rememberFaceForm). This is what
+//      makes the face come back the same in the phone PWA, a LAN-IP tab
+//      and the Tailscale-name tab, and after Safari's storage purge —
+//      localStorage is per-origin, per-browser, per-device, and none of
+//      those is "the last face used".
+//   2. this browser's localStorage (the pre-2026-09-05 mechanism; also
+//      the fallback for a pick whose save never reached the server).
+//   3. the default.
+// An unknown name at any level (a form since removed, a tampered value)
+// falls through to the next: the roster is the only authority. Pure and
+// exported so the precedence is EXECUTED under node
+// (tests/test_interface_face_prefs_and_status_chip.py), not read.
+export function resolveInitialForm(serverForm, storedForm, fallback) {
+    for (const candidate of [serverForm, storedForm]) {
+        if (typeof candidate === 'string' && FORMS.indexOf(candidate) >= 0) return candidate;
+    }
+    return fallback;
+}
 try {
-    const _stored = localStorage.getItem('ghost_face_form');
-    const _i = FORMS.indexOf(_stored);
-    if (_i >= 0) formIndex = _i;
-} catch (e) { /* private mode */ }
+    const _meta = document.querySelector('meta[name="ghost-face-form"]');
+    let _stored = null;
+    try { _stored = localStorage.getItem('ghost_face_form'); } catch (e) { /* private mode */ }
+    formIndex = FORMS.indexOf(resolveInitialForm(
+        _meta ? _meta.getAttribute('content') : null, _stored, FORMS[formIndex]));
+} catch (e) { /* no DOM */ }
 // Reorganization blend: on a form switch the nodes visibly re-assemble
 // from their old positions into the new anatomy over ~1.4s.
 let formBlend = 1.0;

@@ -46,7 +46,7 @@
   <div class="scroll"><table>
     <thead><tr><th>Function</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td><code>normalize_request_id(raw) → str</code></td><td>Wire form <code>chatcmpl-&lt;id&gt;</code> or bare id → bare req_id.</td></tr>
+      <tr><td><code>normalize_request_id(raw) → str</code></td><td>(Since 2026-09-05 the chat route guarantees every streamed frame carries the AGENT's id — <code>api/routes._restamp_sse_request_id</code>; before that the streamed-final path leaked llama-server's own completion id to clients and every web-UI label missed.) Wire form <code>chatcmpl-&lt;id&gt;</code> or bare id → bare req_id.</td></tr>
       <tr><td><code>find_trajectory_for_request(collector, request_id, max_days=8) → Trajectory|None</code></td><td>Day-partition scan, newest day first (restart-proof by construction — no in-memory ring to miss). Matches <code>extra.req_id</code>, with <code>session_id</code> as the legacy fallback; last match of the newest matching day wins.</td></tr>
       <tr><td><code>apply_human_label(agent, request_id, signal, note="", source="") → dict</code></td><td>The label chokepoint — see the ordered side effects below. Never raises.</td></tr>
     </tbody>

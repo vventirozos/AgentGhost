@@ -6,7 +6,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 export function initPalette(ctx) {
-    const { Core, el, toast, toggleRail, toggleDensity, sessions, notifications, status } = ctx;
+    const { Core, el, toast, toggleRail, toggleDensity, sessions, notifications } = ctx;
 
     const overlay = document.getElementById('cmd-palette');
     const input = document.getElementById('palette-input');
@@ -23,18 +23,15 @@ export function initPalette(ctx) {
             { label: 'Toggle sessions rail', hint: '', run: toggleRail },
             { label: 'Toggle live log', hint: 'pretty-log stream drawer', run: () => Core.toggleLogConsole() },
             { label: 'Toggle zen mode', hint: 'hide the chrome', run: () => document.body.classList.toggle('zen-mode') },
-            { label: 'Agent status', hint: 'health · nodes · turns', run: () => status.togglePanel() },
             { label: 'Notifications', hint: 'agent activity', run: () => notifications.togglePanel() },
-            // ⚠ These two are the SAME defect the composer's Stop had: a
-            // null request id means "cancel whatever holds the semaphore"
+            // ⚠ Stop is scoped to THIS tab's turn on purpose: a null
+            // request id means "cancel whatever holds the semaphore"
             // (core/turns.py::current), which may be a background dream or
-            // self-play turn — and the Force variant is a guaranteed lock
-            // release on it. The composer was fixed and these were missed,
-            // one control over (R3 lens B). The status panel lists turns
-            // individually with their own per-turn cancel buttons; that is
-            // the honest way to stop a specific turn.
+            // self-play turn — the composer's Stop had that defect and was
+            // fixed (R3 lens B). 'Agent status' and 'Turn queue…' (the
+            // status panel with per-turn Stop/Force) were removed
+            // 2026-09-05 at the operator's request, along with the panel.
             { label: 'Stop MY turn', hint: 'cooperative cancel of this tab\'s turn', run: () => Core.cancelOwnTurn(false) },
-            { label: 'Turn queue…', hint: 'list in-flight turns and cancel one', run: () => status.openPanel() },
             { label: 'Toggle density', hint: 'compact / comfortable', run: toggleDensity },
             {
                 label: 'Copy last reply', hint: '', run: async () => {
@@ -47,7 +44,8 @@ export function initPalette(ctx) {
                     catch (e) { toast('Copy failed', 'error'); }
                 },
             },
-            { label: 'Save workspace', hint: 'download sandbox + chat as zip', run: () => document.getElementById('workspace-btn')?.click() },
+            { label: 'Save workspace', hint: 'download sandbox + chat as zip', run: () => document.getElementById('workspace-save-btn')?.click() },
+            { label: 'Load workspace', hint: 'restore sandbox + chat from a zip', run: () => document.getElementById('workspace-load-btn')?.click() },
             { label: 'Download file from sandbox', hint: '', run: () => document.getElementById('download-btn')?.click() },
         ];
         for (const s of sessions.list()) {

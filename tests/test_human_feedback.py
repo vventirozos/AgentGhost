@@ -1459,7 +1459,8 @@ def test_the_conftest_live_path_isolation_is_COLLECTION_TIME():
                                     ast.ClassDef))],
         type_ignores=[]))
     for var in ("GHOST_SLACK_REPLY_INDEX", "GHOST_SLACKBOT_LOG",
-                "GHOST_PUSH_SUBS_FILE", "GHOST_VAPID_FILE"):
+                "GHOST_PUSH_SUBS_FILE", "GHOST_VAPID_FILE",
+                "GHOST_UI_PREFS_FILE"):
         assert var in module_level, (
             f"{var} is not isolated at COLLECTION time — a fixture cannot "
             "cover module-scoped loads or import-time binding")

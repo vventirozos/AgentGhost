@@ -3710,11 +3710,20 @@ class LLMClient:
                     if self.foreground_tasks < 0:
                         self.foreground_tasks = 0
 
-    async def stream_openai(self, model: str, content: str, created_time: int, req_id: str):
+    async def stream_openai(self, model: str, content: str, created_time: int, req_id: str,
+                            extra: Optional[Dict[str, Any]] = None):
+        """SSE-wrap a finished string as OpenAI chat.completion.chunk frames.
+
+        ``extra`` (2026-09-05): top-level fields merged into EVERY JSON
+        frame — the route uses it to mark a trivial-fast-path reply
+        ``{"ghost": {"labelable": false}}`` (no trajectory behind it, so no
+        thumbs). None/empty leaves the frames byte-identical to before."""
         chunk_id = f"chatcmpl-{req_id}"
+        extra = dict(extra) if extra else {}
         start_chunk = {
             "id": chunk_id, "object": "chat.completion.chunk", "created": created_time,
-            "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+            "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            **extra,
         }
         yield f"data: {json.dumps(start_chunk)}\n\n".encode('utf-8')
 
@@ -3722,7 +3731,8 @@ class LLMClient:
             slice_str = content[i:i+15]
             content_chunk = {
                 "id": chunk_id, "object": "chat.completion.chunk", "created": created_time,
-                "model": model, "choices": [{"index": 0, "delta": {"content": slice_str}, "finish_reason": None}]
+                "model": model, "choices": [{"index": 0, "delta": {"content": slice_str}, "finish_reason": None}],
+                **extra,
             }
             yield f"data: {json.dumps(content_chunk)}\n\n".encode('utf-8')
             # NOTE: previously this slept 10ms per chunk, adding ~1 second of
@@ -3733,7 +3743,8 @@ class LLMClient:
 
         stop_chunk = {
             "id": chunk_id, "object": "chat.completion.chunk", "created": created_time,
-            "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            **extra,
         }
         yield f"data: {json.dumps(stop_chunk)}\n\n".encode('utf-8')
         yield b"data: [DONE]\n\n"

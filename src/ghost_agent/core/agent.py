@@ -10517,6 +10517,33 @@ class GhostAgent:
         cleaned = result.strip().splitlines()[0].strip()
         return cleaned or legacy_fallback
 
+    # Request ids the trivial fast path answered, bounded (2026-09-05, §4EX).
+    # Those turns write NO trajectory by design, so /api/feedback can never
+    # resolve them — before this the web UI offered thumbs on every greeting
+    # and each tap came back "no trajectory found". The chat route reads
+    # `is_trivial_reply(req_id)` to stamp `ghost.labelable = false` on the
+    # reply's SSE frames; app.js then renders no thumbs. Lazily created so
+    # the constructor (and every test that builds a bare Agent) is untouched.
+    _TRIVIAL_REQ_IDS_CAP = 512
+
+    def _note_trivial_reply(self, req_id: str) -> None:
+        ids = getattr(self, "_trivial_req_ids", None)
+        if not isinstance(ids, dict):
+            ids = self._trivial_req_ids = {}
+        rid = str(req_id or "")
+        if not rid:
+            return
+        ids.pop(rid, None)
+        ids[rid] = True                      # dict order = insertion = age
+        while len(ids) > self._TRIVIAL_REQ_IDS_CAP:
+            ids.pop(next(iter(ids)))
+
+    def is_trivial_reply(self, req_id: str) -> bool:
+        """True when ``req_id`` was answered by the trivial fast path — a
+        reply with no trajectory behind it, hence nothing to label."""
+        ids = getattr(self, "_trivial_req_ids", None)
+        return isinstance(ids, dict) and str(req_id or "") in ids
+
     async def _handle_trivial_chat(self,
                                    last_user_content: str,
                                    messages: List[Dict[str, Any]],
@@ -20990,6 +21017,11 @@ class GhostAgent:
                         req_id=req_id,
                     )
                     if fast_result is not None:
+                        # No trajectory is written for this reply (a
+                        # greeting is not corpus material), so nothing a
+                        # thumb could label: remember the id so the route
+                        # can mark the frames and the UI shows no thumbs.
+                        self._note_trivial_reply(req_id)
                         return fast_result
 
                 should_fetch_memory = (not is_fact_check and not is_trivial_greeting)

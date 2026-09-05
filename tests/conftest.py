@@ -42,6 +42,11 @@ for _live_var, _live_default in (
          os.path.join(_LIVE_ISOLATION_DIR, "push_subs.json")),
         ("GHOST_VAPID_FILE",
          os.path.join(_LIVE_ISOLATION_DIR, "vapid.json")),
+        # The web UI's server-side preferences (face form, 2026-09-05):
+        # written by interface/server.py on every face pick — a test that
+        # POSTs one must not become the operator's face.
+        ("GHOST_UI_PREFS_FILE",
+         os.path.join(_LIVE_ISOLATION_DIR, "ui_prefs.json")),
 ):
     os.environ[_live_var] = _live_default
 

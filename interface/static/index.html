@@ -39,7 +39,7 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=5.4">
+    <link rel="stylesheet" href="/static/style.css?v=5.9">
 </head>
 
 <body>
@@ -53,9 +53,22 @@
     <aside id="session-rail" aria-label="Sessions">
         <div id="rail-header">
             <span id="rail-title">SESSIONS</span>
-            <button id="new-chat-btn" class="icon-btn" title="New chat" aria-label="New chat">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            </button>
+            <!-- Workspace load / save live HERE since 2026-09-05 (operator:
+                 "next to +"), as two explicit buttons — the header's one
+                 glyph used to flip between Load (empty chat) and Save
+                 (non-empty), which you had to know to use. -->
+            <div id="rail-actions">
+                <input type="file" id="workspace-upload-input" style="display: none;" accept=".zip" />
+                <button id="workspace-load-btn" class="icon-btn" type="button" title="Load workspace" aria-label="Load workspace from a zip">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                </button>
+                <button id="workspace-save-btn" class="icon-btn" type="button" title="Save workspace" aria-label="Save workspace as a zip">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
+                </button>
+                <button id="new-chat-btn" class="icon-btn" title="New chat" aria-label="New chat">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                </button>
+            </div>
         </div>
         <input id="session-search" type="search" placeholder="Filter sessions" autocomplete="off"
                aria-label="Filter sessions" />
@@ -124,36 +137,32 @@
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="15" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
                 </button>
                 <div id="status-wrapper">
-                    <div id="status-indicator" role="button" tabindex="0" title="Agent status">
+                    <!-- The ONLINE chip (2026-09-05, operator): an .icon-btn
+                         pill that OPENS THE LIVE LOG — the separate terminal
+                         button is gone. The model pill and the agent-status
+                         panel it used to open are gone too (same day).
+                         status.js still turns it DEGRADED, with the reason in
+                         its title; data-title is the resting tooltip. -->
+                    <button id="status-indicator" class="icon-btn" type="button" title="Live log"
+                            data-title="Live log" aria-label="Live log">
                         <span id="connection-dot"></span>
                         <span id="status-text">ONLINE</span>
-                        <span id="model-pill" class="hidden"></span>
-                    </div>
+                    </button>
                     <div id="planner-monologue"></div>
                 </div>
             </div>
-            <!-- Icon order (2026-08-01, operator): alerts first, then the
-                 console, then the three FILE operations grouped together
-                 (workspace / upload / download), appearance toggles (face,
-                 zen) last — rare-cosmetic sits at the end of the row. -->
+            <!-- Icon order (2026-09-05, operator: "make the sorting make
+                 sense"): left cluster = navigation (sessions rail) then the
+                 status light (opens the live log); right cluster = alerts
+                 (bell), the two sandbox FILE transfers (upload, download),
+                 then appearance (face, zen) last. Workspace load/save moved
+                 to the sessions rail; the terminal button was folded into
+                 the status light. Five controls here + two on the left fit
+                 ONE row on a 375px phone (style.css ≤480 block). -->
             <div id="header-controls">
                 <button id="notif-btn" class="icon-btn" title="Notifications" aria-label="Notifications">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
                     <span id="notif-badge" class="hidden">0</span>
-                </button>
-                <button id="logs-btn" class="icon-btn" title="Live Log" aria-label="Live log">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <polyline points="4 17 10 11 4 5"></polyline>
-                        <line x1="12" y1="19" x2="20" y2="19"></line>
-                    </svg>
-                </button>
-                <input type="file" id="workspace-upload-input" style="display: none;" accept=".zip" />
-                <button id="workspace-btn" class="icon-btn" title="Load Workspace" aria-label="Load workspace">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
-                        <polyline points="17 21 17 13 7 13 7 21"></polyline>
-                        <polyline points="7 3 7 8 15 8"></polyline>
-                    </svg>
                 </button>
                 <input type="file" id="file-upload-input" style="display: none;" />
                 <button id="upload-btn" class="icon-btn" title="Upload to Sandbox" aria-label="Upload a file to the sandbox">
@@ -251,14 +260,6 @@
         <div id="notif-list"></div>
     </div>
 
-    <div id="status-panel" class="hidden" aria-label="Agent status">
-        <div class="panel-header">
-            <span class="panel-title">AGENT STATUS</span>
-            <button id="status-close" class="render-btn" title="Close" aria-label="Close agent status">✕</button>
-        </div>
-        <div id="status-body"></div>
-    </div>
-
     <div id="cmd-palette" class="hidden" role="dialog" aria-modal="true" aria-label="Command palette">
         <div id="palette-box">
             <input id="palette-input" type="text" placeholder="Type a command or session name…"
@@ -268,6 +269,39 @@
     </div>
 
     <div id="msg-menu" class="hidden" role="menu"></div>
+
+    <!-- Ask-about-this-file (2026-09-05, operator): choosing a file no
+         longer uploads it blind. A sheet shows a preview + the name and
+         takes an optional question; "Upload & ask" sends the question
+         and the uploaded filename as ONE chat message, so a photo from
+         the phone camera goes straight to "what kind of car is that?"
+         instead of a second message naming image.jpg by hand. -->
+    <div id="upload-ask-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="upload-ask-title">
+        <div id="upload-ask-box" class="modal-box">
+            <div class="panel-header">
+                <span class="panel-title" id="upload-ask-title">ASK ABOUT THIS FILE</span>
+                <button id="upload-ask-close" class="render-btn" type="button" title="Cancel" aria-label="Cancel the upload">✕</button>
+            </div>
+            <!-- Question FIRST, picture as a thumbnail (operator, same day):
+                 a full-width preview put the typing box below the fold and
+                 under the phone keyboard — the sheet is about the question. -->
+            <label class="modal-label" for="upload-ask-input">Your question (optional)</label>
+            <textarea id="upload-ask-input" class="modal-textarea" rows="3" enterkeyhint="send"
+                      autocapitalize="sentences"></textarea>
+            <div id="upload-ask-meta">
+                <div id="upload-ask-preview-wrap" hidden>
+                    <img id="upload-ask-preview" alt="Thumbnail of the file about to be uploaded">
+                </div>
+                <p id="upload-ask-file" class="modal-hint"></p>
+            </div>
+            <!-- ONE button (operator): an empty question IS "upload only".
+                 The label follows the box: "Upload" / "Upload & ask". -->
+            <div class="modal-actions">
+                <button id="upload-ask-send" class="modal-btn primary" type="button">Upload</button>
+            </div>
+        </div>
+    </div>
 
     <div id="memory-modal" class="hidden" role="dialog" aria-modal="true">
         <div id="memory-modal-box">
@@ -290,7 +324,7 @@
 
     <div id="toast-stack" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js?v=10.7"></script>
+    <script type="module" src="/static/app.js?v=11.5"></script>
 </body>
 
 </html>

@@ -100,15 +100,11 @@ class TestHealthPollDiagnostics:
             out = eval_js(fn, f"_healthFailureNote(new Error('{msg}'))")
             assert "unreachable" in out.lower(), f"{msg} -> {out!r}"
 
-    def test_the_panel_renders_the_classified_note(self, status_js):
-        i = status_js.index("healthOk === false")
-        window = status_js[i:i + 400]
-        assert "healthFailNote" in window, (
-            "the panel renders its own verdict instead of the classified one")
-        assert "_healthFailureNote(" in status_js[
-            status_js.index("healthOk = false"):
-            status_js.index("healthOk = false") + 200], (
-            "the failing poll never classifies its error")
+    # `test_the_panel_renders_the_classified_note` left 2026-09-05 with the
+    # panel itself (operator removal). Its property — the classified note
+    # reaches the operator — now lives on the chip's tooltip and is
+    # EXECUTED in tests/test_interface_face_prefs_and_status_chip.py
+    # (TestStatusChip::test_a_401_says_not_authorised_on_the_chip).
 
     def test_sessions_rail_classifier_RUNS(self, sessions_js):
         """The rail made the same claim from its own fetch — and it is the

@@ -98,23 +98,25 @@ header {
     background: linear-gradient(to bottom, rgba(0, 0, 0, 0.6) 0%, transparent 100%);
 }
 
+/* The ONLINE chip (2026-09-05, operator: "fit the button theme"): an
+   .icon-btn — same glass, border, height and hover as its neighbours —
+   stretched into a pill for the dot + state word. It is the LIVE LOG
+   toggle (app.js); `.active` marks the drawer open. Background, border
+   and blur come from .icon-btn on purpose: nothing here may restate them
+   or the chip drifts from the buttons again. ≤480px it drops the word
+   and becomes a round light (see the phone header block). */
 #status-indicator {
-    display: flex;
-    align-items: center;
-    gap: 12px;
+    width: auto;
+    height: 44px;
+    padding: 0 18px 0 14px;
+    gap: 10px;
+    border-radius: 999px;
     font-family: var(--font-mono);
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     font-weight: 500;
     letter-spacing: 2px;
     text-transform: uppercase;
     color: rgba(255, 255, 255, 0.8);
-    background: rgba(0, 0, 0, 0.5);
-    padding: 8px 18px;
-    border-radius: 30px;
-    border: 1px solid var(--surface-border);
-    backdrop-filter: blur(var(--blur-amt));
-    -webkit-backdrop-filter: blur(var(--blur-amt));
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
 }
 
 #connection-dot {
@@ -496,8 +498,7 @@ html {
 }
 
 body.zen-mode #ui-layer #chat-container,
-body.zen-mode #ui-layer #input-area,
-body.zen-mode #status-indicator {
+body.zen-mode #ui-layer #input-area {
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.5s ease;
@@ -528,25 +529,32 @@ body.zen-mode .icon-btn:hover {
 
 @media (max-width: 480px) {
     header {
-        padding: 12px 16px;
+        padding: 10px 12px;
         /* The shorthand above RESETS padding-top, silently discarding the
            base rule's safe-area inset — in a standalone (home-screen) PWA
            with black-translucent the page runs under the iOS status bar,
            so the header sat beneath the clock/Dynamic Island (2026-08-01).
            Re-assert the inset after every padding shorthand on header. */
-        padding-top: max(12px, env(safe-area-inset-top));
-        flex-direction: column;
+        padding-top: max(10px, env(safe-area-inset-top));
+        padding-left: max(12px, env(safe-area-inset-left));
+        padding-right: max(12px, env(safe-area-inset-right));
+        /* ONE row (2026-09-05, operator). This used to be a two-row
+           column: rail toggle + status centred on top, seven buttons
+           below. The phone header block near the end of this file sizes
+           the controls so the row fits a 375px screen. */
+        flex-direction: row;
         align-items: center;
-        gap: 16px;
+        justify-content: space-between;
+        gap: 8px;
     }
 
     #status-wrapper {
-        align-items: center;
+        align-items: flex-start;
     }
 
     #header-controls {
-        justify-content: center;
-        width: 100%;
+        justify-content: flex-end;
+        width: auto;
     }
 
     #chat-log {
@@ -1471,10 +1479,6 @@ pre:hover .render-code-btn {
     border-bottom: 1px solid rgba(123, 98, 196, 0.18);
 }
 
-/* Status pill: a faint sheen so the header chip feels less flat. */
-#status-indicator {
-    background: linear-gradient(135deg, rgba(0, 0, 0, 0.5), rgba(20, 10, 14, 0.5));
-}
 
 /* Respect reduced-motion: kill the continuous/entrance animations and
    long transitions for users who ask for it. (matrix_graph.js applies a
@@ -1593,7 +1597,7 @@ pre:hover .render-code-btn {
     display: none !important;
 }
 
-#logs-btn.active {
+#status-indicator.active {
     background: rgba(75, 26, 122, 0.28);
     color: #b894ff;
     border-color: rgba(123, 98, 196, 0.7);
@@ -1677,9 +1681,25 @@ body.zen-mode #rail-scrim {
     user-select: none;
     -webkit-user-select: none;
 }
-#new-chat-btn {
-    width: 38px;
-    height: 38px;
+/* Rail actions (2026-09-05): load / save workspace beside "+". Save is
+   disabled with nothing to save — a dimmed, inert glyph, no hover lift. */
+#rail-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+#rail-actions .icon-btn {
+    width: 36px;
+    height: 36px;
+}
+#rail-actions .icon-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+#rail-actions .icon-btn:disabled:hover {
+    background: var(--surface-bg);
+    color: rgba(255, 255, 255, 0.8);
+    transform: none;
 }
 
 #session-search {
@@ -1921,25 +1941,8 @@ body.zen-mode #rail-scrim {
     }
 }
 
-/* ── Status strip additions ────────────────────────────────────── */
-#status-indicator { cursor: pointer; }
-#model-pill {
-    font-family: var(--font-mono);
-    font-size: 0.62rem;
-    letter-spacing: 1px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    border: 1px solid var(--hairline);
-    background: rgba(0, 0, 0, 0.35);
-    color: rgba(158, 170, 192, 0.8);
-    max-width: 170px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    text-transform: none;
-    letter-spacing: 0.5px;
-}
-#model-pill.hidden { display: none; }
+/* ── Status chip: DEGRADED tag (the model pill and the clickable
+      status panel were removed 2026-09-05; the chip is a light) ── */
 #status-indicator.degraded::after {
     content: 'DEGRADED';
     font-family: var(--font-mono);
@@ -1952,8 +1955,8 @@ body.zen-mode #rail-scrim {
     animation: dotPulse 1.6s infinite;
 }
 
-/* ── Shared panel chrome (notifications, status) ───────────────── */
-#notif-panel, #status-panel {
+/* ── Panel chrome (notifications; the status panel was removed 2026-09-05) ── */
+#notif-panel {
     position: fixed;
     top: calc(max(16px, env(safe-area-inset-top)) + 58px);
     right: 16px;
@@ -1971,7 +1974,7 @@ body.zen-mode #rail-scrim {
     pointer-events: auto;
     overflow: hidden;
 }
-#notif-panel.hidden, #status-panel.hidden { display: none; }
+#notif-panel.hidden { display: none; }
 
 .panel-header {
     display: flex;
@@ -1990,7 +1993,7 @@ body.zen-mode #rail-scrim {
     -webkit-user-select: none;
 }
 
-#notif-list, #status-body {
+#notif-list {
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
@@ -2001,7 +2004,7 @@ body.zen-mode #rail-scrim {
 
 /* Bottom sheets on phones. */
 @media (max-width: 640px) {
-    #notif-panel, #status-panel {
+    #notif-panel {
         top: auto;
         left: 0;
         right: 0;
@@ -2065,62 +2068,6 @@ body.zen-mode #rail-scrim {
     box-shadow: 0 0 10px rgba(123, 98, 196, 0.8);
 }
 #notif-badge.hidden { display: none; }
-
-/* ── Status panel content ──────────────────────────────────────── */
-.status-section {
-    padding: 6px 0 10px 0;
-    border-bottom: 1px solid var(--hairline);
-}
-.status-section:last-child { border-bottom: none; }
-.status-section-title {
-    font-family: var(--font-mono);
-    font-size: 0.62rem;
-    letter-spacing: 3px;
-    color: var(--eyebrow-color);
-    padding: 10px 16px 4px 16px;
-}
-.status-row {
-    display: flex;
-    justify-content: space-between;
-    gap: 16px;
-    padding: 5px 16px;
-    font-family: var(--font-mono);
-    font-size: 0.74rem;
-}
-.status-label { color: rgba(158, 170, 192, 0.6); letter-spacing: 1px; flex-shrink: 0; }
-.status-value { color: rgba(255, 255, 255, 0.85); text-align: right; word-break: break-all; }
-.status-row.ok .status-value { color: #4ade80; }
-.status-row.bad .status-value { color: #e0637f; font-weight: 700; }
-.status-note, .status-unreachable {
-    padding: 10px 16px;
-    font-size: 0.76rem;
-    line-height: 1.5;
-    color: rgba(158, 170, 192, 0.6);
-}
-.status-unreachable { color: #e0637f; }
-.status-turn {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 16px;
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-}
-.status-turn.running .status-turn-desc { color: #b894ff; }
-.status-turn-desc { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.status-turn-stop {
-    background: rgba(0, 0, 0, 0.4);
-    border: 1px solid var(--panel-border);
-    color: rgba(255, 255, 255, 0.8);
-    border-radius: 7px;
-    padding: 5px 10px;
-    font-family: var(--font-mono);
-    font-size: 0.66rem;
-    cursor: pointer;
-}
-.status-turn-stop:hover { background: rgba(123, 98, 196, 0.25); color: #fff; }
-.status-turn-stop.force { border-color: rgba(194, 39, 69, 0.5); }
-.status-turn-stop.force:hover { background: rgba(194, 39, 69, 0.25); }
 
 /* ── Toasts ────────────────────────────────────────────────────── */
 #toast-stack {
@@ -2240,7 +2187,7 @@ body.zen-mode #rail-scrim {
 /* ── Per-message actions ───────────────────────────────────────── */
 .msg-actions {
     position: absolute;
-    top: 4px;
+    top: 6px;
     right: 8px;
     display: flex;
     align-items: center;
@@ -2251,6 +2198,26 @@ body.zen-mode #rail-scrim {
 .message:hover .msg-actions { opacity: 1; }
 @media (pointer: coarse) {
     .msg-actions { opacity: 0.55; }
+}
+/* First-line reservation for the overlay (2026-09-05). The absolutely
+   positioned time + ⋯ sat ON the first line of text: a one-word "hello"
+   bubble drew its timestamp behind the word, and a reply's first line
+   ran under the ⋯ button (operator screenshot). A float in normal flow
+   makes the first line wrap around the overlay's footprint — and a
+   one-word bubble simply grows so the word and the overlay share the
+   line — without adding a row to every message. Sized for the widest
+   time the locale can print ("12:59 PM") plus the ⋯ button, minus the
+   bubble's own right padding; touch buttons are bigger, so is the
+   reservation. Only bubbles that HAVE the overlay pay for it:
+   streaming / thinking bubbles keep their full first line. */
+.message:has(> .msg-actions)::before {
+    content: '';
+    float: right;
+    width: 72px;
+    height: 1.6em;
+}
+@media (pointer: coarse) {
+    .message:has(> .msg-actions)::before { width: 86px; }
 }
 .msg-time {
     font-family: var(--font-mono);
@@ -2457,7 +2424,100 @@ body.zen-mode #rail-scrim {
     color: var(--eyebrow-color);
 }
 .modal-label.hidden { display: none; }
-#memory-match, #memory-replacement {
+/* ── Shared modal chrome (2026-09-05): the ask-about-this-file sheet
+      wears the memory modal's look via classes. New modals use these. ── */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 16px;
+}
+.modal-overlay.hidden { display: none; }
+.modal-box {
+    width: min(520px, 100%);
+    max-height: min(84dvh, 720px);
+    overflow-y: auto;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 14px;
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    padding-bottom: 16px;
+}
+.modal-hint {
+    margin: 12px 18px;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: rgba(158, 170, 192, 0.75);
+}
+/* File line under the question: a 64px thumbnail beside the stored name.
+   (The first cut showed the picture full-width ABOVE the box, which put
+   the typing under the phone keyboard — operator.) */
+#upload-ask-meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 12px 18px 0 18px;
+    min-width: 0;
+}
+#upload-ask-meta .modal-hint { margin: 0; min-width: 0; }
+#upload-ask-file { font-family: var(--font-mono); word-break: break-all; }
+#upload-ask-preview-wrap {
+    flex: 0 0 64px;
+    width: 64px;
+    height: 64px;
+    border-radius: 10px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--hairline);
+}
+#upload-ask-preview-wrap[hidden] { display: none; }
+#upload-ask-preview {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+/* Phones: anchor the sheet to the TOP so the keyboard (bottom third)
+   never covers the question box; desktop keeps it centred. */
+@media (max-width: 640px) {
+    .modal-overlay {
+        align-items: flex-start;
+        padding-top: max(20px, env(safe-area-inset-top));
+    }
+}
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin: 16px 18px 0 18px;
+}
+.modal-btn {
+    min-height: 44px;
+    border-radius: 9px;
+    padding: 10px 18px;
+    font-family: var(--font-main);
+    font-size: 0.84rem;
+    cursor: pointer;
+    background: none;
+    border: 1px solid var(--hairline);
+    color: rgba(255, 255, 255, 0.7);
+}
+.modal-btn.primary {
+    background: rgba(123, 98, 196, 0.3);
+    border: 1px solid var(--surface-highlight);
+    color: #fff;
+}
+.modal-btn.primary:hover { background: rgba(123, 98, 196, 0.45); }
+
+#memory-match, #memory-replacement, .modal-textarea {
     display: block;
     width: calc(100% - 36px);
     margin: 0 18px;
@@ -2475,7 +2535,10 @@ body.zen-mode #rail-scrim {
        the :focus border-color nudge below is the pointer treatment, not
        a keyboard focus indicator. */
 }
-#memory-match:focus, #memory-replacement:focus { border-color: var(--surface-highlight); }
+#memory-match:focus, #memory-replacement:focus, .modal-textarea:focus { border-color: var(--surface-highlight); }
+/* A pristine default reads as a suggestion: dimmer, italic — it is gone
+   the moment the operator types (app.js resolvePristineInput). */
+.modal-textarea.pristine { color: rgba(158, 170, 192, 0.7); font-style: italic; }
 #memory-replacement.hidden { display: none; }
 #memory-modal-actions {
     display: flex;
@@ -2537,26 +2600,59 @@ body.restoring .message { animation: none !important; }
     outline-offset: 2px;
 }
 
-/* ── Small-phone header: the ≤480 column layout centers the left
-      cluster; keep rail toggle + status on one row. ─────────────── */
+/* ── Phone header (2026-09-05, operator: "everything fits in a single
+      line in mobile"). Two controls left, five right, 40px targets, 6px
+      gaps. Budget at 375px: 24 padding + 40 + 6 + 40 + 5×40 + 4×6 = 334,
+      so the row has 41px to spare on the smallest iPhone. The status
+      chip drops its word and becomes a round light — the dot's colour
+      is the state, the tap opens the live log; DEGRADED shows as a red
+      ring instead of the tag. The left cluster is the one that shrinks
+      (the planner monologue wraps under the light); the controls never
+      wrap. ────────────────────────────────────────────────────────── */
 @media (max-width: 480px) {
     #header-left {
-        width: 100%;
-        justify-content: center;
+        flex: 1 1 0;
+        min-width: 0;
+        gap: 6px;
         align-items: center;
     }
-    #model-pill { max-width: 110px; }
-}
-
-/* ── Face-form button era (2026-07-28): seven header controls must
-      still fit ONE row on phones. Slightly tighter gap + 42px targets
-      on small screens only (base stays 44px). ─────────────────────── */
-@media (max-width: 480px) {
-    #header-controls {
-        gap: 8px;
+    #status-wrapper {
+        min-width: 0;
+        max-width: 100%;
+        /* The base 8px gap sits between the chip and the (height:0)
+           planner line and made the wrapper 8px taller than the buttons,
+           so the centred row put the chip 4px ABOVE its neighbours —
+           caught by the rendered pin, not by eye. The monologue keeps
+           its own margin-top when it becomes visible. */
+        gap: 0;
     }
-    #header-controls .icon-btn {
-        width: 42px;
-        height: 42px;
+    #planner-monologue {
+        max-width: 100%;
+    }
+    #header-controls {
+        flex: 0 0 auto;
+        flex-wrap: nowrap;
+        gap: 6px;
+    }
+    #header-controls .icon-btn,
+    #header-left .icon-btn {
+        width: 40px;
+        height: 40px;
+    }
+    #status-indicator {
+        width: 40px;
+        padding: 0;
+        gap: 0;
+        border-radius: 50%;
+    }
+    #status-text {
+        display: none;
+    }
+    #status-indicator.degraded::after {
+        display: none;
+    }
+    #status-indicator.degraded {
+        border-color: rgba(194, 39, 69, 0.7);
+        box-shadow: 0 0 14px rgba(194, 39, 69, 0.45);
     }
 }

@@ -60,7 +60,7 @@
   </div>
 
   <h2>Web UI</h2>
-  <p>The main way to use Ghost. A chat interface with the things a local agent needs: file upload, generated-file download, a live view of the agent's log while it works, memory correction controls, and a project view.</p>
+  <p>The main way to use Ghost. A chat interface with the things a local agent needs: file upload (choose or photograph a file, type your question about it in the same step, and it is asked the moment the upload lands), generated-file download, a live view of the agent's log while it works, memory correction controls, and a project view.</p>
 
   <figure class="shot">
     <img src="assets/img/webui.png" alt="The Ghost Agent web interface: a session list on the left, and a dark chat view whose background is a slowly moving 3D graph."
@@ -75,6 +75,8 @@
   <h3>The background is a status display</h3>
 
   <p>The moving graph behind the chat isn't decoration — it's driven by what the agent is actually doing. At rest it drifts slowly and stays cold. When you send something, the camera <em>dives into</em> the graph and it runs hot until the work finishes, then pulls back out.</p>
+
+  <p>The face button in the header switches the graph between several shapes. The one you pick is saved on the server rather than in the browser, so every browser and device you open Ghost from comes up showing the face you used last, until you change it again.</p>
 
   <p>Both clips below are one real turn — asking about the weather, which sends the agent out through Tor to fetch it. Watch the status line at the bottom left: it names the step as it happens.</p>
 
@@ -96,7 +98,10 @@
   <p>The button in the header cycles them and your choice sticks. The colour scheme is deliberately two-pole — deep blue for cold analysis, dark red for hot intent — so the only thing your eye has to track is temperature. If you have reduced motion enabled in your OS, the dive is capped to a slight lean.</p>
 
   <h3>The live log panel</h3>
-  <p>The most useful and least obvious feature. It streams the agent's own log next to the conversation, so when a turn takes forty seconds you can see which tool it's sitting in rather than watching a spinner. If you're ever unsure whether Ghost is working or stuck, look here first.</p>
+  <p>The most useful and least obvious feature. It streams the agent's own log next to the conversation, so when a turn takes forty seconds you can see which tool it's sitting in rather than watching a spinner. If you're ever unsure whether Ghost is working or stuck, look here first. Tap the ONLINE light in the header to open it; on a phone the light is just the coloured dot.</p>
+
+  <h3>Saving and loading a workspace</h3>
+  <p>The sessions panel (the ☰ button) has two buttons next to <strong>+</strong>: save the current chat together with the sandbox files as a zip, or load one back. Loading always starts a new session, so nothing you have open is overwritten.</p>
 
   <h3>On a phone</h3>
   <p>The UI installs as a home-screen app. That needs HTTPS with a certificate the phone will trust, which in practice means putting it behind a tailnet with a real certificate rather than a self-signed one. Once installed, a turn that was in flight when you closed the app resumes when you reopen it rather than being lost.</p>

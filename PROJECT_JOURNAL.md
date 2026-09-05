@@ -35180,3 +35180,238 @@ session. After-measurement in ~2 weeks: re-run the routing query (user turns mat
 SURFACE phrasings × tools used) — the baseline is 9/48 reaching the tool, 9 to `system_utility`.
 If the rule alone does not move the `system_utility` habit, check the lesson playbook for a
 lesson that teaches it.
+
+## §4EV — Web UI: the last face used is the default; model pill + agent-status panel removed (2026-09-05)
+
+**Trigger.** Operator: *"ensure that the last face used remains as the default face until
+changed"* and *"next to ONLINE it shows the model name which when clicked shows agent status.
+remove the model name from the main screen and remove the agent status display altogether."*
+
+**R0 scope.** Property 1: whichever face form was picked last — from ANY browser or device —
+is the form the page boots into, until the next pick. Property 2: the header's ONLINE chip
+carries no model name and opens nothing; the DEGRADED health tag (a separate silent-failure
+detector the operator built in §4BU) stays. Threat model: the prefs file is operator-owned
+but its VALUE reaches an HTML attribute, so it is validated on read as well as on write;
+the POST is keyed like every other interface route. Out of scope: the agent's `/api/health`,
+`/api/turns` and `/api/turn/cancel` routes (unchanged; the interface proxies stay for the CLI).
+
+**Why the face did not stick.** `matrix_graph.js` persisted the pick in `localStorage`
+(`ghost_face_form`) — scoped to one origin in one browser on one device, and purged by
+Safari after seven days without a visit. The Tailscale-name tab, a LAN-IP tab, the installed
+phone PWA and Safari-in-browser each kept their own answer to "the last face used".
+
+**Fixes.**
+1. `interface/server.py`: `GET/POST /api/ui/prefs` (keyed) over one file
+   `~/Data/AI/.ghost_ui_prefs.json` (`GHOST_UI_PREFS_FILE`; isolated at collection time in
+   `tests/conftest.py` like the push files — a test POST must not become the operator's face).
+   `_sanitize_ui_prefs` is the ONE validator for both directions (`[a-z][a-z0-9_-]{0,31}`, the
+   charset of every roster name and the reason the value can sit in an attribute unescaped).
+   Atomic write (tmp + `os.replace`), parents created, OSError → 503 "could not save". `GET /`
+   injects `<meta name="ghost-face-form">` beside the key/manifest injection, only when a pick
+   exists. A first draft had an unknown-keys branch that was redundant with the accepted-vs-sent
+   set comparison (only the wording differed) — collapsed to the one check.
+2. `matrix_graph.js`: exported pure `resolveInitialForm(server, stored, default)` — server
+   record, then localStorage, then default; an unknown name at any level falls through (the
+   `FORMS` roster is the only authority). Boot calls it with the meta + localStorage.
+3. `app.js`: `rememberFaceForm(name)` POSTs the pick (fire-and-forget; a failed save is one
+   console warning and localStorage stays the fallback), called from BOTH pick paths — the
+   menu and the stale-cache cycle fallback.
+4. Removal: `#model-pill` (markup + CSS), `#status-panel` (markup, CSS, the whole panel /
+   turn-queue half of `status.js`), the palette's `Agent status` and `Turn queue…`, the chip's
+   `role=button`/`tabindex`/`title`. `status.js` is the health tag only; the DEGRADED reason
+   (memory system / watchdog / NOT AUTHORISED / unreachable) now rides the chip's `title`,
+   since the panel that explained it is gone. Lost with the panel: the queue LISTING and the
+   Force (hard) cancel of an arbitrary turn; the composer's Stop still reaches
+   `POST /api/turn/cancel`.
+5. Cache-bust chain root-down: app.js + matrix_graph.js 10.8, workspace.js 7.8, status.js 7.1,
+   palette.js 6.9, style.css 5.5; manifest re-recorded.
+
+**Pins.** `tests/test_interface_face_prefs_and_status_chip.py` (39): the store through the real
+FastAPI app (auth, round-trip and REPLACE, meta only once a pick exists and never in the static
+copy, nine refused bodies leaving the old pick intact, malformed JSON → 400, tampered/corrupt
+file → no tag + page still 200, atomic write with no temp leftover, unwritable store → 503,
+shared validator); `resolveInitialForm` and `rememberFaceForm` EXECUTED under node; the chip
+EXECUTED under node with a fake DOM across five fetch worlds + recovery clearing class AND
+title + tab-visible re-poll; the deletions pinned per file (a11y's role=button enumeration got
+an R6 can-fail check since it now passes on an empty set). Adjusted: `test_interface_workspace`
+(markup list, status contract now names what must NOT return), `test_webui_console_review`
+(panel-render test retired with the panel), `test_interface_a11y`, `test_human_feedback`
+(isolation list).
+
+**Mutation (R2).** Copy tree, whole-file mutants, restore after each, the pin files as the
+oracle: **23/23 killed** — server (read skips sanitize, charset `.+`, unconditional meta, auth
+dependency dropped, non-atomic write, 500 instead of 503, inverted set check, merge drops the
+pick), status.js (calm on failed poll, title never set, class never toggled, no re-poll, reasons
+swapped, stale title after recovery, 401 read as unreachable), matrix_graph (localStorage beats
+server, roster check dropped, boot ignores the meta), app.js (PUT, wrong body key, rethrow on
+failure, either pick path not saving). No-op control SURVIVED, known-bad control KILLED.
+Honest caveat: M3 (boot ignores the meta) and A4/A5 (pick paths) die on TOKEN pins — the
+module-level boot and the click handlers are not extractable for node; the executed pins cover
+the functions they call.
+
+**R8 — defects inside this change's own work: 2.** The node harness for the chip omitted the
+module constant `HEALTH_POLL_MS` (six pins failed on a ReferenceError before the first green);
+and the redundant unknown-keys branch above.
+
+**Deploy.** The interface runs from source under launchd (`com.local.ghost-client`,
+KeepAlive): a plain kill of the uvicorn pid is the deploy. After deploy the server has NO stored
+pick, so every browser falls back to its own localStorage exactly as before; the first pick
+anywhere seeds the server and becomes the default everywhere.
+
+## §4EW — Web UI: header simplified; the timestamp behind the text (2026-09-05, later)
+
+**Trigger.** Operator with an iPhone screenshot: *"the timer on the first request got behind the
+'hello' input"*; *"i don't like how we have all these buttons on top"* → five asks: load/save into
+the sessions screen next to +, the log button folded into the status indicator, the status
+indicator in the button theme, one row on mobile Safari, an icon order that makes sense.
+
+**R0 scope.** Property A: the per-message overlay (time + ⋯) never intersects the text's line
+boxes, on phone and desktop, for both time formats. Property B: on ≤480px every header control
+shares one row inside the viewport and the header box; the chip wears the buttons' chrome; the
+chip toggles the console; load/save live in the rail beside +. Threat model: none new (pure
+client layout + wiring). Rendered in WebKit — the iPhone engine; emulated-Chromium green has been
+wrong for viewport code before ([[web-workspace-console]]).
+
+**Cause A.** `.msg-actions` is `position:absolute` at the bubble's top-right with nothing
+reserving its footprint; a one-word bubble is shrink-to-fit, so the overlay sat ON the word.
+**Fix:** `.message:has(> .msg-actions)::before` — a right float in normal flow (72px / 86px on
+coarse pointers, sized for "12:59 PM" + the touch ⋯ minus the bubble's padding), overlay lifted
+to `top: 6px`. The first line wraps around it; a one-word bubble grows so word and overlay share
+ONE line. Only decorated bubbles pay; streaming/thinking keep their full first line.
+
+**Cause B.** Seven right-hand controls + a two-row column header at ≤480. **Fixes:** header is
+one flex row (space-between, 40px targets, 6px gaps → 334 of 375px); `#status-indicator` is a
+`<button class="icon-btn">` pill whose own rule sets only size/lettering (pinned: no
+background/border/blur restated), `logToggleBtn` in app.js, `.active` while the drawer is open,
+`data-title` restored by status.js when healthy; ≤480 it drops the word → round light, DEGRADED
+= red ring; zen dims it with the buttons. `#logs-btn` removed. Workspace → `#rail-actions`
+(load / save / +): two explicit buttons instead of the one glyph that flipped Load↔Save on chat
+emptiness; Save disables (title + aria-label together) with nothing to save; Load always
+available (mints a fresh session; confirms when a chat is open). Order: rail, status | bell,
+upload, download, face, zen. Cache-bust root-down (app/matrix_graph 10.9, workspace 7.9, status
+7.2, palette 7.0, style 5.6).
+
+**Pins.** `tests/test_interface_header_simplify.py`: 6 wiring pins + 20 WebKit-rendered cases —
+one row at 375/390/430/landscape (tops within 2px, inside viewport and header, ≥40px, pinned
+order), round chip on phone / pill with identical computed chrome to the bell on desktop, rail
+actions on one row inside the rail, and the overlay-vs-Range-line-boxes matrix (3 bubbles × 2
+times × phone/desktop) + "reservation only with an overlay". Adjusted: log_console markup,
+workspace markup list, a11y (relabel test now requires `.disabled =`), face_prefs chip harness
+(healthy title = resting tooltip, not '').
+
+**R8 — defects found by this change's own instrument: 1.** The rendered pin failed at first
+run: the chip sat 4px ABOVE its neighbours — `#status-wrapper`'s 8px gap to the `height:0`
+planner line made the wrapper taller than the buttons, and the centred row centred the wrapper.
+Invisible in the source, obvious in a bounding box. Fixed with `gap: 0` in the phone block.
+
+**Deploy.** Interface restart (launchd KeepAlive) + live WebKit iPhone-emulated screenshot.
+
+## §4EX — Web thumbs labelled llama's id: every streamed-turn label was lost (2026-09-05)
+
+**Trigger.** Operator: *"when i rate an answer i get: FEEDBACK NOT RECORDED: NO TRAJECTORY FOUND
+FOR REQUEST_ID 'GTCVXPW50MYB…' (twice) — see why the feedback is not recorded and change it so it
+shows the notification only once."*
+
+**Cause.** The agent log carried `human feedback NOT RECORDED for req GtcVXPW50mYb` for both
+rated turns, and the day file held both turns — filed under `session_id = extra.req_id =
+4f6dc15d` / `dcf35c39`, the agent's 8-hex request ids. The browser had POSTed a 32-character
+mixed-case id: llama-server's own `chatcmpl-` completion id. On the streamed-final-generation
+path `routes.stream_generator` yields the agent's frames verbatim, and the agent's SSE drain
+forwards llama's frames; the web UI captures the first frame's `id` for labels (the contract
+`core/feedback.normalize_request_id` documents). So every streamed turn's label — the scarcest
+signal the learning stack has (§4BR's primary metric) — missed, silently for the corpus and
+loudly for the operator. Slack was immune only because it mints its own `X-Request-ID`.
+Compounding: the 4s client retry re-hit the same 404, and each tap added another system line.
+
+**Fixes.**
+1. `api/routes._restamp_sse_request_id(chunk, req_id)` applied to every chunk on the
+   async-iterator branch of `stream_generator` — the one choke point all client-bound streaming
+   frames pass. Bytes in/out; each JSON `data:` frame gets `id = chatcmpl-<req_id>` (id-less
+   frames too — the client captures the first `id`); `[DONE]`, comments, `event:` lines,
+   non-JSON payloads and undecodable bytes pass untouched; multi-frame chunks split on the blank
+   line. Unchanged chunks are returned as-is (no re-serialisation cost when nothing moves).
+2. `app.js _noteFeedbackFailure(div, message)`: one system line per failure message per
+   bubble (`dataset.fbFailure`); a different message speaks, success clears the latch. Both
+   failure sites (HTTP and network) route through it.
+
+**Pins.** `tests/test_feedback_stream_id_restamp.py` — helper matrix (foreign id, id-less,
+[DONE], comment, error event, multi-frame, non-JSON, empty req_id, str vs bytes, unicode
+preserved); route-level executed pin through the real FastAPI chat route with a stub agent
+whose streamed frames carry a foreign id → every frame the client receives says
+`chatcmpl-<req_id>` and the delta text is intact; the R5 cross-surface table: the id the web
+client's capture rule extracts from those frames == the id `core.feedback._matches_request`
+resolves against a trajectory stamped the way `_record_turn_trajectory` stamps it; the notice
+latch executed under node.
+
+**Deploy.** Agent-side change → agent restart (launchd KeepAlive respawn); interface restart for
+app.js. Live check: stream one trivial turn through `/api/chat`, read the frame ids, compare
+with the newest day-file row's `extra.req_id` (read-only — no synthetic label posted).
+
+**§4EX results.** Mutation batch (copy tree, 11 mutants + 2 controls): **9/11 killed**; the two
+survivors were EQUIVALENT — a `[DONE]` test made dead by the `{` gate (deleted) and a
+`"data:" in` variant that the payload extraction neutralises (kept as the intent-carrying guard).
+Full suite 19,984 passed / 65 skipped (the healthy count — the §4EW rendered pins had been
+skipping as "playwright not installed" under `--dist loadfile` because six `test_browser_*`
+files stub `playwright` in `sys.modules`; the fixture now evicts the stubs, imports the real
+package and restores them, and skips ONLY on a missing executable). Deployed (agent + interface
+restarts, one process each, "system ready" stable). Live: a streamed conversational turn's
+frames all carried one 8-hex `chatcmpl-<req_id>` and the day file held a row under that id; in
+WebKit a bubble with an unknown id tapped 👍/👎/👍 produced ONE "Feedback not recorded" line.
+
+**§4EX addendum — the second cause.** The live check on "hello" found the reply's frames stamped
+correctly (`chatcmpl-5647b58f`) and NO trajectory row: the trivial fast path (`_handle_trivial_chat`,
+"Bypassing turn loop") writes none by design. So a thumb on a greeting could never land, id fix or
+not, and the UI offered thumbs on every agent bubble. Fix: `Agent._note_trivial_reply` /
+`is_trivial_reply` (bounded dict, 512, lazily created), called where the fast-path result is
+returned; `LLMClient.stream_openai(extra=)` merges top-level fields into every frame; the route
+passes `{"ghost": {"labelable": False}}` when `agent.is_trivial_reply(req_id) is True` (identity
+check — a MagicMock agent answers truthy to anything); app.js reads the marker into
+`currentTurnUnlabelable`, stamps `dataset.unlabelable` beside the reqId (cleared on a reused
+bubble's new turn), skips the thumbs row for it, and carries the flag through local history,
+server-history adoption and reload while `toWireMessage` strips it. Pins: the agent helpers on a
+bare namespace (bounded eviction, refresh-on-re-note, empty ignored), `stream_openai` with and
+without `extra` (byte-identical without), the route marking a trivial reply on every frame and
+NOT a real one or a MagicMock agent, `_stampReqId`/`toWireMessage` executed under node, and the
+parser/reset/history sites as text.
+
+## §4EY — Web UI: ask about a file as you upload it (2026-09-05)
+
+**Trigger.** Operator: a camera photo uploaded fine but asking about it took a second message
+naming `image.jpg` by hand — *"can we have a window that will include a request? like 'what do
+you see', or 'what kind of car is that'?"*
+
+**Change.** Choosing a file opens `#upload-ask-modal` (preview for images, stored name + size,
+optional question, Enter sends). *Upload & ask* → `uploadToSandbox()` then
+`composeUploadRequest(question, storedName)` through the ordinary `sendMessage()` (same
+streaming/resume/history/thumbs path as a typed message); *Upload only* = old behaviour;
+close/backdrop/Escape discard and revoke the preview. `uploadNameFor()`: iOS names every capture
+`image.jpg` and a second photo overwrote the first, so generic capture names become
+`photo-YYYYMMDD-HHMMSS.<ext>` (FormData third argument); other names are kept. The modal chrome
+became class-based (`.modal-overlay/.modal-box/.modal-actions/.modal-btn/.modal-textarea`); the
+memory modal's id rules are untouched.
+
+**Pins.** `tests/test_interface_upload_ask.py`: helpers executed under node (fixed clock), wiring
+as text (no blind upload from the change handler; both buttons upload, only ask sends; close
+before upload; every close path revokes), the sheet rendered in WebKit at 390px + hidden at
+desktop. Cache-bust app/matrix_graph 11.2, style 5.7. Deploy: interface restart only (no agent
+change).
+
+**§4EY addendum (operator, same day).** *"the focus is on the picture preview and not to what
+i'm typing … leave [the examples] empty."* The full-width preview above the box put the typing
+below the fold and under the phone keyboard. Now: question box first (focused, `scrollIntoView`,
+no placeholder), a 64px thumbnail beside the filename, and on ≤640px the overlay is top-anchored
+so the sheet — buttons included — stays above the keyboard band; the rendered pin asserts
+`send.bottom ≤ 844 − 336` at iPhone 13 geometry and box-above-thumbnail order.
+
+**§4EY addendum 2 (operator).** *"remove upload only button, an empty request is an upload only
+by definition."* One button, `uploadAskLabel(question)` → "Upload" / "Upload & ask" synced on
+`input`; `confirmUploadAsk()` reads the box and sends nothing when it is empty.
+
+**§4EY addendum 3 (operator).** *"the default input for an uploaded (or taken) photo must be
+'describe this image :' … overwrite this default by typing, and by pressing backspace the whole
+input dialog should clear."* `uploadAskDefaultFor(file)` → "Describe this image:" for `image/*`,
+empty otherwise; the box opens PRISTINE (dim italic). `keydown` while pristine: a character
+clears then inserts itself, Backspace/Delete clears (preventDefault); `resolvePristineInput`
+covers keydown-less edits (dictation/paste/predictive): suffix kept, deletion-into-default →
+empty, replacement stands. Pinned executed under node (both helpers, 8-case table) + the
+keydown/open wiring as text.

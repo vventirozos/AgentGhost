@@ -32,7 +32,9 @@ def css() -> str:
 
 
 def test_markup_present(html):
-    for el in ("logs-btn", "log-console", "log-console-body",
+    # `logs-btn` left 2026-09-05: the ONLINE chip (#status-indicator) is the
+    # console toggle now (tests/test_interface_header_simplify.py).
+    for el in ("status-indicator", "log-console", "log-console-body",
                "log-clear", "log-close", "log-resume"):
         assert f'id="{el}"' in html, f"missing #{el}"
 

@@ -818,6 +818,86 @@ def _request_is_https(request: "Request") -> bool:
     return (fwd or request.url.scheme).lower() == "https"
 
 
+# ── UI preferences: the face form (2026-09-05) ─────────────────────────
+#
+# The face form used to persist ONLY in localStorage, which is scoped to
+# one origin in one browser on one device — and Safari drops it after a
+# week without a visit. So the form picked on the Mac never reached the
+# phone PWA, a LAN-IP tab came up different from the Tailscale-name tab,
+# and an iOS storage purge quietly reset the face to the default. The
+# operator's rule is "the last face used is the default until changed":
+# ONE server-side file holds it, `/` carries it into the page as a <meta>
+# so the face boots straight into it (no blend from the default), and
+# every pick writes it back through the keyed API (app.js). localStorage
+# stays as the fallback for a browser whose save never arrived.
+_UI_PREFS_FILE_ENV = "GHOST_UI_PREFS_FILE"
+# Form names are matrix_graph.js identifiers (`abyssal`, `vortex`, …):
+# lowercase word characters only. The value is interpolated into a <meta>
+# attribute, so the charset IS the escaping — anything else is refused at
+# the door, and refused again on READ so a hand-edited file cannot inject.
+_FACE_FORM_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+_FACE_FORM_META = "ghost-face-form"
+
+
+def _ui_prefs_path() -> Path:
+    return Path(os.environ.get(
+        _UI_PREFS_FILE_ENV, str(Path.home() / "Data/AI/.ghost_ui_prefs.json")))
+
+
+def _sanitize_ui_prefs(raw) -> dict:
+    """The stored/posted shape reduced to the keys and values this server
+    vouches for. ONE function for both directions, so a value that cannot
+    be written can never be read either."""
+    out: dict = {}
+    if isinstance(raw, dict):
+        ff = raw.get("face_form")
+        if isinstance(ff, str) and _FACE_FORM_RE.fullmatch(ff):
+            out["face_form"] = ff
+    return out
+
+
+def _read_ui_prefs() -> dict:
+    try:
+        raw = json.loads(_ui_prefs_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return _sanitize_ui_prefs(raw)
+
+
+def _write_ui_prefs(prefs: dict) -> None:
+    path = _ui_prefs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(prefs, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)   # atomic: a reader sees the old file or the new one
+
+
+@app.get("/api/ui/prefs", dependencies=[Depends(verify_interface_key)])
+async def ui_prefs_get():
+    return JSONResponse(_read_ui_prefs())
+
+
+@app.post("/api/ui/prefs", dependencies=[Depends(verify_interface_key)])
+async def ui_prefs_set(request: Request):
+    body = await _parse_json_body(request)
+    if not isinstance(body, dict):
+        return _err_json(400, "Request body must be a JSON object.")
+    # ONE check: every key the client sent must have come back accepted.
+    # An unknown key and a malformed value are the same refusal (nothing
+    # is half-applied); a separate unknown-keys branch was redundant with
+    # this comparison and only differed in wording.
+    accepted = _sanitize_ui_prefs(body)
+    if set(accepted) != set(body):
+        return _err_json(400, "Body may only set face_form, a short lowercase form name.")
+    merged = {**_read_ui_prefs(), **accepted}
+    try:
+        _write_ui_prefs(merged)
+    except OSError as e:
+        return _err_json(503, "Could not save UI preferences on the server: "
+                              f"{e.__class__.__name__}")
+    return JSONResponse(merged)
+
+
 @app.get("/")
 async def get(request: Request, key: str | None = None):
     # The page itself must be gated, otherwise we'd be handing out the
@@ -848,6 +928,14 @@ async def get(request: Request, key: str | None = None):
         + URL_KEY_SCRUB_SCRIPT
         + f'<link rel="manifest" href="/manifest.webmanifest?key={quote(GHOST_API_KEY)}">\n'
     )
+    # The last face picked (any browser, any device) rides in as a <meta>
+    # so matrix_graph.js boots straight into it. Only when a pick has ever
+    # been saved: an absent tag means "fall back to localStorage, then the
+    # default" (see resolveInitialForm). The value passed _FACE_FORM_RE on
+    # read, which is what makes it safe to place in an attribute unescaped.
+    prefs = _read_ui_prefs()
+    if "face_form" in prefs:
+        injected += f'<meta name="{_FACE_FORM_META}" content="{prefs["face_form"]}">\n'
     html = html.replace("</head>", f"{injected}</head>", 1)
     # `no-cache` forces the browser to revalidate the document with the
     # server on every load instead of serving a stale copy from disk

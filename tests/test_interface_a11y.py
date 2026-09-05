@@ -32,10 +32,11 @@ shipped. `test_no_control_silently_suppresses_its_focus_ring` reads the
 suppressions instead; #chat-input remains the one declared exemption,
 with its `#input-area:focus-within` indicator asserted separately.
 
-The dynamic labels (`#send-btn` flips Send/Stop/Busy, `#workspace-btn`
-flips Load/Save) are checked in app.js: a STATIC label on a control
-whose meaning changes is worse than none, because it is confidently
-wrong.
+The dynamic labels (`#send-btn` flips Send/Stop/Busy; `#workspace-save-btn`
+flips between "save" and "nothing to save yet" as it disables — until
+2026-09-05 one header glyph flipped Load/Save) are checked in app.js: a
+STATIC label on a control whose meaning changes is worse than none,
+because it is confidently wrong.
 """
 
 import re
@@ -151,16 +152,32 @@ def test_icon_only_buttons_do_not_rely_on_title_alone(html):
         f"icon-only controls with no aria-label: {bad}")
 
 
+def _nameless_role_buttons(html: str):
+    return [
+        f"{tag}#{_attr(attrs, 'id')}"
+        for tag in ("div", "span")
+        for attrs, inner in _elements(html, tag)
+        if _attr(attrs, "role") == "button" and not _accessible_name(attrs, inner)
+    ]
+
+
 def test_role_button_elements_have_names_too(html):
-    """`#status-indicator` is a div with role=button; the enumeration has
-    to follow the ROLE, not the tag, or a control moves out of scope by
-    changing element."""
-    for tag in ("div", "span"):
-        for attrs, inner in _elements(html, tag):
-            if _attr(attrs, "role") != "button":
-                continue
-            assert _accessible_name(attrs, inner), (
-                f"role=button {tag} #{_attr(attrs, 'id')} has no name")
+    """The enumeration follows the ROLE, not the tag, or a control moves out
+    of scope by changing element. `#status-indicator` was the div with
+    role=button until 2026-09-05 (it is a real <button> now, covered by the
+    button tests above, so this passes on an empty set — the R6 check below
+    keeps that from being vacuous)."""
+    assert _nameless_role_buttons(html) == []
+
+
+def test_the_role_button_enumeration_can_fail():
+    """R6 for the test above: with no role=button div left in the page it
+    passes on an empty enumeration, which is exactly the shape that stops
+    guarding. A nameless role=button div must be reported."""
+    bad = '<div id="x" role="button" tabindex="0"><svg><path d="M1 1"/></svg></div>'
+    assert _nameless_role_buttons(bad) == ["div#x"]
+    good = '<div id="y" role="button" aria-label="Open"><svg/></div>'
+    assert _nameless_role_buttons(good) == []
 
 
 # ── every focusable control shows a focus ring ──────────────────────
@@ -383,13 +400,16 @@ class TestDynamicLabels:
             "DISABLED button showing a send icon")
 
     def test_workspace_button_relabels_with_its_title(self, app_js):
+        """2026-09-05: the save button DISABLES with nothing to save, and its
+        title says so — the accessible name must move with the title (the
+        old Load/Save flip changed one and not the other)."""
         m = re.search(r"function updateWorkspaceBtnState\(.*?\n\}",
                       app_js, re.S)
         assert m, "updateWorkspaceBtnState is gone"
         body = m.group(0)
         titles = len(re.findall(r"\.title\s*=", body))
         labels = len(re.findall(r"aria-label'", body))
-        assert labels == titles, (
-            f"the title flips between Load/Save on {titles} branches but "
-            f"the accessible name on {labels} — one glyph, two actions, "
-            f"and screen readers hear only one of them")
+        assert titles >= 1 and labels == titles, (
+            f"the title changes on {titles} branches but the accessible name "
+            f"on {labels} — screen readers hear the stale one")
+        assert re.search(r"\.disabled\s*=", body), "save must disable, not just relabel"

@@ -237,7 +237,7 @@
   subscription; re-opening the app re-subscribes automatically.</p>
 
   <h2>Static assets</h2>
-  <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframes), <code>style.css</code> (cyan/magenta cyber theme — directional message entrances, streaming edge-pulse, animated input glow, hairline empty-state wordmark), <code>matrix_graph.js</code> (the background "face" — a three.js particle system with depth-faded nodes/links, a slow orbit, and envelope-reactive bloom; state-reactive via <code>setWorkingState/triggerSpike/triggerPulse/setAudioLevel</code>. THREE ALIEN FORMS since 2026-07-28 (three passes the same day: thermal two-pole recolor → "still looks like random lines and dots" → anatomy rebuild as a medusa → "jellyfish seems wrong for an AI backend" → three interchangeable alien body plans over ONE motion engine; <em>alive is a property of anatomy, not timing curves</em>). The <code>#face-form-btn</code> header button cycles <strong>abyssal</strong> (asymmetric lobed husk tilted off-axis, feelers reaching in all directions, off-center core), <strong>horizon</strong> (eccentric orbital shells collapsing toward a burning core, filament spirals falling inward and heating — briefly the default on 2026-07-28 before vortex superseded it; same-day center fix: a per-form <code>uCenterDim</code> radial dim in both node and line shaders stops additive stacking from bleaching the core to pink, the inner shell sits dead on the arterial-red stop with cold blues confined to the outer shells, and core quads render at 0.7 size via the per-node <code>sz</code> factor — together these keep the heart CRIMSON), <strong>cortex</strong> (asymmetric neural lobes swelling with sequenced thought-waves, dendrites carrying displacement signal-trains), and <strong>vortex</strong> (the DEFAULT since 2026-07-28 evening — a black hole AHEAD of the viewer — final shape after four same-day operator iterations: a dark-red <em>accretion ring</em> (kind 3, slow elliptic orbit) around a genuinely dark <em>shadow</em> with dim crimson embers, fed by five spiral streams. THE CAMERA NEVER MOVES and the flow is <em>expansion</em>: matter emerges through the ring's glow (spawn at <code>VORTEX_LMIN</code>, at the ring edge — inside it the hole stays dark) and blooms exponentially outward past the viewer (<code>L = LMIN·e^(K·dOut)</code>, self-similar, wrap invisible at both extremes) — contraction was tried first and read as moving <em>backward</em>; expansion optical flow is what "falling in" looks like. Hue runs hottest at the hole, cooling blue outward; the vortex damps the hue wave/drift to 30% (<code>uWaveAmp</code>) and dims by screen-radial distance (<code>uCenterXY</code>, strength 0.85) so the center stays DARK RED instead of bleaching pink or swinging plum. A drifting 3-harmonic field morphs the streams through organic never-repeating shapes (the "procedurally generated content"), swelling while a turn runs. A master luminance dial (<code>uFormDim</code> 0.55 + bloom ×0.65 — introduced for the vortex, extended to ALL forms the same day) makes every face emit roughly half its former light so it BLENDS into the background — structure and motion carry visibility, not brightness. Behavior: idle = slow emergence + swirl (idle spin +25%, idle pulse cut to 20%); busy = the swallow surges (~5s per emergence cycle) for as long as the turn runs while spin HALVES (work de-emphasizes rotation — "the main animation is the swallow"); completion is a pure intensity morph — no reset of any kind exists (both the cut-on-black and the ascent resets were vetoed; self-similarity makes busy and idle the same scene)), plus <strong>empty</strong> (no face at all — nodes park on a sparse far sphere past the link radius, so the reorganization blend disperses the face beyond the screen edges on the way in and materializes the next form from the void on the way out; motes are suppressed during dives); the choice persists in localStorage (<code>ghost_face_form</code>) and a switch plays a ~1.4s reorganization blend — the nodes visibly re-assemble into the new body. All forms share the propulsion engine: Motion is medusan propulsion — <code>_pulseShape()</code> is an asymmetric muscle envelope (fast squeeze 0→0.16 of the cycle, long release, quiescent glide; deliberately NOT a sine) propagating apex→margin, tugging the tentacles and kicking a swim bob; tentacles carry metachronal traveling waves; the heading wanders like attention (no turntable orbit); errors trigger a physical flinch (one sharp agitated pulse) alongside the hot tint. Pulse ~4s idle → ~1.7s busy. Colors are the thermal two-pole ring (<code>COLORS.palette</code>: deep ocean blue → indigo → violet → dark arterial red → plum, all dark-first) mapped ANATOMICALLY — cold blue crown, violet waist, hot tentacle currents and arterial core — with seeds assigned per body part; <code>uHueDrift</code> now OSCILLATES (±0.07) instead of cycling so anatomy never scrambles, and the <code>hueWave()</code> chunk (damped by <code>uOrganic</code> under reduced-motion) sends warmth/cold currents through the body. Fragment brightness, line alpha, and bloom (base 0.88) all trimmed because the anatomy is locally dense and additive stacking multiplies luminance; accent-tint cap 0.5 so mood colors the weather without erasing the poles. <code>PROXIMITY_SQ</code> tightened 2.5→1.7 so links trace the anatomy. Restore points: <code>matrix_graph.js.bak-20260728-premedusa</code> (thermal point cloud), <code>matrix_graph.js.bak-20260713-preimmersion</code>. Pins extended in <code>tests/test_interface_face_palette.py</code> (thermal axis, hue wave, medusa anatomy + asymmetric envelope). Palette contract pinned by <code>tests/test_interface_face_palette.py</code>. <strong>Immersion dive (2026-07-13):</strong> while a USER request is in flight the grid "swallows" the camera — scene scales up ×1.7 around the viewer while the camera dollies z=5.0→1.3 into the cloud, drifting back out organically on completion. Driven ONLY by the dedicated <code>setUserTurn()</code> state since 2026-07-28 (it was nominally workingState-gated before, but ambient working-class log icons re-arm workingState almost continuously on an autonomously busy agent, which held the camera inside the cloud all night; the dive now engages exclusively for the operator's own in-flight request — live-verified: real log traffic at workingState≈1.0 leaves the camera at rest, a user turn dives it, completion eases it back out over ~10s while ambient work continues) through an asymmetric ease far slower than workingState itself (~5s in / ~10s out; short requests just lean). Safety rails: near-camera fade in both shaders (nodes dissolve instead of becoming screen-filling quads), bloom damped ×0.65 fully inside (the streaming reply is read on top of near geometry), look-target blends forward through the cloud to dodge the lookAt-origin singularity, and <code>prefers-reduced-motion</code> caps the dive at a 15% lean. Debug/verification hook: <code>window.__ghostFace.getDebugState()</code>. Pre-immersion restore point: <code>matrix_graph.js.bak-20260713-preimmersion</code>. <em>Interior enrichment (v3.6)</em>: the swell dilutes local density exactly when the camera is closest, so the inside looked empty — three dive-gated compensators fix it with zero cost at rest: 400 shader-drifted interior motes (one draw call, <code>visible=false</code> at rest), a ×1.5 thicker proximity web while inside, and +60% data-pulse tempo, with the scale boost trimmed 0.7→0.55. Pins: <code>tests/test_interface_face_immersion.py</code>), <code>cyber_face.png</code> (the notification icon), and <code>sw.js</code> (service worker). All decorative motion (CSS animations and the 3D sphere's orbit/morph) is damped under <code>prefers-reduced-motion</code>. CDN failures degrade gracefully: <code>marked</code>/<code>DOMPurify</code> fall back to escaped plain text, and a missing <code>mermaid</code> only disables diagram rendering rather than breaking the page.</p>
+  <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframes), <code>style.css</code> (cyan/magenta cyber theme — directional message entrances, streaming edge-pulse, animated input glow, hairline empty-state wordmark), <code>matrix_graph.js</code> (the background "face" — a three.js particle system with depth-faded nodes/links, a slow orbit, and envelope-reactive bloom; state-reactive via <code>setWorkingState/triggerSpike/triggerPulse/setAudioLevel</code>. THREE ALIEN FORMS since 2026-07-28 (three passes the same day: thermal two-pole recolor → "still looks like random lines and dots" → anatomy rebuild as a medusa → "jellyfish seems wrong for an AI backend" → three interchangeable alien body plans over ONE motion engine; <em>alive is a property of anatomy, not timing curves</em>). The <code>#face-form-btn</code> header button cycles <strong>abyssal</strong> (asymmetric lobed husk tilted off-axis, feelers reaching in all directions, off-center core), <strong>horizon</strong> (eccentric orbital shells collapsing toward a burning core, filament spirals falling inward and heating — briefly the default on 2026-07-28 before vortex superseded it; same-day center fix: a per-form <code>uCenterDim</code> radial dim in both node and line shaders stops additive stacking from bleaching the core to pink, the inner shell sits dead on the arterial-red stop with cold blues confined to the outer shells, and core quads render at 0.7 size via the per-node <code>sz</code> factor — together these keep the heart CRIMSON), <strong>cortex</strong> (asymmetric neural lobes swelling with sequenced thought-waves, dendrites carrying displacement signal-trains), and <strong>vortex</strong> (the DEFAULT since 2026-07-28 evening — a black hole AHEAD of the viewer — final shape after four same-day operator iterations: a dark-red <em>accretion ring</em> (kind 3, slow elliptic orbit) around a genuinely dark <em>shadow</em> with dim crimson embers, fed by five spiral streams. THE CAMERA NEVER MOVES and the flow is <em>expansion</em>: matter emerges through the ring's glow (spawn at <code>VORTEX_LMIN</code>, at the ring edge — inside it the hole stays dark) and blooms exponentially outward past the viewer (<code>L = LMIN·e^(K·dOut)</code>, self-similar, wrap invisible at both extremes) — contraction was tried first and read as moving <em>backward</em>; expansion optical flow is what "falling in" looks like. Hue runs hottest at the hole, cooling blue outward; the vortex damps the hue wave/drift to 30% (<code>uWaveAmp</code>) and dims by screen-radial distance (<code>uCenterXY</code>, strength 0.85) so the center stays DARK RED instead of bleaching pink or swinging plum. A drifting 3-harmonic field morphs the streams through organic never-repeating shapes (the "procedurally generated content"), swelling while a turn runs. A master luminance dial (<code>uFormDim</code> 0.55 + bloom ×0.65 — introduced for the vortex, extended to ALL forms the same day) makes every face emit roughly half its former light so it BLENDS into the background — structure and motion carry visibility, not brightness. Behavior: idle = slow emergence + swirl (idle spin +25%, idle pulse cut to 20%); busy = the swallow surges (~5s per emergence cycle) for as long as the turn runs while spin HALVES (work de-emphasizes rotation — "the main animation is the swallow"); completion is a pure intensity morph — no reset of any kind exists (both the cut-on-black and the ascent resets were vetoed; self-similarity makes busy and idle the same scene)), plus <strong>empty</strong> (no face at all — nodes park on a sparse far sphere past the link radius, so the reorganization blend disperses the face beyond the screen edges on the way in and materializes the next form from the void on the way out; motes are suppressed during dives); the choice persists in localStorage (<code>ghost_face_form</code>) and, since 2026-09-05, on the SERVER (<code>POST /api/ui/prefs</code> → <code>&lt;meta name="ghost-face-form"&gt;</code>, which wins at boot — see the 2026-09-05 section) and a switch plays a ~1.4s reorganization blend — the nodes visibly re-assemble into the new body. All forms share the propulsion engine: Motion is medusan propulsion — <code>_pulseShape()</code> is an asymmetric muscle envelope (fast squeeze 0→0.16 of the cycle, long release, quiescent glide; deliberately NOT a sine) propagating apex→margin, tugging the tentacles and kicking a swim bob; tentacles carry metachronal traveling waves; the heading wanders like attention (no turntable orbit); errors trigger a physical flinch (one sharp agitated pulse) alongside the hot tint. Pulse ~4s idle → ~1.7s busy. Colors are the thermal two-pole ring (<code>COLORS.palette</code>: deep ocean blue → indigo → violet → dark arterial red → plum, all dark-first) mapped ANATOMICALLY — cold blue crown, violet waist, hot tentacle currents and arterial core — with seeds assigned per body part; <code>uHueDrift</code> now OSCILLATES (±0.07) instead of cycling so anatomy never scrambles, and the <code>hueWave()</code> chunk (damped by <code>uOrganic</code> under reduced-motion) sends warmth/cold currents through the body. Fragment brightness, line alpha, and bloom (base 0.88) all trimmed because the anatomy is locally dense and additive stacking multiplies luminance; accent-tint cap 0.5 so mood colors the weather without erasing the poles. <code>PROXIMITY_SQ</code> tightened 2.5→1.7 so links trace the anatomy. Restore points: <code>matrix_graph.js.bak-20260728-premedusa</code> (thermal point cloud), <code>matrix_graph.js.bak-20260713-preimmersion</code>. Pins extended in <code>tests/test_interface_face_palette.py</code> (thermal axis, hue wave, medusa anatomy + asymmetric envelope). Palette contract pinned by <code>tests/test_interface_face_palette.py</code>. <strong>Immersion dive (2026-07-13):</strong> while a USER request is in flight the grid "swallows" the camera — scene scales up ×1.7 around the viewer while the camera dollies z=5.0→1.3 into the cloud, drifting back out organically on completion. Driven ONLY by the dedicated <code>setUserTurn()</code> state since 2026-07-28 (it was nominally workingState-gated before, but ambient working-class log icons re-arm workingState almost continuously on an autonomously busy agent, which held the camera inside the cloud all night; the dive now engages exclusively for the operator's own in-flight request — live-verified: real log traffic at workingState≈1.0 leaves the camera at rest, a user turn dives it, completion eases it back out over ~10s while ambient work continues) through an asymmetric ease far slower than workingState itself (~5s in / ~10s out; short requests just lean). Safety rails: near-camera fade in both shaders (nodes dissolve instead of becoming screen-filling quads), bloom damped ×0.65 fully inside (the streaming reply is read on top of near geometry), look-target blends forward through the cloud to dodge the lookAt-origin singularity, and <code>prefers-reduced-motion</code> caps the dive at a 15% lean. Debug/verification hook: <code>window.__ghostFace.getDebugState()</code>. Pre-immersion restore point: <code>matrix_graph.js.bak-20260713-preimmersion</code>. <em>Interior enrichment (v3.6)</em>: the swell dilutes local density exactly when the camera is closest, so the inside looked empty — three dive-gated compensators fix it with zero cost at rest: 400 shader-drifted interior motes (one draw call, <code>visible=false</code> at rest), a ×1.5 thicker proximity web while inside, and +60% data-pulse tempo, with the scale boost trimmed 0.7→0.55. Pins: <code>tests/test_interface_face_immersion.py</code>), <code>cyber_face.png</code> (the notification icon), and <code>sw.js</code> (service worker). All decorative motion (CSS animations and the 3D sphere's orbit/morph) is damped under <code>prefers-reduced-motion</code>. CDN failures degrade gracefully: <code>marked</code>/<code>DOMPurify</code> fall back to escaped plain text, and a missing <code>mermaid</code> only disables diagram rendering rather than breaking the page.</p>
 
   <h2>AI face forms (2026-07-29)</h2>
   <p>Four AI-native body plans joined the alien forms — the machine's own internals as anatomy, over the SAME
@@ -357,7 +357,7 @@
   <code>tests/test_interface_workspace.py::test_turn_status_line</code>.</p>
 
   <h2>Live log console (2026-07-13)</h2>
-  <p>A terminal-icon header button (<code>#logs-btn</code>) toggles a bottom-drawer console (<code>#log-console</code>) that renders the agent's pretty-log stream in near-realtime. No new transport: the same WebSocket <code>type:"log"</code> frames that drive the face's activity envelope and the planner monologue feed a 500-entry ring buffer, which collects <em>even while the drawer is closed</em> — opening shows recent history instead of starting blind. Lines are ANSI-stripped client-side (the server broadcasts raw pretty-stream lines), rendered as dim monospace with a jewel-accent left border from the same icon→color mapping the face uses, errors tinted crimson. Auto-scroll follows the tail until the user scrolls up; a "paused — N new" pill offers jump-to-live; DOM is capped at the buffer size. Drawer sits at <code>z-index:90</code> (below <code>#render-window</code>), respects <code>env(safe-area-inset-bottom)</code> on phones. Verified live headlessly (marker appended to the agent log appeared in the open drawer; history survived close/reopen). Pins: <code>tests/test_interface_log_console.py</code>.</p>
+  <p>The header's ONLINE chip (<code>#status-indicator</code>; a separate terminal-icon <code>#logs-btn</code> until 2026-09-05) toggles a bottom-drawer console (<code>#log-console</code>) that renders the agent's pretty-log stream in near-realtime. No new transport: the same WebSocket <code>type:"log"</code> frames that drive the face's activity envelope and the planner monologue feed a 500-entry ring buffer, which collects <em>even while the drawer is closed</em> — opening shows recent history instead of starting blind. Lines are ANSI-stripped client-side (the server broadcasts raw pretty-stream lines), rendered as dim monospace with a jewel-accent left border from the same icon→color mapping the face uses, errors tinted crimson. Auto-scroll follows the tail until the user scrolls up; a "paused — N new" pill offers jump-to-live; DOM is capped at the buffer size. Drawer sits at <code>z-index:90</code> (below <code>#render-window</code>), respects <code>env(safe-area-inset-bottom)</code> on phones. Verified live headlessly (marker appended to the agent log appeared in the open drawer; history survived close/reopen). Pins: <code>tests/test_interface_log_console.py</code>.</p>
 
   <h2>Chat area layout</h2>
   <p>The <code>#ui-layer</code> is a full-height flex column: <code>header</code> (flex-shrink:0), <code>main#chat-container</code> (flex-grow:1), then the input <code>footer</code>. The dominant cause of "the top third isn't showing chats" was the <strong>header height</strong>, not the chat area: <code>#header-controls</code> stacked its 5 icon buttons in a <code>flex-direction:column</code>, making the non-shrinking header ~300px tall and reserving the top third (its transparent gradient background made that band look like empty sphere backdrop with floating buttons). The buttons are now laid out in a <code>flex-direction:row</code> so the header is one button tall.</p>
@@ -490,13 +490,14 @@
     re-serves instead of drops), dedupes re-served records. Badge + panel (bottom sheet on
     phones) + severity-accented toasts. The consumer name is per-client, so the Slack bot's
     watermark is untouched.</li>
-    <li><strong>Status strip + panel</strong> (<code>status.js</code>): <code>/api/health</code>
-    poll feeds a model pill (config key <code>arg.model</code>) and a red DEGRADED tag when
-    either silent-failure detector fires (<code>memory_system_loaded</code> /
-    <code>biological_watchdog_alive</code> false). Clicking the status indicator opens the panel:
-    uptime/RSS/tasks, node pools, and the live turn queue with <em>Stop</em> (cooperative) and
-    <em>Force</em> (hard, guaranteed lock release) via <code>/api/turn/cancel</code> — the REAL
-    cancel; the send button's abort only ever stopped the proxy stream.</li>
+    <li><strong>Health tag</strong> (<code>status.js</code>): <code>/api/health</code> poll
+    turns the ONLINE chip red with a DEGRADED tag when either silent-failure detector fires
+    (<code>memory_system_loaded</code> / <code>biological_watchdog_alive</code> false) or the
+    poll itself fails; the reason rides the chip's <code>title</code>. <em>Until 2026-09-05 this
+    module also drew a model pill (config key <code>arg.model</code>) beside ONLINE and opened
+    an agent-status panel on click — uptime/RSS/tasks, node pools, the live turn queue with
+    <em>Stop</em>/<em>Force</em> via <code>/api/turn/cancel</code>. Both were removed at the
+    operator's request; see the 2026-09-05 section.</em></li>
     <li><strong>Command palette</strong> (<code>palette.js</code>): ⌘K/Ctrl-K, keyboard-first,
     static commands + one entry per session.</li>
     <li><strong>Message actions</strong>: hover (desktop) / always-dim (touch) row with timestamp
@@ -509,8 +510,18 @@
     chosen thumb latched in the violet accent (v1 put emoji buttons in the floating
     <code>.msg-actions</code> overlay, which crowded the timestamp/menu — restyled same day on
     operator feedback). A tap POSTs <code>/api/feedback</code> (proxied); same-signal repeats are
-    a client no-op AND server-idempotent. The id is captured from the SSE frames'
-    <code>chatcmpl-&lt;req_id&gt;</code> envelope, stored on the bubble
+    a client no-op AND server-idempotent. A failed label is reported ONCE per bubble
+    (<code>_noteFeedbackFailure</code>, 2026-09-05 — it used to add a system line per tap; a
+    different failure still speaks, a success clears the latch). The id is captured from the SSE
+    frames' <code>chatcmpl-&lt;req_id&gt;</code> envelope — which the chat route now GUARANTEES is
+    the agent's id (2026-09-05: the streamed-final path forwarded llama-server frames verbatim,
+    so the bubble held llama's 32-char completion id and every thumb came back "no trajectory
+    found for request_id"). A second cause has no fix by design: a greeting takes the trivial
+    fast path, which writes NO trajectory, so the agent remembers those ids
+    (<code>Agent.is_trivial_reply</code>), the route stamps the reply's frames
+    <code>{"ghost": {"labelable": false}}</code>, and the bubble renders <em>no thumbs</em>
+    (<code>dataset.unlabelable</code>, carried through history/adoption, stripped from the wire) —
+    stored on the bubble
     (<code>dataset.reqId</code>) and in the localStorage history entry (<code>reqId</code> /
     <code>feedback</code> — client-only keys, STRIPPED from wire payloads so
     <code>payload.messages</code> stays clean OpenAI shapes), so the buttons and the chosen
@@ -737,7 +748,7 @@
     announced it as "button"; fifteen other icon-only controls had a <code>title</code> and
     nothing else, and <code>title</code> is not surfaced by touch at all. Names that CHANGE with
     state are set in JS rather than markup: <code>#send-btn</code> flips Send / Stop the current
-    turn / Working, and <code>#workspace-btn</code> flips Load / Save with its title. A static
+    turn / Working, and <code>#workspace-save-btn</code> disables and relabels when there is nothing to save (until 2026-09-05 a single header glyph <code>#workspace-btn</code> flipped Load / Save with its title). A static
     name on a control whose meaning changes is worse than none, because it is confidently
     wrong.</li>
 
@@ -766,6 +777,133 @@
   takes 26% of the viewport before a word is shown; there is no scroll-to-bottom control; the
   command palette is ⌘K-only and so unreachable on a phone; <code>.msg-menu-btn</code> is
   34×34px against a 44px touch-target floor.</p>
+
+  <h2>2026-09-05 — the face is remembered on the server; model pill and status panel removed</h2>
+  <p><strong>Trigger.</strong> Operator: <em>"ensure that the last face used remains as the default
+  face until changed"</em> and <em>"remove the model name from the main screen and remove the agent
+  status display altogether"</em>.</p>
+  <p><strong>Why the face did not stick.</strong> The pick was written to <code>localStorage</code>
+  only, and localStorage is scoped to one origin in one browser on one device — the Tailscale-name
+  tab, a LAN-IP tab, the installed phone PWA and Safari-in-browser each kept their own, and Safari
+  purges script-written storage after a week without a visit. So "the last face used" was never
+  what the next device came up with.</p>
+  <p><strong>Mechanism.</strong> One server-side file, <code>~/Data/AI/.ghost_ui_prefs.json</code>
+  (override with <code>GHOST_UI_PREFS_FILE</code>; the test suite isolates it at collection time
+  like the push files). <code>POST /api/ui/prefs</code> (<code>X-Ghost-Key</code>, body
+  <code>{"face_form": "…"}</code>) stores a pick; the face-form menu calls it on every pick
+  (<code>app.js rememberFaceForm</code>, fire-and-forget — the face has already switched locally;
+  a failed save is one console warning and localStorage stays as the fallback). <code>GET /</code>
+  injects the stored value as <code>&lt;meta name="ghost-face-form"&gt;</code> next to the key
+  and manifest link, so the face boots straight into it with no blend from the default.
+  <code>matrix_graph.js resolveInitialForm(server, stored, default)</code> fixes the precedence:
+  the server's record, then this browser's localStorage, then the default — an unknown name at
+  any level (a form since removed, a tampered value) falls through to the next; the
+  <code>FORMS</code> roster is the only authority.</p>
+  <p><strong>Validation is one function both ways.</strong> <code>_sanitize_ui_prefs</code> is
+  applied on write AND on read: a form name is <code>[a-z][a-z0-9_-]{0,31}</code>, which is the
+  charset of every roster name and also the reason the value can sit in a <code>&lt;meta&gt;</code>
+  attribute unescaped. A hand-edited or corrupted file yields no tag and an empty
+  <code>GET /api/ui/prefs</code>; the page still renders. A bad POST (case, markup, length, type,
+  an unknown key, a partially valid body) is a 400 that leaves the previous pick untouched; an
+  unwritable store is a 503 that says the <em>save</em> failed. Writes are atomic
+  (temp file + <code>os.replace</code>) and create the parent directory.</p>
+  <p><strong>Removed.</strong> <code>#model-pill</code> and its CSS; <code>#status-panel</code>,
+  its markup, CSS and the whole panel/turn-queue half of <code>status.js</code>
+  (<code>/api/turns</code> polling, per-turn <em>Stop</em>/<em>Force</em>); the palette's
+  <em>Agent status</em> and <em>Turn queue…</em> commands. <code>#status-indicator</code> stopped
+  opening anything (later the same day it became the live-log toggle — next section). What
+  survives is the DEGRADED tag, now with
+  its reason as the chip's tooltip (memory system not loaded / watchdog dead / NOT AUTHORISED
+  after a key rotation / agent unreachable). The composer's Stop still reaches the real cancel
+  (<code>POST /api/turn/cancel</code>); gone with the panel are the queue listing and the hard
+  cancel of an arbitrary turn — the interface proxy routes for both remain for the CLI and tests.</p>
+  <p><strong>Pins.</strong> <code>tests/test_interface_face_prefs_and_status_chip.py</code> —
+  the store through the real FastAPI app (auth, round-trip, meta-only-once-picked, nine refused
+  bodies, tampered file, atomic write, 503), the boot precedence and the save call EXECUTED under
+  node, the chip EXECUTED under node with a fake DOM across five fetch worlds (healthy, memory
+  dead, watchdog dead, 401, dead socket) plus recovery, and the deletions pinned per file.
+  Cache-bust chain moved root-down (app/matrix_graph 10.8, workspace 7.8, status 7.1, palette
+  6.9, style 5.5). Mutation batch on a copy tree: <strong>23/23 killed</strong>, no-op control
+  survived, known-bad control died.</p>
+  <p><strong>Verifying headlessly.</strong> The docs-capture tip "set <code>localStorage['ghost_face_form']</code>
+  then reload" now only works when the server has NO stored pick (the meta wins); either point
+  <code>GHOST_UI_PREFS_FILE</code> at an empty path for the capture run, or POST the form you want
+  and restore the file afterwards.</p>
+
+  <h2>2026-09-05 (later) — header simplified; the timestamp behind the text</h2>
+  <p><strong>Trigger.</strong> Operator, with an iPhone screenshot: the message timestamp was drawn
+  <em>behind</em> a one-word "hello" bubble and a reply's first line ran under the ⋯ button; and
+  "I don't like how we have all these buttons on top" — five numbered asks: load/save into the
+  sessions screen next to +, the log button folded into the status indicator, the status indicator in
+  the button theme, one row on a phone, and an icon order that makes sense.</p>
+  <p><strong>Timestamp.</strong> <code>.msg-actions</code> (time + ⋯) is an absolutely positioned
+  overlay at the bubble's top-right; nothing reserved its footprint, so it sat on the first line of
+  text. Fix: <code>.message:has(&gt; .msg-actions)::before</code> is a right float in normal flow
+  (72px, 86px on coarse pointers — sized for "12:59 PM" + the touch-sized ⋯, minus the bubble's
+  right padding, and lifted with <code>top: 6px</code>), so the first line wraps around the overlay
+  and a one-word bubble simply grows to fit word and overlay on ONE line. Only decorated bubbles pay
+  for it — streaming/thinking bubbles keep their full first line. Rendered in WebKit with a
+  <code>Range</code> over the text and asserted against both boxes, phone and desktop, both time
+  formats (<code>tests/test_interface_header_simplify.py</code>).</p>
+  <p><strong>Header.</strong> Left: sessions rail toggle, then the ONLINE chip; right: bell, upload,
+  download, face, zen — navigation, status, alerts, files, appearance. The chip is now a real
+  <code>&lt;button class="icon-btn"&gt;</code> pill in the buttons' own chrome (its rule sets only
+  size and lettering; background/border/blur come from <code>.icon-btn</code>, pinned so it cannot
+  drift again) and it <em>is</em> the live-log toggle (<code>app.js logToggleBtn</code>;
+  <code>.active</code> while the drawer is open; <code>status.js</code> keeps painting DEGRADED and
+  restores the resting tooltip from <code>data-title</code>). Zen mode dims it with the other
+  buttons instead of hiding it. The terminal button is gone.</p>
+  <p><strong>Phone (≤480px).</strong> One row again: the ≤480 header is <code>flex-direction: row;
+  justify-content: space-between</code>; 40px targets, 6px gaps — budget at 375px is 334 of 375.
+  The chip drops its word and becomes a round light (the dot's colour is the state; DEGRADED shows
+  as a red ring); the left cluster is the one that shrinks, so a visible planner monologue wraps
+  under the light rather than pushing controls off the row. A rendered pin at 375/390/430 and
+  landscape asserts every control shares one row inside the viewport and inside the header box —
+  it caught the chip sitting 4px above its neighbours (the wrapper's 8px gap to the hidden planner
+  line) before anyone's eye did.</p>
+  <p><strong>Sessions rail.</strong> <code>#rail-actions</code> beside the title: <em>Load
+  workspace</em> (folder), <em>Save workspace</em> (floppy), then <em>+</em>. Two explicit buttons
+  replace the header's one glyph that flipped between Load (empty chat) and Save (non-empty): Save
+  is disabled with nothing to save (title and accessible name move together); Load is always
+  available — loading mints a fresh session, so an open chat is never overwritten; it asks first.
+  The palette offers both.</p>
+  <p><strong>Pins.</strong> <code>tests/test_interface_header_simplify.py</code> (wiring text pins +
+  20 WebKit-rendered layout cases); adjusted <code>test_interface_log_console</code>,
+  <code>test_interface_workspace</code>, <code>test_interface_a11y</code>,
+  <code>test_interface_face_prefs_and_status_chip</code>. Cache-bust: app/matrix_graph 10.9,
+  workspace 7.9, status 7.2, palette 7.0, style 5.6.</p>
+
+  <h2>2026-09-05 — ask about a file as you upload it</h2>
+  <p><strong>Trigger.</strong> Operator: a photo from the phone camera uploaded fine, but asking about
+  it took a second message naming <code>image.jpg</code> by hand — <em>"can we have a window that
+  will include a request? like 'what do you see', or 'what kind of car is that'?"</em></p>
+  <p><strong>Mechanism.</strong> Choosing a file no longer uploads it blind. <code>#upload-ask-modal</code>
+  (a sheet in the memory modal's chrome, now class-based: <code>.modal-overlay</code> /
+  <code>.modal-box</code> / <code>.modal-actions</code> / <code>.modal-btn</code>) shows the
+  question box FIRST (focused, no placeholder examples — operator, same day: a full-width preview
+  above the box put the typing under the phone keyboard), then a 64px thumbnail (object URL,
+  revoked on close) beside the stored name and size (<code>enterkeyhint="send"</code>; Enter
+  sends, Shift+Enter breaks a line). On phones the sheet is top-anchored so the keyboard never
+  covers it; the rendered pin asserts the buttons sit above the iPhone keyboard band. <em>Upload &amp;
+  ask</em> runs <code>uploadToSandbox()</code> and then puts
+  <code>composeUploadRequest(question, storedName)</code> — the question, then
+  <code>(File just uploaded to the sandbox: &lt;name&gt;)</code> — through the ordinary
+  <code>sendMessage()</code>, so the turn gets the same streaming, resume, history and thumbs
+  handling as a typed message. There is ONE button (operator: "an empty request is an upload only by
+  definition") whose label follows the box — <em>Upload</em> when empty, <em>Upload &amp; ask</em>
+  once there is a question; close / backdrop / Escape discard the file.</p>
+  <p><strong>Stored names.</strong> iOS names <em>every</em> camera capture <code>image.jpg</code>, so a
+  second photo silently overwrote the first and a later question pointed at whichever came last.
+  <code>uploadNameFor()</code> renames generic capture names (<code>image</code>/<code>img</code>/
+  <code>photo</code>/<code>capture</code> + digits, image extensions) to
+  <code>photo-YYYYMMDD-HHMMSS.&lt;ext&gt;</code>; every other name is kept. The sheet shows the
+  rename, and the chat message names the stored file.</p>
+  <p><strong>Pins.</strong> <code>tests/test_interface_upload_ask.py</code>: the two pure helpers and the
+  byte formatter executed under node (a fixed clock for the rename), the wiring as text (the change
+  handler opens the sheet and no longer uploads; both buttons upload and only <em>ask</em> sends; the
+  sheet closes before the upload; every close path revokes the preview), and the sheet RENDERED in
+  WebKit at 390px (inside the viewport, buttons on one row ≥44px, preview capped, question box
+  reachable) and hidden by default at desktop width. Cache-bust: app/matrix_graph 11.2, style 5.7.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

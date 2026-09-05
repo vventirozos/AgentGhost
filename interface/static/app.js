@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=10.7';
+import * as matrixGraphFace from './matrix_graph.js?v=11.5';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -247,6 +247,11 @@ let currentAccumulatedContent = "";
 // "chatcmpl-<id>" envelope) — the handle /api/feedback labels ride on.
 // Distinct from currentTaskId, which is the interface proxy's stream handle.
 let currentReqId = null;
+// Set when the reply's frames say `ghost.labelable: false` — the trivial
+// fast path answered (a greeting), which writes NO trajectory, so a thumb
+// could never land (§4EX). The bubble then gets no thumbs at all instead
+// of an error on every tap. Reset wherever currentReqId is.
+let currentTurnUnlabelable = false;
 // The text of the turn this tab most recently sent — the only identifier
 // available when durable sessions are off. See `_resolveOwnTurnId`.
 let _lastSentUserText = '';
@@ -634,7 +639,10 @@ if ('visualViewport' in window) {
 
 const LOG_BUFFER_CAP = 500;
 const logBuffer = [];
-const logsBtn = document.getElementById('logs-btn');
+// The ONLINE chip in the header toggles the console (2026-09-05, operator:
+// the separate terminal button is gone; "when I click or tap the status
+// indicator the log window should open").
+const logToggleBtn = document.getElementById('status-indicator');
 const logConsole = document.getElementById('log-console');
 const logConsoleBody = document.getElementById('log-console-body');
 const logClearBtn = document.getElementById('log-clear');
@@ -692,7 +700,7 @@ function openLogConsole() {
     logConsoleBody.innerHTML = '';
     logConsoleBody.appendChild(frag);
     logConsole.classList.remove('hidden');
-    if (logsBtn) logsBtn.classList.add('active');
+    if (logToggleBtn) logToggleBtn.classList.add('active');
     logPinned = true;
     logUnseen = 0;
     if (logResumeBtn) logResumeBtn.classList.add('hidden');
@@ -702,11 +710,11 @@ function openLogConsole() {
 function closeLogConsole() {
     if (!logConsole) return;
     logConsole.classList.add('hidden');
-    if (logsBtn) logsBtn.classList.remove('active');
+    if (logToggleBtn) logToggleBtn.classList.remove('active');
 }
 
-if (logsBtn) {
-    logsBtn.addEventListener('click', () => {
+if (logToggleBtn) {
+    logToggleBtn.addEventListener('click', () => {
         if (logConsole.classList.contains('hidden')) openLogConsole();
         else closeLogConsole();
     });
@@ -1147,6 +1155,9 @@ function _thumbSvg(kind) {
 // timestamp/menu and could overlap the reply text (operator: "really bad").
 function _ensureFeedbackRow(div) {
     if (!div.classList.contains('agent') || !div.dataset.reqId) return;
+    // No trajectory behind this reply (trivial fast path, §4EX): a thumb
+    // could only ever fail, so offer none.
+    if (div.dataset.unlabelable) return;
     if (div.querySelector(':scope > .msg-feedback')) return;
     const fbRow = document.createElement('div');
     fbRow.className = 'msg-feedback';
@@ -1177,7 +1188,7 @@ function _ensureFeedbackRow(div) {
 // clean-server JSON and read "drifted" on every focus, wiping the labels).
 function toWireMessage(m) {
     if (!m || typeof m !== 'object') return m;
-    const { reqId, feedback, ...rest } = m;
+    const { reqId, feedback, unlabelable, ...rest } = m;
     return rest;
 }
 
@@ -1213,6 +1224,7 @@ function mergeClientLabelKeys(serverMsgs) {
         if (same) {
             out[i].reqId = loc.reqId;
             if (loc.feedback) out[i].feedback = loc.feedback;
+            if (loc.unlabelable) out[i].unlabelable = true;
         }
     }
     return out;
@@ -1223,8 +1235,12 @@ function mergeClientLabelKeys(serverMsgs) {
 // the stale feedback latch + row or the new reply renders a verdict nobody
 // gave — and the same-signal no-op guard would then make that thumb
 // permanently untappable.
-function _stampReqId(div, id) {
+function _stampReqId(div, id, unlabelable) {
     if (!div) return;
+    // Follows the id: a reused bubble must not inherit the previous
+    // turn's "no thumbs" (or its thumbs) — see the reqId stale-clear below.
+    if (unlabelable) div.dataset.unlabelable = '1';
+    else delete div.dataset.unlabelable;
     // Stale-clear runs even when the NEW id is unknown (R3: a reused
     // bubble whose new turn captured no id — the "No response" path —
     // kept the previous turn's reqId, latch, and thumbs, so a tap there
@@ -1296,10 +1312,11 @@ async function sendFeedback(div, signal, retryReqId) {
                 return;
             }
             const err = await r.json().catch(() => ({}));
-            addMessage('system', `Feedback not recorded: ${err.error || err.detail || ('HTTP ' + r.status)}`);
+            _noteFeedbackFailure(div, `Feedback not recorded: ${err.error || err.detail || ('HTTP ' + r.status)}`);
             return;
         }
         delete div.dataset.fbRetried;
+        delete div.dataset.fbFailure;   // a later failure may speak again
         // Latch on the LIVE bubble: a drift re-render can detach `div`
         // between the tap (or an armed retry) and this response — latching
         // the detached node showed no verdict and invited a duplicate tap
@@ -1330,10 +1347,24 @@ async function sendFeedback(div, signal, retryReqId) {
         if (typeof saveChatState === 'function') saveChatState();
     } catch (e) {
         console.warn('feedback failed:', e);
-        addMessage('system', 'Feedback not recorded: network error — tap again.');
+        _noteFeedbackFailure(div, 'Feedback not recorded: network error — tap again.');
     } finally {
         btns.forEach(b => { b.disabled = false; });
     }
+}
+
+// One system line per failure per bubble (2026-09-05, operator: the same
+// "FEEDBACK NOT RECORDED" line stacked up once per tap). The FIRST failure
+// is worth a line — the operator must know the label was lost; the same
+// failure again on the next tap is not. A DIFFERENT message (a 404 that
+// became a network error) still speaks; a success clears the latch so a
+// later failure speaks again. Pure DOM state, so it can be executed under
+// node with a stub bubble.
+function _noteFeedbackFailure(div, message) {
+    if (div && div.dataset && div.dataset.fbFailure === message) return false;
+    if (div && div.dataset) div.dataset.fbFailure = message;
+    addMessage('system', message);
+    return true;
 }
 
 function scrollToBottom() {
@@ -1452,6 +1483,7 @@ function renderHistoryToLog(history) {
                     if (roleClass === 'agent' && msg.reqId) {
                         div.dataset.reqId = msg.reqId;
                         if (msg.feedback) div.dataset.feedback = msg.feedback;
+                        if (msg.unlabelable) div.dataset.unlabelable = '1';
                     }
                     chatLog.appendChild(div);
                 }
@@ -2147,6 +2179,7 @@ async function sendMessage(isResume = false) {
         currentChunkIndex = 0;
         currentAccumulatedContent = "";
         currentReqId = null;
+        currentTurnUnlabelable = false;
 
         chatHistory.push({ role: "user", content: text });
         // Remembered for Stop: with sessions disabled there is no session id
@@ -2246,6 +2279,7 @@ async function sendMessage(isResume = false) {
             // whose task handle was lost) — any captured id belongs to an
             // abandoned turn and must not stamp this one's reply.
             currentReqId = null;
+            currentTurnUnlabelable = false;
             response = await fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2302,6 +2336,9 @@ async function sendMessage(isResume = false) {
                     if (!currentReqId && typeof data.id === 'string' && data.id) {
                         currentReqId = data.id.replace(/^chatcmpl-/, '');
                     }
+                    // The route marks a reply that has no trajectory behind
+                    // it (trivial fast path): no thumbs for this bubble.
+                    if (data.ghost && data.ghost.labelable === false) currentTurnUnlabelable = true;
 
                     if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
                         chunkContent = data.choices[0].delta.content;
@@ -2399,11 +2436,12 @@ async function sendMessage(isResume = false) {
         // the 👍/👎 label buttons survive a reload.
         if (currentAccumulatedContent) {
             chatHistory.push({ role: "assistant", content: currentAccumulatedContent,
-                               reqId: currentReqId || undefined });
+                               reqId: currentReqId || undefined,
+                               unlabelable: currentTurnUnlabelable || undefined });
             // Stamp only alongside a history entry that carries the id —
             // a "No response" bubble with live thumbs would take labels
             // that can never persist (no matching entry to latch onto).
-            _stampReqId(currentAgentMessageDiv, currentReqId);
+            _stampReqId(currentAgentMessageDiv, currentReqId, currentTurnUnlabelable);
         } else if (streamHadError) {
             // An error frame already rendered a system message saying what
             // went wrong. Pushing a phantom assistant reply on top of it put
@@ -2452,9 +2490,10 @@ async function sendMessage(isResume = false) {
                 // wrong is a prime 👎 target, and the trajectory exists.
                 chatHistory.push({ role: "assistant",
                                    content: currentAccumulatedContent + "\n\n*[Aborted]*",
-                                   reqId: currentReqId || undefined });
+                                   reqId: currentReqId || undefined,
+                                   unlabelable: currentTurnUnlabelable || undefined });
                 if (currentAgentMessageDiv && currentAgentMessageDiv.isConnected) {
-                    _stampReqId(currentAgentMessageDiv, currentReqId);
+                    _stampReqId(currentAgentMessageDiv, currentReqId, currentTurnUnlabelable);
                 }
                 addMessage('system', 'Stopped by user.');
             } else {
@@ -2657,6 +2696,32 @@ const FACE_FORM_HINTS = {
 const faceFormBtn = document.getElementById('face-form-btn');
 let faceFormMenu = null;
 
+// Persist a pick SERVER-side (2026-09-05). setForm() writes localStorage,
+// which is per-origin / per-browser / per-device — so the form picked
+// here never became the default on the phone PWA or in a LAN-IP tab, and
+// Safari's storage purge reset it. server.py stores it and injects it
+// into the next page load as <meta name="ghost-face-form">
+// (matrix_graph.js resolveInitialForm); the authed fetch wrapper adds the
+// key header. Fire-and-forget on purpose: the face has already switched
+// locally; a failed save (offline, key rotated) leaves localStorage as
+// the fallback and says so once in the console. Resolves to whether the
+// server took it — pure enough to EXECUTE under node with a fake fetch.
+function rememberFaceForm(name) {
+    return fetch('/api/ui/prefs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ face_form: name }),
+        signal: AbortSignal.timeout(8000),
+    }).then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return true;
+    }).catch((e) => {
+        console.warn('[Ghost] face form kept locally only — server save failed:',
+            (e && e.message) || e);
+        return false;
+    });
+}
+
 function closeFaceFormMenu() {
     if (faceFormMenu) faceFormMenu.classList.add('hidden');
 }
@@ -2684,6 +2749,7 @@ function buildFaceFormMenu() {
         item.appendChild(hint);
         item.addEventListener('click', () => {
             const picked = activeFace.setForm(name);
+            rememberFaceForm(picked);
             markActiveFaceForm();
             closeFaceFormMenu();
             const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
@@ -2722,6 +2788,7 @@ if (faceFormBtn) {
             // Stale-cache fallback: the old blind cycle still works.
             if (typeof activeFace.cycleForm !== 'function') return;
             const name = activeFace.cycleForm();
+            rememberFaceForm(name);
             const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
             if (toast) toast(`Face form: ${name}`);
             return;
@@ -2767,89 +2834,93 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
-// Workspace Save/Load Logic
-const workspaceBtn = document.getElementById('workspace-btn');
+// Workspace Save/Load Logic — two explicit buttons in the sessions rail
+// (2026-09-05, operator: "next to +"). The header's single glyph used to
+// FLIP: Load with an empty chat, Save otherwise — an action you had to
+// know. Now Save is simply disabled with nothing to save, and Load is
+// always available: loading mints a FRESH session (see the change
+// handler), so an open chat is never overwritten — it only asks first.
+const workspaceSaveBtn = document.getElementById('workspace-save-btn');
+const workspaceLoadBtn = document.getElementById('workspace-load-btn');
 const workspaceUploadInput = document.getElementById('workspace-upload-input');
 
 function updateWorkspaceBtnState() {
-    if (!workspaceBtn) return;
-    // One glyph, two actions. The title already flipped; the accessible
-    // name did not, so screen-reader users got the same word for both
-    // branches of the click handler.
-    if (chatHistory.length === 0) {
-        workspaceBtn.title = "Load Workspace";
-        workspaceBtn.setAttribute('aria-label', 'Load workspace');
-    } else {
-        workspaceBtn.title = "Save Workspace";
-        workspaceBtn.setAttribute('aria-label', 'Save workspace');
-    }
-    workspaceBtn.innerHTML = `
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
-            <polyline points="17 21 17 13 7 13 7 21"></polyline>
-            <polyline points="7 3 7 8 15 8"></polyline>
-        </svg>
-    `; // Save/Load icon
+    if (!workspaceSaveBtn) return;
+    const empty = chatHistory.length === 0;
+    workspaceSaveBtn.disabled = empty;
+    // Title and accessible name move TOGETHER (the old flip changed one
+    // and not the other — a11y review).
+    workspaceSaveBtn.title = empty ? 'Save workspace (nothing to save yet)' : 'Save workspace as a zip';
+    workspaceSaveBtn.setAttribute('aria-label', workspaceSaveBtn.title);
 }
 
-if (workspaceBtn && workspaceUploadInput) {
+if (workspaceLoadBtn && workspaceUploadInput) {
+    workspaceLoadBtn.addEventListener('click', () => {
+        if (isProcessingRequest) return;
+        if (chatHistory.length > 0 && !confirm(
+            'Load a workspace into a NEW session? The current chat stays in the sessions list.')) {
+            return;
+        }
+        workspaceUploadInput.click();
+    });
+}
+
+if (workspaceSaveBtn) {
     updateWorkspaceBtnState();
 
-    workspaceBtn.addEventListener('click', async () => {
-        if (isProcessingRequest) return;
-        if (chatHistory.length === 0) {
-            workspaceUploadInput.click();
-        } else {
-            isProcessingRequest = true;
-            activeFace.setWorkingState(true);
-            // The composer must SHOW the busy state: without this the
-            // button still reads SEND, and a click hits neither branch of
-            // the handler while Enter tests !isProcessingRequest — the user
-            // is silently ignored (R2 lens B).
-            toggleSendButtonUI(true, false);   // no AbortController here
+    workspaceSaveBtn.addEventListener('click', async () => {
+        if (isProcessingRequest || chatHistory.length === 0) return;
+        isProcessingRequest = true;
+        activeFace.setWorkingState(true);
+        // The composer must SHOW the busy state: without this the
+        // button still reads SEND, and a click hits neither branch of
+        // the handler while Enter tests !isProcessingRequest — the user
+        // is silently ignored (R2 lens B).
+        toggleSendButtonUI(true, false);   // no AbortController here
 
-            try {
-                const response = await fetch('/api/workspace/save', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    // Same wire-shape strip as /api/chat: a workspace
-                    // restored weeks later would otherwise present live
-                    // thumbs whose reqIds are past the agent's 8-day
-                    // trajectory scan — guaranteed 404s.
-                    body: JSON.stringify({ chat_history: chatHistory.map(toWireMessage) })
-                });
-                
-                if (!response.ok) throw await _httpError(response, 'Save failed');
-                
-                const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                
-                let filename = `workspace_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`;
-                const disposition = response.headers.get('content-disposition');
-                if (disposition && disposition.indexOf('filename=') !== -1) {
-                    filename = disposition.split('filename=')[1].replace(/["']/g, '');
-                }
-                
-                a.download = filename;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                window.URL.revokeObjectURL(url);
-                
-                addMessage('system', 'Workspace saved successfully.');
-            } catch (err) {
-                addMessage('system', `Save Workspace Error: ${err.message}`);
-                activeFace.triggerSpike();
-            } finally {
-                isProcessingRequest = false;
-                activeFace.setWorkingState(false);
-                toggleSendButtonUI(false);
+        try {
+            const response = await fetch('/api/workspace/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                // Same wire-shape strip as /api/chat: a workspace
+                // restored weeks later would otherwise present live
+                // thumbs whose reqIds are past the agent's 8-day
+                // trajectory scan — guaranteed 404s.
+                body: JSON.stringify({ chat_history: chatHistory.map(toWireMessage) })
+            });
+            
+            if (!response.ok) throw await _httpError(response, 'Save failed');
+            
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            
+            let filename = `workspace_${new Date().toISOString().replace(/[:.]/g, '-')}.zip`;
+            const disposition = response.headers.get('content-disposition');
+            if (disposition && disposition.indexOf('filename=') !== -1) {
+                filename = disposition.split('filename=')[1].replace(/["']/g, '');
             }
+            
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            window.URL.revokeObjectURL(url);
+            
+            addMessage('system', 'Workspace saved successfully.');
+        } catch (err) {
+            addMessage('system', `Save Workspace Error: ${err.message}`);
+            activeFace.triggerSpike();
+        } finally {
+            isProcessingRequest = false;
+            activeFace.setWorkingState(false);
+            toggleSendButtonUI(false);
         }
     });
+}
 
+if (workspaceUploadInput) {
     workspaceUploadInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -2922,57 +2993,245 @@ if (uploadBtn && fileUploadInput) {
         fileUploadInput.click();
     });
 
-    fileUploadInput.addEventListener('change', async (e) => {
+    // Choosing a file opens the ask sheet (2026-09-05, operator) instead
+    // of uploading blind — see openUploadAsk below.
+    fileUploadInput.addEventListener('change', (e) => {
         const file = e.target.files[0];
-        if (!file) return;
-
         // Reset input immediately so the same file can be uploaded again if needed
         fileUploadInput.value = '';
+        if (!file) return;
+        openUploadAsk(file);
+    });
+}
 
-        isProcessingRequest = true;
-        activeFace.setWorkingState(true);
-        toggleSendButtonUI(true, false);   // no AbortController here
+// The name the file is stored under in the sandbox. iOS names EVERY camera
+// capture `image.jpg`, so a second photo silently overwrote the first and a
+// later "what kind of car is that?" pointed at whichever came last. Generic
+// camera names get a timestamp; anything else keeps its name. Pure — the
+// clock is a parameter so it can be executed under node.
+// `IMG_0042` / `IMG42` are Photos-library names — unique per photo — and
+// stay; only the literal camera-capture names are generic.
+const _GENERIC_CAPTURE_NAMES = /^(image|photo|capture)\d*\.(jpe?g|png|heic|heif|webp)$/i;
+function uploadNameFor(file, now) {
+    const name = String((file && file.name) || 'upload');
+    if (!_GENERIC_CAPTURE_NAMES.test(name)) return name;
+    const d = now instanceof Date ? now : new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-`
+        + `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    return `photo-${stamp}.${name.split('.').pop().toLowerCase()}`;
+}
 
-        addMessage('system', `Uploading ${file.name} to sandbox...`);
+// The chat message "Upload & ask" sends: the question, then the file it is
+// about, named the way the agent's tools find it (by sandbox filename —
+// which is what the operator used to type by hand). Pure; executed under
+// node. An empty question means "upload only" and composes nothing.
+function composeUploadRequest(question, storedName) {
+    const q = String(question || '').trim();
+    if (!q) return '';
+    return `${q}\n\n(File just uploaded to the sandbox: ${storedName})`;
+}
 
-        const formData = new FormData();
-        formData.append('file', file);
-
-        try {
-            const response = await fetch('/api/upload', {
-                method: 'POST',
-                body: formData
-            });
-
-            if (!response.ok) {
-                // The server explains WHY (type not allowed, too large, no
-                // filename); pasting only the status threw that away.
-                throw await _httpError(response, 'Upload failed');
-            }
-
-            const result = await response.json();
-            if (result.error) {
-                addMessage('system', `Upload Failed: ${result.error}`);
-                activeFace.triggerSpike();
-            } else {
-                // NOTE: an `updateActivityIcon('✅')` call sat here until
-                // 2026-08-02. The function was deleted with the center-stage
-                // #activity-icon on 2026-07-29 but two call sites survived, so
-                // this threw a ReferenceError on every SUCCESSFUL upload — the
-                // enclosing catch then reported "Upload Error" for an upload
-                // that had just worked. The success message above is the
-                // status signal; the turn-status line owns icons now.
-                addMessage('system', `Successfully uploaded ${file.name}.`);
-            }
-        } catch (error) {
-            addMessage('system', `Upload Error: ${error.message}`);
-            activeFace.triggerSpike();
-        } finally {
-            isProcessingRequest = false;
-            activeFace.setWorkingState(false);
-            toggleSendButtonUI(false);
-            scrollToBottom();
+// Upload one file to the sandbox. Resolves to the stored filename, or null
+// after reporting the failure in the chat (the operator sees why: the server
+// explains type/size/name rejections, and the message carries it).
+async function uploadToSandbox(file, storedName) {
+    isProcessingRequest = true;
+    activeFace.setWorkingState(true);
+    toggleSendButtonUI(true, false);   // no AbortController here
+    addMessage('system', `Uploading ${storedName} to sandbox...`);
+    const formData = new FormData();
+    formData.append('file', file, storedName);
+    try {
+        const response = await fetch('/api/upload', { method: 'POST', body: formData });
+        if (!response.ok) {
+            // The server explains WHY (type not allowed, too large, no
+            // filename); pasting only the status threw that away.
+            throw await _httpError(response, 'Upload failed');
         }
+        const result = await response.json();
+        if (result.error) {
+            addMessage('system', `Upload Failed: ${result.error}`);
+            activeFace.triggerSpike();
+            return null;
+        }
+        // NOTE: an `updateActivityIcon('✅')` call sat here until
+        // 2026-08-02. The function was deleted with the center-stage
+        // #activity-icon on 2026-07-29 but two call sites survived, so
+        // this threw a ReferenceError on every SUCCESSFUL upload — the
+        // enclosing catch then reported "Upload Error" for an upload
+        // that had just worked. The success message above is the
+        // status signal; the turn-status line owns icons now.
+        const stored = (result && typeof result.filename === 'string' && result.filename) || storedName;
+        addMessage('system', `Successfully uploaded ${stored}.`);
+        return stored;
+    } catch (error) {
+        addMessage('system', `Upload Error: ${error.message}`);
+        activeFace.triggerSpike();
+        return null;
+    } finally {
+        isProcessingRequest = false;
+        activeFace.setWorkingState(false);
+        toggleSendButtonUI(false);
+        scrollToBottom();
+    }
+}
+
+// ── Ask-about-this-file sheet ───────────────────────────────────────
+// A photo from the phone camera used to need TWO steps: upload, then a
+// typed message naming image.jpg. The sheet shows the file (thumbnail
+// when it is an image), takes an optional question, and ONE button
+// uploads — with a question it also sends question + stored filename as
+// one chat message the moment the upload lands; an empty box is "upload
+// only" by definition (operator: no second button).
+const uploadAskModal = document.getElementById('upload-ask-modal');
+const uploadAskInput = document.getElementById('upload-ask-input');
+const uploadAskPreview = document.getElementById('upload-ask-preview');
+const uploadAskPreviewWrap = document.getElementById('upload-ask-preview-wrap');
+const uploadAskFile = document.getElementById('upload-ask-file');
+const uploadAskSend = document.getElementById('upload-ask-send');
+let pendingUpload = null;          // { file, storedName, previewUrl }
+
+// The button says what it will do: "Upload" for an empty box, "Upload &
+// ask" once there is a question. Pure on the text; executed under node.
+function uploadAskLabel(question) {
+    return String(question || '').trim() ? 'Upload & ask' : 'Upload';
+}
+function _syncUploadAskLabel() {
+    if (uploadAskSend && uploadAskInput) uploadAskSend.textContent = uploadAskLabel(uploadAskInput.value);
+}
+
+// Default question (operator): a photo — taken or picked — opens with
+// "Describe this image:" already in the box, so Upload alone asks for a
+// description. Other files open empty. Pure; executed under node.
+const UPLOAD_ASK_IMAGE_DEFAULT = 'Describe this image:';
+function uploadAskDefaultFor(file) {
+    const type = String((file && file.type) || '');
+    return type.startsWith('image/') ? UPLOAD_ASK_IMAGE_DEFAULT : '';
+}
+
+// The default behaves like a suggestion, not like text the operator
+// wrote: while the box is PRISTINE (still showing the default), the
+// first keystroke REPLACES it — a typed character starts a fresh
+// question, Backspace/Delete clears the whole box. `keydown` handles
+// the physical/virtual keys; `resolvePristineInput` is the fallback for
+// edits that arrive without a keydown (dictation, paste, predictive
+// text): given the default and what the box holds after such an edit,
+// it returns what the operator meant — the text they added (typed after
+// the default), nothing (they deleted into it), or their replacement.
+// Pure; executed under node.
+function resolvePristineInput(defaultText, value) {
+    const d = String(defaultText || ''); const v = String(value || '');
+    if (v === d) return d;                              // nothing happened
+    if (d && v.startsWith(d)) return v.slice(d.length).replace(/^\s+/, '');
+    if (d && d.startsWith(v)) return '';                // a deletion into the default
+    return v;                                           // replaced outright
+}
+let uploadAskPristine = false;
+function _setUploadAskPristine(on) {
+    uploadAskPristine = !!on;
+    uploadAskInput?.classList.toggle('pristine', uploadAskPristine);
+}
+
+function openUploadAsk(file) {
+    if (!uploadAskModal) {
+        // Stale-cached markup without the sheet: keep uploads working.
+        uploadToSandbox(file, uploadNameFor(file));
+        return;
+    }
+    closeUploadAsk();
+    const storedName = uploadNameFor(file);
+    let previewUrl = null;
+    if (file.type && file.type.startsWith('image/') && uploadAskPreview) {
+        try { previewUrl = URL.createObjectURL(file); } catch (e) { previewUrl = null; }
+    }
+    pendingUpload = { file, storedName, previewUrl };
+    if (uploadAskPreviewWrap) uploadAskPreviewWrap.hidden = !previewUrl;
+    if (uploadAskPreview) uploadAskPreview.src = previewUrl || '';
+    if (uploadAskFile) {
+        uploadAskFile.textContent = storedName === file.name
+            ? `${file.name} · ${_fmtBytes(file.size)}`
+            : `${file.name} → ${storedName} · ${_fmtBytes(file.size)}`;
+    }
+    if (uploadAskInput) {
+        uploadAskInput.value = uploadAskDefaultFor(file);
+        _setUploadAskPristine(uploadAskInput.value !== '');
+    }
+    _syncUploadAskLabel();
+    uploadAskModal.classList.remove('hidden');
+    if (uploadAskInput) {
+        uploadAskInput.focus();
+        // The box, not the thumbnail, is what the sheet is about: keep it
+        // in view even if a tall sheet scrolled (phone + keyboard).
+        try { uploadAskInput.scrollIntoView({ block: 'nearest' }); } catch (e) { /* older WebKit */ }
+    }
+}
+
+function closeUploadAsk() {
+    if (pendingUpload && pendingUpload.previewUrl) {
+        try { URL.revokeObjectURL(pendingUpload.previewUrl); } catch (e) { /* ignore */ }
+    }
+    pendingUpload = null;
+    if (uploadAskPreview) uploadAskPreview.src = '';
+    uploadAskModal?.classList.add('hidden');
+}
+
+function _fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function confirmUploadAsk() {
+    if (!pendingUpload || isProcessingRequest) return;
+    const { file, storedName } = pendingUpload;
+    const question = uploadAskInput ? uploadAskInput.value : '';
+    closeUploadAsk();
+    const stored = await uploadToSandbox(file, storedName);
+    if (!stored) return;
+    const message = composeUploadRequest(question, stored);
+    if (!message) return;
+    // Ride the ordinary send path so the turn gets the same streaming,
+    // resume, history and thumbs handling as a typed message.
+    chatInput.value = message;
+    await sendMessage();
+}
+
+if (uploadAskModal) {
+    uploadAskSend?.addEventListener('click', () => confirmUploadAsk());
+    uploadAskInput?.addEventListener('input', () => {
+        if (uploadAskPristine) {
+            const resolved = resolvePristineInput(UPLOAD_ASK_IMAGE_DEFAULT, uploadAskInput.value);
+            if (resolved !== UPLOAD_ASK_IMAGE_DEFAULT) {
+                uploadAskInput.value = resolved;
+                _setUploadAskPristine(false);
+            }
+        }
+        _syncUploadAskLabel();
+    });
+    // First key on a pristine default: a character starts a fresh question,
+    // Backspace/Delete clears the box. Enter still sends the default.
+    uploadAskInput?.addEventListener('keydown', (e) => {
+        if (!uploadAskPristine || e.metaKey || e.ctrlKey || e.altKey) return;
+        if (e.key === 'Backspace' || e.key === 'Delete') {
+            e.preventDefault();
+            uploadAskInput.value = '';
+            _setUploadAskPristine(false);
+            _syncUploadAskLabel();
+        } else if (e.key.length === 1) {
+            uploadAskInput.value = '';          // the key then inserts itself
+            _setUploadAskPristine(false);
+        }
+    });
+    document.getElementById('upload-ask-close')?.addEventListener('click', closeUploadAsk);
+    uploadAskModal.addEventListener('click', (e) => { if (e.target === uploadAskModal) closeUploadAsk(); });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !uploadAskModal.classList.contains('hidden')) closeUploadAsk();
+    });
+    // Enter sends (the phone keyboard's "send" key too); Shift+Enter for a newline.
+    uploadAskInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); confirmUploadAsk(); }
     });
 }
 
@@ -4436,11 +4695,11 @@ window.GhostCore = {
         renderEmptyStateHero();
     },
     isProcessing: () => isProcessingRequest,
-    elements: { chatLog, chatInput, logsBtn },
-    toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
+    elements: { chatLog, chatInput, logToggleBtn },
+    toggleLogConsole: () => { if (logToggleBtn) logToggleBtn.click(); },
 };
 
-import('./workspace.js?v=7.7').catch(e => {
+import('./workspace.js?v=7.9').catch(e => {
     // ⚠ VISIBLE, not console-only. This module owns the sessions rail, and
     // with it `window.__ghostSessionId` — so when it fails to load, every
     // turn silently reverts to CLIENT-CARRIED history: no durable session,
