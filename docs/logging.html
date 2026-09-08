@@ -93,8 +93,9 @@
 │   │   │    │        └── title (lower-cased, bold, level-coloured)
 │   │   │    └── elapsed since the request began
 │   │   └── icon — picks itself per event type
-│   └── 2-char request tag (deterministic colour; groups concurrent requests)
-└── left frame edge</code></pre>
+│   └── 2-char request tag — its HUE is the origin (blue user · violet sim · amber bench · green system);
+│       the shade within that family is per-request, so concurrent requests stay separable
+└── left frame edge (same colour as the tag)</code></pre>
   <p>Requests are framed by <code>┌─ … request started</code> / <code>└─ … request finished +12.3s</code> markers. These now <strong>fill the terminal width</strong> with a <code>─</code> rule, so each request is a visually distinct block even in a busy interleaved stream. The boot and shutdown sequences are framed by <code>🌅 System Boot</code> … <code>🚀 System Ready</code> … <code>💤 System Shutdown</code>.</p>
 
   <div class="note">
@@ -299,6 +300,48 @@
   summarizer's "Worker Compute" &rarr; "Research Compute", boot "Memory Bus" &rarr; "Memory Bus
   Init". The "verifier" stream (one coherent flask-iconed class) and a few sub-event icon varieties
   were left as-is.</p>
+
+  <h2>&sect;4EZ &mdash; origin colour families (2026-09-06)</h2>
+  <p>Operator ask: <em>"I want the logs coming from user requests to be distinct from sim and bench
+  requests, and anything that runs from the system to have different distinct colours."</em>
+  Until now the tag / frame-edge colour was one hash over twelve 256-colour codes, so a self-play
+  turn, a bench attempt and the operator's own request drew from the same palette and only the
+  frame's trailing <code>· sim</code> word (LOG-4) told them apart; SYSTEM <code>**</code> lines
+  had no colour at all. The colour now says <strong>which population</strong> a line belongs to
+  before the eye reads a word of it:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Population</th><th>Hue</th><th>256-colour codes</th><th>What lands here</th></tr></thead>
+    <tbody>
+      <tr><td><code>user</code></td><td>blues / cyans</td><td>39 45 51 81 117 159</td><td>the operator's own requests (web, Slack, uConsole, API)</td></tr>
+      <tr><td><code>sim</code></td><td>violets / magentas</td><td>141 171 177 183 213 219</td><td>self-play, dream replays, sub-agents on a read-only skill store</td></tr>
+      <tr><td><code>bench</code></td><td>ambers / oranges</td><td>172 178 208 214 220 222</td><td>bank runs (<code>bench-&hellip;</code> request ids, externally graded)</td></tr>
+      <tr><td><code>**</code> SYSTEM</td><td>green (one shade)</td><td>34</td><td>not request-scoped: boot/shutdown, the biological tick's idle phases (dream, reflection, skills-auto, GEPA&hellip;), watchdogs, the stream drain</td></tr>
+      <tr><td><em>unclassified</em></td><td>greys</td><td>245 248 251</td><td>a request that declared no origin &mdash; grey on purpose, so it is visible as a gap instead of being laundered into the user family</td></tr>
+    </tbody>
+  </table></div>
+  <p>Within a family the <strong>shade</strong> is still the per-request hash, so two concurrent
+  sim turns remain separable exactly as before; only the hue is new. The frame's origin word
+  (<code>· user</code>) wears the same family colour. The table lives in one place
+  (<code>_ORIGIN_PALETTES</code> / <code>_SYSTEM_COLOR</code> / <code>_UNCLASSIFIED_PALETTE</code>
+  in <code>utils/logging.py</code>) &mdash; tune it there and nowhere else.</p>
+  <p><strong>How a line learns its origin.</strong> <code>handle_chat</code> now sets a second
+  contextvar, <code>request_origin_context</code>, beside the request id, from the <em>same</em>
+  <code>turn_origin</code> value the BEGIN frame stamps (one derivation, not two), and resets it
+  in the same <code>finally</code>. The colour resolver (<code>_line_origin</code>) reads the
+  origin stashed at BEGIN first &mdash; a line always matches the frame the operator saw open
+  &mdash; and the contextvar otherwise, which is what colours the lines logged <em>before</em>
+  the BEGIN frame and the <code>spawn_bg</code> writes that inherit the context and keep logging
+  <em>after</em> END popped the frame state. Colour is ANSI only: stripped, the frame lines are
+  byte-identical, so the three client parsers (uConsole, Slack, web) and the liveness
+  <code>origin=</code> mirror stamp are untouched. <code>NO_COLOR</code> / a non-TTY sink still
+  disable everything. Pins: <code>tests/test_logging_origin_colors.py</code>.</p>
+  <h2>A fourth family: probe (§4FB, 2026-09-06)</h2>
+  <p>Diagnostics sent through the user path with <code>X-Ghost-Origin: probe</code> carry
+  a <code>probe-</code> request-id prefix, stamp <code>&middot; probe</code> on their
+  frames and draw from a red/pink family (<code>_ORIGIN_PALETTES["probe"]</code>) disjoint
+  from the operator's blues. They run exactly like user turns and never teach &mdash;
+  see <a href="core/agent.html">core/agent</a>.</p>
+
 </main>
 </body>
 </html>

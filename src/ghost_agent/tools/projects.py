@@ -717,54 +717,6 @@ def _set_current(context, project_id: Optional[str]):
         _hydrate_scratchpad(context, None)
 
 
-def _delete_eligibility_error(context, store, rid: str) -> Optional[str]:
-    """Return a refusal string when `rid` is NOT eligible for a hard
-    delete in the current request, else None.
-
-    Hard delete is permanent (row + workspace wiped), and the model only
-    ever reaches it from a user message. A bare "delete it" can only
-    refer to something the user has actually seen, so eligibility is:
-
-      * the harness recorded no request-start snapshot
-        (``context.request_start_project_id`` attribute absent — direct
-        tool tests / non-chat surfaces): gate inactive;
-      * ``rid`` was the active project when the user's message arrived
-        (the snapshot), i.e. the thing "it" plausibly refers to;
-      * the user's own message names the project, by title or id.
-
-    Everything else is refused — most importantly a project the agent
-    created seconds earlier in the SAME request. Observed live: one
-    "i don't really like it, delete it an make something else" cascaded
-    into six successive hard deletes, five of them of self-created
-    projects the user never saw, because each new turn re-read the
-    instruction as unfulfilled.
-    """
-    if not hasattr(context, "request_start_project_id"):
-        return None
-    if rid == getattr(context, "request_start_project_id", None):
-        return None
-    user_msg = str(getattr(context, "last_user_content", "") or "").lower()
-    if user_msg:
-        if rid.lower() in user_msg:
-            return None
-        try:
-            proj = store.get_project(rid)
-        except Exception:
-            proj = None
-        title = (proj or {}).get("title") if isinstance(proj, dict) else ""
-        if title and str(title).lower() in user_msg:
-            return None
-    return (
-        f"REFUSED: hard delete of '{rid}' is not allowed in this request. "
-        "It was not the active project when the user's message arrived, and "
-        "the message does not name it — the user has never seen this project, "
-        "so 'delete it' cannot mean this one. If YOU created it earlier in "
-        "this request: STOP cycling ideas. Keep this project and BUILD it "
-        "now. To remove a different project, the user must name it "
-        "explicitly (or use action=archive, which is reversible)."
-    )
-
-
 def conversation_fingerprint(messages) -> str:
     """Stable identity for a conversation: hash of its FIRST user message.
 
@@ -874,6 +826,21 @@ def reconcile_conversation(context, conv_key: str):
     stale scope would tag this turn's keys with the PREVIOUS request's
     project (so the next switch clears the wrong set).
     """
+    # §4FH C1: a coding LEAF runs its own turn loop on an isolated context
+    # whose project is pinned EXPLICITLY (`core/coding_loop.build_leaf_context`
+    # sets `_leaf_pinned_project`). Its prompt has no conversation binding,
+    # so this reconciler parked the pin on every leaf — six leaves wrote
+    # their files at the sandbox ROOT while the workspace diff saw nothing,
+    # and the verify passed via execute's retry-from-root heal: DONE with
+    # zero deliverables. A pinned leaf is not a conversation; leave it alone.
+    _leaf_pin = getattr(context, "_leaf_pinned_project", None)
+    if _leaf_pin:
+        try:
+            context.current_project_id = _leaf_pin
+        except Exception:  # noqa: BLE001
+            pass
+        _set_scratchpad_scope(getattr(context, "scratchpad", None), _leaf_pin)
+        return
     try:
         _reconcile_conversation(context, conv_key)
     finally:
@@ -972,6 +939,51 @@ def _reconcile_conversation(context, conv_key: str):
             context, cur,
             f"Project '{cur}' belongs to another conversation — "
             "deactivated for this request")
+
+
+def _constraint_origin(context) -> str:
+    """"user" when the CURRENT turn is a real user request, else "auto"
+    (§4FD provenance). A scheduled/job/sub-agent turn or any simulated
+    population writes constraints that must never be replayed to the
+    verifier or the prompt as "user-mandated"."""
+    try:
+        from ..core.agent import turn_origin
+        from ..memory.skills import LESSON_ORIGIN_USER, _derive_lesson_origin
+        if turn_origin(context) != "user":
+            return "auto"
+        # ONE derivation for "is the current request a real user request",
+        # shared with the lesson chokepoint (§4FH M2): the contextvar default
+        # "SYSTEM" (idle phases, `_aa_tool_runner` dispatching a tool by name
+        # from the watchdog) is auto, internal prefixes are auto, probes are
+        # not user.
+        return "user" if _derive_lesson_origin() == LESSON_ORIGIN_USER else "auto"
+    except Exception:  # noqa: BLE001 — provenance is best-effort; unknown = user
+        return "user"
+
+
+def _stamp_constraint_origins(meta: Dict[str, Any], constraints: List[str],
+                              origin: str) -> Dict[str, Any]:
+    """Record ``origin`` for each of ``constraints`` in
+    ``meta["constraint_origins"]`` (text → origin). A USER stamp always
+    wins: a constraint first written by an autonomous turn and later
+    RESTATED by the user is user-mandated from then on (restating re-arms —
+    the same rule the retirement lifecycle uses; review §4FH). An auto
+    stamp never overwrites a user stamp. Returns ``meta`` for chaining.
+    The ONE writer of that key."""
+    if not isinstance(meta, dict):
+        return meta
+    stamps = meta.get("constraint_origins")
+    if not isinstance(stamps, dict):
+        stamps = {}
+    o = origin or "user"
+    for c in constraints or []:
+        key = str(c)
+        if not key:
+            continue
+        if o == "user" or key not in stamps:
+            stamps[key] = o
+    meta["constraint_origins"] = stamps
+    return meta
 
 
 def _rearm_inherited_constraints(meta: Dict[str, Any]) -> List[str]:
@@ -2093,6 +2105,8 @@ async def tool_manage_projects(
                          if c.lower() not in {p.lower() for p in prior_constraints}]
                 if fresh:
                     existing_meta["constraints"] = prior_constraints + fresh
+                    _stamp_constraint_origins(existing_meta, fresh,
+                                              _constraint_origin(context))
                     # Re-arm: a retired constraint the user RESTATES is live
                     # intent again — drop it from the retired list so the
                     # lifecycle can't shadow it (retirement happens on
@@ -2189,6 +2203,8 @@ async def tool_manage_projects(
             create_meta = dict(metadata or {})
             if req_constraints:
                 create_meta["constraints"] = req_constraints
+                _stamp_constraint_origins(create_meta, req_constraints,
+                                          _constraint_origin(context))
             if tombstone:
                 create_meta["correction_of"] = tombstone.get("id")
             pid = store.create_project(
@@ -2515,12 +2531,14 @@ async def tool_manage_projects(
                     f"deleted. Use action=list to see the real ids, then pass "
                     f"the exact project_id."
                 )
-            gate = _delete_eligibility_error(context, store, rid)
-            if gate:
-                pretty_log("Project Guard",
-                           f"Hard delete of '{rid}' refused (not user-visible "
-                           "in this request)", icon=Icons.STOP)
-                return _err(gate)
+            # No eligibility gate here. A 2026-06-12 gate refused any hard
+            # delete of a project that was neither active at request start
+            # nor named in the user's message; live req 1e593552 (2026-09-06)
+            # showed it refusing the user's own "delete it" five times in a
+            # row, because the project had just auto-rolled to DONE and was
+            # no longer active. Removed (journal §4FC): a project resolved
+            # by id/title is deletable whether or not it is activated.
+            # Pinned by tests/test_project_delete_ungated.py.
             # Stop the project's services BEFORE the workspace vanishes —
             # rmtree under a running service left orphaned processes +
             # registry entries (review H6). Hard delete also purges their
@@ -3624,6 +3642,7 @@ async def tool_manage_projects(
                 # [] and silently drop the constraint knowledge). They
                 # retire again when THIS version goes DONE.
                 "constraints": _rearm_inherited_constraints(pmeta),
+                "constraint_origins": dict(pmeta.get("constraint_origins") or {}),
                 "research_index": pmeta.get("research_index") or [],
             }
             new_pid = store.create_project(
@@ -3903,6 +3922,7 @@ async def tool_manage_projects(
                     # a DONE/RELEASED source carries its constraint
                     # knowledge in the retired list.
                     "constraints": _rearm_inherited_constraints(smeta),
+                    "constraint_origins": dict(smeta.get("constraint_origins") or {}),
                     "cloned_from": project_id,
                 })
             import shutil

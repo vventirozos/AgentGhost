@@ -233,7 +233,7 @@ async def test_F9_start_with_constraint_hoists_the_opener():
     """F9: a 'Begin your reply with: X' constraint must hoist the X-led
     segment of the assembled reply to the head."""
     a = make_fin_agent()
-    a._active_project_constraints = lambda: []
+    a._active_project_constraints = lambda *_a, **_kw: []
     fs = _fs(
         final_ai_content=("Some earlier analysis narration paragraph.\n\n"
                           "FINAL VERDICT: the parser is correct and the fix "

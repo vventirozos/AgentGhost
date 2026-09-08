@@ -73,7 +73,8 @@ MAX_ATTEMPTS = 4
 # client adapts once per process while test doubles never see each other.
 #   GHOST_CODING_THINK_SKIP_AFTER=<n>   default 2
 #   0 = never think on spec calls;  negative = never adapt (legacy behaviour).
-# A process restart (deploy) or a clean think phase resets the streak.
+# A process restart (deploy), a clean think phase, or (§4FJ) a successful
+# probe think after GHOST_CODING_THINK_PROBE_AFTER no-think calls resets it.
 THINK_SKIP_AFTER_ABORTS_DEFAULT = 2
 # Rejected spec outputs are kept VERBATIM under
 # $GHOST_HOME/system/coding_executor_failures/ (newest UNPARSED_SPEC_KEEP
@@ -725,48 +726,158 @@ def _think_skip_after() -> int:
         return THINK_SKIP_AFTER_ABORTS_DEFAULT
 
 
+# §4FJ (2026-09-07): the disarm path. Once the streak had tripped, "a clean
+# think phase resets" could never happen — no think phase ran any more — so
+# the no-think regime was sticky until a restart, and the leaf bench measured
+# that regime at 2/6 DONE against 6/6 for think-with-fallback in the same
+# process (journal §4FI). Now, after GHOST_CODING_THINK_PROBE_AFTER (default
+# 3) no-think spec calls — or immediately after a verify failure on a spec
+# that was built no-think — ONE spec call thinks again as a probe: a clean
+# probe resets the streak (thinking is back), an aborted probe extends the
+# no-think window by another PROBE_AFTER calls. <= 0 disables probing (the
+# pre-§4FJ sticky behaviour).
+THINK_PROBE_AFTER_DEFAULT = 3
+
+
+def _think_probe_after() -> int:
+    raw = (os.getenv("GHOST_CODING_THINK_PROBE_AFTER") or "").strip()
+    if not raw:
+        return THINK_PROBE_AFTER_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        return THINK_PROBE_AFTER_DEFAULT
+
+
+# Per-client policy record. `skipped_think_last`: the LAST spec call did not
+# ATTEMPT a think phase (it went straight to the no-think call). After a
+# probe that aborted and fell back to the no-think retry this is 0 — a think
+# phase WAS attempted — which is exactly what stops the verify hook from
+# re-probing at once (see _note_nothink_verify_failure).
+_THINK_KEYS: Dict[str, int] = {"aborts": 0, "skipping": 0, "nothink_calls": 0,
+                               "probe": 0, "skipped_think_last": 0}
+
+
 def _think_state(llm) -> Dict[str, int]:
-    """Per-client streak record: ``{"aborts": n, "skipping": 0|1}``."""
+    """Per-client streak record; keys as in ``_THINK_KEYS``. A record created
+    before §4FJ (two keys) is migrated in place with the safe defaults —
+    a fresh window, no pending probe."""
     try:
         st = _THINK_STATE.get(llm)
         if st is None:
-            st = {"aborts": 0, "skipping": 0}
+            st = dict(_THINK_KEYS)
             _THINK_STATE[llm] = st
-        return st
     except TypeError:  # not weak-referenceable / unhashable double
-        return _THINK_STATE_FALLBACK.setdefault(
-            id(llm), {"aborts": 0, "skipping": 0})
+        st = _THINK_STATE_FALLBACK.setdefault(id(llm), dict(_THINK_KEYS))
+    for k, v in _THINK_KEYS.items():
+        st.setdefault(k, v)
+    return st
+
+
+def _probe_due(llm) -> bool:
+    """In the tripped regime, has the no-think window elapsed?"""
+    k = _think_probe_after()
+    return k > 0 and _think_state(llm)["nothink_calls"] >= k
 
 
 def _think_disabled_now(llm) -> bool:
-    """Should this spec call skip the think phase entirely?"""
+    """Should this spec call skip the think phase entirely? A pure predicate
+    (§4FJ review M-2): arming the probe is the CALL SITE's job
+    (`_arm_probe`), so a telemetry reader can ask without side effects."""
     n = _think_skip_after()
     if n < 0:
         return False
     if n == 0:
         return True
-    return _think_state(llm)["aborts"] >= n
+    st = _think_state(llm)
+    if st["aborts"] < n:
+        return False
+    return not _probe_due(llm)
+
+
+def _arm_probe(llm) -> None:
+    """The spec call about to stream a think phase is the scheduled probe."""
+    st = _think_state(llm)
+    st["probe"] = 1
+    logger.warning(
+        "coding_executor: probe think phase after %d no-think spec calls "
+        "(GHOST_CODING_THINK_PROBE_AFTER=%d) — a clean think re-enables "
+        "thinking, an aborted one extends the no-think window",
+        st["nothink_calls"], _think_probe_after())
+
+
+def _note_nothink_call(llm) -> None:
+    """A spec call that started without a think phase (the tripped regime)."""
+    st = _think_state(llm)
+    st["nothink_calls"] += 1
+    st["skipped_think_last"] = 1
+
+
+def _note_nothink_verify_failure(llm, label: str = "") -> None:
+    """The spec just built WITHOUT attempting a think phase failed its
+    verify: probe thinking on the very next spec call instead of waiting out
+    the window. Not armed after a probe that aborted and fell back to the
+    no-think retry (`skipped_think_last` is 0 there) — thinking was just
+    tried; so a failing leaf pays at most floor(max_attempts / 2) probes
+    (§4FJ review MAJOR 2, pinned). Smoke/constraint-gate failures do not arm
+    it on purpose: the verify is the spec's own contract, the gates are
+    mechanical checks the model never saw."""
+    st = _think_state(llm)
+    k = _think_probe_after()
+    if st["skipping"] and st["skipped_think_last"] and k > 0 and st["nothink_calls"] < k:
+        st["nothink_calls"] = k
+        logger.warning(
+            "coding_executor: verify failed on a no-think spec%s — the next "
+            "spec call probes thinking (GHOST_CODING_THINK_PROBE_AFTER=%d)",
+            f" ({label})" if label else "", k)
+
+
+def _note_think_inconclusive(llm) -> None:
+    """The streamed think phase returned NOTHING on either channel (an
+    upstream error frame or an empty response — contention, a restarting
+    server — not evidence about thinking). §4FJ review MAJOR 1: scored as a
+    clean think this wiped the streak and printed "the probe succeeded" for
+    a zero-byte response. The probe is disarmed; the window is left as it
+    was, so the next call probes again once the upstream is back."""
+    st = _think_state(llm)
+    if st["probe"]:
+        logger.warning("coding_executor: probe think phase got an empty "
+                       "upstream response — inconclusive, window unchanged")
+    st["probe"] = 0
+    st["skipped_think_last"] = 0
 
 
 def _note_think_outcome(llm, *, aborted: bool) -> None:
     """Record one streamed think phase: aborted (zero content) or clean."""
     n = _think_skip_after()
     st = _think_state(llm)
+    st["skipped_think_last"] = 0
+    was_probe = st["probe"]
+    st["probe"] = 0
     if not aborted:
         if st["aborts"]:
-            logger.info("coding_executor: think phase produced content — "
-                        "abort streak reset (was %d)", st["aborts"])
+            logger.warning("coding_executor: think phase produced content — "
+                           "abort streak reset (was %d)%s", st["aborts"],
+                           " — the probe succeeded, thinking is back on"
+                           if was_probe else "")
         st["aborts"] = 0
         st["skipping"] = 0
+        st["nothink_calls"] = 0
         return
     st["aborts"] += 1
+    if was_probe:
+        st["nothink_calls"] = 0
+        logger.warning(
+            "coding_executor: probe think phase aborted too — no-think window "
+            "extended by %d spec calls", _think_probe_after())
     if n > 0 and st["aborts"] >= n and not st["skipping"]:
         st["skipping"] = 1
         logger.warning(
             "coding_executor: %d consecutive think phases aborted with no "
             "content — spec calls now start with thinking DISABLED "
-            "(GHOST_CODING_THINK_SKIP_AFTER=%d; a clean think phase or a "
-            "restart resets)", st["aborts"], n)
+            "(GHOST_CODING_THINK_SKIP_AFTER=%d; a clean think phase, a probe "
+            "after GHOST_CODING_THINK_PROBE_AFTER=%d no-think calls, or a "
+            "restart resets)", st["aborts"], n, _think_probe_after())
 
 
 # JSON grammar for the no-think spec call (2026-09-03, §4EI follow-up).
@@ -1377,23 +1488,36 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         # Think policy (§4EI): the streak of aborted think phases has hit the
         # threshold (or the operator set the knob to 0) — skip the ~2-minute
         # think phase that has been producing nothing and go straight to the
-        # call that has been producing specs.
-        logger.info("coding_executor: spec call starts with thinking disabled "
-                    "(GHOST_CODING_THINK_SKIP_AFTER=%d, abort streak %d)",
-                    _think_skip_after(), _think_state(llm)["aborts"])
+        # call that has been producing specs. WARNING so the operator can
+        # count the window between the trip and the probe (§4FJ review M-5).
+        _note_nothink_call(llm)
+        logger.warning("coding_executor: spec call starts with thinking disabled "
+                       "(no-think call %d/%d in this window; abort streak %d)",
+                       _think_state(llm)["nothink_calls"], _think_probe_after(),
+                       _think_state(llm)["aborts"])
         content, reasoning = await _spec_nothink_call(
             llm, model, sys_hint, user, is_background)
         loop_aborted = None
     else:
-        content, reasoning, loop_aborted = await _stream_spec_completion(llm, {
-            "model": model,
-            "messages": [{"role": "system", "content": sys_hint},
-                         {"role": "user", "content": user}],
-            "temperature": 0.3, "max_tokens": 16384,
-        }, is_background)
-        _note_think_outcome(
-            llm, aborted=bool(loop_aborted)
-            or (not content.strip() and bool(reasoning.strip())))
+        _skip = _think_skip_after()
+        if _skip > 0 and _think_state(llm)["aborts"] >= _skip and _probe_due(llm):
+            _arm_probe(llm)
+        try:
+            content, reasoning, loop_aborted = await _stream_spec_completion(llm, {
+                "model": model,
+                "messages": [{"role": "system", "content": sys_hint},
+                             {"role": "user", "content": user}],
+                "temperature": 0.3, "max_tokens": 16384,
+            }, is_background)
+        except BaseException:
+            _note_think_inconclusive(llm)      # no stale probe flag (§4FJ M-1)
+            raise
+        if not content.strip() and not reasoning.strip() and not loop_aborted:
+            _note_think_inconclusive(llm)
+        else:
+            _note_think_outcome(
+                llm, aborted=bool(loop_aborted)
+                or (not content.strip() and bool(reasoning.strip())))
     # Reasoning models (Qwen via llama.cpp) emit their chain-of-thought in a
     # separate `reasoning_content` field. When the think block consumes the
     # whole token budget without closing, the parser routes EVERYTHING there
@@ -1905,6 +2029,19 @@ async def build_coding_task(
     llm = getattr(context, "llm_client", None)
     if llm is None or tool_runner is None:
         return CodingResult(False, "coding executor unavailable (no llm/tool_runner)")
+    # §4FG: the ONE seam every caller inherits — `GHOST_CODING_EXECUTOR=agentic`
+    # or the project's metadata `executor: agentic` routes the leaf to the
+    # bounded edit-test loop (core/coding_loop.py); default stays the spec
+    # executor below until the leaf bench says otherwise.
+    from .coding_loop import build_coding_task_agentic, executor_kind
+    _pid = _ignored.get("project_id") or getattr(context, "current_project_id", None)
+    if executor_kind(context, project_id=_pid, description=description,
+                     existing_files=existing_files) == "agentic":
+        return await build_coding_task_agentic(
+            context, description, tool_runner=tool_runner, ledger=ledger,
+            existing_files=existing_files, research_context=research_context,
+            single_file=single_file, is_background=is_background,
+            constraints=constraints, project_id=_pid)
     model = getattr(getattr(context, "args", None), "model", "default")
     # Work on a COPY: attempts update the snapshot in place (just-written
     # content, between-attempt disk refresh) and the caller's dict must not
@@ -1974,6 +2111,8 @@ async def build_coding_task(
                 continue
             if _verify:
                 vfail = await _run_verify(tool_runner, spec, [])
+                if vfail:
+                    _note_nothink_verify_failure(llm, _short(description, 60))
                 if not vfail:
                     summary = (spec.get("summary") if isinstance(spec, dict) else "") \
                         or "verified existing deliverable (nothing to build)"
@@ -2016,6 +2155,7 @@ async def build_coding_task(
 
         vfail = await _run_verify(tool_runner, spec, written)
         if vfail:
+            _note_nothink_verify_failure(llm, _short(description, 60))   # §4FJ
             last = vfail
             feedback = vfail
             continue

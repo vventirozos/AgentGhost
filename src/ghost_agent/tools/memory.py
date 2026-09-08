@@ -802,6 +802,10 @@ async def tool_query_document(filename: str = None, question: str = None,
     return "\n".join(parts)
 
 
+#: Relevance grades in order of goodness (lower rank = better match).
+_RELEVANCE_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+
 async def tool_recall(query: str = None, memory_system=None, graph_memory=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
@@ -816,6 +820,7 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
         return "Error: Memory retrieval failed."
 
     valid_chunks = []
+    best_relevance = None
     for res in results:
         score = res.get('score', 1.0)
         source = res.get('metadata', {}).get('source', 'Unknown')
@@ -831,7 +836,14 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
 
         # 1.35 is a realistic upper bound for short queries against long chunks using L2 distance
         if score < 1.35:
-            chunk = f"SOURCE: {source}\nCONTENT: {text}"
+            # §4FD: the relevance grade used to reach only the operator's
+            # log — the model saw "highly relevant memories" over rows
+            # scored LOW and invented a project codename from pg_stat
+            # notes. The grade now rides each chunk, and the header names
+            # the best one so an all-LOW recall reads as what it is.
+            if best_relevance is None or _RELEVANCE_RANK[relevance] < _RELEVANCE_RANK[best_relevance]:
+                best_relevance = relevance
+            chunk = f"SOURCE: {source}\nRELEVANCE: {relevance} (distance {score:.2f})\nCONTENT: {text}"
             # Drill-down provenance: syntheses carry {"provenance": [{id,
             # excerpt}, ...]} (their merged sources are deleted, the excerpt
             # IS the surviving evidence); episode-derived skills carry
@@ -867,7 +879,14 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                 logger.debug("recall graph tier skipped: %s", e)
             
     if valid_chunks:
-        out = f"SYSTEM: Found {len(valid_chunks)} highly relevant memories.\n\n" + "\n\n".join(valid_chunks)
+        _best = best_relevance or "LOW"
+        if _best == "LOW":
+            _head = (f"SYSTEM: Found {len(valid_chunks)} memories (best match: LOW — "
+                     "these are probably UNRELATED to the query; do not present them "
+                     "as facts about it).")
+        else:
+            _head = f"SYSTEM: Found {len(valid_chunks)} memories (best match: {_best})."
+        out = _head + "\n\n" + "\n\n".join(valid_chunks)
         # Iterative drill-down affordance: when a hit carries evidence
         # handles, tell the model how to expand them (the query_document
         # "read → refine → read again" loop, generalized to memory).

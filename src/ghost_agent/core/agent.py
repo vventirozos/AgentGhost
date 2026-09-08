@@ -16,12 +16,12 @@ import gc
 import ctypes
 import platform
 import httpx
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 from itertools import zip_longest
 
-from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
+from .prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_COMPILED, SPECIALIST_SYSTEM_PROMPT, SPECIALIST_TOOL_XML_LEGACY, SPECIALIST_TOOL_XML_NATIVE, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 from .planning import TaskTree, TaskStatus
 # Shared "what did this call operate on" helper — same definition the
 # offline post-mortem signature uses, so the in-run no-progress
@@ -33,7 +33,7 @@ from .triggers import (
     guard_key_target,
     looks_mutating_command,
 )
-from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print, verify_purpose
+from ..utils.logging import Icons, pretty_log, request_id_context, request_origin_context, atomic_print, verify_purpose
 from ..utils import logging as _glog
 from ..utils.constraints import extract_constraints, render_constraint_block
 # Live randomized arms + the risk governor that is measured by one of them.
@@ -991,6 +991,22 @@ def turn_origin(context) -> str:
     from. This is an override set by the bench path, not a second
     heuristic — the read-only derivation stays the one inference.
     """
+    # §4FB (2026-09-06): a DIAGNOSTIC PROBE is a fourth population, decided
+    # by the request id the route stamped (`X-Ghost-Origin: probe` →
+    # "probe-" prefix) and read through the contextvar handle_chat sets
+    # first thing — inherited by the turn's background work, so a probe's
+    # late verifier, judge and trajectory writer all see the same answer.
+    # Checked FIRST: a probe is a probe whatever context it runs in, and no
+    # bench/sim context ever carries a probe-prefixed id. Every consumer
+    # that gates on `== "user"` (calibration booking, selfhood, foresight,
+    # feedback, lesson credit …) therefore excludes diagnostics for free.
+    try:
+        from ..utils.logging import (ORIGIN_PROBE, is_probe_request_id,
+                                     request_id_context)
+        if is_probe_request_id(request_id_context.get()):
+            return ORIGIN_PROBE
+    except Exception:  # noqa: BLE001 — the predicate must never raise
+        pass
     label = getattr(context, "turn_origin_label", None)
     if isinstance(label, str) and label:
         return label
@@ -1240,6 +1256,105 @@ _REPAIR_STANDALONE_SUFFIX = (
 )
 
 
+def _render_refute_directive(crit: str, pending_request="") -> str:
+    """The repair-round alert after a REFUTED draft (the ONLY builder).
+
+    Req 2422eb25 (2026-09-06): the refuted draft had not answered the request
+    at all (it "acknowledged" a state block), so "diagnose and FIX it using
+    tools" had no defect to point at — the model invented one ("The user
+    uploaded a new photo") and inspected a file that never existed, which
+    became a strike and a `failed` outcome. The directive therefore
+    (1) restates WHICH request is being answered and that nothing new has
+    arrived, (2) says the repair may need NO tool call when the evidence
+    already in the conversation answers it, and only then (3) asks for a
+    tool-grounded diagnosis. ``pending_request`` is the loop's
+    ``last_user_content``; the quote is bounded by ``_pending_request_head``.
+    """
+    head = _pending_request_head(pending_request)
+    which = (f'THE REQUEST YOU ARE ANSWERING (unchanged): "{head}".' if head
+             else "The request you are answering is the user's most recent "
+                  "one (unchanged).")
+    return (
+        "SYSTEM ALERT — the verifier REFUTED your previous answer: "
+        f"{str(crit or '').strip()}. Do NOT repeat the same claim. {which} "
+        "No new file, message or task has arrived — do not invent one. If "
+        "the evidence already in this conversation answers that request, "
+        "answer it now from that evidence with NO new tool calls. Only if a "
+        "claim genuinely needs checking, diagnose the underlying problem and "
+        "FIX it using tools (run / test / inspect the ACTUAL result), then "
+        "give a corrected final answer grounded in that evidence."
+    )
+
+
+# ── The per-turn <system_state_update> block is a USER-ROLE message, and the
+# transcript therefore claims the human spoke. That role is forced: the live
+# Ornith/Qwen template raises "System message must be at the beginning" for a
+# system-role tail, and a role:"tool" message renders as a user turn too. Since
+# §4ET Fix 2 (2026-09-04) the block rides ALONE on the trailing message of
+# every turn >= 2 (folding it onto the tool result re-prefilled that result
+# every turn), and the model read that lone message as a fresh human turn with
+# no question in it: req 2422eb25 (2026-09-06) held the finished vision
+# description, replied with a 330-char "acknowledging the update" instead,
+# was REFUTED, and the repair turn invented a filename from the block's
+# CURRENT TIME. Two earlier requests since that deploy (48187b80, 0c7c2bb5)
+# show the same "state update but no new user message" reasoning and only
+# recovered by luck; before the deploy no thinking line ever read the block
+# as a human turn. Every block is therefore built HERE and opens by saying
+# whose message it is NOT and which request is still pending — the exact two
+# facts the model went looking for and could not find.
+# tests/test_volatile_block_provenance.py enumerates the module tree so no
+# other site can assemble a block without that header.
+_VOLATILE_BLOCK_OPEN = "<system_state_update>"
+_VOLATILE_BLOCK_CLOSE = "</system_state_update>"
+#: The pending-request line is a bounded, single-line QUOTE of the request
+#: head — enough to re-identify the request, never a second copy of it.
+_PENDING_REQUEST_HEAD_CHARS = 160
+
+
+def _pending_request_head(request_text) -> str:
+    """One bounded line naming the request the turn is still serving.
+
+    Whitespace-collapsed (a multi-line request must not break the block's
+    line structure) and cut at ``_PENDING_REQUEST_HEAD_CHARS`` with an
+    ellipsis, so a pasted document costs a fixed ~40 tokens, not a re-prefill
+    of itself on every turn.
+    """
+    text = " ".join(str(request_text or "").split())
+    if len(text) > _PENDING_REQUEST_HEAD_CHARS:
+        text = text[:_PENDING_REQUEST_HEAD_CHARS].rstrip() + "…"
+    return text
+
+
+def _render_volatile_block(dynamic_state: str, pending_request="") -> str:
+    """The ONLY assembler of a ``<system_state_update>`` block.
+
+    ``dynamic_state`` is the per-turn state (CURRENT TIME, scrapbook, plan
+    focus …); ``pending_request`` is the CURRENT request's text (the
+    request-loop's ``last_user_content``, NOT the first message of a session
+    with history). The block opens with its provenance — not from the user,
+    nothing new was sent, this request is still pending — before any state,
+    so it is the first thing read on the message the model would otherwise
+    mistake for a human turn.
+    """
+    head = _pending_request_head(pending_request)
+    if head:
+        pending = f'PENDING REQUEST (unchanged): "{head}"'
+    else:
+        pending = "PENDING REQUEST: the user's most recent request (not this block)"
+    return (
+        f"{_VOLATILE_BLOCK_OPEN}\n"
+        "(Automated runtime state — NOT a message from the user. The user has "
+        "sent NOTHING new since their request and there is no new question "
+        f"here. {pending} — continue that request from where it stands; when "
+        "it is fully answered, reply to the user.)\n"
+        f"{str(dynamic_state or '').strip()}\n"
+        "(CRITICAL: This is internal system state. Do NOT acknowledge or "
+        "comment on this block in your thoughts. Focus entirely on the "
+        "pending request.)\n"
+        f"{_VOLATILE_BLOCK_CLOSE}"
+    )
+
+
 def _squeeze_evidence_noise(text: str) -> str:
     """Collapse zero-entailment-value bulk (long tracking URLs) in a tool
     output before it competes for the verifier's evidence budget."""
@@ -1317,7 +1432,11 @@ def _project_ledger_evidence(context, tools_run: Optional[list],
         blocks.append("; ".join(parts))
     if not blocks:
         return ""
-    return ("[project ledger (live)] " + " || ".join(blocks))[:cap]
+    # §4FD: task TITLES read like imperatives ("Execute ... starting with
+    # 'What it means to BE ghost'") and a judge took one for a constraint.
+    # Say what the block is, in the block.
+    return ("[project ledger (live) — task titles and statuses, NOT user "
+            "constraints] " + " || ".join(blocks))[:cap]
 
 
 def _collect_verifier_evidence(tools_run: Optional[list],
@@ -5208,6 +5327,58 @@ class StreamState:
 from ..utils.helpers import env_positive
 
 _PLANNER_TIMEOUT_S = env_positive("GHOST_PLANNER_TIMEOUT", 180.0)
+
+
+REWARM_PERIOD_DEFAULT_S = 180.0
+REWARM_PERIOD_FLOOR_S = 30.0
+
+
+def rewarm_period_s() -> float:
+    """GHOST_MAIN_PREFIX_REWARM_S: seconds between head re-warm ticks
+    (default 180 — the head survives ~10 minutes of idle churn). Positive
+    values are floored at 30 s (§4FM review MAJOR-4: a typo of 18 or 0.5
+    would prefill 26k tokens on the single slot in a tight loop); 0 or a
+    negative value disables; garbage is the default."""
+    raw = (os.getenv("GHOST_MAIN_PREFIX_REWARM_S") or "").strip()
+    if not raw:
+        return REWARM_PERIOD_DEFAULT_S
+    try:
+        v = float(raw)
+    except ValueError:
+        return REWARM_PERIOD_DEFAULT_S
+    if v <= 0:
+        return 0.0
+    return max(REWARM_PERIOD_FLOOR_S, v)
+
+
+def rewarm_slow_s() -> float:
+    """GHOST_MAIN_PREFIX_REWARM_SLOW_S: the wall-clock FALLBACK threshold
+    (default 10 s, floored at 1 s) used only when the upstream reply carries
+    no usage block; the primary resident/evicted decision reads
+    `usage.prompt_tokens_details.cached_tokens` (review MAJOR-1: the clock
+    also measures queueing behind a foreground request)."""
+    raw = (os.getenv("GHOST_MAIN_PREFIX_REWARM_SLOW_S") or "").strip()
+    try:
+        return max(1.0, float(raw)) if raw else 10.0
+    except ValueError:
+        return 10.0
+
+
+def rewarm_verdict(resp, dt_s: float) -> Tuple[str, int, int]:
+    """("resident"|"evicted"|"unknown", cached_tokens, prompt_tokens) for a
+    re-warm reply: evicted when fewer than half the prompt tokens came from
+    the cache; unknown (then the clock decides) when the reply has no
+    usage block."""
+    try:
+        u = (resp or {}).get("usage") or {}
+        prompt = int(u.get("prompt_tokens") or 0)
+        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if prompt > 0 and cached is not None:
+            cached = int(cached)
+            return ("resident" if cached * 2 >= prompt else "evicted", cached, prompt)
+    except Exception:  # noqa: BLE001
+        pass
+    return ("unknown", 0, 0)
 
 
 class GhostAgent:
@@ -10238,7 +10409,7 @@ class GhostAgent:
             self._active_tool_defs_resolved = None
             self._xml_schema_cache.clear()
 
-    async def warm_up_main_prefix(self) -> None:
+    async def warm_up_main_prefix(self, *, quiet: bool = False) -> None:
         """Prefill the MAIN node's prompt cache with the byte-stable request
         head at boot, so the first user request doesn't pay it (2026-07-14).
 
@@ -10270,6 +10441,22 @@ class GhostAgent:
         and never escapes. Sibling of ``LLMClient.warm_up_workers`` (which
         covers the off-main nodes); wired in main.py at lifespan start,
         opt-out via GHOST_MAIN_PREFIX_WARMUP=0.
+
+        §4FM (2026-09-08): the warmed head does not stay warm. llama-server
+        saves a ~200 MiB prompt-cache entry (the hybrid model's recurrent
+        state) on EVERY slot release, `--cache-ram 6144` holds ~30 of them,
+        and the idle loop makes 2–4 requests a minute — so the head's entry
+        is evicted ~10 minutes after boot and every later user request
+        re-prefills ~26k tokens (measured: 28,767 prompt tokens, 0 cached,
+        34 s wall, 90 min after boot). `cache_prompt: false` on the churn
+        does not prevent the save (probed). The fix is to re-send the head
+        periodically (`rewarm_main_prefix_loop`) so its entry is always the
+        newest: a re-warm that finds the head resident costs one restore plus
+        a 2,048-token batch (~2 s of slot time); one that finds it evicted
+        pays the full prefill in the background instead of on the user's
+        turn. ``quiet=True`` keeps the two operator lines off the log unless
+        the re-warm took longer than GHOST_MAIN_PREFIX_REWARM_SLOW_S (10 s),
+        which means the entry HAD been evicted and is worth seeing.
         """
         try:
             llm = getattr(self.context, "llm_client", None)
@@ -10335,17 +10522,24 @@ class GhostAgent:
             _tools_h = hashlib.sha1(json.dumps(
                 payload.get("tools", []), sort_keys=True,
             ).encode("utf-8", "ignore")).hexdigest()[:8]
-            pretty_log(
-                "Main Prefix Warmup",
-                f"prefilling ~{_est_tokens} tokens of byte-stable request head "
-                f"(system slot + tool schemas) into the main node's cache · "
-                f"sys h={_sys_h} chars={len(warmed_sys)} · tools h={_tools_h}",
-                icon=Icons.BOOT_AWAKE,
-            )
+            if quiet:
+                logger.debug("main-prefix re-warm: ~%d tokens · sys h=%s · tools h=%s",
+                             _est_tokens, _sys_h, _tools_h)
+            else:
+                pretty_log(
+                    "Main Prefix Warmup",
+                    f"prefilling ~{_est_tokens} tokens of byte-stable request head "
+                    f"(system slot + tool schemas) into the main node's cache · "
+                    f"sys h={_sys_h} chars={len(warmed_sys)} · tools h={_tools_h}",
+                    icon=Icons.BOOT_AWAKE,
+                )
             # Generous timeout: this IS the ~70s prefill we're absorbing.
-            await llm.chat_completion(
+            # The clock starts HERE, after the foreground wait inside the
+            # client, so it measures the prefill and not the queue.
+            _t0 = time.time()
+            _resp = await llm.chat_completion(
                 payload, is_background=True, timeout=240.0,
-                task_label="main-prefix-warmup",
+                task_label="main-prefix-rewarm" if quiet else "main-prefix-warmup",
             )
             # §4N D-MAJOR-1 / R2 NIT-3: stash the warmed hash so the FIRST
             # live request can actually COMPARE (the two log lines existed
@@ -10353,17 +10547,91 @@ class GhostAgent:
             # after the prefill request succeeds — a failed warmup that
             # never touched the cache must not arm a comparison that would
             # then "verify" a prefill which never happened.
+            _dt = time.time() - _t0
+            if quiet:
+                # A re-warm does NOT re-arm the boot-time MISS check: that
+                # comparison fires once per boot by contract (review minor).
+                verdict, _cached, _prompt = rewarm_verdict(_resp, _dt)
+                if verdict == "unknown":
+                    verdict = "evicted" if _dt >= rewarm_slow_s() else "resident"
+                if verdict == "evicted":
+                    pretty_log(
+                        "Main Prefix Warmup",
+                        f"re-warm re-prefilled the head ({_cached} of {_prompt} tokens "
+                        f"cached, {_dt:.0f}s) — its cache entry had been evicted by "
+                        f"main-slot churn; a user turn in that window would have paid it",
+                        icon=Icons.WARN,
+                    )
+                else:
+                    logger.debug("main-prefix re-warm: head resident (%d/%d cached, %.1fs)",
+                                 _cached, _prompt, _dt)
+                return
             self.context._warmed_sys_hash = _sys_h
-            pretty_log(
-                "Main Prefix Warmup",
-                "done — warmed the byte-stable head; the first live request "
-                "verifies the match (a 'prefix warmup MISS' warning means it "
-                "did not).",
-                icon=Icons.OK,
-            )
+            if True:
+                pretty_log(
+                    "Main Prefix Warmup",
+                    "done — warmed the byte-stable head; the first live request "
+                    "verifies the match (a 'prefix warmup MISS' warning means it "
+                    "did not).",
+                    icon=Icons.OK,
+                )
         except Exception as e:  # noqa: BLE001 — warmup is best-effort
             logger.debug("main-prefix warmup skipped: %s: %s",
                          type(e).__name__, e)
+
+    async def _main_slot_metrics(self) -> Tuple[Optional[int], Optional[int]]:
+        """(requests_processing, prompt_tokens_total) from the main node's
+        Prometheus `/metrics` (llama-server `--metrics`); (None, None) when
+        unreachable or unparsable. Off-loop via a thread; 3 s cap."""
+        try:
+            llm = getattr(self.context, "llm_client", None)
+            base = str(getattr(llm, "upstream_url", "") or "")
+            if not base:
+                return (None, None)
+            base = re.sub(r"/v1(/.*)?$", "", base.rstrip("/"))
+            import urllib.request as _ur
+
+            def _fetch():
+                with _ur.urlopen(base + "/metrics", timeout=3.0) as r:
+                    return r.read().decode("utf-8", "replace")
+            text = await asyncio.to_thread(_fetch)
+            proc = total = None
+            for line in text.splitlines():
+                if line.startswith("llamacpp:requests_processing "):
+                    proc = int(float(line.split()[1]))
+                elif line.startswith("llamacpp:prompt_tokens_total "):
+                    total = int(float(line.split()[1]))
+            return (proc, total)
+        except Exception:  # noqa: BLE001
+            return (None, None)
+
+    async def rewarm_main_prefix_loop(self, period_s: float, *, sleep=None,
+                                      metrics=None) -> None:
+        """§4FM: every ``period_s`` seconds re-send the byte-stable head so
+        its prompt-cache entry stays the newest (see `warm_up_main_prefix`).
+        A tick is SKIPPED when the main slot is busy (`requests_processing`
+        > 0 — a coding leaf or a bench in flight; re-warming inside a burst
+        is the expensive, useless case, review MAJOR-2) or when nothing has
+        run since the last re-warm (`prompt_tokens_total` unchanged — the
+        head is still the newest entry). Metrics unreachable → re-warm, as
+        before. Runs until cancelled; each re-warm is best-effort and never
+        raises; ``is_background=True`` inside the warmup yields to any live
+        foreground request. ``sleep`` / ``metrics`` are injectable."""
+        _sleep = sleep or asyncio.sleep
+        _metrics = metrics or self._main_slot_metrics
+        last_total: Optional[int] = None
+        while True:
+            await _sleep(float(period_s))
+            proc, total = await _metrics()
+            if proc is not None and proc > 0:
+                logger.debug("main-prefix re-warm: skipped, main slot busy (%d in flight)", proc)
+                continue
+            if total is not None and last_total is not None and total == last_total:
+                logger.debug("main-prefix re-warm: skipped, nothing ran since the last one")
+                continue
+            await self.warm_up_main_prefix(quiet=True)
+            _, after = await _metrics()
+            last_total = after if after is not None else total
 
     # Allowlist of phrases that the trivial fast path is safe to intercept.
     # Anything not on this list (even a 1-word "test") falls through to the
@@ -10840,7 +11108,9 @@ class GhostAgent:
         # turn's scoped writes against the raw root — bare-spelled files
         # under the just-closed project read as missing (fail-closed, but
         # false). The first version fell back to `request_start_project_id`
-        # and an audit broke it twice: it is one shared never-cleared slot
+        # (the delete-eligibility gate's request-start snapshot; gate and
+        # slot were both removed 2026-09-06, journal §4FC) and an audit
+        # broke it twice: it was one shared never-cleared slot
         # (a CONCURRENT request's start overwrote it before this capture),
         # and a turn that started under A, switched to B, wrote under B and
         # closed B healed to A — refuting B's real files. The close path
@@ -11026,26 +11296,119 @@ class GhostAgent:
             if store is None or not pid:
                 return []
             proj = store.get_project(pid) or {}
-            raw = (proj.get("metadata") or {}).get("constraints") or []
+            _meta = proj.get("metadata") or {}
+            raw = _meta.get("constraints") or []
             # Model-written metadata can carry a bare string — iterating
             # it char-by-char replayed shredded garbage (review 2026-08-01).
             if isinstance(raw, str):
                 raw = [raw]
             cons = [str(c) for c in raw]
+            # §4FD provenance: only constraints a real user turn wrote are
+            # "user-mandated". Legacy rows carry no stamp and stay (they
+            # predate any non-user writer of this field); a stamped
+            # "auto" constraint (scheduled/job/sim turn) is not replayed
+            # to the verifier or the prompt.
+            _origins = _meta.get("constraint_origins") if isinstance(_meta, dict) else None
+            if isinstance(_origins, dict) and _origins:
+                cons = [c for c in cons if str(_origins.get(c, "user")) == "user"]
             return cons[:limit]
         except Exception:
             return []
 
-    def _active_project_constraints(self, limit: int = 5) -> List[str]:
-        """Stored constraints of the ACTIVE (conversation-bound) project."""
-        return self._project_constraints_for(
-            getattr(self.context, "current_project_id", None), limit)
+    def _select_system_prompt(self, body) -> str:
+        """The base system prompt for this request (§4FF).
 
-    def _active_constraint_note(self, limit: int = 5) -> str:
+        `SYSTEM_PROMPT` for every real turn — the warmup, the prefix-cache
+        pins and the GEPA loader all read that constant. The COMPILED
+        variant is served only to a DIAGNOSTIC PROBE that asked for it
+        (`X-Ghost-Prompt-Variant: compiled`, honoured by the route inside
+        its probe branch; the probe prefix is re-checked here so no other
+        path can flip a user's prompt). This is how the instruction-
+        following bench pairs the two prompts on identical items without
+        touching live traffic; a live arm would sit at this same seam."""
+        try:
+            want = str((body or {}).get("_prompt_variant") or "").strip().lower()
+            if want == "compiled":
+                from ..utils.logging import is_probe_request_id, request_id_context
+                if is_probe_request_id(request_id_context.get()):
+                    return SYSTEM_PROMPT_COMPILED
+        except Exception:  # noqa: BLE001 — the control prompt is the safe default
+            pass
+        return SYSTEM_PROMPT
+
+    def _evidence_gate_block(self, tools_run, req_id: str) -> str:
+        """The §4FD EVIDENCE CHECK steer for this turn, or "".
+
+        Fires only when the turn has consulted evidence and got none of it
+        (`core.evidence_gate`). Rendered under the live `evidence_gate`
+        experiment: the trigger is marked on BOTH arms (so the report can
+        condition on turns where it would have fired), the text ships on
+        the treatment arm only. Kill switch `GHOST_EVIDENCE_GATE=0`; an
+        unregistered/disabled experiment (no arm) is inert, like every
+        other arm-gated steer in this loop."""
+        if os.getenv("GHOST_EVIDENCE_GATE", "1").strip().lower() in (
+                "0", "false", "no", "off"):
+            return ""
+        try:
+            from .evidence_gate import steer_for_turn
+            steer, _assessment = steer_for_turn(tools_run)
+            if not steer:
+                return ""
+            from . import experiments as _eg_exp
+            _rid = str(req_id or request_id_context.get() or "")
+            arm = _eg_exp.arm_for(self.context, "evidence_gate", _rid)
+            if not arm:
+                return ""
+            treat = arm == _eg_exp.TREATMENT
+            _eg_exp.mark_trigger(self.context, _rid, "evidence_gate_fired", treat)
+            if not treat:
+                return ""
+            pretty_log("Evidence Gate",
+                       f"all {_assessment.consulted} retrieval(s) empty — "
+                       f"steering ({'; '.join(_assessment.empty[:3])})",
+                       icon=Icons.WARN)
+            return steer
+        except Exception:  # noqa: BLE001 — a steer must never break a turn
+            logger.debug("evidence gate skipped", exc_info=True)
+            return ""
+
+    def _active_project_constraints(self, limit: int = 5, *,
+                                    request_text: str) -> List[str]:
+        """Stored constraints of the ACTIVE (conversation-bound) project —
+        ONLY when ``request_text`` is about that project.
+
+        §4FD (2026-09-07): the active project's constraints were replayed
+        into every turn while the project stayed bound, so a project
+        carrying "Start with: What it means to BE ghost" had a weather
+        question ("how's the weather ?") REFUTED by the late verifier for
+        not starting with that phrase — three such false refutes in the
+        corpus, each a `failed` label that fed calibration, playbook credit
+        and postmortem selection. The gate is the ONE relevance authority
+        (`project_research.request_relevant_to_project`: lexical overlap
+        with the project, a command naming its directory, or a bare
+        continuation such as "proceed"). ``request_text`` is keyword-only
+        and REQUIRED so no caller can reach the pool ungated — the
+        enumeration in `tests/test_4fd_constraint_scoping.py` walks every
+        call site."""
+        pid = getattr(self.context, "current_project_id", None)
+        if not pid:
+            return []
+        try:
+            store = getattr(self.context, "project_store", None)
+            if store is not None and not self._request_relevant_to_project(
+                    store, pid, request_text or ""):
+                return []
+        except Exception:  # noqa: BLE001 — relevance is best-effort, fail OPEN
+            pass
+        return self._project_constraints_for(pid, limit)
+
+    def _active_constraint_note(self, limit: int = 5, *,
+                                request_text: str) -> str:
         """Explicit user constraints stored on the active project, rendered
         as a short prefix for the verifier's request view. Empty string when
-        no project is active or the project carries no constraints."""
-        cons = self._active_project_constraints(limit)
+        no project is active, the project carries no constraints, or the
+        request is not about the project (§4FD scoping)."""
+        cons = self._active_project_constraints(limit, request_text=request_text)
         if not cons:
             return ""
         return ("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): "
@@ -11076,7 +11439,7 @@ class GhostAgent:
         merged = list(request_constraints or [])
         seen = {c.lower() for c in merged}
         added = 0
-        pools = [self._active_project_constraints()]
+        pools = [self._active_project_constraints(request_text=user_text or "")]
         referenced = list(dict.fromkeys(re.findall(
             r"\bprojects/([0-9a-f]{6,32})\b", (user_text or "").lower())))
         for pid in referenced[:3]:
@@ -11283,7 +11646,8 @@ class GhostAgent:
         # highest-priority check, so they must ride along here. Prepended,
         # not appended: the call sites truncate context to 1000 chars and a
         # tail-note would be the first thing cut.
-        constraint_note = self._active_constraint_note()
+        constraint_note = self._active_constraint_note(
+            request_text=last_user_content or "")
         request_view = constraint_note + (last_user_content or "")
         v_result = None
         tool_output = str(last_tool.get("content", ""))[:4000]
@@ -12335,10 +12699,15 @@ class GhostAgent:
         )
 
     @staticmethod
-    def _compose_injection(req_messages, stable_injection, dynamic_state, pin):
+    def _compose_injection(req_messages, stable_injection, dynamic_state, pin,
+                           pending_request=""):
         """Place the per-turn stable + volatile context into ``req_messages``.
 
-        Returns the (mutated) list. The per-turn injection has two parts:
+        Returns the (mutated) list. ``pending_request`` is the CURRENT
+        request's text; every volatile block is rendered by
+        ``_render_volatile_block`` and opens with "not from the user, this
+        request is still pending" — see that function for the live failure
+        (req 2422eb25) a lone trailing user-role block produced. The per-turn injection has two parts:
         a large STABLE block (tool schemas + persona + playbook + hydrated
         memory + continuity — byte-identical across the turns of one
         request) and a small VOLATILE ``dynamic_state`` (timestamp /
@@ -12375,15 +12744,14 @@ class GhostAgent:
                 original_msg = req_messages[-1]["content"]
                 req_messages[-1]["content"] = _prefix_content(
                     original_msg,
-                    f"<system_state_update>\n{transient_injection}\n(CRITICAL: This is "
-                    "internal system state. Do NOT acknowledge or comment on this block in "
-                    "your thoughts. Focus entirely on the user instruction.)\n"
-                    "</system_state_update>\n\n[USER INSTRUCTION]"
+                    _render_volatile_block(transient_injection, pending_request)
+                    + "\n\n[USER INSTRUCTION]",
                 )
             else:
                 req_messages.append({
                     "role": "user",
-                    "content": f"<system_state_update>\n{transient_injection}\n</system_state_update>",
+                    "content": _render_volatile_block(transient_injection,
+                                                      pending_request),
                 })
             return req_messages
 
@@ -12392,12 +12760,7 @@ class GhostAgent:
             "(CRITICAL: internal system state — do NOT acknowledge or comment on this "
             "block; focus entirely on the user instruction.)\n</session_context>"
         )
-        volatile_block = (
-            f"<system_state_update>\n{dynamic_state.strip()}\n"
-            "(CRITICAL: This is internal system state. Do NOT acknowledge or comment on "
-            "this block in your thoughts. Focus entirely on the user instruction.)\n"
-            "</system_state_update>"
-        )
+        volatile_block = _render_volatile_block(dynamic_state, pending_request)
         first_user_idx = next(
             (i for i, m in enumerate(req_messages) if m.get("role") == "user"), None,
         )
@@ -13218,6 +13581,10 @@ class GhostAgent:
             sm = getattr(self.context, "skill_memory", None)
             triggers = [t for t in (surfaced_triggers or []) if t]
             if sm is None or not triggers:
+                return
+            # §4FB: diagnostics never teach — no outcome credit (and no
+            # late-verdict stash, which is written below) for a probe turn.
+            if turn_origin(self.context) == "probe":
                 return
             rec = getattr(sm, "record_surfaced_outcomes", None)
             if not callable(rec):
@@ -18195,7 +18562,8 @@ class GhostAgent:
                 reply_satisfies_start_with as _rssw_fn,
                 extract_constraints as _exc_fn)
             _sw_constraints = (list(_exc_fn(last_user_content or ""))
-                               + self._active_project_constraints())
+                               + self._active_project_constraints(
+                                   request_text=last_user_content or ""))
             _enforced, _sw_dropped = enforce_start_with(
                 final_ai_content, _sw_constraints)
             if _sw_dropped:
@@ -19764,6 +20132,12 @@ class GhostAgent:
             # operator decision admits them (origin="bench", equal-mass
             # capped in the fit). Plain self-play stays excluded.
             _calib_origin = turn_origin(self.context)
+            # §4FB: diagnostics never calibrate. Live-measured 2026-09-06:
+            # a header-marked probe passed this carve-out (its skill memory
+            # is the live one) and landed a calibration row stamped
+            # origin="user" — the population the instrument exists to score.
+            if _calib_origin == "probe":
+                return
             if (getattr(getattr(self.context, "skill_memory", None),
                         "is_read_only", False) is True
                     and _calib_origin != "bench"):
@@ -20068,6 +20442,15 @@ class GhostAgent:
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
+        # §4EZ (2026-09-06): the turn's POPULATION rides a second contextvar
+        # so every pretty_log line of this turn — including the ones below
+        # that precede the BEGIN frame, and the spawn_bg work that inherits
+        # the context and keeps logging after END — renders in the origin's
+        # colour family. Derived ONCE here; the BEGIN frame stamps the same
+        # value (a private second derivation is how the frame and the
+        # liveness count came to disagree in the first place).
+        _turn_origin = turn_origin(self.context)
+        _origin_token = request_origin_context.set(_turn_origin)
         self.context.last_activity_time = datetime.datetime.now()
 
         # Continuous self-play interrupt: if a `self_play_loop` task is
@@ -20126,7 +20509,7 @@ class GhostAgent:
                     raise TurnCancelled(req_id, _active_turn.reason)
                 char_budget = int(self.context.args.max_context * 3.5)
                 pretty_log("Request Initialized", special_marker="BEGIN",
-                           origin=turn_origin(self.context))
+                           origin=_turn_origin)
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
 
                 # Pre-allocate the trajectory id for THIS turn. Several
@@ -20321,17 +20704,6 @@ class GhostAgent:
                 # try/finally whose disarm (§ context R3) is the universal one.
                 # Removing this line survived 2,607 tests; the enumeration is
                 # pinned in tests/test_4ec_read_budget_enumeration.py.
-                # Snapshot the project that was active when THIS user message
-                # arrived — the delete-eligibility gate in tools.projects
-                # only honours a bare "delete it" against this project. A
-                # project the agent creates mid-request was never seen by
-                # the user and therefore can't be what "it" refers to
-                # (observed live: one "delete it and make something else"
-                # cascaded into six hard deletes, five of them of projects
-                # created seconds earlier in the same request).
-                self.context.request_start_project_id = getattr(
-                    self.context, "current_project_id", None)
-
                 # Replay the bound project's stored constraints into THIS
                 # request's constraint set (arming the post-write steer and
                 # the dynamic-state block). Placed AFTER the conversation⇄
@@ -20652,7 +21024,8 @@ class GhostAgent:
                 # the live system state, rather than the start.
                 continuity_blocks = []
 
-                base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_context)
+                base_prompt = self._select_system_prompt(body).replace(
+                    "{{PROFILE}}", profile_context)
 
                 # Selfhood wake-up prefix (recognition layer, proposal item #4).
                 # Splices the agent's own past — autobiographical
@@ -22153,10 +22526,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _tool_names = ", ".join(
                             t["function"]["name"] for t in all_tools
                         ) or "(none)"
+                        # §4FE: under the tool head diet the list is the
+                        # core set; say where the rest live.
+                        try:
+                            from ..tools.registry import tool_head_diet_enabled as _thd
+                            _diet_hint = (" Rarely-needed tools are listed by "
+                                          "tool_catalog(action='list')."
+                                          if _thd() else "")
+                        except Exception:  # noqa: BLE001
+                            _diet_hint = ""
                         _native_pointer = (
                             f"(Tool schemas are advertised via the native "
                             f"`tool_calls` API on this request. Available "
-                            f"tools: {_tool_names}.)"
+                            f"tools: {_tool_names}.{_diet_hint})"
                         )
                         # QWEN_TOOL_PROMPT_NATIVE, not QWEN_TOOL_PROMPT
                         # (2026-07-31): splicing the legacy XML format rules
@@ -22271,6 +22653,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # first appears). Deterministic extraction, no LLM call.
                     if _request_constraint_block:
                         dynamic_state += _request_constraint_block + "\n\n"
+                    # §4FD EVIDENCE CHECK: when every retrieval so far this
+                    # turn came back empty/weak/errored, say so before the
+                    # model answers (experiment arm `evidence_gate`).
+                    _eg_block = self._evidence_gate_block(
+                        tools_run_this_turn, req_id)
+                    if _eg_block:
+                        dynamic_state += _eg_block + "\n\n"
                     # Re-assert the wrap-up gate every iteration: once a project
                     # task was closed this request, the turn must converge to a
                     # final answer (no further tool calls / no next task).
@@ -22478,6 +22867,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # final-gen assembly above depends on it.)
                     req_messages = self._compose_injection(
                         req_messages, _stable_injection, dynamic_state, _pin_stable,
+                        # The CURRENT request (not the session's first message):
+                        # the block quotes it so a lone trailing state message
+                        # can never read as "no pending question" (req 2422eb25).
+                        pending_request=last_user_content,
                     )
 
                     # Precise sampling for any tool-using turn; warm/creative
@@ -24145,12 +24538,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         else (_vr.reasoning
                                               or "the answer was not supported by the evidence")
                                     )
-                                    _directive = (
-                                        "SYSTEM ALERT — the verifier REFUTED your previous "
-                                        f"answer: {_crit}. Do NOT repeat the same claim. "
-                                        "Diagnose the underlying problem and FIX it using tools "
-                                        "(run / test / inspect the ACTUAL result), then give a "
-                                        "corrected final answer grounded in that evidence."
+                                    _directive = _render_refute_directive(
+                                        _crit,
+                                        # The CURRENT request: the repair turn is
+                                        # exactly where 2422eb25 lost track of it.
+                                        pending_request=last_user_content,
                                     )
                                     _do_repair = True
                                 elif _unverified:
@@ -24468,6 +24860,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
             pretty_log("Request Finished", special_marker="END")
             request_id_context.reset(token)
+            try:
+                request_origin_context.reset(_origin_token)
+            except Exception:  # noqa: BLE001 — cross-context reset; never break the finally
+                pass
 
     # Banners this agent DETERMINISTICALLY prepends to a reply, all sharing
     # this exact separator and all stacked in FRONT of the answer body:
@@ -26655,6 +27051,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         2026-07-15). Defers (bounded) to an in-flight deferred verifier
         verdict so the two never contend for the worker node at the same
         instant — see the stagger comment below. Never raises."""
+        # §4FB: diagnostics never teach — a probe turn must not credit or
+        # observe the memories it surfaced (the judge feeds helpful_retrievals
+        # and the RRF refit ledger).
+        if turn_origin(self.context) == "probe":
+            return
         bus = getattr(self.context, "memory_bus", None)
         stash = getattr(bus, "last_hydration", None) if bus is not None else None
         if not stash:
@@ -27199,9 +27600,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # the attribute, so real turns keep the default. isinstance
             # gate, not truthiness: a MagicMock context auto-vivifies the
             # attribute (the test-harness convention throughout this file).
-            task_kind=(_tk if isinstance(
-                (_tk := getattr(self.context, "trajectory_task_kind", None)),
-                str) and _tk else "user_request"),
+            # §4FB: a diagnostic probe is its own kind. `admitted_task_kinds`
+            # never lists it, so every trajectory reader — reflection first —
+            # excludes probe rows by construction.
+            task_kind=("probe" if turn_origin(self.context) == "probe" else
+                       (_tk if isinstance(
+                           (_tk := getattr(self.context, "trajectory_task_kind", None)),
+                           str) and _tk else "user_request")),
             cluster=None,
             tier=None,
             model=str(model or ""),

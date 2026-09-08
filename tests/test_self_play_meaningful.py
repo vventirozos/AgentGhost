@@ -264,8 +264,13 @@ class TestReflectorFailedOnly:
     context sets trajectory_collector=None, so no self_play trajectories
     reach the collector. A pass is never reflectable."""
 
-    def _make_traj(self, *, outcome: str, novelty=None, kind: str = "self_play"):
-        # Build a minimal Trajectory-like duck for _is_reflectable.
+    def _make_traj(self, *, outcome: str, novelty=None, kind: str = "user_request"):
+        # Build a minimal Trajectory-like duck for _is_reflectable. The kind
+        # defaults to the ONE population reflection admits (§4FB: reflection
+        # is REAL_ONLY, so bench / self_play / probe FAILED rows are not
+        # reflectable — see tests/test_probe_origin_never_teaches.py); the
+        # docstring above already records that self_play rows never reach
+        # the collector, so nothing here depended on that kind.
         t = MagicMock()
         t.outcome = outcome
         t.task_kind = kind

@@ -365,6 +365,23 @@ class Reflector:
         # yield transient tooling trivia, not task knowledge.
         if _is_recovery_scaffold(traj):
             return False
+        # §4FB (2026-09-06): only ADMITTED populations teach. Reflection is
+        # a REAL_ONLY consumer (core/admissibility), so a bench, self-play,
+        # reflection or PROBE trajectory in the corpus must never mint a
+        # lesson. Playbook lesson [49] ("Use deep_research ONCE on the
+        # query … do not read files", 37 retrievals into unrelated turns)
+        # was minted from a diagnostic probe sent through the user path
+        # before probes carried their own task_kind. Fails CLOSED: a
+        # teaching gate that cannot decide must teach nothing.
+        try:
+            from ..core.admissibility import admitted_task_kinds
+            kinds = admitted_task_kinds("reflection")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reflection: admissibility unavailable (%s) — "
+                           "reflecting nothing", exc)
+            return False
+        if str(getattr(traj, "task_kind", "") or "") not in kinds:
+            return False
         return traj.outcome == Outcome.FAILED.value
 
     async def _reflect_one(self, traj: Trajectory) -> ReflectionOutcome:

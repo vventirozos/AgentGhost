@@ -23,7 +23,7 @@ These are runtime templates (like ``reflection/prompts.py``), kept out of
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import List, Optional
 
 from ..distill.schema import Trajectory, ToolCall
 from .prompts import _truncate, _summarize_tool_calls
@@ -69,8 +69,17 @@ Final response / failure reason:
 Structural evidence (computed, not guessed):
 {evidence}
 
-Full transcript:
+{contrast}Full transcript:
 {transcript}
+"""
+
+CONTRAST_TEMPLATE = """\
+CONTRAST — a SIMILAR request that SUCCEEDED (use it: what did this run do \
+differently, and which difference caused the failure?):
+  request: {sibling_request}
+  tools: {sibling_tools}
+  reply (head): {sibling_reply}
+
 """
 
 
@@ -131,12 +140,28 @@ def _full_transcript(traj: Trajectory, *, per_call_limit: int = 320, max_calls: 
     )
 
 
+def render_contrast(sibling: Optional[Trajectory]) -> str:
+    """The §4FD CONTRAST block for a passing sibling, or "" when none.
+    Bounded: the sibling is context, not a second transcript."""
+    if sibling is None:
+        return ""
+    names = [str(getattr(c, "name", "") or "") for c in (getattr(sibling, "tool_calls", None) or [])]
+    names = [n for n in names if n]
+    tools = ", ".join(names[:12]) + (f" (+{len(names) - 12})" if len(names) > 12 else "")
+    return CONTRAST_TEMPLATE.format(
+        sibling_request=_truncate(getattr(sibling, "user_request", "") or "(missing)", 400),
+        sibling_tools=tools or "(none)",
+        sibling_reply=_truncate(getattr(sibling, "final_response", "") or "(none)", 400),
+    )
+
+
 def build_postmortem_prompt(
     trajectory: Trajectory,
     signature,
     *,
     max_user_request: int = 1000,
     max_failure_reason: int = 800,
+    sibling: Optional[Trajectory] = None,
 ) -> str:
     user_request = _truncate(trajectory.user_request or "(missing)", max_user_request)
     failure_reason = _truncate(
@@ -149,6 +174,7 @@ def build_postmortem_prompt(
         user_request=user_request,
         failure_reason=failure_reason,
         evidence=evidence,
+        contrast=render_contrast(sibling),
         transcript=transcript,
     )
 

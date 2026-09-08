@@ -33,6 +33,7 @@ from .workspace import tool_workspace
 from .workspace_track import tool_workspace_track
 from .uncertainty_tool import tool_flag_uncertainty
 
+import json
 import logging
 import os
 import re
@@ -212,10 +213,37 @@ def _warn_once(key: str, message: str) -> None:
         logger.warning(message)
 
 
+# Sentences a tuned description must keep VERBATIM, per tool — the
+# exclusions the operator MEASURED into the text (§4FJ: `workspace` was
+# picked 98× with the truth being `workspace` once). A description optimiser
+# rewrites toward the reward and drops exactly these clauses first
+# ([[optimizer-sheds-pinned-rules]]). Explicit and reviewable on purpose: a
+# blanket "every NEVER/ONLY sentence" rule constrained 15 of 39 tools and
+# broke the tuning contract the read-site invariants pin (§4FK). Every entry
+# is checked against the live baseline by tests/test_4fj_… so it cannot drift.
+TOOL_DESC_PINNED: Dict[str, List[str]] = {
+    "workspace": [
+        "It cannot read, write, edit, build, fix, run or continue anything.",
+        "NEVER call this to work on files, code, games, pages, apps or projects, "
+        "to fix a bug, to add a feature, or to proceed with a project's next task",
+    ],
+}
+
+
+def _pinned_sentences(name: str, text: str = "") -> List[str]:
+    """The pinned sentences for tool ``name`` that actually occur in
+    ``text`` (the baseline). A pin that no longer occurs in the baseline is
+    a drift bug the test catches; here it simply does not constrain."""
+    pins = TOOL_DESC_PINNED.get(name) or []
+    return [p for p in pins if p in str(text or "")]
+
+
 def _validate_tool_description(name: str, baseline: str, candidate) -> bool:
     """Placeholder-probe analogue for descriptions: a tuned description must
-    be a non-empty string of sane size. The cap guards the KV-pinned tools
-    block — a runaway description silently inflates every request's prefix."""
+    be a non-empty string of sane size, and it must keep the baseline's
+    pinned sentences (see `_pinned_sentences`) verbatim. The size cap guards
+    the KV-pinned tools block — a runaway description silently inflates
+    every request's prefix."""
     if not isinstance(candidate, str):
         return False
     c = candidate.strip()
@@ -223,6 +251,9 @@ def _validate_tool_description(name: str, baseline: str, candidate) -> bool:
         return False
     if len(c) > max(6000, 3 * len(baseline or "")):
         return False
+    for sent in _pinned_sentences(name, baseline):
+        if sent not in c:
+            return False
     return True
 
 
@@ -646,10 +677,10 @@ TOOL_DEFINITIONS = [
     NOTIFY_OPERATOR_TOOL_DEFINITION,
     {"type": "function", "function": {"name": "learn_skill", "description": "MANDATORY when you solve a complex bug or task after initial failure. Save the lesson so you don't repeat the mistake.", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "mistake": {"type": "string"}, "solution": {"type": "string"}}, "required": ["task", "mistake", "solution"]}}},
     {"type": "function", "function": {"name": "flag_uncertainty", "description": "Register what you DON'T know or are unsure about with your metacognitive tracker. Call action='unknown' when you need a fact you don't have (set impact 1-5 — 4+ means it materially affects correctness; resolution tells how to get it: 'ask user', 'search web', 'read file'). Call action='assumption' when you are proceeding on a belief you have NOT verified (set confidence 0.0-1.0). action='list' shows what is currently flagged plus recurring blind-spots from past turns. A critical unknown (impact>=4, resolution='ask user') triggers a clarification prompt before your answer is finalized — so flag honestly rather than guessing. Everything flagged persists, so questions you keep hitting become visible as recurring blind-spots.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["unknown", "assumption", "list"]}, "text": {"type": "string", "description": "For action='unknown': what you don't know. For action='assumption': the unverified belief."}, "impact": {"type": "integer", "minimum": 1, "maximum": 5, "description": "For action='unknown': how much not knowing this affects correctness (1 minor, 5 critical)."}, "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "For action='assumption': how confident you are in the belief (0.0-1.0)."}, "resolution": {"type": "string", "description": "For action='unknown': how to resolve it — 'ask user', 'search web', 'read file', etc."}, "basis": {"type": "string", "description": "For action='assumption': why you believe it."}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "workspace", "description": "READ-ONLY view of the user's WORKSPACE state — what's outside of you (files, scheduled-task outcomes, research artifacts you've pulled, commands you ran). This is the world-model counterpart to introspect (which reads your selfhood). Use this when the user asks 'what changed since yesterday?', 'what did my scheduled task do?', 'have I already pulled this URL?', 'show me what you've been doing in my project'. Distinct from: introspect (your own selfhood), file_system (one-shot reads of the filesystem), recall (vector search over ingested docs). Actions: 'summary' (default; stats + narrative + recent changes + recent tasks/research); 'stats' (counts); 'files' (the watchlist); 'changes' (diff tracked files against last-seen snapshot); 'tasks' (recent scheduled-task outcomes); 'research' (URLs you've already pulled); 'commands' (significant command outcomes); 'narrative' (the running workspace summary); 'recent' (the activity log, mixed kinds); 'search' (keyword search over the activity log — pass 'query').", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "files", "changes", "tasks", "research", "commands", "narrative", "recent", "search"], "description": "Default 'summary' if omitted."}, "limit": {"type": "integer", "description": "For tasks/research/commands/recent/search: how many entries to return. Defaults to 10; capped at 50."}, "query": {"type": "string", "description": "For action='search': keywords to find in past workspace events (filenames, commands, URLs, task names)."}}, "required": []}}},
-    {"type": "function", "function": {"name": "workspace_track", "description": "WRITE path into the WORKSPACE state — author the watchlist of files to track, free-form workspace notes, and manual research dedup markers. Counterpart to the read-only workspace tool. Actions: 'track' (add a file path to the watchlist; optional 'label' for a human descriptor); 'untrack' (remove a path); 'note' (record a free-form workspace observation); 'mark_seen' (record a URL as already-pulled so future research dedups against it). Tracked files get a stat-cache diff on every wake-up, so 'track' is how you get 'what changed in this file since last session' to surface automatically.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["track", "untrack", "note", "mark_seen"]}, "path": {"type": "string", "description": "For track/untrack: the file path to add/remove from the watchlist."}, "label": {"type": "string", "description": "Optional for track: a short human descriptor (e.g. 'main config', 'experiment log')."}, "text": {"type": "string", "description": "Required for note: the free-form observation."}, "url": {"type": "string", "description": "Required for mark_seen: the URL to record as already-pulled."}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "workspace", "description": "READ-ONLY ACTIVITY LEDGER of the user's workspace — a record of what ALREADY HAPPENED: which TRACKED files changed since the last snapshot, what scheduled tasks concluded, which URLs research already pulled, which significant commands ran. It cannot read, write, edit, build, fix, run or continue anything. NEVER call this to work on files, code, games, pages, apps or projects, to fix a bug, to add a feature, or to proceed with a project's next task — those are file_system (read/write/edit files), execute (run commands), browser (web pages and UIs), manage_projects (project tasks, advancing the current one). Call this ONLY for questions about history: 'what changed since yesterday?', 'what did my scheduled task do?', 'have I already pulled this URL?', 'which commands ran overnight?'. World-model counterpart of introspect (which reads your own selfhood); distinct from recall (vector search over ingested docs). Actions: 'summary' (default; stats + narrative + recent changes + recent tasks/research); 'stats' (counts); 'files' (the watchlist); 'changes' (diff tracked files against last-seen snapshot); 'tasks' (recent scheduled-task outcomes); 'research' (URLs you've already pulled); 'commands' (significant command outcomes); 'narrative' (the running workspace summary); 'recent' (the activity log, mixed kinds); 'search' (keyword search over the activity log — pass 'query').", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "files", "changes", "tasks", "research", "commands", "narrative", "recent", "search"], "description": "Default 'summary' if omitted."}, "limit": {"type": "integer", "description": "For tasks/research/commands/recent/search: how many entries to return. Defaults to 10; capped at 50."}, "query": {"type": "string", "description": "For action='search': keywords to find in past workspace events (filenames, commands, URLs, task names)."}}, "required": []}}},
+    {"type": "function", "function": {"name": "workspace_track", "description": "WRITE path into the workspace ACTIVITY LEDGER — author the watchlist of files to track, free-form workspace notes, and manual research dedup markers. Counterpart to the read-only workspace tool (which only reads that ledger; neither does file work). Actions: 'track' (add a file path to the watchlist; optional 'label' for a human descriptor); 'untrack' (remove a path); 'note' (record a free-form workspace observation); 'mark_seen' (record a URL as already-pulled so future research dedups against it). Tracked files get a stat-cache diff on every wake-up, so 'track' is how you get 'what changed in this file since last session' to surface automatically.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["track", "untrack", "note", "mark_seen"]}, "path": {"type": "string", "description": "For track/untrack: the file path to add/remove from the watchlist."}, "label": {"type": "string", "description": "Optional for track: a short human descriptor (e.g. 'main config', 'experiment log')."}, "text": {"type": "string", "description": "Required for note: the free-form observation."}, "url": {"type": "string", "description": "Required for mark_seen: the URL to record as already-pulled."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "introspect", "description": "READ-ONLY introspection over your OWN selfhood and your own background systems — mood (with its evidence), open questions, your running first-person diary, recent experiences INCLUDING what you answered, what you learned, what ran while the user was away, how your experiments are going. YOU MUST call this before answering anything about yourself: never answer 'how are you' / 'how are you feeling' / 'how's things' / 'how are things going' / 'what have you been doing' / 'what did you do while I was away' from nothing. Distinct from: system_utility (the MACHINE's CPU/RAM/disk/services — NOT you; call it only when the user asks about the machine), self_state (AUTHORS open questions / threads / mood for the next session), knowledge_base (facts about the world), update_profile (facts about the USER), list_lessons (the lesson playbook). Actions: 'overview' (THE one-call briefing for 'how are you' / 'how are you feeling' / 'how's things' / 'give me a briefing / status report': mood with evidence, open questions, the last 24h of background work led by what changed, learning and experiment headlines, pending post-mortem defects, workspace changes — bounded to ~3KB); 'summary' (tell me about yourself: stats + open questions + diary + principles + recent experiences); 'stats' (counts and the topic cluster mix); 'narrative' (just the running diary); 'recent' (the last N first-person experiences — session boots excluded, repeated requests collapsed; optional 'hours' window); 'recall' (relevance-ranked search over your past, IDF-weighted over the request AND your answer, no embeddings — pass 'query'; THE answer to 'what do you remember about X'); 'activity' (the background-activity ledger: dream/REM cycles, PRM/router/calibration retrains, skills graduated, self-play, scheduled-task conclusions — THE answer to 'what did you do while I was away?' / 'what ran in the background?'; default is a kind-grouped brief that leads with notify-severity changes, verbose=true for the line-by-line ledger; optional 'hours' and 'limit'); 'experiments' (LIVE RANDOMIZED ARMS — THE answer to 'did that change actually help?' / 'what are the experiment results?'; default is a brief with one verdict label per metric, section='<experiment name>' for one experiment with its intervals, verbose=true for everything); 'learning' (learning-loop health telemetry — THE answer to 'is my learning actually working?' / 'how are your lessons doing?'; default is the headline brief that lists its section names, section='<name>' for one block, verbose=true for the full report). Selfhood actions route through your SelfModel; 'activity', 'learning', 'experiments' and the non-selfhood parts of 'overview' read the background ledger and learning stores directly. Nothing here writes.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["overview", "summary", "stats", "narrative", "recent", "recall", "activity", "learning", "experiments"], "description": "Default 'summary' if omitted. Use 'overview' for any how-are-you / briefing question."}, "query": {"type": "string", "description": "Required for action='recall': what to search your past for (e.g. 'postgres migrations', 'the trapdoor question'). Matches the request and your answer."}, "limit": {"type": "integer", "description": "For action='recent'/'recall': how many results (default 5, cap 25). For action='activity' with verbose=true: how many ledger lines (default 30, cap 100)."}, "hours": {"type": "number", "description": "For action='activity': look-back window in hours (default 24; capped at 336 = 14 days). For action='recent': keep only experiences younger than this."}, "verbose": {"type": "boolean", "description": "For action='activity'/'learning'/'experiments': true = the full untrimmed report (line-by-line ledger, every learning block, every experiment interval). Default false = the brief."}, "section": {"type": "string", "description": "For action='learning'/'experiments': expand ONE block of the report by name (e.g. 'calibration', 'lessons', or an experiment name like 'foresight_note'); the brief lists the available names."}}, "required": []}}},
-    {"type": "function", "function": {"name": "postmortem", "description": "READ-ONLY view of your post-mortem DEFECT QUEUE — the durable, classified findings your idle-time post-mortem engine files after analysing the whole transcript of your worst FAILED runs. Use this when asked 'what have you found broken in yourself?', 'what defects are open?', 'show me the post-mortem of that bad run', or to review a proposed fix before it's applied by a human. Each defect is one of: 'behavioural' (you chose badly — already routed to a lesson), 'configuration' (a flag/threshold let it through), or 'code_defect' (a tool/loop is broken — may carry a proposed reproducing test + diff, stored for review, NEVER auto-applied). Distinct from: introspect (your selfhood/diary), workspace (the user's world). Actions: 'pending' (default; open defects, worst first); 'list' (all, any status); 'show' (full detail incl. any proposed test/patch — pass 'defect_id'); 'stats' (counts by category/status).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["pending", "list", "show", "stats"], "description": "Default 'pending' if omitted."}, "defect_id": {"type": "string", "description": "Required for action='show': the defect id (or an id-prefix) from a 'pending'/'list' result."}, "limit": {"type": "integer", "description": "For 'pending'/'list': how many to return. Defaults to 10; capped at 25."}}, "required": []}}},
+    {"type": "function", "function": {"name": "postmortem", "description": "READ-ONLY view of your post-mortem DEFECT QUEUE — the durable, classified findings your idle-time post-mortem engine files after analysing the whole transcript of your worst FAILED runs. Use this when asked 'what have you found broken in yourself?', 'what defects are open?', 'show me the post-mortem of that bad run', or to review a proposed fix before it's applied by a human. Each defect is one of: 'behavioural' (you chose badly — already routed to a lesson), 'configuration' (a flag/threshold let it through), or 'code_defect' (a tool/loop is broken — may carry a proposed reproducing test + diff, stored for review, NEVER auto-applied). Distinct from: introspect (your selfhood/diary), workspace (the user's activity ledger). Actions: 'pending' (default; open defects, worst first); 'list' (all, any status); 'show' (full detail incl. any proposed test/patch — pass 'defect_id'); 'stats' (counts by category/status).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["pending", "list", "show", "stats"], "description": "Default 'pending' if omitted."}, "defect_id": {"type": "string", "description": "Required for action='show': the defect id (or an id-prefix) from a 'pending'/'list' result."}, "limit": {"type": "integer", "description": "For 'pending'/'list': how many to return. Defaults to 10; capped at 25."}}, "required": []}}},
     {"type": "function", "function": {"name": "self_state", "description": "Author your OWN cross-session continuity state — the open questions, unfinished threads, and mood you carry from this session into the next. This is YOUR forward-looking self, not facts about the world. Use it when you finish a turn but something is left unresolved that the next session of you should pick up. Distinct from: knowledge_base (facts/documents), update_profile (facts about the USER), scratchpad (notes for THIS conversation only). action='note_question' records something you are still trying to figure out; 'resolve_question' marks one answered; 'add_unfinished' notes a task left mid-flight; 'close_unfinished' completes one; 'set_mood' records your current functional state (e.g. 'curious', 'stuck', 'satisfied') — note the system also DERIVES your mood automatically from real signals (verdict streaks, context pressure, idle time): your self-noted mood is honoured for ~6h, after which the derived reading may replace it, and any mood is dropped from your continuity view once ~48h old, so set_mood is for a genuine current self-assessment, not a durable note (use note_question/add_unfinished for those); 'note_principle' records an operating principle — how you CHOOSE to work (e.g. 'I verify before asserting', 'I prefer reversible actions') — surfaced in your wake-up prefix every session to shape your behaviour; 'list' shows what is currently on file. Whatever you record here is shown to you at the start of your next session.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["note_question", "resolve_question", "add_unfinished", "close_unfinished", "set_mood", "note_principle", "list"]}, "text": {"type": "string", "description": "For note_question/add_unfinished/note_principle: the question, thread, or principle text. For resolve_question/close_unfinished: the id (or id-prefix, or a text substring) of the item to close."}, "mood": {"type": "string", "description": "Required for set_mood: a short functional-state label (e.g. 'curious', 'stuck', 'satisfied')."}, "evidence": {"type": "string", "description": "Optional for set_mood: one sentence on why."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "web_search", "description": "Search the internet (Anonymous via Tor). ALWAYS use this FIRST for simple factual questions and general web searches. CRITICAL: Keep your queries concise and keyword-focused (e.g., 'PostgreSQL 16 release notes'). DO NOT use long conversational sentences. PLAIN KEYWORDS ONLY — do NOT use search operators like 'site:', quoted \"exact phrases\", or boolean OR/AND. The search runs over Tor against scraper backends (DuckDuckGo, Brave, Mojeek) that DO NOT honour those operators; including them returns ZERO results. To bias toward an official source, just add its name as a keyword (e.g. 'python asyncio docs' or 'numpy wikipedia'), not 'site:python.org'.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "deep_research", "description": "Performs deep analysis by searching multiple sources and synthesizing a report. Use this ONLY for complex topics or if web_search fails. Do NOT use for simple factual questions (e.g. 'when was IBM founded'). CRITICAL: Keep your queries concise and keyword-focused (e.g., 'PostgreSQL 16 release notes'). DO NOT use long conversational sentences. PLAIN KEYWORDS ONLY — do NOT use search operators like 'site:', quoted \"exact phrases\", or boolean OR/AND. The search runs over Tor against scraper backends (DuckDuckGo, Brave, Mojeek) that DO NOT honour those operators; including them returns ZERO results. To bias toward an official source, add its name as a keyword (e.g. 'numpy wikipedia'), not 'site:numpy.org'.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
@@ -1151,7 +1182,8 @@ CONDITIONALLY_ADVERTISED_BUILTIN_NAMES = frozenset({
 
 def get_active_tool_definitions(context, query: str = None, *,
                                 serve_tuned: bool = True,
-                                disabled=None):
+                                disabled=None,
+                                apply_diet: bool = True):
     """The advertised tool set.
 
     ⚠ `serve_tuned=False` FOR ANY CALLER THAT IS NOT BUILDING THE PROMPT.
@@ -1454,7 +1486,130 @@ def get_active_tool_definitions(context, query: str = None, *,
     # unintended difference between the arms.
     if _fs_batch_active(context):
         active_tools = _apply_fs_batch_schema(active_tools)
+    # §4FE tool head diet: advertise the core set + `tool_catalog`; every
+    # other built-in stays DISPATCHABLE by name (the handler map is
+    # untouched) and describable on demand. Applied LAST so the tuned
+    # descriptions and the fs_batch schema are computed on the same set
+    # they always were; the catalog itself is never tuned.
+    if apply_diet and tool_head_diet_enabled():
+        active_tools = apply_tool_head_diet(active_tools)
     return active_tools
+
+
+# ── §4FE tool head diet ───────────────────────────────────────────────
+#
+# Measured 2026-09-07 on the live tokenizer: the 39 static schemas cost
+# ≈18,705 tokens (18,625 measured 2026-09-07 + 80 for the §4FJ workspace text; the rendered head ~21.4k with vision/image/acquired tools),
+# 79% of every cold prefill. Eight tools account for 95% of the 2,555 real
+# calls in six weeks; sixteen were never called. Literature (arXiv
+# 2605.24660: 7 visible tools 90.3% vs 50 tools 90.8% on BFCL, adaptive short
+# lists 93.1% vs 87.1% selection; ALE-Claw: 13 vs 30 tools scored higher at
+# −44% input tokens) says a small static set does not cost selection accuracy
+# and may improve it. The set is STATIC for the whole request (never mutate
+# the schema block mid-session — every mutation re-prefills the head).
+#: Always-advertised core: every tool with ≥10 real calls in the 45-day
+#: census plus the operational seams (delegate, jobs, update_profile).
+TOOL_HEAD_CORE = frozenset({
+    "file_system", "manage_projects", "web_search", "execute", "browser",
+    "manage_services", "system_utility", "deep_research", "knowledge_base",
+    "darkweb_search", "jobs", "introspect", "recall", "delegate",
+    "update_profile", "vision_analysis", "tool_catalog",
+})
+
+#: Built-ins that are not in TOOL_DEFINITIONS but are added by the builder
+#: (conditionally or always); the diet treats them as static too — anything
+#: else in the set is an acquired skill or composed macro and is kept.
+TOOL_HEAD_STATIC_EXTRA = frozenset({
+    "vision_analysis", "image_generation", "report_pdf", "manage_composed_skills",
+})
+
+TOOL_CATALOG_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "tool_catalog",
+        "description": (
+            "Rarely-needed tools are not listed in this prompt to keep it "
+            "short. action='list' names them with one line each; "
+            "action='describe' with name='<tool>' returns that tool's full "
+            "parameter schema. After 'describe', call the tool DIRECTLY by "
+            "its name with those parameters — it is dispatchable even though "
+            "it is not advertised here."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "describe"]},
+                "name": {"type": "string",
+                         "description": "Required for action='describe'."},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+def tool_head_diet_enabled() -> bool:
+    """Flag-gated, default OFF until the fixture bench (scripts/
+    tool_head_diet_bench.py) shows selection accuracy is flat or up."""
+    return os.getenv("GHOST_TOOL_HEAD_DIET", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def apply_tool_head_diet(active_tools):
+    """Keep the core set (plus any non-built-in — acquired skills and
+    composed macros are routed by their own admission rule) and append the
+    catalog. Order is preserved, so the pinned prefix stays byte-stable."""
+    static_names = {t.get("function", {}).get("name") for t in TOOL_DEFINITIONS}
+    static_names |= TOOL_HEAD_STATIC_EXTRA
+    kept = [t for t in active_tools
+            if (t.get("function", {}).get("name") in TOOL_HEAD_CORE
+                or t.get("function", {}).get("name") not in static_names)]
+    if not any(t.get("function", {}).get("name") == "tool_catalog" for t in kept):
+        kept.append(dict(TOOL_CATALOG_DEFINITION))
+    return kept
+
+
+def hidden_tool_definitions(context) -> list:
+    """The built-ins the diet hides for this context — the catalog's
+    inventory. Built from the SAME builder as the prompt (minus the diet), so
+    it never names a tool this CONTEXT does not register. It does not see a
+    particular agent's `disabled_tools` (a sub-agent's allow-list): such a
+    tool may be listed and is then refused at dispatch — the containment
+    boundary is the handler map, not this listing (review §4FH)."""
+    if not tool_head_diet_enabled():
+        return []
+    full = get_active_tool_definitions(context, None, serve_tuned=False,
+                                       apply_diet=False)
+    static_names = {t.get("function", {}).get("name") for t in TOOL_DEFINITIONS}
+    static_names |= TOOL_HEAD_STATIC_EXTRA
+    return [t for t in full
+            if t.get("function", {}).get("name") in static_names
+            and t.get("function", {}).get("name") not in TOOL_HEAD_CORE]
+
+
+async def tool_catalog(action: str = "list", name: str = None, context=None, **_kw):
+    """The `tool_catalog` handler. LIST: one line per hidden tool (name +
+    the head of its description). DESCRIBE: the full schema JSON of one
+    hidden tool, plus the instruction to call it by name."""
+    hidden = hidden_tool_definitions(context)
+    act = str(action or "list").strip().lower()
+    if act == "describe":
+        want = str(name or "").strip()
+        for t in hidden:
+            fn = t.get("function", {})
+            if fn.get("name") == want:
+                return ("TOOL SCHEMA (call this tool DIRECTLY by name with these "
+                        "parameters):\n" + json.dumps(t, ensure_ascii=False, indent=1))
+        known = ", ".join(sorted(t.get("function", {}).get("name", "") for t in hidden))
+        if want in TOOL_HEAD_CORE:
+            return f"'{want}' is already listed in your tool set — call it directly."
+        return (f"Error: no hidden tool named '{want}'. Hidden tools: {known}")
+    lines = [f"{len(hidden)} additional tools are available by name (use "
+             "action='describe' for the parameters of one):"]
+    for t in hidden:
+        fn = t.get("function", {})
+        desc = " ".join(str(fn.get("description") or "").split())
+        lines.append(f"- {fn.get('name')}: {desc[:110]}")
+    return "\n".join(lines)
 
 def get_available_tools(context):
     from .memory import (
@@ -1625,6 +1780,10 @@ def get_available_tools(context):
 
     from .report_pdf import tool_generate_pdf
     tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=_proj_ws()[0], **kwargs)
+    # §4FE: the catalog is always dispatchable (harmless when the diet is
+    # off — it then reports zero hidden tools); hidden built-ins keep their
+    # entries above, so a call by name works whether or not it was advertised.
+    tools["tool_catalog"] = lambda **kwargs: tool_catalog(context=context, **kwargs)
 
     if getattr(context.llm_client, 'image_gen_clients', None):
         from .image_gen import tool_generate_image

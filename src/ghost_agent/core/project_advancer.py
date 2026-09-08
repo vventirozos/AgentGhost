@@ -890,6 +890,13 @@ async def advance_once(
                 # non-execution (grep no-match, egress-guard prose, missing
                 # exit code) as a pass and mark the task DONE on nothing.
                 tool_runner=_verify_fail_closed_runner(tool_runner),
+                # §4FG: the executor seam and the agentic leaf need the
+                # project EXPLICITLY — this context is not pinned (the HTTP
+                # route and idle ticks carry no conversation binding), so
+                # reading `context.current_project_id` selected the spec
+                # executor for an "agentic" project. Measured: the first leaf
+                # pilot ran spec vs spec.
+                project_id=project_id,
                 ledger=ledger,
                 existing_files=_gather_project_files(store, project_id),
                 research_context=_gather_research_briefs(store, project_id),

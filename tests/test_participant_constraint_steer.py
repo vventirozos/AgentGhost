@@ -379,31 +379,37 @@ class TestProjectConstraintHelpers:
         fake._project_constraints_for = (
             lambda p, limit=5: GhostAgent._project_constraints_for(
                 fake, p, limit))
+        # §4FD: the active pool is relevance-gated on the request text; a
+        # bare continuation ("proceed") is relevant without touching the
+        # store, which keeps these helper tests about the helpers.
         fake._active_project_constraints = (
-            lambda limit=5: GhostAgent._active_project_constraints(
-                fake, limit))
+            lambda limit=5, *, request_text="": GhostAgent._active_project_constraints(
+                fake, limit, request_text=request_text))
+        fake._request_relevant_to_project = (
+            lambda store_, p, req, cmds=None: GhostAgent._request_relevant_to_project(
+                fake, store_, p, req, cmds))
         fake._store = store
         return fake
 
     def test_returns_stored_constraints(self):
         fake = self._fake_agent(["no html", "with YOU - Ghost plays"])
-        assert fake._active_project_constraints() == [
+        assert fake._active_project_constraints(request_text="proceed") == [
             "no html", "with YOU - Ghost plays"]
 
     def test_empty_without_bound_project(self):
         fake = self._fake_agent(["no html"], pid=None)
-        assert fake._active_project_constraints() == []
+        assert fake._active_project_constraints(request_text="proceed") == []
 
     def test_store_error_is_safe(self):
         fake = self._fake_agent(store_raises=True)
-        assert fake._active_project_constraints() == []
+        assert fake._active_project_constraints(request_text="proceed") == []
 
     def test_merge_dedups_and_arms_steer(self):
         from ghost_agent.core.agent import GhostAgent
         fake = self._fake_agent(["No HTML", "with YOU - Ghost plays"])
         with patch("ghost_agent.core.agent.pretty_log"):
             merged, block, pending = GhostAgent._merge_project_constraints(
-                fake, ["no html"])  # dup differs only by case
+                fake, ["no html"], "proceed")  # dup differs only by case
         assert merged == ["no html", "with YOU - Ghost plays"]
         assert "EXPLICIT USER CONSTRAINTS (CURRENT REQUEST)" in block
         assert pending is True

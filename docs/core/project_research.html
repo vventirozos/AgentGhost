@@ -149,6 +149,17 @@
     <code>tests/test_main_loop_research_writeback.py</code> (executed delegation, executed registry
     wiring, the gatherer integration).
   </p>
+
+  <h2 id="relevance">The relevance authority, sharpened (§4FD, 2026-09-07)</h2>
+  <p><code>request_relevant_to_project(store, project_id, request, cmds)</code> is the ONE authority for "is this request about the project" — it already gated the work-log and the research write-back, and it now also gates which project constraints reach the verifier and the prompt (<a href="verifier.html#constraint-scoping">verifier</a>). Three changes, each earned by a measured case:</p>
+  <ul>
+    <li><strong>Continuations are relevant.</strong> A request whose content tokens are all <code>CONTINUATION_TOKENS</code> ("proceed", "continue with task 5", "do the next one") is about the bound project by virtue of the binding — the chess-session request that wrote the forbidden engine was the single word "proceed."</li>
+    <li><strong>Tokens are accent-folded, never stemmed.</strong> Both sides fold diacritics (NFD, combining marks dropped) so "δαπανες" equals "δαπάνες". Inflection is not matched on purpose: a 5-character prefix stem was measured on the request corpus × live projects (§4FH, 2,097 requests × 4 projects) and raised relevant pairs from 2,704 to 3,267 of 8,036 — "creatine" reached a project through "create", "confirm" through "config" — which is the off-topic constraint replay the gate exists to stop. Accent folding changed no verdict on that corpus and is kept because it cannot widen beyond accent-only spellings.</li>
+    <li><strong>No content tokens means a continuation.</strong> Tokens are Unicode words (a Greek request is not an empty request — the first version returned "not relevant" for 23 Greek requests and 11 short acks like "ok", dropping their constraints, §4FH); a request with no content token left after stopwords and continuation words ("ok", "do it", "ναι") is about the bound project.</li>
+    <li><strong>Function words are not overlap.</strong> Request tokens are filtered through <code>RELEVANCE_STOPWORDS</code> ("what", "with", "just", …) so a stored constraint "Start with: What it means to BE ghost" cannot make "what is 17 times 4?" relevant. The hay side is deliberately unfiltered — proven equivalent by mutation.</li>
+    <li><strong>The project's goal and constraints are part of what it is about.</strong> "make the AI opponent smarter" overlaps "don't come up with some random AI" even when the title never says "AI".</li>
+  </ul>
+  <p>Still fail-open on any store error. Tests: <code>tests/test_4fd_constraint_scoping.py</code>.</p>
 </main>
 </body>
 </html>

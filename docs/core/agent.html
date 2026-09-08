@@ -566,6 +566,71 @@
   argv as an array and echoes it before <code>exec</code>, so the flags actually used
   are on the record in <code>Logs/llama-server.log</code>.</p>
 
+  <p><strong>The defect inside Fix&nbsp;2 (2026-09-06, req <code>2422eb25</code>).</strong>
+  Appending the block on every branch means that on every turn&nbsp;&ge;&nbsp;2 the
+  transcript ends with <em>two consecutive user turns</em>: the tool result, then a
+  message holding nothing but <code>CURRENT TIME</code> and a scrapbook. The role is
+  forced &mdash; the live Ornith/Qwen template raises <em>"System message must be at
+  the beginning"</em> for a system-role tail, and <code>role:"tool"</code> renders as a
+  user turn too &mdash; so the transcript itself claims the human spoke. Request
+  <code>2422eb25</code> held the finished vision description and read that lone
+  message as a fresh human turn (<em>"the last user message is just the
+  system_state_update &hellip; They haven't asked a question"</em>), replied with a
+  330-char acknowledgment, was REFUTED, and the repair turn invented a filename from
+  the block's CURRENT TIME. Two other requests since the deploy showed the same
+  reasoning and recovered by luck; before it, no thinking line ever read the block
+  as a human turn. Every block is now assembled by ONE builder,
+  <code>_render_volatile_block(dynamic_state, pending_request)</code>, that opens with
+  the two facts the model went looking for: <em>NOT a message from the user</em>, and a
+  bounded one-line quote of the <strong>current</strong> request (the loop's
+  <code>last_user_content</code>, never the session's first message). Pinned by
+  <code>tests/test_volatile_block_provenance.py</code> in the consumer's vocabulary
+  &mdash; the message list is rendered through a frozen copy of the live template
+  (<code>tests/fixtures/ornith_chat_template.jinja</code>) and the last user turn must
+  open with the provenance line &mdash; plus an AST enumeration over the source tree
+  (no site may assemble a block outside the builder; the enumeration is itself shown
+  to fire on hand-rolled blocks) and a pin that the production call passes
+  <code>pending_request=last_user_content</code>. Mutation score 18/18 across this
+  and the two companion fixes (inspect's binary sniff, the refute-escalation
+  warning), with no-op and known-bad controls.</p>
+
+  <p><strong>Diagnostic probes never teach (§4FB, 2026-09-06).</strong> The bench
+  probe prompt that surfaced into request <code>2422eb25</code> (playbook lesson 49,
+  <em>"Use deep_research ONCE on the query: llama.cpp prompt prefill speed apple
+  silicon &hellip; do not read files"</em>, 37 retrievals into unrelated turns) had been
+  minted by reflection from five repeats of a perf-audit probe sent through the
+  ordinary user path: a diagnostic is indistinguishable from the operator unless the
+  sender says so. It now can: the request header <code>X-Ghost-Origin: probe</code>
+  makes the chat route prefix the request id with <code>probe-</code>, and
+  <code>turn_origin</code> answers <code>"probe"</code> for that id (checked first,
+  from the request-id contextvar, so the turn's background work agrees). Every gate
+  that already keys on <code>turn_origin(ctx) == "user"</code> &mdash; calibration
+  booking, selfhood capture, foresight, feedback, graduated-retrieval booking &mdash;
+  therefore excludes diagnostics for free; the hydration usefulness judge and the
+  lesson-outcome credit gained explicit probe gates; the trajectory is stamped
+  <code>task_kind="probe"</code>, which no consumer's <code>admitted_task_kinds</code>
+  lists; and reflection's <code>_is_reflectable</code> now requires an admitted kind
+  (it had only checked <code>FAILED</code>), failing <em>closed</em> if admissibility
+  cannot answer. The stream draws probes in their own red/pink family. Pinned by
+  <code>tests/test_probe_origin_never_teaches.py</code>, including a real
+  <code>handle_chat</code> run that reads the stamped row back; mutation score 21/21
+  across this, the repair directive and the bus log below.</p>
+
+  <p><strong>The repair directive names the request it repairs (§4FB).</strong> The
+  post-refute alert used to say only "diagnose the underlying problem and FIX it using
+  tools"; with a draft that had answered nothing there was no defect to point at, and
+  the model invented one. <code>_render_refute_directive(crit, pending_request)</code>
+  now restates <em>which</em> request is being answered (a bounded quote of
+  <code>last_user_content</code>), says no new file, message or task has arrived, and
+  puts the no-tool branch first: if the evidence already in the conversation answers
+  the request, answer it with no new tool calls; only a claim that genuinely needs
+  checking gets the tool-grounded diagnosis. The production site is pinned by AST to
+  pass the current request, and an enumeration keeps the alert text inside the one
+  builder (<code>tests/test_repair_directive_pending_request.py</code>). The memory bus
+  also logs its fan-out sub-queries now (<em>"memory bus sub-queries (n): &hellip;"</em>):
+  no offline reconstruction of 2422eb25's retrieval put lesson 49 inside the 0.45
+  floor, and nothing on disk said which sub-query admitted it.</p>
+
   <h2>Self-play control hooks</h2>
   <p><code>handle_chat</code> carries two small but load-bearing hooks that coordinate with the self-play subsystem:</p>
   <ul>
@@ -598,7 +663,7 @@
   <h2>2026-06-12 churn-loop fixes (delete/create oscillation postmortem)</h2>
   <p>A test session where the model re-executed "delete it and make something else" on every turn (six hard deletes, five of self-created projects, nothing built in 20 turns) produced two more fixes:</p>
   <ul>
-    <li><strong>Request-start project snapshot.</strong> <code>handle_chat</code> records <code>context.request_start_project_id</code> (the project active when the user's message arrived) right after conversation reconcile. The <a href="../tools/projects.html">project tool's delete-eligibility gate</a> uses it: a bare "delete it" can only target that project or one the user's message names — a project created mid-request is refused with an instruction to build it instead. This converts the success-oscillation loop (which the failure-keyed <code>StrikeLedger</code> structurally cannot see) into a loud tool error on its second iteration.</li>
+    <li><strong>Request-start project snapshot &mdash; removed 2026-09-06.</strong> <code>handle_chat</code> used to record <code>context.request_start_project_id</code> (the project active when the user's message arrived) right after conversation reconcile, and the <a href="../tools/projects.html">project tool's delete-eligibility gate</a> read it: a bare "delete it" could only target that project or one the user's message named, so a project created mid-request was refused with an instruction to build it instead (converting the success-oscillation loop, which the failure-keyed <code>StrikeLedger</code> cannot see, into a loud tool error). Live req 1e593552 showed the same gate refusing the user's own "delete it" five times, because the project had just auto-rolled to DONE and was no longer active. Gate and snapshot were removed together (journal &sect;4FC); <code>delete</code> now works on any project that resolves by id or title, active or not. Pinned by <code>tests/test_project_delete_ungated.py</code>.</li>
     <li><strong>Contextual <code>&lt;think&gt;</code>-fragment filter.</strong> The streaming display filter dropped any token whose stripped form was <code>"think"</code> or <code>"&gt;"</code> (meant to hide fragmented <code>&lt;think&gt;</code> tags split across SSE chunks) — and the model emits the literal word <code>" think"</code> as its own token, so every rendered thought lost it ("Let me think about…" displayed as "Let me about…"). <code>_is_think_tag_fragment(token, accumulated)</code> now suppresses those tokens only when the stream immediately before them ends with the matching tag opener (<code>&lt;</code>/<code>&lt;/</code> for <code>think</code>, <code>&lt;think</code>/<code>&lt;/think</code> for <code>&gt;</code>). The filter was and remains <em>display-only</em>: <code>reasoning_content</code>/<code>full_content</code> always accumulated the raw token, so model context was never corrupted. Covered by <code>tests/test_think_stream_fragment.py</code>.</li>
   </ul>
 

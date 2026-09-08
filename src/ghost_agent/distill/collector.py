@@ -330,6 +330,60 @@ class TrajectoryCollector:
         rec = self._load_corrections().get(trajectory_id)
         return dict(rec) if rec is not None else None
 
+    def machine_and_human_outcomes(self) -> dict:
+        """``{trajectory_id: (machine_outcome, human_outcome)}`` from EVERY
+        sidecar row, not just the latest per id (§4FD).
+
+        ``_load_corrections`` is last-write-wins, which is right for the
+        shipping outcome but loses the machine verdict on a turn a human
+        later relabelled. Prediction-powered inference needs BOTH on the
+        same row: the machine verdict is the judge, the human label is the
+        gold. ONE definition of "human" (review §4FH m3): ``human_feedback:*``
+        (the same prefix ``has_human_label`` and ``human_failure_rate`` use)
+        plus ``operator_overlay`` (operator-authored). ``user_correction`` is
+        a LEXICAL detector over the next message, not a human label, and
+        counts as machine. A human-authored row with outcome ``unknown`` is
+        a RETRACTION (live: "the late REFUTED verdict was a false positive")
+        and clears BOTH verdicts for that id (review §4FH m2). Other
+        outcomes than passed/failed on machine rows are ignored.
+        Missing/unreadable sidecar → empty dict; a bad line is skipped."""
+        import json
+        out: dict = {}
+        path = self._corrections_path()
+        if not path.exists():
+            return out
+        human_sources = ("operator_overlay",)
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    tid = str(rec.get("trajectory_id") or "")
+                    oc = str(rec.get("outcome") or "")
+                    src = str(rec.get("source") or "")
+                    if not tid:
+                        continue
+                    is_human = src.startswith(HUMAN_SOURCE_PREFIX) or src in human_sources
+                    machine, human = out.get(tid, (None, None))
+                    if is_human and oc not in (_PASSED, "failed"):
+                        out[tid] = (None, None)          # retraction
+                        continue
+                    if oc not in (_PASSED, "failed"):
+                        continue
+                    if is_human:
+                        human = oc
+                    else:
+                        machine = oc
+                    out[tid] = (machine, human)
+        except OSError:
+            return out
+        return out
+
     def _load_corrections(self) -> dict:
         """Read the corrections sidecar into a ``{traj_id: record}``
         dict. Later records for the same id win (append-only +
@@ -527,6 +581,16 @@ class TrajectoryCollector:
                             if corr:
                                 new_outcome = corr.get("outcome") or ""
                                 if new_outcome:
+                                    # §4FD: keep the write-time (inline)
+                                    # outcome readable beside the overlaid
+                                    # one — the PPI judge needs the machine
+                                    # verdict on rows a human later relabelled.
+                                    try:
+                                        if isinstance(traj.extra, dict):
+                                            traj.extra.setdefault(
+                                                "outcome_native", traj.outcome)
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                     traj.outcome = new_outcome
                                 reason = corr.get("reason") or ""
                                 if new_outcome == _PASSED:

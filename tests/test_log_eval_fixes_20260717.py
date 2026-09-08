@@ -105,7 +105,7 @@ def _agent_confirming_at(conf):
         verifier=StubVerifier(),
         args=SimpleNamespace(no_verifier=False),
     )
-    agent._active_constraint_note = lambda limit=5: ""
+    agent._active_constraint_note = lambda limit=5, **_kw: ""
     return agent
 
 

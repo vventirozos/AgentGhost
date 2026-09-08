@@ -35415,3 +35415,1208 @@ clears then inserts itself, Backspace/Delete clears (preventDefault); `resolvePr
 covers keydown-less edits (dictation/paste/predictive): suffix kept, deletion-into-default →
 empty, replacement stands. Pinned executed under node (both helpers, 8-case table) + the
 keydown/open wiring as text.
+
+## §4EZ — Origin colour families on the operator stream (2026-09-06)
+
+**Ask (operator):** *"this agent produces colored logs, i want the logs coming from user requests to
+be distinct from sim and bench requests and i want anything that runs from the system to have
+different distinct colors."*
+
+**What was there.** `_req_color` hashed the request id over ONE twelve-code palette, so a self-play
+turn, a bench attempt and the operator's own request drew from the same colours; the only origin
+signal was the frame's trailing `· sim` word (LOG-4, mirror + frame suffix). SYSTEM `**` lines
+(boot, the biological tick's 25 idle phases, watchdogs, the stream drain) had NO colour at all —
+`_req_color("SYSTEM")` returned "". The launcher exports `FORCE_COLOR=1`, so the watched stream
+really is coloured; the web console strips ANSI (`ANSI_ESCAPE_RE`) and colours by icon, and the
+uConsole/Slack parsers strip too — colour is a console-only channel with no parser downstream.
+
+**Change (shipped).** `utils/logging.py`: one table of origin colour FAMILIES —
+`user` blues (39 45 51 81 117 159, the old cool set), `sim` violets (141 171 177 183 213 219),
+`bench` ambers (172 178 208 214 220 222), `SYSTEM` one green (34), unclassified greys
+(245 248 251, on purpose: a request with no origin should look like a gap, not a user turn). The
+shade within a family is still the per-request hash, so concurrent same-population requests stay
+separable. `_req_color(req_id, origin=None)` + ONE resolver `_line_origin`: the origin stashed at
+BEGIN first (a line always matches the frame the operator saw open), else a new
+`request_origin_context` contextvar. `handle_chat` sets that contextvar beside the request id from
+the SAME `turn_origin` value the BEGIN frame stamps (one derivation, `_turn_origin`), and resets
+it in the same finally — this is what colours the lines logged BEFORE the BEGIN frame and the
+`spawn_bg` writes that inherit the context and keep logging AFTER END popped the frame state. The
+frame's origin word wears the family colour too. Frame text unchanged byte-for-byte once stripped;
+the liveness `origin=` mirror stamp still comes only from the explicit argument.
+
+**Pins + mutation.** `tests/test_logging_origin_colors.py` (23): the table (pairwise-disjoint
+families, SYSTEM/greys outside every family, the frame vocabulary {user,sim,bench} fully
+coloured, ≥2 shades per family); the resolver (SYSTEM non-empty, 40 ids × 3 origins land in
+family, unknown → grey not user, colour-off → ""); the stream (every line inside a frame wears the
+frame's family across 5 ids × 3 origins, SYSTEM green and never on request lines, contextvar
+colours pre-BEGIN and post-END lines, stash outranks contextvar, origin word coloured, stripped
+frames byte-identical for the client regexes, the ×N collapse summary in-family); and
+`handle_chat` EXECUTED via `tests.helpers.make_agent` (contextvar == frame origin at BEGIN for
+user/bench/sim, reset to "" after the turn). Copy-tree mutation batch, no-op + old-world controls
+both behaved: **16/16 mutants killed** (SYSTEM back to "", resolver ignoring contextvar / stash,
+one shared palette, unknown laundered into user, explicit BEGIN origin ignored, origin word
+uncoloured on BEGIN / END, sim sharing a code with user, one-shade family, collapse summary
+dropping the family, handle_chat never setting / never resetting / setting a constant, SYSTEM
+colliding with user, greys colliding with bench). Docs: `docs/logging.html` §4EZ + the anatomy
+diagram.
+
+**Deferred.** The web console (`app.js`) strips ANSI and has no per-request colour at all; an
+origin-aware accent there would need the tag/frame parsed client-side — separate surface, not
+asked. Per-idle-phase colour within SYSTEM (dream vs reflection vs GEPA) would need a scope
+contextvar set at 25 inline sites in `_biological_tick`; one green for "not a request" is the
+ask as read. Deploy: agent restart (`sudo launchctl kickstart -k system/com.local.ghost-agent`).
+
+## §4FA — The volatile block read as a human turn: the defect inside §4ET Fix 2 (2026-09-06)
+
+**Ask (operator):** *"see the agent log, request: 2422eb25, what went wrong?"* → *"fix it, verify your changes."*
+
+**What went wrong (req 2422eb25, 17:14:51, "Describe this image: photo-20260906-171445.jpg", 126 s,
+outcome `failed` → late-corrected).** Turns 1–2 were fine: inspect, then vision on Eva returned the full
+description at +38 s. Turn 3 read the trailing `<system_state_update>` message as a fresh human turn —
+thinking, verbatim: *"the last user message is just the system_state_update … They haven't asked a
+question … give a brief response acknowledging the update"* — and shipped a 330-char acknowledgment that
+echoed the block's CURRENT TIME. The turn gate REFUTED it (0.90, 60 s; reason "the date and time in the
+claim are not in the tool outputs" — right verdict, side-effect reason; its main-model escalation raised and
+was recorded `unavailable` with only a DEBUG line). The repair directive ("Diagnose the underlying problem
+and FIX it using tools") had no tool-fixable defect to point at, so the model invented one — *"The user
+uploaded a new photo"* — and inspected `photo-20260906-171609.jpg`, a name composed from the upload
+convention plus the block's `CURRENT TIME: 17:16`; no such upload exists in any log or the sandbox. That
+miss was a strike, so the turn was stamped `failed` although turn 5 shipped the correct description; the
+late verifier flipped it 70 s after the reply.
+
+**Why: §4ET Fix 2.** Since the 2026-09-04 17:58 boot the volatile block ALWAYS rides its own trailing
+user-role message (folding it onto the tool result re-prefilled that result every turn, −38%). Tool results
+are user-role `<tool_response>` messages too, so every turn ≥ 2 now ends with two consecutive user turns:
+the tool result, then a message holding nothing but a timestamp and a scrapbook. The role is forced —
+measured live against llama-server `/apply-template`: the Ornith template raises **"System message must
+be at the beginning"** for a system-role tail, and `role:"tool"` renders under `<|im_start|>user` as well.
+Before the deploy, every thinking line that mentions the block (09-02/09-03, ~28) treats it as CONTENT
+(tasks, hints); after it, three requests read it as "a state update but no new user message" — 48187b80
+(09-05, image), 0c7c2bb5 (09-06 10:35), 2422eb25 — and only the first two reasoned their way back. The 16
+§4ET pins all assert placement bytes and cache loss; none asked whether the model still answers after the
+shape change (`verify-cannot-distinguish`, `fix-is-the-least-reviewed-code`).
+
+**Fix.** The role cannot change, so the text must carry the provenance. ONE builder,
+`_render_volatile_block(dynamic_state, pending_request)` (core/agent.py, next to
+`_REPAIR_STANDALONE_SUFFIX`), assembles every block and opens it with the two facts the model went looking
+for and could not find: *"Automated runtime state — NOT a message from the user. The user has sent NOTHING
+new since their request … PENDING REQUEST (unchanged): "<bounded 160-char head of the CURRENT request>" —
+continue that request from where it stands; when it is fully answered, reply to the user."* — BEFORE the
+state, so it is the first thing read on the message the model would otherwise mistake for a human turn.
+`_compose_injection` gained `pending_request=`; the production call passes `last_user_content` (the
+CURRENT request, never the session's first message — with history those differ). All three composition
+branches (pinned append, legacy fold, legacy append) route through the builder; the §4ET placement and
+cache properties are untouched (its 15 pins still pass; the block is still the lone appended message).
+
+Two companions from the same trace: `tool_inspect_file` now sniffs binary like `read` already did (the
+JPEG peek had returned ~1.3 KB of JFIF/Exif/ICC bytes as text) and answers with a factual **non-error**
+line — kind by magic number, size, "use vision_analysis" — because an `Error:` prefix is a strike and the
+model peeks images to confirm they exist. And `_escalate_refute`'s exception path logs at WARNING plus a
+`Verifier` stream line instead of DEBUG (a dead escalation looked exactly like a working one).
+
+**Pins.** `tests/test_volatile_block_provenance.py` (24): the message list is rendered through a FROZEN
+copy of the live template (`tests/fixtures/ornith_chat_template.jinja`, jinja2 3.1.6, `raise_exception`
+bound) and the last `<|im_start|>user` turn must open with the provenance line while the tool result stays
+in the previous turn; the pending line quotes the current request, not the first message; the head is
+single-line and capped (a 10 KB request must not be copied into the block); the template REJECTS a
+system-role tail and renders `tool` as `user` (the constraint that made the fix textual, pinned so the next
+"just use role system" fails here first); an AST enumeration over `src/ghost_agent/**` — any string
+building a `<system_state_update>` block, or any use of `_VOLATILE_BLOCK_OPEN`, outside the builder is an
+offender; readers (`startswith`, `in`), docstrings and the bare-tag constants are not — shown to FIRE on
+five hand-rolled shapes and to ignore four legitimate ones; and the production call passes
+`pending_request=last_user_content`. `tests/test_file_system_inspect_binary.py` (4): no JFIF/replacement
+chars, kind + size, no `Error` prefix, text peek and missing-file controls unchanged.
+`test_verifier_escalation_ledger.py::test_escalation_error_is_recorded_as_unavailable` now also requires
+the WARNING record and the WARNING stream call.
+
+**Mutation score 18/18**, whole-file mutants, restore-after with hash check, no named killers, baseline
+gate, no-op control SURVIVED and known-bad control KILLED: drop the header; render it after the state;
+never truncate the head; keep newlines; drop the call-site kwarg; pass the session's first message;
+hand-roll the block on each of the three branches (the pre-fix code); lose the negation; drop the
+empty-request fallback; disable the sniff; `Error`-prefix the sniffed reply; generic kind; drop the size;
+warning→debug; drop the stream line; stream line at INFO. Full suite **20,062 passed / 65 skipped, twice**
+(`-n 8 --dist loadfile`, 4:58 and 4:51; the 65 skips predate this change — see run-and-test-setup).
+
+**Live verification.** Deployed by `kill <listener pid>` → launchd respawn (new listener 48458, "system
+ready" in 20 s). Three replays of the exact request in fresh sessions (`b8d76a15`, `8b537a42`, `c03185cc`):
+the post-tool turn's thinking reads *"The user's request was to describe the image. I already ran
+vision_analysis … Now I should reply directly"* in all three; zero mentions of the state block; CONFIRMED
+1.00 / 1.00 / ok; 66 s, 42 s, 49 s against the original 126 s; no strikes, no repair rounds. Stochastic
+(temp 0.60), so three clean runs are evidence, not proof — the pre-fix rate was 3 confusions in ~2 days of
+traffic, so watch the thinking stream for "no new user message" over the coming days.
+
+**Not done, and why.** (i) The repair directive still presumes a tool-fixable defect; with the trigger
+gone it was left alone rather than tuned on one sample. (ii) `skills_playbook.json` entry [49] is a bench
+probe prompt ("Use deep_research ONCE on the query: llama.cpp prompt prefill speed apple silicon …",
+source `reflection`, 34 retrievals) that hydrates into image requests — a label-noise leak in the
+lesson miner, not a code defect here; not deleted from live data without the operator. (iii) The three
+`replay*` sessions the verification created were deleted via `DELETE /api/sessions/{id}` (200 ×3). (iv) The hydrated lesson "verify the file exists
+with file_system before vision" adds a turn to every image request; vision itself reports a missing file.
+
+## §4FB — Diagnostics never teach: the probe origin, the repair directive, lesson 49 (2026-09-06)
+
+**Ask (operator):** *"fix it"* — the two items §4FA left open: the bench-probe prompt sitting in the
+playbook as lesson 49 and the repair directive that presumed a tool-fixable defect.
+
+**What lesson 49 was.** `skills_playbook.json` [49]: trigger = task = *"Use deep_research ONCE on the
+query: llama.cpp prompt prefill speed apple silicon. Then reply with one short sentence … Do not
+investigate anything else, do not read files."*, `source=reflection`, `frequency=5` (the probe was sent
+five times during the perf work), `retrievals=37`, `helpful=32`, `verified=True` with
+`verification_attempted=False`. Reflection mints a lesson from any FAILED trajectory in the real root
+with the verbatim request as trigger (`_is_reflectable` checked outcome only), and a diagnostic probe
+sent through `/api/chat` is a user turn in every respect. So the class is not "probe-shaped text" — it is
+**diagnostics are indistinguishable from the operator unless the sender says so**.
+
+**How it reached an image request — not resolved, made observable.** Offline reconstruction with the
+live embedder (BGE-small, unit-norm) against the live collection (chroma 1.5.5, `config_json_str={}`
+→ default L2): for the raw 2422eb25 query and every plausible sub-query, NO lesson sits under the
+`DEFAULT_RETRIEVAL_DISTANCE=0.45` floor (nearest 0.561; [49] at 0.72–0.93); the domain rescue cannot
+fire (query cluster None); the BM25 fallback returns nothing for those queries. Under COSINE distance
+exactly six lessons would pass (38, 4, 58, 71, 83, 49) — the log's `s=6` — but the collection is not
+cosine. The fan-out sub-queries Nova produced were never logged and cannot be reproduced from outside
+(gemma-4-E4B spends the whole 256-token budget thinking and returns empty content to a plain call).
+`MemoryBus.hydrate_context` now logs `memory bus sub-queries (n): …` once per hydration so the next
+such admission is attributable; the question stays open, on the record, instead of a threshold tuned
+on one sample (`tuned-on-the-wrong-regime`). Related and also not touched: the floor's own comment
+calibrates 0.45 as "≈cosine 0.78", which is only true for L2 on unit vectors (it is), and the 16
+reflection lessons with verbatim one-off triggers are the most-retrieved entries in the store
+(101, 98, 77, 68, 49 retrievals) with "helpful" rates of 60–85% from the Nova judge.
+
+**Fix 1 — the probe origin.** `X-Ghost-Origin: probe` on `POST /api/chat` makes the route prefix the
+request id with `probe-` (keeping a client `X-Request-ID` under it, never doubling); `turn_origin`
+answers `"probe"` for that id, checked FIRST from the request-id contextvar `handle_chat` sets first
+thing (so the turn's spawned work agrees, and no bench/sim context ever carries the prefix). That one
+predicate is what 15 sites already gate on with `== "user"` — calibration booking, selfhood, foresight,
+feedback, graduated-retrieval booking, experiments — so they exclude diagnostics for free. Added
+explicit gates where the predicate was not consulted: `_judge_hydration_safe` (the usefulness judge
+feeds `helpful_retrievals` and the RRF ledger), `_record_lesson_outcomes` (outcome credit + late
+stash), and `_record_calibration_safe` — **found live**: the first deployed probe passed the recorder's
+read-only carve-out and landed a calibration row stamped `origin="user"`, the population the
+instrument exists to score. The trajectory is stamped `task_kind="probe"`, which no consumer's
+`admitted_task_kinds` lists, and `reflection/loop.py::_is_reflectable` now requires an admitted kind
+(real root today: 616 `user_request` + 62 `reflection` rows, so nothing changes for live traffic),
+failing CLOSED with a WARNING if admissibility cannot answer. The stream draws probes in a red/pink
+family (`_ORIGIN_PALETTES["probe"]`), frames read `· probe`.
+
+**Fix 2 — the repair directive.** `_render_refute_directive(crit, pending_request)` is the only
+assembler of the post-refute alert. It restates WHICH request is being answered (a bounded quote of
+`last_user_content`, the same `_pending_request_head` §4FA uses), says no new file, message or task
+has arrived, and puts the no-tool branch FIRST — answer from the evidence already in the conversation
+with no new tool calls — before the conditional tool-grounded diagnosis. The site passes
+`pending_request=last_user_content`; `_REPAIR_STANDALONE_SUFFIX` is still appended after it.
+
+**Fix 3 — lesson 49, and how to remove a lesson at all.** The playbook is single-writer
+(`_crossproc_lock` docstring: external scripts must treat it read-only while the agent runs) and
+launchd respawns the agent IMMEDIATELY on a clean exit — measured: the first deploy script waited for
+a process-free window, watched the respawn arrive inside 20 s, and correctly refused to write. So:
+`POST /api/lessons/quarantine {"trigger","reason"}` runs `SkillMemory.quarantine_lesson` inside the
+live process (400 without a reason, 503 on a read-only or missing store, `ok:false` on no match).
+Lesson 49 is quarantined with the reason on the record (86 entries kept, 14 quarantined), announced as
+`lesson quarantined` on the stream; its vector twin stays (the retrieval filter drops quarantined
+triggers post-hoc), removable later via `/api/memory/delete_skill_twin`.
+
+**Pins.** `tests/test_probe_origin_never_teaches.py` (31): the predicate and its precedence; the two
+calibration/booking gates executed both ways; the route (fresh id, client id kept, no doubling, other
+values ignored); a REAL `handle_chat` run on a user context reading the stamped `task_kind` back for a
+probe and a control; `_record_calibration_safe` executed with a stashed reading (records for a user
+id, nothing for a probe id); the judge and lesson-outcome gates with user controls; reflection by kind,
+including "the kinds come from admissibility, not a private list" and fail-closed; the palette;
+the bus sub-query line (present for a fan-out, absent for a short query).
+`tests/test_repair_directive_pending_request.py` (8): content, order, bounded quote, an AST pin that
+the one production site passes `last_user_content`, and an enumeration that the alert text exists
+only in the builder. `tests/test_lessons_quarantine_route.py` (8). Two pre-existing pins had their
+premise change and were updated, not deleted: the palette table now names four populations, and the
+reflector fixture's default kind is the admitted one (its own docstring records that self-play rows
+never reach the collector).
+
+**Mutation score 26/26** (21 + 5 in the follow-up round), whole-file mutants, restore-after with hash
+check, no named killers, no-op control SURVIVED / known-bad control KILLED in both rounds: ignore the
+prefix; label-before-prefix; stamp `user_request`; judge / lesson credit / calibration for probes;
+directive minus the request line, minus "do not invent", minus the no-tool branch, tool branch first,
+whole request quoted, empty pending at the site, hand-rolled site; header unmapped, doubled, client id
+dropped; reflection ignoring kind, failing open, private kind list; probe family removed / copying
+user; bus line removed; route dropping the reason, accepting an empty reason, writing through
+read-only, `ok` on zero. Full suite **20,107 / 65 skipped, twice** (5:00, 4:57).
+
+**Live.** Deploy = kill → immediate respawn (new listener in 15 s). Probe `probe-fb-probe-02` vs control
+`fb-ctrl-02`, same PONG prompt: frames `· probe` / `· user`; trajectory `task_kind` probe /
+user_request; calibration rows none / one (`origin=user`); hydration-judge runs 0 / 1; RRF
+observations 0 / 25 (first deploy's pair). Quarantine: HTTP 200, on disk `quarantined=True` with
+reason + timestamp, stream line present.
+
+**Left open, on the record.** Which sub-query admitted [49] into 2422eb25 (now logged); the 16
+verbatim-trigger reflection lessons and the judge's helpful-rate on them; the four `probe-verify-*`
+sessions were deleted. **Operating rule from here: every diagnostic probe — mine or the operator's
+— is sent with `X-Ghost-Origin: probe`.**
+
+## §4FC — The delete-eligibility gate refused the user's own delete: removed (2026-09-06)
+
+**Ask (operator):** *"see the agent log, request 1e593552, that guiderail: ERROR: REFUSED: hard delete
+of 'feeb0941bd8b' is not in this request. It was not the active…. seems wrong, remove it altogether,
+the agent should be able to delete a project even if it's not activated.. verify ALL your changes."*
+
+**What the log shows (req 1e593552, 22:50:38).** User message *"i got everything i needed. so the …
+delete it"* about the Elden Ring Build Tracker (`feeb0941bd8b`), the project the conversation had
+just finished — it had auto-rolled to DONE and left project mode, so `current` was null when the
+message arrived. Turn 1 `manage_projects action=list` (found it); turn 2 `action=delete` →
+`Project Guard: Hard delete of 'feeb0941bd8b' refused (not user-visible in this request)` →
+`REFUSED … It was not the active project when the user's message arrived, and the message does
+not name it`. The same refusal at +63.8s, +102s, +151s, +185s, +245s (strikes 1→4); in between the
+model read the refusal correctly, `switch`ed to the project and retried — which cannot help,
+because the gate compares against `request_start_project_id`, a snapshot taken before the first
+LLM call. The risk governor fired at step 7. The project survived the request. The refusal text
+("the user has never seen this project, so 'delete it' cannot mean this one") was false: the user
+had been building this project all session.
+
+**What the gate was (2026-06-12, docs/tools/projects.html + docs/core/agent.html).** After one
+"delete it and make something else" cascaded into six hard deletes of self-created projects,
+`_delete_eligibility_error(context, store, rid)` refused any hard delete unless `rid` was the
+request-start snapshot or the user's message contained the id or the exact stored title. Its only
+input was `context.request_start_project_id`, stamped once per request in `handle_chat` and read
+nowhere else (the scope heal's first version borrowed it and was replaced, §4DK-era note at
+agent.py `_captured_project_id`).
+
+**Removed, both ends.** `tools/projects.py`: the 47-line gate, its call site and the `Project
+Guard` stream line (a comment at the site records why; the pin is the test). `core/agent.py`:
+the request-start stamp (the historical comment in `_captured_project_id` now says the slot is
+gone). `tests/test_project_delete_eligibility.py` (7 tests, all asserting the refusal) deleted;
+`test_correction_detection.py`'s fixture no longer sets the attribute and
+`test_bughunt_unit9to12.py`'s MagicMock note is updated. **Kept on the delete path, unchanged:**
+the loud not-found refusal, `_stop_project_services` before the rmtree, the tombstone, the
+activation clear; `archive` untouched. **On the record:** the 2026-06-12 churn scenario (delete →
+create → delete the new one, all "successes" the strike ledger cannot see) is no longer refused by
+the tool. That is the operator's rule — a project that resolves by id or title is deletable
+whether or not it is activated — and the only remaining defence against that loop is the model.
+
+**Pins — `tests/test_project_delete_ungated.py` (8).** Every context carries what the gate used
+to read (`request_start_project_id=None`, a `last_user_content` naming nothing), so a restored gate
+refuses and the pins fail: the live shape replayed (DONE, not active, unnamed → `deleted`, row gone,
+workspace gone, tombstone written — the positive twin of every "no REFUSED"); delete by title of a
+non-active project; the mid-request-created project deletable (both deletes observable); switch
+then delete clears the activation; not-found still fails loudly (control); archive unchanged
+(control); an AST enumeration over `src/ghost_agent` that no site reads or writes
+`request_start_project_id` as an attribute OR as a getattr/hasattr/setattr string, with its own
+can-fail test (a synthetic tree reports both lines).
+
+**Mutation battery** (copy tree under the scratchpad, whole-file mutants, `py_compile` first,
+`__pycache__` purged per mutant, restore-after with hash check, the deployed tree's hashes verified
+untouched, no named killers — the whole pin file runs per mutant): **7/7 killed** — inline
+snapshot-or-wording gate (5 fail), stamp re-added in handle_chat (1), delete mechanism made dead
+`ok = True` (4), activation not cleared (1), gate on status DONE (1), title-must-be-named gate (4),
+stamp via `setattr(…, "request_start_project_id")` (1). Controls: the ORIGINAL gate restored
+(both original files) KILLED 5 failed / 3 passed; no-op comment SURVIVED 8/8. **The harness lied
+first:** the copied `conftest.py` imports `tests.helpers`, which the copy tree lacked, so the first
+battery reported every mutant killed INCLUDING the no-op control — collection failure counted as
+a kill (`harness-that-cannot-run-reports-success`, in its kill-reporting form). Copying
+`helpers.py` + `__init__.py` and re-running gave the numbers above; the no-op control is what
+exposed it. Full suite **20,108 / 65 skipped, twice** (5:07, 5:07; §4FB's 20,107 −7 +8).
+
+**Docs.** `docs/tools/projects.html` — the eligibility-gate section now reads as history plus the
+removal and its reason; `docs/core/agent.html` — the request-start snapshot bullet likewise.
+
+**Live.** Deploy = plain kill of listener 78309 (started 19:53, predating the 23:01 edit) → launchd
+respawn, new listener 88851 in 15 s, one listener, one process, `system ready` 1→2, health ok with
+`memory_system_loaded=true`. Probe `probe-4fc-delete-231819` (`X-Ghost-Origin: probe`, frame `· probe`):
+scratch project *Zqx Probe Tracker* created through `POST /api/projects` (so `current` was None at
+request start, exactly the refused shape), message *"i got everything i needed from the zqx probe
+project. actually delete it — permanently, not archive …"* — names neither the id nor the stored
+title. Turn 1 `action=list`, turn 2 `action=delete` at +25.8 s, reply `DELETED` at +28.1 s; zero
+`Project Guard` lines since the deploy; `GET /api/projects/5b67ea4c1f8c` → 404; the operator's five
+real projects (WebOS, Procedural Dungeon Crawler, Jiu Jitsu Calendar, AI self awareness
+exploration, Chess Coach v3) all present after. The same shape took req 1e593552 five refusals and
+245 s to not do.
+
+**Class, for the record.** A gate keyed on a request-start snapshot offers the model no repair
+path: its refusal told the model to make the project active or name it, and neither a `switch`
+nor any other tool call can change a value captured before the first LLM call — so every retry
+was structurally identical and the strike ledger was the only exit. A guard whose precondition
+the caller cannot satisfy mid-request is not a guard, it is a dead end with an instruction in it.
+
+## §4FD — Four of seven "next moves" shipped: evidence gate, verifier scoping, PPI, postmortem retarget, mutation breaker, provenance (2026-09-07)
+
+**Ask (operator).** *"what's next for this agent? what's missing according to the latest literature …
+make proposals, only provable and high impact ones."* → nine proposals (memo: Ghost Next Moves,
+claude.ai artifact 415f1717) → *"i'm interested in 2, 4, 5, 6, 7, 8 and 9."* This section covers
+**2 (evidence-first answering + verifier scoping), 7 (prediction-powered inference), 8 (postmortem
+retarget + repeated-mutation breaker), 9 (provenance)**. 4 (rule compilation), 5 (coding-leaf
+edit-test loop) and 6 (tool head diet) follow in §4FE+. Proposals 1 (llama.cpp hybrid-cache
+upgrade + slot routing) and 3 (Ornith vs Qwen3.6 bake-off) need a maintenance window and were not
+picked.
+
+### R0 — scope, property, threat model
+
+*Property.* (a) A label the corpus records as `failed` is not manufactured by text the user never
+wrote; (b) a turn that retrieved nothing is told so before it answers; (c) the arm report can use
+every machine-judged row without treating the machine as truth; (d) a human 👎 is analysed;
+(e) an identical mutating call cannot repeat unbounded; (f) every constraint and lesson names the
+population that wrote it. *Trusted:* the corrections sidecar, the trajectory store, the request-id
+contextvar. *Untrusted:* tool output text, project metadata written by any turn, the verifier's
+verdict as a proxy for the human's. *Out of scope:* the objection dismissal (stays OFF on its
+08-07 measurement), the PRM (parked §4ES), any retrieval filter on lesson origin (observability
+first — B3 showed idle lessons earn their keep).
+
+### The measurements that set the targets (six weeks of real turns, 07-25 → 09-07)
+
+1,060 real turns, 469 passed / 124 failed / 467 unknown after the overlay; 117 human labels.
+Failure classes: confabulation on empty/unrelated retrieval ~30 (+ most 👎); explicit-constraint
+violation 23; counting over tool output 19; tool-call loop 16 (p90 533 s); narration/tool-syntax
+leakage 55+8+7; verifier false refutes est. 25–35 of 92 late refutes in a 10-row sample.
+**Corrections audit:** 157 late refutes, 9 cite a constraint, **3 cite a "start with" phrase absent
+from the user's request** (ebd53f40 "how's the weather ?", e17c8610, 63250756) — all from project
+7b62e5e533d1's stored constraint "Start with: What it means to BE ghost", prepended to the
+verifier's request view on every turn while the project stayed bound (`_active_constraint_note`).
+The 25–35% sample figure covered several classes; the constraint-bleed class is small in count but
+is a manufactured label, and it is the one with a mechanical fix.
+**Postmortem engine:** 156 idle cycles, `0/0 analysed` on every one; severity = loops/oscillation/
+steps/duration only, so a clean 👎 scores ~0.01 against the 0.4 bar. Live check today: the old
+selector picks nothing from 1,821 rows / 210 failed; the new one picks the one human-labelled
+failure inside the 7-day window.
+**Ten-click trajectory fb705dcf:** every `#launchBtn` interact result had a DIFFERENT fingerprint
+(lengths 365…404), so the result-keyed no-progress breaker could never count to two; `browser` is
+not in `is_mutating`.
+
+### What shipped
+
+**2a. Constraint scoping (agent.py, project_research.py).** `_active_project_constraints(limit, *,
+request_text)` — keyword-only, required — applies the ONE relevance authority
+(`project_research.request_relevant_to_project`) before returning the bound project's
+constraints; every reader (verifier note, prompt merge, start-with hoist) passes the request, and
+an AST enumeration fails on any call site that does not. The authority gained: continuation
+requests ("proceed", "continue with task 5") are relevant by binding; `RELEVANCE_STOPWORDS` filter
+the request side ("what" in a stored constraint no longer makes "what is 17 times 4?" relevant —
+the hay-side filter was proven equivalent by mutation and deleted); the project's goal and
+constraints join the overlap hay. The project-ledger evidence block is labelled *"task titles and
+statuses, NOT user constraints"*. Objection dismissal untouched (OFF on measurement).
+**2b. Evidence gate (core/evidence_gate.py, live arm `evidence_gate`).** ONE pure classifier over
+the turn's tool results against the tools' REAL empty shapes (browser `LENGTH:`<40 / HTTP 4xx-5xx;
+search "No search results found"; recall "Zero high-confidence" or the new "best match: LOW"
+header; file reads "not found"/`[Empty]`; execute non-zero exit; any error). Fires only when the
+turn consulted evidence and got none. The steer rides the volatile block (never a tool result —
+§4K), on the treatment arm only; the trigger is marked on both arms (`evidence_gate_fired`,
+registered in TRIGGER_KEYS + CONTEXT_MUTATING_KEYS, spec in DEFAULT_SPECS + experiments.json —
+backup kept). Kill: `GHOST_EVIDENCE_GATE=0`.
+**2c. Tool outputs.** `recall` chunks carry `RELEVANCE: <grade> (distance d)` and the header names
+the best grade — an all-LOW recall says "probably UNRELATED … do not present them as facts" (the
+codename confabulation). `list_files` opens with `N entries under …` using the TOTAL (the 19
+counting failures).
+**7. PPI (core/ppi.py; experiments.py `failure_rate[ppi]`; collector).** PPI++ with λ clipped to
+[0,1], a representativeness check (|z|>2.5 flags a skewed gold slice — §4ER labels the shakiest
+turns), refusals that name their reason, and a union-bound anytime CS over the existing
+`asymp_cs_radius`. Judge = machine verdict on every machine-judged row (the overlay now keeps
+`extra["outcome_native"]`; `machine_and_human_outcomes()` reads EVERY sidecar row, since
+last-write-wins loses the machine verdict on a human-relabelled turn); gold = human labels incl.
+`user_correction`/`operator_overlay`. Informational line, not in the verdict set.
+**Live result (the honest part):** across the six live arms λ = 0.00–0.41 (most ≤ 0.2): on the
+~20–27 paired rows per arm the machine verdict predicts the human label only weakly, so one-look
+PPI is 0–9% narrower than gold-only and the union-bound sequence is ~2× wider. PPI cannot rescue
+the arms' power today — the judge is too weak, which is exactly the label-noise story §4BE/§4EE
+told from the other side. The lever is judge accuracy (2a above) and a two-sample PPI sequence
+(follow-up), not more rows.
+**8a. Postmortem (reflection/postmortem.py, prompts, main.py).** `select_failed_runs(…,
+human_labeled=)` admits a human-labelled failure regardless of severity, ranks it first
+(`HUMAN_LABEL_PRIORITY`), dedups it by trajectory id (two clean 👎s hash alike structurally);
+machine failures keep the bar. `find_passing_sibling` (request-token Jaccard ≥0.25, same task
+kind, cluster bonus) feeds a CONTRAST block into the classifier prompt (arXiv 2606.30840:
+contrastive reflection 51.4→60.4 EM vs 57.0 failure-only); the report carries the sibling id; the
+watchdog line reads `… ; h human-labelled, k contrasted …`. main.py passes the collector's
+`has_human_label`.
+**8b. Repeated-mutation breaker (core/strikes.py, agent.py).** `canonical_mutation_key` — browser
+`interact` descends into the batch's state-changing actions (selectors), atomic click keys on the
+selector not the URL, file writes key on `path#sha(content)` (iterative editing is never a
+repeat), execute on the normalised command; `note_repeated_mutation` counts by identity only;
+`StrikeLedger.mutation_sigs` is NOT cleared by `note_world_changed`. The dispatch metadata tuple
+carries the raw args as a 10th element; enforcement steers at 3 identical mutations and forces a
+final response at 5.
+**9. Provenance (tools/projects.py, agent.py, memory/skills.py, learning_health.py).**
+`metadata["constraint_origins"]` (text → user|auto) stamped by ONE writer at the create and
+correction sites and copied on version/clone; `_project_constraints_for` drops stamped `auto`
+rows (legacy unstamped rows stay). Lessons carry `origin` derived ONCE in the write chokepoint
+from the request-id contextvar (`SYSTEM`/empty/sched-/job-/sub- → auto; probe- → probe; else
+user); explicit `origin=` wins; learning-health counts by origin and flags any probe-origin lesson.
+
+### Verification
+
+Pins: `tests/test_ppi.py` (10), `test_ppi_report.py` (7), `test_evidence_gate.py` (18+),
+`test_4fd_constraint_scoping.py` (14), `test_4fd_tool_output_counts_and_relevance.py` (5),
+`test_4fd_mutation_breaker.py` (5), `test_4fd_postmortem_selection.py` (8),
+`test_4fd_provenance.py` (12). Existing pins updated to the new contract, not deleted:
+`test_project_constraints.py` (note requires `request_text`, and now asserts the weather case),
+`test_participant_constraint_steer.py` (helpers pass "proceed").
+**Mutation batteries** (whole-file mutants on a COPIED tree, full listed test set per mutant, no
+named killers, NOOP control SURVIVED / KNOWNBAD control KILLED in both): **P2+P7 36/36**, **P8+P9
+26/26**. Two first-round survivors were resolved honestly: one exposed a fixture where both arms
+had gold (the and/or mutant was indistinguishable → fixture rebuilt with gold on one arm), one was
+dead code (hay-side stopword filter, equivalent by algebra → deleted). One mutant did not apply
+(anchor) and was replaced.
+**Defects found inside this section's own work (R8):** (i) the first coverage pin at n=40 asserted
+a nominal 95% the asymptotic z-interval cannot reach — replaced by an identity pin (recompute the
+variance formula independently) plus a coverage-vs-classical control; (ii) the recall edit applied
+half (header) and not the loop — a NameError caught before any run; (iii) `CONTRAST_TEMPLATE` was
+referenced before its edit landed — caught by the engine pin; (iv) the injection-site AST pin
+parsed `handle_chat` in isolation, which cannot be dedented (column-0 string continuations) — the
+module is parsed instead; (v) the first PPI comparison was against the machine-as-truth width and
+read "+13% wider", which was the wrong baseline — the line now prints one-look vs gold-only AND
+anytime vs gold-only CS; (vi) the lesson-origin derivation initially treated the contextvar default
+`"SYSTEM"` as a user id — pinned.
+
+### Not done, and why
+
+The confident-closing lexical prior (2d in the memo) is unprovable with 117 human labels and a
+verifier-derived label set that would make it circular — not built. No retrieval filter on lesson
+origin (observability first). Live verification of the evidence gate's steer is the next step
+after deploy (probe on a treatment-landing id, per the §4K demo recipe). Proposals 4, 5, 6 next.
+
+### §4FD live (2026-09-07 14:45)
+
+Deploy = `kill 83882` → launchd respawn, listener back in 38 s, boot log `experiments — 8 live`
+(evidence_gate listed), `post-mortem engine — phase 2.5c enabled`, `system ready`. Full suite before
+deploy: run 1 had 15 failures, all test stubs of `_active_constraint_note`/`_active_project_constraints`
+with the old signature plus one pin of the old ledger label — updated to the new contract (not
+deleted); run 2 **20,193 passed / 65 skipped / 0 failed** (5:08). Probe `4fd-probe-01`
+(`X-Ghost-Origin: probe`, list files + recall a codename): trajectory stamped `task_kind=probe`,
+`arms=None` — **a probe never enrolls in an arm by design, so the evidence-gate steer cannot be
+demonstrated with a probe**; what the probe does show: `file_system` output opens with
+`59 entries under the workspace root`, `recall` output carries `best match: HIGH` + per-chunk
+`RELEVANCE:` lines, and the reply abstained ("Codename: not found in memory") instead of inventing
+one. No error lines since the restart. The arm's first real firings will appear in
+`introspect experiments` (trigger key `evidence_gate_fired`) on user traffic; the post-mortem
+watchdog line changes shape on its next idle run (cooldown 3 h).
+
+## §4FE — Tool head diet, flag-gated, with its selection bench (2026-09-07)
+
+**Ask.** Memo proposal 6 (operator: "interested in … 6"). **Measured first** (live tokenizer,
+`/tokenize`): the 39 static schemas = **18,625 tokens** (rendered head ~21.4k with vision/image/
+acquired tools), i.e. 79% of every cold prefill; largest `manage_projects` 3,580, `browser` 1,805,
+`manage_composed_skills` 1,075, `file_system` 1,034 — the regex estimate in the memo had ranked
+composed-skills first; the tokenizer disagrees. Real-call census (foresight ledger, 45 d): eight tools =
+95% of calls, sixteen never called. Literature: arXiv 2605.24660 (7 visible tools 90.3% vs 50 tools
+90.8% on BFCL; adaptive short lists 93.1% vs 87.1% selection), ALE-Claw (13 vs 30 tools scored
+higher at −44% input, −60% wall), 2602.14878 (description examples add nothing, +67% steps).
+
+**Shipped (default OFF — `GHOST_TOOL_HEAD_DIET=1`).** `tools/registry.py`: `TOOL_HEAD_CORE` (16 names
+= every tool with ≥10 real calls + delegate/jobs/update_profile/vision_analysis + the catalog),
+`apply_tool_head_diet` applied LAST in `get_active_tool_definitions` (tuned descriptions and the
+fs_batch schema are computed on the set they always were; `apply_diet=False` lets the catalog build
+its inventory from the un-dieted set), `tool_catalog` (`list` / `describe name=…` → the full schema,
+with the instruction to call the tool by name). **Nothing leaves the handler map** — every hidden
+built-in stays dispatchable; the XML parser accepts any name and the native path's `tool_choice:auto`
+leaves text free for a `<tool_call>` the agent parses. The native pointer line says where the rest
+live. Core-16 = **11,465 tokens incl. the catalog (−38% of the static schemas; 11,314 before the catalog was appended)**. The advertised set is static for the
+request (never mutated — every mutation re-prefills the head).
+
+**Bench (`scripts/tool_head_diet_bench.py`) — a proxy, stated plainly.** The 587 mined fixtures'
+recorded contexts were archived with `GHOST_LLM_RECORD`, so the replay is the live SYSTEM_PROMPT +
+the fixture's request TEXT, full set vs diet, temperature 0, paired. **Pilot, 60 fixtures (551 s):
+full 0.433 vs diet 0.533; discordant 7 diet-only vs 1 full-only; exact McNemar p=0.070.** The full
+set's absolute accuracy is low because the context is gone (execute↔file_system confusion); the
+paired difference is the reading: the full set picked the hidden `workspace` tool three times where
+the truth was `file_system`, and returned no tool nine times vs five under the diet. Two hidden-truth
+fixtures: the diet picked `tool_catalog` once, the truth-by-name never. Next: the full 587 (~1.5 h on
+the main slot) before any flip; the accuracy claim, not the token claim, is what a flip needs.
+
+**Pins.** `tests/test_4fe_tool_head_diet.py` (6): flag-off byte identity, core+catalog only, every
+hidden tool still dispatchable, the catalog's inventory equals the hidden set, describe returns the
+schema (and says "already listed" for a core tool), the diet-off catalog reports nothing hidden, the
+census tools stay in the core. Docs: `docs/tools/registry.html#head-diet`.
+
+## §4FF — The compiled system prompt and the instruction-following bench (2026-09-07)
+
+**Ask.** Memo proposal 4. **Measured first:** `SYSTEM_PROMPT` = 129 sentences / ~4.2k tokens, ~53
+caps imperatives (~39 rule sentences), 76% of it TOOL ORCHESTRATION; six weeks of real turns: 23
+explicit-constraint violations, 55 narration leaks, 8 tool-syntax leaks, 7 raw dumps (~9% of turns
+carry an instruction-following defect). Literature: arXiv 2607.19257 (Qwen 35B perfect compliance
+72.5% @10 rules → 10.0% @40 → 0.0% @80; plain text > markdown +4.8 pp), 2608.02639 (instruction
+compiler +11 pp on the weakest model), 2604.20911 (omission rules decay to 10% by turn 16 on Qwen
+3.5; safe depth ≈ 7).
+
+**Shipped.** `prompts.SYSTEM_PROMPT_COMPILED`: the same policy as 12 numbered plain-text rules
+(precedence line: the current message's explicit instruction wins; explicit format constraints;
+evidence-only facts; counts from tools; native tool calls; never echo state; files; projects;
+participant mode; images; memory) + ONE routing table (a lookup, not a rule list), <60% of the
+control's length. **It never replaces the constant** — every prefix-cache, warmup and loader pin
+reads `SYSTEM_PROMPT`. `GhostAgent._select_system_prompt(body)` serves the compiled prompt only to a
+DIAGNOSTIC PROBE that sent `X-Ghost-Prompt-Variant: compiled`; the route reads that header inside
+its probe branch only, and the agent re-checks the probe prefix (two independent gates). The
+warmup keeps the control prompt by design (byte-identity with the live slot). This is the seam a
+bench-scoped or live arm would use next.
+
+**Bench (`scripts/if_bench.py`).** 26 items seeded from real constrained requests (5a90ff10 "just
+the number" failed; 88d1692d "One word."; the PONG/READY/NOTED probes) + synthetic siblings of the
+same shapes, 6 of them tool-then-format; deterministic checkers (exact / number-only / one word /
+one sentence / yes-no / JSON keys / starts-with / ≤N words / Greek script / N bullets); paired per
+item per repeat through the live agent as probes (never teach, never enrol); secondary counts:
+narration beats, tool-call XML in the reply. Exact McNemar. **Pilot pending the redeploy** (the
+route change is not live until restart).
+
+**Pins.** `tests/test_4ff_prompt_variant.py` (6): compiled ≤ a third of the control's imperatives,
+12 numbered rules, no markdown headers, <60% length, `{{PROFILE}}` kept; every tool the control
+routes is named by the compiled prompt (policy coverage — the first draft dropped
+`manage_projects`, caught by this pin); the selector serves the variant only under a probe id with
+the body flag; an AST pin that the route reads the header inside the probe branch and nowhere
+else; the live site selects through the method and the warmup stays on the constant; the harness
+checkers grade the recorded failure shapes. Docs: `docs/core/prompts.html#compiled`.
+
+## §4FG — The agentic coding leaf (edit-test loop) behind the executor seam (2026-09-07)
+
+**Ask.** Memo proposal 5. **Measured first:** `coding_executor.build_coding_task` = one spec call
+returning WHOLE FILES as JSON → N writes → one verify, ≤4 attempts; §4EI: files drafted inside
+`<think>` to the 30k ceiling, structural slips at the `files` boundary, no-think + JSON grammar as
+the repair — arXiv 2604.03616's worst quadrant (JSON-required output −3…−9 pp on Qwen3; a grammar
+does not remove it); 3 of 6 leaves failed in a 49-min run; `execute` fails 24% of real calls,
+`file_system replace` 48 missing-`replace_with` + 29 syntax rejections. Literature: Claw-SWE-Bench
+2606.12344 (model edits, runner exports the patch: apply-fail 69.1% → <1.5%; harness 27 pp vs model
+29 pp), Cursor (model-specific edit shapes: an order of magnitude fewer tool errors), 2607.26117 /
+2609.02892 (a fresh attempt with a concrete witness beats repair conditioned on the failed attempt;
+prose critique ≈ placebo).
+
+**Shipped (default OFF — `GHOST_CODING_EXECUTOR=agentic` or project `metadata.executor`).**
+`core/coding_loop.py`: `build_leaf_context` keeps `sandbox_dir` + `current_project_id` (paths resolve
+inside the project — the §4EI/2026-07-08 root-vs-project class), wraps memory read-only, nulls
+workspace model / journal / scheduler / profile / bus, stamps `task_kind="leaf"` +
+`turn_origin_label="leaf"` (no user-population ledger admits it, no arm enrols it), contains tools
+to `file_system` + `execute` fail-closed like `run_subagent`; `run_leaf_turn` runs one bounded
+`GhostAgent` loop (14 turns / 600 s via `env_positive`), thinking on; the contract is two trailing
+lines `VERIFY: <cmd|none>` / `SUMMARY:`; **files touched come from a workspace hash diff, never from
+the reply**; the gates run unchanged in order (`_run_verify` through the fail-closed runner →
+`smoke_gate` → `constraint_gate` over the written files); failure → a FRESH second attempt with the
+verify output head as witness; no-files-no-verify is a failed attempt. `CodingResult` unchanged, so
+`_finalize_coding` (DONE/FAILED, artifacts, work log) is untouched. **One seam:** the top of
+`build_coding_task` consults `executor_kind(context)`, so idle autoadvance, the `manage_projects`
+tool and the HTTP route all inherit it.
+
+**Bench (`scripts/leaf_bench.py`).** Two scratch CODING projects (spec vs agentic via metadata),
+the same six small verifiable leaves (fib + pytest, wc CLI + subprocess test, slugify, Flask
+/health + test_client, JSON→CSV, mean/median), `POST /advance` per leaf through the real executor
+and gates, DONE/FAILED + wall time, paired McNemar, hard-delete at the end. **Pilot pending the
+redeploy**; replicate ≥3× before reading (2602.07150).
+
+**Pins.** `tests/test_4fg_coding_loop.py` (9): contract parsing (last occurrence wins; `none` →
+empty), snapshot diff (created/changed only; deleted and dotfiles excluded), executor selection
+(env > metadata > spec), the success path (files from the diff; verify through the runner; ledger
+note), the fresh-attempt-with-witness policy and the attempt cap, no-files-no-verify fails, the
+constraint gate over written files, the isolation shape (project kept, memory read-only, kind
+leaf, live args untouched), the executed dispatch seam. One defect found in this section's own
+work: the loop's timeout constants read the environment unguarded — the suite's env-constant
+enumeration caught it; now `env_positive`. Docs: `docs/core/coding_loop.html`,
+`docs/core/coding_executor.html#agentic-seam`.
+
+### §4FE–§4FG live (2026-09-07 15:14)
+
+Second deploy of the day (kill → launchd respawn, listener back in 20 s, `experiments — 8 live`,
+`system ready`) carrying: the probe-only prompt-variant header + selector, `core/coding_loop.py`
+behind the executor seam (default spec), the tool head diet (flag OFF) with `tool_catalog`
+registered but hidden-set empty, and the §4FD fixes already live since 14:45. Full suite on the
+deployed tree: **20,214 passed / 65 skipped / 0 failed, twice** (4:58 and 5:19; one run in between
+caught the loop's unguarded env constants). Mutation battery P4+P5+P6: **23/23** after the parser
+pin was strengthened (its first form quoted the contract mid-line, so a "first VERIFY wins" mutant
+survived — `pin-must-fail-somewhere`). Pilots on the live agent: tool-head diet (proxy, n=60, done —
+§4FE), instruction-following bench and leaf bench running in chunks (each probe pays a cold
+prefill, ~32 s; the tool call cap is 10 min, so `--offset`/`--leaves` chunk the runs and
+`scripts/if_bench_combine.py` pairs the ledgers).
+
+### §4FF pilot — the instruction-following bench, read (2026-09-07 15:16–15:52)
+
+26 items × 2 variants × 1 repeat, all as probes; **every compiled probe recorded the compiled system
+prompt and every control probe the original (verified from the trajectories' `system_prompt`
+field, 26/26 each)**. Result: **control 24/26 (0.923), compiled 25/26 (0.962); discordant 1 vs 0;
+exact McNemar p = 1.0; narration beats 0/0; tool-call XML in replies 0/0; mean 42.3 s vs 40.7 s.**
+The one discordant item is instructive: "Describe the colour of the sea in five words or fewer" —
+control replied "No sea is visible in the image." (7 words), compiled "No sea is visible." (4) —
+both hallucinated an image that was never sent; the compiled prompt held the length constraint,
+the control did not. Verdict: at n=26 the pilot cannot distinguish the two (both near ceiling on
+this bank), which is itself information — the 23 real explicit-constraint failures came from harder
+shapes (constraints buried in a long task, "notify me in Slack when done" after 37 tools) than a
+one-line format request. Next: a harder bank (constraint + multi-tool task; standing "never X"
+rules probed at turn depth ≥ 7 per arXiv 2604.20911), ≥3 repeats. No flip; the constant stays.
+
+### §4FG pilot 1 — INVALID, and why (2026-09-07 15:52–15:57)
+
+The first leaf pilot reported 6/6 DONE on both arms in 319 s. It measured **spec vs spec**: zero
+`task_kind=leaf` trajectories and zero "Leaf Loop" log lines. The seam read the project id from
+`context.current_project_id`, and the advance path calls the executor on an UNBOUND context (the
+HTTP route and idle ticks carry no conversation binding — the very reason `_PinnedProjectContext`
+exists for the tool runners). So an "agentic" project selected the spec executor. `fix-inherits-the-
+blind-spot`: my `build_leaf_context` pin used a base that already carried the project id, a
+fixture where both worlds agree. Fixed by passing `project_id=project_id` from `advance_once` into
+the executor call (one site, all callers inherit), threading it through the seam,
+`executor_kind`, `_workspace_dir`, `run_leaf_turn` and `build_leaf_context` (which now PINS it).
+New pins: metadata selection on an unbound context through the real seam, the leaf context pins
+an unbound base, the seam forwards the id, an AST pin that `advance_once` passes `project_id=`.
+Battery re-run with four seam mutants: **27/27**. Suite **20,216 / 0 failed**. Third deploy 16:05.
+
+### §4FG pilot 2 — INVALID (theatrical), corrected by §4FH (2026-09-07 16:06–16:12)
+
+Same six leaves, both arms, one repeat, 365 s total. **This time the agentic arm ran the loop:** six
+`task_kind=leaf` trajectories (one per leaf, all first attempts — no witness retries were needed),
+each with the edit-test shape the design asks for: an `ls`/import probe of the workspace, two
+`file_system write` calls (module + test), `execute python -m pytest -q tests/…`, then the
+`VERIFY:`/`SUMMARY:` lines the executor parsed. Files came from the workspace diff; the verify
+command re-ran through the fail-closed runner; both scratch projects were hard-deleted (0 left).
+
+> **Correction (§4FH, 17:40):** the six agentic DONEs below were **theatrical**. The boundaries
+> reviewer found the leaf's `file_system` writes at the SANDBOX ROOT (`fib.py`, `wc.py`, `app.py`,
+> `j2c.py`, `stats.py`, `tests/`, `utils/` — twelve files, since deleted), not inside the project
+> workspace: `handle_chat` runs `reconcile_conversation` on every turn, a leaf has no conversation
+> binding, so the reconciler PARKED the project pin (`sub-leaf … no conversation binding —
+> deactivated` in the log, six times) and every relative path resolved against the root. The
+> executor then took "files written" from a workspace diff that was EMPTY and still marked the leaf
+> DONE because the verify command (run at the root) passed. The 6/6 is a measurement of the gates'
+> blind spot, not of the loop. Fixes and the re-run are in §4FH; the paragraph is kept as written
+> so the defect stays legible.
+
+**Result (as recorded at the time): spec 6/6 DONE, agentic 6/6 DONE, exact McNemar p = 1.0** — parity at ceiling. Wall time
+per leaf: spec 9.4 / 16.5 / 81.2 / 13.1 / 37.2 / 17.1 s; agentic 25.9 / 25.4 / 45.2 / 28.5 / 38.1 /
+27.4 s — the loop pays a few short tool turns per leaf, the spec path pays one long generation; on
+the slug leaf the loop was faster (45 s vs 81 s), elsewhere slower. **Reading:** these six leaves
+are too easy to discriminate (the same ceiling the B4 battery hit, §4F) — they never trigger the
+§4EI failure shape (a file drafted inside `<think>` to the 30k ceiling, a `files`-boundary slip),
+which needs a large single file. The bench that can decide is the §4EI shape: a single-file app
+grown over several leaves (the web tracker), ≥3 repeats; that is the next run, not this one. No
+flip; the spec executor stays the default. Leaf outcomes are `unknown` by design (no verifier on
+leaf turns; DONE is the executor's gates), and no user-population ledger admitted them.
+
+**Session totals (§4FD–§4FG, superseded by §4FH):** seven proposals built (2, 7, 8, 9 live; 4, 5,
+6 flag-gated OFF with their benches shipped), 3 deploys, batteries 36/36 + 26/26 + 27/27 with
+controls, suite 20,216 / 0 failed on the deployed tree, four pilots run (diet proxy n=60: diet
+0.533 vs full 0.433, 7 vs 1, p=0.07; IF n=26: 0.962 vs 0.923, 1 vs 0, p=1.0; leaf n=6: 6/6 vs
+6/6 — **INVALID, see the correction above**; PPI live: λ 0.00–0.41). Defects caught inside this
+session's own work and fixed before they shipped: seven (listed in §4FD R8) plus the seam
+project-id blind spot (§4FG pilot 1) and the unguarded env constants. The verification pass that
+followed (§4FH) found more, including one shipped proposal that had to be retracted.
+
+## §4FH — Verification pass over §4FD–§4FG: one proposal retracted, one pilot voided, twelve fixes (2026-09-07 16:20–18:30)
+
+**Trigger:** the operator asked for every change of the day to be verified. Protocol §R: four
+READ-ONLY reviewer lenses (turn-loop wiring; instruments; boundaries + provenance; test quality),
+each briefed on its consumers rather than the diff; an independent re-derivation of every number
+quoted in §4FD–§4FG; live checks on the deployed process; then a consolidated mutation battery on
+a copied tree and the full suite twice. Convergence = mutation score with controls, not reviewer
+silence.
+
+### What the reviewers found (and what was done)
+
+**C1 (turn loop) + C2 (boundaries) — the repeated-mutation breaker was wrong and is RETRACTED.**
+Its premise was request fb705dcf ("clicked `#launchBtn` ten times"). Fact check: every one of those
+clicks had file edits between it and the next — an edit→verify cycle, not an ungrounded repeat. A
+corpus replay of the shipped identity key over 1,067 real requests: 28 false steers and 11 false
+hard stops (re-reads, green test re-runs, id-keyed task updates collapsing onto one key) against 3
+rows of the class it targeted. A guard with no measured true positive does not ship. Deleted from
+`core/strikes.py` and the turn loop (`tool_call_metadata` back to nine fields at both sites); the
+deletion is pinned in `tests/test_4fh_mutation_breaker_retracted.py`; `docs/core/strikes.html`
+carries the retraction. Proposal 8 is now the postmortem retarget alone.
+
+**C1 (boundaries) — §4FG pilot 2 was theatrical.** The six agentic DONEs had written twelve files at
+the SANDBOX ROOT (`fib.py`, `wc.py`, `app.py`, `j2c.py`, `stats.py`, `tests/`, `utils/`; plus
+`__pycache__`/`.pytest_cache`), not in the project workspace: `handle_chat` runs
+`reconcile_conversation` every turn, a leaf has no conversation binding, so the reconciler parked
+the pin ("`sub-leaf … no conversation binding — deactivated`", six times in the log) and every
+relative path resolved at the root. The executor's workspace diff was EMPTY and the leaf was still
+DONE because the verify command passed where it ran. Fixes: `build_leaf_context` marks the isolated
+context `_leaf_pinned_project`; `reconcile_conversation` honours the mark (re-asserts the pin and
+the scratchpad scope, returns); `run_leaf_turn` fails closed if the pin did not survive the turn;
+`build_coding_task_agentic` fails an attempt whose diff is empty whatever the verify said;
+`is_background` leaves ride the client's background lane (`_BackgroundOnlyLLM`). Root files and
+caches deleted. Pins: `tests/test_4fh_leaf_pin_survives_reconcile.py`. The §4FG pilot 2 entry is
+corrected in place; pilot 3 below.
+
+**M1 (instruments) — the constraint gate failed CLOSED on every Greek request and every short ack.**
+`request_relevant_to_project` tokenised `[a-z0-9]+` and returned "not relevant" for any request
+with no such token of 4+ chars: 34 real requests (23 Greek) silently lost their project constraints.
+Now: Unicode `\w+` tokens, accent-folded on both sides; a request with no content token left after
+stopwords and continuation words (incl. Greek continuations: συνέχισε, ναι, εντάξει, …) is a
+continuation of the bound project (and about nothing when no project is bound). "user" removed from
+the stopword list ("fix the user page" must reach "User Management"). **Rejected on measurement:** a
+5-char prefix stem for inflection ("δαπανών" ≠ "δαπάνες") raised relevant request×project pairs from
+2,704 to 3,267 of 8,036 on the corpus (2,097 requests × 4 live projects) — "creatine" reached a
+project through "create", "confirm" through "config" — the exact off-topic replay §4FD exists to
+stop. Accent folding changed no verdict (2,704 → 2,704) and stays because it cannot widen beyond
+accent-only spellings. An old pin asserting the pre-fix contract ("do it" + project cmd → not
+relevant) was updated with the reason.
+
+**M2/M3 (instruments) — PPI populations and z.** `_z` snapped alpha to a 3-entry table (α=0.02 was
+reported as α=0.01): now exact via `NormalDist().inv_cdf`. A constant judge series produced
+gap_z=0 and "representative": now ±inf → not representative. The report line names its populations
+("anytime ±hw vs gold-only CS on the SAME rows ±(r_c+r_t); union bound"; "human_failure_rate CS
+over ALL human-labelled rows n=c/t"; machine-as-truth CS separately) and is marked informational,
+not in the verdict set. `machine_and_human_outcomes`: a human-authored row whose outcome is neither
+passed nor failed is a RETRACTION `(None, None)`; `user_correction` is a MACHINE source (the old
+battery mutant asserting the opposite contract was dropped as obsolete). `_judge_and_gold` guards a
+non-dict `extra`.
+
+**M (instruments) — postmortem keys and sibling.** A human-labelled turn whose analysis failed was
+recorded under its structural hash, so the next 👎 with the same shape was skipped: failures are now
+keyed `human:<id>` like the selection. `find_passing_sibling` bounds the sibling to the selection
+recency window and uses the shared stopword list; human-labelled reports carry severity 1.0 for the
+queue. **Defect in my own fix (R8):** the stopword change made the sibling pin vacuous — the failed
+decoy tied the passing sibling at Jaccard 0.5 and pool order decided, so the battery mutant that
+deletes the outcome filter SURVIVED; the pin now lists a strictly-more-similar failed decoy first
+and asserts it is never chosen (killed on the fix run).
+
+**M2 (provenance) — `_constraint_origin` treated the contextvar default as a user turn.** The idle
+watchdog dispatches tools with `request_id_context` = "SYSTEM"; the constraint stamp said "user".
+One derivation now, shared with the lesson chokepoint (`_derive_lesson_origin`: SYSTEM/empty/
+sched-/job-/sub- → auto, probe- → probe). A user restatement upgrades an auto stamp; auto never
+demotes user. Sites pinned by AST enumeration.
+
+**m (misc):** recall header grades the best match and says LOW matches are probably unrelated;
+`list_files` opens with the total entry count even when capped; `hidden_tool_definitions` docstring
+no longer promises what `disabled_tools` does not do; the leaf loop's env constants go through
+`env_positive`; docs for coding_loop / project_research / strikes updated.
+
+### Re-derivations (every quoted number, recomputed from the raw rows)
+Late refutes 158 / constraint-bleed 3 (§4FD said 157/3 — off by one, corrected); static tool
+schemas full 18,625 / diet 11,465 tokens (catalog included; the first figure omitted it);
+postmortem selection old 0 / new 1 pick on the human channel; IF bench 26/26 prompts correct per
+variant; leaf ledger rows 6; PPI λ 0.00–0.41 on the all-enrolled lines (the 0.75 was a 2-gold
+slice the report itself flags SKEWED). All other figures matched.
+
+### Live checks
+No new flags on the live process; no error lines since the 14:45 / 15:14 deploys; the human-labelled
+postmortem ran once live ("1/1 analysed … 1 human-labelled"); the operator restarted the agent
+manually at 17:08:50 (clean shutdown/respawn observed). One probe of mine pointed `ProjectStore` at
+the data ROOT and created an empty `projects.db` there — removed 21 s later (the live store is
+`system/memory/projects.db`).
+
+### Convergence
+Battery `battery_all_r2.json`: 99 mutants on a copied tree (src/tests/scripts), whole-file,
+no named killers: 99/99 killed; controls no-op SURVIVED / known-bad KILLED (the no-op had to be
+re-anchored: it sat on the `_Z_TABLE` the M3 fix deleted — a control that cannot apply is not a
+control). The main run applied 95 (94 killed, 1 survived — the sibling pin above); after the pin fix and
+re-anchoring the four mutants whose text this round's fixes had moved, two fix runs on fresh copies
+killed 2/2 and 3/3 with controls correct; one obsolete mutant (it asserted `user_correction` is
+human, the contract this round reversed) was dropped. Suite on the final tree: 20,235 passed / 65 skipped / 0 failed (run 1, 5:08) and 20,235 / 65 / 0 (run 2, 5:03).
+
+### §4FG pilot 3 — the leaf loop measured for real (2026-09-07 18:15–18:24, on the verified tree)
+Same six leaves, both arms, one repeat, 518 s. **Spec 6/6 DONE, agentic 6/6 DONE, exact McNemar
+p = 1.0** — and this time the parity is real: a workspace watch sampled the agentic scratch project
+every 8 s before the bench hard-deleted it and saw every deliverable INSIDE
+`projects/44ee6c4c6b29/` (`app.py fib.py j2c.py stats.py wc.py utils/slug.py tests/test_*.py`);
+the sandbox root held nothing new; six `sub-leaf` log lines and **zero** "no conversation binding
+— deactivated" lines (six in pilot 2); zero "lost its project pin" (the fail-closed check never had
+to fire); six `task_kind=leaf` trajectories with 14 / 9 / 9 / 20 / 15 / 3 tool calls; both scratch
+projects deleted (four projects remain, as before). Wall time per leaf, spec vs agentic: fib 10.9 /
+57.0 s, wc 18.9 / 42.1, slug 14.8 / 65.3, health 12.8 / 92.6, j2c 71.5 / 90.1, stats 12.6 / 29.2 —
+the loop is 1.3–7× slower on leaves this small (mean 24 s vs 63 s) because it pays several short
+tool turns where the spec path pays one generation. **Reading unchanged from §4FG:** six easy
+leaves sit at the ceiling for both arms and never reach the §4EI failure shape; the deciding bench
+is the single-file app grown over several leaves, ≥3 repeats. No flip; the spec executor stays the
+default, the loop stays flag-gated.
+
+### Deploy
+18:14:46 TERM to listener 15223 → launchd respawn, new listener 86419 up at 18:14:52, "system
+ready" in the log, no error lines in `ghost-agent.err`; the prefix warmup prefilled ~26,304 tokens
+of byte-stable head in 3.5 s. Fourth deploy of the day; the tree it runs is the one the battery and
+both suite runs measured.
+
+**Session totals (§4FD–§4FH):** seven proposals built; **six stand** (2, 7, 9 live; 8 as the
+postmortem retarget only; 4, 5, 6 flag-gated OFF with benches) and **one retracted** (the
+repeated-mutation breaker). Reviewer findings: 2 critical, 6 major, 6 minor — all fixed or
+retracted; defects found in this session's own fixes: the vacuous sibling pin, the accent fold that
+broke Greek continuations (caught by the pin before it shipped), the invented replay numbers in a
+code comment (caught when the full replay printed; corrected to the measured 2,704 → 3,267 of
+8,036). Deploys: 4. Pilots: 4 valid (diet proxy, IF, PPI live, leaf pilot 3), 2 invalid (leaf 1, 2).
+
+## §4FI — The two deciding benches run in full: tool head diet (proposal 6) and the single-file leaf suite (proposal 5) (2026-09-07 18:45–21:58)
+
+**Trigger:** "do 2 and 3" from the what's-next list — run the diet bench on every fixture (the
+pre-registered condition before any flip) and author + run the leaf bench that can actually
+separate the edit-test loop from the spec executor. Both runs went through `scripts/preflight_longrun.py`
+(§4U): observable via `RunProgress` files read with `scripts/runstatus.py`, bounded by the tool's own
+count, resumable, and detached into their own session (`start_new_session`) so a turn end cannot
+kill them. Pins for both benches' new behaviour: `tests/test_4fi_bench_scripts.py` (executed with
+the network faked: resume skips paid rows and totals cover the whole ledger; the app suite runs
+end-to-end through the arm/leaf/ledger/progress flow). Suite after the script changes: 20,239 / 65 / 0.
+
+### Proposal 6 — tool head diet, all 587 fixtures (18:48–20:10, 4,865 s, 0 transport errors)
+
+> **Correction (§4FK, 2026-09-08 00:40): the verdict below does not survive the correct unit of
+> analysis.** The instrument reviewer found that the 587 fixture rows hold only **264 distinct
+> requests** (one request is recorded 40×, 151 are repeated, 142 of those with conflicting recorded
+> first tools), and the bench replays the request TEXT only, so repeated rows are one observation
+> each, not forty. Re-scored per distinct request (majority recorded tool among passed turns):
+> **full 0.489 vs diet 0.481, 23 vs 21 discordant, p = 0.88.** Strata: real user requests (n=90)
+> 0.500 vs 0.578, 2 vs 9, p = 0.065; bench-origin requests (n=174) 0.483 vs 0.431, 21 vs 12,
+> p = 0.16; the row-level effect also lived in the 166 rows recorded on FAILED turns (0.078 vs
+> 0.277) and was absent on passed turns (0.439 vs 0.451, p = 0.64). The corpus is the miner's
+> parked (`.notready`) output. Proposal 6's proxy verdict is therefore **inconclusive**, with a
+> suggestive edge on user-origin requests only; the 7,160-token cut per turn remains its measured
+> value. The instrument now scores by distinct request, stratifies, and names its corpus (§4FK).
+> The numbers below are kept as the row-level record they were.
+The bench gained `--resume <ledger>` (skips paid fixture ids, appends, recomputes totals from the
+rows) and a progress file; the gate cleared it with a measured 6.5/min from the pilot (ETA range
+68–135 min; actual 81). Result on `20260907T154857Z`:
+
+| | full head | diet (core 16 + tool_catalog) |
+|---|---|---|
+| first-tool accuracy, n=587 | **0.337** | **0.402** |
+| discordant pairs | 34 full-only | 72 diet-only |
+| exact McNemar | p = 0.00028 | |
+| STRICT (no catalog credit) | 0.337 / 34 | 0.397 / 69, p = 0.0007 |
+| core-truth rows only (561) | 32 | 69, p = 0.0003 |
+| no tool call at all | 83 | 77 |
+
+The pilot's 7-vs-1 held up in direction but not in ratio (the interim split was 15 vs 11 at n=153).
+**Decomposition, which matters more than the p-value:** of the diet's 72 wins, 69 are the model
+picking the RIGHT tool outright and only 3 are the designed `tool_catalog` credit. In 35 of those 69
+the full head had picked **`workspace`** where the truth was `file_system` — a confusion the diet
+removes by hiding `workspace` (file_system accuracy 0.43 → 0.56 on n=223). Take those 35 away and
+the two arms are a wash (34 vs 34). The diet's 34 losses are the model returning no tool (15) or
+`execute` (14) where the truth was file_system/execute. Hidden truths (26 rows) are lost under
+BOTH heads: full 2/26, diet 3/26 — and the diet's three are the catalog; the model reaches for
+`tool_catalog` in 3 of 26 chances, so the discovery path is real but weak.
+
+**Reading:** the proxy's pre-registered condition is met, and the mechanism is legible: most of the
+accuracy gain is one hidden-tool confusion (`workspace` vs `file_system`), the rest is a smaller
+head. The 7,160-token cut per turn (18,625 → 11,465) is a latency gain the proxy does not score.
+**No global flip from a request-text proxy.** Two ways forward, both measured on real traffic:
+(a) enrol the diet as a live arm (`tool_head_diet` in `experiments.json`, per-request
+`apply_tool_head_diet`) and read the TRIGGERED block after the traffic-gated clock; (b) the
+narrower intervention the decomposition points at — hide or re-describe `workspace` alone — which
+should recover ~35 of the 69 without hiding 40 tools. (a) tests the whole proposal, (b) tests its
+dominant cause; the operator picks.
+
+### Proposal 5 — the single-file leaf suite (`--suite app`)
+`--suite app` (§4FI): one single-file Flask expense app grown over six dependent leaves (skel →
+crud → inline page → summary + month filter → CSV export/import → JSON persistence via
+`create_app`), each leaf adding routes AND tests to the same `app.py`; the spec executor must
+re-emit the whole file every leaf, the loop edits in place. Both arms honoured the single-file rule
+in every repeat (only `app.py` + `tests/test_app.py` ever existed; root clean; 0 parked pins).
+Combined by `scripts/leaf_bench_combine.py` (pairs = ledger × rep × leaf).
+
+**Repeat 1 (20:11–20:38, 1,639 s, gate forced — this repeat was the timed slice): spec 6/6,
+agentic 6/6, p = 1.0.** Final `app.py`: 279 lines (spec) / 302 (agentic). Per leaf, spec vs
+agentic seconds: skel 43/71, crud 154/134, page 168/95, summary 110/191, csv 141/166, persist
+137/228 (means 126 vs 148). **The spec arm hit the §4EI shape three times and survived it:** crud
+— a dropped `{` at the `files` boundary, repaired by `_repair_spec_structure`; csv and persist —
+the 30k reasoning ceiling with no content, each retried once with thinking disabled (10–22 s) and
+passing. After the second abort the adaptive policy flipped: "spec calls now start with thinking
+DISABLED". So the failure mode proposal 5 was built against (§4EI: 3 of 6 FAILED, 49 min) is now
+absorbed by the §4EI fixes at this file size — the loop's premise is weaker than the memo said.
+
+**Repeat 2 (20:40–21:08, gate cleared on repeat 1's 0.44/min): spec 2/6, agentic
+6/6.** The spec arm ran 3–4× faster than in repeat 1 (14 / 29 / 45 / 31 / 80 / 33 s) and
+FAILED crud, page and csv on verify and persist on the duplicate-definition guard; only skel and a
+"already implements" summary passed. **Why: the think policy that tripped in repeat 1 is STICKY.**
+`_think_disabled_now` returns True once the abort streak reaches 2; the only resets are a clean
+think phase — which cannot happen because no think phase runs any more — or a process restart
+(`coding_executor.py:76`, confirmed in the code). Same process, same LLM client → every spec call
+in repeat 2 started no-think, and zero new ceiling aborts across six spec leaves confirms no think
+phase ran. This is the class in [[preflight-guard-lifecycle]] again: an arm-on-N-failures guard
+with no disarm path. Its measured cost on this shape: the no-think spec regime fails where the
+think-with-fallback regime passes. Repeat 2 is therefore a measurement of the live executor in its
+post-trip regime, not an independent replicate of repeat 1.
+
+**Repeat 3 (21:09–21:52, 2,574 s, after a launchd restart at 21:08 to reset the policy — new
+listener 50874): spec 2/6, agentic 6/6.** Fresh process, think regime: skel and crud DONE (45 s,
+106 s); page and summary FAILED after long think phases (315 s, 277 s) on the duplicate-definition
+guard ("append to tests/test_app.py refused: it RE-DEFINES identifiers that already exist"); two
+more reasoning-ceiling aborts then tripped the policy again ("thinking DISABLED", 0 streak resets in
+the whole day), and csv and persist FAILED verify fast (69 s, 58 s) in the no-think regime. The
+agentic arm went 6/6 with its slowest leaves of the day (summary 788 s, persist 309 s) — single
+attempts of 14–19 tool calls on a ~300-line file, no witness retries.
+
+**Combined, 18 pairs (`leaf_bench_combine.py` over the three ledgers):**
+
+| | spec executor (live default) | agentic loop (flag-gated) |
+|---|---|---|
+| leaves DONE | **10 / 18 (0.556)** | **18 / 18 (1.000)** |
+| discordant pairs | 0 spec-only | 8 agentic-only |
+| exact McNemar | **p = 0.0078** | |
+| mean seconds per leaf | 103 | 223 |
+
+Per leaf (DONE of 3, mean s) — skel: spec 3/3 34 s, agentic 3/3 74 s · crud: 2/3 96 s, 3/3 161 s ·
+page: 1/3 176 s, 3/3 99 s · summary: 2/3 140 s, 3/3 374 s · csv: 1/3 97 s, 3/3 308 s · persist:
+1/3 76 s, 3/3 324 s. Every disagreement is the same direction; the spec failures are five verify
+failures and three duplicate-definition refusals. Both arms kept the single-file rule in all three
+repeats; root clean throughout; 0 parked pins, 0 pin losses.
+
+**Reading for proposal 5:** on the shape that motivated it, the loop finishes what the spec path
+does not — 8 of 18 leaves flipped, none the other way, p = 0.0078 — at roughly twice the wall time
+per leaf (and 5–13 min on the largest leaves). The three repeats are NOT three draws from one
+regime: repeat 1 is think-with-fallback (6/6 spec), repeat 2 is the tripped no-think regime (2/6),
+repeat 3 is fresh-then-tripped (2/6); the loop is 6/6 in all three. The honest statement is
+therefore two-fold: (1) the spec executor's DONE rate on a growing single file depends on a policy
+state the operator cannot see and that only a restart clears; (2) the loop does not have that
+dependency, because it never makes the spec call. A flip of the default executor to `agentic` is
+now supported by this bench for the growing-single-file shape, at a measured time cost; it is
+still flag-gated (`GHOST_CODING_EXECUTOR=agentic` or project `metadata.executor`) and the small
+suite showed parity, so a project-kind or file-size routing (spec for one-shot small leaves, loop
+for growing files) is the shape of the flip — the operator's call.
+
+**Defect surfaced, not fixed here:** the sticky no-think regime. Proposed disarm path (operator's
+call, not built): after K no-think spec calls (or on the first verify failure under no-think), run
+ONE probe think phase; a clean probe resets the streak, an aborted probe extends the no-think
+window. Pins would have to cover the probe firing AND the reset, at the call site (§4DY, §4EC).
+
+## §4FJ — Two fixes from the §4FI benches: the `workspace` confusion and the sticky no-think regime (2026-09-07 22:05–22:50)
+
+**Trigger:** "fix the workspace confusion and the sticky no-think" — the two defects the §4FI benches
+surfaced. Both are fixed at the mechanism, pinned, mutation-tested, and MEASURED on the same
+instruments that found them.
+
+### Fix 1 — `workspace` no longer advertises itself as a place to do work
+On the 587-fixture replay the full head picked `workspace` 98 times; the recorded truth was
+`workspace` once. 60 of those were `file_system` requests about building or fixing things ("the
+ball spawns inside the wall so when i press space…", "add the option to pin a competition event on
+a date"), 19 were `browser`, 12 `execute`. The old text drew them in: "what's outside of you
+(files, …)" and "show me what you've been doing in my project". The description now says what the
+tool IS (a read-only ACTIVITY LEDGER of what ALREADY HAPPENED), what it CANNOT do (read, write,
+edit, build, fix, run, continue), names the four tools those requests belong to (file_system,
+execute, browser, manage_projects), and keeps every action. Pinned in
+`tests/test_4fj_think_probe_and_workspace.py` (the ledger/exclusion sentences present, the old
+trigger phrases absent, the actions intact).
+
+**Measured, not assumed:** `scripts/tool_head_diet_bench.py --pair A,B` now chooses the two heads,
+and `full-legacy-workspace` is the pre-§4FJ description kept verbatim in the script as a FIXED head
+(an executed pin proves the legacy head differs from the live head in exactly that one description
+— a comparison that cannot distinguish is not one). Only `diet` ever earns the catalog credit; every
+other head is scored on the exact pick; ledger rows carry `picked_<head>`/`ok_<head>` and an
+`arms` field, and resume counts only rows of the same pair. Result on all 587 fixtures:
+
+| all 587 fixture rows (unit = row, as §4FI scored) | old text | new text |
+|---|---|---|
+| first-tool accuracy | 0.337 | 0.363 |
+| discordant | 42 old-only | 57 new-only, p = 0.16 |
+| `workspace` picked (truth = workspace once) | 98 | 67 |
+| the 98 rows the old text sent to `workspace` | 0 correct | 26 correct (p = 3e-8); 51 still `workspace`, 41 → file_system |
+| the other 489 rows | 0.405 | 0.382 (42 vs 31, p = 0.24); 106 picks moved anyway, no-tool replies 83 → 101 |
+
+**At the correct unit — the distinct request (see §4FK: 264 distinct requests in 587 rows) — 0.489 → 0.466,
+23 vs 17, p = 0.43.** So: the targeted error shrinks by a third and a quarter of those rows are now
+right, and the net effect on routing accuracy is zero within the instrument's noise (identical prompts
+give different picks on 15 of 110 repeated requests at temperature 0). The description is kept because
+it is true and it removes the confusion it was written against; it is NOT a routing improvement, and
+the rise in no-tool replies is a side effect to watch. The reviewers' boundary findings on the same
+change (§4FK) are fixed alongside: the wake-up prefix no longer frames the block as "what's outside of
+me", the `workspace_track`/`postmortem` cross-references and the module docstring use the ledger
+vocabulary, "proceed with all tasks" is no longer steered into a tool whose own text forbids it, and a
+tuned description can no longer shed the NEVER/ONLY sentences (`_pinned_sentences` in the validator).
+
+### Fix 2 — the no-think regime has a disarm path
+`_think_disabled_now` returned True once the abort streak reached 2, and the only reset was "a
+clean think phase" — impossible once no think phase runs — or a restart (`coding_executor.py`
+line 76). §4FI measured the consequence: 6/6 DONE in the think-with-fallback regime, 2/6 in the
+tripped regime of the same process. Now (`GHOST_CODING_THINK_PROBE_AFTER`, default 3): after K
+no-think spec calls, or immediately after a verify failure on a spec that was built no-think, ONE
+spec call streams a think phase as a probe; a clean probe resets the streak (thinking is back on),
+an aborted probe extends the no-think window by K more calls. `0`/negative = the pre-§4FJ sticky
+behaviour. The verify-failure hook sits at BOTH verify sites in `build_coding_task` (the
+written-files path and the verify-only path). Probe, reset and hook are logged at WARNING so the
+operator stream shows them. Pins (9): the window and a clean probe, an aborted probe extending the
+window, the knob, the hook at each real call site, a think-built spec's verify failure NOT arming a
+probe. This is the second instance of [[preflight-guard-lifecycle]] (arm-on-N-failures with no
+disarm path); the memory now records the fix.
+
+**Live check:** One app-suite repeat on the restarted agent (00:38–01:22). The operator log, in order: "think phase produced content — abort streak reset (was 1)" (a clean think after one abort), then two aborts and "spec calls now start with thinking DISABLED", then "spec call starts with thinking disabled (no-think call 1/3 … 2/3 … 3/3 in this window)", then "probe think phase after 3 no-think spec calls", 91 s later "probe think phase aborted too — no-think window extended by 3 spec calls" (an exact n-gram loop), and the no-think retry carried the leaf. So both branches of the disarm path have now run live: the reset (a clean think re-enables) and the extension (an aborted probe does not reset on nothing). Before §4FJ this process would have stayed no-think until the next restart. Repeat 4 tally: spec 5/6, agentic 5/6, p = 1.0 — both arms FAILED the csv leaf (spec: a replace that broke syntax, rejected pre-write; agentic: the smoke gate after two attempts, its first failure in four repeats). Over all four repeats (24 pairs): spec 15/24 (0.625), agentic 23/24 (0.958), 0 spec-only vs 8 agentic-only, exact McNemar p = 0.0078, mean 102 s vs 246 s per leaf — the §4FI reading for proposal 5 stands, with one agentic failure now on record.
+
+### Convergence
+Battery `battery_4fj.json`: 16 mutants on a copied tree, 14/16 on the first run — the two survivors were the hook's `skipped_think_last` condition (only exercised with the regime untripped); pinned with the aborted-probe-then-verify-failure world and re-run 2/2; controls correct on both runs. Suite: 20,249 / 65 / 0 and 20,249 / 65 / 1 (the one failure a Tor search-cache count pin, unrelated file, 3/3 green in isolation). Deploy: 22:44 launchd respawn, listener 45733 (superseded by the §4FK restart).
+
+## §4FK — Verification of §4FJ: the instrument was wrong before the fixes were (2026-09-08 00:05–01:25)
+
+**Trigger:** "no matter the result, verify all your changes… in the morning i wanna find the agent
+fixes and restarted." Four READ-ONLY reviewer lenses (executor probe path; the bench as an
+instrument; the description's boundaries; test quality) briefed on consumers, plus the paired
+workspace bench finishing underneath them. Convergence by mutation score with controls.
+
+### The finding that outranks everything else — the diet bench's unit of analysis
+The instrument reviewer recomputed the corpus: **587 fixture rows, 264 distinct requests**; one
+request recorded 40×, 151 repeated, 142 with conflicting recorded first tools; 166 rows recorded on
+FAILED turns; 54% bench-origin; and the file is the miner's *parked* `.notready` output (supply
+gates not met). The bench replays request TEXT at temperature 0, so a request recorded forty times
+was forty "independent" pairs. Re-scored per distinct request the §4FI diet verdict vanishes
+(0.489 vs 0.481, p = 0.88; §4FI carries the correction) and the §4FJ workspace comparison sits in
+the noise (0.489 vs 0.466, p = 0.43). Also found: `--resume` with the default `--limit 60` ran
+nothing, exited 0 and wrote a progress file reading 100% finished over a partial ledger; the
+catalog credit was keyed on `TOOL_HEAD_CORE`, which contains `vision_analysis` that the bench diet
+head never advertises; a resume with a different pair silently mixed pairs in one ledger; the XML
+fallback parser dropped the last character of a truncated `<tool_call>` and scored it a miss;
+temperature 0 gave different picks on 15 of 110 repeated identical prompts.
+
+**Fixed in `scripts/tool_head_diet_bench.py`:** `--unit request` (default; majority recorded tool
+among PASSED turns, `--unit row` kept for comparison), strata by recorded outcome and by origin in
+the summary, the corpus status named in the banner and the summary, seed/limit/unit recorded, a
+resume that selects nothing is an error (not a finished bench), a different pair cannot resume a
+ledger, `n`/progress are selection-scoped, the catalog credit is derived from the head actually
+sent, the truncated-XML fallback parses. Pins (executed, network faked): unit collapse with
+majority-passed truth, strata counts, the two resume guards, the seed shuffle, the transport shape
+(temperature 0, system prompt, 6,000-char cap) and the truncated fallback.
+
+### Reviewer findings on the fixes themselves (R8)
+**Executor (probe path).** MAJOR: an empty or errored upstream stream during a probe scored as a
+CLEAN think — the streak reset and the log said "the probe succeeded" for a zero-byte response;
+reachable only because the probe re-opens think phases at a cadence. Fixed: `("", "", None)` is
+*inconclusive* (probe disarmed, window unchanged, next call probes again). MAJOR: the verify hook
+makes a failing 4-attempt leaf pay 2 aborted probes (~230 s); bounded by the `skipped_think_last`
+rule, now PINNED at the real call site (exactly 2 streams over 4 failing attempts). Minor, all
+fixed: a raising stream left a stale probe flag (try/except bookkeeping); the predicate mutated and
+logged (split: `_probe_due` + `_arm_probe` at the call site); `last_nothink` meant "no think was
+ATTEMPTED" (renamed `skipped_think_last`, docstring says so); no attribution in the hook line (the
+leaf description is logged); the no-think call line was INFO (now WARNING, with the window count).
+Documented as intentional: smoke/constraint-gate failures do not arm the hook.
+
+**Description boundaries.** CRITICAL: the wake-up prefix — above the schemas on every turn — still
+said "WORKSPACE STATE — WHAT'S OUTSIDE OF ME … what I'm looking at"; reworded to the ledger framing
+within its size budget (the three older pins on "WORKSPACE STATE" still hold). CRITICAL: a live
+auto-acquired skill (`auto.generic.workspace_workspace_file_system.e3d150`, support 3) tells the
+model "workspace → workspace → file_system has worked 3×" for "Summarise the latest files in my
+sandbox" — retired from `auto_skills.json` (backup kept) at the restart below. MAJOR: a promoted
+`tool_description.workspace.json` would replace the text wholesale and the registry pin would stay
+green — `_validate_tool_description` now requires the baseline's NEVER/ONLY sentences verbatim
+(`_pinned_sentences`); pinned. MAJOR: "'proceed with all tasks' → manage_projects" contradicted
+that tool's own pacing rule — reworded. Minors fixed: sibling vocabulary in `workspace_track` /
+`postmortem` / the module docstring / `registry.html`; token figure ≈18,705 (+80). Noted, not
+changed: no routing-table entry for the ledger questions; under the diet the catalog listing
+truncates the new sentences at 110 chars; the corpus cannot reward correct `workspace` use (its six
+truth rows are briefings now routed to introspect).
+
+**Test quality.** Eight verified-surviving mutants, two CRITICAL: the leaf bench never pinned that
+its two arms run DIFFERENT executors (`meta = {}` survived every test — the deciding bench for
+proposal 5 could not distinguish itself from a no-op), and nothing pinned that a PASSING verify does
+not arm a probe. Both pinned, plus: `done` must come from the task status not the advance reply,
+the combine fixture made asymmetric (cells swapped survived), the `.notready` corpus path, the
+shuffle, `--keep`, the budget-exhausted think shape (reasoning under the ceiling, no content — the
+2026-07-06 live shape — scored clean survived), the hook's attempt scope, the fallback state store.
+
+### Convergence
+Battery `battery_4fk.json`: 37 mutants (the 16 of §4FJ re-anchored on the reviewed code + 21 for the fixes, including the 8 the test reviewer proved surviving); 33/34 on the main run, then 3/3, 1/1 and 2/2 on fresh copies after one more pin (the head-derived catalog credit needed `vision_analysis`, the only tool that separates the two rules) and after the blanket NEVER/ONLY rule was replaced by the explicit pin map — 37/37, no-op survived and known-bad died on every run. Suite: run 1 on the blanket-rule tree 66 failed (all `test_read_site_invariants` — the rule broke the tuning contract; that is how the blanket rule was caught), then on the final tree 20,263 / 65 / 0 twice (a third run was killed by the system's memory watchdog, not by a failure). Deploy: 00:36 — `auto.generic.workspace_workspace_file_system.e3d150` retired from `auto_skills.json` (backup `auto_skills.json.bak-4fk-*`), launchd respawn, listener 61141 healthy at 00:36:57, 0 workspace-anchored auto-skills after the reload, no tracebacks. Live probe check: One app-suite repeat on the restarted agent (00:38–01:22). The operator log, in order: "think phase produced content — abort streak reset (was 1)" (a clean think after one abort), then two aborts and "spec calls now start with thinking DISABLED", then "spec call starts with thinking disabled (no-think call 1/3 … 2/3 … 3/3 in this window)", then "probe think phase after 3 no-think spec calls", 91 s later "probe think phase aborted too — no-think window extended by 3 spec calls" (an exact n-gram loop), and the no-think retry carried the leaf. So both branches of the disarm path have now run live: the reset (a clean think re-enables) and the extension (an aborted probe does not reset on nothing). Before §4FJ this process would have stayed no-think until the next restart. Repeat 4 tally: spec 5/6, agentic 5/6, p = 1.0 — both arms FAILED the csv leaf (spec: a replace that broke syntax, rejected pre-write; agentic: the smoke gate after two attempts, its first failure in four repeats). Over all four repeats (24 pairs): spec 15/24 (0.625), agentic 23/24 (0.958), 0 spec-only vs 8 agentic-only, exact McNemar p = 0.0078, mean 102 s vs 246 s per leaf — the §4FI reading for proposal 5 stands, with one agentic failure now on record..
+
+**Morning state:** the agent runs the verified tree (listener 61141 since 00:36:20), both fixes live and
+probed, the confusion-codifying auto-skill retired, root clean, 0 parked leaf pins, 0 tracebacks. Left
+open, named: the sticky-policy class has a disarm path but the executor's smoke/constraint-gate
+failures do not arm it (documented as intentional); the description optimiser is guarded only for
+the pinned `workspace` sentences; the tool-choice corpus is a parked mine with 264 distinct requests
+and cannot reward correct `workspace` use; the diet's proxy verdict is inconclusive and its live
+value is the 7k-token cut; proposal 5's flip is supported by shape (growing single file), not as a
+blanket default.
+
+## §4FL — Executor routed by leaf shape; the corpus re-mine window; the upgraded server re-probed (2026-09-08 10:05–10:40)
+
+**Trigger:** "1 is done, llama is at the latest version… do 2 and 3 now."
+
+### 1 — the prefix cache on the upgraded server (b10621 → b10809), re-probed
+Same probe as §4FD (`scratchpad/cacheprobe.py`, max_tokens=1): identical prompt fully cached (4,551 of
+4,555; 18,160 of 18,164 tokens); a tail change re-prefills one 2,048-token batch; **a mid-prompt
+change (~12k into an 18k prompt) still restores NOTHING — cached 0, 17.3 s of prefill, byte-for-byte
+the b10621 behaviour.** The build offers `--ctx-checkpoints N` and `--checkpoint-min-step N`
+(default 8,192 tokens); the running server carries neither, so the hybrid checkpoint restore that the
+upstream fixes added may simply have no checkpoints to restore. Not changed here (the model server is
+the operator's window); the flags to try are named. Item 1 is therefore NOT done for the case that
+costs the most: every request whose prompt diverges mid-way (a new hydration block, a different
+recall) still pays the full prefill.
+
+### 2 — the coding executor is chosen by leaf shape (SHIPPED, default ON)
+The deciding bench separated the executors by one property: whether the leaf grows an existing
+file (§4FI/§4FK: parity on six small fresh leaves three times; 23/24 vs 15/24, p = 0.0078, on a
+single `app.py` grown over six leaves, with the spec failures beginning once the file existed at
+~100 lines — crud 3/4, page 2/4, csv 1/4). `coding_loop.executor_kind(context, project_id,
+description=, existing_files=)`: env → project `metadata.executor` (either value, both ways) →
+**`leaf_shape`**: the leaf names an existing file (path or basename, whole word) holding ≥
+`GHOST_LEAF_GROW_LINES` (80) lines, largest named file decides → spec. `GHOST_LEAF_ROUTE_BY_SHAPE=0`
+turns the rule off. A routed leaf logs at WARNING ("routing leaf to the agentic loop — it extends
+app.py (279 lines …)"). The seam at the top of `build_coding_task` passes the advancer's
+`existing_files` and the description through. The leaf bench now pins its control arm to
+`metadata.executor = "spec"` (the default would route its growing leaves to the loop), and the
+§4FK C-1 pin was updated accordingly. Cost stays where it is paid: fresh/small leaves keep the
+102 s path; growing leaves take the 246 s path that finishes.
+
+Pins `tests/test_4fl_shape_routing.py`: nine shape cases (fresh, growing by path, by basename, too
+small, a different file with the same suffix, no file named, the largest of two), the threshold and
+its measured default, the precedence chain both ways, the kill switch and the log line, and the
+seam executed with a fake spec LLM and a fake loop (growing → loop; fresh and small → spec, by the
+files each path writes). Battery `battery_4fl.json`: 10/10 killed (threshold ignored, rule removed,
+metadata "spec" ignored, basename dropped, substring match, largest-file rule, kill switch inverted,
+default 800, seam without shape inputs, bench control unpinned); controls correct. Suite 20,276 /
+65 / 0 twice. Deploy 10:29 launchd respawn, listener 28245.
+
+**Live check:** a scratch CODING project through the API with no metadata (10:31–10:35, hard-deleted after):
+leaf 1 "Create app.py … CRUD + tests" — no existing file, spec path, DONE in 109 s, `app.py` 97 lines;
+leaf 2 "Extend app.py: GET /api/summary …" — the log reads "routing leaf to the agentic loop — it
+extends app.py (97 lines >= GHOST_LEAF_GROW_LINES=80)", then "leaf loop attempt 1/2", DONE in 104 s,
+`app.py` 112 lines; exactly one `task_kind=leaf` trajectory since the restart (only the loop writes
+one). Root clean, four projects remain as before.
+
+### 3 — the tool-choice corpus re-mine: blocked on supply, window opened
+`scripts/mine_tool_fixtures.py` mines `$GHOST_HOME/system/llm_recordings`, which is EMPTY:
+`GHOST_LLM_RECORD=0` in the launcher since 2026-08-30 (the operator's note: 694 MB across 33
+unrotated day-files, nothing automated consumed them; "set back to 1 only for a bounded collection
+window, and delete the day-files after mining"). The miner's gate needs ~200 real positives; the
+parked pool had 269 user-origin rows over ~6 weeks, so a re-mine that clears its gate is weeks of
+traffic away. Per the operator's own procedure the window is now OPEN (`GHOST_LLM_RECORD=1`, dated
+comment in the launcher, active since the 10:29 restart — verified: `system/llm_recordings/2026-09-08.jsonl` appeared at 10:31, 115 KB after the first leaf); the daily GEPA gate
+(§4DF) mines automatically once the supply gate is met, and the promoted pool will be scored by
+distinct request (§4FK). To close: set the flag back to 0 and delete the day-files after the mine.
+
+## §4FM — The prefix cache, diagnosed correctly and kept warm (2026-09-08 11:35–12:55)
+
+**Trigger:** "let's fix 1. feel free to restart llama server, DO NOT change its version."
+
+### The diagnosis in §4FD/§4FL was wrong about the mechanism
+Three probes against b10809 (`scratchpad/cacheprobe2/3/4.py`), no server change:
+- A head-only request creates a restore point near its end; a later request that diverges right
+  after that head restores it (8,836 of 10,880 tokens cached; the rest is one 2,048-token batch).
+  So "hybrid checkpoint restore fails mid-prompt" was false — what fails is divergence at a point
+  **no request ever ended at** (E: 0 cached), which is what the §4FD probe tested.
+- The head's restore point survives 3 unrelated prompts but **not 36**: llama-server saves a
+  ~200 MiB prompt-cache entry (the recurrent state) on EVERY slot release, `--cache-ram 6144`
+  holds ~30, and eviction is oldest-first ("making room for prompt cache entry, removing oldest
+  entry (size = 201 MiB)" — 1,556 times in the server log since its restart).
+- `cache_prompt: false` on the churn does not prevent the save (36 opt-out requests evicted the
+  head just the same).
+- The idle loop makes 2–4 requests a minute, so the boot warmup's head dies ~10 minutes after
+  boot. **Measured through the agent 90 min after boot: 28,767 prompt tokens, 0 cached, 34.4 s
+  wall** for a one-line probe. That is the TTFT p50 of §4ET.
+
+### The fix — keep the head's entry the newest (agent-side, no server change)
+`GhostAgent.warm_up_main_prefix(quiet=True)` + `rewarm_main_prefix_loop(period_s)` spawned at
+boot by `main._spawn_main_prefix_rewarm` every `GHOST_MAIN_PREFIX_REWARM_S` (180) seconds,
+`is_background=True` (yields to a live foreground request). A re-warm that finds the head
+resident costs one restore plus a 2,048-token batch (~2 s of slot time, ~1% duty, logged at
+debug); one that finds it evicted pays the full prefill in the background and logs a WARNING
+("re-warm re-prefilled the head in Ns — its cache entry had been evicted"), threshold
+`GHOST_MAIN_PREFIX_REWARM_SLOW_S` (10). `0` disables. The loud boot warmup is unchanged.
+Considered and rejected: a larger `--cache-ram` (36 GB UMA, 23 GB RSS, ~6 GB free — the launcher
+caps it for OS headroom on purpose); more `--ctx-checkpoints` (the restore point lives inside the
+prompt-cache entry, so it goes with it).
+
+Pins `tests/test_4fm_prefix_rewarm.py` (8): the knobs, the loop (bounded on the sleep side so any
+loop shape terminates), quiet-resident logs nothing, quiet-evicted warns, the loud path unchanged,
+failure never escapes, the boot wiring spawns only when the period is positive, and boot calls the
+wiring. One older pin (`test_prompt_funnel_4n`) re-anchored on the new label text. Battery
+`battery_4fm.json`: 9/9 killed, controls correct — after the harness learned that a hung run is a
+kill (the known-bad control turned the loop into a spin and the battery crashed on its subprocess
+timeout instead of scoring it). Suite: 20,283 / 65 / 1 (the re-anchored pin) then 20,284 / 65 / 0.
+
+**Review (one read-only lens, replaying the consumers) — four MAJORs in my fix, all fixed and pinned:**
+(1) the slow-warn measured the client's foreground WAIT and reported queueing as eviction — the clock
+now starts after that wait, and the verdict reads the reply's `cached_tokens` (fewer than half
+cached = evicted; the clock is only the fallback when no usage block comes back); (2) the loop
+re-warmed unconditionally, so inside a coding leaf (whose calls are background, never
+foreground-marked) it interleaved the expensive, useless kind — a tick now reads the main node's
+`/metrics` and skips while `requests_processing` > 0 or when `prompt_tokens_total` has not moved
+since the last re-warm; (3) each re-warm wrote a 110 KB record into the LLM recordings (~53 MB/day
+into the corpus window opened in §4FL) — warm-up labels are never recorded; (4) no floor on the
+period (`18` or `0.5` would flood the slot) — positive values are floored at 30 s, negatives are
+off. Minors fixed: a re-warm no longer re-arms the boot-time "prefix warmup MISS" check (that
+fires once per boot by contract); `rewarm_slow_s` floored at 1 s; cancellation propagates through
+the real warm-up (a `BaseException` swallow would make shutdown unable to stop it — pinned); the
+boot wiring's placement inside the warmup opt-out guard is pinned on the AST, not by text
+adjacency. Five mutants the reviewer proved surviving are in the battery and now die. Reviewer
+no-findings worth keeping: the slot etiquette is right (`is_background` waits for foreground and
+takes a bounded semaphore; a user arriving mid-re-warm waits ~1–3 s resident / ~25–34 s evicted,
+the latter only when the previous period already failed — expected ~22 ms/turn against ~34 s
+removed); no stale client (the loop re-reads `llm_client` each tick, so a §4DE epoch swap is
+picked up by the next re-warm); shutdown is clean.
+Battery re-run: 18 mutants, 17/18 then 1/1 after the busy-skip pin learned to assert "never warmed
+while busy" (a count-only pin let the mutant re-warm one tick earlier for the same total);
+controls correct. Suite on the final tree: 20,296 / 65 / 0 twice, plus one more after the
+test-only pin edit.
+
+**Live (12:38 deploy, listener 18269; probes at 12:51, i.e. 12.5 idle minutes later — past the point
+where the head used to be gone):** probe 1: 28,603 prompt tokens, **25,756 cached, 6.0 s wall**;
+probe 2 (20 s later): 26,555 cached, 4.2 s. Baseline the same morning, 90 idle minutes after boot:
+28,767 tokens, **0 cached, 34.4 s**. Zero "re-warm re-prefilled" warnings since the deploy (the head
+stayed resident through the idle churn), the recordings day-file did not grow by a single
+main-prefix record (8 before, 8 after), no tracebacks. Suite on the final tree: 20,296 / 65 / 0
+three times (two background runs were killed by the machine's memory watchdog, not by failures;
+the foreground runs completed).

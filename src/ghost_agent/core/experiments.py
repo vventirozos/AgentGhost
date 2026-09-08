@@ -278,6 +278,22 @@ DEFAULT_SPECS: Tuple[ExperimentSpec, ...] = (
             "Kill: GHOST_VERIFY_DEPTH_ROUTING=0."
         ),
     ),
+    ExperimentSpec(
+        name="evidence_gate",
+        arms=(CONTROL, TREATMENT),
+        traffic=1.0,
+        enabled=True,
+        description=(
+            "§4FD (2026-09-07): when EVERY evidence-bearing tool call so far "
+            "in the turn came back empty, weak (recall best match LOW) or "
+            "errored, the treatment injects an EVIDENCE CHECK steer into the "
+            "volatile state block (answer only from retrieved evidence, ONE "
+            "more targeted attempt, or say what was not found); control gets "
+            "nothing. Targets the largest real failure class — confabulation "
+            "on empty retrieval, ~30 of 124 labelled failures. "
+            "Kill: GHOST_EVIDENCE_GATE=0."
+        ),
+    ),
 )
 
 
@@ -860,7 +876,11 @@ CONTEXT_MUTATING_KEYS: Tuple[str, ...] = ("risk_steer_fired", "fs_batch_context"
                                           # replay that rehydrates a treatment
                                           # turn's context replays an artifact
                                           # only treatment production produced.
-                                          "tts_bon_fired")
+                                          "tts_bon_fired",
+                                          # §4FD: the EVIDENCE CHECK steer is
+                                          # prompt text only the treatment
+                                          # arm saw.
+                                          "evidence_gate_fired")
 
 # experiment -> the `extra` key stamped when that experiment's TRIGGER fired.
 #
@@ -914,7 +934,8 @@ TRIGGER_KEYS: Dict[str, str] = {"risk_steer": "risk_steer_fired",
                                 "foresight_note": "foresight_note_fired",
                                 "use_planning": "use_planning_fired",
                                 "tts_bon": "tts_bon_fired",
-                                "verify_depth": "verify_depth_fired"}
+                                "verify_depth": "verify_depth_fired",
+                                "evidence_gate": "evidence_gate_fired"}
 
 
 def trigger_fired(traj, experiment: str) -> bool:
@@ -1124,12 +1145,32 @@ class ArmStats:
     unknown: int = 0
     values: Dict[str, List[float]] = field(default_factory=dict)
     covariates: Dict[str, List[Optional[float]]] = field(default_factory=dict)
+    # §4FD prediction-powered inference inputs for failure_rate: the machine
+    # verdict (judge, 1.0 = failed) on rows WITHOUT a human label, and the
+    # paired (judge, gold) series on rows WITH one. Kept separate from
+    # `values` because PPI consumes a different population than the
+    # resolved-only classical mean.
+    judge_unlabeled: List[float] = field(default_factory=list)
+    judge_labeled: List[float] = field(default_factory=list)
+    gold: List[float] = field(default_factory=list)
 
     def add(self, metric: str, value: float,
             covariate: Optional[float] = None) -> None:
         self.values.setdefault(metric, []).append(float(value))
         self.covariates.setdefault(metric, []).append(
             None if covariate is None else float(covariate))
+
+    def add_judge(self, judge: Optional[float], gold: Optional[float]) -> None:
+        """Fold one row's PPI inputs. A row with no judge contributes
+        nothing (the estimand is the machine-judged population); a row with
+        a judge and a gold label is a paired observation."""
+        if judge is None:
+            return
+        if gold is None:
+            self.judge_unlabeled.append(float(judge))
+        else:
+            self.judge_labeled.append(float(judge))
+            self.gold.append(float(gold))
 
     def mean(self, metric: str) -> Optional[float]:
         vals = self.values.get(metric) or []
@@ -1592,6 +1633,8 @@ def _metric_values(traj) -> Dict[str, float]:
 
 def summarize_trajectories(trajectories: Iterable[Any], *,
                            triggered_only: bool = False,
+                           judge_map: Optional[Dict[str, Tuple[Optional[str],
+                                                               Optional[str]]]] = None,
                            ) -> Dict[str, Dict[str, ArmStats]]:
     """{experiment: {arm: ArmStats}} over stamped trajectories.
 
@@ -1613,6 +1656,7 @@ def summarize_trajectories(trajectories: Iterable[Any], *,
             metrics = _metric_values(traj)
             covariate = _covariate_of(traj)
             unknown = "failure_rate" not in metrics
+            judge, gold = _judge_and_gold(traj, judge_map)
             for name, arm in stamped.items():
                 if triggered_only and not trigger_fired(traj, name):
                     continue
@@ -1628,6 +1672,7 @@ def summarize_trajectories(trajectories: Iterable[Any], *,
                     stats.unknown += 1
                 for metric, value in metrics.items():
                     stats.add(metric, value, covariate)
+                stats.add_judge(judge, gold)
         except Exception:  # noqa: BLE001 — one bad record must not stop the walk
             continue
     return out
@@ -1882,6 +1927,7 @@ def _render_block(arms: Dict[str, ArmStats], *, alpha: float,
             f"    {'unknown_rate':<14} control={c_s.unknown / c_s.n:.3f} "
             f"treatment={t_s.unknown / t_s.n:.3f}  (failure_rate conditions "
             "on this — a gap here confounds it)")
+    _hw: Dict[str, Optional[float]] = {}
     for cmp_ in compare_arms(arms, alpha=alpha, experiment=experiment):
         if cmp_.control_mean is None and cmp_.treatment_mean is None:
             continue
@@ -1898,7 +1944,95 @@ def _render_block(arms: Dict[str, ArmStats], *, alpha: float,
         lines.append(f"    {cmp_.metric:<14} n={cmp_.control_n}/{cmp_.treatment_n} "
                      f"control={cm} treatment={tm} "
                      f"diff={d} CS={ci}{vr} → {cmp_.verdict}")
+        _hw[cmp_.metric] = cmp_.half_width
+    lines.extend(ppi_metric_lines(
+        arms, alpha=alpha,
+        gold_only_halfwidth=_hw.get("human_failure_rate"),
+        machine_halfwidth=_hw.get("failure_rate")))
     return lines
+
+
+def ppi_metric_lines(arms: Dict[str, ArmStats], *, alpha: float,
+                     gold_only_halfwidth: Optional[float] = None,
+                     machine_halfwidth: Optional[float] = None,
+                     control: str = CONTROL, treatment: str = TREATMENT
+                     ) -> List[str]:
+    """The §4FD prediction-powered line for ``failure_rate`` — one line, or
+    none when neither arm carries a gold label.
+
+    Judge = machine verdict on every machine-judged row; gold = human
+    labels. Per-arm α is the SAME split the classical lines use (÷metrics,
+    ÷2 arms) and the interval is anytime-valid via the union-bound CS in
+    ``core.ppi`` — so the widths are comparable. Two comparisons are
+    printed, and they answer different questions: ``human_failure_rate`` is
+    the GOLD-ONLY estimate (the one PPI exists to sharpen — the paper's
+    35–55% figure is against this), while ``failure_rate`` treats every
+    MACHINE verdict as truth and is narrow only because it does. PPI is
+    the estimate that is both bias-corrected and uses every judged row; it
+    will usually sit between the two in width. It is INFORMATIONAL: it does
+    not enter the verdict set, and it says so, because promoting it changes
+    the estimator a converged instrument reports on (an operator decision,
+    with this line as the evidence).
+
+    Honesty rules (§4CE): a refusal is rendered with its reason, never as
+    an empty number; a gold slice the representativeness check flags is
+    rendered SKEWED, because §4ER asks for labels on the shakiest turns and
+    PPI assumes the labelled rows are a random slice."""
+    from .ppi import ppi_difference, ppi_mean
+    c_s, t_s = arms.get(control), arms.get(treatment)
+    if c_s is None or t_s is None:
+        return []
+    if not c_s.gold and not t_s.gold:
+        return []
+    arm_alpha = (alpha / _tested_metric_count()) / 2.0
+    c = ppi_mean(c_s.gold, c_s.judge_labeled, c_s.judge_unlabeled,
+                 alpha=arm_alpha, radius_fn=asymp_cs_radius)
+    t = ppi_mean(t_s.gold, t_s.judge_labeled, t_s.judge_unlabeled,
+                 alpha=arm_alpha, radius_fn=asymp_cs_radius)
+    head = (f"    {'failure_rate[ppi]':<14} gold={c.n_labeled}/{t.n_labeled} "
+            f"judged={c.n_labeled + c.n_unlabeled}/{t.n_labeled + t.n_unlabeled}")
+    if c.refusal or t.refusal:
+        why = c.refusal if c.refusal else t.refusal
+        side = "control" if c.refusal else "treatment"
+        return [f"{head} → NO PPI ESTIMATE ({side}: {why})"]
+    diff, hw, why = ppi_difference(c, t, anytime=True)
+    if diff is None or hw is None:
+        return [f"{head} → NO PPI ESTIMATE ({why})"]
+    lo, hi = diff - hw, diff + hw
+    # Fixed-sample (one look) widths, PPI vs gold-only, both at the same
+    # arm α: this is the paper's comparison and the estimator's own claim.
+    _, hw_fixed, _ = ppi_difference(c, t, anytime=False)
+    gold_fixed = math.sqrt((c.classical_halfwidth or 0.0) ** 2
+                           + (t.classical_halfwidth or 0.0) ** 2)
+    notes: List[str] = []
+    if not (c.representative and t.representative):
+        zc = c.judge_gap_z if c.judge_gap_z is not None else 0.0
+        zt = t.judge_gap_z if t.judge_gap_z is not None else 0.0
+        notes.append(f"gold slice SKEWED (z={zc:+.1f}/{zt:+.1f}) — "
+                     "labels are not a random sample; interval is not trusted")
+    if hw_fixed is not None and gold_fixed > 0:
+        notes.append(f"one-look ±{hw_fixed:.3f} vs gold-only ±{gold_fixed:.3f} "
+                     f"({hw_fixed / gold_fixed - 1.0:+.0%} width)")
+    # Anytime comparison on the SAME rows (review §4FH M3): a CS over PPI's
+    # own gold series per arm, summed like the report's Minkowski box. The
+    # `human_failure_rate` CS covers ALL human-labelled resolved rows (its n
+    # is larger than PPI's paired gold), so it is printed under its own name.
+    _r_c = asymp_cs_radius(list(c_s.gold), alpha=arm_alpha) if len(c_s.gold) >= 2 else None
+    _r_t = asymp_cs_radius(list(t_s.gold), alpha=arm_alpha) if len(t_s.gold) >= 2 else None
+    if _r_c is not None and _r_t is not None and (_r_c + _r_t) > 0:
+        _same = _r_c + _r_t
+        notes.append(f"anytime ±{hw:.3f} vs gold-only CS on the same rows ±{_same:.3f} "
+                     f"({hw / _same - 1.0:+.0%}; union bound)")
+    if gold_only_halfwidth is not None and gold_only_halfwidth > 0:
+        notes.append(f"human_failure_rate CS ±{gold_only_halfwidth:.3f} "
+                     f"(all human-labelled rows, n={c_s.count('human_failure_rate')}/"
+                     f"{t_s.count('human_failure_rate')})")
+    if machine_halfwidth is not None and machine_halfwidth > 0:
+        notes.append(f"machine-as-truth CS ±{machine_halfwidth:.3f}")
+    notes.append("informational — not in the verdict set")
+    return [f"{head} control={c.estimate:.3f} treatment={t.estimate:.3f} "
+            f"diff={diff:+.3f} CS=[{lo:+.3f}, {hi:+.3f}] "
+            f"λ={c.lam:.2f}/{t.lam:.2f} → " + "; ".join(notes)]
 
 
 def _brief_metric_lines(arms: Dict[str, ArmStats], *, alpha: float,
@@ -2228,10 +2362,43 @@ def render_report(summary: Dict[str, Dict[str, ArmStats]], *,
     return "\n".join(lines)
 
 
+def _judge_and_gold(traj, judge_map) -> Tuple[Optional[float], Optional[float]]:
+    """(judge, gold) for one row as 0/1 failure indicators, or None each.
+
+    Judge = the MACHINE verdict: the last non-human sidecar correction for
+    the row, else the write-time outcome (``extra["outcome_native"]`` when a
+    correction overlaid it, else ``outcome`` itself). Gold = the last
+    human-authored correction. An unresolved machine verdict yields no
+    judge, so the row leaves the PPI population — the same exclusion the
+    classical failure_rate applies, made explicit."""
+    tid = str(getattr(traj, "id", "") or "")
+    machine, human = (judge_map or {}).get(tid, (None, None))
+    extra = getattr(traj, "extra", None) or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    if machine is None:
+        native = extra.get("outcome_native")
+        if native is None:
+            native = getattr(traj, "outcome", "")
+        native = str(native or "").lower()
+        # Only a MACHINE verdict may serve as the judge: when the shipping
+        # outcome is a human label with no earlier machine verdict, the row
+        # is gold without a judge and stays out of the paired series.
+        if native in ("passed", "failed") and not (
+                human is not None and native == human
+                and extra.get("outcome_native") is None):
+            machine = native
+    judge = None if machine is None else (1.0 if machine == "failed" else 0.0)
+    gold = None if human is None else (1.0 if human == "failed" else 0.0)
+    return judge, gold
+
+
 def summarize_streaming(trajectories: Iterable[Any], *,
                         admit_task_kinds: Tuple[str, ...] = ("user_request",),
                         admit_names: Optional[Iterable[str]] = None,
                         deny_names: Optional[Iterable[str]] = None,
+                        judge_map: Optional[Dict[str, Tuple[Optional[str],
+                                                            Optional[str]]]] = None,
                         ) -> Tuple[
         Dict[str, Dict[str, ArmStats]], Dict[str, Dict[str, ArmStats]],
         Dict[str, int]]:
@@ -2294,7 +2461,9 @@ def summarize_streaming(trajectories: Iterable[Any], *,
 
     def _fold(into: Dict[str, Dict[str, ArmStats]], name: str, arm: str,
               metrics: Dict[str, float], unknown: bool,
-              covariate: Optional[float] = None) -> None:
+              covariate: Optional[float] = None,
+              judge: Optional[float] = None,
+              gold: Optional[float] = None) -> None:
         bucket = into.setdefault(name, {})
         stats = bucket.get(arm)
         if stats is None:
@@ -2305,6 +2474,7 @@ def summarize_streaming(trajectories: Iterable[Any], *,
             stats.unknown += 1
         for metric, value in metrics.items():
             stats.add(metric, value, covariate)
+        stats.add_judge(judge, gold)
 
     for traj in trajectories or []:
         try:
@@ -2335,6 +2505,7 @@ def summarize_streaming(trajectories: Iterable[Any], *,
             metrics = _metric_values(traj)
             covariate = _covariate_of(traj)
             unknown = "failure_rate" not in metrics
+            judge, gold = _judge_and_gold(traj, judge_map)
             folded_any = False
             # STAMP HEALTH vs REPORT SCOPE are different questions, and the
             # window must answer the first. `folded_any` below is scoped: it
@@ -2355,9 +2526,11 @@ def summarize_streaming(trajectories: Iterable[Any], *,
                 if _deny is not None and name in _deny:
                     continue
                 folded_any = True
-                _fold(all_stats, name, arm, metrics, unknown, covariate)
+                _fold(all_stats, name, arm, metrics, unknown, covariate,
+                      judge, gold)
                 if trigger_fired(traj, name):
-                    _fold(trig_stats, name, arm, metrics, unknown, covariate)
+                    _fold(trig_stats, name, arm, metrics, unknown, covariate,
+                          judge, gold)
             # "stamped" counts rows that FOLDED into at least one arm (R5
             # review: a malformed {"name": null} stamp counted as covered
             # while entering no arm — the coverage instrument overstated).
@@ -2422,11 +2595,16 @@ def _summaries_from_trajectories(trajectory_root: Any, *,
     from ..distill.collector import TrajectoryCollector
     collector = TrajectoryCollector(root=Path(str(trajectory_root)),
                                     session_id="reader")
+    try:
+        judge_map = collector.machine_and_human_outcomes()
+    except Exception:  # noqa: BLE001 — the PPI line is additive, never fatal
+        judge_map = None
     return summarize_streaming(
         collector.iter_trajectories(day=day),
         admit_task_kinds=admit_task_kinds,
         admit_names=admit_names,
-        deny_names=deny_names)
+        deny_names=deny_names,
+        judge_map=judge_map)
 
 
 def headline_from_trajectories(trajectory_root: Any, *, alpha: float = 0.05,

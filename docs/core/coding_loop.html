@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.coding_loop — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="coding_executor.html">coding_executor</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a class="current" href="coding_loop.html">coding_loop</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / coding_loop.py — the agentic coding leaf</h1>
+  <p class="subtitle"><strong>§4FL (2026-09-08): selected by LEAF SHAPE by default</strong> — a leaf that extends an existing file of <code>GHOST_LEAF_GROW_LINES</code> (80) lines or more runs this loop; a fresh or small leaf keeps the spec executor; <code>metadata.executor</code> (agentic|spec) and <code>GHOST_CODING_EXECUTOR</code> override both ways; <code>GHOST_LEAF_ROUTE_BY_SHAPE=0</code> turns the rule off. The rule is the bench's finding, not a flip: parity on small fresh leaves three times, 23/24 vs 15/24 (p = 0.0078) once the file grows, with the spec failures beginning at ~100 lines; the loop costs ~2.4× the wall time per leaf, so the cheap path stays where it wins. Pins: <code>tests/test_4fl_shape_routing.py</code>.</p>
+  <p class="subtitle">A bounded edit-test loop for one autonomous project leaf: the model edits files with <code>file_system</code> and runs them with <code>execute</code> on an isolated, project-pinned context, then hands back a verify command; the existing gates decide. Selected by <code>GHOST_CODING_EXECUTOR=agentic</code> or a project's <code>metadata.executor</code>; default remains the spec executor (§4FG, 2026-09-07).</p>
+
+  <h2>Why it exists</h2>
+  <p><a href="coding_executor.html">coding_executor.build_coding_task</a> is one spec call that returns whole files as JSON, then N writes and one verify. §4EI measured what that costs on the live model: files drafted inside <code>&lt;think&gt;</code> until the reasoning ceiling fires, structural slips at the <code>files</code> boundary, and a grammar-constrained no-think retry — the exact quadrant arXiv 2604.03616 measures as worst (JSON-required output costs 3–9 pp on Qwen3 and a grammar does not remove it). Three of six leaves failed in a 49-minute run. The shape the literature measures for small open models is the opposite: the model edits and runs, iterating on the witness (Claw-SWE-Bench, arXiv 2606.12344: apply failures 69.1% → &lt;1.5% once the model edits files and the runner exports the patch; Cursor: model-specific edit shapes gave an order of magnitude fewer tool errors; arXiv 2607.26117 / 2609.02892: a fresh attempt with a concrete witness beats repair conditioned on the failed attempt).</p>
+
+  <h2>How a leaf runs</h2>
+  <ol>
+    <li><code>snapshot_workspace</code> hashes every file under the project workspace.</li>
+    <li><code>run_leaf_turn</code> builds <code>build_leaf_context</code> — a copy of the live context that KEEPS <code>sandbox_dir</code> and <code>current_project_id</code> (so paths resolve inside the project), wraps memory read-only, nulls the workspace model / journal / scheduler / profile / bus, sets <code>task_kind="leaf"</code> and <code>turn_origin_label="leaf"</code> (no user-population ledger admits it), and contains the tool surface to <code>file_system</code> + <code>execute</code> the same fail-closed way <code>run_subagent</code> does. A <code>GhostAgent</code> runs one bounded turn loop on it (<code>GHOST_LEAF_MAX_TURNS</code> 14, <code>GHOST_LEAF_TIMEOUT_S</code> 600), thinking on.</li>
+    <li>The prompt carries the task, the ledger, the existing file list, research briefs, the single-file steer, and the contract: end with <code>VERIFY: &lt;command&gt;</code> (or <code>none</code>) and <code>SUMMARY: &lt;line&gt;</code>. <code>parse_leaf_reply</code> takes the LAST occurrence of each.</li>
+    <li>Files touched = <code>diff_snapshots(before, after)</code> — never the model's claims. A leaf that changed nothing inside the project workspace is a failed attempt even if it named a passing verify (§4FH: the second pilot's six "DONE" leaves had written at the sandbox root — the conversation reconciler inside <code>handle_chat</code> had parked the pin because a leaf has no conversation binding; the reconciler now honours <code>_leaf_pinned_project</code>, and <code>run_leaf_turn</code> fails closed if the pin did not survive the turn). With <code>is_background</code> the leaf's model calls ride the client's background lane.</li>
+    <li>Gates, unchanged and in order: the verify command through the fail-closed runner (<code>_run_verify</code>), <code>smoke_gate</code>, <code>constraint_gate</code> over the written files.</li>
+    <li>On failure, a SECOND attempt starts fresh with the failure's witness (verify output head) in its prompt; two failures return <code>CodingResult(ok=False)</code> with the attempt trail in <code>detail</code>. An attempt that changed nothing and gave no verify is a failed attempt, not a pass.</li>
+  </ol>
+  <p><code>_finalize_coding</code> consumes the result exactly as before (<code>ok</code>, <code>files</code>, <code>ledger_note</code>), so DONE/FAILED semantics, artifact registration and the work log are untouched.</p>
+
+  <h2>Proving it: the leaf bench</h2>
+  <p><code>scripts/leaf_bench.py</code> creates two scratch CODING projects through the API (one with <code>metadata.executor = "agentic"</code>, one without), adds the same small verifiable leaves to each (a module plus its pytest, a CLI plus a test, a Flask health endpoint…), drives <code>POST /api/projects/{pid}/advance</code> one leaf at a time, records DONE/FAILED and wall time per leaf, repeats, and reports an exact McNemar over the paired leaves — then hard-deletes both projects. Replicates ≥3× because agentic evaluations vary run to run even at temperature 0 (arXiv 2602.07150). <strong>§4FI — the deciding suite:</strong> <code>--suite app</code> is the §4EI shape — one single-file Flask expense app (<code>app.py</code>) grown over six dependent leaves (skeleton → CRUD → inline HTML page → summary/month filter → CSV export/import → JSON persistence via <code>create_app</code>), every leaf adding routes and tests to the SAME file, so the spec executor must re-emit an ever larger file whole while the loop edits in place. The six small leaves (<code>--suite small</code>) sat at ceiling for both arms three times. Leaves depend on each other, so run whole repeats; progress is written to <code>&lt;ledger&gt;.progress.json</code> (read with <code>scripts/runstatus.py</code>). One ledger per repeat is combined by <code>scripts/leaf_bench_combine.py</code> (pairs by ledger × rep × leaf, both executors required; exact McNemar, per-leaf DONE counts and mean seconds, the disagreements). Pins: <code>tests/test_4fi_bench_scripts.py</code>.</p>
+
+  <div class="note"><strong>Tests:</strong> <code>tests/test_4fg_coding_loop.py</code> — contract parsing, workspace diff, executor selection, the success path (files from the diff, verify through the runner), the fresh-attempt-with-witness policy, the no-files-no-verify failure, the constraint gate over written files, the isolation shape, and the executed dispatch seam at the top of <code>build_coding_task</code>.</div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

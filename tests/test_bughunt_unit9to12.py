@@ -45,10 +45,10 @@ def store(tmp_path):
 
 
 def _ctx(store, current=None):
-    # A real namespace (not MagicMock) so ONLY the attributes we set exist —
-    # MagicMock auto-creates `request_start_project_id`, which activates the
-    # delete-eligibility gate; its absence keeps the gate inactive (the
-    # documented direct-tool-test mode).
+    # A real namespace (not MagicMock) so ONLY the attributes we set exist.
+    # (Until 2026-09-06 a MagicMock's auto-created `request_start_project_id`
+    # armed the delete-eligibility gate; the gate is gone — journal §4FC —
+    # but a bounded namespace still keeps this test about title shadowing.)
     return types.SimpleNamespace(
         project_store=store,
         current_project_id=current,

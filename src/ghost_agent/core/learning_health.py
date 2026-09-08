@@ -303,6 +303,11 @@ def collect_learning_health(memory_dir, args: Any = None) -> Dict[str, Any]:
             "graduated": sum(1 for l in pb if l.get("graduated")),
             "quarantined": sum(1 for l in pb if l.get("quarantined")),
             "verified": sum(1 for l in pb if l.get("verified")),
+            # §4FD provenance: who wrote the lessons the prompt retrieves.
+            # "" = legacy (pre-stamp). A "probe" count above zero is a leak.
+            "by_origin": {
+                k: sum(1 for l in pb if str(l.get("origin") or "") == k)
+                for k in ("user", "auto", "probe", "bench", "")},
             "with_outcome_ticks": sum(
                 1 for l in pb
                 if (int(l.get("succeeded_retrievals") or 0)
@@ -1746,6 +1751,14 @@ def render_learning_health(memory_dir, args: Any = None) -> str:
             f"\nLESSONS: {les['total']} total{_cap_note} "
             f"({les['graduated']} graduated, {les['verified']} verified, "
             f"{les['quarantined']} quarantined)")
+        _bo = les.get("by_origin") or {}
+        if _bo:
+            _probe = int(_bo.get("probe") or 0)
+            lines.append(
+                f"  origin: user {int(_bo.get('user') or 0)}, "
+                f"auto {int(_bo.get('auto') or 0)}, bench {int(_bo.get('bench') or 0)}, "
+                f"legacy {int(_bo.get('') or 0)}"
+                + (f", ⚠ probe {_probe} (diagnostics must never teach)" if _probe else ""))
         if "graduation_eligible" in les:
             lines.append(
                 f"  graduation: {les['graduation_eligible']} eligible "

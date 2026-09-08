@@ -44,6 +44,7 @@ import datetime
 import hashlib
 import inspect
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -142,6 +143,9 @@ class TranscriptSignature:
     read_loop_target: str = ""
     severity: float = 0.0
     hash: str = ""
+    # §4FD: selected because a human labelled the turn failed (bypasses the
+    # structural severity bar; ranked first).
+    human_labeled: bool = False
 
     def summary(self) -> str:
         """One-paragraph human-readable evidence block for the prompt and
@@ -514,13 +518,16 @@ class PostMortemRunReport:
     code_defect: int = 0
     queued: int = 0
     skipped_duplicate: int = 0
+    human_selected: int = 0       # §4FD: selected on a human label
+    contrasted: int = 0           # §4FD: analysed beside a passing sibling
     reports: List[DefectReport] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
             f"post-mortem: {self.analysed_ok}/{self.selected} analysed "
             f"({self.behavioural} behav, {self.configuration} config, "
-            f"{self.code_defect} code) · {self.queued} queued, "
+            f"{self.code_defect} code; {self.human_selected} human-labelled, "
+            f"{self.contrasted} contrasted) · {self.queued} queued, "
             f"{self.skipped_duplicate} dup, {self.analysed_errors} err"
         )
 
@@ -528,6 +535,15 @@ class PostMortemRunReport:
 AnalyzeCallable = Callable[[str], Union[str, Awaitable[str]]]
 PatchCallable = Callable[[str], Union[str, Awaitable[str]]]
 LessonSink = Callable[..., Any]
+
+
+#: §4FD: severity a human-labelled failure is treated as having for
+#: selection. A 👎 on a clean transcript scores ~0.01 on the structural
+#: blend (no loops, one step, thirty seconds) and was never selected: the
+#: engine ran 156 idle cycles over six weeks and analysed nothing while 124
+#: labelled failures accumulated. A human label is the scarcest signal the
+#: agent has; it outranks any structural score.
+HUMAN_LABEL_PRIORITY = 2.0
 
 
 def select_failed_runs(
@@ -538,6 +554,7 @@ def select_failed_runs(
     exclude_signatures: Optional[Set[str]] = None,
     include_unknown: bool = False,
     max_age_days: float = 7.0,
+    human_labeled=None,
 ) -> List[Tuple[Trajectory, TranscriptSignature]]:
     """Pick the worst FAILED runs worth a post-mortem.
 
@@ -590,17 +607,94 @@ def select_failed_runs(
                 _skipped_old += 1
                 continue
         sig = compute_signature(traj)
-        if sig.severity < min_severity:
+        # §4FD: `human_labeled(traj_id)` (the collector's has_human_label)
+        # admits a 👎 turn regardless of its structural severity and ranks
+        # it first. Machine-labelled failures keep the severity bar — a
+        # quarter of late refutes are wrong, and a post-mortem of a false
+        # refute mints a junk lesson.
+        _human = False
+        if human_labeled is not None:
+            try:
+                _human = bool(human_labeled(getattr(traj, "id", "")))
+            except Exception:  # noqa: BLE001
+                _human = False
+        if not _human and sig.severity < min_severity:
             continue
-        if sig.hash in exclude or sig.hash in seen_this_run:
+        # A human 👎 carries its own dedup key: two structurally identical
+        # clean turns (one step, no loops) hash alike, and the second 👎
+        # would otherwise be filed as a duplicate of the first.
+        _key = f"human:{getattr(traj, 'id', '')}" if _human else sig.hash
+        if _key in exclude or _key in seen_this_run:
             continue
-        seen_this_run.add(sig.hash)
+        seen_this_run.add(_key)
+        if _human:
+            sig.human_labeled = True
         scored.append((traj, sig))
     if _skipped_old:
         logger.info("post-mortem: %d failed run(s) older than %.0fd skipped "
                     "(recency bound)", _skipped_old, float(max_age_days))
-    scored.sort(key=lambda ts: ts[1].severity, reverse=True)
+    scored.sort(key=lambda ts: (ts[1].severity
+                                + (HUMAN_LABEL_PRIORITY if getattr(ts[1], "human_labeled", False) else 0.0)),
+                reverse=True)
     return scored[:limit]
+
+
+def _content_tokens(text: str) -> Set[str]:
+    """Topic tokens: >3 chars and not a function word — the SAME stopword
+    list the relevance authority uses (review §4FH M2: "stop it please." paired
+    with "please run a healthcheck." on the token "please")."""
+    from ..core.project_research import RELEVANCE_STOPWORDS
+    return {t for t in re.findall(r"[a-z0-9]+", str(text or "").lower())
+            if len(t) > 3 and t not in RELEVANCE_STOPWORDS}
+
+
+def find_passing_sibling(traj: Trajectory, pool: Iterable[Trajectory],
+                         *, min_jaccard: float = 0.25,
+                         max_age_days: float = 7.0) -> Optional[Trajectory]:
+    """The most similar PASSED trajectory to ``traj`` by request-text
+    Jaccard (same task kind; same cluster preferred), or None.
+
+    §4FD: contrastive reflection — a failure beside its nearest success —
+    improves more and breaks fewer passing cases than failure-only
+    reflection (arXiv 2606.30840: 51.4 → 60.4 EM vs 57.0 for failure-only).
+    Token overlap, no model call, no index: the post-mortem materialises
+    the recent corpus anyway. ``max_age_days`` bounds the sibling to the
+    same recency window selection uses — a success from before the last
+    audits is not a contrast, it is a different agent (review §4FH M2)."""
+    want = _content_tokens(getattr(traj, "user_request", ""))
+    if not want:
+        return None
+    kind = str(getattr(traj, "task_kind", "") or "user_request")
+    cluster = getattr(traj, "cluster", None)
+    _cutoff = None
+    if max_age_days and max_age_days > 0:
+        try:
+            import datetime as _dt
+            _cutoff = (_dt.datetime.utcnow()
+                       - _dt.timedelta(days=float(max_age_days))).isoformat()
+        except Exception:  # noqa: BLE001
+            _cutoff = None
+    best, best_score = None, 0.0
+    for cand in pool or []:
+        if cand is traj or getattr(cand, "id", None) == getattr(traj, "id", None):
+            continue
+        if _cutoff:
+            _ts = str(getattr(cand, "timestamp", "") or "")
+            if _ts and _ts < _cutoff:
+                continue
+        if str(getattr(cand, "outcome", "") or "").lower() != Outcome.PASSED.value:
+            continue
+        if str(getattr(cand, "task_kind", "") or "user_request") != kind:
+            continue
+        have = _content_tokens(getattr(cand, "user_request", ""))
+        if not have:
+            continue
+        j = len(want & have) / len(want | have)
+        if cluster and getattr(cand, "cluster", None) == cluster:
+            j += 0.05
+        if j > best_score:
+            best, best_score = cand, j
+    return best if best_score >= min_jaccard else None
 
 
 class PostMortemEngine:
@@ -632,6 +726,7 @@ class PostMortemEngine:
         min_severity: float = 0.4,
         include_unknown: bool = False,
         model: str = "",
+        human_labeled: Optional[Callable[[str], bool]] = None,
     ):
         self.analyze_fn = analyze_fn
         self.queue = queue
@@ -643,6 +738,9 @@ class PostMortemEngine:
         self.min_severity = float(min_severity)
         self.include_unknown = bool(include_unknown)
         self.model = model
+        # §4FD: `trajectory_id -> bool` (the collector's `has_human_label`);
+        # None = no human-label channel, selection is structural only.
+        self.human_labeled = human_labeled
         # Signatures whose analysis failed (timeout / unparseable reply).
         # Excluded from selection alongside queue.known_signatures(), or
         # a permanently-unanalysable trajectory is re-selected every tick
@@ -692,20 +790,37 @@ class PostMortemEngine:
             min_severity=self.min_severity,
             exclude_signatures=known | self._failed_analysis_sigs.keys(),
             include_unknown=self.include_unknown,
+            human_labeled=self.human_labeled,
         )
         report.selected = len(selected)
+        report.human_selected = sum(1 for _t, s in selected
+                                    if getattr(s, "human_labeled", False))
 
         for traj, sig in selected:
+            sibling = None
             try:
-                rep = await self._analyse_one(traj, sig)
+                sibling = find_passing_sibling(traj, trajectories)
+            except Exception:  # noqa: BLE001 — contrast is optional
+                sibling = None
+            if sibling is not None:
+                report.contrasted += 1
+            # The failed-analysis key must be the SAME key selection excludes
+            # by: a human-labelled turn is keyed `human:<id>`, not by its
+            # structural hash — otherwise a perma-failing 👎 is re-selected
+            # every tick AND its (shared) structural hash blocks unrelated
+            # machine failures (review §4FH M1).
+            _fail_key = (f"human:{getattr(traj, 'id', '')}"
+                         if getattr(sig, "human_labeled", False) else sig.hash)
+            try:
+                rep = await self._analyse_one(traj, sig, sibling=sibling)
             except Exception as e:
                 logger.warning("post-mortem analyse failed: %s", e)
                 report.analysed_errors += 1
-                self._note_failed_analysis(sig.hash)
+                self._note_failed_analysis(_fail_key)
                 continue
             if rep is None:
                 report.analysed_errors += 1
-                self._note_failed_analysis(sig.hash)
+                self._note_failed_analysis(_fail_key)
                 continue
             report.analysed_ok += 1
             report.reports.append(rep)
@@ -747,9 +862,10 @@ class PostMortemEngine:
         return str(call)
 
     async def _analyse_one(
-        self, traj: Trajectory, sig: TranscriptSignature
+        self, traj: Trajectory, sig: TranscriptSignature,
+        sibling: Optional[Trajectory] = None,
     ) -> Optional[DefectReport]:
-        prompt = build_postmortem_prompt(traj, sig)
+        prompt = build_postmortem_prompt(traj, sig, sibling=sibling)
         try:
             text = await self._call(self.analyze_fn, prompt, self.per_call_timeout_s)
         except asyncio.TimeoutError:
@@ -768,11 +884,16 @@ class PostMortemEngine:
             category = CATEGORY_BEHAVIOURAL
 
         rep = DefectReport(
-            signature_hash=sig.hash,
-            source_trajectory_ids=[traj.id],
+            signature_hash=(f"human:{traj.id}" if getattr(sig, "human_labeled", False)
+                            else sig.hash),
+            source_trajectory_ids=([traj.id] + ([sibling.id] if sibling is not None else [])),
             category=category,
             title=(parsed.get("title") or "")[:160],
-            severity=round(sig.severity, 3),
+            # A human-labelled failure ranks first in the operator queue too
+            # (it sorts by severity; the structural score of a clean 👎 is
+            # ~0.01 and would render LAST — review §4FH m5).
+            severity=(1.0 if getattr(sig, "human_labeled", False)
+                      else round(sig.severity, 3)),
             root_cause=(parsed.get("root_cause") or "")[:1200],
             evidence=sig.summary(),
         )

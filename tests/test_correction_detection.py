@@ -31,7 +31,6 @@ def context(tmp_path, store):
         graph_memory=None,
         workspace_model=None,
         current_project_id=None,
-        request_start_project_id=None,
         last_user_content="",
     )
 

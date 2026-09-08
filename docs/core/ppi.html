@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.ppi — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="experiments.html">experiments</a>
+    <a href="calibration.html">calibration</a>
+    <a class="current" href="ppi.html">ppi</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / ppi.py — prediction-powered inference for the arm report</h1>
+  <p class="subtitle">A PPI++ mean estimator: the machine verdict on every judged row, bias-corrected by the human labels on the few rows that have one. Pure functions, no I/O. Consumed by <a href="experiments.html">core.experiments</a> (the <code>failure_rate[ppi]</code> line). Shipped 2026-09-07 (journal §4FD).</p>
+
+  <h2>Why it exists</h2>
+  <p>Journal §4CE measured that every live A/B arm read "no difference" for a difference the design could not detect: a halved failure rate needs ~230–260 <em>resolved</em> turns per arm and the arms hold 67–76, because only rows with a verifier/human/structural verdict count. Meanwhile most rows carry a <strong>judge</strong> (the machine verdict) and a small subset carries <strong>gold</strong> (a human 👍/👎). Prediction-powered inference (Angelopoulos et&nbsp;al. 2023; PPI++) uses the judge on all rows and corrects its bias with the gold subset, so the interval shrinks with the judged count rather than the gold count. arXiv 2601.05420 reports intervals 35–55% narrower than plain PPI at 1–10% gold; arXiv 2601.21471 shows judge-only arm selection is provably unsafe under arm-dependent judge bias — which is why the gold correction is not optional here.</p>
+
+  <h2>The estimator</h2>
+  <pre><code>θ̂(λ) = λ · mean_unlabeled(f) + mean_labeled(Y − λ f)
+Var(θ̂) = λ² Var(f)/N + Var(Y − λ f)/n
+λ*  = Cov(Y, f) / (Var(f) · (1 + n/N))        clipped to [0, 1]</code></pre>
+  <p>λ = 0 reduces to the classical gold-only mean; λ = 1 is plain PPI. An uninformative or constant judge gets λ = 0. The clip keeps a noisy λ̂ from inflating variance at small n.</p>
+
+  <h2>API</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>ppi_mean(gold, judge_labeled, judge_unlabeled, *, alpha, clip, radius_fn)</code></td><td>Returns a <code>PPIEstimate</code>: <code>estimate</code>, fixed-sample <code>halfwidth</code> (normal quantile), <code>lam</code>, the gold-only <code>classical_halfwidth</code> and <code>shrink</code>, the representativeness check (<code>representative</code>, <code>judge_gap</code>, <code>judge_gap_z</code>), and — when <code>radius_fn</code> is given — an anytime-valid <code>cs_halfwidth</code>. Refuses (numeric fields <code>None</code>, <code>refusal</code> set to the reason) on fewer than 2 gold labels, fewer than 2 judged rows, or unpaired inputs.</td></tr>
+      <tr><td><code>ppi_difference(a, b, *, anytime)</code></td><td><code>(a − b, half-width, refusal)</code> for two independent arms. Fixed-sample widths combine in quadrature; anytime widths add (union bound).</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>What it assumes, and the guard for it</h2>
+  <p>The labelled rows must be exchangeable with the unlabelled ones — a random slice. This agent's labels are <strong>not</strong> random by design: §4ER asks for a label on bottom-quintile turns. So every estimate carries a representativeness check — the judge mean on labelled rows against unlabelled rows, as a two-sample z; |z| &gt; 2.5 flags the gold slice as skewed (≈1.2% false flags per arm; a deliberate "label the shaky ones" policy sits far beyond it). A flagged estimate is still computed — absent is not withheld — but the report labels it as resting on non-random labels.</p>
+
+  <h2>Anytime validity</h2>
+  <p>The arm report is read daily, so its intervals are asymptotic confidence sequences (<code>experiments.asymp_cs_radius</code>). The PPI estimator is the sum of two independent means, so its CS is the sum of a CS on the labelled residuals at α/2 and λ times a CS on the unlabelled judge scores at α/2 — a union bound, conservative and never anti-conservative. <strong>Measured cost:</strong> with a judge that flips ~20% of labels and 20 gold rows per arm, the one-look PPI interval is ~10–20% narrower than gold-only, but the union-bound sequence is slightly <em>wider</em> than a CS over the same gold rows. The report prints the one-look comparison, the anytime comparison <em>on the same rows</em> (a CS over PPI's own gold series), and, under its own name, the <code>human_failure_rate</code> CS — which covers ALL human-labelled resolved rows, a larger population than PPI's paired gold (a review of the first wording caught the two being read as one, §4FH). The anytime gain arrives with judge accuracy (the verifier scoping in §4FD) or with a purpose-built two-sample PPI sequence, which is the follow-up. The normal quantile is exact (<code>statistics.NormalDist</code>), not tabulated.</p>
+
+  <div class="note"><strong>Tests:</strong> <code>tests/test_ppi.py</code> (λ = 0 identity, perfect-judge shrink, uninformative-judge fallback, the variance formula recomputed independently, coverage against the classical interval, representativeness flagging, refusals name their reason, the union-bound CS). Report wiring: <code>tests/test_ppi_report.py</code>. Mutation battery §4FD: every formula mutant killed.</div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

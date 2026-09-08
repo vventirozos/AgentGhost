@@ -26,6 +26,8 @@ import inspect
 import json
 from types import SimpleNamespace
 
+import logging
+
 import pytest
 
 from ghost_agent.core import verifier as vmod
@@ -209,16 +211,34 @@ class TestRefuteEscalationRecords:
 
     @pytest.mark.asyncio
     async def test_escalation_error_is_recorded_as_unavailable(
-            self, v, home, monkeypatch):
+            self, v, home, monkeypatch, caplog):
         async def _explode(*a, **k):
             raise RuntimeError("main model down")
         monkeypatch.setattr(v, "_verify_claim_two_stage", _explode)
         monkeypatch.setattr(v, "_call_llm", _explode)
+        caplog.set_level(logging.WARNING, logger="GhostAgent")
+        stream = []
+        import ghost_agent.utils.logging as _glog
+        monkeypatch.setattr(_glog, "pretty_log",
+                            lambda *a, **k: stream.append((a, k)))
         out = await v._escalate_refute(_res(VerifyVerdict.REFUTED, 0.9),
                                        "c", "e", "ctx",
                                        trace={"req_id": "rq"})
         assert out.verdict == VerifyVerdict.REFUTED   # unchanged behaviour
         assert _ledger(home)[0]["outcome"] == "unavailable"
+        # The operator stream gets a WARNING line too (they watch the stream,
+        # not the app log).
+        lines = [(a, k) for a, k in stream
+                 if "refute escalation unavailable" in " ".join(map(str, a))]
+        assert lines and lines[0][1].get("level") == "WARNING", stream
+        # And it is VISIBLE: req 2422eb25 (2026-09-06) had this path fire and
+        # the only trace was the ledger row — a dead escalation looked exactly
+        # like a working one at debug level.
+        warned = [r for r in caplog.records
+                  if r.levelno >= logging.WARNING
+                  and "refute-escalation failed" in r.getMessage()
+                  and "main model down" in r.getMessage()]
+        assert warned, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_no_escalation_writes_no_row(self, v, home, monkeypatch):
@@ -335,7 +355,7 @@ class TestBenchAndSimulationAreExcluded:
         agent.context = NS(verifier=StubVerifier(),
                            args=NS(no_verifier=False),
                            skill_memory=NS(is_read_only=True))
-        agent._active_constraint_note = lambda limit=5: ""
+        agent._active_constraint_note = lambda limit=5, **_kw: ""
         await agent._compute_verifier_verdict(
             tools_run_this_turn=[{"name": "web_search", "content": "x"}],
             messages=[], final_ai_content="answer",
@@ -362,7 +382,7 @@ class TestBenchAndSimulationAreExcluded:
         agent.context = NS(verifier=StubVerifier(),
                            args=NS(no_verifier=False),
                            skill_memory=NS(is_read_only=False))
-        agent._active_constraint_note = lambda limit=5: ""
+        agent._active_constraint_note = lambda limit=5, **_kw: ""
         await agent._compute_verifier_verdict(
             tools_run_this_turn=[{"name": "web_search", "content": "x"}],
             messages=[], final_ai_content="answer",
@@ -586,7 +606,7 @@ class TestBothFinalizePaths:
         agent = GhostAgent.__new__(GhostAgent)
         agent.context = SimpleNamespace(
             verifier=StubVerifier(), args=SimpleNamespace(no_verifier=False))
-        agent._active_constraint_note = lambda limit=5: ""
+        agent._active_constraint_note = lambda limit=5, **_kw: ""
         return agent
 
     @pytest.mark.asyncio
@@ -685,7 +705,7 @@ class TestBothFinalizePaths:
         agent.context = SimpleNamespace(
             verifier=Verifier(llm_client=_LLM()),
             args=SimpleNamespace(no_verifier=False))
-        agent._active_constraint_note = lambda limit=5: ""
+        agent._active_constraint_note = lambda limit=5, **_kw: ""
 
         ident = ({"req_id": "REQ-FIN", "trajectory_id": "TRJ-FIN"}
                  if shape == "finalize"

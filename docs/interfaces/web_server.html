@@ -891,7 +891,13 @@
   <code>sendMessage()</code>, so the turn gets the same streaming, resume, history and thumbs
   handling as a typed message. There is ONE button (operator: "an empty request is an upload only by
   definition") whose label follows the box — <em>Upload</em> when empty, <em>Upload &amp; ask</em>
-  once there is a question; close / backdrop / Escape discard the file.</p>
+  once there is a question; close / backdrop / Escape discard the file. An image opens with the
+  default question <em>Describe this image:</em> already in the box (operator), shown dimmed and
+  italic while it is <em>pristine</em>: the first typed character replaces it, Backspace/Delete
+  clears the whole box, Enter or Upload sends it as-is. Edits that arrive without a keydown
+  (dictation, paste, predictive text) go through <code>resolvePristineInput(default, value)</code>
+  — text added after the default is kept, a deletion into it clears it, a replacement stands.
+  Other file types open empty.</p>
   <p><strong>Stored names.</strong> iOS names <em>every</em> camera capture <code>image.jpg</code>, so a
   second photo silently overwrote the first and a later question pointed at whichever came last.
   <code>uploadNameFor()</code> renames generic capture names (<code>image</code>/<code>img</code>/

@@ -27,7 +27,7 @@
   <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
 
   <h1>Workspace Continuity</h1>
-  <p class="subtitle">The world-model counterpart to selfhood. Selfhood tracks "who I am"; workspace continuity tracks "what I'm looking at."</p>
+  <p class="subtitle">The world-model counterpart to selfhood. Selfhood tracks "who I am"; workspace continuity tracks "what has happened (the activity ledger; not a place to do work)."</p>
 
   <h2>Why this exists</h2>
   <p>Selfhood was added to give a fresh session of the agent a sense of <em>resuming</em> rather than <em>waking blank</em> — autobiographical diary, open questions, mood, recognition prefix. That closed the asymmetry on the <em>self</em> side. But the <em>world</em> side was still snapshot-only: every session the agent saw an unannotated current file listing, no record of what its scheduled tasks did overnight, no memory of which URLs it had already pulled, no diff against the user's last engagement. The agent's self-model had become richer than its world-model.</p>
@@ -159,7 +159,7 @@
   </div>
 
   <h2>Relation to selfhood</h2>
-  <p>The two modules are designed to coexist. <a href="selfhood.html">Selfhood</a> answers "tell me about yourself" with the agent's autobiographical past and ongoing internal state. Workspace continuity answers "what's happening in my workspace?" with the user's external state. Both wake-up prefixes are spliced into the same system prompt, with selfhood first (who I am) and workspace second (what I'm looking at). The clean separation is intentional: an evaluator can strip one block without disturbing the other.</p>
+  <p>The two modules are designed to coexist. <a href="selfhood.html">Selfhood</a> answers "tell me about yourself" with the agent's autobiographical past and ongoing internal state. Workspace continuity answers "what's happening in my workspace?" with the user's external state. Both wake-up prefixes are spliced into the same system prompt, with selfhood first (who I am) and workspace second (what has happened (the activity ledger; not a place to do work)). The clean separation is intentional: an evaluator can strip one block without disturbing the other.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

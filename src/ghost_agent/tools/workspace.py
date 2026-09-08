@@ -1,4 +1,4 @@
-"""workspace tool — read-only view of the user's workspace state.
+"""workspace tool — read-only ACTIVITY LEDGER of the user's workspace (what already happened: tracked-file changes, task/command outcomes, research pulled). It does no work — see §4FJ for why the advertised text says so.
 
 Companion to ``introspect`` (read selfhood) and ``self_state`` (write
 selfhood). This tool answers questions like:

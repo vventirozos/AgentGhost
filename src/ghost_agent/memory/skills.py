@@ -289,6 +289,44 @@ def _normalize_lesson(lesson: dict) -> dict:
     return out
 
 
+#: Lesson provenance values (§4FD). "user" = written during a real user
+#: request; "auto" = idle machinery or an internal (sched-/job-/sub-) turn;
+#: "probe" = a diagnostic (must never teach — pinned upstream, stamped here
+#: so a leak is visible). Legacy rows carry "".
+LESSON_ORIGIN_USER = "user"
+LESSON_ORIGIN_AUTO = "auto"
+LESSON_ORIGIN_PROBE = "probe"
+
+
+def _derive_lesson_origin() -> str:
+    """The population writing a lesson RIGHT NOW, from the request-id
+    contextvar the turn loop sets first thing (§4FB) — the ONE derivation,
+    inside the write chokepoint, so no caller has to know. Idle phases
+    (reflection, dream, post-mortem, distillation) run under the contextvar
+    default ("SYSTEM") and are "auto"; internal prefixes (sched-/job-/sub-)
+    are "auto"; a probe id is "probe"; any other live request id is "user".
+    Never raises."""
+    try:
+        from ..utils.logging import is_probe_request_id, request_id_context
+        rid = str(request_id_context.get() or "")
+    except Exception:  # noqa: BLE001
+        return LESSON_ORIGIN_AUTO
+    if not rid or rid == "SYSTEM":
+        return LESSON_ORIGIN_AUTO
+    try:
+        if is_probe_request_id(rid):
+            return LESSON_ORIGIN_PROBE
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from ..core.autonomous_activity import is_internal_request
+        if is_internal_request(rid):
+            return LESSON_ORIGIN_AUTO
+    except Exception:  # noqa: BLE001
+        pass
+    return LESSON_ORIGIN_USER
+
+
 def build_lesson(
     *,
     task: str = "",
@@ -303,6 +341,7 @@ def build_lesson(
     source_trajectory_id: str = "",
     source_refs=None,
     dimension: str = "",
+    origin: str = "",
 ) -> dict:
     """Construct a canonical structured lesson. Callers that only have
     legacy `task/mistake/solution` can pass those as trigger/
@@ -362,6 +401,10 @@ def build_lesson(
         "failed_retrievals": 0,
         "last_retrieved_at": "",
         "source": source or "",
+        # §4FD provenance: which POPULATION wrote this lesson — "user" (a
+        # real turn), "auto" (idle machinery: reflection, dream, self-play,
+        # post-mortem, distillation), "bench". Legacy rows carry "".
+        "origin": origin or "",
         "source_trajectory_id": source_trajectory_id or "",
         "source_refs": [str(r) for r in (source_refs or [])][:20],
         "dimension": dimension or "",
@@ -1158,9 +1201,12 @@ class SkillMemory:
         source_trajectory_id: str = "",
         source_refs=None,
         dimension: str = "",
+        origin: str = "",
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
+        ``origin`` (§4FD) names the population that wrote it — see
+        ``make_lesson``; every production caller passes it (pinned).
 
         When structured kwargs are provided they take precedence. The
         canonical on-disk entry contains BOTH representations so older
@@ -1176,6 +1222,7 @@ class SkillMemory:
         Backward-compatible: pre-existing callers ignore the return value.
         """
         try:
+            origin = origin or _derive_lesson_origin()
             effective_trigger = trigger or task or ""
             effective_anti = anti_pattern or mistake or ""
             effective_correct = correct_pattern or solution or ""
@@ -1467,6 +1514,7 @@ class SkillMemory:
                 source_trajectory_id=source_trajectory_id,
                 source_refs=source_refs,
                 dimension=effective_dim,
+                origin=origin,
             )
 
             with self._get_lock():

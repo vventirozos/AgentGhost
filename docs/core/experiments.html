@@ -457,6 +457,11 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
     exclusion silently rots.
   </p>
 
+  <h2 id="ppi">The prediction-powered line (§4FD, 2026-09-07)</h2>
+  <p>Under every <code>failure_rate</code> block the report now prints one more line, <code>failure_rate[ppi]</code>, computed by <a href="ppi.html">core.ppi</a>: the <strong>judge</strong> is the machine verdict on every machine-judged row (the last non-human sidecar correction, else the write-time outcome — the overlay now keeps it readable as <code>extra["outcome_native"]</code>), the <strong>gold</strong> is the human label, read from every sidecar row by <code>TrajectoryCollector.machine_and_human_outcomes()</code> (last-write-wins would lose the machine verdict on a human-relabelled turn). Per-arm α is the same split the classical lines use; the interval is the union-bound confidence sequence.</p>
+  <p>Two comparisons are printed because they answer different questions: <code>human_failure_rate</code> is the <em>gold-only</em> estimate (the one PPI exists to sharpen), while <code>failure_rate</code> treats every machine verdict as truth and is narrow only because it does. The line is <strong>informational</strong> — it does not enter the verdict set, and says so; promoting it changes the estimator a converged instrument reports on, an operator decision with this line as the evidence. A skewed gold slice (labels are asked for on the shakiest turns, §4ER) renders as <code>SKEWED (z=…)</code>; a refusal renders its reason, never an empty number.</p>
+  <p>Rows with no machine verdict leave the PPI population (the same exclusion the classical <code>failure_rate</code> applies, made explicit); a row whose only signal is a human label is gold without a judge and stays out of the paired series. Tests: <code>tests/test_ppi_report.py</code>.</p>
+
   <h2>Registered experiments</h2>
   <div class="scroll"><table>
     <thead><tr><th>name</th><th>trigger key</th><th>context-mutating key</th><th>what differs</th></tr></thead>
@@ -466,6 +471,12 @@ radius = σ̂ · sqrt( 2(nρ² + 1) / (n²ρ²) · log( sqrt(nρ² + 1) / α ) )
         <td><code>risk_steer_fired</code></td>
         <td><code>risk_steer_fired</code></td>
         <td>The depth/effort steer on deep struggling turns. Trigger fires on ~7.6% of turns and is computed from state the arm cannot touch, so the triggered-only block is the powered comparison.</td>
+      </tr>
+      <tr>
+        <td><code>evidence_gate</code></td>
+        <td><code>evidence_gate_fired</code></td>
+        <td><code>evidence_gate_fired</code></td>
+        <td>§4FD: when every evidence-bearing call so far in the turn came back empty/weak/errored, the treatment injects the EVIDENCE CHECK steer into the volatile block (<a href="evidence_gate.html">core.evidence_gate</a>); control gets nothing. Kill: <code>GHOST_EVIDENCE_GATE=0</code>.</td>
       </tr>
       <tr>
         <td><code>fs_batch</code></td>

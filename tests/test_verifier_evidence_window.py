@@ -265,7 +265,7 @@ def _agent_with_stub_verifier(captured):
         args=SimpleNamespace(no_verifier=False),
     )
     # Project-constraint replay needs live project systems — not under test.
-    agent._active_constraint_note = lambda limit=5: ""
+    agent._active_constraint_note = lambda limit=5, **_kw: ""
     return agent
 
 

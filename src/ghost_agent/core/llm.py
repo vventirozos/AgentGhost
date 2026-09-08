@@ -3064,6 +3064,12 @@ class LLMClient:
         default — payloads carry unredacted memory/profile text). Best-
         effort by contract; see core/llm_recording.py."""
         try:
+            # §4FM: the periodic head re-warm is ~110 KB of byte-stable
+            # prompt per tick (≈53 MB/day at the default period) and carries
+            # no tool call — it would outweigh real traffic ~20:1 in the
+            # corpus the miner scans. Never recorded.
+            if str(meta.get("task_label") or "").startswith("main-prefix-"):
+                return
             from .llm_recording import maybe_record
             maybe_record(kind, payload, result, **meta)
         except Exception:

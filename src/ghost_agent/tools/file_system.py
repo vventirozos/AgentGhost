@@ -3133,7 +3133,12 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None, path: str = Non
 
         tree_lines, total = await asyncio.to_thread(_build_map)
         if tree_lines:
-            sandbox_tree = "\n".join(tree_lines)
+            # §4FD: the model counted 34 listed entries as "45 files" — 19
+            # real turns contradicted their own tool output by counting.
+            # State the count; never make the model count a list.
+            sandbox_tree = (f"{total} entries under "
+                            f"{('/' + str(path).strip('/')) if _want_sub else 'the workspace root'}"
+                            f" (files, excluding dotfiles):\n" + "\n".join(tree_lines))
             if total > len(tree_lines):
                 sandbox_tree += (
                     f"\n  ... [{total - len(tree_lines)} more files NOT shown "
@@ -3524,6 +3529,45 @@ async def tool_find_files(pattern: str, sandbox_manager, path: str = ".", sandbo
         return output if output.strip() else "Report: No files found matching that pattern."
     except Exception as e: return f"Error: {e}"
 
+_BINARY_MAGIC = (
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"\x89PNG\r\n\x1a\n", "PNG image"),
+    (b"GIF87a", "GIF image"), (b"GIF89a", "GIF image"),
+    (b"RIFF", "RIFF container (WebP/WAV/AVI)"),
+    (b"%PDF", "PDF document"),
+    (b"PK\x03\x04", "ZIP archive (or docx/xlsx/jar)"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"SQLite format 3", "SQLite database"),
+    (b"\x7fELF", "ELF executable"),
+    (b"\xcf\xfa\xed\xfe", "Mach-O executable"),
+)
+
+
+def _binary_peek_summary(path: Path, filename: str) -> str:
+    """What `inspect` says about a binary file instead of dumping its bytes.
+
+    A factual, non-error line: the file exists, its kind (by magic number)
+    and size, and where to go next (vision for images, read_chunked never —
+    it is binary). Deliberately does not start with "Error" because the
+    strike counter treats that prefix as an execution failure."""
+    try:
+        head = _read_head(path, 16)
+    except OSError:
+        head = b""
+    kind = next((name for magic, name in _BINARY_MAGIC
+                 if head.startswith(magic)), "binary file")
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = -1
+    size_s = (f"{size:,} bytes" if size >= 0 else "size unknown")
+    hint = (" Use 'vision_analysis' to look at it."
+            if kind.endswith("image") else
+            " It has no text preview; do not read it as text.")
+    return (f"'{filename}' exists: {kind}, {size_s} — binary, so no text "
+            f"lines to show.{hint}")
+
+
 async def tool_inspect_file(filename: str, sandbox_dir: Path, lines: int = 10):
     if not filename: return "Error: 'path' (filename) is required for inspection."
     pretty_log("File Peek", filename, icon=Icons.TOOL_FILE_I)
@@ -3544,6 +3588,16 @@ async def tool_inspect_file(filename: str, sandbox_dir: Path, lines: int = 10):
             _fb_note = (f"NOTE: serving the sandbox-ROOT copy "
                         f"'{_to_container_path(sandbox_dir, fb)}' (not in this "
                         f"project's workspace).\n")
+        # Binary sniff, as `read` / `read_chunked` already do. Without it a
+        # JPEG "peek" returned its first ten newline-delimited runs of
+        # JFIF/Exif/ICC bytes as text (req 2422eb25, 2026-09-06). This is NOT
+        # an "Error:" reply on purpose: the model peeks images to confirm
+        # they exist before vision, and an Error prefix is a strike.
+        try:
+            if _looks_like_binary(_read_head(path, 8192)):
+                return _fb_note + _binary_peek_summary(path, filename)
+        except OSError as oe:
+            return f"Error: failed to read '{filename}': {oe}"
         def _read_peek():
             content = []
             with open(path, 'r', encoding='utf-8', errors='replace') as f:

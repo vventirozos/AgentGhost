@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime
 import logging
 import re
+import unicodedata
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -300,6 +301,52 @@ _SEARCH_BLOCK_RE = re.compile(
     re.DOTALL)
 
 
+#: Function words longer than three letters that carry no topic (§4FD).
+#: Filtered from the REQUEST side of the overlap so "what" in a stored
+#: constraint ("Start with: What it means…") cannot make "what is 17 times
+#: 4?" relevant.
+RELEVANCE_STOPWORDS = frozenset({
+    "what", "with", "that", "this", "from", "have", "will", "your", "about",
+    "into", "then", "than", "they", "them", "when", "where", "which", "make",
+    "more", "some", "such", "only", "also", "just", "like", "does", "done",
+    "been", "were", "want", "need", "here", "there", "please", "thanks",
+    "should", "would", "could", "give", "tell", "show", "know", "think",
+    "over", "under", "after", "before", "again", "still", "very", "much",
+    "many", "each", "every", "other", "another", "same", "these", "those",
+    "using", "used", "means", "start", "starting", "with",
+    # NOT "user": it is a content word here ("fix the user page" must overlap
+    # a "User Management" project — review §4FH).
+})
+
+#: Words a continuation request is made of (§4FD). A request consisting only
+#: of these (after the >3-char token filter) is relevant to the ACTIVE
+#: project by virtue of the conversation binding, not by lexical overlap.
+CONTINUATION_TOKENS = frozenset({
+    "proceed", "continue", "carry", "next", "task", "tasks", "step", "steps",
+    "again", "retry", "resume", "start", "begin", "finish", "complete",
+    "done", "okay", "please", "then", "with", "this", "that", "them", "these",
+    "those", "rest", "remaining", "project", "keep", "going", "ahead", "move",
+    "forward", "first", "second", "third", "last", "another", "more", "work",
+    "advance", "build", "implement", "everything", "whole", "plan", "yes",
+    "sure", "just", "only", "also", "same", "thing", "item", "items",
+    # Greek continuations (the operator's other language; §4FH M1)
+    "συνέχισε", "συνέχεια", "συνεχίζουμε", "προχώρα", "προχωράμε", "εντάξει",
+    "κάνε", "κάντο", "επόμενο", "επόμενη", "ξανά", "συνέχισέ",
+})
+
+
+def _fold_token(tok: str) -> str:
+    """Accent-fold one lower-cased token (NFD, drop combining marks) so a
+    request typed without accents ("δαπανες") still equals the accented
+    title token ("δαπάνες"). Nothing else is normalised: see the note on
+    inflection inside `request_relevant_to_project`."""
+    try:
+        return "".join(c for c in unicodedata.normalize("NFD", tok)
+                       if unicodedata.category(c) != "Mn")
+    except Exception:
+        return tok
+
+
 def request_relevant_to_project(store, project_id, request, cmds=None) -> bool:
     """True when ``request`` plausibly concerns ``project_id``: shares a
     significant token with the project title/description or its task
@@ -309,23 +356,69 @@ def request_relevant_to_project(store, project_id, request, cmds=None) -> bool:
     authority: Agent._request_relevant_to_project delegates here and the
     findings recorder uses the same verdict (one input, one story)."""
     try:
-        req_tokens = {
-            t for t in re.findall(r"[a-z0-9]+", str(request or "").lower())
-            if len(t) > 3}
-        if not req_tokens:
-            return False
+        # Unicode word tokens (§4FH M1): the first version matched only
+        # [a-z0-9]+, so every Greek request had ZERO tokens and returned
+        # False before any other rule — 23 Greek-script requests and 11
+        # short acks ("ok", "yes", "do it") in the corpus silently dropped
+        # their project constraints. Content = tokens that are neither
+        # function words nor continuation words.
+        raw = [_fold_token(t) for t in re.findall(r"\w+", str(request or "").lower())
+               if len(t) > 3]
+        # the comparison sets are folded the same way, or an accented
+        # continuation word ("συνέχισε") would stop being a continuation
+        _stop = {_fold_token(t) for t in RELEVANCE_STOPWORDS}
+        _cont = {_fold_token(t) for t in CONTINUATION_TOKENS}
+        content = {t for t in raw if t not in _stop and t not in _cont}
         for _cmd in (cmds or []):
             if project_id and str(project_id) in str(_cmd):
                 return True
+        # §4FD: a bare continuation ("proceed", "continue with task 5", "do
+        # the next one", "ok", "ναι") names nothing but IS about the bound
+        # project — the chess-session request that wrote the forbidden
+        # engine was the single word "proceed." A request with NO content
+        # tokens is relevant to the bound project; one that carries content
+        # ("how's the weather?") must earn relevance by overlap.
+        if project_id and not content:
+            return True
+        if not content:
+            return False
+        req_tokens = content
         proj = store.get_project(project_id) or {}
         hay = str(proj.get("title") or "") + " " + str(proj.get("description") or "")
+        # §4FD: the goal and the stored constraints are part of what the
+        # project is ABOUT — "make the AI opponent smarter" overlaps the
+        # constraint "don't come up with some random AI" even when the
+        # title does not mention an opponent.
+        hay += " " + str(proj.get("goal") or "")
+        try:
+            _meta = proj.get("metadata") or {}
+            _cons = _meta.get("constraints") if isinstance(_meta, dict) else None
+            if isinstance(_cons, str):
+                _cons = [_cons]
+            for c in (_cons or []):
+                hay += " " + str(c)
+        except Exception:
+            pass
         try:
             for t in store.list_tasks(project_id) or []:
                 hay += " " + str(t.get("description") or "")
         except Exception:
             pass
+        # No stopword filter on this side: the request side already
+        # removed them, and (req − S) ∩ hay == (req − S) ∩ (hay − S) — a
+        # second filter here was proven equivalent by mutation (§4FD).
+        # Unicode on this side too, or a Greek title can never overlap.
+        # Exact (accent-folded) token equality on purpose: inflection is NOT
+        # matched. A 5-character prefix stem was measured on the request
+        # corpus × live projects (§4FH: 2,097 user requests × 4 projects =
+        # 8,036 pairs) and raised relevant pairs from 2,704 to 3,267 —
+        # "creatine" reached a project via "create", "complain" via
+        # "complete", "confirm" via "config" — which is the off-topic
+        # constraint replay this gate exists to stop. Accent folding changed
+        # no verdict on that corpus (2,704 → 2,704); it is kept because it
+        # cannot widen beyond accent-only spellings.
         hay_tokens = {
-            t for t in re.findall(r"[a-z0-9]+", hay.lower()) if len(t) > 3}
+            _fold_token(t) for t in re.findall(r"\w+", hay.lower()) if len(t) > 3}
         return bool(req_tokens & hay_tokens)
     except Exception:
         return True

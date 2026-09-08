@@ -14,6 +14,37 @@ from typing import Any, Optional
 
 request_id_context = contextvars.ContextVar("request_id", default="SYSTEM")
 
+# §4EZ (2026-09-06): WHICH POPULATION the current request belongs to —
+# "user", "sim" (self-play / dream / sub-agent on a read-only store) or
+# "bench" (bank runs). Set by `handle_chat` beside the request id, from the
+# SAME `turn_origin` derivation the BEGIN frame stamps, and reset in the
+# same finally. Read ONLY by the colour resolver in `pretty_log`: every line
+# of a turn (including the ones logged before its BEGIN frame and the
+# background writes that outlive its END frame, which inherit the context)
+# renders in the origin's colour FAMILY. Empty = not classified; the frame
+# text itself still comes from the explicit `origin=` argument, so the
+# liveness `origin=` stamp readers see nothing new.
+request_origin_context = contextvars.ContextVar("request_origin", default="")
+
+# §4FB (2026-09-06): a DIAGNOSTIC request — an operator/Claude probe sent
+# through the live user path to exercise it. It must run exactly like a user
+# turn and must never TEACH: no lesson mint, no reflection, no calibration
+# booking, no retrieval credit, no selfhood capture. A probe that taught
+# once: playbook lesson [49] ("Use deep_research ONCE on the query: llama.cpp
+# prompt prefill speed apple silicon … do not read files", minted by
+# reflection from five repeats of a perf-audit probe, then surfaced 37 times
+# into unrelated requests). Marked by the `X-Ghost-Origin: probe` request
+# header and carried as a request-id PREFIX, so every reader that derives the
+# population from the request id — `core/agent.turn_origin`, the trajectory
+# stamp, the stream frame — agrees without a second channel.
+PROBE_REQUEST_PREFIX = "probe-"
+ORIGIN_PROBE = "probe"
+
+
+def is_probe_request_id(req_id) -> bool:
+    """True iff ``req_id`` carries the diagnostic-probe prefix."""
+    return str(req_id or "").startswith(PROBE_REQUEST_PREFIX)
+
 # WHY a verify call is being routed ("turn gate", "reflection plan-verify",
 # …). Read by the llm-routing log lines so a burst of otherwise-identical
 # "Routing verification …" entries says which subsystem is asking. A
@@ -202,16 +233,64 @@ _LEVEL_COLOR = {
     "DEBUG": _ansi("2"),       # dim
 }
 
-# Twelve high-contrast 256-color codes for per-request tags. Picked so that
-# adjacent palette entries are visually distinct.
-_REQ_PALETTE = [39, 45, 51, 81, 117, 141, 178, 208, 213, 198, 159, 222]
+# §4EZ (2026-09-06): ORIGIN COLOUR FAMILIES. The tag/frame colour used to be
+# one hash over twelve codes, so a self-play turn, a bench attempt and the
+# operator's own request drew from the same palette and only the frame's
+# trailing "· sim" told them apart. Now the HUE says which population a
+# line belongs to before the eye reads a word of it, and the shade within
+# the family keeps concurrent same-population requests separable (the
+# original per-request grouping). One table; tune it here and nowhere else.
+#
+#   user   blues / cyans      — the operator's own traffic (the old cool set)
+#   sim    violets / magentas — self-play, dream, sub-agents on read-only stores
+#   bench  ambers / oranges   — bank runs (externally graded)
+#   probe  reds / pinks       — diagnostics sent through the user path; they
+#                               run like user turns and never teach (§4FB)
+#   SYSTEM green (one shade)  — not request-scoped: boot, the biological tick's
+#                               idle phases, watchdogs, the stream drain
+#   (none) greys              — a request that declared no origin. Grey on
+#                               purpose: laundering it into the user family
+#                               would hide exactly the defect worth seeing.
+_ORIGIN_PALETTES: dict = {
+    "user":  (39, 45, 51, 81, 117, 159),
+    "sim":   (141, 171, 177, 183, 213, 219),
+    "bench": (172, 178, 208, 214, 220, 222),
+    "probe": (196, 203, 204, 210, 211, 217),
+}
+_UNCLASSIFIED_PALETTE = (245, 248, 251)
+_SYSTEM_COLOR = 34
 
 
-def _req_color(req_id: str) -> str:
-    if not _USE_COLOR or req_id == "SYSTEM":
+def _line_origin(req_id: str) -> str:
+    """The population a request-scoped line belongs to, for colour only.
+
+    ONE resolver, two sources in a fixed order: the origin the BEGIN frame
+    was stamped with (so a line always wears the family of the frame the
+    operator saw open), else the turn's `request_origin_context` (lines
+    logged before BEGIN, and background work that inherits the context and
+    keeps logging after END popped the frame state). "" = unclassified."""
+    with _REQ_STATE_LOCK:
+        st = _REQ_STATE.get(req_id)
+    stashed = (st or {}).get("origin")
+    if stashed:
+        return str(stashed)
+    return str(request_origin_context.get() or "")
+
+
+def _req_color(req_id: str, origin: Optional[str] = None) -> str:
+    """ANSI colour for a line's tag and frame edge, by origin FAMILY.
+
+    ``origin`` may be passed explicitly (the BEGIN frame knows it before the
+    state is stashed); ``None`` resolves it through :func:`_line_origin`."""
+    if not _USE_COLOR:
         return ""
-    h = sum(ord(c) for c in req_id) % len(_REQ_PALETTE)
-    return f"\033[38;5;{_REQ_PALETTE[h]}m"
+    if req_id == "SYSTEM":
+        return f"\033[38;5;{_SYSTEM_COLOR}m"
+    fam = _ORIGIN_PALETTES.get(
+        origin if origin is not None else _line_origin(req_id),
+        _UNCLASSIFIED_PALETTE)
+    h = sum(ord(c) for c in req_id) % len(fam)
+    return f"\033[38;5;{fam[h]}m"
 
 
 def _req_tag(req_id: str) -> str:
@@ -617,8 +696,10 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
 #   │   │    │   │         └── title (lowercased, bold, level-colored)
 #   │   │    │   └── delta from request start
 #   │   │    └── icon (emoji, picks itself)
-#   │   └── 2-char request tag (deterministic color)
-#   └── left frame edge (matches BEGIN/END box)
+#   │   └── 2-char request tag — colour FAMILY = origin (blue user · violet
+#   │       sim · amber bench · green SYSTEM · grey unclassified), shade
+#   │       within the family = deterministic per request (§4EZ)
+#   └── left frame edge (matches BEGIN/END box; same colour as the tag)
 #
 # BEGIN frame:
 #   ┌─ R7 a8a93a27  request started  11:02:33 ─────────────────────────
@@ -626,7 +707,8 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
 #   └─ R7  request finished  +12.3s ──────────────────────────────────
 #
 # Concurrent requests still interleave line-by-line, but each line carries
-# the colored 2-char tag so the eye can group them by stream.
+# the colored 2-char tag so the eye can group them by stream — and the hue
+# of that tag says which population the stream belongs to.
 
 
 def _truncate(content_str: str, limit: int) -> str:
@@ -793,7 +875,9 @@ def _mirror(req_id: str, title: str, content: str, level: str = "INFO",
 def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None, no_truncate: bool = False, origin: str = None):
     req_id = request_id_context.get()
     tag = _req_tag(req_id)
-    rcol = _req_color(req_id)
+    # §4EZ: an explicit `origin=` (the BEGIN frame) picks the family
+    # directly; every other line resolves it (stash, then contextvar).
+    rcol = _req_color(req_id, origin=(origin or None))
 
     # ---- Lifecycle frames ------------------------------------------------
     if special_marker == "BEGIN":
@@ -817,7 +901,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{rcol}┌─ {BOLD}{tag}{RESET}{rcol} {req_id[:8]}{RESET}  "
             f"{DIM}request started  {ts}{RESET} "
             f"{rcol}{rule}{RESET}"
-            + (f" {DIM}·{RESET} {BOLD}{origin}{RESET}" if origin else "")
+            + (f" {DIM}·{RESET} {rcol}{BOLD}{origin}{RESET}" if origin else "")
         )
         # ORIGIN STAMP (2026-08-11). Self-play/dream turns enter through the
         # SAME handle_chat as a human request, so the durable log could not
@@ -853,7 +937,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{rcol}└─ {BOLD}{tag}{RESET}  "
             f"{DIM}request finished  {delta}{RESET} "
             f"{rcol}{rule}{RESET}"
-            + (f" {DIM}·{RESET} {BOLD}{_end_origin}{RESET}"
+            + (f" {DIM}·{RESET} {rcol}{BOLD}{_end_origin}{RESET}"
                if _end_origin else "")
         )
         atomic_print(line)

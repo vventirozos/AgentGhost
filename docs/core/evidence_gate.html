@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.evidence_gate — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="experiments.html">experiments</a>
+    <a class="current" href="evidence_gate.html">evidence_gate</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>core / evidence_gate.py — the EVIDENCE CHECK steer</h1>
+  <p class="subtitle">One pure function reads the turn's tool results and answers "did any call this turn return substantive evidence?". When every evidence-bearing call came back empty, weak or errored, the loop tells the model so before it answers. Shipped 2026-09-07 (journal §4FD), under the live experiment arm <code>evidence_gate</code>.</p>
+
+  <h2>Why it exists</h2>
+  <p>The largest real failure class in six weeks of live turns (~30 of 124 labelled failures, and most of the human 👎) was a confident answer produced after every retrieval came back empty or unrelated: <code>recall</code> returned rows about pg_stat when asked for a project codename and the agent invented a name; <code>browser extract_text</code> returned <code>LENGTH: 1</code> and the agent answered "around 4 hours"; web search returned nothing usable 54 times and the agent defined a Greek dessert anyway. arXiv 2606.21409 measures the mechanism — unreliable retrieval is worse than none (44.8 → 4.7 F1 on shuffled context) — and this model abstains readily when it is told the evidence is empty. Nothing told it.</p>
+
+  <h2>What it does</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Function</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>assess_turn_evidence(tools_run)</code></td><td>Walks the turn's recorded tool results (synthetic loop-minted rejections excluded). Only <code>EVIDENCE_TOOLS</code> count (searches, recall/knowledge_base, browser, file_system reads, execute, fact_check, news, system_utility). Returns an <code>EvidenceAssessment</code>: <code>consulted</code>, <code>substantive</code>, and one reason per empty call.</td></tr>
+      <tr><td><code>EvidenceAssessment.fires</code></td><td>True only when the turn consulted evidence and got none of it. A chat turn with no retrieval never fires; one good result among empties never fires.</td></tr>
+      <tr><td><code>render_evidence_steer(assessment)</code></td><td>The steer text: names up to four reasons, forbids stating facts that were not retrieved, and allows exactly three moves — one more targeted attempt, or say plainly what was not found, and stop.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>The empty shapes</h2>
+  <p>Each shape is the tool's <em>own</em> wording, and this module is the single place they are recognised — a tool that rewords its empty result reddens the shape pin in <code>tests/test_evidence_gate.py</code> rather than silently disarming the gate.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Tool</th><th>Empty when</th></tr></thead>
+    <tbody>
+      <tr><td>browser</td><td><code>HTTP_STATUS: 4xx/5xx</code>, or <code>LENGTH:</code> under <code>BROWSER_MIN_TEXT</code> (40) characters of page text</td></tr>
+      <tr><td>web_search, darkweb_search, deep_research, fact_check, news</td><td>"No search results found", "Zero …", "(0 results)", or an empty body — checked <em>before</em> the generic error prefix, since the search tool's empty result is worded as an ERROR</td></tr>
+      <tr><td>recall, knowledge_base</td><td>"Zero high-confidence memories found", or the §4FD header "best match: LOW" (see <a href="../tools/memory_tools.html">memory_tools</a>)</td></tr>
+      <tr><td>file_system reads</td><td>"not found." / "does not exist", or <code>[Empty]</code></td></tr>
+      <tr><td>execute</td><td>a non-zero <code>EXIT CODE:</code></td></tr>
+      <tr><td>any</td><td>an <code>error</code>-flagged result, or an <code>ERROR:</code> / <code>Error:</code> head</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Loop wiring and the arm</h2>
+  <p><code>GhostAgent._evidence_gate_block(tools_run_this_turn, req_id)</code> is called at the volatile-state assembly site, right after the explicit-constraints block, and its text rides the volatile block (never a tool result — the corpus stays what the tool returned, the §4K lesson). It is arm-gated: <code>experiments.arm_for(ctx, "evidence_gate", req_id)</code>; the trigger is marked on <em>both</em> arms (<code>evidence_gate_fired</code>: True on treatment, False on control) so the report can condition on turns where it would have fired; the text ships on treatment only. The key is registered in <code>TRIGGER_KEYS</code> and <code>CONTEXT_MUTATING_KEYS</code>. Kill switch: <code>GHOST_EVIDENCE_GATE=0</code>; an unregistered arm is inert.</p>
+
+  <div class="note"><strong>Tests:</strong> <code>tests/test_evidence_gate.py</code> — every real shape both ways, the fires-only-when-all-empty rule, synthetic exclusion, bounded reasons, the arm gating executed on both arms and the kill switch, an AST pin that the production loop calls the method with the turn's tools and appends its result to the volatile state, and the registry keys. Mutation battery §4FD: all gate mutants killed.</div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

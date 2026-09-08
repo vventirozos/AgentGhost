@@ -430,8 +430,10 @@ def test_r2_warmup_miss_skips_isolate_contexts():
     assert "_iso = (" in seg and "is_read_only" in seg
     assert "profile_memory" in seg
     # NIT-3: the warmed hash is stashed AFTER the prefill request succeeds
+    # §4FM: the label became `"main-prefix-rewarm" if quiet else "main-prefix-warmup"`;
+    # the property is unchanged — the stash comes AFTER the request succeeded
     assert (src.index("self.context._warmed_sys_hash = _sys_h")
-            > src.index('task_label="main-prefix-warmup"'))
+            > src.index('else "main-prefix-warmup"'))
 
 
 def test_r2_self_play_forcing_excludes_sub_agents():

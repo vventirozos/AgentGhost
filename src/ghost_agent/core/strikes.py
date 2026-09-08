@@ -137,6 +137,18 @@ READWRITE_LOOP_TOOLS = frozenset({
 READWRITE_HARD_STOP = 5
 
 
+# ⚠ RETRACTED 2026-09-07 (§4FH). A "repeated-mutation" breaker keyed on call
+# IDENTITY (tool, action, target — result ignored) shipped here for a few
+# hours and was pulled by the verification pass. Its premise was the
+# ten-click request fb705dcf; the fact check showed every one of those
+# clicks had file edits between it and the next — an edit→verify cycle, not
+# an ungrounded repeat — and a corpus replay measured 28/1067 real requests
+# false-steered and 11 false-stopped (reads, green test re-runs, id-keyed
+# task updates collapsing to one key) against 3 rows of the target class.
+# A guard with no measured true positive does not ship; the deletion is
+# pinned in tests/test_4fh_mutation_breaker_retracted.py.
+
+
 def is_readwrite_loop_exempt(fname) -> bool:
     """True if a no-progress READ loop on ``fname`` must NOT force a text-only
     final response, because the same tool is how the agent performs the

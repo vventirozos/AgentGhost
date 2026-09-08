@@ -322,6 +322,9 @@
     only a producer-side pin caught it (mutation-testing showed removing the marker reddened nothing).
   </p>
 
+  <h2 id="shape-routing">Executor chosen by leaf shape <span class="tag">2026-09-08 · §4FL</span></h2>
+  <p>The seam at the top of <code>build_coding_task</code> asks <code>coding_loop.executor_kind(context, project_id, description=, existing_files=)</code>. Precedence: <code>GHOST_CODING_EXECUTOR</code> → the project's <code>metadata.executor</code> (either value) → the shape rule (<code>leaf_shape</code>: the leaf names an existing file, by path or basename as a whole word, whose content holds ≥ <code>GHOST_LEAF_GROW_LINES</code> = 80 lines; the largest named file decides) → spec. A routed leaf logs "routing leaf to the agentic loop — it extends app.py (279 lines …)". The leaf bench pins its control arm to <code>metadata.executor = "spec"</code> since the default would otherwise route its growing leaves to the loop. See <a href="coding_loop.html">coding_loop</a>.</p>
+
   <h2 id="think-policy">Think policy, kept rejections, append rollback, two pre-write guards <span class="tag">2026-09-03 · §4EI</span></h2>
   <p>
     Request <code>463111ad</code> (an Elden Ring tracker, 7 leaves, <code>autoadvance count=all</code>) ran
@@ -339,7 +342,18 @@
     thinking disabled (<code>_spec_nothink_call</code>: the same <code>/no_think</code> +
     <code>enable_thinking=False</code> recipe the retry used). One clean think phase resets the streak; a
     restart resets it too. The streak is kept <b>per LLM client</b> (weak-keyed), so the one production
-    client adapts once per process while test doubles never see each other. <code>0</code> = never think on
+    client adapts once per process while test doubles never see each other.
+    <b>§4FJ disarm path (2026-09-07).</b> "A clean think phase resets" could never fire once the streak had
+    tripped — no think phase ran any more — so the no-think regime was sticky until a restart, and the
+    single-file leaf bench measured that regime at 2/6 DONE against 6/6 for think-with-fallback in the same
+    process (§4FI). Now, after <code>GHOST_CODING_THINK_PROBE_AFTER</code> (default 3) no-think spec calls —
+    or immediately after a verify failure on a spec that was built no-think — ONE spec call thinks again as a
+    <em>probe</em>: a clean probe resets the streak (thinking is back), an aborted probe extends the no-think
+    window by another <code>PROBE_AFTER</code> calls. <code>0</code> or negative disables probing (the
+    pre-§4FJ sticky behaviour). The probe, the reset and the verify-triggered probe are logged at WARNING
+    so they show in the operator stream. Pins: <code>tests/test_4fj_think_probe_and_workspace.py</code>
+    (the window, a clean and an aborted probe, the knob, and the verify hook at its real call site in
+    <code>build_coding_task</code>). <code>0</code> = never think on
     spec calls; a negative value = never adapt. The system hint also tells the model not to draft file
     contents in its thinking. A no-think first call that comes back reasoning-only is <em>not</em> retried
     with the same recipe.
@@ -432,6 +446,9 @@
     name plus a <code>content</code> parameter). It is not one; it was renamed to what it is
     (<code>_keep_unparsed_spec_output</code>) rather than added to an exempt list.
   </p>
+
+  <h2 id="agentic-seam">The agentic alternative and its seam (§4FG, 2026-09-07)</h2>
+  <p>The top of <code>build_coding_task</code> — after the llm/tool_runner check and before any spec call — now consults <code>coding_loop.executor_kind(context)</code>: <code>GHOST_CODING_EXECUTOR=agentic</code> or a project's <code>metadata.executor = "agentic"</code> routes the leaf to <a href="coding_loop.html">core.coding_loop</a>, a bounded edit-test loop that returns the same <code>CodingResult</code>, so every caller (idle autoadvance, the <code>manage_projects</code> tool, the HTTP route) inherits the choice from one place. The default stays this spec executor until <code>scripts/leaf_bench.py</code> shows the loop's DONE rate is not worse. Pinned executed in <code>tests/test_4fg_coding_loop.py</code>.</p>
 </main>
 </body>
 </html>

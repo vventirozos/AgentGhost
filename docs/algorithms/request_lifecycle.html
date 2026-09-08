@@ -103,6 +103,21 @@
   </ol>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>Marking a diagnostic request (§4FB)</h2>
+  <p>Alongside <code>X-Request-ID</code>, <code>POST /api/chat</code> honours
+  <code>X-Ghost-Origin: probe</code>: the route prefixes the request id with
+  <code>probe-</code> (keeping a client-supplied id under it, never doubling an existing
+  prefix), <code>turn_origin</code> answers <code>"probe"</code>, and the turn runs the
+  full live path without minting lessons, booking calibration, crediting retrievals or
+  being reflected on. Use it for every operator/Claude probe &mdash; a probe that taught
+  once became playbook lesson 49.</p>
+  <p>Companion endpoint: <code>POST /api/lessons/quarantine</code> with
+  <code>{"trigger": &lt;exact trigger&gt;, "reason": &lt;why&gt;}</code> quarantines a playbook
+  lesson <em>inside the live process</em> (the playbook is single-writer and launchd respawns
+  the agent immediately on exit, so an external script never has a safe window). 400 without a
+  reason &mdash; it is written on the record; 503 on a read-only or missing skill memory;
+  <code>ok:false</code> when nothing matched.</p>
+
 </main>
 </body>
 </html>

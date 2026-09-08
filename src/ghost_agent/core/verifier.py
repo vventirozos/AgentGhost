@@ -3036,8 +3036,23 @@ class Verifier:
                                                 force_main=True)
                     strong = self._build_verify_result(data)
         except Exception as exc:
-            logger.debug("Verifier refute-escalation failed (keeping "
-                         "original verdict): %s", exc)
+            # WARNING, not debug: req 2422eb25 (2026-09-06) had its refute
+            # escalation raise and the only trace was the ledger row's
+            # outcome="unavailable" — nothing reached the operator stream or
+            # the app log, so a dead escalation path looks exactly like a
+            # working one that upholds every refute.
+            logger.warning("Verifier refute-escalation failed (keeping "
+                           "original verdict): %s: %s",
+                           type(exc).__name__, exc)
+            try:
+                from ..utils.logging import Icons, pretty_log
+                pretty_log(
+                    "Verifier",
+                    f"refute escalation unavailable — {type(exc).__name__}: "
+                    f"{str(exc)[:120]} (cheap REFUTED stands)",
+                    icon=Icons.VERIFIER_LAB, level="WARNING")
+            except Exception:  # noqa: BLE001 — logging must never eat the verdict
+                pass
             record_escalation(
                 kind="refute", route=route, outcome="unavailable",
                 cheap_verdict=result.verdict.value,

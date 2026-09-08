@@ -458,7 +458,7 @@ def test_project_ledger_evidence_block(context):
     context.current_project_id = pid
     tools = [{"name": "manage_projects", "content": "…"}]
     block = _project_ledger_evidence(context, tools)
-    assert block.startswith("[project ledger (live)]")
+    assert block.startswith("[project ledger (live) — task titles and statuses, NOT user constraints]")
     assert "status=FAILED" in block
     assert "does NOT parse" in block
     # non-project turn → nothing

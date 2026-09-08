@@ -1267,6 +1267,17 @@ async def _announce_ready_when_warm(warmup_task, timeout: float = 120.0):
                icon=Icons.SYSTEM_READY)
 
 
+
+def _spawn_main_prefix_rewarm(agent, spawn):
+    """§4FM: schedule the periodic head re-warm (`rewarm_main_prefix_loop`)
+    when GHOST_MAIN_PREFIX_REWARM_S > 0. Returns the task or None. Split out
+    so the wiring is executable in tests without booting the app."""
+    from .core.agent import rewarm_period_s
+    period = rewarm_period_s()
+    if period <= 0:
+        return None
+    return spawn(agent.rewarm_main_prefix_loop(period), name="main-prefix-rewarm")
+
 def calib_startup_fields(cp) -> dict:
     """The payload of the startup 📐 CALIB line.
 
@@ -2552,6 +2563,12 @@ async def lifespan(app):
                 max_runs=2,
                 min_severity=float(getattr(args, "postmortem_min_severity", 0.4)),
                 model=args.model,
+                # §4FD: human 👎 turns are selected regardless of structural
+                # severity — the engine analysed 0 of 124 labelled failures
+                # in six weeks because a clean 👎 scores ~0.01.
+                human_labeled=getattr(
+                    getattr(context, "trajectory_collector", None),
+                    "has_human_label", None),
             )
             pretty_log(
                 "Post-Mortem Engine",
@@ -3006,6 +3023,7 @@ async def lifespan(app):
         from .utils.logging import spawn_bg as _spawn_bg_main
         _warmup_task = _spawn_bg_main(agent.warm_up_main_prefix(),
                                       name="main-prefix-warmup")
+        _spawn_main_prefix_rewarm(agent, _spawn_bg_main)
 
     # Calibration spine (roadmap phase 2.5). Pairs each turn's composite
     # confidence with the realized outcome, measures Brier/ECE, and (idle

@@ -119,10 +119,10 @@ def build_workspace_prefix(
 
     return (
         f"{WORKSPACE_PREFIX_OPEN}\n"
-        f"### WORKSPACE STATE — WHAT'S OUTSIDE OF ME\n"
-        f"This is the state of the user's workspace, not my own internal "
-        f"state. Read it as 'what I'm looking at', distinct from the "
-        f"selfhood block above which is 'who I am'.\n\n"
+        f"### WORKSPACE STATE — ACTIVITY LEDGER (what already happened)\n"
+        f"The user's workspace record, not my own state, and not a place to do "
+        f"work (file_system / execute / browser / manage_projects do that). "
+        f"Read it as 'what has happened', not 'who I am'.\n\n"
         f"{body}\n"
         f"{WORKSPACE_PREFIX_CLOSE}\n"
     )

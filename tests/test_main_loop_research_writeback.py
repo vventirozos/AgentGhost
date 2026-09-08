@@ -173,8 +173,14 @@ def test_shared_authority_honours_project_dir_in_commands(store, pid):
         store, pid, "please rerun that thing", cmds=[f"cd projects/{pid} && ls"]) is True
     assert request_relevant_to_project(
         store, pid, "please rerun that thing", cmds=["ls"]) is False
-    # No significant token at all → False before the store is consulted.
-    assert request_relevant_to_project(store, pid, "do it", cmds=[f"cd projects/{pid}"]) is False
+    # §4FH: a request with NO content token is a continuation of the bound
+    # project (the old contract returned False here and dropped the chess
+    # session's constraints on the single word "proceed."); with a command
+    # naming the project dir it is relevant twice over.
+    assert request_relevant_to_project(store, pid, "do it", cmds=[f"cd projects/{pid}"]) is True
+    assert request_relevant_to_project(store, pid, "do it", cmds=["ls"]) is True
+    # …but with NO bound project a content-less request is about nothing.
+    assert request_relevant_to_project(store, None, "do it", cmds=["ls"]) is False
 
 
 # ---------------------------------------------------------------------------

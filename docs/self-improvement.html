@@ -143,7 +143,7 @@ idle 1..10s   …and round again, forever</code></pre>
   <h3>Two more that are off by default</h3>
   <dl class="kv terms">
     <dt>Post-mortems</dt>
-    <dd>Reads the entire transcript of its worst failed runs and files a classified defect report: <em>I chose badly</em>, <em>a setting allowed this</em>, or <em>a tool is broken</em>. The last kind can carry a proposed test and patch — stored for a human to read, <strong>never applied automatically</strong>. Turn on with <code>--postmortem</code>.</dd>
+    <dd>Reads the entire transcript of its worst failed runs and files a classified defect report: <em>I chose badly</em>, <em>a setting allowed this</em>, or <em>a tool is broken</em>. The last kind can carry a proposed test and patch — stored for a human to read, <strong>never applied automatically</strong>. Turn on with <code>--postmortem</code>. Since 2026-09-07 (§4FD) a turn a human marked 👎 is selected regardless of its structural severity and ranked first — the engine had run 156 idle cycles over six weeks and analysed nothing, because its severity is a blend of loop shapes and a confabulation on a clean transcript scores ~0.01 — and every analysed failure is shown its nearest <em>passing</em> sibling (same task kind, request-text overlap) as a CONTRAST block, which the literature measures as the reflection shape that improves more and breaks fewer passing cases (arXiv 2606.30840).</dd>
     <dt>Advancing projects on its own</dt>
     <dd>When idle, push one active project forward by one step without being asked. Runs on hard per-project budgets with human gates. Turn on with <code>--autoadvance-idle</code>.</dd>
   </dl>

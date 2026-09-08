@@ -254,6 +254,14 @@ class MemoryBus:
 
         # RAG-Fusion: decompose into sub-queries for broader coverage
         sub_queries = await self._decompose_query(query, llm_client)
+        # §4FB (2026-09-06): the fan-out queries were invisible. When an
+        # unrelated lesson surfaced for an image request (req 2422eb25) no
+        # log or ledger said WHICH sub-query admitted it — every offline
+        # reconstruction put it far outside the 0.45 floor. One INFO line
+        # per hydration, so the next such admission is attributable.
+        if len(sub_queries) > 1:
+            logger.info("memory bus sub-queries (%d): %s", len(sub_queries) - 1,
+                        " | ".join(str(q)[:80] for q in sub_queries[1:]))
 
         # Fan-out retrieval for each sub-query in parallel
         fetch_coros = []

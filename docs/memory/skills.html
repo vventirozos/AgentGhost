@@ -242,6 +242,18 @@
   <strong>Archive replay:</strong> of the 50 usefully-dropped lessons, grow-and-refine retains
   50/50 vs 2/50 under the legacy cap. Pinned in <code>tests/test_4eg_ace_playbook.py</code>
   including the kill-switch differential.</p>
+  <h2>Probe lessons and the reflection kind filter (§4FB, 2026-09-06)</h2>
+  <p>Reflection now mints only from trajectories whose <code>task_kind</code> is in
+  <code>admitted_task_kinds("reflection")</code> (today: <code>user_request</code>), so bench,
+  self-play, reflection and <em>probe</em> rows never become lessons. The one probe lesson
+  already in the store (entry 49, <em>"Use deep_research ONCE on the query &hellip;"</em>) was
+  quarantined through <code>quarantine_lesson</code> with the reason on the record, via the
+  in-process <code>POST /api/lessons/quarantine</code> endpoint (an external writer would
+  violate the store's single-writer contract).</p>
+
+  <h2 id="lesson-origin">Lesson provenance (§4FD, 2026-09-07)</h2>
+  <p>Every lesson record now carries <code>origin</code>: <code>"user"</code> (written during a real user request), <code>"auto"</code> (idle machinery — reflection, dream, post-mortem, distillation — or an internal sched-/job-/sub- turn), <code>"probe"</code> (a diagnostic; must never teach, stamped so a leak is visible), <code>"bench"</code>, or <code>""</code> for legacy rows. It is derived ONCE inside the write chokepoint (<code>_derive_lesson_origin</code>, from the request-id contextvar the turn loop sets first thing — the default <code>"SYSTEM"</code> outside any request is "auto"), so no caller has to know; an explicit <code>learn_lesson(..., origin=)</code> wins. The learning-health report counts lessons by origin and flags any probe-origin lesson. Motivation: HEARTBEAT (arXiv 2603.23064) — background activity promoted into long-term memory 91% of the time; this agent's idle loop writes lessons from web-derived content, and §4FB found a diagnostic probe sitting in the playbook as lesson 49. No retrieval filter is applied yet: the operator's B3 ablation showed idle-loop lessons earn their keep, so this ships as observability first. Tests: <code>tests/test_4fd_provenance.py</code>.</p>
+
 </main>
 </body>
 </html>

@@ -220,13 +220,17 @@ class TestActiveConstraintNote:
             "Chess Game", metadata={"constraints": ["no random AI"]})
         agent.context = SimpleNamespace(project_store=store,
                                         current_project_id=pid)
-        note = agent._active_constraint_note()
+        # §4FD: the note is built for requests ABOUT the project ("proceed"
+        # is a continuation of the bound project); an off-topic request in
+        # the same conversation gets no note (test_4fd_constraint_scoping).
+        note = agent._active_constraint_note(request_text="proceed")
         assert "no random AI" in note
         assert note.endswith("USER REQUEST: ")
+        assert agent._active_constraint_note(request_text="how's the weather ?") == ""
 
     def test_empty_without_project(self):
         from ghost_agent.core.agent import GhostAgent
         agent = object.__new__(GhostAgent)
         agent.context = SimpleNamespace(project_store=None,
                                         current_project_id=None)
-        assert agent._active_constraint_note() == ""
+        assert agent._active_constraint_note(request_text="proceed") == ""

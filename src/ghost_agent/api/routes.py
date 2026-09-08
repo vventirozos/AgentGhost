@@ -15,7 +15,7 @@ from fastapi.security.api_key import APIKeyHeader
 from starlette.background import BackgroundTask
 from ..utils.helpers import get_utc_timestamp
 import logging
-from ..utils.logging import Icons, pretty_log
+from ..utils.logging import Icons, pretty_log, ORIGIN_PROBE, PROBE_REQUEST_PREFIX, is_probe_request_id
 
 logger = logging.getLogger("GhostAgent")
 
@@ -655,6 +655,22 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
 
     # Extract Request ID if provided (for Slack Bot correlation)
     request_id = request.headers.get("X-Request-ID")
+    # §4FB (2026-09-06): `X-Ghost-Origin: probe` marks a DIAGNOSTIC turn —
+    # an operator/Claude probe exercising the live path. It runs exactly
+    # like a user turn but must never teach (no lesson, reflection,
+    # calibration or credit). The mark travels as a request-id PREFIX so
+    # every population reader agrees — see `core/agent.turn_origin`.
+    if (request.headers.get("X-Ghost-Origin") or "").strip().lower() == ORIGIN_PROBE:
+        if not is_probe_request_id(request_id):
+            request_id = PROBE_REQUEST_PREFIX + (
+                str(request_id or "").strip() or uuid.uuid4().hex[:8])
+        # §4FF: a PROBE may choose the system-prompt variant under test
+        # (`control` | `compiled`). Read ONLY inside the probe branch, so a
+        # user turn can never be switched by a header; the agent re-checks
+        # the probe prefix before honouring it (defence in depth).
+        _variant = (request.headers.get("X-Ghost-Prompt-Variant") or "").strip().lower()
+        if _variant in ("control", "compiled"):
+            body["_prompt_variant"] = _variant
 
     # ---- durable sessions (2026-07-11) --------------------------------
     # With `session_id`, the SERVER is the source of truth for history: the
@@ -1679,6 +1695,40 @@ async def memory_delete_skill_twin(request: Request):
         return JSONResponse({"error": "memory system unavailable"}, 503)
     removed, detail = memory.delete_skill_twins(triggers)
     return {"ok": True, "requested": len(triggers), "removed": removed, **detail}
+
+
+@router.post("/api/lessons/quarantine", dependencies=[Security(verify_api_key)])
+async def lessons_quarantine(request: Request):
+    """Quarantine a playbook lesson by trigger — IN-PROCESS (§4FB, 2026-09-06).
+
+    The playbook has a single-writer contract (memory/skills.py
+    `_crossproc_lock`): an external script must not write it while the agent
+    runs, and launchd respawns the agent immediately on exit, so there is no
+    process-free window either. This is the designed, reversible path
+    (`SkillMemory.quarantine_lesson`: excluded from injection, kept on disk
+    with the reason + timestamp, announced on the stream). First use: lesson
+    49, a bench-probe prompt minted by reflection (see turn_origin "probe").
+    Body: {"trigger": <exact trigger text>, "reason": <why>}.
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        return JSONResponse({"error": f"Invalid JSON: {e}"}, 400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, 400)
+    trigger = str(body.get("trigger") or "").strip()
+    reason = str(body.get("reason") or "").strip()
+    if not trigger:
+        return JSONResponse({"error": "body needs a non-empty 'trigger'"}, 400)
+    if not reason:
+        return JSONResponse({"error": "body needs a non-empty 'reason' (it is written on the record)"}, 400)
+    sm = getattr(getattr(agent, "context", None), "skill_memory", None)
+    if sm is None or not callable(getattr(sm, "quarantine_lesson", None)) \
+            or getattr(sm, "is_read_only", False) is True:
+        return JSONResponse({"error": "skill memory unavailable or read-only"}, 503)
+    n = int(sm.quarantine_lesson(trigger, reason) or 0)
+    return {"ok": n > 0, "quarantined": n, "trigger": trigger[:120]}
 
 
 @router.post("/api/upload", dependencies=[Security(verify_api_key)])

@@ -983,6 +983,29 @@ PYTHONPATH=src python scripts/verify_bench.py --tier private --two-stage both</p
   trap, a loud one is a choice.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>A failed refute escalation is now loud (2026-09-06)</h2>
+  <p>When the strong-model call inside <code>_escalate_refute</code> raises, the cheap
+  REFUTED stands and the ledger records <code>outcome="unavailable"</code> &mdash; but
+  the only log line was at <code>debug</code>. Request <code>2422eb25</code> had exactly
+  this happen and nothing reached the app log or the operator stream, so a dead
+  escalation path was indistinguishable from a working one that upholds every
+  refute. The failure now logs at <code>WARNING</code> and emits a
+  <code>Verifier</code> stream line (<em>"refute escalation unavailable &mdash;
+  &lt;exception&gt; (cheap REFUTED stands)"</em>). Pinned in
+  <code>tests/test_verifier_escalation_ledger.py</code> (both the logger record and the
+  stream call, at WARNING).</p>
+
+  <h2>The repair directive names the request (§4FB, 2026-09-06)</h2>
+  <p>After a REFUTED draft the repair alert now quotes the pending request, states that
+  nothing new has arrived, and offers the no-tool branch first; only a claim that
+  genuinely needs checking is sent back to tools. See <a href="agent.html">core/agent</a>
+  for the failure that motivated it (req <code>2422eb25</code>) and the pins.</p>
+
+  <h2 id="constraint-scoping">Project constraints reach the verifier only for project requests (§4FD, 2026-09-07)</h2>
+  <p>The verifier's USER REQUEST view is prefixed with the active project's stored constraints (<code>GhostAgent._active_constraint_note</code>) because the binding message is often just "proceed". Until §4FD that prefix was applied to <em>every</em> turn while the project stayed bound: project <code>7b62e5e533d1</code> carried "Start with: What it means to BE ghost", and "how's the weather ?" was REFUTED by the late verifier for not starting with that phrase — three such false refutes in the corrections corpus (<code>ebd53f40</code>, <code>e17c8610</code>, <code>63250756</code>), each a <code>failed</code> label that fed calibration, playbook credit and post-mortem selection.</p>
+  <p>Now <code>_active_project_constraints(limit, *, request_text)</code> — the accessor every reader goes through (the verifier note, the prompt-side merge, the start-with hoist) — applies the one relevance authority (<a href="project_research.html#relevance">project_research</a>); <code>request_text</code> is keyword-only and required, and an AST enumeration fails if any call site omits it. Two companions: the live project-ledger evidence block is labelled <code>[project ledger (live) — task titles and statuses, NOT user constraints]</code>, because a task title phrased as an imperative was read as a constraint; and constraints carry per-row provenance (<a href="../tools/projects.html#constraint-origins">projects</a>) so only user-written ones are replayed as user-mandated.</p>
+  <p>Not changed: the deterministic objection dismissal stays default-OFF on its 2026-08-07 measurement (3 rescues / 9 damage). Tests: <code>tests/test_4fd_constraint_scoping.py</code>, <code>tests/test_4fd_provenance.py</code>.</p>
+
 </main>
 </body>
 </html>
