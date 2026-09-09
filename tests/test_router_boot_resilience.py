@@ -312,6 +312,31 @@ class TestMainSourcePins:
 # 4. Idle-loop LLM closures are background-marked (FIX 2 pins)
 # ---------------------------------------------------------------------------
 
+def _closure_is_background(name: str) -> bool:
+    """Does the closure's `chat_completion` call pass `is_background=True`?
+
+    By AST rather than by substring (2026-09-09): the substring version
+    pinned the call's FORMATTING, so adding a `task_label=` keyword — which
+    changes nothing about priority — broke four pins whose subject is
+    priority. The AST check survives any formatting and still fails the
+    moment the flag is dropped, which is the property these tests are for.
+    """
+    import ast
+    tree = ast.parse(MAIN_SRC)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n.name == name)
+    for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+        if getattr(call.func, "attr", "") != "chat_completion":
+            continue
+        for kw in call.keywords:
+            if (kw.arg == "is_background"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True):
+                return True
+    return False
+
+
 def _closure_src(name: str) -> str:
     """Exact closure body: from its `async def` line to the first
     non-empty line at the same or lower indentation (docstrings contain
@@ -337,20 +362,20 @@ class TestIdleClosuresAreBackground:
     for the main slot with a live turn."""
 
     def test_selfhood_critique_is_background(self):
-        body = _closure_src("_selfhood_critique_fn")
-        assert "chat_completion(payload, is_background=True)" in body
+        assert _closure_is_background("_selfhood_critique_fn"), \
+            "_selfhood_critique_fn must call chat_completion(is_background=True)"
 
     def test_workspace_critique_is_background(self):
-        body = _closure_src("_workspace_critique_fn")
-        assert "chat_completion(payload, is_background=True)" in body
+        assert _closure_is_background("_workspace_critique_fn"), \
+            "_workspace_critique_fn must call chat_completion(is_background=True)"
 
     def test_postmortem_analyze_is_background(self):
-        body = _closure_src("_analyze_fn")
-        assert "chat_completion(payload, is_background=True)" in body
+        assert _closure_is_background("_analyze_fn"), \
+            "_analyze_fn must call chat_completion(is_background=True)"
 
     def test_postmortem_patch_is_background(self):
-        body = _closure_src("_patch_fn")
-        assert "chat_completion(payload, is_background=True)" in body
+        assert _closure_is_background("_patch_fn"), \
+            "_patch_fn must call chat_completion(is_background=True)"
 
 
 # ---------------------------------------------------------------------------

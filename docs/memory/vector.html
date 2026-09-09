@@ -57,6 +57,47 @@
   </ul>
   <p><strong>Measured live</strong>: manual ingested in 2 m 29 s → 3,075 pages, 1,897 sections, 7,131 chunks. A 6-question eval (<code>wal_level</code>, VACUUM vs VACUUM FULL, range partitioning syntax, <code>pg_stat_activity</code>, MVCC isolation levels, <code>shared_buffers</code>) retrieved the correct section <strong>6/6</strong>, with the agent citing breadcrumbs like <code>Chapter 27 › 27.2. The Cumulative Statistics System › 27.2.3. pg_stat_activity</code>. Unprompted routing verified: a plain "what does archive_command do?" made the agent choose the scoped tool on its own. Tests: <code>tests/test_rag_document_qa.py</code> (20).</p>
 
+  <h2>Document STRUCTURE — the outline route (2026-09-09)</h2>
+  <p><strong>Why it exists.</strong> "How many chapters does the PostgreSQL manual have?" ran for five
+  minutes across 20+ turns and was never answered (request <code>e0f4a8bd</code>). The question is about a
+  document's SHAPE, and the only retrieval on offer was semantic: <code>query</code> returned eight passages
+  at relevance 0.08 &mdash; text-search headline options, <code>EXPLAIN</code> output &mdash; under a footer
+  that said "if they do not contain the answer, query again with different wording". That instruction cannot
+  terminate for a structural question, and the model obeyed it ten times, each call adding ~10 KB of
+  irrelevant passages to a context that reached 170 K chars. <em>The structure was never missing.</em>
+  <code>build_page_breadcrumbs</code> reads the PDF's entire table of contents to build its breadcrumbs, and
+  the ingest then threw it away.</p>
+  <ul>
+    <li><strong>Kept at ingest.</strong> <code>IngestStats.outline</code> now carries the normalised
+    <code>[(level, title, page), …]</code>, and <code>tool_gain_knowledge</code> writes it to
+    <code>memory_dir/document_outlines.json</code> (its own sidecar, locked + atomic like the library index;
+    that index is a bare list of names with a dozen readers, so widening its shape would break every one).
+    One normaliser, <code>normalise_toc</code>, serves both the breadcrumbs and the record &mdash; two private
+    parsers of the same table is the &sect;4FN compound-age defect.</li>
+    <li><strong>Rebuilt for what was already ingested.</strong> The live manual was ingested on 2026-09-04, so
+    no record exists for it. <code>derive_document_outline</code> reconstructs one from the breadcrumbs the
+    chunks already carry: distinct paths &rarr; a tree, sorted by the titles' own numbering (Chapter 9 before
+    Chapter 10). It reads in pages of 400 chunks so peak memory is one page, not one 7.6 M-char manual, and
+    the result is cached, so the rebuild happens once per document, ever. The record says
+    <code>source: "breadcrumbs"</code> and the rendered output says so too &mdash; page numbers are absent and
+    the reader is told, rather than being handed a record that looks exact.</li>
+    <li><strong>Deleted with the document.</strong> <code>delete_document_by_name</code> drops the record: an
+    outline for a forgotten document is a claim about something that no longer exists.</li>
+  </ul>
+  <p><strong>Two defects the real store found that the unit tests could not.</strong> Run against a copy of
+  the live 8,279-chunk manual: (1) reading rows by <code>source</code> alone swept in the single
+  <code>document_summary</code> row the ingest writes under the same source, so "Reference document: 3083
+  pages, 1936 sections…" appeared in the outline as a top-level heading &mdash; a fabricated division in the
+  one output whose whole job is exactness; the query is now scoped to <code>type="document"</code> as well.
+  (2) The per-level count is <em>not</em> the chapter count: level 2 holds 91 entries &mdash; 70 chapters, 15
+  appendices, 6 front-matter headings &mdash; so the first draft would have answered 91 where the truth is 70.
+  The renderer now counts the divisions the document labels itself, and both numbers are printed with what
+  each one means. Verified against ground truth recomputed independently from the raw breadcrumbs: <strong>8
+  parts, 70 chapters, 15 appendices</strong>.</p>
+  <p>Read through <code>knowledge_base(action='outline', filename=…)</code>. Pins:
+  <code>tests/test_kb_document_outline.py</code> (31, over a real PyMuPDF-built PDF and the real store code);
+  battery 29/29.</p>
+
   <h2>Audio ingest — talks, podcasts, recorded meetings (2026-08-02)</h2>
   <p>The sibling of the PDF path, in <code>memory/audio_ingest.py</code>. Spoken material was previously <em>unreachable</em>: nothing in the stack could read a <code>.wav</code>/<code>.mp3</code>, so <code>gain_knowledge</code> fell through to the plain-text branch and decoded the container as replacement-char noise. A large slice of AI-research discourse is audio-first, so this closed a whole missing media class.</p>
   <ul>

@@ -264,8 +264,21 @@ def test_reflection_and_postmortem_llm_calls_are_background():
     learning work: background priority, never contending with a live user."""
     import ghost_agent.main as main_mod
 
-    src = inspect.getsource(main_mod)
-    assert src.count("chat_completion(payload, is_background=True)") >= 4
+    # By AST, not by substring (2026-09-09): the substring counted a
+    # FORMATTING, so a `task_label=` keyword that changes nothing about
+    # priority dropped the count below the bar. What must hold is that at
+    # least four `chat_completion` calls in main.py are background.
+    import ast
+    tree = ast.parse(inspect.getsource(main_mod))
+    background = [
+        c for c in ast.walk(tree)
+        if isinstance(c, ast.Call)
+        and getattr(c.func, "attr", "") == "chat_completion"
+        and any(kw.arg == "is_background"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True for kw in c.keywords)
+    ]
+    assert len(background) >= 4, len(background)
 
 
 async def test_long_park_emits_visibility_log(monkeypatch):

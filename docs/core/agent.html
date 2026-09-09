@@ -734,6 +734,25 @@
 
   <h2>No-progress loop breaker — probe-before-hypothesis (2026-07-08)</h2>
   <p>The breaker now trips on the <strong>second</strong> identical successful read (<code>note_action(threshold=2)</code>, was 3) and hard-aborts at <strong>3</strong> repeats (was 5). All steer/abort messages lead with <em>evidence-gathering</em>: (1) probe the thing being theorized about (curl/run it and read the actual response), (2) apply the pending change, or (3) ask the user for the exact error/URL from their side — one question beats guessing. Motivated by the chess session: five identical re-reads of <code>index.html</code> over 536&nbsp;s while flip-flopping a CDN URL that one curl would have settled. Covered by <code>tests/test_probe_before_hypothesis.py</code>.</p>
+  <h2>Ten ways of finding nothing is ten times no progress <span class="tag">2026-09-09</span></h2>
+  <p>The breaker keys on <code>tool | target | result-fingerprint</code>, so it fires only when the same
+  call returns the same <em>bytes</em>. Request <code>e0f4a8bd</code> asked ONE document ten re-worded
+  questions; each returned a different set of irrelevant passages, so the ledger held ten signatures with a
+  count of one each and nothing ever tripped &mdash; only the 40-turn budget was left to stop it.</p>
+  <p>The fix does not try to GUESS futility from the passages (the lexical-proxy trap). The tool already
+  computes it and says so in its own output, so <code>strikes.result_says_nothing_found</code> reads that one
+  shared constant (<code>tools.memory.KB_NO_ANSWER_MARKER</code> &mdash; the same "one home" discipline as
+  &sect;4FN's <code>FALLBACK_HEADS</code>), and <code>strikes.breaker_fingerprint</code> collapses every
+  fruitless result onto <code>NO_ANSWER_FP</code>. The second hopeless search of a document now trips at the
+  usual threshold, however differently it was worded, while a productive search still iterates freely.</p>
+  <p>The steer had to change too. The default remedy is a forced text-only final turn, which drops the
+  toolset &mdash; and the remedy for a fruitless search is <em>another call to the same tool</em>
+  (<code>action='outline'</code>). <code>knowledge_base</code> was already on the read/write exemption list,
+  so tools survive the steer, and the message now names the route: use the structure action, look elsewhere,
+  or say what you could not find. Pins: <code>tests/test_loopbreaker_fruitless_probe.py</code> (12, including
+  an AST check that the branch is reachable and a control proving the old fingerprint tripped on none of the
+  ten); battery 11/11.</p>
+
   <h2>LATE-verdict-empty: three distinct outcomes (2026-07-08)</h2>
   <p><code>_record_late_verdict</code> used to log one ambiguous line — "LATE verdict was empty" — whenever the async verdict produced nothing. It fired on every bookkeeping-only turn and every sim/ablation context, drowning the one case it exists for: a genuinely dead verifier path. The handler now receives <code>last_tool</code> and differentiates: <strong>no substantive evidence tool</strong> → quiet by-design skip (no evidence, no verdict); <strong>verifier not attached</strong> (sim/ablation) → quiet by-design skip; <strong>evidence present AND verifier attached, yet no verdict</strong> → <code>WARNING</code>, because that is either a trivial-chat skip or a real verifier error worth investigating if frequent. Covered by <code>tests/test_host_process_and_verdict_clarity.py</code>.</p>
   <h2>Pre-flight guard: operation-aware key + block budget (2026-07-08)</h2>

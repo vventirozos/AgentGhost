@@ -122,16 +122,19 @@ def test_a_tie_between_two_subjects_says_nothing():
 
     "Your sons are 9 (Thodoris) and 5 months old (Leonidas)" puts BOTH names
     exactly 14 characters from "5 months old". First-wins bound the infant's
-    age to the nine-year-old and refuted a correct answer. Skipping a tie
-    costs a label we never had; taking it writes a 0.0 on a right answer.
+    age to the nine-year-old and refuted a correct answer. §4FN round 3:
+    there is no distance any more — "(Thodoris) and " is not a link, and the
+    bracketed name AFTER the phrase is the subject, so the phrase is checked
+    against Leonidas and found consistent.
     """
     assert _issues(
         "Your sons are 9 (Thodoris) and 5 months old (Leonidas).") == []
+    assert _issues("Your sons are 9 (Leonidas) and 5 months old (Thodoris).")
 
 
 def test_an_unambiguous_binding_still_works():
-    """The tie rule must not be a blanket mute: two claims, each nearest its
-    own subject, are both judged."""
+    """The subject rule must not be a blanket mute: two claims, each linked
+    to its own subject, are both judged."""
     assert _issues("Thodoris is 9 years old and Leonidas is 5 months old.") == []
     both = _issues("Thodoris is 2 years old and Leonidas is 40 years old.")
     assert len(both) == 2, both
@@ -175,8 +178,9 @@ def test_binding_does_not_cross_a_LINE():
 
 
 def test_a_distant_name_is_not_the_subject():
-    """The world it fails in: the binding window is unbounded and a name
-    three paragraphs up captures an unrelated number."""
+    """The world it fails in: a name sentences back captures an unrelated
+    number. §4FN round 3: there is no window — the words between the name
+    and the phrase are not a link, and that is the whole test."""
     far = ("Leonidas is doing well. " + "Filler sentence here. " * 8 +
            "The lease is 9 years old.")
     assert _issues(far) == []

@@ -89,7 +89,7 @@ class TestThePruneDecisionIsArmINVARIANT:
         short = names[0]
         specs = {short: _base(short)[:max(20, len(_base(short)) - 5000)]}
         for n in names[1:]:
-            specs[n] = _base(n) + " " + "z" * 4600
+            specs[n] = _base(n) + " " + _pad_to(n, 4600)
         _setup(tmp_path, monkeypatch, specs=specs)
 
         kept = {"control": 0, "treatment": 0}
@@ -400,6 +400,36 @@ class TestEveryCouldNotMeasureBranchExitsTwo:
         assert "_unmeasurable = True" in before, before
 
 
+def _pad_to(name, want):
+    """Padding for ``name`` that the description validator will ACCEPT.
+
+    `_validate_tool_description` refuses a candidate longer than
+    ``max(6000, 3 × baseline)``, so a fixed pad silently becomes a
+    REJECTED artifact the moment a real description grows — the baseline is
+    served instead, and the test's ceiling arithmetic collapses for a reason
+    unrelated to what it is testing (2026-09-09: `knowledge_base` grew to
+    1,783 chars and +4600 crossed the 6,000 cap). Derived from the live cap.
+    """
+    base = _base(name)
+    cap = max(6000, 3 * len(base))
+    return "x" * max(0, min(int(want), cap - len(base) - 1))
+
+
+def _longest_shortenable(names):
+    """The longest baseline among tools whose description may be TRUNCATED.
+
+    A tool with pinned sentences (`R.TOOL_DESC_PINNED` — `knowledge_base`
+    gained some on 2026-09-09) rejects any candidate that sheds them, so a
+    truncated stub for one of those is never served: the fixture's shortened
+    artifact silently becomes the baseline, the signed/positive arithmetic
+    below collapses, and the test fails for a reason that has nothing to do
+    with the prune it is about. Derived from the live pin map rather than a
+    name list, so the next pin does not break these fixtures either.
+    """
+    ok = [n for n in names if not R.TOOL_DESC_PINNED.get(n)]
+    return max(ok or names, key=lambda n: len(_base(n)))
+
+
 class TestAnAllTreatmentTurnDoesNotEscapeThePrune:
     def test_the_prune_fires_with_no_withheld_names(self, tmp_path,
                                                     monkeypatch):
@@ -421,10 +451,11 @@ class TestAnAllTreatmentTurnDoesNotEscapeThePrune:
         # with the LONGEST baseline to shorten — my first fixture shrank
         # an 823-char description "by 2000", which clamps to −803 and
         # left the signed sum over the ceiling, so the render branch
-        # fired and the escape was never reached.
-        _short = max(names, key=lambda n: len(_base(n)))
+        # fired and the escape was never reached. …and it must be one whose
+        # description may legally be truncated (see `_longest_shortenable`).
+        _short = _longest_shortenable(names)
         _pad = sorted(set(names) - {_short})
-        specs = {n: _base(n) + " " + "y" * 4100 for n in _pad}
+        specs = {n: _base(n) + " " + _pad_to(n, 4100) for n in _pad}
         specs[_short] = _base(_short)[:20]
         home = _setup(tmp_path, monkeypatch, specs=specs)
         # Force EVERY signature to treatment: no registered experiment
@@ -680,9 +711,9 @@ class TestTheWithheldSideUsesThePOSITIVE_part:
     @staticmethod
     def _all_control(tmp_path, monkeypatch, *, pad, shorten):
         names = [t["function"]["name"] for t in R.TOOL_DEFINITIONS[:6]]
-        _short = max(names, key=lambda n: len(_base(n)))
+        _short = _longest_shortenable(names)
         _pad = sorted(set(names) - {_short})
-        specs = {n: _base(n) + " " + "y" * pad for n in _pad}
+        specs = {n: _base(n) + " " + _pad_to(n, pad) for n in _pad}
         specs[_short] = _base(_short)[:max(1, len(_base(_short)) - shorten)]
         home = tmp_path / "home"
         (home / "system" / "optim").mkdir(parents=True)

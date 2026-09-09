@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -38,7 +39,13 @@ logger = logging.getLogger("GhostDistill")
 # and avoids the byte-offset bookkeeping a true mutation would
 # require. Readers overlay it on top of the source JSONL when
 # iterating.
+def _utcnow_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 CORRECTIONS_FILENAME = "corrections.jsonl"
+WITHHELD_VERDICTS_FILENAME = "withheld_verdicts.jsonl"     # §4FN, measurement only
 
 # Source prefix that marks an EXPLICIT human label (/api/feedback). Owned
 # HERE (not core/feedback, which imports it) because the writer-side
@@ -330,6 +337,46 @@ class TrajectoryCollector:
         rec = self._load_corrections().get(trajectory_id)
         return dict(rec) if rec is not None else None
 
+    def record_withheld_verdict(self, trajectory_id: str, outcome: str,
+                                reason: str = "", *, source: str = "verifier_late") -> bool:
+        """§4FN: a machine verdict that a human label already WITHHELD from
+        every consequence (outcome, lessons, banners) is still worth
+        keeping as a MEASUREMENT — it is exactly the machine/human pair the
+        judge's own calibration and PPI need, and 84 of 121 labelled turns
+        had none because the human was faster than the verdict. Written to
+        its own sidecar (never the corrections file), so the outcome overlay
+        and the human-authority doctrine are untouched; read only by
+        `machine_and_human_outcomes`. Never raises."""
+        if not self.enabled:            # the dream's read-only collector never appends
+            return False
+        try:
+            tid = str(trajectory_id or "")
+            oc = str(outcome or "")
+            if not tid or oc not in (_PASSED, "failed"):
+                return False
+            from .redact import redact_text
+            rec = {"trajectory_id": tid, "outcome": oc,
+                   "reason": redact_text(str(reason or ""), self.redaction)[:500],
+                   "source": str(source or "verifier_late"), "withheld": True,
+                   "timestamp": _utcnow_iso()}
+            path = self._withheld_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            return True
+        except Exception as exc:  # noqa: BLE001 — a measurement must never break a turn
+            logger.debug("withheld verdict not recorded: %s: %s", type(exc).__name__, exc)
+            return False
+
+    def _withheld_path(self) -> Path:
+        """Its OWN directory (`system/judge/`): not under the corpus root
+        (`corpus_fingerprint` globs it to skip idle refits) and not beside
+        the verdict sidecars either (`scripts/verdict_override_report.py` and
+        `scripts/measure_undecidable_turns.py` glob `system/verdicts/*.jsonl`
+        and would count these rows as text-judge verdicts — review §4FN M-C)."""
+        return self.root.parent / "judge" / WITHHELD_VERDICTS_FILENAME
+
     def machine_and_human_outcomes(self) -> dict:
         """``{trajectory_id: (machine_outcome, human_outcome)}`` from EVERY
         sidecar row, not just the latest per id (§4FD).
@@ -350,10 +397,13 @@ class TrajectoryCollector:
         import json
         out: dict = {}
         path = self._corrections_path()
-        if not path.exists():
-            return out
         human_sources = ("operator_overlay",)
+        # ONE exit: whatever the corrections file yielded (all of it, part
+        # of it before an OSError, or nothing) gets the withheld overlay
+        # (round 3 m7 — the OSError exit skipped it).
         try:
+            if not path.exists():
+                raise FileNotFoundError(str(path))
             with path.open("r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -381,7 +431,44 @@ class TrajectoryCollector:
                         machine = oc
                     out[tid] = (machine, human)
         except OSError:
-            return out
+            pass
+        return self._overlay_withheld(out)
+
+    def _overlay_withheld(self, out: dict) -> dict:
+        """§4FN: verdicts the human-authority lock withheld from the
+        corrections file. A withheld row fills the machine slot ONLY for a
+        trajectory the corrections file already knows with a HUMAN LABEL
+        and no machine verdict — a corrections-file verdict is the one that
+        shipped and stays authoritative; a retraction (`(None, None)`) stays
+        retracted; an id the corrections file never saw (a human write that
+        failed) mints no orphan pair (review §4FN M6). Last write wins, as
+        in the corrections file."""
+        seen: set = set()          # local, never instance state (review §4FN minor 1)
+        try:
+            wpath = self._withheld_path()
+            if not wpath.exists():
+                return out
+            with wpath.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    tid = str(rec.get("trajectory_id") or "")
+                    oc = str(rec.get("outcome") or "")
+                    if not tid or oc not in (_PASSED, "failed") or tid not in out:
+                        continue
+                    machine, human = out[tid]
+                    if human not in (_PASSED, "failed"):
+                        continue
+                    if machine is None or tid in seen:
+                        out[tid] = (oc, human)
+                        seen.add(tid)
+        except OSError:
+            pass
         return out
 
     def _load_corrections(self) -> dict:

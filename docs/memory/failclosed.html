@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.failclosed — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Guide</h3>
+    <a href="../index.html">&larr; Back to the guide</a>
+    <a href="../glossary.html">Glossary</a>
+    <a href="../reference.html">Reference index</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="skills.html">skills</a>
+    <a href="frontier.html">frontier</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="competence.html">competence</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+    <a href="profile.html">profile</a>
+    <a class="current" href="failclosed.html">failclosed</a>
+  </nav>
+</aside>
+<main>
+  <p class="ref-banner">Reference page &mdash; written for maintainers. New here? Start with <a href="../index.html">the guide</a>, or check the <a href="../glossary.html">glossary</a>.</p>
+
+  <h1>memory / failclosed.py — FailClosedStore</h1>
+  <p class="subtitle">A store that blocks its own writes after an unreadable read must be able to come back without a restart.</p>
+
+  <h2>Why (&sect;4FP, 2026-09-09)</h2>
+  <p>Four memory stores refuse to write after a read of their own file raises <code>OSError</code> &mdash; the
+  file is PRESENT but unreadable (EIO, EACCES, <code>ENFILE</code>/<code>EMFILE</code>), so the on-disk state
+  is probably intact and overwriting it with whatever is in memory would destroy it. That guard is right and
+  it was measured: without it, <code>adaptive_threshold</code>'s very next <code>record()</code> atomically
+  overwrote the whole learned window.</p>
+  <p><strong>The half that was missing is the way back.</strong> <code>contradiction_log</code> and
+  <code>profile</code> re-read on every operation, so a successful read clears the flag by itself &mdash;
+  documented there as "cleared automatically as soon as a read succeeds". <code>adaptive_threshold</code> and
+  <code>competence</code> read only in <code>__init__</code>, so their flag was cleared only by a RESTART: one
+  transient file-descriptor exhaustion stopped that store learning for the life of the process &mdash; days,
+  here &mdash; announced by a single log line. The two broken stores' own comments cite the two working ones
+  as sharing the discipline.</p>
+
+  <h2>The policy, in one place</h2>
+  <ul>
+    <li><strong>Retry the read that armed it</strong>, no more often than <code>RETRY_EVERY_S</code> (30 s): a
+    store that saves on every observation must not stat a sick disk thousands of times a minute. The clock
+    starts EXPIRED, so a blip lasting one write costs one write.</li>
+    <li><strong>Recover only on a real read.</strong> The flag clears because the file was READ, never because
+    time passed. A hook that raises leaves the store closed.</li>
+    <li><strong>Lose nothing.</strong> Whatever accumulated while blind is merged onto the history it could
+    not see, by a hook the store owns &mdash; only the store knows what merging its own state means.
+    <code>adaptive_threshold</code> appends the blind observations after the reloaded window (chronological
+    order); <code>competence</code> adds <code>alpha-1</code> successes and <code>beta-1</code> failures onto
+    each disk cell so the 1.0 Beta prior is counted once, and merges <code>samples</code> separately because
+    <code>_Cell.n</code> falls back to the mass and would hide a dropped counter for weighted records.</li>
+    <li><strong>One ERROR per arming, not per retry.</strong> The retry clears <code>_degraded</code> so the
+    reload can re-arm it and thereby report failure; a naive re-arm logs every 30 s for as long as the disk is
+    sick. Re-arming during a reload is silent &mdash; and it must not reset the retry clock either, or the
+    rate limit is dead (measured: 21 reads for 20 records).</li>
+  </ul>
+
+  <h2>The class, not the two sites</h2>
+  <p><code>tests/test_failclosed_recovery.py</code> enumerates every class in <code>memory/</code> that arms a
+  fail-closed flag, straight from the AST, and fails the suite for any that cannot clear it outside
+  <code>__init__</code>. Fixing this shape site-by-site is exactly what let two of the four drift apart, and
+  the guard is what makes a fifth store inherit the discipline rather than copy half of it.</p>
+
+  <h2>The rest of the audit</h2>
+  <p>Item 4 of the 2026-09-08 list swept every "arm after N failures" counter in the tree from the AST. The
+  healthy ones are worth naming, because the point of the sweep is that most guards already do this right:
+  <code>NodeCircuitBreaker</code> (open &rarr; cooldown &rarr; half-open &rarr; a success closes it, and it
+  documents its own known limitation rather than hiding it), the darkweb per-engine breaker (same shape, with
+  a "recovered &mdash; breaker cleared" line), the sandbox provisioning backoff (set before the installs,
+  lifted on success), and the self-play cooldown (recomputed adaptively each cycle). One more counter was
+  repaired: <code>manage_projects</code>'s duplicate-create loop counter was a LIFETIME total on the project
+  record, so a project that saw three duplicates once kept the alarmed "STOP. This is retry #N" instruction
+  and its operator WARNING for every duplicate create it ever saw again. It now measures a burst
+  (<code>_DUPLICATE_CREATE_LOOP_WINDOW_SECONDS</code>, 10 minutes) and stamps the attempt it measures from.</p>
+</main>
+</body>
+</html>

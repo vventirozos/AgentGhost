@@ -40,12 +40,14 @@ import os
 import threading
 import time
 from collections import deque
+
+from .failclosed import FailClosedStore
 from pathlib import Path
 
 logger = logging.getLogger("GhostAgent")
 
 
-class AdaptiveThreshold:
+class AdaptiveThreshold(FailClosedStore):
     """Self-tuning memory acceptance threshold.
 
     Maintains a sliding window of (score, was_useful) observations and
@@ -77,8 +79,11 @@ class AdaptiveThreshold:
         self.threshold = initial
         self.window: deque = deque(maxlen=self.WINDOW_SIZE)
         # Set when the state file is PRESENT but could not be read. While
-        # set, _save() refuses to write — see _load().
+        # set, _save() refuses to write — see _load() — and `FailClosedStore`
+        # retries the read so a transient fault does not stop learning until
+        # the next restart (§4FP).
         self._degraded = False
+        self._fc_last_retry = 0.0
         self._load()
 
     def _quarantine_corrupt(self, why: str) -> None:
@@ -113,13 +118,8 @@ class AdaptiveThreshold:
             # threshold and the very next record() atomically OVERWROTE
             # the intact file — the whole learned window gone, at no log
             # level at all. Refuse to write instead: fail closed, loudly.
-            self._degraded = True
-            logger.error(
-                "adaptive_threshold.json is present but unreadable (%s: %s). "
-                "Running on the initial threshold and REFUSING to overwrite "
-                "the on-disk state until it can be read.",
-                type(exc).__name__, exc,
-            )
+            self._fc_arm(f"adaptive_threshold.json is present but unreadable "
+                         f"({type(exc).__name__}: {exc})")
             return
         if not content.strip():
             return
@@ -142,10 +142,36 @@ class AdaptiveThreshold:
             except TypeError:
                 continue
 
+    def _fc_reload_from_disk(self) -> bool:
+        """Retry the read, then put the two halves back together.
+
+        While degraded the window holds ONLY what was observed since —
+        `_load` returned before appending anything — so the merge is
+        "history first, then what happened while we were blind", which is
+        just chronological order. The deque's own maxlen does the trimming.
+        """
+        blind = list(self.window)
+        keep_threshold = self.threshold
+        self.window.clear()
+        self.threshold = self._initial
+        self._degraded = False          # let _load() speak for itself
+        self._load()
+        if self._degraded:              # still unreadable — put it back
+            self.window.clear()
+            self.window.extend(blind)
+            self.threshold = keep_threshold
+            return False
+        for obs in blind:
+            self.window.append(obs)
+        if blind:
+            self._recalculate()
+        return True
+
     def _save(self):
-        if self._degraded:
+        if not self._fc_ready_to_write():
             # See _load(): the on-disk state exists but could not be read,
-            # so writing would destroy it.
+            # so writing would destroy it. `_fc_ready_to_write` retries that
+            # read first, so this is a skip, not a life sentence.
             logger.warning(
                 "Adaptive threshold save skipped: on-disk state is unreadable "
                 "and must not be overwritten."

@@ -557,6 +557,7 @@ class TestHumanLabelWins:
             ),
             _flush_stashed_lesson_outcome=lambda tid, ok: flushes.append(
                 (tid, ok)),
+            _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
         return fake, flushes, update_calls
 
@@ -683,6 +684,7 @@ class TestWholeChainGuard:
             _file_refute_followup_tasks=lambda *a, **k: calls.append(
                 ("followups", a)),
             _critic_async_enabled=lambda: False,
+            _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
         from ghost_agent.core.agent import GhostAgent
         fake._human_label_locked = GhostAgent._human_label_locked.__get__(fake)
@@ -778,6 +780,7 @@ class TestWholeChainGuard:
             ),
             _flush_stashed_lesson_outcome=lambda tid, ok: None,
             _drop_pending_corrections_for=lambda tid: drops.append(tid),
+            _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
 
         async def go():
@@ -817,6 +820,7 @@ class TestWholeChainGuard:
             ),
             _flush_stashed_lesson_outcome=lambda tid, ok: None,
             _drop_pending_corrections_for=lambda tid: drops.append(tid),
+            _record_withheld_verdict=lambda tid, oc, reason="": None,   # §4FN measurement channel
         )
 
         async def go():

@@ -68,6 +68,22 @@
   <p>Saves fsync before rename (torn-write window, journal.py rationale). Known-open (logged, not yet wired): <code>by_domain()</code> / <code>get_context_string()</code> still have no consumer — the docstring's "used by the planner" remains aspirational.</p>
 
 
+
+  <h2>…and the way back <span class="tag">2026-09-09 &sect;4FP</span></h2>
+  <p>The guard above is right and the audit kept it. What was missing is the DISARM. <code>_degraded</code>
+  was cleared only in <code>__init__</code>, so one transient <code>OSError</code> &mdash; an EIO, an EACCES
+  during a deploy, an <code>ENFILE</code>/<code>EMFILE</code> when the box runs out of descriptors &mdash;
+  stopped this store writing for the <em>life of the process</em>, which for this agent is days, announced by
+  a single log line. The sibling stores <code>contradiction_log</code> and <code>profile</code> re-read on
+  every operation and clear the flag by themselves; their comments cite each other as sharing one discipline,
+  and two of the four had quietly drifted out of it.</p>
+  <p>The policy now lives in <a href="failclosed.html"><code>memory/failclosed.py</code></a>: retry the read
+  that armed it (rate-limited, and the clock starts EXPIRED so a blip lasting one write costs one write),
+  clear the flag only when a read actually SUCCEEDS, and merge whatever accumulated while blind onto the
+  history it could not see &mdash; a cell's 1.0 prior counted ONCE, so the merge adds <code>alpha-1</code> successes and
+  <code>beta-1</code> failures onto the disk cell rather than the raw numbers. A failed retry restores the in-memory state exactly and stays closed. Pins:
+  <code>tests/test_failclosed_recovery.py</code>; battery 18/18.</p>
+
   <h2>Wired into the prompt (2026-07-26)</h2>
   <p><code>get_context_string()</code> / <code>by_domain()</code> were computed on every tool outcome (39 live cells) but rendered NOWHERE — the docstring's "used by the planner" was aspirational. Now injected into the system-prompt continuity blocks (agent.py), gated on <code>_COMPETENCE_MIN_OBS</code> (20) total observations so a cold profile doesn't inject small-n noise, so the model can prefer a domain it's reliable in and be cautious in a weak one. Tests: <code>tests/test_memory_audit_fixes_2026_07_26.py::TestCompetenceContextString</code>. Also: saves fsync before rename.</p>
 

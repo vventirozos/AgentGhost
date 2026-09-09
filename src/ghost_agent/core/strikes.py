@@ -64,6 +64,52 @@ def action_result_fingerprint(result: str) -> str:
     return hashlib.sha1(norm.encode("utf-8", "ignore")).hexdigest()[:12]
 
 
+#: Fingerprint substituted for a result whose OWN text says it found
+#: nothing. Every re-worded search of the same document then collapses onto
+#: ONE signature, so the second fruitless probe trips the no-progress
+#: breaker at its usual threshold.
+NO_ANSWER_FP = "no-answer"
+
+
+def result_says_nothing_found(result: str) -> bool:
+    """True when a tool's own output DECLARES that it found nothing.
+
+    WHY (request e0f4a8bd, 2026-09-08). `note_repeated_action` keys on
+    ``tool | target | result-fingerprint``, so it fires only when the same
+    call returns the same bytes. The agent asked the same document ten
+    questions, each re-worded, each returning DIFFERENT irrelevant passages
+    — same tool, same target, same futility, ten different fingerprints,
+    and the breaker never moved. Progress is not "the bytes changed"; ten
+    different ways of finding nothing is ten times no progress.
+
+    Read from the emitting tool's own constant (imported lazily — the tools
+    package imports core), never from a phrase written out again here: two
+    copies of a banner is how a check goes dark when one of them is
+    reworded.
+    """
+    text = str(result or "")
+    if not text:
+        return False
+    try:
+        from ..tools.memory import KB_NO_ANSWER_MARKER
+    except Exception:  # noqa: BLE001 — the breaker must survive an import
+        return False
+    return KB_NO_ANSWER_MARKER in text
+
+
+def breaker_fingerprint(result: str) -> str:
+    """The fingerprint the no-progress breaker should count this result
+    under — the ONE place that decision is made.
+
+    Two results are "the same observation" when their bytes match, EXCEPT
+    when the tool itself reports that it found nothing: those all collapse
+    onto :data:`NO_ANSWER_FP`, because ten re-wordings of a hopeless search
+    are ten repeats of one failure, not ten observations (e0f4a8bd)."""
+    if result_says_nothing_found(result):
+        return NO_ANSWER_FP
+    return action_result_fingerprint(result)
+
+
 def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 3):
     """Companion to ``note_repeated_failure`` for the INVERSE pathology:
     a turn loop where every tool call SUCCEEDS but the agent keeps taking
@@ -121,6 +167,10 @@ READWRITE_LOOP_TOOLS = frozenset({
     # the "reconfigure-a-composed-skill" bug this set exists to prevent.
     "manage_projects",
     "file_system",
+    # `knowledge_base` was already here for the read/write reason; e0f4a8bd
+    # added a second one. The remedy for a FRUITLESS search is another call
+    # to this same tool — `action='outline'` — so force-finalising the turn
+    # would bar the one call that answers the question.
     "knowledge_base",
     "update_profile",
 })

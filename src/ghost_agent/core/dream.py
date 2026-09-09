@@ -4438,6 +4438,7 @@ Return ONLY a JSON object with:
             try:
                 data = await self.context.llm_client.chat_completion(
                     payload,
+                    task_label="selfplay generate",
                     use_coding=has_coding_node,
                     use_worker=not has_coding_node,
                     # Honour the caller's mode: idle-loop generation must
@@ -4733,6 +4734,7 @@ Return ONLY a JSON object with:
                         use_coding=has_coding_node,
                         use_worker=not has_coding_node,
                         is_background=is_background,
+                        task_label="selfplay repair (reference)",
                         # Same contract as the generation call above:
                         # background repair degrades on pool failure
                         # (except below treats it as "no usable repair").
@@ -4877,6 +4879,7 @@ Return ONLY a JSON object with:
                         use_coding=has_coding_node,
                         use_worker=not has_coding_node,
                         is_background=is_background,
+                        task_label="selfplay repair",
                         # Same contract as the generation call above:
                         # background repair degrades on pool failure
                         # (except below falls back to full regeneration).

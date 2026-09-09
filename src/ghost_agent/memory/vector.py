@@ -14,6 +14,17 @@ from chromadb.config import Settings
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import get_utc_timestamp
 
+#: Sort "Chapter 9." before "Chapter 10." — a manual's own numbering is the
+#: document order, and a plain string sort puts 10 before 9.
+_NATNUM_RE = re.compile(r"(\d+)")
+
+
+def _natural_key(text: str):
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part.lower())
+        for part in _NATNUM_RE.split(str(text or "")) if part != ""
+    )
+
 logger = logging.getLogger("GhostAgent")
 
 # Give tqdm a THREADING lock before the embedder loads (2026-07-15). transformers
@@ -279,6 +290,12 @@ class VectorMemory:
         self.library_file = self.chroma_dir / "library_index.json"
         if not self.library_file.exists():
             self.library_file.write_text("[]")
+
+        #: Per-document STRUCTURE (table of contents + counts), keyed by
+        #: filename. Its own file, not the library index: that index is a
+        #: bare list of names with a dozen readers, and widening its shape
+        #: would break every one of them.
+        self.outlines_file = self.chroma_dir / "document_outlines.json"
 
         # Reentrant lock guarding all ChromaDB collection mutations & queries.
         # The biological watchdog can write to the vector store from a
@@ -600,6 +617,143 @@ class VectorMemory:
             return []
         except Exception:
             return []
+
+    # ── Document STRUCTURE ────────────────────────────────────────────
+    #
+    # WHY (request e0f4a8bd, 2026-09-08). "How many chapters does the
+    # PostgreSQL manual have?" is a question about a document's SHAPE, and
+    # the only retrieval this store offered was semantic: eight passages at
+    # relevance 0.08 (text-search headline options; EXPLAIN output), and a
+    # footer telling the model to query again with different wording. It
+    # did, 10+ times, for five minutes. The structure was never missing —
+    # `pdf_ingest` computes the whole table of contents to build its
+    # breadcrumbs — it was computed, used, and thrown away.
+
+    def _read_outlines(self) -> dict:
+        try:
+            if not self.outlines_file.exists():
+                return {}
+            data = json.loads(self.outlines_file.read_text() or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001 — a corrupt sidecar is not a fatal
+            logger.warning("Document outline index was corrupt; ignoring it")
+            return {}
+
+    def set_document_outline(self, filename: str, record: dict) -> None:
+        """Store one document's outline record. Locked + atomic, exactly as
+        `_update_library_index` — two concurrent ingests must not lose one
+        another's record, and a crash mid-write must not blank the file."""
+        if not filename or not isinstance(record, dict):
+            return
+        with self._get_lock():
+            try:
+                data = self._read_outlines()
+                data[str(filename)] = record
+                tmp = self.outlines_file.with_suffix(
+                    self.outlines_file.suffix + ".tmp")
+                tmp.write_text(json.dumps(data))
+                os.replace(tmp, self.outlines_file)
+            except Exception as e:  # noqa: BLE001 — never fail an ingest for this
+                logger.error(f"Outline index write failed: {e}")
+
+    def get_document_outline(self, filename: str) -> dict:
+        """One document's outline record, or ``{}`` when none is stored."""
+        rec = self._read_outlines().get(str(filename))
+        return rec if isinstance(rec, dict) else {}
+
+    def drop_document_outline(self, filename: str) -> None:
+        with self._get_lock():
+            try:
+                data = self._read_outlines()
+                if str(filename) in data:
+                    del data[str(filename)]
+                    tmp = self.outlines_file.with_suffix(
+                        self.outlines_file.suffix + ".tmp")
+                    tmp.write_text(json.dumps(data))
+                    os.replace(tmp, self.outlines_file)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Outline index delete failed: {e}")
+
+    def derive_document_outline(self, filename: str, *, page: int = 400) -> dict:
+        """Rebuild a document's outline from the breadcrumbs already stored
+        on its chunks — the path for documents ingested BEFORE the outline
+        was persisted (the live PostgreSQL manual is one).
+
+        Every streamed chunk begins ``[file.pdf] Part II › Chapter 12 › …``
+        (`pdf_ingest.iter_pdf_chunks`), so the distinct breadcrumb paths ARE
+        the outline, minus page numbers. Read in pages of ``page`` chunks so
+        peak memory is one page, not one manual (7.6 M chars for the
+        PostgreSQL docs) — the same discipline the streaming ingest uses.
+
+        Returns a record in `set_document_outline`'s shape with
+        ``source="breadcrumbs"``; ``{}`` if the document has no chunks.
+        """
+        paths: set = set()       # the distinct breadcrumb PATHS
+        chunks = 0
+        offset = 0
+        while True:
+            try:
+                with self._get_lock():
+                    res = self.collection.get(
+                        # type="document" too, NOT source alone: the ingest
+                        # also writes ONE `document_summary` row under the
+                        # same source ("Reference document: 3083 pages…"),
+                        # and reading it as a breadcrumb put that sentence
+                        # in the live manual's outline as a top-level
+                        # heading (measured against the real store).
+                        where={"$and": [{"source": str(filename)},
+                                        {"type": "document"}]},
+                        include=["documents"],
+                        limit=int(page), offset=offset,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("derive_document_outline(%s) page failed: %s", filename, e)
+                break
+            docs = (res or {}).get("documents") or []
+            if not docs:
+                break
+            for text in docs:
+                chunks += 1
+                head = str(text or "").split("\n", 1)[0]
+                # "[file.pdf] A › B › C" — the crumb is what follows the
+                # bracketed source, and a chunk with no crumb contributes
+                # nothing (a section the PDF's own TOC never named).
+                if "]" in head:
+                    head = head.split("]", 1)[1]
+                crumb = head.strip()
+                if not crumb:
+                    continue
+                parts = tuple(p.strip() for p in crumb.split("\u203a") if p.strip())
+                if parts:
+                    paths.add(parts)
+            if len(docs) < page:
+                break
+            offset += len(docs)
+        if not chunks:
+            return {}
+        # Paths → a flat outline in TREE order. A path carries its whole
+        # ancestry, so sorting the paths naturally and emitting each unseen
+        # ancestor before its leaf reconstructs the document order — exact
+        # for a numbered manual, alphabetical otherwise (`source` says which
+        # kind of record this is, so a reader is never misled).
+        entries: list = []
+        emitted: set = set()
+        for path in sorted(paths, key=lambda pp: tuple(_natural_key(x) for x in pp)):
+            for depth in range(1, len(path) + 1):
+                prefix = path[:depth]
+                if prefix in emitted:
+                    continue
+                emitted.add(prefix)
+                entries.append([depth, prefix[-1], 0])
+        return {
+            "filename": str(filename),
+            "source": "breadcrumbs",
+            "entries": entries,
+            "chunks": chunks,
+            "pages": 0,
+            "chars": 0,
+            "at": get_utc_timestamp(),
+        }
     
     def add(self, text: str, meta: dict = None):
         if len(text) < 5: return
@@ -1260,8 +1414,18 @@ class VectorMemory:
             for d, i, dist in zip(docs, ids, dists)
         ]
         ranked = _cross_encoder_rerank(question, candidates, top_k=max(1, int(k)))
+        # `dist` is the RAW vector distance and `score` the BM25-adjusted
+        # rank key. They are reported separately because they answer
+        # different questions and only one of them can be read as "how well
+        # does this document match": the rank key subtracts up to 0.3 for
+        # keyword overlap, so a structural question full of common words
+        # ("list every Part and Chapter") scores 0.055 — better-looking than
+        # a genuinely good factual query at 0.113 — while its raw distance,
+        # 0.347, is out with the off-topic queries. Measured on the live
+        # manual, 2026-09-09; see `tools.memory._DIST_*`.
         return [
             {"text": c["doc"], "id": c["id"],
+             "dist": round(float(c["dist"]), 4),
              "score": round(c.get("rerank_score", c["dist"]), 4)}
             for c in ranked
         ]
@@ -1284,6 +1448,9 @@ class VectorMemory:
             self.collection.delete(where={"source": filename})
         # _update_library_index takes its own lock (RLock so re-entry is fine).
         self._update_library_index(filename, "remove")
+        # …and so does the outline sidecar: a forgotten document that keeps
+        # its structure is a claim about a document that no longer exists.
+        self.drop_document_outline(filename)
         return True, "Deleted"
 
     def correct_fragment(self, match: str, replacement: str):

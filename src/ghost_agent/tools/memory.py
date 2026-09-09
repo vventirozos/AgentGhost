@@ -555,6 +555,22 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
             if not stats.chunks:
                 return "Error: Extracted text is empty."
 
+            # STRUCTURE, persisted (request e0f4a8bd): the TOC was computed
+            # to build the breadcrumbs and then dropped, leaving no route to
+            # "how many chapters". Stored before the summary below so a
+            # failure in the nice-to-have never costs the structure.
+            try:
+                await asyncio.to_thread(
+                    memory_system.set_document_outline, filename,
+                    {"filename": filename, "source": "toc",
+                     "entries": [list(e) for e in (stats.outline or [])],
+                     "pages": stats.pages_total or stats.pages,
+                     "chunks": stats.chunks, "chars": stats.chars,
+                     "at": get_utc_timestamp()},
+                )
+            except Exception as _oe:  # noqa: BLE001 — never fail an ingest for this
+                logger.debug("outline not stored for %s: %s", filename, _oe)
+
             # Doc-level summary for "what's in X / summarise X" queries.
             try:
                 summary = (
@@ -740,6 +756,46 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
 
     return f"SUCCESS: Ingested '{filename}'."
 
+#: RAW VECTOR DISTANCE bands, measured on the live PostgreSQL manual
+#: (8,279 chunks, bge-small-en-v1.5) on 2026-09-09 — the best hit of each
+#: query class:
+#:
+#:   0.222  "pg_stat_activity columns"                  (answerable)
+#:   0.242  "what does wal_level control"               (answerable)
+#:   0.268  "how does VACUUM FULL differ from VACUUM"   (answerable)
+#:   ------------------------------------------------- 0.34 —
+#:   0.347  "Table of Contents: list every Part"        (STRUCTURAL: no
+#:   0.376  "how many top-level numbered chapters"       passage can answer)
+#:   0.407  "what is the offside rule in football"      (off-topic)
+#:   0.480  "how do I bake sourdough bread"             (off-topic)
+#:
+#: The floor changes only the ADVICE in the footer, never which passages are
+#: returned, so a mis-set band costs a sentence rather than an answer. It is
+#: env-overridable because the scale is the embedder's, not a law of nature.
+_DIST_STRONG = float(os.environ.get("GHOST_KB_DIST_STRONG", "0.30"))
+_DIST_WEAK = float(os.environ.get("GHOST_KB_DIST_WEAK", "0.34"))
+
+
+#: The sentence a fruitless document search prints, and the ONE home for
+#: it: the loop-breaker imports this constant to recognise a probe that
+#: found nothing, so the banner cannot be reworded without the breaker
+#: following (the §4FN `FALLBACK_HEADS` shape). It is real prose the model
+#: reads, not a hidden token — a marker the reader cannot see is a marker
+#: the reader cannot act on.
+KB_NO_ANSWER_MARKER = "NOTHING IN THIS DOCUMENT ANSWERS THIS"
+
+
+def _match_word(dist: float) -> str:
+    """A distance in the document's own terms. The bare number was
+    reported as "relevance", which inverts it — lower is CLOSER, and the
+    rank key it was taken from can even be negative."""
+    if dist < _DIST_STRONG:
+        return "strong"
+    if dist < _DIST_WEAK:
+        return "moderate"
+    return "weak"
+
+
 async def tool_query_document(filename: str = None, question: str = None,
                               memory_system=None, k: int = 8):
     """Ask a question against ONE ingested document (2026-07-13).
@@ -790,16 +846,245 @@ async def tool_query_document(filename: str = None, question: str = None,
         return (f"No passages found in '{filename}' for that question. "
                 f"Try rephrasing with the document's own terminology.")
 
+    # The BEST raw vector distance decides whether this document contains an
+    # answer at all. Never the rank key (see `search_document`) — it is
+    # BM25-adjusted, and keyword overlap is exactly what a hopeless
+    # structural query has plenty of.
+    dists = [float(h.get("dist", h.get("score", 0.0))) for h in hits]
+    best = min(dists) if dists else 1.0
+
     parts = [
-        f"PASSAGES FROM '{filename}' (ranked, {len(hits)} of the best matches):",
-        "Answer the user's question FROM THESE PASSAGES. Cite the section "
-        "breadcrumb shown in each passage's header. If they do not contain "
-        "the answer, say so and query again with different wording.",
-        "",
+        f"PASSAGES FROM '{filename}' ({len(hits)} closest; best match is "
+        f"{_match_word(best)}, distance {best:.2f} — under {_DIST_STRONG:.2f} "
+        f"a passage answers, over {_DIST_WEAK:.2f} it is unrelated; LOWER IS "
+        f"CLOSER):",
     ]
+    if best >= _DIST_WEAK:
+        # ⚠ NOT "query again with different wording". Request e0f4a8bd: the
+        # question was "how many chapters", every passage came back at 0.35+
+        # (the off-topic band), and that footer told the model to keep
+        # searching. It obeyed 10+ times over five minutes, adding ~10 KB of
+        # unrelated passages to its context each time. No wording retrieves
+        # a count, and telling a model to retry a search that cannot
+        # succeed is an instruction with no exit.
+        parts += [
+            f"⚠ {KB_NO_ANSWER_MARKER}. Every passage above is in the "
+            "unrelated band, so RE-WORDING THIS SEARCH WILL NOT HELP — do "
+            "not try. Instead:",
+            "  • a question about the document's STRUCTURE (how many "
+            "chapters/parts/sections, what the chapters are, what section N "
+            "covers) is knowledge_base(action='outline', filename="
+            f"'{filename}') — semantic search cannot count;",
+            "  • otherwise the document simply may not cover it: say so, or "
+            "answer from another source, and say where the answer came from.",
+        ]
+    else:
+        parts += [
+            "Answer the user's question FROM THESE PASSAGES. Cite the section "
+            "breadcrumb shown in each passage's header. If they do not "
+            "contain the answer, ONE more query with the document's own "
+            "terminology is worth it — but if the next one is no closer, "
+            "stop searching and say so (for structure, use action='outline').",
+        ]
+    parts.append("")
     for i, h in enumerate(hits, 1):
-        parts.append(f"--- [{i}] (relevance {h['score']}) ---\n{h['text']}")
+        d = float(h.get("dist", h.get("score", 0.0)))
+        parts.append(f"--- [{i}] ({_match_word(d)} match, distance {d:.2f}) "
+                     f"---\n{h['text']}")
     return "\n".join(parts)
+
+
+#: How many rendered outline lines a single `outline` call may return. The
+#: PostgreSQL manual has ~6,200 outline entries; dumping them would cost
+#: more context than the answer is worth, and the COUNTS above the tree
+#: already answer "how many".
+_OUTLINE_MAX_LINES = 120
+
+
+#: A structural LABEL is a word followed by its ENUMERATOR and a closing
+#: mark — "Part I.", "Chapter 12.", "Appendix F." — which is a SHAPE, not a
+#: vocabulary: nothing to go stale on a document that says "Book" or
+#: "Annex". The enumerator admits digits, roman numerals AND a bare letter
+#: (the PostgreSQL manual's appendices are lettered A–P, and a roman-only
+#: rule counted the 5 whose letter happens to be a roman numeral, reporting
+#: "5 Appendix" for a document with 15). The trailing `.`/`:`/`)`/end is
+#: what keeps prose out: "See Also", "DROP TABLE", "Note A brief summary"
+#: all fail it.
+_OUTLINE_LABEL_RE = re.compile(
+    r"^([A-Za-z][A-Za-z-]{2,})\s+(?:\d+|[IVXLCDM]+|[A-Z])\s*(?:[.:)]|$)")
+
+
+def _outline_labels(entries) -> dict:
+    """``{level: {label: count}}`` over the WHOLE outline.
+
+    This is what answers "how many chapters". The per-level count does not:
+    measured on the live PostgreSQL manual, level 2 holds 91 entries — 70
+    chapters, 15 appendices and 6 front-matter headings — so reporting the
+    level count as the chapter count would have answered 91 to a question
+    whose true answer is 70.
+    """
+    out: dict = {}
+    for row in entries or ():
+        try:
+            lvl, title = int(row[0]), str(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        m = _OUTLINE_LABEL_RE.match(title.strip())
+        if m:
+            out.setdefault(lvl, {})
+            label = m.group(1)
+            out[lvl][label] = out[lvl].get(label, 0) + 1
+    return out
+
+
+def _outline_level_counts(entries) -> dict:
+    counts: dict = {}
+    for row in entries or ():
+        try:
+            lvl = int(row[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        counts[lvl] = counts.get(lvl, 0) + 1
+    return counts
+
+
+def render_document_outline(record: dict, depth: int = 2) -> str:
+    """The stored outline record → what a model reads.
+
+    Leads with the LEVEL COUNTS, because the question this exists for is
+    "how many chapters" and a count is the answer; the tree underneath is
+    what lets the model tell which level "chapter" means (the titles say so
+    themselves in any real manual).
+    """
+    entries = record.get("entries") or []
+    counts = _outline_level_counts(entries)
+    name = record.get("filename") or "the document"
+    max_level = max(counts) if counts else 0
+    depth = max(1, min(int(depth or 2), max_level or 1))
+
+    head = [f"OUTLINE OF '{name}'"]
+    facts = []
+    if record.get("pages"):
+        facts.append(f"{record['pages']} pages")
+    if record.get("chunks"):
+        facts.append(f"{record['chunks']} indexed chunks")
+    if max_level:
+        facts.append(f"{max_level} levels deep")
+    if facts:
+        head.append(" — " + " · ".join(facts))
+    out = ["".join(head)]
+
+    if not entries:
+        out.append(
+            "This document has NO table of contents (a plain-text ingest, or "
+            "a PDF without an outline), so there is no structure to report. "
+            "Use action='query' for its contents.")
+        return "\n".join(out)
+
+    labels = _outline_labels(entries)
+    if labels:
+        out.append("HOW MANY — exact counts of the divisions the document "
+                   "names itself, over the WHOLE outline:")
+        for lvl in sorted(labels):
+            top = sorted(labels[lvl].items(), key=lambda kv: -kv[1])[:3]
+            out.append("  level %d: " % lvl + " · ".join(
+                f"{n} \u00d7 {name}" for name, n in top))
+    out.append("Entries per level, INCLUDING unlabelled ones (front matter, "
+               "indexes, prose headings):")
+    out.append("  " + " · ".join(
+        f"level {lvl}: {counts[lvl]}" for lvl in sorted(counts)))
+    if record.get("source") == "breadcrumbs":
+        out.append("(Rebuilt from the stored section breadcrumbs, so page "
+                   "numbers are absent and the order is the titles' own "
+                   "numbering.)")
+    out.append("")
+    out.append(f"Levels 1-{depth} of {max_level}"
+               + (f" (call again with depth={depth + 1} for more):"
+                  if depth < max_level else ":"))
+
+    shown = 0
+    for row in entries:
+        try:
+            lvl, title, page = int(row[0]), str(row[1]), int(row[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if lvl > depth:
+            continue
+        if shown >= _OUTLINE_MAX_LINES:
+            out.append(f"… {sum(counts[l] for l in counts if l <= depth) - shown} "
+                       f"more entries at this depth — the per-level counts "
+                       f"above are complete; narrow with depth=1.")
+            break
+        out.append("  " * (lvl - 1) + title + (f"  (p. {page})" if page else ""))
+        shown += 1
+    return "\n".join(out)
+
+
+async def tool_document_outline(filename: str = None, memory_system=None,
+                                depth: int = 2, **kwargs):
+    """The STRUCTURE of one ingested document — parts, chapters, sections.
+
+    WHY THIS EXISTS (request e0f4a8bd, 2026-09-08). "How many chapters does
+    the PostgreSQL manual have?" is a question about shape, and the only
+    retrieval on offer was semantic: eight passages at relevance 0.08, and a
+    footer saying "query again with different wording". The agent obeyed it
+    for five minutes over 20+ turns and never could have succeeded — no
+    wording retrieves a count. The structure existed the whole time.
+
+    Cached after the first call: an ingest stores it exactly (page numbers
+    included); a document ingested before that is rebuilt once from the
+    breadcrumbs its own chunks carry.
+    """
+    if not filename:
+        return ("SYSTEM ERROR: 'filename' is MANDATORY for action='outline'. "
+                "Worked call: knowledge_base(action='outline', "
+                "filename='<an ingested document>')")
+    if not memory_system:
+        return "Error: Memory system is disabled."
+
+    library = await asyncio.to_thread(memory_system.get_library)
+    library = library or []
+    if filename not in library:
+        stem = str(filename).lower().rsplit(".", 1)[0]
+        match = next((f for f in library
+                      if f.lower() == str(filename).lower()
+                      or f.lower().rsplit(".", 1)[0] == stem), None)
+        if not match:
+            return (f"Error: '{filename}' is not in the knowledge base. "
+                    f"Available documents: {library or '(none)'}. "
+                    f"Ingest it first with action='ingest_document'.")
+        filename = match
+
+    try:
+        record = await asyncio.to_thread(
+            memory_system.get_document_outline, filename)
+    except Exception:  # noqa: BLE001
+        record = {}
+    if not record:
+        pretty_log("KB Outline", f"{filename} ← rebuilding from breadcrumbs",
+                   icon=Icons.MEM_READ)
+        try:
+            record = await asyncio.to_thread(
+                memory_system.derive_document_outline, filename)
+        except Exception as e:  # noqa: BLE001
+            return f"Error: could not read the outline of '{filename}': {e}"
+        if record:
+            try:
+                await asyncio.to_thread(
+                    memory_system.set_document_outline, filename, record)
+            except Exception:  # noqa: BLE001 — caching is best-effort
+                pass
+    if not record:
+        return (f"Error: '{filename}' has no indexed chunks, so it has no "
+                f"readable structure. Re-ingest it with "
+                f"action='ingest_document'.")
+
+    try:
+        depth = int(depth)
+    except (TypeError, ValueError):
+        depth = 2
+    pretty_log("KB Outline", f"{filename} (depth {depth})", icon=Icons.MEM_READ)
+    return render_document_outline(record, depth=depth)
 
 
 #: Relevance grades in order of goodness (lower rank = better match).
@@ -1835,8 +2120,8 @@ _KB_TARGET_ALIASES = (
 #: generated from it. (`update_profile` is dispatched but deliberately not
 #: advertised; see the branch at the end of `tool_knowledge_base`.)
 _KB_ACTIONS = (
-    "transcribe", "ingest_document", "query", "insert_fact", "expand",
-    "forget", "list_docs", "reset_all",
+    "transcribe", "ingest_document", "query", "outline", "insert_fact",
+    "expand", "forget", "list_docs", "reset_all",
 )
 
 
@@ -2033,6 +2318,13 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
             memory_system=memory_system,
         )
 
+    elif action == "outline":
+        return await tool_document_outline(
+            filename=kwargs.get("filename") or kwargs.get("source") or target,
+            memory_system=memory_system,
+            depth=kwargs.get("depth", 2),
+        )
+
     elif action == "expand":
         return await tool_expand_evidence(
             ref=kwargs.get("ref") or kwargs.get("id") or target,
@@ -2041,9 +2333,39 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
         )
 
     elif action == "list_docs":
+        # Names AND shape. A bare name list is what sent request e0f4a8bd
+        # into 20 turns of semantic guessing: the model could see the manual
+        # existed and nothing about it, so every structural question had to
+        # be asked as a search. The counts here come from the cached outline
+        # record (free); a document with none says so and names the call
+        # that builds it, rather than silently reporting nothing.
         if not memory_system: return "Error: Memory system is disabled."
-        library = memory_system.get_library() or []
-        return f"LIBRARY CONTENTS ({len(library)} files):\n" + "\n".join([f"- {doc}" for doc in library]) if library else "No docs."
+        library = await asyncio.to_thread(memory_system.get_library)
+        library = library or []
+        if not library:
+            return "No docs."
+        lines = [f"LIBRARY CONTENTS ({len(library)} files):"]
+        for doc in library:
+            try:
+                rec = await asyncio.to_thread(
+                    memory_system.get_document_outline, doc)
+            except Exception:  # noqa: BLE001
+                rec = {}
+            facts = []
+            if rec.get("pages"):
+                facts.append(f"{rec['pages']} pages")
+            if rec.get("chunks"):
+                facts.append(f"{rec['chunks']} chunks")
+            counts = _outline_level_counts(rec.get("entries") or [])
+            if counts:
+                facts.append("outline " + "/".join(
+                    str(counts[lvl]) for lvl in sorted(counts))
+                    + " entries by level")
+            lines.append(f"- {doc}" + (f"  ({' · '.join(facts)})" if facts else ""))
+        if not any("outline" in ln for ln in lines[1:]):
+            lines.append("Structure (parts/chapters/sections and their counts): "
+                         "knowledge_base(action='outline', filename=...).")
+        return "\n".join(lines)
 
     elif action == "reset_all":
         if not memory_system: return "Error: Memory system is disabled."

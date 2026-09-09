@@ -301,16 +301,57 @@ def gather_failure_corpus(context) -> List[dict]:
 
 # --- adjudication ------------------------------------------------------
 
+#: Where the "we already asked about this record" memo lives inside the
+#: distillation state file, and how many entries it keeps.
+_ADJUDICATED_KEY = "dimension_adjudications"
+_ADJUDICATION_MEMO_CAP = 500
+
+
+def _adjudication_key(rec: dict) -> str:
+    """Identity of the QUESTION, not just the record: handle + a hash of the
+    text, so an edited lesson is asked again and an unchanged one is not."""
+    handle = str(rec.get("handle") or "")
+    text = str(rec.get("text") or "")
+    if not (handle or text):
+        return ""
+    return f"{handle}|{hashlib.md5(text.encode('utf-8')).hexdigest()[:8]}"
+
+
 async def adjudicate_unknowns(llm_client, corpus: List[dict],
                               skill_memory=None,
-                              cap: int = _ADJUDICATION_CAP) -> int:
+                              cap: int = _ADJUDICATION_CAP,
+                              context=None) -> int:
     """Offline LLM re-classification of records the heuristics left
-    unattributed. Adjudicated playbook records are persisted (via
-    ``_update_lesson_fields``) so the work isn't repeated next cycle.
-    Cleanly skippable — GHOST_FAILURE_ADJUDICATE=0. Returns the number
-    of records whose dimension changed."""
+    unattributed. Cleanly skippable — GHOST_FAILURE_ADJUDICATE=0. Returns
+    the number of records whose dimension changed.
+
+    ⚠ ASKED ONCE, NOT EVERY CYCLE (§4FQ, 2026-09-09). This docstring used
+    to claim the work "isn't repeated next cycle" because a successful
+    adjudication is written back to the lesson — but the common answer is
+    ``unknown``, and that answer was written NOWHERE. Measured over 25
+    hours of the recording window: **151 adjudications, 147 of them
+    ``unknown``, and those 147 were only SIX distinct records asked 29
+    times each** — once per dream cycle, for ever, at ~1 s of worker time
+    apiece. Most of them are not even failures ("None observed; the
+    solution was direct and efficient"), so ``unknown`` is the right and
+    permanent answer.
+
+    Every verdict is now remembered in the distillation state file, keyed
+    by the record AND its text, so a re-ask happens only when the record
+    itself changed.
+    """
     if not adjudicate_enabled() or llm_client is None:
         return 0
+    memo: Dict[str, str] = {}
+    if context is not None:
+        try:
+            _st = _load_state(context)
+            _prev = _st.get(_ADJUDICATED_KEY)
+            if isinstance(_prev, dict):
+                memo = dict(_prev)
+        except Exception as e:  # noqa: BLE001 — the memo is an optimisation
+            logger.debug("adjudication memo read skipped: %s", e)
+    memo_dirty = False
     changed = 0
     examined = 0
     for rec in corpus:
@@ -319,9 +360,21 @@ async def adjudicate_unknowns(llm_client, corpus: List[dict],
         dim = (rec.get("dimension") or "").strip()
         if dim not in ("", DIM_UNKNOWN):
             continue
+        _key = _adjudication_key(rec)
+        if _key and _key in memo:
+            # Asked before; the record has not changed, so neither has the
+            # answer. Adopt the remembered verdict without a call.
+            _prev_verdict = str(memo.get(_key) or "")
+            if (_prev_verdict in DIMENSIONS and _prev_verdict != DIM_UNKNOWN
+                    and _prev_verdict != dim):
+                rec["dimension"] = _prev_verdict
+            continue
         examined += 1
         verdict = await adjudicate_dimension(
             llm_client, rec.get("text") or "", dim or DIM_UNKNOWN)
+        if _key:
+            memo[_key] = verdict or DIM_UNKNOWN
+            memo_dirty = True
         if verdict in DIMENSIONS and verdict != DIM_UNKNOWN and verdict != dim:
             rec["dimension"] = verdict
             changed += 1
@@ -341,6 +394,16 @@ async def adjudicate_unknowns(llm_client, corpus: List[dict],
                         skill_memory._update_lesson_fields, _match, _mut)
                 except Exception as e:
                     logger.debug("adjudication persist skipped: %s", e)
+    if memo_dirty and context is not None:
+        # Written BEFORE the cycle report, which re-reads the state file and
+        # would otherwise save a copy taken before this pass ran.
+        try:
+            _st = _load_state(context)
+            _st[_ADJUDICATED_KEY] = dict(
+                list(memo.items())[-_ADJUDICATION_MEMO_CAP:])
+            _save_state(context, _st)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("adjudication memo write skipped: %s", e)
     return changed
 
 
@@ -403,7 +466,8 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
 
         try:
             adjudicated = await adjudicate_unknowns(
-                llm_client, corpus, skill_memory=skill_memory)
+                llm_client, corpus, skill_memory=skill_memory,
+                context=context)
             if adjudicated:
                 logger.debug("failure_distill: adjudicated %d unknown "
                              "dimension(s)", adjudicated)

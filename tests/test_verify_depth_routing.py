@@ -272,7 +272,11 @@ class TestTheUntreatableRouteIsExcludedAndNamed:
         treatment. Diluting the arm with those silently would understate
         the effect."""
         src = self._agent_src()
-        assert 'verify_route=str(_verify_route)' in src
+        # §4FN round 4: the recording block is one recorder
+        # (`_record_verdict_instruments`); the choke point hands it the
+        # route and it forwards the route to turn-facts and the sidecar.
+        assert 'verify_route=_verify_route)' in src
+        assert 'verify_route=str(verify_route)' in src
         assert '_verify_route = "code_output"' in src
 
 

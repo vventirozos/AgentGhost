@@ -22,6 +22,15 @@ import sys
 from pathlib import Path
 
 
+def override_tags(row: dict) -> list:
+    """The override tag(s) a sidecar row was produced by: the chain
+    ``"reply-shape+web-exec"`` is two tags; no override is the text judge."""
+    raw = str(row.get("override") or "").strip()
+    if not raw:
+        return ["(text judge)"]
+    return [t for t in (p.strip() for p in raw.split("+")) if t]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=45)
@@ -76,20 +85,30 @@ def main() -> int:
 
     by = collections.defaultdict(collections.Counter)
     agree = collections.defaultdict(collections.Counter)
+    chains = collections.Counter()
     for tid, r in last.items():
-        tag = r.get("override") or "(text judge)"
-        by[tag][r.get("verdict")] += 1
-        if tid in human:
-            v, (h, src) = r.get("verdict"), human[tid]
-            if h not in ("passed", "failed"):
-                continue                     # "unknown" is not agreement
-            bucket = ("self" if "verifier" in src else "human")
-            key = ("agrees" if (v == "REFUTED") == (h == "failed")
-                   else "DISAGREES")
-            agree[tag][f"{bucket}:{key}"] += 1
+        # §4FN: a verdict several overrides touched carries the CHAIN
+        # ("reply-shape+web-exec"); the question "how often is web-exec
+        # right" needs the row under EACH of its tags, not under a string
+        # no other row shares (round 3 m5)
+        for tag in override_tags(r):
+            by[tag][r.get("verdict")] += 1
+            if tid in human:
+                v, (h, src) = r.get("verdict"), human[tid]
+                if h not in ("passed", "failed"):
+                    continue                     # "unknown" is not agreement
+                bucket = ("self" if "verifier" in src else "human")
+                key = ("agrees" if (v == "REFUTED") == (h == "failed")
+                       else "DISAGREES")
+                agree[tag][f"{bucket}:{key}"] += 1
+        if "+" in str(r.get("override") or ""):
+            chains[str(r.get("override"))] += 1
 
     print(f"{len(last)} shipped verdicts across {len(files)} day-file(s); "
-          f"{sum(1 for t in last if t in human)} with a correction/label\n")
+          f"{sum(1 for t in last if t in human)} with a correction/label"
+          + (f"; {sum(chains.values())} chained ("
+             + ", ".join(f"{k}={v}" for k, v in chains.most_common()) + ")"
+             if chains else "") + "\n")
     print(f"{'override':22} {'total':>5}  verdicts / label-agreement")
     for tag in sorted(by, key=lambda t: -sum(by[t].values())):
         verdicts = ", ".join(f"{k}={v}" for k, v in by[tag].most_common())

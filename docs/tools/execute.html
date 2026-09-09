@@ -163,6 +163,30 @@
     <li>Executes via <code>sandbox_manager.execute(bash -c ...)</code> with 300 s timeout.</li>
   </ul>
 
+  <h2>A pipeline's failure is the pipeline's failure <span class="tag">2026-09-09</span></h2>
+  <p>The shell now runs <code>bash -c 'set -o pipefail; …'</code> (one home, <code>_bash_c</code>, used by
+  the primary run <em>and</em> the project-path remap retry). Request <code>e0f4a8bd</code> ran
+  <code>python3 probe.py 2>&amp;1 | head -200</code> twice; probe.py raised a Traceback both times and the tool
+  logged <strong>execution ok &middot; exit 0</strong>, because bash returns the status of the LAST command in
+  a pipeline and <code>head</code> succeeded. The 6-strike budget was never charged, the failure taught the
+  model nothing, and the log printed a status beside its own contradiction.</p>
+  <p><strong>The exemption that keeps it honest.</strong> Naive pipefail breaks the far commoner
+  <code>&lt;producer&gt; | head -N</code>, where the closing pipe KILLS the producer. On the development host
+  standard tools report <strong>141</strong> (SIGPIPE) and Python <strong>120</strong> (a failed stdout flush
+  at shutdown), so a code-only exemption looked sufficient &mdash; and passed every test.</p>
+  <p><strong>⚠ The host lied, and only the real container said so.</strong> Run inside the live sandbox
+  (Debian, bash 5.2, CPython 3.11) the same truncated pipeline exits <strong>1</strong>: Python raises
+  <code>BrokenPipeError</code> as an ordinary uncaught exception, which is indistinguishable <em>by exit
+  code</em> from a script that genuinely failed. A code-only exemption would therefore have turned every
+  truncated <code>… | head</code> in production into a strike &mdash; trading a silent-failure bug for a
+  loud false-failure one. So the second signal is the runtime NAMING the broken pipe
+  (<code>BrokenPipeError</code> / <code>Broken pipe</code> / <code>SIGPIPE</code>) in output that is captured
+  anyway: a real <code>ModuleNotFoundError</code> through <code>| head</code> keeps its strike, a pipe closed
+  by <code>head</code> does not. Both the primary run and the remap retry pass their output. Verified by
+  running all nine cases inside the live container. Pins:
+  <code>tests/test_execute_pipefail.py</code> (42 &mdash; every shell claim executed against a real bash, plus
+  the container's measured shapes replayed end to end); battery 18/18.</p>
+
   <h2>Path &amp; exit-code healing (2026-07-02)</h2>
   <p>Four fixes from the 2026-07-01 chess-game trace (rounds <code>a4e1b33d</code> / <code>a4a2ce04</code> in <code>ghost-agent.log</code>), where the agent looped 10+ turns on files it had just written. All covered by <code>tests/test_execute_path_and_exit1_heal.py</code>.</p>
   <ul>

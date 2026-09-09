@@ -336,6 +336,38 @@
   explainable. Tests: <code>tests/test_lesson_graduation_gates.py</code> (19).</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>The idle-loop census, and asking once <span class="tag">2026-09-09 &sect;4FQ</span></h2>
+  <p><strong>What the agent calls when nobody asked it to.</strong> Item 5 of the 2026-09-08 list: count
+  background model calls per kind from the recording window, name each kind's consumer, cut what has none.
+  Measured over 25 live hours &mdash; 2,590 recorded calls:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>kind</th><th>calls</th><th>avg chars in</th><th>consumer</th></tr></thead>
+    <tbody>
+      <tr><td>keepalive</td><td>1,869</td><td>2</td><td>the node's network path &mdash; a <code>max_tokens=1</code> ping every 45 s, one per physical node, off-main. It exists because a Tailscale peer's direct path re-cools and both ends of a request then trip a 5 s <code>ReadTimeout</code>; it is also the breaker's most frequent recovery detector. <strong>Kept</strong>: 80% of the count, a rounding error of the cost.</td></tr>
+      <tr><td>tag failure-dimension</td><td>151</td><td>1,087</td><td>failure distillation &mdash; <strong>the one real find, see below</strong></td></tr>
+      <tr><td>(unlabelled)</td><td>81</td><td>8,742</td><td>verifier verdicts, post-mortem triage, self-play generation and repair, the two idle narratives &mdash; all consumed. The post-mortem, narrative, self-play and repair calls now carry a <code>task_label</code>, so the next census attributes them instead of guessing. The verifier's do NOT: its calls must tolerate a client whose <code>chat_completion</code> takes nothing but the payload (a documented contract with its own test), and a logging nicety does not get to break that.</td></tr>
+      <tr><td>decompose / expand query</td><td>55</td><td>~505</td><td>retrieval</td></tr>
+      <tr><td>planner</td><td>43</td><td>12,320</td><td>a live experiment arm</td></tr>
+      <tr><td>warmup, dream, self-play, memory extract, hydration-judge, distill, postmortem, prefix re-warm, perfect-it</td><td>&le;44 each</td><td>&mdash;</td><td>each has a reader</td></tr>
+    </tbody>
+  </table></div>
+  <p><strong>The find: 147 of 151 adjudications were the same six questions.</strong>
+  <code>adjudicate_dimension</code> re-classifies failure records the heuristics left <code>unknown</code>.
+  147 of its 151 calls returned <code>unknown</code> &mdash; the value the heuristic already had &mdash; and
+  those 147 were only <strong>six distinct records, each asked 29 times</strong>: once per dream cycle, for
+  ever. Most are not failures at all ("None observed; the solution was direct and efficient"), so
+  <code>unknown</code> is the right and permanent answer. The function's own docstring promised this could
+  not happen &mdash; "adjudicated playbook records are persisted so the work isn't repeated next cycle"
+  &mdash; but the persist ran only when the LLM produced a USABLE label, so the common answer was written
+  nowhere. Every verdict is now remembered in the distillation state file, keyed by the record AND a hash of
+  its text so an edited record is asked again: <strong>151 calls become 6</strong>. Same shape as
+  &sect;4FP's fail-closed stores &mdash; a mechanism whose "done" state is never recorded for the common
+  case. Pins: <code>tests/test_idle_adjudication_memo.py</code>; battery 10/10.</p>
+  <p><strong>The honest headline is that there was almost no fat.</strong> One loop was repeating itself;
+  every other background kind has a reader and a defensible rate. The measurement was worth more than the
+  cut, and it only became possible because the calls carry labels &mdash; which is why the unlabelled ones
+  were labelled rather than left for the next person to guess at.</p>
+
   <h2>Counterfactual replay — regression-of-learning, phase 1 (2026-07-17)</h2>
   <p><code>core/counterfactual.py</code>. Every concluded self-play sim now persists its
   challenge spec (prompt + setup + validator + outcome) to

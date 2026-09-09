@@ -105,9 +105,12 @@ _ANCHOR_TEXT_RE = re.compile(
 )
 
 # A previously-derived gloss, stripped before a fresh one is appended so
-# derive() is idempotent and self-correcting.
+# derive() is idempotent and self-correcting. The look-behind keeps the
+# leading ``\s*`` from being retried at every position of a whitespace run
+# (quadratic: 42 ms per pass on 4000 trailing spaces, and the writer runs
+# ten passes — review §4FN round 3 m6); the match it finds is the same.
 _GLOSS_RE = re.compile(
-    r"\s*(?:→|->)\s*~?\d+\s+(?:year|month|week|day)s?\s+old",
+    r"(?<!\s)\s*(?:→|->)\s*~?\d+\s+(?:year|month|week|day)s?\s+old",
     re.IGNORECASE,
 )
 
@@ -218,6 +221,15 @@ def _fmt_anchor(d: datetime.date, unit: str) -> str:
 # "Leonidas born ~2026-02-20" rather than "Leonidas is born ~…".
 _COPULA = r"(?:\b(?:is|was|are|were|turns|turned)\s+)?"
 
+#: The COUNT of an age phrase. The look-behind keeps a decimal's fraction
+#: ("9.5 years old" read as FIVE years; "5.8 months" — the checker's own
+#: rendering — read as eight), a range's tail ("9-10 years old") and a
+#: vulgar fraction ("9 1/2") from being a count of their own (review §4FN
+#: round 4 C6/m6). A decimal is captured whole: the writer leaves it
+#: (`int()` fails → untouched, as for any unparseable count) and the
+#: checker compares it as a number.
+_NUM = r"(?<![\d.,/-])\b(\d{1,3}(?:[.,]\d{1,2})?)"
+
 _UNIT_ALT = (r"year|years|yr|yrs|month|months|mo|mos|"
              r"week|weeks|wk|wks|day|days")
 
@@ -228,22 +240,234 @@ _UNIT_ALT = (r"year|years|yr|yrs|month|months|mo|mos|"
 # Note both spaced variants require whitespace on at least one side of the
 # compound, which is what keeps the fully-hyphenated ATTRIBUTIVE form
 # ("9-year-old son") out of this list — see _ATTRIB_AGE_RE below.
+#: "N years, M months and D days old" / "5 months and 23 days old" — two or
+#: three components joined by ", " / " and " / ", and ", ending in "old".
+#: ONE authority for the profile WRITER (`anchor`) and the CHECKER
+#: (`core/memory_claim_check`): before §4FN both read the TAIL component
+#: ("23 days old") — the writer anchored a nine-year-old to a birth date ten
+#: days ago and the checker refuted three correct replies (2026-09-04).
+#: Groups: (1,2) first component, (3,4) second, (5,6) optional third.
+#: The tail is ``[\s-]+old``, not ``\s*[-\s]\s*old``: one class for the
+#: three adjacent quantifiers. Measured (review §4FN rounds 3–4 m6): the
+#: old idiom is quadratic on a whitespace run that is NOT followed by
+#: "old" — 11.8 s for this pattern on 16 000 spaces before "olx", 0.6 s
+#: for the "9 years old" pattern below — and where a GROUP follows it
+#: (the "9-year old" pattern: 7.5 s). With a literal "old" after the run
+#: the engine skips the backtracking, which is why a first measurement
+#: (spaces after "old") called the compound tail harmless. Same text
+#: matched, one idiom for all three.
+_COMPOUND_AGE_RE = re.compile(
+    _COPULA + _NUM + r"\s+(years?|yrs?|months?|mos?|weeks?|wks?)"
+    r"(?:,\s*(?:and\s+)?|\s+and\s+)(\d{1,3})\s+(months?|mos?|weeks?|wks?|days?)"
+    r"(?:(?:,\s*(?:and\s+)?|\s+and\s+)(\d{1,3})\s+(weeks?|wks?|days?))?"
+    r"[\s-]+old\b",
+    re.IGNORECASE)
+
+_MONTHS_PER_UNIT = {"year": 12.0, "month": 1.0, "week": 12.0 / 52.0,
+                    "day": 12.0 / 365.25}
+
+# ── A PLURAL SUBJECT gets no anchor ────────────────────────────────────
+#
+# "Thodoris and Leonidas: 9 years and 5 months old" is two ages, and one
+# birth date for two people corrupts the record: the checker then reads
+# the name before the anchor and refutes the CORRECT answer about the
+# second child forever (review §4FN M-B, and round 3 C1 — the first guard
+# named one surface of the scenario, ``are`` glued to the number, and
+# "Thodoris and Leonidas: …", "… are, respectively, …", "… are about …"
+# walked around it). Two shapes, read from the text BEFORE the phrase:
+#
+#   * a LIST of capitalised names right before it — "Thodoris and
+#     Leonidas", "Thodoris, Leonidas and Vasilis" (`conjoined_subject`);
+#   * a plural copula within a couple of words of a COMPOUND — "are:",
+#     "are, respectively,", "are about" (`plural_clause`). A single-unit
+#     phrase keeps §4EL's reading of "are": "my twins are 4 months old"
+#     is one birth date, correctly.
+#
+# Names are Unicode (``[^\W\d_]``, then ``isupper``): "Θοδωρής and
+# Λεωνίδας" is a list too.
+# The joiner is "and" / "&" / "και"; a bare COMMA joins two names only for a
+# caller that can tell a name from a sentence opener: "Yes, Thodoris",
+# "Today, Leonidas", "Hi Vasilis, Thodoris" are an opener and a subject,
+# and reading them as a list muted the writer AND the checker (round 4
+# M2). The checker passes its anchored names (`comma_names`); the reader
+# of stored values passes None (any capitalised word counts — it is the
+# last defence against a date already glued onto "Thodoris, Leonidas:");
+# the writer passes nothing (no comma lists). "Thodoris, Leonidas and
+# Vasilis" is a list for everyone, through its "and" tail.
+_NAME_TOKEN = r"[^\W\d_][\w'’-]*"
+_JOINED = r"\s*(?:,?\s*&|,?\s*\band\b|,?\s*\bκαι\b)\s*"
+#: at most three words may follow the list — `conjoined_subject`'s
+#: ``trail_words`` is capped here (round 4: a larger argument was a no-op)
+_TRAIL = r"((?:[\s:—–\-,(\[]*\w+){0,3})[\s:—–\-,(\[]*\Z"
+_CONJOINED_AND_RE = re.compile(
+    r"(?<![\w'’-])(" + _NAME_TOKEN + r")" + _JOINED + r"(" + _NAME_TOKEN + r")" + _TRAIL,
+    re.IGNORECASE)
+_CONJOINED_COMMA_RE = re.compile(
+    r"(?<![\w'’-])(" + _NAME_TOKEN + r")\s*,\s*(" + _NAME_TOKEN + r")" + _TRAIL,
+    re.IGNORECASE)
+#: a list of names ANYWHERE on the line (no trail cap), for `plural_line`
+_LIST_ANYWHERE_RE = re.compile(
+    r"(?<![\w'’-])(" + _NAME_TOKEN + r")" + _JOINED + r"(" + _NAME_TOKEN + r")(?![\w'’-])",
+    re.IGNORECASE)
+#: "are" only: "were" is a TENSE marker and the line is left alone before
+#: any plural rule is consulted (round 4 — a second "were" here was a
+#: redundant guard no pin could isolate)
+_PLURAL_CLAUSE_RE = re.compile(
+    r"\bare\b(?:[\s,:;—–\-]+\w+){0,2}[\s,:;—–\-]*\Z", re.IGNORECASE)
+_PLURAL_COPULA_RE = re.compile(r"\bare\b", re.IGNORECASE)
+
+# ── A PAST OR FUTURE age is not today's ────────────────────────────────
+#
+# "Thodoris was 5 years old when they moved in 2021", "Leonidas turns 7
+# months old on October 12", "By March Leonidas is 12 months old": the
+# writer anchored these to the day they were SAID (a birth date in 2021 for
+# a child born in 2016) and the checker compared them with today (round 4
+# C1). The marker can sit anywhere on the line — before the name as easily
+# as in the copula — so the LINE is what is read, and any marker means
+# neither side touches the phrase. Loss: "turned 9 today" is not anchored
+# either; the stated present form ("is 9") is the one the store lives on.
+_TENSE_RE = re.compile(
+    r"\b(?:was|were|turned|turns|will|would|next|last|ago|when|by|until|then|"
+    r"earlier|later|formerly|previously|used\s+to|at\s+the\s+time|back\s+in|"
+    r"at\s+(?=\d)|"
+    r"in\s+(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\.?\s+)?(?:19|20)\d\d)\b", re.IGNORECASE)
+
+
+def tense_marked(line: str) -> bool:
+    """True when ``line`` carries a past/future marker (see above)."""
+    return bool(_TENSE_RE.search(line or ""))
+
+
+def _line_of(text: str, pos: int) -> str:
+    """The whole line containing ``pos``."""
+    lo = text.rfind("\n", 0, pos) + 1
+    hi = text.find("\n", pos)
+    return text[lo:(len(text) if hi == -1 else hi)]
+
+
+def _line_before(text: str, pos: int) -> str:
+    """The text of ``pos``'s line before ``pos``: a subject is read on its
+    own line, never across one — and the WHOLE line (an 80-char look-back
+    let a list 90 characters back glue two children to one date, round 4
+    M3)."""
+    return text[text.rfind("\n", 0, pos) + 1:pos]
+
+
+def conjoined_subject(text_before: str, trail_words: int = 0,
+                      comma_names=()) -> bool:
+    """True when the words right before a phrase are a LIST of capitalised
+    names, at most ``trail_words`` words after the last one ("Thodoris and
+    Leonidas are 9 and " → the age belongs to several people). Only
+    punctuation may follow the list when ``trail_words`` is 0. A comma-only
+    pair ("Thodoris, Leonidas") counts when its first name is in
+    ``comma_names`` (lower-cased), or for every capitalised word when
+    ``comma_names`` is None; never when it is empty."""
+    text_before = text_before or ""
+    m = _CONJOINED_AND_RE.search(text_before)
+    if m is None and comma_names != ():
+        m = _CONJOINED_COMMA_RE.search(text_before)
+        if m is not None and comma_names is not None \
+                and m.group(1).lower() not in comma_names:
+            m = None
+    if not m or not (m.group(1)[:1].isupper() and m.group(2)[:1].isupper()):
+        return False
+    return len(re.findall(r"\w+", m.group(3))) <= trail_words
+
+
+def plural_clause(text_before: str) -> bool:
+    """True when a plural copula stands within two words before the phrase
+    ("are ", "are: ", "are, respectively, ", "are about ")."""
+    return bool(_PLURAL_CLAUSE_RE.search(text_before or ""))
+
+
+def plural_line(text_before: str) -> bool:
+    """True when the line's subject is a LIST of names followed, however
+    far back, by a plural copula: "Thodoris and Leonidas are, as of today
+    (September 4, 2026, …), respectively 9 years and 5 months old" (round
+    4 M3). Applied to COMPOUNDS only: a single-unit age later on such a
+    line ("… are brothers and the younger one Leonidas is 5 months old")
+    is one person's and stays anchored."""
+    text_before = text_before or ""
+    for m in _LIST_ANYWHERE_RE.finditer(text_before):
+        if (m.group(1)[:1].isupper() and m.group(2)[:1].isupper()
+                and _PLURAL_COPULA_RE.search(text_before, m.end())):
+            return True
+    return False
+
+
+def compound_age_parts(m: "re.Match") -> Optional[Tuple[int, int]]:
+    """``(whole months, days)`` for a `_COMPOUND_AGE_RE` match — EXACT, in
+    the units the user counted in (years and months → months, weeks and
+    days → days) — or None when a component is unparseable or the total is
+    implausible for its largest unit (the same bar `_anchor_for` applies to
+    single-unit phrases)."""
+    try:
+        months = days = 0
+        for num, raw in ((m.group(1), m.group(2)), (m.group(3), m.group(4)),
+                         (m.group(5), m.group(6))):
+            if num is None or raw is None:
+                continue
+            unit = _norm_unit(raw)
+            if unit == "year":
+                months += 12 * int(num)
+            elif unit == "month":
+                months += int(num)
+            elif unit == "week":
+                days += 7 * int(num)
+            elif unit == "day":
+                days += int(num)
+            else:
+                return None
+        first = _norm_unit(m.group(2)) or "month"
+        cap = _MAX_PLAUSIBLE_AGE.get(first, 0) * _MONTHS_PER_UNIT.get(first, 1.0)
+        total = months + days * _MONTHS_PER_UNIT["day"]
+        if total <= 0 or (cap and total > cap):
+            return None
+        return months, days
+    except (TypeError, ValueError):
+        return None
+
+
+def compound_age_months(m: "re.Match") -> Optional[float]:
+    """The compound as ONE number of months, for the checker's comparison
+    (its tolerance is a month either way, so the day→month factor only
+    moves the comparand inside that window). The WRITER never uses this:
+    it anchors from the exact parts."""
+    parts = compound_age_parts(m)
+    if parts is None:
+        return None
+    months, days = parts
+    return months + days * _MONTHS_PER_UNIT["day"]
+
+
+def _birth_from_parts(when: datetime.date, months: int, days: int) -> datetime.date:
+    """The birth date ``months`` and ``days`` before ``when``: the days are
+    subtracted FIRST, then the whole months — the order the age was counted
+    in ("9 years, 9 months and 10 days" on 2026-09-04: Sep 4 − 10 days =
+    Aug 25, − 117 months = 2016-11-25; months first lands on the 24th).
+    Exact: no month-length constant (round 3 m3 — the fraction round trip
+    through 30.4375 was one unpinned approximation too many)."""
+    return _shift_months(when - datetime.timedelta(days=days), -months)
+
+
 _AGE_PATTERNS = [
     # "9 years old", "9 years-old"
-    (re.compile(_COPULA + r"\b(\d{1,3})\s+(" + _UNIT_ALT + r")\s*[-\s]\s*old\b",
+    (re.compile(_COPULA + _NUM + r"\s+(" + _UNIT_ALT + r")[\s-]+old\b",
                 re.IGNORECASE), True),
     # "9-year old", "9 year old"
-    (re.compile(_COPULA + r"\b(\d{1,3})\s*[-\s]\s*(" + _UNIT_ALT + r")\s+old\b",
+    (re.compile(_COPULA + _NUM + r"[\s-]+(" + _UNIT_ALT + r")\s+old\b",
                 re.IGNORECASE), True),
     # "aged 4 months", "age 4 months"
-    (re.compile(r"\bage[d]?\s+(\d{1,3})\s+(" + _UNIT_ALT + r")\b",
+    (re.compile(r"\bage[d]?\s+" + _NUM + r"\s+(" + _UNIT_ALT + r")\b",
                 re.IGNORECASE), True),
     # "9yo", "9 y/o"
-    (re.compile(_COPULA + r"\b(\d{1,3})\s*(yo|y/o)\b", re.IGNORECASE), True),
+    (re.compile(_COPULA + _NUM + r"\s*(yo|y/o)\b", re.IGNORECASE), True),
     # "4mo" — the compact form an extractor emits ("Leonidas, 4mo")
-    (re.compile(_COPULA + r"\b(\d{1,3})\s*(mo|mos)\b(?!\w)", re.IGNORECASE), True),
+    (re.compile(_COPULA + _NUM + r"\s*(mo|mos)\b(?!\w)", re.IGNORECASE), True),
     # "age 9" / "aged 9" — a bare number after an age cue means YEARS
-    (re.compile(r"\bage[d]?\s+(\d{1,3})\b(?!\s*[-\s]?\s*(?:year|month|week|day))",
+    (re.compile(r"\bage[d]?\s+" + _NUM + r"\b(?!\s*[-\s]?\s*(?:year|month|week|day))",
                 re.IGNORECASE), False),
 ]
 
@@ -263,7 +487,7 @@ _AGE_PATTERNS = [
 # The lookahead keeps this idempotent — an annotated compound is not
 # re-annotated on a second pass.
 _ATTRIB_AGE_RE = re.compile(
-    r"\b(\d{1,3})-(" + _UNIT_ALT + r")-old\b(?!\s*\(?\s*born\b)",
+    r"(?<![\d.,/-])\b(\d{1,3})-(" + _UNIT_ALT + r")-old\b(?!\s*\(?\s*born\b)",
     re.IGNORECASE)
 
 # Verbatim spans — a quoted string is a RECORD (a search query the agent
@@ -300,14 +524,21 @@ def _protected_spans(text: str) -> list:
     return spans
 
 
-def _sub_unprotected(pattern: "re.Pattern", text: str, repl) -> str:
+def _sub_unprotected(pattern: "re.Pattern", text: str, repl,
+                     protect_compounds: bool = True) -> str:
     """``pattern.sub(repl, text)`` that leaves protected spans alone.
 
     Spans are computed against the ORIGINAL text and matched by offset, so
     a substitution earlier in the string cannot shift a later match out of
-    (or into) a protected region mid-pass.
+    (or into) a protected region mid-pass. §4FN: a COMPOUND age phrase
+    still present in the text (declined as implausible, or plural-subject)
+    is protected from the single-unit passes, or they would anchor its tail
+    ("999 years and 11 months old" → "… and born ~2025-09"); the compound
+    pass itself passes ``protect_compounds=False``.
     """
-    spans = _protected_spans(text)
+    spans = list(_protected_spans(text))
+    if protect_compounds:
+        spans += [(m.start(), m.end()) for m in _COMPOUND_AGE_RE.finditer(text)]
     if not spans:
         return pattern.sub(repl, text)
     out, last = [], 0
@@ -354,8 +585,35 @@ def anchor(text, said_at=None) -> str:
 
     out = _sub_unprotected(_ATTRIB_AGE_RE, text, _sub_attrib)
 
+    # Compounds next, as ONE phrase (§4FN): the single-unit patterns below
+    # would otherwise anchor the tail component alone.
+    def _sub_compound(m: "re.Match") -> str:
+        # "Thodoris and Leonidas are 9 years and 5 months old" is two ages,
+        # not one: a plural subject gets no anchor (review §4FN M-B / round
+        # 3 C1 — see the helpers). The look-back starts at the NUMBER so a
+        # copula inside the match counts.
+        pre = _line_before(m.string, m.start(1))
+        if (tense_marked(_line_of(m.string, m.start(1))) or plural_clause(pre)
+                or conjoined_subject(pre, trail_words=3) or plural_line(pre)):
+            return m.group(0)
+        parts = compound_age_parts(m)
+        if parts is None:
+            return m.group(0)
+        # a compound is known to at least the month: the full date form
+        return _fmt_anchor(_birth_from_parts(when, *parts), "month")
+
+    out = _sub_unprotected(_COMPOUND_AGE_RE, out, _sub_compound,
+                           protect_compounds=False)
+
     for pattern, has_unit in _AGE_PATTERNS:
         def _sub(m: "re.Match", _hu=has_unit) -> str:
+            # "Thodoris and Leonidas are 9 and 5 months old": the tail age
+            # of a LIST of people is nobody's birth date (round 3 C1); a
+            # past or future age is not a birth date either (round 4 C1)
+            pre = _line_before(m.string, m.start(1))
+            if (tense_marked(_line_of(m.string, m.start(1)))
+                    or conjoined_subject(pre, trail_words=3)):
+                return m.group(0)
             anc = _anchor_for(m, _hu)
             return m.group(0) if anc is None else anc
         out = _sub_unprotected(pattern, out, _sub)

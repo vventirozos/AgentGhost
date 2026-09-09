@@ -443,6 +443,78 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 
 ## 4. WHAT REMAINS TO DO
 
+### ▶ START HERE — TODO for 2026-09-09 (written 2026-09-08 21:30, operator: "we'll do them tomorrow")
+The 2026-09-08 ranked list ("what else can we do…") had five items; 1–3 are DONE (§4FM prefix
+cache, §4FL/§4FJ executor routing + no-think disarm, §4FN the judge). Order fixed by the operator:
+**item 4 first, then item 5.** Both under the full §R protocol (read-only reviewers in their own
+`/tmp` dir, whole-file battery with controls on a COPIED tree, suite green twice, deploy, live
+check, journal).
+
+1. ✅ **DONE 2026-09-09 (§4FP) — audited from the AST; 4 fail-closed stores found, 2 could only be
+   disarmed by a restart, both repaired behind one shared policy (`memory/failclosed.py`) plus an AST
+   guard over the class; the project duplicate-create counter also went from lifetime to burst.
+   Battery 18/18, suite 20,627 ×2, live-verified on the real store.**
+   **Item 4 — audit every "arm after N failures" guard for a DISARM path.** The sticky no-think
+   policy (§4EI → fixed §4FJ) was the SECOND instance of a counter that arms and never disarms
+   ([[preflight-guard-lifecycle]] in memory). Method: enumerate from the AST, not from a name
+   list — every module-level or instance counter compared against a threshold (`>= N`,
+   `_after`, `failures`, `strikes`, `_armed`, `_tripped`, `consecutive`), then for each: what
+   resets it, is the reset reachable on the live path, is it pinned (a pin that fails when the
+   reset is deleted). Fix the ones without a reset or with a reset only a restart reaches; pin the
+   probe/disarm shape §4FJ used (`_probe_due` / `_arm_probe`). Battery + suite + deploy.
+2. ✅ **DONE 2026-09-09 (§4FQ) — censused 2,590 calls over 25 h: almost no fat. keepalive is 80% of
+   the count and 2 chars a call (kept); the one real find was `adjudicate_dimension` asking the SAME
+   six records 29 times each (147 of 151 answers were "unknown", remembered nowhere) — now memoised,
+   151 → 6. Post-mortem / narrative / self-play calls labelled so the next census can attribute them.
+   Battery 10/10, suite 20,636 ×2, deployed 10:52, memo live.**
+   **Item 5 — idle-loop diet.** From the recordings window (`GHOST_LLM_RECORD=1` since
+   2026-09-08 10:29, `Data/system/llm_recordings/*.jsonl`): count background LLM calls per KIND per
+   hour (label/route/origin fields), list each kind's CONSUMER (grep the reader), and cut the kinds
+   with no consumer or no measured value (e.g. digests nobody reads, re-derivations already
+   cached). Measure tokens/hour and main-slot busy time before/after; the §4FM `/metrics` busy
+   gate is the instrument. ⚠ Take the count BEFORE closing the recording window (item 3 below).
+3. ☐ **Operator: close the recording window** — `GHOST_LLM_RECORD=0` in
+   `bin/start-ghost-agent.sh` + delete `system/llm_recordings/*.jsonl` — after the daily gate
+   promotes a tool-choice fixture pool (§4FL; miner needs ~200 real positives) AND after item 5's
+   count is taken.
+4. ✅ **DONE 2026-09-09 (§4FO) — Request e0f4a8bd, all five fixes shipped, deployed 08:33 and
+   live-verified (the same question now answers in 73 s; battery 82/82; suite 20,611 ×2).**
+   Original entry kept below for the diagnosis.
+   **Request e0f4a8bd (21:51, "how many chapters does the postgresql 19 manual have") — five
+   fixes, from the post-mortem the operator asked for the same evening.** The question is
+   STRUCTURAL and the `knowledge_base` tool only does semantic search: `query` returned eight
+   passages at relevance 0.08 (headline options, EXPLAIN output) and its footer said "query again
+   with different wording" — an infinite instruction for a structure question; the model obeyed it
+   10+ times (+10 KB of context each; turns went 6 s → 30 s). Before that it spent six turns
+   writing probe.py / pip pypdf / `find /` for a PDF that is not in the sandbox (the tool
+   description forbids PDF scripts but never says the file lives host-side); foresight showed
+   7→9 precedent failures, unheeded. Guards that did not fire: risk governor 0.52 WOULD have
+   steered — CONTROL arm; planner — control arm; strike counter stuck at 1/6 because
+   `python3 probe.py 2>&1 | head -200` returns head's exit 0 (`bash -c` without `pipefail`, a
+   Traceback logged as "execution ok") and a pivot success decrements by 2; the no-progress loop
+   breaker keys on the same result fingerprint and every reworded query got different passages;
+   the 40-turn budget was the only backstop. Fixes, in order:
+   a. ✅ persist the PDF outline at ingest (`pdf_ingest.build_page_breadcrumbs` already has it
+      from `doc.get_toc()`) and add `knowledge_base(action='outline')` (parts → chapters →
+      sections, with counts); make `list_docs` return pages / chapters / sections / chunks (it
+      returns only the filename today — the "3083 pages, 1936 sections" the model quoted came from
+      memory hydration, not the tool);
+   b. ✅ an honest `query` footer: when every passage is below a relevance floor, say "no passage
+      answers this; a structure question → use `outline`", never "query again";
+   c. ✅ tool description: ingested files live OUTSIDE the sandbox — never `find` / parse them;
+   d. ✅ `set -o pipefail` (or classify a Traceback in stdout as failure) in the sandbox
+      `bash -c` wrapper (`tools/execute.py:983`), so a piped failure counts a strike — pin it;
+   e. ✅ a second loop-breaker signature: the same tool against the same document N times with
+      all-low relevance, regardless of wording (`strikes.note_action` today fingerprints the
+      result). d and e belong to item 1's class (a guard with a blind spot); do them in that pass.
+5. ☐ **Judge precision readout (no work until traffic accrues, ~2–3 weeks):**
+   `scripts/verdict_override_report.py` now shows rows per tag (`memory-claim`, `reply-shape`,
+   `visual`, chains) and `Data/system/judge/withheld_verdicts.jsonl` holds verdicts the human lock
+   withheld — read both, per tag, against the human labels (§4FN).
+6. Standing decisions, do NOT reopen without new data: tool-head diet stays OFF (§4FK
+   inconclusive at the request unit); llama-server version/flags unchanged (§4FM: eviction, not
+   restore, was the fault); no re-survey of proposals.
+
 ### ▶ FRESH-EYE REVIEW QUEUE (opened 2026-08-17, operator-requested)
 Ranked by the lens that made §4BR and §4BS pay off: **instruments and seams that changed
 recently, whose failure mode is SILENT**. Two just converged (§4BR verify_depth, §4BS
@@ -36620,3 +36692,532 @@ stayed resident through the idle churn), the recordings day-file did not grow by
 main-prefix record (8 before, 8 after), no tracebacks. Suite on the final tree: 20,296 / 65 / 0
 three times (two background runs were killed by the machine's memory watchdog, not by failures;
 the foreground runs completed).
+
+## §4FN — The judge, fixed where the human labels said it was wrong (2026-09-08 13:10–21:20)
+
+**Trigger:** "do 3 first, then 4 and 5 last. always .... ALWAYS verify your changes properly.."
+(item 3 of the 2026-09-08 ranked list = fix the judge; [[ppi-judge-too-weak]]: λ ≈ 0–0.4, the
+machine verdict barely predicts the human label).
+
+**Measurement first (what "the judge is weak" actually was).** 121 human-labelled turns (2026-08-13 →
+09-08). The verifier had a verdict on 37 (24 agree, 13 disagree) and NONE on 84: 47 were zero-tool
+turns the evidence verifier skips by design, and 37 were tool turns where the human label landed
+before the late verdict (median 0.9 min vs 0.4 min) and the human-authority lock withheld the verdict
+from everything — including measurement. Of the 13 disagreements: 3 of the 6 false REFUTEs were one
+parser bug (a compound age "5 months and 23 days old" read as its tail "23 days old" — the writer had
+anchored a nine-year-old to a birth date ten days ago the same way); 6 of the 7 false PASSes were
+replies that were not answers (the finalize fallback's raw tool dump, narration, an idle digest). A
+narration check was measured on the labelled corpus and REJECTED (4 human-approved replies refuted
+per 1 rejected); the raw-dump shape was clean (0 of 103 approved replies match). Offline replay of
+the fixes over the same 121 turns: agree/disagree/none 24/13/84 → 25/9/87.
+
+**Shipped.**
+1. Compound ages are ONE claim, from ONE regex shared by the profile writer and the checker
+   (`temporal._COMPOUND_AGE_RE`; `compound_age_parts` exact — years/months → months, weeks/days →
+   days; `_birth_from_parts` subtracts the days first). Claims compare in months (a largest-unit
+   tolerance admitted a three-year band for "1 year and 2 months"); `_true_months` is exact to the day.
+2. A reply that is raw tool output is refuted by SHAPE before any evidence question
+   (`core/reply_shape_check.refute_raw_tool_dump`): the finalize fallback's three heads live in
+   `FALLBACK_HEADS` and the finalize site imports them (one home), the tools' own framings are matched,
+   a request that asked for the raw output is exempt, the issue text is on the follow-up-task
+   denylist. On tool turns it is an OVERRIDE ahead of WEB-EXEC / FILE-ARTIFACT, not an early return,
+   so a standing grounded refute keeps its issues first and the sidecar records the provenance.
+3. A verdict the human-authority lock withholds is RECORDED for measurement only
+   (`system/judge/withheld_verdicts.jsonl`, written by `_record_withheld_verdict` at all three
+   withhold sites; read only by `machine_and_human_outcomes`, and only into the machine slot of a
+   trajectory the corrections file already knows with a human label and no shipped verdict —
+   retractions stay retracted, unknown ids mint nothing). The doctrine is untouched: the human label
+   still outranks the machine verdict for outcome and consequences.
+4. Override provenance is a CHAIN stamped by one helper (`GhostAgent._chain_override`) at all five
+   arms — reply-shape, VISUAL (which stamped nothing: a visual refute was reported as "(text judge)"),
+   WEB-EXEC, FILE-ARTIFACT merge and replace — and `scripts/verdict_override_report.py` counts a
+   chained row under each of its tags.
+5. The subject binding of the arithmetic check (§4EQ) was REWRITTEN in the third review round — see
+   below; it is the part of this section worth reading twice.
+
+**Three review rounds, each one's criticals inside the previous round's fix (R8).**
+- Round 1: the tie rule was the whole binding (C1); the compound tolerance in its largest unit (M1);
+  the writer had the same tail bug (M2); an early return bypassed the sidecar and the ground-truth
+  arms (M3); the shape issue could be filed as project work (M4); the "dump" IS the agent's own
+  finalize fallback (M5); the withheld overlay resurrected retractions (M6); two more withhold sites
+  (M7); a vacuous narration pin, a missing control leg, a missing `llm_client` guard.
+- Round 2: the "nearest edge" rule was asymmetric by the name's own length — six correct phrasings
+  refuted (C1-R2); a declined compound fell through to its tail (M-A); a plural compound glued two
+  ages into one (M-B); the withheld file polluted two report scripts' globs (M-C); the day
+  remainder was applied after the months (off by one).
+- Round 3: the plural guard named ONE surface of the scenario (`are` glued to the number) and
+  "Thodoris and Leonidas: 9 years and 5 months old" walked around it — the writer stored one date for
+  two children and the reader then refuted the correct answer about the second child forever (C1); a
+  name in possessive / attributive position captured any nearby age — "Thodoris's laptop is 3 years
+  old" REFUTED (C2); the punctuation-only cue lost "Thodoris — now 9 years old" to the other child
+  (M1); the tie rule, the cue and the 60-char window were three redundant guards, any of which could
+  be deleted with the suite green (M2); the window was unpinned across a 10× range (M3); the
+  "smallest unit" granularity expression could never yield a year (m1); `were` and the copula anchoring
+  unpinned (m2); 30.4375 unpinned (m3); `[A-Z]` is ASCII — a Greek-spelled name was never a subject
+  (m4); the override consumers (m5); quadratic backtracking on a whitespace run (m6); the OSError exit
+  of `machine_and_human_outcomes` skipped the overlay (m7).
+
+**The round-3 fix inverted the rule instead of tuning it** ([[binding-rule-moved-the-defect]]). A
+distance was a proxy for a grammatical relation, and each round tuned the proxy to its own fixtures.
+Now the subject is the name the phrase is PREDICATED of: the closest anchored name before the phrase
+on its line, accepted only when everything between them is a LINK — copula, age cue, hedge, date (the
+agent's arithmetic shape "born March 12, 2026 → today (Sep 4, 2026) is about 6 months old" and a table
+row "| Leonidas | 2026-03-12 | 5 months old |"), punctuation — and nothing else, and the name does not
+close a LIST (`temporal.conjoined_subject`, Unicode, "Θοδωρής και Λεωνίδας" included). One backward
+form: a bracketed name right after the phrase. Everything else abstains. No window, no tie, no cue —
+nothing left to calibrate. The writer applies the same list rule to every predicative pass and a
+plural-copula rule (within two words) to compounds; a single-unit "my twins are 4 months old" keeps
+§4EL's one date. The reader skips a date already glued onto a list in stored data. Every link token
+is pinned in BOTH directions (the correct reply silent, its wrong mirror refuted), or "abstain always"
+would pass.
+
+**Defects in my own fixes, this round (R8).** The first link draft failed the existing table-row
+control (the date between name and age was not a link) and the dates were admitted after the
+failure, not before; the visual-provenance pin expected "reply-shape+visual" — the site runs VISUAL
+first, so the chain is "visual+reply-shape" (the pin now states the site's order); the previous-override
+capture at the VISUAL arm was dead code (nothing stamps before it) and its mutant was equivalent —
+removed rather than pinned; I measured the quadratic regexes on ONE input class (a whitespace run
+AFTER "old"), found the gloss stripper (42 ms × 10 passes; fixed with a `(?<!\s)` look-behind) and
+the "9-year old" pattern (7.5 s at 16,000 spaces), declared the compound tail harmless and wrote that
+into a comment and the round-3 timing pin — round 4 showed that with the run NOT followed by "old" the
+compound tail costs 11.8 s and the "9 years old" pattern 0.6 s, i.e. my measurement was right for its
+input and wrong as a conclusion, and the pin could not tell the idioms apart ([[verify-cannot-distinguish]]);
+one new pin ("were, at the time," — three words) was wrong for the two-word plural window; the round-3
+reviewer overwrote the session's JSON-spec mutation harness in the shared scratchpad
+([[reviewer-mutation-race]]) and it was rewritten from its contract. Unpinnable and documented: the
+collector's single-exit change (an OSError cannot be raised mid-iteration in a test).
+
+**Battery** (`battery_4fn.json`, whole-file mutants on a COPIED tree, five test files, controls every
+run): rounds 1–2 ended at 38/40 with five stale anchors and two survivors (the asymmetric binding and
+the WEB-EXEC provenance); after round 3, 66/66 killed, noop SURVIVED / known-bad KILLED, none
+not-applied. Two equivalent mutants dropped (above), 27 round-3 mutants added (link accepts any word,
+link punctuation-only, link loses cues, link loses dates, nearest-by-distance again, list-closing name
+bound, annotation dropped / unclosed / tried first, binding crosses lines, ASCII-only names, lowercase
+"name", glued list read, plural guards dropped / one-only ×2, `were`, plural window ×10, single-unit
+list guard dropped / punctuation-only, month-only anchor, days via the month fraction, a six-day week,
+quadratic idiom restored, gloss look-behind dropped, visual not stamped, WEB-EXEC drops the chain,
+report chain as own bucket / first tag only).
+
+**Suite:** round-3 tree 20,397 / 65 / 0 twice; final (round-4) tree: run 1 20,504 passed with one
+stale source pin (`test_verify_depth_routing` grepped the turn-facts call that moved into the
+recorder — test-only update), run 2 **20,505 / 65 / 0**; all foreground `-n 4 --dist loadfile`, no
+`MagicMock` residue.
+
+**Round 4 (a fresh reviewer, briefed to GENERATE its own phrasings — 63 of them — and to replay every
+consumer).** Seven false-refute classes came out of the round-3 whitelist itself, each executed with
+the exact input: C1 tense — "was", "turned", "turns", "at", "in", "on" and bare digits were links, so
+"Thodoris was 4 years old when you moved in 2021" and "Leonidas turns 7 months old on October 12" were
+compared with today, and the WRITER had stored "born ~2021-03" for a child born in 2016; C2 "of" — the
+age of "the father of Thodoris" was Thodoris's, in a reply and in a stored value, and with two stored
+dates for one name the verdict depended on dict order; C3 a bare possessive — "Thodoris's 5 month old
+brother" bound to Thodoris; C4 "was born … is" chains ("the hospital Leonidas was born in is 30 years
+old"); C5 the forward candidate outranking the phrase's own bracket ("9 years old (Thodoris), 5 months
+old (Leonidas)" — the pinned form survived only because "and" sat in the gap); C6 decimals read from
+their fraction ("9.5 years old" as FIVE; "5.8 months" — the checker's own rendering, quoted back 12
+times in the live corpus — as eight); C7 week/day claims compared on the calendar-month scale ("26
+weeks" for 25 weeks 1 day refuted). M1: the tool-free exits of `_compute_verifier_verdict` returned
+BEFORE the recording block, so the arithmetic route — the one the override report exists to measure —
+and the tool-free reply-shape refute never reached the sidecar and carried no override. M2: "Yes,
+Thodoris", "Today, Leonidas" were read as lists (capitalised word + comma) and muted both the checker
+and the writer. M3: the writer's 80-character look-back let a list 90 characters back glue two children
+to one date. M4: a markdown link "[Thodoris](url)" was an annotation; "| Thodoris | 2 | 3 years old |"
+bound a count of bikes. M5: "1 year old" admitted a newborn (N−1 = 0). Lens 3: 53 of 110 mutants
+survived on the round-3 tree — 31 link words and 7 class characters had no pin in either direction —
+and the round-3 timing pin put its whitespace AFTER "old", where no idiom backtracks: on the reviewer's
+inputs (a run NOT followed by "old") the compound tail I had called harmless costs 11.8 s at 16,000
+spaces. My round-3 measurement was right for its input and wrong as a conclusion.
+
+**Round-4 fixes.** The link list is now `is`, `'s age`, `age`, `aged`, `now`, `currently`, `today`,
+`just`, `already`, `still`, `only`, the hedges, `who`, `born`, `b`, and DATE SHAPES (ISO, slash, "Month
+D, YYYY", "D Month YYYY", a bare year) — never bare digits, tense words, "of", or a bare possessive; a
+tense marker anywhere on the LINE (`temporal.tense_marked`: was/were/turned/turns/will/next/last/ago/
+when/by/until/"at N"/"in [Month] YYYY"…) makes the checker skip the claim and the writer leave the phrase;
+"of Name" and "Name's" are never subjects for the checker or the reader; a bracketed name is an annotation
+of the phrase before it and never the forward subject of the next, and a markdown link is not an
+annotation; the shared number token refuses a decimal's fraction, a range's tail and a vulgar fraction,
+captures a decimal whole (the writer leaves it, the checker compares it); week/day claims compare in
+days with five-percent slack for a large count; the lower bound is never below half the count; one name
+with two stored dates decides nothing; a comma joins two names only for a caller that knows its names
+(the checker) or is the last defence (the reader), never for the writer; the plural guard reads the whole
+line and, for compounds, a list followed by a plural copula anywhere on it; the tool-free exits call the
+same recorder as the choke point (`_record_verdict_instruments`, stamped `memory-claim` /
+`reply-shape`). Every link word, separator, date shape and month name is pinned in BOTH directions, and
+the catalogue is asserted to cover the list (a word added without a pin fails the suite). The timing pin
+uses the reviewer's inputs. Coverage deliberately given up: "at N years old", "the age of X", "turned 9
+today", a compound after "X and Y are happy; their grandma …".
+
+**Round-4 battery.** The reviewer's own pass on the round-3 tree: 110 whole-file mutants, 53 SURVIVED
+(the 31 link words and 7 class characters above, `_ANNOT_OPEN_RE.fullmatch`, IGNORECASE, the `\b`
+boundaries, the writer's trail cap, `_LOOKBACK`, the newline confinement, the idioms). My battery after
+the round-4 fixes (`battery_4fn.json`, 109 mutants, five test files, controls every run): 105/110 on
+the first pass with five survivors — a `were` in the plural regexes that the tense rule had made
+redundant (removed: one mechanism), two writer pins written on sentences that carried a SECOND marker
+("will … next month", "in 2036" behind the link rule) and re-pinned on the marker alone, a plural-line
+rule whose copula requirement had no pin ("… love their grandma, who is 70 years and 2 months old"
+anchors), and the hyphen-unit idiom, which none of the three timing inputs reached — a count followed
+by a whitespace run and no unit ("Leonidas is 9" + 16,000 spaces + "x": 15 s against 21 ms) does. All
+five plus their neighbours re-run on fresh copies: 17/17 killed, controls correct; final full run on the
+finished tree: **109/109 killed, noop SURVIVED / known-bad KILLED, none not-applied**. Equivalent/accepted, documented: `o[1] <= start` vs `<` (a name
+ends in a word character), `o[0] >= end` vs `>`, the reader keeping the last token of a multi-word name
+(pre-§4FN), a Greek name in CAPITALS losing its tonos under IGNORECASE (a miss, not a refute), the
+collector's single exit.
+
+**Deploy + live (21:13 → 21:14, listener 18269 → 28817).** Kill → launchd respawn → `/api/health`
+200 after 12 s; no Traceback/ERROR in the boot log, the err file's delta is the usual torch note; the
+main-prefix warm-up ran. Probe (`X-Ghost-Origin: probe`, tool-free, "how old are Thodoris and
+Leonidas today?"): reply "Thodoris is 9 years old (born Nov 25, 2016), and Leonidas is about 6 months
+old (born March 12, 2026)" in 12.2 s — both ages bound through the new link rule ("is", "is about")
+and found consistent, so the arithmetic route said nothing ("no verdict — turn ran NO tools"), as
+designed; no traceback. `scripts/verdict_override_report.py` runs on the live sidecars (207 shipped
+verdicts, 141 labelled, all "(text judge)" so far — the tagged rows start accruing from this deploy).
+`system/judge/` is empty until the next human label outruns a verdict. What the next weeks answer:
+how often `memory-claim` / `reply-shape` / `visual` refutes agree with the human label, per tag.
+
+**Remaining from the 09-08 list:** item 4 (audit every arm-on-N-failures counter for a disarm path)
+and item 5 (idle-loop diet from the open recording window).
+
+## §4FO — "How many chapters?": five fixes from one failed request (2026-09-09 06:40–09:00)
+
+**Trigger:** the operator read request `e0f4a8bd` and asked what went wrong; then "continue with all 5 tasks,
+do one by one and always verify your changes." The five were the post-mortem's own list (journal §4 TODO
+item 4, written the night before).
+
+**The request.** "how many chapters does postgresql 19 manual in your knowledgebase has ?" ran **1,050
+seconds across 40 turns** and never answered. It is a question about a document's SHAPE, and the only
+retrieval on offer was semantic: `query` returned eight passages at "relevance 0.08" — text-search headline
+options, `EXPLAIN` output — under a footer that said *"if they do not contain the answer, say so and query
+again with different wording."* No wording retrieves a count, so the instruction had no exit; the model
+obeyed it ten times, each call adding ~10 KB of unrelated passages to a context that reached 170 K chars
+(turns slowed 6 s → 30 s). In between it spent six turns writing `probe.py`, `pip install pypdf` and running
+`find /` five times for a PDF that is not in the sandbox and never was. Nothing stopped it: the risk governor
+scored 0.52 and **drew the control arm**; two of the failures ran as `python3 probe.py 2>&1 | head -200`,
+which reported **exit 0** because `head` succeeded, so the strike counter never left 1/6; and the no-progress
+breaker keys on the result FINGERPRINT, so ten different irrelevant answers were ten counts of one.
+
+### (a) The structure was computed, used, and thrown away
+
+`pdf_ingest` reads the PDF's entire table of contents to build its section breadcrumbs — and dropped it.
+`IngestStats.outline` now keeps it (one normaliser, `normalise_toc`, for the breadcrumbs and the record —
+two private parsers of the same table is the §4FN compound-age defect), `tool_gain_knowledge` writes it to
+`memory_dir/document_outlines.json` (its own sidecar; the library index is a bare list of names with a dozen
+readers), and `knowledge_base(action='outline')` renders it. A document ingested BEFORE this change is
+rebuilt once from the breadcrumbs its own chunks carry — read in pages of 400 so peak memory is one page, not
+one 7.6 M-char manual — and cached. `delete_document_by_name` drops the record with the document.
+`list_docs` now reports pages / chunks / per-level counts instead of a bare filename.
+
+**Two defects the unit tests could not have found, both from running it against a copy of the live
+8,279-chunk manual:**
+1. Reading rows by `source` alone swept in the single `document_summary` row the ingest writes under the same
+   source, so *"Reference document: 3083 pages, 1936 sections…"* appeared in the outline **as a top-level
+   heading** — a fabricated division in the one output whose whole job is exactness. Scoped to
+   `type="document"`.
+2. **The per-level count is not the chapter count.** Level 2 holds 91 entries: 70 chapters, 15 appendices and
+   6 front-matter headings. My first renderer announced the level total as the answer, so it would have said
+   **91** where the truth is **70**. It now counts the divisions the document names itself — a SHAPE (a word,
+   an enumerator, a closing mark), not a word list, so "Annex 4:" counts and "See Also" does not. The first
+   enumerator rule admitted digits and roman numerals only and reported **5** of the manual's 15 lettered
+   appendices while calling the number exact. Final output verified against ground truth recomputed
+   independently from the raw breadcrumbs: **8 parts, 70 chapters, 15 appendices.**
+
+### (b) The number the model was shown was inverted
+
+The "relevance" in each passage header was the **BM25-adjusted rank key**, where lower is better and the
+value can be negative. Measured on the live manual:
+
+| query | rank key | raw distance |
+|---|---|---|
+| "Table of Contents: list every Part and Chapter" | 0.055 | 0.347 |
+| "pg_stat_activity columns" | 0.113 | 0.222 |
+
+The hopeless structural query looked **twice as relevant** as the good one — keyword overlap is exactly what
+a structural question has plenty of. `search_document` now returns the raw distance beside the rank key, and
+the footer branches on it: answerable queries sit at 0.22–0.27, structural at 0.35–0.38, off-topic at
+0.41–0.48, so above `GHOST_KB_DIST_WEAK` (0.34) it says plainly that re-wording will not help and names
+`action='outline'`. Below it, the invitation to iterate survives but is **bounded** ("one more query, and if
+it is no closer, stop"). Passages are returned either way — only the advice changes, so a mis-set band costs
+a sentence, not an answer.
+
+### (c) A prohibition the model could not explain
+
+The description said "do NOT write Python scripts to read PDFs" and never said why, so the model treated the
+file as merely missing and hunted it for six turns. It now says an ingested document is not a file you can
+open, that the original lives outside the sandbox and is often deleted, and which actions ARE the access
+route. Those sentences and the structural-routing sentence are in `TOOL_DESC_PINNED`, so the description
+optimiser cannot shed the reason with the rule.
+
+### (d) A pipeline's failure is the pipeline's failure
+
+The sandbox shell runs `bash -c 'set -o pipefail; …'` through one wrapper used by the primary run and the
+project-path remap retry. **The exemption is where the work was.** Naive pipefail breaks the far commoner
+`<producer> | head -N`; on this host standard tools report 141 and Python 120, so a code-only exemption
+looked sufficient and passed all 31 tests. Run in the REAL sandbox — Debian, bash 5.2, CPython 3.11 — the
+same pipeline exits **1**: Python raises `BrokenPipeError` as an ordinary uncaught exception, indistinguishable
+by code from a script that genuinely failed. A code-only exemption would have turned every truncated
+`… | head` in production into a strike. The second signal is therefore the runtime NAMING the broken pipe in
+output that is captured anyway; all nine cases were then re-run inside the live container, 0 mismatches.
+
+### (e) Ten ways of finding nothing is ten times no progress
+
+The breaker keyed on `tool | target | result-fingerprint`, so ten re-worded searches were ten signatures with
+a count of one. The fix does not GUESS futility from the passages (the lexical-proxy trap): the tool already
+computes it in (b) and prints it, so `strikes.result_says_nothing_found` reads that one shared constant
+(`tools.memory.KB_NO_ANSWER_MARKER`, the §4FN `FALLBACK_HEADS` shape) and `strikes.breaker_fingerprint`
+collapses every fruitless result onto `NO_ANSWER_FP`. The second hopeless search now trips at the usual
+threshold however differently it was worded, while a productive search iterates freely. The steer had to
+change too: the default remedy is a forced text-only turn, which drops the toolset — and the remedy here is
+another call to the same tool. `knowledge_base` was already on the read/write exemption list, so tools
+survive, and the message names the route.
+
+### Defects in my own fixes (R8)
+
+1. The outline leaked the document-summary row — found only by running it on the real store.
+2. The first renderer would have answered **91 chapters** instead of 70.
+3. The label rule reported **5** of 15 lettered appendices and called it exact.
+4. `strikes.breaker_fingerprint(…)` at a site where `strikes` is the **StrikeLedger instance**, not the
+   module: it parses, it greps green, and it raised `AttributeError` through the entire dispatch path. My
+   source-text pin saw nothing; the executed dispatch pins failed **75 tests** and caught it. A source pin
+   cannot see a NameError.
+5. The pipefail exemption was calibrated on this host's exit codes and would have regressed production (see
+   (d)). Two environments, two answers, and only one of them is the one that runs.
+6. I added `"knowledge_base"` to `READWRITE_LOOP_TOOLS` — it was **already there**. A duplicate in a frozenset
+   is invisible, and it made the "removed the exemption" mutant equivalent. Removed; the new reason is a
+   comment on the existing entry, and a pin asserts the entry appears once.
+7. Two pins in (c) survived mutation because they asserted words that occur elsewhere in the description
+   ("query", "outline") and a pin count rather than pin CONTENT.
+8. Growing the knowledge_base description (1,170 → 1,783 chars, ~613 more on every request's tool block)
+   broke two unrelated `§4DA` fixtures: one truncated that description below its now-pinned sentences, the
+   other padded it past the validator's `max(6000, 3×baseline)` cap. Both fixtures now derive their tool
+   choice and padding from the live pin map and cap instead of hard-coding, so the next description change
+   does not break them.
+
+### Verification
+
+| | mutants | outcome |
+|---|---|---|
+| (a) outline | 29 | 29 killed |
+| (b) footer | 17 | 17 killed |
+| (c) description | 7 | 7 killed |
+| (d) pipefail | 18 | 18 killed |
+| (e) loop breaker | 11 | 11 killed |
+
+Controls correct on every run (noop SURVIVED, known-bad KILLED, none not-applied). Suite **20,611 passed /
+65 skipped / 0 failed**, twice, foreground `-n 4 --dist loadfile`, no `MagicMock` residue. New pins:
+`tests/test_kb_document_outline.py` (34), `tests/test_kb_query_footer.py` (16),
+`tests/test_execute_pipefail.py` (42), `tests/test_loopbreaker_fruitless_probe.py` (12).
+
+**Live (deployed 08:33, listener 88766; health 200 in 12 s, no tracebacks).** The operator had asked the
+agent to forget the PostgreSQL manual overnight, so the end-to-end check used a fresh 6-page handbook with a
+known structure (2 parts, 4 chapters, 1 appendix):
+
+* *"Ingest widget_handbook_probe.pdf, then tell me how many chapters it has"* → **73 seconds, three tool
+  calls** (ingest → **outline** → answer): *"The handbook has **4 chapters** (plus 2 parts and an
+  appendix)."* Correct, and the model chose `outline` on its own. The stored record shows `source: "toc"`
+  with all 9 entries and their page numbers.
+* *"what does it say about the offside rule in football?"* → **one** query, then *"Nothing — …its passages on
+  'offside' all fall in the unrelated band"*. No loop.
+* `python3 -c "import nosuchmodule_xyz" 2>&1 | head -20` → **execution fail · Strike 1/6** (yesterday: "✅
+  execution ok · exit 0" beside its own traceback).
+* `python3 -c "for i in range(200000): print(i)" | head -3` → **exit 0**, no strike.
+* `forget` → library empty AND the outline record dropped with it.
+
+The same question that ran 17.5 minutes and never answered now answers in 73 seconds.
+
+## §4FP — Item 4: every "arm after N failures" guard, audited for a way back (2026-09-09 09:05–10:20)
+
+**Trigger:** "proceed with 4 first, then 5, verify your changes!" — item 4 of the 2026-09-08 list. The
+sticky no-think policy (§4EI → fixed §4FJ) was the second instance of a counter that arms and never
+disarms; §4FO found a third shape the same morning. This is the sweep.
+
+**Method.** Enumerated from the AST, not from a name list (`scratchpad/scan_guards.py`,
+`scan_sticky.py`): every module global and `self.X` that is incremented or set truthy AND read in a
+condition, with every site that resets it. 31 candidates on the first pass, 38 on the sharper one that
+keeps only state OUTLIVING the turn it was armed in — a local counter is reset by the next call, by
+definition. Most were false positives the name filter dragged in (compiled regexes, `failure_threshold`
+config, feature flags).
+
+**The guards that are already right, named because that is the point of a sweep.**
+`NodeCircuitBreaker` (closed → open → cooldown → half-open, a success closes it; and it documents its
+own known limitation — half-open is not single-flight — with the reason it was left rather than hiding
+it); the darkweb per-engine breaker (same shape, with a "recovered — breaker cleared" line); the sandbox
+provisioning backoff (set pessimistically BEFORE the installs, lifted on success); the self-play cooldown
+(recomputed each cycle); `consecutive_parse_errors`, `execution_failure_count`, `preflight_blocks_this_request`
+(all reset per request or on success).
+
+### The finding: four fail-closed stores, two of which could not be disarmed
+
+Four memory stores refuse to write after a read of their own file raises `OSError` — the file is
+PRESENT but unreadable (EIO, EACCES, `ENFILE`/`EMFILE`) — because overwriting it with whatever is in
+memory would destroy it. That guard is right and was measured: without it `adaptive_threshold`'s very
+next `record()` atomically overwrote the whole learned window.
+
+| store | arms on | clears |
+|---|---|---|
+| `contradiction_log` | unreadable read | any successful read — it re-reads on every operation ✅ |
+| `profile` | unreadable read | any successful `load_raw()` ✅ |
+| `adaptive_threshold` | unreadable read | **`__init__` only** ❌ |
+| `competence` | unreadable read | **`__init__` only** ❌ |
+
+The two broken ones read only at construction, so their flag was cleared only by a RESTART: one
+transient file-descriptor exhaustion stopped that store learning for the life of the process — days,
+here — announced by a single log line. Their own comments cite the two working ones as sharing "the same
+discipline"; two of the four had quietly drifted out of it. That is the sibling-one-revision-behind
+shape, and it is why this sweep was worth running.
+
+**The fix.** One home, `memory/failclosed.py`: retry the read that armed it, rate-limited to
+`RETRY_EVERY_S` (30 s) with the clock starting EXPIRED so a blip lasting one write costs one write;
+clear the flag only when a read actually SUCCEEDS (never because time passed, never because a hook
+raised); and merge whatever accumulated while blind onto the history it could not see, through a hook
+the store owns. `adaptive_threshold` appends the blind observations after the reloaded window —
+chronological order, the deque's own maxlen trims. `competence` adds `alpha-1` successes and `beta-1`
+failures onto each disk cell so the 1.0 Beta prior is counted once, and merges `samples` separately.
+A failed retry restores the in-memory state exactly and stays closed.
+
+**A second counter, repaired.** `manage_projects`'s duplicate-create loop counter was a LIFETIME total
+on the project record with nothing that ever cleared it, so a project that saw three duplicate creates
+once kept the alarmed "STOP. This is retry #N of a create call that was already refused. You are in a
+LOOP" instruction — and its operator WARNING — for every duplicate create it ever saw again, months
+later. It now measures a burst (`_DUPLICATE_CREATE_LOOP_WINDOW_SECONDS`, 10 minutes) and stamps the
+attempt it measures from.
+
+### Defects in my own fixes (R8)
+
+1. **The rate limit was dead on arrival.** A failed retry re-arms through `_fc_arm`, which reset the
+   retry clock to "expired" — so a sick disk was re-read on every single save. Measured by the pin that
+   exists for it: **21 reads for 20 records**. Fixed by resetting the clock only on a FRESH arming.
+2. A naive re-arm also logged a fresh ERROR every retry; one sick disk would have become a log flood.
+   The reload now runs under a flag that keeps the re-arm silent.
+3. Two of my own pins could not distinguish the mutant: `_Cell.n` falls back to the Beta mass, so
+   "samples not merged" still reported the right `n` for unit-weight records — the pin now records at
+   `weight=0.05`, where the mass floors to 0 and `samples` is the only witness. The other asserted a
+   timestamp was `> 0` when the test itself had written it; it now asserts the tool stamped a FRESH one.
+4. My first duplicate-create pin re-implemented the site's arithmetic instead of running it. Replaced
+   with the real `tool_manage_projects` path.
+
+### Verification
+
+Battery `battery_4fp.json`: **18 mutants, 18 killed**, controls correct (noop SURVIVED, known-bad
+KILLED, none not-applied). Pins: `tests/test_failclosed_recovery.py` (16), including an AST test that
+enumerates every fail-closed class in `memory/` and fails the suite for any that cannot clear its flag
+outside `__init__` — fixing this shape site-by-site is what let the four drift. Suite **20,627 passed /
+65 skipped / 0 failed**, twice. Docs: `docs/memory/failclosed.html` (new), plus the recovery section on
+both store pages.
+
+**Live (deployed 10:01, then 10:19; listener 63665).** A controlled experiment on the real store, with
+a backup taken first:
+
+* `chmod 000` on the live `adaptive_threshold.json` and a restart → the guard armed on the boot read
+  (`agent·failclosed  AdaptiveThreshold: … present but unreadable … REFUSING to overwrite`), and the
+  agent kept answering turns normally while degraded.
+* The file was **byte-identical** before and after the degraded window, and identical again to the
+  pre-test backup at the end. The experiment cost nothing.
+* ⚠ The recovery TRANSITION did not fire live, honestly: `_save()` runs only when a hydration
+  observation is recorded, and none occurred in that window. So it was closed against the real data
+  instead — the shipped code, in a separate process, over copies of the live
+  `adaptive_threshold.json` (100-entry window) and `competence_profile.json` (46 cells): both armed,
+  left the file untouched, recovered on the retry, and merged exactly. `fs|file_system` went
+  2663 → 2667 alpha and n 2779 → 2783 for four blind successes, beta unchanged; the threshold's window
+  kept its history with the four blind observations appended.
+
+## §4FQ — Item 5: the idle-loop diet, and the one loop that was repeating itself (2026-09-09 10:25–12:10)
+
+**Trigger:** item 5 of the 2026-09-08 list — count background LLM calls per kind per hour from the open
+recording window, name each kind's consumer, cut the ones with none. Done before the window closes,
+which is why it had to come before the operator's `GHOST_LLM_RECORD=0`.
+
+**The census** (`scratchpad/idle_census.py`, 2,590 recorded calls over 25 live hours, keyed on the
+recorder's own `meta.task_label` + `meta.background`):
+
+| kind | calls | avg chars in | consumer |
+|---|---|---|---|
+| keepalive | 1,869 | 2 | the node's network path |
+| **tag failure-dimension** | **151** | 1,087 | failure distillation — the one real find |
+| (unlabelled background) | 81 | 8,742 | verifier, post-mortem, self-play, the idle narratives |
+| decompose / expand query | 55 | ~505 | retrieval |
+| warmup | 44 | 2 | boot + node warm-up |
+| planner | 43 | 12,320 | a live experiment arm |
+| dream / self-play / memory-extract / hydration-judge / distill / postmortem / prefix re-warm / perfect-it | ≤22 each | — | each has a reader |
+
+**keepalive is 80% of the count and a rounding error of the cost**: a `max_tokens=1` ping every 45 s, one
+per physical node, off-main, with a measured job — a Tailscale peer's direct path re-cools and both ends
+of a request then trip a 5 s `ReadTimeout` — and it is the circuit breaker's most frequent recovery
+detector. Kept, deliberately: cutting the biggest number here would have been a diet by count rather
+than by cost.
+
+### The find: 147 of 151 adjudications were the same six questions
+
+`adjudicate_dimension` re-classifies failure records the heuristics left `unknown`. Over the window:
+
+* **147 of its 151 calls returned `unknown`** — the value the heuristic already had;
+* those 147 were only **SIX distinct records, each asked 29 times** — once per dream cycle, for ever;
+* most are not failures at all ("None observed; the solution was direct and efficient", "Sub-optimal
+  pattern identified via Perfection Protocol"), so `unknown` is the right and permanent answer;
+* the 4 that did produce a label were the longer, genuinely ambiguous records (415–436 chars against a
+  133-char median for the repeats), so the mechanism itself is sound — it was just being re-asked.
+
+The function's own docstring promised this could not happen: "adjudicated playbook records are persisted
+(via `_update_lesson_fields`) so the work isn't repeated next cycle". The persist ran **only when the LLM
+produced a usable label**, so the common answer was written nowhere — and the work-log half of the corpus
+had no persist path at all. Same shape as §4FP's fail-closed stores: a mechanism whose "done" state is
+never recorded for the common case.
+
+**The fix.** Every verdict — including `unknown` — is remembered in the distillation state file that
+already exists, keyed by the record's handle AND a hash of its text, so an edited lesson is a new
+question while an unchanged one is not. A remembered usable label is re-applied without a call, so the
+memo cannot lose an answer it once had. Bounded at 500 entries; a write failure costs the optimisation,
+not the cycle. **151 calls become 6.**
+
+### The instrumentation, half-fixed on purpose
+
+81 background calls carried no `task_label`, so nothing could attribute them; identifying them meant
+reading their prompts. Post-mortem triage and patch, the selfhood and workspace narratives, and
+self-play generation and repair now carry labels, so the next census attributes them.
+
+**The verifier's calls deliberately do NOT.** `tests/test_verifier_offmain.py` pins that a client whose
+`chat_completion` accepts nothing but the payload must still verify — "the fallback must not TypeError it
+(which the broad except would silently turn into a skipped verdict)". I added labels there, 10 tests went
+red, and the right response was to revert: a logging nicety does not get to break a documented resilience
+contract on the answer path.
+
+Four other pins broke — source-TEXT assertions of the exact string
+`chat_completion(payload, is_background=True)`, whose subject is priority, not formatting. Replaced with
+AST checks that the call passes `is_background=True`: strictly stronger (they survive any formatting and
+still fail when the flag is dropped), and verified by mutation rather than asserted — dropping the flag
+at either site kills them.
+
+### Defects in my own work (R8)
+
+1. The first census keyed on `meta.label`, which does not exist; it reported 2,589 calls as "unlabelled"
+   and would have concluded the instrumentation was absent. The recorder's field is `meta.task_label`.
+2. I labelled the verifier's calls without checking what its clients are required to tolerate — 10 red
+   tests, reverted (above).
+3. I broke five pins by reformatting call sites and had to be careful that rewriting them was a genuine
+   improvement rather than loosening a pin to fit my change; they are AST checks now, mutation-verified.
+
+### Verification
+
+Battery `battery_4fq.json`: **10 mutants, 10 killed**, controls correct — including "only USABLE verdicts
+remembered", which is the original defect restored. Pins: `tests/test_idle_adjudication_memo.py` (9),
+with a control that proves the memo is what does the work (drop the context and it asks 30 times again).
+A second small battery proved the rewritten priority pins discriminate: 2/2. Suite **20,636 passed / 65
+skipped / 0 failed**, twice. Docs: the census and the find are in `docs/core/dream.html`.
+
+**The honest headline is that there was almost no fat.** One loop was repeating itself; every other
+background kind has a reader and a defensible rate. The measurement was worth more than the cut — and it
+was only possible because calls carry labels, which is why the unlabelled ones were labelled rather than
+left for the next person to guess at.
+
+**Live (deployed 10:52, listener 58333; health 200, no tracebacks).** The steady pre-deploy rate was
+visible in the recordings as a flat **5 adjudications per hour**, hour after hour (00h–04h UTC), which is
+the dream cycle re-asking the same records. After the deploy the state file carries
+
+    "dimension_adjudications": { "pb:e59c7b93|6d4f4ccb": "unknown", …5 entries… }
+
+— exactly the records that were being re-asked, now remembered — and **0 adjudications** in the calls
+recorded since. A full post-deploy hour is the confirming measurement; the memo's contents are the
+mechanism.
+
+⚠ One thing worth remembering from this deploy: the state file gained the memo key at 10:48, four
+minutes BEFORE the restart. A long-running process imports a module at FIRST USE, so the agent picked up
+the edited `failure_distill.py` mid-life, without a deploy. Harmless here (the code was complete and its
+suite was green), but it means an edit to a lazily-imported module is live the moment it is saved, not at
+the next restart.

@@ -34,6 +34,8 @@ import os
 import threading
 import time
 
+from .failclosed import FailClosedStore
+
 
 def wilson_interval(p: float, n: int, z: float = 1.96) -> tuple:
     """Wilson 95% interval ``(lo, hi)`` for a rate ``p`` seen ``n`` times.
@@ -129,7 +131,7 @@ class _Cell:
         self.samples += 1
 
 
-class CompetenceProfile:
+class CompetenceProfile(FailClosedStore):
     """In-memory + JSON-backed capability map.
 
     Reads are lock-free fast-path (a single dict lookup); writes acquire
@@ -159,7 +161,10 @@ class CompetenceProfile:
         # roll-up. Concrete (domain, tool) cells are leaves.
         self._cells: Dict[Tuple[str, str], _Cell] = {}
         # Set when the profile file is PRESENT but unreadable — see _load().
+        # `FailClosedStore` retries the read, so a transient fault costs a
+        # few observations rather than every one until the next restart.
         self._degraded = False
+        self._fc_last_retry = 0.0
         self._flush_interval = max(0.0, float(flush_interval or 0.0))
         self._dirty = 0
         self._last_flush = time.monotonic()
@@ -351,13 +356,8 @@ class CompetenceProfile:
         except OSError as exc:
             # Present but unreadable → fail CLOSED: keep serving the
             # neutral prior in memory, but never write over the file.
-            self._degraded = True
-            logger.error(
-                "competence_profile.json is present but unreadable (%s: %s). "
-                "Serving neutral priors and REFUSING to overwrite the on-disk "
-                "profile until it can be read.",
-                type(exc).__name__, exc,
-            )
+            self._fc_arm(f"competence_profile.json is present but unreadable "
+                         f"({type(exc).__name__}: {exc})")
             return
         if not content.strip():
             return
@@ -384,9 +384,35 @@ class CompetenceProfile:
                 continue
             self._cells[(d, t)] = _Cell(alpha=alpha, beta=beta, samples=samples)
 
+    def _fc_reload_from_disk(self) -> bool:
+        """Retry the read, then ADD what was learned while blind onto the
+        history it could not see.
+
+        A cell's `alpha`/`beta` carry a 1.0 prior each, so the observations
+        are `alpha - 1` successes and `beta - 1` failures; adding the raw
+        numbers would count the prior twice. `samples` adds directly.
+        """
+        blind = self._cells
+        self._cells = {}
+        self._degraded = False          # let _load() speak for itself
+        self._load()
+        if self._degraded:              # still unreadable — put it back
+            self._cells = blind
+            return False
+        for key, cell in blind.items():
+            base = self._cells.get(key)
+            if base is None:
+                self._cells[key] = cell
+                continue
+            base.alpha += max(0.0, cell.alpha - 1.0)
+            base.beta += max(0.0, cell.beta - 1.0)
+            base.samples += int(cell.samples or 0)
+        return True
+
     def _save(self) -> None:
-        if self._degraded:
+        if not self._fc_ready_to_write():
             # See _load(): the file exists but could not be read.
+            # `_fc_ready_to_write` retries that read first.
             logger.warning(
                 "Competence profile save skipped: %s is unreadable and must "
                 "not be overwritten.", self.file_path.name,

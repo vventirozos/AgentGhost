@@ -122,15 +122,48 @@
   the store's own <code>_age_phrase</code> renders "5 months" and the user called it "about 6 months"
   &mdash; both right, and a pedantic check would have written a 0.0 on one of them. It still refutes
   what it is for: "9 years old" against a true 5.9 months is off by a factor of 18.</p>
-  <p><strong>Binding is confined to one line, and a tie says nothing.</strong> Distance alone was run
+  <p><strong>Binding is confined to one line.</strong> Distance alone was run
   over the 1977 replies in the trajectory store and produced three hits &mdash; <em>all three
   false</em>, every one a markdown list or table where subjects and ages interleave and the nearest
   name by character count belongs to the previous row ("<code>| Vasilis | 1980-01-29 | 44 years
-  |</code>" bound Vasilis's age to Thodoris). A line is the unit these replies are organised in. The
-  live reply "Your sons are 9 (Thodoris) and 5 months old (Leonidas)" puts both names exactly 14
-  characters from the age phrase; first-wins bound the infant's age to the nine-year-old and refuted a
-  correct answer, so an equidistant tie is skipped. After both rules: <strong>zero refutations across
-  the same 1977 replies</strong>, while the contradictions still fire.</p>
+  |</code>" bound Vasilis's age to Thodoris). A line is the unit these replies are organised in.</p>
+  <p><strong>The subject is the name the phrase is predicated of &mdash; not the nearest one (§4FN round 3).</strong>
+  Three review rounds of "the nearest name within <em>N</em> characters" each moved the defect instead of
+  removing it: a nearby name captured any age at all ("Thodoris's laptop is 3 years old" and "Leonidas has a
+  cot that is 20 years old" were REFUTED), while one word between a name and its own age ("Thodoris &mdash; now
+  9 years old, Leonidas &mdash; now 5 months old") handed the age to the other child; and the tie rule, the
+  punctuation cue and the 60-character window turned out to be three redundant guards, any of which could be
+  deleted with the suite green. The rule now reads the grammar the distance was a proxy for: the closest name
+  <em>before</em> the phrase on its line is the subject when everything between them is a <em>link</em> &mdash;
+  a copula, an age cue ("age", "aged", "'s age is"), a hedge ("about", "now", "currently"), punctuation
+  (<code>memory_claim_check._SUBJECT_LINK_RE</code>) &mdash; and nothing else, and when the name does not close
+  a list ("Thodoris and Leonidas: 9 years and 5 months old" is two ages, <code>temporal.conjoined_subject</code>).
+  One word outside the link ("'s laptop", "goes to a school that", "and Maria") leaves the phrase unbound, which
+  costs a label the route never had. The one backward form is the agent's own disambiguation, a bracketed name
+  right after the phrase: "9 years old (Thodoris) and 5 months old (Leonidas)". There is no window and no tie
+  any more &mdash; nothing left to calibrate. Names are Unicode, so a Greek-spelled profile entry is a subject.
+  After the rules: <strong>zero refutations across the same 1977 replies</strong>, while the contradictions
+  still fire.</p>
+  <p><strong>What the link must not admit (round 4).</strong> A fourth reviewer generated 63 phrasings of its own
+  and executed them; seven false-refute classes came out of the whitelist itself, and each is now a rule with
+  a two-direction pin: <em>tense</em> &mdash; "was", "turned", "turns", "at", "in", "on" were links, so "Thodoris
+  was 4 years old when you moved" and "Leonidas turns 7 months old on October 12" were compared with today (the
+  marker can sit before the name, so the whole LINE is read, <code>temporal.tense_marked</code>, by the checker
+  and by the writer, which had stored "born ~2021-03" for a child born in 2016); <em>"of"</em> &mdash; the age of
+  "the father of Thodoris" belongs to the noun before "of", in a reply and in a stored value; a <em>bare
+  possessive</em> &mdash; "Thodoris's 5 month old brother" (only "'s age" links); the forward candidate
+  outranking the phrase's own bracket &mdash; "9 years old (Thodoris), 5 months old (Leonidas)" (a bracketed name
+  is an annotation of the phrase before it, never the subject of the next; a markdown link is not an
+  annotation); <em>decimals</em> &mdash; "9.5 years old" read as five and "5.8 months" (the checker's own
+  rendering) as eight, fixed in the shared number token so the writer stops at them too; <em>week and day
+  claims</em> compared on the calendar-month scale ("26 weeks" for 25 weeks 1 day refuted) &mdash; now on their
+  own scale, with five percent slack for a large count; and bare digits as links ("| Thodoris | 2 | 3 years old |"
+  is a count of bikes) &mdash; only date SHAPES link. Also from round 4: "1 year old" admitted a newborn (the
+  lower bound is never below half the count); a name with two stored dates decides nothing; a sentence opener
+  before a comma ("Yes, Thodoris") is not a list &mdash; a comma joins two names only for the checker (which
+  knows its names) and the reader (the last defence for stored values), never for the writer; the plural guard
+  reads the whole line, not 80 characters; and every word left on the link list has a catalogue pin that fails
+  the suite if a word is added without one.</p>
   <p><strong>The consumption guard had to widen, or this was dead code.</strong> It read
   <code>last_tool is not None</code> &mdash; false for every verdict this route can produce, since the
   route exists for tool-free turns. The verdict would have been computed, logged and consumed by
@@ -143,6 +176,9 @@
   guard that fires when that stops being true, not a source of label volume. What it changes is that a
   tool-free turn is no longer <em>unfalsifiable</em>. Pins:
   <code>tests/test_memory_claim_check.py</code> (24); mutation battery 16/16 killed.</p>
+  <h2 id="4fn">The judge against 121 human labels <span class="tag">2026-09-08 · §4FN</span></h2>
+  <p>Measured: of 121 human-labelled turns (2026-08-13 → 09-08) the verifier had a verdict on 37 (24 agree, 13 disagree) and none on 84. Three of the six false REFUTEs were one parser bug — a compound age ("5 months and 23 days old") read as its tail ("23 days old"); <code>memory_claim_check._age_claims</code> now takes compounds first, as one claim (in months — see below). All seven false PASSes carried an empty reason: the reply was not an answer. The one shape that is mechanical and clean on the labelled corpus is refuted before any evidence question — <code>core/reply_shape_check.refute_raw_tool_dump</code> (the reply opens as a tool's own framing: "Process finished successfully. ### Final Output: …", "--- EXECUTION RESULT --- EXIT CODE: …"), computed in <code>_compute_verifier_verdict</code> for tool and tool-free turns under the same "verifier attached, real content, not trivial chat" guard as the arithmetic route, and on tool turns applied as an OVERRIDE ahead of the ground-truth checks (WEB-EXEC, FILE-ARTIFACT) rather than an early return — so a refute that already stands keeps its grounded issues in the first slots, the later overrides merge into it, and the verdict sidecar the instruments read records it with <code>override="reply-shape"</code> — and every arm that replaces or merges a verdict (reply-shape, VISUAL, WEB-EXEC, FILE-ARTIFACT) stamps through one helper that keeps the chain in the order the arms run ("visual+reply-shape"), which <code>scripts/verdict_override_report.py</code> counts under each of its tags; and the tool-free exits (reply-shape, the arithmetic route <code>memory-claim</code>) go through the same recorder as the tool-turn choke point — before round 4 they returned early and the one route the report exists to measure never reached the sidecar. What the check actually detects is the agent's OWN finalize fallback (tools ran, the model emitted no final text): its three heads live in <code>reply_shape_check.FALLBACK_HEADS</code> and the finalize site imports them, so the banner cannot be reworded without the check following; the tools' own framings are matched too. A request that asked for the raw output is exempt. The issue text is on the follow-up-task denylist (a delivery-shape complaint is never project work). A narration check was measured and rejected: 4 human-approved replies refuted for every 1 rejected. The coverage hole: a human label that lands before the verdict (median 0.9 min vs 0.4 min) locks the turn and the verdict was WITHHELD from everything, including measurement; all three withhold sites (<code>_record_late_verdict</code>, the backfill's cached-label guard, the writer-side yield) now record it through <code>_record_withheld_verdict</code> on a measurement-only sidecar (<code>system/judge/withheld_verdicts.jsonl</code> — its own directory, outside the corpus root the refit fingerprint globs and outside <code>system/verdicts/</code>; written under the collector lock, redacted, never by a read-only collector). Read only by <code>machine_and_human_outcomes</code>, and only for a trajectory the corrections file already knows with a human label and no shipped machine verdict — a retraction stays retracted and an unknown id mints no pair — so the judge stays measurable without touching the human-authority doctrine. The compound-age fix shares ONE regex with the profile writer (<code>temporal._COMPOUND_AGE_RE</code>): the writer anchored "9 years, 9 months and 10 days old" to a birth date ten days ago until §4FN; compounds are one claim in months (a largest-unit expression admitted a three-year band); the subject binding went through three rounds — a start-only distance (round 1), a symmetric gap with a punctuation cue (round 2: the first was asymmetric by the name's own length and refuted six correct phrasings), and finally the LINK rule above (round 3: the distance rules refuted "Thodoris's laptop is 3 years old" and lost "Thodoris — now 9 years old" to the other child); a plural subject gets no anchor and no claim — a LIST of names before the phrase ("Thodoris and Leonidas: …", "Θοδωρής και Λεωνίδας: …") or a plural copula within two words of a compound ("are, respectively,", "are about") — where the first guard had named one surface of that scenario (<code>are</code> glued to the number) and every other surface walked around it, and a reader that meets a date the old writer already glued onto a list ("Thodoris and Leonidas: born ~2017-04-04") yields no subject rather than refuting the correct answer about the second child forever; a declined compound still shadows its tail on both the writer and the checker; a future birth date never refutes; a compound anchors to the day from its EXACT parts (years and months → months, weeks and days → days; the month-fraction round trip through 30.4375 put a 40-day remainder back as 10 days); the two writer regexes that backtracked quadratically on a whitespace run — the derived-gloss stripper and the "9-year old" age pattern, 0.9 s for 4000 trailing spaces and 7.5 s for 16000 — are linear (the compound tail shared the idiom but a literal after it kept it fast; it was normalized with them); and <code>_true_months</code> is exact to the day. The withheld-verdict file lives in <code>system/judge/</code> — not the corpus root and not <code>system/verdicts/</code>, which two report scripts glob. Pins: <code>tests/test_4fn_judge_fixes.py</code>.</p>
+
 
   <h3 id="skip-cause">The skip message named the wrong cause</h3>
   <p>One line covered every evidence-free turn: <em>"no verdict &mdash; turn carried no verifiable

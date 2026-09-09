@@ -2781,6 +2781,7 @@ from .strikes import (  # noqa: E402
     note_repeated_failure as _note_repeated_failure,
     note_repeated_action as _note_repeated_action,
     action_result_fingerprint as _action_result_fingerprint,
+    breaker_fingerprint as _breaker_fingerprint,
     is_readwrite_loop_exempt as _is_readwrite_loop_exempt,
 )
 
@@ -11611,6 +11612,17 @@ class GhostAgent:
         if getattr(getattr(self, "context", None), "args", None) is not None and \
                 getattr(self.context.args, "no_verifier", False) is True:
             return None, last_tool
+        # §4FN: the reply's SHAPE, before any evidence question. A raw tool
+        # dump pasted as the answer is refuted mechanically for tool turns
+        # and tool-free turns alike; the same "verifier attached, real
+        # content, not trivial chat" guard as the arithmetic route below so
+        # an ablation that exists to have no verdicts still has none.
+        _shape = None
+        if (verifier is not None
+                and getattr(verifier, "llm_client", None) is not None
+                and final_ai_content
+                and not self._is_strict_trivial_chat(lc)):
+            _shape = self._reply_shape_refutation(final_ai_content, last_user_content)
         # Flat early-return (not an `if (verifier is not None and ...)`
         # block) so the post-loop gate stays the single match for the
         # gate-strictness source check — and so a missing verifier /
@@ -11634,8 +11646,18 @@ class GhostAgent:
                     and evidence_tool is None
                     and final_ai_content
                     and not self._is_strict_trivial_chat(lc)):
+                if _shape is not None:          # §4FN: a tool-free non-answer
+                    self._chain_override(_shape, "reply-shape")
+                    self._record_verdict_instruments(
+                        _shape, req_id=req_id, trajectory_id=trajectory_id,
+                        verify_route="reply-shape")
+                    return _shape, last_tool
                 _mem = self._memory_claim_refutation(final_ai_content)
                 if _mem is not None:
+                    self._chain_override(_mem, "memory-claim")
+                    self._record_verdict_instruments(
+                        _mem, req_id=req_id, trajectory_id=trajectory_id,
+                        verify_route="memory-claim")
                     return _mem, last_tool
             return None, last_tool
         # Replay the active project's explicit user constraints into the
@@ -11855,10 +11877,15 @@ class GhostAgent:
                         before_image=_before_img,
                     )
                     if _vv is not None:
-                        if _vv.confidence >= 0.7 and _vv.verdict == VerifyVerdict.REFUTED:
+                        if _vv.confidence >= 0.7 and (
+                                _vv.verdict == VerifyVerdict.REFUTED or v_result is None):
                             v_result = _vv
-                        elif _vv.confidence >= 0.7 and v_result is None:
-                            v_result = _vv
+                            # provenance for the sidecar: a visual refute used
+                            # to be reported as "(text judge)" (§4FN round 3 m5).
+                            # VISUAL is the FIRST arm — the text judge's result
+                            # carries no override — so there is no chain to
+                            # keep here; the arms after it chain onto "visual".
+                            self._chain_override(v_result, "visual")
                         pretty_log(
                             "Verifier",
                             f"VISUAL {_vv.verdict.value} "
@@ -11885,6 +11912,22 @@ class GhostAgent:
                 f"VISUAL check error: {type(_vv_exc).__name__}: {_vv_exc}",
                 icon=Icons.WARN, level="WARNING",
             )
+        # §4FN reply-shape override: the finalize fallback / a pasted tool
+        # result is not an answer. Applied HERE — before the ground-truth
+        # overrides and the verdict recording below — so those merge into it
+        # and the verdict instruments see it (review §4FN M3). A refute that
+        # already stands keeps its grounded issues in the first slots.
+        if _shape is not None:
+            if v_result is None or getattr(v_result, "verdict", None) != VerifyVerdict.REFUTED:
+                v_result = _shape
+            else:
+                try:
+                    v_result.issues = (list(getattr(v_result, "issues", None) or [])[:2]
+                                       + list(_shape.issues)[:1])
+                except Exception:  # noqa: BLE001
+                    pass
+            self._chain_override(v_result, "reply-shape",
+                                 str(getattr(v_result, "override", "") or ""))
         # Web-artifact ground-truth override — execute, don't trust. The
         # text verifier CONFIRMED (95%) a build whose data.js had a parse
         # error: every claim/evidence pair read fine, but the page threw on
@@ -11932,6 +11975,7 @@ class GhostAgent:
                     page_rel, err_block = check
                     if err_block:
                         from .verifier import VerifyResult
+                        _prev_ov = str(getattr(v_result, "override", "") or "")
                         v_result = VerifyResult(
                             verdict=VerifyVerdict.REFUTED,
                             confidence=0.95,
@@ -11942,10 +11986,7 @@ class GhostAgent:
                             ),
                             issues=[f"uncaught JS exception(s) on {page_rel}"],
                         )
-                        try:
-                            v_result.override = "web-exec"
-                        except Exception:
-                            pass
+                        self._chain_override(v_result, "web-exec", _prev_ov)
                         pretty_log(
                             "Verifier",
                             f"WEB-EXEC REFUTED: '{page_rel}' throws on load",
@@ -12092,13 +12133,8 @@ class GhostAgent:
                         icon=Icons.VERIFIER_LAB, level="WARNING",
                     )
                 if _fa is not None:
-                    try:        # provenance for the sidecar (see below)
-                        _prev = str(getattr(v_result, "override", "") or "")
-                        v_result.override = (
-                            f"{_prev}+file-artifact" if _prev
-                            else "file-artifact")
-                    except Exception:
-                        pass
+                    _prev = str(getattr(v_result, "override", "") or "")
+                    self._chain_override(v_result, "file-artifact", _prev)   # provenance for the sidecar
                     # ⚠ Do not throw away a refute that already stands. An
                     # earlier override (WEB-EXEC execution, VISUAL) may have
                     # refuted with far more actionable evidence — "the page
@@ -12143,6 +12179,7 @@ class GhostAgent:
                                                   _fa.confidence)
                     else:
                         v_result = _fa
+                        self._chain_override(v_result, "file-artifact", _prev)   # the replace path dropped it
                     pretty_log(
                         "Verifier",
                         f"FILE-ARTIFACT REFUTED: {(_fa.reasoning or '')[:260]}",
@@ -12257,7 +12294,22 @@ class GhostAgent:
         # answer (the gate reuses the cached in-loop result), so it is the
         # one choke point every path shares — recording at the three
         # consumer sites instead would be the wrapper-split that has
-        # already produced three defects in this feature.
+        # already produced three defects in this feature. §4FN round 4 M1:
+        # the tool-free branch above returns BEFORE this point, so its
+        # verdicts (reply-shape, the arithmetic route) reached neither the
+        # sidecar nor turn-facts and the override report could not measure
+        # the one route it was built to measure; both exits now call the
+        # same recorder.
+        self._record_verdict_instruments(v_result, req_id=req_id,
+                                         trajectory_id=trajectory_id,
+                                         verify_route=_verify_route)
+
+        return v_result, last_tool
+
+    def _record_verdict_instruments(self, v_result, *, req_id, trajectory_id,
+                                    verify_route: str) -> None:
+        """Turn-facts + the durable verdict sidecar for ONE verdict — the
+        single recorder every exit of `_compute_verifier_verdict` calls."""
         try:
             if v_result is not None:
                 _verdict = getattr(v_result, "verdict", None)
@@ -12269,7 +12321,7 @@ class GhostAgent:
                     from . import turn_facts as _tf
                     _tf.record(self.context, str(req_id),
                                verifier_verdict=_vs, verifier_confidence=_vc,
-                               verify_route=str(_verify_route))
+                               verify_route=str(verify_route))
                 # (b) A DURABLE SIDECAR, because (a) alone records NOTHING
                 #     on either live delivery path. Measured: on the
                 #     streamed path `_record_turn_trajectory` runs before
@@ -12317,11 +12369,10 @@ class GhostAgent:
                         # therefore no treatment, and without this they are
                         # indistinguishable from turns the treatment simply
                         # failed to help.
-                        route=str(_verify_route))
+                        route=str(verify_route))
         except Exception as _vf_exc:   # recording must never fail a turn
             logger.debug("verdict recording skipped: %s", _vf_exc)
 
-        return v_result, last_tool
 
     @staticmethod
     def _verify_file_artifacts(claimed, host_dir, soft=None, *,
@@ -13275,6 +13326,7 @@ class GhostAgent:
                     f"WITHHELD — a human label already resolved this turn",
                     icon=Icons.VERIFIER_LAB,
                 )
+                self._record_withheld_verdict(trajectory_id, outcome, reason)   # §4FN
                 return
             # The direction guards are NO LONGER hand-mirrored here: this
             # site now calls `resolve_turn_outcome` itself (2026-08-04). It
@@ -13373,6 +13425,7 @@ class GhostAgent:
                     yield_to_human=True,
                 )
                 if ok == "withheld":
+                    self._record_withheld_verdict(trajectory_id, outcome, reason)   # §4FN
                     # A human label landed in the deferral window. The
                     # collector said why; revoke the banner this verdict's
                     # caller queued in that window (R3 review — the route's
@@ -13694,7 +13747,8 @@ class GhostAgent:
     _REFUTE_TASK_ARTIFACT_RE = re.compile(
         r"truncat\w*\s+(?:response|reply|answer)"
         r"|(?:response|reply|answer)\s+(?:is|was|appears|seems)?\s*truncat"
-        r"|internal system message|system noise", re.IGNORECASE)
+        r"|internal system message|system noise"
+        r"|raw tool output pasted as the answer", re.IGNORECASE)
 
     def _file_refute_followup_tasks(self, v_result, project_id):
         """File a late refute's concrete leftovers as tasks on the project
@@ -13966,6 +14020,18 @@ class GhostAgent:
             logger.debug("late outcome correction skipped: %s: %s",
                          type(_exc).__name__, _exc)
 
+    def _record_withheld_verdict(self, trajectory_id, outcome, reason="") -> None:
+        """§4FN: a machine verdict the human-authority order WITHHELD from
+        every consequence is kept as a MEASUREMENT (the machine/human pair
+        judges the judge). Called at all three withhold sites. Never raises."""
+        try:
+            _coll = getattr(self.context, "trajectory_collector", None)
+            _rec = getattr(_coll, "record_withheld_verdict", None)
+            if _rec is not None and trajectory_id and outcome in ("passed", "failed"):
+                _rec(trajectory_id, outcome, str(reason or "")[:500])
+        except Exception:  # noqa: BLE001
+            pass
+
     def _drop_pending_corrections_for(self, trajectory_id) -> int:
         """Revoke queued next-turn correction banners for a trajectory a
         HUMAN label just resolved (R2 review). The verdict-then-label
@@ -14146,6 +14212,16 @@ class GhostAgent:
                 f"resolved this turn",
                 icon=Icons.VERIFIER_LAB,
             )
+            # §4FN: withheld from every CONSEQUENCE, kept as a MEASUREMENT —
+            # the machine/human pair is what judges the judge, and a fast
+            # human label used to erase it (84 of 121 labelled turns had no
+            # machine verdict). Same confidence bar as the consequence chain.
+            if v_result.confidence >= 0.7 and v_result.verdict in (
+                    VerifyVerdict.CONFIRMED, VerifyVerdict.REFUTED):
+                self._record_withheld_verdict(
+                    trajectory_id,
+                    "passed" if v_result.verdict == VerifyVerdict.CONFIRMED else "failed",
+                    "; ".join(str(x) for x in (getattr(v_result, "issues", None) or []))[:500])
             return
         if v_result.confidence >= 0.7:
             if v_result.verdict == VerifyVerdict.CONFIRMED:
@@ -17478,10 +17554,19 @@ class GhostAgent:
                         # session 2026-07-08: 5 identical re-reads of
                         # index.html while theorizing about a URL one
                         # probe would have settled).
+                        # A result that DECLARES it found nothing collapses
+                        # onto one fingerprint per (tool, target), so ten
+                        # re-wordings of a hopeless search count as ten
+                        # repeats instead of ten different observations —
+                        # the blind spot request e0f4a8bd fell into (§e).
+                        # ⚠ the MODULE function, not `strikes.` — at this
+                        # site `strikes` is the StrikeLedger INSTANCE, and
+                        # an attribute lookup on it raised AttributeError
+                        # through the whole dispatch path (caught by the
+                        # dispatch pins, invisible to a source-text pin).
+                        _res_fp = _breaker_fingerprint(str_res)
                         _asig, _acnt, _atrip = strikes.note_action(
-                            fname, ptarget,
-                            _action_result_fingerprint(str_res),
-                            threshold=2,
+                            fname, ptarget, _res_fp, threshold=2,
                         )
                         if _atrip and (_noprogress_trip is None or _acnt > _noprogress_trip[1]):
                             _noprogress_trip = (_asig, _acnt, fname, ptarget)
@@ -17770,7 +17855,30 @@ class GhostAgent:
                                else "forcing a grounded conclusion."),
                             level="WARNING", icon=Icons.WARN,
                         )
-                        if _readwrite_loop:
+                        _fruitless = str(_asig).endswith("|" + getattr(_strk, "NO_ANSWER_FP", "\0"))
+                        if _fruitless:
+                            # The tool ITSELF said it has no answer, N times
+                            # over. "Do the write instead" is the wrong
+                            # remedy here and "write your final answer" bars
+                            # the right one, so this branch names it.
+                            messages.append({"role": "user", "content": (
+                                f"SYSTEM ALERT: '{_afname}'{_tgt_desc} has now told you {_acnt} "
+                                "times that it found NOTHING for what you asked. Re-wording the "
+                                "same search a third time will return a third set of unrelated "
+                                "results — that is not progress, it is the same failure with new "
+                                "words. STOP SEARCHING THIS WAY. Do ONE of these NOW:\n"
+                                "1. USE THE RIGHT ROUTE: if you are asking about a document's "
+                                "STRUCTURE (how many chapters/parts/sections, what they are "
+                                "called, what section N covers), call knowledge_base("
+                                f"action='outline', filename='{_atarget}') — a semantic search "
+                                "cannot count and never will.\n"
+                                "2. LOOK ELSEWHERE: if the fact is not in this document, say so "
+                                "and get it from another source, naming where it came from.\n"
+                                "3. ANSWER WITHOUT IT: say plainly what you could not find and "
+                                "what you can answer anyway.\n"
+                                "Do NOT issue another search of this document."
+                            )})
+                        elif _readwrite_loop:
                             messages.append({"role": "user", "content": (
                                 f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} "
                                 "times and gotten the SAME result — re-reading produces NO new "
@@ -18842,16 +18950,14 @@ class GhostAgent:
                             _raw_out.lstrip().startswith(
                                 ("Error:", "ERROR:", "SYSTEM ERROR",
                                  "Critical Tool Error"))
+                    from .reply_shape_check import FALLBACK_HEADS, FALLBACK_OUTPUT_MARKER
                     if _still_running:
-                        _head = ("The command is STILL RUNNING in the background "
-                                 "(it outran its execution budget and was detached, "
-                                 "not killed); its result is not in yet.")
+                        _head = FALLBACK_HEADS["running"]
                     elif _looks_failed:
-                        _head = ("The last command FAILED — the output below "
-                                 "is its error result, not a success.")
+                        _head = FALLBACK_HEADS["failed"]
                     else:
-                        _head = "Process finished successfully."
-                    final_ai_content = f"{_head}\n\n### Final Output:\n```text\n{preview}\n```"
+                        _head = FALLBACK_HEADS["success"]
+                    final_ai_content = f"{_head}\n\n{FALLBACK_OUTPUT_MARKER}\n```text\n{preview}\n```"
 
         if not final_ai_content:
             final_ai_content = "Task executed successfully."
@@ -25241,6 +25347,44 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as exc:  # noqa: BLE001 — never break a turn for this
             logger.debug("label request skipped: %s", exc)
             return ""
+
+    @staticmethod
+    def _chain_override(v_result, tag: str, prev: str = "") -> None:
+        """Stamp WHICH override produced/last touched a verdict, keeping the
+        chain ("reply-shape+file-artifact"). One home for the five arms
+        (reply-shape, VISUAL, WEB-EXEC, FILE-ARTIFACT merge and replace) — the
+        WEB-EXEC arm used to assign a bare tag and the FILE-ARTIFACT replace
+        path dropped the stamp with the old object (§4FN review)."""
+        try:
+            v_result.override = f"{prev}+{tag}" if prev else tag
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _reply_shape_refutation(self, final_ai_content: str, request_text: str = ""):
+        """A REFUTED verdict when the reply is not an answer by SHAPE (§4FN:
+        `core/reply_shape_check`), or `None`. Never confirms. Computed for
+        every turn that has a verifier attached — tool or not — because the
+        finalize fallback pasted as the reply is wrong regardless of
+        evidence; on tool turns it is applied as an OVERRIDE ahead of the
+        ground-truth checks, not as an early return."""
+        try:
+            from .reply_shape_check import refute_raw_tool_dump
+            from .reply_smoothing import strip_system_notes
+            claim = strip_system_notes(final_ai_content or "")
+            issues = refute_raw_tool_dump(claim, request_text or "")
+            if not issues:
+                return None       # ⚠ NOT a pass — nothing to say
+            from .verifier import VerifyResult, VerifyVerdict
+            return VerifyResult(
+                verdict=VerifyVerdict.REFUTED,
+                confidence=0.9,
+                reasoning="reply-shape check (raw tool output pasted as the answer)",
+                issues=list(issues),
+            )
+        except Exception as exc:  # noqa: BLE001 — a checker must not break a turn
+            logger.debug("reply shape check skipped: %s: %s",
+                         type(exc).__name__, exc)
+            return None
 
     def _memory_claim_refutation(self, final_ai_content: str):
         """A REFUTED verdict when the reply contradicts anchored memory, or

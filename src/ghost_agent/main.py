@@ -2507,7 +2507,8 @@ async def lifespan(app):
                 }
                 # BACKGROUND priority: post-mortem analysis runs from the
                 # idle watchdog and must never contend with a live user.
-                res = await context.llm_client.chat_completion(payload, is_background=True)
+                res = await context.llm_client.chat_completion(
+                    payload, is_background=True, task_label="postmortem triage")
                 return (
                     (res or {}).get("choices", [{}])[0]
                     .get("message", {}).get("content", "") or ""
@@ -2531,7 +2532,9 @@ async def lifespan(app):
                         "stream": False,
                     }
                     # BACKGROUND priority — same rationale as _analyze_fn.
-                    res = await context.llm_client.chat_completion(payload, is_background=True)
+                    res = await context.llm_client.chat_completion(
+                        payload, is_background=True,
+                        task_label="postmortem patch")
                     return (
                         (res or {}).get("choices", [{}])[0]
                         .get("message", {}).get("content", "") or ""
@@ -2880,7 +2883,8 @@ async def lifespan(app):
             # synchronous path. Foreground-marked it bumped foreground_tasks
             # (skewing every "is a user live?" check) and contended for the
             # main slot with a live turn.
-            res = await context.llm_client.chat_completion(payload, is_background=True)
+            res = await context.llm_client.chat_completion(
+                payload, is_background=True, task_label="selfhood narrative")
             content = (
                 (res or {})
                 .get("choices", [{}])[0]
@@ -2952,7 +2956,8 @@ async def lifespan(app):
             # BACKGROUND priority — same rationale as the selfhood
             # narrative closure above: idle-phase call, never on the
             # user's synchronous path.
-            res = await context.llm_client.chat_completion(payload, is_background=True)
+            res = await context.llm_client.chat_completion(
+                payload, is_background=True, task_label="workspace narrative")
             content = (
                 (res or {})
                 .get("choices", [{}])[0]

@@ -144,6 +144,65 @@ _EXEC_TIMEOUT_S = 600
 _TIMEOUT_KILL_CODES = (124, 137, 143)
 
 
+#: "The DOWNSTREAM of a pipe closed early", not "the command failed".
+#: Without this, turning pipefail on would report every `… | head -N` that
+#: actually truncated as a FAILURE — a far commoner shape than the one
+#: pipefail exists to catch.
+#:
+#: ⚠ THE EXIT CODE ALONE IS NOT ENOUGH, and the host lied about it.
+#: Measured on macOS: standard tools report 141 (SIGPIPE) and Python 120 (a
+#: failed stdout flush at shutdown). Measured in the REAL sandbox
+#: (Debian, bash 5.2, CPython 3.11) the same Python pipeline reports
+#: **1** — it raises `BrokenPipeError` as an ordinary uncaught exception —
+#: which is indistinguishable by code from a script that genuinely failed.
+#: So the second signal is the runtime NAMING the broken pipe itself, in
+#: output that is captured anyway. A real traceback keeps its strike; a
+#: pipe closed by `head` does not.
+_PIPE_CLOSED_EARLY_CODES = (141, 120)
+_BROKEN_PIPE_RE = re.compile(r"BrokenPipeError|Broken pipe|SIGPIPE",
+                             re.IGNORECASE)
+
+
+def _bash_c(command: str) -> str:
+    """The sandbox shell invocation for a raw command — ONE home, because
+    both call sites (the primary run and the project-path remap retry) must
+    agree about pipefail or one of them keeps the old blindness.
+
+    WHY PIPEFAIL (request e0f4a8bd, 2026-09-08). `python3 probe.py 2>&1 |
+    head -200` raised a Traceback and the tool logged **execution ok, exit
+    0** — twice — because bash returns the exit status of the LAST command
+    in a pipeline and `head` succeeded. The strike counter therefore never
+    moved off 1/6, the failure taught the model nothing, and it re-ran the
+    same broken probe. A pipeline's failure is the pipeline's failure.
+    """
+    return "bash -c " + shlex.quote("set -o pipefail; " + (command or ""))
+
+
+def _normalise_pipe_exit(command: str, exit_code, output: str = "") -> int:
+    """Undo pipefail's one false alarm: an early-closing downstream.
+
+    Narrowed to commands that actually contain a PIPE, so a bare
+    `python3 x.py` exiting 1 stays the failure it is. `||` is stripped
+    before the test: it is an OR, not a pipeline, and nothing in
+    `a || b` can close a pipe early. Within a pipeline the run is forgiven
+    only when the failure IDENTIFIES ITSELF as a broken pipe — by exit code
+    (141/120) or by the runtime's own error name in the output. Anything
+    else, including a `ModuleNotFoundError` through `| head`, is a failure
+    and costs its strike.
+    """
+    try:
+        code = int(exit_code or 0)
+    except (TypeError, ValueError):
+        return exit_code
+    if code == 0 or "|" not in str(command or "").replace("||", ""):
+        return code
+    if code in _PIPE_CLOSED_EARLY_CODES:
+        return 0
+    if _BROKEN_PIPE_RE.search(str(output or "")):
+        return 0
+    return code
+
+
 async def _run_in_sandbox(sandbox_manager, cmd_str, *, timeout=_EXEC_TIMEOUT_S,
                           label=None, project_id=None, cleanup_paths=None,
                           identity=None, **kwargs):
@@ -980,7 +1039,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # process can't hang the container indefinitely.
         import time as _time
         _t0 = _time.time()
-        cmd_str = f"bash -c {shlex.quote(command)}"
+        cmd_str = _bash_c(command)
         # spill_large_output: same small-view + full-log-to-file policy as the
         # script path (the bash branch previously had NO tool-level trim, so a
         # noisy direct command dumped its whole 256 KB into context).
@@ -989,6 +1048,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             label=command[:120],
             project_id=_project_id_from_workdir(container_workdir),
             spill_large_output=True, **_workdir_kw)
+        exit_code = _normalise_pipe_exit(command, exit_code, output)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
         # reference a file that lives at the sandbox ROOT — e.g. one it wrote
@@ -1072,8 +1132,9 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 # the exact flood the primary call's spill mode prevents.
                 _re_out, _re_code = await asyncio.to_thread(
                     sandbox_manager.execute,
-                    f"bash -c {shlex.quote(_remapped)}", timeout=_EXEC_TIMEOUT_S,
+                    _bash_c(_remapped), timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, **_workdir_kw)
+                _re_code = _normalise_pipe_exit(_remapped, _re_code, _re_out)
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
                     output, exit_code = _re_out, _re_code
                     # Teach on EVERY adopted remap, not just clean exits.

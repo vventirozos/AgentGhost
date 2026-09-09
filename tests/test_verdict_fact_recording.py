@@ -413,16 +413,27 @@ class TestTheWriterActuallyRuns:
         import ghost_agent.core.agent as m
         from ghost_agent.core.agent import GhostAgent
         tree = ast.parse(Path(m.__file__).read_text())
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.AsyncFunctionDef)
-                  and n.name == "_compute_verifier_verdict")
-        call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
+        rec = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef)
+                   and n.name == "_record_verdict_instruments")
+        call = next(c for c in ast.walk(rec) if isinstance(c, ast.Call)
                     and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
         kw = {k.arg: k.value for k in call.keywords}
         assert "route" in kw, "the route is not forwarded to the sidecar"
-        assert "_verify_route" in ast.dump(kw["route"])
+        assert "verify_route" in ast.dump(kw["route"])
         params = inspect.signature(GhostAgent._record_verdict_sidecar).parameters
         assert "route" in params
+        # …and the verdict path hands the recorder ITS route at the choke
+        # point (§4FN round 4: the tool-free exits pass their own names)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "_compute_verifier_verdict")
+        routes = []
+        for c in ast.walk(fn):
+            if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_record_verdict_instruments":
+                routes.append(ast.dump({k.arg: k.value for k in c.keywords}["verify_route"]))
+        assert any("_verify_route" in r for r in routes), routes
+        assert sum("'reply-shape'" in r for r in routes) == 1 and sum("'memory-claim'" in r for r in routes) == 1, routes
 
     def test_a_repaired_turn_keeps_BOTH_rows_with_seq_ordering(self, tmp_path):
         """An auto-repaired turn verifies twice. Both rows are real
@@ -493,9 +504,13 @@ class TestTheStampIsWiredAtTheChokePoint:
         from pathlib import Path
         import ghost_agent.core.agent as m
         tree = ast.parse(Path(m.__file__).read_text())
+        # §4FN round 4 M1: the recording block became ONE recorder,
+        # `_record_verdict_instruments`, that every exit of
+        # `_compute_verifier_verdict` calls (the tool-free exits used to
+        # return before the block and never reached the sidecar).
         fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.AsyncFunctionDef)
-                  and n.name == "_compute_verifier_verdict")
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_record_verdict_instruments")
         return next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
                     and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
 
@@ -541,13 +556,23 @@ class TestTheStampIsWiredAtTheChokePoint:
         from pathlib import Path
         import ghost_agent.core.agent as m
         tree = ast.parse(Path(m.__file__).read_text())
-        owners = []
+        owners, callers = [], []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 seg = ast.dump(node)
                 if "_record_verdict_sidecar" in seg and node.name != "_record_verdict_sidecar":
                     owners.append(node.name)
-        assert owners == ["_compute_verifier_verdict"], owners
+                if "_record_verdict_instruments" in seg and node.name != "_record_verdict_instruments":
+                    callers.append(node.name)
+        # one recorder, called only from the verdict computation — at the
+        # tool-turn choke point AND at both tool-free exits (§4FN round 4 M1)
+        assert owners == ["_record_verdict_instruments"], owners
+        assert callers == ["_compute_verifier_verdict"], callers
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "_compute_verifier_verdict")
+        n_calls = sum(1 for c in ast.walk(fn) if isinstance(c, ast.Call)
+                      and getattr(c.func, "attr", "") == "_record_verdict_instruments")
+        assert n_calls == 3, n_calls
 
     def test_recording_can_never_fail_a_turn(self):
         """A durable write on the answer path must be strictly optional.
@@ -562,8 +587,8 @@ class TestTheStampIsWiredAtTheChokePoint:
         import ghost_agent.core.agent as m
         tree = ast.parse(Path(m.__file__).read_text())
         fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.AsyncFunctionDef)
-                  and n.name == "_compute_verifier_verdict")
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_record_verdict_instruments")
         call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
                     and getattr(c.func, "attr", "") == "_record_verdict_sidecar")
         guarding = [t for t in ast.walk(fn) if isinstance(t, ast.Try)

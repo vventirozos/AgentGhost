@@ -71,11 +71,45 @@ class IngestStats:
     truncated: bool = False
     skipped_pages: int = 0
     errors: List[str] = field(default_factory=list)
+    #: The document's own table of contents, ``[(level, title, page), ...]``
+    #: in document order — the STRUCTURE, kept rather than thrown away once
+    #: the breadcrumbs are built. Before 2026-09-09 this was computed and
+    #: discarded, so "how many chapters does the manual have?" had no
+    #: answerable route and the agent ground through 20+ semantic queries
+    #: (request e0f4a8bd). Empty for a PDF with no outline.
+    outline: List[Tuple[int, str, int]] = field(default_factory=list)
+    #: Pages in the FILE (``st.pages`` counts pages that yielded text).
+    pages_total: int = 0
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Table of contents → per-page breadcrumb
 # ──────────────────────────────────────────────────────────────────────
+
+def normalise_toc(toc) -> List[Tuple[int, str, int]]:
+    """PyMuPDF's ``[[level, title, page_1based], ...]`` → clean, sorted
+    ``[(level, title, page), ...]``.
+
+    ONE authority for the two readers — the breadcrumb builder below and the
+    stored outline (`IngestStats.outline`). They disagreed about nothing
+    while one of them existed; a second private normaliser is how the
+    §4FN compound-age bug happened, so there is only ever this one.
+    A malformed row is dropped, never fatal.
+    """
+    entries: List[Tuple[int, str, int]] = []
+    for row in toc or ():
+        try:
+            level = int(row[0])
+            title = " ".join(str(row[1]).split())
+            page = int(row[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if page < 1 or not title:
+            continue
+        entries.append((max(1, level), title, page))
+    entries.sort(key=lambda e: (e[2], e[0]))
+    return entries
+
 
 def build_page_breadcrumbs(toc, page_count: int) -> List[str]:
     """Map every page index → a "Chapter › Section › Subsection" string.
@@ -91,21 +125,9 @@ def build_page_breadcrumbs(toc, page_count: int) -> List[str]:
     if not toc or not crumbs:
         return crumbs
 
-    # Normalise + sort defensively: a malformed outline must not crash ingest.
-    entries: List[Tuple[int, str, int]] = []
-    for row in toc:
-        try:
-            level = int(row[0])
-            title = " ".join(str(row[1]).split())
-            page = int(row[2])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if page < 1 or not title:
-            continue
-        entries.append((max(1, level), title, page))
+    entries = normalise_toc(toc)
     if not entries:
         return crumbs
-    entries.sort(key=lambda e: (e[2], e[0]))
 
     stack: List[str] = []
     idx = 0
@@ -168,9 +190,13 @@ def iter_pdf_chunks(
                 f"PDF has {page_count} pages; ingest refuses more than "
                 f"{max_pages}. Split it first."
             )
+        st.pages_total = page_count
         try:
-            crumbs = build_page_breadcrumbs(doc.get_toc(), page_count)
+            _toc = doc.get_toc()
+            crumbs = build_page_breadcrumbs(_toc, page_count)
             st.sections = len({c for c in crumbs if c})
+            # KEEP the structure, do not just consume it (request e0f4a8bd).
+            st.outline = normalise_toc(_toc)
         except Exception as e:  # noqa: BLE001 — outline is optional
             logger.debug("PDF TOC unavailable (%s); ingesting without breadcrumbs", e)
             crumbs = [""] * page_count

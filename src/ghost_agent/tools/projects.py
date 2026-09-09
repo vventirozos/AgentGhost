@@ -42,6 +42,15 @@ logger = logging.getLogger("GhostAgent")
 # the "no guard" case by patching it to None.
 _DUPLICATE_CREATE_WINDOW_SECONDS = None  # None == always reuse
 
+#: How long a duplicate-create attempt keeps counting toward "you are in a
+#: LOOP". A loop is a BURST — the model re-issuing the same create inside
+#: one turn or a few minutes. The counter used to be a LIFETIME total on
+#: the project record with nothing that ever cleared it, so a project that
+#: hit three duplicates once kept the alarmed "STOP. This is retry #N"
+#: instruction and its operator WARNING for every duplicate create it ever
+#: saw again, months later (§4FP: arm-on-N with no disarm path).
+_DUPLICATE_CREATE_LOOP_WINDOW_SECONDS = 600.0
+
 
 _ACTIONS = {
     # project-level
@@ -2090,8 +2099,19 @@ async def tool_manage_projects(
                 # visible signal (via pretty_log) that something is
                 # wrong at the model level.
                 existing_meta = dict(existing.get("metadata") or {})
-                retry_count = int(existing_meta.get("duplicate_create_retries", 0)) + 1
+                # Count the BURST, not the lifetime: a duplicate long after
+                # the last one is a fresh mistake, not turn 4 of a loop.
+                try:
+                    _last_dup = float(existing_meta.get(
+                        "duplicate_create_last_at", 0) or 0)
+                except (TypeError, ValueError):
+                    _last_dup = 0.0
+                _prev = int(existing_meta.get("duplicate_create_retries", 0) or 0)
+                if _last_dup and (now - _last_dup) > _DUPLICATE_CREATE_LOOP_WINDOW_SECONDS:
+                    _prev = 0
+                retry_count = _prev + 1
                 existing_meta["duplicate_create_retries"] = retry_count
+                existing_meta["duplicate_create_last_at"] = now
                 # A re-issued create that carries NEW explicit constraints is
                 # a CORRECTION, not a duplicate: the user restated the request
                 # because the existing decomposition missed something (chess

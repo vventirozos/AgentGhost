@@ -272,7 +272,11 @@ async def test_query_action_returns_ranked_passages_with_guidance():
     assert "wal_level" in out and "archive_mode" in out
     assert "[1]" in out and "[2]" in out           # ranked
     assert "breadcrumb" in out.lower()             # told to cite the section
-    assert "query again" in out.lower()            # told it may iterate
+    # …and told it may iterate — but BOUNDED since 2026-09-09: "one more
+    # query, and if it is no closer, stop". The unbounded "query again with
+    # different wording" is what request e0f4a8bd obeyed ten times.
+    assert "one more query" in out.lower()
+    assert "query again with different wording" not in out.lower()
 
 
 @pytest.mark.asyncio
